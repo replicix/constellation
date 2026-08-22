@@ -1,0 +1,62 @@
+# Reproducible test infrastructure.
+#
+#   docker compose up -d --wait floci          # S3 backend only (host tests)
+#   tests/compose-test.sh                      # fully containerized run
+#
+# Floci (https://github.com/floci-io/floci) provides the S3-compatible
+# backend: MIT-licensed, no auth token, LocalStack-compatible wire
+# protocol and init hooks. The `smoke` service runs the complete
+# integration test — including the FUSE mount itself — inside a
+# container, so the whole suite is reproducible locally and in CI.
+services:
+  floci:
+    # -compat variant ships the AWS CLI, needed by the bucket init hook.
+    image: floci/floci:1.7.0-compat
+    ports:
+      - "4566:4566"
+    environment:
+      - FLOCI_STORAGE_MODE=memory
+    volumes:
+      # LocalStack-compatible init path, honored by floci.
+      - ./tests/docker/floci-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_floci/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 2s
+
+  smoke: &suite
+    image: ${SMOKE_IMAGE:-constellation-smoke:local}
+    build:
+      context: .
+      dockerfile: tests/docker/Dockerfile
+    profiles: ["test"]
+    depends_on:
+      floci:
+        condition: service_healthy
+    # FUSE inside a container: the fuse device, mount capability, and an
+    # unconfined apparmor profile (mount is otherwise denied).
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    environment: &suite-env
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT: http://floci:4566
+      AWS_ALLOW_HTTP: "true"
+    command: ["smoke"]
+
+  # POSIX compliance (pjdfstest vs. tests/pjdfstest-baseline.txt).
+  compliance:
+    <<: *suite
+    command: ["compliance"]
+
+  # Data-integrity (fio verify) + metadata churn (stress-ng).
+  stress:
+    <<: *suite
+    command: ["stress"]

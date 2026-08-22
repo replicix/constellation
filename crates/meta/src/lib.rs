@@ -1,0 +1,105 @@
+//! Metadata plane: local full replica in SQLite behind an engine trait
+//! (DECISIONS.md ADR-9), log records and the local journal (DESIGN.md §4).
+
+pub mod error;
+pub mod record;
+pub mod sqlite;
+
+pub use error::MetaError;
+pub use record::LogRecord;
+pub use sqlite::SqliteMeta;
+
+use constellation_fs_core::{FileAttr, Ino};
+
+/// A directory entry as returned by `readdir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub ino: Ino,
+    pub kind: constellation_fs_core::InodeKind,
+}
+
+/// The metadata engine interface (DESIGN.md §4 "Local store").
+///
+/// Every mutating call journals the corresponding log record in the same
+/// transaction; `take_journal` drains records for flushing to S3.
+pub trait MetaStore: Send + Sync {
+    // --- namespace reads ---
+    fn lookup(&self, parent: Ino, name: &str) -> Result<Option<FileAttr>, MetaError>;
+    fn getattr(&self, ino: Ino) -> Result<Option<FileAttr>, MetaError>;
+    fn readdir(&self, parent: Ino) -> Result<Vec<DirEntry>, MetaError>;
+    fn readlink(&self, ino: Ino) -> Result<Option<String>, MetaError>;
+    fn manifest(&self, ino: Ino) -> Result<Option<Vec<u8>>, MetaError>;
+
+    // --- namespace writes (journaled) ---
+    fn mkdir(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, MetaError>;
+    fn create(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, MetaError>;
+    fn symlink(
+        &self,
+        parent: Ino,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, MetaError>;
+    /// Create a special node (fifo/socket/device). `kind.is_special()`.
+    #[allow(clippy::too_many_arguments)]
+    fn mknod(
+        &self,
+        parent: Ino,
+        name: &str,
+        kind: constellation_fs_core::InodeKind,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u64,
+    ) -> Result<FileAttr, MetaError>;
+    /// Hard link `ino` at `parent/name` (files and special nodes only).
+    fn link(&self, ino: Ino, parent: Ino, name: &str) -> Result<FileAttr, MetaError>;
+    fn unlink(&self, parent: Ino, name: &str) -> Result<(), MetaError>;
+    fn rmdir(&self, parent: Ino, name: &str) -> Result<(), MetaError>;
+    fn rename(
+        &self,
+        parent: Ino,
+        name: &str,
+        new_parent: Ino,
+        new_name: &str,
+    ) -> Result<(), MetaError>;
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &self,
+        ino: Ino,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime_ns: Option<i64>,
+        mtime_ns: Option<i64>,
+    ) -> Result<FileAttr, MetaError>;
+    fn set_manifest(&self, ino: Ino, manifest: &[u8], size: u64) -> Result<(), MetaError>;
+
+    // --- orphan lifecycle (unlink-while-open, DESIGN.md §3) ---
+    /// Remove an orphaned inode (nlink == 0) after the last close.
+    fn reap_orphan(&self, ino: Ino) -> Result<(), MetaError>;
+    /// Inodes with nlink == 0 (candidates for reap at startup).
+    fn orphans(&self) -> Result<Vec<Ino>, MetaError>;
+
+    // --- journal ---
+    fn take_journal(&self, max: usize) -> Result<Vec<(u64, LogRecord)>, MetaError>;
+    fn ack_journal(&self, upto_seq: u64) -> Result<(), MetaError>;
+    fn journal_len(&self) -> Result<u64, MetaError>;
+}

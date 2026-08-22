@@ -1,0 +1,9 @@
+# pjdfstest known-failure baseline for the constellation FUSE mount.
+# Format: <category>/<file>.t:<test-number>, one per line; # comments.
+#
+# The compliance suite (tests/compliance.sh) fails on any failure NOT
+# listed here (regression) and warns about entries that now pass
+# (update this file when you fix something).
+#
+# Generated against pjdfstest 85a8aea. Regenerate: run the compliance
+# suite and copy the failure list.

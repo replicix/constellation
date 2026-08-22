@@ -1,0 +1,27 @@
+[package]
+name = "constellation"
+description = "Constellation CLI, daemon, and FUSE mount (single binary)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "constellation"
+path = "src/main.rs"
+
+[dependencies]
+constellation-fs-core.workspace = true
+constellation-meta.workspace = true
+constellation-store-s3.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+fuser.workspace = true
+libc.workspace = true
+object_store.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
