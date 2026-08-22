@@ -30,14 +30,16 @@ struct WriteState {
 
 pub struct ConstellationFs {
     meta: Arc<dyn MetaStore>,
-    store: ChunkStore,
-    cache: DiskCache,
+    store: Arc<ChunkStore>,
+    cache: Arc<DiskCache>,
     rt: Handle,
     chunk_size: u32,
     compression: CompressionSetting,
     writes: Mutex<HashMap<Ino, WriteState>>,
     /// Open handle counts per inode, for orphan reaping on last close.
     opens: Mutex<HashMap<Ino, u32>>,
+    /// Sequential readahead.
+    pub(crate) prefetch: crate::prefetch::Prefetcher,
 }
 
 fn errno(e: &MetaError) -> i32 {
@@ -101,12 +103,13 @@ fn time_or_now_ns(t: TimeOrNow) -> i64 {
 impl ConstellationFs {
     pub fn new(
         meta: Arc<dyn MetaStore>,
-        store: ChunkStore,
-        cache: DiskCache,
+        store: Arc<ChunkStore>,
+        cache: Arc<DiskCache>,
         rt: Handle,
         chunk_size: u32,
         compression: CompressionSetting,
     ) -> Self {
+        let prefetch = crate::prefetch::Prefetcher::new(rt.clone(), store.clone(), cache.clone());
         Self {
             meta,
             store,
@@ -116,6 +119,7 @@ impl ConstellationFs {
             compression,
             writes: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
+            prefetch,
         }
     }
 
@@ -139,7 +143,15 @@ impl ConstellationFs {
     }
 
     /// Get one chunk: cache first, then object store (inserted clean).
+    /// An in-flight prefetch for the same chunk is awaited rather than
+    /// duplicated.
     fn fetch_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, i32> {
+        if let Ok(Some(data)) = self.cache.get(hash) {
+            return Ok(data);
+        }
+        while self.prefetch.is_inflight(hash) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         if let Ok(Some(data)) = self.cache.get(hash) {
             return Ok(data);
         }

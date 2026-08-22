@@ -315,6 +315,7 @@ impl Filesystem for ConstellationFs {
                     let last = *n == 0;
                     if last {
                         opens.remove(&ino);
+                        self.prefetch.forget(ino);
                     }
                     last
                 }
@@ -405,6 +406,8 @@ impl ConstellationFs {
         }
         let len = size.min(file_len - offset);
         let hashes = self.chunk_list(&manifest)?;
+        // Kick sequential readahead for upcoming committed chunks.
+        self.prefetch.on_read(ino, offset, len, self.chunk_size, &hashes);
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let mut out = Vec::with_capacity(len as usize);
         for slice in layout.slices(offset, len) {

@@ -2,6 +2,7 @@
 
 mod backend;
 mod fusefs;
+mod prefetch;
 mod shipper;
 
 use anyhow::{bail, Context, Result};
@@ -153,7 +154,7 @@ fn mount(
     cache_size: u64,
     allow_other: bool,
 ) -> Result<()> {
-    let store = ChunkStore::new(backend::open_backend(s3)?);
+    let store = std::sync::Arc::new(ChunkStore::new(backend::open_backend(s3)?));
     let fsmeta = rt
         .block_on(store.load_fs())
         .context("loading filesystem (fs create first?)")?;
@@ -187,7 +188,7 @@ fn mount(
             )?;
         }
     }
-    let cache = DiskCache::open(state_dir.join("cache"), cache_size)?;
+    let cache = std::sync::Arc::new(DiskCache::open(state_dir.join("cache"), cache_size)?);
     let compression: CompressionSetting = fsmeta
         .compression
         .parse()

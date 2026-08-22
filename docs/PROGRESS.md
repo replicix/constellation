@@ -32,6 +32,7 @@ Status of the implementation against ROADMAP.md. Updated as work lands.
 | Metadata checkpoints (DB snapshot + LATEST pointer, auto every 32 segments + on unmount) | done | `meta::replay`, `cli::shipper` |
 | Fresh-node bootstrap (checkpoint restore + log replay, ino continuation) | done | `cli::shipper::bootstrap`, `meta::replay` |
 | kill -9 + remount recovery | done — harness `kill9-remount` scenario | `crates/harness` |
+| Prefetcher: sequential readahead, in-flight dedup with the read path | done — harness `readahead` scenario proves pipelining under injected latency | `cli::prefetch` |
 
 Unit tests: 48 across fs-core / store-s3 / meta / cli. End-to-end smoke
 test green on both the local-file backend and floci S3 (host and fully
@@ -43,7 +44,6 @@ crash+remount, cold cache, fresh-node bootstrap).
 
 | Item | State | Notes |
 |---|---|---|
-| Prefetcher | **not started** | sequential-read detection → readahead into cache |
 | Control API skeleton | **not started** | CLI currently links the internals directly; the API layer (`crates/api`) is an empty stub |
 | Census-scale import benchmark | **not started** | `bench/` reserved |
 

@@ -61,6 +61,11 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
         run: fresh_node_bootstrap,
     },
+    Scenario {
+        name: "readahead",
+        desc: "cold sequential read of a multi-chunk file under S3 latency must pipeline (prefetcher)",
+        run: readahead,
+    },
 ];
 
 fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
@@ -306,5 +311,55 @@ fn fresh_node_bootstrap(seed: u64) -> Result<()> {
     );
     model.verify(&c1.mnt)?;
     c1.unmount()?;
+    Ok(())
+}
+
+/// With 60 ms of injected S3 latency and a cold cache, a sequential
+/// read of a 32-chunk file takes >= 32 * latency when chunks are
+/// fetched one-by-one. The prefetcher must pipeline fetches and land
+/// well under that; content integrity is verified too.
+fn readahead(_seed: u64) -> Result<()> {
+    let (env, root) = setup("readahead")?;
+    let proxy = env.s3_proxy()?;
+    let mut c = one_client(&env, root.path(), &format!("ra-{}", ts()))?;
+
+    // 32 chunks of 1 MiB (chunk size set by the harness fs_create).
+    let n_chunks = 32u64;
+    let mut data = vec![0u8; (n_chunks * (1 << 20)) as usize];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let expected = blake3::hash(&data);
+    std::fs::write(c.mnt.join("big"), &data)?;
+    drop(data);
+
+    c.unmount()?;
+    c.drop_cache()?;
+    c.mount()?;
+    let latency_ms = 60u64;
+    proxy.latency(latency_ms, 0)?;
+
+    let t0 = std::time::Instant::now();
+    let read = std::fs::read(c.mnt.join("big"))?;
+    let elapsed = t0.elapsed();
+    proxy.heal()?;
+    anyhow::ensure!(
+        blake3::hash(&read) == expected,
+        "content corrupted on cold read"
+    );
+
+    // Serial worst case: one round-trip per chunk. Pipelining must beat
+    // half of it (generous bound to avoid CI flakiness).
+    let serial = Duration::from_millis(n_chunks * latency_ms);
+    anyhow::ensure!(
+        elapsed < serial / 2,
+        "cold sequential read took {elapsed:.1?}; serial fetch estimate is {serial:.1?} — \
+         prefetcher is not pipelining"
+    );
+    eprintln!(
+        "    readahead: {n_chunks} chunks under {latency_ms}ms latency read in {elapsed:.1?} \
+         (serial estimate {serial:.1?})"
+    );
+    c.unmount()?;
     Ok(())
 }

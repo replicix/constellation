@@ -169,7 +169,9 @@ Scenarios (see `harness list`): `baseline`, `latency`, `slow-network`,
 criterion), `cold-cache`, `two-clients-disjoint`,
 `fresh-node-bootstrap` (a brand-new node reconstructs the namespace and
 data purely from S3 — checkpoint restore plus log replay — and must
-match the model exactly). The two-client
+match the model exactly), `readahead` (cold sequential read of a
+multi-chunk file under injected latency must beat the serial-fetch
+floor, proving the prefetcher pipelines). The two-client
 scenario is phase-1 scoped (disjoint namespaces, shared bucket); it
 upgrades to shared-namespace linearizability checks when multi-writer
 leases land. Verification points sit at block boundaries where all
