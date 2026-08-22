@@ -8,6 +8,7 @@
 //! Requires: docker, fusermount3, a release `constellation` binary
 //! (CONSTELLATION_BIN or target/release/constellation).
 
+mod bench;
 mod client;
 mod docker;
 mod model;
@@ -39,6 +40,21 @@ enum Command {
         #[arg(long, default_value_t = 42)]
         seed: u64,
     },
+    /// Census-scale import benchmark (many small files).
+    Bench {
+        /// Number of files to import.
+        #[arg(long, default_value_t = 20_000)]
+        files: u64,
+        /// Size of each file in bytes.
+        #[arg(long, default_value_t = 4096)]
+        file_size: u64,
+        /// Number of directories the files spread across.
+        #[arg(long, default_value_t = 100)]
+        fanout: u64,
+        /// Fail when durable import exceeds this many seconds.
+        #[arg(long)]
+        budget_s: Option<u64>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -55,6 +71,21 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Run { names, seed } => run(names, seed),
+        Command::Bench {
+            files,
+            file_size,
+            fanout,
+            budget_s,
+        } => {
+            let cfg = bench::BenchConfig {
+                files,
+                file_size,
+                fanout,
+                budget_s,
+            };
+            cfg.validate()?;
+            bench::run(&cfg)
+        }
     }
 }
 

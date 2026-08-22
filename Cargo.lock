@@ -274,6 +274,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "constellation-api",
  "constellation-fs-core",
  "constellation-meta",
  "constellation-store-s3",
@@ -290,6 +291,14 @@ dependencies = [
 [[package]]
 name = "constellation-api"
 version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "constellation-fs-core"

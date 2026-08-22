@@ -17,6 +17,15 @@ pub struct Shipper {
     log: LogStore,
     next_seq: u64,
     shipped_since_ckpt: u64,
+    /// Live spool observability shared with the control API.
+    pub spool: Arc<std::sync::Mutex<SpoolInfo>>,
+}
+
+/// Snapshot of shipping progress (updated on every flush attempt).
+#[derive(Default, Clone)]
+pub struct SpoolInfo {
+    pub shipped_seq: u64,
+    pub last_error: Option<String>,
 }
 
 fn encode(records: &[LogRecord]) -> Result<Vec<u8>> {
@@ -39,6 +48,10 @@ impl Shipper {
             log,
             next_seq: last_seq + 1,
             shipped_since_ckpt: 0,
+            spool: Arc::new(std::sync::Mutex::new(SpoolInfo {
+                shipped_seq: last_seq,
+                last_error: None,
+            })),
         };
         if last_seq > 0 {
             shipper.recover_unacked(last_seq).await?;
@@ -105,6 +118,11 @@ impl Shipper {
             records = records.len(),
             "shipped log segment"
         );
+        {
+            let mut spool = self.spool.lock().unwrap();
+            spool.shipped_seq = self.next_seq;
+            spool.last_error = None;
+        }
         self.next_seq += 1;
         self.shipped_since_ckpt += 1;
         if self.shipped_since_ckpt >= CHECKPOINT_EVERY {

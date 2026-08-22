@@ -167,11 +167,33 @@ fn s3_outage(seed: u64) -> Result<()> {
     std::fs::create_dir(c.mnt.join("during-outage"))?;
     model.mkdir(std::path::Path::new("during-outage"));
 
-    // Heal and verify everything still converges.
+    // Spool observability (DESIGN.md §12): the control API must report
+    // the metadata backlog and the shipping error while S3 is down.
+    std::thread::sleep(Duration::from_secs(3)); // let a flush attempt fail
+    let status = c.control_status()?;
+    let backlog = status["spool"]["journal_backlog"].as_u64().unwrap_or(0);
+    anyhow::ensure!(
+        backlog > 0,
+        "expected journal backlog during outage, got {status}"
+    );
+    anyhow::ensure!(
+        !status["spool"]["last_ship_error"].is_null(),
+        "expected last_ship_error during outage, got {status}"
+    );
+
+    // Heal and verify everything still converges — including the spool
+    // draining back to zero.
     proxy.heal()?;
     std::thread::sleep(Duration::from_secs(1));
     wl.run_block(&c.mnt, &mut model, 30)?;
     model.verify(&c.mnt)?;
+    std::thread::sleep(Duration::from_secs(3)); // >= 1 shipper tick
+    let status = c.control_status()?;
+    anyhow::ensure!(
+        status["spool"]["journal_backlog"].as_u64() == Some(0)
+            && status["spool"]["last_ship_error"].is_null(),
+        "spool did not drain after heal: {status}"
+    );
     c.unmount()?;
     Ok(())
 }

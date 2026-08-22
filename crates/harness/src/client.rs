@@ -168,6 +168,23 @@ impl Client {
         }
         Ok(())
     }
+
+    /// Query the daemon's control socket (`status`).
+    pub fn control_status(&self) -> Result<serde_json::Value> {
+        use std::io::{BufRead, BufReader, Write};
+        let sock = self.state.join("control.sock");
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
+            .with_context(|| format!("connecting to {}", sock.display()))?;
+        stream.write_all(b"{\"cmd\":\"status\"}\n")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        let resp: serde_json::Value = serde_json::from_str(&line)?;
+        anyhow::ensure!(
+            resp["resp"] == "status",
+            "unexpected control response: {resp}"
+        );
+        Ok(resp)
+    }
 }
 
 impl Drop for Client {

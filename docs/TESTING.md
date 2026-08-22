@@ -182,6 +182,18 @@ Requires docker + fusermount3 + a release binary on the host
 `constellation-harness=1` and removed on drop, even when a scenario
 panics.
 
+The harness also hosts the census-scale import benchmark:
+
+```bash
+cargo run -p constellation-harness -- bench \
+  --files 20000 --file-size 4096 --fanout 100 [--budget-s N]
+```
+
+It stages a many-small-files tree, imports it (`cp -r`) into a mount
+against floci S3, and reports import (copy + durable-in-S3), warm
+metadata-walk, and cold read-back rates; `--budget-s` turns the durable
+import time into a hard gate.
+
 ## CI notes
 
 - The `integration` job builds the runner image via buildx with

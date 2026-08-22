@@ -52,10 +52,14 @@ enum Command {
         #[arg(long)]
         s3: String,
     },
-    /// Show filesystem information from the backend.
+    /// Show filesystem information from the backend, or live daemon
+    /// status (spool backlog, cache) from a mount's state dir.
     Status {
+        #[arg(long, conflicts_with = "state_dir")]
+        s3: Option<String>,
+        /// State dir of a running mount: query its control socket.
         #[arg(long)]
-        s3: String,
+        state_dir: Option<PathBuf>,
     },
 }
 
@@ -130,12 +134,29 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Status { s3 } => {
-            let store = ChunkStore::new(backend::open_backend(&s3)?);
-            let meta = rt.block_on(store.load_fs())?;
-            println!("{}", serde_json::to_string_pretty(&meta)?);
-            Ok(())
-        }
+        Command::Status { s3, state_dir } => match (s3, state_dir) {
+            (Some(s3), None) => {
+                let store = ChunkStore::new(backend::open_backend(&s3)?);
+                let meta = rt.block_on(store.load_fs())?;
+                println!("{}", serde_json::to_string_pretty(&meta)?);
+                Ok(())
+            }
+            (None, Some(dir)) => {
+                let sock = dir.join(constellation_api::SOCKET_NAME);
+                let resp = rt.block_on(constellation_api::call(
+                    &sock,
+                    &constellation_api::Request::Status,
+                ))?;
+                match resp {
+                    constellation_api::Response::Status(s) => {
+                        println!("{}", serde_json::to_string_pretty(&s)?)
+                    }
+                    other => bail!("unexpected response: {other:?}"),
+                }
+                Ok(())
+            }
+            _ => bail!("exactly one of --s3 or --state-dir is required"),
+        },
         Command::Mount {
             s3,
             mountpoint,
@@ -196,18 +217,19 @@ fn mount(
     let fs = fusefs::ConstellationFs::new(
         meta.clone(),
         store,
-        cache,
+        cache.clone(),
         rt.handle().clone(),
         fsmeta.chunk_size,
         compression,
     );
 
     // Background log shipping: journal -> S3 segments every 2 s.
-    let ship = rt.block_on(shipper::Shipper::attach(meta, log))?;
+    let ship = rt.block_on(shipper::Shipper::attach(meta.clone(), log))?;
+    let spool = ship.spool.clone();
     let ship = std::sync::Arc::new(tokio::sync::Mutex::new(ship));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        let (ship, stop) = (ship.clone(), stop.clone());
+        let (ship, stop, spool) = (ship.clone(), stop.clone(), spool.clone());
         rt.spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -218,9 +240,27 @@ fn mount(
                     // Transient S3 failures: the journal retains the
                     // records; the next tick retries (DESIGN.md §12).
                     tracing::warn!(error = %e, "log shipping failed; will retry");
+                    spool.lock().unwrap().last_error = Some(format!("{e:#}"));
                 }
             }
         });
+    }
+
+    // Control API on <state_dir>/control.sock (spool + cache status).
+    let status = std::sync::Arc::new(DaemonStatus {
+        meta,
+        cache,
+        spool,
+        fs_uuid: fsmeta.uuid.to_string(),
+        backend: s3.to_string(),
+        mountpoint: mountpoint.display().to_string(),
+        started: std::time::Instant::now(),
+    });
+    {
+        let _guard = rt.enter();
+        if let Err(e) = constellation_api::serve(&state_dir, status) {
+            tracing::warn!(error = %e, "control API unavailable");
+        }
     }
 
     let mut options = vec![
@@ -238,6 +278,41 @@ fn mount(
     rt.block_on(async { ship.lock().await.shutdown().await })
         .context("final log flush")?;
     Ok(())
+}
+
+/// Live daemon state exposed over the control socket.
+struct DaemonStatus {
+    meta: std::sync::Arc<SqliteMeta>,
+    cache: std::sync::Arc<DiskCache>,
+    spool: std::sync::Arc<std::sync::Mutex<shipper::SpoolInfo>>,
+    fs_uuid: String,
+    backend: String,
+    mountpoint: String,
+    started: std::time::Instant,
+}
+
+impl constellation_api::StatusSource for DaemonStatus {
+    fn status(&self) -> constellation_api::StatusReport {
+        let spool = self.spool.lock().unwrap().clone();
+        let usage = self.cache.usage();
+        constellation_api::StatusReport {
+            fs_uuid: self.fs_uuid.clone(),
+            backend: self.backend.clone(),
+            mountpoint: self.mountpoint.clone(),
+            uptime_s: self.started.elapsed().as_secs(),
+            spool: constellation_api::SpoolStatus {
+                journal_backlog: constellation_meta::MetaStore::journal_len(&*self.meta)
+                    .unwrap_or(0),
+                shipped_seq: spool.shipped_seq,
+                last_ship_error: spool.last_error,
+            },
+            cache: constellation_api::CacheStatus {
+                used_bytes: usage.used,
+                budget_bytes: usage.budget,
+                chunks: usage.entries as u64,
+            },
+        }
+    }
 }
 
 fn default_state_dir(meta: &FsMeta) -> PathBuf {
