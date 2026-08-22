@@ -175,6 +175,11 @@ impl SqliteMeta {
         )?;
         Ok(())
     }
+
+    /// Raw connection access for same-crate extensions (replay).
+    pub(crate) fn raw(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap()
+    }
 }
 
 impl MetaStore for SqliteMeta {

@@ -56,6 +56,11 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "two clients, one bucket: disjoint namespaces must not corrupt each other (phase-1 scope)",
         run: two_clients_disjoint,
     },
+    Scenario {
+        name: "fresh-node-bootstrap",
+        desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
+        run: fresh_node_bootstrap,
+    },
 ];
 
 fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
@@ -258,6 +263,48 @@ fn two_clients_disjoint(seed: u64) -> Result<()> {
             .with_context(|| format!("c1 block {block}"))?;
     }
     c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+/// The metadata log is the source of truth: after clean unmounts and a
+/// crash, a brand-new node must reconstruct the exact namespace and
+/// data from the bucket alone.
+fn fresh_node_bootstrap(seed: u64) -> Result<()> {
+    let (env, root) = setup("bootstrap")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/boot-{}", ts());
+    let mut model = Model::default();
+    let mut wl = Workload::new(seed, "w");
+
+    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
+    c0.fs_create()?;
+    c0.mount()?;
+    wl.run_block(&c0.mnt, &mut model, 50)?;
+    // Clean unmount ships the journal tail and writes a checkpoint.
+    c0.unmount()?;
+
+    // Second epoch exercises the replay path past the checkpoint: ops
+    // ship on the 2 s ticker, then the daemon is SIGKILLed so no final
+    // checkpoint covers them.
+    c0.mount()?;
+    wl.run_block(&c0.mnt, &mut model, 40)?;
+    std::thread::sleep(Duration::from_secs(5)); // >= 2 shipper ticks, journal drained
+    c0.kill9()?;
+
+    // A brand-new node with an empty state dir sees the same world.
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?;
+    c1.mount().context("bootstrap mount on fresh node")?;
+    model
+        .verify(&c1.mnt)
+        .context("fresh node namespace/data vs model")?;
+    // And it is writable: allocation continues past replayed inos.
+    std::fs::write(c1.mnt.join("bootstrap-proof"), b"hello from c1")?;
+    model.write_file(
+        std::path::Path::new("bootstrap-proof"),
+        b"hello from c1".to_vec(),
+    );
+    model.verify(&c1.mnt)?;
     c1.unmount()?;
     Ok(())
 }

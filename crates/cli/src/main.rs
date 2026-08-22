@@ -2,6 +2,7 @@
 
 mod backend;
 mod fusefs;
+mod shipper;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -158,17 +159,24 @@ fn mount(
         .context("loading filesystem (fs create first?)")?;
     let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&fsmeta));
     std::fs::create_dir_all(&state_dir)?;
-    let meta = SqliteMeta::open(state_dir.join("meta.db"))?;
+    let log = constellation_store_s3::LogStore::new(store.inner().clone());
+    let db_path = state_dir.join("meta.db");
+    // Fresh node: rebuild the replica from checkpoint + log replay.
+    if !db_path.exists() {
+        rt.block_on(shipper::bootstrap(&db_path, &log))
+            .context("bootstrapping metadata replica")?;
+    }
+    let meta = std::sync::Arc::new(SqliteMeta::open(&db_path)?);
     // First mount: adopt the mounting user as owner of the root directory
     // (the DB bootstraps it as 0:0).
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
     if let Some(root) =
-        constellation_meta::MetaStore::getattr(&meta, constellation_fs_core::types::ROOT_INO)?
+        constellation_meta::MetaStore::getattr(&*meta, constellation_fs_core::types::ROOT_INO)?
     {
         if root.uid == 0 && euid != 0 {
             constellation_meta::MetaStore::setattr(
-                &meta,
+                &*meta,
                 constellation_fs_core::types::ROOT_INO,
                 None,
                 Some(euid),
@@ -185,13 +193,35 @@ fn mount(
         .parse()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let fs = fusefs::ConstellationFs::new(
-        Box::new(meta),
+        meta.clone(),
         store,
         cache,
         rt.handle().clone(),
         fsmeta.chunk_size,
         compression,
     );
+
+    // Background log shipping: journal -> S3 segments every 2 s.
+    let ship = rt.block_on(shipper::Shipper::attach(meta, log))?;
+    let ship = std::sync::Arc::new(tokio::sync::Mutex::new(ship));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (ship, stop) = (ship.clone(), stop.clone());
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(e) = ship.lock().await.flush().await {
+                    // Transient S3 failures: the journal retains the
+                    // records; the next tick retries (DESIGN.md §12).
+                    tracing::warn!(error = %e, "log shipping failed; will retry");
+                }
+            }
+        });
+    }
+
     let mut options = vec![
         fuser::MountOption::FSName("constellation".into()),
         fuser::MountOption::DefaultPermissions,
@@ -201,6 +231,11 @@ fn mount(
     }
     tracing::info!(?mountpoint, ?state_dir, fs = %fsmeta.uuid, "mounting");
     fuser::mount2(fs, mountpoint, &options).context("FUSE mount")?;
+
+    // Clean unmount: ship the journal tail and checkpoint.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    rt.block_on(async { ship.lock().await.shutdown().await })
+        .context("final log flush")?;
     Ok(())
 }
 

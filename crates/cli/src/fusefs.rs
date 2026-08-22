@@ -13,7 +13,7 @@ use fuser::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
@@ -29,7 +29,7 @@ struct WriteState {
 }
 
 pub struct ConstellationFs {
-    meta: Box<dyn MetaStore>,
+    meta: Arc<dyn MetaStore>,
     store: ChunkStore,
     cache: DiskCache,
     rt: Handle,
@@ -100,7 +100,7 @@ fn time_or_now_ns(t: TimeOrNow) -> i64 {
 
 impl ConstellationFs {
     pub fn new(
-        meta: Box<dyn MetaStore>,
+        meta: Arc<dyn MetaStore>,
         store: ChunkStore,
         cache: DiskCache,
         rt: Handle,

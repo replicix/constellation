@@ -166,10 +166,13 @@ is the Jepsen-style lane. The harness orchestrates everything itself:
 
 Scenarios (see `harness list`): `baseline`, `latency`, `slow-network`,
 `s3-outage`, `s3-flap`, `kill9-remount` (the phase-1 crash-recovery exit
-criterion), `cold-cache`, `two-clients-disjoint`. The two-client
+criterion), `cold-cache`, `two-clients-disjoint`,
+`fresh-node-bootstrap` (a brand-new node reconstructs the namespace and
+data purely from S3 — checkpoint restore plus log replay — and must
+match the model exactly). The two-client
 scenario is phase-1 scoped (disjoint namespaces, shared bucket); it
-upgrades to shared-namespace linearizability checks when metadata log
-shipping lands. Verification points sit at block boundaries where all
+upgrades to shared-namespace linearizability checks when multi-writer
+leases land. Verification points sit at block boundaries where all
 files are closed, matching close-to-open durability semantics.
 
 Requires docker + fusermount3 + a release binary on the host

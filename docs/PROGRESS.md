@@ -2,7 +2,7 @@
 
 Status of the implementation against ROADMAP.md. Updated as work lands.
 
-## Phase 1 — Single-node FUSE on S3: **IN PROGRESS (~70%)**
+## Phase 1 — Single-node FUSE on S3: **IN PROGRESS (~90%)**
 
 ### Done
 
@@ -27,31 +27,36 @@ Status of the implementation against ROADMAP.md. Updated as work lands.
 | Test framework: smoke test, floci S3 emulator, containerized FUSE lane, GitHub Actions CI (fmt/clippy/unit/integration) | done | `tests/`, `docker-compose.yml`, `.github/workflows/ci.yml`, docs/TESTING.md |
 | pjdfstest compliance lane | done — **8798/8798 pass, empty baseline** | `tests/compliance.sh`, `tests/pjdfstest-baseline.txt` |
 | Stress lane: fio write-verify + stress-ng metadata churn | done | `tests/stress.sh` |
+| Fault-injection harness: floci+toxiproxy orchestration, seeded workloads, model-oracle verification | done | `crates/harness`, docs/TESTING.md |
+| Metadata log shipping to S3 (CAS segments, crash-safe ack, duplicate-writer detection) | done | `store-s3::log`, `cli::shipper` |
+| Metadata checkpoints (DB snapshot + LATEST pointer, auto every 32 segments + on unmount) | done | `meta::replay`, `cli::shipper` |
+| Fresh-node bootstrap (checkpoint restore + log replay, ino continuation) | done | `cli::shipper::bootstrap`, `meta::replay` |
+| kill -9 + remount recovery | done — harness `kill9-remount` scenario | `crates/harness` |
 
-Unit tests: 44 across fs-core / store-s3 / meta / cli. End-to-end smoke
+Unit tests: 48 across fs-core / store-s3 / meta / cli. End-to-end smoke
 test green on both the local-file backend and floci S3 (host and fully
-containerized lanes). pjdfstest: full pass, no exclusions.
+containerized lanes). pjdfstest: full pass, no exclusions. Harness: 9
+fault-injection scenarios green (S3 outage/flap/latency/bandwidth,
+crash+remount, cold cache, fresh-node bootstrap).
 
 ### Remaining for phase 1
 
 | Item | State | Notes |
 |---|---|---|
-| Metadata log shipping to S3 | **not started** | journal records exist locally, but no segment writer/uploader; layout keys reserved. Without it, namespace lives only in the local SQLite replica — a fresh node cannot reconstruct the tree from the bucket. This is the biggest gap. |
-| Metadata checkpoints/snapshots (single partition) | **not started** | needed with log shipping (bounded replay) |
 | Prefetcher | **not started** | sequential-read detection → readahead into cache |
 | Control API skeleton | **not started** | CLI currently links the internals directly; the API layer (`crates/api`) is an empty stub |
-| kill -9 + remount recovery test | **not started** | crash-consistency exit criterion |
 | Census-scale import benchmark | **not started** | `bench/` reserved |
 
 ### Phase 1 exit criteria (ROADMAP.md)
 
 - [x] pjdfstest passes — full pass (8798/8798), empty failure baseline
-- [ ] kill -9 + remount recovers — untested
+- [x] kill -9 + remount recovers — harness `kill9-remount` scenario verifies
+      committed state survives SIGKILL across three crash/remount rounds
 - [ ] census-scale import within budget — not measured
 
-**Verdict: phase 1 is not finished.** The mount works end-to-end for a
-single node, but the durability story (metadata log + checkpoints in S3)
-and the exit gates are outstanding.
+**Verdict: phase 1 is nearly done.** The durability story is complete
+(metadata log + checkpoints in S3, fresh-node bootstrap proven by the
+oracle); prefetcher, API skeleton, and the import benchmark remain.
 
 ## Known design-debt in the current code (fix within phase 1)
 

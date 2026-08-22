@@ -3,6 +3,7 @@
 
 pub mod error;
 pub mod record;
+pub mod replay;
 pub mod sqlite;
 
 pub use error::MetaError;
