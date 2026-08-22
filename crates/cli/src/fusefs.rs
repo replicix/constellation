@@ -28,6 +28,17 @@ struct WriteState {
     base: Option<Manifest>,
 }
 
+/// A request to the daemon's sync task: `None` nudges an immediate
+/// round; `Some(reply)` additionally awaits its completion.
+pub type SyncRequest = Option<tokio::sync::oneshot::Sender<Result<(), String>>>;
+
+/// FUSE-side handle to the metadata sync task.
+pub struct SyncHandle {
+    pub tx: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
+    /// `--fsync-mode s3`: fsync() returns only once the journal is in S3.
+    pub fsync_s3: bool,
+}
+
 pub struct ConstellationFs {
     meta: Arc<dyn MetaStore>,
     store: Arc<ChunkStore>,
@@ -40,6 +51,8 @@ pub struct ConstellationFs {
     opens: Mutex<HashMap<Ino, u32>>,
     /// Sequential readahead.
     pub(crate) prefetch: crate::prefetch::Prefetcher,
+    /// Publication path to the sync task (None in tests).
+    sync: Option<SyncHandle>,
 }
 
 fn errno(e: &MetaError) -> i32 {
@@ -108,6 +121,7 @@ impl ConstellationFs {
         rt: Handle,
         chunk_size: u32,
         compression: CompressionSetting,
+        sync: Option<SyncHandle>,
     ) -> Self {
         let prefetch = crate::prefetch::Prefetcher::new(rt.clone(), store.clone(), cache.clone());
         Self {
@@ -120,6 +134,38 @@ impl ConstellationFs {
             writes: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
             prefetch,
+            sync,
+        }
+    }
+
+    /// Ask the sync task for an immediate round without waiting:
+    /// close() is the close-to-open publication point, and the sooner
+    /// the record ships, the sooner other nodes tail it.
+    pub(crate) fn nudge_sync(&self) {
+        if let Some(h) = &self.sync {
+            let _ = h.tx.send(None);
+        }
+    }
+
+    /// fsync() barrier. In `--fsync-mode s3`, block until the journal
+    /// (up to now) is durable in the shared log; otherwise just nudge.
+    pub(crate) fn sync_barrier(&self) -> Result<(), i32> {
+        let Some(h) = &self.sync else { return Ok(()) };
+        if !h.fsync_s3 {
+            let _ = h.tx.send(None);
+            return Ok(());
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if h.tx.send(Some(reply_tx)).is_err() {
+            return Err(libc::EIO);
+        }
+        match reply_rx.blocking_recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "fsync barrier: sync failed");
+                Err(libc::EIO)
+            }
+            Err(_) => Err(libc::EIO),
         }
     }
 

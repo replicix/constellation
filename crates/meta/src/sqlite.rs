@@ -13,6 +13,11 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 use std::sync::Mutex;
 
+/// Inos are `node_prefix << 40 | counter`: 24 bits of node id, 40 bits
+/// (~1.1e12) of per-node allocations. Prefix 0 belongs to `fs create`
+/// genesis (the root inode is 1).
+pub const INO_PREFIX_SHIFT: u32 = 40;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS inode (
     ino       INTEGER PRIMARY KEY,
@@ -81,11 +86,13 @@ impl SqliteMeta {
                  VALUES (?1, ?2, ?3, 0, 0, 2, ?4, ?4, ?4)",
                 params![ROOT_INO, InodeKind::Dir.as_u8(), 0o755, t],
             )?;
-            conn.execute(
-                "INSERT OR REPLACE INTO kv (key, value) VALUES ('next_ino', ?1)",
-                params![(ROOT_INO + 1).to_string()],
-            )?;
         }
+        // Present even on DBs restored from a checkpoint (which strips
+        // node-local kv keys); `set_node_prefix` re-scopes it anyway.
+        conn.execute(
+            "INSERT OR IGNORE INTO kv (key, value) VALUES ('next_ino', ?1)",
+            params![(ROOT_INO + 1).to_string()],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -96,14 +103,97 @@ impl SqliteMeta {
             conn.query_row("SELECT value FROM kv WHERE key = 'next_ino'", [], |r| {
                 r.get(0)
             })?;
-        let ino: Ino = next
+        let counter: u64 = next
             .parse()
             .map_err(|_| MetaError::Invalid("next_ino".into()))?;
         conn.execute(
             "UPDATE kv SET value = ?1 WHERE key = 'next_ino'",
-            params![(ino + 1).to_string()],
+            params![(counter + 1).to_string()],
         )?;
-        Ok(ino)
+        Ok(Self::prefix_of(conn)? << INO_PREFIX_SHIFT | counter)
+    }
+
+    fn prefix_of(conn: &Connection) -> Result<u64, MetaError> {
+        let v: Option<String> = conn
+            .query_row("SELECT value FROM kv WHERE key = 'node_prefix'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(v.and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+
+    /// This node's ino prefix (0 until [`set_node_prefix`] is called).
+    pub fn node_prefix(&self) -> Result<u64, MetaError> {
+        Self::prefix_of(&self.conn.lock().unwrap())
+    }
+
+    /// Scope all future ino allocations to a cluster-unique node prefix
+    /// (`ino = prefix << 40 | counter`), so concurrent nodes can never
+    /// allocate colliding inode numbers. Changing the prefix restarts
+    /// the counter: the new prefix is a fresh, empty ino namespace.
+    pub fn set_node_prefix(&self, prefix: u64) -> Result<(), MetaError> {
+        if prefix >= 1 << (64 - INO_PREFIX_SHIFT) {
+            return Err(MetaError::Invalid(format!("node prefix {prefix}")));
+        }
+        let conn = self.conn.lock().unwrap();
+        if Self::prefix_of(&conn)? == prefix {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES ('node_prefix', ?1)",
+            params![prefix.to_string()],
+        )?;
+        conn.execute("UPDATE kv SET value = '1' WHERE key = 'next_ino'", [])?;
+        Ok(())
+    }
+
+    /// The highest shared-log sequence this replica has applied or
+    /// shipped (kv `applied_seq`; 0 when never synced).
+    pub fn applied_seq(&self) -> Result<u64, MetaError> {
+        Ok(self
+            .kv_get("applied_seq")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0))
+    }
+
+    pub fn set_applied_seq(&self, seq: u64) -> Result<(), MetaError> {
+        self.kv_set("applied_seq", &seq.to_string())
+    }
+
+    /// Atomically ack journal records and record the log position that
+    /// covers them: a crash can never separate the two (which would
+    /// either wedge recovery or re-ship acked records).
+    pub fn ack_journal_at(&self, upto_journal_seq: u64, applied_seq: u64) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM journal WHERE seq <= ?1",
+            params![upto_journal_seq],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES ('applied_seq', ?1)",
+            params![applied_seq.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn kv_get(&self, key: &str) -> Result<Option<String>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn kv_set(&self, key: &str, value: &str) -> Result<(), MetaError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     fn journal(conn: &Connection, record: &LogRecord) -> Result<(), MetaError> {
@@ -727,7 +817,7 @@ impl MetaStore for SqliteMeta {
     fn take_journal(&self, max: usize) -> Result<Vec<(u64, LogRecord)>, MetaError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT seq, record FROM journal ORDER BY seq LIMIT ?1")?;
-        let rows = stmt.query_map(params![max as i64], |r| {
+        let rows = stmt.query_map(params![max.min(i64::MAX as usize) as i64], |r| {
             Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?))
         })?;
         let mut out = Vec::new();

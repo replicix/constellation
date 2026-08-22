@@ -22,6 +22,10 @@ pub struct StatusReport {
     pub fs_uuid: String,
     pub backend: String,
     pub mountpoint: String,
+    /// This node's cluster-unique id (scopes ino allocation, marks log
+    /// segment origin).
+    #[serde(default)]
+    pub node_id: u64,
     pub uptime_s: u64,
     pub spool: SpoolStatus,
     pub cache: CacheStatus,
@@ -32,9 +36,13 @@ pub struct StatusReport {
 pub struct SpoolStatus {
     /// Journal records not yet shipped to S3.
     pub journal_backlog: u64,
-    /// Highest log segment sequence shipped so far.
-    pub shipped_seq: u64,
-    /// Last shipping error, if the most recent flush failed (S3 outage).
+    /// Highest log segment sequence shipped or applied so far.
+    pub head_seq: u64,
+    /// Foreign records skipped because a pending local op won (phase 2
+    /// leaseless conflict detection).
+    #[serde(default)]
+    pub conflicts: u64,
+    /// Last sync error, if the most recent round failed (S3 outage).
     pub last_ship_error: Option<String>,
 }
 

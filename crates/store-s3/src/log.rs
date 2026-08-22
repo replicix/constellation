@@ -66,10 +66,17 @@ impl LogStore {
 
     /// All segment sequence numbers, ascending.
     pub async fn list_segments(&self) -> Result<Vec<u64>, StoreError> {
+        self.list_segments_from(1).await
+    }
+
+    /// Segment sequence numbers `>= from`, ascending. Keys are
+    /// zero-padded hex, so lexicographic offset listing is numeric.
+    pub async fn list_segments_from(&self, from: u64) -> Result<Vec<u64>, StoreError> {
         let prefix = layout::log_prefix(PARTITION);
+        let offset = layout::log_segment(PARTITION, from.saturating_sub(1));
         let mut seqs: Vec<u64> = self
             .store
-            .list(Some(&prefix))
+            .list_with_offset(Some(&prefix), &offset)
             .try_collect::<Vec<_>>()
             .await?
             .into_iter()
@@ -77,6 +84,7 @@ impl LogStore {
                 let name = m.location.filename()?.strip_suffix(".zst")?.to_string();
                 u64::from_str_radix(&name, 16).ok()
             })
+            .filter(|&s| s >= from)
             .collect();
         seqs.sort_unstable();
         Ok(seqs)

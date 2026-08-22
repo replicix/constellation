@@ -58,7 +58,9 @@ impl Client {
             .env("AWS_SECRET_ACCESS_KEY", "test")
             .env("AWS_DEFAULT_REGION", "us-east-1")
             .env("AWS_ENDPOINT", &self.endpoint)
-            .env("AWS_ALLOW_HTTP", "true");
+            .env("AWS_ALLOW_HTTP", "true")
+            // Snappy cross-node propagation for multi-client scenarios.
+            .env("CONSTELLATION_SYNC_INTERVAL_MS", "200");
         c
     }
 

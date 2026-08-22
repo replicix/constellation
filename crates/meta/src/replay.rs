@@ -1,44 +1,158 @@
-//! Replay: apply shipped log records to rebuild a metadata replica
-//! (fresh-node bootstrap, checkpoint catch-up). Replay writes use the
-//! recorded inos and timestamps and are NOT journaled — they already
-//! live in the log.
+//! Replay: apply shipped log records to rebuild or advance a metadata
+//! replica (fresh-node bootstrap, checkpoint catch-up, live tailing of
+//! foreign segments). Replay writes use the recorded inos and
+//! timestamps and are NOT journaled — they already live in the log.
+//!
+//! Replay is **convergent**, not strict: records apply with last-wins
+//! upsert semantics so that (a) segments replayed over a checkpoint
+//! that already contains their effects are idempotent, and (b) two
+//! replicas that saw the same records in different interleavings agree
+//! (the record later in the global log wins). Conflicts with *pending*
+//! (unshipped) local records are skipped by the caller via
+//! [`TouchSet`] — our own records sit later in the global log than
+//! anything we are tailing, so ours win everywhere.
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::sqlite::SqliteMeta;
+use crate::sqlite::{SqliteMeta, INO_PREFIX_SHIFT};
 use constellation_fs_core::InodeKind;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
+
+/// The namespace state a set of log records reads or writes: used to
+/// detect foreign records conflicting with pending local ones.
+#[derive(Default)]
+pub struct TouchSet {
+    pub dentries: HashSet<(u64, String)>,
+    pub inos: HashSet<u64>,
+}
+
+impl TouchSet {
+    pub fn from_records<'a>(records: impl Iterator<Item = &'a LogRecord>) -> Self {
+        let mut set = Self::default();
+        for r in records {
+            set.add(r);
+        }
+        set
+    }
+
+    pub fn add(&mut self, rec: &LogRecord) {
+        match rec {
+            LogRecord::Mkdir {
+                parent, name, ino, ..
+            }
+            | LogRecord::Create {
+                parent, name, ino, ..
+            }
+            | LogRecord::Symlink {
+                parent, name, ino, ..
+            }
+            | LogRecord::Mknod {
+                parent, name, ino, ..
+            }
+            | LogRecord::Link {
+                parent, name, ino, ..
+            } => {
+                self.dentries.insert((*parent, name.clone()));
+                self.inos.insert(*ino);
+            }
+            LogRecord::Unlink { parent, name, .. } | LogRecord::Rmdir { parent, name, .. } => {
+                self.dentries.insert((*parent, name.clone()));
+            }
+            LogRecord::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            } => {
+                self.dentries.insert((*parent, name.clone()));
+                self.dentries.insert((*new_parent, new_name.clone()));
+            }
+            LogRecord::Setattr { ino, .. } | LogRecord::WriteManifest { ino, .. } => {
+                self.inos.insert(*ino);
+            }
+        }
+    }
+
+    pub fn conflicts(&self, rec: &LogRecord) -> bool {
+        let mut single = TouchSet::default();
+        single.add(rec);
+        single.dentries.iter().any(|d| self.dentries.contains(d))
+            || single.inos.iter().any(|i| self.inos.contains(i))
+    }
+}
 
 impl SqliteMeta {
-    /// Apply a batch of records in one transaction, then advance
-    /// `next_ino` past every inode seen.
+    /// Apply a batch of records in one transaction (bootstrap /
+    /// checkpoint catch-up), then advance this node's ino counter past
+    /// every inode seen under its own prefix.
     pub fn apply_records(&self, records: &[LogRecord]) -> Result<(), MetaError> {
+        self.apply_foreign(records, &TouchSet::default())?;
+        Ok(())
+    }
+
+    /// Apply records tailed from other nodes' segments, skipping any
+    /// that conflict with pending (unshipped) local records. Returns
+    /// the number of records skipped as conflicts.
+    pub fn apply_foreign(
+        &self,
+        records: &[LogRecord],
+        pending: &TouchSet,
+    ) -> Result<usize, MetaError> {
         let mut conn = self.raw();
         let tx = conn.transaction()?;
+        let mut skipped = 0usize;
         for rec in records {
-            apply_one(&tx, rec)?;
+            if pending.conflicts(rec) {
+                tracing::warn!(?rec, "conflict: pending local op wins over foreign record");
+                skipped += 1;
+                continue;
+            }
+            match apply_one(&tx, rec) {
+                Ok(Applied::Done) => {}
+                Ok(Applied::Skipped(why)) => {
+                    tracing::warn!(?rec, why, "skipped foreign record");
+                    skipped += 1;
+                }
+                Err(e) => return Err(e),
+            }
         }
-        // next_ino must clear everything ever allocated.
-        let max_ino: u64 =
-            tx.query_row("SELECT COALESCE(MAX(ino), 1) FROM inode", [], |r| r.get(0))?;
+        // Our ino counter must clear everything ever allocated under
+        // our own prefix (relevant when replaying our own history).
+        let prefix: u64 = tx
+            .query_row("SELECT value FROM kv WHERE key = 'node_prefix'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let (lo, hi) = (prefix << INO_PREFIX_SHIFT, (prefix + 1) << INO_PREFIX_SHIFT);
+        let max_counter: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(ino), 0) FROM inode WHERE ino >= ?1 AND ino < ?2",
+            params![lo, hi],
+            |r| r.get::<_, i64>(0).map(|v| v as u64),
+        )? & ((1 << INO_PREFIX_SHIFT) - 1);
         let next: u64 = tx
             .query_row("SELECT value FROM kv WHERE key = 'next_ino'", [], |r| {
                 r.get::<_, String>(0)
             })?
             .parse()
             .map_err(|_| MetaError::Invalid("next_ino".into()))?;
-        if max_ino + 1 > next {
+        if max_counter + 1 > next {
             tx.execute(
                 "UPDATE kv SET value = ?1 WHERE key = 'next_ino'",
-                params![(max_ino + 1).to_string()],
+                params![(max_counter + 1).to_string()],
             )?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(skipped)
     }
 
     /// Consistent zstd-free snapshot of the whole DB with the journal
-    /// stripped (checkpoint payload; a restored node must not re-ship).
+    /// and node-local identity stripped (checkpoint payload; a restored
+    /// node must not re-ship records or inherit our node id / ino
+    /// counter).
     pub fn snapshot(&self) -> Result<Vec<u8>, MetaError> {
         let conn = self.raw();
         let tmp =
@@ -51,12 +165,21 @@ impl SqliteMeta {
             c.execute("DELETE FROM journal", [])?;
             // Reset AUTOINCREMENT so the restored node journals from 1.
             let _ = c.execute("DELETE FROM sqlite_sequence WHERE name = 'journal'", []);
+            c.execute(
+                "DELETE FROM kv WHERE key IN ('node_id', 'node_prefix', 'next_ino', 'applied_seq')",
+                [],
+            )?;
             c.execute("VACUUM", [])?;
         }
         let bytes = std::fs::read(&tmp).map_err(|e| MetaError::Invalid(e.to_string()))?;
         let _ = std::fs::remove_file(&tmp);
         Ok(bytes)
     }
+}
+
+enum Applied {
+    Done,
+    Skipped(&'static str),
 }
 
 fn dentry_ino(tx: &Connection, parent: u64, name: &str) -> Result<Option<u64>, MetaError> {
@@ -69,12 +192,48 @@ fn dentry_ino(tx: &Connection, parent: u64, name: &str) -> Result<Option<u64>, M
         .optional()?)
 }
 
-fn kind_of(tx: &Connection, ino: u64) -> Result<u8, MetaError> {
-    tx.query_row("SELECT kind FROM inode WHERE ino = ?1", params![ino], |r| {
-        r.get(0)
-    })
-    .optional()?
-    .ok_or(MetaError::NoEnt(ino))
+fn kind_of(tx: &Connection, ino: u64) -> Result<Option<u8>, MetaError> {
+    Ok(tx
+        .query_row("SELECT kind FROM inode WHERE ino = ?1", params![ino], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+fn ino_exists(tx: &Connection, ino: u64) -> Result<bool, MetaError> {
+    Ok(kind_of(tx, ino)?.is_some())
+}
+
+/// Drop an existing dentry so a later log record can claim the name
+/// (last-wins). Non-empty directories refuse: replacing them silently
+/// would drop a subtree.
+fn evict_dentry(tx: &Connection, parent: u64, name: &str, ino: u64) -> Result<Applied, MetaError> {
+    if kind_of(tx, ino)? == Some(InodeKind::Dir.as_u8()) {
+        let children: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM dentry WHERE parent = ?1",
+            params![ino],
+            |r| r.get(0),
+        )?;
+        if children > 0 {
+            return Ok(Applied::Skipped("name held by non-empty directory"));
+        }
+        tx.execute("DELETE FROM inode WHERE ino = ?1", params![ino])?;
+        tx.execute(
+            "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
+            params![parent],
+        )?;
+    } else {
+        // nlink drops; a 0-nlink inode is an orphan, reaped at mount.
+        tx.execute(
+            "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
+            params![ino],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
+        params![parent, name],
+    )?;
+    Ok(Applied::Done)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -92,10 +251,25 @@ fn insert_node(
     size: u64,
     target: Option<&str>,
     t: i64,
-) -> Result<(), MetaError> {
+) -> Result<Applied, MetaError> {
+    if !ino_exists(tx, parent)? {
+        // Cascade of a skipped conflicting mkdir: the parent never
+        // materialized here. Skip the whole subtree.
+        return Ok(Applied::Skipped("parent does not exist"));
+    }
+    if let Some(existing) = dentry_ino(tx, parent, name)? {
+        if existing != ino {
+            // Last-wins: this record is later in the log than whatever
+            // holds the name now.
+            if let Applied::Skipped(why) = evict_dentry(tx, parent, name, existing)? {
+                return Ok(Applied::Skipped(why));
+            }
+        }
+    }
+    // OR REPLACE: idempotent under checkpoint/segment overlap.
     tx.execute(
-        "INSERT INTO inode (ino, kind, size, mode, uid, gid, nlink, atime_ns, mtime_ns, ctime_ns,
-                            rdev, symlink_target)
+        "INSERT OR REPLACE INTO inode (ino, kind, size, mode, uid, gid, nlink, atime_ns,
+                            mtime_ns, ctime_ns, rdev, symlink_target)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, ?9, ?10)",
         params![
             ino,
@@ -110,11 +284,11 @@ fn insert_node(
             target
         ],
     )?;
-    tx.execute(
-        "INSERT INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
         params![parent, name, ino],
     )?;
-    if kind == InodeKind::Dir {
+    if inserted > 0 && kind == InodeKind::Dir {
         tx.execute(
             "UPDATE inode SET nlink = nlink + 1 WHERE ino = ?1",
             params![parent],
@@ -124,10 +298,10 @@ fn insert_node(
         "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
         params![parent, t],
     )?;
-    Ok(())
+    Ok(Applied::Done)
 }
 
-fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<(), MetaError> {
+fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
     match rec {
         LogRecord::Mkdir {
             parent,
@@ -221,6 +395,17 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<(), MetaError> {
             name,
             time_ns,
         } => {
+            if !ino_exists(tx, *ino)? || !ino_exists(tx, *parent)? {
+                return Ok(Applied::Skipped("link target or parent missing"));
+            }
+            if let Some(existing) = dentry_ino(tx, *parent, name)? {
+                if existing == *ino {
+                    return Ok(Applied::Done); // idempotent re-apply
+                }
+                if let Applied::Skipped(why) = evict_dentry(tx, *parent, name, existing)? {
+                    return Ok(Applied::Skipped(why));
+                }
+            }
             tx.execute(
                 "INSERT INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
                 params![parent, name, ino],
@@ -233,14 +418,16 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<(), MetaError> {
                 "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
                 params![parent, time_ns],
             )?;
-            Ok(())
+            Ok(Applied::Done)
         }
         LogRecord::Unlink {
             parent,
             name,
             time_ns,
         } => {
-            let ino = dentry_ino(tx, *parent, name)?.ok_or(MetaError::NoEntry)?;
+            let Some(ino) = dentry_ino(tx, *parent, name)? else {
+                return Ok(Applied::Done); // already gone: idempotent
+            };
             tx.execute(
                 "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
                 params![parent, name],
@@ -255,14 +442,25 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<(), MetaError> {
                 "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
                 params![parent, time_ns],
             )?;
-            Ok(())
+            Ok(Applied::Done)
         }
         LogRecord::Rmdir {
             parent,
             name,
             time_ns,
         } => {
-            let ino = dentry_ino(tx, *parent, name)?.ok_or(MetaError::NoEntry)?;
+            let Some(ino) = dentry_ino(tx, *parent, name)? else {
+                return Ok(Applied::Done); // already gone: idempotent
+            };
+            let children: u64 = tx.query_row(
+                "SELECT COUNT(*) FROM dentry WHERE parent = ?1",
+                params![ino],
+                |r| r.get(0),
+            )?;
+            if children > 0 {
+                // A skipped-conflict cascade left local children here.
+                return Ok(Applied::Skipped("directory not empty locally"));
+            }
             tx.execute(
                 "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
                 params![parent, name],
@@ -272,7 +470,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<(), MetaError> {
                 "UPDATE inode SET nlink = nlink - 1, mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
                 params![parent, time_ns],
             )?;
-            Ok(())
+            Ok(Applied::Done)
         }
         LogRecord::Rename {
             parent,
@@ -281,28 +479,20 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<(), MetaError> {
             new_name,
             time_ns,
         } => {
-            let ino = dentry_ino(tx, *parent, name)?.ok_or(MetaError::NoEntry)?;
-            let src_is_dir = kind_of(tx, ino)? == InodeKind::Dir.as_u8();
+            let Some(ino) = dentry_ino(tx, *parent, name)? else {
+                return Ok(Applied::Done); // source gone: already applied
+            };
+            if !ino_exists(tx, *new_parent)? {
+                return Ok(Applied::Skipped("rename destination parent missing"));
+            }
+            let src_is_dir = kind_of(tx, ino)? == Some(InodeKind::Dir.as_u8());
             if let Some(existing) = dentry_ino(tx, *new_parent, new_name)? {
                 if existing == ino {
-                    return Ok(());
+                    return Ok(Applied::Done); // hardlink pair: POSIX no-op
                 }
-                if kind_of(tx, existing)? == InodeKind::Dir.as_u8() {
-                    tx.execute("DELETE FROM inode WHERE ino = ?1", params![existing])?;
-                    tx.execute(
-                        "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
-                        params![new_parent],
-                    )?;
-                } else {
-                    tx.execute(
-                        "UPDATE inode SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1",
-                        params![existing, time_ns],
-                    )?;
+                if let Applied::Skipped(why) = evict_dentry(tx, *new_parent, new_name, existing)? {
+                    return Ok(Applied::Skipped(why));
                 }
-                tx.execute(
-                    "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
-                    params![new_parent, new_name],
-                )?;
             }
             tx.execute(
                 "UPDATE dentry SET parent = ?3, name = ?4 WHERE parent = ?1 AND name = ?2",
@@ -324,7 +514,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<(), MetaError> {
                     params![p, time_ns],
                 )?;
             }
-            Ok(())
+            Ok(Applied::Done)
         }
         LogRecord::Setattr {
             ino,
@@ -336,6 +526,9 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<(), MetaError> {
             mtime_ns,
             time_ns,
         } => {
+            if !ino_exists(tx, *ino)? {
+                return Ok(Applied::Done); // inode gone: attrs moot
+            }
             if let Some(m) = mode {
                 tx.execute(
                     "UPDATE inode SET mode = ?2 WHERE ino = ?1",
@@ -370,7 +563,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<(), MetaError> {
                 "UPDATE inode SET ctime_ns = ?2 WHERE ino = ?1",
                 params![ino, time_ns],
             )?;
-            Ok(())
+            Ok(Applied::Done)
         }
         LogRecord::WriteManifest {
             ino,
@@ -378,12 +571,15 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<(), MetaError> {
             size,
             time_ns,
         } => {
+            if !ino_exists(tx, *ino)? {
+                return Ok(Applied::Done); // inode gone: data moot
+            }
             tx.execute(
                 "UPDATE inode SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4
                  WHERE ino = ?1",
                 params![ino, manifest, *size as i64, time_ns],
             )?;
-            Ok(())
+            Ok(Applied::Done)
         }
     }
 }

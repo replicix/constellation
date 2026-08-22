@@ -46,6 +46,10 @@ enum Command {
         /// Allow other users to access the mount.
         #[arg(long)]
         allow_other: bool,
+        /// What fsync() waits for: "local" (journal on disk; background
+        /// ship) or "s3" (record durable in the shared log).
+        #[arg(long, default_value = "local")]
+        fsync_mode: String,
     },
     /// Verify backend capabilities (conditional writes, filesystem state).
     Doctor {
@@ -163,10 +167,27 @@ fn main() -> Result<()> {
             state_dir,
             cache_size,
             allow_other,
-        } => mount(rt, &s3, &mountpoint, state_dir, cache_size, allow_other),
+            fsync_mode,
+        } => {
+            let fsync_s3 = match fsync_mode.as_str() {
+                "local" => false,
+                "s3" => true,
+                other => bail!("invalid --fsync-mode {other:?} (expected local or s3)"),
+            };
+            mount(
+                rt,
+                &s3,
+                &mountpoint,
+                state_dir,
+                cache_size,
+                allow_other,
+                fsync_s3,
+            )
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mount(
     rt: tokio::runtime::Runtime,
     s3: &str,
@@ -174,6 +195,7 @@ fn mount(
     state_dir: Option<PathBuf>,
     cache_size: u64,
     allow_other: bool,
+    fsync_s3: bool,
 ) -> Result<()> {
     let store = std::sync::Arc::new(ChunkStore::new(backend::open_backend(s3)?));
     let fsmeta = rt
@@ -189,6 +211,20 @@ fn mount(
             .context("bootstrapping metadata replica")?;
     }
     let meta = std::sync::Arc::new(SqliteMeta::open(&db_path)?);
+    // Node identity: claim a cluster-unique id on first mount of this
+    // state dir; it scopes ino allocation and marks log segment origin.
+    let node_id: u64 = match meta.kv_get("node_id")? {
+        Some(v) => v.parse().context("corrupt node_id in state dir")?,
+        None => {
+            let id = rt
+                .block_on(constellation_store_s3::claim_node_id(store.inner().clone()))
+                .context("claiming node id")?;
+            meta.kv_set("node_id", &id.to_string())?;
+            id
+        }
+    };
+    meta.set_node_prefix(node_id)?;
+    tracing::info!(node_id, "node identity");
     // First mount: adopt the mounting user as owner of the root directory
     // (the DB bootstraps it as 0:0).
     let euid = unsafe { libc::geteuid() };
@@ -214,6 +250,9 @@ fn mount(
         .compression
         .parse()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Sync task channel: FUSE nudges it on close (publication point)
+    // and blocks on it for fsync in --fsync-mode s3.
+    let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel::<fusefs::SyncRequest>();
     let fs = fusefs::ConstellationFs::new(
         meta.clone(),
         store,
@@ -221,10 +260,19 @@ fn mount(
         rt.handle().clone(),
         fsmeta.chunk_size,
         compression,
+        Some(fusefs::SyncHandle {
+            tx: sync_tx,
+            fsync_s3,
+        }),
     );
 
-    // Background log shipping: journal -> S3 segments every 2 s.
-    let ship = rt.block_on(shipper::Shipper::attach(meta.clone(), log))?;
+    // Background metadata sync: tail foreign segments + ship the
+    // journal, every interval or on demand (close/fsync nudges).
+    let interval_ms: u64 = std::env::var("CONSTELLATION_SYNC_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
+    let ship = shipper::Shipper::attach(meta.clone(), log, node_id)?;
     let spool = ship.spool.clone();
     let ship = std::sync::Arc::new(tokio::sync::Mutex::new(ship));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -232,23 +280,29 @@ fn mount(
         let (ship, stop, spool) = (ship.clone(), stop.clone(), spool.clone());
         rt.spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let request = tokio::select! {
+                    msg = sync_rx.recv() => match msg {
+                        Some(req) => req,
+                        None => break, // FUSE gone; shutdown ships the tail
+                    },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(interval_ms)) => None,
+                };
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                // Drain the whole journal, not just one batch: churny
-                // workloads produce records faster than one batch/tick.
                 let r = async {
                     let mut ship = ship.lock().await;
-                    while ship.flush().await? {}
-                    anyhow::Ok(())
+                    ship.sync().await
                 }
                 .await;
-                if let Err(e) = r {
+                if let Err(e) = &r {
                     // Transient S3 failures: the journal retains the
-                    // records; the next tick retries (DESIGN.md §12).
-                    tracing::warn!(error = %e, "log shipping failed; will retry");
+                    // records; the next round retries (DESIGN.md §12).
+                    tracing::warn!(error = %e, "metadata sync failed; will retry");
                     spool.lock().unwrap().last_error = Some(format!("{e:#}"));
+                }
+                if let Some(reply) = request {
+                    let _ = reply.send(r.map_err(|e| format!("{e:#}")));
                 }
             }
         });
@@ -262,6 +316,7 @@ fn mount(
         fs_uuid: fsmeta.uuid.to_string(),
         backend: s3.to_string(),
         mountpoint: mountpoint.display().to_string(),
+        node_id,
         started: std::time::Instant::now(),
     });
     {
@@ -296,6 +351,7 @@ struct DaemonStatus {
     fs_uuid: String,
     backend: String,
     mountpoint: String,
+    node_id: u64,
     started: std::time::Instant,
 }
 
@@ -307,11 +363,13 @@ impl constellation_api::StatusSource for DaemonStatus {
             fs_uuid: self.fs_uuid.clone(),
             backend: self.backend.clone(),
             mountpoint: self.mountpoint.clone(),
+            node_id: self.node_id,
             uptime_s: self.started.elapsed().as_secs(),
             spool: constellation_api::SpoolStatus {
                 journal_backlog: constellation_meta::MetaStore::journal_len(&*self.meta)
                     .unwrap_or(0),
-                shipped_seq: spool.shipped_seq,
+                head_seq: spool.head_seq,
+                conflicts: spool.conflicts,
                 last_ship_error: spool.last_error,
             },
             cache: constellation_api::CacheStatus {

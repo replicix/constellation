@@ -68,6 +68,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: two_clients_disjoint,
     },
     Scenario {
+        name: "two-clients-shared",
+        desc: "two clients, ONE filesystem: writes on each propagate to the other (close-to-open)",
+        requires: &[],
+        run: two_clients_shared,
+    },
+    Scenario {
+        name: "git-workflow",
+        desc: "stage/publish/edit ping-pong between two nodes of one filesystem",
+        requires: &[],
+        run: git_workflow,
+    },
+    Scenario {
         name: "fresh-node-bootstrap",
         desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
         requires: &[],
@@ -296,6 +308,147 @@ fn cold_cache(seed: u64) -> Result<()> {
 /// filesystems (different prefixes) in one bucket. Verifies the shared
 /// chunk plane doesn't cross-corrupt. Upgraded to a shared-namespace
 /// scenario when metadata log shipping lands (phase 2).
+/// Poll until `f` succeeds or `deadline` passes (cross-node
+/// propagation is asynchronous: sync interval + FUSE TTLs).
+fn eventually(what: &str, deadline: Duration, mut f: impl FnMut() -> Result<()>) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        match f() {
+            Ok(()) => return Ok(()),
+            Err(e) if start.elapsed() > deadline => {
+                return Err(e.context(format!("'{what}' not reached within {deadline:?}")))
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
+}
+
+/// Two clients mount the SAME filesystem. Each works in its own
+/// subtree; after every block, each node must observe the other's
+/// subtree exactly (model-verified through the foreign mount).
+fn two_clients_shared(seed: u64) -> Result<()> {
+    let (env, root) = setup("two-shared")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/shared-{}", ts());
+    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?;
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?; // fresh state dir: bootstraps the same namespace
+
+    std::fs::create_dir(c0.mnt.join("a"))?;
+    std::fs::create_dir(c1.mnt.join("b"))?;
+    eventually("subtrees visible on both", Duration::from_secs(20), || {
+        anyhow::ensure!(c0.mnt.join("b").is_dir(), "b not on c0");
+        anyhow::ensure!(c1.mnt.join("a").is_dir(), "a not on c1");
+        Ok(())
+    })?;
+
+    let mut m0 = Model::default();
+    let mut m1 = Model::default();
+    let mut w0 = Workload::new(seed, "a");
+    let mut w1 = Workload::new(seed.wrapping_add(1), "b");
+    for block in 0..3 {
+        w0.run_block(&c0.mnt.join("a"), &mut m0, 30)?;
+        w1.run_block(&c1.mnt.join("b"), &mut m1, 30)?;
+        // Local view is immediate.
+        m0.verify(&c0.mnt.join("a"))
+            .with_context(|| format!("c0 local, block {block}"))?;
+        m1.verify(&c1.mnt.join("b"))
+            .with_context(|| format!("c1 local, block {block}"))?;
+        // Remote view converges (close-to-open through S3 alone).
+        eventually(
+            &format!("cross-node convergence, block {block}"),
+            Duration::from_secs(30),
+            || {
+                m0.verify(&c1.mnt.join("a")).context("c0's tree via c1")?;
+                m1.verify(&c0.mnt.join("b")).context("c1's tree via c0")?;
+                Ok(())
+            },
+        )?;
+    }
+
+    let status = c0.control_status()?;
+    anyhow::ensure!(
+        status["spool"]["conflicts"].as_u64() == Some(0),
+        "disjoint subtrees must produce zero conflicts: {status}"
+    );
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+/// The git-style workflow from the roadmap: node A stages a tree and
+/// publishes it with an atomic rename; node B consumes it, edits, and
+/// publishes back. Ping-pong with exact content verification.
+fn git_workflow(_seed: u64) -> Result<()> {
+    let (env, root) = setup("git-workflow")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/gitwf-{}", ts());
+    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?;
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+
+    // A: stage, then publish atomically.
+    let stage = c0.mnt.join("stage");
+    std::fs::create_dir_all(stage.join("src"))?;
+    std::fs::write(stage.join("src/main.c"), b"int main(){return 0;}\n")?;
+    std::fs::write(stage.join("README.md"), b"# demo v1\n")?;
+    std::fs::rename(&stage, c0.mnt.join("repo"))?;
+
+    // B: sees the published tree, exactly.
+    eventually("repo published on B", Duration::from_secs(20), || {
+        let repo = c1.mnt.join("repo");
+        anyhow::ensure!(!c1.mnt.join("stage").exists(), "stage leaked");
+        let readme = std::fs::read(repo.join("README.md")).context("README")?;
+        anyhow::ensure!(readme == b"# demo v1\n", "README content");
+        let main = std::fs::read(repo.join("src/main.c")).context("main.c")?;
+        anyhow::ensure!(main == b"int main(){return 0;}\n", "main.c content");
+        Ok(())
+    })?;
+
+    // B: edit, restructure, publish back.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(c1.mnt.join("repo/README.md"))?;
+        f.write_all(b"edited on B\n")?;
+    }
+    std::fs::write(c1.mnt.join("repo/BUILD"), b"cc src/*.c\n")?;
+    std::fs::remove_file(c1.mnt.join("repo/src/main.c"))?;
+    std::fs::rename(c1.mnt.join("repo/src"), c1.mnt.join("repo/lib"))?;
+
+    // A: sees B's edits, exactly.
+    eventually("B's edits visible on A", Duration::from_secs(20), || {
+        let repo = c0.mnt.join("repo");
+        let readme = std::fs::read(repo.join("README.md")).context("README")?;
+        anyhow::ensure!(readme == b"# demo v1\nedited on B\n", "README round 2");
+        anyhow::ensure!(
+            std::fs::read(repo.join("BUILD"))? == b"cc src/*.c\n",
+            "BUILD content"
+        );
+        anyhow::ensure!(!repo.join("src").exists(), "src should be renamed");
+        anyhow::ensure!(repo.join("lib").is_dir(), "lib missing");
+        anyhow::ensure!(!repo.join("lib/main.c").exists(), "main.c deleted on B");
+        Ok(())
+    })?;
+
+    // A: final round-trip (overwrite shrinks the file).
+    std::fs::write(c0.mnt.join("repo/README.md"), b"v3\n")?;
+    eventually("round 3 on B", Duration::from_secs(20), || {
+        let readme = std::fs::read(c1.mnt.join("repo/README.md")).context("README")?;
+        anyhow::ensure!(readme == b"v3\n", "README round 3: {readme:?}");
+        Ok(())
+    })?;
+
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
 fn two_clients_disjoint(seed: u64) -> Result<()> {
     let (env, root) = setup("two-clients")?;
     let _proxy = env.s3_proxy()?;

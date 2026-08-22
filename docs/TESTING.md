@@ -179,11 +179,18 @@ latency), `fio-blips` (fio verify while S3 is cut for 800 ms every
 (metadata churn during S3 flapping; the mount must stay healthy and
 the spool drain afterwards). Scenarios declare required host binaries
 and are skipped loudly when a tool is missing (CI installs fio and
-stress-ng, so nothing is skipped there). The two-client
-scenario is phase-1 scoped (disjoint namespaces, shared bucket); it
-upgrades to shared-namespace linearizability checks when multi-writer
-leases land. Verification points sit at block boundaries where all
-files are closed, matching close-to-open durability semantics.
+stress-ng, so nothing is skipped there).
+
+Phase-2 scenarios exercise **one filesystem mounted by two nodes**
+(close-to-open through S3 alone): `two-clients-shared` (each node runs
+a seeded workload in its own subtree; after every block each node's
+tree is model-verified *through the other node's mount*, asserting
+zero conflicts), and `git-workflow` (stage → atomic-rename publish on
+A, consume+edit+restructure on B, publish back — exact content
+verification in both directions). Verification points sit at block
+boundaries where all files are closed, matching close-to-open
+durability semantics; cross-node checks poll with a deadline because
+propagation is asynchronous (sync interval + FUSE TTLs).
 
 Requires docker + fusermount3 + a release binary on the host
 (`CONSTELLATION_BIN` overrides discovery). Containers are labeled

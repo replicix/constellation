@@ -73,7 +73,45 @@ the oracle-based harness.
 - `setattr` journals a redundant record when invoked for truncate (size
   is also recorded by the subsequent `write_manifest`).
 
+## Phase 2 — Second node, close-to-open: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Node registry: CAS-claimed cluster-unique node ids | done | `store-s3::nodes` |
+| Node-scoped ino allocation (`prefix << 40 \| counter`) — concurrent nodes can never collide | done | `meta::sqlite` |
+| Segment envelope (`{v, node, records}`, versioned; legacy bare arrays decode as node 0) | done | `cli::shipper` |
+| Log tailing + replica application (poll + on-demand, contiguous-run ordering) | done | `cli::shipper::Shipper::sync` |
+| Convergent replay: last-wins upsert semantics, idempotent under checkpoint/segment overlap | done | `meta::replay` |
+| Leaseless conflict handling: foreign records touching pending local state are skipped (ours are later in the log and win everywhere); counted + logged, surfaced via control API | done | `meta::replay::TouchSet`, `cli::shipper` |
+| Multi-writer CAS collision: loser re-tails and retries at the next sequence | done | `cli::shipper` |
+| Crash-atomic ack (journal ack + applied-seq in one tx) | done | `meta::sqlite::ack_journal_at` |
+| Publication point: close() nudges an immediate sync round | done | `cli::fusefs_ops` |
+| fsync modes: `--fsync-mode local` (default) / `s3` (fsync blocks until the record is durable in the shared log) | done | `cli::{main,fusefs}` |
+| Checkpoints strip node identity (a restored node claims its own id/counter) | done | `meta::replay::snapshot` |
+| Two-node convergence unit tests (disjoint, same-name conflict, sequential cross-edits, lost-response recovery) | done | `cli::shipper` tests |
+| Harness scenarios: `two-clients-shared`, `git-workflow` | done | `crates/harness` |
+
+### Phase 2 exit criteria (ROADMAP.md)
+
+- [x] Two nodes mount concurrently with close-to-open semantics through
+      S3 alone (no P2P) — `two-clients-shared` model-verifies each
+      node's subtree through the *other* node's mount every block
+- [x] Simulation layer green for two-node histories — in-process
+      convergence tests over a shared in-memory object store cover
+      disjoint writes, same-name conflicts (deterministic last-wins,
+      never silent), sequential cross-node edits, and lost-response
+      recovery
+- [x] git-workflow scenario clean — stage/publish/edit ping-pong with
+      exact content verification in both directions
+
+Known phase-2 scope limits (by design, lifted in phase 3): concurrent
+conflicting writes to the *same* dentry/inode from two nodes resolve
+deterministically (log order) but are only detected+logged, not
+prevented — leases make them impossible in the default mode; attribute
+and entry invalidation is TTL-based (1 s) rather than push-based, so
+cross-node visibility is sync-interval + TTL, not gossip-RTT.
+
 ## Later phases
 
-Not started (phases 2–8). No code exists for log tailing, leases, P2P,
+Not started (phases 3–8). No code exists for leases, P2P,
 pin/offline, cooperative cache, sharing/snapshots/E2E, web UI, or GC.

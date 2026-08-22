@@ -94,10 +94,12 @@ mod tests {
                 fs_uuid: "test-uuid".into(),
                 backend: "s3://bucket/prefix".into(),
                 mountpoint: "/mnt/x".into(),
+                node_id: 1,
                 uptime_s: 12,
                 spool: SpoolStatus {
                     journal_backlog: 3,
-                    shipped_seq: 7,
+                    head_seq: 7,
+                    conflicts: 0,
                     last_ship_error: None,
                 },
                 cache: CacheStatus {

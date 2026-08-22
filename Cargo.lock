@@ -281,6 +281,7 @@ dependencies = [
  "fuser",
  "libc",
  "object_store",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -338,6 +339,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

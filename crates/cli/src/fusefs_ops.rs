@@ -291,7 +291,10 @@ impl Filesystem for ConstellationFs {
 
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
         match self.flush_inode(ino) {
-            Ok(()) => reply.ok(),
+            Ok(()) => match self.sync_barrier() {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            },
             Err(e) => reply.error(e),
         }
     }
@@ -331,7 +334,11 @@ impl Filesystem for ConstellationFs {
             }
         }
         match flush_result {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                // close() is the close-to-open publication point.
+                self.nudge_sync();
+                reply.ok()
+            }
             Err(e) => reply.error(e),
         }
     }
