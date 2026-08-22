@@ -1,7 +1,7 @@
 # Testing
 
-Constellation has four test lanes, from fastest to most realistic. All of
-them run in GitHub Actions on every PR (`.github/workflows/ci.yml`).
+Constellation has five test lanes, from fastest to most realistic. All
+of them run in GitHub Actions on every PR (`.github/workflows/ci.yml`).
 
 | Lane | Command | Backend | Needs | Speed |
 |---|---|---|---|---|
@@ -9,10 +9,7 @@ them run in GitHub Actions on every PR (`.github/workflows/ci.yml`).
 | Host smoke | `tests/smoke.sh` | local directory (`object_store` LocalFileSystem) | Rust, fuse3 | ~2 s |
 | Host integration | `tests/integration.sh` | floci S3 (container) | + docker | ~10 s |
 | Containerized | `tests/compose-test.sh` | floci S3 (container) | docker only | ~5 min cold |
-
-The containerized lane runs three suites (see below): `smoke`,
-`compliance` (pjdfstest), and `stress` (fio + stress-ng). Run a subset
-with `tests/compose-test.sh smoke stress`.
+| Fault injection | `cargo run -p constellation-harness -- run` | floci S3 via toxiproxy | Rust, fuse3, docker | ~90 s |
 
 The containerized lane runs three suites (all by default, or pick:
 `tests/compose-test.sh smoke stress`):
@@ -146,6 +143,39 @@ Reasons this lane exists (vs. mounting on the host):
 Caveats: the kernel is still shared with the host (FUSE behavior is
 kernel-dependent), and hardened runners that forbid `CAP_SYS_ADMIN`
 can't run this lane — use the host lanes there.
+
+## Fault injection: the harness (`crates/harness`)
+
+`cargo run -p constellation-harness -- run [scenario ...] [--seed N]`
+is the Jepsen-style lane. The harness orchestrates everything itself:
+
+- **Topology**: floci (S3) + [toxiproxy](https://github.com/Shopify/toxiproxy)
+  on a private docker network; constellation clients run on the host and
+  reach S3 *through* the proxy, so every scenario can inject faults on
+  the S3 path (hard cuts, latency+jitter, bandwidth caps, sliced
+  packets, mid-stream timeouts).
+- **Oracle**: every workload op is applied both to the real mount and to
+  an in-memory filesystem model; `verify` walks the real tree and fails
+  on any divergence (missing/extra entries, kind, size, content hash,
+  symlink target). A divergence means constellation lost or corrupted
+  data.
+- **Determinism**: workloads are seeded (`--seed`); a failure reproduces
+  exactly.
+- **Client lifecycle**: mount, clean unmount, `kill -9` (crash), remount,
+  chunk-cache wipe — all first-class scenario operations.
+
+Scenarios (see `harness list`): `baseline`, `latency`, `slow-network`,
+`s3-outage`, `s3-flap`, `kill9-remount` (the phase-1 crash-recovery exit
+criterion), `cold-cache`, `two-clients-disjoint`. The two-client
+scenario is phase-1 scoped (disjoint namespaces, shared bucket); it
+upgrades to shared-namespace linearizability checks when metadata log
+shipping lands. Verification points sit at block boundaries where all
+files are closed, matching close-to-open durability semantics.
+
+Requires docker + fusermount3 + a release binary on the host
+(`CONSTELLATION_BIN` overrides discovery). Containers are labeled
+`constellation-harness=1` and removed on drop, even when a scenario
+panics.
 
 ## CI notes
 
