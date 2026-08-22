@@ -5,6 +5,7 @@
 use crate::client::Client;
 use crate::model::Model;
 use crate::s3env::{S3Env, BUCKET};
+use crate::suites;
 use crate::workload::Workload;
 use anyhow::{Context, Result};
 use std::time::Duration;
@@ -12,6 +13,8 @@ use std::time::Duration;
 pub struct Scenario {
     pub name: &'static str,
     pub desc: &'static str,
+    /// Host binaries the scenario needs; missing ones cause a loud skip.
+    pub requires: &'static [&'static str],
     pub run: fn(seed: u64) -> Result<()>,
 }
 
@@ -19,52 +22,80 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "baseline",
         desc: "workload with a healthy network; model verified per block",
+        requires: &[],
         run: baseline,
     },
     Scenario {
         name: "latency",
         desc: "workload under 150ms +/-50ms S3 latency",
+        requires: &[],
         run: latency,
     },
     Scenario {
         name: "slow-network",
         desc: "workload under 256 KB/s S3 bandwidth + sliced packets",
+        requires: &[],
         run: slow_network,
     },
     Scenario {
         name: "s3-outage",
         desc: "cut S3 mid-workload: cached reads keep working, writes recover after heal",
+        requires: &[],
         run: s3_outage,
     },
     Scenario {
         name: "s3-flap",
         desc: "S3 connection cut/heal every block; workload must stay correct",
+        requires: &[],
         run: s3_flap,
     },
     Scenario {
         name: "kill9-remount",
         desc: "SIGKILL the daemon between blocks; remount must recover all committed state",
+        requires: &[],
         run: kill9_remount,
     },
     Scenario {
         name: "cold-cache",
         desc: "wipe the chunk cache between blocks; reads must re-fetch from S3",
+        requires: &[],
         run: cold_cache,
     },
     Scenario {
         name: "two-clients-disjoint",
         desc: "two clients, one bucket: disjoint namespaces must not corrupt each other (phase-1 scope)",
+        requires: &[],
         run: two_clients_disjoint,
     },
     Scenario {
         name: "fresh-node-bootstrap",
         desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
+        requires: &[],
         run: fresh_node_bootstrap,
     },
     Scenario {
         name: "readahead",
         desc: "cold sequential read of a multi-chunk file under S3 latency must pipeline (prefetcher)",
+        requires: &[],
         run: readahead,
+    },
+    Scenario {
+        name: "fio-latency",
+        desc: "fio randwrite + crc32c verify under 80ms S3 latency",
+        requires: &["fio"],
+        run: fio_latency,
+    },
+    Scenario {
+        name: "fio-blips",
+        desc: "fio verify while S3 blips on/off: retries must absorb transient cuts",
+        requires: &["fio"],
+        run: fio_blips,
+    },
+    Scenario {
+        name: "stress-ng-flap",
+        desc: "stress-ng metadata churn while S3 flaps; mount healthy + spool drains",
+        requires: &["stress-ng"],
+        run: stress_ng_flap,
     },
 ];
 
@@ -384,4 +415,89 @@ fn readahead(_seed: u64) -> Result<()> {
     );
     c.unmount()?;
     Ok(())
+}
+
+/// fio random writes with crc32c verification while every S3 round
+/// trip carries 80 ms of latency: slow but perfectly correct.
+fn fio_latency(_seed: u64) -> Result<()> {
+    let (env, root) = setup("fio-latency")?;
+    let proxy = env.s3_proxy()?;
+    let mut c = one_client(&env, root.path(), &format!("fiolat-{}", ts()))?;
+    proxy.latency(80, 20)?;
+    suites::fio_verify(&c.mnt, "8M", 1)?;
+    proxy.heal()?;
+    c.unmount()?;
+    Ok(())
+}
+
+/// fio verify while a background flapper cuts S3 for 800 ms every ~4 s.
+/// The object-store retry layer must absorb the blips: no I/O errors,
+/// no verification failures.
+fn fio_blips(_seed: u64) -> Result<()> {
+    let (env, root) = setup("fio-blips")?;
+    let proxy = env.s3_proxy()?;
+    let mut c = one_client(&env, root.path(), &format!("fioblip-{}", ts()))?;
+
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let flapper = scope.spawn(|| -> Result<()> {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                proxy.cut()?;
+                std::thread::sleep(Duration::from_millis(800));
+                proxy.heal()?;
+                std::thread::sleep(Duration::from_secs(4));
+            }
+            Ok(())
+        });
+        let fio = suites::fio_verify(&c.mnt, "16M", 2);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        flapper.join().expect("flapper panicked")?;
+        fio
+    })?;
+    proxy.heal()?;
+    c.unmount()?;
+    Ok(())
+}
+
+/// stress-ng metadata churn while S3 flaps: namespace ops are local in
+/// phase 1 and must be entirely unaffected; afterwards the mount is
+/// healthy and the metadata spool drains to zero.
+fn stress_ng_flap(_seed: u64) -> Result<()> {
+    let (env, root) = setup("stress-flap")?;
+    let proxy = env.s3_proxy()?;
+    let mut c = one_client(&env, root.path(), &format!("sng-{}", ts()))?;
+
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let flapper = scope.spawn(|| -> Result<()> {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                proxy.cut()?;
+                std::thread::sleep(Duration::from_millis(1500));
+                proxy.heal()?;
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            Ok(())
+        });
+        let churn = suites::stress_ng(&c.mnt, &["dentry", "rename", "open"], 8);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        flapper.join().expect("flapper panicked")?;
+        churn
+    })?;
+    proxy.heal()?;
+
+    // Mount still healthy, and the churned metadata ships out.
+    std::fs::write(c.mnt.join("canary"), b"ok")?;
+    anyhow::ensure!(std::fs::read(c.mnt.join("canary"))? == b"ok");
+    for _ in 0..30 {
+        let status = c.control_status()?;
+        if status["spool"]["journal_backlog"].as_u64() == Some(0) {
+            c.unmount()?;
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    anyhow::bail!(
+        "spool did not drain after stress-ng churn: {}",
+        c.control_status()?
+    )
 }

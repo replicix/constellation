@@ -171,7 +171,15 @@ criterion), `cold-cache`, `two-clients-disjoint`,
 data purely from S3 — checkpoint restore plus log replay — and must
 match the model exactly), `readahead` (cold sequential read of a
 multi-chunk file under injected latency must beat the serial-fetch
-floor, proving the prefetcher pipelines). The two-client
+floor, proving the prefetcher pipelines). Suite-under-fault scenarios
+run the external tools from the stress lane through the same fault
+injector: `fio-latency` (crc32c-verified random writes under 80 ms S3
+latency), `fio-blips` (fio verify while S3 is cut for 800 ms every
+~4 s — the retry layer must absorb the blips), and `stress-ng-flap`
+(metadata churn during S3 flapping; the mount must stay healthy and
+the spool drain afterwards). Scenarios declare required host binaries
+and are skipped loudly when a tool is missing (CI installs fio and
+stress-ng, so nothing is skipped there). The two-client
 scenario is phase-1 scoped (disjoint namespaces, shared bucket); it
 upgrades to shared-namespace linearizability checks when multi-writer
 leases land. Verification points sit at block boundaries where all

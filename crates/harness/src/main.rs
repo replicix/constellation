@@ -14,6 +14,7 @@ mod docker;
 mod model;
 mod s3env;
 mod scenarios;
+mod suites;
 mod toxiproxy;
 mod workload;
 
@@ -104,7 +105,13 @@ fn run(names: Vec<String>, seed: u64) -> Result<()> {
     };
 
     let mut failures = Vec::new();
+    let mut skipped = Vec::new();
     for s in selected {
+        if let Some(missing) = s.requires.iter().find(|b| !suites::have(b)) {
+            eprintln!("=== {} SKIPPED ({missing} not installed)", s.name);
+            skipped.push(s.name);
+            continue;
+        }
         let t0 = std::time::Instant::now();
         eprintln!("=== {} (seed {seed}) ===", s.name);
         match (s.run)(seed) {
@@ -122,6 +129,14 @@ fn run(names: Vec<String>, seed: u64) -> Result<()> {
             failures.join(", ")
         );
     }
-    eprintln!("ALL SCENARIOS PASSED");
+    if skipped.is_empty() {
+        eprintln!("ALL SCENARIOS PASSED");
+    } else {
+        eprintln!(
+            "ALL RUN SCENARIOS PASSED ({} skipped: {})",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
     Ok(())
 }
