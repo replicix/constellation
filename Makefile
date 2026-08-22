@@ -28,7 +28,8 @@ HARNESS_SEED ?= 42
 BENCH_FILES ?= 20000
 
 .PHONY: help build build-release build-debug test test-unit fmt fmt-check clippy lint \
-	check ci clean smoke integration compose compose-down harness harness-list bench deps
+	check ci clean smoke integration compose compose-down harness harness-docker \
+	harness-list bench deps
 
 .DEFAULT_GOAL := help
 
@@ -108,9 +109,16 @@ harness: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Run fault-injection harness (needs
 		$(RELEASE_HARNESS) run --seed $(HARNESS_SEED); \
 	fi
 
+harness-docker: ## Fault-injection harness fully in docker (host needs docker only)
+	docker compose --profile test build harness
+	docker compose --profile test run --rm harness \
+		run $(HARNESS_SCENARIOS) --seed $(HARNESS_SEED)
+
 bench: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Census-scale import benchmark (needs docker + fuse3)
 	$(RELEASE_HARNESS) bench --files $(BENCH_FILES)
 
-deps: ## Install host tools (Debian/Ubuntu): fuse3, fio, stress-ng, docker
+deps: ## Install host tools for the non-docker lanes (Debian/Ubuntu)
+	# Only docker is required for `make compose` and `make harness-docker`;
+	# these are for the faster host lanes (`make smoke`, `make harness`).
 	sudo apt-get update
 	sudo apt-get install -y fuse3 fio stress-ng docker.io docker-compose-v2

@@ -31,6 +31,7 @@ services:
     build:
       context: .
       dockerfile: tests/docker/Dockerfile
+      target: suite
     profiles: ["test"]
     depends_on:
       floci:
@@ -60,3 +61,26 @@ services:
   stress:
     <<: *suite
     command: ["stress"]
+
+  # Fault-injection harness, fully containerized: only docker is needed
+  # on the host. The harness drives the host docker daemon through the
+  # mounted socket (floci/toxiproxy run as sibling containers) and runs
+  # the FUSE mounts inside this container. Host networking keeps the
+  # sibling containers' published 127.0.0.1 ports reachable.
+  harness:
+    image: ${HARNESS_IMAGE:-constellation-harness:local}
+    build:
+      context: .
+      dockerfile: tests/docker/Dockerfile
+      target: harness
+    profiles: ["test"]
+    network_mode: host
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["run"]

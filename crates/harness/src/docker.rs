@@ -108,7 +108,12 @@ pub struct Network {
 impl Network {
     pub fn create(name: &str) -> Result<Self> {
         let _ = docker(&["network", "rm", name]);
-        docker(&["network", "create", name])?;
+        if docker(&["network", "create", name]).is_err() {
+            // Still exists (e.g. attached containers from a crashed
+            // run survived): reuse it if it is actually there.
+            docker(&["network", "inspect", name])
+                .map_err(|e| anyhow::anyhow!("network {name} unusable: {e}"))?;
+        }
         Ok(Self {
             name: name.to_string(),
         })

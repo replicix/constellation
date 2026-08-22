@@ -89,35 +89,56 @@ impl Shipper {
     /// segment was written.
     pub async fn flush(&mut self) -> Result<bool> {
         let batch = self.meta.take_journal(SEGMENT_BATCH)?;
-        let Some((last_journal_seq, _)) = batch.last() else {
+        if batch.is_empty() {
             return Ok(false);
-        };
-        let last_journal_seq = *last_journal_seq;
+        }
         let records: Vec<LogRecord> = batch.iter().map(|(_, r)| r.clone()).collect();
         let payload = encode(&records)?;
         match self.log.put_segment(self.next_seq, &payload).await {
             Ok(()) => {}
             Err(constellation_store_s3::StoreError::AlreadyExists) => {
-                // Our own crash-replay wrote it, or a second writer is
-                // active. Identical content is benign; anything else is
-                // fatal in single-writer phase 1.
-                let existing = self.log.get_segment(self.next_seq).await?;
-                if existing != payload {
-                    bail!(
-                        "log segment {} already exists with different content: \
-                         another writer is active on this filesystem",
-                        self.next_seq
+                // Three legitimate shapes:
+                //  1. identical content — our own earlier PUT succeeded
+                //     but the response was lost (crash or network blip);
+                //  2. the existing segment is a strict prefix of our
+                //     batch — same lost-response case, but more records
+                //     were journaled before the retry;
+                //  3. anything else — a second writer, fatal in
+                //     single-writer phase 1.
+                let existing = decode(&self.log.get_segment(self.next_seq).await?)?;
+                if existing.len() <= records.len() && existing == records[..existing.len()] {
+                    let acked = batch[existing.len() - 1].0;
+                    self.meta.ack_journal(acked)?;
+                    tracing::info!(
+                        seq = self.next_seq,
+                        records = existing.len(),
+                        "segment already durable (lost response); acked and advancing"
                     );
+                    self.advance();
+                    return Ok(true); // remaining records ship next round
                 }
+                bail!(
+                    "log segment {} already exists with different content: \
+                     another writer is active on this filesystem",
+                    self.next_seq
+                );
             }
             Err(e) => return Err(e).context("shipping log segment"),
         }
-        self.meta.ack_journal(last_journal_seq)?;
+        self.meta.ack_journal(batch.last().unwrap().0)?;
         tracing::debug!(
             seq = self.next_seq,
             records = records.len(),
             "shipped log segment"
         );
+        self.advance();
+        if self.shipped_since_ckpt >= CHECKPOINT_EVERY {
+            self.checkpoint().await?;
+        }
+        Ok(true)
+    }
+
+    fn advance(&mut self) {
         {
             let mut spool = self.spool.lock().unwrap();
             spool.shipped_seq = self.next_seq;
@@ -125,10 +146,6 @@ impl Shipper {
         }
         self.next_seq += 1;
         self.shipped_since_ckpt += 1;
-        if self.shipped_since_ckpt >= CHECKPOINT_EVERY {
-            self.checkpoint().await?;
-        }
-        Ok(true)
     }
 
     /// Snapshot the local DB as a checkpoint covering the shipped log.

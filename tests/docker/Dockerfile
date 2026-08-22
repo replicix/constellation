@@ -9,8 +9,9 @@ WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p constellation \
-    && cp target/release/constellation /constellation
+    cargo build --release -p constellation -p constellation-harness \
+    && cp target/release/constellation /constellation \
+    && cp target/release/harness /harness
 
 FROM debian:bookworm-slim AS pjdfstest
 # Pinned upstream commit for reproducible test semantics.
@@ -26,13 +27,33 @@ RUN git clone https://github.com/pjd/pjdfstest /opt/pjdfstest \
     && ./configure \
     && make pjdfstest
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        fuse3 util-linux diffutils ca-certificates \
+        fuse3 util-linux diffutils ca-certificates curl \
         fio stress-ng openssl \
     && rm -rf /var/lib/apt/lists/* \
     && echo user_allow_other >> /etc/fuse.conf
+
+# Containerized fault-injection harness: drives the host docker daemon
+# (mounted socket) to start floci/toxiproxy as sibling containers, and
+# runs the FUSE mounts inside this container. Run with:
+#   network_mode: host, /dev/fuse, CAP_SYS_ADMIN, apparmor:unconfined,
+#   -v /var/run/docker.sock:/var/run/docker.sock
+FROM runtime-base AS harness
+ARG DOCKER_VERSION=27.3.1
+RUN arch="$(uname -m)" \
+    && curl -fsSL "https://download.docker.com/linux/static/stable/${arch}/docker-${DOCKER_VERSION}.tgz" \
+       | tar xz --strip-components=1 -C /usr/local/bin docker/docker
+COPY --from=build /constellation /usr/local/bin/constellation
+COPY --from=build /harness /usr/local/bin/harness
+ENV CONSTELLATION_BIN=/usr/local/bin/constellation
+ENTRYPOINT ["harness"]
+CMD ["run"]
+
+# Suite runner (smoke / pjdfstest compliance / fio+stress-ng stress).
+# Kept last so it stays the default build target.
+FROM runtime-base AS suite
 COPY --from=build /constellation /usr/local/bin/constellation
 COPY --from=pjdfstest /opt/pjdfstest/pjdfstest /opt/pjdfstest/pjdfstest
 COPY --from=pjdfstest /opt/pjdfstest/tests /opt/pjdfstest/tests

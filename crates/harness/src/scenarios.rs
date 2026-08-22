@@ -485,14 +485,31 @@ fn stress_ng_flap(_seed: u64) -> Result<()> {
     })?;
     proxy.heal()?;
 
-    // Mount still healthy, and the churned metadata ships out.
+    // Mount still healthy, and the churned metadata ships out. Churn
+    // produces hundreds of thousands of records; require progress, not
+    // a fixed deadline.
     std::fs::write(c.mnt.join("canary"), b"ok")?;
     anyhow::ensure!(std::fs::read(c.mnt.join("canary"))? == b"ok");
-    for _ in 0..30 {
+    let mut last = u64::MAX;
+    let mut stalled = 0;
+    for _ in 0..300 {
         let status = c.control_status()?;
-        if status["spool"]["journal_backlog"].as_u64() == Some(0) {
+        let backlog = status["spool"]["journal_backlog"]
+            .as_u64()
+            .unwrap_or(u64::MAX);
+        if backlog == 0 {
             c.unmount()?;
             return Ok(());
+        }
+        if backlog < last {
+            last = backlog;
+            stalled = 0;
+        } else {
+            stalled += 1;
+            anyhow::ensure!(
+                stalled < 15,
+                "spool drain stalled at backlog {backlog}: {status}"
+            );
         }
         std::thread::sleep(Duration::from_secs(1));
     }

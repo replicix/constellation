@@ -190,6 +190,13 @@ Requires docker + fusermount3 + a release binary on the host
 `constellation-harness=1` and removed on drop, even when a scenario
 panics.
 
+The harness also runs **fully containerized** (`make harness-docker`,
+compose service `harness`): the image bundles the binaries plus fio and
+stress-ng, mounts the host docker socket (floci/toxiproxy become
+sibling containers), uses host networking so their published
+`127.0.0.1` ports stay reachable, and gets `/dev/fuse` +
+`CAP_SYS_ADMIN` for the mounts. Only docker is needed on the host.
+
 The harness also hosts the census-scale import benchmark:
 
 ```bash

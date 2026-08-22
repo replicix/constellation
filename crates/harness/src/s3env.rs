@@ -27,6 +27,8 @@ pub struct S3Env {
 
 impl S3Env {
     pub fn start() -> Result<S3Env> {
+        // Leftovers from a crashed run would hold the network open.
+        let _ = crate::docker::docker(&["rm", "-f", "harness-floci", "harness-toxiproxy"]);
         let net = Network::create("constellation-harness")?;
         let floci = Container::run(
             "harness-floci",

@@ -236,7 +236,15 @@ fn mount(
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                if let Err(e) = ship.lock().await.flush().await {
+                // Drain the whole journal, not just one batch: churny
+                // workloads produce records faster than one batch/tick.
+                let r = async {
+                    let mut ship = ship.lock().await;
+                    while ship.flush().await? {}
+                    anyhow::Ok(())
+                }
+                .await;
+                if let Err(e) = r {
                     // Transient S3 failures: the journal retains the
                     // records; the next tick retries (DESIGN.md §12).
                     tracing::warn!(error = %e, "log shipping failed; will retry");
