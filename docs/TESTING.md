@@ -9,7 +9,7 @@ of them run in GitHub Actions on every PR (`.github/workflows/ci.yml`).
 | Host smoke | `tests/smoke.sh` | local directory (`object_store` LocalFileSystem) | Rust, fuse3 | ~2 s |
 | Host integration | `tests/integration.sh` | floci S3 (container) | + docker | ~10 s |
 | Containerized | `tests/compose-test.sh` | floci S3 (container) | docker only | ~5 min cold |
-| Fault injection | `cargo run -p constellation-harness -- run` | floci S3 via toxiproxy | Rust, fuse3, docker | ~90 s |
+| Fault injection | `cargo run -p constellation-harness -- run` | floci S3 via toxiproxy | Rust, fuse3, docker | ~3 min |
 
 The containerized lane runs three suites (all by default, or pick:
 `tests/compose-test.sh smoke stress`):
@@ -191,6 +191,22 @@ verification in both directions). Verification points sit at block
 boundaries where all files are closed, matching close-to-open
 durability semantics; cross-node checks poll with a deadline because
 propagation is asynchronous (sync interval + FUSE TTLs).
+
+Phase-3 scenarios exercise the partition lease (DESIGN.md §4/§5):
+`lease-handover` (A writes, goes write-idle, and cooperatively releases
+the lease; B must acquire it within a few seconds — not a 60 s TTL
+wait — and write its own files; the epoch strictly advances across
+each handover and both nodes report zero conflicts) and `lease-fencing`
+(A holds the lease with unshipped records and is frozen with
+`SIGSTOP`; after the TTL expires B takes over — legally, only after
+tailing everything A had flushed — and writes; A is then resumed with
+`SIGCONT` and must discover via a failed renew CAS that it was
+deposed, report `lost` over the control API, keep its stranded journal
+rather than shipping or discarding it, and refuse further mutations;
+a third, fresh node bootstrapping from the shared log alone must see
+exactly B's namespace). `Client::pause()`/`resume()` wrap
+`SIGSTOP`/`SIGCONT`; querying the control socket is done *before*
+pausing, since a stopped daemon cannot answer it.
 
 Requires docker + fusermount3 + a release binary on the host
 (`CONSTELLATION_BIN` overrides discovery). Containers are labeled
