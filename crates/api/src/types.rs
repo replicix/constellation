@@ -29,6 +29,28 @@ pub struct StatusReport {
     pub uptime_s: u64,
     pub spool: SpoolStatus,
     pub cache: CacheStatus,
+    /// Write authority for the (single, phase-3) partition.
+    #[serde(default)]
+    pub lease: LeaseStatus,
+}
+
+/// Partition lease state (DESIGN.md §4). `held` is this node's own
+/// authority; `holder`/`epoch` also describe the *foreign* holder once
+/// this node has been deposed, which is what `lost` reports.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LeaseStatus {
+    #[serde(default)]
+    pub held: bool,
+    #[serde(default)]
+    pub holder: u64,
+    #[serde(default)]
+    pub epoch: u64,
+    #[serde(default)]
+    pub expires_in_ms: i64,
+    /// This node was deposed: it refuses to ship and its unshipped
+    /// journal is stranded pending reintegration.
+    #[serde(default)]
+    pub lost: bool,
 }
 
 /// Spool observability (DESIGN.md §12): outstanding unflushed metadata.

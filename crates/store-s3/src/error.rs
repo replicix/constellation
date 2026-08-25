@@ -17,6 +17,9 @@ pub enum StoreError {
     #[error("filesystem already exists at this prefix")]
     AlreadyExists,
 
+    #[error("conditional write refused: the object changed since it was read")]
+    CasConflict,
+
     #[error("no filesystem found at this prefix (missing meta.json)")]
     NotFound,
 

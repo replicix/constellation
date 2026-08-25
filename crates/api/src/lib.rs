@@ -7,7 +7,7 @@
 
 pub mod types;
 
-pub use types::{CacheStatus, Request, Response, SpoolStatus, StatusReport};
+pub use types::{CacheStatus, LeaseStatus, Request, Response, SpoolStatus, StatusReport};
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -107,6 +107,13 @@ mod tests {
                     budget_bytes: 1000,
                     chunks: 5,
                 },
+                lease: LeaseStatus {
+                    held: true,
+                    holder: 1,
+                    epoch: 4,
+                    expires_in_ms: 30_000,
+                    lost: false,
+                },
             }
         }
     }
@@ -120,6 +127,7 @@ mod tests {
                 assert_eq!(s.fs_uuid, "test-uuid");
                 assert_eq!(s.spool.journal_backlog, 3);
                 assert_eq!(s.cache.chunks, 5);
+                assert_eq!((s.lease.epoch, s.lease.held), (4, true));
             }
             other => panic!("unexpected response {other:?}"),
         }

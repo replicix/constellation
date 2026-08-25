@@ -61,6 +61,19 @@ with CLI (same API, verified by shared tests).
 xfstests sweep, performance regression gates, packaging (static musl builds,
 Linux + macOS). Exit: nightly full matrix green; v1.
 
+## Phase 9 — Secure Automated Crash Reporting Pipeline
+
+Enable automatic capture and centralization of application crashes without exposing customer PII or proprietary source code strings in the client binary.
+
+Implementation Details:
+    - Integrate `crash-handler` and `minidump-writer` crates to catch panics and native OS faults.
+    - Configure `Cargo.toml` (`debug = true`, `strip = "symbols"`) for server-side symbolication.
+    - Set up a central collection backend (Sentry/GlitchTip) with `send_default_pii: false`.
+    - Implement a client-side crash-dump staging mechanism to upload `.dmp` files safely upon next application restart.
+
+Acceptance Criteria:
+Successful end-to-end telemetry generation where server logs display exact Rust file line numbers, while the distributed binary contains zero plaintext function names or local variable values.
+
 ## Deferred (format-reserved)
 
 Slice overlays (random-write workloads), packfiles (tiny-object costs), CDC

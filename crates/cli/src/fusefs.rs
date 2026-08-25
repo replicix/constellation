@@ -28,15 +28,26 @@ struct WriteState {
     base: Option<Manifest>,
 }
 
-/// A request to the daemon's sync task: `None` nudges an immediate
-/// round; `Some(reply)` additionally awaits its completion.
-pub type SyncRequest = Option<tokio::sync::oneshot::Sender<Result<(), String>>>;
+/// A request to the daemon's sync task.
+pub enum SyncRequest {
+    /// Run a sync round soon; the sender does not wait.
+    Nudge,
+    /// Run a sync round and report its outcome (fsync barrier).
+    Barrier(tokio::sync::oneshot::Sender<Result<(), String>>),
+    /// Take the partition lease if it is free. `Ok(false)` means a live
+    /// foreign holder still owns it.
+    Acquire(tokio::sync::oneshot::Sender<Result<bool, String>>),
+}
 
 /// FUSE-side handle to the metadata sync task.
 pub struct SyncHandle {
     pub tx: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
     /// `--fsync-mode s3`: fsync() returns only once the journal is in S3.
     pub fsync_s3: bool,
+    /// Lock-free lease state; the write gate reads it per mutating op.
+    pub lease: Arc<crate::lease::LeaseView>,
+    /// Bound on how long a mutation waits for a foreign holder.
+    pub acquire_deadline: Duration,
 }
 
 pub struct ConstellationFs {
@@ -143,7 +154,55 @@ impl ConstellationFs {
     /// the record ships, the sooner other nodes tail it.
     pub(crate) fn nudge_sync(&self) {
         if let Some(h) = &self.sync {
-            let _ = h.tx.send(None);
+            let _ = h.tx.send(SyncRequest::Nudge);
+        }
+    }
+
+    /// The write gate (DESIGN.md §5): every mutating op passes through
+    /// here, reads never do. The fast path is a few atomic loads; only
+    /// when the lease is not currently usable does this hand off to the
+    /// sync task, and only the first mutation after an idle release
+    /// pays a CAS round trip.
+    pub(crate) fn require_lease(&self) -> Result<(), i32> {
+        let Some(h) = &self.sync else { return Ok(()) };
+        if h.lease.usable() {
+            h.lease.touch();
+            return Ok(());
+        }
+        if h.lease.is_lost() {
+            // Deposed: refusing writes is the only way to keep the
+            // stranded journal a *bounded* branch (phase-4 reintegration).
+            tracing::error!("refusing mutation: this node lost the partition lease");
+            return Err(libc::EIO);
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if h.tx.send(SyncRequest::Acquire(tx)).is_err() {
+                return Err(libc::EIO);
+            }
+            match rx.blocking_recv() {
+                Ok(Ok(true)) => {
+                    h.lease.touch();
+                    return Ok(());
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "lease acquisition failed");
+                    return Err(libc::EIO);
+                }
+                Err(_) => return Err(libc::EIO),
+            }
+            if start.elapsed() >= h.acquire_deadline {
+                tracing::error!(
+                    waited = ?start.elapsed(),
+                    "another node holds the partition lease; failing the write with EIO"
+                );
+                return Err(libc::EIO);
+            }
+            // The holder either releases when idle or expires; poll
+            // rather than gossip until the P2P path exists (M3.3).
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -152,11 +211,11 @@ impl ConstellationFs {
     pub(crate) fn sync_barrier(&self) -> Result<(), i32> {
         let Some(h) = &self.sync else { return Ok(()) };
         if !h.fsync_s3 {
-            let _ = h.tx.send(None);
+            let _ = h.tx.send(SyncRequest::Nudge);
             return Ok(());
         }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if h.tx.send(Some(reply_tx)).is_err() {
+        if h.tx.send(SyncRequest::Barrier(reply_tx)).is_err() {
             return Err(libc::EIO);
         }
         match reply_rx.blocking_recv() {
@@ -231,6 +290,11 @@ impl ConstellationFs {
 
     /// Flush an inode's pending writes: hash + upload chunks, write the
     /// new manifest. No-op when there is no pending state.
+    ///
+    /// The manifest commit is a namespace mutation, so it needs the
+    /// lease — but the chunk uploads do not (content is immutable and
+    /// content-addressed), which is why the gate sits just before the
+    /// commit rather than at the top.
     fn flush_inode(&self, ino: Ino) -> Result<(), i32> {
         let ws = {
             let mut writes = self.writes.lock().unwrap();
@@ -239,6 +303,12 @@ impl ConstellationFs {
                 None => return Ok(()),
             }
         };
+        if let Err(e) = self.require_lease() {
+            // Put the pending state back: the data is not lost, the
+            // caller sees the error and can retry.
+            self.writes.lock().unwrap().insert(ino, ws);
+            return Err(e);
+        }
         let base = match &ws.base {
             Some(m) => m.clone(),
             None => self.load_manifest(ino)?,

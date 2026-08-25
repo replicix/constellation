@@ -15,6 +15,18 @@ macro_rules! checked_name {
     }};
 }
 
+/// Write gate (DESIGN.md §5): a mutating op may only proceed while this
+/// node holds the partition lease. Acquisition is lazy — the first
+/// mutation after a mount or an idle release blocks here for one CAS.
+macro_rules! gate {
+    ($self:expr, $reply:expr) => {
+        if let Err(e) = $self.require_lease() {
+            $reply.error(e);
+            return;
+        }
+    };
+}
+
 impl Filesystem for ConstellationFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name = checked_name!(name, reply);
@@ -60,6 +72,7 @@ impl Filesystem for ConstellationFs {
     ) {
         // Truncate/extend goes through write state so data and metadata
         // commit together at flush.
+        gate!(self, reply);
         if let Some(new_size) = size {
             if let Err(e) = self.truncate(ino, new_size) {
                 reply.error(e);
@@ -92,6 +105,7 @@ impl Filesystem for ConstellationFs {
         reply: ReplyEntry,
     ) {
         let name = checked_name!(name, reply);
+        gate!(self, reply);
         match self.meta.mkdir(parent, &name, mode, req.uid(), req.gid()) {
             Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
             Err(e) => reply.error(errno(&e)),
@@ -109,6 +123,7 @@ impl Filesystem for ConstellationFs {
         reply: ReplyEntry,
     ) {
         let name = checked_name!(name, reply);
+        gate!(self, reply);
         let kind = match mode & libc::S_IFMT {
             libc::S_IFREG | 0 => {
                 // Some callers use mknod for regular files.
@@ -150,6 +165,7 @@ impl Filesystem for ConstellationFs {
         reply: ReplyEntry,
     ) {
         let name = checked_name!(newname, reply);
+        gate!(self, reply);
         match self.meta.link(ino, newparent, &name) {
             Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
             Err(e) => reply.error(errno(&e)),
@@ -167,6 +183,7 @@ impl Filesystem for ConstellationFs {
         reply: fuser::ReplyCreate,
     ) {
         let name = checked_name!(name, reply);
+        gate!(self, reply);
         match self.meta.create(parent, &name, mode, req.uid(), req.gid()) {
             Ok(attr) => {
                 *self.opens.lock().unwrap().entry(attr.ino).or_insert(0) += 1;
@@ -185,6 +202,7 @@ impl Filesystem for ConstellationFs {
         reply: ReplyEntry,
     ) {
         let name = checked_name!(link_name, reply);
+        gate!(self, reply);
         let target = target.to_string_lossy();
         match self.meta.symlink(parent, &name, &target, req.uid(), req.gid()) {
             Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
@@ -194,6 +212,7 @@ impl Filesystem for ConstellationFs {
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name = checked_name!(name, reply);
+        gate!(self, reply);
         let target = self.meta.lookup(parent, &name);
         match self.meta.unlink(parent, &name) {
             Ok(()) => {
@@ -212,6 +231,7 @@ impl Filesystem for ConstellationFs {
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name = checked_name!(name, reply);
+        gate!(self, reply);
         match self.meta.rmdir(parent, &name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
@@ -230,6 +250,7 @@ impl Filesystem for ConstellationFs {
     ) {
         let name = name.to_string_lossy();
         let newname = newname.to_string_lossy();
+        gate!(self, reply);
         match self.meta.rename(parent, &name, newparent, &newname) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),

@@ -2,6 +2,7 @@
 
 mod backend;
 mod fusefs;
+mod lease;
 mod prefetch;
 mod shipper;
 
@@ -128,7 +129,11 @@ fn main() -> Result<()> {
                 bail!("backend lacks create-if-absent; unusable as a constellation backend");
             }
             if !caps.etag_cas {
-                println!("note: etag CAS unavailable; fine for single-node (phase 1), required for leases");
+                println!(
+                    "note: etag CAS unavailable; single-node mounts work (leases degrade to \
+                     create-only, single-writer assumed), but lease renew/takeover — and \
+                     therefore multi-node mounts — need If-Match"
+                );
             }
             print!("filesystem at prefix .............. ");
             match rt.block_on(store.load_fs()) {
@@ -225,33 +230,51 @@ fn mount(
     };
     meta.set_node_prefix(node_id)?;
     tracing::info!(node_id, "node identity");
-    // First mount: adopt the mounting user as owner of the root directory
-    // (the DB bootstraps it as 0:0).
-    let euid = unsafe { libc::geteuid() };
-    let egid = unsafe { libc::getegid() };
-    if let Some(root) =
-        constellation_meta::MetaStore::getattr(&*meta, constellation_fs_core::types::ROOT_INO)?
-    {
-        if root.uid == 0 && euid != 0 {
-            constellation_meta::MetaStore::setattr(
-                &*meta,
-                constellation_fs_core::types::ROOT_INO,
-                None,
-                Some(euid),
-                Some(egid),
-                None,
-                None,
-                None,
-            )?;
-        }
-    }
     let cache = std::sync::Arc::new(DiskCache::open(state_dir.join("cache"), cache_size)?);
     let compression: CompressionSetting = fsmeta
         .compression
         .parse()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // Sync task channel: FUSE nudges it on close (publication point)
-    // and blocks on it for fsync in --fsync-mode s3.
+
+    // Write authority (DESIGN.md §4/§5). Renew and takeover need
+    // If-Match; a backend without it can only be driven safely by one
+    // node at a time, so say so loudly and fall back to create-only
+    // lease semantics instead of refusing to mount at all.
+    let caps = rt
+        .block_on(store.probe_conditional_writes())
+        .context("probing backend conditional writes")?;
+    if !caps.create_if_absent {
+        bail!(
+            "backend lacks create-if-absent (If-None-Match); unusable as a constellation backend"
+        );
+    }
+    let lease_mode = if caps.etag_cas {
+        constellation_store_s3::LeaseMode::Cas
+    } else {
+        tracing::warn!(
+            "backend has no etag CAS (If-Match): lease renew/takeover cannot be \
+             enforced. Running in single-writer mode — mount this filesystem from \
+             ONE node only. Run `constellation doctor` and use an S3 backend with \
+             If-Match for multi-node operation."
+        );
+        constellation_store_s3::LeaseMode::SingleWriter
+    };
+    let keeper = lease::LeaseKeeper::new(
+        constellation_store_s3::LeaseStore::new(
+            store.inner().clone(),
+            constellation_store_s3::log::PARTITION,
+            lease_mode,
+        ),
+        node_id,
+    );
+    let lease_view = keeper.view();
+    // A mutation waits at most ~2 TTLs for a foreign holder to release
+    // or expire before failing with EIO.
+    let acquire_deadline = std::time::Duration::from_millis(2 * keeper.ttl_ms());
+
+    // Sync task channel: FUSE nudges it on close (publication point),
+    // blocks on it for fsync in --fsync-mode s3, and asks it to take
+    // the lease on the first mutation.
     let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel::<fusefs::SyncRequest>();
     let fs = fusefs::ConstellationFs::new(
         meta.clone(),
@@ -263,6 +286,8 @@ fn mount(
         Some(fusefs::SyncHandle {
             tx: sync_tx,
             fsync_s3,
+            lease: lease_view.clone(),
+            acquire_deadline,
         }),
     );
 
@@ -274,35 +299,76 @@ fn mount(
         .unwrap_or(500);
     let ship = shipper::Shipper::attach(meta.clone(), log, node_id)?;
     let spool = ship.spool.clone();
+    let mut ship = ship;
+    let mut keeper = keeper;
+    // First mount of a brand-new filesystem: adopt the mounting user as
+    // owner of the root directory (the DB bootstraps it as 0:0). This is
+    // a namespace mutation, so it goes through the lease like any other
+    // — otherwise two nodes bootstrapping the same empty log would both
+    // journal it and collide.
+    rt.block_on(adopt_root(&meta, &mut ship, &mut keeper))
+        .context("adopting the root directory owner")?;
     let ship = std::sync::Arc::new(tokio::sync::Mutex::new(ship));
+    let keeper = std::sync::Arc::new(tokio::sync::Mutex::new(keeper));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        let (ship, stop, spool) = (ship.clone(), stop.clone(), spool.clone());
+        let (ship, stop, spool, keeper) =
+            (ship.clone(), stop.clone(), spool.clone(), keeper.clone());
         rt.spawn(async move {
+            let mut pending: Option<fusefs::SyncRequest> = None;
             loop {
-                let request = tokio::select! {
-                    msg = sync_rx.recv() => match msg {
-                        Some(req) => req,
-                        None => break, // FUSE gone; shutdown ships the tail
-                    },
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(interval_ms)) => None,
-                };
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let r = async {
-                    let mut ship = ship.lock().await;
-                    ship.sync().await
-                }
-                .await;
-                if let Err(e) = &r {
-                    // Transient S3 failures: the journal retains the
-                    // records; the next round retries (DESIGN.md §12).
-                    tracing::warn!(error = %e, "metadata sync failed; will retry");
-                    spool.lock().unwrap().last_error = Some(format!("{e:#}"));
-                }
-                if let Some(reply) = request {
-                    let _ = reply.send(r.map_err(|e| format!("{e:#}")));
+                let request = if let Some(req) = pending.take() {
+                    Some(req)
+                } else {
+                    tokio::select! {
+                        msg = sync_rx.recv() => match msg {
+                            Some(req) => Some(req),
+                            None => break,
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(interval_ms)) => None,
+                    }
+                };
+                // Acquire must preempt an in-flight ship/renew: object_store
+                // retries last minutes when S3 is unreachable, and a FUSE
+                // thread is blocked on the oneshot until we answer.
+                match request {
+                    Some(fusefs::SyncRequest::Acquire(reply)) => {
+                        let mut ship = ship.lock().await;
+                        let mut keeper = keeper.lock().await;
+                        let r = shipper::acquire_lease(&mut ship, &mut keeper).await;
+                        if let Err(e) = &r {
+                            tracing::warn!(error = %e, "lease acquisition failed");
+                        }
+                        let _ = reply.send(r.map_err(|e| format!("{e:#}")));
+                    }
+                    Some(fusefs::SyncRequest::Barrier(reply)) => {
+                        let r = run_sync_round(&ship, &keeper).await;
+                        if let Err(e) = &r {
+                            tracing::warn!(error = %e, "metadata sync failed; will retry");
+                            spool.lock().unwrap().last_error = Some(format!("{e:#}"));
+                        }
+                        let _ = reply.send(r.map_err(|e| format!("{e:#}")));
+                    }
+                    Some(fusefs::SyncRequest::Nudge) | None => {
+                        tokio::select! {
+                            biased;
+                            msg = sync_rx.recv() => {
+                                pending = msg;
+                            }
+                            r = run_sync_round(&ship, &keeper) => {
+                                if let Err(e) = r {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "metadata sync failed; will retry"
+                                    );
+                                    spool.lock().unwrap().last_error = Some(format!("{e:#}"));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -313,6 +379,7 @@ fn mount(
         meta,
         cache,
         spool,
+        lease: lease_view,
         fs_uuid: fsmeta.uuid.to_string(),
         backend: s3.to_string(),
         mountpoint: mountpoint.display().to_string(),
@@ -336,10 +403,80 @@ fn mount(
     tracing::info!(?mountpoint, ?state_dir, fs = %fsmeta.uuid, "mounting");
     fuser::mount2(fs, mountpoint, &options).context("FUSE mount")?;
 
-    // Clean unmount: ship the journal tail and checkpoint.
+    // Clean unmount: ship the journal tail, checkpoint, then release the
+    // lease so a peer does not have to wait out the TTL.
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    rt.block_on(async { ship.lock().await.shutdown().await })
-        .context("final log flush")?;
+    let flush = rt.block_on(async {
+        let mut ship = ship.lock().await;
+        let mut keeper = keeper.lock().await;
+        let r = ship.shutdown(&keeper).await;
+        keeper.release().await?;
+        r
+    });
+    flush.context("final log flush")?;
+    Ok(())
+}
+
+async fn run_sync_round(
+    ship: &std::sync::Arc<tokio::sync::Mutex<shipper::Shipper>>,
+    keeper: &std::sync::Arc<tokio::sync::Mutex<lease::LeaseKeeper>>,
+) -> Result<()> {
+    let mut ship = ship.lock().await;
+    let mut keeper = keeper.lock().await;
+    if keeper.is_lost() {
+        // Deposed: no renew, no release, no shipping. Tailing still
+        // runs so reads stay fresh.
+        return ship.tail_to_head().await.map(|_| ());
+    }
+    keeper.renew_if_due().await?;
+    ship.sync(&keeper).await?;
+    // Cooperative hand-back: without P2P a holder cannot know a peer
+    // is waiting, so it gives the lease up whenever it has been
+    // write-idle with nothing pending. Reacquiring costs one CAS.
+    if keeper.idle_release_due(ship.journal_backlog()) {
+        keeper.release().await?;
+    }
+    Ok(())
+}
+
+/// Give the root directory to the mounting user on a freshly created
+/// filesystem. Skipped entirely unless the root is still 0:0, so this
+/// costs nothing (and needs no lease) on every subsequent mount; when it
+/// does apply, it takes the lease like any other mutation.
+async fn adopt_root(
+    meta: &std::sync::Arc<SqliteMeta>,
+    ship: &mut shipper::Shipper,
+    keeper: &mut lease::LeaseKeeper,
+) -> Result<()> {
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    if euid == 0 {
+        return Ok(());
+    }
+    // Another node may already have done it; make sure we have its log.
+    ship.tail_to_head().await?;
+    let root =
+        constellation_meta::MetaStore::getattr(&**meta, constellation_fs_core::types::ROOT_INO)?;
+    if !matches!(root, Some(a) if a.uid == 0) {
+        return Ok(());
+    }
+    if !shipper::acquire_lease(ship, keeper).await? {
+        // Another node holds authority; it either already adopted the
+        // root or will, and its record reaches us by tailing.
+        tracing::info!("root adoption deferred: partition lease held elsewhere");
+        return Ok(());
+    }
+    constellation_meta::MetaStore::setattr(
+        &**meta,
+        constellation_fs_core::types::ROOT_INO,
+        None,
+        Some(euid),
+        Some(egid),
+        None,
+        None,
+        None,
+    )?;
+    ship.sync(keeper).await?;
     Ok(())
 }
 
@@ -348,6 +485,7 @@ struct DaemonStatus {
     meta: std::sync::Arc<SqliteMeta>,
     cache: std::sync::Arc<DiskCache>,
     spool: std::sync::Arc<std::sync::Mutex<shipper::SpoolInfo>>,
+    lease: std::sync::Arc<lease::LeaseView>,
     fs_uuid: String,
     backend: String,
     mountpoint: String,
@@ -377,6 +515,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                 budget_bytes: usage.budget,
                 chunks: usage.entries as u64,
             },
+            lease: self.lease.status(),
         }
     }
 }

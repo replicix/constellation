@@ -80,6 +80,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: git_workflow,
     },
     Scenario {
+        name: "lease-handover",
+        desc: "A writes then goes idle; B must take the partition lease within seconds and write too",
+        requires: &[],
+        run: lease_handover,
+    },
+    Scenario {
+        name: "lease-fencing",
+        desc: "freeze the lease holder (SIGSTOP), let B take over after expiry, then resume A: A must detect deposition and refuse to ship",
+        requires: &[],
+        run: lease_fencing,
+    },
+    Scenario {
         name: "fresh-node-bootstrap",
         desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
         requires: &[],
@@ -373,6 +385,11 @@ fn two_clients_shared(seed: u64) -> Result<()> {
         status["spool"]["conflicts"].as_u64() == Some(0),
         "disjoint subtrees must produce zero conflicts: {status}"
     );
+    let status1 = c1.control_status()?;
+    anyhow::ensure!(
+        status1["spool"]["conflicts"].as_u64() == Some(0),
+        "disjoint subtrees must produce zero conflicts: {status1}"
+    );
     c0.unmount()?;
     c1.unmount()?;
     Ok(())
@@ -444,8 +461,254 @@ fn git_workflow(_seed: u64) -> Result<()> {
         Ok(())
     })?;
 
+    // Leases serialize the ping-pong, so the leaseless conflict path
+    // must never have fired on either node.
+    for c in [&c0, &c1] {
+        anyhow::ensure!(
+            conflicts_of(c)? == 0,
+            "lease-serialized ping-pong must produce zero conflicts on {}: {}",
+            c.name,
+            c.control_status()?["spool"]
+        );
+    }
+
     c0.unmount()?;
     c1.unmount()?;
+    Ok(())
+}
+
+/// Lease state from a node's control API.
+fn lease_of(c: &Client) -> Result<serde_json::Value> {
+    Ok(c.control_status()?["lease"].clone())
+}
+
+fn conflicts_of(c: &Client) -> Result<u64> {
+    Ok(c.control_status()?["spool"]["conflicts"]
+        .as_u64()
+        .unwrap_or(u64::MAX))
+}
+
+/// Assert the leaseless conflict path never fired: with leases the
+/// authority holder is the only writer, so a skipped foreign record
+/// would mean the invariant broke somewhere.
+fn ensure_no_conflicts(clients: [&Client; 2]) -> Result<()> {
+    for c in clients {
+        let n = conflicts_of(c)?;
+        anyhow::ensure!(
+            n == 0,
+            "lease-serialized writes must produce zero conflicts, {} saw {n}: {}\n--- {} log ---\n{}",
+            c.name,
+            c.control_status()?["spool"],
+            c.name,
+            c.tail_log_n(80),
+        );
+    }
+    Ok(())
+}
+
+/// Write authority handover on the single shared partition (DESIGN.md
+/// §4): A writes, goes write-idle and cooperatively releases the lease;
+/// B must take it within a couple of seconds — no 60 s TTL wait — and
+/// write its own files. Both nodes then see both sets, the epoch has
+/// advanced across the handover, and neither node recorded a conflict
+/// (with leases the leaseless conflict path must be unreachable).
+fn lease_handover(seed: u64) -> Result<()> {
+    let (env, root) = setup("lease-handover")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/lease-{}", ts());
+    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?;
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+
+    let mut m = Model::default();
+    let mut w0 = Workload::new(seed, "a");
+    let mut w1 = Workload::new(seed.wrapping_add(1), "b");
+    // The model's root is the shared subtree both nodes write into.
+    std::fs::create_dir(c0.mnt.join("shared"))?;
+    eventually("shared subtree on B", Duration::from_secs(20), || {
+        anyhow::ensure!(c1.mnt.join("shared").is_dir(), "shared not on c1");
+        Ok(())
+    })?;
+
+    let mut epochs = Vec::new();
+    for round in 0..3 {
+        // A takes (or keeps) authority and writes.
+        w0.run_block(&c0.mnt.join("shared"), &mut m, 25)?;
+        let a_lease = lease_of(&c0)?;
+        anyhow::ensure!(
+            a_lease["held"] == true && a_lease["lost"] == false,
+            "A should hold the lease while writing, got {a_lease}"
+        );
+        epochs.push(a_lease["epoch"].as_u64().unwrap_or(0));
+
+        // A goes write-idle: the cooperative idle release must hand the
+        // lease over quickly, and B's first mutation must then succeed.
+        eventually(
+            &format!("B acquires the lease, round {round}"),
+            Duration::from_secs(15),
+            || {
+                let probe = c1.mnt.join(format!("shared/probe-{round}"));
+                std::fs::write(&probe, b"b")?;
+                std::fs::remove_file(&probe)?;
+                let l = lease_of(&c1)?;
+                anyhow::ensure!(l["held"] == true, "B does not hold the lease: {l}");
+                Ok(())
+            },
+        )?;
+        let b_lease = lease_of(&c1)?;
+        epochs.push(b_lease["epoch"].as_u64().unwrap_or(0));
+        w1.run_block(&c1.mnt.join("shared"), &mut m, 25)?;
+
+        // Both nodes converge on the union of both nodes' writes.
+        eventually(
+            &format!("both views converge, round {round}"),
+            Duration::from_secs(30),
+            || {
+                m.verify(&c1.mnt.join("shared")).context("via c1")?;
+                m.verify(&c0.mnt.join("shared")).context("via c0")?;
+                Ok(())
+            },
+        )?;
+    }
+
+    anyhow::ensure!(
+        epochs.windows(2).all(|w| w[1] >= w[0]) && epochs.last() > epochs.first(),
+        "lease epoch must advance across handovers, saw {epochs:?}"
+    );
+    ensure_no_conflicts([&c0, &c1])?;
+    eprintln!("    lease-handover: epochs {epochs:?}");
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+/// Fencing (DESIGN.md §4): A holds the lease with unshipped records and
+/// is frozen with SIGSTOP, so it stops renewing. After expiry B takes
+/// over — legally, having applied everything A flushed — and writes.
+/// Resumed, A must discover it was deposed, refuse to ship, and say so
+/// through the control API. A's unshipped writes are expected to be
+/// stranded (phase-4 reintegration); what must hold is that nothing
+/// *shared* is damaged: B's namespace stays exactly model-correct and a
+/// third, fresh node rebuilds the same world from the log alone.
+fn lease_fencing(_seed: u64) -> Result<()> {
+    eprintln!("    lease-fencing: starting S3 env");
+    let (env, root) = setup("lease-fencing")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/fence-{}", ts());
+    // Short TTL so expiry is observable inside a test.
+    let ttl_ms = 5_000u64;
+    let short = |c: Client| {
+        c.with_env("CONSTELLATION_LEASE_TTL_MS", &ttl_ms.to_string())
+            // Long enough that A never releases voluntarily here.
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
+    };
+    let mut c0 = short(Client::new(root.path(), "c0", &env.endpoint, &backend)?);
+    let mut c1 = short(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
+    c0.fs_create()?;
+    eprintln!("    lease-fencing: mounting");
+    c0.mount()?;
+    c1.mount()?;
+
+    let mut model = Model::default();
+    std::fs::create_dir(c0.mnt.join("shared"))?;
+    model.mkdir(std::path::Path::new("shared"));
+    std::fs::write(c0.mnt.join("shared/from-a"), b"a1")?;
+    model.write_file(std::path::Path::new("shared/from-a"), b"a1".to_vec());
+    eventually(
+        "A's write flushed and visible on B",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(
+                std::fs::read(c1.mnt.join("shared/from-a"))? == b"a1",
+                "from-a not on B yet"
+            );
+            Ok(())
+        },
+    )?;
+    eprintln!("    lease-fencing: from-a visible on B");
+    let a_epoch = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
+
+    // Journal a metadata-only mutation, then freeze A before the 200ms
+    // shipper tick can flush it. Do not cut S3 first: mkdir while the
+    // proxy is down makes require_lease/ship retries block the FUSE
+    // thread for object_store's ~180s retry budget. Query the control
+    // socket before SIGSTOP — a paused daemon cannot answer.
+    std::fs::create_dir(c0.mnt.join("shared/stranded"))?;
+    let a_spool_before = c0.control_status()?["spool"].clone();
+    anyhow::ensure!(
+        a_spool_before["journal_backlog"].as_u64().unwrap_or(0) > 0,
+        "A should hold unshipped records before being deposed: {a_spool_before}"
+    );
+    eprintln!("    lease-fencing: pausing A (SIGSTOP)");
+    c0.pause()?;
+
+    // Wait out A's lease, then force B to acquire with a mutation.
+    std::thread::sleep(Duration::from_millis(ttl_ms + 1_500));
+    eprintln!("    lease-fencing: B taking over");
+    std::fs::write(c1.mnt.join("shared/from-b"), b"b1")
+        .context("B must be able to take over an expired lease")?;
+    model.write_file(std::path::Path::new("shared/from-b"), b"b1".to_vec());
+    let b_lease = lease_of(&c1)?;
+    anyhow::ensure!(
+        b_lease["held"] == true && b_lease["epoch"].as_u64().unwrap_or(0) > a_epoch,
+        "B must hold a strictly newer epoch than A's {a_epoch}: {b_lease}"
+    );
+    // The takeover applied everything A had flushed.
+    anyhow::ensure!(
+        std::fs::read(c1.mnt.join("shared/from-a"))? == b"a1",
+        "takeover must not lose the predecessor's flushed writes"
+    );
+
+    // Resume A: its next renew CAS fails and it must declare itself out.
+    c0.resume()?;
+    eventually("A reports the lost lease", Duration::from_secs(30), || {
+        let l = lease_of(&c0)?;
+        anyhow::ensure!(l["lost"] == true, "A does not report lost: {l}");
+        anyhow::ensure!(l["held"] == false, "A still claims to hold it: {l}");
+        Ok(())
+    })?;
+    // Its stranded records stay in the journal — neither shipped behind
+    // B's back nor silently dropped (phase-4 reintegration).
+    let a_spool = c0.control_status()?["spool"].clone();
+    anyhow::ensure!(
+        a_spool["journal_backlog"].as_u64().unwrap_or(0) > 0,
+        "a deposed node must keep its unshipped journal: {a_spool}"
+    );
+    // And it refuses further mutations rather than writing behind B.
+    let refused = std::fs::write(c0.mnt.join("shared/after-deposition"), b"nope");
+    anyhow::ensure!(
+        refused.is_err(),
+        "a deposed node must not accept new mutations"
+    );
+
+    // B's view is exactly the model, and A's stranded records never
+    // reached the shared log.
+    eventually(
+        "B's namespace is model-correct",
+        Duration::from_secs(20),
+        || model.verify(&c1.mnt),
+    )?;
+    anyhow::ensure!(
+        !c1.mnt.join("shared/stranded").exists(),
+        "a deposed holder's unshipped write must not appear on the new holder"
+    );
+
+    // The shared log is uncorrupted: a fresh node rebuilds B's world.
+    c0.kill9()?; // A's journal stays stranded on disk, by design
+    c1.unmount()?;
+    let mut c2 = short(Client::new(root.path(), "c2", &env.endpoint, &backend)?);
+    c2.mount().context("fresh node bootstrap after fencing")?;
+    model
+        .verify(&c2.mnt)
+        .context("shared log must reconstruct exactly the surviving namespace")?;
+    anyhow::ensure!(
+        conflicts_of(&c2)? == 0,
+        "fencing must not surface as a data conflict: {}",
+        c2.control_status()?["spool"]
+    );
+    c2.unmount()?;
     Ok(())
 }
 

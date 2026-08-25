@@ -16,9 +16,21 @@ pub fn open_backend(url: &str) -> Result<Arc<dyn ObjectStore>> {
         if bucket.is_empty() {
             bail!("missing bucket in {url:?}");
         }
+        let mut retry = object_store::RetryConfig::default();
+        if let Ok(n) = std::env::var("CONSTELLATION_S3_MAX_RETRIES") {
+            if let Ok(n) = n.parse() {
+                retry.max_retries = n;
+            }
+        }
+        if let Ok(ms) = std::env::var("CONSTELLATION_S3_RETRY_TIMEOUT_MS") {
+            if let Ok(ms) = ms.parse() {
+                retry.retry_timeout = std::time::Duration::from_millis(ms);
+            }
+        }
         let s3 = object_store::aws::AmazonS3Builder::from_env()
             .with_bucket_name(bucket)
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+            .with_retry(retry)
             .build()
             .with_context(|| format!("building S3 client for {url:?}"))?;
         if prefix.is_empty() {
