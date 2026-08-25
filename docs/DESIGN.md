@@ -23,7 +23,7 @@ correctness never depends on P2P.
                                  |
                                  v
             S3 bucket: chunks/  log/  leases/  checkpoints/
-                       snaps/  registry/  keys/  exports/
+                       snaps/  registry/  keys/
 ```
 
 Trust model: **membership = bucket access.** Valid credentials (`AWS_*` env,
@@ -45,7 +45,6 @@ ability to change bucket policy or IAM.
   holds/<node-id>.json          # TTL'd open-handle holds on orphaned inodes (§3)
   chunks/<a>/<b>/<hash>         # content-addressed blocks (sharded by hash)
   keys/keyring                  # only in E2E mode: wrapped DEKs
-  exports/<share-id>/...        # materialized plain-object shares
 ```
 
 Required S3 features: GET/PUT/DELETE/LIST plus conditional writes
@@ -102,7 +101,7 @@ exponential backoff.
   writes under that path (nearest-ancestor wins); never recompresses existing
   objects. Incompressible guard: if compressed >= original, store raw.
   Compression runs across chunks on a worker pool; zstd internal MT only for
-  big single blobs (checkpoints, exports). Order in E2E mode:
+  big single blobs (checkpoints). Order in E2E mode:
   compress-then-encrypt.
 - **Manifest spill**: a file's metadata row stores the chunk list inline when
   <= 8 chunks (~32 MiB; covers >99.9% of files per the reference census);
@@ -419,11 +418,11 @@ seen.
   Dedup still works within the filesystem (same key everywhere), the
   provider learns nothing from object names, and the choice is fixed at
   `fs create` — a per-FS setting, never a migration.
-- **Sharing = IAM.** Whole FS: grant bucket access (read-only creds = RO
-  member). Subtrees can't be IAM-scoped (content addressing), so
-  `constellation share --export <path>` materializes plain objects under
-  `exports/<id>/` — an IAM-scopable, presignable prefix — with daemon-side
-  expiry GC.
+- **Access = IAM.** Whole filesystem (bucket prefix): grant credentials
+  with read or read-write as needed; read-only creds make a read-only
+  follower member. Subtrees cannot be IAM-scoped independently — content
+  addressing makes per-path policies impossible without a separate
+  materialization layer, which is out of scope.
 
 ## 9. Failure Handling
 
@@ -466,8 +465,8 @@ Blocked immediately:
   acquire/steal is an S3 CAS. Exception: inside a continuation epoch, leases
   transfer P2P among epoch members.
 - Visibility of new commits from nodes with no P2P path to us.
-- Enrollment, exports, GC, checkpoints, snapshot create/delete — deferred or
-  rejected cleanly, none load-bearing.
+- Enrollment, GC, checkpoints, snapshot create/delete — deferred or rejected
+  cleanly, none load-bearing.
 
 Degrades on a timer — writes under a held lease:
 
@@ -510,12 +509,12 @@ or the iroh tunnel), and scripts. Surfaces: dashboard (health, sync lag,
 spool backlog + headroom, see §9), peers (RTT, direct/relay, registry), file
 browser (rename/move/delete/up/download, inspect, history), cache (states,
 hit rates, prefetch efficiency, pins), leases/designations (+ admin
-force-release), exports, snapshots/clones (create, browse, delete, mounts),
+force-release), snapshots/clones (create, browse, delete, mounts),
 compression settings, ops (log tail, fsck, doctor), Prometheus `/metrics`.
 
 CLI highlights: `fs create|mount|umount`, `mount [SOURCE[@snap]] MOUNTPOINT`,
 `pin|unpin`, `offline|online`, `snapshot create|ls|delete|diff`,
-`clone <path@snap> <dest>`, `compression set|get`, `share --export`,
+`clone <path@snap> <dest>`, `compression set|get`,
 `status [--spool]`, `inspect <path>`, `cache ls|stat|evict|verify`,
 `gc run|verify`, `log tail`, `fsck [--repair]`, `doctor`, `host init`.
 
@@ -695,8 +694,8 @@ lease holder.
 
 ### When (three cadences, cheapest first)
 
-- **Continuous, every node**: export-expiry cleanup, and **deref
-  tracking** — while applying log records, each replica records the txid at
+- **Continuous, every node**: **deref tracking** — while applying log
+  records, each replica records the txid at
   which a chunk's last reference disappeared. Free, and it makes the GC
   candidate set a local query: no bucket LIST for reference GC.
 - **Periodic (default daily), under the GC lease**: the **reference

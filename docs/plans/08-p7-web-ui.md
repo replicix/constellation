@@ -40,8 +40,7 @@ UI feature parity with the CLI, same API, verified by shared tests.
    Mutations (rename/delete/upload/download) are STRETCH — implement
    ReadDir/Inspect first, add mutations only if time permits; note
    whichever you skip.
-6. **Snapshots/exports**: list + create + delete snapshot; list
-   exports with expiry; create export.
+6. **Snapshots**: list + create + delete snapshot.
 7. **Ops**: doctor output, log tail (last N daemon log lines — keep
    an in-memory ring buffer subscriber in the daemon, expose via
    `api::Request::LogTail {lines}`).
@@ -49,7 +48,7 @@ UI feature parity with the CLI, same API, verified by shared tests.
 ## New API requests
 
 `ReadDir`, `Inspect`, `ListSnapshots`, `SnapshotCreate/Delete`,
-`ListExports`, `ExportCreate/Rm`, `ForceRelease`, `LogTail`, plus
+`ForceRelease`, `LogTail`, plus
 whatever plans 03–07 already added — keep one enum, serde-tagged as
 established, versioned by additive change only. The CLI gains
 matching subcommands where DESIGN §10 lists them (`inspect`,

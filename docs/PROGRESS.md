@@ -111,7 +111,55 @@ prevented — leases make them impossible in the default mode; attribute
 and entry invalidation is TTL-based (1 s) rather than push-based, so
 cross-node visibility is sync-interval + TTL, not gossip-RTT.
 
+## Phase 3 — Leases + P2P fast path: **IN PROGRESS**
+
+### M3.1 — single-partition (p0) lease-based write authority
+
+| Item | State | Where |
+|---|---|---|
+| Lease object (`{v, partition, holder, epoch, expires_unix_ms, released}`) + `LeaseStore` CAS create/renew/release over `PutMode::Create`/`Update{etag}` | done | `store-s3::lease` |
+| `LeaseMode::SingleWriter` fallback for backends without `If-Match` (e.g. `file://`): swaps degrade to unconditional PUTs, exclusion assumed not enforced, loud warning on mount | done | `store-s3::lease`, `cli::main` |
+| `LeaseKeeper` state machine: classify → commit, renew at half-TTL, idle release (`CONSTELLATION_LEASE_IDLE_RELEASE_MS`, default 2000 ms), deposition detection (renew CAS failure → permanently `lost`) | done | `cli::lease` |
+| Takeover ordering enforced structurally: a handover claim requires a `TailedToHead` witness that only the shipper's tail can mint | done | `cli::lease`, `cli::shipper::acquire_lease` |
+| `LeaseView` lock-free snapshot (atomics) for the FUSE write gate — nanosecond fast path when held, hands off to the sync task only when not currently usable | done | `cli::lease`, `cli::fusefs` |
+| FUSE write gate: every mutating op (not reads) blocks on `require_lease()`, bounded wait ~2×TTL then EIO; a deposed node refuses immediately | done | `cli::fusefs`, `cli::fusefs_ops` |
+| Segments stamped with the lease epoch; shipping refused without a usable lease; a segment with an epoch below the max observed is a fencing violation and is skipped, not applied | done | `cli::shipper` |
+| Sync task: `Acquire` requests preempt an in-flight ship/renew round (nested `select!` with a pending-request queue) so a FUSE thread waiting on the lease is never stuck behind S3's multi-minute retry budget | done | `cli::main` |
+| Control API: `StatusReport.lease: {held, holder, epoch, expires_in_ms, lost}` | done | `crates/api` |
+| Harness: `Client::pause()`/`resume()` (SIGSTOP/SIGCONT), `lease-handover` (cooperative idle-release handover, epoch advances, zero conflicts), `lease-fencing` (SIGSTOP the holder, peer takes over after TTL expiry, resumed holder detects deposition and refuses to ship) | done | `crates/harness` |
+| Unit tests: CAS create/renew/expired-takeover/epoch-bump/release/CAS-conflict-loser (`store-s3::lease`), acquire-before-ship/refuse-when-deposed/epoch-in-envelope/takeover-tail-ordering (`cli::shipper`) | done | `store-s3::lease`, `cli::shipper` tests |
+
+### Phase 3 exit criteria (ROADMAP.md)
+
+- [x] Single-authority invariant holds under simulated partitions — the
+      `lease-fencing` harness scenario freezes the holder (SIGSTOP),
+      lets a peer take over after TTL expiry (only after tailing the
+      frozen holder's flushed log), and verifies the resumed holder
+      detects its own deposition, refuses to ship, and that the
+      deposed node's stranded journal never reaches the shared log or
+      corrupts the new holder's namespace. `two-clients-shared` and
+      `git-workflow` both assert `conflicts == 0` on every node: the
+      leaseless convergence path is unreachable in normal operation.
+- [ ] Lease transfer ~1 RTT when peers connected — not yet: no P2P
+      exists (M3.3). Today's handover latency is the idle-release
+      window (default 2 s) plus one CAS round trip, not a gossip push;
+      `lease-handover`'s wall-clock is the baseline to compare once
+      P2P lands.
+
+### M3.1 scope limits (by design, addressed in later M3.x / phase 4)
+
+- **Handover latency**: without P2P a holder cannot know a peer is
+  waiting, so cooperative hand-back is time-based (write-idle for
+  `CONSTELLATION_LEASE_IDLE_RELEASE_MS`), not push-based. A peer
+  contending for a busy lease otherwise waits out the full TTL.
+- **Stranded-journal reintegration**: a deposed holder's unshipped
+  journal is preserved on local disk but has no path back into the
+  shared log. Reintegration is phase 4 scope.
+- **Single partition**: the whole filesystem is one lease (`p0`).
+  Partition split/merge and cross-partition rename are M3.2.
+
 ## Later phases
 
-Not started (phases 3–8). No code exists for leases, P2P,
-pin/offline, cooperative cache, sharing/snapshots/E2E, web UI, or GC.
+Not started (phases 4–8, and M3.2/M3.3 of phase 3). No code exists for
+partition split/merge, P2P/gossip, pin/offline, cooperative cache,
+snapshots/E2E, web UI, or GC.

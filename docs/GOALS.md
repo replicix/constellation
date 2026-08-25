@@ -41,7 +41,7 @@ no mandatory services beyond the bucket.
   files, 1–5 TB, 3–10 nodes; the on-bucket format is partitioned so 100M+
   files need no migration.
 - **Fully administrable** from a CLI and an embedded web UI: mounts, pins,
-  offline designations, cache state, peers, latencies, exports, fsck.
+  offline designations, cache state, peers, latencies, fsck.
 - **Thoroughly tested**: POSIX suites, property-based tests, deterministic
   multi-node fault-injection simulation, and end-to-end scenario tests are
   part of the definition of done.

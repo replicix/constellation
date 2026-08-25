@@ -25,7 +25,7 @@ Execution protocol:
 | 04 | `04-p4b-epochs-reintegration.md` | continuation epochs, stranded-branch reintegration | 03 |
 | 05 | `05-p5-coop-cache.md` | cooperative cache: digests, peer serving, source selection | 02 (03–04 committed in practice) |
 | 06 | `06-p6a-snapshots-clones.md` | snapshots, clones, subtree/snapshot mounts | 01 (05 committed in practice) |
-| 07 | `07-p6b-sharing-e2e.md` | exports + E2E passphrase mode | 06 |
+| 07 | `07-p6-e2e.md` | E2E passphrase mode | 06 |
 | 08 | `08-p7-web-ui.md` | embedded web UI + /metrics over the control API | 07 |
 | 09 | `09-p8a-gc-fsck.md` | bucket GC (lease, deref, condemned handshake) + fsck --repair | 06 (07–08 committed in practice) |
 | 10 | `10-p8b-hardening-packaging.md` | xfstests, perf gates, musl/macOS packaging, nightly matrix | 09 |

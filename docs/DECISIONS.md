@@ -35,8 +35,9 @@ metadata.
 **Rejected**: 1:1 object-per-path (s3fs/rclone/mountpoint style) — renames
 become O(size) copies (explicit goal violation), no dedup, no atomic
 multi-file ops, multi-writer correctness much harder.
-**Consequence accepted**: the bucket is opaque; subtree sharing needs
-exports (ADR-7).
+**Consequence accepted**: the bucket is opaque; access control is at
+bucket/prefix granularity via IAM credentials only — per-subtree IAM
+scoping is not supported (ADR-7).
 
 ## ADR-4: Consistency default = close-to-open; strict and relaxed opt-ins
 
@@ -67,10 +68,13 @@ designee leaves" conflict-free.
 
 **Decision**: bucket credentials are the only identity; no user DB, ACL
 mapping, share tokens, or gateway. uid/gid/mode are plain attributes
-(NFS-style). Subtree sharing = materialized `exports/` prefix (IAM-scopable,
-presignable). Node registry is self-enrollment gated by bucket write.
+(NFS-style). Node registry is self-enrollment gated by bucket write.
 **Rejected**: internal users + wrapped-key sharing + gateway (earlier
 design) — a second identity system to administer; the user chose IAM.
+**Rejected**: materialized `exports/` subtree shares (plain-object copies
+under an IAM-scopable prefix) — duplicates data, complicates GC, and
+presign/ expiry semantics do not fit the content-addressed model well
+enough to be worth building.
 **Consequence accepted**: no cryptographic isolation between holders of the
 same bucket credentials; permissions are cooperative.
 

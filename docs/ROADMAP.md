@@ -41,23 +41,22 @@ Bloom digests over gossip, peer chunk serving, latency-adaptive source
 selection with hedging. Exit: web-fleet scenario meets TTFB targets;
 latency-matrix simulations converge.
 
-## Phase 6 — Sharing, snapshots + E2E mode
+## Phase 6 — Snapshots + E2E mode
 
-`share --export` with expiry GC; snapshots + clones (tree objects,
-`.constellation/snapshot/` access, subtree/snapshot mounts, ESTALE-on-delete
-semantics); optional passphrase E2E mode (keyring, compress-then-encrypt,
-keyed addressing). Exit: export lifecycle, snapshot/clone lifecycle, and
-E2E mount/recovery tests.
+Snapshots + clones (tree objects, `.constellation/snapshot/` access,
+subtree/snapshot mounts, ESTALE-on-delete semantics); optional passphrase
+E2E mode (keyring, compress-then-encrypt, keyed addressing). Exit:
+snapshot/clone lifecycle and E2E mount/recovery tests.
 
 ## Phase 7 — Web UI
 
 Embedded UI over the control API: dashboard, peers, file browser, cache,
-leases/designations, exports, compression, ops. Exit: UI feature parity
+leases/designations, compression, ops. Exit: UI feature parity
 with CLI (same API, verified by shared tests).
 
 ## Phase 8 — Hardening
 
-`fsck --repair` for every corruption class, GC (chunks, segments, exports),
+`fsck --repair` for every corruption class, GC (chunks, segments),
 xfstests sweep, performance regression gates, packaging (static musl builds,
 Linux + macOS). Exit: nightly full matrix green; v1.
 
