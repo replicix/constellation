@@ -92,6 +92,24 @@ pub const SCENARIOS: &[Scenario] = &[
         run: lease_fencing,
     },
     Scenario {
+        name: "continuation-epoch",
+        desc: "cut S3 with all writers on P2P: both keep writing, then flush and converge after heal",
+        requires: &[],
+        run: continuation_epoch,
+    },
+    Scenario {
+        name: "epoch-member-lost",
+        desc: "pause one continuation-epoch member: survivors immediately freeze writes with EROFS",
+        requires: &[],
+        run: epoch_member_lost,
+    },
+    Scenario {
+        name: "deposed-reintegration",
+        desc: "reintegrate a deposed holder: clean writes append and a deliberate edit conflict materializes",
+        requires: &[],
+        run: deposed_reintegration,
+    },
+    Scenario {
         name: "partition-split",
         desc: "two nodes, low split threshold: /hot becomes its own partition, then idles into a merge",
         requires: &[],
@@ -295,7 +313,9 @@ fn s3_flap(seed: u64) -> Result<()> {
             std::thread::sleep(Duration::from_millis(300));
             proxy.heal()?;
         }
-        wl.run_block(&c.mnt, &mut model, 30)?;
+        if let Err(error) = wl.run_block(&c.mnt, &mut model, 30) {
+            anyhow::bail!("{error:#}; daemon log:\n{}", c.tail_log_n(120));
+        }
         model
             .verify(&c.mnt)
             .with_context(|| format!("block {block}"))?;
@@ -868,6 +888,284 @@ fn lease_fencing(_seed: u64) -> Result<()> {
         c2.control_status()?["spool"]
     );
     c2.unmount()?;
+    Ok(())
+}
+
+fn epoch_clients(env: &S3Env, root: &std::path::Path, backend: &str) -> Result<(Client, Client)> {
+    let tune = |client: Client, key: &str| {
+        client
+            .with_env("CONSTELLATION_NODE_KEY", key)
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "5000")
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
+            .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
+    };
+    Ok((
+        tune(
+            Client::new(root, "c0", &env.endpoint, backend)?,
+            "/tmp/.constellation-epoch-c0.key",
+        ),
+        tune(
+            Client::new(root, "c1", &env.endpoint, backend)?,
+            "/tmp/.constellation-epoch-c1.key",
+        ),
+    ))
+}
+
+fn wait_for_epoch(clients: [&Client; 2]) -> Result<()> {
+    for client in clients {
+        eventually(
+            &format!("{} activates the continuation epoch", client.name),
+            Duration::from_secs(20),
+            || {
+                let status = client.control_status()?;
+                anyhow::ensure!(
+                    status["epoch"]["active"] == true,
+                    "{} epoch not active: {}",
+                    client.name,
+                    status["epoch"]
+                );
+                anyhow::ensure!(
+                    status["epoch"]["members"]
+                        .as_array()
+                        .is_some_and(|m| m.len() == 2),
+                    "{} epoch does not cover both writers: {}",
+                    client.name,
+                    status["epoch"]
+                );
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn continuation_epoch(_seed: u64) -> Result<()> {
+    let (env, root) = setup("continuation-epoch")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/epoch-{}", ts());
+    let (mut c0, mut c1) = epoch_clients(&env, root.path(), &backend)?;
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    wait_for_p2p([&c0, &c1])?;
+
+    // Make A the current p0 holder before S3 disappears.
+    std::fs::create_dir(c0.mnt.join("a"))?;
+    std::fs::create_dir(c0.mnt.join("b"))?;
+    eventually("epoch roots visible on B", Duration::from_secs(20), || {
+        anyhow::ensure!(c1.mnt.join("a").is_dir());
+        anyhow::ensure!(c1.mnt.join("b").is_dir());
+        Ok(())
+    })?;
+
+    proxy.cut()?;
+    wait_for_epoch([&c0, &c1])?;
+
+    std::fs::write(c0.mnt.join("a/from-a"), b"epoch-a")?;
+    // B's write forces a P2P-only p0 handoff from A.
+    std::fs::write(c1.mnt.join("b/from-b"), b"epoch-b")?;
+    anyhow::ensure!(
+        c0.control_status()?["spool"]["journal_backlog"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+    anyhow::ensure!(
+        c1.control_status()?["spool"]["journal_backlog"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+
+    proxy.heal()?;
+    eventually(
+        "epoch journals flush and both trees converge",
+        Duration::from_secs(40),
+        || {
+            for client in [&c0, &c1] {
+                let status = client.control_status()?;
+                let from_a = std::fs::read(client.mnt.join("a/from-a"));
+                let from_b = std::fs::read(client.mnt.join("b/from-b"));
+                if !matches!(&from_a, Ok(bytes) if bytes == b"epoch-a")
+                    || !matches!(&from_b, Ok(bytes) if bytes == b"epoch-b")
+                {
+                    anyhow::bail!(
+                        "{} has a={from_a:?}, b={from_b:?}; status={status}; \
+                         peer status={}; logs:\n--- c0 ---\n{}\n--- c1 ---\n{}",
+                        client.name,
+                        if client.name == "c0" {
+                            c1.control_status()?
+                        } else {
+                            c0.control_status()?
+                        },
+                        c0.tail_log_n(100),
+                        c1.tail_log_n(100)
+                    );
+                }
+                anyhow::ensure!(status["epoch"]["active"] == false);
+                anyhow::ensure!(
+                    status["spool"]["journal_backlog"].as_u64() == Some(0),
+                    "journal did not drain: {status}"
+                );
+                anyhow::ensure!(
+                    status["reintegration"]["conflicts_materialized"].as_u64() == Some(0)
+                );
+            }
+            Ok(())
+        },
+    )?;
+    ensure_no_conflicts([&c0, &c1])?;
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+fn epoch_member_lost(_seed: u64) -> Result<()> {
+    let (env, root) = setup("epoch-member-lost")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/epoch-lost-{}", ts());
+    let (mut c0, mut c1) = epoch_clients(&env, root.path(), &backend)?;
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    wait_for_p2p([&c0, &c1])?;
+    std::fs::create_dir(c0.mnt.join("shared"))?;
+    eventually("shared visible", Duration::from_secs(20), || {
+        anyhow::ensure!(c1.mnt.join("shared").is_dir());
+        Ok(())
+    })?;
+
+    proxy.cut()?;
+    wait_for_epoch([&c0, &c1])?;
+    c1.pause()?;
+    eventually("A freezes after losing B", Duration::from_secs(10), || {
+        let status = c0.control_status()?;
+        anyhow::ensure!(status["epoch"]["active"] == false, "not frozen: {status}");
+        let error = std::fs::create_dir(c0.mnt.join("shared/refused"))
+            .expect_err("frozen epoch must refuse writes");
+        anyhow::ensure!(
+            error.raw_os_error() == Some(libc::EROFS),
+            "expected EROFS, got {error}"
+        );
+        Ok(())
+    })?;
+
+    c1.resume()?;
+    eventually(
+        "epoch resumes when B returns",
+        Duration::from_secs(15),
+        || {
+            anyhow::ensure!(c0.control_status()?["epoch"]["active"] == true);
+            anyhow::ensure!(c1.control_status()?["epoch"]["active"] == true);
+            Ok(())
+        },
+    )?;
+    std::fs::write(c0.mnt.join("shared/after-resume"), b"ok")?;
+    proxy.heal()?;
+    eventually("resumed write converges", Duration::from_secs(40), || {
+        anyhow::ensure!(std::fs::read(c1.mnt.join("shared/after-resume"))? == b"ok");
+        Ok(())
+    })?;
+    ensure_no_conflicts([&c0, &c1])?;
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+fn deposed_reintegration(_seed: u64) -> Result<()> {
+    let (env, root) = setup("deposed-reintegration")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/reintegrate-{}", ts());
+    let tune = |client: Client, key: &str| {
+        client
+            .with_env("CONSTELLATION_NODE_KEY", key)
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "5000")
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "200")
+            .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "3000")
+    };
+    let mut c0 = tune(
+        Client::new(root.path(), "c0", &env.endpoint, &backend)?,
+        "/tmp/.constellation-reintegrate-c0.key",
+    );
+    let mut c1 = tune(
+        Client::new(root.path(), "c1", &env.endpoint, &backend)?,
+        "/tmp/.constellation-reintegrate-c1.key",
+    );
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    wait_for_p2p([&c0, &c1])?;
+
+    std::fs::create_dir(c0.mnt.join("shared"))?;
+    std::fs::write(c0.mnt.join("shared/same"), b"baseline")?;
+    eventually("baseline visible on B", Duration::from_secs(30), || {
+        anyhow::ensure!(std::fs::read(c1.mnt.join("shared/same"))? == b"baseline");
+        Ok(())
+    })?;
+
+    // Two stranded changes: one clean path and one deliberate edit conflict.
+    std::fs::write(c0.mnt.join("shared/clean-from-a"), b"clean")?;
+    std::fs::write(c0.mnt.join("shared/same"), b"loser-from-a")?;
+    anyhow::ensure!(
+        c0.control_status()?["spool"]["journal_backlog"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "A did not retain stranded records"
+    );
+    c0.pause()?;
+
+    std::thread::sleep(Duration::from_millis(6500));
+    std::fs::write(c1.mnt.join("shared/same"), b"winner-from-b")
+        .context("B takes over expired lease")?;
+    eventually("B winner is durable", Duration::from_secs(15), || {
+        anyhow::ensure!(std::fs::read(c1.mnt.join("shared/same"))? == b"winner-from-b");
+        anyhow::ensure!(c1.control_status()?["spool"]["journal_backlog"].as_u64() == Some(0));
+        Ok(())
+    })?;
+
+    c0.resume()?;
+    eventually("A reports deposition", Duration::from_secs(20), || {
+        anyhow::ensure!(lease_of(&c0)?["lost"] == true);
+        Ok(())
+    })?;
+    c0.reintegrate()?;
+
+    eventually(
+        "clean branch and conflict materialization converge",
+        Duration::from_secs(40),
+        || {
+            for client in [&c0, &c1] {
+                let current = std::fs::read(client.mnt.join("shared/same"))?;
+                anyhow::ensure!(
+                    current == b"winner-from-b",
+                    "{} kept wrong winner {:?}; status {}; log:\n{}",
+                    client.name,
+                    String::from_utf8_lossy(&current),
+                    client.control_status()?,
+                    client.tail_log_n(80)
+                );
+                anyhow::ensure!(std::fs::read(client.mnt.join("shared/clean-from-a"))? == b"clean");
+                let dir = client.mnt.join("shared/.constellation-conflict");
+                let conflict = std::fs::read_dir(&dir)?
+                    .filter_map(|entry| entry.ok())
+                    .find(|entry| entry.file_name().to_string_lossy().starts_with("same@"))
+                    .context("same@ conflict file missing")?;
+                anyhow::ensure!(std::fs::read(conflict.path())? == b"loser-from-a");
+                let status = client.control_status()?;
+                anyhow::ensure!(
+                    status["reintegration"]["conflicts_materialized"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        >= 1
+                        || client.name == "c1"
+                );
+            }
+            Ok(())
+        },
+    )?;
+    c0.unmount()?;
+    c1.unmount()?;
     Ok(())
 }
 

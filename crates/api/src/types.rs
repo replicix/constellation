@@ -28,6 +28,9 @@ pub enum Request {
         path: String,
     },
     ListDesignations,
+    /// Replay this node's stranded journal against the shared log
+    /// (DESIGN.md §6 / §9). Needs the write lease.
+    Reintegrate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +114,33 @@ pub struct StatusReport {
     /// agree modulo the periodic refresh lag.
     #[serde(default)]
     pub designations: Vec<DesignationStatus>,
+    /// Continuation epoch (phase 4b, DESIGN.md §5.3).
+    #[serde(default)]
+    pub epoch: EpochStatus,
+    /// Stranded-journal reintegration (phase 4b).
+    #[serde(default)]
+    pub reintegration: ReintegrationStatus,
+}
+
+/// Live continuation-epoch snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EpochStatus {
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_id: Option<String>,
+    #[serde(default)]
+    pub members: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReintegrationStatus {
+    #[serde(default)]
+    pub stranded_records: u64,
+    #[serde(default)]
+    pub conflicts_materialized: u64,
+    #[serde(default)]
+    pub in_progress: bool,
 }
 
 /// P2P fast-path state. Purely observational: the filesystem is correct

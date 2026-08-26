@@ -220,7 +220,7 @@ workload with the kill switch to prove the S3 bound still applies.
   which the current `mount2` call does not expose.
 - **Offline designation acks**: phase 4.
 
-## Phase 4 — Pin/offline, continuation epochs: **IN PROGRESS**
+## Phase 4 — Pin/offline, continuation epochs: **DONE**
 
 ### Phase 4a — pin/unpin + offline designation
 
@@ -276,7 +276,53 @@ workload with the kill switch to prove the S3 bound still applies.
   finer-grained one — matching DESIGN.md's per-path (not per-file)
   framing of the mechanism.
 
+### Phase 4b — continuation epochs + reintegration
+
+| Item | State | Where |
+|---|---|---|
+| Write-eligible roster from `NodeInfo.ro`; first-mount `--read-only-member` enrollment | done | `store-s3::nodes`, `cli::main` |
+| Roster derivation **fails closed**: any unreadable/unparseable `nodes/` record aborts the roster instead of silently shrinking it (a short roster would let one node believe its component covers the cluster and open an epoch alone). `list_nodes` stays tolerant for the P2P directory, where a skipped record only costs a fast path | done | `store-s3::nodes::write_eligible_roster`, `cli::main::refresh_peers` |
+| Persist-before-ack epoch promises, all-member activation, deterministic concurrent-proposer tie-break | done | `net::epoch`, `cli::epoch`, `meta::sqlite` |
+| P2P-only lease handoff while S3 is unavailable; dirty data and metadata remain local | done | `cli::{main,lease,fusefs,shipper}`, `net::peers` |
+| Epoch discipline: loss of any promised member freezes FUSE writes with `EROFS`; an open promise blocks S3 takeover | done | `cli::epoch`, `cli::{fusefs,lease}` |
+| Ordered epoch drain: current holder uploads dirty chunks and ships first; prior holders tail, follow, release, and close locally | done | `cli::main`, `cli::shipper` |
+| Reintegration: current-replica classification, clean re-journal, visible conflict materialization preserving stranded bytes and winner | done | `meta::reintegrate`, `cli::reintegrate` |
+| Crash-safe/idempotent reintegration batch + persisted deposed unlock; automatic mount recovery and `constellation reintegrate` | done | `meta::sqlite`, `cli::{main,reintegrate}` |
+| Control status for epoch and reintegration state/counters | done | `crates/api`, `cli::main` |
+| Required fault scenarios | done | `continuation-epoch`, `epoch-member-lost`, `deposed-reintegration` |
+
+### Phase 4 exit criteria / availability rows
+
+| S3 | P2P component | Write-eligible coverage | Expected result | Proven by |
+|---|---|---|---|---|
+| down | healthy | all writers | writes continue under a continuation epoch, then drain without conflicts after heal | `continuation-epoch` |
+| down | loses one promised member | incomplete | all survivors immediately become read-only (`EROFS`); resume/heal converges without divergence | `epoch-member-lost` |
+| up | holder deposed with a stranded branch | n/a | clean records append; conflicting bytes materialize visibly while the shared winner remains | `deposed-reintegration` |
+
+**Verdict: phase 4 is functionally complete.** The S3-down
+availability rows and stranded-branch recovery are enforced in the
+daemon and verified end-to-end by the three dedicated scenarios.
+
+### Phase 4b scope limits (honest, not silently dropped)
+
+- **Epoch liveness is poll-based.** `EpochManager::check_liveness` runs
+  from the sync task, so the freeze after losing a member lands within
+  one sync interval rather than instantly. The safety argument does not
+  depend on the delay (the departed member is itself frozen by its own
+  persisted promise, and `blocks_s3_takeover` refuses the S3 takeover
+  path either way), but `epoch-member-lost` necessarily asserts the
+  `EROFS` transition through `eventually()` rather than immediately.
+- **`SqliteMeta::reintegrate_commit` is unused by the daemon.** The
+  per-record mark-and-rejournal function plan 04 step B4 describes exists
+  and is unit tested, but `cli::reintegrate` commits the whole
+  reconciled batch through `commit_reintegration_batch` instead. That is
+  still crash-safe — one transaction swaps the namespace, marks every
+  disposition, and journals the output, so a crash leaves the stranded
+  rows unmarked and the next mount redoes the batch — but the resume
+  granularity is the batch, not "the first unmarked record". Worth
+  collapsing to one path.
+
 ## Later phases
 
-Not started (phases 4b–8). No code exists for continuation epochs,
-reintegration, cooperative cache, snapshots/E2E, web UI, or GC.
+Not started (phases 5–8). No code exists for cooperative cache,
+snapshots/E2E, web UI, or GC.

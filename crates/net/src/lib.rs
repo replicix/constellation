@@ -32,6 +32,7 @@
 pub mod allowlist;
 pub mod delegation;
 pub mod endpoint;
+pub mod epoch;
 pub mod handoff;
 pub mod identity;
 pub mod message;
@@ -40,6 +41,9 @@ pub mod peers;
 pub use allowlist::{Allowlist, Decision};
 pub use delegation::{DelegationGranter, DelegationHolder, DEFAULT_DELEGATION_TTL_MS};
 pub use endpoint::{topic_for, P2p, PeerService};
+pub use epoch::{
+    component_covers_roster, EpochState, Machine as EpochMachine, Promise as EpochPromise,
+};
 pub use handoff::{handle_request, interpret_reply, Handoff, RequestOutcome};
 pub use identity::{load_or_create, parse_pubkey, pubkey_hex};
 pub use message::{Payload, Signed, ALPN};

@@ -82,6 +82,9 @@ pub enum LogRecord {
     },
     WriteManifest {
         ino: Ino,
+        /// Manifest this edit was based on. Reintegration may append
+        /// cleanly only when the shared winner still equals this value.
+        base_manifest: Option<Vec<u8>>,
         /// Encoded `fs_core::Manifest` bytes.
         manifest: Vec<u8>,
         size: u64,

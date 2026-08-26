@@ -65,9 +65,28 @@ CREATE TABLE IF NOT EXISTS pin (
     ino       INTEGER NOT NULL,
     pinned_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS epochs (
+    epoch_id    TEXT PRIMARY KEY,
+    members     TEXT NOT NULL,
+    base        TEXT NOT NULL,
+    promised_at INTEGER NOT NULL,
+    state       TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reintegration (
+    journal_seq  INTEGER PRIMARY KEY,
+    disposition  TEXT NOT NULL,
+    detail       TEXT
+);
 ";
 
 pub type JournalBatch = Vec<(u64, LogRecord)>;
+pub type EpochRow = (
+    String,
+    Vec<u64>,
+    std::collections::BTreeMap<String, u64>,
+    i64,
+    String,
+);
 
 /// SQLite-backed [`MetaStore`].
 pub struct SqliteMeta {
@@ -902,6 +921,201 @@ impl SqliteMeta {
         Ok(())
     }
 
+    pub fn child_ino(&self, parent: Ino, name: &str) -> Result<Option<Ino>, MetaError> {
+        Self::dentry_ino(&self.conn.lock().unwrap(), parent, name)
+    }
+
+    pub fn applied_vector(&self) -> Result<std::collections::BTreeMap<String, u64>, MetaError> {
+        let mut out = std::collections::BTreeMap::new();
+        for (id, _) in self.partitions()? {
+            out.insert(id.clone(), self.applied_seq_of(&id)?);
+        }
+        Ok(out)
+    }
+
+    pub fn persist_epoch(
+        &self,
+        epoch_id: &str,
+        members: &[u64],
+        base: &std::collections::BTreeMap<String, u64>,
+        promised_at: i64,
+        state: &str,
+    ) -> Result<(), MetaError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO epochs (epoch_id, members, base, promised_at, state)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                epoch_id,
+                serde_json::to_string(members)?,
+                serde_json::to_string(base)?,
+                promised_at,
+                state,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_open_epoch(&self) -> Result<Option<EpochRow>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(String, String, String, i64, String)> = conn
+            .query_row(
+                "SELECT epoch_id, members, base, promised_at, state FROM epochs
+                 WHERE state != 'closed' ORDER BY promised_at DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((id, members, base, at, state)) = row else {
+            return Ok(None);
+        };
+        Ok(Some((
+            id,
+            serde_json::from_str(&members)?,
+            serde_json::from_str(&base)?,
+            at,
+            state,
+        )))
+    }
+
+    pub fn set_epoch_state(&self, epoch_id: &str, state: &str) -> Result<(), MetaError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE epochs SET state = ?1 WHERE epoch_id = ?2",
+            params![state, epoch_id],
+        )?;
+        Ok(())
+    }
+
+    /// Journal rows not yet given a reintegration disposition.
+    pub fn unmarked_journal(&self) -> Result<Vec<(u64, LogRecord)>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT j.seq, j.record FROM journal j
+             LEFT JOIN reintegration r ON r.journal_seq = j.seq
+             WHERE r.journal_seq IS NULL
+             ORDER BY j.seq",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, json) = row?;
+            out.push((seq, serde_json::from_str(&json)?));
+        }
+        Ok(out)
+    }
+
+    pub fn unmarked_journal_parts(&self) -> Result<Vec<String>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT j.part
+             FROM journal j
+             LEFT JOIN reintegration r ON r.journal_seq = j.seq
+             WHERE r.journal_seq IS NULL
+             ORDER BY j.part",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Same-tx: mark a stranded journal row's disposition, drop it, and
+    /// optionally re-journal a replacement (clean replay). Crash-safe
+    /// resume starts at the first unmarked remaining row.
+    pub fn reintegrate_commit(
+        &self,
+        orig_seq: u64,
+        disposition: &str,
+        detail: &str,
+        rejournal: Option<&LogRecord>,
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO reintegration (journal_seq, disposition, detail)
+             VALUES (?1, ?2, ?3)",
+            params![orig_seq, disposition, detail],
+        )?;
+        if inserted == 0 {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute("DELETE FROM journal WHERE seq = ?1", params![orig_seq])?;
+        if let Some(rec) = rejournal {
+            Self::journal(&tx, rec)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn reintegration_conflict_count(&self) -> Result<u64, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM reintegration WHERE disposition = 'conflict'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Atomically replace the local namespace with a reconciled side
+    /// replica, mark every stranded row, and journal the reconciled
+    /// output. This is the crash-safety boundary for reintegration:
+    /// after commit the namespace and disposition table cannot disagree.
+    pub fn commit_reintegration_batch(
+        &self,
+        reconciled_db: &Path,
+        dispositions: &[(u64, String, String)],
+        output: &[LogRecord],
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "ATTACH DATABASE ?1 AS reintegrated",
+            params![reconciled_db.to_string_lossy().as_ref()],
+        )?;
+        let result: Result<(), MetaError> = (|| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("DELETE FROM dentry", [])?;
+            tx.execute("DELETE FROM inode", [])?;
+            tx.execute("INSERT INTO inode SELECT * FROM reintegrated.inode", [])?;
+            tx.execute("INSERT INTO dentry SELECT * FROM reintegrated.dentry", [])?;
+            tx.execute("DELETE FROM partition", [])?;
+            tx.execute(
+                "INSERT INTO partition SELECT * FROM reintegrated.partition",
+                [],
+            )?;
+            tx.execute("DELETE FROM xpart_pending", [])?;
+            tx.execute(
+                "INSERT INTO xpart_pending SELECT * FROM reintegrated.xpart_pending",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM kv WHERE key = 'applied_seq' OR key LIKE 'applied_seq/%'",
+                [],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO kv
+                 SELECT key, value FROM reintegrated.kv
+                 WHERE key = 'applied_seq' OR key LIKE 'applied_seq/%'",
+                [],
+            )?;
+            for (seq, disposition, detail) in dispositions {
+                tx.execute(
+                    "INSERT OR IGNORE INTO reintegration
+                     (journal_seq, disposition, detail) VALUES (?1, ?2, ?3)",
+                    params![seq, disposition, detail],
+                )?;
+                tx.execute("DELETE FROM journal WHERE seq = ?1", params![seq])?;
+            }
+            for record in output {
+                Self::journal(&tx, record)?;
+            }
+            tx.execute("DELETE FROM kv WHERE key LIKE 'part_of/%'", [])?;
+            tx.commit()?;
+            Ok(())
+        })();
+        let _ = conn.execute("DETACH DATABASE reintegrated", []);
+        result
+    }
+
     /// Raw connection access for same-crate extensions (replay).
     pub(crate) fn raw(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
@@ -1330,6 +1544,14 @@ impl MetaStore for SqliteMeta {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let t = now_ns();
+        let base_manifest: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT manifest FROM inode WHERE ino = ?1",
+                params![ino],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
         let n = tx.execute(
             "UPDATE inode SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4 WHERE ino = ?1",
             params![ino, manifest, size as i64, t],
@@ -1341,6 +1563,7 @@ impl MetaStore for SqliteMeta {
             &tx,
             &LogRecord::WriteManifest {
                 ino,
+                base_manifest,
                 manifest: manifest.to_vec(),
                 size,
                 time_ns: t,
@@ -1406,6 +1629,24 @@ mod tests {
         let root = m.getattr(ROOT_INO).unwrap().unwrap();
         assert_eq!(root.kind, InodeKind::Dir);
         assert_eq!(root.nlink, 2);
+    }
+
+    #[test]
+    fn epoch_promise_persists_before_activation() {
+        let m = store();
+        let members = vec![1, 2];
+        let base = std::collections::BTreeMap::from([("p0".to_string(), 7), ("p1".to_string(), 3)]);
+        m.persist_epoch("e1", &members, &base, 123, "promised")
+            .unwrap();
+        let loaded = m.load_open_epoch().unwrap().unwrap();
+        assert_eq!(loaded.0, "e1");
+        assert_eq!(loaded.1, members);
+        assert_eq!(loaded.2, base);
+        assert_eq!(loaded.3, 123);
+        assert_eq!(loaded.4, "promised");
+
+        m.set_epoch_state("e1", "closed").unwrap();
+        assert!(m.load_open_epoch().unwrap().is_none());
     }
 
     #[test]

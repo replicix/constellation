@@ -49,6 +49,9 @@ pub enum SyncRequest {
         part: String,
         reply: tokio::sync::oneshot::Sender<Option<u64>>,
     },
+    /// Reintegrate a stranded branch, either from the control API or
+    /// automatically after mounting a persisted deposed state dir.
+    Reintegrate(tokio::sync::oneshot::Sender<Result<String, String>>),
 }
 
 /// FUSE-side handle to the metadata sync task.
@@ -66,6 +69,12 @@ pub struct SyncHandle {
     /// exist for this mount — the write gate then behaves exactly as
     /// before phase 4a.
     pub designations: Option<Arc<crate::designation::DesignationManager>>,
+    /// Continuation epoch (DESIGN.md §5.3): frozen ⇒ EROFS; active ⇒
+    /// epoch is the authority root (writes without S3 CAS).
+    pub epoch_frozen: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub epoch_active: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// A read-only registry member never enters the write gate.
+    pub read_only_member: bool,
 }
 
 pub struct ConstellationFs {
@@ -188,6 +197,15 @@ impl ConstellationFs {
 
     pub(crate) fn require_lease_for(&self, ino: Ino) -> Result<(), i32> {
         let Some(h) = &self.sync else { return Ok(()) };
+        if h.read_only_member {
+            return Err(libc::EROFS);
+        }
+        if let Some(frozen) = &h.epoch_frozen {
+            if frozen.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!("refusing mutation: continuation epoch frozen (lost a member)");
+                return Err(libc::EROFS);
+            }
+        }
         // Offline designation gate (DESIGN.md §5.2), checked before the
         // ordinary lease: a designated path's write authority does not
         // come from the partition lease at all while the designee is
@@ -207,6 +225,20 @@ impl ConstellationFs {
                     return Err(libc::EROFS);
                 }
             }
+        }
+        if h.epoch_active
+            .as_ref()
+            .is_some_and(|active| active.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            let part = self.meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
+            let map = h.leases.lock().unwrap();
+            if let Some(view) = map.get(&part) {
+                if view.usable() {
+                    view.touch();
+                    return Ok(());
+                }
+            }
+            // The sync task performs a P2P-only handoff in epoch mode.
         }
         let part = self.meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
         {
@@ -317,10 +349,17 @@ impl ConstellationFs {
         if let Ok(Some(data)) = self.cache.get(hash) {
             return Ok(data);
         }
-        let data = self
-            .rt
-            .block_on(self.store.get_chunk(hash))
-            .map_err(|_| libc::EIO)?;
+        let mut data = None;
+        for attempt in 0..3 {
+            if let Ok(bytes) = self.rt.block_on(self.store.get_chunk(hash)) {
+                data = Some(bytes);
+                break;
+            }
+            if attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        let data = data.ok_or(libc::EIO)?;
         // Best effort: cache full just means we stream through.
         let _ = self.cache.insert(hash, &data, ChunkState::Clean);
         Ok(data)
@@ -352,6 +391,34 @@ impl ConstellationFs {
     /// lease — but the chunk uploads do not (content is immutable and
     /// content-addressed), which is why the gate sits just before the
     /// commit rather than at the top.
+    ///
+    /// Eager chunk upload is best-effort. The dirty cache entry is
+    /// reserve-accounted and the sync task uploads all dirty chunks
+    /// before publishing this manifest, so a transient reset on a
+    /// healed S3 connection does not become application-visible EIO in
+    /// local-fsync mode.
+    fn try_upload_dirty(&self, hash: &ChunkHash, data: &[u8]) {
+        let mut last_error = None;
+        for attempt in 0..3 {
+            match self
+                .rt
+                .block_on(self.store.put_chunk(hash, data, self.compression))
+            {
+                Ok(()) => {
+                    self.cache.set_state(hash, ChunkState::Clean);
+                    return;
+                }
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        if let Some(error) = last_error {
+            tracing::warn!(%error, %hash, "deferring dirty chunk upload to sync task");
+        }
+    }
+
     fn flush_inode(&self, ino: Ino) -> Result<(), i32> {
         let ws = {
             let mut writes = self.writes.lock().unwrap();
@@ -366,6 +433,11 @@ impl ConstellationFs {
             self.writes.lock().unwrap().insert(ino, ws);
             return Err(e);
         }
+        let epoch_active = self.sync.as_ref().is_some_and(|h| {
+            h.epoch_active
+                .as_ref()
+                .is_some_and(|active| active.load(std::sync::atomic::Ordering::Relaxed))
+        });
         let base = match &ws.base {
             Some(m) => m.clone(),
             None => self.load_manifest(ino)?,
@@ -384,10 +456,9 @@ impl ConstellationFs {
                 self.cache
                     .insert(&hash, &data, ChunkState::Dirty)
                     .map_err(|_| libc::ENOSPC)?;
-                self.rt
-                    .block_on(self.store.put_chunk(&hash, &data, self.compression))
-                    .map_err(|_| libc::EIO)?;
-                self.cache.set_state(&hash, ChunkState::Clean);
+                if !epoch_active {
+                    self.try_upload_dirty(&hash, &data);
+                }
                 new_hashes.push(hash);
             } else if let Some(h) = old_hashes.get(idx as usize) {
                 // Untouched chunk: reuse. The final (possibly shortened)
@@ -398,10 +469,12 @@ impl ConstellationFs {
                         let mut data = self.fetch_chunk(h)?;
                         data.resize(expect_len, 0);
                         let hash = ChunkHash::of(&data);
-                        self.rt
-                            .block_on(self.store.put_chunk(&hash, &data, self.compression))
-                            .map_err(|_| libc::EIO)?;
-                        let _ = self.cache.insert(&hash, &data, ChunkState::Clean);
+                        self.cache
+                            .insert(&hash, &data, ChunkState::Dirty)
+                            .map_err(|_| libc::ENOSPC)?;
+                        if !epoch_active {
+                            self.try_upload_dirty(&hash, &data);
+                        }
                         new_hashes.push(hash);
                         continue;
                     }
@@ -411,9 +484,12 @@ impl ConstellationFs {
                 // Hole created by extension without data: a zero chunk.
                 let data = vec![0u8; expect_len];
                 let hash = ChunkHash::of(&data);
-                self.rt
-                    .block_on(self.store.put_chunk(&hash, &data, self.compression))
-                    .map_err(|_| libc::EIO)?;
+                self.cache
+                    .insert(&hash, &data, ChunkState::Dirty)
+                    .map_err(|_| libc::ENOSPC)?;
+                if !epoch_active {
+                    self.try_upload_dirty(&hash, &data);
+                }
                 new_hashes.push(hash);
             }
         }
@@ -421,9 +497,12 @@ impl ConstellationFs {
             Manifest::from_chunks(self.chunk_size, ws.file_len, new_hashes, INLINE_CHUNKS_MAX);
         if let Some(blob) = spill {
             let bh = ChunkHash::of(&blob);
-            self.rt
-                .block_on(self.store.put_chunk(&bh, &blob, self.compression))
-                .map_err(|_| libc::EIO)?;
+            self.cache
+                .insert(&bh, &blob, ChunkState::Dirty)
+                .map_err(|_| libc::ENOSPC)?;
+            if !epoch_active {
+                self.try_upload_dirty(&bh, &blob);
+            }
         }
         self.meta
             .set_manifest(ino, &manifest.encode(), ws.file_len)

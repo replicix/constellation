@@ -32,6 +32,9 @@ pub enum StoreError {
     #[error("compression: {0}")]
     Compression(String),
 
+    #[error("node registry: {0}")]
+    Registry(String),
+
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 

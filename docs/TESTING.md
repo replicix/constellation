@@ -208,6 +208,22 @@ exactly B's namespace). `Client::pause()`/`resume()` wrap
 `SIGSTOP`/`SIGCONT`; querying the control socket is done *before*
 pausing, since a stopped daemon cannot answer it.
 
+Phase-4b scenarios cover the availability matrix's S3-down rows and
+stranded-branch recovery:
+
+- `continuation-epoch` cuts S3 for both write-eligible nodes while P2P
+  remains healthy, asserts the all-member epoch through the control API,
+  writes real file data from both nodes using a P2P-only lease handoff,
+  heals S3, and verifies ordered drain, convergence, and zero conflicts.
+- `epoch-member-lost` stops one promised member with `SIGSTOP`; the
+  survivor must freeze and return `EROFS`, then resume cleanly when the
+  member returns and converge after S3 heals.
+- `deposed-reintegration` creates both a clean stranded file and an
+  edit-vs-edit conflict on a deposed holder. On-demand reintegration must
+  retain B's winner, publish A's clean file, and materialize A's exact
+  bytes as `shared/.constellation-conflict/same@<node>-<ts>` on both
+  mounts.
+
 M3.2 scenarios exercise the partition map (DESIGN.md §4):
 `partition-split` (two nodes, one FS; `CONSTELLATION_PART_SPLIT_OPS`
 is lowered so node A hammering `/hot` produces a child partition

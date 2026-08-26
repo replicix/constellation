@@ -101,6 +101,8 @@ pub struct Shipper {
     /// Per-partition stream state (next_seq, max_epoch, log handle).
     parts: HashMap<String, PartState>,
     shipped_since_ckpt: u64,
+    /// Continuation epoch: journal locally, do not CAS-create segments.
+    skip_ship: Arc<std::sync::atomic::AtomicBool>,
     /// Live spool observability shared with the control API.
     pub spool: Arc<std::sync::Mutex<SpoolInfo>>,
     /// Per-directory write-op counts used by the split heuristic.
@@ -210,6 +212,7 @@ impl Shipper {
             lease_mode,
             parts,
             shipped_since_ckpt: 0,
+            skip_ship: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             spool: Arc::new(std::sync::Mutex::new(SpoolInfo {
                 head_seq: head,
                 ..Default::default()
@@ -224,6 +227,22 @@ impl Shipper {
     /// Attach the P2P handle so shipped segments are announced to peers.
     pub fn set_peers(&mut self, peers: constellation_net::Peers) {
         self.peers = peers;
+    }
+
+    pub fn log(&self) -> &LogStore {
+        &self.log
+    }
+
+    pub fn lease_keeper(&self, part: &str) -> LeaseKeeper {
+        LeaseKeeper::new(
+            LeaseStore::new(self.log.inner(), part, self.lease_mode),
+            self.node_id,
+        )
+    }
+
+    pub fn set_skip_ship(&self, skip: bool) {
+        self.skip_ship
+            .store(skip, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Attach the offline-designation manager (DESIGN.md §5.2) so a
@@ -454,6 +473,24 @@ impl Shipper {
                     }
                 }
             }
+            let needs_reacquire = leases
+                .get(&part)
+                .is_some_and(|keeper| !keeper.is_lost() && keeper.ship_epoch().is_none());
+            if needs_reacquire {
+                let keeper = leases.get_mut(&part).expect("checked above");
+                match acquire_lease_for(self, keeper, &part).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            part,
+                            "lease reacquisition for pending journal failed"
+                        );
+                        continue;
+                    }
+                }
+            }
             let Some(lease) = leases.get(&part) else {
                 continue;
             };
@@ -467,6 +504,9 @@ impl Shipper {
     /// Ship one journal batch for `part`. Returns true if another
     /// round is needed (more records pending, or a CAS collision).
     async fn ship_part(&mut self, part: &str, lease: &LeaseKeeper) -> Result<bool> {
+        if self.skip_ship.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(false);
+        }
         let Some(epoch) = lease.ship_epoch() else {
             return Ok(false);
         };

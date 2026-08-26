@@ -8,8 +8,8 @@
 pub mod types;
 
 pub use types::{
-    CacheStatus, DesignationStatus, LeaseStatus, P2pStatus, PartitionStatus, PeerStatus, PinStatus,
-    Request, Response, SpoolStatus, StatusReport,
+    CacheStatus, DesignationStatus, EpochStatus, LeaseStatus, P2pStatus, PartitionStatus,
+    PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SpoolStatus, StatusReport,
 };
 
 use anyhow::{Context, Result};
@@ -52,6 +52,10 @@ pub trait StatusSource: Send + Sync + 'static {
 
     fn list_designations(&self) -> Vec<DesignationStatus> {
         Vec::new()
+    }
+
+    fn reintegrate(&self) -> std::result::Result<String, String> {
+        Err("reintegration is not supported by this daemon".into())
     }
 }
 
@@ -108,6 +112,10 @@ async fn handle(stream: UnixStream, source: Arc<dyn StatusSource>) -> Result<()>
             },
             Ok(Request::ListDesignations) => Response::Designations {
                 designations: source.list_designations(),
+            },
+            Ok(Request::Reintegrate) => match source.reintegrate() {
+                Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
             },
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
@@ -173,6 +181,8 @@ mod tests {
                 p2p: P2pStatus::default(),
                 pins: Vec::new(),
                 designations: Vec::new(),
+                epoch: EpochStatus::default(),
+                reintegration: ReintegrationStatus::default(),
             }
         }
 
@@ -278,6 +288,8 @@ mod tests {
                 p2p: P2pStatus::default(),
                 pins: Vec::new(),
                 designations: Vec::new(),
+                epoch: EpochStatus::default(),
+                reintegration: ReintegrationStatus::default(),
             }
         }
     }

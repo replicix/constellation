@@ -232,6 +232,25 @@ impl Client {
         );
         Ok(resp)
     }
+
+    pub fn reintegrate(&self) -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::time::Duration;
+        let sock = self.state.join("control.sock");
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
+            .with_context(|| format!("connecting to {}", sock.display()))?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.write_all(b"{\"cmd\":\"reintegrate\"}\n")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        let resp: serde_json::Value = serde_json::from_str(&line)?;
+        anyhow::ensure!(
+            resp["resp"] == "ok",
+            "reintegration failed: {resp}; log:\n{}",
+            self.tail_log_n(80)
+        );
+        Ok(())
+    }
 }
 
 impl Drop for Client {

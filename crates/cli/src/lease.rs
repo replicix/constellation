@@ -57,13 +57,16 @@ pub struct LeaseView {
     lost: AtomicBool,
     /// Unix ms of the last gated mutation, for idle release.
     last_write_ms: AtomicI64,
+    /// Continuation-epoch local authority (no S3 lease object).
+    epoch_held: AtomicBool,
 }
 
 impl LeaseView {
     /// Usable right now, with enough margin to finish an op.
     pub fn usable(&self) -> bool {
         !self.lost.load(Ordering::Relaxed)
-            && self.valid_until_ms.load(Ordering::Relaxed) - now_unix_ms() > EXPIRY_MARGIN_MS
+            && (self.epoch_held.load(Ordering::Relaxed)
+                || self.valid_until_ms.load(Ordering::Relaxed) - now_unix_ms() > EXPIRY_MARGIN_MS)
     }
 
     pub fn is_lost(&self) -> bool {
@@ -101,10 +104,12 @@ impl LeaseView {
 
     fn clear(&self) {
         self.valid_until_ms.store(0, Ordering::Relaxed);
+        self.epoch_held.store(false, Ordering::Relaxed);
     }
 }
 
 /// What the current lease object allows this node to do.
+#[derive(Debug)]
 pub enum Plan {
     /// Already held by us and still valid.
     Held,
@@ -154,6 +159,8 @@ pub struct LeaseKeeper {
     view: Arc<LeaseView>,
     /// The lease we believe we hold, with the tag needed to swap it.
     held: Option<(Lease, LeaseTag)>,
+    /// Open continuation-epoch promise forbids S3 takeover (DESIGN.md §5.3).
+    takeover_gate: Arc<AtomicBool>,
 }
 
 impl LeaseKeeper {
@@ -165,7 +172,12 @@ impl LeaseKeeper {
             idle_release_ms: idle_release_ms(),
             view: Arc::new(LeaseView::default()),
             held: None,
+            takeover_gate: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn share_takeover_gate(&mut self, gate: Arc<AtomicBool>) {
+        self.takeover_gate = gate;
     }
 
     pub fn view(&self) -> Arc<LeaseView> {
@@ -179,12 +191,64 @@ impl LeaseKeeper {
     /// Epoch to stamp into a segment, or `None` when this node may not
     /// ship (no lease, expired, or deposed).
     pub fn ship_epoch(&self) -> Option<u64> {
+        if self.view.is_lost() {
+            return None;
+        }
+        if self.view.epoch_held.load(Ordering::Relaxed) {
+            let e = self.view.epoch.load(Ordering::Relaxed);
+            return Some(e.max(1));
+        }
         let (lease, _) = self.held.as_ref()?;
         (self.view.usable() && lease.holder == self.node_id).then_some(lease.epoch)
     }
 
+    pub fn holds_authority(&self) -> bool {
+        self.view.usable()
+    }
+
+    pub fn authority_epoch(&self) -> u64 {
+        self.view.epoch.load(Ordering::Relaxed).max(1)
+    }
+
     pub fn is_lost(&self) -> bool {
         self.view.is_lost()
+    }
+
+    pub fn force_lost(&mut self) {
+        self.held = None;
+        self.view.clear();
+        self.view.lost.store(true, Ordering::Relaxed);
+    }
+
+    pub fn clear_lost(&mut self) {
+        self.view.lost.store(false, Ordering::Relaxed);
+    }
+
+    /// Epoch-local authority: no S3 CAS. Used while a continuation epoch
+    /// is the authority root (handoff without shipping).
+    pub fn adopt_epoch_hold(&mut self, epoch: u64) {
+        self.view.lost.store(false, Ordering::Relaxed);
+        self.view.holder.store(self.node_id, Ordering::Relaxed);
+        self.view.epoch.store(epoch.max(1), Ordering::Relaxed);
+        self.view
+            .valid_until_ms
+            .store(now_unix_ms() + 365 * 24 * 3600 * 1000, Ordering::Relaxed);
+        self.view.epoch_held.store(true, Ordering::Relaxed);
+        self.view.touch();
+    }
+
+    pub fn release_local(&mut self) {
+        self.held = None;
+        self.view.clear();
+    }
+
+    pub fn extend_local(&mut self) {
+        if self.holds_authority() {
+            self.view
+                .valid_until_ms
+                .store(now_unix_ms() + 365 * 24 * 3600 * 1000, Ordering::Relaxed);
+            self.view.epoch_held.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Read the lease and decide what this node may do with it.
@@ -215,6 +279,16 @@ impl LeaseKeeper {
             });
         }
         let needs_tail = prev.holder != 0 && prev.holder != self.node_id;
+        if needs_tail && self.takeover_gate.load(Ordering::Relaxed) {
+            tracing::warn!(
+                holder = prev.holder,
+                "refusing S3 lease takeover: an open continuation-epoch promise is binding"
+            );
+            return Ok(Plan::Busy {
+                holder: prev.holder,
+                expires_in_ms: prev.expires_in_ms(now),
+            });
+        }
         Ok(Plan::Claim {
             prev,
             tag,
@@ -290,6 +364,10 @@ impl LeaseKeeper {
 
     /// Renew when past half-TTL. Detects deposition.
     pub async fn renew_if_due(&mut self) -> Result<()> {
+        if self.view.epoch_held.load(Ordering::Relaxed) {
+            self.extend_local();
+            return Ok(());
+        }
         let Some((lease, _)) = self.held.as_ref() else {
             return Ok(());
         };
@@ -370,7 +448,8 @@ impl LeaseKeeper {
     /// Write-idle with nothing pending: hand the lease back so a peer
     /// does not have to wait out the TTL. Reacquiring costs one CAS.
     pub fn idle_release_due(&self, journal_backlog: u64) -> bool {
-        self.held.is_some()
+        !self.view.epoch_held.load(Ordering::Relaxed)
+            && self.held.is_some()
             && journal_backlog == 0
             && self.view.idle_for_ms() >= self.idle_release_ms as i64
     }
@@ -393,6 +472,30 @@ impl LeaseKeeper {
                 Ok(())
             }
             Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use constellation_store_s3::{LeaseMode, LeaseStore};
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn open_epoch_promise_refuses_s3_takeover() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let a = LeaseStore::new(store.clone(), "p0", LeaseMode::Cas);
+        let mut ka = LeaseKeeper::new(a, 1);
+        assert!(ka.commit(Plan::Create, None).await.unwrap());
+        ka.release().await.unwrap();
+
+        let b = LeaseStore::new(store, "p0", LeaseMode::Cas);
+        let mut kb = LeaseKeeper::new(b, 2);
+        kb.share_takeover_gate(Arc::new(AtomicBool::new(true)));
+        match kb.classify().await.unwrap() {
+            Plan::Busy { holder, .. } => assert_eq!(holder, 1),
+            other => panic!("takeover must be refused, got {other:?}"),
         }
     }
 }

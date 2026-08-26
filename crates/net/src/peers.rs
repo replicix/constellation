@@ -256,8 +256,68 @@ impl Peers {
                 }
                 Ok(reply)
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => anyhow::bail!("request timed out"),
+            Ok(Err(e)) => {
+                if let Some(id) = node_id {
+                    self.note_rtt(id, started.elapsed(), false);
+                }
+                Err(e)
+            }
+            Err(_) => {
+                if let Some(id) = node_id {
+                    self.note_rtt(id, started.elapsed(), false);
+                }
+                anyhow::bail!("request timed out")
+            }
+        }
+    }
+
+    /// Direct request to a registry-known node id.
+    pub async fn request_to_node(&self, node_id: u64, payload: &Payload) -> Result<Payload> {
+        let addr = self
+            .snapshot()
+            .into_iter()
+            .find(|p| p.node_id == node_id)
+            .ok_or_else(|| anyhow::anyhow!("no address for node {node_id}"))?
+            .addr;
+        self.request_raw(addr, payload).await
+    }
+
+    /// Liveness probe used by continuation epochs. Failure is a missing
+    /// member, not a safety input on its own — the persisted promise is.
+    pub async fn ping_node(&self, node_id: u64) -> bool {
+        let inner = match self.inner.as_ref() {
+            Some(i) => i,
+            None => return false,
+        };
+        matches!(
+            self.request_to_node(
+                node_id,
+                &Payload::Ping {
+                    node_id: inner.node_id
+                }
+            )
+            .await,
+            Ok(Payload::Pong { .. })
+        )
+    }
+
+    pub async fn announce_epoch_activate(
+        &self,
+        epoch_id: &str,
+        members: &[u64],
+        base: &[(String, u64)],
+    ) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        let payload = Payload::EpochActivate {
+            epoch_id: epoch_id.to_string(),
+            members: members.to_vec(),
+            base: base.to_vec(),
+        };
+        let _ = inner.p2p.broadcast(&payload).await;
+        for p in self.snapshot() {
+            let _ = self.request_raw(p.addr, &payload).await;
         }
     }
 
@@ -360,8 +420,16 @@ pub async fn run_gossip<S: PeerService>(
             tracing::debug!(peer = %hex, "dropping gossip from an unenrolled key");
             continue;
         }
-        if let Payload::SegmentPublished { part, seq, epoch } = payload {
-            service.segment_published(&part, seq, epoch);
+        if let Payload::SegmentPublished { part, seq, epoch } = &payload {
+            service.segment_published(part, *seq, *epoch);
+        }
+        if let Payload::EpochActivate {
+            epoch_id,
+            members,
+            base,
+        } = payload
+        {
+            service.epoch_activated(epoch_id, members, base);
         }
     }
 }
@@ -429,9 +497,32 @@ async fn handle_conn<S: PeerService>(
             Payload::Ping { .. } => Some(Payload::Pong {
                 node_id: service.node_id(),
             }),
+            Payload::EpochPropose {
+                epoch_id,
+                members,
+                base,
+                proposer,
+            } => Some(
+                service
+                    .epoch_proposed(epoch_id, members, base, proposer)
+                    .await,
+            ),
+            Payload::EpochActivate {
+                epoch_id,
+                members,
+                base,
+            } => {
+                service.epoch_activated(epoch_id.clone(), members, base);
+                Some(Payload::EpochAck {
+                    epoch_id,
+                    member: service.node_id(),
+                    accepted: true,
+                })
+            }
             Payload::Pong { .. }
             | Payload::LeaseHandoff { .. }
-            | Payload::DelegationGrant { .. } => None,
+            | Payload::DelegationGrant { .. }
+            | Payload::EpochAck { .. } => None,
         };
         if let Some(reply) = reply {
             let signed = Signed::new(inner.p2p.secret_key(), &reply)?;

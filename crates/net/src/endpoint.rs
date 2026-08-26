@@ -63,6 +63,25 @@ pub trait PeerService: Send + Sync + 'static {
             }
         })
     }
+    /// A peer proposed a continuation epoch. Persist the promise, then
+    /// reply with an ack. Default declines (P2P-disabled / tests).
+    fn epoch_proposed(
+        &self,
+        _epoch_id: String,
+        _members: Vec<u64>,
+        _base: Vec<(String, u64)>,
+        _proposer: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::EpochAck {
+                epoch_id: String::new(),
+                member: 0,
+                accepted: false,
+            }
+        })
+    }
+    /// A peer redistributed activation. Default is a no-op.
+    fn epoch_activated(&self, _epoch_id: String, _members: Vec<u64>, _base: Vec<(String, u64)>) {}
     /// This node's id, for `Ping`/`Pong`.
     fn node_id(&self) -> u64;
 }

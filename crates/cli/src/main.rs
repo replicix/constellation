@@ -2,10 +2,12 @@
 
 mod backend;
 mod designation;
+mod epoch;
 mod fusefs;
 mod lease;
 mod pin;
 mod prefetch;
+mod reintegrate;
 mod shipper;
 
 use anyhow::{bail, Context, Result};
@@ -53,6 +55,11 @@ enum Command {
         /// ship) or "s3" (record durable in the shared log).
         #[arg(long, default_value = "local")]
         fsync_mode: String,
+        /// Enrol this state directory as a read-only cluster member.
+        /// Only valid on its first mount; RO members do not count toward
+        /// a continuation epoch's write-eligible roster.
+        #[arg(long)]
+        read_only_member: bool,
     },
     /// Verify backend capabilities (conditional writes, filesystem state).
     Doctor {
@@ -106,6 +113,11 @@ enum Command {
     },
     /// List active offline designations visible to this node.
     Designations {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// Reintegrate this node's stranded journal after deposition.
+    Reintegrate {
         #[arg(long)]
         state_dir: PathBuf,
     },
@@ -240,6 +252,10 @@ fn main() -> Result<()> {
             &state_dir,
             constellation_api::Request::ListDesignations,
         )),
+        Command::Reintegrate { state_dir } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::Reintegrate,
+        )),
         Command::Mount {
             s3,
             mountpoint,
@@ -247,6 +263,7 @@ fn main() -> Result<()> {
             cache_size,
             allow_other,
             fsync_mode,
+            read_only_member,
         } => {
             let fsync_s3 = match fsync_mode.as_str() {
                 "local" => false,
@@ -261,6 +278,7 @@ fn main() -> Result<()> {
                 cache_size,
                 allow_other,
                 fsync_s3,
+                read_only_member,
             )
         }
     }
@@ -275,6 +293,7 @@ fn mount(
     cache_size: u64,
     allow_other: bool,
     fsync_s3: bool,
+    read_only_member: bool,
 ) -> Result<()> {
     let store = std::sync::Arc::new(ChunkStore::new(backend::open_backend(s3)?));
     let fsmeta = rt
@@ -292,6 +311,7 @@ fn mount(
     let meta = std::sync::Arc::new(SqliteMeta::open(&db_path)?);
     // Node identity: claim a cluster-unique id on first mount of this
     // state dir; it scopes ino allocation and marks log segment origin.
+    let first_mount = meta.kv_get("node_id")?.is_none();
     let node_id: u64 = match meta.kv_get("node_id")? {
         Some(v) => v.parse().context("corrupt node_id in state dir")?,
         None => {
@@ -302,6 +322,17 @@ fn mount(
             id
         }
     };
+    if first_mount {
+        rt.block_on(constellation_store_s3::publish_ro(
+            store.inner().clone(),
+            node_id,
+            read_only_member,
+        ))
+        .context("publishing read-only membership")?;
+        meta.kv_set("read_only_member", if read_only_member { "1" } else { "0" })?;
+    } else if read_only_member != matches!(meta.kv_get("read_only_member")?.as_deref(), Some("1")) {
+        bail!("--read-only-member is fixed on first mount for this state directory");
+    }
     meta.set_node_prefix(node_id)?;
     tracing::info!(node_id, "node identity");
     let cache = std::sync::Arc::new(DiskCache::open(state_dir.join("cache"), cache_size)?);
@@ -333,7 +364,7 @@ fn mount(
         );
         constellation_store_s3::LeaseMode::SingleWriter
     };
-    let keeper = lease::LeaseKeeper::new(
+    let mut keeper = lease::LeaseKeeper::new(
         constellation_store_s3::LeaseStore::new(
             store.inner().clone(),
             constellation_store_s3::log::PARTITION,
@@ -364,6 +395,22 @@ fn mount(
     // the offline-designation gate (phase 4a) needs it for delegation
     // requests.
     let peers = rt.block_on(start_p2p(&fsmeta, store.inner().clone(), node_id));
+    let epochs = std::sync::Arc::new(epoch::EpochManager::new(
+        node_id,
+        meta.clone(),
+        peers.clone(),
+    ));
+    keeper.share_takeover_gate(epochs.blocks_takeover.clone());
+    let lost_on_mount = matches!(meta.kv_get("lease_lost")?.as_deref(), Some("1"));
+    if lost_on_mount {
+        keeper.force_lost();
+    }
+    let roster = rt
+        .block_on(constellation_store_s3::write_eligible_roster(
+            store.inner().clone(),
+        ))
+        .context("loading write-eligible roster")?;
+    epochs.set_roster(roster);
     let designations = std::sync::Arc::new(designation::DesignationManager::new(
         constellation_store_s3::designation::DesignationStore::new(
             store.inner().clone(),
@@ -392,6 +439,9 @@ fn mount(
             leases: lease_views.clone(),
             acquire_deadline,
             designations: Some(designations.clone()),
+            epoch_frozen: Some(epochs.frozen.clone()),
+            epoch_active: Some(epochs.active.clone()),
+            read_only_member,
         }),
     );
 
@@ -404,9 +454,10 @@ fn mount(
     let ship = shipper::Shipper::attach_with_mode(meta.clone(), log, node_id, lease_mode)?;
     let spool = ship.spool.clone();
     let mut ship = ship;
-    let mut keeper = keeper;
-    rt.block_on(adopt_root(&meta, &mut ship, &mut keeper))
-        .context("adopting the root directory owner")?;
+    if !read_only_member {
+        rt.block_on(adopt_root(&meta, &mut ship, &mut keeper))
+            .context("adopting the root directory owner")?;
+    }
 
     ship.set_peers(peers.clone());
     ship.set_designations(designations.clone());
@@ -421,21 +472,28 @@ fn mount(
         m.insert(constellation_store_s3::log::PARTITION.to_string(), keeper);
         m
     }));
+    let reintegration = std::sync::Arc::new(reintegrate::ReintegrationState::default());
+    // Only a persisted deposition is known to be a stranded branch.
+    // Ordinary crash-recovery journals must retain their existing
+    // ship-in-place path; treating every pending row as deposed would
+    // unnecessarily rebuild a healthy replica on each remount.
+    let reintegrate_on_mount = lost_on_mount && !epochs.is_open();
     let bridge = std::sync::Arc::new(P2pBridge {
         node_id,
         nudge: sync_tx.clone(),
         designations: designations.clone(),
         meta: meta.clone(),
+        epochs: epochs.clone(),
     });
     if peers.is_enabled() {
         // Refresh-on-miss: an unknown key may be a peer that mounted
         // after us, which on a cold start is the normal case rather than
         // the exception.
         {
-            let (p, store_inner) = (peers.clone(), store.inner().clone());
+            let (p, store_inner, epochs) = (peers.clone(), store.inner().clone(), epochs.clone());
             peers.set_refresher(std::sync::Arc::new(move || {
-                let (p, store_inner) = (p.clone(), store_inner.clone());
-                Box::pin(async move { refresh_peers(&p, store_inner).await })
+                let (p, store_inner, epochs) = (p.clone(), store_inner.clone(), epochs.clone());
+                Box::pin(async move { refresh_peers(&p, store_inner, Some(&epochs)).await })
             }));
         }
         // Accept inbound peer connections.
@@ -448,15 +506,19 @@ fn mount(
         // mounts first has nobody to bootstrap from, so poll briefly for
         // a peer instead of joining a topic alone.
         {
-            let (peers, bridge, store_inner) =
-                (peers.clone(), bridge.clone(), store.inner().clone());
+            let (peers, bridge, store_inner, epochs) = (
+                peers.clone(),
+                bridge.clone(),
+                store.inner().clone(),
+                epochs.clone(),
+            );
             rt.spawn(async move {
                 for _ in 0..40 {
                     if !peers.snapshot().is_empty() {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    refresh_peers(&peers, store_inner.clone()).await;
+                    refresh_peers(&peers, store_inner.clone(), Some(&epochs)).await;
                 }
                 let bootstrap: Vec<constellation_net::EndpointId> =
                     peers.snapshot().iter().map(|p| p.addr.id).collect();
@@ -470,11 +532,12 @@ fn mount(
         // Periodically re-read the registry so nodes that join later are
         // dialable and enrolled without a remount.
         {
-            let (peers, store_inner) = (peers.clone(), store.inner().clone());
+            let (peers, store_inner, epochs) =
+                (peers.clone(), store.inner().clone(), epochs.clone());
             rt.spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    refresh_peers(&peers, store_inner.clone()).await;
+                    refresh_peers(&peers, store_inner.clone(), Some(&epochs)).await;
                 }
             });
         }
@@ -495,7 +558,23 @@ fn mount(
     }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        let (ship, stop, spool, keepers, lease_views, store_inner, lease_mode, peers, pins) = (
+        let (
+            ship,
+            stop,
+            spool,
+            keepers,
+            lease_views,
+            store_inner,
+            lease_mode,
+            peers,
+            pins,
+            epochs,
+            meta,
+            cache,
+            chunk_store,
+            reintegration,
+            state_dir,
+        ) = (
             ship.clone(),
             stop.clone(),
             spool.clone(),
@@ -505,6 +584,12 @@ fn mount(
             lease_mode,
             peers.clone(),
             pins.clone(),
+            epochs.clone(),
+            meta.clone(),
+            cache.clone(),
+            store.clone(),
+            reintegration.clone(),
+            state_dir.clone(),
         );
         rt.spawn(async move {
             let mut pending: Option<fusefs::SyncRequest> = None;
@@ -528,7 +613,7 @@ fn mount(
                         let mut ship = ship.lock().await;
                         let mut keepers = keepers.lock().await;
                         if !keepers.contains_key(&part) {
-                            let k = lease::LeaseKeeper::new(
+                            let mut k = lease::LeaseKeeper::new(
                                 constellation_store_s3::LeaseStore::new(
                                     store_inner.clone(),
                                     &part,
@@ -536,18 +621,31 @@ fn mount(
                                 ),
                                 node_id,
                             );
+                            k.share_takeover_gate(epochs.blocks_takeover.clone());
                             lease_views.lock().unwrap().insert(part.clone(), k.view());
                             keepers.insert(part.clone(), k);
                         }
                         let keeper = keepers.get_mut(&part).unwrap();
-                        let mut r = shipper::acquire_lease_for(&mut ship, keeper, &part).await;
+                        let mut r = if epochs.writes_ok() {
+                            if keeper.holds_authority() {
+                                Ok(true)
+                            } else if peers.request_lease(&part).await {
+                                keeper.adopt_epoch_hold(keeper.authority_epoch());
+                                Ok(true)
+                            } else {
+                                Ok(false)
+                            }
+                        } else {
+                            shipper::acquire_lease_for(&mut ship, keeper, &part).await
+                        };
                         // Fast path (M3.3): a live holder can hand the
                         // lease over in ~1 RTT instead of making us wait
                         // out its idle window or TTL. Only worth asking
                         // when the plain CAS just failed, and the retry
                         // is still an ordinary CAS — S3 stays the commit
                         // point, so a lying peer only wastes one round.
-                        if matches!(r, Ok(false))
+                        if !epochs.is_open()
+                            && matches!(r, Ok(false))
                             && peers.is_enabled()
                             && peers.request_lease(&part).await
                         {
@@ -568,7 +666,20 @@ fn mount(
                         let epoch = match keepers.get_mut(&part) {
                             Some(k) if k.ship_epoch().is_some() && !k.is_lost() => {
                                 let held = k.ship_epoch();
-                                match ship.sync_one(&part, k).await {
+                                if epochs.writes_ok() {
+                                    k.release_local();
+                                    held
+                                } else if let Err(e) =
+                                    upload_dirty_chunks(&cache, &chunk_store, compression).await
+                                {
+                                    tracing::warn!(
+                                        error = %e,
+                                        part,
+                                        "dirty chunk upload before handoff failed; keeping the lease"
+                                    );
+                                    None
+                                } else {
+                                    match ship.sync_one(&part, k).await {
                                     Ok(()) => match k.release().await {
                                         Ok(()) => held,
                                         Err(e) => {
@@ -582,6 +693,7 @@ fn mount(
                                             "flush before handoff failed; keeping the lease");
                                         None
                                     }
+                                    }
                                 }
                             }
                             _ => None,
@@ -589,7 +701,16 @@ fn mount(
                         let _ = reply.send(epoch);
                     }
                     Some(fusefs::SyncRequest::Barrier(reply)) => {
-                        let r = run_sync_round(&ship, &keepers).await;
+                        let r = run_managed_sync_round(
+                            &ship,
+                            &keepers,
+                            &epochs,
+                            &meta,
+                            &cache,
+                            &chunk_store,
+                            compression,
+                        )
+                        .await;
                         if let Err(e) = &r {
                             tracing::warn!(error = %e, "metadata sync failed; will retry");
                             spool.lock().unwrap().last_error = Some(format!("{e:#}"));
@@ -598,13 +719,41 @@ fn mount(
                         }
                         let _ = reply.send(r.map_err(|e| format!("{e:#}")));
                     }
+                    Some(fusefs::SyncRequest::Reintegrate(reply)) => {
+                        if epochs.is_open() {
+                            let _ = reply.send(Err(
+                                "cannot reintegrate while a continuation epoch is open".into(),
+                            ));
+                            continue;
+                        }
+                        let mut ship = ship.lock().await;
+                        let mut keepers = keepers.lock().await;
+                        let r = reintegrate::run(
+                            &meta,
+                            &mut ship,
+                            &mut keepers,
+                            node_id,
+                            &state_dir,
+                            &reintegration,
+                        )
+                        .await;
+                        let _ = reply.send(r.map_err(|e| format!("{e:#}")));
+                    }
                     Some(fusefs::SyncRequest::Nudge) | None => {
                         tokio::select! {
                             biased;
                             msg = sync_rx.recv() => {
                                 pending = msg;
                             }
-                            r = run_sync_round(&ship, &keepers) => {
+                            r = run_managed_sync_round(
+                                &ship,
+                                &keepers,
+                                &epochs,
+                                &meta,
+                                &cache,
+                                &chunk_store,
+                                compression,
+                            ) => {
                                 if let Err(e) = r {
                                     tracing::warn!(
                                         error = %e,
@@ -622,6 +771,17 @@ fn mount(
         });
     }
 
+    if reintegrate_on_mount {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        sync_tx
+            .send(fusefs::SyncRequest::Reintegrate(reply))
+            .map_err(|_| anyhow::anyhow!("sync task stopped before automatic reintegration"))?;
+        rt.block_on(receive)
+            .context("automatic reintegration task stopped")?
+            .map_err(anyhow::Error::msg)
+            .context("automatic reintegration after mount")?;
+    }
+
     let status = std::sync::Arc::new(DaemonStatus {
         meta: meta.clone(),
         cache,
@@ -635,6 +795,9 @@ fn mount(
         peers: peers.clone(),
         pins: pins.clone(),
         designations: designations.clone(),
+        epochs: epochs.clone(),
+        reintegration: reintegration.clone(),
+        sync_tx: sync_tx.clone(),
         rt: rt.handle().clone(),
     });
     {
@@ -681,6 +844,7 @@ struct P2pBridge {
     nudge: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
     designations: std::sync::Arc<designation::DesignationManager>,
     meta: std::sync::Arc<SqliteMeta>,
+    epochs: std::sync::Arc<epoch::EpochManager>,
 }
 
 impl constellation_net::PeerService for P2pBridge {
@@ -766,6 +930,25 @@ impl constellation_net::PeerService for P2pBridge {
         })
     }
 
+    fn epoch_proposed(
+        &self,
+        epoch_id: String,
+        members: Vec<u64>,
+        base: Vec<(String, u64)>,
+        proposer: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            self.epochs
+                .handle_propose(epoch_id, members, base, proposer)
+        })
+    }
+
+    fn epoch_activated(&self, epoch_id: String, members: Vec<u64>, base: Vec<(String, u64)>) {
+        self.epochs.handle_activate(epoch_id, members, base);
+        let _ = self.nudge.send(fusefs::SyncRequest::Nudge);
+    }
+
     fn node_id(&self) -> u64 {
         self.node_id
     }
@@ -828,7 +1011,7 @@ async fn start_p2p(
         }
         Err(e) => tracing::warn!(error = %e, "could not serialize our P2P address"),
     }
-    refresh_peers(&peers, store).await;
+    refresh_peers(&peers, store, None).await;
     tracing::info!(
         node_id,
         peers = peers.snapshot().len(),
@@ -841,9 +1024,29 @@ async fn start_p2p(
 async fn refresh_peers(
     peers: &constellation_net::Peers,
     store: std::sync::Arc<dyn object_store::ObjectStore>,
+    epochs: Option<&epoch::EpochManager>,
 ) {
     if !peers.is_enabled() {
         return;
+    }
+    // The peer directory is tolerant of unreadable records (a peer we
+    // cannot dial only loses its fast path); the epoch roster is not,
+    // so it gets its own fail-closed read. On failure the roster is
+    // cleared rather than left stale: an empty roster can never satisfy
+    // `component_covers_roster`, so no epoch activates on a registry we
+    // could not fully read.
+    if let Some(epochs) = epochs {
+        match constellation_store_s3::write_eligible_roster(store.clone()).await {
+            Ok(roster) => epochs.set_roster(roster),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "cannot determine the write-eligible roster; \
+                     continuation epochs stay unavailable"
+                );
+                epochs.set_roster(Vec::new());
+            }
+        }
     }
     match constellation_store_s3::list_nodes(store).await {
         Ok(nodes) => {
@@ -925,6 +1128,158 @@ async fn run_sync_round(
     Ok(())
 }
 
+async fn upload_dirty_chunks(
+    cache: &DiskCache,
+    store: &ChunkStore,
+    compression: CompressionSetting,
+) -> Result<()> {
+    for hash in cache.dirty_chunks() {
+        let data = cache
+            .get(&hash)?
+            .with_context(|| format!("dirty chunk {hash} vanished from local cache"))?;
+        store.put_chunk(&hash, &data, compression).await?;
+        cache.set_state(&hash, constellation_fs_core::cache::ChunkState::Clean);
+    }
+    Ok(())
+}
+
+/// Drive either the ordinary S3 authority path or a continuation epoch.
+/// An S3 failure may activate an epoch, but the failing round remains an
+/// error for spool observability. While active, a successful tail probe
+/// means S3 returned: upload dirty chunks first, close the promise, then
+/// resume ordinary CAS-serialized shipping.
+async fn run_managed_sync_round(
+    ship: &std::sync::Arc<tokio::sync::Mutex<shipper::Shipper>>,
+    keepers: &std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, lease::LeaseKeeper>>,
+    >,
+    epochs: &epoch::EpochManager,
+    meta: &SqliteMeta,
+    cache: &DiskCache,
+    store: &ChunkStore,
+    compression: CompressionSetting,
+) -> Result<()> {
+    if epochs.is_open() {
+        {
+            let mut keepers = keepers.lock().await;
+            for keeper in keepers.values_mut().filter(|k| k.holds_authority()) {
+                let authority_epoch = keeper.authority_epoch();
+                keeper.adopt_epoch_hold(authority_epoch);
+            }
+        }
+        epochs.check_liveness().await;
+        if epochs.is_frozen() {
+            return Ok(());
+        }
+        let s3_back = {
+            let mut ship = ship.lock().await;
+            ship.tail_to_head().await.is_ok()
+        };
+        if !s3_back {
+            return Ok(());
+        }
+        let holds_epoch_lease = keepers
+            .lock()
+            .await
+            .values()
+            .any(|keeper| keeper.holds_authority());
+        if !holds_epoch_lease && !epochs.shared_log_advanced(&meta.applied_vector()?) {
+            // The current epoch holder must publish first. A previous
+            // holder keeps its promise open until it has tailed that
+            // publication, then follows with its older local journal.
+            return Ok(());
+        }
+        upload_dirty_chunks(cache, store, compression).await?;
+        {
+            let ship = ship.lock().await;
+            ship.set_skip_ship(false);
+        }
+        epochs.close();
+        {
+            let mut keepers = keepers.lock().await;
+            for keeper in keepers.values_mut() {
+                keeper.release_local();
+            }
+        }
+        let result = run_sync_round(ship, keepers).await;
+        if result.is_ok() {
+            let ship = ship.lock().await;
+            let mut keepers = keepers.lock().await;
+            let mut drained = true;
+            for (part, keeper) in keepers.iter_mut() {
+                if ship.journal_backlog_of(part) == 0 {
+                    keeper.release().await?;
+                } else {
+                    drained = false;
+                }
+            }
+            if drained {
+                epochs.finish_flushing();
+            }
+            // Keep the guard alive only long enough to read backlog;
+            // release above is S3-only and does not call into shipper.
+            drop(ship);
+        }
+        return result;
+    }
+
+    if let Err(error) = upload_dirty_chunks(cache, store, compression).await {
+        let base = meta.applied_vector()?;
+        if epochs.maybe_propose(base).await? {
+            let ship = ship.lock().await;
+            ship.set_skip_ship(true);
+            drop(ship);
+            let mut keepers = keepers.lock().await;
+            for keeper in keepers.values_mut().filter(|k| k.holds_authority()) {
+                let authority_epoch = keeper.authority_epoch();
+                keeper.adopt_epoch_hold(authority_epoch);
+            }
+        }
+        return Err(error);
+    }
+
+    let result = run_sync_round(ship, keepers).await;
+    if result.is_ok() {
+        epochs.note_s3_success();
+    }
+    if keepers.lock().await.values().any(|k| k.is_lost()) {
+        meta.kv_set("lease_lost", "1")?;
+    }
+    if result.is_ok() && epochs.is_flushing() {
+        let ship = ship.lock().await;
+        let drained = {
+            let keepers = keepers.lock().await;
+            keepers
+                .keys()
+                .all(|part| ship.journal_backlog_of(part) == 0)
+        };
+        if drained {
+            let mut keepers = keepers.lock().await;
+            for keeper in keepers.values_mut() {
+                keeper.release().await?;
+            }
+            epochs.finish_flushing();
+        }
+    }
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let base = meta.applied_vector()?;
+            if epochs.maybe_propose(base).await? {
+                let ship = ship.lock().await;
+                ship.set_skip_ship(true);
+                drop(ship);
+                let mut keepers = keepers.lock().await;
+                for keeper in keepers.values_mut().filter(|k| k.holds_authority()) {
+                    let epoch = keeper.authority_epoch();
+                    keeper.adopt_epoch_hold(epoch);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Give the root directory to the mounting user on a freshly created
 /// filesystem. Skipped entirely unless the root is still 0:0, so this
 /// costs nothing (and needs no lease) on every subsequent mount; when it
@@ -982,6 +1337,9 @@ struct DaemonStatus {
     peers: constellation_net::Peers,
     pins: std::sync::Arc<pin::PinManager>,
     designations: std::sync::Arc<designation::DesignationManager>,
+    epochs: std::sync::Arc<epoch::EpochManager>,
+    reintegration: std::sync::Arc<reintegrate::ReintegrationState>,
+    sync_tx: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
     /// Handle for the blocking control-API calls that need to await.
     rt: tokio::runtime::Handle,
 }
@@ -1053,6 +1411,13 @@ impl constellation_api::StatusSource for DaemonStatus {
             p2p,
             pins: self.list_pins(),
             designations: self.list_designations(),
+            epoch: self.epochs.status(),
+            reintegration: self.reintegration.snapshot(
+                self.meta
+                    .unmarked_journal()
+                    .map(|rows| rows.len() as u64)
+                    .unwrap_or(0),
+            ),
         }
     }
 
@@ -1113,6 +1478,18 @@ impl constellation_api::StatusSource for DaemonStatus {
                 read_only: d.read_only,
             })
             .collect()
+    }
+
+    fn reintegrate(&self) -> std::result::Result<String, String> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sync_tx
+            .send(fusefs::SyncRequest::Reintegrate(reply))
+            .map_err(|_| "sync task is not running".to_string())?;
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(receive)
+                .map_err(|_| "reintegration task stopped".to_string())?
+        })
     }
 }
 

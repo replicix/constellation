@@ -35,6 +35,17 @@ pub struct NodeInfo {
     /// When the P2P fields were last refreshed, for staleness checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2p_updated_unix: Option<i64>,
+    /// Read-only member: enrolled in the registry but not write-eligible
+    /// (DESIGN.md §5.3). Continuation epochs ignore RO nodes when
+    /// checking that the live P2P component covers the roster.
+    ///
+    /// Defaulted so a record written by a binary that predates this
+    /// field still decodes as write-eligible — the conservative reading.
+    /// The roster's safety does not rest on this default: see
+    /// [`write_eligible_roster`], which refuses to answer at all if any
+    /// record fails to parse.
+    #[serde(default)]
+    pub ro: bool,
 }
 
 fn node_key(id: u64) -> object_store::path::Path {
@@ -71,6 +82,7 @@ pub async fn claim_node_id(store: Arc<dyn ObjectStore>) -> Result<u64, StoreErro
             pubkey: None,
             p2p_addr: None,
             p2p_updated_unix: None,
+            ro: false,
         };
         let body = serde_json::to_vec(&info)?;
         match store
@@ -107,9 +119,55 @@ pub async fn list_node_ids(store: Arc<dyn ObjectStore>) -> Result<Vec<u64>, Stor
     Ok(ids)
 }
 
+/// The write-eligible roster: every non-RO node in the registry.
+///
+/// Unlike [`list_nodes`] this **fails closed**. A continuation epoch is
+/// legal only when the live P2P component covers every write-eligible
+/// node (DESIGN.md §5.3), so a roster that silently omits a node is not
+/// a degraded answer — it is a wrong one that authorizes writing while
+/// an unaccounted-for node may also be writing. Any object under
+/// `nodes/` that cannot be read or parsed therefore aborts the whole
+/// roster: epoch activation stops (writes freeze, the safe direction)
+/// instead of proceeding against an incomplete membership view.
+///
+/// The tolerant listing is still right for the P2P peer directory, where
+/// dropping an undialable record costs a fast path and nothing more.
+pub async fn write_eligible_roster(store: Arc<dyn ObjectStore>) -> Result<Vec<u64>, StoreError> {
+    let prefix = object_store::path::Path::from("nodes");
+    let metas = store.list(Some(&prefix)).try_collect::<Vec<_>>().await?;
+    let mut out = Vec::new();
+    for m in metas {
+        // Only objects whose key is a node id are registry records.
+        let is_node_record = m
+            .location
+            .filename()
+            .and_then(|f| f.strip_suffix(".json"))
+            .is_some_and(|stem| u64::from_str_radix(stem, 16).is_ok());
+        if !is_node_record {
+            continue;
+        }
+        let bytes = store.get(&m.location).await?.bytes().await?;
+        let info: NodeInfo = serde_json::from_slice(&bytes).map_err(|e| {
+            StoreError::Registry(format!(
+                "unparseable node record {}: {e}; refusing to derive a \
+                 write-eligible roster from an incomplete registry",
+                m.location
+            ))
+        })?;
+        if !info.ro {
+            out.push(info.node_id);
+        }
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
 /// Every node record in the registry. Unparseable records are skipped
 /// rather than failing the whole listing: one bad object must not stop
 /// the P2P layer from finding its peers.
+///
+/// Do **not** use this to derive the continuation-epoch roster — see
+/// [`write_eligible_roster`], which fails closed instead.
 pub async fn list_nodes(store: Arc<dyn ObjectStore>) -> Result<Vec<NodeInfo>, StoreError> {
     let prefix = object_store::path::Path::from("nodes");
     let metas = store.list(Some(&prefix)).try_collect::<Vec<_>>().await?;
@@ -169,6 +227,46 @@ pub async fn publish_p2p(
         pubkey: Some(pubkey_hex.to_string()),
         p2p_addr: Some(addr),
         p2p_updated_unix: Some(now_unix()),
+        ro: existing.as_ref().map(|i| i.ro).unwrap_or(false),
+    };
+    store
+        .put(&key, PutPayload::from(serde_json::to_vec(&info)?))
+        .await?;
+    Ok(())
+}
+
+/// Mark this node read-only in the registry (or clear the flag).
+/// Same overwrite-PUT rule as [`publish_p2p`]: the node id is owned by
+/// one live state dir, so this node is the only writer of this key.
+pub async fn publish_ro(
+    store: Arc<dyn ObjectStore>,
+    node_id: u64,
+    ro: bool,
+) -> Result<(), StoreError> {
+    let key = node_key(node_id);
+    let existing: Option<NodeInfo> = match store.get(&key).await {
+        Ok(r) => r
+            .bytes()
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok()),
+        Err(object_store::Error::NotFound { .. }) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let info = NodeInfo {
+        node_id,
+        hostname: existing
+            .as_ref()
+            .map(|i| i.hostname.clone())
+            .unwrap_or_else(hostname),
+        created_unix: existing
+            .as_ref()
+            .map(|i| i.created_unix)
+            .unwrap_or_else(now_unix),
+        pubkey: existing.as_ref().and_then(|i| i.pubkey.clone()),
+        p2p_addr: existing.as_ref().and_then(|i| i.p2p_addr.clone()),
+        p2p_updated_unix: existing.as_ref().and_then(|i| i.p2p_updated_unix),
+        ro,
     };
     store
         .put(&key, PutPayload::from(serde_json::to_vec(&info)?))
@@ -236,10 +334,12 @@ mod tests {
         assert_eq!(claim_node_id(store).await.unwrap(), id + 1);
     }
 
-    /// A pre-M3.3 record (no P2P fields) must still parse: existing
-    /// filesystems keep mounting, those nodes just have no fast path.
+    /// A record without the newer P2P fields must still parse: absent
+    /// fields simply mean that node has no fast path. The fixture is
+    /// deliberately the original on-disk shape — `ro` is defaulted, not
+    /// required, so this stays a real test of a narrower record.
     #[tokio::test]
-    async fn legacy_records_without_p2p_fields_still_parse() {
+    async fn records_without_p2p_fields_still_parse() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         store
             .put(
@@ -252,6 +352,58 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, 7);
         assert!(nodes[0].pubkey.is_none());
+        assert!(!nodes[0].ro, "an absent ro flag means write-eligible");
+    }
+
+    /// The roster must fail CLOSED. A corrupt record that silently
+    /// shrinks it would let `component_covers_roster` authorize a
+    /// continuation epoch while an unaccounted-for node may be writing.
+    #[tokio::test]
+    async fn roster_refuses_an_unreadable_registry() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let good = claim_node_id(store.clone()).await.unwrap();
+        assert_eq!(write_eligible_roster(store.clone()).await.unwrap(), [good]);
+
+        store
+            .put(&node_key(99), PutPayload::from(b"{ truncated".to_vec()))
+            .await
+            .unwrap();
+        // The tolerant listing still degrades gracefully...
+        assert_eq!(list_nodes(store.clone()).await.unwrap().len(), 1);
+        // ...but the roster refuses to answer at all.
+        let err = write_eligible_roster(store)
+            .await
+            .expect_err("a corrupt record must abort the roster, not shrink it");
+        assert!(
+            matches!(err, StoreError::Registry(_)),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_excludes_read_only_members() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let writer = claim_node_id(store.clone()).await.unwrap();
+        let reader = claim_node_id(store.clone()).await.unwrap();
+        publish_ro(store.clone(), reader, true).await.unwrap();
+        assert_eq!(write_eligible_roster(store).await.unwrap(), [writer]);
+    }
+
+    #[tokio::test]
+    async fn publish_ro_is_sticky_across_p2p_refresh() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let id = claim_node_id(store.clone()).await.unwrap();
+        publish_ro(store.clone(), id, true).await.unwrap();
+        publish_p2p(
+            store.clone(),
+            id,
+            "aa".repeat(32).as_str(),
+            serde_json::json!({"id": "abc", "addrs": []}),
+        )
+        .await
+        .unwrap();
+        let nodes = list_nodes(store).await.unwrap();
+        assert!(nodes[0].ro, "P2P refresh must not clear the RO flag");
     }
 
     /// One corrupt object must not hide every other peer.

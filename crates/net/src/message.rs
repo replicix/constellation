@@ -83,6 +83,31 @@ pub enum Payload {
         /// the requester keeps waiting up to its bounded deadline.
         acked: bool,
     },
+    /// Propose a continuation epoch (DESIGN.md §5.3). Recipients persist
+    /// the promise locally BEFORE replying; activation is a later
+    /// [`Payload::EpochActivate`] once every member has acked.
+    EpochPropose {
+        epoch_id: String,
+        members: Vec<u64>,
+        /// Applied-seq vector at proposal time (`part` → seq).
+        base: Vec<(String, u64)>,
+        proposer: u64,
+    },
+    /// Signed ack of an [`Payload::EpochPropose`]. The ack is only sent
+    /// after the promise is durable on the member's local disk.
+    EpochAck {
+        epoch_id: String,
+        member: u64,
+        accepted: bool,
+    },
+    /// All members have acked: the epoch is now the authority root.
+    /// Redistributed by the proposer; also gossiped so a late joiner of
+    /// the message stream still activates.
+    EpochActivate {
+        epoch_id: String,
+        members: Vec<u64>,
+        base: Vec<(String, u64)>,
+    },
 }
 
 /// A payload plus its author and signature.

@@ -18,5 +18,8 @@ pub use designation::{Designation, DesignationMode, DesignationStore, Designatio
 pub use error::StoreError;
 pub use lease::{Lease, LeaseMode, LeaseStore, LeaseTag};
 pub use log::{CheckpointVector, LogStore};
-pub use nodes::{claim_node_id, list_node_ids, list_nodes, publish_p2p, NodeInfo};
+pub use nodes::{
+    claim_node_id, list_node_ids, list_nodes, publish_p2p, publish_ro, write_eligible_roster,
+    NodeInfo,
+};
 pub use store::{Capabilities, ChunkStore, FsMeta};

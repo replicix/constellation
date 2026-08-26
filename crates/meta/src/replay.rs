@@ -621,6 +621,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
         }
         LogRecord::WriteManifest {
             ino,
+            base_manifest: _,
             manifest,
             size,
             time_ns,

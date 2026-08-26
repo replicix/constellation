@@ -3,11 +3,13 @@
 
 pub mod error;
 pub mod record;
+pub mod reintegrate;
 pub mod replay;
 pub mod sqlite;
 
 pub use error::MetaError;
 pub use record::LogRecord;
+pub use reintegrate::{classify, materialize, Disposition, CONFLICT_DIR};
 pub use sqlite::SqliteMeta;
 
 use constellation_fs_core::{FileAttr, Ino};
