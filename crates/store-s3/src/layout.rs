@@ -31,6 +31,17 @@ pub fn lease(partition: &str) -> Path {
     Path::from(format!("leases/{partition}.json"))
 }
 
+/// `designations/<hash-of-path>.json` (DESIGN.md §5.2). Hashed rather
+/// than the literal path so an arbitrarily deep/long path never produces
+/// an unwieldy or invalid object key.
+pub fn designation(path_hash: &str) -> Path {
+    Path::from(format!("designations/{path_hash}.json"))
+}
+
+pub fn designations_prefix() -> Path {
+    Path::from("designations")
+}
+
 pub fn registry(node_id: &str) -> Path {
     Path::from(format!("registry/{node_id}.json"))
 }

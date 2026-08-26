@@ -253,6 +253,21 @@ the idle window and that the epoch advanced. Observed: ~27–33 ms.
 unreachable peer) and re-runs the shared-filesystem workload: everything
 must still converge over S3.
 
+**Phase 4a (pin/offline, DESIGN.md §5.2, §7, §9) has no harness
+scenarios yet.** `pin-follow`, `offline-designee-writes`, and
+`offline-delegation` (plan 03's asks) are not automated; pin admission,
+overlap rejection, and delegation grant/expiry are covered by unit
+tests instead (`fs-core::cache`, `meta::sqlite`, `store-s3::designation`,
+`net::delegation`), and the operator-facing paths (`pin`/`unpin`/
+`offline`/`online`/`--ro`, admission refusal, overlap refusal,
+designee-writes-through, release-by-designee-only) were verified
+manually end-to-end on a live single-node mount. The existing 20-scenario
+matrix plus pjdfstest stayed green with the new per-mutation designation
+check added to the FUSE write gate, but that only proves the gate is a
+no-op when no designation exists — it does not exercise the multi-node
+fault scenarios (cut S3+P2P to the designee, verify EROFS elsewhere,
+heal, model-verify) plan 03 describes.
+
 Requires docker + fusermount3 + a release binary on the host
 (`CONSTELLATION_BIN` overrides discovery). Containers are labeled
 `constellation-harness=1` and removed on drop, even when a scenario

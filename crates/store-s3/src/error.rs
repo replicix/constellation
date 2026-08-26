@@ -20,6 +20,9 @@ pub enum StoreError {
     #[error("conditional write refused: the object changed since it was read")]
     CasConflict,
 
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("no filesystem found at this prefix (missing meta.json)")]
     NotFound,
 

@@ -8,8 +8,8 @@
 pub mod types;
 
 pub use types::{
-    CacheStatus, LeaseStatus, P2pStatus, PartitionStatus, PeerStatus, Request, Response,
-    SpoolStatus, StatusReport,
+    CacheStatus, DesignationStatus, LeaseStatus, P2pStatus, PartitionStatus, PeerStatus, PinStatus,
+    Request, Response, SpoolStatus, StatusReport,
 };
 
 use anyhow::{Context, Result};
@@ -21,8 +21,38 @@ use tokio::net::{UnixListener, UnixStream};
 pub const SOCKET_NAME: &str = "control.sock";
 
 /// Providers answer API requests with live daemon state.
+///
+/// `status` is read-only; the pin operations mutate node-local state and
+/// may do I/O (admission checks, eager fetch scheduling), so they return
+/// a result the caller reports back over the socket. Default
+/// implementations refuse, so a provider that does not support pinning
+/// (tests, older daemons) stays valid.
 pub trait StatusSource: Send + Sync + 'static {
     fn status(&self) -> StatusReport;
+
+    fn pin(&self, _path: &str) -> std::result::Result<String, String> {
+        Err("pinning is not supported by this daemon".into())
+    }
+
+    fn unpin(&self, _path: &str) -> std::result::Result<String, String> {
+        Err("pinning is not supported by this daemon".into())
+    }
+
+    fn list_pins(&self) -> Vec<PinStatus> {
+        Vec::new()
+    }
+
+    fn offline(&self, _path: &str, _read_only: bool) -> std::result::Result<String, String> {
+        Err("offline designation is not supported by this daemon".into())
+    }
+
+    fn online(&self, _path: &str) -> std::result::Result<String, String> {
+        Err("offline designation is not supported by this daemon".into())
+    }
+
+    fn list_designations(&self) -> Vec<DesignationStatus> {
+        Vec::new()
+    }
 }
 
 /// Serve the control API on `<state_dir>/control.sock` until the task
@@ -57,6 +87,28 @@ async fn handle(stream: UnixStream, source: Arc<dyn StatusSource>) -> Result<()>
         let resp = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Status) => Response::Status(Box::new(source.status())),
             Ok(Request::Ping) => Response::Pong,
+            Ok(Request::Pin { path }) => match source.pin(&path) {
+                Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
+            },
+            Ok(Request::Unpin { path }) => match source.unpin(&path) {
+                Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
+            },
+            Ok(Request::ListPins) => Response::Pins {
+                pins: source.list_pins(),
+            },
+            Ok(Request::Offline { path, read_only }) => match source.offline(&path, read_only) {
+                Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
+            },
+            Ok(Request::Online { path }) => match source.online(&path) {
+                Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
+            },
+            Ok(Request::ListDesignations) => Response::Designations {
+                designations: source.list_designations(),
+            },
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
@@ -119,7 +171,26 @@ mod tests {
                 },
                 partitions: vec![],
                 p2p: P2pStatus::default(),
+                pins: Vec::new(),
+                designations: Vec::new(),
             }
+        }
+
+        fn list_pins(&self) -> Vec<PinStatus> {
+            vec![PinStatus {
+                path: "/data".into(),
+                bytes: 42,
+                chunks_cached: 1,
+                chunks_total: 2,
+            }]
+        }
+
+        fn list_designations(&self) -> Vec<DesignationStatus> {
+            vec![DesignationStatus {
+                path: "/site".into(),
+                designee: 1,
+                read_only: false,
+            }]
         }
     }
 
@@ -205,6 +276,8 @@ mod tests {
                 lease: lease.unwrap_or_default(),
                 partitions,
                 p2p: P2pStatus::default(),
+                pins: Vec::new(),
+                designations: Vec::new(),
             }
         }
     }
@@ -251,6 +324,59 @@ mod tests {
         }
         match call(&sock, &Request::Ping).await.unwrap() {
             Response::Pong => {}
+            other => panic!("unexpected response {other:?}"),
+        }
+    }
+
+    /// `ListPins` must round-trip end to end. Regression: `Response::Pins`
+    /// was a bare newtype variant (`Pins(Vec<PinStatus>)`). Serde's
+    /// internally-tagged representation (`tag = "resp"`) cannot serialize
+    /// a newtype variant whose payload is a sequence — `to_vec` returned
+    /// `Err`, `handle()` propagated it via `?`, and the connection closed
+    /// having written zero bytes. The only trace was a `debug!`-level log
+    /// line, invisible under the daemon's default `info` filter, so a
+    /// caller just saw "daemon closed the connection without a response"
+    /// with nothing in the daemon's log to explain why. The fix wraps the
+    /// vec in a struct variant (`Pins { pins: Vec<PinStatus> }`).
+    #[tokio::test]
+    async fn list_pins_round_trips_over_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = serve(dir.path(), Arc::new(Fake)).unwrap();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(&sock, &Request::ListPins),
+        )
+        .await
+        .expect("list_pins must not hang")
+        .expect("list_pins must not close the connection with no response");
+        match resp {
+            Response::Pins { pins } => {
+                assert_eq!(pins.len(), 1);
+                assert_eq!(pins[0].path, "/data");
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+    }
+
+    /// `ListDesignations` uses the same struct-variant shape as `Pins`;
+    /// verify it round-trips too rather than assuming the pattern was
+    /// applied correctly by analogy.
+    #[tokio::test]
+    async fn list_designations_round_trips_over_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = serve(dir.path(), Arc::new(Fake)).unwrap();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(&sock, &Request::ListDesignations),
+        )
+        .await
+        .expect("list_designations must not hang")
+        .expect("list_designations must not close the connection with no response");
+        match resp {
+            Response::Designations { designations } => {
+                assert_eq!(designations.len(), 1);
+                assert_eq!(designations[0].path, "/site");
+            }
             other => panic!("unexpected response {other:?}"),
         }
     }

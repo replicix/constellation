@@ -220,7 +220,63 @@ workload with the kill switch to prove the S3 bound still applies.
   which the current `mount2` call does not expose.
 - **Offline designation acks**: phase 4.
 
+## Phase 4 — Pin/offline, continuation epochs: **IN PROGRESS**
+
+### Phase 4a — pin/unpin + offline designation
+
+| Item | State | Where |
+|---|---|---|
+| Cache states `{clean,pinned,dirty}` already modeled; LRU evictor already skips pinned/dirty (verified with a dedicated test, no change needed) | done | `fs-core::cache` |
+| Pin registry: node-local `pin(path, ino, pinned_at)` table, NOT replicated — each node pins for itself | done | `meta::sqlite` |
+| Subtree walk (`subtree_manifests`) + `pinned_ancestor` (files under a pinned dir are covered without re-pinning) | done | `meta::sqlite` |
+| Admission check: estimate incoming bytes from unresident chunks × mean chunk size before reserving, refuse with an actionable message rather than half-filling a pin | done | `cli::pin::PinManager::pin` |
+| Eager fetch: bounded-concurrency (8) chunk fill via a `JoinSet`, marking each `Pinned`; follows spilled chunk-list manifests too | done | `cli::pin` |
+| Push-sync: pins re-filled after every successful sync round (both `Barrier` and `Nudge` paths), so a peer's write under a pinned path is fetched without waiting for a read | done | `cli::main`, `cli::pin::refresh_all` |
+| Unpin demotes only chunks not covered by another still-active pin | done | `cli::pin::unpin` |
+| CLI + control API: `pin`/`unpin`/`pins`, `Request::{Pin,Unpin,ListPins}`, `StatusReport.pins` | done | `crates/api`, `cli::main` |
+| Designation objects `designations/<hash-of-path>.json`, CAS create/release (`DesignationStore`, mirrors `LeaseStore`'s CAS idioms) | done | `store-s3::designation` |
+| Overlap check (component-aware, not string-prefix) at creation in both directions; TOCTOU close via re-list-after-create and self-delete if an older overlapping claim appears | done | `store-s3::designation` |
+| Delegation grant/renew/expiry state machine (designee side: `DelegationGranter`; requester side: `DelegationHolder`), both driven by an injected clock for deterministic tests | done | `net::delegation` |
+| P2P messages `DelegationRequest`/`DelegationGrant`/`FlushAck`, dispatched through the same signed-frame ALPN as the M3.3 messages | done | `net::message`, `net::peers` |
+| FUSE gate: innermost covering designation resolved per mutation; designee ⇒ proceed; live delegation ⇒ proceed; else request one (bounded 2 s) ⇒ proceed or **EROFS**; `--ro` designations never gate writes | done | `cli::designation::DesignationManager::check`, `cli::fusefs::require_lease_for` |
+| `constellation offline <path> [--ro]` / `online <path>`; only the designee may release (non-stealable, DESIGN.md) | done | `cli::designation`, `cli::main` |
+| Control API `StatusReport.designations`, `Request::{Offline,Online,ListDesignations}` | done | `crates/api`, `cli::main` |
+| Unit tests: pin admission math, pinned/dirty-skip-LRU (pre-existing + new), subtree walk, overlap rejection (both directions) incl. the TOCTOU tie-break, delegation grant/renew/expiry/per-requester isolation, decline/unrelated-message rejection | done | `fs-core::cache`, `meta::sqlite`, `store-s3::designation`, `net::delegation` tests |
+
+### Phase 4a scope limits (honest, not silently dropped)
+
+- **Flush-ack is verify-only, not a hard journal gate.** DESIGN.md's
+  invariant is that the designee provably holds every committed change
+  under its path before a foreign flush counts as published. The
+  implementation asks the designee to ack a just-shipped segment
+  (`DesignationManager::await_flush_ack`, wired into
+  `Shipper::ship_part` as `verify_flush_acks`) — but by the time that
+  runs, the segment's CAS-create has already succeeded and the log's
+  exactly-once sequencing means it cannot be un-shipped without either
+  double-shipping the same records under a new seq or restructuring the
+  journal-ack/seq coupling that phases 1–3 rely on. A missed/timed-out
+  ack is therefore logged as a warning (visible on the daemon and
+  counted nowhere yet), not turned into "stay journaled and retry" as
+  the plan's ideal describes. The ~1 RTT cost DESIGN.md budgets for is
+  paid; the hard gate on it is not. Tightening this to a true
+  pre-publish gate is follow-up work, likely needing a lease-epoch-style
+  fencing token per segment rather than a boolean ack.
+- **No harness scenarios yet** for `pin-follow`, `offline-designee-writes`,
+  `offline-delegation` (plan 03's exact asks). The mechanisms are unit
+  tested and manually verified end-to-end on a live mount (admission
+  refusal, overlap refusal, `--ro`, designee-writes-through, `online`
+  release-by-designee-only), and the full existing harness matrix (20
+  scenarios) plus pjdfstest (8798/8798) stayed green with the new FUSE
+  gate in the hot mutation path, but the specific multi-node fault
+  scenarios plan 03 names (cut S3+P2P to the designee, verify EROFS
+  elsewhere, heal, model-verify) are not yet automated.
+- **Delegation is per-designation-path, not per-mutation-path.** A
+  write under `/site/deep/nested` resolves the designation at `/site`
+  and requests/holds one delegation for the whole `/site` claim, not a
+  finer-grained one — matching DESIGN.md's per-path (not per-file)
+  framing of the mechanism.
+
 ## Later phases
 
-Not started (phases 4–8). No code exists for pin/offline, cooperative
-cache, snapshots/E2E, web UI, or GC.
+Not started (phases 4b–8). No code exists for continuation epochs,
+reintegration, cooperative cache, snapshots/E2E, web UI, or GC.

@@ -527,6 +527,7 @@ dependencies = [
 name = "constellation-store-s3"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "bytes",
  "constellation-fs-core",
  "futures",

@@ -1,13 +1,13 @@
 //! P2P fast path: iroh endpoint + registry-based allowlist, gossip
 //! (invalidation, digests, lease handoff), cooperative cache, and
-//! latency-adaptive source selection. Never load-bearing for correctness.
+//! latency-adaptive source selection.
 //!
 //! See docs/DESIGN.md §7 (cooperative cache) and §8 (security).
 //!
-//! # Why nothing here can break the filesystem
+//! # Why most of this cannot break the filesystem
 //!
-//! S3 is the source of truth and the commit point. Every mechanism in
-//! this crate accelerates something the S3 path already does on a timer:
+//! S3 is the source of truth and the commit point. Most mechanisms in
+//! this crate accelerate something the S3 path already does on a timer:
 //!
 //! * `SegmentPublished` gossip makes a peer tail *now* instead of at its
 //!   next poll — but the poll still happens.
@@ -15,11 +15,22 @@
 //!   *now* — but authority still comes from the lease object's CAS, so a
 //!   forged or replayed handoff just makes the requester's CAS fail.
 //!
-//! So a peer that is unreachable, lying, or absent costs latency and
-//! nothing else. `CONSTELLATION_P2P=off` disables the whole crate, and
-//! the fault-injection harness asserts the S3-only bounds still hold.
+//! So for those, a peer that is unreachable, lying, or absent costs
+//! latency and nothing else. `CONSTELLATION_P2P=off` disables the whole
+//! crate, and the fault-injection harness asserts the S3-only bounds
+//! still hold.
+//!
+//! **Delegation is the exception** ([`delegation`], DESIGN.md §5.2): a
+//! foreign write under an offline-designated path is only legitimate
+//! while a live delegation from the designee backs it, and the
+//! designee's flush-ack requirement is what keeps its "provably holds
+//! everything" invariant true. There, an unreachable or non-responding
+//! designee correctly turns other nodes read-only rather than degrading
+//! to some default — that IS the safety property, not a fallback from
+//! one.
 
 pub mod allowlist;
+pub mod delegation;
 pub mod endpoint;
 pub mod handoff;
 pub mod identity;
@@ -27,6 +38,7 @@ pub mod message;
 pub mod peers;
 
 pub use allowlist::{Allowlist, Decision};
+pub use delegation::{DelegationGranter, DelegationHolder, DEFAULT_DELEGATION_TTL_MS};
 pub use endpoint::{topic_for, P2p, PeerService};
 pub use handoff::{handle_request, interpret_reply, Handoff, RequestOutcome};
 pub use identity::{load_or_create, parse_pubkey, pubkey_hex};

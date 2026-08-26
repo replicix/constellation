@@ -36,6 +36,33 @@ pub trait PeerService: Send + Sync + 'static {
         part: String,
         requester: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>;
+    /// A peer wants a delegation to write under `path`, which this node
+    /// may be offline-designated for. Returns the grant or decline.
+    fn delegation_requested(
+        &self,
+        _path: String,
+        _requester: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        let decline = crate::delegation::DelegationGranter::decline("");
+        Box::pin(async move { decline })
+    }
+    /// A delegated peer flushed `seq` of `part` (touching `path`) and
+    /// wants this node's ack. Returns whether it has been tailed yet.
+    fn flush_ack_requested(
+        &self,
+        _path: String,
+        _part: String,
+        _seq: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::FlushAck {
+                path: String::new(),
+                part: String::new(),
+                seq: 0,
+                acked: false,
+            }
+        })
+    }
     /// This node's id, for `Ping`/`Pong`.
     fn node_id(&self) -> u64;
 }

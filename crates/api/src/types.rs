@@ -7,6 +7,27 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     Ping,
     Status,
+    /// Fully cache `path`'s subtree on this node and keep it current.
+    Pin {
+        path: String,
+    },
+    /// Stop keeping `path` resident; its chunks become evictable.
+    Unpin {
+        path: String,
+    },
+    ListPins,
+    /// `constellation offline <path> [--ro]`: designate this node for
+    /// `path` (DESIGN.md §5.2).
+    Offline {
+        path: String,
+        #[serde(default)]
+        read_only: bool,
+    },
+    /// Release this node's designation for `path`.
+    Online {
+        path: String,
+    },
+    ListDesignations,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,7 +35,47 @@ pub enum Request {
 pub enum Response {
     Pong,
     Status(Box<StatusReport>),
-    Error { message: String },
+    /// A mutating command succeeded; `detail` is a human-readable summary.
+    Ok {
+        detail: String,
+    },
+    /// Wrapped in a struct rather than a bare `Pins(Vec<PinStatus>)`:
+    /// serde's internally-tagged representation (`tag = "resp"`) cannot
+    /// serialize a newtype variant whose content is a sequence — it
+    /// needs the variant's content to be map-like so the tag field can
+    /// be merged in. A bare `Vec` there makes serialization fail
+    /// silently at runtime (the error is only visible at debug-level
+    /// tracing), which manifests as the daemon closing the connection
+    /// with no response at all.
+    Pins {
+        pins: Vec<PinStatus>,
+    },
+    Designations {
+        designations: Vec<DesignationStatus>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// One offline designation, as exposed by the control API.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DesignationStatus {
+    pub path: String,
+    pub designee: u64,
+    pub read_only: bool,
+}
+
+/// One pinned subtree on this node.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PinStatus {
+    pub path: String,
+    /// Logical bytes the subtree's manifests describe.
+    pub bytes: u64,
+    /// Chunks of the subtree currently resident.
+    pub chunks_cached: u64,
+    /// Chunks the subtree needs in total.
+    pub chunks_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +103,14 @@ pub struct StatusReport {
     /// when `CONSTELLATION_P2P=off`.
     #[serde(default)]
     pub p2p: P2pStatus,
+    /// Locally pinned subtrees (phase 4a). Node-local, not replicated.
+    #[serde(default)]
+    pub pins: Vec<PinStatus>,
+    /// Live offline designations visible to this node (phase 4a,
+    /// DESIGN.md §5.2). Replicated via S3, so every node's view should
+    /// agree modulo the periodic refresh lag.
+    #[serde(default)]
+    pub designations: Vec<DesignationStatus>,
 }
 
 /// P2P fast-path state. Purely observational: the filesystem is correct

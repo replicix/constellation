@@ -110,6 +110,11 @@ pub struct Shipper {
     /// P2P handle for push invalidation. Disabled by default so the
     /// existing tests and the no-P2P path need no changes.
     peers: constellation_net::Peers,
+    /// Offline designation (phase 4a, DESIGN.md §5.2): when a foreign
+    /// node ships records touching a designated path, the designee's
+    /// ack is awaited (bounded) before the batch is treated as fully
+    /// published. `None` when no designations exist for this mount.
+    designations: Option<std::sync::Arc<crate::designation::DesignationManager>>,
 }
 
 struct PartState {
@@ -212,12 +217,23 @@ impl Shipper {
             dir_ops: HashMap::new(),
             last_ship_at: HashMap::new(),
             peers: constellation_net::Peers::disabled(),
+            designations: None,
         })
     }
 
     /// Attach the P2P handle so shipped segments are announced to peers.
     pub fn set_peers(&mut self, peers: constellation_net::Peers) {
         self.peers = peers;
+    }
+
+    /// Attach the offline-designation manager (DESIGN.md §5.2) so a
+    /// foreign flush touching a designated path waits for the
+    /// designee's ack before being treated as fully published.
+    pub fn set_designations(
+        &mut self,
+        designations: std::sync::Arc<crate::designation::DesignationManager>,
+    ) {
+        self.designations = Some(designations);
     }
 
     fn ensure_part(&mut self, id: &str) {
@@ -484,6 +500,22 @@ impl Shipper {
         // tail now rather than at their next poll. Best effort by
         // design — the poll is what guarantees they converge.
         self.peers.announce_segment(part, next_seq, epoch).await;
+        // Offline designation flush-ack (DESIGN.md §5.2, phase 4a): if
+        // any shipped record touches a path designated to a different
+        // node, wait (bounded) for that designee's ack. The segment is
+        // already durable in S3 at this point — the CAS above is what
+        // committed it, and the log's exactly-once sequencing means it
+        // cannot be un-shipped — so a missed/timed-out ack cannot be
+        // turned into "stay journaled and retry" without either
+        // double-shipping the same records under a new seq or
+        // restructuring the journal-ack/seq coupling. This is logged as
+        // a best-effort verification point (the ~1 RTT cost DESIGN.md
+        // budgets for) rather than a hard gate; see PROGRESS.md for the
+        // scope note.
+        if let Some(designations) = self.designations.clone() {
+            self.verify_flush_acks(&designations, part, next_seq, &records)
+                .await;
+        }
         let st = self.parts.get_mut(part).unwrap();
         st.max_epoch = st.max_epoch.max(epoch);
         st.next_seq = next_seq + 1;
@@ -556,6 +588,42 @@ impl Shipper {
                 self.meta.parent_of(*ino).ok().flatten()
             }
             _ => None,
+        }
+    }
+
+    /// Best-effort verification that the designee (if any) has seen a
+    /// just-shipped batch touching its designated path. See the caller
+    /// for why this cannot be a hard journal-ack gate. Distinct
+    /// directories in the batch are deduplicated so a single foreign
+    /// designation is only asked about once per shipped segment.
+    async fn verify_flush_acks(
+        &self,
+        designations: &crate::designation::DesignationManager,
+        part: &str,
+        seq: u64,
+        records: &[LogRecord],
+    ) {
+        let mut checked_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for rec in records {
+            let Some(dir) = self.traffic_dir_of(rec) else {
+                continue;
+            };
+            let Ok(path) = self.meta.path_of(dir) else {
+                continue;
+            };
+            if !checked_paths.insert(path.clone()) {
+                continue;
+            }
+            if !designations.await_flush_ack(&path, part, seq).await {
+                tracing::warn!(
+                    part,
+                    seq,
+                    path,
+                    "designee did not ack this flush within the bound; \
+                     the write is durable in S3 but the designee's view \
+                     may lag briefly"
+                );
+            }
         }
     }
 

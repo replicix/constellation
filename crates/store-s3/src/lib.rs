@@ -4,6 +4,7 @@
 //! See docs/DESIGN.md §2 (bucket layout) and §3 (data plane).
 
 pub mod codec;
+pub mod designation;
 pub mod error;
 pub mod format;
 pub mod layout;
@@ -13,6 +14,7 @@ pub mod nodes;
 pub mod store;
 
 pub use codec::{Codec, CompressionSetting};
+pub use designation::{Designation, DesignationMode, DesignationStore, DesignationTag};
 pub use error::StoreError;
 pub use lease::{Lease, LeaseMode, LeaseStore, LeaseTag};
 pub use log::{CheckpointVector, LogStore};

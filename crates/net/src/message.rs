@@ -57,6 +57,32 @@ pub enum Payload {
     Pong {
         node_id: u64,
     },
+    /// "I want to write under `path`, which you are designated for."
+    /// Sent directly to the designee.
+    DelegationRequest {
+        path: String,
+        requester: u64,
+    },
+    /// Designee's answer: a short-TTL delegation to write under `path`,
+    /// or a refusal (`granted: false`) if the designee does not hold
+    /// that designation. Renewed like a mini-lease.
+    DelegationGrant {
+        path: String,
+        epoch: u64,
+        ttl_ms: u64,
+        granted: bool,
+    },
+    /// "I flushed segment `seq` of `part`, which touches your
+    /// delegation for `path` — please ack so I can consider it
+    /// published." Sent to the designee after a foreign flush.
+    FlushAck {
+        path: String,
+        part: String,
+        seq: u64,
+        /// `false` means the designee has not (yet) tailed this segment;
+        /// the requester keeps waiting up to its bounded deadline.
+        acked: bool,
+    },
 }
 
 /// A payload plus its author and signature.

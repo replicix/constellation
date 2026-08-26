@@ -1,8 +1,10 @@
 //! Constellation entry point: CLI, daemon, and FUSE mount in one binary.
 
 mod backend;
+mod designation;
 mod fusefs;
 mod lease;
+mod pin;
 mod prefetch;
 mod shipper;
 
@@ -65,6 +67,47 @@ enum Command {
         /// State dir of a running mount: query its control socket.
         #[arg(long)]
         state_dir: Option<PathBuf>,
+    },
+    /// Keep a subtree fully cached on this node and follow its changes.
+    Pin {
+        /// Absolute path inside the filesystem, e.g. /data.
+        path: String,
+        /// State dir of the running mount to talk to.
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// Stop keeping a subtree resident; its chunks become evictable.
+    Unpin {
+        path: String,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// List this node's pinned subtrees.
+    Pins {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// Designate this node for exclusive local-speed writes under a
+    /// subtree while it stays reachable (DESIGN.md §5.2).
+    Offline {
+        path: String,
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Grant a read guarantee (pin) without write authority; other
+        /// nodes' writes under `path` remain unrestricted.
+        #[arg(long)]
+        ro: bool,
+    },
+    /// Release this node's designation for a subtree.
+    Online {
+        path: String,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// List active offline designations visible to this node.
+    Designations {
+        #[arg(long)]
+        state_dir: PathBuf,
     },
 }
 
@@ -166,6 +209,37 @@ fn main() -> Result<()> {
             }
             _ => bail!("exactly one of --s3 or --state-dir is required"),
         },
+        Command::Pin { path, state_dir } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::Pin { path },
+        )),
+        Command::Unpin { path, state_dir } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::Unpin { path },
+        )),
+        Command::Pins { state_dir } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::ListPins,
+        )),
+        Command::Offline {
+            path,
+            state_dir,
+            ro,
+        } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::Offline {
+                path,
+                read_only: ro,
+            },
+        )),
+        Command::Online { path, state_dir } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::Online { path },
+        )),
+        Command::Designations { state_dir } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::ListDesignations,
+        )),
         Command::Mount {
             s3,
             mountpoint,
@@ -283,6 +357,28 @@ fn mount(
     // blocks on it for fsync in --fsync-mode s3, and asks it to take
     // the lease on the first mutation.
     let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel::<fusefs::SyncRequest>();
+
+    // P2P fast path (DESIGN.md §8, M3.3). Every failure here is
+    // non-fatal: without peers the daemon behaves exactly as phases 1-2,
+    // reaching other nodes through S3 polling. Built before `fs` because
+    // the offline-designation gate (phase 4a) needs it for delegation
+    // requests.
+    let peers = rt.block_on(start_p2p(&fsmeta, store.inner().clone(), node_id));
+    let designations = std::sync::Arc::new(designation::DesignationManager::new(
+        constellation_store_s3::designation::DesignationStore::new(
+            store.inner().clone(),
+            if lease_mode == constellation_store_s3::LeaseMode::Cas {
+                constellation_store_s3::designation::DesignationMode::Cas
+            } else {
+                constellation_store_s3::designation::DesignationMode::SingleWriter
+            },
+        ),
+        meta.clone(),
+        peers.clone(),
+        node_id,
+    ));
+    rt.block_on(designations.refresh());
+
     let fs = fusefs::ConstellationFs::new(
         meta.clone(),
         store.clone(),
@@ -295,6 +391,7 @@ fn mount(
             fsync_s3,
             leases: lease_views.clone(),
             acquire_deadline,
+            designations: Some(designations.clone()),
         }),
     );
 
@@ -311,12 +408,14 @@ fn mount(
     rt.block_on(adopt_root(&meta, &mut ship, &mut keeper))
         .context("adopting the root directory owner")?;
 
-    // P2P fast path (DESIGN.md §8, M3.3). Every failure here is
-    // non-fatal: without peers the daemon behaves exactly as phases 1-2,
-    // reaching other nodes through S3 polling.
-    let peers = rt.block_on(start_p2p(&fsmeta, store.inner().clone(), node_id));
     ship.set_peers(peers.clone());
+    ship.set_designations(designations.clone());
     let ship = std::sync::Arc::new(tokio::sync::Mutex::new(ship));
+    let pins = std::sync::Arc::new(pin::PinManager::new(
+        meta.clone(),
+        store.clone(),
+        cache.clone(),
+    ));
     let keepers = std::sync::Arc::new(tokio::sync::Mutex::new({
         let mut m = std::collections::HashMap::new();
         m.insert(constellation_store_s3::log::PARTITION.to_string(), keeper);
@@ -325,6 +424,8 @@ fn mount(
     let bridge = std::sync::Arc::new(P2pBridge {
         node_id,
         nudge: sync_tx.clone(),
+        designations: designations.clone(),
+        meta: meta.clone(),
     });
     if peers.is_enabled() {
         // Refresh-on-miss: an unknown key may be a peer that mounted
@@ -378,9 +479,23 @@ fn mount(
             });
         }
     }
+    // Designations are rare, operator-driven objects, but the daemon
+    // must notice one appear/disappear without a remount (e.g. another
+    // node ran `offline`). Poll less aggressively than the peer
+    // registry since S3 LIST is not free and there is no gossip signal
+    // for this yet.
+    {
+        let designations = designations.clone();
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                designations.refresh().await;
+            }
+        });
+    }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        let (ship, stop, spool, keepers, lease_views, store_inner, lease_mode, peers) = (
+        let (ship, stop, spool, keepers, lease_views, store_inner, lease_mode, peers, pins) = (
             ship.clone(),
             stop.clone(),
             spool.clone(),
@@ -389,6 +504,7 @@ fn mount(
             store.inner().clone(),
             lease_mode,
             peers.clone(),
+            pins.clone(),
         );
         rt.spawn(async move {
             let mut pending: Option<fusefs::SyncRequest> = None;
@@ -477,6 +593,8 @@ fn mount(
                         if let Err(e) = &r {
                             tracing::warn!(error = %e, "metadata sync failed; will retry");
                             spool.lock().unwrap().last_error = Some(format!("{e:#}"));
+                        } else {
+                            pins.refresh_all().await;
                         }
                         let _ = reply.send(r.map_err(|e| format!("{e:#}")));
                     }
@@ -493,6 +611,8 @@ fn mount(
                                         "metadata sync failed; will retry"
                                     );
                                     spool.lock().unwrap().last_error = Some(format!("{e:#}"));
+                                } else {
+                                    pins.refresh_all().await;
                                 }
                             }
                         }
@@ -502,7 +622,6 @@ fn mount(
         });
     }
 
-    // Control API on <state_dir>/control.sock (spool + cache status).
     let status = std::sync::Arc::new(DaemonStatus {
         meta: meta.clone(),
         cache,
@@ -514,6 +633,9 @@ fn mount(
         node_id,
         started: std::time::Instant::now(),
         peers: peers.clone(),
+        pins: pins.clone(),
+        designations: designations.clone(),
+        rt: rt.handle().clone(),
     });
     {
         let _guard = rt.enter();
@@ -557,6 +679,8 @@ fn mount(
 struct P2pBridge {
     node_id: u64,
     nudge: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
+    designations: std::sync::Arc<designation::DesignationManager>,
+    meta: std::sync::Arc<SqliteMeta>,
 }
 
 impl constellation_net::PeerService for P2pBridge {
@@ -603,6 +727,41 @@ impl constellation_net::PeerService for P2pBridge {
                 // requester falls back to the S3 path, which is always
                 // correct — it just costs the TTL wait.
                 _ => declined,
+            }
+        })
+    }
+
+    fn delegation_requested(
+        &self,
+        path: String,
+        requester: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            self.designations
+                .handle_delegation_request(&path, requester)
+        })
+    }
+
+    fn flush_ack_requested(
+        &self,
+        path: String,
+        part: String,
+        seq: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            // We can ack once our own replica has tailed at least this
+            // seq for the partition — that IS "provably holds all
+            // committed changes" for this record. `applied_seq_of`
+            // reads the same kv counter the syncer advances after
+            // applying (or shipping) a segment.
+            let applied = self.meta.applied_seq_of(&part).unwrap_or(0);
+            constellation_net::Payload::FlushAck {
+                path,
+                part,
+                seq,
+                acked: applied >= seq,
             }
         })
     }
@@ -700,6 +859,39 @@ async fn refresh_peers(
     }
 }
 
+/// Send one control-API request to a running mount and print the answer.
+///
+/// A daemon-side refusal (over budget, no such path) comes back as
+/// `Response::Error` and must exit non-zero: `pin` failing silently would
+/// leave the user believing a subtree is resident when it is not.
+async fn control_call(state_dir: &std::path::Path, req: constellation_api::Request) -> Result<()> {
+    let sock = state_dir.join(constellation_api::SOCKET_NAME);
+    match constellation_api::call(&sock, &req).await? {
+        constellation_api::Response::Ok { detail } => {
+            println!("{detail}");
+            Ok(())
+        }
+        constellation_api::Response::Pins { pins } => {
+            if pins.is_empty() {
+                println!("no pinned subtrees");
+            } else {
+                println!("{}", serde_json::to_string_pretty(&pins)?);
+            }
+            Ok(())
+        }
+        constellation_api::Response::Designations { designations } => {
+            if designations.is_empty() {
+                println!("no active designations");
+            } else {
+                println!("{}", serde_json::to_string_pretty(&designations)?);
+            }
+            Ok(())
+        }
+        constellation_api::Response::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
 async fn run_sync_round(
     ship: &std::sync::Arc<tokio::sync::Mutex<shipper::Shipper>>,
     keepers: &std::sync::Arc<
@@ -788,6 +980,10 @@ struct DaemonStatus {
     node_id: u64,
     started: std::time::Instant,
     peers: constellation_net::Peers,
+    pins: std::sync::Arc<pin::PinManager>,
+    designations: std::sync::Arc<designation::DesignationManager>,
+    /// Handle for the blocking control-API calls that need to await.
+    rt: tokio::runtime::Handle,
 }
 
 impl constellation_api::StatusSource for DaemonStatus {
@@ -855,7 +1051,68 @@ impl constellation_api::StatusSource for DaemonStatus {
             lease: p0_lease,
             partitions,
             p2p,
+            pins: self.list_pins(),
+            designations: self.list_designations(),
         }
+    }
+
+    fn pin(&self, path: &str) -> std::result::Result<String, String> {
+        let pins = self.pins.clone();
+        let path = path.to_string();
+        // The API handler runs on the runtime already, so block_in_place
+        // keeps the fetch off the async executor without a nested runtime.
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(async move { pins.pin(&path).await })
+                .map_err(|e| format!("{e:#}"))
+        })
+    }
+
+    fn unpin(&self, path: &str) -> std::result::Result<String, String> {
+        let pins = self.pins.clone();
+        let path = path.to_string();
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(async move { pins.unpin(&path).await })
+                .map_err(|e| format!("{e:#}"))
+        })
+    }
+
+    fn list_pins(&self) -> Vec<constellation_api::PinStatus> {
+        let pins = self.pins.clone();
+        tokio::task::block_in_place(|| self.rt.block_on(async move { pins.status().await }))
+    }
+
+    fn offline(&self, path: &str, read_only: bool) -> std::result::Result<String, String> {
+        let designations = self.designations.clone();
+        let path = path.to_string();
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(async move { designations.offline(&path, read_only).await })
+                .map_err(|e| format!("{e:#}"))
+        })
+    }
+
+    fn online(&self, path: &str) -> std::result::Result<String, String> {
+        let designations = self.designations.clone();
+        let path = path.to_string();
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(async move { designations.online(&path).await })
+                .map_err(|e| format!("{e:#}"))
+        })
+    }
+
+    fn list_designations(&self) -> Vec<constellation_api::DesignationStatus> {
+        self.designations
+            .snapshot()
+            .into_iter()
+            .map(|d| constellation_api::DesignationStatus {
+                path: d.path,
+                designee: d.designee,
+                read_only: d.read_only,
+            })
+            .collect()
     }
 }
 

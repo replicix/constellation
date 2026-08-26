@@ -62,6 +62,10 @@ pub struct SyncHandle {
         Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<crate::lease::LeaseView>>>>,
     /// Bound on how long a mutation waits for a foreign holder.
     pub acquire_deadline: Duration,
+    /// Offline designation (DESIGN.md §5.2). `None` when no designations
+    /// exist for this mount — the write gate then behaves exactly as
+    /// before phase 4a.
+    pub designations: Option<Arc<crate::designation::DesignationManager>>,
 }
 
 pub struct ConstellationFs {
@@ -184,6 +188,26 @@ impl ConstellationFs {
 
     pub(crate) fn require_lease_for(&self, ino: Ino) -> Result<(), i32> {
         let Some(h) = &self.sync else { return Ok(()) };
+        // Offline designation gate (DESIGN.md §5.2), checked before the
+        // ordinary lease: a designated path's write authority does not
+        // come from the partition lease at all while the designee is
+        // reachable — see the module doc on `designation::GateDecision`.
+        if let Some(designations) = &h.designations {
+            let path = self.meta.path_of(ino).unwrap_or_else(|_| "/".into());
+            match self.rt.block_on(designations.check(&path)) {
+                crate::designation::GateDecision::NoDesignation => {}
+                crate::designation::GateDecision::Proceed => return Ok(()),
+                crate::designation::GateDecision::ReadOnly { designee, path } => {
+                    tracing::error!(
+                        path,
+                        designee,
+                        "refusing mutation: path is offline-designated to another node \
+                         and no delegation is available"
+                    );
+                    return Err(libc::EROFS);
+                }
+            }
+        }
         let part = self.meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
         {
             let map = h.leases.lock().unwrap();

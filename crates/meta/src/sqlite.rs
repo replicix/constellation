@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS xpart_pending (
     half   TEXT NOT NULL,
     record TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pin (
+    path      TEXT PRIMARY KEY,
+    ino       INTEGER NOT NULL,
+    pinned_at INTEGER NOT NULL
+);
 ";
 
 pub type JournalBatch = Vec<(u64, LogRecord)>;
@@ -442,6 +447,112 @@ impl SqliteMeta {
     /// Allocate the next partition id (see [`Self::alloc_part_id`]).
     pub fn next_part_id(&self) -> Result<String, MetaError> {
         Self::alloc_part_id(&self.conn.lock().unwrap())
+    }
+
+    /// Resolve an absolute path to its inode. `/` is the root.
+    pub fn resolve_path(&self, path: &str) -> Result<Option<Ino>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut cur = ROOT_INO;
+        for part in path.split('/').filter(|s| !s.is_empty()) {
+            match Self::dentry_ino(&conn, cur, part)? {
+                Some(next) => cur = next,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(cur))
+    }
+
+    /// Every manifest under `ino` (inclusive), as `(ino, manifest_bytes,
+    /// size)`. Used to compute a pin's footprint and to fetch its chunks.
+    ///
+    /// Walks the dentry tree rather than trusting a stored aggregate: the
+    /// replica is the authority for what a subtree currently contains,
+    /// and a stale aggregate would let a pin over-commit the cache.
+    pub fn subtree_manifests(&self, ino: Ino) -> Result<Vec<(Ino, Vec<u8>, u64)>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = Vec::new();
+        let mut stack = vec![ino];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue; // hard links can reach one inode twice
+            }
+            let row: Option<(Option<Vec<u8>>, i64, u8)> = conn
+                .query_row(
+                    "SELECT manifest, size, kind FROM inode WHERE ino = ?1",
+                    params![cur],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((manifest, size, kind)) = row {
+                if let Some(m) = manifest {
+                    out.push((cur, m, size as u64));
+                }
+                if kind == InodeKind::Dir.as_u8() {
+                    let mut stmt = conn.prepare("SELECT ino FROM dentry WHERE parent = ?1")?;
+                    let kids = stmt.query_map(params![cur], |r| r.get::<_, Ino>(0))?;
+                    for k in kids {
+                        stack.push(k?);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record a pin. Pins are **node-local**: each node decides what it
+    /// keeps resident, so they are deliberately not replicated through
+    /// the log.
+    pub fn add_pin(&self, path: &str, ino: Ino) -> Result<(), MetaError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO pin (path, ino, pinned_at) VALUES (?1, ?2, ?3)",
+            params![path, ino, now_ns()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a pin. Returns whether it existed.
+    pub fn remove_pin(&self, path: &str) -> Result<bool, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM pin WHERE path = ?1", params![path])? > 0)
+    }
+
+    pub fn pins(&self) -> Result<Vec<(String, Ino)>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT path, ino FROM pin ORDER BY path")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Is `ino` inside any pinned subtree? Walks up to the root, so a
+    /// file created under a pin is covered without re-pinning.
+    pub fn pinned_ancestor(&self, ino: Ino) -> Result<Option<String>, MetaError> {
+        let pins = self.pins()?;
+        if pins.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut cur = ino;
+        loop {
+            if let Some((path, _)) = pins.iter().find(|(_, pino)| *pino == cur) {
+                return Ok(Some(path.clone()));
+            }
+            if cur == ROOT_INO {
+                return Ok(None);
+            }
+            match conn
+                .query_row(
+                    "SELECT parent FROM dentry WHERE ino = ?1 LIMIT 1",
+                    params![cur],
+                    |r| r.get::<_, Ino>(0),
+                )
+                .optional()?
+            {
+                Some(p) => cur = p,
+                None => return Ok(None),
+            }
+        }
     }
 
     /// Parent of `ino` in the dentry tree, if any.
@@ -1558,6 +1669,80 @@ mod tests {
         // Both names still resolve to the same inode.
         assert_eq!(m.lookup(hot.ino, "x").unwrap().unwrap().ino, f.ino);
         assert_eq!(m.lookup(cold.ino, "same").unwrap().unwrap().ino, f.ino);
+    }
+
+    /// Pins are node-local state keyed by path, and `pinned_ancestor`
+    /// must cover anything created underneath a pin later, so a new file
+    /// in a pinned directory is kept resident without re-pinning.
+    #[test]
+    fn pins_cover_descendants() {
+        let m = store();
+        let data = m.mkdir(ROOT_INO, "data", 0o755, 0, 0).unwrap();
+        let sub = m.mkdir(data.ino, "sub", 0o755, 0, 0).unwrap();
+        let f = m.create(sub.ino, "deep", 0o644, 0, 0).unwrap();
+        let outside = m.create(ROOT_INO, "outside", 0o644, 0, 0).unwrap();
+
+        assert_eq!(m.resolve_path("/data/sub").unwrap(), Some(sub.ino));
+        assert_eq!(m.resolve_path("/").unwrap(), Some(ROOT_INO));
+        assert!(m.resolve_path("/data/nope").unwrap().is_none());
+
+        assert!(m.pinned_ancestor(f.ino).unwrap().is_none());
+        m.add_pin("/data", data.ino).unwrap();
+        assert_eq!(m.pins().unwrap(), vec![("/data".to_string(), data.ino)]);
+        assert_eq!(m.pinned_ancestor(f.ino).unwrap().as_deref(), Some("/data"));
+        assert_eq!(
+            m.pinned_ancestor(data.ino).unwrap().as_deref(),
+            Some("/data"),
+            "the pin root itself is covered"
+        );
+        assert!(
+            m.pinned_ancestor(outside.ino).unwrap().is_none(),
+            "a sibling of the pin must not be covered"
+        );
+
+        assert!(m.remove_pin("/data").unwrap());
+        assert!(!m.remove_pin("/data").unwrap(), "second unpin is a no-op");
+        assert!(m.pinned_ancestor(f.ino).unwrap().is_none());
+    }
+
+    /// A pin's footprint is the manifests under it, so admission control
+    /// can refuse before reserving cache space.
+    #[test]
+    fn subtree_manifests_walks_the_whole_subtree() {
+        let m = store();
+        let data = m.mkdir(ROOT_INO, "data", 0o755, 0, 0).unwrap();
+        let sub = m.mkdir(data.ino, "sub", 0o755, 0, 0).unwrap();
+        let a = m.create(data.ino, "a", 0o644, 0, 0).unwrap();
+        let b = m.create(sub.ino, "b", 0o644, 0, 0).unwrap();
+        let outside = m.create(ROOT_INO, "outside", 0o644, 0, 0).unwrap();
+        m.set_manifest(a.ino, b"MA", 10).unwrap();
+        m.set_manifest(b.ino, b"MB", 20).unwrap();
+        m.set_manifest(outside.ino, b"MO", 40).unwrap();
+
+        let mut got = m.subtree_manifests(data.ino).unwrap();
+        got.sort_by_key(|(ino, _, _)| *ino);
+        let total: u64 = got.iter().map(|(_, _, sz)| sz).sum();
+        assert_eq!(total, 30, "only the subtree counts: {got:?}");
+        assert!(got.iter().all(|(ino, _, _)| *ino != outside.ino));
+
+        // A file with no manifest (never written) contributes nothing.
+        m.create(data.ino, "empty", 0o644, 0, 0).unwrap();
+        let after: u64 = m
+            .subtree_manifests(data.ino)
+            .unwrap()
+            .iter()
+            .map(|(_, _, sz)| sz)
+            .sum();
+        assert_eq!(after, 30);
+
+        // Whole-filesystem pin sees everything.
+        let all: u64 = m
+            .subtree_manifests(ROOT_INO)
+            .unwrap()
+            .iter()
+            .map(|(_, _, sz)| sz)
+            .sum();
+        assert_eq!(all, 70);
     }
 
     #[test]

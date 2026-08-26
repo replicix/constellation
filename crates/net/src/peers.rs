@@ -232,6 +232,35 @@ impl Peers {
         }
     }
 
+    /// Send an arbitrary payload directly to a known peer address and
+    /// wait for its reply, with the same RTT bound as
+    /// [`Peers::request_lease`]. For requests that are not one of the
+    /// built-in convenience methods (e.g. `DelegationRequest`).
+    pub async fn request_raw(&self, addr: EndpointAddr, payload: &Payload) -> Result<Payload> {
+        let Some(inner) = self.inner.as_ref() else {
+            anyhow::bail!("P2P disabled");
+        };
+        let node_id = inner
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .find(|p| p.addr.id == addr.id)
+            .map(|p| p.node_id);
+        let started = Instant::now();
+        let result = tokio::time::timeout(REQUEST_TIMEOUT, inner.p2p.request(addr, payload)).await;
+        match result {
+            Ok(Ok(reply)) => {
+                if let Some(id) = node_id {
+                    self.note_rtt(id, started.elapsed(), true);
+                }
+                Ok(reply)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => anyhow::bail!("request timed out"),
+        }
+    }
+
     /// Serve inbound direct requests until shutdown.
     ///
     /// Uses iroh's [`Router`] so connections are dispatched **by ALPN**: a
@@ -384,10 +413,25 @@ async fn handle_conn<S: PeerService>(
             Payload::LeaseRequest { part, requester } => {
                 Some(service.lease_requested(part, requester).await)
             }
+            Payload::DelegationRequest { path, requester } => {
+                Some(service.delegation_requested(path, requester).await)
+            }
+            Payload::FlushAck {
+                path, part, seq, ..
+            } => {
+                // Inbound `FlushAck` on this ALPN is a *request* for an
+                // ack (see the module doc on `Payload::FlushAck`): the
+                // field name is shared with the reply for symmetry, but
+                // an incoming message's `acked` is meaningless — only
+                // the reply's `acked` matters.
+                Some(service.flush_ack_requested(path, part, seq).await)
+            }
             Payload::Ping { .. } => Some(Payload::Pong {
                 node_id: service.node_id(),
             }),
-            Payload::Pong { .. } | Payload::LeaseHandoff { .. } => None,
+            Payload::Pong { .. }
+            | Payload::LeaseHandoff { .. }
+            | Payload::DelegationGrant { .. } => None,
         };
         if let Some(reply) = reply {
             let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
