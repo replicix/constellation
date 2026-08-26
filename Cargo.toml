@@ -44,6 +44,11 @@ futures = "0.3"
 tempfile = "3"
 rand = "0.9"
 
+# P2P fast path (M3.3): QUIC endpoint keyed by node pubkey plus a gossip
+# topic for push invalidation and lease handoff.
+iroh = "1"
+iroh-gossip = "0.101"
+
 [profile.release]
 lto = "thin"
 strip = true

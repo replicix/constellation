@@ -1,0 +1,7 @@
+[toolchain]
+# iroh 1.x (the P2P fast path, M3.3) requires Rust >= 1.91. Pinning the
+# channel keeps CI, the containerized suites, and dev hosts on one
+# toolchain so a stale 1.90 host does not fail dependency resolution
+# with a confusing transitive-crate error.
+channel = "1.98"
+components = ["rustfmt", "clippy"]

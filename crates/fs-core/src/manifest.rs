@@ -182,8 +182,12 @@ pub fn decode_chunk_list(data: &[u8]) -> Result<Vec<ChunkHash>, CoreError> {
 }
 
 fn decode_hashes(body: &[u8]) -> Vec<ChunkHash> {
-    body.chunks_exact(32)
-        .map(|c| ChunkHash(c.try_into().unwrap()))
+    // Callers validate `body.len() % 32 == 0`, so the remainder is empty.
+    body.as_chunks::<32>()
+        .0
+        .iter()
+        .copied()
+        .map(ChunkHash)
         .collect()
 }
 
