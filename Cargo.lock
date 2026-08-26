@@ -511,6 +511,7 @@ name = "constellation-net"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "iroh",
  "iroh-gossip",
  "serde",

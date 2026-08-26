@@ -20,11 +20,13 @@
 //! the fault-injection harness asserts the S3-only bounds still hold.
 
 pub mod allowlist;
+pub mod endpoint;
 pub mod handoff;
 pub mod identity;
 pub mod message;
 
 pub use allowlist::{Allowlist, Decision};
+pub use endpoint::{topic_for, P2p, PeerService};
 pub use handoff::{handle_request, interpret_reply, Handoff, RequestOutcome};
 pub use identity::{load_or_create, parse_pubkey, pubkey_hex};
 pub use message::{Payload, Signed, ALPN};
