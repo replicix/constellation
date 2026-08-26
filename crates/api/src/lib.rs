@@ -8,7 +8,8 @@
 pub mod types;
 
 pub use types::{
-    CacheStatus, LeaseStatus, PartitionStatus, Request, Response, SpoolStatus, StatusReport,
+    CacheStatus, LeaseStatus, P2pStatus, PartitionStatus, PeerStatus, Request, Response,
+    SpoolStatus, StatusReport,
 };
 
 use anyhow::{Context, Result};
@@ -117,6 +118,7 @@ mod tests {
                     lost: false,
                 },
                 partitions: vec![],
+                p2p: P2pStatus::default(),
             }
         }
     }
@@ -202,6 +204,7 @@ mod tests {
                 },
                 lease: lease.unwrap_or_default(),
                 partitions,
+                p2p: P2pStatus::default(),
             }
         }
     }

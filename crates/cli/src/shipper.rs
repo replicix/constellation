@@ -107,6 +107,9 @@ pub struct Shipper {
     /// Keyed by the directory inode under a partition root.
     dir_ops: HashMap<u64, DirTraffic>,
     last_ship_at: HashMap<String, Instant>,
+    /// P2P handle for push invalidation. Disabled by default so the
+    /// existing tests and the no-P2P path need no changes.
+    peers: constellation_net::Peers,
 }
 
 struct PartState {
@@ -208,7 +211,13 @@ impl Shipper {
             })),
             dir_ops: HashMap::new(),
             last_ship_at: HashMap::new(),
+            peers: constellation_net::Peers::disabled(),
         })
+    }
+
+    /// Attach the P2P handle so shipped segments are announced to peers.
+    pub fn set_peers(&mut self, peers: constellation_net::Peers) {
+        self.peers = peers;
     }
 
     fn ensure_part(&mut self, id: &str) {
@@ -471,6 +480,10 @@ impl Shipper {
         );
         self.note_xpart_shipped(&records)?;
         self.note_shipped(part, &records);
+        // Push invalidation: tell peers the segment is durable so they
+        // tail now rather than at their next poll. Best effort by
+        // design — the poll is what guarantees they converge.
+        self.peers.announce_segment(part, next_seq, epoch).await;
         let st = self.parts.get_mut(part).unwrap();
         st.max_epoch = st.max_epoch.max(epoch);
         st.next_seq = next_seq + 1;

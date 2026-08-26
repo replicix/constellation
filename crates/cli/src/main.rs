@@ -291,7 +291,7 @@ fn mount(
         fsmeta.chunk_size,
         compression,
         Some(fusefs::SyncHandle {
-            tx: sync_tx,
+            tx: sync_tx.clone(),
             fsync_s3,
             leases: lease_views.clone(),
             acquire_deadline,
@@ -310,15 +310,77 @@ fn mount(
     let mut keeper = keeper;
     rt.block_on(adopt_root(&meta, &mut ship, &mut keeper))
         .context("adopting the root directory owner")?;
+
+    // P2P fast path (DESIGN.md §8, M3.3). Every failure here is
+    // non-fatal: without peers the daemon behaves exactly as phases 1-2,
+    // reaching other nodes through S3 polling.
+    let peers = rt.block_on(start_p2p(&fsmeta, store.inner().clone(), node_id));
+    ship.set_peers(peers.clone());
     let ship = std::sync::Arc::new(tokio::sync::Mutex::new(ship));
     let keepers = std::sync::Arc::new(tokio::sync::Mutex::new({
         let mut m = std::collections::HashMap::new();
         m.insert(constellation_store_s3::log::PARTITION.to_string(), keeper);
         m
     }));
+    let bridge = std::sync::Arc::new(P2pBridge {
+        node_id,
+        nudge: sync_tx.clone(),
+    });
+    if peers.is_enabled() {
+        // Refresh-on-miss: an unknown key may be a peer that mounted
+        // after us, which on a cold start is the normal case rather than
+        // the exception.
+        {
+            let (p, store_inner) = (peers.clone(), store.inner().clone());
+            peers.set_refresher(std::sync::Arc::new(move || {
+                let (p, store_inner) = (p.clone(), store_inner.clone());
+                Box::pin(async move { refresh_peers(&p, store_inner).await })
+            }));
+        }
+        // Accept inbound peer connections.
+        {
+            let (peers, bridge) = (peers.clone(), bridge.clone());
+            rt.spawn(async move { peers.serve(bridge).await });
+        }
+        // Join the gossip topic and consume it. Bootstrapping from the
+        // registry replaces a global discovery service; the node that
+        // mounts first has nobody to bootstrap from, so poll briefly for
+        // a peer instead of joining a topic alone.
+        {
+            let (peers, bridge, store_inner) =
+                (peers.clone(), bridge.clone(), store.inner().clone());
+            rt.spawn(async move {
+                for _ in 0..40 {
+                    if !peers.snapshot().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    refresh_peers(&peers, store_inner.clone()).await;
+                }
+                let bootstrap: Vec<constellation_net::EndpointId> =
+                    peers.snapshot().iter().map(|p| p.addr.id).collect();
+                tracing::info!(bootstrap = bootstrap.len(), "joining the gossip topic");
+                match peers.join_topic(bootstrap).await {
+                    Ok(rx) => constellation_net::run_gossip(peers.clone(), rx, bridge).await,
+                    Err(e) => tracing::warn!(error = %e, "gossip unavailable; peers will poll S3"),
+                }
+            });
+        }
+        // Periodically re-read the registry so nodes that join later are
+        // dialable and enrolled without a remount.
+        {
+            let (peers, store_inner) = (peers.clone(), store.inner().clone());
+            rt.spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    refresh_peers(&peers, store_inner.clone()).await;
+                }
+            });
+        }
+    }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        let (ship, stop, spool, keepers, lease_views, store_inner, lease_mode) = (
+        let (ship, stop, spool, keepers, lease_views, store_inner, lease_mode, peers) = (
             ship.clone(),
             stop.clone(),
             spool.clone(),
@@ -326,6 +388,7 @@ fn mount(
             lease_views.clone(),
             store.inner().clone(),
             lease_mode,
+            peers.clone(),
         );
         rt.spawn(async move {
             let mut pending: Option<fusefs::SyncRequest> = None;
@@ -361,11 +424,53 @@ fn mount(
                             keepers.insert(part.clone(), k);
                         }
                         let keeper = keepers.get_mut(&part).unwrap();
-                        let r = shipper::acquire_lease_for(&mut ship, keeper, &part).await;
+                        let mut r = shipper::acquire_lease_for(&mut ship, keeper, &part).await;
+                        // Fast path (M3.3): a live holder can hand the
+                        // lease over in ~1 RTT instead of making us wait
+                        // out its idle window or TTL. Only worth asking
+                        // when the plain CAS just failed, and the retry
+                        // is still an ordinary CAS — S3 stays the commit
+                        // point, so a lying peer only wastes one round.
+                        if matches!(r, Ok(false))
+                            && peers.is_enabled()
+                            && peers.request_lease(&part).await
+                        {
+                            r = shipper::acquire_lease_for(&mut ship, keeper, &part).await;
+                        }
                         if let Err(e) = &r {
                             tracing::warn!(error = %e, part, "lease acquisition failed");
                         }
                         let _ = reply.send(r.map_err(|e| format!("{e:#}")));
+                    }
+                    Some(fusefs::SyncRequest::HandOff { part, reply }) => {
+                        // Fast-path handoff (M3.3): flush this partition
+                        // so the requester sees every committed record,
+                        // then release. Declining is always safe — the
+                        // requester waits the lease out through S3.
+                        let mut ship = ship.lock().await;
+                        let mut keepers = keepers.lock().await;
+                        let epoch = match keepers.get_mut(&part) {
+                            Some(k) if k.ship_epoch().is_some() && !k.is_lost() => {
+                                let held = k.ship_epoch();
+                                match ship.sync_one(&part, k).await {
+                                    Ok(()) => match k.release().await {
+                                        Ok(()) => held,
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, part,
+                                                "lease release failed; keeping it");
+                                            None
+                                        }
+                                    },
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, part,
+                                            "flush before handoff failed; keeping the lease");
+                                        None
+                                    }
+                                }
+                            }
+                            _ => None,
+                        };
+                        let _ = reply.send(epoch);
                     }
                     Some(fusefs::SyncRequest::Barrier(reply)) => {
                         let r = run_sync_round(&ship, &keepers).await;
@@ -408,6 +513,7 @@ fn mount(
         mountpoint: mountpoint.display().to_string(),
         node_id,
         started: std::time::Instant::now(),
+        peers: peers.clone(),
     });
     {
         let _guard = rt.enter();
@@ -440,6 +546,158 @@ fn mount(
     });
     flush.context("final log flush")?;
     Ok(())
+}
+
+/// Bridges the P2P layer to the daemon's sync task.
+///
+/// Both directions are latency-only. A `SegmentPublished` hint just
+/// nudges the syncer, which would have polled anyway; a `LeaseRequest`
+/// asks the sync task to flush and release, and S3's CAS remains the
+/// authority for who actually holds the lease.
+struct P2pBridge {
+    node_id: u64,
+    nudge: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
+}
+
+impl constellation_net::PeerService for P2pBridge {
+    fn segment_published(&self, part: &str, seq: u64, epoch: u64) {
+        tracing::debug!(part, seq, epoch, "peer published a segment; syncing now");
+        // Nudge, never block: if the channel is gone the periodic sync
+        // still picks the segment up.
+        let _ = self.nudge.send(fusefs::SyncRequest::Nudge);
+    }
+
+    fn lease_requested(
+        &self,
+        part: String,
+        requester: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let declined = constellation_net::Payload::LeaseHandoff {
+                part: part.clone(),
+                epoch: 0,
+                released: false,
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if self
+                .nudge
+                .send(fusefs::SyncRequest::HandOff {
+                    part: part.clone(),
+                    reply: tx,
+                })
+                .is_err()
+            {
+                return declined;
+            }
+            match rx.await {
+                Ok(Some(epoch)) => {
+                    tracing::info!(part, requester, epoch, "handed the lease to a peer");
+                    constellation_net::Payload::LeaseHandoff {
+                        part,
+                        epoch,
+                        released: true,
+                    }
+                }
+                // Not ours, flush failed, or the task went away: the
+                // requester falls back to the S3 path, which is always
+                // correct — it just costs the TTL wait.
+                _ => declined,
+            }
+        })
+    }
+
+    fn node_id(&self) -> u64 {
+        self.node_id
+    }
+}
+
+/// Start the P2P fast path, or return a disabled handle.
+///
+/// Everything here is best-effort by design (plan 02 / DESIGN.md §8): a
+/// missing node key, an unbindable endpoint, or an unreachable gossip
+/// topic all degrade to the S3 polling path rather than failing the
+/// mount. `CONSTELLATION_P2P=off` skips it entirely.
+async fn start_p2p(
+    fsmeta: &constellation_store_s3::FsMeta,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    node_id: u64,
+) -> constellation_net::Peers {
+    if !constellation_net::enabled() {
+        tracing::info!("P2P disabled by CONSTELLATION_P2P; using the S3 path only");
+        return constellation_net::Peers::disabled();
+    }
+    let key_path = constellation_net::identity::default_key_path();
+    let (key, generated) = match constellation_net::load_or_create(&key_path) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %key_path.display(),
+                "no usable node key; running without the P2P fast path");
+            return constellation_net::Peers::disabled();
+        }
+    };
+    if generated {
+        tracing::info!(path = %key_path.display(), "generated a host node key");
+    }
+    let topic =
+        constellation_net::topic_for(fsmeta.gossip_seed().as_ref(), &fsmeta.uuid.to_string());
+    if fsmeta.gossip_seed().is_none() {
+        tracing::info!(
+            "filesystem predates gossip_secret; deriving the topic from its UUID \
+             (weaker: the UUID is not a secret)"
+        );
+    }
+    let p2p = match constellation_net::P2p::spawn(key, topic).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not bind the P2P endpoint; using the S3 path only");
+            return constellation_net::Peers::disabled();
+        }
+    };
+    let addr = p2p.addr();
+    let pubkey = p2p.pubkey_hex();
+    let peers = constellation_net::Peers::new(p2p, node_id);
+    // Publish how peers reach us, then learn about them.
+    match serde_json::to_value(&addr) {
+        Ok(addr_json) => {
+            if let Err(e) =
+                constellation_store_s3::publish_p2p(store.clone(), node_id, &pubkey, addr_json)
+                    .await
+            {
+                tracing::warn!(error = %e, "could not publish our P2P address; peers cannot dial us");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not serialize our P2P address"),
+    }
+    refresh_peers(&peers, store).await;
+    tracing::info!(
+        node_id,
+        peers = peers.snapshot().len(),
+        "P2P fast path ready"
+    );
+    peers
+}
+
+/// Re-read the registry into the peer directory and allowlist.
+async fn refresh_peers(
+    peers: &constellation_net::Peers,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+) {
+    if !peers.is_enabled() {
+        return;
+    }
+    match constellation_store_s3::list_nodes(store).await {
+        Ok(nodes) => {
+            let records: Vec<(u64, String, serde_json::Value)> = nodes
+                .into_iter()
+                .filter_map(|n| Some((n.node_id, n.pubkey?, n.p2p_addr?)))
+                .collect();
+            peers.refresh_registry(records);
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "registry refresh failed; keeping the cached peer set")
+        }
+    }
 }
 
 async fn run_sync_round(
@@ -529,6 +787,7 @@ struct DaemonStatus {
     mountpoint: String,
     node_id: u64,
     started: std::time::Instant,
+    peers: constellation_net::Peers,
 }
 
 impl constellation_api::StatusSource for DaemonStatus {
@@ -558,6 +817,23 @@ impl constellation_api::StatusSource for DaemonStatus {
                 .collect();
             (p0, parts)
         };
+        let p2p = constellation_api::P2pStatus {
+            enabled: self.peers.is_enabled(),
+            node_addr: self
+                .peers
+                .node_addr()
+                .and_then(|a| serde_json::to_string(&a).ok()),
+            peers: self
+                .peers
+                .snapshot()
+                .into_iter()
+                .map(|p| constellation_api::PeerStatus {
+                    node_id: p.node_id,
+                    connected: p.connected,
+                    rtt_ms: p.rtt_ms,
+                })
+                .collect(),
+        };
         constellation_api::StatusReport {
             fs_uuid: self.fs_uuid.clone(),
             backend: self.backend.clone(),
@@ -578,6 +854,7 @@ impl constellation_api::StatusSource for DaemonStatus {
             },
             lease: p0_lease,
             partitions,
+            p2p,
         }
     }
 }

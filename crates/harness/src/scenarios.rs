@@ -104,6 +104,24 @@ pub const SCENARIOS: &[Scenario] = &[
         run: rename_across_partitions,
     },
     Scenario {
+        name: "p2p-invalidation",
+        desc: "gossip push makes a write visible on the peer far faster than the S3 poll bound; P2P=off restores the old bound",
+        requires: &[],
+        run: p2p_invalidation,
+    },
+    Scenario {
+        name: "p2p-handover",
+        desc: "a blocked writer takes the lease from an ACTIVE holder in ~1 RTT instead of waiting out the idle window",
+        requires: &[],
+        run: p2p_handover,
+    },
+    Scenario {
+        name: "p2p-partition-tolerance",
+        desc: "with P2P disabled on one node, shared-filesystem correctness still holds on the S3 slow path",
+        requires: &[],
+        run: p2p_partition_tolerance,
+    },
+    Scenario {
         name: "fresh-node-bootstrap",
         desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
         requires: &[],
@@ -489,9 +507,138 @@ fn git_workflow(_seed: u64) -> Result<()> {
     Ok(())
 }
 
+/// Push invalidation (DESIGN.md §12): with peers connected, a write on A
+/// reaches B from a gossip hint rather than B's next poll.
+///
+/// The sync interval is set deliberately long (3 s) so polling cannot
+/// explain a fast result: anything well under that must have come from a
+/// push. The same workload is then re-run with `CONSTELLATION_P2P=off`,
+/// which must fall back to the poll bound — proving the fast path is an
+/// accelerator and not a correctness dependency.
+fn p2p_invalidation(_seed: u64) -> Result<()> {
+    let interval_ms = 3_000u64;
+    let slow = |c: Client| {
+        c.with_env("CONSTELLATION_SYNC_INTERVAL_MS", &interval_ms.to_string())
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "200")
+    };
+
+    // --- P2P on ---
+    let (env, root) = setup("p2p-invalidation")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/p2pinval-{}", ts());
+    let mut c0 = slow(Client::new(root.path(), "c0", &env.endpoint, &backend)?).with_env(
+        "CONSTELLATION_NODE_KEY",
+        "/tmp/.constellation-harness-c0.key",
+    );
+    let mut c1 = slow(Client::new(root.path(), "c1", &env.endpoint, &backend)?).with_env(
+        "CONSTELLATION_NODE_KEY",
+        "/tmp/.constellation-harness-c1.key",
+    );
+    // Distinct host keys: the node key is per host, and both "hosts"
+    // here share one machine.
+    let _ = std::fs::remove_file("/tmp/.constellation-harness-c0.key");
+    let _ = std::fs::remove_file("/tmp/.constellation-harness-c1.key");
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    wait_for_p2p([&c0, &c1])?;
+
+    let mut pushed = Vec::new();
+    for i in 0..5 {
+        pushed.push(visibility_ms(&c0, &c1, &format!("push-{i}"))?);
+    }
+    pushed.sort_unstable();
+    let push_median = pushed[pushed.len() / 2];
+    eprintln!("    p2p-invalidation: push median {push_median} ms (samples {pushed:?})");
+    c0.unmount()?;
+    c1.unmount()?;
+    drop(root);
+
+    // --- P2P off: the old bound must still hold ---
+    let (env2, root2) = setup("p2p-invalidation-off")?;
+    let _proxy2 = env2.s3_proxy()?;
+    let backend2 = format!("s3://{BUCKET}/p2poff-{}", ts());
+    let off = |c: Client| slow(c).with_env("CONSTELLATION_P2P", "off");
+    let mut d0 = off(Client::new(root2.path(), "d0", &env2.endpoint, &backend2)?);
+    let mut d1 = off(Client::new(root2.path(), "d1", &env2.endpoint, &backend2)?);
+    d0.fs_create()?;
+    d0.mount()?;
+    d1.mount()?;
+    anyhow::ensure!(
+        p2p_of(&d0)?["enabled"] == false,
+        "CONSTELLATION_P2P=off must disable the fast path: {}",
+        p2p_of(&d0)?
+    );
+    let mut polled = Vec::new();
+    for i in 0..3 {
+        polled.push(visibility_ms(&d0, &d1, &format!("poll-{i}"))?);
+    }
+    polled.sort_unstable();
+    let poll_median = polled[polled.len() / 2];
+    eprintln!("    p2p-invalidation: poll median {poll_median} ms (samples {polled:?})");
+    d0.unmount()?;
+    d1.unmount()?;
+
+    // The push path must be decisively faster than the poll bound.
+    anyhow::ensure!(
+        push_median * 2 < poll_median,
+        "push invalidation must beat the poll bound by a wide margin, \
+         got push {push_median} ms vs poll {poll_median} ms"
+    );
+    anyhow::ensure!(
+        push_median < interval_ms as u128,
+        "push median {push_median} ms is not below the {interval_ms} ms sync interval, \
+         so the speedup cannot be attributed to gossip"
+    );
+    Ok(())
+}
 /// Lease state from a node's control API.
 fn lease_of(c: &Client) -> Result<serde_json::Value> {
     Ok(c.control_status()?["lease"].clone())
+}
+
+/// P2P state from a node's control API.
+fn p2p_of(c: &Client) -> Result<serde_json::Value> {
+    Ok(c.control_status()?["p2p"].clone())
+}
+
+/// Wait until both nodes report a live fast path with a peer enrolled
+/// from the registry, so a latency measurement is not just racing
+/// startup.
+fn wait_for_p2p(clients: [&Client; 2]) -> Result<()> {
+    for c in clients {
+        eventually(
+            &format!("{} reports a live P2P peer", c.name),
+            Duration::from_secs(30),
+            || {
+                let p = p2p_of(c)?;
+                anyhow::ensure!(p["enabled"] == true, "{} has no fast path: {p}", c.name);
+                let n = p["peers"].as_array().map(|a| a.len()).unwrap_or(0);
+                anyhow::ensure!(n >= 1, "{} sees no peers yet: {p}", c.name);
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// How long a write on `from` takes to appear on `to`.
+fn visibility_ms(from: &Client, to: &Client, tag: &str) -> Result<u128> {
+    let started = std::time::Instant::now();
+    let body = format!("body-{tag}");
+    std::fs::write(from.mnt.join(tag), body.as_bytes())?;
+    let dst = to.mnt.join(tag);
+    loop {
+        if matches!(std::fs::read(&dst), Ok(v) if v == body.as_bytes()) {
+            return Ok(started.elapsed().as_millis());
+        }
+        anyhow::ensure!(
+            started.elapsed() < Duration::from_secs(60),
+            "{tag} never became visible on {}",
+            to.name
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn conflicts_of(c: &Client) -> Result<u64> {
@@ -1155,6 +1302,143 @@ fn rename_across_partitions(_seed: u64) -> Result<()> {
         model.verify(&c1.mnt).context("via c1")?;
         Ok(())
     })?;
+    ensure_no_conflicts([&c0, &c1])?;
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+/// Lease handoff in ~1 RTT (roadmap M3.3 exit criterion).
+///
+/// A holds the lease and keeps writing, so it never goes write-idle. B
+/// then writes: without P2P it would have to wait out A's idle window or
+/// TTL, but with the fast path it asks A directly, A flushes and
+/// releases, and B's CAS succeeds. The idle window is set long (30 s) so
+/// a fast result cannot be explained by A releasing on its own.
+fn p2p_handover(_seed: u64) -> Result<()> {
+    let (env, root) = setup("p2p-handover")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/p2phand-{}", ts());
+    let idle_ms = 30_000u64;
+    let tune = |c: Client, key: &str| {
+        c.with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", &idle_ms.to_string())
+            .with_env("CONSTELLATION_NODE_KEY", key)
+    };
+    let _ = std::fs::remove_file("/tmp/.constellation-hand-c0.key");
+    let _ = std::fs::remove_file("/tmp/.constellation-hand-c1.key");
+    let mut c0 = tune(
+        Client::new(root.path(), "c0", &env.endpoint, &backend)?,
+        "/tmp/.constellation-hand-c0.key",
+    );
+    let mut c1 = tune(
+        Client::new(root.path(), "c1", &env.endpoint, &backend)?,
+        "/tmp/.constellation-hand-c1.key",
+    );
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    wait_for_p2p([&c0, &c1])?;
+
+    // A becomes the active holder and stays busy.
+    std::fs::write(c0.mnt.join("a-owns"), b"a")?;
+    eventually("A holds the lease", Duration::from_secs(20), || {
+        let l = lease_of(&c0)?;
+        anyhow::ensure!(l["held"] == true, "A does not hold the lease: {l}");
+        Ok(())
+    })?;
+    let epoch_before = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
+
+    // B writes while A is still the holder: this is the handoff path.
+    let started = std::time::Instant::now();
+    std::fs::write(c1.mnt.join("b-wants"), b"b")?;
+    let took = started.elapsed();
+    eprintln!(
+        "    p2p-handover: B's first write under a live holder took {} ms (idle window {idle_ms} ms)",
+        took.as_millis()
+    );
+    anyhow::ensure!(
+        took < Duration::from_millis(idle_ms / 2),
+        "handover took {:?}, which is not decisively faster than the {idle_ms} ms idle window",
+        took
+    );
+    eventually("B holds the lease", Duration::from_secs(20), || {
+        let l = lease_of(&c1)?;
+        anyhow::ensure!(l["held"] == true, "B never took the lease: {l}");
+        Ok(())
+    })?;
+    let epoch_after = lease_of(&c1)?["epoch"].as_u64().unwrap_or(0);
+    anyhow::ensure!(
+        epoch_after > epoch_before,
+        "the lease epoch must advance across a handoff ({epoch_before} -> {epoch_after})"
+    );
+
+    // Both nodes converge on both writes, and nothing conflicted.
+    let mut model = Model::default();
+    model.write_file(std::path::Path::new("a-owns"), b"a".to_vec());
+    model.write_file(std::path::Path::new("b-wants"), b"b".to_vec());
+    eventually("both nodes converge", Duration::from_secs(30), || {
+        model.verify(&c0.mnt).context("via c0")?;
+        model.verify(&c1.mnt).context("via c1")?;
+        Ok(())
+    })?;
+    ensure_no_conflicts([&c0, &c1])?;
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+/// A P2P partition must be survivable: the fast path is an accelerator,
+/// so disabling it on one node only slows things down.
+///
+/// toxiproxy only fronts S3, so the P2P path is cut with the kill switch
+/// on one node instead (documented choice from plan 02): that node can
+/// neither gossip nor be asked for a handoff, which is exactly the
+/// "peer unreachable" case. Everything must still converge over S3.
+fn p2p_partition_tolerance(seed: u64) -> Result<()> {
+    let (env, root) = setup("p2p-partition")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/p2ppart-{}", ts());
+    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
+    // Only c1 has the fast path; c0 cannot participate at all.
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_NODE_KEY", "/tmp/.constellation-part-c1.key");
+    c0 = c0.with_env("CONSTELLATION_P2P", "off");
+    let _ = std::fs::remove_file("/tmp/.constellation-part-c1.key");
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    anyhow::ensure!(
+        p2p_of(&c0)?["enabled"] == false,
+        "c0 must have no fast path"
+    );
+
+    // The two-clients-shared workload: each node owns a subtree and must
+    // observe the other's exactly, purely over S3.
+    let mut m0 = Model::default();
+    let mut m1 = Model::default();
+    let mut w0 = Workload::new(seed, "a");
+    let mut w1 = Workload::new(seed.wrapping_add(1), "b");
+    for dir in ["from-a", "from-b"] {
+        std::fs::create_dir(c0.mnt.join(dir))?;
+    }
+    eventually("subtrees visible on both", Duration::from_secs(30), || {
+        anyhow::ensure!(
+            c1.mnt.join("from-a").is_dir() && c1.mnt.join("from-b").is_dir(),
+            "subtrees not on c1"
+        );
+        Ok(())
+    })?;
+    for _ in 0..2 {
+        w0.run_block(&c0.mnt.join("from-a"), &mut m0, 15)?;
+        w1.run_block(&c1.mnt.join("from-b"), &mut m1, 15)?;
+        eventually("cross-node convergence", Duration::from_secs(60), || {
+            m0.verify(&c0.mnt.join("from-a")).context("a via c0")?;
+            m0.verify(&c1.mnt.join("from-a")).context("a via c1")?;
+            m1.verify(&c1.mnt.join("from-b")).context("b via c1")?;
+            m1.verify(&c0.mnt.join("from-b")).context("b via c0")?;
+            Ok(())
+        })?;
+    }
     ensure_no_conflicts([&c0, &c1])?;
     c0.unmount()?;
     c1.unmount()?;

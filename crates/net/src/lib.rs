@@ -31,7 +31,12 @@ pub use endpoint::{topic_for, P2p, PeerService};
 pub use handoff::{handle_request, interpret_reply, Handoff, RequestOutcome};
 pub use identity::{load_or_create, parse_pubkey, pubkey_hex};
 pub use message::{Payload, Signed, ALPN};
-pub use peers::{run_gossip, Peer, Peers};
+pub use peers::{run_gossip, Peer, Peers, Refresher};
+
+/// Re-exported so the daemon can name peer ids without depending on
+/// `iroh` directly: this crate is the only place that knows the
+/// transport.
+pub use iroh::EndpointId;
 
 /// Whether the P2P fast path is enabled. `CONSTELLATION_P2P=off`
 /// (or `0`/`false`) is the kill switch the harness uses to prove the

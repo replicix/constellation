@@ -208,6 +208,31 @@ mod tests {
         });
     }
 
+    /// Gossip carries whole datagrams while streams need framing, so the
+    /// two encodings differ. A prefixed frame must NOT decode as a bare
+    /// gossip payload — the mismatch was silent and disabled push
+    /// invalidation entirely (every peer fell back to polling).
+    #[test]
+    fn stream_framing_and_bare_encoding_are_distinct() {
+        let k = key();
+        let payload = Payload::SegmentPublished {
+            part: "p0".into(),
+            seq: 3,
+            epoch: 1,
+        };
+        let signed = Signed::new(&k, &payload).unwrap();
+        let bare = serde_json::to_vec(&signed).unwrap();
+        let framed = signed.encode().unwrap();
+        assert_eq!(framed.len(), bare.len() + 4, "frame adds a length prefix");
+        // The bare form is what gossip receivers decode.
+        assert_eq!(Signed::decode(&bare).unwrap().verify().unwrap().1, payload);
+        // The framed form must not be mistaken for it.
+        assert!(
+            Signed::decode(&framed).is_err(),
+            "a length-prefixed frame must not decode as a bare payload"
+        );
+    }
+
     #[test]
     fn oversized_frame_is_refused() {
         let k = key();

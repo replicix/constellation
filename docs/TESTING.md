@@ -230,6 +230,29 @@ other scenario inherits them, and a tiny split threshold makes
 otherwise-unrelated scenarios (`lease-handover`, which assumes a
 single partition) split and fail in confusing ways.
 
+M3.3 scenarios exercise the P2P fast path (DESIGN.md §8, §12). Each one
+sets a distinct `CONSTELLATION_NODE_KEY` per client, because the node key
+is per *host* and the harness runs both "hosts" on one machine — sharing
+a key would give both nodes the same identity.
+
+`p2p-invalidation` measures cross-node visibility twice: once with the
+fast path and a deliberately long 3 s sync interval (so a fast result
+cannot be attributed to polling), then again with
+`CONSTELLATION_P2P=off`, which must fall back to the poll bound. It
+asserts the push median is both under the sync interval and less than
+half the poll median. Observed: ~19–25 ms versus 3015 ms.
+
+`p2p-handover` makes A the *active* holder under a 30 s idle-release
+window, then has B write. Without the fast path B would wait out that
+window or the TTL; with it, B asks A directly, A flushes and releases,
+and B's CAS succeeds. It asserts the write completes in well under half
+the idle window and that the epoch advanced. Observed: ~27–33 ms.
+
+`p2p-partition-tolerance` cuts P2P with the kill switch on one node
+(toxiproxy only fronts S3, so this is how plan 02 specifies simulating an
+unreachable peer) and re-runs the shared-filesystem workload: everything
+must still converge over S3.
+
 Requires docker + fusermount3 + a release binary on the host
 (`CONSTELLATION_BIN` overrides discovery). Containers are labeled
 `constellation-harness=1` and removed on drop, even when a scenario

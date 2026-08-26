@@ -441,6 +441,7 @@ dependencies = [
  "constellation-api",
  "constellation-fs-core",
  "constellation-meta",
+ "constellation-net",
  "constellation-store-s3",
  "fuser",
  "libc",

@@ -12,7 +12,7 @@
 
 use crate::allowlist::Decision;
 use crate::endpoint::{P2p, PeerService};
-use crate::message::{read_frame, write_frame, Payload, Signed};
+use crate::message::{read_frame, write_frame, Payload, Signed, ALPN};
 use anyhow::Result;
 use iroh::EndpointAddr;
 use std::collections::HashMap;
@@ -41,10 +41,16 @@ pub struct Peers {
     inner: Option<Arc<Inner>>,
 }
 
+/// Re-reads the node registry on demand. Supplied by the daemon, which
+/// owns the object store handle.
+pub type Refresher =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
 struct Inner {
     p2p: P2p,
     node_id: u64,
     peers: Mutex<HashMap<u64, Peer>>,
+    refresher: Mutex<Option<Refresher>>,
 }
 
 impl Peers {
@@ -60,6 +66,7 @@ impl Peers {
                 p2p,
                 node_id,
                 peers: Mutex::new(HashMap::new()),
+                refresher: Mutex::new(None),
             })),
         }
     }
@@ -74,6 +81,18 @@ impl Peers {
 
     pub fn pubkey_hex(&self) -> Option<String> {
         Some(self.inner.as_ref()?.p2p.pubkey_hex())
+    }
+
+    /// Join the gossip topic and return the receiver to drive.
+    pub async fn join_topic(
+        &self,
+        bootstrap: Vec<iroh::EndpointId>,
+    ) -> Result<iroh_gossip::api::GossipReceiver> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("P2P disabled"))?;
+        inner.p2p.join(bootstrap).await
     }
 
     /// Refresh the peer directory and the accept-time allowlist from the
@@ -92,6 +111,9 @@ impl Peers {
             // An unparseable address just means we cannot dial that peer
             // yet; it stays on the allowlist so it may still dial us.
             if let Ok(addr) = serde_json::from_value::<EndpointAddr>(addr_json) {
+                // Feed the address to iroh so gossip, which bootstraps
+                // from bare endpoint ids, can dial this peer at all.
+                inner.p2p.learn_addr(addr.clone());
                 let prev = inner.peers.lock().unwrap().get(&node_id).cloned();
                 peers.insert(
                     node_id,
@@ -107,6 +129,16 @@ impl Peers {
         }
         inner.p2p.set_allowed(allowed);
         *inner.peers.lock().unwrap() = peers;
+    }
+
+    /// Install the callback used to re-read the registry when an unknown
+    /// key connects. Without it a node that mounted before its peers
+    /// rejects them until the next periodic refresh, which in practice
+    /// means the gossip topic never forms on a cold start.
+    pub fn set_refresher(&self, refresher: Refresher) {
+        if let Some(inner) = self.inner.as_ref() {
+            *inner.refresher.lock().unwrap() = Some(refresher);
+        }
     }
 
     pub fn snapshot(&self) -> Vec<Peer> {
@@ -129,8 +161,11 @@ impl Peers {
             seq,
             epoch,
         };
-        if let Err(e) = inner.p2p.broadcast(&payload).await {
-            tracing::debug!(error = %e, part, seq, "segment announce failed; peers will poll");
+        match inner.p2p.broadcast(&payload).await {
+            Ok(()) => tracing::debug!(part, seq, epoch, "announced segment to peers"),
+            Err(e) => {
+                tracing::debug!(error = %e, part, seq, "segment announce failed; peers will poll")
+            }
         }
     }
 
@@ -197,23 +232,58 @@ impl Peers {
         }
     }
 
-    /// Serve inbound direct requests until the endpoint closes. Spawned
-    /// by the daemon; returns only on shutdown.
+    /// Serve inbound direct requests until shutdown.
+    ///
+    /// Uses iroh's [`Router`] so connections are dispatched **by ALPN**: a
+    /// bare `endpoint.accept()` loop here would also swallow
+    /// `iroh-gossip`'s connections and reject them, which silently kills
+    /// the gossip mesh while leaving direct requests working.
     pub async fn serve<S: PeerService>(&self, service: Arc<S>) {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
-        loop {
-            let Some(incoming) = inner.p2p.endpoint().accept().await else {
-                return; // endpoint closed
-            };
-            let inner = inner.clone();
-            let service = service.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_conn(&inner, service.as_ref(), incoming).await {
-                    tracing::debug!(error = %e, "peer connection ended with an error");
-                }
-            });
+        let handler = DirectHandler {
+            inner: inner.clone(),
+            service,
+        };
+        let router = iroh::protocol::Router::builder(inner.p2p.endpoint().clone())
+            .accept(ALPN, handler)
+            .accept(iroh_gossip::ALPN, inner.p2p.gossip().clone())
+            .spawn();
+        // Hold the router for the daemon's lifetime; dropping it would
+        // abort the accept loop.
+        std::mem::forget(router);
+        std::future::pending::<()>().await
+    }
+}
+
+/// Handles our own ALPN: verify, dispatch, reply.
+struct DirectHandler<S: PeerService> {
+    inner: Arc<Inner>,
+    service: Arc<S>,
+}
+
+// `ProtocolHandler` requires `Debug`; neither the endpoint nor the
+// service is usefully printable, so keep it minimal.
+impl<S: PeerService> std::fmt::Debug for DirectHandler<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DirectHandler")
+    }
+}
+
+impl<S: PeerService> iroh::protocol::ProtocolHandler for DirectHandler<S> {
+    fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> impl std::future::Future<Output = std::result::Result<(), iroh::protocol::AcceptError>> + Send
+    {
+        let inner = self.inner.clone();
+        let service = self.service.clone();
+        async move {
+            if let Err(e) = handle_conn(&inner, service.as_ref(), conn).await {
+                tracing::debug!(error = %e, "peer connection ended with an error");
+            }
+            Ok(())
         }
     }
 }
@@ -233,12 +303,17 @@ pub async fn run_gossip<S: PeerService>(
     let Some(inner) = peers.inner.clone() else {
         return;
     };
+    tracing::debug!("gossip receive loop started");
     while let Some(event) = rx.next().await {
         let Ok(event) = event else { continue };
         let iroh_gossip::api::Event::Received(msg) = event else {
             continue; // neighbor up/down: status only
         };
+        // Gossip carries whole messages, so the length prefix used for
+        // stream framing is not present here — decode the payload
+        // directly.
         let Ok(signed) = Signed::decode(&msg.content) else {
+            tracing::debug!(bytes = msg.content.len(), "undecodable gossip message");
             continue;
         };
         let Ok((author, payload)) = signed.verify() else {
@@ -246,6 +321,12 @@ pub async fn run_gossip<S: PeerService>(
             continue;
         };
         let hex = crate::identity::hex32(author.as_bytes());
+        if inner.p2p.check(&hex) == Decision::Refresh {
+            let refresher = inner.refresher.lock().unwrap().clone();
+            if let Some(refresh) = refresher {
+                refresh().await;
+            }
+        }
         if inner.p2p.check(&hex) != Decision::Accept {
             tracing::debug!(peer = %hex, "dropping gossip from an unenrolled key");
             continue;
@@ -261,15 +342,21 @@ pub async fn run_gossip<S: PeerService>(
 async fn handle_conn<S: PeerService>(
     inner: &Arc<Inner>,
     service: &S,
-    incoming: iroh::endpoint::Incoming,
+    conn: iroh::endpoint::Connection,
 ) -> Result<()> {
-    let conn = incoming.await?;
     let remote = conn.remote_id();
     let hex = crate::identity::hex32(remote.as_bytes());
     // Accept-time authorization: the key must be enrolled in the
-    // registry, which requires bucket write. On a miss we cannot refresh
-    // from here (no store handle), so a cold allowlist rejects and the
-    // periodic refresh admits the peer on its next attempt.
+    // registry, which requires bucket write. A miss re-reads the registry
+    // once (rate-limited) before rejecting, because a peer that mounted
+    // after us is legitimately absent from our cached view — on a cold
+    // start that is the common case, not the exception.
+    if inner.p2p.check(&hex) == Decision::Refresh {
+        let refresher = inner.refresher.lock().unwrap().clone();
+        if let Some(refresh) = refresher {
+            refresh().await;
+        }
+    }
     if inner.p2p.check(&hex) != Decision::Accept {
         tracing::warn!(peer = %hex, "rejecting peer: not in the registry allowlist");
         conn.close(1u32.into(), b"not allowed");
@@ -295,7 +382,7 @@ async fn handle_conn<S: PeerService>(
                 None
             }
             Payload::LeaseRequest { part, requester } => {
-                Some(service.lease_requested(&part, requester))
+                Some(service.lease_requested(part, requester).await)
             }
             Payload::Ping { .. } => Some(Payload::Pong {
                 node_id: service.node_id(),
@@ -331,16 +418,23 @@ mod tests {
                 .unwrap()
                 .push((part.to_string(), seq, epoch));
         }
-        fn lease_requested(&self, part: &str, requester: u64) -> Payload {
+        fn lease_requested(
+            &self,
+            part: String,
+            requester: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
             self.lease_asks
                 .lock()
                 .unwrap()
-                .push((part.to_string(), requester));
-            Payload::LeaseHandoff {
-                part: part.to_string(),
-                epoch: 5,
-                released: self.release,
-            }
+                .push((part.clone(), requester));
+            let released = self.release;
+            Box::pin(async move {
+                Payload::LeaseHandoff {
+                    part,
+                    epoch: 5,
+                    released,
+                }
+            })
         }
         fn node_id(&self) -> u64 {
             7

@@ -38,6 +38,32 @@ pub struct StatusReport {
     /// daemons (serde default).
     #[serde(default)]
     pub partitions: Vec<PartitionStatus>,
+    /// P2P fast path (M3.3). `enabled: false` on daemons without it, or
+    /// when `CONSTELLATION_P2P=off`.
+    #[serde(default)]
+    pub p2p: P2pStatus,
+}
+
+/// P2P fast-path state. Purely observational: the filesystem is correct
+/// with `enabled: false` and every peer disconnected, just slower.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct P2pStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    /// This node's dialable address, as published to the registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_addr: Option<String>,
+    #[serde(default)]
+    pub peers: Vec<PeerStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerStatus {
+    pub node_id: u64,
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u64>,
 }
 
 /// One partition as exposed by the control API.

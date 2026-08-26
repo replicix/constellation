@@ -182,9 +182,45 @@ cross-node visibility is sync-interval + TTL, not gossip-RTT.
 - **Offline designation**: phase 4.
 - **P2P/gossip**: M3.3.
 
+### M3.3 — P2P fast path (iroh endpoint, gossip, lease handoff)
+
+S3 stays the source of truth and the commit point; every mechanism here
+only removes waiting. `CONSTELLATION_P2P=off` disables the lot.
+
+| Item | State | Where |
+|---|---|---|
+| Host Ed25519 node key (`~/.config/constellation/node.key`, 0600, `CONSTELLATION_NODE_KEY` override), generated on first mount | done | `net::identity` |
+| Registry carries `pubkey` + `p2p_addr`; accept-time allowlist, so enrolment needs bucket write and IAM stays the trust root | done | `store-s3::nodes`, `net::allowlist` |
+| iroh endpoint with relay and address publishing disabled — the registry is the only peer directory; addresses are injected into iroh via `MemoryLookup` | done | `net::endpoint` |
+| Signed length-prefixed JSON messages, verified before use (gossip is relayed, so the transport peer is not the author) | done | `net::message` |
+| Push invalidation: `SegmentPublished` gossip nudges the syncer | done | `net::peers::run_gossip`, `cli::shipper` |
+| Lease handoff: requester asks the holder, holder flushes + releases, requester CAS-claims. Declining is always safe | done | `net::handoff`, `cli::main` |
+| Control API `StatusReport.p2p { enabled, node_addr, peers[] }` | done | `crates/api`, `cli::main` |
+| Harness: `p2p-invalidation`, `p2p-handover`, `p2p-partition-tolerance` | done | `crates/harness` |
+
+Measured on the harness (S3 emulator, loopback P2P):
+
+| Path | With P2P | S3 only | Bound being beaten |
+|---|---|---|---|
+| Cross-node visibility | **19–25 ms** | 3015 ms | 3 s sync interval |
+| Lease handoff from an *active* holder | **27–33 ms** | — | 30 s idle window |
+
+The roadmap exit criterion (lease transfer ~1 RTT when peers are
+connected) therefore holds, and `p2p-invalidation` re-runs the same
+workload with the kill switch to prove the S3 bound still applies.
+
+### M3.3 scope limits
+
+- **Cooperative chunk serving** over the endpoint is phase 5; the ALPN
+  and message enum are deliberately extensible for it.
+- **FUSE kernel invalidation + raised attr TTLs** (plan 02 step 3's
+  second half) are not implemented: visibility is already gossip-driven,
+  but the kernel attr/entry TTLs stay at 1 s rather than being raised to
+  30 s with dynamic fallback. Raising them needs `fuser`'s notifier,
+  which the current `mount2` call does not expose.
+- **Offline designation acks**: phase 4.
+
 ## Later phases
 
-Not started (phases 4–8, and M3.3 of phase 3). No code exists for
-P2P/gossip, pin/offline, cooperative cache, snapshots/E2E, web UI, or
-GC. M3.2 (partitions) is in the working tree — see the Phase 3 table
-above.
+Not started (phases 4–8). No code exists for pin/offline, cooperative
+cache, snapshots/E2E, web UI, or GC.

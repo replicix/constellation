@@ -13,6 +13,7 @@
 use crate::allowlist::{Allowlist, Decision};
 use crate::message::{Payload, Signed, ALPN};
 use anyhow::{Context, Result};
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use iroh_gossip::net::Gossip;
@@ -22,11 +23,19 @@ use std::sync::{Arc, Mutex};
 /// What the daemon gives the endpoint so it can serve peer requests.
 /// Kept as a trait object so `cli` owns the shipper/lease logic and this
 /// crate stays free of filesystem concerns.
+///
+/// `lease_requested` is async because answering it means flushing to S3;
+/// doing that on a blocking call inside the accept task would stall a
+/// runtime worker.
 pub trait PeerService: Send + Sync + 'static {
     /// A peer published a segment: tail now instead of at the next poll.
     fn segment_published(&self, part: &str, seq: u64, epoch: u64);
     /// A peer wants `part`'s lease. Returns the reply to send.
-    fn lease_requested(&self, part: &str, requester: u64) -> Payload;
+    fn lease_requested(
+        &self,
+        part: String,
+        requester: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>;
     /// This node's id, for `Ping`/`Pong`.
     fn node_id(&self) -> u64;
 }
@@ -38,6 +47,10 @@ pub struct P2p {
     topic: TopicId,
     key: SecretKey,
     allow: Arc<Mutex<Allowlist>>,
+    /// Registry-sourced peer addresses, fed to iroh so gossip (which
+    /// bootstraps from bare endpoint ids) can actually dial them. With
+    /// address publishing disabled this is the only address source.
+    lookup: MemoryLookup,
     /// Broadcast handle for the joined topic, once it exists.
     sender: Arc<tokio::sync::Mutex<Option<iroh_gossip::api::GossipSender>>>,
 }
@@ -59,11 +72,14 @@ impl P2p {
     /// Bind the endpoint and spawn gossip. Errors are the caller's cue to
     /// run without a fast path.
     pub async fn spawn(key: SecretKey, topic: TopicId) -> Result<Self> {
+        let lookup = MemoryLookup::new();
         let endpoint = Endpoint::builder(presets::Minimal)
             // No relay and no address publishing: the registry in S3 is
-            // the only directory (DESIGN.md §8).
+            // the only directory (DESIGN.md §8). Peer addresses from the
+            // registry are injected through `lookup`.
             .relay_mode(RelayMode::Disabled)
             .secret_key(key.clone())
+            .address_lookup(lookup.clone())
             .alpns(vec![ALPN.to_vec(), iroh_gossip::ALPN.to_vec()])
             .bind()
             .await
@@ -75,8 +91,14 @@ impl P2p {
             topic,
             key,
             allow: Arc::new(Mutex::new(Allowlist::new())),
+            lookup,
             sender: Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+
+    /// Teach iroh how to reach a peer learned from the registry.
+    pub fn learn_addr(&self, addr: EndpointAddr) {
+        self.lookup.add_endpoint_info(addr);
     }
 
     pub fn addr(&self) -> EndpointAddr {
@@ -117,13 +139,19 @@ impl P2p {
 
     /// Broadcast a signed payload to the topic. Best effort: a failure
     /// only means peers learn from their next poll instead.
+    ///
+    /// Gossip delivers whole datagrams, so this sends the bare JSON —
+    /// the 4-byte length prefix from [`Signed::encode`] exists only to
+    /// frame messages on a byte stream, and including it here would make
+    /// every receiver's decode fail silently.
     pub async fn broadcast(&self, payload: &Payload) -> Result<()> {
         let msg = Signed::new(&self.key, payload)?;
+        let body = serde_json::to_vec(&msg)?;
         let guard = self.sender.lock().await;
         let Some(tx) = guard.as_ref() else {
             anyhow::bail!("gossip topic not joined yet");
         };
-        tx.broadcast(msg.encode()?.into()).await?;
+        tx.broadcast(body.into()).await?;
         Ok(())
     }
 
@@ -156,6 +184,11 @@ impl P2p {
 
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// The gossip actor, so the router can dispatch its ALPN.
+    pub fn gossip(&self) -> &Gossip {
+        &self.gossip
     }
 
     pub fn secret_key(&self) -> &SecretKey {

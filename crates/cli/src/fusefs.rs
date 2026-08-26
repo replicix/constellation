@@ -40,6 +40,15 @@ pub enum SyncRequest {
         part: String,
         reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
     },
+    /// A peer asked us to hand `part`'s lease over (M3.3 fast path):
+    /// flush that partition's journal to S3 and release the lease.
+    /// Replies with the epoch we held, or `None` if we do not hold it or
+    /// the flush failed — in which case the requester falls back to
+    /// waiting the lease out through S3, which is always correct.
+    HandOff {
+        part: String,
+        reply: tokio::sync::oneshot::Sender<Option<u64>>,
+    },
 }
 
 /// FUSE-side handle to the metadata sync task.
