@@ -22,6 +22,13 @@ pub struct FsMeta {
     pub compression: String,
     pub e2e: bool,
     pub created_unix: i64,
+    /// Random 32 bytes (hex) that seed the P2P gossip topic id (M3.3).
+    /// Optional: filesystems created before this existed derive the
+    /// topic from the UUID instead, which is weaker (the UUID is not a
+    /// secret) but still works — messages are signed and direct
+    /// connections are gated by the registry allowlist regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gossip_secret: Option<String>,
 }
 
 impl FsMeta {
@@ -36,8 +43,32 @@ impl FsMeta {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
+            gossip_secret: Some(random_hex32()),
         }
     }
+
+    /// The gossip topic seed, if this filesystem has one.
+    pub fn gossip_seed(&self) -> Option<[u8; 32]> {
+        let hex = self.gossip_secret.as_deref()?;
+        if hex.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, pair) in hex.as_bytes().chunks(2).enumerate() {
+            let s = std::str::from_utf8(pair).ok()?;
+            out[i] = u8::from_str_radix(s, 16).ok()?;
+        }
+        Some(out)
+    }
+}
+
+fn random_hex32() -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in rand::random::<[u8; 32]>() {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 impl Default for FsMeta {
@@ -228,11 +259,52 @@ mod tests {
         let loaded = s.load_fs().await.unwrap();
         assert_eq!(loaded.uuid, meta.uuid);
         assert_eq!(loaded.chunk_size, DEFAULT_CHUNK_SIZE);
+        assert_eq!(loaded.gossip_secret, meta.gossip_secret);
         // Second create refused.
         assert!(matches!(
             s.create_fs(&meta).await,
             Err(StoreError::AlreadyExists)
         ));
+    }
+
+    /// A fresh filesystem gets a random gossip seed; two filesystems
+    /// never share one, so joining a topic needs the bucket.
+    #[test]
+    fn gossip_secret_is_random_and_decodes() {
+        let a = FsMeta::default();
+        let b = FsMeta::default();
+        assert_ne!(a.gossip_secret, b.gossip_secret);
+        let seed = a.gossip_seed().expect("a fresh fs has a seed");
+        assert_eq!(seed.len(), 32);
+        assert_ne!(seed, [0u8; 32], "seed must not be all zeroes");
+        assert_eq!(a.gossip_seed(), a.gossip_seed(), "stable across calls");
+    }
+
+    /// A pre-M3.3 `meta.json` has no `gossip_secret`. It must still load
+    /// (the daemon falls back to a UUID-derived topic), and a malformed
+    /// secret must degrade to that same fallback rather than panicking.
+    #[tokio::test]
+    async fn legacy_meta_json_without_gossip_secret_loads() {
+        let s = store();
+        let legacy = br#"{"uuid":"3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+            "format_version":1,"chunk_size":1048576,"compression":"zstd:3",
+            "e2e":false,"created_unix":1}"#;
+        s.inner()
+            .put(
+                &object_store::path::Path::from("meta.json"),
+                PutPayload::from(legacy.to_vec()),
+            )
+            .await
+            .unwrap();
+        let loaded = s.load_fs().await.unwrap();
+        assert!(loaded.gossip_secret.is_none());
+        assert!(loaded.gossip_seed().is_none(), "no seed to derive from");
+
+        let bad = FsMeta {
+            gossip_secret: Some("not-hex".into()),
+            ..FsMeta::default()
+        };
+        assert!(bad.gossip_seed().is_none(), "malformed seed must not panic");
     }
 
     #[tokio::test]

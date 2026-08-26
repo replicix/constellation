@@ -1,0 +1,521 @@
+//! The P2P supervisor: what the daemon actually holds.
+//!
+//! Ties together the endpoint, the gossip topic, the registry-derived
+//! allowlist and peer directory, and the accept loop. The daemon gets a
+//! [`Peers`] handle it can call from the sync task and the FUSE lease
+//! wait; every method is best-effort and cheap to call when P2P is off.
+//!
+//! Design rule for this whole module: **no method may block progress**.
+//! Broadcasting a hint, asking for a lease, or looking up a peer all
+//! either succeed quickly or give up, because the S3 path behind them is
+//! what actually guarantees the operation completes.
+
+use crate::allowlist::Decision;
+use crate::endpoint::{P2p, PeerService};
+use crate::message::{read_frame, write_frame, Payload, Signed};
+use anyhow::Result;
+use iroh::EndpointAddr;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How long to wait for a peer's answer to a lease request before
+/// falling back to the S3 path. Generous enough for a WAN round trip,
+/// short enough that it never dominates the idle-release window.
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+/// One known peer, as learned from the node registry.
+#[derive(Debug, Clone)]
+pub struct Peer {
+    pub node_id: u64,
+    pub pubkey_hex: String,
+    pub addr: EndpointAddr,
+    /// Last successful round trip, for status output.
+    pub rtt_ms: Option<u64>,
+    pub connected: bool,
+}
+
+/// Handle the daemon holds. Cloneable and cheap.
+#[derive(Clone)]
+pub struct Peers {
+    inner: Option<Arc<Inner>>,
+}
+
+struct Inner {
+    p2p: P2p,
+    node_id: u64,
+    peers: Mutex<HashMap<u64, Peer>>,
+}
+
+impl Peers {
+    /// A disabled handle: every operation is a no-op that reports "no
+    /// fast path", so callers need no `if p2p_enabled` branches.
+    pub fn disabled() -> Self {
+        Self { inner: None }
+    }
+
+    pub fn new(p2p: P2p, node_id: u64) -> Self {
+        Self {
+            inner: Some(Arc::new(Inner {
+                p2p,
+                node_id,
+                peers: Mutex::new(HashMap::new()),
+            })),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    pub fn node_addr(&self) -> Option<EndpointAddr> {
+        Some(self.inner.as_ref()?.p2p.addr())
+    }
+
+    pub fn pubkey_hex(&self) -> Option<String> {
+        Some(self.inner.as_ref()?.p2p.pubkey_hex())
+    }
+
+    /// Refresh the peer directory and the accept-time allowlist from the
+    /// registry. `records` is `(node_id, pubkey_hex, addr_json)`.
+    pub fn refresh_registry(&self, records: Vec<(u64, String, serde_json::Value)>) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        let mut allowed = Vec::with_capacity(records.len());
+        let mut peers = HashMap::new();
+        for (node_id, pubkey_hex, addr_json) in records {
+            allowed.push(pubkey_hex.clone());
+            if node_id == inner.node_id {
+                continue; // never dial ourselves
+            }
+            // An unparseable address just means we cannot dial that peer
+            // yet; it stays on the allowlist so it may still dial us.
+            if let Ok(addr) = serde_json::from_value::<EndpointAddr>(addr_json) {
+                let prev = inner.peers.lock().unwrap().get(&node_id).cloned();
+                peers.insert(
+                    node_id,
+                    Peer {
+                        node_id,
+                        pubkey_hex,
+                        addr,
+                        rtt_ms: prev.as_ref().and_then(|p| p.rtt_ms),
+                        connected: prev.map(|p| p.connected).unwrap_or(false),
+                    },
+                );
+            }
+        }
+        inner.p2p.set_allowed(allowed);
+        *inner.peers.lock().unwrap() = peers;
+    }
+
+    pub fn snapshot(&self) -> Vec<Peer> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Vec::new();
+        };
+        let mut v: Vec<Peer> = inner.peers.lock().unwrap().values().cloned().collect();
+        v.sort_by_key(|p| p.node_id);
+        v
+    }
+
+    /// Tell peers a segment is durable so they tail now instead of at
+    /// their next poll. Failure is fine: the poll still happens.
+    pub async fn announce_segment(&self, part: &str, seq: u64, epoch: u64) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        let payload = Payload::SegmentPublished {
+            part: part.to_string(),
+            seq,
+            epoch,
+        };
+        if let Err(e) = inner.p2p.broadcast(&payload).await {
+            tracing::debug!(error = %e, part, seq, "segment announce failed; peers will poll");
+        }
+    }
+
+    /// Ask whoever holds `part` to hand the lease over.
+    ///
+    /// Returns `true` only when a holder said it flushed and released, so
+    /// the caller should attempt its CAS immediately. Everything else —
+    /// no peers, no answer, a decline, a forged reply — returns `false`
+    /// and leaves the caller on the S3 path.
+    pub async fn request_lease(&self, part: &str) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        let peers = self.snapshot();
+        if peers.is_empty() {
+            return false;
+        }
+        let payload = Payload::LeaseRequest {
+            part: part.to_string(),
+            requester: inner.node_id,
+        };
+        for peer in peers {
+            let started = Instant::now();
+            let reply = tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                inner.p2p.request(peer.addr.clone(), &payload),
+            )
+            .await;
+            match reply {
+                Ok(Ok(body)) => {
+                    self.note_rtt(peer.node_id, started.elapsed(), true);
+                    if crate::interpret_reply(part, &body) == crate::RequestOutcome::ClaimNow {
+                        tracing::info!(
+                            part,
+                            holder = peer.node_id,
+                            took_ms = started.elapsed().as_millis(),
+                            "peer handed the lease over"
+                        );
+                        return true;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, peer = peer.node_id, part, "lease request failed");
+                    self.note_rtt(peer.node_id, started.elapsed(), false);
+                }
+                Err(_) => {
+                    tracing::debug!(peer = peer.node_id, part, "lease request timed out");
+                    self.note_rtt(peer.node_id, started.elapsed(), false);
+                }
+            }
+        }
+        false
+    }
+
+    fn note_rtt(&self, node_id: u64, took: Duration, ok: bool) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        if let Some(p) = inner.peers.lock().unwrap().get_mut(&node_id) {
+            p.connected = ok;
+            if ok {
+                p.rtt_ms = Some(took.as_millis() as u64);
+            }
+        }
+    }
+
+    /// Serve inbound direct requests until the endpoint closes. Spawned
+    /// by the daemon; returns only on shutdown.
+    pub async fn serve<S: PeerService>(&self, service: Arc<S>) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        loop {
+            let Some(incoming) = inner.p2p.endpoint().accept().await else {
+                return; // endpoint closed
+            };
+            let inner = inner.clone();
+            let service = service.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_conn(&inner, service.as_ref(), incoming).await {
+                    tracing::debug!(error = %e, "peer connection ended with an error");
+                }
+            });
+        }
+    }
+}
+
+/// Consume gossip events, dispatching verified `SegmentPublished` hints
+/// to the service. Returns when the topic ends.
+///
+/// Unsigned, forged, or unauthorized messages are dropped: gossip is
+/// forwarded by third parties, so the sender of a datagram is not
+/// necessarily its author.
+pub async fn run_gossip<S: PeerService>(
+    peers: Peers,
+    mut rx: iroh_gossip::api::GossipReceiver,
+    service: Arc<S>,
+) {
+    use futures_lite::StreamExt;
+    let Some(inner) = peers.inner.clone() else {
+        return;
+    };
+    while let Some(event) = rx.next().await {
+        let Ok(event) = event else { continue };
+        let iroh_gossip::api::Event::Received(msg) = event else {
+            continue; // neighbor up/down: status only
+        };
+        let Ok(signed) = Signed::decode(&msg.content) else {
+            continue;
+        };
+        let Ok((author, payload)) = signed.verify() else {
+            tracing::debug!("dropping gossip message with a bad signature");
+            continue;
+        };
+        let hex = crate::identity::hex32(author.as_bytes());
+        if inner.p2p.check(&hex) != Decision::Accept {
+            tracing::debug!(peer = %hex, "dropping gossip from an unenrolled key");
+            continue;
+        }
+        if let Payload::SegmentPublished { part, seq, epoch } = payload {
+            service.segment_published(&part, seq, epoch);
+        }
+    }
+}
+
+/// Serve one inbound connection: enforce the allowlist, then answer
+/// frames until the peer goes away.
+async fn handle_conn<S: PeerService>(
+    inner: &Arc<Inner>,
+    service: &S,
+    incoming: iroh::endpoint::Incoming,
+) -> Result<()> {
+    let conn = incoming.await?;
+    let remote = conn.remote_id();
+    let hex = crate::identity::hex32(remote.as_bytes());
+    // Accept-time authorization: the key must be enrolled in the
+    // registry, which requires bucket write. On a miss we cannot refresh
+    // from here (no store handle), so a cold allowlist rejects and the
+    // periodic refresh admits the peer on its next attempt.
+    if inner.p2p.check(&hex) != Decision::Accept {
+        tracing::warn!(peer = %hex, "rejecting peer: not in the registry allowlist");
+        conn.close(1u32.into(), b"not allowed");
+        return Ok(());
+    }
+    loop {
+        let (mut send, mut recv) = match conn.accept_bi().await {
+            Ok(pair) => pair,
+            // Normal close.
+            Err(_) => return Ok(()),
+        };
+        let req = read_frame(&mut recv).await?;
+        let (author, payload) = req.verify()?;
+        // The signer must be the peer we authorized, so an allowed peer
+        // cannot relay a third party's request through its connection.
+        if author.as_bytes() != remote.as_bytes() {
+            tracing::warn!(peer = %hex, "dropping frame signed by a different key");
+            continue;
+        }
+        let reply = match payload {
+            Payload::SegmentPublished { part, seq, epoch } => {
+                service.segment_published(&part, seq, epoch);
+                None
+            }
+            Payload::LeaseRequest { part, requester } => {
+                Some(service.lease_requested(&part, requester))
+            }
+            Payload::Ping { .. } => Some(Payload::Pong {
+                node_id: service.node_id(),
+            }),
+            Payload::Pong { .. } | Payload::LeaseHandoff { .. } => None,
+        };
+        if let Some(reply) = reply {
+            let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
+            write_frame(&mut send, &signed).await?;
+        }
+        let _ = send.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A recording [`PeerService`] so tests can assert what the endpoint
+    /// dispatched.
+    #[derive(Default)]
+    struct Recorder {
+        segments: Mutex<Vec<(String, u64, u64)>>,
+        lease_asks: Mutex<Vec<(String, u64)>>,
+        /// What to answer a lease request with.
+        release: bool,
+    }
+
+    impl PeerService for Recorder {
+        fn segment_published(&self, part: &str, seq: u64, epoch: u64) {
+            self.segments
+                .lock()
+                .unwrap()
+                .push((part.to_string(), seq, epoch));
+        }
+        fn lease_requested(&self, part: &str, requester: u64) -> Payload {
+            self.lease_asks
+                .lock()
+                .unwrap()
+                .push((part.to_string(), requester));
+            Payload::LeaseHandoff {
+                part: part.to_string(),
+                epoch: 5,
+                released: self.release,
+            }
+        }
+        fn node_id(&self) -> u64 {
+            7
+        }
+    }
+
+    async fn pair(release: bool) -> (Peers, Peers, Arc<Recorder>) {
+        let topic = crate::topic_for(Some(&[3u8; 32]), "fs");
+        let a = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let b = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let (a_key, b_key) = (a.pubkey_hex(), b.pubkey_hex());
+        let (a_addr, b_addr) = (a.addr(), b.addr());
+        let holder = Peers::new(a, 1);
+        let asker = Peers::new(b, 2);
+        // Each side enrolls the other, as the registry would.
+        holder.refresh_registry(vec![
+            (1, a_key.clone(), serde_json::to_value(&a_addr).unwrap()),
+            (2, b_key.clone(), serde_json::to_value(&b_addr).unwrap()),
+        ]);
+        asker.refresh_registry(vec![
+            (1, a_key, serde_json::to_value(&a_addr).unwrap()),
+            (2, b_key, serde_json::to_value(&b_addr).unwrap()),
+        ]);
+        let service = Arc::new(Recorder {
+            release,
+            ..Default::default()
+        });
+        let serving = holder.clone();
+        let svc = service.clone();
+        tokio::spawn(async move { serving.serve(svc).await });
+        (holder, asker, service)
+    }
+
+    /// The disabled handle must be safe to call everywhere, so the
+    /// daemon needs no `if p2p` branches and `CONSTELLATION_P2P=off`
+    /// cannot change behaviour beyond losing the speedup.
+    #[tokio::test]
+    async fn disabled_handle_is_inert() {
+        let p = Peers::disabled();
+        assert!(!p.is_enabled());
+        assert!(p.node_addr().is_none());
+        assert!(p.pubkey_hex().is_none());
+        assert!(p.snapshot().is_empty());
+        p.refresh_registry(vec![(1, "aa".into(), serde_json::json!({}))]);
+        p.announce_segment("p0", 1, 1).await;
+        assert!(
+            !p.request_lease("p0").await,
+            "no fast path means the caller must use S3"
+        );
+    }
+
+    /// The end-to-end fast path: the asker's request reaches the holder's
+    /// service and a release turns into "claim now".
+    #[tokio::test]
+    async fn lease_request_reaches_the_holder_and_releases() {
+        let (_holder, asker, service) = pair(true).await;
+        assert!(
+            asker.request_lease("p0").await,
+            "a released lease must tell the caller to CAS now"
+        );
+        assert_eq!(
+            service.lease_asks.lock().unwrap().as_slice(),
+            [("p0".to_string(), 2)]
+        );
+        // RTT is recorded for status output.
+        let peer = asker
+            .snapshot()
+            .into_iter()
+            .find(|p| p.node_id == 1)
+            .unwrap();
+        assert!(peer.connected && peer.rtt_ms.is_some());
+    }
+
+    /// A holder that declines must leave the caller on the S3 path.
+    #[tokio::test]
+    async fn declined_lease_request_keeps_the_caller_waiting() {
+        let (_holder, asker, service) = pair(false).await;
+        assert!(!asker.request_lease("p0").await);
+        assert_eq!(service.lease_asks.lock().unwrap().len(), 1);
+    }
+
+    /// A peer that is not enrolled in the registry must be refused even
+    /// though it can reach us: enrolment requires bucket write, so IAM
+    /// stays the trust root.
+    #[tokio::test]
+    async fn unenrolled_peer_is_refused() {
+        let topic = crate::topic_for(Some(&[4u8; 32]), "fs");
+        let holder_p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let holder_addr = holder_p2p.addr();
+        let holder_key = holder_p2p.pubkey_hex();
+        let holder = Peers::new(holder_p2p, 1);
+        // Registry contains only the holder: the stranger is unknown.
+        holder.refresh_registry(vec![(
+            1,
+            holder_key.clone(),
+            serde_json::to_value(&holder_addr).unwrap(),
+        )]);
+        let service = Arc::new(Recorder {
+            release: true,
+            ..Default::default()
+        });
+        let serving = holder.clone();
+        let svc = service.clone();
+        tokio::spawn(async move { serving.serve(svc).await });
+
+        let stranger_p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let stranger_addr = stranger_p2p.addr();
+        let stranger = Peers::new(stranger_p2p, 9);
+        stranger.refresh_registry(vec![
+            (1, holder_key, serde_json::to_value(&holder_addr).unwrap()),
+            (
+                9,
+                "ff".repeat(32),
+                serde_json::to_value(&stranger_addr).unwrap(),
+            ),
+        ]);
+        assert!(
+            !stranger.request_lease("p0").await,
+            "an unenrolled peer must not get a handoff"
+        );
+        assert!(
+            service.lease_asks.lock().unwrap().is_empty(),
+            "the request must never reach the service"
+        );
+    }
+
+    /// Refreshing the registry must not list ourselves as a peer (we
+    /// would otherwise dial our own endpoint on every lease wait) while
+    /// still enrolling our own key so peers accept us.
+    #[tokio::test]
+    async fn refresh_excludes_self_but_enrolls_own_key() {
+        let topic = crate::topic_for(Some(&[5u8; 32]), "fs");
+        let p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let (own_key, own_addr) = (p2p.pubkey_hex(), p2p.addr());
+        let peers = Peers::new(p2p, 1);
+        peers.refresh_registry(vec![(
+            1,
+            own_key.clone(),
+            serde_json::to_value(&own_addr).unwrap(),
+        )]);
+        assert!(peers.snapshot().is_empty(), "must not dial ourselves");
+        assert!(!peers.request_lease("p0").await, "nobody else to ask");
+    }
+
+    /// A registry record whose address will not parse must not drop the
+    /// peer from the allowlist: it can still dial us even if we cannot
+    /// dial it.
+    #[tokio::test]
+    async fn unparseable_peer_address_is_skipped_but_still_allowed() {
+        let topic = crate::topic_for(Some(&[6u8; 32]), "fs");
+        let p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let own = p2p.pubkey_hex();
+        let peers = Peers::new(p2p, 1);
+        let other = "cc".repeat(32);
+        peers.refresh_registry(vec![
+            (1, own, serde_json::json!({})),
+            (2, other.clone(), serde_json::json!("not-an-addr")),
+        ]);
+        assert!(peers.snapshot().is_empty(), "undialable peer is not listed");
+        assert_eq!(
+            peers.inner.as_ref().unwrap().p2p.check(&other),
+            Decision::Accept,
+            "but it stays enrolled so it may dial us"
+        );
+    }
+}

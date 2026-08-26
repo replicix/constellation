@@ -512,6 +512,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "blake3",
+ "futures-lite",
  "iroh",
  "iroh-gossip",
  "serde",
@@ -529,6 +530,7 @@ dependencies = [
  "constellation-fs-core",
  "futures",
  "object_store",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "tempfile",

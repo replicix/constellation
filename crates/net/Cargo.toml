@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+futures-lite = "2.6.1"
 iroh.workspace = true
 iroh-gossip.workspace = true
 serde.workspace = true

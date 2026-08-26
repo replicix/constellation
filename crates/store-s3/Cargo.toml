@@ -10,6 +10,7 @@ constellation-fs-core.workspace = true
 bytes.workspace = true
 futures.workspace = true
 object_store.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
