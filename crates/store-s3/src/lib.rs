@@ -15,6 +15,6 @@ pub mod store;
 pub use codec::{Codec, CompressionSetting};
 pub use error::StoreError;
 pub use lease::{Lease, LeaseMode, LeaseStore, LeaseTag};
-pub use log::LogStore;
-pub use nodes::claim_node_id;
+pub use log::{CheckpointVector, LogStore};
+pub use nodes::{claim_node_id, list_node_ids};
 pub use store::{Capabilities, ChunkStore, FsMeta};

@@ -208,6 +208,28 @@ exactly B's namespace). `Client::pause()`/`resume()` wrap
 `SIGSTOP`/`SIGCONT`; querying the control socket is done *before*
 pausing, since a stopped daemon cannot answer it.
 
+M3.2 scenarios exercise the partition map (DESIGN.md §4):
+`partition-split` (two nodes, one FS; `CONSTELLATION_PART_SPLIT_OPS`
+is lowered so node A hammering `/hot` produces a child partition
+visible on the control API `partitions` list; both nodes'
+trees are model-verified; then `/hot` goes idle under a small
+`CONSTELLATION_PART_MERGE_IDLE_S` and the child merges back to `p0`
+with continued correctness) and `rename-across-partitions` (same low
+split threshold, then files/dirs renamed between `/hot` and `/cold`
+from both nodes — serialized by the two leases — model-verified;
+a `kill9` of the renamer between operations, remount, and a further
+cross-partition rename prove recovery, including the abort rule for
+a durable `RenameXpartSrc` whose dst half never appears). A
+single-node filesystem never splits (the heuristic requires ≥2
+registered nodes).
+
+**Both scenarios tune the policy through the environment, and the
+daemon reads those variables from its own environment.** Never export
+`CONSTELLATION_PART_*` into the shell that runs the harness: every
+other scenario inherits them, and a tiny split threshold makes
+otherwise-unrelated scenarios (`lease-handover`, which assumes a
+single partition) split and fail in confusing ways.
+
 Requires docker + fusermount3 + a release binary on the host
 (`CONSTELLATION_BIN` overrides discovery). Containers are labeled
 `constellation-harness=1` and removed on drop, even when a scenario

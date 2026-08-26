@@ -215,7 +215,6 @@ impl Client {
         Ok(())
     }
 
-    /// Query the daemon's control socket (`status`).
     pub fn control_status(&self) -> Result<serde_json::Value> {
         use std::io::{BufRead, BufReader, Write};
         use std::time::Duration;

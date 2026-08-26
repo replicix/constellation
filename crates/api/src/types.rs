@@ -29,8 +29,22 @@ pub struct StatusReport {
     pub uptime_s: u64,
     pub spool: SpoolStatus,
     pub cache: CacheStatus,
-    /// Write authority for the (single, phase-3) partition.
+    /// Write authority for the genesis partition (p0). Kept for
+    /// backward-compatible `status` consumers; per-partition detail is
+    /// in [`StatusReport::partitions`].
     #[serde(default)]
+    pub lease: LeaseStatus,
+    /// Partition map + per-partition lease (M3.2). Empty on pre-partition
+    /// daemons (serde default).
+    #[serde(default)]
+    pub partitions: Vec<PartitionStatus>,
+}
+
+/// One partition as exposed by the control API.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PartitionStatus {
+    pub id: String,
+    pub root_path: String,
     pub lease: LeaseStatus,
 }
 

@@ -267,7 +267,14 @@ fn mount(
         ),
         node_id,
     );
-    let lease_view = keeper.view();
+    let lease_views = std::sync::Arc::new(std::sync::Mutex::new({
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            constellation_store_s3::log::PARTITION.to_string(),
+            keeper.view(),
+        );
+        m
+    }));
     // A mutation waits at most ~2 TTLs for a foreign holder to release
     // or expire before failing with EIO.
     let acquire_deadline = std::time::Duration::from_millis(2 * keeper.ttl_ms());
@@ -278,7 +285,7 @@ fn mount(
     let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel::<fusefs::SyncRequest>();
     let fs = fusefs::ConstellationFs::new(
         meta.clone(),
-        store,
+        store.clone(),
         cache.clone(),
         rt.handle().clone(),
         fsmeta.chunk_size,
@@ -286,7 +293,7 @@ fn mount(
         Some(fusefs::SyncHandle {
             tx: sync_tx,
             fsync_s3,
-            lease: lease_view.clone(),
+            leases: lease_views.clone(),
             acquire_deadline,
         }),
     );
@@ -297,23 +304,29 @@ fn mount(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(500);
-    let ship = shipper::Shipper::attach(meta.clone(), log, node_id)?;
+    let ship = shipper::Shipper::attach_with_mode(meta.clone(), log, node_id, lease_mode)?;
     let spool = ship.spool.clone();
     let mut ship = ship;
     let mut keeper = keeper;
-    // First mount of a brand-new filesystem: adopt the mounting user as
-    // owner of the root directory (the DB bootstraps it as 0:0). This is
-    // a namespace mutation, so it goes through the lease like any other
-    // — otherwise two nodes bootstrapping the same empty log would both
-    // journal it and collide.
     rt.block_on(adopt_root(&meta, &mut ship, &mut keeper))
         .context("adopting the root directory owner")?;
     let ship = std::sync::Arc::new(tokio::sync::Mutex::new(ship));
-    let keeper = std::sync::Arc::new(tokio::sync::Mutex::new(keeper));
+    let keepers = std::sync::Arc::new(tokio::sync::Mutex::new({
+        let mut m = std::collections::HashMap::new();
+        m.insert(constellation_store_s3::log::PARTITION.to_string(), keeper);
+        m
+    }));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        let (ship, stop, spool, keeper) =
-            (ship.clone(), stop.clone(), spool.clone(), keeper.clone());
+        let (ship, stop, spool, keepers, lease_views, store_inner, lease_mode) = (
+            ship.clone(),
+            stop.clone(),
+            spool.clone(),
+            keepers.clone(),
+            lease_views.clone(),
+            store.inner().clone(),
+            lease_mode,
+        );
         rt.spawn(async move {
             let mut pending: Option<fusefs::SyncRequest> = None;
             loop {
@@ -331,21 +344,31 @@ fn mount(
                         _ = tokio::time::sleep(std::time::Duration::from_millis(interval_ms)) => None,
                     }
                 };
-                // Acquire must preempt an in-flight ship/renew: object_store
-                // retries last minutes when S3 is unreachable, and a FUSE
-                // thread is blocked on the oneshot until we answer.
                 match request {
-                    Some(fusefs::SyncRequest::Acquire(reply)) => {
+                    Some(fusefs::SyncRequest::Acquire { part, reply }) => {
                         let mut ship = ship.lock().await;
-                        let mut keeper = keeper.lock().await;
-                        let r = shipper::acquire_lease(&mut ship, &mut keeper).await;
+                        let mut keepers = keepers.lock().await;
+                        if !keepers.contains_key(&part) {
+                            let k = lease::LeaseKeeper::new(
+                                constellation_store_s3::LeaseStore::new(
+                                    store_inner.clone(),
+                                    &part,
+                                    lease_mode,
+                                ),
+                                node_id,
+                            );
+                            lease_views.lock().unwrap().insert(part.clone(), k.view());
+                            keepers.insert(part.clone(), k);
+                        }
+                        let keeper = keepers.get_mut(&part).unwrap();
+                        let r = shipper::acquire_lease_for(&mut ship, keeper, &part).await;
                         if let Err(e) = &r {
-                            tracing::warn!(error = %e, "lease acquisition failed");
+                            tracing::warn!(error = %e, part, "lease acquisition failed");
                         }
                         let _ = reply.send(r.map_err(|e| format!("{e:#}")));
                     }
                     Some(fusefs::SyncRequest::Barrier(reply)) => {
-                        let r = run_sync_round(&ship, &keeper).await;
+                        let r = run_sync_round(&ship, &keepers).await;
                         if let Err(e) = &r {
                             tracing::warn!(error = %e, "metadata sync failed; will retry");
                             spool.lock().unwrap().last_error = Some(format!("{e:#}"));
@@ -358,7 +381,7 @@ fn mount(
                             msg = sync_rx.recv() => {
                                 pending = msg;
                             }
-                            r = run_sync_round(&ship, &keeper) => {
+                            r = run_sync_round(&ship, &keepers) => {
                                 if let Err(e) = r {
                                     tracing::warn!(
                                         error = %e,
@@ -376,10 +399,10 @@ fn mount(
 
     // Control API on <state_dir>/control.sock (spool + cache status).
     let status = std::sync::Arc::new(DaemonStatus {
-        meta,
+        meta: meta.clone(),
         cache,
         spool,
-        lease: lease_view,
+        leases: lease_views,
         fs_uuid: fsmeta.uuid.to_string(),
         backend: s3.to_string(),
         mountpoint: mountpoint.display().to_string(),
@@ -408,9 +431,11 @@ fn mount(
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let flush = rt.block_on(async {
         let mut ship = ship.lock().await;
-        let mut keeper = keeper.lock().await;
-        let r = ship.shutdown(&keeper).await;
-        keeper.release().await?;
+        let mut keepers = keepers.lock().await;
+        let r = ship.shutdown_all(&mut keepers).await;
+        for k in keepers.values_mut() {
+            k.release().await?;
+        }
         r
     });
     flush.context("final log flush")?;
@@ -419,22 +444,33 @@ fn mount(
 
 async fn run_sync_round(
     ship: &std::sync::Arc<tokio::sync::Mutex<shipper::Shipper>>,
-    keeper: &std::sync::Arc<tokio::sync::Mutex<lease::LeaseKeeper>>,
+    keepers: &std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, lease::LeaseKeeper>>,
+    >,
 ) -> Result<()> {
     let mut ship = ship.lock().await;
-    let mut keeper = keeper.lock().await;
-    if keeper.is_lost() {
-        // Deposed: no renew, no release, no shipping. Tailing still
-        // runs so reads stay fresh.
+    let mut keepers = keepers.lock().await;
+    let any_lost = keepers.values().any(|k| k.is_lost());
+    if any_lost
+        && keepers
+            .values()
+            .all(|k| k.is_lost() || k.ship_epoch().is_none())
+    {
         return ship.tail_to_head().await.map(|_| ());
     }
-    keeper.renew_if_due().await?;
-    ship.sync(&keeper).await?;
-    // Cooperative hand-back: without P2P a holder cannot know a peer
-    // is waiting, so it gives the lease up whenever it has been
-    // write-idle with nothing pending. Reacquiring costs one CAS.
-    if keeper.idle_release_due(ship.journal_backlog()) {
-        keeper.release().await?;
+    for k in keepers.values_mut() {
+        if !k.is_lost() {
+            k.renew_if_due().await?;
+        }
+    }
+    ship.sync_all(&mut keepers).await?;
+    for (part, k) in keepers.iter_mut() {
+        if k.is_lost() {
+            continue;
+        }
+        if k.idle_release_due(ship.journal_backlog_of(part)) {
+            k.release().await?;
+        }
     }
     Ok(())
 }
@@ -485,7 +521,9 @@ struct DaemonStatus {
     meta: std::sync::Arc<SqliteMeta>,
     cache: std::sync::Arc<DiskCache>,
     spool: std::sync::Arc<std::sync::Mutex<shipper::SpoolInfo>>,
-    lease: std::sync::Arc<lease::LeaseView>,
+    leases: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<lease::LeaseView>>>,
+    >,
     fs_uuid: String,
     backend: String,
     mountpoint: String,
@@ -497,6 +535,29 @@ impl constellation_api::StatusSource for DaemonStatus {
     fn status(&self) -> constellation_api::StatusReport {
         let spool = self.spool.lock().unwrap().clone();
         let usage = self.cache.usage();
+        // Collect everything that needs the lease map BEFORE building the
+        // report: temporaries created inside a struct literal live until
+        // the whole literal is built, so locking twice in there would
+        // self-deadlock the non-reentrant mutex and hang every caller.
+        let (p0_lease, partitions) = {
+            let views = self.leases.lock().unwrap();
+            let p0 = views
+                .get(constellation_store_s3::log::PARTITION)
+                .map(|v| v.status())
+                .unwrap_or_default();
+            let parts: Vec<constellation_api::PartitionStatus> = self
+                .meta
+                .partitions()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, root)| constellation_api::PartitionStatus {
+                    root_path: self.meta.path_of(root).unwrap_or_else(|_| "/".into()),
+                    lease: views.get(&id).map(|v| v.status()).unwrap_or_default(),
+                    id,
+                })
+                .collect();
+            (p0, parts)
+        };
         constellation_api::StatusReport {
             fs_uuid: self.fs_uuid.clone(),
             backend: self.backend.clone(),
@@ -515,7 +576,8 @@ impl constellation_api::StatusSource for DaemonStatus {
                 budget_bytes: usage.budget,
                 chunks: usage.entries as u64,
             },
-            lease: self.lease.status(),
+            lease: p0_lease,
+            partitions,
         }
     }
 }

@@ -60,6 +60,25 @@ pub async fn claim_node_id(store: Arc<dyn ObjectStore>) -> Result<u64, StoreErro
     }
 }
 
+/// Cluster-unique node ids currently claimed in the registry. Used as a
+/// cheap "is anyone else here?" signal for the split heuristic (a
+/// single-node filesystem must never split).
+pub async fn list_node_ids(store: Arc<dyn ObjectStore>) -> Result<Vec<u64>, StoreError> {
+    let prefix = object_store::path::Path::from("nodes");
+    let mut ids: Vec<u64> = store
+        .list(Some(&prefix))
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .filter_map(|m| {
+            let name = m.location.filename()?.strip_suffix(".json")?.to_string();
+            u64::from_str_radix(&name, 16).ok()
+        })
+        .collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
 fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())

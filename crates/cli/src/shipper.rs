@@ -22,14 +22,32 @@ use crate::lease::{LeaseKeeper, TailedToHead};
 use anyhow::{bail, Context, Result};
 use constellation_meta::replay::TouchSet;
 use constellation_meta::{LogRecord, MetaStore, SqliteMeta};
-use constellation_store_s3::LogStore;
+use constellation_store_s3::log::{CheckpointVector, PARTITION};
+use constellation_store_s3::{LeaseMode, LeaseStore, LogStore};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
-/// Checkpoint after this many shipped segments.
+/// Checkpoint after this many shipped segments (across all partitions).
 const CHECKPOINT_EVERY: u64 = 32;
 /// Max journal records per segment.
 const SEGMENT_BATCH: usize = 10_000;
+
+pub fn part_split_ops() -> u64 {
+    std::env::var("CONSTELLATION_PART_SPLIT_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(512)
+}
+
+pub fn part_merge_idle_s() -> u64 {
+    std::env::var("CONSTELLATION_PART_MERGE_IDLE_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600)
+}
 
 /// What one log segment holds: its origin node, the lease epoch under
 /// which it was written, and a batch of records. Versioned; old bare
@@ -79,13 +97,49 @@ pub struct Shipper {
     meta: Arc<SqliteMeta>,
     log: LogStore,
     node_id: u64,
-    /// Next sequence number not yet seen (neither shipped nor tailed).
-    next_seq: u64,
-    /// Highest lease epoch observed in an applied segment: the fence.
-    max_epoch: u64,
+    lease_mode: LeaseMode,
+    /// Per-partition stream state (next_seq, max_epoch, log handle).
+    parts: HashMap<String, PartState>,
     shipped_since_ckpt: u64,
     /// Live spool observability shared with the control API.
     pub spool: Arc<std::sync::Mutex<SpoolInfo>>,
+    /// Per-directory write-op counts used by the split heuristic.
+    /// Keyed by the directory inode under a partition root.
+    dir_ops: HashMap<u64, DirTraffic>,
+    last_ship_at: HashMap<String, Instant>,
+}
+
+struct PartState {
+    log: LogStore,
+    next_seq: u64,
+    max_epoch: u64,
+}
+
+/// Write-op traffic for one directory, accumulated over an unbroken run
+/// of shipped segments (DESIGN.md §4 / plan 01: "sustains more than
+/// `CONSTELLATION_PART_SPLIT_OPS` records across at least two
+/// consecutive shipped segments").
+///
+/// Two properties matter and both are load-bearing:
+///
+/// * Counting per *segment* would make the policy a function of segment
+///   batching — and therefore of the sync interval — rather than of real
+///   traffic: a busy directory written one file at a time ships many
+///   2-record segments and would never reach the threshold. So records
+///   accumulate across segments.
+/// * The run must be **consecutive**. A lifetime total would eventually
+///   split every directory that is merely long-lived, since any write
+///   ever seen would still count. A directory that goes quiet — even
+///   briefly, as any bursty workload does — starts over.
+#[derive(Default)]
+struct DirTraffic {
+    /// Records seen for this directory during the current unbroken run.
+    ops: u64,
+    /// How many consecutive shipped segments the run spans.
+    segments: u64,
+    /// True once the run is both wide enough (≥2 segments, so a single
+    /// burst never carves a partition) and heavy enough.
+    armed: bool,
 }
 
 /// Snapshot of sync progress (updated on every sync attempt).
@@ -104,95 +158,211 @@ impl Shipper {
     /// Attach to an existing local replica. `applied_seq` is the log
     /// position the replica covers (from the local kv store); segments
     /// beyond it are tailed on the first `sync`.
+    #[allow(dead_code)]
     pub fn attach(meta: Arc<SqliteMeta>, log: LogStore, node_id: u64) -> Result<Self> {
-        let applied = meta.applied_seq()?;
+        Self::attach_with_mode(meta, log, node_id, LeaseMode::Cas)
+    }
+
+    pub fn attach_with_mode(
+        meta: Arc<SqliteMeta>,
+        log: LogStore,
+        node_id: u64,
+        lease_mode: LeaseMode,
+    ) -> Result<Self> {
+        let mut parts = HashMap::new();
+        let mut head = 0u64;
+        for (id, _) in meta.partitions()? {
+            let applied = meta.applied_seq_of(&id)?;
+            head = head.max(applied);
+            parts.insert(
+                id.clone(),
+                PartState {
+                    log: log.with_partition(&id),
+                    next_seq: applied + 1,
+                    max_epoch: 0,
+                },
+            );
+        }
+        if parts.is_empty() {
+            let applied = meta.applied_seq()?;
+            head = applied;
+            parts.insert(
+                PARTITION.into(),
+                PartState {
+                    log: log.with_partition(PARTITION),
+                    next_seq: applied + 1,
+                    max_epoch: 0,
+                },
+            );
+        }
         Ok(Self {
             meta,
             log,
             node_id,
-            next_seq: applied + 1,
-            max_epoch: 0,
+            lease_mode,
+            parts,
             shipped_since_ckpt: 0,
             spool: Arc::new(std::sync::Mutex::new(SpoolInfo {
-                head_seq: applied,
+                head_seq: head,
                 ..Default::default()
             })),
+            dir_ops: HashMap::new(),
+            last_ship_at: HashMap::new(),
         })
     }
 
-    /// One full sync round: tail new segments, then ship the journal
-    /// until it drains (re-tailing after every CAS collision).
-    ///
-    /// `lease` gates shipping: without a usable lease the journal simply
-    /// stays put (tailing always proceeds — reads never need authority).
-    pub async fn sync(&mut self, lease: &LeaseKeeper) -> Result<()> {
+    fn ensure_part(&mut self, id: &str) {
+        if self.parts.contains_key(id) {
+            return;
+        }
+        let applied = self.meta.applied_seq_of(id).unwrap_or(0);
+        self.parts.insert(
+            id.to_string(),
+            PartState {
+                log: self.log.with_partition(id),
+                next_seq: applied + 1,
+                max_epoch: 0,
+            },
+        );
+    }
+
+    /// Compatibility helper used by existing single-partition tests.
+    #[allow(dead_code)]
+    pub fn next_seq(&self) -> u64 {
+        self.parts.get(PARTITION).map(|p| p.next_seq).unwrap_or(1)
+    }
+
+    /// One full sync round: tail every partition, then ship every
+    /// partition's journal until it drains (re-tailing after every CAS
+    /// collision). `leases` is keyed by partition id.
+    pub async fn sync_all(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<()> {
         loop {
-            self.tail().await?;
-            if !self.ship_one(lease).await? {
+            self.tail_all().await?;
+            self.consider_xpart_aborts_all(leases).await?;
+            if !self.ship_all(leases).await? {
+                self.maybe_split_merge(leases).await?;
                 return Ok(());
             }
         }
     }
 
-    /// Tail-only round: applies the shared log up to head and returns
-    /// the witness that makes a lease takeover legal (DESIGN.md §4:
-    /// "takeover is legal only after applying everything the holder
-    /// flushed").
+    /// Single-partition convenience used by existing tests and by the
+    /// FUSE write-gate's default p0 path.
+    pub async fn sync(&mut self, lease: &LeaseKeeper) -> Result<()> {
+        self.sync_one(PARTITION, lease).await
+    }
+
+    pub async fn sync_one(&mut self, part: &str, lease: &LeaseKeeper) -> Result<()> {
+        loop {
+            self.tail_part(part).await?;
+            self.consider_xpart_aborts(part, lease).await?;
+            if !self.ship_part(part, lease).await? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Tail-only round over every known partition.
     pub async fn tail_to_head(&mut self) -> Result<TailedToHead> {
-        self.tail().await?;
+        self.tail_all().await?;
         Ok(TailedToHead::witness())
     }
 
-    /// Apply all segments at `next_seq..` (contiguous run only: a gap
-    /// means a concurrent LIST raced a PUT; the next round gets it).
-    async fn tail(&mut self) -> Result<()> {
-        let seqs = self.log.list_segments_from(self.next_seq).await?;
-        for seq in seqs {
-            if seq != self.next_seq {
+    pub async fn tail_part_to_head(&mut self, part: &str) -> Result<TailedToHead> {
+        self.tail_part(part).await?;
+        Ok(TailedToHead::witness())
+    }
+
+    /// Tail every known partition. Applying a `part_split` can reveal a
+    /// partition we did not know about, so this repeats until no new
+    /// stream appears — otherwise `tail_to_head` would return while a
+    /// freshly discovered child stream was still unread, which matters
+    /// because lease takeover uses it as the "I have seen everything"
+    /// witness.
+    async fn tail_all(&mut self) -> Result<()> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let mut ids: Vec<String> = self.parts.keys().cloned().collect();
+            for (id, _) in self.meta.partitions()? {
+                if !ids.iter().any(|x| x == &id) {
+                    ids.push(id);
+                }
+            }
+            let todo: Vec<String> = ids.into_iter().filter(|id| !seen.contains(id)).collect();
+            if todo.is_empty() {
+                return Ok(());
+            }
+            for id in todo {
+                self.ensure_part(&id);
+                self.tail_part(&id).await?;
+                seen.insert(id);
+            }
+        }
+    }
+
+    async fn tail_part(&mut self, part: &str) -> Result<()> {
+        self.ensure_part(part);
+        loop {
+            let next = self.parts[part].next_seq;
+            let seqs = self.parts[part].log.list_segments_from(next).await?;
+            let mut progressed = false;
+            for seq in seqs {
+                if seq != self.parts[part].next_seq {
+                    break;
+                }
+                self.apply_segment(part, seq).await?;
+                progressed = true;
+            }
+            if !progressed {
                 break;
             }
-            self.apply_segment(seq).await?;
         }
         Ok(())
     }
 
-    async fn apply_segment(&mut self, seq: u64) -> Result<()> {
-        let seg = decode(&self.log.get_segment(seq).await?)?;
+    async fn apply_segment(&mut self, part: &str, seq: u64) -> Result<()> {
+        let payload = {
+            let log = &self.parts[part].log;
+            log.get_segment(seq).await?
+        };
+        let seg = decode(&payload)?;
         if seg.node == self.node_id {
-            // Our own segment from a previous life: the PUT succeeded
-            // but the response (or the ack) was lost. The journal head
-            // must match; ack it instead of re-applying.
-            let journal = self.meta.take_journal(seg.records.len())?;
+            let grouped = self.meta.take_journal_grouped(seg.records.len())?;
+            let journal = grouped
+                .into_iter()
+                .find(|(p, _)| p == part)
+                .map(|(_, r)| r)
+                .unwrap_or_default();
             let matches = journal.len() == seg.records.len()
                 && journal.iter().map(|(_, r)| r).eq(seg.records.iter());
             if !matches {
                 bail!(
-                    "segment {seq} claims our node id {} but does not match \
+                    "segment {seq} of {part} claims our node id {} but does not match \
                      the journal head: state dir reuse or id collision",
                     self.node_id
                 );
             }
-            self.meta.ack_journal_at(journal.last().unwrap().0, seq)?;
+            let seqs: Vec<u64> = journal.iter().map(|(s, _)| *s).collect();
+            self.meta.ack_journal_rows_at(&seqs, part, seq)?;
+            self.note_xpart_shipped(&seg.records)?;
             tracing::info!(
                 seq,
+                part,
                 records = seg.records.len(),
                 "recovered unacked segment"
             );
-        } else if seg.epoch > 0 && seg.epoch < self.max_epoch {
-            // A deposed holder flushed after losing the lease. The
-            // sequence CAS stops most of this; the epoch catches the
-            // rest. Skipping is the only safe choice: the current holder
-            // built its state without these records.
+        } else if seg.epoch > 0 && seg.epoch < self.parts[part].max_epoch {
             self.spool.lock().unwrap().fenced += 1;
             tracing::error!(
                 seq,
+                part,
                 node = seg.node,
                 epoch = seg.epoch,
-                max_epoch = self.max_epoch,
+                max_epoch = self.parts[part].max_epoch,
                 records = seg.records.len(),
                 "FENCING VIOLATION: segment from a superseded lease epoch; skipping"
             );
-            self.meta.set_applied_seq(seq)?;
+            self.meta.set_applied_seq_of(part, seq)?;
         } else {
             let pending =
                 TouchSet::from_records(self.meta.take_journal(usize::MAX)?.iter().map(|(_, r)| r));
@@ -202,53 +372,113 @@ impl Shipper {
             }
             tracing::debug!(
                 seq,
+                part,
                 node = seg.node,
                 epoch = seg.epoch,
                 records = seg.records.len(),
                 skipped,
                 "applied foreign segment"
             );
-            self.meta.set_applied_seq(seq)?;
+            self.meta.set_applied_seq_of(part, seq)?;
+            self.note_policy_records(&seg.records);
+            self.last_ship_at.insert(part.to_string(), Instant::now());
         }
-        self.max_epoch = self.max_epoch.max(seg.epoch);
-        self.advance(seq);
+        let st = self.parts.get_mut(part).unwrap();
+        st.max_epoch = st.max_epoch.max(seg.epoch);
+        st.next_seq = seq + 1;
+        {
+            let mut spool = self.spool.lock().unwrap();
+            spool.head_seq = spool.head_seq.max(seq);
+            spool.last_error = None;
+        }
+        // A split record may have introduced a new partition.
+        for (id, _) in self.meta.partitions()? {
+            self.ensure_part(&id);
+        }
         Ok(())
     }
 
-    /// Ship one journal batch at `next_seq`. Returns true if another
+    /// Ship every partition that has journaled records. A partition
+    /// without a lease keeper yet gets one created and acquired here:
+    /// keepers are otherwise only made by the FUSE write gate, so a
+    /// daemon that restarted with a stranded child-partition journal
+    /// would never ship it.
+    async fn ship_all(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<bool> {
+        let grouped = self.meta.take_journal_grouped(SEGMENT_BATCH)?;
+        if grouped.is_empty() {
+            return Ok(false);
+        }
+        let mut more = false;
+        for (part, _batch) in grouped {
+            self.ensure_part(&part);
+            if !leases.contains_key(&part) {
+                let mut keeper = LeaseKeeper::new(
+                    LeaseStore::new(self.log.inner(), &part, self.lease_mode),
+                    self.node_id,
+                );
+                match acquire_lease_for(self, &mut keeper, &part).await {
+                    Ok(true) => {
+                        leases.insert(part.clone(), keeper);
+                    }
+                    // A live foreign holder: leave the records journaled
+                    // and retry next round.
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::warn!(error = %e, part, "lease acquisition for pending journal failed");
+                        continue;
+                    }
+                }
+            }
+            let Some(lease) = leases.get(&part) else {
+                continue;
+            };
+            if self.ship_part(&part, lease).await? {
+                more = true;
+            }
+        }
+        Ok(more)
+    }
+
+    /// Ship one journal batch for `part`. Returns true if another
     /// round is needed (more records pending, or a CAS collision).
-    async fn ship_one(&mut self, lease: &LeaseKeeper) -> Result<bool> {
+    async fn ship_part(&mut self, part: &str, lease: &LeaseKeeper) -> Result<bool> {
         let Some(epoch) = lease.ship_epoch() else {
-            // No write authority: the journal waits. Deposed nodes stay
-            // here forever by design (phase-4 reintegration).
             return Ok(false);
         };
-        let batch = self.meta.take_journal(SEGMENT_BATCH)?;
+        let grouped = self.meta.take_journal_grouped(SEGMENT_BATCH)?;
+        let Some((_, batch)) = grouped.into_iter().find(|(p, _)| p == part) else {
+            return Ok(false);
+        };
         if batch.is_empty() {
             return Ok(false);
         }
         let records: Vec<LogRecord> = batch.iter().map(|(_, r)| r.clone()).collect();
         let payload = encode(self.node_id, epoch, &records)?;
-        match self.log.put_segment(self.next_seq, &payload).await {
+        let next_seq = self.parts[part].next_seq;
+        match self.parts[part].log.put_segment(next_seq, &payload).await {
             Ok(()) => {}
-            Err(constellation_store_s3::StoreError::AlreadyExists) => {
-                // Lost the race for this sequence number (or our own
-                // earlier PUT's response was lost). The next round's
-                // tail applies whatever is there and re-ships.
-                return Ok(true);
-            }
+            Err(constellation_store_s3::StoreError::AlreadyExists) => return Ok(true),
             Err(e) => return Err(e).context("shipping log segment"),
         }
-        self.meta
-            .ack_journal_at(batch.last().unwrap().0, self.next_seq)?;
+        let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+        self.meta.ack_journal_rows_at(&seqs, part, next_seq)?;
         tracing::debug!(
-            seq = self.next_seq,
+            seq = next_seq,
+            part,
             epoch,
             records = records.len(),
             "shipped log segment"
         );
-        self.max_epoch = self.max_epoch.max(epoch);
-        self.advance(self.next_seq);
+        self.note_xpart_shipped(&records)?;
+        self.note_shipped(part, &records);
+        let st = self.parts.get_mut(part).unwrap();
+        st.max_epoch = st.max_epoch.max(epoch);
+        st.next_seq = next_seq + 1;
+        {
+            let mut spool = self.spool.lock().unwrap();
+            spool.head_seq = spool.head_seq.max(next_seq);
+            spool.last_error = None;
+        }
         self.shipped_since_ckpt += 1;
         if self.shipped_since_ckpt >= CHECKPOINT_EVERY {
             self.checkpoint().await?;
@@ -256,34 +486,209 @@ impl Shipper {
         Ok(true)
     }
 
-    fn advance(&mut self, seq: u64) {
-        {
-            let mut spool = self.spool.lock().unwrap();
-            spool.head_seq = seq;
-            spool.last_error = None;
+    fn note_shipped(&mut self, part: &str, records: &[LogRecord]) {
+        self.last_ship_at.insert(part.to_string(), Instant::now());
+        // A directory that already is a partition root cannot split
+        // again, so its traffic is not worth tracking.
+        let roots: std::collections::HashSet<u64> = self
+            .meta
+            .partitions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, root)| root)
+            .collect();
+        let mut touched: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for rec in records {
+            if let Some(dir) = self.traffic_dir_of(rec) {
+                if roots.contains(&dir) {
+                    continue;
+                }
+                self.dir_ops.entry(dir).or_default().ops += 1;
+                touched.insert(dir);
+            }
         }
-        self.next_seq = seq + 1;
+        let thresh = part_split_ops();
+        self.dir_ops.retain(|ino, t| {
+            if roots.contains(ino) {
+                return false;
+            }
+            if touched.contains(ino) {
+                t.segments += 1;
+                t.armed = t.segments >= 2 && t.ops >= thresh;
+                return true;
+            }
+            // Not in this segment: the run is broken. Keep only an
+            // already-armed candidate, whose split is journaled on a
+            // later round (typically a segment with no traffic for it).
+            t.armed
+        });
     }
 
-    /// Snapshot the local DB as a checkpoint covering the log up to the
-    /// last sequence this replica has seen.
+    /// Which directory a record's traffic is attributed to. Records that
+    /// name an inode rather than a parent (`setattr`, `write_manifest` —
+    /// the bulk of a file write) are attributed to that inode's parent
+    /// directory, otherwise a file-heavy directory would never accumulate
+    /// traffic against itself.
+    fn traffic_dir_of(&self, rec: &LogRecord) -> Option<u64> {
+        match rec {
+            LogRecord::Mkdir { parent, .. }
+            | LogRecord::Create { parent, .. }
+            | LogRecord::Symlink { parent, .. }
+            | LogRecord::Mknod { parent, .. }
+            | LogRecord::Link { parent, .. }
+            | LogRecord::Unlink { parent, .. }
+            | LogRecord::Rmdir { parent, .. }
+            | LogRecord::Rename { parent, .. } => Some(*parent),
+            LogRecord::Setattr { ino, .. } | LogRecord::WriteManifest { ino, .. } => {
+                self.meta.parent_of(*ino).ok().flatten()
+            }
+            _ => None,
+        }
+    }
+
+    /// After a src/dst/abort half is durable in the log, update the
+    /// local pending table so the holder can abort an orphan src.
+    fn note_xpart_shipped(&self, records: &[LogRecord]) -> Result<()> {
+        for rec in records {
+            match rec {
+                LogRecord::RenameXpartDst { txid, .. } => {
+                    self.meta.mark_xpart_dst(*txid)?;
+                    self.meta.unpark_xpart(*txid)?;
+                }
+                LogRecord::RenameXpartAbort { txid } => {
+                    self.meta.unpark_xpart(*txid)?;
+                }
+                LogRecord::RenameXpartSrc { txid, .. } => {
+                    if self.meta.xpart_dst_seen(*txid)? {
+                        self.meta.unpark_xpart(*txid)?;
+                    } else {
+                        let dst_journaled = self
+                            .meta
+                            .take_journal_grouped(usize::MAX)?
+                            .iter()
+                            .any(|(_, recs)| {
+                                recs.iter().any(|(_, r)| {
+                                    matches!(r, LogRecord::RenameXpartDst { txid: t, .. } if *t == *txid)
+                                })
+                            });
+                        if !dst_journaled {
+                            self.meta.park_xpart(*txid, "src", rec)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn note_policy_records(&mut self, records: &[LogRecord]) {
+        for rec in records {
+            match rec {
+                LogRecord::PartSplit {
+                    new_part, at_ino, ..
+                } => {
+                    self.ensure_part(new_part);
+                    // A partition root cannot itself split again.
+                    self.dir_ops.remove(at_ino);
+                }
+                LogRecord::PartMerge { part, .. } => {
+                    self.parts.remove(part);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A `RenameXpartSrc` whose partner never appears is voided by
+    /// appending `RenameXpartAbort` on the src stream. Only the current
+    /// holder of the src partition may do this, and only after the src
+    /// half is durable (parked) with no dst at the dst stream's head.
+    async fn consider_xpart_aborts(&mut self, held_part: &str, lease: &LeaseKeeper) -> Result<()> {
+        if lease.ship_epoch().is_none() {
+            return Ok(());
+        }
+        let pending = self.meta.pending_xparts()?;
+        for (txid, half, rec) in pending {
+            if half != "src" {
+                continue;
+            }
+            let LogRecord::RenameXpartSrc { part, .. } = rec else {
+                continue;
+            };
+            if part != held_part {
+                continue;
+            }
+            if self.meta.xpart_dst_seen(txid)? {
+                self.meta.unpark_xpart(txid)?;
+                continue;
+            }
+            let has_dst_pending = self
+                .meta
+                .pending_xparts()?
+                .iter()
+                .any(|(t, h, _)| *t == txid && h == "dst");
+            if has_dst_pending {
+                continue;
+            }
+            let has_dst_journaled =
+                self.meta
+                    .take_journal_grouped(usize::MAX)?
+                    .iter()
+                    .any(|(_, recs)| {
+                        recs.iter().any(|(_, r)| {
+                        matches!(r, LogRecord::RenameXpartDst { txid: t, .. } if *t == txid)
+                    })
+                    });
+            if has_dst_journaled {
+                continue;
+            }
+            self.meta
+                .journal_on(&part, &LogRecord::RenameXpartAbort { txid })?;
+            tracing::warn!(txid, part, "aborting orphan rename_xpart src");
+        }
+        Ok(())
+    }
+
+    async fn consider_xpart_aborts_all(
+        &mut self,
+        leases: &HashMap<String, LeaseKeeper>,
+    ) -> Result<()> {
+        for (part, k) in leases {
+            self.consider_xpart_aborts(part, k).await?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot the local DB as a checkpoint covering every partition
+    /// this replica has seen, plus a VECTOR.json sidecar.
     pub async fn checkpoint(&mut self) -> Result<()> {
-        if self.next_seq == 1 {
-            return Ok(()); // nothing seen, nothing to cover
+        let mut vector = CheckpointVector::default();
+        let mut covered = 0u64;
+        for (id, st) in &self.parts {
+            let seq = st.next_seq.saturating_sub(1);
+            vector.applied.insert(id.clone(), seq);
+            covered = covered.max(seq);
+        }
+        if covered == 0 {
+            return Ok(());
         }
         let snap = self.meta.snapshot()?;
-        let covered = self.next_seq - 1;
-        self.log.put_checkpoint(covered, &snap).await?;
+        self.log
+            .put_checkpoint_with_vector(covered, &snap, &vector)
+            .await?;
         self.shipped_since_ckpt = 0;
         tracing::info!(
             seq = covered,
             bytes = snap.len(),
+            parts = vector.applied.len(),
             "wrote metadata checkpoint"
         );
         Ok(())
     }
 
     /// Final sync + checkpoint on clean unmount.
+    #[allow(dead_code)]
     pub async fn shutdown(&mut self, lease: &LeaseKeeper) -> Result<()> {
         self.sync(lease).await?;
         if self.shipped_since_ckpt > 0 {
@@ -292,17 +697,189 @@ impl Shipper {
         Ok(())
     }
 
+    pub async fn shutdown_all(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<()> {
+        self.sync_all(leases).await?;
+        if self.shipped_since_ckpt > 0 {
+            self.checkpoint().await?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub fn journal_backlog(&self) -> u64 {
         MetaStore::journal_len(&*self.meta).unwrap_or(0)
     }
+
+    pub fn journal_backlog_of(&self, part: &str) -> u64 {
+        self.meta
+            .take_journal_grouped(usize::MAX)
+            .ok()
+            .and_then(|g| g.into_iter().find(|(p, _)| p == part))
+            .map(|(_, r)| r.len() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Directories currently over the split threshold (two consecutive
+    /// shipped segments, each ≥ `CONSTELLATION_PART_SPLIT_OPS`).
+    #[allow(dead_code)]
+    pub fn split_candidates(&self) -> Vec<u64> {
+        self.dir_ops
+            .iter()
+            .filter(|(_, t)| t.armed)
+            .map(|(ino, _)| *ino)
+            .collect()
+    }
+
+    async fn maybe_split_merge(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<()> {
+        let might_split = self.dir_ops.values().any(|t| t.armed);
+        let might_merge = self.meta.partitions()?.len() > 1;
+        if !might_split && !might_merge {
+            return Ok(());
+        }
+        // Single-node filesystems must never split (or merge).
+        let nodes = match constellation_store_s3::list_node_ids(self.log.inner()).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "list_node_ids failed; skipping split/merge");
+                return Ok(());
+            }
+        };
+        if nodes.len() < 2 {
+            return Ok(());
+        }
+        if might_split {
+            self.maybe_split(leases).await?;
+        }
+        if might_merge {
+            self.maybe_merge(leases).await?;
+        }
+        Ok(())
+    }
+
+    async fn maybe_split(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<()> {
+        let candidates: Vec<u64> = self
+            .dir_ops
+            .iter()
+            .filter(|(_, t)| t.armed)
+            .map(|(ino, _)| *ino)
+            .collect();
+        for ino in candidates {
+            // Only a *direct* subdirectory of a partition root splits.
+            let Some(parent) = parent_of(&self.meta, ino) else {
+                continue;
+            };
+            let parent_part = self.meta.partition_of(parent)?;
+            let child_part = self.meta.partition_of(ino)?;
+            if parent_part != child_part {
+                continue; // already its own partition
+            }
+            let Some(lease) = leases.get(&parent_part) else {
+                continue;
+            };
+            if lease.ship_epoch().is_none() {
+                continue; // we don't hold the parent
+            }
+            // Refuse to split if this dir is already a partition root.
+            if self.meta.partitions()?.iter().any(|(_, root)| *root == ino) {
+                continue;
+            }
+            let new_part = self.meta.next_part_id()?;
+            let rec = LogRecord::PartSplit {
+                part: parent_part.clone(),
+                at_ino: ino,
+                new_part: new_part.clone(),
+                time_ns: constellation_fs_core::types::now_ns(),
+            };
+            self.meta.journal_on(&parent_part, &rec)?;
+            self.ensure_part(&new_part);
+            self.last_ship_at.insert(new_part.clone(), Instant::now());
+            tracing::info!(part = %parent_part, new_part = %new_part, at_ino = ino, "splitting partition");
+            self.dir_ops.remove(&ino);
+        }
+        Ok(())
+    }
+
+    async fn maybe_merge(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<()> {
+        let idle = std::time::Duration::from_secs(part_merge_idle_s());
+        let parts = self.meta.partitions()?;
+        for (id, root) in parts {
+            if id == PARTITION {
+                continue;
+            }
+            let last = self.last_ship_at.get(&id).copied();
+            let quiet = match last {
+                Some(t) => t.elapsed() >= idle,
+                None => {
+                    // Never shipped on this process; treat as idle only
+                    // if the stream has no records past seq 0 and we
+                    // hold the parent.
+                    self.parts.get(&id).map(|p| p.next_seq <= 1).unwrap_or(true)
+                }
+            };
+            if !quiet {
+                continue;
+            }
+            if self.journal_backlog_of(&id) > 0 {
+                continue;
+            }
+            let parent_ino = parent_of(&self.meta, root).unwrap_or(1);
+            let parent_part = self.meta.partition_of(parent_ino)?;
+            if parent_part == id {
+                continue;
+            }
+            // Holder of the PARENT performs the merge, after taking
+            // the child's lease.
+            let Some(parent_lease) = leases.get(&parent_part) else {
+                continue;
+            };
+            if parent_lease.ship_epoch().is_none() {
+                continue;
+            }
+            // The parent holder must also hold (or find idle) the child
+            // so a live writer on the child cannot race the merge.
+            match leases.get(&id) {
+                Some(child_lease) if child_lease.ship_epoch().is_none() => continue,
+                None => continue,
+                Some(_) => {}
+            }
+            let rec = LogRecord::PartMerge {
+                part: id.clone(),
+                into_part: parent_part.clone(),
+                time_ns: constellation_fs_core::types::now_ns(),
+            };
+            self.meta.journal_on(&parent_part, &rec)?;
+            // Forget this subtree's traffic: it was, by definition, hot
+            // enough to split once. Leaving the run armed would re-split
+            // the directory on the very next round, so a merge could
+            // never settle (split/merge must be hysteretic).
+            self.dir_ops.remove(&root);
+            if let Some(child_log) = self.parts.get(&id) {
+                let _ = child_log.log.seal().await;
+            }
+            tracing::info!(part = %id, into = %parent_part, "merging partition");
+        }
+        Ok(())
+    }
 }
 
-/// Acquire the partition lease if it is free, tailing the shared log to
+fn parent_of(meta: &SqliteMeta, ino: u64) -> Option<u64> {
+    meta.parent_of(ino).ok().flatten()
+}
+
+/// Acquire the lease for `part` if it is free, tailing that stream to
 /// head first when this would be a takeover from another node. Returns
 /// false when a live foreign holder still owns it (the caller waits and
 /// retries). This is the *only* acquisition path, which is what makes
 /// the takeover ordering rule structural.
 pub async fn acquire_lease(ship: &mut Shipper, keeper: &mut LeaseKeeper) -> Result<bool> {
+    acquire_lease_for(ship, keeper, PARTITION).await
+}
+
+pub async fn acquire_lease_for(
+    ship: &mut Shipper,
+    keeper: &mut LeaseKeeper,
+    part: &str,
+) -> Result<bool> {
     let plan = keeper.classify().await?;
     if let crate::lease::Plan::Busy {
         holder,
@@ -312,19 +889,35 @@ pub async fn acquire_lease(ship: &mut Shipper, keeper: &mut LeaseKeeper) -> Resu
         tracing::debug!(
             holder,
             expires_in_ms,
+            part,
             "partition lease held by another node"
         );
     }
     let tailed = if plan.needs_tail() {
-        Some(ship.tail_to_head().await?)
+        Some(ship.tail_part_to_head(part).await?)
     } else {
         None
     };
     keeper.commit(plan, tailed).await
 }
 
+#[allow(dead_code)]
+pub fn new_keeper(
+    store: Arc<dyn object_store::ObjectStore>,
+    part: &str,
+    node_id: u64,
+    mode: LeaseMode,
+) -> LeaseKeeper {
+    LeaseKeeper::new(LeaseStore::new(store, part, mode), node_id)
+}
+
 /// Build a fresh local replica from S3: latest checkpoint (if any) plus
 /// replay of newer segments. Used when the state dir has no metadata DB.
+///
+/// The checkpoint is a whole-DB snapshot; `checkpoints/VECTOR.json`
+/// records every partition's applied_seq at snapshot time. Bootstrap
+/// restores the snapshot and then tails each partition from its vector
+/// entry (falling back to p0-only for pre-partition checkpoints).
 pub async fn bootstrap(db_path: &std::path::Path, log: &LogStore) -> Result<()> {
     let from_seq = match log.get_latest_checkpoint().await? {
         Some((seq, snapshot)) => {
@@ -334,21 +927,38 @@ pub async fn bootstrap(db_path: &std::path::Path, log: &LogStore) -> Result<()> 
         }
         None => 0,
     };
+    let vector = log.get_checkpoint_vector().await?;
     let meta = SqliteMeta::open(db_path)?;
     let mut replayed = 0usize;
-    let mut applied = from_seq;
-    for seq in log.list_segments_from(from_seq + 1).await? {
-        if seq != applied + 1 {
-            break; // gap: a racing PUT; the mount's tailer catches up
-        }
-        let seg = decode(&log.get_segment(seq).await?)?;
-        replayed += seg.records.len();
-        meta.apply_records(&seg.records)
-            .with_context(|| format!("replaying log segment {seq}"))?;
-        applied = seq;
+    let mut parts: Vec<String> = vector.applied.keys().cloned().collect();
+    if parts.is_empty() {
+        parts.push(PARTITION.into());
     }
-    meta.set_applied_seq(applied)?;
-    // No process holds unlinked-but-open files on a brand-new replica.
+    for (id, _) in meta.partitions().unwrap_or_default() {
+        if !parts.iter().any(|p| p == &id) {
+            parts.push(id);
+        }
+    }
+    for part in parts {
+        let start = vector
+            .applied
+            .get(&part)
+            .copied()
+            .unwrap_or(if part == PARTITION { from_seq } else { 0 });
+        let part_log = log.with_partition(&part);
+        let mut applied = start;
+        for seq in part_log.list_segments_from(start + 1).await? {
+            if seq != applied + 1 {
+                break;
+            }
+            let seg = decode(&part_log.get_segment(seq).await?)?;
+            replayed += seg.records.len();
+            meta.apply_records(&seg.records)
+                .with_context(|| format!("replaying {part} log segment {seq}"))?;
+            applied = seq;
+        }
+        meta.set_applied_seq_of(&part, applied)?;
+    }
     for ino in meta.orphans()? {
         meta.reap_orphan(ino)?;
     }
@@ -361,9 +971,9 @@ mod tests {
     use super::*;
     use crate::lease::LeaseKeeper;
     use constellation_meta::MetaStore;
-    use constellation_store_s3::lease::LeaseMode;
-    use constellation_store_s3::LeaseStore;
+    use constellation_store_s3::{LeaseMode, LeaseStore, LogStore};
     use object_store::memory::InMemory;
+    use object_store::ObjectStore;
     use std::sync::Arc as StdArc;
 
     struct Node {
@@ -417,6 +1027,20 @@ mod tests {
     async fn segment(store: &StdArc<InMemory>, seq: u64) -> Segment {
         let log = LogStore::new(store.clone());
         decode(&log.get_segment(seq).await.unwrap()).unwrap()
+    }
+
+    /// Every record on one partition's stream, in sequence order.
+    async fn all_records(store: &StdArc<InMemory>, part: &str) -> Vec<LogRecord> {
+        let log = LogStore::for_partition(store.clone(), part);
+        let mut out = Vec::new();
+        for seq in log.list_segments().await.unwrap() {
+            out.extend(
+                decode(&log.get_segment(seq).await.unwrap())
+                    .unwrap()
+                    .records,
+            );
+        }
+        out
     }
 
     /// Two writers on disjoint names: both replicas converge to the
@@ -532,7 +1156,7 @@ mod tests {
 
         a.sync().await;
         assert_eq!(a.meta.journal_len().unwrap(), 0, "journal acked");
-        assert_eq!(a.ship.next_seq, 2);
+        assert_eq!(a.ship.next_seq(), 2);
         // The op is not applied twice (dir still exists exactly once).
         assert_eq!(names(&a.meta, 1).len(), 1);
     }
@@ -656,7 +1280,7 @@ mod tests {
             gid: 0,
             time_ns: 0,
         }];
-        let seq = b.ship.next_seq;
+        let seq = b.ship.next_seq();
         b.ship
             .log
             .put_segment(seq, &encode(1, 1, &stranded).unwrap())
@@ -687,5 +1311,617 @@ mod tests {
             ..cur
         };
         ls.try_swap(&expired, &tag).await.unwrap();
+    }
+
+    /// The traffic heuristic must actually arm and fire: a directory that
+    /// sustains ≥ threshold write ops across at least two consecutive
+    /// shipped segments becomes its own partition, the split record lands
+    /// on the PARENT stream, and later writes land on the child stream.
+    ///
+    /// Regression: the counter required each individual *segment* to meet
+    /// the threshold. The syncer ships whatever is journaled every sync
+    /// interval, so a hot directory written one file at a time produces
+    /// many tiny segments and could never arm — no split ever happened
+    /// (the harness saw only `p0` forever). Traffic must accumulate
+    /// across consecutive segments instead.
+    #[tokio::test]
+    async fn traffic_threshold_splits_a_hot_directory() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        // A second registered node: single-node filesystems never split.
+        constellation_store_s3::claim_node_id(store.clone() as StdArc<dyn ObjectStore>)
+            .await
+            .unwrap();
+        constellation_store_s3::claim_node_id(store.clone() as StdArc<dyn ObjectStore>)
+            .await
+            .unwrap();
+
+        let hot = a.meta.mkdir(1, "hot", 0o755, 0, 0).unwrap();
+        a.sync().await;
+
+        let thresh = part_split_ops();
+        let mut leases = HashMap::new();
+        leases.insert(PARTITION.to_string(), a.lease);
+        // Write the threshold's worth of ops ONE AT A TIME, each shipped
+        // as its own small segment — the realistic daemon shape that the
+        // old per-segment rule could never satisfy.
+        for i in 0..thresh {
+            a.meta
+                .create(hot.ino, &format!("f{i}"), 0o644, 0, 0)
+                .unwrap();
+            a.ship.sync_all(&mut leases).await.unwrap();
+        }
+        // One more round: the armed candidate is journaled as a split.
+        a.ship.sync_all(&mut leases).await.unwrap();
+
+        let parts = a.meta.partitions().unwrap();
+        let child = parts.iter().find(|(id, _)| id != PARTITION);
+        assert!(
+            child.is_some(),
+            "hot dir never split; partitions={parts:?} candidates={:?}",
+            a.ship.split_candidates()
+        );
+        let (child_id, child_root) = child.unwrap();
+        assert_eq!(*child_root, hot.ino, "child must be rooted at /hot");
+        assert_eq!(a.meta.partition_of(hot.ino).unwrap(), *child_id);
+
+        // The split record itself belongs to the parent stream.
+        let parent_recs = all_records(&store, PARTITION).await;
+        assert!(
+            parent_recs
+                .iter()
+                .any(|r| matches!(r, LogRecord::PartSplit { at_ino, .. } if *at_ino == hot.ino)),
+            "part_split must be carried by the parent stream"
+        );
+
+        // Post-split writes flow to the child stream.
+        let mut kc = LeaseKeeper::new(LeaseStore::new(store.clone(), child_id, LeaseMode::Cas), 1);
+        acquire_lease_for(&mut a.ship, &mut kc, child_id)
+            .await
+            .unwrap();
+        a.meta.create(hot.ino, "after", 0o644, 0, 0).unwrap();
+        a.ship.sync_one(child_id, &kc).await.unwrap();
+        let child_recs = all_records(&store, child_id).await;
+        assert!(
+            child_recs
+                .iter()
+                .any(|r| matches!(r, LogRecord::Create { name, .. } if name == "after")),
+            "post-split writes must land on the child stream"
+        );
+
+        // A second node bootstrapping from the log alone agrees.
+        let mut b = node(&store, 2);
+        b.ship.tail_to_head().await.unwrap();
+        assert_eq!(b.meta.partition_of(hot.ino).unwrap(), *child_id);
+        assert!(b.meta.lookup(hot.ino, "after").unwrap().is_some());
+    }
+
+    /// A journal batch for a partition this node has no lease keeper for
+    /// must still be shipped: the keeper is created and acquired lazily.
+    ///
+    /// Regression: `ship_all` skipped any partition missing from the
+    /// `leases` map. Lease keepers were only ever created by the FUSE
+    /// write gate, so after a remount (which starts with a `p0` keeper
+    /// only) a stranded journal for a child partition was never shipped
+    /// and its records were invisible to every other node — exactly what
+    /// `rename-across-partitions` hit after `kill9`.
+    #[tokio::test]
+    async fn stranded_child_journal_ships_without_a_preexisting_keeper() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let hot = a.meta.mkdir(1, "hot", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        a.meta
+            .journal_on(
+                "p0",
+                &LogRecord::PartSplit {
+                    part: "p0".into(),
+                    at_ino: hot.ino,
+                    new_part: "p1".into(),
+                    time_ns: 1,
+                },
+            )
+            .unwrap();
+        a.sync().await;
+        assert_eq!(a.meta.partition_of(hot.ino).unwrap(), "p1");
+
+        // Records for p1 are journaled, but only p0 has a keeper — the
+        // state a daemon is in right after a remount.
+        a.meta.create(hot.ino, "stranded", 0o644, 0, 0).unwrap();
+        let mut leases = HashMap::new();
+        leases.insert(PARTITION.to_string(), a.lease);
+        assert_eq!(a.ship.journal_backlog_of("p1"), 1);
+
+        a.ship.sync_all(&mut leases).await.unwrap();
+
+        assert_eq!(
+            a.ship.journal_backlog_of("p1"),
+            0,
+            "p1's journal must drain even though no keeper existed for it"
+        );
+        assert!(
+            leases.contains_key("p1"),
+            "a keeper for p1 must have been created lazily"
+        );
+        let child = all_records(&store, "p1").await;
+        assert!(
+            child
+                .iter()
+                .any(|r| matches!(r, LogRecord::Create { name, .. } if name == "stranded")),
+            "the stranded record must reach p1's stream: {child:?}"
+        );
+        // And a second node sees it from the log alone.
+        let mut b = node(&store, 2);
+        b.ship.tail_to_head().await.unwrap();
+        assert!(b.meta.lookup(hot.ino, "stranded").unwrap().is_some());
+    }
+
+    /// File writes must count as traffic against the *directory* holding
+    /// the file. `write_manifest`/`setattr` name the file inode, so
+    /// attributing them to that inode meant a directory full of file
+    /// writes (the normal case, and what the harness does) never armed.
+    #[tokio::test]
+    async fn file_writes_count_toward_their_directory() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        constellation_store_s3::claim_node_id(store.clone() as StdArc<dyn ObjectStore>)
+            .await
+            .unwrap();
+        constellation_store_s3::claim_node_id(store.clone() as StdArc<dyn ObjectStore>)
+            .await
+            .unwrap();
+        let hot = a.meta.mkdir(1, "hot", 0o755, 0, 0).unwrap();
+        a.sync().await;
+
+        let thresh = part_split_ops();
+        let mut leases = HashMap::new();
+        leases.insert(PARTITION.to_string(), a.lease);
+        // Only manifest writes on a file inside /hot — no dentry op names
+        // /hot at all after the initial create, so the directory can only
+        // arm if file writes are attributed to their parent.
+        let f = a.meta.create(hot.ino, "big", 0o644, 0, 0).unwrap();
+        a.ship.sync_all(&mut leases).await.unwrap();
+        for i in 0..thresh {
+            a.meta.set_manifest(f.ino, b"M", 1 + i).unwrap();
+            a.ship.sync_all(&mut leases).await.unwrap();
+        }
+        a.ship.sync_all(&mut leases).await.unwrap();
+
+        let parts = a.meta.partitions().unwrap();
+        assert!(
+            parts.iter().any(|(_, root)| *root == hot.ino),
+            "file-write traffic must split /hot; partitions={parts:?}"
+        );
+    }
+
+    /// Merging a child back must clear that subtree's traffic run.
+    /// Otherwise the still-armed counter immediately re-splits the same
+    /// directory (the harness saw `p0`+`p2` right after the merge), so a
+    /// merge could never settle — splits must be hysteretic.
+    #[tokio::test]
+    async fn merge_clears_traffic_so_it_does_not_immediately_resplit() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        constellation_store_s3::claim_node_id(store.clone() as StdArc<dyn ObjectStore>)
+            .await
+            .unwrap();
+        constellation_store_s3::claim_node_id(store.clone() as StdArc<dyn ObjectStore>)
+            .await
+            .unwrap();
+        let hot = a.meta.mkdir(1, "hot", 0o755, 0, 0).unwrap();
+        a.sync().await;
+
+        let thresh = part_split_ops();
+        let mut leases = HashMap::new();
+        leases.insert(PARTITION.to_string(), a.lease);
+        for i in 0..thresh {
+            a.meta
+                .create(hot.ino, &format!("f{i}"), 0o644, 0, 0)
+                .unwrap();
+            a.ship.sync_all(&mut leases).await.unwrap();
+        }
+        a.ship.sync_all(&mut leases).await.unwrap();
+        let child = a
+            .meta
+            .partitions()
+            .unwrap()
+            .into_iter()
+            .find(|(id, _)| id != PARTITION)
+            .expect("expected a split");
+        assert_eq!(child.1, hot.ino);
+
+        // Traffic continues on /hot while it is its own partition — the
+        // real harness shape (a post-split write, then the merge).
+        let mut kc = LeaseKeeper::new(LeaseStore::new(store.clone(), &child.0, LeaseMode::Cas), 1);
+        acquire_lease_for(&mut a.ship, &mut kc, &child.0)
+            .await
+            .unwrap();
+        leases.insert(child.0.clone(), kc);
+        for i in 0..thresh {
+            a.meta
+                .create(hot.ino, &format!("post{i}"), 0o644, 0, 0)
+                .unwrap();
+            a.ship.sync_all(&mut leases).await.unwrap();
+        }
+
+        // Merge it back the way the policy does.
+        a.meta
+            .journal_on(
+                PARTITION,
+                &LogRecord::PartMerge {
+                    part: child.0.clone(),
+                    into_part: PARTITION.into(),
+                    time_ns: 1,
+                },
+            )
+            .unwrap();
+        a.ship.sync_all(&mut leases).await.unwrap();
+        assert_eq!(a.meta.partition_of(hot.ino).unwrap(), PARTITION);
+
+        // Several idle rounds must NOT resurrect the split.
+        for _ in 0..4 {
+            a.ship.sync_all(&mut leases).await.unwrap();
+        }
+        let parts = a.meta.partitions().unwrap();
+        assert_eq!(
+            parts.len(),
+            1,
+            "merged subtree re-split immediately: {parts:?} candidates={:?}",
+            a.ship.split_candidates()
+        );
+    }
+
+    /// Partition ids must be globally unique. `next_part_id` is a local
+    /// counter, so two nodes splitting different directories would both
+    /// mint `p1` and the "replicated" partition map would disagree per
+    /// node (observed live: c0 saw `[p0, p2]` while c1 saw `[p0, p1]`).
+    /// Ids are therefore node-scoped.
+    #[tokio::test]
+    async fn concurrent_splits_on_two_nodes_get_distinct_ids() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let mut b = node(&store, 2);
+        let d1 = a.meta.mkdir(1, "one", 0o755, 0, 0).unwrap();
+        let d2 = a.meta.mkdir(1, "two", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        b.ship.tail_to_head().await.unwrap();
+
+        let id_a = a.meta.next_part_id().unwrap();
+        let id_b = b.meta.next_part_id().unwrap();
+        assert_ne!(
+            id_a, id_b,
+            "two nodes minted the same partition id ({id_a}); the replicated \
+             partition map would diverge"
+        );
+
+        // Both splits replay everywhere and both partitions survive.
+        a.meta
+            .journal_on(
+                PARTITION,
+                &LogRecord::PartSplit {
+                    part: PARTITION.into(),
+                    at_ino: d1.ino,
+                    new_part: id_a.clone(),
+                    time_ns: 1,
+                },
+            )
+            .unwrap();
+        a.sync().await;
+        a.release().await;
+        b.meta
+            .journal_on(
+                PARTITION,
+                &LogRecord::PartSplit {
+                    part: PARTITION.into(),
+                    at_ino: d2.ino,
+                    new_part: id_b.clone(),
+                    time_ns: 2,
+                },
+            )
+            .unwrap();
+        b.sync().await;
+        a.ship.tail_to_head().await.unwrap();
+
+        for m in [&a.meta, &b.meta] {
+            assert_eq!(m.partition_of(d1.ino).unwrap(), id_a);
+            assert_eq!(m.partition_of(d2.ino).unwrap(), id_b);
+        }
+    }
+
+    /// A directory that is written *intermittently* must never split, no
+    /// matter how long it lives or how many writes it sees in total.
+    ///
+    /// Regression: traffic was accumulated as a lifetime total, so any
+    /// long-lived directory eventually crossed the threshold and split.
+    /// That silently broke `lease-handover`, which assumes the filesystem
+    /// stays a single partition. The run must be consecutive.
+    #[tokio::test]
+    async fn intermittent_traffic_never_splits() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        constellation_store_s3::claim_node_id(store.clone() as StdArc<dyn ObjectStore>)
+            .await
+            .unwrap();
+        constellation_store_s3::claim_node_id(store.clone() as StdArc<dyn ObjectStore>)
+            .await
+            .unwrap();
+        let warm = a.meta.mkdir(1, "warm", 0o755, 0, 0).unwrap();
+        let other = a.meta.mkdir(1, "other", 0o755, 0, 0).unwrap();
+        a.sync().await;
+
+        let thresh = part_split_ops();
+        let mut leases = HashMap::new();
+        leases.insert(PARTITION.to_string(), a.lease);
+        // Far more than the threshold in total, but never two consecutive
+        // shipped segments in a row: every write is followed by a segment
+        // that only touches an unrelated directory.
+        for i in 0..(thresh * 3) {
+            a.meta
+                .create(warm.ino, &format!("w{i}"), 0o644, 0, 0)
+                .unwrap();
+            a.ship.sync_all(&mut leases).await.unwrap();
+            a.meta
+                .create(other.ino, &format!("o{i}"), 0o644, 0, 0)
+                .unwrap();
+            a.ship.sync_all(&mut leases).await.unwrap();
+        }
+        a.ship.sync_all(&mut leases).await.unwrap();
+
+        let parts = a.meta.partitions().unwrap();
+        assert_eq!(
+            parts.len(),
+            1,
+            "intermittently written dirs must not split: {parts:?} candidates={:?}",
+            a.ship.split_candidates()
+        );
+    }
+
+    /// A single-node filesystem must never split, however hot a directory
+    /// gets: with one registered node there is nobody to hand work to.
+    #[tokio::test]
+    async fn single_node_never_splits() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        constellation_store_s3::claim_node_id(store.clone() as StdArc<dyn ObjectStore>)
+            .await
+            .unwrap();
+        let hot = a.meta.mkdir(1, "hot", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        let thresh = part_split_ops();
+        let mut leases = HashMap::new();
+        leases.insert(PARTITION.to_string(), a.lease);
+        for wave in 0..3 {
+            for i in 0..thresh {
+                a.meta
+                    .create(hot.ino, &format!("f{wave}-{i}"), 0o644, 0, 0)
+                    .unwrap();
+                a.ship.sync_all(&mut leases).await.unwrap();
+            }
+        }
+        assert_eq!(
+            a.meta.partitions().unwrap().len(),
+            1,
+            "a single-node filesystem must never split"
+        );
+    }
+
+    /// Split: records land in the child stream after the split point; a
+    /// second node tails both streams and converges.
+    #[tokio::test]
+    async fn split_child_stream_and_second_node_converges() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let mut b = node(&store, 2);
+        let hot = a.meta.mkdir(1, "hot", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        a.release().await;
+
+        let rec = LogRecord::PartSplit {
+            part: "p0".into(),
+            at_ino: hot.ino,
+            new_part: "p1".into(),
+            time_ns: 1,
+        };
+        a.meta.journal_on("p0", &rec).unwrap();
+        a.sync().await;
+        assert_eq!(a.meta.partition_of(hot.ino).unwrap(), "p1");
+
+        a.meta.create(hot.ino, "child-file", 0o644, 0, 0).unwrap();
+        // After split, shipping p1 needs a keeper for p1.
+        let mut k1 = LeaseKeeper::new(LeaseStore::new(store.clone(), "p1", LeaseMode::Cas), 1);
+        acquire_lease_for(&mut a.ship, &mut k1, "p1").await.unwrap();
+        a.ship.sync_one("p1", &k1).await.unwrap();
+
+        b.sync().await;
+        acquire_lease_for(&mut b.ship, &mut b.lease, "p0")
+            .await
+            .ok();
+        b.ship.tail_to_head().await.unwrap();
+        assert_eq!(b.meta.partition_of(hot.ino).unwrap(), "p1");
+        assert!(b.meta.lookup(hot.ino, "child-file").unwrap().is_some());
+        let p1 = LogStore::for_partition(store.clone(), "p1");
+        assert!(
+            !p1.list_segments().await.unwrap().is_empty(),
+            "child stream must contain the post-split records"
+        );
+    }
+
+    /// Merge: child sealed, records flow to parent, replicas converge.
+    #[tokio::test]
+    async fn merge_seals_child_and_replicas_converge() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let mut b = node(&store, 2);
+        let hot = a.meta.mkdir(1, "hot", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        a.meta
+            .journal_on(
+                "p0",
+                &LogRecord::PartSplit {
+                    part: "p0".into(),
+                    at_ino: hot.ino,
+                    new_part: "p1".into(),
+                    time_ns: 1,
+                },
+            )
+            .unwrap();
+        a.sync().await;
+        a.meta
+            .journal_on(
+                "p0",
+                &LogRecord::PartMerge {
+                    part: "p1".into(),
+                    into_part: "p0".into(),
+                    time_ns: 2,
+                },
+            )
+            .unwrap();
+        a.sync().await;
+        LogStore::for_partition(store.clone(), "p1")
+            .seal()
+            .await
+            .unwrap();
+        assert!(LogStore::for_partition(store.clone(), "p1")
+            .is_sealed()
+            .await
+            .unwrap());
+        assert_eq!(a.meta.partition_of(hot.ino).unwrap(), "p0");
+        a.meta.create(hot.ino, "after-merge", 0o644, 0, 0).unwrap();
+        a.sync().await;
+        b.ship.tail_to_head().await.unwrap();
+        assert_eq!(b.meta.partition_of(hot.ino).unwrap(), "p0");
+        assert!(b.meta.lookup(hot.ino, "after-merge").unwrap().is_some());
+    }
+
+    /// Xpart rename: both halves applied on a tailing replica; abort
+    /// path drops the dst half before shipping, next writer appends the
+    /// abort, every replica keeps the file at the source.
+    #[tokio::test]
+    async fn xpart_rename_and_abort() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let mut b = node(&store, 2);
+        let hot = a.meta.mkdir(1, "hot", 0o755, 0, 0).unwrap();
+        let cold = a.meta.mkdir(1, "cold", 0o755, 0, 0).unwrap();
+        let f = a.meta.create(hot.ino, "x", 0o644, 0, 0).unwrap();
+        a.sync().await;
+        a.meta
+            .journal_on(
+                "p0",
+                &LogRecord::PartSplit {
+                    part: "p0".into(),
+                    at_ino: hot.ino,
+                    new_part: "p1".into(),
+                    time_ns: 1,
+                },
+            )
+            .unwrap();
+        a.sync().await;
+        b.ship.tail_to_head().await.unwrap();
+
+        // Happy path: both halves journaled and shipped.
+        a.meta
+            .rename_xpart(hot.ino, "x", cold.ino, "y", "p1", "p0")
+            .unwrap();
+        let mut k1 = LeaseKeeper::new(LeaseStore::new(store.clone(), "p1", LeaseMode::Cas), 1);
+        acquire_lease_for(&mut a.ship, &mut a.lease, "p0")
+            .await
+            .unwrap();
+        acquire_lease_for(&mut a.ship, &mut k1, "p1").await.unwrap();
+        a.ship.sync_one("p1", &k1).await.unwrap();
+        a.ship.sync_one("p0", &a.lease).await.unwrap();
+        b.ship.tail_to_head().await.unwrap();
+        assert!(b.meta.lookup(cold.ino, "y").unwrap().is_some());
+        assert!(b.meta.lookup(hot.ino, "x").unwrap().is_none());
+
+        // Abort path: journal only the src half, ship it, then the next
+        // writer sees the orphan and appends abort. File stays at source.
+        let f2 = a.meta.create(hot.ino, "z", 0o644, 0, 0).unwrap();
+        a.ship.sync_one("p1", &k1).await.unwrap();
+        a.meta
+            .journal_on(
+                "p1",
+                &LogRecord::RenameXpartSrc {
+                    txid: 99,
+                    part: "p1".into(),
+                    from_parent: hot.ino,
+                    name: "z".into(),
+                    ino: f2.ino,
+                    time_ns: 3,
+                },
+            )
+            .unwrap();
+        a.ship.sync_one("p1", &k1).await.unwrap();
+        // Replica B tails the src half (parks it) with no dst.
+        b.ship.tail_to_head().await.unwrap();
+        // Next write round on A (src holder) must abort.
+        a.ship.sync_one("p1", &k1).await.unwrap();
+        b.ship.tail_to_head().await.unwrap();
+        assert!(
+            a.meta.lookup(hot.ino, "z").unwrap().is_some(),
+            "abort keeps the file at the source"
+        );
+        assert!(b.meta.lookup(hot.ino, "z").unwrap().is_some());
+        assert!(b.meta.lookup(cold.ino, "z").unwrap().is_none());
+        let _ = f;
+    }
+
+    /// Bootstrap with the applied-seq vector across 3 partitions.
+    #[tokio::test]
+    async fn bootstrap_vector_across_three_partitions() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let d1 = a.meta.mkdir(1, "a", 0o755, 0, 0).unwrap();
+        let d2 = a.meta.mkdir(1, "b", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        a.meta
+            .journal_on(
+                "p0",
+                &LogRecord::PartSplit {
+                    part: "p0".into(),
+                    at_ino: d1.ino,
+                    new_part: "p1".into(),
+                    time_ns: 1,
+                },
+            )
+            .unwrap();
+        a.sync().await;
+        a.meta
+            .journal_on(
+                "p0",
+                &LogRecord::PartSplit {
+                    part: "p0".into(),
+                    at_ino: d2.ino,
+                    new_part: "p2".into(),
+                    time_ns: 2,
+                },
+            )
+            .unwrap();
+        a.sync().await;
+        a.meta.create(d1.ino, "f1", 0o644, 0, 0).unwrap();
+        a.meta.create(d2.ino, "f2", 0o644, 0, 0).unwrap();
+        let mut k1 = LeaseKeeper::new(LeaseStore::new(store.clone(), "p1", LeaseMode::Cas), 1);
+        let mut k2 = LeaseKeeper::new(LeaseStore::new(store.clone(), "p2", LeaseMode::Cas), 1);
+        acquire_lease_for(&mut a.ship, &mut k1, "p1").await.unwrap();
+        acquire_lease_for(&mut a.ship, &mut k2, "p2").await.unwrap();
+        a.ship.sync_one("p1", &k1).await.unwrap();
+        a.ship.sync_one("p2", &k2).await.unwrap();
+        a.ship.checkpoint().await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("meta.db");
+        bootstrap(&db, &LogStore::new(store.clone())).await.unwrap();
+        let restored = SqliteMeta::open(&db).unwrap();
+        let parts: Vec<String> = restored
+            .partitions()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(parts.contains(&"p0".into()));
+        assert!(parts.contains(&"p1".into()));
+        assert!(parts.contains(&"p2".into()));
+        assert!(restored.lookup(d1.ino, "f1").unwrap().is_some());
+        assert!(restored.lookup(d2.ino, "f2").unwrap().is_some());
     }
 }

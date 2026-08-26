@@ -11,6 +11,29 @@
 //! (unshipped) local records are skipped by the caller via
 //! [`TouchSet`] — our own records sit later in the global log than
 //! anything we are tailing, so ours win everywhere.
+//!
+//! ### Partition map
+//!
+//! `part_split` is carried on the **parent** partition's stream; the
+//! child stream starts empty at seq 1 after that record is durable.
+//! `part_merge` is carried on the surviving (parent) stream. Both
+//! mutate the `partition` table and nothing else — no data moves.
+//!
+//! ### Cross-partition rename
+//!
+//! A `rename_xpart` is a linked two-record commit: `RenameXpartSrc` on
+//! the source stream and `RenameXpartDst` on the destination stream,
+//! sharing a `txid`. A replica applies the rename only when it has
+//! **both** halves (parked in `xpart_pending` until the pair arrives).
+//!
+//! **Recovery rule.** A `RenameXpartSrc` whose partner never appears
+//! (writer crashed between the two PUTs) is resolved the next time
+//! *any* node writes to either stream: if the dst record is absent
+//! from the dst stream at or before that stream's head, the current
+//! holder of the src partition appends `RenameXpartAbort { txid }` to
+//! the src stream and the file stays at its source. Only the current
+//! holder of the src partition may append the abort (lease + epoch
+//! fencing makes this race-free).
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
@@ -70,6 +93,28 @@ impl TouchSet {
                 self.dentries.insert((*new_parent, new_name.clone()));
             }
             LogRecord::Setattr { ino, .. } | LogRecord::WriteManifest { ino, .. } => {
+                self.inos.insert(*ino);
+            }
+            LogRecord::PartSplit { at_ino, .. } => {
+                self.inos.insert(*at_ino);
+            }
+            LogRecord::PartMerge { .. } | LogRecord::RenameXpartAbort { .. } => {}
+            LogRecord::RenameXpartSrc {
+                from_parent,
+                name,
+                ino,
+                ..
+            } => {
+                self.dentries.insert((*from_parent, name.clone()));
+                self.inos.insert(*ino);
+            }
+            LogRecord::RenameXpartDst {
+                to_parent,
+                new_name,
+                ino,
+                ..
+            } => {
+                self.dentries.insert((*to_parent, new_name.clone()));
                 self.inos.insert(*ino);
             }
         }
@@ -155,8 +200,15 @@ impl SqliteMeta {
     /// counter).
     pub fn snapshot(&self) -> Result<Vec<u8>, MetaError> {
         let conn = self.raw();
-        let tmp =
-            std::env::temp_dir().join(format!("constellation-ckpt-{}.db", std::process::id()));
+        // Unique per call: a daemon checkpoints per partition, so two
+        // snapshots can be in flight at once. Sharing one scratch path
+        // let them delete each other's file mid-VACUUM.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "constellation-ckpt-{}-{}.db",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_file(&tmp);
         conn.execute("VACUUM INTO ?1", params![tmp.to_string_lossy()])?;
         drop(conn);
@@ -166,7 +218,8 @@ impl SqliteMeta {
             // Reset AUTOINCREMENT so the restored node journals from 1.
             let _ = c.execute("DELETE FROM sqlite_sequence WHERE name = 'journal'", []);
             c.execute(
-                "DELETE FROM kv WHERE key IN ('node_id', 'node_prefix', 'next_ino', 'applied_seq')",
+                "DELETE FROM kv WHERE key IN ('node_id', 'node_prefix', 'next_ino', 'applied_seq')
+                 OR key LIKE 'applied_seq/%' OR key LIKE 'part_of/%'",
                 [],
             )?;
             c.execute("VACUUM", [])?;
@@ -498,6 +551,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 "UPDATE dentry SET parent = ?3, name = ?4 WHERE parent = ?1 AND name = ?2",
                 params![parent, name, new_parent, new_name],
             )?;
+            crate::sqlite::SqliteMeta::invalidate_part_cache(tx, ino)?;
             if src_is_dir && parent != new_parent {
                 tx.execute(
                     "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
@@ -581,7 +635,107 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             )?;
             Ok(Applied::Done)
         }
+        LogRecord::PartSplit {
+            part,
+            at_ino,
+            new_part,
+            ..
+        } => {
+            let _ = part;
+            tx.execute(
+                "INSERT OR REPLACE INTO partition (id, root_ino) VALUES (?1, ?2)",
+                params![new_part, at_ino],
+            )?;
+            // Any cached resolution under this subtree is now stale.
+            tx.execute("DELETE FROM kv WHERE key LIKE 'part_of/%'", [])?;
+            Ok(Applied::Done)
+        }
+        LogRecord::PartMerge {
+            part, into_part, ..
+        } => {
+            let _ = into_part;
+            tx.execute("DELETE FROM partition WHERE id = ?1", params![part])?;
+            tx.execute("DELETE FROM kv WHERE key LIKE 'part_of/%'", [])?;
+            Ok(Applied::Done)
+        }
+        LogRecord::RenameXpartSrc { txid, .. } => park_or_apply_xpart(tx, *txid, "src", rec),
+        LogRecord::RenameXpartDst { txid, .. } => park_or_apply_xpart(tx, *txid, "dst", rec),
+        LogRecord::RenameXpartAbort { txid } => {
+            tx.execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
+            Ok(Applied::Done)
+        }
     }
+}
+
+fn park_or_apply_xpart(
+    tx: &Connection,
+    txid: u64,
+    half: &str,
+    rec: &LogRecord,
+) -> Result<Applied, MetaError> {
+    let other = if half == "src" { "dst" } else { "src" };
+    let partner: Option<String> = tx
+        .query_row(
+            "SELECT record FROM xpart_pending WHERE txid = ?1 AND half = ?2",
+            params![txid, other],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(json) = partner {
+        let other_rec: LogRecord = serde_json::from_str(&json)?;
+        tx.execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
+        let (src, dst) = if half == "src" {
+            (rec, &other_rec)
+        } else {
+            (&other_rec, rec)
+        };
+        apply_xpart_pair(tx, src, dst)
+    } else {
+        tx.execute(
+            "INSERT OR REPLACE INTO xpart_pending (txid, half, record) VALUES (?1, ?2, ?3)",
+            params![txid, half, serde_json::to_string(rec)?],
+        )?;
+        Ok(Applied::Done)
+    }
+}
+
+fn apply_xpart_pair(
+    tx: &Connection,
+    src: &LogRecord,
+    dst: &LogRecord,
+) -> Result<Applied, MetaError> {
+    let LogRecord::RenameXpartSrc {
+        from_parent,
+        name,
+        ino,
+        time_ns,
+        ..
+    } = src
+    else {
+        return Ok(Applied::Skipped("malformed xpart src"));
+    };
+    let LogRecord::RenameXpartDst {
+        to_parent,
+        new_name,
+        ..
+    } = dst
+    else {
+        return Ok(Applied::Skipped("malformed xpart dst"));
+    };
+    // Same as an in-partition Rename, but the two halves may have
+    // arrived on different streams / in either order.
+    apply_one(
+        tx,
+        &LogRecord::Rename {
+            parent: *from_parent,
+            name: name.clone(),
+            new_parent: *to_parent,
+            new_name: new_name.clone(),
+            time_ns: *time_ns,
+        },
+    )?;
+    SqliteMeta::invalidate_part_cache(tx, *ino)?;
+    Ok(Applied::Done)
 }
 
 #[cfg(test)]
@@ -627,6 +781,33 @@ mod tests {
         // Ino allocation continues past everything replayed.
         let n = dst.create(1, "new", 0o644, 0, 0).unwrap();
         assert!(n.ino > f.ino.max(g.ino));
+    }
+
+    /// Concurrent snapshots in one process must not clobber each other.
+    ///
+    /// Regression: the scratch file was named by PID alone, so two
+    /// threads checkpointing at once removed and re-created the same
+    /// path; the loser's connection then failed with "database file has
+    /// moved" / "attempt to write a readonly database". A daemon
+    /// checkpoints per partition, so this is reachable in production and
+    /// not merely a test artifact.
+    #[test]
+    fn concurrent_snapshots_do_not_collide() {
+        let stores: Vec<std::sync::Arc<SqliteMeta>> = (0..8)
+            .map(|i| {
+                let m = SqliteMeta::open_in_memory().unwrap();
+                m.mkdir(1, &format!("d{i}"), 0o755, 0, 0).unwrap();
+                std::sync::Arc::new(m)
+            })
+            .collect();
+        let handles: Vec<_> = stores
+            .into_iter()
+            .map(|m| std::thread::spawn(move || m.snapshot().map(|b| b.len())))
+            .collect();
+        for h in handles {
+            let bytes = h.join().unwrap().expect("snapshot failed under contention");
+            assert!(bytes > 0, "empty snapshot");
+        }
     }
 
     #[test]

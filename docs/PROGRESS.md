@@ -155,11 +155,36 @@ cross-node visibility is sync-interval + TTL, not gossip-RTT.
 - **Stranded-journal reintegration**: a deposed holder's unshipped
   journal is preserved on local disk but has no path back into the
   shared log. Reintegration is phase 4 scope.
-- **Single partition**: the whole filesystem is one lease (`p0`).
-  Partition split/merge and cross-partition rename are M3.2.
+
+### M3.2 — partitions (automatic split/merge, cross-partition rename)
+
+| Item | State | Where |
+|---|---|---|
+| Partition map table `partition(id, root_ino)` mutated by `PartSplit`/`PartMerge` log records; `partition_of(ino)` walks to the nearest root (cached, invalidated on split/merge/rename) | done | `meta::sqlite`, `meta::record`, `meta::replay` |
+| Split record on the **parent** stream; child stream starts empty at seq 1. Merge on the surviving parent stream. Child stream `seal()` marker | done | `meta::replay` module doc, `store-s3::log`, `cli::shipper` |
+| Per-partition journal column, `applied_seq/<part>`, `LogStore` per partition, one `LeaseKeeper` per partition (lazy) | done | `meta::sqlite`, `cli::{shipper,main}` |
+| Whole-DB checkpoint under p0 plus `checkpoints/VECTOR.json` (`CheckpointVector`); bootstrap = snapshot + per-partition replay | done | `store-s3::log`, `cli::shipper::bootstrap` |
+| Traffic split: a direct subdirectory of a partition root accumulating ≥ `CONSTELLATION_PART_SPLIT_OPS` (default 512) records over an **unbroken run** of ≥2 shipped segments, **and** ≥2 nodes in the registry. Intermittently written directories never split; single-node filesystems never split | done | `cli::shipper::{note_shipped,maybe_split}` |
+| Idle merge: child quiet for `CONSTELLATION_PART_MERGE_IDLE_S` (default 3600); parent holder (also holding the child) journals `part_merge` and seals the child stream. Merging clears the subtree's traffic so it cannot immediately re-split | done | `cli::shipper::maybe_merge` |
+| Partition ids are **node-scoped** (`p<node>_<n>`; plain `p<n>` on the genesis prefix) so two nodes splitting concurrently can never mint the same id and diverge | done | `meta::sqlite::alloc_part_id` |
+| `rename_xpart` linked two-record commit, applied and journaled in ONE transaction (a crash cannot strand a plain `Rename` in place of the pair); pending table until both halves; abort of durable orphan src (`RenameXpartAbort`) by the src holder | done | `meta::{sqlite,replay}`, `cli::shipper`, `cli::fusefs_ops` |
+| Control API: `StatusReport.partitions: [{id, root_path, lease}]` (serde defaults; legacy `lease` is p0) | done | `crates/api`, `cli::main` |
+| A journaled batch for a partition with no lease keeper yet acquires one lazily, so a stranded child-partition journal after a remount still ships | done | `cli::shipper::ship_all` |
+| Unit tests: split child stream + replica converge, merge+seal, xpart happy+abort, bootstrap vector across 3 partitions, traffic policy (arms, single-node, intermittent, file-writes, merge hysteresis), id uniqueness, stranded journal, `status` deadlock | done | `cli::shipper`, `meta::sqlite`, `api` tests |
+| Harness: `partition-split`, `rename-across-partitions` | done | `crates/harness` |
+
+### M3.2 scope limits (by design, addressed in later M3.x / phase 4)
+
+- **Foreign-lease-driven splits**: DESIGN.md also splits when a foreign
+  lease is long-lived on a subtree. That needs P2P liveness signals
+  (M3.3); deferred. Today's only automatic trigger is log-traffic
+  thresholds plus the ≥2-node registry heuristic.
+- **Offline designation**: phase 4.
+- **P2P/gossip**: M3.3.
 
 ## Later phases
 
-Not started (phases 4–8, and M3.2/M3.3 of phase 3). No code exists for
-partition split/merge, P2P/gossip, pin/offline, cooperative cache,
-snapshots/E2E, web UI, or GC.
+Not started (phases 4–8, and M3.3 of phase 3). No code exists for
+P2P/gossip, pin/offline, cooperative cache, snapshots/E2E, web UI, or
+GC. M3.2 (partitions) is in the working tree — see the Phase 3 table
+above.

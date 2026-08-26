@@ -92,6 +92,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: lease_fencing,
     },
     Scenario {
+        name: "partition-split",
+        desc: "two nodes, low split threshold: /hot becomes its own partition, then idles into a merge",
+        requires: &[],
+        run: partition_split,
+    },
+    Scenario {
+        name: "rename-across-partitions",
+        desc: "force a split, rename files between partitions from both nodes, kill9 the renamer and recover",
+        requires: &[],
+        run: rename_across_partitions,
+    },
+    Scenario {
         name: "fresh-node-bootstrap",
         desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
         requires: &[],
@@ -933,4 +945,218 @@ fn stress_ng_flap(_seed: u64) -> Result<()> {
         "spool did not drain after stress-ng churn: {}",
         c.control_status()?
     )
+}
+
+fn partition_ids(c: &Client) -> Result<Vec<String>> {
+    Ok(partition_ids_from(&c.control_status()?))
+}
+
+fn partition_ids_from(status: &serde_json::Value) -> Vec<String> {
+    status["partitions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| p["id"].as_str().map(|s| s.to_string()))
+        .collect()
+}
+
+fn part_env(c: Client, split_ops: u64, merge_idle_s: u64) -> Client {
+    c.with_env("CONSTELLATION_PART_SPLIT_OPS", &split_ops.to_string())
+        .with_env("CONSTELLATION_PART_MERGE_IDLE_S", &merge_idle_s.to_string())
+        .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "60000")
+}
+
+/// Hammer `/hot` with enough close()s to close two split windows, then
+/// wait until the control API shows a child partition rooted there.
+fn wait_for_split(c: &Client, hot: &std::path::Path, model: &mut Model, tag: &str) -> Result<()> {
+    for wave in 0..3 {
+        for i in 0..8 {
+            let rel = std::path::PathBuf::from(format!("hot/{tag}-w{wave}-{i}"));
+            let data = format!("{tag}-{wave}-{i}").into_bytes();
+            std::fs::write(hot.join(rel.file_name().unwrap()), &data)?;
+            model.write_file(&rel, data);
+        }
+        eventually(
+            &format!("wave {wave} shipped"),
+            Duration::from_secs(10),
+            || {
+                let b = c.control_status()?["spool"]["journal_backlog"]
+                    .as_u64()
+                    .unwrap_or(1);
+                anyhow::ensure!(b == 0, "backlog {b}");
+                Ok(())
+            },
+        )?;
+    }
+    eventually(
+        "split appears on control API",
+        Duration::from_secs(20),
+        || {
+            let status = c.control_status()?;
+            let ids = partition_ids_from(&status);
+            anyhow::ensure!(
+                ids.iter().any(|id| id != "p0"),
+                "still one partition: {ids:?} partitions={} log=\n{}",
+                status["partitions"],
+                c.tail_log_n(50)
+            );
+            Ok(())
+        },
+    )
+}
+
+/// Two nodes, one FS: node A hammers `/hot` until a split is visible on
+/// the control API; both trees match the model; then `/hot` goes idle
+/// and the child merges back into p0.
+fn partition_split(_seed: u64) -> Result<()> {
+    let (env, root) = setup("partition-split")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/psplit-{}", ts());
+    let mut c0 = part_env(
+        Client::new(root.path(), "c0", &env.endpoint, &backend)?,
+        4,
+        8,
+    );
+    let mut c1 = part_env(
+        Client::new(root.path(), "c1", &env.endpoint, &backend)?,
+        4,
+        8,
+    );
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+
+    let mut model = Model::default();
+    std::fs::create_dir(c0.mnt.join("hot"))?;
+    model.mkdir(std::path::Path::new("hot"));
+    eventually("hot visible on B", Duration::from_secs(20), || {
+        anyhow::ensure!(c1.mnt.join("hot").is_dir(), "hot not on c1");
+        Ok(())
+    })?;
+
+    wait_for_split(&c0, &c0.mnt.join("hot"), &mut model, "a")?;
+    // A write after the split acquires the child lease so the parent
+    // holder can merge it once /hot goes idle.
+    std::fs::write(c0.mnt.join("hot/post"), b"post")?;
+    model.write_file(std::path::Path::new("hot/post"), b"post".to_vec());
+    eprintln!("    partition-split: after split {:?}", partition_ids(&c0)?);
+    eventually("trees match after split", Duration::from_secs(30), || {
+        model.verify(&c0.mnt).context("via c0")?;
+        model.verify(&c1.mnt).context("via c1")?;
+        Ok(())
+    })?;
+
+    // Keep p0 busy with an unrelated dir so the parent lease stays held
+    // while /hot goes idle long enough to merge.
+    std::fs::create_dir(c0.mnt.join("keep"))?;
+    model.mkdir(std::path::Path::new("keep"));
+    std::thread::sleep(Duration::from_secs(10));
+    std::fs::write(c0.mnt.join("keep/tick"), b"1")?;
+    model.write_file(std::path::Path::new("keep/tick"), b"1".to_vec());
+    eventually("child merged back into p0", Duration::from_secs(20), || {
+        let ids = partition_ids(&c0)?;
+        anyhow::ensure!(
+            ids == ["p0".to_string()] || (ids.len() == 1 && ids[0] == "p0"),
+            "still split: {ids:?}"
+        );
+        Ok(())
+    })?;
+    eventually("trees match after merge", Duration::from_secs(20), || {
+        model.verify(&c0.mnt).context("via c0")?;
+        model.verify(&c1.mnt).context("via c1")?;
+        Ok(())
+    })?;
+    ensure_no_conflicts([&c0, &c1])?;
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+/// Force a split, then rename across the two partitions from both
+/// nodes. Kill the renamer between operations; remount must keep the
+/// namespace correct (abort recovery if a half-committed xpart was
+/// stranded).
+fn rename_across_partitions(_seed: u64) -> Result<()> {
+    let (env, root) = setup("rename-xpart")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/xpart-{}", ts());
+    let mut c0 = part_env(
+        Client::new(root.path(), "c0", &env.endpoint, &backend)?,
+        4,
+        3600,
+    );
+    let mut c1 = part_env(
+        Client::new(root.path(), "c1", &env.endpoint, &backend)?,
+        4,
+        3600,
+    );
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+
+    let mut model = Model::default();
+    std::fs::create_dir(c0.mnt.join("hot"))?;
+    std::fs::create_dir(c0.mnt.join("cold"))?;
+    model.mkdir(std::path::Path::new("hot"));
+    model.mkdir(std::path::Path::new("cold"));
+    eventually("dirs on B", Duration::from_secs(20), || {
+        anyhow::ensure!(c1.mnt.join("hot").is_dir() && c1.mnt.join("cold").is_dir());
+        Ok(())
+    })?;
+    wait_for_split(&c0, &c0.mnt.join("hot"), &mut model, "s")?;
+    anyhow::ensure!(
+        partition_ids(&c0)?.iter().any(|id| id != "p0"),
+        "expected a split before cross-partition rename"
+    );
+
+    std::fs::write(c0.mnt.join("hot/x"), b"from-a")?;
+    model.write_file(std::path::Path::new("hot/x"), b"from-a".to_vec());
+    std::fs::rename(c0.mnt.join("hot/x"), c0.mnt.join("cold/y"))?;
+    model.rename(
+        std::path::Path::new("hot/x"),
+        std::path::Path::new("cold/y"),
+    );
+    eventually("rename A->B visible", Duration::from_secs(20), || {
+        anyhow::ensure!(c1.mnt.join("cold/y").is_file(), "y not on c1");
+        anyhow::ensure!(!c1.mnt.join("hot/x").exists(), "x still on c1");
+        Ok(())
+    })?;
+
+    std::fs::write(c1.mnt.join("cold/p"), b"from-b")?;
+    model.write_file(std::path::Path::new("cold/p"), b"from-b".to_vec());
+    std::fs::rename(c1.mnt.join("cold/p"), c1.mnt.join("hot/q"))?;
+    model.rename(
+        std::path::Path::new("cold/p"),
+        std::path::Path::new("hot/q"),
+    );
+    eventually("rename B->A visible", Duration::from_secs(20), || {
+        anyhow::ensure!(c0.mnt.join("hot/q").is_file(), "q not on c0");
+        Ok(())
+    })?;
+
+    // Kill the renamer between operations; remount must recover.
+    std::fs::write(c0.mnt.join("hot/z"), b"z")?;
+    model.write_file(std::path::Path::new("hot/z"), b"z".to_vec());
+    c0.kill9()?;
+    c0.mount()?;
+    eventually("post-kill9 namespace", Duration::from_secs(30), || {
+        model.verify(&c0.mnt).context("via c0 after remount")?;
+        model.verify(&c1.mnt).context("via c1")?;
+        Ok(())
+    })?;
+    std::fs::rename(c0.mnt.join("hot/z"), c0.mnt.join("cold/z"))?;
+    model.rename(
+        std::path::Path::new("hot/z"),
+        std::path::Path::new("cold/z"),
+    );
+    eventually("final xpart rename", Duration::from_secs(20), || {
+        model.verify(&c0.mnt).context("via c0")?;
+        model.verify(&c1.mnt).context("via c1")?;
+        Ok(())
+    })?;
+    ensure_no_conflicts([&c0, &c1])?;
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
 }

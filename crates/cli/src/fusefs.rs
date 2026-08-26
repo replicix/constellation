@@ -5,7 +5,7 @@ use anyhow::Result;
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
-use constellation_meta::{MetaError, MetaStore};
+use constellation_meta::{MetaError, MetaStore, SqliteMeta};
 use constellation_store_s3::{ChunkStore, CompressionSetting};
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
@@ -34,9 +34,12 @@ pub enum SyncRequest {
     Nudge,
     /// Run a sync round and report its outcome (fsync barrier).
     Barrier(tokio::sync::oneshot::Sender<Result<(), String>>),
-    /// Take the partition lease if it is free. `Ok(false)` means a live
+    /// Take the lease for `part` if it is free. `Ok(false)` means a live
     /// foreign holder still owns it.
-    Acquire(tokio::sync::oneshot::Sender<Result<bool, String>>),
+    Acquire {
+        part: String,
+        reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
+    },
 }
 
 /// FUSE-side handle to the metadata sync task.
@@ -44,14 +47,16 @@ pub struct SyncHandle {
     pub tx: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
     /// `--fsync-mode s3`: fsync() returns only once the journal is in S3.
     pub fsync_s3: bool,
-    /// Lock-free lease state; the write gate reads it per mutating op.
-    pub lease: Arc<crate::lease::LeaseView>,
+    /// Lock-free lease state keyed by partition; the write gate reads
+    /// the relevant view per mutating op.
+    pub leases:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<crate::lease::LeaseView>>>>,
     /// Bound on how long a mutation waits for a foreign holder.
     pub acquire_deadline: Duration,
 }
 
 pub struct ConstellationFs {
-    meta: Arc<dyn MetaStore>,
+    meta: Arc<SqliteMeta>,
     store: Arc<ChunkStore>,
     cache: Arc<DiskCache>,
     rt: Handle,
@@ -126,7 +131,7 @@ fn time_or_now_ns(t: TimeOrNow) -> i64 {
 
 impl ConstellationFs {
     pub fn new(
-        meta: Arc<dyn MetaStore>,
+        meta: Arc<SqliteMeta>,
         store: Arc<ChunkStore>,
         cache: Arc<DiskCache>,
         rt: Handle,
@@ -163,27 +168,47 @@ impl ConstellationFs {
     /// when the lease is not currently usable does this hand off to the
     /// sync task, and only the first mutation after an idle release
     /// pays a CAS round trip.
+    #[allow(dead_code)]
     pub(crate) fn require_lease(&self) -> Result<(), i32> {
+        self.require_lease_for(constellation_fs_core::types::ROOT_INO)
+    }
+
+    pub(crate) fn require_lease_for(&self, ino: Ino) -> Result<(), i32> {
         let Some(h) = &self.sync else { return Ok(()) };
-        if h.lease.usable() {
-            h.lease.touch();
-            return Ok(());
-        }
-        if h.lease.is_lost() {
-            // Deposed: refusing writes is the only way to keep the
-            // stranded journal a *bounded* branch (phase-4 reintegration).
-            tracing::error!("refusing mutation: this node lost the partition lease");
-            return Err(libc::EIO);
+        let part = self.meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
+        {
+            let map = h.leases.lock().unwrap();
+            if let Some(view) = map.get(&part) {
+                if view.usable() {
+                    view.touch();
+                    return Ok(());
+                }
+                if view.is_lost() {
+                    tracing::error!(
+                        part,
+                        "refusing mutation: this node lost the partition lease"
+                    );
+                    return Err(libc::EIO);
+                }
+            }
         }
         let start = std::time::Instant::now();
         loop {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if h.tx.send(SyncRequest::Acquire(tx)).is_err() {
+            if h.tx
+                .send(SyncRequest::Acquire {
+                    part: part.clone(),
+                    reply: tx,
+                })
+                .is_err()
+            {
                 return Err(libc::EIO);
             }
             match rx.blocking_recv() {
                 Ok(Ok(true)) => {
-                    h.lease.touch();
+                    if let Some(view) = h.leases.lock().unwrap().get(&part) {
+                        view.touch();
+                    }
                     return Ok(());
                 }
                 Ok(Ok(false)) => {}
@@ -196,12 +221,11 @@ impl ConstellationFs {
             if start.elapsed() >= h.acquire_deadline {
                 tracing::error!(
                     waited = ?start.elapsed(),
+                    part,
                     "another node holds the partition lease; failing the write with EIO"
                 );
                 return Err(libc::EIO);
             }
-            // The holder either releases when idle or expires; poll
-            // rather than gossip until the P2P path exists (M3.3).
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -303,7 +327,7 @@ impl ConstellationFs {
                 None => return Ok(()),
             }
         };
-        if let Err(e) = self.require_lease() {
+        if let Err(e) = self.require_lease_for(ino) {
             // Put the pending state back: the data is not lost, the
             // caller sees the error and can retry.
             self.writes.lock().unwrap().insert(ino, ws);
