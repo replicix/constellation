@@ -610,6 +610,22 @@ fn mount(
                 };
                 match request {
                     Some(fusefs::SyncRequest::Acquire { part, reply }) => {
+                        let deposed = match meta.kv_get("lease_lost") {
+                            Ok(value) => matches!(value.as_deref(), Some("1")),
+                            Err(error) => {
+                                let _ = reply.send(Err(format!(
+                                    "cannot read persisted deposition state: {error}"
+                                )));
+                                continue;
+                            }
+                        };
+                        if deposed {
+                            let _ = reply.send(Err(
+                                "this node was deposed; run reintegration before acquiring leases"
+                                    .into(),
+                            ));
+                            continue;
+                        }
                         let mut ship = ship.lock().await;
                         let mut keepers = keepers.lock().await;
                         if !keepers.contains_key(&part) {

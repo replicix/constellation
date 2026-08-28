@@ -23,7 +23,8 @@ Execution protocol:
 | 02 | `02-m33-p2p.md` | iroh P2P: gossip invalidation, ~1 RTT lease handoff | 01 |
 | 03 | `03-p4a-pin-offline.md` | pin/unpin, offline designation + delegation | 02 |
 | 04 | `04-p4b-epochs-reintegration.md` | continuation epochs, stranded-branch reintegration | 03 |
-| 05 | `05-p5-coop-cache.md` | cooperative cache: digests, peer serving, source selection | 02 (03–04 committed in practice) |
+| 04c | `04-p4c-leave.md` | `constellation leave`: permanent node departure, roster shrink | 04 |
+| 05 | `05-p5-coop-cache.md` | cooperative cache: digests, peer serving, source selection | 02 (03–04c committed in practice) |
 | 06 | `06-p6a-snapshots-clones.md` | snapshots, clones, subtree/snapshot mounts | 01 (05 committed in practice) |
 | 07 | `07-p6-e2e.md` | E2E passphrase mode | 06 |
 | 08 | `08-p7-web-ui.md` | embedded web UI + /metrics over the control API | 07 |

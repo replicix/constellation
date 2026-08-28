@@ -222,7 +222,13 @@ stranded-branch recovery:
   edit-vs-edit conflict on a deposed holder. On-demand reintegration must
   retain B's winner, publish A's clean file, and materialize A's exact
   bytes as `shared/.constellation-conflict/same@<node>-<ts>` on both
-  mounts.
+  mounts. The scenario verifies state transitions rather than sleeping
+  across a race: B must hold an epoch newer than A's, resumed A must
+  report `lost`, and B must then idle-release before A reintegrates.
+  A focused shipper test also sets the durable `lease_lost` bit with no
+  in-memory keeper and proves ordinary sync cannot create one or ship
+  the stranded journal; the explicit reintegration sync path is the
+  only bypass.
 
 M3.2 scenarios exercise the partition map (DESIGN.md §4):
 `partition-split` (two nodes, one FS; `CONSTELLATION_PART_SPLIT_OPS`

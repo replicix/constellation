@@ -276,12 +276,38 @@ impl Shipper {
         self.parts.get(PARTITION).map(|p| p.next_seq).unwrap_or(1)
     }
 
-    /// One full sync round: tail every partition, then ship every
-    /// partition's journal until it drains (re-tailing after every CAS
-    /// collision). `leases` is keyed by partition id.
+    /// One full ordinary sync round. A persisted deposition is terminal:
+    /// tailing may continue, but no lease may be acquired and no local
+    /// journal may ship until explicit reintegration succeeds.
     pub async fn sync_all(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<()> {
+        self.sync_all_inner(leases, false).await
+    }
+
+    /// The explicit reintegration path is the sole exception to the
+    /// persisted deposition gate. It needs temporary write authority to
+    /// append the classified records, while `lease_lost` remains durable
+    /// until the complete procedure succeeds.
+    pub async fn sync_all_for_reintegration(
+        &mut self,
+        leases: &mut HashMap<String, LeaseKeeper>,
+    ) -> Result<()> {
+        self.sync_all_inner(leases, true).await
+    }
+
+    async fn sync_all_inner(
+        &mut self,
+        leases: &mut HashMap<String, LeaseKeeper>,
+        reintegrating: bool,
+    ) -> Result<()> {
         loop {
             self.tail_all().await?;
+            if !reintegrating && matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
+                tracing::debug!(
+                    "deposed node remains tail-only until reintegration; \
+                     refusing ordinary lease acquisition and journal shipping"
+                );
+                return Ok(());
+            }
             self.consider_xpart_aborts_all(leases).await?;
             if !self.ship_all(leases).await? {
                 self.maybe_split_merge(leases).await?;
@@ -1374,6 +1400,34 @@ mod tests {
         // B's namespace is intact.
         assert_eq!(names(&b.meta, 1).len(), 2);
         assert!(b.meta.lookup(1, "stranded").unwrap().is_none());
+    }
+
+    /// The durable lost bit is an authority gate, not just mount-time
+    /// recovery metadata. Even if the in-memory keeper map is empty, an
+    /// ordinary sync must not manufacture a fresh keeper and ship the
+    /// stranded branch. Explicit reintegration is the only bypass.
+    #[tokio::test]
+    async fn persisted_deposition_blocks_ordinary_reacquisition() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        a.meta.mkdir(1, "stranded", 0o755, 0, 0).unwrap();
+        a.meta.kv_set("lease_lost", "1").unwrap();
+        let mut leases = HashMap::new();
+
+        a.ship.sync_all(&mut leases).await.unwrap();
+        assert!(
+            leases.is_empty(),
+            "ordinary sync manufactured a keeper for a deposed node"
+        );
+        assert_eq!(a.meta.journal_len().unwrap(), 1);
+        assert!(a.ship.log.list_segments().await.unwrap().is_empty());
+
+        a.ship
+            .sync_all_for_reintegration(&mut leases)
+            .await
+            .unwrap();
+        assert_eq!(a.meta.journal_len().unwrap(), 0);
+        assert_eq!(a.ship.log.list_segments().await.unwrap(), [1]);
     }
 
     /// A late segment stamped with a superseded epoch is fenced out

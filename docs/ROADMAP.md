@@ -32,8 +32,9 @@ under simulated partitions; lease transfer ~1 RTT when peers connected.
 
 `pin/unpin` with eager push-sync; `offline/online` designation with
 delegation + ack protocol; continuation epochs with persisted promises;
-reintegration paths. Exit: the three-machine scenario suite (TESTING.md §5
-items 1–4) passes under fault injection.
+reintegration paths; `leave` (permanent roster removal; unmount stays a
+temporary departure). Exit: the three-machine scenario suite (TESTING.md §5
+items 1–4) plus `node-leave` passes under fault injection.
 
 ## Phase 5 — Cooperative cache
 

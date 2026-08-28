@@ -1080,7 +1080,11 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
         client
             .with_env("CONSTELLATION_NODE_KEY", key)
             .with_env("CONSTELLATION_LEASE_TTL_MS", "5000")
-            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "200")
+            // Keep B's takeover live long enough for resumed A to
+            // deterministically observe the fencing CAS failure. We
+            // explicitly wait for B's later idle release before asking A
+            // to reintegrate.
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "10000")
             .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "3000")
     };
     let mut c0 = tune(
@@ -1102,6 +1106,7 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
         anyhow::ensure!(std::fs::read(c1.mnt.join("shared/same"))? == b"baseline");
         Ok(())
     })?;
+    let a_epoch = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
 
     // Two stranded changes: one clean path and one deliberate edit conflict.
     std::fs::write(c0.mnt.join("shared/clean-from-a"), b"clean")?;
@@ -1121,6 +1126,11 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     eventually("B winner is durable", Duration::from_secs(15), || {
         anyhow::ensure!(std::fs::read(c1.mnt.join("shared/same"))? == b"winner-from-b");
         anyhow::ensure!(c1.control_status()?["spool"]["journal_backlog"].as_u64() == Some(0));
+        let lease = lease_of(&c1)?;
+        anyhow::ensure!(
+            lease["held"] == true && lease["epoch"].as_u64().unwrap_or(0) > a_epoch,
+            "B must hold a newer epoch than A's {a_epoch}: {lease}"
+        );
         Ok(())
     })?;
 
@@ -1129,6 +1139,15 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
         anyhow::ensure!(lease_of(&c0)?["lost"] == true);
         Ok(())
     })?;
+    eventually(
+        "B releases the takeover lease for reintegration",
+        Duration::from_secs(20),
+        || {
+            let lease = lease_of(&c1)?;
+            anyhow::ensure!(lease["held"] == false, "B still holds the lease: {lease}");
+            Ok(())
+        },
+    )?;
     c0.reintegrate()?;
 
     eventually(

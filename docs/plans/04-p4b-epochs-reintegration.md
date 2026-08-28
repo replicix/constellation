@@ -113,7 +113,6 @@ Harness scenarios:
 
 ## Gates + report
 
-Per CONVENTIONS.md. This closes phase 4: check off the ROADMAP
-exit criterion in PROGRESS.md with pointers to the three scenarios,
-and update the availability-matrix row coverage table started in
-plan 03.
+Per CONVENTIONS.md. This closes phase 4's availability matrix and
+reintegration. Permanent membership shrinkage (`constellation leave`)
+is plan 04c — NOT here.

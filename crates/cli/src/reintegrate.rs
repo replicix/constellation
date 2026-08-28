@@ -121,7 +121,7 @@ pub async fn run(
         drop(shared);
         let _ = std::fs::remove_file(&view_path);
 
-        ship.sync_all(keepers)
+        ship.sync_all_for_reintegration(keepers)
             .await
             .context("shipping reintegrated journal")?;
 
