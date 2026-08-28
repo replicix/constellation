@@ -396,10 +396,27 @@ seen.
   fetch only the needed chunk (ranged within it if partial). Pins reuse the
   prefetcher at full parallelism.
 - **Cooperative cache**: nodes gossip bloom-filter digests (+deltas) of their
-  cached chunk sets (~10 bits/entry). A local miss checks peer digests
-  *locally* — zero per-request messages — then fetches from the best source.
-  Chunks are self-verifying (hash), so peer serving needs no trust or
-  invalidation. Rendezvous hashing is a composable alternative policy.
+  cached chunk sets (~10 bits/entry, ~1% FPR). A local miss checks peer
+  digests *locally* — zero per-request messages — then fetches from the
+  best source. Chunks are self-verifying (hash), so peer serving needs no
+  trust or invalidation. Rendezvous hashing is a composable alternative
+  policy.
+  A cache may be a thin slice of the dataset or the whole of it: a node
+  is free to dedicate one or more full local drives, so 1–4 TiB is an
+  ordinary size. Each node sizes and evicts independently; nothing
+  assumes peers have equal cache budgets. The digest is advisory (a peer
+  may have evicted since advertising, or not yet advertised a new chunk);
+  S3 remains the source of truth.
+  A single bloom is capped at 16 KiB so it fits one gossip frame
+  (~13k chunks). Larger caches are split by hash prefix into as many
+  buckets as that node's own size needs (128 for 4 TiB at 4 MiB chunks).
+  Receivers store each peer's buckets separately, use *that* peer's
+  bucket count on lookup, and cap what they will retain (~4 MiB/peer)
+  so the largest cache cannot dictate everyone else's memory. Full
+  snapshots rotate one hash-prefix bucket per interval (~5 kbit/s for 4 TiB);
+  add-only deltas cover inserts between rotations. Membership changes
+  are a journal on the cache (`take_digest_events`), not a full-set clone
+  on every tick.
 - **Latency-adaptive source selection**: per-source EWMA of TTFB and goodput
   (S3 and each peer, learned from real transfers), peer RTT (free from QUIC)
   and path type, error rate, queue depth. Pick min predicted

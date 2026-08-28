@@ -2,6 +2,7 @@
 //! sequentially, the next chunks are fetched into the disk cache in the
 //! background so the reader never stalls on S3 latency.
 
+use anyhow::anyhow;
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::{ChunkHash, Ino};
 use constellation_store_s3::ChunkStore;
@@ -16,6 +17,7 @@ pub struct Prefetcher {
     rt: Handle,
     store: Arc<ChunkStore>,
     cache: Arc<DiskCache>,
+    coop: Option<Arc<crate::coop::Coop>>,
     /// Next expected sequential offset per inode.
     cursors: Mutex<HashMap<Ino, u64>>,
     /// Chunks currently being fetched (dedup across reads and inodes).
@@ -23,11 +25,17 @@ pub struct Prefetcher {
 }
 
 impl Prefetcher {
-    pub fn new(rt: Handle, store: Arc<ChunkStore>, cache: Arc<DiskCache>) -> Self {
+    pub fn new(
+        rt: Handle,
+        store: Arc<ChunkStore>,
+        cache: Arc<DiskCache>,
+        coop: Option<Arc<crate::coop::Coop>>,
+    ) -> Self {
         Self {
             rt,
             store,
             cache,
+            coop,
             cursors: Mutex::new(HashMap::new()),
             inflight: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -56,20 +64,26 @@ impl Prefetcher {
             if !self.inflight.lock().unwrap().insert(hash) {
                 continue; // already being fetched
             }
-            let (store, cache, inflight) = (
+            let (store, cache, inflight, coop) = (
                 self.store.clone(),
                 self.cache.clone(),
                 self.inflight.clone(),
+                self.coop.clone(),
             );
             self.rt.spawn(async move {
-                match store.get_chunk(&hash).await {
-                    // Cache-full is fine: the read path will re-fetch.
-                    Ok(data) => {
-                        let _ = cache.insert(&hash, &data, ChunkState::Clean);
+                let result = if let Some(coop) = coop {
+                    coop.fetch(&hash).await.map(|_| ())
+                } else {
+                    match store.get_chunk(&hash).await {
+                        Ok(data) => {
+                            let _ = cache.insert(&hash, &data, ChunkState::Clean);
+                            Ok(())
+                        }
+                        Err(e) => Err(anyhow!("{e}")),
                     }
-                    Err(e) => {
-                        tracing::debug!(chunk = %hash.to_hex(), error = %e, "prefetch failed")
-                    }
+                };
+                if let Err(e) = result {
+                    tracing::debug!(chunk = %hash.to_hex(), error = %e, "prefetch failed");
                 }
                 inflight.lock().unwrap().remove(&hash);
             });

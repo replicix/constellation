@@ -87,6 +87,18 @@ pub struct SyncHandle {
     pub read_only_member: bool,
 }
 
+/// Everything [`ConstellationFs::new`] needs besides the two filesystem
+/// format knobs (`chunk_size`, `compression`). Grouped so a new
+/// dependency cannot be silently swapped with a neighbour of the same type.
+pub struct FsDependencies {
+    pub meta: Arc<SqliteMeta>,
+    pub store: Arc<ChunkStore>,
+    pub cache: Arc<DiskCache>,
+    pub rt: Handle,
+    pub sync: Option<SyncHandle>,
+    pub coop: Option<Arc<crate::coop::Coop>>,
+}
+
 pub struct ConstellationFs {
     meta: Arc<SqliteMeta>,
     store: Arc<ChunkStore>,
@@ -99,6 +111,9 @@ pub struct ConstellationFs {
     opens: Mutex<HashMap<Ino, u32>>,
     /// Sequential readahead.
     pub(crate) prefetch: crate::prefetch::Prefetcher,
+    /// Cooperative cache (phase 5). `None` only in unit tests that
+    /// construct a filesystem without a live store/P2P stack.
+    coop: Option<std::sync::Arc<crate::coop::Coop>>,
     /// Publication path to the sync task (None in tests).
     sync: Option<SyncHandle>,
 }
@@ -162,27 +177,25 @@ fn time_or_now_ns(t: TimeOrNow) -> i64 {
 }
 
 impl ConstellationFs {
-    pub fn new(
-        meta: Arc<SqliteMeta>,
-        store: Arc<ChunkStore>,
-        cache: Arc<DiskCache>,
-        rt: Handle,
-        chunk_size: u32,
-        compression: CompressionSetting,
-        sync: Option<SyncHandle>,
-    ) -> Self {
-        let prefetch = crate::prefetch::Prefetcher::new(rt.clone(), store.clone(), cache.clone());
+    pub fn new(deps: FsDependencies, chunk_size: u32, compression: CompressionSetting) -> Self {
+        let prefetch = crate::prefetch::Prefetcher::new(
+            deps.rt.clone(),
+            deps.store.clone(),
+            deps.cache.clone(),
+            deps.coop.clone(),
+        );
         Self {
-            meta,
-            store,
-            cache,
-            rt,
+            meta: deps.meta,
+            store: deps.store,
+            cache: deps.cache,
+            rt: deps.rt,
             chunk_size,
             compression,
             writes: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
             prefetch,
-            sync,
+            coop: deps.coop,
+            sync: deps.sync,
         }
     }
 
@@ -364,6 +377,9 @@ impl ConstellationFs {
         }
         if let Ok(Some(data)) = self.cache.get(hash) {
             return Ok(data);
+        }
+        if let Some(coop) = &self.coop {
+            return self.rt.block_on(coop.fetch(hash)).map_err(|_| libc::EIO);
         }
         let mut data = None;
         for attempt in 0..3 {

@@ -192,7 +192,7 @@ only removes waiting. `CONSTELLATION_P2P=off` disables the lot.
 | Host Ed25519 node key (`~/.config/constellation/node.key`, 0600, `CONSTELLATION_NODE_KEY` override), generated on first mount | done | `net::identity` |
 | Registry carries `pubkey` + `p2p_addr`; accept-time allowlist, so enrolment needs bucket write and IAM stays the trust root | done | `store-s3::nodes`, `net::allowlist` |
 | iroh endpoint with relay and address publishing disabled — the registry is the only peer directory; addresses are injected into iroh via `MemoryLookup` | done | `net::endpoint` |
-| Signed length-prefixed JSON messages, verified before use (gossip is relayed, so the transport peer is not the author) | done | `net::message` |
+| Signed length-prefixed postcard messages, verified before use (gossip is relayed, so the transport peer is not the author) | done | `net::message` |
 | Push invalidation: `SegmentPublished` gossip nudges the syncer | done | `net::peers::run_gossip`, `cli::shipper` |
 | Lease handoff: requester asks the holder, holder flushes + releases, requester CAS-claims. Declining is always safe | done | `net::handoff`, `cli::main` |
 | Control API `StatusReport.p2p { enabled, node_addr, peers[] }` | done | `crates/api`, `cli::main` |
@@ -342,7 +342,111 @@ temporary departure; only explicit leave shrinks the write-eligible
 roster. Spec: `docs/DESIGN.md` §1, §2 (`nodes/`), §5.3, §8
 (Join / leave), §9, §10.
 
+### Phase 5 — cooperative cache
+
+| Item | State | Where |
+|---|---|---|
+| Bloom digest (~10 bits/entry, k=7, homemade double-hashing); FPR unit-tested. Caches past one 16 KiB frame split by hash prefix (`bucket_count_for`); 4 TiB → 128 buckets. Per-peer RSS cap 4 MiB. `k` clamped on the wire. | done | `net::bloom` |
+| Incremental digest journal: insert/evict/state-change notes; `take_digest_events` on the 250 ms tick; overflow collapses to one snapshot. Publisher never clones the full set on the hot path. | done | `fs-core::DiskCache`, `cli::coop::DigestTracker` |
+| Peer `ChunkRequest`/`ChunkResponse` on the ALPN stream, length-prefixed body (not through `MAX_FRAME`); serve clean/pinned only | done | `net::{endpoint,peers}`, `fs-core::DiskCache::get_servable` |
+| Per-peer (4) + global (16) serving budget; excess → `found: false` | done | `cli::coop` |
+| Streams handled concurrently per connection (bounded at 32); the chunk read runs on a blocking thread, not a runtime worker | done | `net::peers::handle_stream`, `cli::coop::serve_chunk` |
+| Per-peer pooled QUIC connections; multiplexed streams; one redial through a shared gate | done | `net::endpoint` |
+| Compact postcard wire for all P2P messages; gossip `max_message_size` 32 KiB with a 30 KiB content budget | done | `net::message`, `net::endpoint` |
+| Latency-adaptive source selection: EWMA TTFB/goodput/err, QUIC RTT + path type, 20% hysteresis, one hedge when a fetch outlives its predicted P95 first byte **plus** predicted body time | done | `cli::sources`, wired in `cli::coop::fetch` |
+| TTFB measured to the response head at both sources (`store.get`, peer control reply) so goodput is learned rather than left at its prior | done | `store-s3::get_chunk_timed`, `net::ChunkFetch` |
+| Fetch path (FUSE + prefetch + pin) source-selects; blake3 verify; S3-leg-only retries; hash fail / miss / timeout → error that peer and fall back to S3 | done | `cli::{fusefs,prefetch,pin,coop}` |
+| Kill switch `CONSTELLATION_COOP=off` (serving, using, and gossiping), parsed once at construction | done | `cli::coop::CoopConfig` |
+| `StatusReport.coop` counters + per-source EWMAs + capacity/stale telemetry | done | `api::CoopStatus`, `cli::main` |
+| Unit tests: bloom FPR, digest delta apply, selector hysteresis/hedge, frame budgets, pooling | done | `net::{bloom,message,peers}`, `cli::{coop,sources}` |
+| Harness: `coop-cache-hit`, `coop-fallback`, `web-fleet`, `s3-retry` | done | `harness::scenarios` |
+
+**Verdict: phase 5 is functionally complete.** Review remediation
+closed every open finding with regression coverage. Harness counters
+(seed 42):
+
+- `coop-cache-hit`: B `peer_hits=8` `s3_fetches=0` `hedges=0–1`, read in 28–55 ms under 200 ms S3 latency (8 × 1 MiB).
+- `coop-fallback`: A SIGSTOPped; B `s3_fetches=8` `hedges_fired=8` `peer_misses=0`, content hash-verified. Every fetch hedging is the *correct* reading here: the peer is frozen, so each one is genuinely late, but canceled losers are not failures.
+- `web-fleet`: two cold readers × two reads; aggregate `s3_fetches=0` `peer_hits=16` against 8 unique chunks (writer already held them).
+- `s3-retry`: cold remount with object_store retries off; toxiproxy cut on first GET, healed in the app retry window; hash-verified read, four logical S3 successes, no peer hits.
+
+#### Phase 5 review remediation
+
+The post-implementation review found the following defects and scaling
+risks. They are recorded before remediation so a passing implementation
+cannot erase the reason for each regression test.
+
+| Finding | State | Required proof |
+|---|---|---|
+| Gossip used signed/base64/hex JSON sized against the 64 KiB direct-stream cap, while iroh-gossip retained its independent 4 KiB default; full bloom buckets and ordinary delta bursts were silently oversized | fixed | `message::{a_full_bloom_bucket_fits_the_real_gossip_budget,a_maximum_delta_batch_fits_the_real_gossip_budget}`, `peers::a_full_bloom_bucket_crosses_real_gossip` |
+| The coop-enabled FUSE path bypassed the former bounded S3 retry loop | fixed | `coop::{s3_retry_succeeds_after_two_transient_failures,s3_retry_stops_after_the_bounded_attempt_count}` and harness `s3-retry` |
+| A healthy primary canceled after a winning hedge was recorded as an error and peer miss | fixed | `sources::a_cancelled_race_loser_is_not_an_error_sample`; `coop-fallback` now reports `peer_misses=0` for canceled losers |
+| Digest journal drains split adds/removes and lost event order within one publisher tick | fixed | `cache::digest_journal_preserves_{add_then_remove,remove_then_add}_order`, `coop::tracker_replays_*_in_order` |
+| Peer digests had no `received_at` or expiry and survived peer churn indefinitely | fixed | `coop::stale_peer_digests_expire_and_old_generations_are_rejected`; holder lookup also prunes nodes absent from the live registry |
+| Bucket count could flap at every power-of-two occupancy boundary, forcing repeated complete re-partitioning | fixed | `coop::bucket_count_has_downsize_hysteresis` |
+| `pending_adds` used linear `Vec::retain`, was unbounded while buckets awaited snapshots, and was discarded on resize | fixed | deduplicated `HashSet`, snapshot collapse at a bounded limit; `pending_delta_overflow_collapses_to_snapshots`, `deltas_are_batched_without_losing_the_remainder` |
+| Every chunk request dialed a fresh QUIC connection despite the server supporting multiplexed streams | fixed | `peers::{sequential_and_concurrent_chunks_reuse_one_connection,a_closed_pooled_connection_is_redialed_once,two_streams_on_one_connection_are_served_concurrently}` |
+| Digest-log overflow behavior used a different compile-time threshold in tests than production | fixed | `DiskCache::open_with_digest_log_limit`; `cache::a_flood_of_changes_collapses_to_a_rebuild_snapshot` executes the production branch |
+| Chunk requests used an undocumented hard-coded timeout inconsistent with the rest of P2P | fixed | named `CHUNK_REQUEST_TIMEOUT`; one outer timeout bounds pooled stream plus its single redial; `peers::chunk_timeout_bounds_the_wait_and_server_work_releases` |
+| `CONSTELLATION_COOP` was reparsed on every hot-path fetch/serve and lacked direct regression coverage | fixed | immutable construction-time `CoopConfig`; `coop::{coop_kill_switch_values_are_parsed_once_at_construction,disabled_coop_neither_selects_nor_serves_peers}` |
+| Saturating at `MAX_BUCKETS` silently raised bloom FPR with no status signal | fixed | `StatusReport.coop.digest_capacity_exceeded`; `coop::digest_capacity_limit_is_observable_before_fpr_degrades` |
+| Cold-peer selection ignored available QUIC RTT/path evidence and paid a new handshake in every TTFB sample | fixed | `ChunkFetch` carries selected QUIC RTT/path; `sources::{transport_rtt_and_relay_path_break_a_cold_peer_tie,measured_transfer_data_can_override_a_path_penalty}` |
+
+The compact wire uses raw 32-byte hashes, raw bloom bytes, a raw 32-byte
+author, and a 64-byte signature. A full bucket therefore remains close
+to its 16,384-byte bit vector and below the proven 30,720-byte signed
+content budget; iroh-gossip is explicitly configured for 32 KiB.
+At 4 MiB chunks, a 4 TiB cache selects 128 buckets: 2 MiB of digest
+memory per observing peer. Rotating one 16 KiB snapshot every 30 seconds
+is about 546 bytes/s per publishing node (plus bounded deltas), and a
+complete 128-bucket refresh takes 64 minutes. Cache size and eviction
+remain independent per node.
+
+Validation (2026-08-28):
+
+- `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace`: pass.
+- `tests/smoke.sh`; `tests/integration.sh`; release workspace build: pass.
+- Full harness: all runnable scenarios passed; only `fio-latency` and `fio-blips` skipped because `fio` is absent. New `s3-retry` passed.
+- pjdfstest: **8798 passed, 0 failed**, empty baseline.
+
+### Known limits carried into later phases
+
+- **`/metrics` and the web UI** (DESIGN.md §7) do not exist; the counters
+  are only on `StatusReport.coop`. Phase 7.
+
+### TiB-class caches
+
+A cache is expected to run from a small slice of the dataset up to the
+whole of it — a node may dedicate one or more full drives, so 1–4 TiB is
+an ordinary size, not an extreme. At 4 MiB chunks that is 262k–1M
+chunks. Per node, at 10 bits/entry (~1% FPR):
+
+| Cache | Chunks | Filter | One-shot flood / 30 s | 128 buckets, one per 30 s |
+|---|---|---|---|---|
+| 52 GiB | 13k | 16 KiB | 4.4 kbit/s | fits a single frame |
+| 1 TiB | 262k | 320 KiB | 87 kbit/s | ~2.7 kbit/s, full cycle ~32 min |
+| 4 TiB | 1M | 1.25 MiB | 350 kbit/s | ~5.5 kbit/s, full cycle ~64 min |
+
+Holding a 4 TiB peer's filter costs 1.25 MiB of RSS; eight such peers
+cost 10 MiB. That is affordable. Re-flooding 1.25 MiB through the gossip
+mesh every 30 s is not, which is why snapshots rotate one hash-prefix
+bucket per interval. Add-only deltas cover inserts between rotations;
+an eviction can linger as a false positive until that bucket next
+rotates, then the requester falls back to S3.
+
+Each node picks `buckets` from *its own* cache size. A 200 GiB node and
+a 4 TiB node advertise different counts; the receiver uses the sender's
+count on lookup. A receiver also refuses more than 4 MiB per peer, so
+the largest cache in the fleet cannot dictate everyone else's memory.
+
+Cache lifecycle is local: LRU, pins, and dirty holds run against that
+node's budget only. The digest is advisory.
+
+- A peer may advertise chunks it has since evicted.
+- A peer may hold chunks it has not advertised yet.
+- Either way the fetch falls back to S3.
+
 ## Later phases
 
-Not started (phases 5–8). No code exists for cooperative cache,
-snapshots/E2E, web UI, or GC.
+Phase 5 is closed. Not started: phases 6–8 (snapshots/E2E, web UI, GC).
+No code exists for those yet.

@@ -30,6 +30,7 @@
 //! one.
 
 pub mod allowlist;
+pub mod bloom;
 pub mod delegation;
 pub mod endpoint;
 pub mod epoch;
@@ -39,8 +40,11 @@ pub mod message;
 pub mod peers;
 
 pub use allowlist::{Allowlist, Decision};
+pub use bloom::Bloom;
 pub use delegation::{DelegationGranter, DelegationHolder, DEFAULT_DELEGATION_TTL_MS};
-pub use endpoint::{topic_for, P2p, PeerService};
+pub use endpoint::{
+    topic_for, ChunkFetch, DigestDelta, DigestSnapshot, P2p, PathKind, PeerService,
+};
 pub use epoch::{
     component_covers_roster, EpochState, Machine as EpochMachine, Promise as EpochPromise,
 };

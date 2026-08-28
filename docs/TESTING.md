@@ -282,6 +282,35 @@ window or the TTL; with it, B asks A directly, A flushes and releases,
 and B's CAS succeeds. It asserts the write completes in well under half
 the idle window and that the epoch advanced. Observed: ~27–33 ms.
 
+Phase 5 scenarios exercise the cooperative cache (DESIGN.md §7). Each
+one uses a distinct `CONSTELLATION_NODE_KEY` and
+`CONSTELLATION_DIGEST_INTERVAL_S=1` so blooms propagate in the harness
+without waiting the 30 s production interval. Small caches fit in one
+hash-prefix bucket (the common harness case); a TiB-class cache rotates
+one bucket per interval rather than flooding a 1 MiB snapshot. S3 is
+toxiproxied to 200 ms so a peer hit is unambiguously cheaper than a GET.
+
+- `coop-cache-hit`: A writes a multi-chunk file and ships it; B (cold
+  cache) reads it. B's `status.coop.peer_hits` must exceed `s3_fetches`
+  and the read must finish under the all-S3 serial bound. It also
+  asserts `hedges_fired < chunks`: a hedge is supposed to rescue a late
+  transfer, and one that fires on every fetch doubles request load while
+  sending the spare copy to the source the selector just rejected.
+- `s3-retry`: a single mounted client writes four chunks, unmounts,
+  drops its cache, and remounts with object_store retries disabled.
+  Toxiproxy cuts S3 for the first cold GET and heals inside the
+  application retry window. The hash-verified read must complete with
+  exactly four logical S3 successes and no peer hits or hedges. This
+  isolates the S3-leg retry from whole-fetch retries that would repeat
+  peer selection.
+- `coop-fallback`: same setup, then A is SIGSTOPped. B must still
+  complete a hash-verified read from S3 (`s3_fetches >= 1`); hedges /
+  peer errors record the dead source. Here every fetch *should* hedge —
+  the peer is frozen, so each one really is late.
+- `web-fleet`: one writer, two cold "web" readers each reading twice.
+  Aggregate `s3_fetches` on the readers stays near the unique-chunk
+  count; `peer_hits` covers the rest.
+
 `p2p-partition-tolerance` cuts P2P with the kill switch on one node
 (toxiproxy only fronts S3, so this is how plan 02 specifies simulating an
 unreachable peer) and re-runs the shared-filesystem workload: everything

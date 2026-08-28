@@ -8,8 +8,9 @@
 pub mod types;
 
 pub use types::{
-    CacheStatus, DesignationStatus, EpochStatus, LeaseStatus, P2pStatus, PartitionStatus,
-    PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SpoolStatus, StatusReport,
+    CacheStatus, CoopStatus, DesignationStatus, EpochStatus, LeaseStatus, P2pStatus,
+    PartitionStatus, PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SourceStatus,
+    SpoolStatus, StatusReport,
 };
 
 use anyhow::{Context, Result};
@@ -192,6 +193,7 @@ mod tests {
                 designations: Vec::new(),
                 epoch: EpochStatus::default(),
                 reintegration: ReintegrationStatus::default(),
+                coop: CoopStatus::default(),
             }
         }
 
@@ -300,6 +302,7 @@ mod tests {
                 designations: Vec::new(),
                 epoch: EpochStatus::default(),
                 reintegration: ReintegrationStatus::default(),
+                coop: CoopStatus::default(),
             }
         }
     }

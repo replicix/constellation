@@ -32,11 +32,80 @@ struct Entry {
     atime: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct State {
     entries: HashMap<ChunkHash, Entry>,
     used: u64,
     clock: u64,
+    digest: DigestLog,
+    digest_limit: usize,
+}
+
+/// Bound so a stalled consumer cannot grow the log without limit.
+/// Past this the log collapses to [`DigestLog::Invalidated`] and the
+/// next drain is a one-shot snapshot.
+const MAX_DIGEST_LOG: usize = 65_536;
+
+#[derive(Debug)]
+enum DigestLog {
+    Incremental(Vec<DigestChange>),
+    Invalidated,
+}
+
+impl Default for DigestLog {
+    fn default() -> Self {
+        Self::Incremental(Vec::new())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestChange {
+    Add(ChunkHash),
+    Remove(ChunkHash),
+}
+
+/// Drained cooperative-cache journal: hashes that became (or stopped
+/// being) clean/pinned since the last drain. `rebuild` means the log
+/// overflowed and `events` is an add-only snapshot of what is servable now.
+#[derive(Debug, Default)]
+pub struct DigestBatch {
+    pub events: Vec<DigestChange>,
+    pub rebuild: bool,
+}
+
+fn is_servable(state: ChunkState) -> bool {
+    state != ChunkState::Dirty
+}
+
+impl State {
+    fn new(digest_limit: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            used: 0,
+            clock: 0,
+            digest: DigestLog::default(),
+            digest_limit,
+        }
+    }
+
+    fn note(&mut self, hash: ChunkHash, was: Option<ChunkState>, now: Option<ChunkState>) {
+        let was_s = was.is_some_and(is_servable);
+        let now_s = now.is_some_and(is_servable);
+        if was_s == now_s {
+            return;
+        }
+        let DigestLog::Incremental(v) = &mut self.digest else {
+            return;
+        };
+        v.push(if now_s {
+            DigestChange::Add(hash)
+        } else {
+            DigestChange::Remove(hash)
+        });
+        if v.len() > self.digest_limit {
+            self.digest = DigestLog::Invalidated;
+        }
+    }
 }
 
 /// Disk-backed chunk cache with budget accounting.
@@ -56,12 +125,22 @@ pub struct CacheUsage {
 impl DiskCache {
     /// Open (or create) a cache directory and rebuild accounting from disk.
     pub fn open(root: impl Into<PathBuf>, budget: u64) -> Result<Self, CoreError> {
+        Self::open_with_digest_log_limit(root, budget, MAX_DIGEST_LOG)
+    }
+
+    /// Alternate journal limit for deterministic tests and constrained
+    /// deployments. The production constructor uses [`MAX_DIGEST_LOG`].
+    pub fn open_with_digest_log_limit(
+        root: impl Into<PathBuf>,
+        budget: u64,
+        digest_limit: usize,
+    ) -> Result<Self, CoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         let cache = Self {
             root,
             budget,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State::new(digest_limit.max(1))),
         };
         cache.rescan()?;
         Ok(cache)
@@ -98,6 +177,7 @@ impl DiskCache {
                             atime,
                         },
                     );
+                    st.note(hash, None, Some(ChunkState::Clean));
                 }
             }
         }
@@ -173,17 +253,24 @@ impl DiskCache {
         let size = data.len() as u64;
         let victims = {
             let mut st = self.state.lock().unwrap();
-            if let Some(e) = st.entries.get_mut(hash) {
-                // Already present: possibly upgrade state, done.
+            if let Some((old, now)) = st.entries.get_mut(hash).map(|e| {
+                let old = e.state;
                 e.state = merge_state(e.state, state);
+                (old, e.state)
+            }) {
+                st.note(*hash, Some(old), Some(now));
                 return Ok(());
             }
             let victims = plan_eviction(&mut st, size, self.budget)?;
+            for (vh, _) in &victims {
+                st.note(*vh, Some(ChunkState::Clean), None);
+            }
             // Reserve: account now, before any disk write.
             st.used += size;
             st.clock += 1;
             let atime = st.clock;
             st.entries.insert(*hash, Entry { size, state, atime });
+            st.note(*hash, None, Some(state));
             victims
         };
         for (vh, _) in &victims {
@@ -195,6 +282,7 @@ impl DiskCache {
             let mut st = self.state.lock().unwrap();
             if let Some(entry) = st.entries.remove(hash) {
                 st.used -= entry.size;
+                st.note(*hash, Some(entry.state), None);
             }
             return Err(e);
         }
@@ -218,13 +306,15 @@ impl DiskCache {
     /// Change a chunk's state (e.g. dirty -> clean after upload).
     pub fn set_state(&self, hash: &ChunkHash, state: ChunkState) -> bool {
         let mut st = self.state.lock().unwrap();
-        match st.entries.get_mut(hash) {
-            Some(e) => {
-                e.state = state;
-                true
-            }
-            None => false,
-        }
+        let Some(old) = st.entries.get_mut(hash).map(|e| {
+            let old = e.state;
+            e.state = state;
+            old
+        }) else {
+            return false;
+        };
+        st.note(*hash, Some(old), Some(state));
+        true
     }
 
     /// Remove a chunk from cache and disk.
@@ -241,6 +331,50 @@ impl DiskCache {
         let mut st = self.state.lock().unwrap();
         if let Some(e) = st.entries.remove(hash) {
             st.used -= e.size;
+            st.note(*hash, Some(e.state), None);
+        }
+    }
+
+    /// Read a chunk only if it is clean or pinned. Dirty (unpublished)
+    /// chunks are never served to peers.
+    pub fn get_servable(&self, hash: &ChunkHash) -> Result<Option<Vec<u8>>, CoreError> {
+        if self.state_of(hash) == Some(ChunkState::Dirty) {
+            return Ok(None);
+        }
+        self.get(hash)
+    }
+
+    /// Hashes of clean/pinned chunks. Prefer [`Self::take_digest_events`]
+    /// on the publish path: this clones the whole set under the lock.
+    pub fn servable_hashes(&self) -> Vec<ChunkHash> {
+        let st = self.state.lock().unwrap();
+        st.entries
+            .iter()
+            .filter(|(_, e)| is_servable(e.state))
+            .map(|(h, _)| *h)
+            .collect()
+    }
+
+    /// Drain membership changes for the cooperative-cache publisher.
+    /// Cheap in the common case: only hashes that became or stopped
+    /// being servable since the last drain. Overflow collapses to a
+    /// one-shot snapshot (`rebuild`).
+    pub fn take_digest_events(&self) -> DigestBatch {
+        let mut st = self.state.lock().unwrap();
+        match std::mem::replace(&mut st.digest, DigestLog::Incremental(Vec::new())) {
+            DigestLog::Incremental(events) => DigestBatch {
+                events,
+                rebuild: false,
+            },
+            DigestLog::Invalidated => DigestBatch {
+                events: st
+                    .entries
+                    .iter()
+                    .filter(|(_, e)| is_servable(e.state))
+                    .map(|(h, _)| DigestChange::Add(*h))
+                    .collect(),
+                rebuild: true,
+            },
         }
     }
 
@@ -414,5 +548,107 @@ mod tests {
         fs::write(&path, b"garbage").unwrap();
         assert_eq!(c.get(&h).unwrap(), None);
         assert!(!c.contains(&h));
+    }
+
+    #[test]
+    fn dirty_chunks_are_not_servable() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        let (h1, d1) = chunk(1, 32);
+        let (h2, d2) = chunk(2, 32);
+        c.insert(&h1, &d1, ChunkState::Dirty).unwrap();
+        c.insert(&h2, &d2, ChunkState::Clean).unwrap();
+        assert!(c.get_servable(&h1).unwrap().is_none());
+        assert_eq!(c.get_servable(&h2).unwrap(), Some(d2));
+        assert_eq!(c.servable_hashes(), vec![h2]);
+    }
+
+    #[test]
+    fn digest_journal_tracks_servable_membership() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        let _ = c.take_digest_events(); // drop the empty-open drain
+
+        let (dirty_h, dirty_d) = chunk(1, 32);
+        let (clean_h, clean_d) = chunk(2, 32);
+        c.insert(&dirty_h, &dirty_d, ChunkState::Dirty).unwrap();
+        c.insert(&clean_h, &clean_d, ChunkState::Clean).unwrap();
+        let batch = c.take_digest_events();
+        assert_eq!(batch.events, vec![DigestChange::Add(clean_h)]);
+        assert!(!batch.rebuild);
+
+        c.set_state(&dirty_h, ChunkState::Clean);
+        let batch = c.take_digest_events();
+        assert_eq!(batch.events, vec![DigestChange::Add(dirty_h)]);
+
+        c.set_state(&clean_h, ChunkState::Dirty);
+        let batch = c.take_digest_events();
+        assert_eq!(batch.events, vec![DigestChange::Remove(clean_h)]);
+        assert!(c.take_digest_events().events.is_empty());
+    }
+
+    #[test]
+    fn eviction_is_a_digest_remove() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 100).unwrap();
+        let _ = c.take_digest_events();
+        let (h1, d1) = chunk(1, 60);
+        let (h2, d2) = chunk(2, 60);
+        c.insert(&h1, &d1, ChunkState::Clean).unwrap();
+        let _ = c.take_digest_events();
+        c.insert(&h2, &d2, ChunkState::Clean).unwrap();
+        let batch = c.take_digest_events();
+        assert_eq!(
+            batch.events,
+            vec![DigestChange::Remove(h1), DigestChange::Add(h2)]
+        );
+    }
+
+    #[test]
+    fn a_flood_of_changes_collapses_to_a_rebuild_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let limit = 8;
+        let c = DiskCache::open_with_digest_log_limit(dir.path(), 1 << 20, limit).unwrap();
+        let _ = c.take_digest_events();
+        for i in 0..limit + 1 {
+            let (h, d) = chunk((i % 250) as u8, 16 + i);
+            c.insert(&h, &d, ChunkState::Clean).unwrap();
+        }
+        let batch = c.take_digest_events();
+        assert!(batch.rebuild, "overflow must force a snapshot");
+        assert_eq!(batch.events.len(), limit + 1);
+        assert!(batch
+            .events
+            .iter()
+            .all(|event| matches!(event, DigestChange::Add(_))));
+    }
+
+    #[test]
+    fn digest_journal_preserves_add_then_remove_order() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        let _ = c.take_digest_events();
+        let (h, d) = chunk(1, 32);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        c.remove(&h).unwrap();
+        assert_eq!(
+            c.take_digest_events().events,
+            vec![DigestChange::Add(h), DigestChange::Remove(h)]
+        );
+    }
+
+    #[test]
+    fn digest_journal_preserves_remove_then_add_order() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        let (h, d) = chunk(1, 32);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        let _ = c.take_digest_events();
+        c.remove(&h).unwrap();
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        assert_eq!(
+            c.take_digest_events().events,
+            vec![DigestChange::Remove(h), DigestChange::Add(h)]
+        );
     }
 }

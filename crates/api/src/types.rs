@@ -137,6 +137,46 @@ pub struct StatusReport {
     /// Stranded-journal reintegration (phase 4b).
     #[serde(default)]
     pub reintegration: ReintegrationStatus,
+    /// Cooperative cache (phase 5, DESIGN.md §7).
+    #[serde(default)]
+    pub coop: CoopStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CoopStatus {
+    #[serde(default)]
+    pub peer_hits: u64,
+    #[serde(default)]
+    pub peer_misses: u64,
+    #[serde(default)]
+    pub s3_fetches: u64,
+    #[serde(default)]
+    pub hedges_fired: u64,
+    #[serde(default)]
+    pub bytes_served_to_peers: u64,
+    #[serde(default)]
+    pub stale_digests_pruned: u64,
+    #[serde(default)]
+    pub digest_rebuilds: u64,
+    #[serde(default)]
+    pub digest_capacity_exceeded: bool,
+    #[serde(default)]
+    pub per_source: Vec<SourceStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SourceStatus {
+    pub id: String,
+    #[serde(default)]
+    pub ttfb_ms_ewma: f64,
+    #[serde(default)]
+    pub goodput_mbps_ewma: f64,
+    #[serde(default)]
+    pub err_rate: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_rtt_ms: Option<f64>,
+    #[serde(default)]
+    pub path: String,
 }
 
 /// Live continuation-epoch snapshot.

@@ -41,11 +41,22 @@ pub struct PinManager {
     meta: Arc<SqliteMeta>,
     store: Arc<ChunkStore>,
     cache: Arc<DiskCache>,
+    coop: Option<Arc<crate::coop::Coop>>,
 }
 
 impl PinManager {
-    pub fn new(meta: Arc<SqliteMeta>, store: Arc<ChunkStore>, cache: Arc<DiskCache>) -> Self {
-        Self { meta, store, cache }
+    pub fn new(
+        meta: Arc<SqliteMeta>,
+        store: Arc<ChunkStore>,
+        cache: Arc<DiskCache>,
+        coop: Option<Arc<crate::coop::Coop>>,
+    ) -> Self {
+        Self {
+            meta,
+            store,
+            cache,
+            coop,
+        }
     }
 
     /// Resolve a pin path to its inode, rejecting anything unusable with
@@ -224,7 +235,18 @@ impl PinManager {
                 match queue.next() {
                     Some(h) => {
                         let store = self.store.clone();
-                        tasks.spawn(async move { (h, store.get_chunk(&h).await) });
+                        let coop = self.coop.clone();
+                        tasks.spawn(async move {
+                            let data = if let Some(coop) = coop {
+                                coop.fetch(&h).await.map_err(|e| anyhow::anyhow!("{e}"))
+                            } else {
+                                store
+                                    .get_chunk(&h)
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!("{e}"))
+                            };
+                            (h, data)
+                        });
                     }
                     None => break,
                 }
@@ -253,6 +275,9 @@ impl PinManager {
     async fn get_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>> {
         if let Ok(Some(d)) = self.cache.get(hash) {
             return Ok(d);
+        }
+        if let Some(coop) = &self.coop {
+            return coop.fetch(hash).await;
         }
         Ok(self.store.get_chunk(hash).await?)
     }

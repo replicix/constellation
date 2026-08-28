@@ -148,8 +148,22 @@ impl ChunkStore {
 
     /// Fetch and verify a chunk by content address.
     pub async fn get_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, StoreError> {
+        Ok(self.get_chunk_timed(hash).await?.0)
+    }
+
+    /// `get_chunk` plus the time-to-first-byte: the point where the
+    /// response head has landed and the body is still streaming. The
+    /// source selector needs the two halves apart, because TTFB and
+    /// goodput are separate terms of its ETA (DESIGN.md §7) and a single
+    /// end-to-end duration can only feed one of them.
+    pub async fn get_chunk_timed(
+        &self,
+        hash: &ChunkHash,
+    ) -> Result<(Vec<u8>, std::time::Duration), StoreError> {
         let key = layout::chunk_key(hash);
+        let started = std::time::Instant::now();
         let res = self.store.get(&key).await?;
+        let ttfb = started.elapsed();
         let obj = res.bytes().await?;
         let data = format::decode_object(&obj)?;
         if &ChunkHash::of(&data) != hash {
@@ -157,7 +171,7 @@ impl ChunkStore {
                 key: key.to_string(),
             });
         }
-        Ok(data)
+        Ok((data, ttfb))
     }
 
     pub async fn has_chunk(&self, hash: &ChunkHash) -> Result<bool, StoreError> {

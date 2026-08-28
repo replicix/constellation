@@ -18,7 +18,50 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+type ConnectionSlot = Arc<tokio::sync::Mutex<Option<iroh::endpoint::Connection>>>;
+type ConnectionPool = Arc<Mutex<HashMap<iroh::EndpointId, ConnectionSlot>>>;
+
+/// One hash-prefix bucket of a peer's cache bloom, as gossiped.
+pub struct DigestSnapshot {
+    pub node_id: u64,
+    pub generation: u64,
+    pub bits: Vec<u8>,
+    pub nbits: u64,
+    pub k: u32,
+    pub n: u64,
+    pub bucket: u32,
+    pub buckets: u32,
+}
+
+/// Add-only bloom delta. `adds` are raw hashes; the receiver routes
+/// each one with this sender's `buckets`.
+pub struct DigestDelta {
+    pub node_id: u64,
+    pub generation: u64,
+    pub adds: Vec<[u8; 32]>,
+    pub buckets: u32,
+}
+
+/// One chunk pulled from a peer, with the timing the source selector
+/// needs. `ttfb` is measured to the control reply, so `ttfb` and the
+/// caller's end-to-end duration bracket the body transfer.
+#[derive(Debug)]
+pub struct ChunkFetch {
+    pub data: Vec<u8>,
+    pub ttfb: std::time::Duration,
+    pub rtt: Option<std::time::Duration>,
+    pub path: PathKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    Direct,
+    Relay,
+    Unknown,
+}
 
 /// What the daemon gives the endpoint so it can serve peer requests.
 /// Kept as a trait object so `cli` owns the shipper/lease logic and this
@@ -82,6 +125,23 @@ pub trait PeerService: Send + Sync + 'static {
     }
     /// A peer redistributed activation. Default is a no-op.
     fn epoch_activated(&self, _epoch_id: String, _members: Vec<u64>, _base: Vec<(String, u64)>) {}
+    /// Cooperative-cache digest snapshot from a peer.
+    fn cache_digest(&self, _digest: DigestSnapshot) {}
+    fn cache_digest_delta(&self, _delta: DigestDelta) {}
+    /// Serve a clean/pinned chunk, or `None` to decline (busy, dirty,
+    /// missing, or cooperative cache disabled). `from_hex` is the
+    /// requester's node-key hex, used for the per-peer concurrency cap.
+    ///
+    /// Async for the same reason as `lease_requested`: answering means
+    /// reading and verifying up to a whole chunk from disk, which must
+    /// not happen inline on a runtime worker.
+    fn serve_chunk(
+        &self,
+        _hash: [u8; 32],
+        _from_hex: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
+        Box::pin(async move { None })
+    }
     /// This node's id, for `Ping`/`Pong`.
     fn node_id(&self) -> u64;
 }
@@ -99,6 +159,10 @@ pub struct P2p {
     lookup: MemoryLookup,
     /// Broadcast handle for the joined topic, once it exists.
     sender: Arc<tokio::sync::Mutex<Option<iroh_gossip::api::GossipSender>>>,
+    /// One gate per remote prevents dial storms while allowing unrelated
+    /// peers to connect concurrently. QUIC streams multiplex over the
+    /// retained connection.
+    connections: ConnectionPool,
 }
 
 /// Derive the gossip topic. Prefers the `gossip_secret` from
@@ -130,7 +194,9 @@ impl P2p {
             .bind()
             .await
             .context("binding the iroh endpoint")?;
-        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let gossip = Gossip::builder()
+            .max_message_size(crate::message::GOSSIP_MAX_MESSAGE_SIZE)
+            .spawn(endpoint.clone());
         Ok(Self {
             endpoint,
             gossip,
@@ -139,6 +205,7 @@ impl P2p {
             allow: Arc::new(Mutex::new(Allowlist::new())),
             lookup,
             sender: Arc::new(tokio::sync::Mutex::new(None)),
+            connections: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -186,13 +253,19 @@ impl P2p {
     /// Broadcast a signed payload to the topic. Best effort: a failure
     /// only means peers learn from their next poll instead.
     ///
-    /// Gossip delivers whole datagrams, so this sends the bare JSON —
+    /// Gossip delivers whole datagrams, so this sends bare postcard —
     /// the 4-byte length prefix from [`Signed::encode`] exists only to
     /// frame messages on a byte stream, and including it here would make
     /// every receiver's decode fail silently.
     pub async fn broadcast(&self, payload: &Payload) -> Result<()> {
         let msg = Signed::new(&self.key, payload)?;
-        let body = serde_json::to_vec(&msg)?;
+        let body = msg.encode_bare()?;
+        anyhow::ensure!(
+            body.len() <= crate::message::GOSSIP_CONTENT_LIMIT,
+            "gossip content is {} bytes, limit is {}",
+            body.len(),
+            crate::message::GOSSIP_CONTENT_LIMIT
+        );
         let guard = self.sender.lock().await;
         let Some(tx) = guard.as_ref() else {
             anyhow::bail!("gossip topic not joined yet");
@@ -208,24 +281,145 @@ impl P2p {
     /// only way to learn how to dial.
     pub async fn request(&self, peer: EndpointAddr, payload: &Payload) -> Result<Payload> {
         let expect = peer.id;
-        let conn = self
-            .endpoint
-            .connect(peer, ALPN)
-            .await
-            .context("dialing peer")?;
-        let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
-        let msg = Signed::new(&self.key, payload)?;
+        let conn = self.connection(&peer).await?;
+        let result = async {
+            let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
+            let msg = Signed::new(&self.key, payload)?;
+            crate::message::write_frame(&mut send, &msg).await?;
+            send.finish().ok();
+            let reply = crate::message::read_frame(&mut recv).await?;
+            let (author, body) = reply.verify()?;
+            anyhow::ensure!(
+                author.as_bytes() == expect.as_bytes(),
+                "reply signed by an unexpected key"
+            );
+            Ok(body)
+        }
+        .await;
+        if result.is_err() {
+            self.invalidate_connection(expect, conn.stable_id()).await;
+        }
+        result
+    }
+
+    /// Fetch one chunk from `peer`. The control frames use the same
+    /// signed postcard as everything else; the payload (up to the FS chunk
+    /// size) follows as `u64be length + bytes` so we never shove 4 MiB
+    /// through [`crate::message::MAX_FRAME`].
+    pub async fn request_chunk(
+        &self,
+        peer: EndpointAddr,
+        hash: &[u8; 32],
+    ) -> Result<Option<ChunkFetch>> {
+        let expect = peer.id;
+        let first = self.connection(&peer).await?;
+        match self.request_chunk_on(&first, expect, hash).await {
+            Ok(value) => Ok(value),
+            Err(first_error) => {
+                self.invalidate_connection(expect, first.stable_id()).await;
+                let retry = self.connection(&peer).await?;
+                self.request_chunk_on(&retry, expect, hash)
+                    .await
+                    .with_context(|| format!("chunk stream failed after redial: {first_error:#}"))
+            }
+        }
+    }
+
+    async fn request_chunk_on(
+        &self,
+        conn: &iroh::endpoint::Connection,
+        expect: iroh::EndpointId,
+        hash: &[u8; 32],
+    ) -> Result<Option<ChunkFetch>> {
+        use tokio::io::AsyncReadExt;
+        let started = std::time::Instant::now();
+        let (mut send, mut recv) = conn.open_bi().await.context("opening a chunk stream")?;
+        let msg = Signed::new(&self.key, &Payload::ChunkRequest { hash: *hash })?;
         crate::message::write_frame(&mut send, &msg).await?;
         send.finish().ok();
         let reply = crate::message::read_frame(&mut recv).await?;
+        // The control reply precedes the body, so this is a true
+        // first-byte mark: everything after it is transfer time.
+        let ttfb = started.elapsed();
         let (author, body) = reply.verify()?;
-        // The reply must be signed by the peer we dialled, not merely by
-        // somebody on the allowlist.
         anyhow::ensure!(
             author.as_bytes() == expect.as_bytes(),
-            "reply signed by an unexpected key"
+            "chunk reply signed by an unexpected key"
         );
-        Ok(body)
+        match body {
+            Payload::ChunkResponse { found: false, .. } => Ok(None),
+            Payload::ChunkResponse { found: true, .. } => {
+                let len = recv.read_u64().await.context("chunk length")?;
+                anyhow::ensure!(
+                    len > 0 && len <= 64 * 1024 * 1024,
+                    "implausible chunk length {len}"
+                );
+                let mut data = vec![0u8; len as usize];
+                recv.read_exact(&mut data).await?;
+                let (rtt, path) = transport_observation(conn);
+                Ok(Some(ChunkFetch {
+                    data,
+                    ttfb,
+                    rtt,
+                    path,
+                }))
+            }
+            other => anyhow::bail!("unexpected chunk reply {other:?}"),
+        }
+    }
+
+    async fn connection(&self, peer: &EndpointAddr) -> Result<iroh::endpoint::Connection> {
+        let gate = self
+            .connections
+            .lock()
+            .unwrap()
+            .entry(peer.id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+            .clone();
+        let mut slot = gate.lock().await;
+        if let Some(conn) = slot.as_ref() {
+            if conn.weak_handle().upgrade().is_some() {
+                return Ok(conn.clone());
+            }
+            *slot = None;
+        }
+        let conn = self
+            .endpoint
+            .connect(peer.clone(), ALPN)
+            .await
+            .context("dialing peer")?;
+        *slot = Some(conn.clone());
+        Ok(conn)
+    }
+
+    async fn invalidate_connection(&self, peer: iroh::EndpointId, stable_id: usize) {
+        let gate = self.connections.lock().unwrap().get(&peer).cloned();
+        if let Some(gate) = gate {
+            let mut slot = gate.lock().await;
+            if slot
+                .as_ref()
+                .is_some_and(|conn| conn.stable_id() == stable_id)
+            {
+                *slot = None;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pooled_connection_id(&self, peer: iroh::EndpointId) -> Option<usize> {
+        let gate = self.connections.lock().unwrap().get(&peer).cloned()?;
+        let id = gate.lock().await.as_ref().map(|conn| conn.stable_id());
+        id
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn close_pooled_connection(&self, peer: iroh::EndpointId) {
+        let gate = self.connections.lock().unwrap().get(&peer).cloned();
+        if let Some(gate) = gate {
+            if let Some(conn) = gate.lock().await.as_ref() {
+                conn.close(iroh::endpoint::VarInt::from_u32(0), b"test close");
+            }
+        }
     }
 
     pub fn endpoint(&self) -> &Endpoint {
@@ -239,6 +433,19 @@ impl P2p {
 
     pub fn secret_key(&self) -> &SecretKey {
         &self.key
+    }
+}
+
+fn transport_observation(
+    conn: &iroh::endpoint::Connection,
+) -> (Option<std::time::Duration>, PathKind) {
+    let paths = conn.paths();
+    let selected = paths.iter().find(|path| path.is_selected());
+    match selected {
+        Some(path) if path.is_relay() => (Some(path.rtt()), PathKind::Relay),
+        Some(path) if path.is_ip() => (Some(path.rtt()), PathKind::Direct),
+        Some(path) => (Some(path.rtt()), PathKind::Unknown),
+        None => (None, PathKind::Unknown),
     }
 }
 

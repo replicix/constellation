@@ -1,6 +1,7 @@
 //! Constellation entry point: CLI, daemon, and FUSE mount in one binary.
 
 mod backend;
+mod coop;
 mod designation;
 mod epoch;
 mod fusefs;
@@ -10,6 +11,7 @@ mod pin;
 mod prefetch;
 mod reintegrate;
 mod shipper;
+mod sources;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -457,6 +459,7 @@ fn mount(
         ))
         .context("loading write-eligible roster")?;
     epochs.set_roster(roster);
+
     let designations = std::sync::Arc::new(designation::DesignationManager::new(
         constellation_store_s3::designation::DesignationStore::new(
             store.inner().clone(),
@@ -472,25 +475,36 @@ fn mount(
     ));
     rt.block_on(designations.refresh());
 
+    let coop = crate::coop::Coop::new(
+        cache.clone(),
+        store.clone(),
+        peers.clone(),
+        node_id,
+        fsmeta.chunk_size,
+    );
+
     let departed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fs = fusefs::ConstellationFs::new(
-        meta.clone(),
-        store.clone(),
-        cache.clone(),
-        rt.handle().clone(),
+        fusefs::FsDependencies {
+            meta: meta.clone(),
+            store: store.clone(),
+            cache: cache.clone(),
+            rt: rt.handle().clone(),
+            sync: Some(fusefs::SyncHandle {
+                tx: sync_tx.clone(),
+                fsync_s3,
+                leases: lease_views.clone(),
+                acquire_deadline,
+                designations: Some(designations.clone()),
+                epoch_frozen: Some(epochs.frozen.clone()),
+                epoch_active: Some(epochs.active.clone()),
+                departed: Some(departed.clone()),
+                read_only_member,
+            }),
+            coop: Some(coop.clone()),
+        },
         fsmeta.chunk_size,
         compression,
-        Some(fusefs::SyncHandle {
-            tx: sync_tx.clone(),
-            fsync_s3,
-            leases: lease_views.clone(),
-            acquire_deadline,
-            designations: Some(designations.clone()),
-            epoch_frozen: Some(epochs.frozen.clone()),
-            epoch_active: Some(epochs.active.clone()),
-            departed: Some(departed.clone()),
-            read_only_member,
-        }),
     );
 
     // Background metadata sync: tail foreign segments + ship the
@@ -514,6 +528,7 @@ fn mount(
         meta.clone(),
         store.clone(),
         cache.clone(),
+        Some(coop.clone()),
     ));
     let keepers = std::sync::Arc::new(tokio::sync::Mutex::new({
         let mut m = std::collections::HashMap::new();
@@ -532,6 +547,7 @@ fn mount(
         designations: designations.clone(),
         meta: meta.clone(),
         epochs: epochs.clone(),
+        coop: coop.clone(),
     });
     if peers.is_enabled() {
         // Refresh-on-miss: an unknown key may be a peer that mounted
@@ -576,6 +592,11 @@ fn mount(
                     Err(e) => tracing::warn!(error = %e, "gossip unavailable; peers will poll S3"),
                 }
             });
+        }
+        // Cooperative-cache digest publisher (DESIGN.md §7).
+        {
+            let coop = coop.clone();
+            rt.spawn(async move { coop.publish_loop().await });
         }
         // Periodically re-read the registry so nodes that join later are
         // dialable and enrolled without a remount. Also detect our own
@@ -965,6 +986,7 @@ fn mount(
         store: store.inner().clone(),
         departed: departed.clone(),
         rt: rt.handle().clone(),
+        coop: coop.clone(),
     });
     {
         let _guard = rt.enter();
@@ -1016,6 +1038,7 @@ struct P2pBridge {
     designations: std::sync::Arc<designation::DesignationManager>,
     meta: std::sync::Arc<SqliteMeta>,
     epochs: std::sync::Arc<epoch::EpochManager>,
+    coop: std::sync::Arc<crate::coop::Coop>,
 }
 
 impl constellation_net::PeerService for P2pBridge {
@@ -1118,6 +1141,22 @@ impl constellation_net::PeerService for P2pBridge {
     fn epoch_activated(&self, epoch_id: String, members: Vec<u64>, base: Vec<(String, u64)>) {
         self.epochs.handle_activate(epoch_id, members, base);
         let _ = self.nudge.send(fusefs::SyncRequest::Nudge);
+    }
+
+    fn cache_digest(&self, digest: constellation_net::DigestSnapshot) {
+        self.coop.apply_digest(digest);
+    }
+
+    fn cache_digest_delta(&self, delta: constellation_net::DigestDelta) {
+        self.coop.apply_delta(delta);
+    }
+
+    fn serve_chunk(
+        &self,
+        hash: [u8; 32],
+        from_hex: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
+        Box::pin(async move { self.coop.serve_chunk(hash, &from_hex).await })
     }
 
     fn node_id(&self) -> u64 {
@@ -1515,6 +1554,7 @@ struct DaemonStatus {
     departed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Handle for the blocking control-API calls that need to await.
     rt: tokio::runtime::Handle,
+    coop: std::sync::Arc<crate::coop::Coop>,
 }
 
 impl constellation_api::StatusSource for DaemonStatus {
@@ -1597,6 +1637,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                     .map(|rows| rows.len() as u64)
                     .unwrap_or(0),
             ),
+            coop: self.coop.report(),
         }
     }
 

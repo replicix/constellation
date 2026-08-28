@@ -1,9 +1,9 @@
 //! Wire messages for the P2P fast path (DESIGN.md §4, §12).
 //!
-//! Encoding is length-prefixed JSON, matching the rest of the codebase
-//! (log segments and the control API are both JSON) — the volume here is
-//! tiny (a few hundred bytes per segment PUT), so a compact binary
-//! encoding would buy nothing and cost readability in `tcpdump`.
+//! Encoding is postcard. Gossip carries the bare signed envelope while
+//! direct streams add a four-byte length prefix. Cache digests make JSON
+//! materially expensive (base64 bloom bits and hex hashes), so every P2P
+//! message uses one compact format rather than maintaining two codecs.
 //!
 //! Every message is **signed by the sender's node key and verified
 //! before it is acted on**. Signing matters even though QUIC already
@@ -25,11 +25,21 @@ pub const ALPN: &[u8] = b"constellation/1";
 /// Largest accepted frame. Messages are small; the cap just stops a
 /// malicious peer from making us allocate.
 pub const MAX_FRAME: usize = 64 * 1024;
+/// iroh-gossip's transport frame. Its default is only 4 KiB; every node
+/// must configure this same value so a full bloom bucket is deliverable.
+pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 32 * 1024;
+/// Conservative content budget beneath iroh-gossip's postcard protocol
+/// envelope. `Signed::encode_bare` enforces this before enqueue, because
+/// the gossip sender otherwise reports an oversized frame asynchronously.
+pub const GOSSIP_CONTENT_LIMIT: usize = GOSSIP_MAX_MESSAGE_SIZE - 1024;
+/// Conservative delta batch under [`GOSSIP_CONTENT_LIMIT`]. Raw hashes
+/// cost 32 bytes each; the remaining headroom covers payload/envelope
+/// tags, counters, author, and signature.
+pub const MAX_GOSSIP_DELTA_ADDS: usize = 900;
 
 /// What a peer can say. Extensible on purpose: phase 5 adds cooperative
 /// chunk serving over the same ALPN.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "msg", rename_all = "snake_case")]
 pub enum Payload {
     /// Gossiped after a segment PUT succeeds: recipients tail
     /// immediately instead of waiting for their next poll.
@@ -108,29 +118,64 @@ pub enum Payload {
         members: Vec<u64>,
         base: Vec<(String, u64)>,
     },
+    /// Gossiped bloom of one hash-prefix bucket of this node's
+    /// clean/pinned chunk cache (DESIGN.md §7). Recipients consult it
+    /// locally on a miss — zero per-request messages. Caches larger
+    /// than one frame are split: `bucket` / `buckets` identify the
+    /// slice. A node with a small cache sends `buckets = 1`.
+    CacheDigest {
+        node_id: u64,
+        generation: u64,
+        /// Packed bloom bit vector (see [`crate::bloom`]).
+        bits: Vec<u8>,
+        nbits: u64,
+        k: u32,
+        n: u64,
+        /// Index of this slice.
+        bucket: u32,
+        /// How many slices this sender currently uses.
+        buckets: u32,
+    },
+    /// Add-only delta between snapshots. Removals are not sent: they
+    /// raise FPR until the next [`Payload::CacheDigest`] for that
+    /// bucket. `adds` may span buckets; the receiver routes each hash
+    /// with the sender's `buckets` count.
+    CacheDigestDelta {
+        node_id: u64,
+        generation: u64,
+        /// Raw blake3 hashes newly inserted since the last snapshot.
+        adds: Vec<[u8; 32]>,
+        buckets: u32,
+    },
+    /// Direct request for one cached chunk. The payload is tiny; the
+    /// bytes follow on the same stream (length-prefixed) if `found`.
+    ChunkRequest {
+        hash: [u8; 32],
+    },
+    ChunkResponse {
+        hash: [u8; 32],
+        found: bool,
+    },
 }
 
 /// A payload plus its author and signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signed {
-    /// Author's public key, hex (also the iroh endpoint id).
-    pub from: String,
-    /// Ed25519 signature over the canonical payload bytes, hex.
-    sig: String,
-    /// Canonical JSON of the [`Payload`]. Kept as a string so verify
-    /// checks exactly the bytes that were signed, not a re-serialization
-    /// (which could differ in key order and fail spuriously).
-    body: String,
+    /// Author's raw public key (also the iroh endpoint id).
+    pub from: [u8; 32],
+    /// Ed25519 signature over `body`.
+    sig: Vec<u8>,
+    /// Exact postcard bytes that were signed.
+    body: Vec<u8>,
 }
 
 impl Signed {
     pub fn new(key: &SecretKey, payload: &Payload) -> Result<Self> {
-        let body = serde_json::to_string(payload)?;
-        let sig = key.sign(body.as_bytes());
+        let body = postcard::to_allocvec(payload)?;
+        let sig = key.sign(&body);
         Ok(Self {
-            from: crate::identity::pubkey_hex(&key.public()),
-            sig: crate::identity::hex32(&sig.to_bytes()[..32].try_into().unwrap())
-                + &crate::identity::hex32(&sig.to_bytes()[32..].try_into().unwrap()),
+            from: *key.public().as_bytes(),
+            sig: sig.to_bytes().to_vec(),
             body,
         })
     }
@@ -139,28 +184,34 @@ impl Signed {
     /// [`Signed::from`]; the caller still has to decide whether that
     /// key is allowed (see [`crate::allowlist`]).
     pub fn verify(&self) -> Result<(PublicKey, Payload)> {
-        let key = crate::identity::parse_pubkey(&self.from)?;
-        anyhow::ensure!(self.sig.len() == 128, "signature must be 64 bytes of hex");
-        let mut raw = [0u8; 64];
-        raw[..32].copy_from_slice(&crate::identity::decode_hex32(&self.sig[..64])?);
-        raw[32..].copy_from_slice(&crate::identity::decode_hex32(&self.sig[64..])?);
-        key.verify(self.body.as_bytes(), &iroh::Signature::from_bytes(&raw))
+        let key = PublicKey::from_bytes(&self.from)?;
+        let sig: [u8; 64] = self
+            .sig
+            .as_slice()
+            .try_into()
+            .context("signature must be 64 bytes")?;
+        key.verify(&self.body, &iroh::Signature::from_bytes(&sig))
             .context("bad signature on peer message")?;
-        Ok((key, serde_json::from_str(&self.body)?))
+        Ok((key, postcard::from_bytes(&self.body)?))
     }
 
-    /// Length-prefixed frame: 4-byte big-endian length, then JSON.
+    /// Bare postcard envelope used by gossip and inside stream framing.
+    pub fn encode_bare(&self) -> Result<Vec<u8>> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    /// Length-prefixed frame: 4-byte big-endian length, then postcard.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let json = serde_json::to_vec(self)?;
-        anyhow::ensure!(json.len() <= MAX_FRAME, "message too large: {}", json.len());
-        let mut out = Vec::with_capacity(4 + json.len());
-        out.extend_from_slice(&(json.len() as u32).to_be_bytes());
-        out.extend_from_slice(&json);
+        let bare = self.encode_bare()?;
+        anyhow::ensure!(bare.len() <= MAX_FRAME, "message too large: {}", bare.len());
+        let mut out = Vec::with_capacity(4 + bare.len());
+        out.extend_from_slice(&(bare.len() as u32).to_be_bytes());
+        out.extend_from_slice(&bare);
         Ok(out)
     }
 
     pub fn decode(frame: &[u8]) -> Result<Self> {
-        Ok(serde_json::from_slice(frame)?)
+        Ok(postcard::from_bytes(frame)?)
     }
 }
 
@@ -225,7 +276,7 @@ mod tests {
             },
         )
         .unwrap();
-        signed.body = signed.body.replace("\"p0\"", "\"p1\"");
+        signed.body[0] ^= 1;
         assert!(signed.verify().is_err(), "modified body must not verify");
     }
 
@@ -237,7 +288,7 @@ mod tests {
         let payload = Payload::Ping { node_id: 1 };
         let real = Signed::new(&a, &payload).unwrap();
         let forged = Signed {
-            from: crate::identity::pubkey_hex(&b.public()),
+            from: *b.public().as_bytes(),
             ..real
         };
         assert!(forged.verify().is_err(), "author/signature mismatch");
@@ -272,7 +323,7 @@ mod tests {
             epoch: 1,
         };
         let signed = Signed::new(&k, &payload).unwrap();
-        let bare = serde_json::to_vec(&signed).unwrap();
+        let bare = signed.encode_bare().unwrap();
         let framed = signed.encode().unwrap();
         assert_eq!(framed.len(), bare.len() + 4, "frame adds a length prefix");
         // The bare form is what gossip receivers decode.
@@ -297,5 +348,48 @@ mod tests {
         )
         .unwrap();
         assert!(msg.encode().is_err(), "must refuse to send a huge frame");
+    }
+
+    #[test]
+    fn a_full_bloom_bucket_fits_the_real_gossip_budget() {
+        let bits = vec![0xa5; crate::bloom::MAX_BITS_BYTES];
+        let msg = Signed::new(
+            &key(),
+            &Payload::CacheDigest {
+                node_id: 1,
+                generation: 2,
+                nbits: (bits.len() * 8) as u64,
+                k: crate::bloom::K,
+                n: crate::bloom::ENTRIES_PER_BUCKET as u64,
+                bits,
+                bucket: 127,
+                buckets: 128,
+            },
+        )
+        .unwrap();
+        let n = msg.encode_bare().unwrap().len();
+        assert!(
+            n <= GOSSIP_CONTENT_LIMIT,
+            "full digest is {n} bytes, content limit is {GOSSIP_CONTENT_LIMIT}"
+        );
+    }
+
+    #[test]
+    fn a_maximum_delta_batch_fits_the_real_gossip_budget() {
+        let msg = Signed::new(
+            &key(),
+            &Payload::CacheDigestDelta {
+                node_id: 1,
+                generation: 2,
+                adds: vec![[7; 32]; MAX_GOSSIP_DELTA_ADDS],
+                buckets: 128,
+            },
+        )
+        .unwrap();
+        let n = msg.encode_bare().unwrap().len();
+        assert!(
+            n <= GOSSIP_CONTENT_LIMIT,
+            "maximum delta is {n} bytes, content limit is {GOSSIP_CONTENT_LIMIT}"
+        );
     }
 }

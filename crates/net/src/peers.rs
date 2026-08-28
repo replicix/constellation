@@ -23,6 +23,16 @@ use std::time::{Duration, Instant};
 /// falling back to the S3 path. Generous enough for a WAN round trip,
 /// short enough that it never dominates the idle-release window.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// A chunk includes its body, unlike the small control requests above.
+/// Keep this named and single-layered so source hedging/cancellation has
+/// one predictable upper bound.
+const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-connection ceiling on concurrently handled streams. High enough
+/// that a peer's chunk requests overlap (the cooperative cache caps its
+/// own serving well below this), low enough that one peer cannot spawn
+/// unbounded work.
+const MAX_CONCURRENT_STREAMS: usize = 32;
 
 /// One known peer, as learned from the node registry.
 #[derive(Debug, Clone)]
@@ -148,6 +158,50 @@ impl Peers {
         let mut v: Vec<Peer> = inner.peers.lock().unwrap().values().cloned().collect();
         v.sort_by_key(|p| p.node_id);
         v
+    }
+
+    /// Best-effort gossip of an already-signed-capable payload (digests,
+    /// segment hints). Failure is fine: peers will learn on the next
+    /// snapshot or S3 poll.
+    pub async fn gossip(&self, payload: Payload) -> Result<()> {
+        let Some(inner) = self.inner.as_ref() else {
+            anyhow::bail!("P2P disabled");
+        };
+        inner.p2p.broadcast(&payload).await
+    }
+
+    /// Fetch one content-addressed chunk from `node_id`. `None` means
+    /// the peer declined (busy, miss, dirty); an error means the
+    /// transport failed.
+    pub async fn request_chunk(
+        &self,
+        node_id: u64,
+        hash: &[u8; 32],
+    ) -> Result<Option<crate::endpoint::ChunkFetch>> {
+        self.request_chunk_with_timeout(node_id, hash, CHUNK_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_chunk_with_timeout(
+        &self,
+        node_id: u64,
+        hash: &[u8; 32],
+        timeout: Duration,
+    ) -> Result<Option<crate::endpoint::ChunkFetch>> {
+        let Some(inner) = self.inner.as_ref() else {
+            anyhow::bail!("P2P disabled");
+        };
+        let addr = inner
+            .peers
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .map(|p| p.addr.clone())
+            .ok_or_else(|| anyhow::anyhow!("peer {node_id} has no endpoint"))?;
+        match tokio::time::timeout(timeout, inner.p2p.request_chunk(addr, hash)).await {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("chunk request to {node_id} timed out"),
+        }
     }
 
     /// Tell peers a segment is durable so they tail now instead of at
@@ -369,7 +423,7 @@ impl<S: PeerService> iroh::protocol::ProtocolHandler for DirectHandler<S> {
         let inner = self.inner.clone();
         let service = self.service.clone();
         async move {
-            if let Err(e) = handle_conn(&inner, service.as_ref(), conn).await {
+            if let Err(e) = handle_conn(&inner, &service, conn).await {
                 tracing::debug!(error = %e, "peer connection ended with an error");
             }
             Ok(())
@@ -420,16 +474,52 @@ pub async fn run_gossip<S: PeerService>(
             tracing::debug!(peer = %hex, "dropping gossip from an unenrolled key");
             continue;
         }
-        if let Payload::SegmentPublished { part, seq, epoch } = &payload {
-            service.segment_published(part, *seq, *epoch);
-        }
-        if let Payload::EpochActivate {
-            epoch_id,
-            members,
-            base,
-        } = payload
-        {
-            service.epoch_activated(epoch_id, members, base);
+        match &payload {
+            Payload::SegmentPublished { part, seq, epoch } => {
+                service.segment_published(part, *seq, *epoch);
+            }
+            Payload::CacheDigest {
+                node_id,
+                generation,
+                bits,
+                nbits,
+                k,
+                n,
+                bucket,
+                buckets,
+            } => {
+                service.cache_digest(crate::endpoint::DigestSnapshot {
+                    node_id: *node_id,
+                    generation: *generation,
+                    bits: bits.clone(),
+                    nbits: *nbits,
+                    k: *k,
+                    n: *n,
+                    bucket: *bucket,
+                    buckets: *buckets,
+                });
+            }
+            Payload::CacheDigestDelta {
+                node_id,
+                generation,
+                adds,
+                buckets,
+            } => {
+                service.cache_digest_delta(crate::endpoint::DigestDelta {
+                    node_id: *node_id,
+                    generation: *generation,
+                    adds: adds.clone(),
+                    buckets: *buckets,
+                });
+            }
+            Payload::EpochActivate {
+                epoch_id,
+                members,
+                base,
+            } => {
+                service.epoch_activated(epoch_id.clone(), members.clone(), base.clone());
+            }
+            _ => {}
         }
     }
 }
@@ -438,10 +528,11 @@ pub async fn run_gossip<S: PeerService>(
 /// frames until the peer goes away.
 async fn handle_conn<S: PeerService>(
     inner: &Arc<Inner>,
-    service: &S,
+    service: &Arc<S>,
     conn: iroh::endpoint::Connection,
 ) -> Result<()> {
     let remote = conn.remote_id();
+    let remote_key = *remote.as_bytes();
     let hex = crate::identity::hex32(remote.as_bytes());
     // Accept-time authorization: the key must be enrolled in the
     // registry, which requires bucket write. A miss re-reads the registry
@@ -459,82 +550,135 @@ async fn handle_conn<S: PeerService>(
         conn.close(1u32.into(), b"not allowed");
         return Ok(());
     }
+    // Streams run concurrently rather than one-at-a-time. A chunk
+    // request costs a disk read plus a multi-megabyte transfer, so
+    // serializing behind `accept_bi` would both stall unrelated requests
+    // and make the cooperative cache's serving budget (`cli::coop`)
+    // unreachable — it could never see more than one serve in flight.
+    // The semaphore keeps the resulting concurrency bounded per peer.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
     loop {
-        let (mut send, mut recv) = match conn.accept_bi().await {
+        let (send, recv) = match conn.accept_bi().await {
             Ok(pair) => pair,
             // Normal close.
             Err(_) => return Ok(()),
         };
-        let req = read_frame(&mut recv).await?;
-        let (author, payload) = req.verify()?;
-        // The signer must be the peer we authorized, so an allowed peer
-        // cannot relay a third party's request through its connection.
-        if author.as_bytes() != remote.as_bytes() {
-            tracing::warn!(peer = %hex, "dropping frame signed by a different key");
-            continue;
-        }
-        let reply = match payload {
-            Payload::SegmentPublished { part, seq, epoch } => {
-                service.segment_published(&part, seq, epoch);
-                None
-            }
-            Payload::LeaseRequest { part, requester } => {
-                Some(service.lease_requested(part, requester).await)
-            }
-            Payload::DelegationRequest { path, requester } => {
-                Some(service.delegation_requested(path, requester).await)
-            }
-            Payload::FlushAck {
-                path, part, seq, ..
-            } => {
-                // Inbound `FlushAck` on this ALPN is a *request* for an
-                // ack (see the module doc on `Payload::FlushAck`): the
-                // field name is shared with the reply for symmetry, but
-                // an incoming message's `acked` is meaningless — only
-                // the reply's `acked` matters.
-                Some(service.flush_ack_requested(path, part, seq).await)
-            }
-            Payload::Ping { .. } => Some(Payload::Pong {
-                node_id: service.node_id(),
-            }),
-            Payload::EpochPropose {
-                epoch_id,
-                members,
-                base,
-                proposer,
-            } => Some(
-                service
-                    .epoch_proposed(epoch_id, members, base, proposer)
-                    .await,
-            ),
-            Payload::EpochActivate {
-                epoch_id,
-                members,
-                base,
-            } => {
-                service.epoch_activated(epoch_id.clone(), members, base);
-                Some(Payload::EpochAck {
-                    epoch_id,
-                    member: service.node_id(),
-                    accepted: true,
-                })
-            }
-            Payload::Pong { .. }
-            | Payload::LeaseHandoff { .. }
-            | Payload::DelegationGrant { .. }
-            | Payload::EpochAck { .. } => None,
+        let Ok(permit) = slots.clone().acquire_owned().await else {
+            return Ok(());
         };
-        if let Some(reply) = reply {
+        let inner = inner.clone();
+        let service = service.clone();
+        let hex = hex.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let r = handle_stream(&inner, service.as_ref(), &remote_key, &hex, send, recv).await;
+            if let Err(e) = r {
+                tracing::debug!(peer = %hex, error = %e, "peer stream ended with an error");
+            }
+        });
+    }
+}
+
+/// One request/response exchange on its own bidirectional stream.
+///
+/// Errors here are scoped to the stream: a malformed or unauthorized
+/// frame drops that exchange and leaves the connection serving.
+async fn handle_stream<S: PeerService>(
+    inner: &Arc<Inner>,
+    service: &S,
+    remote_key: &[u8; 32],
+    hex: &str,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+) -> Result<()> {
+    let req = read_frame(&mut recv).await?;
+    let (author, payload) = req.verify()?;
+    // The signer must be the peer we authorized, so an allowed peer
+    // cannot relay a third party's request through its connection.
+    if author.as_bytes() != remote_key {
+        tracing::warn!(peer = %hex, "dropping frame signed by a different key");
+        return Ok(());
+    }
+    let reply = match payload {
+        Payload::SegmentPublished { part, seq, epoch } => {
+            service.segment_published(&part, seq, epoch);
+            None
+        }
+        Payload::LeaseRequest { part, requester } => {
+            Some(service.lease_requested(part, requester).await)
+        }
+        Payload::DelegationRequest { path, requester } => {
+            Some(service.delegation_requested(path, requester).await)
+        }
+        Payload::FlushAck {
+            path, part, seq, ..
+        } => {
+            // Inbound `FlushAck` on this ALPN is a *request* for an
+            // ack (see the module doc on `Payload::FlushAck`): the
+            // field name is shared with the reply for symmetry, but
+            // an incoming message's `acked` is meaningless — only
+            // the reply's `acked` matters.
+            Some(service.flush_ack_requested(path, part, seq).await)
+        }
+        Payload::Ping { .. } => Some(Payload::Pong {
+            node_id: service.node_id(),
+        }),
+        Payload::EpochPropose {
+            epoch_id,
+            members,
+            base,
+            proposer,
+        } => Some(
+            service
+                .epoch_proposed(epoch_id, members, base, proposer)
+                .await,
+        ),
+        Payload::EpochActivate {
+            epoch_id,
+            members,
+            base,
+        } => {
+            service.epoch_activated(epoch_id.clone(), members, base);
+            Some(Payload::EpochAck {
+                epoch_id,
+                member: service.node_id(),
+                accepted: true,
+            })
+        }
+        Payload::ChunkRequest { hash } => {
+            let data = service.serve_chunk(hash, hex.to_string()).await;
+            let found = data.is_some();
+            let reply = Payload::ChunkResponse { hash, found };
             let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
             write_frame(&mut send, &signed).await?;
+            if let Some(bytes) = data {
+                use tokio::io::AsyncWriteExt;
+                send.write_u64(bytes.len() as u64).await?;
+                send.write_all(&bytes).await?;
+            }
+            let _ = send.finish();
+            return Ok(());
         }
-        let _ = send.finish();
+        Payload::Pong { .. }
+        | Payload::LeaseHandoff { .. }
+        | Payload::DelegationGrant { .. }
+        | Payload::EpochAck { .. }
+        | Payload::CacheDigest { .. }
+        | Payload::CacheDigestDelta { .. }
+        | Payload::ChunkResponse { .. } => None,
+    };
+    if let Some(reply) = reply {
+        let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
+        write_frame(&mut send, &signed).await?;
     }
+    let _ = send.finish();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrder};
 
     /// A recording [`PeerService`] so tests can assert what the endpoint
     /// dispatched.
@@ -542,6 +686,7 @@ mod tests {
     struct Recorder {
         segments: Mutex<Vec<(String, u64, u64)>>,
         lease_asks: Mutex<Vec<(String, u64)>>,
+        digests: Mutex<Vec<crate::endpoint::DigestSnapshot>>,
         /// What to answer a lease request with.
         release: bool,
     }
@@ -570,6 +715,9 @@ mod tests {
                     released,
                 }
             })
+        }
+        fn cache_digest(&self, digest: crate::endpoint::DigestSnapshot) {
+            self.digests.lock().unwrap().push(digest);
         }
         fn node_id(&self) -> u64 {
             7
@@ -655,6 +803,74 @@ mod tests {
         assert_eq!(service.lease_asks.lock().unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn a_full_bloom_bucket_crosses_real_gossip() {
+        let (holder, asker, service) = pair(false).await;
+        let holder_id = holder.node_addr().unwrap().id;
+        let asker_id = asker.node_addr().unwrap().id;
+        let mut holder_rx = holder.join_topic(vec![asker_id]).await.unwrap();
+        let mut asker_rx = asker.join_topic(vec![holder_id]).await.unwrap();
+        let asker_service = Arc::new(Recorder::default());
+        let serving = asker.clone();
+        let svc = asker_service.clone();
+        tokio::spawn(async move { serving.serve(svc).await });
+        let (holder_joined, asker_joined) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(holder_rx.joined(), asker_rx.joined())
+        })
+        .await
+        .expect("gossip peers did not join");
+        holder_joined.unwrap();
+        asker_joined.unwrap();
+        tokio::spawn(run_gossip(holder.clone(), holder_rx, service.clone()));
+        tokio::spawn(run_gossip(asker.clone(), asker_rx, asker_service));
+
+        let bits = vec![0x5a; crate::bloom::MAX_BITS_BYTES];
+        asker
+            .gossip(Payload::CacheDigest {
+                node_id: 2,
+                generation: 1,
+                nbits: (bits.len() * 8) as u64,
+                k: crate::bloom::K,
+                n: crate::bloom::ENTRIES_PER_BUCKET as u64,
+                bits,
+                bucket: 0,
+                buckets: 1,
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if service.digests.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("full digest never crossed the gossip transport");
+
+        // The large digest must not poison the gossip connection.
+        asker
+            .gossip(Payload::SegmentPublished {
+                part: "after-digest".into(),
+                seq: 1,
+                epoch: 1,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if service.segments.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("digest killed unrelated gossip");
+    }
+
     /// A peer that is not enrolled in the registry must be refused even
     /// though it can reach us: enrolment requires bucket write, so IAM
     /// stays the trust root.
@@ -701,6 +917,266 @@ mod tests {
         assert!(
             service.lease_asks.lock().unwrap().is_empty(),
             "the request must never reach the service"
+        );
+    }
+
+    /// Serves one fixed chunk, recording how many serves overlapped and
+    /// stalling long enough for the overlap to be observable.
+    struct ChunkServer {
+        data: Option<Vec<u8>>,
+        delay: Duration,
+        in_flight: AtomicU32,
+        peak: AtomicU32,
+    }
+
+    impl ChunkServer {
+        fn new(data: Option<Vec<u8>>, delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                data,
+                delay,
+                in_flight: AtomicU32::new(0),
+                peak: AtomicU32::new(0),
+            })
+        }
+    }
+
+    impl PeerService for ChunkServer {
+        fn segment_published(&self, _part: &str, _seq: u64, _epoch: u64) {}
+        fn lease_requested(
+            &self,
+            part: String,
+            _requester: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+            Box::pin(async move {
+                Payload::LeaseHandoff {
+                    part,
+                    epoch: 0,
+                    released: false,
+                }
+            })
+        }
+        fn serve_chunk(
+            &self,
+            _hash: [u8; 32],
+            _from_hex: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>
+        {
+            Box::pin(async move {
+                let n = self.in_flight.fetch_add(1, AtomicOrder::SeqCst) + 1;
+                self.peak.fetch_max(n, AtomicOrder::SeqCst);
+                tokio::time::sleep(self.delay).await;
+                self.in_flight.fetch_sub(1, AtomicOrder::SeqCst);
+                self.data.clone()
+            })
+        }
+        fn node_id(&self) -> u64 {
+            1
+        }
+    }
+
+    /// Stand up a chunk-serving holder and return the asker's handle.
+    async fn chunk_pair(service: Arc<ChunkServer>) -> Peers {
+        let topic = crate::topic_for(Some(&[8u8; 32]), "fs");
+        let a = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let b = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let (a_key, b_key) = (a.pubkey_hex(), b.pubkey_hex());
+        let (a_addr, b_addr) = (a.addr(), b.addr());
+        let holder = Peers::new(a, 1);
+        let asker = Peers::new(b, 2);
+        let registry = vec![
+            (1, a_key, serde_json::to_value(&a_addr).unwrap()),
+            (2, b_key, serde_json::to_value(&b_addr).unwrap()),
+        ];
+        holder.refresh_registry(registry.clone());
+        asker.refresh_registry(registry);
+        tokio::spawn(async move { holder.serve(service).await });
+        asker
+    }
+
+    fn a_hash() -> [u8; 32] {
+        [9u8; 32]
+    }
+
+    /// Two chunk fetches issued at once must overlap end to end.
+    #[tokio::test]
+    async fn concurrent_chunk_requests_are_served_in_parallel() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::from_millis(300));
+        let asker = chunk_pair(service.clone()).await;
+        let hash = a_hash();
+        let (x, y) = tokio::join!(asker.request_chunk(1, &hash), asker.request_chunk(1, &hash));
+        assert!(x.unwrap().is_some() && y.unwrap().is_some());
+        assert_eq!(
+            service.peak.load(AtomicOrder::SeqCst),
+            2,
+            "the two requests were serialized, not served concurrently"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_and_concurrent_chunks_reuse_one_connection() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        let peer = inner.peers.lock().unwrap().get(&1).unwrap().addr.id;
+        asker.request_chunk(1, &a_hash()).await.unwrap().unwrap();
+        let first = inner.p2p.pooled_connection_id(peer).await.unwrap();
+        let hash = a_hash();
+        let (a, b) = tokio::join!(asker.request_chunk(1, &hash), asker.request_chunk(1, &hash));
+        assert!(a.unwrap().is_some() && b.unwrap().is_some());
+        let after = inner.p2p.pooled_connection_id(peer).await.unwrap();
+        assert_eq!(first, after, "all streams should share one QUIC connection");
+    }
+
+    #[tokio::test]
+    async fn a_closed_pooled_connection_is_redialed_once() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        let peer = inner.peers.lock().unwrap().get(&1).unwrap().addr.id;
+        asker.request_chunk(1, &a_hash()).await.unwrap().unwrap();
+        let first = inner.p2p.pooled_connection_id(peer).await.unwrap();
+        inner.p2p.close_pooled_connection(peer).await;
+        asker.request_chunk(1, &a_hash()).await.unwrap().unwrap();
+        let replacement = inner.p2p.pooled_connection_id(peer).await.unwrap();
+        assert_ne!(
+            first, replacement,
+            "a closed pooled connection must be replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_timeout_bounds_the_wait_and_server_work_releases() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::from_millis(150));
+        let asker = chunk_pair(service.clone()).await;
+        let started = Instant::now();
+        let got = asker
+            .request_chunk_with_timeout(1, &a_hash(), Duration::from_millis(20))
+            .await;
+        assert!(got.is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "foreground read outlived its timeout"
+        );
+        assert_eq!(
+            service.in_flight.load(AtomicOrder::SeqCst),
+            1,
+            "test did not time out an active serve"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if service.in_flight.load(AtomicOrder::SeqCst) == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed-out server work never released its serving slot");
+    }
+
+    /// The same, but both requests share one QUIC connection — which is
+    /// what a peer does when its transport pools. Handling streams
+    /// one-at-a-time inside the accept loop passes the test above (each
+    /// dial gets its own connection) while still stalling every request
+    /// behind the slowest stream here, and capping the cooperative
+    /// cache's serving budget at one serve per peer.
+    #[tokio::test]
+    async fn two_streams_on_one_connection_are_served_concurrently() {
+        let topic = crate::topic_for(Some(&[10u8; 32]), "fs");
+        let holder_p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let client_p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let holder_addr = holder_p2p.addr();
+        let holder = Peers::new(holder_p2p, 1);
+        holder.refresh_registry(vec![
+            (
+                1,
+                holder.pubkey_hex().unwrap(),
+                serde_json::to_value(&holder_addr).unwrap(),
+            ),
+            (
+                2,
+                client_p2p.pubkey_hex(),
+                serde_json::to_value(client_p2p.addr()).unwrap(),
+            ),
+        ]);
+        let service = ChunkServer::new(Some(vec![5u8; 4096]), Duration::from_millis(300));
+        let serving = holder.clone();
+        let svc = service.clone();
+        tokio::spawn(async move { serving.serve(svc).await });
+
+        let conn = client_p2p
+            .endpoint()
+            .connect(holder_addr, ALPN)
+            .await
+            .unwrap();
+        let msg = Signed::new(
+            client_p2p.secret_key(),
+            &Payload::ChunkRequest { hash: a_hash() },
+        )
+        .unwrap();
+        let mut pending = Vec::new();
+        for _ in 0..2 {
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            write_frame(&mut send, &msg).await.unwrap();
+            send.finish().ok();
+            pending.push(recv);
+        }
+        for mut recv in pending {
+            let (_, body) = read_frame(&mut recv).await.unwrap().verify().unwrap();
+            assert!(
+                matches!(body, Payload::ChunkResponse { found: true, .. }),
+                "unexpected reply {body:?}"
+            );
+        }
+        assert_eq!(
+            service.peak.load(AtomicOrder::SeqCst),
+            2,
+            "streams on one connection were handled one at a time"
+        );
+    }
+
+    /// A decline is a clean `None`, not a transport error: the caller
+    /// must be able to tell "peer said no" from "peer is broken".
+    #[tokio::test]
+    async fn a_declined_chunk_request_is_a_miss_not_an_error() {
+        let service = ChunkServer::new(None, Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let got = asker.request_chunk(1, &a_hash()).await;
+        assert!(
+            matches!(got, Ok(None)),
+            "expected a clean miss, got {got:?}"
+        );
+    }
+
+    /// TTFB is measured to the control reply, so it tracks how long the
+    /// holder took to answer and excludes the body transfer. The source
+    /// selector needs these apart to learn goodput at all.
+    #[tokio::test]
+    async fn chunk_fetch_reports_time_to_the_reply_not_to_the_last_byte() {
+        let service = ChunkServer::new(Some(vec![2u8; 4096]), Duration::from_millis(250));
+        let asker = chunk_pair(service).await;
+        let fetch = asker.request_chunk(1, &a_hash()).await.unwrap().unwrap();
+        assert!(
+            fetch.ttfb >= Duration::from_millis(250),
+            "ttfb {:?} does not include the holder's own latency",
+            fetch.ttfb
+        );
+
+        let service = ChunkServer::new(Some(vec![2u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let fetch = asker.request_chunk(1, &a_hash()).await.unwrap().unwrap();
+        assert!(
+            fetch.ttfb < Duration::from_millis(250),
+            "ttfb {:?} looks like a constant, not a measurement",
+            fetch.ttfb
         );
     }
 

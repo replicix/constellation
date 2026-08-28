@@ -146,6 +146,30 @@ pub const SCENARIOS: &[Scenario] = &[
         run: p2p_partition_tolerance,
     },
     Scenario {
+        name: "coop-cache-hit",
+        desc: "cold reader fetches most chunks from a warm peer while S3 is delayed 200ms",
+        requires: &[],
+        run: coop_cache_hit,
+    },
+    Scenario {
+        name: "s3-retry",
+        desc: "cold read survives a first-attempt S3 cut via S3-leg-only retries",
+        requires: &[],
+        run: s3_retry,
+    },
+    Scenario {
+        name: "coop-fallback",
+        desc: "paused warm peer: reader still completes from S3 with hash-verified content",
+        requires: &[],
+        run: coop_fallback,
+    },
+    Scenario {
+        name: "web-fleet",
+        desc: "one writer, two cold readers: aggregate S3 GETs stay near the unique-chunk count",
+        requires: &[],
+        run: web_fleet,
+    },
+    Scenario {
         name: "fresh-node-bootstrap",
         desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
         requires: &[],
@@ -631,20 +655,280 @@ fn p2p_of(c: &Client) -> Result<serde_json::Value> {
 /// Wait until both nodes report a live fast path with a peer enrolled
 /// from the registry, so a latency measurement is not just racing
 /// startup.
-fn wait_for_p2p(clients: [&Client; 2]) -> Result<()> {
+/// Wait until every node reports a live fast path with the other
+/// participants enrolled from the registry.
+fn wait_for_peers(clients: &[&Client]) -> Result<()> {
+    let need = clients.len().saturating_sub(1);
     for c in clients {
         eventually(
-            &format!("{} reports a live P2P peer", c.name),
+            &format!("{} reports {need} live P2P peer(s)", c.name),
             Duration::from_secs(30),
             || {
                 let p = p2p_of(c)?;
                 anyhow::ensure!(p["enabled"] == true, "{} has no fast path: {p}", c.name);
                 let n = p["peers"].as_array().map(|a| a.len()).unwrap_or(0);
-                anyhow::ensure!(n >= 1, "{} sees no peers yet: {p}", c.name);
+                anyhow::ensure!(n >= need, "{} sees {n} peers, want {need}: {p}", c.name);
                 Ok(())
             },
         )?;
     }
+    Ok(())
+}
+
+fn wait_for_p2p(clients: [&Client; 2]) -> Result<()> {
+    wait_for_peers(&[clients[0], clients[1]])
+}
+
+fn coop_of(c: &Client) -> Result<serde_json::Value> {
+    Ok(c.control_status()?["coop"].clone())
+}
+
+fn coop_client(
+    root: &std::path::Path,
+    name: &str,
+    endpoint: &str,
+    backend: &str,
+) -> Result<Client> {
+    let key = format!("/tmp/.constellation-coop-{name}.key");
+    let _ = std::fs::remove_file(&key);
+    Ok(Client::new(root, name, endpoint, backend)?
+        .with_env("CONSTELLATION_NODE_KEY", &key)
+        .with_env("CONSTELLATION_DIGEST_INTERVAL_S", "1"))
+}
+
+fn blob(n_chunks: usize) -> (Vec<u8>, blake3::Hash) {
+    let mut data = vec![0u8; n_chunks * (1 << 20)];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let h = blake3::hash(&data);
+    (data, h)
+}
+
+/// The mounted production path always has `Coop`, so its S3 leg must
+/// preserve the old bounded read retry without re-running peer selection.
+/// Disable object_store's own retries to isolate that application layer.
+fn s3_retry(_seed: u64) -> Result<()> {
+    let (env, root) = setup("s3-retry")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/s3retry-{}", ts());
+    let mut c = Client::new(root.path(), "retry", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_S3_MAX_RETRIES", "0")
+        .with_env("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "500");
+    c.fs_create()?;
+    c.mount()?;
+    let (data, expected) = blob(4);
+    std::fs::write(c.mnt.join("big"), &data)?;
+    eventually("write is durable", Duration::from_secs(20), || {
+        anyhow::ensure!(c.control_status()?["spool"]["journal_backlog"].as_u64() == Some(0));
+        Ok(())
+    })?;
+    c.unmount()?;
+    c.drop_cache()?;
+    c.mount()?;
+
+    proxy.cut()?;
+    let read = std::thread::scope(|scope| -> Result<Vec<u8>> {
+        scope.spawn(|| -> Result<()> {
+            // First GET fails while cut. The S3-only retry waits 50 ms,
+            // so healing here makes its second attempt deterministic.
+            std::thread::sleep(Duration::from_millis(25));
+            proxy.heal()
+        });
+        std::fs::read(c.mnt.join("big")).context("cold read must retry S3")
+    })?;
+    anyhow::ensure!(blake3::hash(&read) == expected, "retried read was corrupt");
+    let coop = coop_of(&c)?;
+    anyhow::ensure!(
+        coop["peer_hits"].as_u64() == Some(0) && coop["hedges_fired"].as_u64() == Some(0),
+        "S3 retry unexpectedly contacted or hedged a peer: {coop}"
+    );
+    anyhow::ensure!(
+        coop["s3_fetches"].as_u64() == Some(4),
+        "successful logical S3 fetches should equal chunks: {coop}"
+    );
+    c.unmount()?;
+    Ok(())
+}
+
+/// Cooperative cache (DESIGN.md §7): A warms a multi-chunk file; B
+/// (cold) reads it while S3 is 200 ms away. Most of B's fetches must
+/// come from A, and the read must beat the all-S3 serial bound.
+fn coop_cache_hit(_seed: u64) -> Result<()> {
+    let (env, root) = setup("coop-cache-hit")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/coophit-{}", ts());
+    let mut a = coop_client(root.path(), "a", &env.endpoint, &backend)?;
+    let mut b = coop_client(root.path(), "b", &env.endpoint, &backend)?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    wait_for_p2p([&a, &b])?;
+
+    let n_chunks = 8usize;
+    let (data, expected) = blob(n_chunks);
+    std::fs::write(a.mnt.join("big"), &data)?;
+    eventually("A shipped the write", Duration::from_secs(20), || {
+        let s = a.control_status()?;
+        anyhow::ensure!(
+            s["spool"]["journal_backlog"].as_u64() == Some(0),
+            "A still has a journal backlog: {s}"
+        );
+        Ok(())
+    })?;
+    eventually("B sees the file", Duration::from_secs(20), || {
+        anyhow::ensure!(b.mnt.join("big").is_file(), "big not on B");
+        Ok(())
+    })?;
+    // Digest interval is 1s; wait for a snapshot of A's now-clean cache.
+    std::thread::sleep(Duration::from_secs(2));
+    proxy.latency(200, 0)?;
+
+    let t0 = std::time::Instant::now();
+    let read = std::fs::read(b.mnt.join("big"))?;
+    let elapsed = t0.elapsed();
+    proxy.heal()?;
+    anyhow::ensure!(blake3::hash(&read) == expected, "B's read was corrupt");
+
+    let coop = coop_of(&b)?;
+    let hits = coop["peer_hits"].as_u64().unwrap_or(0);
+    let s3 = coop["s3_fetches"].as_u64().unwrap_or(0);
+    let hedges = coop["hedges_fired"].as_u64().unwrap_or(0);
+    eprintln!(
+        "    coop-cache-hit: B peer_hits={hits} s3_fetches={s3} hedges={hedges} in {elapsed:.1?}"
+    );
+    anyhow::ensure!(
+        hits > s3 && hits >= (n_chunks as u64) / 2,
+        "B should have fetched most chunks from A, got peer_hits={hits} s3_fetches={s3}: {coop}"
+    );
+    // A hedge is meant to rescue a late transfer, not to accompany every
+    // healthy one: hedging unconditionally doubles the request load and
+    // sends the second copy to the source we just decided against.
+    anyhow::ensure!(
+        hedges < n_chunks as u64,
+        "every fetch hedged ({hedges} for {n_chunks} chunks): the deadline is not a late-transfer signal"
+    );
+    let serial = Duration::from_millis((n_chunks as u64) * 200);
+    anyhow::ensure!(
+        elapsed < serial,
+        "read took {elapsed:.1?} which is not under the all-S3 serial bound {serial:.1?}"
+    );
+    a.unmount()?;
+    b.unmount()?;
+    Ok(())
+}
+
+/// Same shape as coop-cache-hit, but A is frozen mid-read. B must still
+/// finish from S3; content is hash-verified; the dead peer is evicted
+/// (errors / hedges show up on B's selector).
+fn coop_fallback(_seed: u64) -> Result<()> {
+    let (env, root) = setup("coop-fallback")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/coopfb-{}", ts());
+    let mut a = coop_client(root.path(), "a", &env.endpoint, &backend)?;
+    let mut b = coop_client(root.path(), "b", &env.endpoint, &backend)?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    wait_for_p2p([&a, &b])?;
+
+    let n_chunks = 8usize;
+    let (data, expected) = blob(n_chunks);
+    std::fs::write(a.mnt.join("big"), &data)?;
+    eventually("A shipped the write", Duration::from_secs(20), || {
+        let s = a.control_status()?;
+        anyhow::ensure!(s["spool"]["journal_backlog"].as_u64() == Some(0), "{s}");
+        Ok(())
+    })?;
+    eventually("B sees the file", Duration::from_secs(20), || {
+        anyhow::ensure!(b.mnt.join("big").is_file());
+        Ok(())
+    })?;
+    std::thread::sleep(Duration::from_secs(2));
+    proxy.latency(200, 0)?;
+    a.pause()?;
+
+    let read = std::fs::read(b.mnt.join("big")).context("B must complete the read from S3")?;
+    proxy.heal()?;
+    anyhow::ensure!(blake3::hash(&read) == expected, "fallback read was corrupt");
+
+    let coop = coop_of(&b)?;
+    let s3 = coop["s3_fetches"].as_u64().unwrap_or(0);
+    let hedges = coop["hedges_fired"].as_u64().unwrap_or(0);
+    eprintln!(
+        "    coop-fallback: B s3_fetches={s3} hedges_fired={hedges} peer_misses={}",
+        coop["peer_misses"]
+    );
+    anyhow::ensure!(
+        s3 >= 1,
+        "B must have fallen back to S3 after A was paused: {coop}"
+    );
+    a.resume()?;
+    a.unmount()?;
+    b.unmount()?;
+    Ok(())
+}
+
+/// Web-fleet shape: one node writes, two "servers" with cold caches read
+/// repeatedly under S3 latency. Aggregate S3 fetches stay near the
+/// unique-chunk count (each chunk pulled from S3 ~once, then peer-served).
+fn web_fleet(_seed: u64) -> Result<()> {
+    let (env, root) = setup("web-fleet")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/webfleet-{}", ts());
+    let mut a = coop_client(root.path(), "a", &env.endpoint, &backend)?;
+    let mut b = coop_client(root.path(), "b", &env.endpoint, &backend)?;
+    let mut c = coop_client(root.path(), "c", &env.endpoint, &backend)?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    c.mount()?;
+    wait_for_peers(&[&a, &b, &c])?;
+
+    let n_chunks = 8usize;
+    let (data, expected) = blob(n_chunks);
+    std::fs::write(a.mnt.join("site"), &data)?;
+    eventually("A shipped", Duration::from_secs(20), || {
+        anyhow::ensure!(a.control_status()?["spool"]["journal_backlog"].as_u64() == Some(0));
+        Ok(())
+    })?;
+    eventually("file visible on B and C", Duration::from_secs(20), || {
+        anyhow::ensure!(b.mnt.join("site").is_file() && c.mnt.join("site").is_file());
+        Ok(())
+    })?;
+    std::thread::sleep(Duration::from_secs(2));
+    proxy.latency(200, 0)?;
+
+    for reader in [&b, &c] {
+        for _ in 0..2 {
+            let got = std::fs::read(reader.mnt.join("site"))?;
+            anyhow::ensure!(
+                blake3::hash(&got) == expected,
+                "{} read corrupt",
+                reader.name
+            );
+        }
+    }
+    proxy.heal()?;
+
+    let cb = coop_of(&b)?;
+    let cc = coop_of(&c)?;
+    let s3 = cb["s3_fetches"].as_u64().unwrap_or(0) + cc["s3_fetches"].as_u64().unwrap_or(0);
+    let hits = cb["peer_hits"].as_u64().unwrap_or(0) + cc["peer_hits"].as_u64().unwrap_or(0);
+    eprintln!(
+        "    web-fleet: aggregate s3_fetches={s3} peer_hits={hits} (unique chunks {n_chunks})"
+    );
+    anyhow::ensure!(
+        s3 <= n_chunks as u64 + 4,
+        "S3 fetches {s3} should stay near the unique-chunk count {n_chunks}: b={cb} c={cc}"
+    );
+    anyhow::ensure!(
+        hits >= n_chunks as u64,
+        "readers should have served each other / A: peer_hits={hits}"
+    );
+    a.unmount()?;
+    b.unmount()?;
+    c.unmount()?;
     Ok(())
 }
 
