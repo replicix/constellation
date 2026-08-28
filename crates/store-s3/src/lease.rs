@@ -226,6 +226,36 @@ impl LeaseStore {
     }
 }
 
+/// Partition ids whose lease is currently held by `node_id` (not
+/// released, not expired). Used by admin `leave --node-id` to refuse
+/// retiring a node that still appears to own write authority.
+pub async fn live_leases_held_by(
+    store: Arc<dyn ObjectStore>,
+    node_id: u64,
+) -> Result<Vec<String>, StoreError> {
+    use futures::TryStreamExt;
+    let prefix = object_store::path::Path::from("leases");
+    let metas = store.list(Some(&prefix)).try_collect::<Vec<_>>().await?;
+    let now = now_unix_ms();
+    let mut out = Vec::new();
+    for m in metas {
+        let Ok(res) = store.get(&m.location).await else {
+            continue;
+        };
+        let Ok(bytes) = res.bytes().await else {
+            continue;
+        };
+        let Ok(lease) = serde_json::from_slice::<Lease>(&bytes) else {
+            continue;
+        };
+        if lease.holder == node_id && !lease.is_claimable(now) {
+            out.push(lease.partition);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -251,6 +251,45 @@ impl Client {
         );
         Ok(())
     }
+
+    /// Permanently leave the cluster (self), or admin-retire `node_id`.
+    pub fn leave(&mut self, node_id: Option<u64>, force: bool) -> Result<()> {
+        let mut args = vec![
+            "leave".to_string(),
+            "--state-dir".into(),
+            self.state.display().to_string(),
+        ];
+        if let Some(id) = node_id {
+            args.push("--node-id".into());
+            args.push(id.to_string());
+        }
+        if force {
+            args.push("--force".into());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = self.cmd(&arg_refs).output()?;
+        if !out.status.success() {
+            bail!(
+                "leave failed: {}\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        // Self-leave triggers fusermount; wait for the daemon to exit.
+        if node_id.is_none() {
+            if let Some(mut child) = self.child.take() {
+                for _ in 0..100 {
+                    if child.try_wait()?.is_some() {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                child.kill().ok();
+                bail!("{} daemon did not exit after leave", self.name);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Client {

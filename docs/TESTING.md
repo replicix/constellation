@@ -230,6 +230,18 @@ stranded-branch recovery:
   the stranded journal; the explicit reintegration sync path is the
   only bypass.
 
+Phase-4c scenarios prove permanent leave (and that unmount alone is
+not leave):
+
+- `node-leave` mounts three write-eligible peers. With C merely
+  **unmounted**, cutting S3 on A+B must **not** open a continuation
+  epoch (C still counts on the roster). Admin `leave --node-id C`
+  from A then shrinks the roster; after a refresh, A+B **can** open an
+  epoch under S3 cut and converge after heal. A fresh third writer
+  then self-leaves via `constellation leave` (tombstone + unmount);
+  A+B again form an epoch under cut. Registry records are retired
+  tombstones, not deleted, so numeric ids are never recycled.
+
 M3.2 scenarios exercise the partition map (DESIGN.md §4):
 `partition-split` (two nodes, one FS; `CONSTELLATION_PART_SPLIT_OPS`
 is lowered so node A hammering `/hot` produces a child partition

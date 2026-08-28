@@ -23,7 +23,7 @@ correctness never depends on P2P.
                                  |
                                  v
             S3 bucket: chunks/  log/  leases/  checkpoints/
-                       snaps/  registry/  keys/
+                       snaps/  nodes/  keys/
 ```
 
 Trust model: **membership = bucket access.** Valid credentials (`AWS_*` env,
@@ -31,12 +31,22 @@ profiles, IMDS, ...) make a node a full member; IAM read-only credentials make
 it a read-only follower (auto-detected). Constellation never requires the
 ability to change bucket policy or IAM.
 
+Enrollment is self-service on first mount (CAS-claim a cluster-unique node
+id into `nodes/`). **Unmount is a temporary departure** — the registry
+record stays, so the node remains write-eligible and may return with S3.
+**`constellation leave` is the permanent departure** (§8): it retires the
+registry record so survivors can form continuation epochs without waiting
+forever. Heartbeats and missed pings never drop a member (ADR-12: safety
+never depends on failure detection).
+
 ## 2. S3 Bucket Layout
 
 ```
 <prefix>/
   meta.json                     # fs UUID, format version, settings, E2E flag
-  registry/<node-id>.json       # self-enrolled node records (pubkey, name, role)
+  nodes/<node-id>.json          # self-enrolled members (pubkey, P2P addr, ro);
+                                # leave writes a tombstone {retired:true} —
+                                # the id is never recycled
   heartbeat/<node-id>           # liveness beacons (~15-30 s), UX only
   leases/<partition-id>.json    # CAS lease objects (the arbiter)
   log/<partition-id>/<seq>.zst  # ordered metadata log segments
@@ -302,14 +312,22 @@ designee per path, overlap-checked.
 ### 5.3 Continuation epochs
 
 If S3 is unreachable but the P2P-connected component contains **all
-write-eligible nodes** (read-only followers don't count), members sign and
-locally persist a continuation epoch: leases transfer P2P, writes journal
-locally, everything flushes when S3 returns. Majority quorum is deliberately
-insufficient (a minority node with S3 access could legally take expired
-leases). If the component loses a member mid-epoch, the remaining nodes go
-read-only; the departed member persisted its epoch promise and must not take
-epoch-held leases via S3 until holders flush — both sides freeze, no
-conflict. Promises are persisted before activation (crash-safe).
+write-eligible nodes** (every *live* non-read-only registry record —
+read-only followers and leave-tombstones with `retired: true` do not
+count), members sign and locally persist a continuation epoch: leases
+transfer P2P, writes journal locally, everything flushes when S3
+returns. Majority quorum is deliberately insufficient (a minority node
+with S3 access could legally take expired leases). If the component loses
+a member mid-epoch, the remaining nodes go read-only; the departed member
+persisted its epoch promise and must not take epoch-held leases via S3
+until holders flush — both sides freeze, no conflict. Promises are
+persisted before activation (crash-safe).
+
+Shrinking the write-eligible roster is an **operator action**
+(`constellation leave`, §8), never a timeout: an unmounted or
+P2P-unreachable node still counts until explicitly retired, so a
+remaining component cannot open an epoch while a still-enrolled writer
+might take expired leases via S3.
 
 ### Availability matrix (per subtree)
 
@@ -394,12 +412,39 @@ seen.
 
 - **Transport**: iroh QUIC, TLS 1.3, mutual auth by node keypair
   (NodeId = pubkey). Relays forward ciphertext only.
-- **Authorization**: accept-time allowlist against `registry/` (self-
+- **Authorization**: accept-time allowlist against `nodes/` (self-
   enrollment requires bucket write, so IAM decides); read-only members are
   countersigned by a writer node. Unknown NodeIds are dropped post-handshake.
   Gossip topic ID derives from a secret in `meta.json` (bucket-readers only).
   Control messages (lease handoff, delegation grant/ack, epoch promises) are
   signed by node keys.
+- **Join / leave**: first mount CAS-creates `nodes/<id>.json`. Permanent
+  leave **tombstones** the record (`retired: true`, `retired_unix`) rather
+  than DELETE, so numeric ids (log-segment origin, ino prefixes) are never
+  reused by a later claim. Unmount alone never leaves — the live record
+  stays and still blocks continuation epochs until retired.
+
+  - **Self-leave** (`constellation leave --state-dir …`): refuse if a
+    continuation epoch is open locally, or if this node holds a stranded
+    deposed journal (`reintegrate` first). Refuse live offline
+    designations unless `--force` (courtesy; force never skips the epoch
+    or stranded-journal checks). Then flush the journal, release every
+    partition lease, write the tombstone, persist `left=1` in the local
+    state dir, stop writing, and unmount. Remount of that state dir fails
+    until the operator uses a **fresh** `--state-dir` (new id).
+  - **Admin leave** (`leave --state-dir <live-peer> --node-id N`): a
+    still-mounted peer with bucket write tombstones another member. It
+    does not flush that node's journal. Refuse if `N` is the calling
+    node, or if `N` currently holds a live lease or unreleased
+    designation, unless `--force`. A still-running target that sees its
+    own record vanished or retired must stop writing (treat as
+    deposition).
+  - **Rejoin** is new enrollment: mount with a new state dir (or delete
+    the old one) and claim a fresh id. Optional `--rejoin` sugar on a
+    spent state dir is not required.
+
+  Peers refresh `nodes/` periodically (~5 s); after a leave, survivors
+  observe the smaller write-eligible roster without remounting.
 - **Discovery unpublished by default**: peers learn addresses from the
   registry, so a leaked NodeId is not dialable by outsiders.
 - **Node key**: Ed25519 at `~/.config/constellation/node.key` (0600),
@@ -465,8 +510,9 @@ Blocked immediately:
   acquire/steal is an S3 CAS. Exception: inside a continuation epoch, leases
   transfer P2P among epoch members.
 - Visibility of new commits from nodes with no P2P path to us.
-- Enrollment, GC, checkpoints, snapshot create/delete — deferred or rejected
-  cleanly, none load-bearing.
+- Enrollment, leave, GC, checkpoints, snapshot create/delete — deferred or
+  rejected cleanly when S3 is down; none load-bearing. Leave never
+  auto-fires on unmount or a missed heartbeat.
 
 Degrades on a timer — writes under a held lease:
 
@@ -513,9 +559,10 @@ force-release), snapshots/clones (create, browse, delete, mounts),
 compression settings, ops (log tail, fsck, doctor), Prometheus `/metrics`.
 
 CLI highlights: `fs create|mount|umount`, `mount [SOURCE[@snap]] MOUNTPOINT`,
-`pin|unpin`, `offline|online`, `snapshot create|ls|delete|diff`,
-`clone <path@snap> <dest>`, `compression set|get`,
-`status [--spool]`, `inspect <path>`, `cache ls|stat|evict|verify`,
+`leave [--node-id N] [--force]`, `pin|unpin`, `offline|online`,
+`snapshot create|ls|delete|diff`, `clone <path@snap> <dest>`,
+`compression set|get`, `status [--spool]` (includes `node_id` /
+`enrolled`), `inspect <path>`, `cache ls|stat|evict|verify`,
 `gc run|verify`, `log tail`, `fsck [--repair]`, `doctor`, `host init`.
 
 ## 11. Scale Targets

@@ -52,6 +52,13 @@ pub enum SyncRequest {
     /// Reintegrate a stranded branch, either from the control API or
     /// automatically after mounting a persisted deposed state dir.
     Reintegrate(tokio::sync::oneshot::Sender<Result<String, String>>),
+    /// Permanently leave the cluster (self). Flushes, tombstones the
+    /// registry record, marks the state dir spent, then the caller
+    /// unmounts.
+    Leave {
+        force: bool,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
 }
 
 /// FUSE-side handle to the metadata sync task.
@@ -73,6 +80,9 @@ pub struct SyncHandle {
     /// epoch is the authority root (writes without S3 CAS).
     pub epoch_frozen: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub epoch_active: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Set after a successful self-leave, or when our registry record is
+    /// retired/vanished under us: mutations fail with EIO.
+    pub departed: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// A read-only registry member never enters the write gate.
     pub read_only_member: bool,
 }
@@ -199,6 +209,12 @@ impl ConstellationFs {
         let Some(h) = &self.sync else { return Ok(()) };
         if h.read_only_member {
             return Err(libc::EROFS);
+        }
+        if let Some(departed) = &h.departed {
+            if departed.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!("refusing mutation: this node has left the cluster");
+                return Err(libc::EIO);
+            }
         }
         if let Some(frozen) = &h.epoch_frozen {
             if frozen.load(std::sync::atomic::Ordering::Relaxed) {

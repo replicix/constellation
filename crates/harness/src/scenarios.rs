@@ -110,6 +110,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: deposed_reintegration,
     },
     Scenario {
+        name: "node-leave",
+        desc: "three writers; C leaves; A+B can open a continuation epoch under S3 cut (unmount alone cannot)",
+        requires: &[],
+        run: node_leave,
+    },
+    Scenario {
         name: "partition-split",
         desc: "two nodes, low split threshold: /hot becomes its own partition, then idles into a merge",
         requires: &[],
@@ -1183,6 +1189,145 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
             Ok(())
         },
     )?;
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+/// Phase 4c: unmount ≠ leave. With C merely unmounted, A+B cannot open
+/// a continuation epoch (C still write-eligible). After C self-leaves —
+/// or after admin leave of an unmounted C — A+B can.
+fn node_leave(_seed: u64) -> Result<()> {
+    let (env, root) = setup("node-leave")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/leave-{}", ts());
+    let tune = |client: Client, key: &str| {
+        client
+            .with_env("CONSTELLATION_NODE_KEY", key)
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "5000")
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
+            .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
+    };
+    let mut c0 = tune(
+        Client::new(root.path(), "c0", &env.endpoint, &backend)?,
+        "/tmp/.constellation-leave-c0.key",
+    );
+    let mut c1 = tune(
+        Client::new(root.path(), "c1", &env.endpoint, &backend)?,
+        "/tmp/.constellation-leave-c1.key",
+    );
+    let mut c2 = tune(
+        Client::new(root.path(), "c2", &env.endpoint, &backend)?,
+        "/tmp/.constellation-leave-c2.key",
+    );
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    c2.mount()?;
+    for c in [&c0, &c1, &c2] {
+        eventually(
+            &format!("{} reports live P2P peers", c.name),
+            Duration::from_secs(30),
+            || {
+                let p = p2p_of(c)?;
+                anyhow::ensure!(p["enabled"] == true);
+                anyhow::ensure!(p["peers"].as_array().map(|a| a.len()).unwrap_or(0) >= 2);
+                Ok(())
+            },
+        )?;
+    }
+
+    std::fs::create_dir(c0.mnt.join("a"))?;
+    std::fs::create_dir(c1.mnt.join("b"))?;
+    eventually("dirs visible on C", Duration::from_secs(20), || {
+        anyhow::ensure!(c2.mnt.join("a").is_dir());
+        anyhow::ensure!(c2.mnt.join("b").is_dir());
+        Ok(())
+    })?;
+
+    let c2_id = c2.control_status()?["node_id"]
+        .as_u64()
+        .context("C has no node_id")?;
+
+    // --- Half 1: unmount alone must NOT unlock epochs ---
+    c2.unmount()?;
+    // Give A/B a roster refresh cycle while C is still enrolled.
+    std::thread::sleep(Duration::from_secs(6));
+    proxy.cut()?;
+    std::thread::sleep(Duration::from_secs(8));
+    for c in [&c0, &c1] {
+        let status = c.control_status()?;
+        anyhow::ensure!(
+            status["epoch"]["active"] != true,
+            "{} opened an epoch while unmounted C was still enrolled: {}",
+            c.name,
+            status["epoch"]
+        );
+    }
+    proxy.heal()?;
+    // Let A/B re-sync with S3 before admin-leave.
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Admin-retire the unmounted C from A.
+    c0.leave(Some(c2_id), true)?;
+    eventually(
+        "A and B see a two-node roster after admin leave",
+        Duration::from_secs(20),
+        || {
+            // Peers list omits retired C; wait a refresh.
+            for c in [&c0, &c1] {
+                let p = p2p_of(c)?;
+                let peers = p["peers"].as_array().cloned().unwrap_or_default();
+                anyhow::ensure!(
+                    peers.iter().all(|p| p["node_id"].as_u64() != Some(c2_id)),
+                    "{} still lists retired C: {p}",
+                    c.name
+                );
+            }
+            Ok(())
+        },
+    )?;
+
+    proxy.cut()?;
+    wait_for_epoch([&c0, &c1])?;
+    std::fs::write(c0.mnt.join("a/after-leave"), b"ok")?;
+    std::fs::write(c1.mnt.join("b/after-leave"), b"ok")?;
+    proxy.heal()?;
+    eventually(
+        "post-leave epoch writes converge",
+        Duration::from_secs(40),
+        || {
+            anyhow::ensure!(std::fs::read(c0.mnt.join("b/after-leave"))? == b"ok");
+            anyhow::ensure!(std::fs::read(c1.mnt.join("a/after-leave"))? == b"ok");
+            Ok(())
+        },
+    )?;
+    ensure_no_conflicts([&c0, &c1])?;
+
+    // --- Half 2: self-leave of a live third writer ---
+    // Remount C under a *fresh* state dir so it claims a new id, then leave.
+    let mut c3 = tune(
+        Client::new(root.path(), "c3", &env.endpoint, &backend)?,
+        "/tmp/.constellation-leave-c3.key",
+    );
+    c3.mount()?;
+    eventually("C3 peers with A+B", Duration::from_secs(30), || {
+        let p = p2p_of(&c3)?;
+        anyhow::ensure!(p["peers"].as_array().map(|a| a.len()).unwrap_or(0) >= 2);
+        Ok(())
+    })?;
+    let c3_id = c3.control_status()?["node_id"].as_u64().unwrap();
+    c3.leave(None, false)?;
+    anyhow::ensure!(!c3.is_mounted(), "self-leave must unmount");
+    eventually("A sees C3 gone from peers", Duration::from_secs(20), || {
+        let p = p2p_of(&c0)?;
+        let peers = p["peers"].as_array().cloned().unwrap_or_default();
+        anyhow::ensure!(peers.iter().all(|p| p["node_id"].as_u64() != Some(c3_id)));
+        Ok(())
+    })?;
+    proxy.cut()?;
+    wait_for_epoch([&c0, &c1])?;
+    proxy.heal()?;
     c0.unmount()?;
     c1.unmount()?;
     Ok(())

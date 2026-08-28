@@ -16,10 +16,10 @@ pub mod store;
 pub use codec::{Codec, CompressionSetting};
 pub use designation::{Designation, DesignationMode, DesignationStore, DesignationTag};
 pub use error::StoreError;
-pub use lease::{Lease, LeaseMode, LeaseStore, LeaseTag};
+pub use lease::{live_leases_held_by, Lease, LeaseMode, LeaseStore, LeaseTag};
 pub use log::{CheckpointVector, LogStore};
 pub use nodes::{
-    claim_node_id, list_node_ids, list_nodes, publish_p2p, publish_ro, write_eligible_roster,
-    NodeInfo,
+    claim_node_id, get_node, leave_node, list_node_ids, list_nodes, publish_p2p, publish_ro,
+    write_eligible_roster, NodeInfo,
 };
 pub use store::{Capabilities, ChunkStore, FsMeta};

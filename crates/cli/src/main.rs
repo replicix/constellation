@@ -5,6 +5,7 @@ mod designation;
 mod epoch;
 mod fusefs;
 mod lease;
+mod leave;
 mod pin;
 mod prefetch;
 mod reintegrate;
@@ -120,6 +121,20 @@ enum Command {
     Reintegrate {
         #[arg(long)]
         state_dir: PathBuf,
+    },
+    /// Permanently leave the cluster (tombstone the registry record).
+    /// Omit `--node-id` to leave this mount; pass `--node-id` to retire
+    /// a different (unreachable) member via a still-mounted peer.
+    Leave {
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Admin form: retire a different node id.
+        #[arg(long)]
+        node_id: Option<u64>,
+        /// Skip courtesy refusals (live designation / live foreign lease).
+        /// Never skips an open epoch or a stranded deposed journal.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -256,6 +271,14 @@ fn main() -> Result<()> {
             &state_dir,
             constellation_api::Request::Reintegrate,
         )),
+        Command::Leave {
+            state_dir,
+            node_id,
+            force,
+        } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::Leave { node_id, force },
+        )),
         Command::Mount {
             s3,
             mountpoint,
@@ -309,6 +332,13 @@ fn mount(
             .context("bootstrapping metadata replica")?;
     }
     let meta = std::sync::Arc::new(SqliteMeta::open(&db_path)?);
+    if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
+        bail!(
+            "this state directory has permanently left the cluster \
+             (kv left=1); mount with a fresh --state-dir to re-enroll \
+             under a new node id"
+        );
+    }
     // Node identity: claim a cluster-unique id on first mount of this
     // state dir; it scopes ino allocation and marks log segment origin.
     let first_mount = meta.kv_get("node_id")?.is_none();
@@ -322,6 +352,22 @@ fn mount(
             id
         }
     };
+    // A remount whose registry record was retired (or deleted) under us
+    // must not silently reclaim that id.
+    match rt.block_on(constellation_store_s3::get_node(
+        store.inner().clone(),
+        node_id,
+    ))? {
+        None => bail!(
+            "node {node_id} has no registry record; an operator may have \
+             retired it. Use a fresh --state-dir to claim a new id"
+        ),
+        Some(info) if info.retired => bail!(
+            "node {node_id} is retired in the registry; use a fresh \
+             --state-dir to re-enroll under a new id"
+        ),
+        Some(_) => {}
+    }
     if first_mount {
         rt.block_on(constellation_store_s3::publish_ro(
             store.inner().clone(),
@@ -426,6 +472,7 @@ fn mount(
     ));
     rt.block_on(designations.refresh());
 
+    let departed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fs = fusefs::ConstellationFs::new(
         meta.clone(),
         store.clone(),
@@ -441,6 +488,7 @@ fn mount(
             designations: Some(designations.clone()),
             epoch_frozen: Some(epochs.frozen.clone()),
             epoch_active: Some(epochs.active.clone()),
+            departed: Some(departed.clone()),
             read_only_member,
         }),
     );
@@ -530,17 +578,83 @@ fn mount(
             });
         }
         // Periodically re-read the registry so nodes that join later are
-        // dialable and enrolled without a remount.
+        // dialable and enrolled without a remount. Also detect our own
+        // record vanishing or being retired (admin leave under us).
         {
-            let (peers, store_inner, epochs) =
-                (peers.clone(), store.inner().clone(), epochs.clone());
+            let (peers, store_inner, epochs, departed, node_id, meta) = (
+                peers.clone(),
+                store.inner().clone(),
+                epochs.clone(),
+                departed.clone(),
+                node_id,
+                meta.clone(),
+            );
             rt.spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     refresh_peers(&peers, store_inner.clone(), Some(&epochs)).await;
+                    match constellation_store_s3::get_node(store_inner.clone(), node_id).await {
+                        Ok(None) => {
+                            tracing::error!(
+                                node_id,
+                                "our registry record vanished; stopping writes \
+                                 (operator admin-leave?). remount with a fresh state dir"
+                            );
+                            departed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = meta.kv_set("left", "1");
+                        }
+                        Ok(Some(info)) if info.retired => {
+                            tracing::error!(
+                                node_id,
+                                "our registry record is retired; stopping writes"
+                            );
+                            departed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = meta.kv_set("left", "1");
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::debug!(error = %e, "own-record membership check failed"),
+                    }
                 }
             });
         }
+    } else {
+        // P2P off: still refresh the epoch roster and watch our own record.
+        let (store_inner, epochs, departed, node_id, meta) = (
+            store.inner().clone(),
+            epochs.clone(),
+            departed.clone(),
+            node_id,
+            meta.clone(),
+        );
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                match constellation_store_s3::write_eligible_roster(store_inner.clone()).await {
+                    Ok(roster) => epochs.set_roster(roster),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "cannot determine the write-eligible roster; \
+                             continuation epochs stay unavailable"
+                        );
+                        epochs.set_roster(Vec::new());
+                    }
+                }
+                match constellation_store_s3::get_node(store_inner.clone(), node_id).await {
+                    Ok(None) => {
+                        tracing::error!(node_id, "our registry record vanished; stopping writes");
+                        departed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = meta.kv_set("left", "1");
+                    }
+                    Ok(Some(info)) if info.retired => {
+                        tracing::error!(node_id, "our registry record is retired; stopping writes");
+                        departed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = meta.kv_set("left", "1");
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
     // Designations are rare, operator-driven objects, but the daemon
     // must notice one appear/disappear without a remount (e.g. another
@@ -574,6 +688,7 @@ fn mount(
             chunk_store,
             reintegration,
             state_dir,
+            designations,
         ) = (
             ship.clone(),
             stop.clone(),
@@ -590,6 +705,7 @@ fn mount(
             store.clone(),
             reintegration.clone(),
             state_dir.clone(),
+            designations.clone(),
         );
         rt.spawn(async move {
             let mut pending: Option<fusefs::SyncRequest> = None;
@@ -755,6 +871,38 @@ fn mount(
                         .await;
                         let _ = reply.send(r.map_err(|e| format!("{e:#}")));
                     }
+                    Some(fusefs::SyncRequest::Leave { force, reply }) => {
+                        if let Err(e) = leave::refuse_open_epoch(&epochs) {
+                            let _ = reply.send(Err(e.to_string()));
+                            continue;
+                        }
+                        // Upload dirty chunks before the journal flush so
+                        // self-leave does not strand content that only
+                        // exists in the local cache.
+                        if let Err(e) =
+                            upload_dirty_chunks(&cache, &chunk_store, compression).await
+                        {
+                            let _ = reply.send(Err(format!(
+                                "cannot upload dirty chunks before leave: {e:#}"
+                            )));
+                            continue;
+                        }
+                        let mut ship = ship.lock().await;
+                        let mut keepers = keepers.lock().await;
+                        let r = leave::self_leave(
+                            store_inner.clone(),
+                            &meta,
+                            &mut ship,
+                            &mut keepers,
+                            &designations,
+                            node_id,
+                            force,
+                        )
+                        .await;
+                        let _ = reply.send(r.map(|_| format!(
+                            "left cluster as node {node_id}; registry record retired"
+                        )).map_err(|e| e.to_string()));
+                    }
                     Some(fusefs::SyncRequest::Nudge) | None => {
                         tokio::select! {
                             biased;
@@ -814,6 +962,8 @@ fn mount(
         epochs: epochs.clone(),
         reintegration: reintegration.clone(),
         sync_tx: sync_tx.clone(),
+        store: store.inner().clone(),
+        departed: departed.clone(),
         rt: rt.handle().clone(),
     });
     {
@@ -834,8 +984,13 @@ fn mount(
     fuser::mount2(fs, mountpoint, &options).context("FUSE mount")?;
 
     // Clean unmount: ship the journal tail, checkpoint, then release the
-    // lease so a peer does not have to wait out the TTL.
+    // lease so a peer does not have to wait out the TTL. Skip when we
+    // already flushed and retired via `leave` — the registry record is
+    // a tombstone and a second ship is unnecessary.
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
+        return Ok(());
+    }
     let flush = rt.block_on(async {
         let mut ship = ship.lock().await;
         let mut keepers = keepers.lock().await;
@@ -1356,6 +1511,8 @@ struct DaemonStatus {
     epochs: std::sync::Arc<epoch::EpochManager>,
     reintegration: std::sync::Arc<reintegrate::ReintegrationState>,
     sync_tx: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    departed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Handle for the blocking control-API calls that need to await.
     rt: tokio::runtime::Handle,
 }
@@ -1404,11 +1561,17 @@ impl constellation_api::StatusSource for DaemonStatus {
                 })
                 .collect(),
         };
+        let enrolled = !self.departed.load(std::sync::atomic::Ordering::Relaxed)
+            && !matches!(
+                self.meta.kv_get("left").ok().flatten().as_deref(),
+                Some("1")
+            );
         constellation_api::StatusReport {
             fs_uuid: self.fs_uuid.clone(),
             backend: self.backend.clone(),
             mountpoint: self.mountpoint.clone(),
             node_id: self.node_id,
+            enrolled,
             uptime_s: self.started.elapsed().as_secs(),
             spool: constellation_api::SpoolStatus {
                 journal_backlog: constellation_meta::MetaStore::journal_len(&*self.meta)
@@ -1506,6 +1669,49 @@ impl constellation_api::StatusSource for DaemonStatus {
                 .block_on(receive)
                 .map_err(|_| "reintegration task stopped".to_string())?
         })
+    }
+
+    fn leave(&self, node_id: Option<u64>, force: bool) -> std::result::Result<String, String> {
+        match node_id {
+            Some(target) => {
+                let store = self.store.clone();
+                let designations = self.designations.clone();
+                let self_id = self.node_id;
+                tokio::task::block_in_place(|| {
+                    self.rt.block_on(async move {
+                        leave::admin_leave(store, &designations, self_id, target, force)
+                            .await
+                            .map(|_| format!("retired node {target} in the registry"))
+                            .map_err(|e| e.to_string())
+                    })
+                })
+            }
+            None => {
+                leave::refuse_open_epoch(&self.epochs).map_err(|e| e.to_string())?;
+                let (reply, receive) = tokio::sync::oneshot::channel();
+                self.sync_tx
+                    .send(fusefs::SyncRequest::Leave { force, reply })
+                    .map_err(|_| "sync task is not running".to_string())?;
+                let detail = tokio::task::block_in_place(|| {
+                    self.rt
+                        .block_on(receive)
+                        .map_err(|_| "leave task stopped".to_string())?
+                })?;
+                self.departed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                // Unmount after the response is on the wire: the control
+                // handler writes the Ok then this returns, then we detach.
+                let mp = self.mountpoint.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let _ = std::process::Command::new("fusermount3")
+                        .args(["-u"])
+                        .arg(&mp)
+                        .status();
+                });
+                Ok(detail)
+            }
+        }
     }
 }
 

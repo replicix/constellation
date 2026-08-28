@@ -31,6 +31,15 @@ pub enum Request {
     /// Replay this node's stranded journal against the shared log
     /// (DESIGN.md §6 / §9). Needs the write lease.
     Reintegrate,
+    /// Permanently retire a registry member (phase 4c). `node_id: None`
+    /// means this node (flush + tombstone + stop writing); `Some(id)` is
+    /// admin removal of a *different* node via a still-mounted peer.
+    Leave {
+        #[serde(default)]
+        node_id: Option<u64>,
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +90,10 @@ pub struct PinStatus {
     pub chunks_total: u64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusReport {
     pub fs_uuid: String,
@@ -90,6 +103,10 @@ pub struct StatusReport {
     /// segment origin).
     #[serde(default)]
     pub node_id: u64,
+    /// Whether this node's registry record is present and not retired.
+    /// False after a successful `leave`, or when an admin retired us.
+    #[serde(default = "default_true")]
+    pub enrolled: bool,
     pub uptime_s: u64,
     pub spool: SpoolStatus,
     pub cache: CacheStatus,

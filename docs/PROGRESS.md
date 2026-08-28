@@ -323,6 +323,25 @@ daemon and verified end-to-end by the three dedicated scenarios.
   granularity is the batch, not "the first unmarked record". Worth
   collapsing to one path.
 
+### Phase 4c — permanent roster leave
+
+| Item | State | Where |
+|---|---|---|
+| Registry leave is a **tombstone** (`retired: true`, `retired_unix`), not a DELETE — numeric ids stay reserved forever so old log segments / ino prefixes never scramble onto a new host | done | `store-s3::nodes::{leave_node,claim_node_id}` |
+| `write_eligible_roster` omits `ro \|\| retired`; `list_nodes` (P2P) omits retired; fail-closed roster rule unchanged | done | `store-s3::nodes` |
+| Self-leave via control API: refuse open epoch; refuse live designations unless `--force`; flush + release leases; refuse stranded `lease_lost` journal (reintegrate first); tombstone; `kv_set("left","1")`; stop writes + fusermount | done | `cli::leave`, `cli::{main,fusefs}`, `Request::Leave` |
+| Admin leave `leave --node-id N` from a live peer: refuse self; refuse live lease/designation unless `--force`; tombstone only | done | `cli::leave::admin_leave` |
+| Remount of a left / retired id refuses with a clear error (fresh `--state-dir` to re-enroll); vanished/retired own record while mounted freezes writes (`EIO`) and persists `left=1` | done | `cli::main` |
+| Status reports `enrolled: bool` | done | `crates/api::StatusReport` |
+| CLI `constellation leave --state-dir … [--node-id N] [--force]` | done | `cli::main` |
+| Unit + harness proofs | done | `store-s3::nodes`, `cli::leave` tests; harness `node-leave` |
+
+**Verdict: phase 4c is functionally complete** (additive on top of 4b;
+4b's availability-row verdict is unchanged). Unmount remains a
+temporary departure; only explicit leave shrinks the write-eligible
+roster. Spec: `docs/DESIGN.md` §1, §2 (`nodes/`), §5.3, §8
+(Join / leave), §9, §10.
+
 ## Later phases
 
 Not started (phases 5–8). No code exists for cooperative cache,

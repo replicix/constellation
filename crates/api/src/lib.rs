@@ -57,6 +57,10 @@ pub trait StatusSource: Send + Sync + 'static {
     fn reintegrate(&self) -> std::result::Result<String, String> {
         Err("reintegration is not supported by this daemon".into())
     }
+
+    fn leave(&self, _node_id: Option<u64>, _force: bool) -> std::result::Result<String, String> {
+        Err("leave is not supported by this daemon".into())
+    }
 }
 
 /// Serve the control API on `<state_dir>/control.sock` until the task
@@ -117,6 +121,10 @@ async fn handle(stream: UnixStream, source: Arc<dyn StatusSource>) -> Result<()>
                 Ok(detail) => Response::Ok { detail },
                 Err(message) => Response::Error { message },
             },
+            Ok(Request::Leave { node_id, force }) => match source.leave(node_id, force) {
+                Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
+            },
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
@@ -158,6 +166,7 @@ mod tests {
                 backend: "s3://bucket/prefix".into(),
                 mountpoint: "/mnt/x".into(),
                 node_id: 1,
+                enrolled: true,
                 uptime_s: 12,
                 spool: SpoolStatus {
                     journal_backlog: 3,
@@ -271,6 +280,7 @@ mod tests {
                 backend: "s3://bucket/prefix".into(),
                 mountpoint: "/mnt/x".into(),
                 node_id: 1,
+                enrolled: true,
                 uptime_s: 1,
                 spool: SpoolStatus {
                     journal_backlog: 0,
