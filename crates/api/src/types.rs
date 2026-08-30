@@ -281,6 +281,16 @@ pub struct WritebackStatus {
     pub remote_probe_enabled: bool,
     #[serde(default)]
     pub remote_probe_hit_rate: f64,
+    #[serde(default)]
+    pub existence_listed: u64,
+    #[serde(default)]
+    pub existence_complete: bool,
+    #[serde(default)]
+    pub existence_bloom_hits: u64,
+    #[serde(default)]
+    pub existence_bloom_misses: u64,
+    #[serde(default)]
+    pub existence_peer_hints: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

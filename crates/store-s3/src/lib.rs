@@ -7,6 +7,7 @@ pub mod codec;
 pub mod designation;
 pub mod e2e;
 pub mod error;
+pub mod existence;
 pub mod format;
 pub mod gc;
 pub mod layout;
@@ -22,6 +23,7 @@ pub use e2e::{
     change_passphrase, load_keyring, put_keyring, Argon2Params, E2eKeys, Keyring, SharedE2eKeys,
 };
 pub use error::StoreError;
+pub use existence::{parse_chunk_key, scan_chunk_hashes, ChunkHashScan};
 pub use gc::{
     append_journal, is_condemned, publish_condemned, read_condemned, CondemnedList, GcJournalEntry,
 };

@@ -4,6 +4,7 @@ mod backend;
 mod coop;
 mod designation;
 mod epoch;
+mod existence;
 mod fsck;
 mod fusefs;
 mod gc;
@@ -948,7 +949,6 @@ fn mount(
         constellation_store_s3::LeaseMode::SingleWriter
     };
     let write_mode = std::sync::Arc::new(writeback::WriteModeState::new(initial_write_mode));
-    let upload = std::sync::Arc::new(UploadRuntime::new(caps.create_if_absent));
     let mut keeper = lease::LeaseKeeper::new(
         constellation_store_s3::LeaseStore::new(
             store.inner().clone(),
@@ -1049,6 +1049,12 @@ fn mount(
         node_id,
         fsmeta.chunk_size,
     );
+    let existence = crate::existence::Existence::from_env();
+    let upload = std::sync::Arc::new(UploadRuntime::new(
+        caps.create_if_absent,
+        Some(coop.clone()),
+        existence.clone(),
+    ));
 
     let departed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut fs = fusefs::ConstellationFs::new(
@@ -1639,6 +1645,7 @@ fn mount(
     if selector.is_some() && !rw_snapshot {
         options.push(fuser::MountOption::RO);
     }
+    existence.spawn_seed(store.clone(), &rt);
     tracing::info!(?mountpoint, ?state_dir, fs = %fsmeta.uuid, "mounting");
     fuser::mount2(fs, mountpoint, &options).context("FUSE mount")?;
 
@@ -2066,10 +2073,16 @@ struct UploadRuntime {
     create_if_absent: bool,
     probe: std::sync::Mutex<writeback::ProbePolicy>,
     decisions: std::sync::atomic::AtomicU64,
+    coop: Option<std::sync::Arc<crate::coop::Coop>>,
+    existence: std::sync::Arc<crate::existence::Existence>,
 }
 
 impl UploadRuntime {
-    fn new(create_if_absent: bool) -> Self {
+    fn new(
+        create_if_absent: bool,
+        coop: Option<std::sync::Arc<crate::coop::Coop>>,
+        existence: std::sync::Arc<crate::existence::Existence>,
+    ) -> Self {
         let concurrency = std::env::var("CONSTELLATION_UPLOAD_CONCURRENCY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -2080,10 +2093,32 @@ impl UploadRuntime {
             create_if_absent,
             probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
             decisions: std::sync::atomic::AtomicU64::new(0),
+            coop,
+            existence,
         }
     }
 
-    fn put_mode(&self) -> constellation_store_s3::ChunkPutMode {
+    fn put_mode(
+        &self,
+        hash: &constellation_fs_core::ChunkHash,
+    ) -> constellation_store_s3::ChunkPutMode {
+        if self.existence.peer_hints_enabled()
+            && self
+                .coop
+                .as_ref()
+                .is_some_and(|coop| coop.peer_digest_contains(hash))
+        {
+            self.existence.note_peer_hint();
+            return constellation_store_s3::ChunkPutMode::Probe;
+        }
+        match self.existence.contains(hash) {
+            Some(true) => return constellation_store_s3::ChunkPutMode::Probe,
+            Some(false) if self.create_if_absent => {
+                return constellation_store_s3::ChunkPutMode::Create;
+            }
+            Some(false) => return constellation_store_s3::ChunkPutMode::Overwrite,
+            None => {}
+        }
         let n = self
             .decisions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2094,6 +2129,15 @@ impl UploadRuntime {
         } else {
             constellation_store_s3::ChunkPutMode::Overwrite
         }
+    }
+
+    #[cfg(test)]
+    fn for_test(create_if_absent: bool) -> Self {
+        Self::new(
+            create_if_absent,
+            None,
+            crate::existence::Existence::new(1024, false, false),
+        )
     }
 }
 
@@ -2132,7 +2176,7 @@ async fn upload_dirty_chunks(
         })
         .collect::<Result<Vec<_>>>()?;
     let results = stream::iter(jobs.into_iter().map(|(hash, inos, data)| async move {
-        let mode = upload.put_mode();
+        let mode = upload.put_mode(&hash);
         let mut last = None;
         for attempt in 0..3 {
             match store.put_chunk_mode(&hash, &data, compression, mode).await {
@@ -2152,6 +2196,7 @@ async fn upload_dirty_chunks(
     for result in results {
         match result {
             Ok((hash, inos, mode, existed)) => {
+                upload.existence.insert(&hash);
                 if mode == constellation_store_s3::ChunkPutMode::Probe {
                     upload.probe.lock().unwrap().record(existed);
                 }
@@ -2505,6 +2550,7 @@ impl constellation_api::StatusSource for DaemonStatus {
             coop: self.coop.report(),
             writeback: {
                 let probe = self.upload.probe.lock().unwrap();
+                let existence = self.upload.existence.report();
                 constellation_api::WritebackStatus {
                     mode: self.write_mode.get().as_str().into(),
                     dirty_bytes: self
@@ -2515,6 +2561,11 @@ impl constellation_api::StatusSource for DaemonStatus {
                     upload_concurrency: self.upload.concurrency as u32,
                     remote_probe_enabled: probe.enabled(),
                     remote_probe_hit_rate: probe.hit_rate(),
+                    existence_listed: existence.listed,
+                    existence_complete: existence.complete,
+                    existence_bloom_hits: existence.bloom_hits,
+                    existence_bloom_misses: existence.bloom_misses,
+                    existence_peer_hints: existence.peer_hints,
                 }
             },
         }
@@ -2892,6 +2943,7 @@ mod pending_upload_tests {
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
         puts: AtomicUsize,
+        heads: AtomicUsize,
     }
 
     impl FailingStore {
@@ -2903,6 +2955,7 @@ mod pending_upload_tests {
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
                 puts: AtomicUsize::new(0),
+                heads: AtomicUsize::new(0),
             })
         }
 
@@ -2960,6 +3013,9 @@ mod pending_upload_tests {
             location: &ObjPath,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            if options.head {
+                self.heads.fetch_add(1, Ordering::SeqCst);
+            }
             self.inner.get_opts(location, options).await
         }
 
@@ -2996,9 +3052,9 @@ mod pending_upload_tests {
 
     struct Fixture {
         meta: SqliteMeta,
-        cache: DiskCache,
+        cache: Arc<DiskCache>,
         cache_dir: PathBuf,
-        store: ChunkStore,
+        store: Arc<ChunkStore>,
         failing: Arc<FailingStore>,
         _cache_tmp: tempfile::TempDir,
     }
@@ -3008,7 +3064,7 @@ mod pending_upload_tests {
         /// rebuilds accounting purely from what is on disk, the same
         /// path a real remount after `kill -9` takes.
         fn reopen_cache_simulating_crash(&mut self) {
-            self.cache = DiskCache::open(&self.cache_dir, 64 * 1024 * 1024).unwrap();
+            self.cache = Arc::new(DiskCache::open(&self.cache_dir, 64 * 1024 * 1024).unwrap());
         }
     }
 
@@ -3018,9 +3074,9 @@ mod pending_upload_tests {
         let cache_dir = cache_tmp.path().to_path_buf();
         Fixture {
             meta: SqliteMeta::open_in_memory().unwrap(),
-            cache: DiskCache::open(&cache_dir, 64 * 1024 * 1024).unwrap(),
+            cache: Arc::new(DiskCache::open(&cache_dir, 64 * 1024 * 1024).unwrap()),
             cache_dir,
-            store: ChunkStore::new(failing.clone() as Arc<dyn ObjectStore>),
+            store: Arc::new(ChunkStore::new(failing.clone() as Arc<dyn ObjectStore>)),
             failing,
             _cache_tmp: cache_tmp,
         }
@@ -3064,7 +3120,7 @@ mod pending_upload_tests {
             &f.meta,
             &f.store,
             CompressionSetting::RAW,
-            &UploadRuntime::new(true),
+            &UploadRuntime::for_test(true),
             None,
         ))
         .unwrap();
@@ -3102,7 +3158,7 @@ mod pending_upload_tests {
             &f.meta,
             &f.store,
             CompressionSetting::RAW,
-            &UploadRuntime::new(true),
+            &UploadRuntime::for_test(true),
             None,
         ));
         assert!(err.is_err(), "drain must fail while S3 is unreachable");
@@ -3119,7 +3175,7 @@ mod pending_upload_tests {
             &f.meta,
             &f.store,
             CompressionSetting::RAW,
-            &UploadRuntime::new(true),
+            &UploadRuntime::for_test(true),
             None,
         ))
         .unwrap();
@@ -3153,6 +3209,8 @@ mod pending_upload_tests {
             create_if_absent: true,
             probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
             decisions: AtomicU64::new(0),
+            coop: None,
+            existence: crate::existence::Existence::new(1024, false, false),
         };
         rt().block_on(upload_dirty_chunks(
             &f.cache,
@@ -3168,5 +3226,141 @@ mod pending_upload_tests {
             f.failing.max_in_flight.load(Ordering::SeqCst) >= 2,
             "the test must observe actual parallelism"
         );
+    }
+
+    fn queue(f: &Fixture, name: &str, data: &[u8]) -> ChunkHash {
+        let file = f
+            .meta
+            .create(constellation_fs_core::types::ROOT_INO, name, 0o644, 0, 0)
+            .unwrap();
+        let hash = ChunkHash::of(data);
+        f.cache.insert(&hash, data, ChunkState::Dirty).unwrap();
+        f.meta
+            .set_manifest_dirty(file.ino, b"M", data.len() as u64, &[hash])
+            .unwrap();
+        hash
+    }
+
+    #[test]
+    fn complete_list_seed_probes_hits_and_creates_misses_without_head() {
+        let f = fixture();
+        let known_data = b"already in S3";
+        let known = ChunkHash::of(known_data);
+        rt().block_on(f.store.put_chunk_mode(
+            &known,
+            known_data,
+            CompressionSetting::RAW,
+            constellation_store_s3::ChunkPutMode::Create,
+        ))
+        .unwrap();
+        f.failing.puts.store(0, Ordering::SeqCst);
+        f.failing.heads.store(0, Ordering::SeqCst);
+
+        queue(&f, "known", known_data);
+        queue(&f, "new", b"not in S3");
+        let existence = crate::existence::Existence::new(1024, true, false);
+        existence.seed_for_test(&[known], true);
+        let upload = UploadRuntime::new(true, None, existence);
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &upload,
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 1);
+        assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
+        assert!(f.meta.pending_uploads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bloom_false_positive_still_calls_store_before_ack() {
+        let f = fixture();
+        let data = b"forced false positive";
+        let hash = queue(&f, "false-positive", data);
+        let existence = crate::existence::Existence::new(1024, true, false);
+        existence.seed_for_test(&[hash], true);
+        let upload = UploadRuntime::new(true, None, existence);
+
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &upload,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 1);
+        assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
+        assert!(f.meta.pending_uploads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_hit_selects_probe_but_peer_miss_retains_adaptive_head() {
+        let f = fixture();
+        let hinted = ChunkHash::of(b"hinted");
+        let bloom = constellation_net::Bloom::from_hashes(&[hinted.0]);
+        let coop = crate::coop::Coop::new_for_upload_test(f.cache.clone(), f.store.clone());
+        coop.apply_digest(constellation_net::DigestSnapshot {
+            node_id: 2,
+            generation: 1,
+            bits: bloom.bits,
+            nbits: bloom.nbits,
+            k: bloom.k,
+            n: bloom.n,
+            bucket: 0,
+            buckets: 1,
+        });
+        let existence = crate::existence::Existence::new(1024, true, true);
+        let upload = UploadRuntime::new(true, Some(coop), existence);
+        assert_eq!(
+            upload.put_mode(&hinted),
+            constellation_store_s3::ChunkPutMode::Probe
+        );
+        assert_eq!(upload.existence.report().peer_hints, 1);
+        assert_eq!(
+            upload.put_mode(&ChunkHash::of(b"peer miss")),
+            constellation_store_s3::ChunkPutMode::Probe,
+            "an incomplete LIST plus peer miss must keep the adaptive probe"
+        );
+    }
+
+    #[test]
+    fn condemned_hash_overwrites_even_when_existence_bloom_claims_present() {
+        let f = fixture();
+        let data = b"condemned existence hit";
+        let hash = queue(&f, "condemned", data);
+        rt().block_on(constellation_store_s3::publish_condemned(
+            f.store.inner(),
+            vec![hash.to_hex()],
+            1,
+        ))
+        .unwrap();
+        f.failing.puts.store(0, Ordering::SeqCst);
+        f.failing.heads.store(0, Ordering::SeqCst);
+        let existence = crate::existence::Existence::new(1024, true, false);
+        existence.seed_for_test(&[hash], true);
+        let upload = UploadRuntime::new(true, None, existence);
+
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &upload,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            f.failing.heads.load(Ordering::SeqCst),
+            0,
+            "condemned must bypass the hinted HEAD and overwrite"
+        );
+        assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
+        assert!(f.meta.pending_uploads().unwrap().is_empty());
     }
 }

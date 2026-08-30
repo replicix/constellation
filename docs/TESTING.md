@@ -410,6 +410,23 @@ Phase 8a adds three destructive-integrity scenarios:
   asserts exit codes 1 (detected), 2 (repaired), then 0 (clean), remounts, and
   verifies the healed file bytes.
 
+Phase 8c adds two upload-existence scenarios:
+
+- `existence-bloom-dedup` writes a unique multi-chunk tree on A, unmounts it,
+  then mounts B with a fresh state directory and waits for the background
+  256-prefix chunk LIST to report complete. B writes identical bytes without
+  warming its local cache first; bloom hits must advance, misses stay near
+  zero, the model oracle verifies both files, and a direct bucket LIST proves
+  no additional chunk keys appeared. A second fresh node repeats the copy
+  with `CONSTELLATION_EXISTENCE_LIST=off`, proving the optimization is
+  optional and its counters stay disabled. The scenario prints listed-key
+  count and seed wall time so LIST cost remains visible.
+- `existence-peer-hint` disables existence LIST on both nodes, waits for A's
+  clean-cache digest, and writes identical bytes through B. B must report at
+  least one peer upload hint, yet every hint still selects a confirming store
+  operation. A fresh `CONSTELLATION_COOP=off` node repeats the write with zero
+  peer hints and exact model verification.
+
 Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.

@@ -77,8 +77,19 @@ pub struct Bloom {
 impl Bloom {
     /// Empty filter sized for `n` expected entries.
     pub fn with_capacity(n: usize) -> Self {
+        Self::with_capacity_and_max_bytes(n, MAX_BITS_BYTES)
+    }
+
+    /// Empty filter with a caller-selected local memory ceiling.
+    ///
+    /// Gossip callers use [`Self::with_capacity`], whose 16 KiB limit is
+    /// part of the wire contract. Local-only filters may be larger without
+    /// weakening [`Self::from_wire_bytes`], which still rejects oversized
+    /// peer input.
+    pub fn with_capacity_and_max_bytes(n: usize, max_bytes: usize) -> Self {
+        let max_bits = max_bytes.max(8).saturating_mul(8);
         let want = n.max(1).saturating_mul(BITS_PER_ENTRY).max(64);
-        let nbits = want.min(MAX_BITS_BYTES * 8) as u64;
+        let nbits = want.min(max_bits) as u64;
         let nbytes = nbits.div_ceil(8) as usize;
         Self {
             bits: vec![0u8; nbytes],

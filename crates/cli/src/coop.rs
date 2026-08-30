@@ -182,6 +182,22 @@ impl Coop {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_upload_test(cache: Arc<DiskCache>, store: Arc<ChunkStore>) -> Arc<Self> {
+        Self::new_with_config(
+            cache,
+            store,
+            Peers::disabled(),
+            1,
+            1 << 20,
+            CoopConfig {
+                enabled: true,
+                digest_interval: Duration::from_secs(1),
+                digest_ttl: Duration::from_secs(60),
+            },
+        )
+    }
+
     pub fn apply_digest(&self, d: constellation_net::DigestSnapshot) {
         if d.node_id == self.node_id {
             return;
@@ -312,6 +328,15 @@ impl Coop {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// Whether any live, non-stale cooperative-cache digest claims `hash`.
+    ///
+    /// This is deliberately membership-only: upload policy may use the
+    /// answer to select a confirming HEAD, but it must not treat a peer's
+    /// cache advertisement as proof that S3 contains the object.
+    pub fn peer_digest_contains(&self, hash: &ChunkHash) -> bool {
+        self.config.enabled && !self.holders(hash).is_empty()
     }
 
     fn candidates(&self, hash: &ChunkHash) -> Vec<SourceId> {

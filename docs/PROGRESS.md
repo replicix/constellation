@@ -778,8 +778,50 @@ exclusions), with no regressions. The three-run-median performance gate passes
 all eight rates, and `make dist-linux` produces a static-PIE musl binary whose
 `ldd` result is `statically linked`.
 
+## Phase 8c — LIST-seeded existence bloom: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Mount-time background scan of 256 `chunks/<aa>/` prefixes at bounded concurrency, with canonical key parsing and incomplete-on-cap semantics | done | `store-s3::existence`, `cli::existence` |
+| Local-only 10-bit/entry, k=7 bloom with `CONSTELLATION_EXISTENCE_BLOOM_BYTES` (default 4 MiB); the 16 KiB gossip cap remains wire-only | done | `net::bloom`, `cli::existence` |
+| Upload ladder: local durable first, live peer digest probe hint, complete LIST bloom miss → Create without HEAD, hit → Probe, then unchanged adaptive fallback | done | `cli::{main,coop,existence}` |
+| Successful uploads add to the local filter; GC does not delete bits, so stale membership costs a HEAD but cannot skip a PUT | done | `cli::main` |
+| Kill switches `CONSTELLATION_EXISTENCE_LIST=off` and `CONSTELLATION_EXISTENCE_PEER_HINT=off`; `CONSTELLATION_COOP=off` also removes peer hints | done | `cli::existence` |
+| Additive writeback status and Prometheus metrics for listed keys, completeness, bloom hits/misses, and peer hints | done | `api::{types,web}`, `cli::main` |
+| Counting-store unit coverage for hit/miss request shape, false-positive safety, peer hint/fallback, incomplete cap, canonical parsing, and condemned overwrite | done | `store-s3::{existence,store}`, `cli::{existence,main}` tests |
+| Fault scenarios for cold duplicate import and LIST-disabled peer hints | done | `harness::{existence-bloom-dedup,existence-peer-hint}` |
+
+### Phase 8c exit criteria (plan 12)
+
+- [x] A complete S3 LIST seed can prove absence and choose a conditional
+      Create without HEAD; every bloom or peer-digest hit still performs a
+      store call before its pending row is acknowledged.
+- [x] Capacity overflow leaves the seed incomplete, so no unlisted hash is
+      treated as absent. Listing and filter memory are bounded independently
+      of bucket size.
+- [x] Peer digests remain cache-membership hints only; a peer miss falls
+      through and dirty chunks remain excluded by the existing digest rules.
+- [x] Condemned hashes still force an overwrite even when a LIST bloom or
+      peer digest selects Probe.
+- [x] Harness scenarios `existence-bloom-dedup` and `existence-peer-hint`
+      pass with byte-exact model verification and their kill-switch beats.
+
+The mount performs no periodic re-LIST. Insert-on-put keeps ordinary additions
+current; after bucket GC, stale hits are safe and only raise HEAD traffic. A
+post-GC re-LIST could tighten the false-positive rate but is deliberately out
+of scope for this phase.
+
+Validation (2026-08-30): fmt and strict clippy clean; 275 workspace tests,
+smoke, S3 integration, release build, every runnable harness scenario, and
+pjdfstest **8798 passed, 0 failed** with an empty baseline. Harness seed 42:
+`existence-bloom-dedup` listed 300 keys in 359.1 ms and reported
+`bloom_hits=300 bloom_misses=0`; its 256 sharded LIST requests replaced 300
+per-chunk HEAD decisions for this tree. `existence-peer-hint` reported
+`peer_hints=9` with LIST disabled; its coop-disabled beat reported zero hints.
+Only `fio-latency` and `fio-blips` skipped because `fio` is absent.
+
 ## Later phases
 
-Phases 1–8 are closed. Phase 9 automated crash reporting remains future work.
+Phases 1–8c are closed. Phase 9 automated crash reporting remains future work.
 Deferred format/data-plane items remain listed in `docs/ROADMAP.md` and the
 phase-specific scope notes above.

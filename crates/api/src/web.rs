@@ -116,6 +116,31 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.coop.hedges_fired
     );
     gauge!(
+        "constellation_existence_listed",
+        "Chunk keys admitted by the mount-time S3 LIST seed.",
+        status.writeback.existence_listed
+    );
+    gauge!(
+        "constellation_existence_complete",
+        "Whether the S3 existence LIST seed completed within its memory cap.",
+        u8::from(status.writeback.existence_complete)
+    );
+    gauge!(
+        "constellation_existence_bloom_hits_total",
+        "Upload decisions whose complete existence filter reported present.",
+        status.writeback.existence_bloom_hits
+    );
+    gauge!(
+        "constellation_existence_bloom_misses_total",
+        "Upload decisions whose complete existence filter proved absent.",
+        status.writeback.existence_bloom_misses
+    );
+    gauge!(
+        "constellation_existence_peer_hints_total",
+        "Upload probes selected by live cooperative-cache digests.",
+        status.writeback.existence_peer_hints
+    );
+    gauge!(
         "constellation_lease_held",
         "Whether this node holds the p0 lease.",
         u8::from(status.lease.held)

@@ -302,6 +302,18 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         run: writeback_backpressure,
     },
+    Scenario {
+        name: "existence-bloom-dedup",
+        desc: "fresh node LIST-seeds S3 existence and deduplicates without per-chunk HEAD misses",
+        requires: &[],
+        run: existence_bloom_dedup,
+    },
+    Scenario {
+        name: "existence-peer-hint",
+        desc: "LIST-disabled uploader uses live peer cache digests only as confirming probe hints",
+        requires: &[],
+        run: existence_peer_hint,
+    },
 ];
 
 fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
@@ -1193,6 +1205,218 @@ fn blob(n_chunks: usize) -> (Vec<u8>, blake3::Hash) {
     }
     let h = blake3::hash(&data);
     (data, h)
+}
+
+fn raw_chunk_count(env: &S3Env, prefix: &str) -> Result<usize> {
+    let url = format!(
+        "{}/{}?list-type=2&prefix={}/chunks/",
+        env.direct_endpoint, BUCKET, prefix
+    );
+    let mut body = String::new();
+    ureq::get(&url)
+        .call()
+        .context("raw bucket LIST for chunk count")?
+        .into_reader()
+        .read_to_string(&mut body)?;
+    Ok(body.matches("<Key>").count())
+}
+
+fn existence_fixture_files() -> Vec<Vec<u8>> {
+    (0..300u32)
+        .map(|i| {
+            let marker = format!("existence-{i:04}-");
+            marker
+                .as_bytes()
+                .iter()
+                .copied()
+                .cycle()
+                .take(4096)
+                .collect()
+        })
+        .collect()
+}
+
+/// A complete LIST seed turns a cold duplicate import into confirming HEADs
+/// on hits, while a disabled second pass proves the optimization is optional.
+fn existence_bloom_dedup(_seed: u64) -> Result<()> {
+    let (env, root) = setup("existence-bloom-dedup")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("existence-bloom-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let files = existence_fixture_files();
+    let mut model = Model::default();
+    model.mkdir(std::path::Path::new("source"));
+    for (i, data) in files.iter().enumerate() {
+        model.write_file(
+            std::path::Path::new(&format!("source/{i:04}")),
+            data.clone(),
+        );
+    }
+
+    let mut a = Client::new(root.path(), "a", &env.endpoint, &backend)?;
+    a.fs_create()?;
+    a.mount()?;
+    std::fs::create_dir(a.mnt.join("source"))?;
+    for (i, data) in files.iter().enumerate() {
+        std::fs::write(a.mnt.join(format!("source/{i:04}")), data)?;
+    }
+    a.unmount()?;
+    let before = raw_chunk_count(&env, &prefix)?;
+
+    let mut b = Client::new(root.path(), "b", &env.endpoint, &backend)?;
+    let seed_started = std::time::Instant::now();
+    b.mount()?;
+    eventually(
+        "existence LIST seed completes",
+        Duration::from_secs(20),
+        || {
+            let status = b.control_status()?;
+            anyhow::ensure!(
+                status["writeback"]["existence_complete"] == true,
+                "seed not complete: {status}"
+            );
+            Ok(())
+        },
+    )?;
+    let seed_elapsed = seed_started.elapsed();
+    std::fs::create_dir(b.mnt.join("duplicate"))?;
+    model.mkdir(std::path::Path::new("duplicate"));
+    for (i, data) in files.iter().enumerate() {
+        std::fs::write(b.mnt.join(format!("duplicate/{i:04}")), data)?;
+        model.write_file(
+            std::path::Path::new(&format!("duplicate/{i:04}")),
+            data.clone(),
+        );
+    }
+    eventually(
+        "duplicate upload decision drains",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(
+                b.control_status()?["writeback"]["pending_uploads"].as_u64() == Some(0)
+            );
+            Ok(())
+        },
+    )?;
+    model.verify(&b.mnt)?;
+    let status = b.control_status()?;
+    let wb = &status["writeback"];
+    let listed = wb["existence_listed"].as_u64().unwrap_or(0);
+    let hits = wb["existence_bloom_hits"].as_u64().unwrap_or(0);
+    let misses = wb["existence_bloom_misses"].as_u64().unwrap_or(u64::MAX);
+    eprintln!(
+        "    existence-bloom-dedup: listed={listed} complete=true bloom_hits={hits} bloom_misses={misses} list_seed={seed_elapsed:.1?}"
+    );
+    anyhow::ensure!(listed >= before as u64, "LIST omitted chunk keys: {wb}");
+    anyhow::ensure!(
+        hits >= before as u64,
+        "duplicate did not hit the seed: {wb}"
+    );
+    anyhow::ensure!(misses <= 1, "duplicate unexpectedly missed the seed: {wb}");
+    anyhow::ensure!(
+        raw_chunk_count(&env, &prefix)? == before,
+        "duplicate import created extra chunk objects"
+    );
+    b.unmount()?;
+
+    let mut c = Client::new(root.path(), "list-off", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_EXISTENCE_LIST", "off");
+    c.mount()?;
+    std::fs::create_dir(c.mnt.join("without-list"))?;
+    model.mkdir(std::path::Path::new("without-list"));
+    for (i, data) in files.iter().enumerate() {
+        std::fs::write(c.mnt.join(format!("without-list/{i:04}")), data)?;
+        model.write_file(
+            std::path::Path::new(&format!("without-list/{i:04}")),
+            data.clone(),
+        );
+    }
+    eventually("LIST-disabled copy drains", Duration::from_secs(20), || {
+        anyhow::ensure!(c.control_status()?["writeback"]["pending_uploads"].as_u64() == Some(0));
+        Ok(())
+    })?;
+    model.verify(&c.mnt)?;
+    let off = c.control_status()?;
+    anyhow::ensure!(
+        off["writeback"]["existence_listed"].as_u64() == Some(0)
+            && off["writeback"]["existence_complete"] == false,
+        "LIST kill switch still seeded: {off}"
+    );
+    c.unmount()?;
+    Ok(())
+}
+
+/// With LIST disabled, a clean peer digest gets sole credit for selecting
+/// the probe. Disabling cooperative cache removes that hint without changing
+/// correctness.
+fn existence_peer_hint(_seed: u64) -> Result<()> {
+    let (env, root) = setup("existence-peer-hint")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/existence-peer-{}", ts());
+    let mut a = coop_client(root.path(), "hint-a", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_EXISTENCE_LIST", "off");
+    let mut b = coop_client(root.path(), "hint-b", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_EXISTENCE_LIST", "off");
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    wait_for_p2p([&a, &b])?;
+
+    let (data, _) = blob(8);
+    std::fs::write(a.mnt.join("source"), &data)?;
+    eventually("peer source is durable", Duration::from_secs(20), || {
+        anyhow::ensure!(a.control_status()?["writeback"]["pending_uploads"].as_u64() == Some(0));
+        Ok(())
+    })?;
+    eventually(
+        "peer source metadata reaches B",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(b.mnt.join("source").is_file());
+            Ok(())
+        },
+    )?;
+    std::thread::sleep(Duration::from_secs(2));
+    std::fs::write(b.mnt.join("peer-copy"), &data)?;
+    eventually("peer-hinted copy drains", Duration::from_secs(20), || {
+        anyhow::ensure!(b.control_status()?["writeback"]["pending_uploads"].as_u64() == Some(0));
+        Ok(())
+    })?;
+    let status = b.control_status()?;
+    let hints = status["writeback"]["existence_peer_hints"]
+        .as_u64()
+        .unwrap_or(0);
+    eprintln!(
+        "    existence-peer-hint: peer_hints={hints} list_enabled=false bloom_hits={} bloom_misses={}",
+        status["writeback"]["existence_bloom_hits"],
+        status["writeback"]["existence_bloom_misses"]
+    );
+    anyhow::ensure!(hints >= 1, "peer digest never selected a probe: {status}");
+    let mut model = Model::default();
+    model.write_file(std::path::Path::new("source"), data.clone());
+    model.write_file(std::path::Path::new("peer-copy"), data.clone());
+    model.verify(&b.mnt)?;
+    a.unmount()?;
+    b.unmount()?;
+
+    let mut c = Client::new(root.path(), "coop-off", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_EXISTENCE_LIST", "off")
+        .with_env("CONSTELLATION_COOP", "off");
+    c.mount()?;
+    std::fs::write(c.mnt.join("coop-off-copy"), &data)?;
+    model.write_file(std::path::Path::new("coop-off-copy"), data);
+    eventually("coop-off copy drains", Duration::from_secs(20), || {
+        anyhow::ensure!(c.control_status()?["writeback"]["pending_uploads"].as_u64() == Some(0));
+        Ok(())
+    })?;
+    model.verify(&c.mnt)?;
+    let off = c.control_status()?;
+    anyhow::ensure!(
+        off["writeback"]["existence_peer_hints"].as_u64() == Some(0),
+        "CONSTELLATION_COOP=off reported peer hints: {off}"
+    );
+    c.unmount()?;
+    Ok(())
 }
 
 /// The mounted production path always has `Coop`, so its S3 leg must
