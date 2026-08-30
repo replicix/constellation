@@ -6,7 +6,7 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::{CloneNode, CloneSpec, DirEntry, MetaStore, SnapshotNode, SnapshotRow};
+use crate::{CloneNode, CloneSpec, DirEntry, MetaStore, SetXattrMode, SnapshotNode, SnapshotRow};
 use constellation_fs_core::types::{now_ns, ROOT_INO};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS dentry (
     PRIMARY KEY (parent, name)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS dentry_by_ino ON dentry (ino);
+CREATE TABLE IF NOT EXISTS xattr (
+    ino   INTEGER NOT NULL,
+    name  TEXT NOT NULL,
+    value BLOB NOT NULL,
+    PRIMARY KEY (ino, name)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS journal (
     seq    INTEGER PRIMARY KEY AUTOINCREMENT,
     record TEXT NOT NULL,
@@ -518,9 +524,10 @@ impl SqliteMeta {
             | LogRecord::Unlink { parent, .. }
             | LogRecord::Rmdir { parent, .. }
             | LogRecord::Rename { parent, .. } => Self::partition_of_conn(conn, *parent),
-            LogRecord::Setattr { ino, .. } | LogRecord::WriteManifest { ino, .. } => {
-                Self::partition_of_conn(conn, *ino)
-            }
+            LogRecord::Setattr { ino, .. }
+            | LogRecord::WriteManifest { ino, .. }
+            | LogRecord::SetXattr { ino, .. }
+            | LogRecord::RemoveXattr { ino, .. } => Self::partition_of_conn(conn, *ino),
         }
     }
 
@@ -676,34 +683,42 @@ impl SqliteMeta {
     /// Fetch one directory's complete snapshot rows with one indexed join.
     pub fn snapshot_children(&self, parent: Ino) -> Result<Vec<SnapshotNode>, MetaError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT d.name, i.ino, i.kind, i.size, i.mode, i.uid, i.gid, i.nlink,
-                    i.atime_ns, i.mtime_ns, i.ctime_ns, i.rdev, i.symlink_target, i.manifest
-             FROM dentry d JOIN inode i ON i.ino = d.ino
-             WHERE d.parent = ?1 ORDER BY d.name",
-        )?;
-        let rows = stmt.query_map(params![parent], |row| {
-            let kind: u8 = row.get(2)?;
-            Ok(SnapshotNode {
-                name: row.get(0)?,
-                attr: FileAttr {
-                    ino: row.get(1)?,
-                    kind: InodeKind::from_u8(kind).expect("database kind is validated on insert"),
-                    size: row.get::<_, i64>(3)? as u64,
-                    mode: row.get(4)?,
-                    uid: row.get(5)?,
-                    gid: row.get(6)?,
-                    nlink: row.get(7)?,
-                    atime_ns: row.get(8)?,
-                    mtime_ns: row.get(9)?,
-                    ctime_ns: row.get(10)?,
-                    rdev: row.get::<_, i64>(11)? as u64,
-                },
-                target: row.get(12)?,
-                manifest: row.get(13)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut nodes = {
+            let mut stmt = conn.prepare(
+                "SELECT d.name, i.ino, i.kind, i.size, i.mode, i.uid, i.gid, i.nlink,
+                        i.atime_ns, i.mtime_ns, i.ctime_ns, i.rdev, i.symlink_target, i.manifest
+                 FROM dentry d JOIN inode i ON i.ino = d.ino
+                 WHERE d.parent = ?1 ORDER BY d.name",
+            )?;
+            let rows = stmt.query_map(params![parent], |row| {
+                let kind: u8 = row.get(2)?;
+                Ok(SnapshotNode {
+                    name: row.get(0)?,
+                    attr: FileAttr {
+                        ino: row.get(1)?,
+                        kind: InodeKind::from_u8(kind)
+                            .expect("database kind is validated on insert"),
+                        size: row.get::<_, i64>(3)? as u64,
+                        mode: row.get(4)?,
+                        uid: row.get(5)?,
+                        gid: row.get(6)?,
+                        nlink: row.get(7)?,
+                        atime_ns: row.get(8)?,
+                        mtime_ns: row.get(9)?,
+                        ctime_ns: row.get(10)?,
+                        rdev: row.get::<_, i64>(11)? as u64,
+                    },
+                    target: row.get(12)?,
+                    manifest: row.get(13)?,
+                    xattrs: Vec::new(),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for node in &mut nodes {
+            node.xattrs = Self::xattrs_by_ino(&conn, node.attr.ino)?;
+        }
+        Ok(nodes)
     }
 
     /// Make a snapshot visible locally and journal its immutable root.
@@ -861,6 +876,12 @@ impl SqliteMeta {
                 "INSERT INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
                 params![node_parent, node_name, ino],
             )?;
+            for (xattr_name, value) in &spec.xattrs {
+                tx.execute(
+                    "INSERT INTO xattr (ino, name, value) VALUES (?1, ?2, ?3)",
+                    params![ino, xattr_name, value],
+                )?;
+            }
             Self::track_manifest_transition(
                 &tx,
                 None,
@@ -887,6 +908,7 @@ impl SqliteMeta {
                 rdev: 0,
                 target: spec.target.clone(),
                 manifest: spec.manifest.clone(),
+                xattrs: spec.xattrs.clone(),
             });
             inos.push(ino);
         }
@@ -1148,6 +1170,13 @@ impl SqliteMeta {
             .optional()?)
     }
 
+    fn xattrs_by_ino(conn: &Connection, ino: Ino) -> Result<Vec<(String, Vec<u8>)>, MetaError> {
+        let mut stmt =
+            conn.prepare_cached("SELECT name, value FROM xattr WHERE ino = ?1 ORDER BY name")?;
+        let rows = stmt.query_map(params![ino], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     fn require_dir(conn: &Connection, ino: Ino) -> Result<(), MetaError> {
         match Self::attr_by_ino(conn, ino)? {
             None => Err(MetaError::NoEnt(ino)),
@@ -1293,6 +1322,7 @@ impl SqliteMeta {
                 if children > 0 {
                     return Err(MetaError::NotEmpty);
                 }
+                tx.execute("DELETE FROM xattr WHERE ino = ?1", params![existing])?;
                 tx.execute("DELETE FROM inode WHERE ino = ?1", params![existing])?;
                 // The removed dir's ".." reference to new_parent is gone.
                 tx.execute(
@@ -1300,6 +1330,9 @@ impl SqliteMeta {
                     params![new_parent],
                 )?;
             } else {
+                if ex.nlink == 1 {
+                    tx.execute("DELETE FROM xattr WHERE ino = ?1", params![existing])?;
+                }
                 tx.execute(
                     "UPDATE inode SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1",
                     params![existing, t],
@@ -1505,8 +1538,10 @@ impl SqliteMeta {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute("DELETE FROM dentry", [])?;
             tx.execute("DELETE FROM inode", [])?;
+            tx.execute("DELETE FROM xattr", [])?;
             tx.execute("INSERT INTO inode SELECT * FROM reintegrated.inode", [])?;
             tx.execute("INSERT INTO dentry SELECT * FROM reintegrated.dentry", [])?;
+            tx.execute("INSERT INTO xattr SELECT * FROM reintegrated.xattr", [])?;
             tx.execute("DELETE FROM partition", [])?;
             tx.execute(
                 "INSERT INTO partition SELECT * FROM reintegrated.partition",
@@ -1758,6 +1793,53 @@ impl MetaStore for SqliteMeta {
             .flatten())
     }
 
+    fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        if Self::attr_by_ino(&conn, ino)?.is_none() {
+            return Err(MetaError::NoEnt(ino));
+        }
+        Ok(conn
+            .query_row(
+                "SELECT value FROM xattr WHERE ino = ?1 AND name = ?2",
+                params![ino, name],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        if Self::attr_by_ino(&conn, ino)?.is_none() {
+            return Err(MetaError::NoEnt(ino));
+        }
+        Ok(Self::xattrs_by_ino(&conn, ino)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    fn recursive_size(&self, ino: Ino) -> Result<(u64, u64), MetaError> {
+        let conn = self.conn.lock().unwrap();
+        if Self::attr_by_ino(&conn, ino)?.is_none() {
+            return Err(MetaError::NoEnt(ino));
+        }
+        let file_kind = InodeKind::File.as_u8();
+        let (size, count): (i64, i64) = conn.query_row(
+            "WITH RECURSIVE subtree(ino) AS (
+                 VALUES (?1)
+                 UNION
+                 SELECT d.ino FROM dentry d JOIN subtree s ON d.parent = s.ino
+             )
+             SELECT
+                 COALESCE(SUM(CASE WHEN i.kind = ?2 THEN i.size ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN i.kind = ?2 THEN 1 ELSE 0 END), 0)
+             FROM subtree s JOIN inode i ON i.ino = s.ino",
+            params![ino, file_kind],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((size as u64, count as u64))
+    }
+
     fn mkdir(
         &self,
         parent: Ino,
@@ -1980,6 +2062,7 @@ impl MetaStore for SqliteMeta {
             params![ino, t],
         )?;
         if attr.nlink == 1 {
+            tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             let manifest: Option<Vec<u8>> = tx.query_row(
                 "SELECT manifest FROM inode WHERE ino = ?1",
                 params![ino],
@@ -2030,6 +2113,7 @@ impl MetaStore for SqliteMeta {
             "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
             params![parent, name],
         )?;
+        tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
         tx.execute("DELETE FROM inode WHERE ino = ?1", params![ino])?;
         tx.execute(
             "UPDATE inode SET nlink = nlink - 1, mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
@@ -2143,6 +2227,80 @@ impl MetaStore for SqliteMeta {
         Ok(())
     }
 
+    fn set_xattr(
+        &self,
+        ino: Ino,
+        name: &str,
+        value: &[u8],
+        mode: SetXattrMode,
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::attr_by_ino(&tx, ino)?.is_none() {
+            return Err(MetaError::NoEnt(ino));
+        }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM xattr WHERE ino = ?1 AND name = ?2)",
+            params![ino, name],
+            |row| row.get(0),
+        )?;
+        match (mode, exists) {
+            (SetXattrMode::Create, true) => return Err(MetaError::Exists),
+            (SetXattrMode::Replace, false) => return Err(MetaError::NoData),
+            _ => {}
+        }
+        let time_ns = now_ns();
+        tx.execute(
+            "INSERT OR REPLACE INTO xattr (ino, name, value) VALUES (?1, ?2, ?3)",
+            params![ino, name, value],
+        )?;
+        tx.execute(
+            "UPDATE inode SET ctime_ns = ?2 WHERE ino = ?1",
+            params![ino, time_ns],
+        )?;
+        Self::journal(
+            &tx,
+            &LogRecord::SetXattr {
+                ino,
+                name: name.to_string(),
+                value: value.to_vec(),
+                time_ns,
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn remove_xattr(&self, ino: Ino, name: &str) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::attr_by_ino(&tx, ino)?.is_none() {
+            return Err(MetaError::NoEnt(ino));
+        }
+        let time_ns = now_ns();
+        if tx.execute(
+            "DELETE FROM xattr WHERE ino = ?1 AND name = ?2",
+            params![ino, name],
+        )? == 0
+        {
+            return Err(MetaError::NoData);
+        }
+        tx.execute(
+            "UPDATE inode SET ctime_ns = ?2 WHERE ino = ?1",
+            params![ino, time_ns],
+        )?;
+        Self::journal(
+            &tx,
+            &LogRecord::RemoveXattr {
+                ino,
+                name: name.to_string(),
+                time_ns,
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn reap_orphan(&self, ino: Ino) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2156,6 +2314,11 @@ impl MetaStore for SqliteMeta {
             .flatten();
         tx.execute(
             "DELETE FROM inode WHERE ino = ?1 AND nlink = 0",
+            params![ino],
+        )?;
+        tx.execute(
+            "DELETE FROM xattr WHERE ino = ?1 AND NOT EXISTS
+             (SELECT 1 FROM inode WHERE inode.ino = xattr.ino)",
             params![ino],
         )?;
         Self::track_manifest_transition(
@@ -2389,6 +2552,95 @@ mod tests {
             m.set_manifest(9999, b"x", 1),
             Err(MetaError::NoEnt(9999))
         ));
+    }
+
+    #[test]
+    fn xattr_roundtrip_flags_and_unlink_cleanup() {
+        let m = store();
+        let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        assert_eq!(m.get_xattr(f.ino, "user.foo").unwrap(), None);
+        m.set_xattr(f.ino, "user.foo", b"one", SetXattrMode::Create)
+            .unwrap();
+        assert!(matches!(
+            m.set_xattr(f.ino, "user.foo", b"two", SetXattrMode::Create),
+            Err(MetaError::Exists)
+        ));
+        m.set_xattr(f.ino, "user.foo", b"two", SetXattrMode::Replace)
+            .unwrap();
+        assert!(matches!(
+            m.set_xattr(f.ino, "user.missing", b"x", SetXattrMode::Replace),
+            Err(MetaError::NoData)
+        ));
+        m.set_xattr(f.ino, "user.other", b"x", SetXattrMode::Set)
+            .unwrap();
+        assert_eq!(
+            m.list_xattrs(f.ino).unwrap(),
+            vec!["user.foo".to_string(), "user.other".to_string()]
+        );
+        m.remove_xattr(f.ino, "user.other").unwrap();
+        assert!(matches!(
+            m.remove_xattr(f.ino, "user.other"),
+            Err(MetaError::NoData)
+        ));
+        m.unlink(ROOT_INO, "f").unwrap();
+        assert_eq!(m.get_xattr(f.ino, "user.foo").unwrap(), None);
+    }
+
+    #[test]
+    fn xattr_journal_replays() {
+        let src = store();
+        let file = src.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        src.set_xattr(file.ino, "user.foo", b"value", SetXattrMode::Set)
+            .unwrap();
+        let records: Vec<_> = src
+            .take_journal(10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect();
+        let dst = store();
+        dst.apply_records(&records).unwrap();
+        assert_eq!(
+            dst.get_xattr(file.ino, "user.foo").unwrap(),
+            Some(b"value".to_vec())
+        );
+        src.remove_xattr(file.ino, "user.foo").unwrap();
+        let remove = src.take_journal(10).unwrap().last().unwrap().1.clone();
+        dst.apply_records(&[remove]).unwrap();
+        assert_eq!(dst.get_xattr(file.ino, "user.foo").unwrap(), None);
+    }
+
+    #[test]
+    fn xattr_survives_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("meta.db");
+        let ino = {
+            let m = SqliteMeta::open(&path).unwrap();
+            let file = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+            m.set_xattr(file.ino, "user.foo", b"value", SetXattrMode::Set)
+                .unwrap();
+            file.ino
+        };
+        let m = SqliteMeta::open(&path).unwrap();
+        assert_eq!(
+            m.get_xattr(ino, "user.foo").unwrap(),
+            Some(b"value".to_vec())
+        );
+    }
+
+    #[test]
+    fn recursive_size_counts_logical_file_lengths() {
+        let m = store();
+        let dir = m.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        let a = m.create(dir.ino, "a", 0o644, 0, 0).unwrap();
+        let nested = m.mkdir(dir.ino, "nested", 0o755, 0, 0).unwrap();
+        let b = m.create(nested.ino, "b", 0o644, 0, 0).unwrap();
+        m.setattr(a.ino, None, None, None, Some(7), None, None)
+            .unwrap();
+        m.setattr(b.ino, None, None, None, Some(1 << 30), None, None)
+            .unwrap();
+        assert_eq!(m.recursive_size(dir.ino).unwrap(), ((1 << 30) + 7, 2));
+        assert_eq!(m.recursive_size(b.ino).unwrap(), (1 << 30, 1));
     }
 
     #[test]

@@ -90,10 +90,12 @@ pub fn classify(view: &SqliteMeta, rec: &LogRecord) -> Result<Disposition, MetaE
             }
             Ok(Disposition::Clean)
         }
-        LogRecord::Setattr { ino, .. } => {
+        LogRecord::Setattr { ino, .. }
+        | LogRecord::SetXattr { ino, .. }
+        | LogRecord::RemoveXattr { ino, .. } => {
             if view.getattr(*ino)?.is_none() {
                 Ok(Disposition::Conflict {
-                    reason: "setattr target missing (edit-vs-delete)".into(),
+                    reason: "attribute target missing (edit-vs-delete)".into(),
                 })
             } else {
                 Ok(Disposition::Clean)

@@ -1,6 +1,6 @@
 //! Immutable snapshot tree objects (DESIGN.md §13).
 //!
-//! A directory is encoded as one deterministic `CTR1` blob.  Its entries
+//! A directory is encoded as one deterministic `CTR2` blob.  Its entries
 //! carry the complete inode metadata needed by a frozen view and point to
 //! either another tree object or an encoded file manifest.  Names are sorted
 //! before encoding, so an unchanged directory has the same BLAKE3 identity
@@ -12,10 +12,13 @@
 
 use crate::{ChunkHash, CoreError, InodeKind};
 
-const MAGIC: &[u8; 4] = b"CTR1";
+const MAGIC_V1: &[u8; 4] = b"CTR1";
+const MAGIC_V2: &[u8; 4] = b"CTR2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tree {
+    /// Attributes of the directory represented by this tree object.
+    pub xattrs: Vec<(String, Vec<u8>)>,
     pub entries: Vec<TreeEntry>,
 }
 
@@ -29,6 +32,7 @@ pub struct TreeEntry {
     pub size: u64,
     pub mtime_ns: i64,
     pub target: Option<String>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
     /// Child tree for a directory, encoded manifest for a file, absent for
     /// symlinks and special nodes.
     pub manifest_or_tree_hash: Option<ChunkHash>,
@@ -36,17 +40,35 @@ pub struct TreeEntry {
 
 impl Tree {
     pub fn new(mut entries: Vec<TreeEntry>) -> Result<Self, CoreError> {
+        for entry in &mut entries {
+            entry
+                .xattrs
+                .sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            if entry.xattrs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return Err(CoreError::CorruptTree("duplicate xattr name".into()));
+            }
+        }
         entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         if entries.windows(2).any(|w| w[0].name == w[1].name) {
             return Err(CoreError::CorruptTree("duplicate entry name".into()));
         }
-        Ok(Self { entries })
+        Ok(Self {
+            xattrs: Vec::new(),
+            entries,
+        })
+    }
+
+    pub fn with_xattrs(mut self, mut xattrs: Vec<(String, Vec<u8>)>) -> Result<Self, CoreError> {
+        sort_xattrs(&mut xattrs)?;
+        self.xattrs = xattrs;
+        Ok(self)
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(MAGIC_V2);
         put_u32(&mut out, self.entries.len() as u32);
+        put_xattrs(&mut out, &self.xattrs);
         for entry in &self.entries {
             put_bytes(&mut out, entry.name.as_bytes());
             out.push(entry.kind.as_u8());
@@ -63,16 +85,27 @@ impl Tree {
                 }
                 None => out.push(0),
             }
+            put_xattrs(&mut out, &entry.xattrs);
         }
         out
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, CoreError> {
         let mut input = data;
-        if take(&mut input, 4)? != MAGIC {
+        let magic = take(&mut input, 4)?;
+        let has_xattrs = if magic == MAGIC_V2 {
+            true
+        } else if magic == MAGIC_V1 {
+            false
+        } else {
             return Err(CoreError::CorruptTree("bad magic".into()));
-        }
+        };
         let count = read_u32(&mut input)? as usize;
+        let xattrs = if has_xattrs {
+            read_xattrs(&mut input)?
+        } else {
+            Vec::new()
+        };
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let name = String::from_utf8(read_bytes(&mut input)?.to_vec())
@@ -93,6 +126,11 @@ impl Tree {
                 1 => Some(ChunkHash(take(&mut input, 32)?.try_into().unwrap())),
                 _ => return Err(CoreError::CorruptTree("invalid hash tag".into())),
             };
+            let xattrs = if has_xattrs {
+                read_xattrs(&mut input)?
+            } else {
+                Vec::new()
+            };
             entries.push(TreeEntry {
                 name,
                 kind,
@@ -103,12 +141,13 @@ impl Tree {
                 mtime_ns,
                 target,
                 manifest_or_tree_hash,
+                xattrs,
             });
         }
         if !input.is_empty() {
             return Err(CoreError::CorruptTree("trailing bytes".into()));
         }
-        let tree = Self::new(entries)?;
+        let tree = Self::new(entries)?.with_xattrs(xattrs)?;
         if tree.entries.windows(2).any(|w| w[0].name >= w[1].name) {
             return Err(CoreError::CorruptTree("entries are not sorted".into()));
         }
@@ -143,6 +182,22 @@ fn put_optional_bytes(out: &mut Vec<u8>, value: Option<&[u8]>) {
     }
 }
 
+fn sort_xattrs(xattrs: &mut [(String, Vec<u8>)]) -> Result<(), CoreError> {
+    xattrs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    if xattrs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(CoreError::CorruptTree("duplicate xattr name".into()));
+    }
+    Ok(())
+}
+
+fn put_xattrs(out: &mut Vec<u8>, xattrs: &[(String, Vec<u8>)]) {
+    put_u32(out, xattrs.len() as u32);
+    for (name, value) in xattrs {
+        put_bytes(out, name.as_bytes());
+        put_bytes(out, value);
+    }
+}
+
 fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8], CoreError> {
     if input.len() < len {
         return Err(CoreError::CorruptTree("truncated blob".into()));
@@ -173,6 +228,17 @@ fn read_optional_bytes<'a>(input: &mut &'a [u8]) -> Result<Option<&'a [u8]>, Cor
     }
 }
 
+fn read_xattrs(input: &mut &[u8]) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
+    let count = read_u32(input)? as usize;
+    let mut xattrs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = String::from_utf8(read_bytes(input)?.to_vec())
+            .map_err(|_| CoreError::CorruptTree("xattr name is not UTF-8".into()))?;
+        xattrs.push((name, read_bytes(input)?.to_vec()));
+    }
+    Ok(xattrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +255,7 @@ mod tests {
                 mtime_ns: 123,
                 target: None,
                 manifest_or_tree_hash: Some(ChunkHash::of(b"manifest")),
+                xattrs: vec![("user.foo".into(), b"bar".to_vec())],
             },
             TreeEntry {
                 name: "a-link".into(),
@@ -200,17 +267,42 @@ mod tests {
                 mtime_ns: 456,
                 target: Some("target".into()),
                 manifest_or_tree_hash: None,
+                xattrs: Vec::new(),
             },
         ]
     }
 
     #[test]
     fn round_trip_is_sorted_and_self_describing() {
-        let tree = Tree::new(entries()).unwrap();
+        let tree = Tree::new(entries())
+            .unwrap()
+            .with_xattrs(vec![("user.root".into(), b"value".to_vec())])
+            .unwrap();
         assert_eq!(tree.entries[0].name, "a-link");
         let encoded = tree.encode();
-        assert_eq!(&encoded[..4], b"CTR1");
+        assert_eq!(&encoded[..4], b"CTR2");
         assert_eq!(Tree::decode(&encoded).unwrap(), tree);
+    }
+
+    #[test]
+    fn legacy_ctr1_decodes_with_empty_xattrs() {
+        let all = entries();
+        let entry = &all[1];
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(MAGIC_V1);
+        put_u32(&mut encoded, 1);
+        put_bytes(&mut encoded, entry.name.as_bytes());
+        encoded.push(entry.kind.as_u8());
+        put_u32(&mut encoded, entry.mode);
+        put_u32(&mut encoded, entry.uid);
+        put_u32(&mut encoded, entry.gid);
+        put_u64(&mut encoded, entry.size);
+        encoded.extend_from_slice(&entry.mtime_ns.to_le_bytes());
+        put_optional_bytes(&mut encoded, entry.target.as_deref().map(str::as_bytes));
+        encoded.push(0);
+        let tree = Tree::decode(&encoded).unwrap();
+        assert!(tree.xattrs.is_empty());
+        assert!(tree.entries[0].xattrs.is_empty());
     }
 
     #[test]

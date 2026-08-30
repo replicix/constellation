@@ -321,6 +321,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: existence_peer_hint,
     },
     Scenario {
+        name: "xattr-roundtrip",
+        desc: "file and directory xattrs replicate; removal and logical recursive size are correct",
+        requires: &[],
+        run: xattr_roundtrip,
+    },
+    Scenario {
         name: "fallocate-sparse",
         desc: "large sparse extend, hole punch, SEEK_HOLE/DATA, rewrite, and fresh-node verification",
         requires: &[],
@@ -3069,6 +3075,124 @@ fn big_file_write(seed: u64) -> Result<()> {
     anyhow::ensure!(back == data, "readback mismatch after the big write");
     c.unmount()?;
     Ok(())
+}
+
+fn xattr_roundtrip(_seed: u64) -> Result<()> {
+    let (env, root) = setup("xattr-roundtrip")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("xattr-roundtrip-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut a = Client::new(root.path(), "a", &env.endpoint, &backend)?;
+    let mut b = Client::new(root.path(), "b", &env.endpoint, &backend)?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+
+    let dir = a.mnt.join("tree");
+    std::fs::create_dir(&dir)?;
+    let file = dir.join("file");
+    std::fs::write(&file, b"seven!!")?;
+    let sparse = dir.join("sparse");
+    std::fs::File::create(&sparse)?.set_len(1 << 30)?;
+    set_xattr(&file, "user.foo", b"file-value")?;
+    set_xattr(&dir, "user.foo", b"dir-value")?;
+
+    eventually(
+        "xattrs visible on second node",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(
+                get_xattr(&b.mnt.join("tree/file"), "user.foo")? == b"file-value",
+                "file xattr not yet visible"
+            );
+            anyhow::ensure!(
+                get_xattr(&b.mnt.join("tree"), "user.foo")? == b"dir-value",
+                "directory xattr not yet visible"
+            );
+            Ok(())
+        },
+    )?;
+    let expected = (1u64 << 30) + 7;
+    let rsize = String::from_utf8(get_xattr(&b.mnt.join("tree"), "user.constellation.rsize")?)?
+        .parse::<u64>()?;
+    let rcount = String::from_utf8(get_xattr(&b.mnt.join("tree"), "user.constellation.rcount")?)?
+        .parse::<u64>()?;
+    anyhow::ensure!(rsize == expected, "rsize {rsize} != {expected}");
+    anyhow::ensure!(rcount == 2, "rcount {rcount} != 2");
+
+    remove_xattr(&file, "user.foo")?;
+    eventually(
+        "xattr removal visible",
+        Duration::from_secs(20),
+        || match get_xattr(&b.mnt.join("tree/file"), "user.foo") {
+            Err(error) if error.raw_os_error() == Some(libc::ENODATA) => Ok(()),
+            Ok(_) => anyhow::bail!("removed xattr still visible"),
+            Err(error) => Err(error.into()),
+        },
+    )?;
+    a.unmount()?;
+    b.unmount()?;
+    eprintln!("    xattr-roundtrip: rsize={rsize} rcount={rcount} sparse_holes=logical");
+    Ok(())
+}
+
+fn c_path(path: &std::path::Path) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(std::ffi::CString::new(path.as_os_str().as_bytes())?)
+}
+
+fn set_xattr(path: &std::path::Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    let path = c_path(path).map_err(std::io::Error::other)?;
+    let name = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn get_xattr(path: &std::path::Path, name: &str) -> std::io::Result<Vec<u8>> {
+    let path = c_path(path).map_err(std::io::Error::other)?;
+    let name = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
+    let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut value = vec![0u8; size as usize];
+    let read = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if read < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        value.truncate(read as usize);
+        Ok(value)
+    }
+}
+
+fn remove_xattr(path: &std::path::Path, name: &str) -> std::io::Result<()> {
+    let path = c_path(path).map_err(std::io::Error::other)?;
+    let name = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
+    let result = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn fallocate_sparse(seed: u64) -> Result<()> {

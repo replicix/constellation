@@ -30,6 +30,7 @@ pub struct SnapshotNode {
     pub attr: FileAttr,
     pub target: Option<String>,
     pub manifest: Option<Vec<u8>>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,14 @@ pub struct CloneSpec {
     pub mtime_ns: i64,
     pub target: Option<String>,
     pub manifest: Option<Vec<u8>>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetXattrMode {
+    Set,
+    Create,
+    Replace,
 }
 
 /// The metadata engine interface (DESIGN.md §4 "Local store").
@@ -69,6 +78,9 @@ pub trait MetaStore: Send + Sync {
     fn readdir(&self, parent: Ino) -> Result<Vec<DirEntry>, MetaError>;
     fn readlink(&self, ino: Ino) -> Result<Option<String>, MetaError>;
     fn manifest(&self, ino: Ino) -> Result<Option<Vec<u8>>, MetaError>;
+    fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>, MetaError>;
+    fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>, MetaError>;
+    fn recursive_size(&self, ino: Ino) -> Result<(u64, u64), MetaError>;
 
     // --- namespace writes (journaled) ---
     fn mkdir(
@@ -130,6 +142,14 @@ pub trait MetaStore: Send + Sync {
         mtime_ns: Option<i64>,
     ) -> Result<FileAttr, MetaError>;
     fn set_manifest(&self, ino: Ino, manifest: &[u8], size: u64) -> Result<(), MetaError>;
+    fn set_xattr(
+        &self,
+        ino: Ino,
+        name: &str,
+        value: &[u8],
+        mode: SetXattrMode,
+    ) -> Result<(), MetaError>;
+    fn remove_xattr(&self, ino: Ino, name: &str) -> Result<(), MetaError>;
 
     // --- orphan lifecycle (unlink-while-open, DESIGN.md §3) ---
     /// Remove an orphaned inode (nlink == 0) after the last close.

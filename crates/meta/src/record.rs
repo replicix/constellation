@@ -21,6 +21,8 @@ pub struct CloneNode {
     pub rdev: u64,
     pub target: Option<String>,
     pub manifest: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
 /// One metadata operation. Field names are stable format surface.
@@ -107,6 +109,17 @@ pub enum LogRecord {
         /// Encoded `fs_core::Manifest` bytes.
         manifest: Vec<u8>,
         size: u64,
+        time_ns: i64,
+    },
+    SetXattr {
+        ino: Ino,
+        name: String,
+        value: Vec<u8>,
+        time_ns: i64,
+    },
+    RemoveXattr {
+        ino: Ino,
+        name: String,
         time_ns: i64,
     },
     /// Split a directory off as its own partition. Carried on the

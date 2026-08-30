@@ -92,7 +92,10 @@ impl TouchSet {
                 self.dentries.insert((*parent, name.clone()));
                 self.dentries.insert((*new_parent, new_name.clone()));
             }
-            LogRecord::Setattr { ino, .. } | LogRecord::WriteManifest { ino, .. } => {
+            LogRecord::Setattr { ino, .. }
+            | LogRecord::WriteManifest { ino, .. }
+            | LogRecord::SetXattr { ino, .. }
+            | LogRecord::RemoveXattr { ino, .. } => {
                 self.inos.insert(*ino);
             }
             LogRecord::PartSplit { at_ino, .. } => {
@@ -277,6 +280,7 @@ fn evict_dentry(tx: &Connection, parent: u64, name: &str, ino: u64) -> Result<Ap
         if children > 0 {
             return Ok(Applied::Skipped("name held by non-empty directory"));
         }
+        tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
         tx.execute("DELETE FROM inode WHERE ino = ?1", params![ino])?;
         tx.execute(
             "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
@@ -294,6 +298,7 @@ fn evict_dentry(tx: &Connection, parent: u64, name: &str, ino: u64) -> Result<Ap
             params![ino],
         )?;
         if nlink == 1 {
+            tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             SqliteMeta::track_manifest_transition(
                 tx,
                 manifest.as_deref(),
@@ -518,6 +523,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 params![ino, time_ns],
             )?;
             if nlink == 1 {
+                tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
                 SqliteMeta::track_manifest_transition(
                     tx,
                     manifest.as_deref(),
@@ -553,6 +559,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
                 params![parent, name],
             )?;
+            tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             tx.execute("DELETE FROM inode WHERE ino = ?1", params![ino])?;
             tx.execute(
                 "UPDATE inode SET nlink = nlink - 1, mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
@@ -648,6 +655,36 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                     params![ino, m],
                 )?;
             }
+            tx.execute(
+                "UPDATE inode SET ctime_ns = ?2 WHERE ino = ?1",
+                params![ino, time_ns],
+            )?;
+            Ok(Applied::Done)
+        }
+        LogRecord::SetXattr {
+            ino,
+            name,
+            value,
+            time_ns,
+        } => {
+            if !ino_exists(tx, *ino)? {
+                return Ok(Applied::Done);
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO xattr (ino, name, value) VALUES (?1, ?2, ?3)",
+                params![ino, name, value],
+            )?;
+            tx.execute(
+                "UPDATE inode SET ctime_ns = ?2 WHERE ino = ?1",
+                params![ino, time_ns],
+            )?;
+            Ok(Applied::Done)
+        }
+        LogRecord::RemoveXattr { ino, name, time_ns } => {
+            tx.execute(
+                "DELETE FROM xattr WHERE ino = ?1 AND name = ?2",
+                params![ino, name],
+            )?;
             tx.execute(
                 "UPDATE inode SET ctime_ns = ?2 WHERE ino = ?1",
                 params![ino, time_ns],
@@ -790,6 +827,13 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                     "INSERT OR REPLACE INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
                     params![node.parent, node.name, node.ino],
                 )?;
+                tx.execute("DELETE FROM xattr WHERE ino = ?1", params![node.ino])?;
+                for (name, value) in &node.xattrs {
+                    tx.execute(
+                        "INSERT INTO xattr (ino, name, value) VALUES (?1, ?2, ?3)",
+                        params![node.ino, name, value],
+                    )?;
+                }
                 SqliteMeta::track_manifest_transition(
                     tx,
                     None,

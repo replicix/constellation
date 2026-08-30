@@ -124,9 +124,22 @@ impl SnapshotManager {
                     mtime_ns: child.attr.mtime_ns,
                     target: child.target,
                     manifest_or_tree_hash: reference,
+                    xattrs: child.xattrs,
                 });
             }
-            let blob = Tree::new(entries)?.encode();
+            let root_xattrs = self
+                .meta
+                .list_xattrs(ino)?
+                .into_iter()
+                .map(|name| {
+                    let value = self
+                        .meta
+                        .get_xattr(ino, &name)?
+                        .context("listed xattr disappeared")?;
+                    Ok((name, value))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let blob = Tree::new(entries)?.with_xattrs(root_xattrs)?.encode();
             let hash = self.chunks.hash(&blob);
             if !self
                 .chunks
@@ -228,6 +241,7 @@ impl SnapshotManager {
             mtime_ns: row.created_unix_ms * 1_000_000,
             target: None,
             manifest: None,
+            xattrs: Vec::new(),
         }];
         self.flatten_tree(root, 0, &mut specs).await?;
         self.meta.eager_clone(
@@ -251,6 +265,7 @@ impl SnapshotManager {
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let tree = Tree::decode(&self.chunks.get_chunk(&hash).await?)?;
+            specs[parent_index].xattrs = tree.xattrs.clone();
             for entry in tree.entries {
                 let manifest = if entry.kind == InodeKind::File {
                     let hash = entry
@@ -275,6 +290,7 @@ impl SnapshotManager {
                     mtime_ns: entry.mtime_ns,
                     target: entry.target,
                     manifest,
+                    xattrs: entry.xattrs,
                 });
                 if let Some(child_tree) = child_tree {
                     self.flatten_tree(child_tree, index, specs).await?;
@@ -385,7 +401,21 @@ mod tests {
     async fn eager_clone_write_cannot_mutate_snapshot_tree() {
         let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
         let source = meta.mkdir(1, "source", 0o755, 1, 1).unwrap();
+        meta.set_xattr(
+            source.ino,
+            "user.directory",
+            b"root",
+            constellation_meta::SetXattrMode::Set,
+        )
+        .unwrap();
         let file = meta.create(source.ino, "file", 0o644, 1, 1).unwrap();
+        meta.set_xattr(
+            file.ino,
+            "user.snapshot",
+            b"preserved",
+            constellation_meta::SetXattrMode::Set,
+        )
+        .unwrap();
         let original = Manifest::from_chunks(
             DEFAULT_CHUNK_SIZE,
             3,
@@ -418,6 +448,10 @@ mod tests {
         let clone_attr = meta.getattr(clone_root).unwrap().unwrap();
         assert_eq!(clone_attr.uid, unsafe { libc::geteuid() });
         assert_eq!(clone_attr.gid, unsafe { libc::getegid() });
+        assert_eq!(
+            meta.get_xattr(clone_root, "user.directory").unwrap(),
+            Some(b"root".to_vec())
+        );
         let clone_file = meta.resolve_path("/copy/file").unwrap().unwrap();
         let changed = Manifest::from_chunks(
             DEFAULT_CHUNK_SIZE,
@@ -431,6 +465,10 @@ mod tests {
 
         assert_eq!(chunks.get_chunk(&root).await.unwrap(), frozen_before);
         let tree = manager.load_tree(root).await.unwrap();
+        assert_eq!(
+            tree.entries[0].xattrs,
+            vec![("user.snapshot".into(), b"preserved".to_vec())]
+        );
         let manifest_hash = tree.entries[0].manifest_or_tree_hash.unwrap();
         assert_eq!(
             manager.load_manifest(manifest_hash).await.unwrap(),
@@ -438,5 +476,9 @@ mod tests {
         );
         assert_eq!(meta.manifest(file.ino).unwrap().unwrap(), original);
         assert_eq!(meta.manifest(clone_file).unwrap().unwrap(), changed);
+        assert_eq!(
+            meta.get_xattr(clone_file, "user.snapshot").unwrap(),
+            Some(b"preserved".to_vec())
+        );
     }
 }

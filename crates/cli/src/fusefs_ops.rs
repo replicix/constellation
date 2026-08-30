@@ -572,6 +572,160 @@ impl Filesystem for ConstellationFs {
         reply.ok();
     }
 
+    fn setxattr(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let ino = self.real_ino(ino);
+        let name = match checked_xattr_name(req, name) {
+            Ok(name) => name,
+            Err(error) => return reply.error(error),
+        };
+        if virtual_xattr(&name) {
+            reply.error(libc::EPERM);
+            return;
+        }
+        if Self::is_synthetic(ino) {
+            reply.error(libc::EROFS);
+            return;
+        }
+        if value.len() > 64 * 1024 {
+            reply.error(libc::E2BIG);
+            return;
+        }
+        if position != 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        let mode = match flags {
+            0 => constellation_meta::SetXattrMode::Set,
+            libc::XATTR_CREATE => constellation_meta::SetXattrMode::Create,
+            libc::XATTR_REPLACE => constellation_meta::SetXattrMode::Replace,
+            _ => return reply.error(libc::EINVAL),
+        };
+        gate!(self, ino, reply);
+        match self.meta.set_xattr(ino, &name, value, mode) {
+            Ok(()) => {
+                self.nudge_sync();
+                reply.ok()
+            }
+            Err(error) => reply.error(errno(&error)),
+        }
+    }
+
+    fn getxattr(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        let ino = self.real_ino(ino);
+        let name = match checked_xattr_name(req, name) {
+            Ok(name) => name,
+            Err(error) => return reply.error(error),
+        };
+        let value = if virtual_xattr(&name) {
+            let aggregate = if Self::is_synthetic(ino) {
+                self.synthetic_recursive_size(ino)
+            } else {
+                self.meta.recursive_size(ino).map_err(|error| errno(&error))
+            };
+            match aggregate {
+                Ok((rsize, rcount)) => {
+                    if name == RSIZE_XATTR {
+                        rsize.to_string().into_bytes()
+                    } else {
+                        rcount.to_string().into_bytes()
+                    }
+                }
+                Err(error) => return reply.error(error),
+            }
+        } else {
+            let result = if Self::is_synthetic(ino) {
+                self.synthetic_xattrs(ino).map(|attrs| {
+                    attrs
+                        .into_iter()
+                        .find(|(key, _)| key == &name)
+                        .map(|x| x.1)
+                })
+            } else {
+                self.meta
+                    .get_xattr(ino, &name)
+                    .map_err(|error| errno(&error))
+            };
+            match result {
+                Ok(Some(value)) => value,
+                Ok(None) => return reply.error(libc::ENODATA),
+                Err(error) => return reply.error(error),
+            }
+        };
+        reply_xattr(value, size, reply);
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        let ino = self.real_ino(ino);
+        let names = if Self::is_synthetic(ino) {
+            self.synthetic_xattrs(ino)
+                .map(|attrs| attrs.into_iter().map(|(name, _)| name).collect())
+        } else {
+            self.meta
+                .list_xattrs(ino)
+                .map_err(|error| errno(&error))
+        };
+        let mut names: Vec<String> = match names {
+            Ok(names) => names,
+            Err(error) => return reply.error(error),
+        };
+        names.push(RSIZE_XATTR.to_string());
+        names.push(RCOUNT_XATTR.to_string());
+        names.sort();
+        names.dedup();
+        let mut encoded = Vec::new();
+        for name in names {
+            encoded.extend_from_slice(name.as_bytes());
+            encoded.push(0);
+        }
+        reply_xattr(encoded, size, reply);
+    }
+
+    fn removexattr(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        reply: ReplyEmpty,
+    ) {
+        let ino = self.real_ino(ino);
+        let name = match checked_xattr_name(req, name) {
+            Ok(name) => name,
+            Err(error) => return reply.error(error),
+        };
+        if virtual_xattr(&name) {
+            reply.error(libc::EPERM);
+            return;
+        }
+        if Self::is_synthetic(ino) {
+            reply.error(libc::EROFS);
+            return;
+        }
+        gate!(self, ino, reply);
+        match self.meta.remove_xattr(ino, &name) {
+            Ok(()) => {
+                self.nudge_sync();
+                reply.ok()
+            }
+            Err(error) => reply.error(errno(&error)),
+        }
+    }
+
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
         // Effectively unlimited backing store; block size mirrors blksize.
         let bsize: u32 = 131072;
@@ -618,6 +772,37 @@ impl Filesystem for ConstellationFs {
             Ok(position) => reply.offset(position),
             Err(error) => reply.error(error),
         }
+    }
+}
+
+fn checked_xattr_name(req: &Request<'_>, name: &OsStr) -> Result<String, i32> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 255 {
+        return Err(libc::ERANGE);
+    }
+    let name = std::str::from_utf8(bytes).map_err(|_| libc::EINVAL)?;
+    if name.starts_with("user.") {
+        return Ok(name.to_string());
+    }
+    if name.starts_with("trusted.") {
+        // FUSE does not carry Linux capability bits. Treat uid 0 as the
+        // kernel-authenticated privileged caller and refuse everyone else.
+        return if req.uid() == 0 {
+            Ok(name.to_string())
+        } else {
+            Err(libc::EPERM)
+        };
+    }
+    Err(libc::ENOTSUP)
+}
+
+fn reply_xattr(value: Vec<u8>, size: u32, reply: ReplyXattr) {
+    if size == 0 {
+        reply.size(value.len() as u32);
+    } else if (size as usize) < value.len() {
+        reply.error(libc::ERANGE);
+    } else {
+        reply.data(&value);
     }
 }
 

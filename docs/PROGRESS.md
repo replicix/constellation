@@ -896,8 +896,41 @@ objects** (including immutable superseded data versions, but no 64-object hole
 span) and **67 MiB RSS**. Only `fio-latency` and `fio-blips` skipped because
 `fio` is absent.
 
+## Phase 8f — POSIX extended attributes and recursive size: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Journaled inode xattrs with atomic set/remove records, create/replace semantics, last-unlink cleanup, replay, reopen, and eager-clone copying | done | `meta::{record,sqlite,replay}` |
+| FUSE `getxattr`, `setxattr`, `listxattr`, and `removexattr`; full `user.*`, uid-0-only `trusted.*` (FUSE lacks capability bits), unsupported system/security namespaces, Linux size limits, and lease-gated mutation | done | `cli::{fusefs,fusefs_ops}` |
+| Read-only decimal `user.constellation.rsize` / `rcount`; files report logical size/count 1 and directories use a bounded recursive SQLite query | done | `meta::sqlite`, `cli::fusefs_ops` |
+| Backward-readable `CTR2` snapshot trees carrying directory and entry xattrs; frozen views expose them and eager clones restore them | done | `fs-core::tree`, `cli::{snapshot,fusefs}` |
+| Two-node file/directory round-trip, removal propagation, and sparse logical-size oracle | done | harness `xattr-roundtrip` |
+
+### Phase 8f exit criteria (plan 15)
+
+- [x] User xattrs set, list, replace, remove, survive SQLite reopen, replay to
+      another replica, disappear on final unlink, and copy into eager clones.
+- [x] Snapshot trees preserve xattrs in `CTR2`; old `CTR1` blobs decode with
+      empty xattrs, and hidden frozen views expose the captured values.
+- [x] Virtual recursive aggregates are read-only decimal ASCII. A file reports
+      `(size, 1)`; a directory sums descendant logical file lengths and counts
+      each reachable file inode once. Holes therefore contribute to `rsize`.
+- [x] `xattr-roundtrip`, the complete harness matrix, and pjdfstest pass.
+
+The aggregate fallback is intentionally computed from the authoritative
+replica with a recursive CTE rather than maintained `inode.rsize/rcount`
+columns. Its cost is bounded by the reachable subtree and requires no S3 I/O;
+maintained O(1) directory columns remain a future performance optimization.
+
+Validation (2026-08-30): fmt and strict clippy clean; 286 workspace tests,
+smoke, S3 integration, and release workspace build pass. Full harness:
+**ALL RUN SCENARIOS PASSED**, including `xattr-roundtrip`; only `fio-latency`
+and `fio-blips` skipped because `fio` is absent. pjdfstest: **8798 passed,
+0 failed**, empty baseline. `xattr-roundtrip` reported `rsize=1073741831`,
+`rcount=2` for a seven-byte file plus a sparse 1 GiB logical file.
+
 ## Later phases
 
-Phases 1–8e are closed. Phase 9 automated crash reporting remains future work.
+Phases 1–8f are closed. Phase 9 automated crash reporting remains future work.
 Deferred format/data-plane items remain listed in `docs/ROADMAP.md` and the
 phase-specific scope notes above.

@@ -471,6 +471,14 @@ under the fixed cache-plus-overhead ceiling. The scenario prints file size,
 chunk-object count, RSS, and cache budget; seed 42 measured 256 MiB, 18
 objects, 67 MiB RSS, and a 32 MiB cache.
 
+Phase 8f adds `xattr-roundtrip`. One node sets `user.foo` on a file and its
+directory, then a second node waits for log sync and verifies both values.
+Removal must propagate as `ENODATA`. The same directory contains a seven-byte
+file and a sparse file with a 1 GiB logical length; the virtual
+`user.constellation.rsize` must return `1073741831` and
+`user.constellation.rcount` must return `2`, proving holes count by logical
+`file_len` without materializing data.
+
 Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.

@@ -20,6 +20,9 @@ pub enum MetaError {
     #[error("directory not empty")]
     NotEmpty,
 
+    #[error("attribute does not exist")]
+    NoData,
+
     #[error("invalid argument: {0}")]
     Invalid(String),
 

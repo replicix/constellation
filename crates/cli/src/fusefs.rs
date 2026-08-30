@@ -23,10 +23,11 @@ use constellation_meta::{MetaError, MetaStore, SqliteMeta};
 use constellation_store_s3::{ChunkStore, CompressionSetting};
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek,
-    ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -156,6 +157,7 @@ pub(crate) enum SyntheticNode {
         mtime_ns: i64,
         target: Option<String>,
         object: Option<ChunkHash>,
+        xattrs: Vec<(String, Vec<u8>)>,
     },
 }
 
@@ -203,9 +205,17 @@ fn errno(e: &MetaError) -> i32 {
         MetaError::NotDir => libc::ENOTDIR,
         MetaError::IsDir => libc::EISDIR,
         MetaError::NotEmpty => libc::ENOTEMPTY,
+        MetaError::NoData => libc::ENODATA,
         MetaError::Invalid(_) => libc::EINVAL,
         MetaError::Sqlite(_) | MetaError::Json(_) => libc::EIO,
     }
+}
+
+const RSIZE_XATTR: &str = "user.constellation.rsize";
+const RCOUNT_XATTR: &str = "user.constellation.rcount";
+
+fn virtual_xattr(name: &str) -> bool {
+    matches!(name, RSIZE_XATTR | RCOUNT_XATTR)
 }
 
 fn to_fuse_attr(a: &FileAttr) -> fuser::FileAttr {
@@ -317,6 +327,7 @@ impl ConstellationFs {
             mtime_ns: row.created_unix_ms * 1_000_000,
             target: None,
             object: Some(crate::snapshot::parse_hash(&row.root_hash)?),
+            xattrs: Vec::new(),
         };
         self.view_root = self.intern_synthetic(format!("mount:{path}@{name}"), node);
         Ok(())
@@ -396,6 +407,76 @@ impl ConstellationFs {
         }
     }
 
+    pub(crate) fn synthetic_xattrs(&self, ino: Ino) -> Result<Vec<(String, Vec<u8>)>, i32> {
+        let node = self.synthetic_node(ino).ok_or(libc::ESTALE)?;
+        if !self.synthetic_active(&node) {
+            return Err(libc::ESTALE);
+        }
+        match node {
+            SyntheticNode::Frozen {
+                kind: InodeKind::Dir,
+                object: Some(tree_hash),
+                xattrs,
+                ..
+            } if xattrs.is_empty() => Ok(self.snapshot_tree(tree_hash)?.xattrs),
+            SyntheticNode::Frozen { xattrs, .. } => Ok(xattrs),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) fn synthetic_recursive_size(&self, ino: Ino) -> Result<(u64, u64), i32> {
+        let node = self.synthetic_node(ino).ok_or(libc::ESTALE)?;
+        if !self.synthetic_active(&node) {
+            return Err(libc::ESTALE);
+        }
+        self.synthetic_node_recursive_size(&node)
+    }
+
+    fn synthetic_node_recursive_size(&self, node: &SyntheticNode) -> Result<(u64, u64), i32> {
+        match node {
+            SyntheticNode::Frozen {
+                kind: InodeKind::File,
+                size,
+                ..
+            } => Ok((*size, 1)),
+            SyntheticNode::Frozen {
+                kind: InodeKind::Dir,
+                object: Some(tree_hash),
+                ..
+            } => {
+                let mut total = (0u64, 0u64);
+                for entry in self.snapshot_tree(*tree_hash)?.entries {
+                    match entry.kind {
+                        InodeKind::File => {
+                            total.0 = total.0.saturating_add(entry.size);
+                            total.1 = total.1.saturating_add(1);
+                        }
+                        InodeKind::Dir => {
+                            let child = SyntheticNode::Frozen {
+                                snapshot_id: String::new(),
+                                kind: entry.kind,
+                                mode: entry.mode,
+                                uid: entry.uid,
+                                gid: entry.gid,
+                                size: entry.size,
+                                mtime_ns: entry.mtime_ns,
+                                target: entry.target,
+                                object: entry.manifest_or_tree_hash,
+                                xattrs: entry.xattrs,
+                            };
+                            let subtotal = self.synthetic_node_recursive_size(&child)?;
+                            total.0 = total.0.saturating_add(subtotal.0);
+                            total.1 = total.1.saturating_add(subtotal.1);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(total)
+            }
+            _ => Ok((0, 0)),
+        }
+    }
+
     pub(crate) fn snapshot_tree(
         &self,
         hash: ChunkHash,
@@ -467,6 +548,7 @@ impl ConstellationFs {
                         mtime_ns: row.created_unix_ms * 1_000_000,
                         target: None,
                         object: Some(root),
+                        xattrs: Vec::new(),
                     }
                 }
                 SyntheticNode::Frozen {
@@ -490,6 +572,7 @@ impl ConstellationFs {
                         mtime_ns: entry.mtime_ns,
                         target: entry.target,
                         object: entry.manifest_or_tree_hash,
+                        xattrs: entry.xattrs,
                     }
                 }
                 _ => return Ok(None),
@@ -530,6 +613,7 @@ impl ConstellationFs {
                             mtime_ns: row.created_unix_ms * 1_000_000,
                             target: None,
                             object: Some(root),
+                            xattrs: Vec::new(),
                         },
                     ))
                 })
@@ -556,6 +640,7 @@ impl ConstellationFs {
                             mtime_ns: entry.mtime_ns,
                             target: entry.target,
                             object: entry.manifest_or_tree_hash,
+                            xattrs: entry.xattrs,
                         },
                     )
                 })
