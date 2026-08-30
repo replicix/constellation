@@ -772,7 +772,7 @@ audit rather than being hidden with ignore flags.
 
 Validation (2026-08-30): fmt and strict clippy clean; 267 workspace tests,
 smoke, S3 integration, all runnable harness scenarios, and pjdfstest
-8798/8798 pass. The bounded generic xfstests sweep reports **139 passed, 50
+8798/8798 pass. The bounded generic xfstests sweep reports **118 passed, 50
 known failures, 630 excluded** (609 capability-skipped plus 21 reasoned
 exclusions), with no regressions. The three-run-median performance gate passes
 all eight rates, and `make dist-linux` produces a static-PIE musl binary whose
