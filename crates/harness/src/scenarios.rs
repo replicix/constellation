@@ -177,6 +177,24 @@ pub const SCENARIOS: &[Scenario] = &[
         run: web_ui_smoke,
     },
     Scenario {
+        name: "gc-lifecycle",
+        desc: "reference GC removes dead chunks while preserving snapshot and live roots",
+        requires: &[],
+        run: gc_lifecycle,
+    },
+    Scenario {
+        name: "gc-dedup-race",
+        desc: "a writer reuses condemned content during the TTL wait without creating a dangle",
+        requires: &[],
+        run: gc_dedup_race,
+    },
+    Scenario {
+        name: "fsck-repair",
+        desc: "fsck detects and repairs a missing chunk, orphan, and torn segment",
+        requires: &[],
+        run: fsck_repair,
+    },
+    Scenario {
         name: "snapshot-lifecycle",
         desc: "snapshot remains frozen behind hidden .constellation view, then becomes stale",
         requires: &[],
@@ -608,6 +626,173 @@ fn eventually(what: &str, deadline: Duration, mut f: impl FnMut() -> Result<()>)
             Err(_) => std::thread::sleep(Duration::from_millis(250)),
         }
     }
+}
+
+fn raw_key(endpoint: &str, key: &str) -> String {
+    format!("{endpoint}/{BUCKET}/{key}")
+}
+
+fn chunk_key(prefix: &str, data: &[u8]) -> String {
+    let hash = blake3::hash(data).to_hex().to_string();
+    format!("{prefix}/chunks/{}/{}/{}", &hash[..2], &hash[2..4], hash)
+}
+
+fn raw_exists(endpoint: &str, key: &str) -> bool {
+    ureq::head(&raw_key(endpoint, key)).call().is_ok()
+}
+
+fn gc_lifecycle(_seed: u64) -> Result<()> {
+    let (env, root) = setup("gc-lifecycle")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("gc-life-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut client = Client::new(root.path(), "gc", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_LEASE_TTL_MS", "200")
+        .with_env("CONSTELLATION_GC_HORIZON_S", "0");
+    client.fs_create()?;
+    client.mount()?;
+    let doomed = b"doomed-unique-content";
+    let frozen = b"snapshot-only-content";
+    let live = b"still-live-content";
+    std::fs::create_dir(client.mnt.join("tree"))?;
+    std::fs::write(client.mnt.join("tree/frozen"), frozen)?;
+    client.snapshot_create("/tree@keep")?;
+    std::fs::write(client.mnt.join("tree/doomed"), doomed)?;
+    std::fs::remove_file(client.mnt.join("tree/frozen"))?;
+    std::fs::remove_file(client.mnt.join("tree/doomed"))?;
+    std::fs::write(client.mnt.join("tree/live"), live)?;
+
+    let output = client.gc_run(false)?;
+    let gc_stdout = String::from_utf8_lossy(&output.stdout);
+    anyhow::ensure!(
+        output.status.success(),
+        "gc run failed: {}{}",
+        gc_stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    anyhow::ensure!(
+        !raw_exists(&env.direct_endpoint, &chunk_key(&prefix, doomed)),
+        "dereferenced unique chunk survived GC: {gc_stdout}"
+    );
+    anyhow::ensure!(
+        raw_exists(&env.direct_endpoint, &chunk_key(&prefix, frozen)),
+        "snapshot-rooted chunk was collected"
+    );
+    anyhow::ensure!(
+        raw_exists(&env.direct_endpoint, &chunk_key(&prefix, live)),
+        "live chunk was collected"
+    );
+    anyhow::ensure!(
+        std::fs::read(client.mnt.join("tree/live"))? == live,
+        "live file changed after GC"
+    );
+    let listing = ureq::get(&format!(
+        "{}/{BUCKET}?list-type=2&prefix={prefix}/gc/journal/",
+        env.direct_endpoint
+    ))
+    .call()?
+    .into_string()?;
+    anyhow::ensure!(listing.contains("<Key>"), "GC journal is empty");
+    client.unmount()
+}
+
+fn gc_dedup_race(_seed: u64) -> Result<()> {
+    let (env, root) = setup("gc-dedup-race")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("gc-race-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut client = Client::new(root.path(), "race", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_LEASE_TTL_MS", "1000")
+        .with_env("CONSTELLATION_GC_HORIZON_S", "0");
+    client.fs_create()?;
+    client.mount()?;
+    let bytes = b"dedup-race-content";
+    std::fs::write(client.mnt.join("old"), bytes)?;
+    std::fs::remove_file(client.mnt.join("old"))?;
+    let child = client.gc_process(false)?;
+    eventually(
+        "condemned pointer publication",
+        Duration::from_secs(10),
+        || {
+            anyhow::ensure!(
+                raw_exists(&env.direct_endpoint, &format!("{prefix}/gc/condemned.json")),
+                "not published"
+            );
+            Ok(())
+        },
+    )?;
+    std::fs::write(client.mnt.join("resurrected"), bytes)?;
+    let output = child.wait_with_output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "race GC failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    anyhow::ensure!(
+        std::fs::read(client.mnt.join("resurrected"))? == bytes,
+        "GC deleted content committed during condemned wait"
+    );
+    client.unmount()
+}
+
+fn fsck_repair(_seed: u64) -> Result<()> {
+    let (env, root) = setup("fsck-repair")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("fsck-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut client = Client::new(root.path(), "fsck", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_LEASE_TTL_MS", "200")
+        .with_env("CONSTELLATION_GC_HORIZON_S", "0");
+    client.fs_create()?;
+    client.mount()?;
+    let bytes = b"recover-from-local-cache";
+    std::fs::write(client.mnt.join("recoverable"), bytes)?;
+    client.unmount()?;
+
+    let data_key = chunk_key(&prefix, bytes);
+    ureq::delete(&raw_key(&env.direct_endpoint, &data_key)).call()?;
+    let orphan_hash = blake3::hash(b"orphan-name").to_hex().to_string();
+    let orphan_key = format!(
+        "{prefix}/chunks/{}/{}/{}",
+        &orphan_hash[..2],
+        &orphan_hash[2..4],
+        orphan_hash
+    );
+    ureq::put(&raw_key(&env.direct_endpoint, &orphan_key)).send_bytes(b"orphan-object")?;
+    let torn = format!("{prefix}/log/p0/fffffffffffffffe.zst");
+    ureq::put(&raw_key(&env.direct_endpoint, &torn)).send_bytes(b"torn")?;
+
+    let detect = client.fsck(false)?;
+    anyhow::ensure!(
+        detect.status.code() == Some(1),
+        "fsck detection exit was not 1: {:?}\n{}{}",
+        detect.status.code(),
+        String::from_utf8_lossy(&detect.stdout),
+        String::from_utf8_lossy(&detect.stderr)
+    );
+    let repair = client.fsck(true)?;
+    anyhow::ensure!(
+        repair.status.code() == Some(2),
+        "fsck repair exit was not 2: {:?}\n{}{}",
+        repair.status.code(),
+        String::from_utf8_lossy(&repair.stdout),
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    let clean = client.fsck(false)?;
+    anyhow::ensure!(
+        clean.status.code() == Some(0),
+        "post-repair fsck not clean: {:?}\n{}{}",
+        clean.status.code(),
+        String::from_utf8_lossy(&clean.stdout),
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    client.mount()?;
+    anyhow::ensure!(
+        std::fs::read(client.mnt.join("recoverable"))? == bytes,
+        "repaired file did not model-verify"
+    );
+    client.unmount()
 }
 
 fn snapshot_lifecycle(_seed: u64) -> Result<()> {

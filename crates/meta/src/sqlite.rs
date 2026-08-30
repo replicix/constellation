@@ -18,6 +18,13 @@ use std::sync::Mutex;
 /// genesis (the root inode is 1).
 pub const INO_PREFIX_SHIFT: u32 = 40;
 
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS inode (
     ino       INTEGER PRIMARY KEY,
@@ -90,6 +97,11 @@ CREATE TABLE IF NOT EXISTS snapshot (
     created_unix_ms INTEGER NOT NULL,
     UNIQUE(path, name)
 );
+CREATE TABLE IF NOT EXISTS deref (
+    chunk_hash    BLOB PRIMARY KEY,
+    deref_seq     INTEGER NOT NULL,
+    deref_unix_ms INTEGER NOT NULL
+);
 ";
 
 pub type JournalBatch = Vec<(u64, LogRecord)>;
@@ -107,6 +119,170 @@ pub struct SqliteMeta {
 }
 
 impl SqliteMeta {
+    fn manifest_hashes(
+        bytes: Option<&[u8]>,
+    ) -> Result<std::collections::HashSet<ChunkHash>, MetaError> {
+        use constellation_fs_core::manifest::{ChunkInfo, Manifest};
+        let Some(bytes) = bytes else {
+            return Ok(std::collections::HashSet::new());
+        };
+        // Corrupt historical rows are reported by fsck. Deref bookkeeping
+        // must not make replay of the surrounding metadata transaction fail.
+        let Ok(manifest) = Manifest::decode(bytes) else {
+            return Ok(std::collections::HashSet::new());
+        };
+        Ok(match manifest.chunks {
+            ChunkInfo::Inline(hashes) => hashes.into_iter().collect(),
+            // The spill object is itself a bucket chunk and is the only hash
+            // available without doing S3 I/O inside the SQLite transaction.
+            // Its data hashes are protected by the spill while referenced and
+            // become orphan-sweep candidates after the spill is collected.
+            ChunkInfo::Spilled(hash) => [hash].into_iter().collect(),
+        })
+    }
+
+    fn hash_is_live(conn: &Connection, hash: &ChunkHash) -> Result<bool, MetaError> {
+        let mut stmt =
+            conn.prepare("SELECT manifest FROM inode WHERE nlink > 0 AND manifest IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        for row in rows {
+            if Self::manifest_hashes(Some(&row?))?.contains(hash) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Maintain the local indexed candidate set in the same transaction as
+    /// a manifest/root transition. This is called by both journaled local
+    /// mutations and foreign replay; bucket GC never needs to LIST chunks to
+    /// discover ordinary reference garbage.
+    pub(crate) fn track_manifest_transition(
+        conn: &Connection,
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+        seq: u64,
+        unix_ms: i64,
+    ) -> Result<(), MetaError> {
+        let old = Self::manifest_hashes(old)?;
+        let new = Self::manifest_hashes(new)?;
+        for hash in new.difference(&old) {
+            conn.execute(
+                "DELETE FROM deref WHERE chunk_hash = ?1",
+                params![hash.0.to_vec()],
+            )?;
+        }
+        for hash in old.difference(&new) {
+            if !Self::hash_is_live(conn, hash)? {
+                conn.execute(
+                    "INSERT OR REPLACE INTO deref (chunk_hash, deref_seq, deref_unix_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![hash.0.to_vec(), seq, unix_ms],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn next_deref_seq(conn: &Connection) -> Result<u64, MetaError> {
+        Ok(
+            conn.query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM journal", [], |row| {
+                row.get(0)
+            })?,
+        )
+    }
+
+    /// One-time upgrade backfill. Existing live references cancel stale
+    /// candidate rows; pre-upgrade abandoned uploads remain the orphan
+    /// sweep's responsibility because no historical disappearance time can
+    /// be reconstructed safely.
+    pub fn backfill_deref_once(&self) -> Result<(), MetaError> {
+        if self.kv_get("deref_backfill_v1")?.as_deref() == Some("1") {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut live = std::collections::HashSet::new();
+        {
+            let mut stmt =
+                tx.prepare("SELECT manifest FROM inode WHERE nlink > 0 AND manifest IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                live.extend(Self::manifest_hashes(Some(&row?))?);
+            }
+        }
+        for hash in live {
+            tx.execute(
+                "DELETE FROM deref WHERE chunk_hash = ?1",
+                params![hash.0.to_vec()],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES ('deref_backfill_v1', '1')",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn deref_candidates(
+        &self,
+        older_than_unix_ms: i64,
+    ) -> Result<Vec<(ChunkHash, u64, i64)>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chunk_hash, deref_seq, deref_unix_ms FROM deref
+             WHERE deref_unix_ms <= ?1 ORDER BY deref_unix_ms, chunk_hash",
+        )?;
+        let rows = stmt.query_map(params![older_than_unix_ms], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (bytes, seq, at) = row?;
+            let hash = ChunkHash(
+                bytes
+                    .try_into()
+                    .map_err(|_| MetaError::Invalid("deref hash length".into()))?,
+            );
+            out.push((hash, seq, at));
+        }
+        Ok(out)
+    }
+
+    pub fn live_manifest_hashes(&self) -> Result<std::collections::HashSet<ChunkHash>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = std::collections::HashSet::new();
+        let mut stmt =
+            conn.prepare("SELECT manifest FROM inode WHERE nlink > 0 AND manifest IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        for row in rows {
+            out.extend(Self::manifest_hashes(Some(&row?))?);
+        }
+        Ok(out)
+    }
+
+    pub fn live_manifests(&self) -> Result<Vec<Vec<u8>>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT manifest FROM inode WHERE nlink > 0 AND manifest IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn clear_deref(&self, hash: &ChunkHash) -> Result<(), MetaError> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM deref WHERE chunk_hash = ?1",
+            params![hash.0.to_vec()],
+        )?;
+        Ok(())
+    }
+
+    fn parse_hash_hex(value: &str) -> Result<ChunkHash, MetaError> {
+        ChunkHash::from_hex(value)
+            .ok_or_else(|| MetaError::Invalid(format!("invalid chunk hash {value:?}")))
+    }
+
     /// Open (or create) a metadata DB. Creates the root inode on first use.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MetaError> {
         let conn = Connection::open(path)?;
@@ -545,6 +721,10 @@ impl SqliteMeta {
                 row.created_unix_ms
             ],
         )?;
+        tx.execute(
+            "DELETE FROM deref WHERE chunk_hash = ?1",
+            params![Self::parse_hash_hex(&row.root_hash)?.0.to_vec()],
+        )?;
         Self::journal(
             &tx,
             &LogRecord::SnapCreate {
@@ -562,14 +742,14 @@ impl SqliteMeta {
     pub fn delete_snapshot(&self, path: &str, name: &str) -> Result<bool, MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let row: Option<String> = tx
+        let row: Option<(String, String)> = tx
             .query_row(
-                "SELECT id FROM snapshot WHERE path = ?1 AND name = ?2",
+                "SELECT id, root_hash FROM snapshot WHERE path = ?1 AND name = ?2",
                 params![path, name],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some(id) = row else {
+        let Some((id, root_hash)) = row else {
             return Ok(false);
         };
         tx.execute("DELETE FROM snapshot WHERE id = ?1", params![id])?;
@@ -580,6 +760,15 @@ impl SqliteMeta {
                 path: path.to_string(),
                 name: name.to_string(),
             },
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO deref (chunk_hash, deref_seq, deref_unix_ms)
+             VALUES (?1, ?2, ?3)",
+            params![
+                Self::parse_hash_hex(&root_hash)?.0.to_vec(),
+                Self::next_deref_seq(&tx)?,
+                now_unix_ms()
+            ],
         )?;
         tx.commit()?;
         Ok(true)
@@ -671,6 +860,13 @@ impl SqliteMeta {
             tx.execute(
                 "INSERT INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
                 params![node_parent, node_name, ino],
+            )?;
+            Self::track_manifest_transition(
+                &tx,
+                None,
+                spec.manifest.as_deref(),
+                Self::next_deref_seq(&tx)?,
+                spec.mtime_ns / 1_000_000,
             )?;
             if spec.kind == InodeKind::Dir {
                 tx.execute(
@@ -883,6 +1079,14 @@ impl SqliteMeta {
             out.push((txid, half, serde_json::from_str(&json)?));
         }
         Ok(out)
+    }
+
+    pub fn clear_pending_xpart(&self, txid: u64) -> Result<(), MetaError> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
+        Ok(())
     }
 
     /// Peek the journal grouped by partition, preserving per-partition
@@ -1374,6 +1578,13 @@ impl SqliteMeta {
         if n == 0 {
             return Err(MetaError::NoEnt(ino));
         }
+        Self::track_manifest_transition(
+            tx,
+            base_manifest.as_deref(),
+            Some(manifest),
+            Self::next_deref_seq(tx)?,
+            t / 1_000_000,
+        )?;
         Self::journal(
             tx,
             &LogRecord::WriteManifest {
@@ -1768,6 +1979,20 @@ impl MetaStore for SqliteMeta {
             "UPDATE inode SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1",
             params![ino, t],
         )?;
+        if attr.nlink == 1 {
+            let manifest: Option<Vec<u8>> = tx.query_row(
+                "SELECT manifest FROM inode WHERE ino = ?1",
+                params![ino],
+                |row| row.get(0),
+            )?;
+            Self::track_manifest_transition(
+                &tx,
+                manifest.as_deref(),
+                None,
+                Self::next_deref_seq(&tx)?,
+                t / 1_000_000,
+            )?;
+        }
         tx.execute(
             "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
             params![parent, t],
@@ -1919,11 +2144,28 @@ impl MetaStore for SqliteMeta {
     }
 
     fn reap_orphan(&self, ino: Ino) -> Result<(), MetaError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let manifest: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT manifest FROM inode WHERE ino = ?1 AND nlink = 0",
+                params![ino],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        tx.execute(
             "DELETE FROM inode WHERE ino = ?1 AND nlink = 0",
             params![ino],
         )?;
+        Self::track_manifest_transition(
+            &tx,
+            manifest.as_deref(),
+            None,
+            Self::next_deref_seq(&tx)?,
+            now_unix_ms(),
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1963,6 +2205,7 @@ impl MetaStore for SqliteMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use constellation_fs_core::manifest::Manifest;
 
     fn store() -> SqliteMeta {
         SqliteMeta::open_in_memory().unwrap()
@@ -1974,6 +2217,75 @@ mod tests {
         let root = m.getattr(ROOT_INO).unwrap().unwrap();
         assert_eq!(root.kind, InodeKind::Dir);
         assert_eq!(root.nlink, 2);
+    }
+
+    fn one_hash_manifest(hash: ChunkHash) -> Vec<u8> {
+        Manifest::from_chunks(
+            constellation_fs_core::DEFAULT_CHUNK_SIZE,
+            1,
+            vec![hash],
+            constellation_fs_core::INLINE_CHUNKS_MAX,
+        )
+        .0
+        .encode()
+    }
+
+    #[test]
+    fn deref_tracks_manifest_replace_and_rereference() {
+        let meta = store();
+        let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap();
+        let old = ChunkHash::of(b"old");
+        let new = ChunkHash::of(b"new");
+        meta.set_manifest(file.ino, &one_hash_manifest(old), 1)
+            .unwrap();
+        meta.set_manifest(file.ino, &one_hash_manifest(new), 1)
+            .unwrap();
+        let rows = meta.deref_candidates(i64::MAX).unwrap();
+        assert!(rows.iter().any(|(hash, _, _)| *hash == old));
+        assert!(!rows.iter().any(|(hash, _, _)| *hash == new));
+
+        meta.set_manifest(file.ino, &one_hash_manifest(old), 1)
+            .unwrap();
+        assert!(!meta
+            .deref_candidates(i64::MAX)
+            .unwrap()
+            .iter()
+            .any(|(hash, _, _)| *hash == old));
+    }
+
+    #[test]
+    fn deref_tracks_last_unlink() {
+        let meta = store();
+        let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap();
+        let hash = ChunkHash::of(b"unlinked");
+        meta.set_manifest(file.ino, &one_hash_manifest(hash), 1)
+            .unwrap();
+        meta.unlink(ROOT_INO, "file").unwrap();
+        assert!(meta
+            .deref_candidates(i64::MAX)
+            .unwrap()
+            .iter()
+            .any(|(candidate, _, _)| *candidate == hash));
+    }
+
+    #[test]
+    fn deref_tracks_snapshot_delete() {
+        let meta = store();
+        let hash = ChunkHash::of(b"snapshot-root");
+        let row = SnapshotRow {
+            id: "snap".into(),
+            path: "/".into(),
+            name: "before".into(),
+            root_hash: hash.to_hex(),
+            created_unix_ms: 1,
+        };
+        meta.record_snapshot(&row).unwrap();
+        meta.delete_snapshot("/", "before").unwrap();
+        assert!(meta
+            .deref_candidates(i64::MAX)
+            .unwrap()
+            .iter()
+            .any(|(candidate, _, _)| *candidate == hash));
     }
 
     #[test]

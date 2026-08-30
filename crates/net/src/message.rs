@@ -48,6 +48,11 @@ pub enum Payload {
         seq: u64,
         epoch: u64,
     },
+    /// GC has CAS-published `gc/condemned.json`. Writers still re-read S3;
+    /// this is only a freshness nudge, never the authority.
+    CondemnedPublished {
+        epoch: u64,
+    },
     /// "I want the lease for `part`." Sent directly to the holder.
     LeaseRequest {
         part: String,

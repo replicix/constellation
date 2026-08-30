@@ -354,6 +354,7 @@ impl LeaseKeeper {
                 self.view.set_held(&lease);
                 self.view.touch();
                 self.held = Some((lease, tag));
+                self.refresh_condemned().await;
                 Ok(true)
             }
             // Somebody else got there first; the caller retries.
@@ -388,6 +389,7 @@ impl LeaseKeeper {
             Ok(tag) => {
                 self.view.set_held(&renewed);
                 self.held = Some((renewed, tag));
+                self.refresh_condemned().await;
                 Ok(())
             }
             Err(StoreError::CasConflict) => {
@@ -399,6 +401,25 @@ impl LeaseKeeper {
                 // retry on the next tick (it is still unexpired).
                 self.held = Some((lease, tag));
                 Err(e.into())
+            }
+        }
+    }
+
+    async fn refresh_condemned(&self) {
+        match constellation_store_s3::read_condemned(&self.store.inner()).await {
+            Ok(Some(list)) => {
+                tracing::debug!(
+                    epoch = list.epoch,
+                    hashes = list.hashes.len(),
+                    "refreshed GC condemned pointer at lease renewal"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // Renewal already succeeded. Upload-time refresh remains the
+                // safety gate, so a transient read failure here costs only
+                // the early freshness hint.
+                tracing::debug!(%error, "could not refresh GC condemned pointer");
             }
         }
     }

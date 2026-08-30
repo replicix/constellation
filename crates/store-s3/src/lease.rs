@@ -169,6 +169,10 @@ impl LeaseStore {
         &self.partition
     }
 
+    pub fn inner(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
+    }
+
     /// Current lease plus the token needed to swap it; `None` when no
     /// node has ever claimed the partition.
     pub async fn get(&self) -> Result<Option<(Lease, LeaseTag)>, StoreError> {

@@ -690,6 +690,51 @@ every runnable scenario passed, including `web-ui-smoke`; only `fio-latency`
 and `fio-blips` skipped because `fio` is absent. pjdfstest: **8798 passed, 0
 failed**, empty baseline.
 
+## Phase 8a — garbage collection and fsck: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Continuous transactional dereference index, maintained by local mutations and foreign replay, with one-time replica upgrade backfill | done | `meta::{sqlite,replay}` |
+| Exclusive `leases/_gc.json` holder using the unchanged partition lease store; daily daemon timer plus `gc run` / mark-only `gc verify` | done | `cli::gc`, `cli::main`, `store-s3::lease` |
+| Horizon-filtered reference sweep with conservative offline-designation protection, bucket-authoritative hold roots, immutable snapshot-tree root walking/cache, segment retention, and newest-two checkpoint retention | done | `cli::gc` |
+| CAS condemned pointer, P2P freshness announcement, full-TTL wait, renewal/upload-path refresh, dedup resurrection, and pre-DELETE reference recheck | done | `store-s3::gc`, `store-s3::store`, `net::{message,peers}`, `cli::{gc,lease}` |
+| Explicit LIST-based orphan pass and immutable per-deletion evidence journal | done | `gc run --orphans`, `gc/journal/` |
+| Machine-readable offline `fsck [--repair]`: dangling references/cache healing, orphan GC, xpart abort, corrupt metadata quarantine/checkpoint rebuild, explicit-only stale lease release, cache cruft, and GC-journal audit | done | `cli::fsck` |
+| Unit coverage for deref transitions, horizon/exemption filtering, condemned dedup resurrection, and corrupt fixtures | done | `meta::sqlite`, `store-s3::{gc,store}`, `cli::{gc,fsck}` tests |
+| Fault scenarios for lifecycle roots, the condemned dedup race, and repair exit-code lifecycle | done | `harness::{gc-lifecycle,gc-dedup-race,fsck-repair}` |
+
+### Phase 8a exit criteria (plan 09)
+
+- [x] Reference GC discovers ordinary garbage from the replica index without
+      listing chunks; only `--orphans` performs the expensive chunk LIST.
+- [x] The delete-vs-dedup race is closed by condemned publication, gossip,
+      one full authority TTL, upload resurrection, and a final live/deref
+      recheck.
+- [x] Live files, snapshot trees, active designations, and advertised holds
+      are protected roots; metadata retention keeps the newest two
+      checkpoints and the configured log floor.
+- [x] Every destructive GC action is journaled with rule/evidence, and
+      `gc verify` is mark-only.
+- [x] `fsck` exits 0 clean / 1 detected / 2 repaired / 3 unrepairable and
+      never silently truncates a file with unavailable content.
+- [x] Harness `gc-lifecycle`, `gc-dedup-race`, and `fsck-repair` pass.
+
+**Design choices.** SQLite records inline data hashes directly and records a
+spilled manifest object's hash transactionally; the sweep resolves the spill
+through S3 before deleting anything. An active offline designation
+conservatively pauses all reference candidates because the current
+designation object does not retain per-hash provenance; this sacrifices
+reclamation while a designation exists, never safety. Uploads read the
+condemned pointer at every dedup decision in addition to lease-renewal
+refreshes, closing the acquisition/publication edge without relying on gossip.
+
+Validation (2026-08-30): fmt and strict clippy clean; 267 workspace unit tests
+pass; smoke and S3 integration pass. Full harness: every runnable scenario
+passed, including `gc-lifecycle`, `gc-dedup-race`, and `fsck-repair`; only
+`fio-latency` and `fio-blips` skipped because `fio` is absent. pjdfstest:
+**8798 passed, 0 failed**, empty baseline.
+
 ## Later phases
 
-Phases 5, 5a, 5b, 6a, 6b, and 7 are closed. Not started: phase 8 GC.
+Phases 5, 5a, 5b, 6a, 6b, 7, and 8a are closed. Next: phase 8b hardening and
+packaging.

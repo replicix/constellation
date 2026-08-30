@@ -58,6 +58,18 @@ pub fn hold(node_id: &str) -> Path {
     Path::from(format!("holds/{node_id}.json"))
 }
 
+pub fn gc_condemned() -> Path {
+    Path::from("gc/condemned.json")
+}
+
+pub fn gc_journal(ts: i64, nonce: &str) -> Path {
+    Path::from(format!("gc/journal/{ts:016x}-{nonce}.json"))
+}
+
+pub fn gc_journal_prefix() -> Path {
+    Path::from("gc/journal")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

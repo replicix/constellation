@@ -8,6 +8,7 @@ pub mod designation;
 pub mod e2e;
 pub mod error;
 pub mod format;
+pub mod gc;
 pub mod layout;
 pub mod lease;
 pub mod log;
@@ -21,6 +22,9 @@ pub use e2e::{
     change_passphrase, load_keyring, put_keyring, Argon2Params, E2eKeys, Keyring, SharedE2eKeys,
 };
 pub use error::StoreError;
+pub use gc::{
+    append_journal, is_condemned, publish_condemned, read_condemned, CondemnedList, GcJournalEntry,
+};
 pub use lease::{live_leases_held_by, Lease, LeaseMode, LeaseStore, LeaseTag};
 pub use log::{CheckpointVector, LogStore};
 pub use nodes::{

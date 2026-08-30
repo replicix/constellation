@@ -4,7 +4,9 @@ mod backend;
 mod coop;
 mod designation;
 mod epoch;
+mod fsck;
 mod fusefs;
+mod gc;
 mod lease;
 mod leave;
 mod log_buffer;
@@ -203,6 +205,46 @@ enum Command {
     Debug {
         #[command(subcommand)]
         command: DebugCommand,
+    },
+    /// Coordinated bucket garbage collection.
+    Gc {
+        #[command(subcommand)]
+        command: GcCommand,
+    },
+    /// Check bucket, replica, and cache consistency.
+    Fsck {
+        #[arg(long)]
+        s3: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        repair: bool,
+        /// Explicitly release this expired partition lease while repairing.
+        #[arg(long, requires = "repair")]
+        force_release: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GcCommand {
+    /// Mark, condemn, wait, and sweep eligible objects.
+    Run {
+        #[arg(long)]
+        s3: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Include the expensive LIST-based orphan pass.
+        #[arg(long)]
+        orphans: bool,
+    },
+    /// Run the mark phase only and print deletion evidence.
+    Verify {
+        #[arg(long)]
+        s3: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        orphans: bool,
     },
 }
 
@@ -514,6 +556,42 @@ fn main() -> Result<()> {
             &state_dir,
             constellation_api::Request::SnapRefs { id },
         )),
+        Command::Gc { command } => {
+            let (s3, state_dir, orphans, verify_only) = match command {
+                GcCommand::Run {
+                    s3,
+                    state_dir,
+                    orphans,
+                } => (s3, state_dir, orphans, false),
+                GcCommand::Verify {
+                    s3,
+                    state_dir,
+                    orphans,
+                } => (s3, state_dir, orphans, true),
+            };
+            let report = rt.block_on(run_gc_cli(&s3, state_dir, orphans, verify_only))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::Fsck {
+            s3,
+            state_dir,
+            repair,
+            force_release,
+        } => {
+            let report = rt.block_on(run_fsck_cli(
+                &s3,
+                state_dir,
+                repair,
+                force_release.as_deref(),
+            ))?;
+            let code = report.exit_code();
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::Mount {
             s3,
             paths,
@@ -559,6 +637,101 @@ fn main() -> Result<()> {
             )
         }
     }
+}
+
+async fn run_gc_cli(
+    s3: &str,
+    state_dir: Option<PathBuf>,
+    orphans: bool,
+    verify_only: bool,
+) -> Result<gc::GcReport> {
+    let backend = backend::open_backend(s3)?;
+    let plain = ChunkStore::new(backend.clone());
+    let fsmeta = plain.load_fs().await?;
+    let keys = if fsmeta.e2e {
+        let secret = passphrase("CONSTELLATION_PASSPHRASE", "Filesystem passphrase: ")?;
+        Some(load_keyring(&backend, &secret).await?)
+    } else {
+        None
+    };
+    let chunks = std::sync::Arc::new(match &keys {
+        Some(keys) => ChunkStore::new_e2e(backend.clone(), keys.clone()),
+        None => plain,
+    });
+    let logs = match keys {
+        Some(keys) => constellation_store_s3::LogStore::new_e2e(backend.clone(), keys),
+        None => constellation_store_s3::LogStore::new(backend.clone()),
+    };
+    let dir = state_dir.unwrap_or_else(|| default_state_dir(&fsmeta));
+    std::fs::create_dir_all(&dir)?;
+    let db = dir.join("meta.db");
+    if !db.exists() {
+        shipper::bootstrap(&db, &logs).await?;
+    }
+    let meta = std::sync::Arc::new(SqliteMeta::open(db)?);
+    meta.backfill_deref_once()?;
+    let caps = chunks.probe_conditional_writes().await?;
+    let mode = if caps.etag_cas {
+        constellation_store_s3::LeaseMode::Cas
+    } else {
+        constellation_store_s3::LeaseMode::SingleWriter
+    };
+    gc::run(backend, chunks, meta, mode, orphans, verify_only, None).await
+}
+
+async fn run_fsck_cli(
+    s3: &str,
+    state_dir: Option<PathBuf>,
+    repair: bool,
+    force_release: Option<&str>,
+) -> Result<fsck::FsckReport> {
+    let backend = backend::open_backend(s3)?;
+    let plain = ChunkStore::new(backend.clone());
+    let fsmeta = plain.load_fs().await?;
+    let keys = if fsmeta.e2e {
+        let secret = passphrase("CONSTELLATION_PASSPHRASE", "Filesystem passphrase: ")?;
+        Some(load_keyring(&backend, &secret).await?)
+    } else {
+        None
+    };
+    let chunks = std::sync::Arc::new(match &keys {
+        Some(keys) => ChunkStore::new_e2e(backend.clone(), keys.clone()),
+        None => plain,
+    });
+    let logs = match keys {
+        Some(keys) => constellation_store_s3::LogStore::new_e2e(backend.clone(), keys),
+        None => constellation_store_s3::LogStore::new(backend.clone()),
+    };
+    let dir = state_dir.unwrap_or_else(|| default_state_dir(&fsmeta));
+    std::fs::create_dir_all(&dir)?;
+    let db = dir.join("meta.db");
+    if !db.exists() {
+        shipper::bootstrap(&db, &logs).await?;
+    }
+    let meta = std::sync::Arc::new(SqliteMeta::open(db)?);
+    meta.backfill_deref_once()?;
+    let caps = chunks.probe_conditional_writes().await?;
+    let mode = if caps.etag_cas {
+        constellation_store_s3::LeaseMode::Cas
+    } else {
+        constellation_store_s3::LeaseMode::SingleWriter
+    };
+    let compression: CompressionSetting = fsmeta
+        .compression
+        .parse()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    fsck::run(
+        backend,
+        chunks,
+        &logs,
+        meta,
+        Some(&dir),
+        compression,
+        mode,
+        repair,
+        force_release,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -609,6 +782,7 @@ fn mount(
             .context("bootstrapping metadata replica")?;
     }
     let meta = std::sync::Arc::new(SqliteMeta::open(&db_path)?);
+    meta.backfill_deref_once()?;
     if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
         bail!(
             "this state directory has permanently left the cluster \
@@ -800,6 +974,36 @@ fn mount(
     // the offline-designation gate (phase 4a) needs it for delegation
     // requests.
     let peers = rt.block_on(start_p2p(&fsmeta, store.inner().clone(), node_id));
+    let _gc_task = {
+        let interval = std::env::var("CONSTELLATION_GC_INTERVAL_S")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(gc::DEFAULT_GC_INTERVAL_S);
+        let object_store = store.inner().clone();
+        let chunks = store.clone();
+        let meta = meta.clone();
+        let gc_peers = peers.clone();
+        rt.spawn(async move {
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval.max(1)));
+            timer.tick().await;
+            loop {
+                timer.tick().await;
+                if let Err(error) = gc::run(
+                    object_store.clone(),
+                    chunks.clone(),
+                    meta.clone(),
+                    lease_mode,
+                    false,
+                    false,
+                    Some(&gc_peers),
+                )
+                .await
+                {
+                    tracing::warn!(%error, "periodic bucket GC pass failed");
+                }
+            }
+        })
+    };
     let epochs = std::sync::Arc::new(epoch::EpochManager::new(
         node_id,
         meta.clone(),

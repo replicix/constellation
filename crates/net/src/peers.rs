@@ -223,6 +223,19 @@ impl Peers {
         }
     }
 
+    pub async fn announce_condemned(&self, epoch: u64) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        if let Err(error) = inner
+            .p2p
+            .broadcast(&Payload::CondemnedPublished { epoch })
+            .await
+        {
+            tracing::debug!(%error, epoch, "condemned announce failed; writers read S3");
+        }
+    }
+
     /// Ask whoever holds `part` to hand the lease over.
     ///
     /// Returns `true` only when a holder said it flushed and released, so
@@ -478,6 +491,9 @@ pub async fn run_gossip<S: PeerService>(
             Payload::SegmentPublished { part, seq, epoch } => {
                 service.segment_published(part, *seq, *epoch);
             }
+            Payload::CondemnedPublished { epoch } => {
+                tracing::debug!(epoch, "GC condemned pointer was published");
+            }
             Payload::CacheDigest {
                 node_id,
                 generation,
@@ -604,6 +620,7 @@ async fn handle_stream<S: PeerService>(
             service.segment_published(&part, seq, epoch);
             None
         }
+        Payload::CondemnedPublished { .. } => None,
         Payload::LeaseRequest { part, requester } => {
             Some(service.lease_requested(part, requester).await)
         }

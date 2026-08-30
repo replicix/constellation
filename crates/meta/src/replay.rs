@@ -284,10 +284,24 @@ fn evict_dentry(tx: &Connection, parent: u64, name: &str, ino: u64) -> Result<Ap
         )?;
     } else {
         // nlink drops; a 0-nlink inode is an orphan, reaped at mount.
+        let (nlink, manifest): (u32, Option<Vec<u8>>) = tx.query_row(
+            "SELECT nlink, manifest FROM inode WHERE ino = ?1",
+            params![ino],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         tx.execute(
             "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
             params![ino],
         )?;
+        if nlink == 1 {
+            SqliteMeta::track_manifest_transition(
+                tx,
+                manifest.as_deref(),
+                None,
+                0,
+                constellation_fs_core::types::now_ns() / 1_000_000,
+            )?;
+        }
     }
     tx.execute(
         "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
@@ -488,6 +502,11 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             let Some(ino) = dentry_ino(tx, *parent, name)? else {
                 return Ok(Applied::Done); // already gone: idempotent
             };
+            let (nlink, manifest): (u32, Option<Vec<u8>>) = tx.query_row(
+                "SELECT nlink, manifest FROM inode WHERE ino = ?1",
+                params![ino],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
             tx.execute(
                 "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
                 params![parent, name],
@@ -498,6 +517,15 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 "UPDATE inode SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1",
                 params![ino, time_ns],
             )?;
+            if nlink == 1 {
+                SqliteMeta::track_manifest_transition(
+                    tx,
+                    manifest.as_deref(),
+                    None,
+                    0,
+                    time_ns / 1_000_000,
+                )?;
+            }
             tx.execute(
                 "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
                 params![parent, time_ns],
@@ -636,10 +664,22 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             if !ino_exists(tx, *ino)? {
                 return Ok(Applied::Done); // inode gone: data moot
             }
+            let old: Option<Vec<u8>> = tx.query_row(
+                "SELECT manifest FROM inode WHERE ino = ?1",
+                params![ino],
+                |row| row.get(0),
+            )?;
             tx.execute(
                 "UPDATE inode SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4
                  WHERE ino = ?1",
                 params![ino, manifest, *size as i64, time_ns],
+            )?;
+            SqliteMeta::track_manifest_transition(
+                tx,
+                old.as_deref(),
+                Some(manifest),
+                0,
+                time_ns / 1_000_000,
             )?;
             Ok(Applied::Done)
         }
@@ -685,10 +725,35 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![id, path, name, root_hash, created_unix_ms],
             )?;
+            if let Some(hash) = constellation_fs_core::ChunkHash::from_hex(root_hash) {
+                tx.execute(
+                    "DELETE FROM deref WHERE chunk_hash = ?1",
+                    params![hash.0.to_vec()],
+                )?;
+            }
             Ok(Applied::Done)
         }
         LogRecord::SnapDelete { id, .. } => {
+            let root_hash: Option<String> = tx
+                .query_row(
+                    "SELECT root_hash FROM snapshot WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
             tx.execute("DELETE FROM snapshot WHERE id = ?1", params![id])?;
+            if let Some(hash) =
+                root_hash.and_then(|value| constellation_fs_core::ChunkHash::from_hex(&value))
+            {
+                tx.execute(
+                    "INSERT OR REPLACE INTO deref (chunk_hash, deref_seq, deref_unix_ms)
+                     VALUES (?1, 0, ?2)",
+                    params![
+                        hash.0.to_vec(),
+                        constellation_fs_core::types::now_ns() / 1_000_000
+                    ],
+                )?;
+            }
             Ok(Applied::Done)
         }
         LogRecord::Clone { nodes, .. } => {
@@ -724,6 +789,13 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 tx.execute(
                     "INSERT OR REPLACE INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
                     params![node.parent, node.name, node.ino],
+                )?;
+                SqliteMeta::track_manifest_transition(
+                    tx,
+                    None,
+                    node.manifest.as_deref(),
+                    0,
+                    node.mtime_ns / 1_000_000,
                 )?;
             }
             Ok(Applied::Done)

@@ -228,6 +228,43 @@ impl Client {
         self.control_command(&["clone", selector, destination])
     }
 
+    pub fn gc_process(&self, orphans: bool) -> Result<Child> {
+        let mut args = vec![
+            "gc",
+            "run",
+            "--s3",
+            &self.backend,
+            "--state-dir",
+            self.state.to_str().unwrap(),
+        ];
+        if orphans {
+            args.push("--orphans");
+        }
+        Ok(self
+            .cmd(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?)
+    }
+
+    pub fn gc_run(&self, orphans: bool) -> Result<std::process::Output> {
+        Ok(self.gc_process(orphans)?.wait_with_output()?)
+    }
+
+    pub fn fsck(&self, repair: bool) -> Result<std::process::Output> {
+        let mut args = vec![
+            "fsck",
+            "--s3",
+            &self.backend,
+            "--state-dir",
+            self.state.to_str().unwrap(),
+        ];
+        if repair {
+            args.push("--repair");
+        }
+        Ok(self.cmd(&args).output()?)
+    }
+
     fn control_command(&self, prefix: &[&str]) -> Result<()> {
         let mut args: Vec<String> = prefix.iter().map(|arg| (*arg).to_string()).collect();
         args.push("--state-dir".into());

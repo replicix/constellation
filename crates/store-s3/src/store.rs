@@ -209,6 +209,15 @@ impl ChunkStore {
     ) -> Result<ChunkPutResult, StoreError> {
         debug_assert_eq!(&self.hash(data), hash);
         let key = layout::chunk_key(hash);
+        // Stronger than the minimum renewal-time refresh: checking the
+        // pointer at each dedup decision also covers a writer acquired just
+        // before publication. An unconditional idempotent PUT resurrects the
+        // bytes before its manifest can commit.
+        let mode = if crate::gc::is_condemned(&self.store, hash).await? {
+            ChunkPutMode::Overwrite
+        } else {
+            mode
+        };
         if mode == ChunkPutMode::Probe {
             match self.store.head(&key).await {
                 Ok(_) => return Ok(ChunkPutResult { existed: true }),
@@ -368,6 +377,27 @@ pub struct Capabilities {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    #[tokio::test]
+    async fn condemned_dedup_hit_is_reuploaded() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = ChunkStore::new(inner.clone());
+        let data = b"condemned-race";
+        let hash = store.hash(data);
+        store
+            .put_chunk_mode(&hash, data, CompressionSetting::RAW, ChunkPutMode::Create)
+            .await
+            .unwrap();
+        crate::gc::publish_condemned(&inner, vec![hash.to_hex()], 1)
+            .await
+            .unwrap();
+        inner.delete(&layout::chunk_key(&hash)).await.unwrap();
+        let result = store
+            .put_chunk_mode(&hash, data, CompressionSetting::RAW, ChunkPutMode::Probe)
+            .await
+            .unwrap();
+        assert!(!result.existed);
+        assert_eq!(store.get_chunk(&hash).await.unwrap(), data);
+    }
 
     fn store() -> ChunkStore {
         ChunkStore::new(Arc::new(InMemory::new()))

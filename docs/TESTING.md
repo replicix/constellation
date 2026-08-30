@@ -392,6 +392,20 @@ response and requires spool, cache, and lease gauge names. This checks the
 embedded server and shared control dispatcher while keeping frontend rendering
 out of the fault-injection lane.
 
+Phase 8a adds three destructive-integrity scenarios:
+
+- `gc-lifecycle` creates live, dead, and snapshot-only chunks under a
+  zero-second test horizon. Reference GC must remove only the dead chunk,
+  preserve both root classes, and write deletion evidence to `gc/journal/`.
+- `gc-dedup-race` starts GC, waits until `gc/condemned.json` is visible, then
+  commits identical content during the full-TTL wait. The writer must
+  re-upload the condemned hash and the completed file must remain byte-exact
+  after the collector's final recheck.
+- `fsck-repair` removes a referenced bucket chunk while retaining its local
+  cache copy, uploads an old-enough orphan, and plants a torn log segment. It
+  asserts exit codes 1 (detected), 2 (repaired), then 0 (clean), remounts, and
+  verifies the healed file bytes.
+
 Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.
