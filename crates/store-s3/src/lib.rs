@@ -5,6 +5,7 @@
 
 pub mod codec;
 pub mod designation;
+pub mod e2e;
 pub mod error;
 pub mod format;
 pub mod layout;
@@ -16,6 +17,9 @@ pub mod store;
 
 pub use codec::{Codec, CompressionSetting};
 pub use designation::{Designation, DesignationMode, DesignationStore, DesignationTag};
+pub use e2e::{
+    change_passphrase, load_keyring, put_keyring, Argon2Params, E2eKeys, Keyring, SharedE2eKeys,
+};
 pub use error::StoreError;
 pub use lease::{live_leases_held_by, Lease, LeaseMode, LeaseStore, LeaseTag};
 pub use log::{CheckpointVector, LogStore};

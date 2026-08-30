@@ -96,7 +96,7 @@ impl SnapshotManager {
                         let manifest = child
                             .manifest
                             .unwrap_or_else(|| Manifest::empty(self.chunk_size).encode());
-                        let hash = ChunkHash::of(&manifest);
+                        let hash = self.chunks.hash(&manifest);
                         if !self
                             .chunks
                             .put_chunk_mode(
@@ -127,7 +127,7 @@ impl SnapshotManager {
                 });
             }
             let blob = Tree::new(entries)?.encode();
-            let hash = ChunkHash::of(&blob);
+            let hash = self.chunks.hash(&blob);
             if !self
                 .chunks
                 .put_chunk_mode(

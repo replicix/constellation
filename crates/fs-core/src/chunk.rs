@@ -12,6 +12,13 @@ impl ChunkHash {
         Self(*blake3::hash(data).as_bytes())
     }
 
+    /// Per-filesystem keyed identity used by E2E filesystems. Keeping the
+    /// choice at the call site makes legacy filesystems retain their stable
+    /// unkeyed object names.
+    pub fn keyed(key: &[u8; 32], data: &[u8]) -> Self {
+        Self(*blake3::keyed_hash(key, data).as_bytes())
+    }
+
     pub fn to_hex(&self) -> String {
         let mut s = String::with_capacity(64);
         for b in self.0 {
@@ -113,6 +120,18 @@ mod tests {
         assert_eq!(ChunkHash::from_hex(&h.to_hex()), Some(h));
         assert_eq!(h.to_hex().len(), 64);
         assert!(ChunkHash::from_hex("zz").is_none());
+    }
+
+    #[test]
+    fn keyed_hashes_are_stable_and_not_plain() {
+        let key = [7; 32];
+        let data = b"same plaintext";
+        assert_eq!(ChunkHash::keyed(&key, data), ChunkHash::keyed(&key, data));
+        assert_ne!(ChunkHash::keyed(&key, data), ChunkHash::of(data));
+        assert_ne!(
+            ChunkHash::keyed(&key, data),
+            ChunkHash::keyed(&[8; 32], data)
+        );
     }
 
     #[test]

@@ -27,6 +27,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+rpassword = "7.5.4"
+zeroize = "1.9.0"
 
 [dev-dependencies]
 tempfile.workspace = true

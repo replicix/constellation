@@ -20,8 +20,12 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::SqliteMeta;
-use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta, StoreError};
+use constellation_store_s3::{
+    change_passphrase, load_keyring, put_keyring, ChunkStore, CompressionSetting, FsMeta,
+    StoreError,
+};
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
@@ -222,7 +226,29 @@ enum FsCommand {
         /// Root compression setting (raw, zstd, zstd:LEVEL).
         #[arg(long, default_value = "zstd:3")]
         compression: String,
+        /// Protect content and filename-bearing metadata with a passphrase.
+        #[arg(long)]
+        e2e: bool,
     },
+    /// Change an E2E filesystem's passphrase without re-encrypting data.
+    Passwd {
+        #[arg(long)]
+        s3: String,
+    },
+}
+
+fn passphrase(env: &str, prompt: &str) -> Result<Zeroizing<String>> {
+    if let Ok(value) = std::env::var(env) {
+        if value.is_empty() {
+            bail!("{env} must not be empty");
+        }
+        return Ok(Zeroizing::new(value));
+    }
+    let value = rpassword::prompt_password(prompt)?;
+    if value.is_empty() {
+        bail!("passphrase must not be empty");
+    }
+    Ok(Zeroizing::new(value))
 }
 
 fn main() -> Result<()> {
@@ -244,18 +270,45 @@ fn main() -> Result<()> {
                     s3,
                     chunk_size,
                     compression,
+                    e2e,
                 },
         } => {
             constellation_fs_core::validate_chunk_size(chunk_size)?;
             let setting: CompressionSetting =
                 compression.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let store = ChunkStore::new(backend::open_backend(&s3)?);
-            let meta = FsMeta::new(chunk_size, &setting.to_string());
+            let backend = backend::open_backend(&s3)?;
+            let store = ChunkStore::new(backend.clone());
+            let mut meta = FsMeta::new(chunk_size, &setting.to_string());
+            meta.e2e = e2e;
             rt.block_on(store.create_fs(&meta))
                 .context("creating filesystem")?;
+            if e2e {
+                let secret = passphrase("CONSTELLATION_PASSPHRASE", "New filesystem passphrase: ")?;
+                rt.block_on(put_keyring(&backend, &secret))
+                    .context("creating E2E keyring")?;
+            }
             println!("created filesystem {} at {s3}", meta.uuid);
             println!("  chunk_size:  {chunk_size}");
             println!("  compression: {setting}");
+            println!("  e2e:         {e2e}");
+            Ok(())
+        }
+        Command::Fs {
+            command: FsCommand::Passwd { s3 },
+        } => {
+            let backend = backend::open_backend(&s3)?;
+            let meta = rt.block_on(ChunkStore::new(backend.clone()).load_fs())?;
+            if !meta.e2e {
+                bail!("filesystem is not in E2E mode");
+            }
+            let old = passphrase("CONSTELLATION_PASSPHRASE", "Current passphrase: ")?;
+            let new = passphrase(
+                "CONSTELLATION_NEW_PASSPHRASE",
+                "New filesystem passphrase: ",
+            )?;
+            rt.block_on(change_passphrase(&backend, &old, &new))
+                .context("changing E2E passphrase")?;
+            println!("passphrase changed; data-encryption keys were not rotated");
             Ok(())
         }
         Command::Doctor { s3 } => {
@@ -457,13 +510,29 @@ fn mount(
     clone_name: Option<String>,
     ephemeral: bool,
 ) -> Result<()> {
-    let store = std::sync::Arc::new(ChunkStore::new(backend::open_backend(s3)?));
+    let backend = backend::open_backend(s3)?;
     let fsmeta = rt
-        .block_on(store.load_fs())
+        .block_on(ChunkStore::new(backend.clone()).load_fs())
         .context("loading filesystem (fs create first?)")?;
+    let e2e_keys = if fsmeta.e2e {
+        let secret = passphrase("CONSTELLATION_PASSPHRASE", "Filesystem passphrase: ")?;
+        Some(
+            rt.block_on(load_keyring(&backend, &secret))
+                .context("unlocking E2E keyring (wrong passphrase?)")?,
+        )
+    } else {
+        None
+    };
+    let store = std::sync::Arc::new(match &e2e_keys {
+        Some(keys) => ChunkStore::new_e2e(backend.clone(), keys.clone()),
+        None => ChunkStore::new(backend.clone()),
+    });
     let state_dir = state_dir.unwrap_or_else(|| default_state_dir(&fsmeta));
     std::fs::create_dir_all(&state_dir)?;
-    let log = constellation_store_s3::LogStore::new(store.inner().clone());
+    let log = match &e2e_keys {
+        Some(keys) => constellation_store_s3::LogStore::new_e2e(backend, keys.clone()),
+        None => constellation_store_s3::LogStore::new(backend),
+    };
     let db_path = state_dir.join("meta.db");
     // Fresh node: rebuild the replica from checkpoint + log replay.
     if !db_path.exists() {
@@ -544,7 +613,12 @@ fn mount(
         .unwrap_or(cache_size / 4);
     let staging_budget = staging::StagingBudget::new(staging_budget_bytes);
 
-    let cache = std::sync::Arc::new(DiskCache::open(state_dir.join("cache"), cache_size)?);
+    let cache = std::sync::Arc::new(match &e2e_keys {
+        Some(keys) => {
+            DiskCache::open_keyed(state_dir.join("cache"), cache_size, *keys.addressing_key())?
+        }
+        None => DiskCache::open(state_dir.join("cache"), cache_size)?,
+    });
     let compression: CompressionSetting = fsmeta
         .compression
         .parse()

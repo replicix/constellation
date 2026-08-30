@@ -18,6 +18,11 @@ thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 zstd.workspace = true
+chacha20poly1305 = "0.11.0"
+argon2 = "0.6.0"
+zeroize = "1.9.0"
+region = "4.0.0"
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

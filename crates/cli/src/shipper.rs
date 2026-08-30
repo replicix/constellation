@@ -931,6 +931,10 @@ impl Shipper {
                 continue;
             }
             let new_part = self.meta.next_part_id()?;
+            self.log
+                .ensure_partition_key(&new_part)
+                .await
+                .context("creating partition encryption key")?;
             let rec = LogRecord::PartSplit {
                 part: parent_part.clone(),
                 at_ino: ino,

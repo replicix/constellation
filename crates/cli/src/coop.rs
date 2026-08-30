@@ -260,6 +260,10 @@ impl Coop {
             .ok()?
             .ok()
             .flatten()?;
+        let data = self
+            .store
+            .protect_peer_chunk(&ChunkHash(hash), &data)
+            .ok()?;
         self.counters
             .bytes_served
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -454,13 +458,18 @@ impl Coop {
                 Err(_) => return FetchResult::Fail,
             },
             SourceId::Peer(id) => match self.peers.request_chunk(id, &hash.0).await {
-                Ok(Some(fetch)) => (fetch.data, fetch.ttfb, fetch.rtt, fetch.path),
+                Ok(Some(fetch)) => {
+                    let Ok(data) = self.store.open_peer_chunk(hash, &fetch.data) else {
+                        return FetchResult::Fail;
+                    };
+                    (data, fetch.ttfb, fetch.rtt, fetch.path)
+                }
                 Ok(None) => return FetchResult::Miss,
                 Err(_) => return FetchResult::Fail,
             },
         };
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        if ChunkHash::of(&data) != *hash {
+        if self.store.hash(&data) != *hash {
             return FetchResult::Fail;
         }
         FetchResult::Data {

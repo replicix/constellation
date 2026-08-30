@@ -13,6 +13,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkState {
@@ -112,6 +113,7 @@ impl State {
 pub struct DiskCache {
     root: PathBuf,
     budget: u64,
+    addressing_key: Option<Box<[u8; 32]>>,
     state: Mutex<State>,
 }
 
@@ -125,7 +127,24 @@ pub struct CacheUsage {
 impl DiskCache {
     /// Open (or create) a cache directory and rebuild accounting from disk.
     pub fn open(root: impl Into<PathBuf>, budget: u64) -> Result<Self, CoreError> {
-        Self::open_with_digest_log_limit(root, budget, MAX_DIGEST_LOG)
+        Self::open_inner(root, budget, MAX_DIGEST_LOG, None)
+    }
+
+    /// Open an E2E cache whose decompressed entries use keyed identities.
+    /// The key is needed locally because cache corruption must be detected
+    /// before bytes are trusted or offered to a peer.
+    pub fn open_keyed(
+        root: impl Into<PathBuf>,
+        budget: u64,
+        addressing_key: [u8; 32],
+    ) -> Result<Self, CoreError> {
+        let key = Box::new(addressing_key);
+        if region::lock(key.as_ptr(), key.len()).is_err() {
+            eprintln!(
+                "warning: could not mlock E2E cache verifier key; continuing in ordinary memory"
+            );
+        }
+        Self::open_inner(root, budget, MAX_DIGEST_LOG, Some(key))
     }
 
     /// Alternate journal limit for deterministic tests and constrained
@@ -135,11 +154,21 @@ impl DiskCache {
         budget: u64,
         digest_limit: usize,
     ) -> Result<Self, CoreError> {
+        Self::open_inner(root, budget, digest_limit, None)
+    }
+
+    fn open_inner(
+        root: impl Into<PathBuf>,
+        budget: u64,
+        digest_limit: usize,
+        addressing_key: Option<Box<[u8; 32]>>,
+    ) -> Result<Self, CoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         let cache = Self {
             root,
             budget,
+            addressing_key,
             state: Mutex::new(State::new(digest_limit.max(1))),
         };
         cache.rescan()?;
@@ -187,6 +216,12 @@ impl DiskCache {
     fn path_for(&self, hash: &ChunkHash) -> PathBuf {
         let hex = hash.to_hex();
         self.root.join(&hex[0..2]).join(&hex[2..4]).join(hex)
+    }
+
+    fn hash(&self, data: &[u8]) -> ChunkHash {
+        self.addressing_key
+            .as_ref()
+            .map_or_else(|| ChunkHash::of(data), |key| ChunkHash::keyed(key, data))
     }
 
     pub fn usage(&self) -> CacheUsage {
@@ -243,7 +278,7 @@ impl DiskCache {
             }
             Err(e) => return Err(e.into()),
         };
-        if &ChunkHash::of(&data) != hash {
+        if &self.hash(&data) != hash {
             // Corrupt local copy: drop it, let the caller refetch.
             self.remove(hash)?;
             return Ok(None);
@@ -260,7 +295,7 @@ impl DiskCache {
         data: &[u8],
         state: ChunkState,
     ) -> Result<(), CoreError> {
-        debug_assert_eq!(&ChunkHash::of(data), hash);
+        debug_assert_eq!(&self.hash(data), hash);
         let size = data.len() as u64;
         let victims = {
             let mut st = self.state.lock().unwrap();
@@ -397,6 +432,15 @@ impl DiskCache {
             .filter(|(_, e)| e.state == ChunkState::Dirty)
             .map(|(h, _)| *h)
             .collect()
+    }
+}
+
+impl Drop for DiskCache {
+    fn drop(&mut self) {
+        if let Some(key) = &mut self.addressing_key {
+            let _ = unsafe { region::unlock(key.as_ptr(), key.len()) };
+            key.zeroize();
+        }
     }
 }
 

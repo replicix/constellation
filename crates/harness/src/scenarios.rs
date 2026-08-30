@@ -8,6 +8,7 @@ use crate::s3env::{S3Env, BUCKET};
 use crate::suites;
 use crate::workload::Workload;
 use anyhow::{Context, Result};
+use std::io::Read;
 use std::time::Duration;
 
 pub struct Scenario {
@@ -188,6 +189,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: snapshot_mount,
     },
     Scenario {
+        name: "e2e-basic",
+        desc: "passphrase mount encrypts chunks and logs, cold-remounts, and rejects a wrong passphrase",
+        requires: &[],
+        run: e2e_basic,
+    },
+    Scenario {
+        name: "e2e-two-nodes",
+        desc: "two passphrase nodes converge and use cooperative cache without exposing plaintext",
+        requires: &[],
+        run: e2e_two_nodes,
+    },
+    Scenario {
         name: "fresh-node-bootstrap",
         desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
         requires: &[],
@@ -306,6 +319,116 @@ fn baseline(seed: u64) -> Result<()> {
     }
     c.unmount()?;
     Ok(())
+}
+
+fn bucket_objects(endpoint: &str, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let response = ureq::get(&format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}"))
+        .call()
+        .context("listing raw E2E objects")?
+        .into_string()?;
+    let mut keys = Vec::new();
+    let mut rest = response.as_str();
+    while let Some(start) = rest.find("<Key>") {
+        rest = &rest[start + 5..];
+        let Some(end) = rest.find("</Key>") else {
+            break;
+        };
+        keys.push(rest[..end].to_string());
+        rest = &rest[end + 6..];
+    }
+    keys.into_iter()
+        .filter(|key| key.contains("/chunks/") || key.contains("/log/"))
+        .map(|key| {
+            let mut bytes = Vec::new();
+            ureq::get(&format!("{endpoint}/{BUCKET}/{key}"))
+                .call()
+                .with_context(|| format!("fetching raw object {key}"))?
+                .into_reader()
+                .read_to_end(&mut bytes)?;
+            Ok((key, bytes))
+        })
+        .collect()
+}
+
+fn e2e_basic(seed: u64) -> Result<()> {
+    let (env, root) = setup("e2e-basic")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("e2e-basic-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut writer = Client::new(root.path(), "writer", &env.endpoint, &backend)?.with_e2e();
+    writer.fs_create()?;
+    writer.mount()?;
+
+    let marker = vec![b'A'; 2 << 20];
+    std::fs::write(writer.mnt.join("known-marker"), &marker)?;
+    std::fs::create_dir(writer.mnt.join("model"))?;
+    let mut model = Model::default();
+    let mut workload = Workload::new(seed, "w");
+    workload.run_block(&writer.mnt.join("model"), &mut model, 40)?;
+    model.verify(&writer.mnt.join("model"))?;
+    writer.unmount()?;
+
+    let objects = bucket_objects(&env.direct_endpoint, &format!("{prefix}/"))?;
+    anyhow::ensure!(
+        !objects.is_empty(),
+        "E2E filesystem produced no chunks/logs"
+    );
+    for (key, bytes) in &objects {
+        anyhow::ensure!(
+            !bytes
+                .windows(64)
+                .any(|window| window.iter().all(|b| *b == b'A')),
+            "plaintext marker leaked into {key}"
+        );
+        anyhow::ensure!(
+            !bytes.starts_with(b"CCH1") && !bytes.starts_with(b"\x28\xb5\x2f\xfd"),
+            "unencrypted object format visible in {key}"
+        );
+    }
+
+    writer.assert_wrong_passphrase_rejected()?;
+    let mut cold = Client::new(root.path(), "cold", &env.endpoint, &backend)?.with_e2e();
+    cold.mount()?;
+    anyhow::ensure!(
+        std::fs::read(cold.mnt.join("known-marker"))? == marker,
+        "cold E2E remount returned different bytes"
+    );
+    eventually("cold E2E model restore", Duration::from_secs(20), || {
+        model.verify(&cold.mnt.join("model"))
+    })?;
+    cold.unmount()
+}
+
+fn e2e_two_nodes(_seed: u64) -> Result<()> {
+    let (env, root) = setup("e2e-two-nodes")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/e2e-two-{}", ts());
+    let mut a = coop_client(root.path(), "e2e-a", &env.endpoint, &backend)?.with_e2e();
+    let mut b = coop_client(root.path(), "e2e-b", &env.endpoint, &backend)?.with_e2e();
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    let (data, expected) = blob(8);
+    std::fs::write(a.mnt.join("shared"), &data)?;
+    eventually("E2E metadata visible", Duration::from_secs(20), || {
+        anyhow::ensure!(b.mnt.join("shared").exists(), "shared file missing");
+        Ok(())
+    })?;
+    std::thread::sleep(Duration::from_secs(2));
+    proxy.latency(200, 0)?;
+    let got = std::fs::read(b.mnt.join("shared"))?;
+    anyhow::ensure!(
+        blake3::hash(&got) == expected,
+        "E2E peer read corrupted data"
+    );
+    let status = b.control_status()?;
+    anyhow::ensure!(
+        status["coop"]["peer_hits"].as_u64().unwrap_or(0) > 0,
+        "E2E cold reader did not use its encrypted peer path: {status}"
+    );
+    proxy.heal()?;
+    a.unmount()?;
+    b.unmount()
 }
 
 fn latency(seed: u64) -> Result<()> {

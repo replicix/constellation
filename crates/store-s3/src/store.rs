@@ -2,6 +2,7 @@
 //! (`meta.json`) lifecycle with conditional-create.
 
 use crate::codec::CompressionSetting;
+use crate::e2e::{decrypt_object, encrypt_object, SharedE2eKeys};
 use crate::error::StoreError;
 use crate::{format, layout};
 use constellation_fs_core::{ChunkHash, DEFAULT_CHUNK_SIZE};
@@ -83,6 +84,7 @@ impl Default for FsMeta {
 /// (e.g. via `object_store::prefix::PrefixStore` or a bucket subpath).
 pub struct ChunkStore {
     store: Arc<dyn ObjectStore>,
+    e2e: Option<SharedE2eKeys>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,11 +104,45 @@ pub struct ChunkPutResult {
 
 impl ChunkStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self { store, e2e: None }
+    }
+
+    pub fn new_e2e(store: Arc<dyn ObjectStore>, keys: SharedE2eKeys) -> Self {
+        Self {
+            store,
+            e2e: Some(keys),
+        }
     }
 
     pub fn inner(&self) -> &Arc<dyn ObjectStore> {
         &self.store
+    }
+
+    /// Compute the filesystem's chunk identity. All callers which mint a
+    /// manifest use this helper so an E2E mount cannot accidentally expose a
+    /// plain confirmation-of-file hash.
+    pub fn hash(&self, data: &[u8]) -> ChunkHash {
+        self.e2e
+            .as_ref()
+            .map_or_else(|| ChunkHash::of(data), |keys| keys.hash(data))
+    }
+
+    /// Protect a cooperative-cache response with the filesystem DEK. Peers
+    /// cache plaintext for fast local reads, so E2E mounts create a fresh
+    /// authenticated envelope at the serving boundary rather than putting
+    /// plaintext on the application stream.
+    pub fn protect_peer_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<Vec<u8>, StoreError> {
+        match &self.e2e {
+            Some(keys) => encrypt_object(&keys.dek("p0")?, &hash.0, data),
+            None => Ok(data.to_vec()),
+        }
+    }
+
+    pub fn open_peer_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<Vec<u8>, StoreError> {
+        match &self.e2e {
+            Some(keys) => decrypt_object(&keys.dek("p0")?, &hash.0, data),
+            None => Ok(data.to_vec()),
+        }
     }
 
     /// Create a new filesystem at the prefix. Fails with `AlreadyExists`
@@ -171,7 +207,7 @@ impl ChunkStore {
         setting: CompressionSetting,
         mode: ChunkPutMode,
     ) -> Result<ChunkPutResult, StoreError> {
-        debug_assert_eq!(&ChunkHash::of(data), hash);
+        debug_assert_eq!(&self.hash(data), hash);
         let key = layout::chunk_key(hash);
         if mode == ChunkPutMode::Probe {
             match self.store.head(&key).await {
@@ -181,9 +217,17 @@ impl ChunkStore {
             }
         }
         let owned = data.to_vec();
-        let obj = tokio::task::spawn_blocking(move || format::encode_object(&owned, setting))
-            .await
-            .map_err(|error| StoreError::Meta(format!("chunk encoder task failed: {error}")))??;
+        let e2e = self.e2e.clone();
+        let aad = hash.0;
+        let obj = tokio::task::spawn_blocking(move || {
+            let encoded = format::encode_object(&owned, setting)?;
+            match e2e {
+                Some(keys) => encrypt_object(&keys.dek("p0")?, &aad, &encoded),
+                None => Ok(encoded),
+            }
+        })
+        .await
+        .map_err(|error| StoreError::Meta(format!("chunk encoder task failed: {error}")))??;
         let result = match mode {
             ChunkPutMode::Create => {
                 self.store
@@ -226,8 +270,12 @@ impl ChunkStore {
         let res = self.store.get(&key).await?;
         let ttfb = started.elapsed();
         let obj = res.bytes().await?;
-        let data = format::decode_object(&obj)?;
-        if &ChunkHash::of(&data) != hash {
+        let encoded = match &self.e2e {
+            Some(keys) => decrypt_object(&keys.dek("p0")?, &hash.0, &obj)?,
+            None => obj.to_vec(),
+        };
+        let data = format::decode_object(&encoded)?;
+        if &self.hash(&data) != hash {
             return Err(StoreError::HashMismatch {
                 key: key.to_string(),
             });

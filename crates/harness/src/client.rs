@@ -22,6 +22,7 @@ pub struct Client {
     /// `--cache-size` override; `None` keeps the binary's default.
     cache_size: Option<u64>,
     write_mode: Option<String>,
+    e2e: bool,
 }
 
 fn bin() -> PathBuf {
@@ -56,6 +57,7 @@ impl Client {
             env: Vec::new(),
             cache_size: None,
             write_mode: None,
+            e2e: false,
         })
     }
 
@@ -73,6 +75,15 @@ impl Client {
 
     pub fn with_write_mode(mut self, mode: &str) -> Self {
         self.write_mode = Some(mode.to_string());
+        self
+    }
+
+    pub fn with_e2e(mut self) -> Self {
+        self.e2e = true;
+        self.env.push((
+            "CONSTELLATION_PASSPHRASE".into(),
+            "harness-correct-passphrase".into(),
+        ));
         self
     }
 
@@ -97,18 +108,46 @@ impl Client {
     }
 
     pub fn fs_create(&self) -> Result<()> {
-        let out = self
-            .cmd(&[
-                "fs",
-                "create",
-                "--s3",
-                &self.backend,
-                "--chunk-size",
-                "1048576",
-            ])
-            .output()?;
+        let mut args = vec![
+            "fs",
+            "create",
+            "--s3",
+            &self.backend,
+            "--chunk-size",
+            "1048576",
+        ];
+        if self.e2e {
+            args.push("--e2e");
+        }
+        let out = self.cmd(&args).output()?;
         if !out.status.success() {
             bail!("fs create failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(())
+    }
+
+    pub fn assert_wrong_passphrase_rejected(&self) -> Result<()> {
+        let wrong_state = self.work.join("wrong-state");
+        let wrong_mnt = self.work.join("wrong-mnt");
+        std::fs::create_dir_all(&wrong_state)?;
+        std::fs::create_dir_all(&wrong_mnt)?;
+        let output = self
+            .cmd(&[
+                "mount",
+                "--s3",
+                &self.backend,
+                wrong_mnt.to_str().unwrap(),
+                "--state-dir",
+                wrong_state.to_str().unwrap(),
+            ])
+            .env("CONSTELLATION_PASSPHRASE", "definitely-wrong")
+            .output()?;
+        if output.status.success() {
+            bail!("mount unexpectedly accepted a wrong E2E passphrase");
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("unlocking E2E keyring") {
+            bail!("wrong-passphrase failure was not clean: {stderr}");
         }
         Ok(())
     }

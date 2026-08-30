@@ -15,6 +15,7 @@ pub struct BenchConfig {
     pub fanout: u64,
     /// Optional gate: fail when the import takes longer than this.
     pub budget_s: Option<u64>,
+    pub e2e: bool,
 }
 
 fn stage_tree(root: &Path, cfg: &BenchConfig) -> Result<()> {
@@ -59,6 +60,9 @@ pub fn run(cfg: &BenchConfig) -> Result<()> {
         .tempdir()?;
     let backend = format!("s3://{BUCKET}/bench-{}", std::process::id());
     let mut c = Client::new(root.path(), "bench", &env.endpoint, &backend)?;
+    if cfg.e2e {
+        c = c.with_e2e();
+    }
     c.fs_create()?;
     c.mount()?;
 
@@ -94,6 +98,9 @@ pub fn run(cfg: &BenchConfig) -> Result<()> {
     let back_backend = format!("s3://{BUCKET}/bench-back-{}", std::process::id());
     let mut back = Client::new(root.path(), "bench-back", &env.endpoint, &back_backend)?
         .with_write_mode("back");
+    if cfg.e2e {
+        back = back.with_e2e();
+    }
     back.fs_create()?;
     back.mount()?;
     let back_t0 = Instant::now();

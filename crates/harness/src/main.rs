@@ -55,6 +55,9 @@ enum Command {
         /// Fail when durable import exceeds this many seconds.
         #[arg(long)]
         budget_s: Option<u64>,
+        /// Benchmark an E2E passphrase filesystem.
+        #[arg(long)]
+        e2e: bool,
     },
 }
 
@@ -77,12 +80,14 @@ fn main() -> Result<()> {
             file_size,
             fanout,
             budget_s,
+            e2e,
         } => {
             let cfg = bench::BenchConfig {
                 files,
                 file_size,
                 fanout,
                 budget_s,
+                e2e,
             };
             cfg.validate()?;
             bench::run(&cfg)

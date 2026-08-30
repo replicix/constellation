@@ -372,6 +372,18 @@ roots:
   and `EROFS` on mutation, then mounts `--rw --ephemeral`, writes the clone,
   cleanly unmounts, and verifies the temporary namespace entry disappears.
 
+Phase 6b scenarios exercise E2E passphrase mode:
+
+- `e2e-basic` creates with `--e2e`, runs a seeded workload beside a known
+  repeated-`A` marker, and reads raw `chunks/` and `log/` objects through
+  floci's direct endpoint. No marker or legacy chunk/zstd magic may be
+  visible. A fresh state directory must cold-bootstrap and return exact bytes;
+  a deliberately wrong passphrase must fail before mounting.
+- `e2e-two-nodes` mounts one E2E filesystem on distinct P2P identities, writes
+  an eight-chunk file, and cold-reads it through the second node under 200 ms
+  S3 latency. The keyed hash must verify and cooperative-cache `peer_hits`
+  must advance, proving encrypted peer responses interoperate.
+
 Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.
@@ -418,7 +430,9 @@ cargo run -p constellation-harness -- bench \
 It stages a many-small-files tree, imports it (`cp -r`) into a mount
 against floci S3, and reports import (copy + durable-in-S3), warm
 metadata-walk, and cold read-back rates; `--budget-s` turns the durable
-import time into a hard gate.
+import time into a hard gate. Add `--e2e` to create both benchmark
+filesystems in passphrase mode (`CONSTELLATION_PASSPHRASE` is supplied by the
+harness) for an otherwise identical encryption-overhead comparison.
 
 ## CI notes
 

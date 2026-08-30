@@ -886,7 +886,7 @@ impl ConstellationFs {
             ws.staging
                 .read_at(idx * u64::from(self.chunk_size), &mut data)
                 .map_err(|error| staging_errno(&error))?;
-            let hash = ChunkHash::of(&data);
+            let hash = self.store.hash(&data);
             let known_durable = self.cache.contains(&hash)
                 && !self
                     .meta
@@ -993,7 +993,7 @@ impl ConstellationFs {
                 ws.staging
                     .read_at(idx * self.chunk_size as u64, &mut data)
                     .map_err(|e| staging_errno(&e))?;
-                let hash = ChunkHash::of(&data);
+                let hash = self.store.hash(&data);
                 if self.cache_for_upload(&hash, &data)? {
                     dirty_hashes.push(hash);
                 }
@@ -1006,7 +1006,7 @@ impl ConstellationFs {
                     if old_len != expect_len {
                         let mut data = self.fetch_chunk(h)?;
                         data.resize(expect_len, 0);
-                        let hash = ChunkHash::of(&data);
+                        let hash = self.store.hash(&data);
                         if self.cache_for_upload(&hash, &data)? {
                             dirty_hashes.push(hash);
                         }
@@ -1018,7 +1018,7 @@ impl ConstellationFs {
             } else {
                 // Hole created by extension without data: a zero chunk.
                 let data = vec![0u8; expect_len];
-                let hash = ChunkHash::of(&data);
+                let hash = self.store.hash(&data);
                 if self.cache_for_upload(&hash, &data)? {
                     dirty_hashes.push(hash);
                 }
@@ -1028,7 +1028,7 @@ impl ConstellationFs {
         let (manifest, spill) =
             Manifest::from_chunks(self.chunk_size, ws.file_len, new_hashes, INLINE_CHUNKS_MAX);
         if let Some(blob) = spill {
-            let bh = ChunkHash::of(&blob);
+            let bh = self.store.hash(&blob);
             if self.cache_for_upload(&bh, &blob)? {
                 dirty_hashes.push(bh);
             }

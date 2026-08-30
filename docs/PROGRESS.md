@@ -586,7 +586,67 @@ smoke, and S3 integration pass. Full harness: every runnable scenario passed,
 with only `fio-latency` and `fio-blips` skipped because `fio` is absent.
 pjdfstest: **8798 passed, 0 failed**, empty baseline.
 
+## Phase 6b — E2E passphrase encryption: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| `fs create --e2e` generates a random addressing key and p0 DEK; Argon2id-derived KEK wraps them into versioned `keys/keyring.json`, while `meta.json.e2e` fixes the filesystem mode | done | `store-s3::e2e`, `cli::main` |
+| Argon2id parameters are persisted (19,456 KiB, 2 iterations, 1 lane); XChaCha20-Poly1305 envelopes carry a version byte and random 24-byte nonce | done | `store-s3::e2e` |
+| Mount requires `CONSTELLATION_PASSPHRASE` or a no-echo prompt; wrong passphrases fail before replica/cache startup | done | `cli::main`; harness `e2e-basic` |
+| Addressing key, wrapping key, partition DEKs, and the cache verifier's addressing-key copy are best-effort `mlock`ed with `region`, zeroized on drop, and warn without aborting if the host refuses locking | done | `store-s3::e2e`, `fs-core::cache` |
+| Chunk identity is keyed BLAKE3 throughout manifest, spill, snapshot tree, peer verification, and local-cache verification paths | done | `fs-core::{chunk,cache}`, `store-s3::store`, `cli::{fusefs,snapshot,coop}` |
+| Chunk objects compress before XChaCha20-Poly1305 encryption with chunk hash as AAD; reads decrypt/authenticate before codec decode and keyed-hash verification | done | `store-s3::{store,e2e}` |
+| Log segments and checkpoints compress then encrypt with object key as AAD; lease, registry, node, designation, heartbeat, and checkpoint pointer/vector coordination objects remain plaintext | done | `store-s3::{log,e2e}` |
+| A partition split persists a fresh random DEK before journaling `part_split`; peers refresh the rewritten keyring with their in-memory wrapping key before reading the child stream | done | `cli::shipper`, `store-s3::{log,e2e}` |
+| Cooperative-cache responses from E2E peers are freshly authenticated/encrypted on the application stream and opened before keyed-hash verification | done | `store-s3::store`, `cli::coop`; harness `e2e-two-nodes` |
+| `fs passwd` re-derives a KEK and re-wraps unchanged addressing/DEK material; `CONSTELLATION_NEW_PASSPHRASE` supports non-interactive operation | done | `cli::main`, `store-s3::e2e` |
+| Unit proofs cover keyring/wrong passphrase, passphrase change without DEK rotation, partition-DEK persistence, AAD rejection, metadata ciphertext, and keyed addressing | done | `store-s3::{e2e,log}`, `fs-core::chunk` |
+| End-to-end scenarios cover ciphertext inspection, cold remount, wrong-passphrase rejection, two-node convergence, and cooperative peer hits | done | `harness::scenarios::{e2e-basic,e2e-two-nodes}` |
+
+### Phase 6b exit criteria (plan 07)
+
+- [x] E2E mode is fixed at filesystem creation and requires credentials plus
+      the passphrase on every mount.
+- [x] User content, snapshot/tree blobs, filename-bearing log segments, and
+      checkpoints are encrypted; raw `chunks/` and `log/` objects contain
+      neither known plaintext markers nor legacy object-format magic.
+- [x] Keyed addressing preserves within-filesystem dedup while preventing
+      plain-hash confirmation; local, S3, and peer reads authenticate and
+      verify against the same keyed identity.
+- [x] Two passphrase nodes converge and record cooperative-cache hits; a cold
+      node reconstructs and reads the filesystem while a wrong passphrase is
+      rejected cleanly.
+- [x] Passphrase changes re-wrap only the keyring. Full DEK rotation remains
+      deliberately out of scope because it requires rewriting every encrypted
+      object.
+
+**Design choices.** The `region` crate provides portable `mlock`/`munlock`;
+failure is a warning because containers commonly have a restrictive
+`RLIMIT_MEMLOCK`. Chunk data uses p0's DEK because immutable chunk identity and
+dedup span partition boundaries; per-partition DEKs protect that partition's
+metadata stream. New partition DEKs are random (not derived): the splitter
+writes the expanded keyring before publishing `part_split`, and followers
+unwrap additions with the already-locked KEK without retaining the passphrase.
+
+The plaintext boundary is coordination-only: `meta.json`, leases, registry,
+nodes/heartbeats, designations, holds, checkpoint pointers/vectors, and snapshot
+index records remain visible. They contain identifiers, timing, hashes, and
+authority state but no file contents; filenames inside snapshot trees and the
+metadata replica are carried by encrypted chunks/checkpoints/log segments.
+
+Benchmark (2026-08-30, local floci, 2,000 × 4 KiB files / 100 dirs): plain
+durable write-through **11.2 s / 179 files/s**, E2E **10.9 s / 184 files/s**;
+plain write-back copy/drain **0.7/1.1 s**, E2E **0.7/1.1 s**. At this scale the
+measured E2E delta is inside run-to-run noise; S3 request and FUSE overhead
+dominate XChaCha20-Poly1305 and keyed BLAKE3.
+
+Validation (2026-08-30): fmt and strict clippy clean; 258 workspace unit tests
+pass; smoke and S3 integration pass. Full harness: every runnable scenario
+passed, including `e2e-basic` and `e2e-two-nodes`; only `fio-latency` and
+`fio-blips` skipped because `fio` is absent. pjdfstest: **8798 passed, 0
+failed**, empty baseline.
+
 ## Later phases
 
-Phases 5, 5a, 5b, and 6a are closed. Not started: phase 6b E2E, phase
-7 web UI, and phase 8 GC.
+Phases 5, 5a, 5b, 6a, and 6b are closed. Not started: phase 7 web UI
+and phase 8 GC.

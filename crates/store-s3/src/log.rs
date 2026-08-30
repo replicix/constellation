@@ -12,6 +12,7 @@
 //!   object in the child's log prefix; tailers treat sealed+fully-applied
 //!   as removable from the active set.
 
+use crate::e2e::{decrypt_object, encrypt_object, SharedE2eKeys};
 use crate::error::StoreError;
 use crate::layout;
 use futures::TryStreamExt;
@@ -53,6 +54,7 @@ fn sealed_key(partition: &str) -> object_store::path::Path {
 pub struct LogStore {
     store: Arc<dyn ObjectStore>,
     partition: String,
+    e2e: Option<SharedE2eKeys>,
 }
 
 impl LogStore {
@@ -64,6 +66,15 @@ impl LogStore {
         Self {
             store,
             partition: partition.to_string(),
+            e2e: None,
+        }
+    }
+
+    pub fn new_e2e(store: Arc<dyn ObjectStore>, keys: SharedE2eKeys) -> Self {
+        Self {
+            store,
+            partition: PARTITION.to_string(),
+            e2e: Some(keys),
         }
     }
 
@@ -72,18 +83,39 @@ impl LogStore {
     }
 
     pub fn with_partition(&self, partition: &str) -> Self {
-        Self::for_partition(self.store.clone(), partition)
+        Self {
+            store: self.store.clone(),
+            partition: partition.to_string(),
+            e2e: self.e2e.clone(),
+        }
     }
 
     pub fn inner(&self) -> Arc<dyn ObjectStore> {
         self.store.clone()
     }
 
+    /// Persist a newly generated partition DEK before the split record can
+    /// direct any metadata into that partition's encrypted stream.
+    pub async fn ensure_partition_key(&self, partition: &str) -> Result<(), StoreError> {
+        if let Some(keys) = &self.e2e {
+            keys.ensure_partition(&self.store, partition).await?;
+        }
+        Ok(())
+    }
+
     /// CAS-create segment `seq`. `AlreadyExists` when the sequence was
     /// already written (crash replay or a second writer).
     pub async fn put_segment(&self, seq: u64, payload: &[u8]) -> Result<(), StoreError> {
-        let body = zstd::encode_all(payload, ZSTD_LEVEL)?;
         let key = layout::log_segment(&self.partition, seq);
+        let compressed = zstd::encode_all(payload, ZSTD_LEVEL)?;
+        let body = match &self.e2e {
+            Some(keys) => encrypt_object(
+                &keys.dek(&self.partition)?,
+                key.as_ref().as_bytes(),
+                &compressed,
+            )?,
+            None => compressed,
+        };
         match self
             .store
             .put_opts(
@@ -104,7 +136,21 @@ impl LogStore {
             .store
             .get(&layout::log_segment(&self.partition, seq))
             .await?;
-        Ok(zstd::decode_all(&res.bytes().await?[..])?)
+        let body = res.bytes().await?;
+        let compressed = match &self.e2e {
+            Some(keys) => {
+                keys.refresh_partition(&self.store, &self.partition).await?;
+                decrypt_object(
+                    &keys.dek(&self.partition)?,
+                    layout::log_segment(&self.partition, seq)
+                        .as_ref()
+                        .as_bytes(),
+                    &body,
+                )?
+            }
+            None => body.to_vec(),
+        };
+        Ok(zstd::decode_all(&compressed[..])?)
     }
 
     /// All segment sequence numbers, ascending.
@@ -166,10 +212,15 @@ impl LogStore {
         snapshot: &[u8],
         vector: &CheckpointVector,
     ) -> Result<(), StoreError> {
-        let body = zstd::encode_all(snapshot, ZSTD_LEVEL)?;
-        self.store
-            .put(&layout::checkpoint(PARTITION, seq), PutPayload::from(body))
-            .await?;
+        let key = layout::checkpoint(PARTITION, seq);
+        let compressed = zstd::encode_all(snapshot, ZSTD_LEVEL)?;
+        let body = match &self.e2e {
+            Some(keys) => {
+                encrypt_object(&keys.dek(PARTITION)?, key.as_ref().as_bytes(), &compressed)?
+            }
+            None => compressed,
+        };
+        self.store.put(&key, PutPayload::from(body)).await?;
         let ptr = serde_json::to_vec(&CheckpointRef { seq })?;
         self.store.put(&latest_key(), PutPayload::from(ptr)).await?;
         let vec_body = serde_json::to_vec(vector)?;
@@ -191,7 +242,16 @@ impl LogStore {
             .store
             .get(&layout::checkpoint(PARTITION, r.seq))
             .await?;
-        Ok(Some((r.seq, zstd::decode_all(&res.bytes().await?[..])?)))
+        let body = res.bytes().await?;
+        let compressed = match &self.e2e {
+            Some(keys) => decrypt_object(
+                &keys.dek(PARTITION)?,
+                layout::checkpoint(PARTITION, r.seq).as_ref().as_bytes(),
+                &body,
+            )?,
+            None => body.to_vec(),
+        };
+        Ok(Some((r.seq, zstd::decode_all(&compressed[..])?)))
     }
 
     pub async fn get_checkpoint_vector(&self) -> Result<CheckpointVector, StoreError> {
@@ -263,5 +323,31 @@ mod tests {
         s.put_checkpoint_with_vector(3, b"snap", &v).await.unwrap();
         let got = s.get_checkpoint_vector().await.unwrap();
         assert_eq!(got.applied.get("p1").copied(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn e2e_segments_and_checkpoints_are_ciphertext() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let keys = crate::e2e::put_keyring(&store, "test-pass").await.unwrap();
+        let logs = LogStore::new_e2e(store.clone(), keys);
+        logs.put_segment(1, b"secret filename").await.unwrap();
+        logs.put_checkpoint(1, b"checkpoint filename")
+            .await
+            .unwrap();
+        assert_eq!(logs.get_segment(1).await.unwrap(), b"secret filename");
+        assert_eq!(
+            logs.get_latest_checkpoint().await.unwrap().unwrap().1,
+            b"checkpoint filename"
+        );
+        let raw_log = store
+            .get(&layout::log_segment(PARTITION, 1))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(!raw_log
+            .windows(b"secret filename".len())
+            .any(|window| window == b"secret filename"));
     }
 }
