@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 constellation-fs-core.workspace = true
 constellation-meta.workspace = true
-constellation-api.workspace = true
+constellation-api = { workspace = true, features = ["web"] }
 constellation-net.workspace = true
 constellation-store-s3.workspace = true
 anyhow.workspace = true

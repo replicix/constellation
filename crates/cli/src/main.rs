@@ -7,6 +7,7 @@ mod epoch;
 mod fusefs;
 mod lease;
 mod leave;
+mod log_buffer;
 mod pin;
 mod prefetch;
 mod reintegrate;
@@ -85,6 +86,9 @@ enum Command {
         /// Create a temporary clone and remove it on clean unmount.
         #[arg(long, requires = "rw", conflicts_with = "clone_name")]
         ephemeral: bool,
+        /// Serve the embedded control UI on localhost. Zero disables it.
+        #[arg(long, env = "CONSTELLATION_WEB_UI_PORT", default_value_t = 0)]
+        web_ui: u16,
     },
     /// Verify backend capabilities (conditional writes, filesystem state).
     Doctor {
@@ -167,6 +171,22 @@ enum Command {
         #[arg(long)]
         state_dir: PathBuf,
     },
+    /// Inspect one file or directory through the running daemon.
+    Inspect {
+        path: String,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// Inspect local cache state.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+    /// Read recent daemon logs.
+    Log {
+        #[command(subcommand)]
+        command: LogCommand,
+    },
     /// Create, list, and delete immutable subtree snapshots.
     Snapshot {
         #[command(subcommand)]
@@ -202,6 +222,28 @@ enum SnapshotCommand {
         selector: String,
         #[arg(long)]
         state_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    Ls {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    Stat {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogCommand {
+    Tail {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        lines: usize,
     },
 }
 
@@ -252,10 +294,13 @@ fn passphrase(env: &str, prompt: &str) -> Result<Zeroizing<String>> {
 }
 
 fn main() -> Result<()> {
+    let log_buffer = log_buffer::LogBuffer::default();
+    let log_writer = log_buffer.clone();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with_writer(move || log_writer.writer())
         .init();
     let cli = Cli::parse();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -413,6 +458,25 @@ fn main() -> Result<()> {
                 },
             ))
         }
+        Command::Inspect { path, state_dir } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::Inspect { path },
+        )),
+        Command::Cache { command } => match command {
+            CacheCommand::Ls { state_dir } => rt.block_on(control_call(
+                &state_dir,
+                constellation_api::Request::CacheList,
+            )),
+            CacheCommand::Stat { state_dir } => {
+                rt.block_on(control_call(&state_dir, constellation_api::Request::Status))
+            }
+        },
+        Command::Log {
+            command: LogCommand::Tail { state_dir, lines },
+        } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::LogTail { lines },
+        )),
         Command::Snapshot { command } => match command {
             SnapshotCommand::Create {
                 selector,
@@ -462,6 +526,7 @@ fn main() -> Result<()> {
             rw,
             clone_name,
             ephemeral,
+            web_ui,
         } => {
             let (inner_path, mountpoint) = match paths.as_slice() {
                 [mountpoint] => ("/".to_string(), mountpoint.clone()),
@@ -489,6 +554,8 @@ fn main() -> Result<()> {
                 rw,
                 clone_name,
                 ephemeral,
+                web_ui,
+                log_buffer,
             )
         }
     }
@@ -509,6 +576,8 @@ fn mount(
     rw_snapshot: bool,
     clone_name: Option<String>,
     ephemeral: bool,
+    web_ui: u16,
+    log_buffer: log_buffer::LogBuffer,
 ) -> Result<()> {
     let backend = backend::open_backend(s3)?;
     let fsmeta = rt
@@ -1335,11 +1404,18 @@ fn mount(
         write_mode: write_mode.clone(),
         upload: upload.clone(),
         snapshots: snapshots.clone(),
+        log_buffer,
     });
     {
         let _guard = rt.enter();
-        if let Err(e) = constellation_api::serve(&state_dir, status) {
+        if let Err(e) = constellation_api::serve(&state_dir, status.clone()) {
             tracing::warn!(error = %e, "control API unavailable");
+        }
+        if web_ui != 0 {
+            match rt.block_on(constellation_api::web::serve(web_ui, status)) {
+                Ok(address) => tracing::info!(%address, "web UI listening (localhost only)"),
+                Err(error) => tracing::warn!(%error, "web UI unavailable"),
+            }
         }
     }
 
@@ -1703,6 +1779,24 @@ async fn control_call(state_dir: &std::path::Path, req: constellation_api::Reque
         constellation_api::Response::Refs { hashes } => {
             for hash in hashes {
                 println!("{hash}");
+            }
+            Ok(())
+        }
+        constellation_api::Response::Status(status) => {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            Ok(())
+        }
+        constellation_api::Response::Inspection { entry } => {
+            println!("{}", serde_json::to_string_pretty(&entry)?);
+            Ok(())
+        }
+        constellation_api::Response::CacheEntries { entries } => {
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+            Ok(())
+        }
+        constellation_api::Response::Logs { lines } => {
+            for line in lines {
+                println!("{line}");
             }
             Ok(())
         }
@@ -2079,6 +2173,7 @@ struct DaemonStatus {
     write_mode: std::sync::Arc<writeback::WriteModeState>,
     upload: std::sync::Arc<UploadRuntime>,
     snapshots: std::sync::Arc<snapshot::SnapshotManager>,
+    log_buffer: log_buffer::LogBuffer,
 }
 
 impl DaemonStatus {
@@ -2154,6 +2249,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                     node_id: p.node_id,
                     connected: p.connected,
                     rtt_ms: p.rtt_ms,
+                    last_seen_ms: None,
                 })
                 .collect(),
         };
@@ -2180,6 +2276,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                 used_bytes: usage.used,
                 budget_bytes: usage.budget,
                 chunks: usage.entries as u64,
+                pinned_bytes: usage.pinned,
                 staging_bytes: self.staging_budget.used(),
                 staging_budget_bytes: self.staging_budget.budget(),
             },
@@ -2412,6 +2509,132 @@ impl constellation_api::StatusSource for DaemonStatus {
         let id = id.to_string();
         tokio::task::block_in_place(|| self.rt.block_on(snapshots.refs(&id)))
             .map_err(|error| format!("{error:#}"))
+    }
+
+    fn read_dir(
+        &self,
+        path: &str,
+    ) -> std::result::Result<Vec<constellation_api::DirectoryEntry>, String> {
+        use constellation_meta::MetaStore;
+        let normalized = normalize_control_path(path);
+        let ino = self
+            .meta
+            .resolve_path(&normalized)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{normalized}: not found"))?;
+        let entries = self.meta.readdir(ino).map_err(|error| error.to_string())?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| constellation_api::DirectoryEntry {
+                path: if normalized == "/" {
+                    format!("/{}", entry.name)
+                } else {
+                    format!("{normalized}/{}", entry.name)
+                },
+                name: entry.name,
+                ino: entry.ino,
+                kind: format!("{:?}", entry.kind).to_lowercase(),
+            })
+            .collect())
+    }
+
+    fn inspect(&self, path: &str) -> std::result::Result<constellation_api::InspectStatus, String> {
+        use constellation_meta::MetaStore;
+        let normalized = normalize_control_path(path);
+        let ino = self
+            .meta
+            .resolve_path(&normalized)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{normalized}: not found"))?;
+        let attr = self
+            .meta
+            .getattr(ino)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{normalized}: stale inode"))?;
+        let manifest = self
+            .meta
+            .manifest(ino)
+            .map_err(|error| error.to_string())?
+            .map(|bytes| {
+                constellation_fs_core::manifest::Manifest::decode(&bytes)
+                    .map(|manifest| constellation_api::ManifestStatus {
+                        chunk_size: manifest.layout.chunk_size,
+                        chunk_count: manifest.layout.chunk_count(manifest.file_len),
+                        spilled: manifest.is_spilled(),
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        Ok(constellation_api::InspectStatus {
+            path: normalized,
+            ino: attr.ino,
+            kind: format!("{:?}", attr.kind).to_lowercase(),
+            size: attr.size,
+            mode: attr.mode,
+            uid: attr.uid,
+            gid: attr.gid,
+            nlink: attr.nlink,
+            atime_ns: attr.atime_ns,
+            mtime_ns: attr.mtime_ns,
+            ctime_ns: attr.ctime_ns,
+            rdev: attr.rdev,
+            manifest,
+        })
+    }
+
+    fn force_release(&self, part: &str) -> std::result::Result<String, String> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sync_tx
+            .send(fusefs::SyncRequest::HandOff {
+                part: part.to_string(),
+                reply,
+            })
+            .map_err(|_| "sync task is not running".to_string())?;
+        let epoch = tokio::task::block_in_place(|| self.rt.block_on(receive))
+            .map_err(|_| "lease release task stopped".to_string())?;
+        match epoch {
+            Some(epoch) => Ok(format!(
+                "voluntarily released {part} at epoch {epoch}; this was cooperative, not fencing"
+            )),
+            None => Err(format!(
+                "{part} was not held locally or could not be flushed; no fencing was attempted"
+            )),
+        }
+    }
+
+    fn log_tail(&self, lines: usize) -> Vec<String> {
+        self.log_buffer.tail(lines)
+    }
+
+    fn doctor(&self) -> std::result::Result<constellation_api::DoctorStatus, String> {
+        let store = ChunkStore::new(self.store.clone());
+        tokio::task::block_in_place(|| self.rt.block_on(store.probe_conditional_writes()))
+            .map(|caps| constellation_api::DoctorStatus {
+                create_if_absent: caps.create_if_absent,
+                etag_cas: caps.etag_cas,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn cache_list(&self) -> Vec<constellation_api::CacheEntryStatus> {
+        self.cache
+            .entries()
+            .into_iter()
+            .map(|(hash, size, state)| constellation_api::CacheEntryStatus {
+                hash: hash.to_hex(),
+                size,
+                state: format!("{state:?}").to_lowercase(),
+            })
+            .collect()
+    }
+}
+
+fn normalize_control_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        "/".into()
+    } else {
+        format!("/{}", parts.join("/"))
     }
 }
 

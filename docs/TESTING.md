@@ -384,6 +384,14 @@ Phase 6b scenarios exercise E2E passphrase mode:
   S3 latency. The keyed hash must verify and cooperative-cache `peer_hits`
   must advance, proving encrypted peer responses interoperate.
 
+Phase 7 adds `web-ui-smoke`: one mounted daemon enables its localhost web
+listener, then the harness uses ordinary HTTP (no browser automation) to
+exercise `GET /api/status`, `POST /api` with `ReadDir`, snapshot
+create/list/delete, and `GET /metrics`. It also JSON-round-trips the status
+response and requires spool, cache, and lease gauge names. This checks the
+embedded server and shared control dispatcher while keeping frontend rendering
+out of the fault-injection lane.
+
 Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.

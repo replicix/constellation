@@ -49,6 +49,11 @@ pub enum Request {
     SnapshotList {
         path: Option<String>,
     },
+    /// Preferred additive spelling for snapshot listing. `SnapshotList`
+    /// remains accepted for compatibility with phase-6 clients.
+    ListSnapshots {
+        path: Option<String>,
+    },
     SnapshotDelete {
         selector: String,
     },
@@ -59,6 +64,27 @@ pub enum Request {
     SnapRefs {
         id: String,
     },
+    /// List one directory from the authoritative local metadata replica.
+    ReadDir {
+        path: String,
+    },
+    /// Inspect one namespace object and its manifest summary.
+    Inspect {
+        path: String,
+    },
+    /// Voluntarily release a locally held partition lease. This is
+    /// cooperative administration, not a fencing operation.
+    ForceRelease {
+        part: String,
+    },
+    /// Return the most recent daemon log lines from the in-memory ring.
+    LogTail {
+        lines: usize,
+    },
+    /// Run the mounted daemon's backend capability probes.
+    Doctor,
+    /// Enumerate local cache entries for operator inspection.
+    CacheList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,12 +113,74 @@ pub enum Response {
     Snapshots {
         snapshots: Vec<SnapshotStatus>,
     },
+    Directory {
+        path: String,
+        entries: Vec<DirectoryEntry>,
+    },
+    Inspection {
+        entry: InspectStatus,
+    },
+    Logs {
+        lines: Vec<String>,
+    },
+    Doctor {
+        report: DoctorStatus,
+    },
+    CacheEntries {
+        entries: Vec<CacheEntryStatus>,
+    },
     Refs {
         hashes: Vec<String>,
     },
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub ino: u64,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InspectStatus {
+    pub path: String,
+    pub ino: u64,
+    pub kind: String,
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u32,
+    pub atime_ns: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    pub rdev: u64,
+    #[serde(default)]
+    pub manifest: Option<ManifestStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ManifestStatus {
+    pub chunk_size: u32,
+    pub chunk_count: u64,
+    pub spilled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DoctorStatus {
+    pub create_if_absent: bool,
+    pub etag_cas: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheEntryStatus {
+    pub hash: String,
+    pub size: u64,
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -273,6 +361,8 @@ pub struct PeerStatus {
     pub connected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
 }
 
 /// One partition as exposed by the control API.
@@ -322,6 +412,9 @@ pub struct CacheStatus {
     pub used_bytes: u64,
     pub budget_bytes: u64,
     pub chunks: u64,
+    /// Bytes protected from eviction by local pins.
+    #[serde(default)]
+    pub pinned_bytes: u64,
     /// In-flight (unflushed) write bytes staged to local disk, bounded
     /// independently of the chunk cache (plan 05a). Zero on daemons
     /// with no open dirty inode.

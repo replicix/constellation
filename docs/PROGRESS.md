@@ -646,7 +646,50 @@ passed, including `e2e-basic` and `e2e-two-nodes`; only `fio-latency` and
 `fio-blips` skipped because `fio` is absent. pjdfstest: **8798 passed, 0
 failed**, empty baseline.
 
+## Phase 7 — embedded web UI and metrics: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Optional localhost-only axum server (`--web-ui` / `CONSTELLATION_WEB_UI_PORT`, zero disables) with rust-embed assets behind the `api/web` feature | done | `api::web`, `cli::main`, `api/webui/index.html` |
+| One exhaustive request dispatcher shared by newline-delimited unix sockets and HTTP `POST /api`; convenience `GET /api/status` | done | `api::dispatch` |
+| Hand-rolled Prometheus text endpoint for spool, cache, cooperative-cache, and lease/partition gauges | done | `api::web::metrics` |
+| Dark, build-free vanilla UI: dashboard, peers, cache/source EWMAs, partitions + voluntary release, read-only file browser/inspect, snapshots, doctor, and log tail | done | `crates/api/webui/index.html` |
+| Additive API operations for directory browsing, inspect, snapshot-list spelling, cooperative force-release, log tail, doctor, and cache listing | done | `api::{Request,Response,StatusSource}`, `cli::DaemonStatus` |
+| In-memory bounded tracing ring; CLI `inspect`, `cache ls\|stat`, and `log tail` parity | done | `cli::log_buffer`, `cli::main` |
+| Exhaustive unix/HTTP adapter parity table and HTTP-level harness smoke | done | `api` tests; harness `web-ui-smoke` |
+
+### Phase 7 exit criteria (plan 08)
+
+- [x] The daemon serves the embedded UI only when explicitly enabled and
+      binds `127.0.0.1`; it has no authentication by design. Remote access
+      must use a tunnel.
+- [x] Unix-socket and HTTP requests pass through one dispatcher over the same
+      serde-tagged request/response enums.
+- [x] The file browser reads the authoritative SQLite replica, snapshot
+      create/list/delete works through HTTP, and log tail is bounded in memory.
+- [x] `/metrics` exposes spool/cache/coop/lease state without adding a
+      Prometheus dependency.
+- [x] Harness `web-ui-smoke` covers status, metrics, ReadDir, snapshot
+      create/delete, and a JSON round-trip.
+
+### Phase 7 scope notes
+
+- File-panel rename/delete/upload/download mutations are deliberately deferred:
+  plan 08 marks them stretch, while `ReadDir` and `Inspect` provide the required
+  read-only browser.
+- Snapshot clone/browse/mount actions remain CLI/FUSE operations; phase 7's
+  required web panel is list/create/delete.
+- Force-release is holder-side flush plus voluntary lease release. It does not
+  fence a remote holder and the UI labels that cooperative limitation.
+- The web endpoint has no remote bind knob or authentication. Access from
+  another host is intentionally tunnel-only.
+
+Validation (2026-08-30): fmt and strict clippy clean; all workspace tests,
+local smoke, S3 integration, and release workspace build pass. Full harness:
+every runnable scenario passed, including `web-ui-smoke`; only `fio-latency`
+and `fio-blips` skipped because `fio` is absent. pjdfstest: **8798 passed, 0
+failed**, empty baseline.
+
 ## Later phases
 
-Phases 5, 5a, 5b, 6a, and 6b are closed. Not started: phase 7 web UI
-and phase 8 GC.
+Phases 5, 5a, 5b, 6a, 6b, and 7 are closed. Not started: phase 8 GC.

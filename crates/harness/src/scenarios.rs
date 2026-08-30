@@ -171,6 +171,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: web_fleet,
     },
     Scenario {
+        name: "web-ui-smoke",
+        desc: "localhost HTTP control adapter, embedded UI, and Prometheus metrics",
+        requires: &[],
+        run: web_ui_smoke,
+    },
+    Scenario {
         name: "snapshot-lifecycle",
         desc: "snapshot remains frozen behind hidden .constellation view, then becomes stale",
         requires: &[],
@@ -1228,6 +1234,77 @@ fn web_fleet(_seed: u64) -> Result<()> {
     a.unmount()?;
     b.unmount()?;
     c.unmount()?;
+    Ok(())
+}
+
+/// HTTP-level phase-7 smoke test. The listener is deliberately localhost-only;
+/// remote administration is expected to use a tunnel rather than widening an
+/// unauthenticated control endpoint.
+fn web_ui_smoke(_seed: u64) -> Result<()> {
+    let (env, root) = setup("web-ui-smoke")?;
+    let _proxy = env.s3_proxy()?;
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+        .local_addr()?
+        .port();
+    let backend = format!("s3://{BUCKET}/web-ui-smoke-{}", ts());
+    let mut client = Client::new(root.path(), "web", &env.endpoint, &backend)?.with_web_ui(port);
+    client.fs_create()?;
+    client.mount()?;
+    std::fs::create_dir(client.mnt.join("through-http"))?;
+
+    let base = format!("http://127.0.0.1:{port}");
+    let status: serde_json::Value = ureq::get(&format!("{base}/api/status"))
+        .timeout(Duration::from_secs(10))
+        .call()
+        .context("GET /api/status")?
+        .into_json()?;
+    anyhow::ensure!(status["resp"] == "status", "bad HTTP status: {status}");
+    let round_trip: serde_json::Value = serde_json::from_str(&serde_json::to_string(&status)?)?;
+    anyhow::ensure!(round_trip == status, "HTTP status serde round-trip changed");
+
+    let request = |body: serde_json::Value| -> Result<serde_json::Value> {
+        Ok(ureq::post(&format!("{base}/api"))
+            .timeout(Duration::from_secs(30))
+            .send_json(body)?
+            .into_json()?)
+    };
+    let directory = request(serde_json::json!({"cmd":"read_dir","path":"/"}))?;
+    anyhow::ensure!(
+        directory["entries"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|e| e["name"] == "through-http")),
+        "HTTP ReadDir omitted created directory: {directory}"
+    );
+    let created = request(serde_json::json!({
+        "cmd":"snapshot_create",
+        "selector":"/@web-ui-smoke"
+    }))?;
+    anyhow::ensure!(created["resp"] == "ok", "snapshot create failed: {created}");
+    let listed = request(serde_json::json!({"cmd":"list_snapshots","path":null}))?;
+    anyhow::ensure!(
+        listed["snapshots"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["name"] == "web-ui-smoke")),
+        "snapshot not listed through HTTP: {listed}"
+    );
+    let deleted = request(serde_json::json!({
+        "cmd":"snapshot_delete",
+        "selector":"/@web-ui-smoke"
+    }))?;
+    anyhow::ensure!(deleted["resp"] == "ok", "snapshot delete failed: {deleted}");
+
+    let metrics = ureq::get(&format!("{base}/metrics"))
+        .timeout(Duration::from_secs(10))
+        .call()?
+        .into_string()?;
+    for gauge in [
+        "constellation_spool_backlog",
+        "constellation_cache_used_bytes",
+        "constellation_lease_held",
+    ] {
+        anyhow::ensure!(metrics.contains(gauge), "/metrics omitted {gauge}");
+    }
+    client.unmount()?;
     Ok(())
 }
 

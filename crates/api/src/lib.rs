@@ -6,11 +6,14 @@
 //! Wire format: one JSON request per line, one JSON response per line.
 
 pub mod types;
+#[cfg(feature = "web")]
+pub mod web;
 
 pub use types::{
-    CacheStatus, CoopStatus, DesignationStatus, EpochStatus, LeaseStatus, P2pStatus,
-    PartitionStatus, PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SnapshotStatus,
-    SourceStatus, SpoolStatus, StatusReport, WritebackStatus,
+    CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry, DoctorStatus,
+    EpochStatus, InspectStatus, LeaseStatus, ManifestStatus, P2pStatus, PartitionStatus,
+    PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SnapshotStatus, SourceStatus,
+    SpoolStatus, StatusReport, WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -93,6 +96,92 @@ pub trait StatusSource: Send + Sync + 'static {
     fn snap_refs(&self, _id: &str) -> std::result::Result<Vec<String>, String> {
         Err("snapshot references are not supported by this daemon".into())
     }
+
+    fn read_dir(&self, _path: &str) -> std::result::Result<Vec<DirectoryEntry>, String> {
+        Err("directory browsing is not supported by this daemon".into())
+    }
+
+    fn inspect(&self, _path: &str) -> std::result::Result<InspectStatus, String> {
+        Err("inspection is not supported by this daemon".into())
+    }
+
+    fn force_release(&self, _part: &str) -> std::result::Result<String, String> {
+        Err("lease release is not supported by this daemon".into())
+    }
+
+    fn log_tail(&self, _lines: usize) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn doctor(&self) -> std::result::Result<DoctorStatus, String> {
+        Err("backend probes are not supported by this daemon".into())
+    }
+
+    fn cache_list(&self) -> Vec<CacheEntryStatus> {
+        Vec::new()
+    }
+}
+
+/// The single request dispatcher shared by unix sockets and HTTP. Keeping
+/// transport code outside this match is the parity guarantee: both adapters
+/// deserialize the same enum and invoke this exact function.
+pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
+    let result = |result: std::result::Result<String, String>| match result {
+        Ok(detail) => Response::Ok { detail },
+        Err(message) => Response::Error { message },
+    };
+    match request {
+        Request::Status => Response::Status(Box::new(source.status())),
+        Request::Ping => Response::Pong,
+        Request::Pin { path } => result(source.pin(&path)),
+        Request::Unpin { path } => result(source.unpin(&path)),
+        Request::ListPins => Response::Pins {
+            pins: source.list_pins(),
+        },
+        Request::Offline { path, read_only } => result(source.offline(&path, read_only)),
+        Request::Online { path } => result(source.online(&path)),
+        Request::ListDesignations => Response::Designations {
+            designations: source.list_designations(),
+        },
+        Request::Reintegrate => result(source.reintegrate()),
+        Request::Leave { node_id, force } => result(source.leave(node_id, force)),
+        Request::SetWriteMode { mode } => result(source.set_write_mode(&mode)),
+        Request::SnapshotCreate { selector } => result(source.snapshot_create(&selector)),
+        Request::SnapshotList { path } | Request::ListSnapshots { path } => {
+            match source.snapshot_list(path.as_deref()) {
+                Ok(snapshots) => Response::Snapshots { snapshots },
+                Err(message) => Response::Error { message },
+            }
+        }
+        Request::SnapshotDelete { selector } => result(source.snapshot_delete(&selector)),
+        Request::Clone {
+            selector,
+            destination,
+        } => result(source.clone_snapshot(&selector, &destination)),
+        Request::SnapRefs { id } => match source.snap_refs(&id) {
+            Ok(hashes) => Response::Refs { hashes },
+            Err(message) => Response::Error { message },
+        },
+        Request::ReadDir { path } => match source.read_dir(&path) {
+            Ok(entries) => Response::Directory { path, entries },
+            Err(message) => Response::Error { message },
+        },
+        Request::Inspect { path } => match source.inspect(&path) {
+            Ok(entry) => Response::Inspection { entry },
+            Err(message) => Response::Error { message },
+        },
+        Request::ForceRelease { part } => result(source.force_release(&part)),
+        Request::LogTail { lines } => Response::Logs {
+            lines: source.log_tail(lines.min(10_000)),
+        },
+        Request::Doctor => match source.doctor() {
+            Ok(report) => Response::Doctor { report },
+            Err(message) => Response::Error { message },
+        },
+        Request::CacheList => Response::CacheEntries {
+            entries: source.cache_list(),
+        },
+    }
 }
 
 /// Serve the control API on `<state_dir>/control.sock` until the task
@@ -125,65 +214,7 @@ async fn handle(stream: UnixStream, source: Arc<dyn StatusSource>) -> Result<()>
             continue;
         }
         let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(Request::Status) => Response::Status(Box::new(source.status())),
-            Ok(Request::Ping) => Response::Pong,
-            Ok(Request::Pin { path }) => match source.pin(&path) {
-                Ok(detail) => Response::Ok { detail },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::Unpin { path }) => match source.unpin(&path) {
-                Ok(detail) => Response::Ok { detail },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::ListPins) => Response::Pins {
-                pins: source.list_pins(),
-            },
-            Ok(Request::Offline { path, read_only }) => match source.offline(&path, read_only) {
-                Ok(detail) => Response::Ok { detail },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::Online { path }) => match source.online(&path) {
-                Ok(detail) => Response::Ok { detail },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::ListDesignations) => Response::Designations {
-                designations: source.list_designations(),
-            },
-            Ok(Request::Reintegrate) => match source.reintegrate() {
-                Ok(detail) => Response::Ok { detail },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::Leave { node_id, force }) => match source.leave(node_id, force) {
-                Ok(detail) => Response::Ok { detail },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::SetWriteMode { mode }) => match source.set_write_mode(&mode) {
-                Ok(detail) => Response::Ok { detail },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::SnapshotCreate { selector }) => match source.snapshot_create(&selector) {
-                Ok(detail) => Response::Ok { detail },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::SnapshotList { path }) => match source.snapshot_list(path.as_deref()) {
-                Ok(snapshots) => Response::Snapshots { snapshots },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::SnapshotDelete { selector }) => match source.snapshot_delete(&selector) {
-                Ok(detail) => Response::Ok { detail },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::Clone {
-                selector,
-                destination,
-            }) => match source.clone_snapshot(&selector, &destination) {
-                Ok(detail) => Response::Ok { detail },
-                Err(message) => Response::Error { message },
-            },
-            Ok(Request::SnapRefs { id }) => match source.snap_refs(&id) {
-                Ok(hashes) => Response::Refs { hashes },
-                Err(message) => Response::Error { message },
-            },
+            Ok(request) => dispatch(source.as_ref(), request),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
@@ -237,6 +268,7 @@ mod tests {
                     used_bytes: 100,
                     budget_bytes: 1000,
                     chunks: 5,
+                    pinned_bytes: 0,
                     staging_bytes: 0,
                     staging_budget_bytes: 250,
                 },
@@ -272,6 +304,61 @@ mod tests {
                 path: "/site".into(),
                 designee: 1,
                 read_only: false,
+            }]
+        }
+
+        fn snapshot_list(
+            &self,
+            _path: Option<&str>,
+        ) -> std::result::Result<Vec<SnapshotStatus>, String> {
+            Ok(vec![SnapshotStatus {
+                id: "snap-id".into(),
+                path: "/".into(),
+                name: "nightly".into(),
+                root_hash: "00".repeat(32),
+                created_unix_ms: 1,
+            }])
+        }
+
+        fn read_dir(&self, path: &str) -> std::result::Result<Vec<DirectoryEntry>, String> {
+            Ok(vec![DirectoryEntry {
+                name: "file".into(),
+                path: format!("{}/file", path.trim_end_matches('/')),
+                ino: 2,
+                kind: "file".into(),
+            }])
+        }
+
+        fn inspect(&self, path: &str) -> std::result::Result<InspectStatus, String> {
+            Ok(InspectStatus {
+                path: path.into(),
+                ino: 2,
+                kind: "file".into(),
+                size: 4,
+                ..InspectStatus::default()
+            })
+        }
+
+        fn force_release(&self, part: &str) -> std::result::Result<String, String> {
+            Ok(format!("released {part}"))
+        }
+
+        fn log_tail(&self, lines: usize) -> Vec<String> {
+            vec![format!("last {lines}")]
+        }
+
+        fn doctor(&self) -> std::result::Result<DoctorStatus, String> {
+            Ok(DoctorStatus {
+                create_if_absent: true,
+                etag_cas: true,
+            })
+        }
+
+        fn cache_list(&self) -> Vec<CacheEntryStatus> {
+            vec![CacheEntryStatus {
+                hash: "00".repeat(32),
+                size: 4,
+                state: "clean".into(),
             }]
         }
     }
@@ -355,6 +442,7 @@ mod tests {
                     used_bytes: 0,
                     budget_bytes: 1,
                     chunks: 0,
+                    pinned_bytes: 0,
                     staging_bytes: 0,
                     staging_budget_bytes: 0,
                 },
@@ -468,5 +556,99 @@ mod tests {
             }
             other => panic!("unexpected response {other:?}"),
         }
+    }
+
+    /// Every additive request variant must use the same dispatcher on both
+    /// transports. Adding a variant makes this table visibly incomplete in
+    /// review, while the central exhaustive match prevents either adapter
+    /// from quietly inventing different semantics.
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn unix_and_http_adapters_have_request_parity() {
+        let requests = vec![
+            Request::Ping,
+            Request::Status,
+            Request::Pin { path: "/x".into() },
+            Request::Unpin { path: "/x".into() },
+            Request::ListPins,
+            Request::Offline {
+                path: "/x".into(),
+                read_only: false,
+            },
+            Request::Online { path: "/x".into() },
+            Request::ListDesignations,
+            Request::Reintegrate,
+            Request::Leave {
+                node_id: Some(9),
+                force: false,
+            },
+            Request::SetWriteMode {
+                mode: "back".into(),
+            },
+            Request::SnapshotCreate {
+                selector: "/@x".into(),
+            },
+            Request::SnapshotList { path: None },
+            Request::ListSnapshots { path: None },
+            Request::SnapshotDelete {
+                selector: "/@x".into(),
+            },
+            Request::Clone {
+                selector: "/@x".into(),
+                destination: "/clone".into(),
+            },
+            Request::SnapRefs { id: "x".into() },
+            Request::ReadDir { path: "/".into() },
+            Request::Inspect { path: "/".into() },
+            Request::ForceRelease { part: "p0".into() },
+            Request::LogTail { lines: 10 },
+            Request::Doctor,
+            Request::CacheList,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(Fake);
+        let sock = serve(dir.path(), source.clone()).unwrap();
+        for request in requests {
+            let unix = call(&sock, &request).await.unwrap();
+            let http = web::adapt(source.as_ref(), request.clone());
+            assert_eq!(
+                serde_json::to_value(unix).unwrap(),
+                serde_json::to_value(http).unwrap(),
+                "transport mismatch for {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_handlers_return_structured_results_from_an_in_memory_source() {
+        let source = Fake;
+        assert!(matches!(
+            dispatch(&source, Request::ReadDir { path: "/".into() }),
+            Response::Directory { entries, .. } if entries.len() == 1
+        ));
+        assert!(matches!(
+            dispatch(&source, Request::Inspect { path: "/file".into() }),
+            Response::Inspection { entry } if entry.ino == 2
+        ));
+        assert!(matches!(
+            dispatch(&source, Request::ListSnapshots { path: None }),
+            Response::Snapshots { snapshots } if snapshots.len() == 1
+        ));
+        assert!(matches!(
+            dispatch(&source, Request::ForceRelease { part: "p0".into() }),
+            Response::Ok { .. }
+        ));
+        assert!(matches!(
+            dispatch(&source, Request::LogTail { lines: 7 }),
+            Response::Logs { lines } if lines == ["last 7"]
+        ));
+        assert!(matches!(
+            dispatch(&source, Request::Doctor),
+            Response::Doctor { report } if report.etag_cas
+        ));
+        assert!(matches!(
+            dispatch(&source, Request::CacheList),
+            Response::CacheEntries { entries } if entries.len() == 1
+        ));
     }
 }

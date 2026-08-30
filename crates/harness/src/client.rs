@@ -23,6 +23,7 @@ pub struct Client {
     cache_size: Option<u64>,
     write_mode: Option<String>,
     e2e: bool,
+    web_ui_port: Option<u16>,
 }
 
 fn bin() -> PathBuf {
@@ -58,6 +59,7 @@ impl Client {
             cache_size: None,
             write_mode: None,
             e2e: false,
+            web_ui_port: None,
         })
     }
 
@@ -84,6 +86,11 @@ impl Client {
             "CONSTELLATION_PASSPHRASE".into(),
             "harness-correct-passphrase".into(),
         ));
+        self
+    }
+
+    pub fn with_web_ui(mut self, port: u16) -> Self {
+        self.web_ui_port = Some(port);
         self
     }
 
@@ -180,6 +187,10 @@ impl Client {
         if let Some(mode) = &self.write_mode {
             args.push("--write-mode".to_string());
             args.push(mode.clone());
+        }
+        if let Some(port) = self.web_ui_port {
+            args.push("--web-ui".to_string());
+            args.push(port.to_string());
         }
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let child = self

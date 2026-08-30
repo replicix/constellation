@@ -122,6 +122,7 @@ pub struct CacheUsage {
     pub used: u64,
     pub budget: u64,
     pub entries: usize,
+    pub pinned: u64,
 }
 
 impl DiskCache {
@@ -230,7 +231,26 @@ impl DiskCache {
             used: st.used,
             budget: self.budget,
             entries: st.entries.len(),
+            pinned: st
+                .entries
+                .values()
+                .filter(|entry| entry.state == ChunkState::Pinned)
+                .map(|entry| entry.size)
+                .sum(),
         }
+    }
+
+    /// Stable operator-facing snapshot of cache contents. Data bytes are
+    /// deliberately not read: listing a TiB cache must remain metadata-only.
+    pub fn entries(&self) -> Vec<(ChunkHash, u64, ChunkState)> {
+        let st = self.state.lock().unwrap();
+        let mut entries: Vec<_> = st
+            .entries
+            .iter()
+            .map(|(hash, entry)| (*hash, entry.size, entry.state))
+            .collect();
+        entries.sort_by_key(|(hash, _, _)| hash.0);
+        entries
     }
 
     pub fn dirty_bytes(&self) -> u64 {
