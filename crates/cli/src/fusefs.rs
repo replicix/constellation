@@ -1,5 +1,18 @@
-//! FUSE filesystem: bridges the metadata store, chunk store, and disk
-//! cache (Phase 1: single node, close/fsync-time flush).
+//! FUSE filesystem: bridges metadata, staging, the chunk cache, and S3.
+//!
+//! Phase 5b seals a sequential writer's crossed chunks using a
+//! contiguous high-water mark. Sealing uploads immutable content early
+//! but never publishes a partial manifest, so close-to-open semantics
+//! are unchanged. Write-through pays chunk RTTs before close returns;
+//! write-back returns after local journaling and shares the continuation
+//! epoch's durable pending queue and ship-time barrier.
+//!
+//! Write-back is disk-bound for small-file imports and coalesces edits
+//! made before drain, at the cost of delayed cross-node visibility,
+//! non-evictable dirty cache pressure, and loss exposure if the writer
+//! node is permanently destroyed before drain. P2P announcements remain
+//! post-S3 and peer serving rejects Dirty chunks, so neither path can
+//! expose a manifest whose content is absent from S3.
 
 use crate::staging::{GenCounter, Staging, StagingBudget};
 use anyhow::Result;
@@ -30,6 +43,8 @@ struct WriteState {
     staging: Staging,
     file_len: u64,
     base: Option<Manifest>,
+    sealed: HashMap<u64, ChunkHash>,
+    high_water: u64,
 }
 
 /// A request to the daemon's sync task.
@@ -37,7 +52,14 @@ pub enum SyncRequest {
     /// Run a sync round soon; the sender does not wait.
     Nudge,
     /// Run a sync round and report its outcome (fsync barrier).
-    Barrier(tokio::sync::oneshot::Sender<Result<(), String>>),
+    Barrier {
+        ino: Ino,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    DrainInode {
+        ino: Ino,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Take the lease for `part` if it is free. `Ok(false)` means a live
     /// foreign holder still owns it.
     Acquire {
@@ -89,6 +111,7 @@ pub struct SyncHandle {
     pub departed: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// A read-only registry member never enters the write gate.
     pub read_only_member: bool,
+    pub write_mode: Arc<crate::writeback::WriteModeState>,
 }
 
 /// Everything [`ConstellationFs::new`] needs besides the two filesystem
@@ -116,7 +139,6 @@ pub struct ConstellationFs {
     cache: Arc<DiskCache>,
     rt: Handle,
     chunk_size: u32,
-    compression: CompressionSetting,
     writes: Mutex<HashMap<Ino, WriteState>>,
     /// Open handle counts per inode, for orphan reaping on last close.
     opens: Mutex<HashMap<Ino, u32>>,
@@ -198,7 +220,7 @@ fn time_or_now_ns(t: TimeOrNow) -> i64 {
 }
 
 impl ConstellationFs {
-    pub fn new(deps: FsDependencies, chunk_size: u32, compression: CompressionSetting) -> Self {
+    pub fn new(deps: FsDependencies, chunk_size: u32, _compression: CompressionSetting) -> Self {
         let prefetch = crate::prefetch::Prefetcher::new(
             deps.rt.clone(),
             deps.store.clone(),
@@ -211,7 +233,6 @@ impl ConstellationFs {
             cache: deps.cache,
             rt: deps.rt,
             chunk_size,
-            compression,
             writes: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
             prefetch,
@@ -350,14 +371,20 @@ impl ConstellationFs {
 
     /// fsync() barrier. In `--fsync-mode s3`, block until the journal
     /// (up to now) is durable in the shared log; otherwise just nudge.
-    pub(crate) fn sync_barrier(&self) -> Result<(), i32> {
+    pub(crate) fn sync_barrier(&self, ino: Ino) -> Result<(), i32> {
         let Some(h) = &self.sync else { return Ok(()) };
         if !h.fsync_s3 {
             let _ = h.tx.send(SyncRequest::Nudge);
             return Ok(());
         }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if h.tx.send(SyncRequest::Barrier(reply_tx)).is_err() {
+        if h.tx
+            .send(SyncRequest::Barrier {
+                ino,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             return Err(libc::EIO);
         }
         match reply_rx.blocking_recv() {
@@ -456,9 +483,91 @@ impl ConstellationFs {
                 staging,
                 file_len: manifest.file_len,
                 base: Some(manifest.clone()),
+                sealed: HashMap::new(),
+                high_water: manifest.file_len,
             });
         }
         Ok(writes.get_mut(&ino).unwrap())
+    }
+
+    fn drain_inode(&self, ino: Ino) -> Result<(), i32> {
+        let Some(handle) = &self.sync else {
+            return Ok(());
+        };
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        handle
+            .tx
+            .send(SyncRequest::DrainInode { ino, reply })
+            .map_err(|_| libc::EIO)?;
+        match receive.blocking_recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, ino, "write-through upload failed");
+                Err(libc::EIO)
+            }
+            Err(_) => Err(libc::EIO),
+        }
+    }
+
+    /// Seal dirty full chunks below the contiguous write high-water
+    /// mark. Byte-prefix continuity is used instead of borrowing the
+    /// read prefetcher's signal: it directly proves a sequential
+    /// writer has crossed the boundary. A later write into a sealed
+    /// chunk re-admits and re-dirties that chunk.
+    fn seal_crossed_chunks(&self, ino: Ino, ws: &mut WriteState) -> Result<(), i32> {
+        let complete = ws.high_water / u64::from(self.chunk_size);
+        let mut sealed_any = false;
+        for idx in 0..complete {
+            if !ws.staging.is_dirty(idx) || ws.sealed.contains_key(&idx) {
+                continue;
+            }
+            let mut data = vec![0u8; self.chunk_size as usize];
+            ws.staging
+                .read_at(idx * u64::from(self.chunk_size), &mut data)
+                .map_err(|error| staging_errno(&error))?;
+            let hash = ChunkHash::of(&data);
+            let known_durable = self.cache.contains(&hash)
+                && !self
+                    .meta
+                    .upload_pending_for_hash(&hash)
+                    .map_err(|error| errno(&error))?;
+            if !known_durable {
+                self.cache
+                    .insert(&hash, &data, ChunkState::Dirty)
+                    .map_err(|_| libc::ENOSPC)?;
+                self.meta
+                    .add_pending_upload(&hash, ino)
+                    .map_err(|error| errno(&error))?;
+            }
+            ws.staging.release_chunk(idx, self.chunk_size);
+            ws.sealed.insert(idx, hash);
+            sealed_any = true;
+        }
+        if sealed_any {
+            self.nudge_sync();
+        }
+        Ok(())
+    }
+
+    /// Insert content as Dirty unless the local durable-set rung proves
+    /// S3 already has it. Returns whether this inode must enrol a
+    /// pending row.
+    fn cache_for_upload(&self, hash: &ChunkHash, data: &[u8]) -> Result<bool, i32> {
+        let known_durable = self
+            .cache
+            .state_of(hash)
+            .is_some_and(|state| matches!(state, ChunkState::Clean | ChunkState::Pinned))
+            && !self
+                .meta
+                .upload_pending_for_hash(hash)
+                .map_err(|error| errno(&error))?;
+        if known_durable {
+            return Ok(false);
+        }
+        self.cache
+            .insert(hash, data, ChunkState::Dirty)
+            .map_err(|_| libc::ENOSPC)?;
+        Ok(true)
     }
 
     /// Flush an inode's pending writes: hash + upload chunks, write the
@@ -474,29 +583,7 @@ impl ConstellationFs {
     /// before publishing this manifest, so a transient reset on a
     /// healed S3 connection does not become application-visible EIO in
     /// local-fsync mode.
-    fn try_upload_dirty(&self, hash: &ChunkHash, data: &[u8]) {
-        let mut last_error = None;
-        for attempt in 0..3 {
-            match self
-                .rt
-                .block_on(self.store.put_chunk(hash, data, self.compression))
-            {
-                Ok(()) => {
-                    self.cache.set_state(hash, ChunkState::Clean);
-                    return;
-                }
-                Err(error) => last_error = Some(error),
-            }
-            if attempt < 2 {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-        if let Some(error) = last_error {
-            tracing::warn!(%error, %hash, "deferring dirty chunk upload to sync task");
-        }
-    }
-
-    fn flush_inode(&self, ino: Ino) -> Result<(), i32> {
+    fn flush_inode(&self, ino: Ino, force_through: bool) -> Result<(), i32> {
         let ws = {
             let mut writes = self.writes.lock().unwrap();
             match writes.remove(&ino) {
@@ -531,19 +618,23 @@ impl ConstellationFs {
         let mut dirty_hashes: Vec<ChunkHash> = Vec::new();
         for idx in 0..n_chunks {
             let expect_len = layout.chunk_len(ws.file_len, idx) as usize;
-            if ws.staging.is_dirty(idx) {
+            if let Some(hash) = ws.sealed.get(&idx) {
+                if self
+                    .meta
+                    .upload_pending_for_hash(hash)
+                    .map_err(|error| errno(&error))?
+                {
+                    dirty_hashes.push(*hash);
+                }
+                new_hashes.push(*hash);
+            } else if ws.staging.is_dirty(idx) {
                 let mut data = vec![0u8; expect_len];
                 ws.staging
                     .read_at(idx * self.chunk_size as u64, &mut data)
                     .map_err(|e| staging_errno(&e))?;
                 let hash = ChunkHash::of(&data);
-                // Dirty until uploaded, then demoted to clean.
-                self.cache
-                    .insert(&hash, &data, ChunkState::Dirty)
-                    .map_err(|_| libc::ENOSPC)?;
-                dirty_hashes.push(hash);
-                if !epoch_active {
-                    self.try_upload_dirty(&hash, &data);
+                if self.cache_for_upload(&hash, &data)? {
+                    dirty_hashes.push(hash);
                 }
                 new_hashes.push(hash);
             } else if let Some(h) = old_hashes.get(idx as usize) {
@@ -555,12 +646,8 @@ impl ConstellationFs {
                         let mut data = self.fetch_chunk(h)?;
                         data.resize(expect_len, 0);
                         let hash = ChunkHash::of(&data);
-                        self.cache
-                            .insert(&hash, &data, ChunkState::Dirty)
-                            .map_err(|_| libc::ENOSPC)?;
-                        dirty_hashes.push(hash);
-                        if !epoch_active {
-                            self.try_upload_dirty(&hash, &data);
+                        if self.cache_for_upload(&hash, &data)? {
+                            dirty_hashes.push(hash);
                         }
                         new_hashes.push(hash);
                         continue;
@@ -571,12 +658,8 @@ impl ConstellationFs {
                 // Hole created by extension without data: a zero chunk.
                 let data = vec![0u8; expect_len];
                 let hash = ChunkHash::of(&data);
-                self.cache
-                    .insert(&hash, &data, ChunkState::Dirty)
-                    .map_err(|_| libc::ENOSPC)?;
-                dirty_hashes.push(hash);
-                if !epoch_active {
-                    self.try_upload_dirty(&hash, &data);
+                if self.cache_for_upload(&hash, &data)? {
+                    dirty_hashes.push(hash);
                 }
                 new_hashes.push(hash);
             }
@@ -585,12 +668,8 @@ impl ConstellationFs {
             Manifest::from_chunks(self.chunk_size, ws.file_len, new_hashes, INLINE_CHUNKS_MAX);
         if let Some(blob) = spill {
             let bh = ChunkHash::of(&blob);
-            self.cache
-                .insert(&bh, &blob, ChunkState::Dirty)
-                .map_err(|_| libc::ENOSPC)?;
-            dirty_hashes.push(bh);
-            if !epoch_active {
-                self.try_upload_dirty(&bh, &blob);
+            if self.cache_for_upload(&bh, &blob)? {
+                dirty_hashes.push(bh);
             }
         }
         self.meta
@@ -600,6 +679,15 @@ impl ConstellationFs {
         // enrolled in `pending_upload`); the staging file is scratch
         // and safe to drop.
         ws.staging.discard();
+        let through = self.sync.as_ref().is_none_or(|handle| {
+            handle
+                .write_mode
+                .effective(force_through, false, handle.fsync_s3)
+                == crate::writeback::WriteMode::Through
+        });
+        if through && !epoch_active {
+            self.drain_inode(ino)?;
+        }
         Ok(())
     }
 }

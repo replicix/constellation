@@ -22,4 +22,4 @@ pub use nodes::{
     claim_node_id, get_node, leave_node, list_node_ids, list_nodes, publish_p2p, publish_ro,
     write_eligible_roster, NodeInfo,
 };
-pub use store::{Capabilities, ChunkStore, FsMeta};
+pub use store::{Capabilities, ChunkPutMode, ChunkPutResult, ChunkStore, FsMeta};

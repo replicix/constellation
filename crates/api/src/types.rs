@@ -40,6 +40,9 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
+    SetWriteMode {
+        mode: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +143,25 @@ pub struct StatusReport {
     /// Cooperative cache (phase 5, DESIGN.md §7).
     #[serde(default)]
     pub coop: CoopStatus,
+    /// Phase 5b write-back queue and adaptive upload policy.
+    #[serde(default)]
+    pub writeback: WritebackStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WritebackStatus {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub dirty_bytes: u64,
+    #[serde(default)]
+    pub pending_uploads: u64,
+    #[serde(default)]
+    pub upload_concurrency: u32,
+    #[serde(default)]
+    pub remote_probe_enabled: bool,
+    #[serde(default)]
+    pub remote_probe_hit_rate: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

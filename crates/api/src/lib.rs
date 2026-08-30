@@ -10,7 +10,7 @@ pub mod types;
 pub use types::{
     CacheStatus, CoopStatus, DesignationStatus, EpochStatus, LeaseStatus, P2pStatus,
     PartitionStatus, PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SourceStatus,
-    SpoolStatus, StatusReport,
+    SpoolStatus, StatusReport, WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -61,6 +61,10 @@ pub trait StatusSource: Send + Sync + 'static {
 
     fn leave(&self, _node_id: Option<u64>, _force: bool) -> std::result::Result<String, String> {
         Err("leave is not supported by this daemon".into())
+    }
+
+    fn set_write_mode(&self, _mode: &str) -> std::result::Result<String, String> {
+        Err("write-mode switching is not supported by this daemon".into())
     }
 }
 
@@ -123,6 +127,10 @@ async fn handle(stream: UnixStream, source: Arc<dyn StatusSource>) -> Result<()>
                 Err(message) => Response::Error { message },
             },
             Ok(Request::Leave { node_id, force }) => match source.leave(node_id, force) {
+                Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
+            },
+            Ok(Request::SetWriteMode { mode }) => match source.set_write_mode(&mode) {
                 Ok(detail) => Response::Ok { detail },
                 Err(message) => Response::Error { message },
             },
@@ -196,6 +204,7 @@ mod tests {
                 epoch: EpochStatus::default(),
                 reintegration: ReintegrationStatus::default(),
                 coop: CoopStatus::default(),
+                writeback: WritebackStatus::default(),
             }
         }
 
@@ -307,6 +316,7 @@ mod tests {
                 epoch: EpochStatus::default(),
                 reintegration: ReintegrationStatus::default(),
                 coop: CoopStatus::default(),
+                writeback: WritebackStatus::default(),
             }
         }
     }

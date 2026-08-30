@@ -348,6 +348,15 @@ the mount alone.
   throttle and then ENOSPC rather than grow without bound or deadlock,
   and the mount must recover after heal.
 
+The scenarios mount with `--write-mode back`; `writeback-drain` also
+uses the `write-mode through --state-dir ...` control operation and
+asserts that it returns only after `writeback.pending_uploads` reaches
+zero. Status also exposes dirty bytes, pool concurrency, and the
+adaptive remote-HEAD hit rate/decision. The measured seed-42 latency
+baseline is 8.98 s through versus 20.61 ms back for 24 small files;
+the big-file ceiling run is 320 MiB on a 32 MiB cache with 242 MiB peak
+RSS and 32 MiB peak cache use.
+
 Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.

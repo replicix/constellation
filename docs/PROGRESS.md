@@ -499,9 +499,43 @@ node's budget only. The digest is advisory.
 - A peer may hold chunks it has not advertised yet.
 - Either way the fetch falls back to S3.
 
+## Phase 5b — streaming writes and write-back policy: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Contiguous-high-water eager sealing releases crossed staging ranges; later overwrites re-admit and re-dirty them | done | `cli::{fusefs,staging}` |
+| Durable pending queue drained by a bounded pool (`CONSTELLATION_UPLOAD_CONCURRENCY`, default 8, range 1–32) | done | `cli::{main,writeback}`, `meta::sqlite` |
+| Local-durable, conditional-create/plain fallback, and adaptive-HEAD dedup ladder; zstd on `spawn_blocking` | done | `cli::{fusefs,main,writeback}`, `store-s3::store` |
+| Mount and dynamic write-mode controls, drain-before-switch, and status mode/dirty/pending/probe telemetry | done | `cli::main`, `api` |
+| fsync/fdatasync/O_SYNC and `--fsync-mode s3` force through; S3 fsync is inode/partition-scoped | done | `cli::{fusefs,fusefs_ops,main}` |
+| Increasing dirty-pressure throttle before hard-limit ENOSPC | done | `cli::writeback` |
+| Five write-back scenarios and through-vs-back census benchmark | done | `harness::{scenarios,bench}`, `docs/TESTING.md` |
+
+### Phase 5b exit criteria (plan 05b)
+
+- [x] `writeback-bigfile`: 320 MiB (10x a 32 MiB cache), peak daemon
+  RSS 242 MiB and peak cache usage 32 MiB.
+- [x] `writeback-latency`: 24 closes under 150 ms S3 latency took
+  8.98 s through versus 20.61 ms back, comfortably above the 3x gate.
+- [x] Census import (20k x 4 KiB, 100 dirs): through copy 87.0 s /
+  230 files/s; back copy 7.9 s / 2539 files/s (11.0x), fully drained
+  in 10.8 s / 1857 files/s.
+- [x] Drain, fsync-after-kill, and S3-cut backpressure/recovery pass in
+  `writeback-drain`, `writeback-fsync`, and `writeback-backpressure`.
+
+Write-back keeps the ship-time upload barrier but trades immediate
+cross-node visibility and permanent-node-loss durability for local-disk
+close latency. Dirty chunks remain non-evictable and are not peer-served;
+P2P announcement remains post-S3. Handoff, leave, unmount, and epoch close
+all drain the same durable queue. Explicit fsync remains conservative:
+local-only durability is POSIX-valid across reboot, but acknowledging data
+that can disappear with permanent node loss is too surprising.
+
+Deferred: a LIST-seeded existence bloom for cold high-dedup imports,
+dirty peer serving, and record-bearing P2P are separate data/visibility
+plane work.
+
 ## Later phases
 
-Phases 5 and 5a are closed. Planned next: phase 5b (streaming writes
-and the write-through/write-back policy) — see
-`docs/plans/05b-p5b-streaming-writeback.md`. Not started: phases 6–8
+Phases 5, 5a, and 5b are closed. Not started: phases 6–8
 (snapshots/E2E, web UI, GC). No code exists for any of these yet.

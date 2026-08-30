@@ -88,6 +88,32 @@ pub fn run(cfg: &BenchConfig) -> Result<()> {
         cfg.files as f64 / durable_s,
     );
 
+    // Same staged tree under write-back. Copy time is the operator
+    // visible import figure; switching back to through is the explicit
+    // drain barrier and gives the corresponding durable time.
+    let back_backend = format!("s3://{BUCKET}/bench-back-{}", std::process::id());
+    let mut back = Client::new(root.path(), "bench-back", &env.endpoint, &back_backend)?
+        .with_write_mode("back");
+    back.fs_create()?;
+    back.mount()?;
+    let back_t0 = Instant::now();
+    let status = std::process::Command::new("cp")
+        .arg("-r")
+        .arg(&staged)
+        .arg(back.mnt.join("census"))
+        .status()?;
+    anyhow::ensure!(status.success(), "write-back cp -r failed");
+    let back_copy_s = back_t0.elapsed().as_secs_f64();
+    back.set_write_mode("through")?;
+    let back_durable_s = back_t0.elapsed().as_secs_f64();
+    eprintln!(
+        "write-back import: copy {back_copy_s:.1}s ({:.0} files/s), drained {back_durable_s:.1}s ({:.0} files/s); through/back copy speedup {:.1}x",
+        cfg.files as f64 / back_copy_s,
+        cfg.files as f64 / back_durable_s,
+        copy_s / back_copy_s,
+    );
+    back.unmount()?;
+
     // Metadata walk over the full tree (warm replica).
     c.mount()?;
     let t1 = Instant::now();

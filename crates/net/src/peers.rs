@@ -1052,6 +1052,11 @@ mod tests {
     async fn chunk_timeout_bounds_the_wait_and_server_work_releases() {
         let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::from_millis(150));
         let asker = chunk_pair(service.clone()).await;
+        // Warm the pooled QUIC connection. Otherwise the deliberately
+        // tiny timeout can expire during the first handshake before
+        // server work starts, making the assertion below scheduler-
+        // dependent instead of testing cancellation of an active serve.
+        asker.request_chunk(1, &a_hash()).await.unwrap().unwrap();
         let started = Instant::now();
         let got = asker
             .request_chunk_with_timeout(1, &a_hash(), Duration::from_millis(20))

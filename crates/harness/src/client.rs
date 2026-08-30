@@ -21,6 +21,7 @@ pub struct Client {
     env: Vec<(String, String)>,
     /// `--cache-size` override; `None` keeps the binary's default.
     cache_size: Option<u64>,
+    write_mode: Option<String>,
 }
 
 fn bin() -> PathBuf {
@@ -54,6 +55,7 @@ impl Client {
             child: None,
             env: Vec::new(),
             cache_size: None,
+            write_mode: None,
         })
     }
 
@@ -66,6 +68,11 @@ impl Client {
     /// Override `--cache-size` (bytes) at mount time.
     pub fn with_cache_size(mut self, bytes: u64) -> Self {
         self.cache_size = Some(bytes);
+        self
+    }
+
+    pub fn with_write_mode(mut self, mode: &str) -> Self {
+        self.write_mode = Some(mode.to_string());
         self
     }
 
@@ -122,6 +129,10 @@ impl Client {
         if let Some(bytes) = self.cache_size {
             args.push("--cache-size".to_string());
             args.push(bytes.to_string());
+        }
+        if let Some(mode) = &self.write_mode {
+            args.push("--write-mode".to_string());
+            args.push(mode.clone());
         }
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let child = self
@@ -285,6 +296,22 @@ impl Client {
             resp["resp"] == "ok",
             "reintegration failed: {resp}; log:\n{}",
             self.tail_log_n(80)
+        );
+        Ok(())
+    }
+
+    pub fn set_write_mode(&self, mode: &str) -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        let sock = self.state.join("control.sock");
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
+        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+        writeln!(stream, "{{\"cmd\":\"set_write_mode\",\"mode\":\"{mode}\"}}")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        let response: serde_json::Value = serde_json::from_str(&line)?;
+        anyhow::ensure!(
+            response["resp"] == "ok",
+            "write-mode switch failed: {response}"
         );
         Ok(())
     }

@@ -198,6 +198,17 @@ impl DiskCache {
         }
     }
 
+    pub fn dirty_bytes(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .filter(|entry| entry.state == ChunkState::Dirty)
+            .map(|entry| entry.size)
+            .sum()
+    }
+
     pub fn contains(&self, hash: &ChunkHash) -> bool {
         self.state.lock().unwrap().entries.contains_key(hash)
     }

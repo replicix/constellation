@@ -13,6 +13,7 @@ mod reintegrate;
 mod shipper;
 mod sources;
 mod staging;
+mod writeback;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -59,6 +60,10 @@ enum Command {
         /// ship) or "s3" (record durable in the shared log).
         #[arg(long, default_value = "local")]
         fsync_mode: String,
+        /// Chunk close policy: "through" waits for S3; "back" returns
+        /// after the local durable queue is journaled.
+        #[arg(long, default_value = "through")]
+        write_mode: String,
         /// Enrol this state directory as a read-only cluster member.
         /// Only valid on its first mount; RO members do not count toward
         /// a continuation epoch's write-eligible roster.
@@ -138,6 +143,13 @@ enum Command {
         /// Never skips an open epoch or a stranded deposed journal.
         #[arg(long)]
         force: bool,
+    },
+    /// Change a running mount's write policy. Switching to `through`
+    /// drains the durable pending-upload queue before it takes effect.
+    WriteMode {
+        mode: String,
+        #[arg(long)]
+        state_dir: PathBuf,
     },
 }
 
@@ -282,6 +294,15 @@ fn main() -> Result<()> {
             &state_dir,
             constellation_api::Request::Leave { node_id, force },
         )),
+        Command::WriteMode { mode, state_dir } => {
+            let mode: writeback::WriteMode = mode.parse().map_err(anyhow::Error::msg)?;
+            rt.block_on(control_call(
+                &state_dir,
+                constellation_api::Request::SetWriteMode {
+                    mode: mode.as_str().into(),
+                },
+            ))
+        }
         Command::Mount {
             s3,
             mountpoint,
@@ -289,6 +310,7 @@ fn main() -> Result<()> {
             cache_size,
             allow_other,
             fsync_mode,
+            write_mode,
             read_only_member,
         } => {
             let fsync_s3 = match fsync_mode.as_str() {
@@ -296,6 +318,8 @@ fn main() -> Result<()> {
                 "s3" => true,
                 other => bail!("invalid --fsync-mode {other:?} (expected local or s3)"),
             };
+            let write_mode: writeback::WriteMode =
+                write_mode.parse().map_err(anyhow::Error::msg)?;
             mount(
                 rt,
                 &s3,
@@ -304,6 +328,7 @@ fn main() -> Result<()> {
                 cache_size,
                 allow_other,
                 fsync_s3,
+                write_mode,
                 read_only_member,
             )
         }
@@ -319,6 +344,7 @@ fn mount(
     cache_size: u64,
     allow_other: bool,
     fsync_s3: bool,
+    initial_write_mode: writeback::WriteMode,
     read_only_member: bool,
 ) -> Result<()> {
     let store = std::sync::Arc::new(ChunkStore::new(backend::open_backend(s3)?));
@@ -437,6 +463,8 @@ fn mount(
         );
         constellation_store_s3::LeaseMode::SingleWriter
     };
+    let write_mode = std::sync::Arc::new(writeback::WriteModeState::new(initial_write_mode));
+    let upload = std::sync::Arc::new(UploadRuntime::new(caps.create_if_absent));
     let mut keeper = lease::LeaseKeeper::new(
         constellation_store_s3::LeaseStore::new(
             store.inner().clone(),
@@ -525,6 +553,7 @@ fn mount(
                 epoch_active: Some(epochs.active.clone()),
                 departed: Some(departed.clone()),
                 read_only_member,
+                write_mode: write_mode.clone(),
             }),
             coop: Some(coop.clone()),
             staging_dir: staging_dir.clone(),
@@ -737,6 +766,7 @@ fn mount(
             reintegration,
             state_dir,
             designations,
+            upload,
         ) = (
             ship.clone(),
             stop.clone(),
@@ -754,6 +784,7 @@ fn mount(
             reintegration.clone(),
             state_dir.clone(),
             designations.clone(),
+            upload.clone(),
         );
         rt.spawn(async move {
             let mut pending: Option<fusefs::SyncRequest> = None;
@@ -850,7 +881,15 @@ fn mount(
                                     k.release_local();
                                     held
                                 } else if let Err(e) =
-                                    upload_dirty_chunks(&cache, &meta, &chunk_store, compression).await
+                                    upload_dirty_chunks(
+                                        &cache,
+                                        &meta,
+                                        &chunk_store,
+                                        compression,
+                                        &upload,
+                                        None,
+                                    )
+                                    .await
                                 {
                                     tracing::warn!(
                                         error = %e,
@@ -880,17 +919,41 @@ fn mount(
                         };
                         let _ = reply.send(epoch);
                     }
-                    Some(fusefs::SyncRequest::Barrier(reply)) => {
-                        let r = run_managed_sync_round(
-                            &ship,
-                            &keepers,
-                            &epochs,
-                            &meta,
+                    Some(fusefs::SyncRequest::DrainInode { ino, reply }) => {
+                        let result = upload_dirty_chunks(
                             &cache,
+                            &meta,
                             &chunk_store,
                             compression,
+                            &upload,
+                            (ino != 0).then_some(ino),
                         )
                         .await;
+                        let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                    }
+                    Some(fusefs::SyncRequest::Barrier { ino, reply }) => {
+                        // `--fsync-mode s3` is an inode/partition
+                        // barrier, not a whole-mount backlog drain.
+                        let mut r = upload_dirty_chunks(
+                            &cache,
+                            &meta,
+                            &chunk_store,
+                            compression,
+                            &upload,
+                            Some(ino),
+                        )
+                        .await;
+                        if r.is_ok() {
+                            let part = meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
+                            let mut ship = ship.lock().await;
+                            let mut keepers = keepers.lock().await;
+                            r = match keepers.get_mut(&part) {
+                                Some(keeper) => ship.sync_one(&part, keeper).await,
+                                None => Err(anyhow::anyhow!(
+                                    "no lease keeper for fsync partition {part}"
+                                )),
+                            };
+                        }
                         if let Err(e) = &r {
                             tracing::warn!(error = %e, "metadata sync failed; will retry");
                             spool.lock().unwrap().last_error = Some(format!("{e:#}"));
@@ -928,7 +991,15 @@ fn mount(
                         // self-leave does not strand content that only
                         // exists in the local cache.
                         if let Err(e) =
-                            upload_dirty_chunks(&cache, &meta, &chunk_store, compression).await
+                            upload_dirty_chunks(
+                                &cache,
+                                &meta,
+                                &chunk_store,
+                                compression,
+                                &upload,
+                                None,
+                            )
+                            .await
                         {
                             let _ = reply.send(Err(format!(
                                 "cannot upload dirty chunks before leave: {e:#}"
@@ -965,6 +1036,7 @@ fn mount(
                                 &cache,
                                 &chunk_store,
                                 compression,
+                                &upload,
                             ) => {
                                 if let Err(e) = r {
                                     tracing::warn!(
@@ -1015,6 +1087,8 @@ fn mount(
         departed: departed.clone(),
         rt: rt.handle().clone(),
         coop: coop.clone(),
+        write_mode: write_mode.clone(),
+        upload: upload.clone(),
     });
     {
         let _guard = rt.enter();
@@ -1048,7 +1122,8 @@ fn mount(
         // is the last chance to drain `pending_upload` before the
         // journal ships — an unmount that refuses to finish cleanly here
         // is strictly better than one that silently strands content.
-        if let Err(e) = upload_dirty_chunks(&cache, &meta, &store, compression).await {
+        if let Err(e) = upload_dirty_chunks(&cache, &meta, &store, compression, &upload, None).await
+        {
             ship.lock().await.set_skip_ship(true);
             return Err(e).context(
                 "uploading dirty chunks before unmount; the journal was left un-shipped \
@@ -1392,25 +1467,116 @@ async fn run_sync_round(
 /// here already makes every caller treat the round as failed and skip
 /// shipping (see `run_managed_sync_round`'s existing epoch-propose-on-
 /// failure path), which is exactly the "journal must wait" behavior.
+struct UploadRuntime {
+    concurrency: usize,
+    create_if_absent: bool,
+    probe: std::sync::Mutex<writeback::ProbePolicy>,
+    decisions: std::sync::atomic::AtomicU64,
+}
+
+impl UploadRuntime {
+    fn new(create_if_absent: bool) -> Self {
+        let concurrency = std::env::var("CONSTELLATION_UPLOAD_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 32);
+        Self {
+            concurrency,
+            create_if_absent,
+            probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
+            decisions: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn put_mode(&self) -> constellation_store_s3::ChunkPutMode {
+        let n = self
+            .decisions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.probe.lock().unwrap().enabled() || n.is_multiple_of(16) {
+            constellation_store_s3::ChunkPutMode::Probe
+        } else if self.create_if_absent {
+            constellation_store_s3::ChunkPutMode::Create
+        } else {
+            constellation_store_s3::ChunkPutMode::Overwrite
+        }
+    }
+}
+
 async fn upload_dirty_chunks(
     cache: &DiskCache,
     meta: &SqliteMeta,
     store: &ChunkStore,
     compression: CompressionSetting,
+    upload: &UploadRuntime,
+    only_ino: Option<constellation_fs_core::Ino>,
 ) -> Result<()> {
+    use futures::{stream, StreamExt};
+    let mut grouped: std::collections::HashMap<
+        constellation_fs_core::ChunkHash,
+        Vec<constellation_fs_core::Ino>,
+    > = std::collections::HashMap::new();
     for (hash, ino) in meta.pending_uploads()? {
-        let Some(data) = cache.get(&hash)? else {
-            tracing::error!(
-                %hash,
-                ino,
-                "pending upload chunk missing from local cache (unrecoverable content); \
-                 leaving the pending row and refusing to ship"
-            );
-            bail!("pending upload chunk {hash} for ino {ino} missing from local cache");
-        };
-        store.put_chunk(&hash, &data, compression).await?;
-        cache.set_state(&hash, constellation_fs_core::cache::ChunkState::Clean);
-        meta.ack_upload(&hash, ino)?;
+        if only_ino.is_some_and(|wanted| ino != wanted) {
+            continue;
+        }
+        grouped.entry(hash).or_default().push(ino);
+    }
+    let jobs = grouped
+        .into_iter()
+        .map(|(hash, inos)| {
+            let Some(data) = cache.get(&hash)? else {
+                tracing::error!(
+                    %hash,
+                    ?inos,
+                    "pending upload chunk missing from local cache (unrecoverable content); \
+                     leaving the pending row and refusing to ship"
+                );
+                bail!("pending upload chunk {hash} missing from local cache");
+            };
+            Ok((hash, inos, data))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let results = stream::iter(jobs.into_iter().map(|(hash, inos, data)| async move {
+        let mode = upload.put_mode();
+        let mut last = None;
+        for attempt in 0..3 {
+            match store.put_chunk_mode(&hash, &data, compression, mode).await {
+                Ok(result) => return Ok((hash, inos, mode, result.existed)),
+                Err(error) => last = Some(error),
+            }
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
+    }))
+    .buffer_unordered(upload.concurrency)
+    .collect::<Vec<_>>()
+    .await;
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok((hash, inos, mode, existed)) => {
+                if mode == constellation_store_s3::ChunkPutMode::Probe {
+                    upload.probe.lock().unwrap().record(existed);
+                }
+                for ino in inos {
+                    meta.ack_upload(&hash, ino)?;
+                }
+                if !meta.upload_pending_for_hash(&hash)? {
+                    cache.set_state(&hash, constellation_fs_core::cache::ChunkState::Clean);
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(())
 }
@@ -1420,6 +1586,7 @@ async fn upload_dirty_chunks(
 /// error for spool observability. While active, a successful tail probe
 /// means S3 returned: upload dirty chunks first, close the promise, then
 /// resume ordinary CAS-serialized shipping.
+#[allow(clippy::too_many_arguments)]
 async fn run_managed_sync_round(
     ship: &std::sync::Arc<tokio::sync::Mutex<shipper::Shipper>>,
     keepers: &std::sync::Arc<
@@ -1430,6 +1597,7 @@ async fn run_managed_sync_round(
     cache: &DiskCache,
     store: &ChunkStore,
     compression: CompressionSetting,
+    upload: &UploadRuntime,
 ) -> Result<()> {
     if epochs.is_open() {
         {
@@ -1461,7 +1629,7 @@ async fn run_managed_sync_round(
             // publication, then follows with its older local journal.
             return Ok(());
         }
-        upload_dirty_chunks(cache, meta, store, compression).await?;
+        upload_dirty_chunks(cache, meta, store, compression, upload, None).await?;
         {
             let ship = ship.lock().await;
             ship.set_skip_ship(false);
@@ -1495,7 +1663,7 @@ async fn run_managed_sync_round(
         return result;
     }
 
-    if let Err(error) = upload_dirty_chunks(cache, meta, store, compression).await {
+    if let Err(error) = upload_dirty_chunks(cache, meta, store, compression, upload, None).await {
         let base = meta.applied_vector()?;
         if epochs.maybe_propose(base).await? {
             let ship = ship.lock().await;
@@ -1618,6 +1786,8 @@ struct DaemonStatus {
     /// Handle for the blocking control-API calls that need to await.
     rt: tokio::runtime::Handle,
     coop: std::sync::Arc<crate::coop::Coop>,
+    write_mode: std::sync::Arc<writeback::WriteModeState>,
+    upload: std::sync::Arc<UploadRuntime>,
 }
 
 impl constellation_api::StatusSource for DaemonStatus {
@@ -1703,6 +1873,20 @@ impl constellation_api::StatusSource for DaemonStatus {
                     .unwrap_or(0),
             ),
             coop: self.coop.report(),
+            writeback: {
+                let probe = self.upload.probe.lock().unwrap();
+                constellation_api::WritebackStatus {
+                    mode: self.write_mode.get().as_str().into(),
+                    dirty_bytes: self
+                        .cache
+                        .dirty_bytes()
+                        .saturating_add(self.staging_budget.used()),
+                    pending_uploads: self.meta.pending_upload_count().unwrap_or(0),
+                    upload_concurrency: self.upload.concurrency as u32,
+                    remote_probe_enabled: probe.enabled(),
+                    remote_probe_hit_rate: probe.hit_rate(),
+                }
+            },
         }
     }
 
@@ -1819,6 +2003,26 @@ impl constellation_api::StatusSource for DaemonStatus {
             }
         }
     }
+
+    fn set_write_mode(&self, mode: &str) -> std::result::Result<String, String> {
+        let requested: writeback::WriteMode = mode.parse().map_err(str::to_string)?;
+        if self.write_mode.get() == requested {
+            return Ok(format!("write mode already {}", requested.as_str()));
+        }
+        if requested == writeback::WriteMode::Through {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            self.sync_tx
+                .send(fusefs::SyncRequest::DrainInode { ino: 0, reply })
+                .map_err(|_| "sync task is not running".to_string())?;
+            tokio::task::block_in_place(|| {
+                self.rt
+                    .block_on(receive)
+                    .map_err(|_| "upload drain stopped".to_string())?
+            })?;
+        }
+        self.write_mode.set(requested);
+        Ok(format!("write mode set to {}", requested.as_str()))
+    }
 }
 
 fn default_state_dir(meta: &FsMeta) -> PathBuf {
@@ -1851,7 +2055,7 @@ mod pending_upload_tests {
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     /// Wraps an in-memory backend and can be told to fail every `put`,
@@ -1861,6 +2065,10 @@ mod pending_upload_tests {
     struct FailingStore {
         inner: InMemory,
         fail_puts: AtomicBool,
+        delay_puts: AtomicBool,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        puts: AtomicUsize,
     }
 
     impl FailingStore {
@@ -1868,11 +2076,19 @@ mod pending_upload_tests {
             Arc::new(Self {
                 inner: InMemory::new(),
                 fail_puts: AtomicBool::new(false),
+                delay_puts: AtomicBool::new(false),
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+                puts: AtomicUsize::new(0),
             })
         }
 
         fn set_fail_puts(&self, fail: bool) {
             self.fail_puts.store(fail, Ordering::SeqCst);
+        }
+
+        fn set_delay_puts(&self, delay: bool) {
+            self.delay_puts.store(delay, Ordering::SeqCst);
         }
     }
 
@@ -1890,13 +2106,22 @@ mod pending_upload_tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> object_store::Result<PutResult> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            let active = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(active, Ordering::SeqCst);
+            if self.delay_puts.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
             if self.fail_puts.load(Ordering::SeqCst) {
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 return Err(object_store::Error::Generic {
                     store: "FailingStore",
                     source: "S3 path is cut (test injection)".into(),
                 });
             }
-            self.inner.put_opts(location, payload, opts).await
+            let result = self.inner.put_opts(location, payload, opts).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
         }
 
         async fn put_multipart_opts(
@@ -2016,6 +2241,8 @@ mod pending_upload_tests {
             &f.meta,
             &f.store,
             CompressionSetting::RAW,
+            &UploadRuntime::new(true),
+            None,
         ))
         .unwrap();
 
@@ -2052,6 +2279,8 @@ mod pending_upload_tests {
             &f.meta,
             &f.store,
             CompressionSetting::RAW,
+            &UploadRuntime::new(true),
+            None,
         ));
         assert!(err.is_err(), "drain must fail while S3 is unreachable");
         assert_eq!(
@@ -2067,8 +2296,54 @@ mod pending_upload_tests {
             &f.meta,
             &f.store,
             CompressionSetting::RAW,
+            &UploadRuntime::new(true),
+            None,
         ))
         .unwrap();
         assert!(f.meta.pending_uploads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn upload_pool_honours_its_bound() {
+        let f = fixture();
+        f.failing.set_delay_puts(true);
+        for i in 0..12u8 {
+            let file = f
+                .meta
+                .create(
+                    constellation_fs_core::types::ROOT_INO,
+                    &format!("f-{i}"),
+                    0o644,
+                    0,
+                    0,
+                )
+                .unwrap();
+            let data = vec![i; 4096];
+            let hash = ChunkHash::of(&data);
+            f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
+            f.meta
+                .set_manifest_dirty(file.ino, b"M", data.len() as u64, &[hash])
+                .unwrap();
+        }
+        let upload = UploadRuntime {
+            concurrency: 3,
+            create_if_absent: true,
+            probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
+            decisions: AtomicU64::new(0),
+        };
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &upload,
+            None,
+        ))
+        .unwrap();
+        assert!(f.failing.max_in_flight.load(Ordering::SeqCst) <= 3);
+        assert!(
+            f.failing.max_in_flight.load(Ordering::SeqCst) >= 2,
+            "the test must observe actual parallelism"
+        );
     }
 }

@@ -1216,6 +1216,41 @@ impl SqliteMeta {
         Ok(out)
     }
 
+    /// Enrol an eagerly sealed chunk before the manifest commit. If the
+    /// writer crashes before committing, uploading the resulting
+    /// content-addressed orphan is harmless and later GC reclaims it.
+    pub fn add_pending_upload(&self, hash: &ChunkHash, ino: Ino) -> Result<(), MetaError> {
+        self.conn.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO pending_upload (hash, ino) VALUES (?1, ?2)",
+            params![hash.0.to_vec(), ino],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_upload_count(&self) -> Result<u64, MetaError> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM pending_upload",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn upload_pending_for_hash(&self, hash: &ChunkHash) -> Result<bool, MetaError> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_upload WHERE hash = ?1)",
+            params![hash.0.to_vec()],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn pending_uploads_for_inode(&self, ino: Ino) -> Result<Vec<(ChunkHash, Ino)>, MetaError> {
+        Ok(self
+            .pending_uploads()?
+            .into_iter()
+            .filter(|(_, row_ino)| *row_ino == ino)
+            .collect())
+    }
+
     /// Ack one pending upload. Deleting the row for `(hash, ino)` never
     /// disturbs a different inode still pending on the same hash (dedup
     /// across inodes is the upload side's job, not this table's).
@@ -1226,6 +1261,13 @@ impl SqliteMeta {
             params![hash.0.to_vec(), ino],
         )?;
         Ok(())
+    }
+
+    /// Cancel an eager seal that was re-dirtied before its manifest
+    /// committed. If a worker already completed the upload this delete
+    /// is a harmless no-op; immutable orphan content is GC-safe.
+    pub fn cancel_pending_upload(&self, hash: &ChunkHash, ino: Ino) -> Result<(), MetaError> {
+        self.ack_upload(hash, ino)
     }
 }
 

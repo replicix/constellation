@@ -318,26 +318,32 @@ impl Filesystem for ConstellationFs {
         offset: i64,
         data: &[u8],
         _write_flags: u32,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         match self.do_write(ino, offset as u64, data) {
+            Ok(n) if flags & (libc::O_SYNC | libc::O_DSYNC) != 0 => {
+                match self.flush_inode(ino, true) {
+                    Ok(()) => reply.written(n),
+                    Err(error) => reply.error(error),
+                }
+            }
             Ok(n) => reply.written(n),
             Err(e) => reply.error(e),
         }
     }
 
     fn flush(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        match self.flush_inode(ino) {
+        match self.flush_inode(ino, false) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
     }
 
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
-        match self.flush_inode(ino) {
-            Ok(()) => match self.sync_barrier() {
+        match self.flush_inode(ino, true) {
+            Ok(()) => match self.sync_barrier(ino) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(e),
             },
@@ -350,12 +356,12 @@ impl Filesystem for ConstellationFs {
         _req: &Request<'_>,
         ino: u64,
         _fh: u64,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let flush_result = self.flush_inode(ino);
+        let flush_result = self.flush_inode(ino, flags & (libc::O_SYNC | libc::O_DSYNC) != 0);
         let last = {
             let mut opens = self.opens.lock().unwrap();
             match opens.get_mut(&ino) {
@@ -469,6 +475,11 @@ impl ConstellationFs {
         for slice in layout.slices(offset, len) {
             let full_len = layout.chunk_len(file_len, slice.index);
             let chunk: Vec<u8> = match &ws {
+                Some(w) if w.sealed.contains_key(&slice.index) => self
+                    .cache
+                    .get(w.sealed.get(&slice.index).unwrap())
+                    .map_err(|_| libc::EIO)?
+                    .ok_or(libc::EIO)?,
                 Some(w) if w.staging.is_dirty(slice.index) => {
                     let mut buf = vec![0u8; full_len as usize];
                     w.staging
@@ -505,24 +516,48 @@ impl ConstellationFs {
         if data.is_empty() {
             return Ok(0);
         }
+        let dirty = self.cache.dirty_bytes();
+        let budget = self.cache.usage().budget;
+        match crate::writeback::throttle_delay(dirty, budget) {
+            Ok(delay) if !delay.is_zero() => std::thread::sleep(delay),
+            Ok(_) => {}
+            Err(()) => return Err(libc::ENOSPC),
+        }
         let manifest = self.load_manifest(ino)?;
         let hashes = self.chunk_list(&manifest)?;
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let mut writes = self.writes.lock().unwrap();
         let ws = self.write_state(&mut writes, ino, &manifest)?;
-        let new_file_len = ws.file_len.max(offset + data.len() as u64);
+        let write_end = offset + data.len() as u64;
+        let new_file_len = ws.file_len.max(write_end);
         let mut consumed = 0usize;
         for slice in layout.slices(offset, data.len() as u64) {
             let full_len = layout.chunk_len(new_file_len, slice.index);
             let is_whole_chunk = slice.offset == 0 && slice.len == full_len;
             let chunk_start = slice.index * self.chunk_size as u64;
+            let sealed = ws.sealed.remove(&slice.index);
+            ws.staging
+                .prepare_chunk(slice.index, self.chunk_size)
+                .map_err(|e| staging_errno(&e))?;
+            if let Some(old_hash) = sealed {
+                self.meta
+                    .cancel_pending_upload(&old_hash, ino)
+                    .map_err(|error| errno(&error))?;
+            }
             // A partial (not-whole-chunk) write into a chunk this open
             // handle has not touched yet must first seed the untouched
             // bytes from the committed content — otherwise they would
             // read back as a spurious hole (zero) instead of their real
             // pre-write value.
             if !is_whole_chunk && !ws.staging.is_dirty(slice.index) {
-                let seed = self.committed_chunk_padded(&hashes, slice.index, full_len)?;
+                let seed = match sealed {
+                    Some(hash) => {
+                        let mut data = self.cache.get(&hash).map_err(|_| libc::EIO)?.ok_or(libc::EIO)?;
+                        data.resize(full_len as usize, 0);
+                        data
+                    }
+                    None => self.committed_chunk_padded(&hashes, slice.index, full_len)?,
+                };
                 ws.staging
                     .write_at(chunk_start, &seed)
                     .map_err(|e| staging_errno(&e))?;
@@ -537,6 +572,10 @@ impl ConstellationFs {
             consumed += slice.len as usize;
         }
         ws.file_len = new_file_len;
+        if offset <= ws.high_water && write_end > ws.high_water {
+            ws.high_water = write_end;
+        }
+        self.seal_crossed_chunks(ino, ws)?;
         Ok(data.len() as u32)
     }
 

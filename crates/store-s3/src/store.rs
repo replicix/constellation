@@ -85,6 +85,21 @@ pub struct ChunkStore {
     store: Arc<dyn ObjectStore>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkPutMode {
+    /// Probe with HEAD, then PUT only on a miss.
+    Probe,
+    /// One conditional PUT (`If-None-Match: *`).
+    Create,
+    /// Unconditional PUT for backends lacking create-if-absent.
+    Overwrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkPutResult {
+    pub existed: bool,
+}
+
 impl ChunkStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self { store }
@@ -136,14 +151,60 @@ impl ChunkStore {
         data: &[u8],
         setting: CompressionSetting,
     ) -> Result<(), StoreError> {
+        self.put_chunk_mode(hash, data, setting, ChunkPutMode::Create)
+            .await
+            .map(|_| ())
+    }
+
+    /// Store a chunk using one rung of the upload dedup ladder.
+    ///
+    /// Encoding is CPU-bound zstd work and must not occupy an async
+    /// runtime worker when a bounded upload pool runs many chunks at
+    /// once. `PutMode::Create` is one RTT and treats `AlreadyExists` as
+    /// success. object_store does not send `Expect: 100-continue`, so
+    /// a create hit still transmits the body; it saves the HEAD and
+    /// avoids creating another version, not uplink bandwidth.
+    pub async fn put_chunk_mode(
+        &self,
+        hash: &ChunkHash,
+        data: &[u8],
+        setting: CompressionSetting,
+        mode: ChunkPutMode,
+    ) -> Result<ChunkPutResult, StoreError> {
         debug_assert_eq!(&ChunkHash::of(data), hash);
         let key = layout::chunk_key(hash);
-        if self.store.head(&key).await.is_ok() {
-            return Ok(()); // dedup: identical content already stored
+        if mode == ChunkPutMode::Probe {
+            match self.store.head(&key).await {
+                Ok(_) => return Ok(ChunkPutResult { existed: true }),
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        let obj = format::encode_object(data, setting)?;
-        self.store.put(&key, PutPayload::from(obj)).await?;
-        Ok(())
+        let owned = data.to_vec();
+        let obj = tokio::task::spawn_blocking(move || format::encode_object(&owned, setting))
+            .await
+            .map_err(|error| StoreError::Meta(format!("chunk encoder task failed: {error}")))??;
+        let result = match mode {
+            ChunkPutMode::Create => {
+                self.store
+                    .put_opts(
+                        &key,
+                        PutPayload::from(obj),
+                        PutOptions::from(PutMode::Create),
+                    )
+                    .await
+            }
+            ChunkPutMode::Probe | ChunkPutMode::Overwrite => {
+                self.store.put(&key, PutPayload::from(obj)).await
+            }
+        };
+        match result {
+            Ok(_) => Ok(ChunkPutResult { existed: false }),
+            Err(object_store::Error::AlreadyExists { .. }) if mode == ChunkPutMode::Create => {
+                Ok(ChunkPutResult { existed: true })
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Fetch and verify a chunk by content address.

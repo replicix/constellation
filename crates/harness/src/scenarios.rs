@@ -217,6 +217,36 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         run: unmount_drain,
     },
+    Scenario {
+        name: "writeback-latency",
+        desc: "150ms S3 latency: write-back small-file closes beat write-through by at least 3x",
+        requires: &[],
+        run: writeback_latency,
+    },
+    Scenario {
+        name: "writeback-bigfile",
+        desc: "write-back streams a file ten times cache budget within RSS and cache ceilings",
+        requires: &[],
+        run: writeback_bigfile,
+    },
+    Scenario {
+        name: "writeback-drain",
+        desc: "back-to-through switch drains pending uploads before returning",
+        requires: &[],
+        run: writeback_drain,
+    },
+    Scenario {
+        name: "writeback-fsync",
+        desc: "fsync under write-back reaches S3 before kill -9",
+        requires: &[],
+        run: writeback_fsync,
+    },
+    Scenario {
+        name: "writeback-backpressure",
+        desc: "S3 cut throttles then returns ENOSPC at the dirty hard limit and recovers",
+        requires: &[],
+        run: writeback_backpressure,
+    },
 ];
 
 fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
@@ -2404,5 +2434,190 @@ fn unmount_drain(seed: u64) -> Result<()> {
         .context("second node reading the file written under the cut")?;
     anyhow::ensure!(back == data, "second node saw corrupt/partial content");
     c1.unmount()?;
+    Ok(())
+}
+
+fn timed_small_file_import(mode: &str, tag: &str) -> Result<Duration> {
+    let (env, root) = setup(tag)?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/{tag}-{}", ts());
+    let mut client = Client::new(root.path(), "c0", &env.endpoint, &backend)?
+        .with_write_mode(mode)
+        .with_env("CONSTELLATION_UPLOAD_CONCURRENCY", "8");
+    client.fs_create()?;
+    client.mount()?;
+    proxy.latency(150, 0)?;
+    let started = std::time::Instant::now();
+    for i in 0..24 {
+        let data = pattern(i, 8192);
+        std::fs::write(client.mnt.join(format!("f-{i:03}")), data)?;
+    }
+    let elapsed = started.elapsed();
+    proxy.heal()?;
+    client.set_write_mode("through")?;
+    for i in 0..24 {
+        anyhow::ensure!(
+            std::fs::read(client.mnt.join(format!("f-{i:03}")))? == pattern(i, 8192),
+            "{mode} import content mismatch at file {i}"
+        );
+    }
+    client.unmount()?;
+    Ok(elapsed)
+}
+
+fn writeback_latency(_seed: u64) -> Result<()> {
+    let through = timed_small_file_import("through", "writeback-latency-through")?;
+    let back = timed_small_file_import("back", "writeback-latency-back")?;
+    eprintln!("    writeback-latency: through={through:.2?} back={back:.2?}");
+    anyhow::ensure!(
+        back * 3 < through,
+        "write-back must beat write-through by 3x, through={through:?} back={back:?}"
+    );
+    Ok(())
+}
+
+fn writeback_bigfile(seed: u64) -> Result<()> {
+    let (env, root) = setup("writeback-bigfile")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/writeback-big-{}", ts());
+    let cache_size = 32 * 1024 * 1024u64;
+    let mut client = Client::new(root.path(), "c0", &env.endpoint, &backend)?
+        .with_cache_size(cache_size)
+        .with_write_mode("back");
+    client.fs_create()?;
+    client.mount()?;
+    let data = pattern(seed, (cache_size * 10) as usize);
+    let expected = blake3::hash(&data);
+    let path = client.mnt.join("ten-x.bin");
+    let mut peak_rss = 0;
+    let mut peak_cache = 0;
+    std::thread::scope(|scope| -> Result<()> {
+        let writer = scope.spawn(|| -> Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path)?;
+            for piece in data.chunks(1024 * 1024) {
+                file.write_all(piece)?;
+            }
+            Ok(())
+        });
+        while !writer.is_finished() {
+            peak_rss = peak_rss.max(client.rss_bytes().unwrap_or(0));
+            peak_cache = peak_cache.max(
+                client.control_status()?["cache"]["used_bytes"]
+                    .as_u64()
+                    .unwrap_or(0),
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        writer.join().expect("writer panicked")
+    })?;
+    client.set_write_mode("through")?;
+    let rss_ceiling = cache_size + 240 * 1024 * 1024;
+    anyhow::ensure!(peak_rss < rss_ceiling, "RSS {peak_rss} >= {rss_ceiling}");
+    anyhow::ensure!(
+        peak_cache <= cache_size,
+        "cache {peak_cache} exceeded budget {cache_size}"
+    );
+    anyhow::ensure!(blake3::hash(&std::fs::read(&path)?) == expected);
+    eprintln!(
+        "    writeback-bigfile: file={} MiB peak_rss={} MiB peak_cache={} MiB",
+        data.len() / 1024 / 1024,
+        peak_rss / 1024 / 1024,
+        peak_cache / 1024 / 1024
+    );
+    client.unmount()?;
+    Ok(())
+}
+
+fn writeback_drain(seed: u64) -> Result<()> {
+    let (env, root) = setup("writeback-drain")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/writeback-drain-{}", ts());
+    let mut a = Client::new(root.path(), "a", &env.endpoint, &backend)?.with_write_mode("back");
+    a.fs_create()?;
+    a.mount()?;
+    let data = pattern(seed, 24 * 1024 * 1024);
+    std::fs::write(a.mnt.join("payload"), &data)?;
+    a.set_write_mode("through")?;
+    let status = a.control_status()?;
+    anyhow::ensure!(
+        status["writeback"]["pending_uploads"].as_u64() == Some(0),
+        "back-to-through returned with pending uploads: {status}"
+    );
+    a.unmount()?;
+    let mut b = Client::new(root.path(), "b", &env.endpoint, &backend)?;
+    b.mount()?;
+    anyhow::ensure!(std::fs::read(b.mnt.join("payload"))? == data);
+    b.unmount()?;
+    Ok(())
+}
+
+fn writeback_fsync(seed: u64) -> Result<()> {
+    let (env, root) = setup("writeback-fsync")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/writeback-fsync-{}", ts());
+    let mut client =
+        Client::new(root.path(), "c0", &env.endpoint, &backend)?.with_write_mode("back");
+    client.fs_create()?;
+    client.mount()?;
+    let committed = pattern(seed, 4 * 1024 * 1024);
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(client.mnt.join("f"))?;
+        file.write_all(&committed)?;
+        file.sync_all()?;
+        file.write_all(b"unsynced-tail")?;
+        std::mem::forget(file);
+    }
+    client.kill9()?;
+    client.mount()?;
+    let got = std::fs::read(client.mnt.join("f"))?;
+    anyhow::ensure!(
+        got.starts_with(&committed),
+        "fsynced prefix was lost or corrupted"
+    );
+    client.unmount()?;
+    Ok(())
+}
+
+fn writeback_backpressure(seed: u64) -> Result<()> {
+    let (env, root) = setup("writeback-backpressure")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/writeback-pressure-{}", ts());
+    let cache_size = 8 * 1024 * 1024u64;
+    let mut client = Client::new(root.path(), "c0", &env.endpoint, &backend)?
+        .with_cache_size(cache_size)
+        .with_write_mode("back")
+        .with_env("CONSTELLATION_STAGING_BUDGET", "2097152");
+    client.fs_create()?;
+    client.mount()?;
+    proxy.cut()?;
+    let path = client.mnt.join("pressure");
+    let mut file = std::fs::File::create(&path)?;
+    let started = std::time::Instant::now();
+    let mut saw_enospc = false;
+    for i in 0..32 {
+        use std::io::Write;
+        let block = pattern(seed.wrapping_add(i), 1024 * 1024);
+        if let Err(error) = file.write_all(&block) {
+            saw_enospc = error.raw_os_error() == Some(libc::ENOSPC);
+            break;
+        }
+    }
+    anyhow::ensure!(saw_enospc, "dirty hard limit did not return ENOSPC");
+    anyhow::ensure!(
+        started.elapsed() >= Duration::from_millis(100),
+        "ENOSPC arrived without observable throttling"
+    );
+    drop(file);
+    proxy.heal()?;
+    eventually("write-back queue recovers", Duration::from_secs(30), || {
+        anyhow::ensure!(
+            client.control_status()?["writeback"]["pending_uploads"].as_u64() == Some(0)
+        );
+        Ok(())
+    })?;
+    std::fs::write(client.mnt.join("after-heal"), b"ok")?;
+    client.unmount()?;
     Ok(())
 }

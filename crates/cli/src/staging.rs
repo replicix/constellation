@@ -133,6 +133,23 @@ impl DirtyRuns {
         pos > 0 && self.runs[pos - 1].1 > idx
     }
 
+    pub fn clear(&mut self, idx: u64) {
+        let mut next = Vec::with_capacity(self.runs.len() + 1);
+        for &(start, end) in &self.runs {
+            if idx < start || idx >= end {
+                next.push((start, end));
+                continue;
+            }
+            if start < idx {
+                next.push((start, idx));
+            }
+            if idx + 1 < end {
+                next.push((idx + 1, end));
+            }
+        }
+        self.runs = next;
+    }
+
     /// Drop every dirty chunk at or after `keep` (truncate-down).
     pub fn retain_below(&mut self, keep: u64) {
         let pos = self.runs.partition_point(|&(s, _)| s < keep);
@@ -164,7 +181,9 @@ pub struct Staging {
     path: PathBuf,
     budget: Arc<StagingBudget>,
     file_len: u64,
+    reserved: u64,
     dirty: DirtyRuns,
+    released_chunks: std::collections::HashSet<u64>,
 }
 
 impl Staging {
@@ -189,7 +208,9 @@ impl Staging {
             path,
             budget,
             file_len: 0,
+            reserved: 0,
             dirty: DirtyRuns::default(),
+            released_chunks: std::collections::HashSet::new(),
         })
     }
 
@@ -202,7 +223,9 @@ impl Staging {
         }
         let end = offset + buf.len() as u64;
         if end > self.file_len {
-            self.budget.reserve(end - self.file_len)?;
+            let growth = end - self.file_len;
+            self.budget.reserve(growth)?;
+            self.reserved += growth;
             self.file_len = end;
         }
         self.file.write_at(buf, offset)?;
@@ -228,9 +251,12 @@ impl Staging {
                 self.budget.release(growth);
                 return Err(e.into());
             }
+            self.reserved += growth;
         } else if new_len < self.file_len {
             self.file.set_len(new_len)?;
-            self.budget.release(self.file_len - new_len);
+            let released = (self.file_len - new_len).min(self.reserved);
+            self.budget.release(released);
+            self.reserved -= released;
         }
         self.file_len = new_len;
         Ok(())
@@ -245,11 +271,56 @@ impl Staging {
     /// staging file (== its logical length; see the module doc).
     #[allow(dead_code)] // part of the public shape (plan 05a)
     pub fn reserved_bytes(&self) -> u64 {
-        self.file_len
+        self.reserved
     }
 
     pub fn mark_dirty(&mut self, idx: u64) {
         self.dirty.mark(idx);
+    }
+
+    /// Re-admit a previously sealed range before modifying it.
+    pub fn prepare_chunk(&mut self, idx: u64, chunk_size: u32) -> Result<(), StagingError> {
+        if !self.released_chunks.remove(&idx) {
+            return Ok(());
+        }
+        let start = idx * u64::from(chunk_size);
+        let len = u64::from(chunk_size).min(self.file_len.saturating_sub(start));
+        if let Err(error) = self.budget.reserve(len) {
+            self.released_chunks.insert(idx);
+            return Err(error);
+        }
+        self.reserved += len;
+        Ok(())
+    }
+
+    /// A sealed chunk no longer needs staging residency. Keep the
+    /// sparse file's logical offsets stable, but punch the range out
+    /// and release its budget. Linux filesystems that do not support
+    /// hole punching still get the logical budget release; the bytes
+    /// are already durable in the chunk cache before this is called.
+    pub fn release_chunk(&mut self, idx: u64, chunk_size: u32) {
+        if !self.dirty.contains(idx) {
+            return;
+        }
+        self.dirty.clear(idx);
+        self.released_chunks.insert(idx);
+        let start = idx * u64::from(chunk_size);
+        let len = u64::from(chunk_size).min(self.file_len.saturating_sub(start));
+        if len == 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::fallocate(
+                std::os::fd::AsRawFd::as_raw_fd(&self.file),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                start as libc::off_t,
+                len as libc::off_t,
+            );
+        }
+        let released = len.min(self.reserved);
+        self.reserved -= released;
+        self.budget.release(released);
     }
 
     pub fn is_dirty(&self, idx: u64) -> bool {
@@ -274,7 +345,7 @@ impl Staging {
     /// content has been sealed into the chunk cache (flush) and is no
     /// longer needed here.
     pub fn discard(self) {
-        self.budget.release(self.file_len);
+        self.budget.release(self.reserved);
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -452,6 +523,23 @@ mod tests {
         s.discard();
         assert_eq!(b.used(), 0);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn eager_release_is_once_and_redirty_readmits() {
+        let dir = TempDir::new().unwrap();
+        let b = budget(128);
+        let mut s = Staging::create(dir.path(), 9, 1, b.clone()).unwrap();
+        s.write_at(0, &[1u8; 64]).unwrap();
+        s.mark_dirty(0);
+        s.release_chunk(0, 64);
+        assert_eq!(b.used(), 0);
+        s.release_chunk(0, 64);
+        assert_eq!(b.used(), 0, "one boundary seals only once");
+        s.prepare_chunk(0, 64).unwrap();
+        s.write_at(0, &[2u8; 64]).unwrap();
+        s.mark_dirty(0);
+        assert_eq!(b.used(), 64, "writing a sealed chunk re-dirties it");
     }
 
     #[test]
