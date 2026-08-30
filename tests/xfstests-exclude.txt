@@ -1,0 +1,23 @@
+# Tests below require local block-device controls that a network FUSE
+# filesystem cannot provide. Every entry has an explicit reason.
+generic/013 # REASON: multi-process fsstress workload is covered by the bounded harness stress lane
+generic/133 # REASON: 512 MiB direct-I/O stress is prohibitive over an object-store network FS
+generic/247 # REASON: multi-gigabyte data-integrity workload exceeds the nightly network-FS budget
+generic/298 # REASON: 1 TiB reflink stress is unsupported and prohibitive on a network FUSE FS
+generic/310 # REASON: fills the filesystem to ENOSPC, but object-store capacity is effectively unbounded
+generic/363 # REASON: 100,000-operation fsx stress is covered by the bounded harness stress lane
+generic/438 # REASON: long fallocate/fsync stress assumes local-block latency and allocation semantics
+generic/476 # REASON: 100,000-operation fsstress workload is covered by the bounded harness lane
+generic/694 # REASON: writes a 4 GiB test file, prohibitive for an object-store compliance lane
+generic/701 # REASON: writes a 5 GiB test file, prohibitive for an object-store compliance lane
+generic/766 # REASON: requires filesystem freeze/thaw ioctls
+generic/775 # REASON: requires direct block-device access
+generic/782 # REASON: requires device-mapper fault injection
+generic/784 # REASON: requires filesystem freeze/thaw ioctls
+generic/785 # REASON: requires device-mapper fault injection
+generic/789 # REASON: requires direct block-device discard
+generic/790 # REASON: requires a swap-capable block device
+generic/791 # REASON: requires device-mapper fault injection
+generic/792 # REASON: requires device-mapper fault injection
+generic/794 # REASON: requires direct block-device corruption
+generic/795 # REASON: requires host-global drop_caches while running unbounded fsstress

@@ -1,0 +1,145 @@
+name: Nightly full matrix
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check 2>&1 | tee lint.log
+      - run: cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee -a lint.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: lint-logs, path: lint.log }
+
+  unit:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace 2>&1 | tee unit.log
+      - run: cargo install cargo-audit --locked && cargo audit 2>&1 | tee audit.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: unit-audit-logs, path: "*.log" }
+
+  integration:
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose --profile test build smoke
+      - run: docker compose --profile test run --rm smoke 2>&1 | tee integration.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: integration-logs, path: integration.log }
+
+  compliance:
+    needs: integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose --profile test build compliance
+      - run: docker compose --profile test run --rm compliance 2>&1 | tee compliance.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: compliance-logs, path: compliance.log }
+
+  harness:
+    needs: compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 fio stress-ng
+      - run: cargo build --release -p constellation -p constellation-harness
+      - run: target/release/harness run 2>&1 | tee harness.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: harness-logs, path: harness.log }
+
+  xfstests:
+    needs: harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose --profile test build xfstests
+      - run: docker compose --profile test run --rm xfstests 2>&1 | tee xfstests.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: xfstests-logs, path: xfstests.log }
+
+  performance:
+    needs: xfstests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - run: cargo build --release -p constellation -p constellation-harness
+      - run: make perf-gate 2>&1 | tee performance.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: performance-logs, path: performance.log }
+
+  linux-package:
+    needs: performance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make dist-linux 2>&1 | tee package.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-package
+          path: |
+            package.log
+            target/dist/*
+
+  macos:
+    needs: lint
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace 2>&1 | tee macos.log
+      - run: make dist-macos 2>&1 | tee -a macos.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-build
+          path: |
+            macos.log
+            target/dist/*
+
+  summary:
+    if: always()
+    needs: [lint, unit, integration, compliance, harness, xfstests, performance, linux-package, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish summary
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo '| Job | Result |' >> "$GITHUB_STEP_SUMMARY"
+          echo '|---|---|' >> "$GITHUB_STEP_SUMMARY"
+          echo "$RESULTS" | jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"' >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$RESULTS" > nightly-results.json
+      - uses: actions/upload-artifact@v4
+        with: { name: nightly-summary, path: nightly-results.json }

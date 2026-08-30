@@ -27,6 +27,20 @@ RUN git clone https://github.com/pjd/pjdfstest /opt/pjdfstest \
     && ./configure \
     && make pjdfstest
 
+FROM debian:bookworm-slim AS xfstests-build
+# Pinned upstream revision: 2026-08-29 xfstests-dev HEAD.
+ARG XFSTESTS_REF=56c410ad0f69da5b13c5807bc47b4876dcfa02b2
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       git ca-certificates gcc make autoconf automake libtool pkg-config \
+       libaio-dev liburing-dev libattr1-dev libacl1-dev libcap-dev \
+       libgdbm-dev uuid-dev xfslibs-dev xfsprogs \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /opt/xfstests \
+    && cd /opt/xfstests \
+    && git checkout "$XFSTESTS_REF" \
+    && make -j"$(nproc)"
+
 FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -50,6 +64,27 @@ COPY --from=build /harness /usr/local/bin/harness
 ENV CONSTELLATION_BIN=/usr/local/bin/constellation
 ENTRYPOINT ["harness"]
 CMD ["run"]
+
+# Nightly xfstests runner. Kept separate because its toolset and upstream
+# checkout are too large for the fast PR image.
+FROM runtime-base AS xfstests-runner
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       acl attr bc e2fsprogs gawk libaio1 liburing2 perl python3 quota xfsprogs \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m fsgqa \
+    && useradd 123456-fsgqa \
+    && groupadd fsgqa2
+COPY --from=build /constellation /usr/local/bin/constellation
+COPY --from=xfstests-build /opt/xfstests /opt/xfstests
+COPY tests/docker/mount.fuse.constellation /sbin/mount.fuse.constellation
+COPY tests/xfstests.sh tests/xfstests-exclude.txt tests/xfstests-baseline.txt \
+     /usr/local/lib/constellation/
+RUN chmod +x /sbin/mount.fuse.constellation /usr/local/lib/constellation/xfstests.sh
+ENV XFSTESTS_DIR=/opt/xfstests \
+    XFSTESTS_BASELINE=/usr/local/lib/constellation/xfstests-baseline.txt \
+    XFSTESTS_EXCLUDE=/usr/local/lib/constellation/xfstests-exclude.txt
+ENTRYPOINT ["bash", "/usr/local/lib/constellation/xfstests.sh"]
 
 # Suite runner (smoke / pjdfstest compliance / fio+stress-ng stress).
 # Kept last so it stays the default build target.

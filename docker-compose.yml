@@ -62,6 +62,16 @@ services:
     <<: *suite
     command: ["stress"]
 
+  # Full generic xfstests sweep, nightly/manual only.
+  xfstests:
+    <<: *suite
+    image: ${XFSTESTS_IMAGE:-constellation-xfstests:local}
+    build:
+      context: .
+      dockerfile: tests/docker/Dockerfile
+      target: xfstests-runner
+    command: []
+
   # Fault-injection harness, fully containerized: only docker is needed
   # on the host. The harness drives the host docker daemon through the
   # mounted socket (floci/toxiproxy run as sibling containers) and runs

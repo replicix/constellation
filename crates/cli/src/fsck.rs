@@ -12,7 +12,7 @@ use constellation_meta::{LogRecord, SqliteMeta};
 use constellation_store_s3::{CompressionSetting, GcJournalEntry, LeaseMode, LeaseStore, LogStore};
 use futures::TryStreamExt;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashSet;

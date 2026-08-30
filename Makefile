@@ -29,7 +29,7 @@ BENCH_FILES ?= 20000
 
 .PHONY: help build build-release build-debug test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration compose compose-down harness harness-docker \
-	harness-list bench deps
+	harness-list bench xfstests perf-gate dist-linux dist-macos deps
 
 .DEFAULT_GOAL := help
 
@@ -116,6 +116,34 @@ harness-docker: ## Fault-injection harness fully in docker (host needs docker on
 
 bench: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Census-scale import benchmark (needs docker + fuse3)
 	$(RELEASE_HARNESS) bench --files $(BENCH_FILES)
+
+perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Check benchmark rates against baseline
+	tests/perf-gate.sh
+
+xfstests: ## Run generic xfstests lane in Docker
+	docker compose --profile test build xfstests
+	docker compose --profile test run --rm xfstests
+
+dist-linux: ## Build static x86_64 Linux musl release archive
+	docker build -f tests/docker/Dockerfile.dist --target export \
+		--build-arg CONSTELLATION_GIT_DESCRIBE="$$(git describe --tags --always --dirty)" \
+		--output type=local,dest=target/musl-out .
+	@version=`target/musl-out/constellation --version | awk '{print $$2}'`; \
+	name="constellation-$$version-x86_64-linux-musl"; \
+	rm -rf "target/dist/$$name"; mkdir -p "target/dist/$$name"; \
+	cp target/musl-out/constellation LICENSE README.md "target/dist/$$name/"; \
+	tar -C target/dist -czf "target/dist/$$name.tar.gz" "$$name"; \
+	echo "target/dist/$$name.tar.gz"
+
+dist-macos: ## Build native macOS release archive
+	@[ "$$(uname -s)" = Darwin ] || { echo "dist-macos must run on macOS"; exit 2; }
+	$(CARGO) build --release -p constellation
+	@version=`target/release/constellation --version | awk '{print $$2}'`; \
+	arch=`uname -m`; name="constellation-$$version-$$arch-macos"; \
+	rm -rf "target/dist/$$name"; mkdir -p "target/dist/$$name"; \
+	cp target/release/constellation LICENSE README.md "target/dist/$$name/"; \
+	tar -C target/dist -czf "target/dist/$$name.tar.gz" "$$name"; \
+	echo "target/dist/$$name.tar.gz"
 
 deps: ## Install host tools for the non-docker lanes (Debian/Ubuntu)
 	# Only docker is required for `make compose` and `make harness-docker`;

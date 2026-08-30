@@ -6,7 +6,7 @@ use crate::e2e::{decrypt_object, encrypt_object, SharedE2eKeys};
 use crate::error::StoreError;
 use crate::{format, layout};
 use constellation_fs_core::{ChunkHash, DEFAULT_CHUNK_SIZE};
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -352,7 +352,7 @@ impl ChunkStore {
                     Err(object_store::Error::Precondition { .. })
                 )
             }
-            Err(object_store::Error::NotImplemented) => false,
+            Err(object_store::Error::NotImplemented { .. }) => false,
             Err(e) => {
                 let _ = self.store.delete(&key).await;
                 return Err(e.into());

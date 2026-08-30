@@ -7,7 +7,7 @@
 
 use crate::{layout, StoreError};
 use constellation_fs_core::ChunkHash;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

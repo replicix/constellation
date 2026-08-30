@@ -33,7 +33,7 @@ use zeroize::Zeroizing;
 #[derive(Parser)]
 #[command(
     name = "constellation",
-    version,
+    version = env!("CONSTELLATION_VERSION"),
     about = "Distributed POSIX filesystem on S3"
 )]
 struct Cli {
@@ -66,6 +66,9 @@ enum Command {
         /// Allow other users to access the mount.
         #[arg(long)]
         allow_other: bool,
+        /// Filesystem source name reported by mount tools.
+        #[arg(long, default_value = "constellation")]
+        fs_name: String,
         /// What fsync() waits for: "local" (journal on disk; background
         /// ship) or "s3" (record durable in the shared log).
         #[arg(long, default_value = "local")]
@@ -598,6 +601,7 @@ fn main() -> Result<()> {
             state_dir,
             cache_size,
             allow_other,
+            fs_name,
             fsync_mode,
             write_mode,
             read_only_member,
@@ -626,6 +630,7 @@ fn main() -> Result<()> {
                 state_dir,
                 cache_size,
                 allow_other,
+                fs_name,
                 fsync_s3,
                 write_mode,
                 read_only_member,
@@ -743,6 +748,7 @@ fn mount(
     state_dir: Option<PathBuf>,
     cache_size: u64,
     allow_other: bool,
+    fs_name: String,
     fsync_s3: bool,
     initial_write_mode: writeback::WriteMode,
     read_only_member: bool,
@@ -1624,7 +1630,7 @@ fn mount(
     }
 
     let mut options = vec![
-        fuser::MountOption::FSName("constellation".into()),
+        fuser::MountOption::FSName(fs_name),
         fuser::MountOption::DefaultPermissions,
     ];
     if allow_other {
@@ -2869,7 +2875,7 @@ mod pending_upload_tests {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjPath;
     use object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -2957,8 +2963,11 @@ mod pending_upload_tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
         }
 
         fn list(
@@ -2975,16 +2984,13 @@ mod pending_upload_tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(
+        async fn copy_opts(
             &self,
             from: &ObjPath,
             to: &ObjPath,
+            options: CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

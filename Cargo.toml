@@ -35,7 +35,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
-object_store = { version = "0.12", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 clap = { version = "4", features = ["derive", "env"] }
 fuser = { version = "0.15", default-features = false }
 libc = "0.2"

@@ -8,7 +8,7 @@
 use crate::{layout, StoreError};
 use constellation_fs_core::ChunkHash;
 use futures::StreamExt;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

@@ -15,7 +15,7 @@ use constellation_store_s3::{
 };
 use futures::TryStreamExt;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};

@@ -6,8 +6,13 @@ and use encrypted P2P links between peers purely as a latency fast path.
 One static binary — FUSE mount, daemon, CLI, and web UI. The only
 infrastructure is an S3-compatible bucket with conditional-write support.
 
-**Status:** usable single-/multi-node FUSE mounts on S3; see
-[docs/PROGRESS.md](docs/PROGRESS.md) for phase detail.
+**Status:** phases 1–8 are implemented: single- and multi-node mounts,
+leases and offline epochs, cooperative caching, snapshots, E2E encryption,
+the web UI, fsck/GC, and release hardening. Linux is the fully exercised
+platform; macOS receives build and mount-less test coverage, while FUSE
+mount behavior requires macFUSE and remains less battle-tested. Automated
+crash reporting is future phase-9 work. See
+[docs/PROGRESS.md](docs/PROGRESS.md) for detailed evidence and limitations.
 
 ## Quick start: mount a real S3 bucket
 
@@ -38,6 +43,7 @@ mkdir -p /mnt/constellation
 $BIN doctor --s3 "$BUCKET"                 # checks If-None-Match / If-Match
 $BIN fs create --s3 "$BUCKET"              # once per prefix
 $BIN mount --s3 "$BUCKET" /mnt/constellation
+$BIN status                                # from another shell
 # … use /mnt/constellation …
 fusermount3 -u /mnt/constellation
 ```
@@ -55,6 +61,7 @@ Needs FUSE (`fusermount3`) on the host.
 | [docs/DECISIONS.md](docs/DECISIONS.md) | ADRs — what was rejected and why |
 | [docs/TESTING.md](docs/TESTING.md) | correctness strategy: property tests, deterministic simulation, POSIX suites, e2e scenarios |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | phased milestones to v1 |
+| [docs/RELEASING.md](docs/RELEASING.md) | release artifacts and tag checklist |
 
 ## Layout
 

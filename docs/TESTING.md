@@ -1,7 +1,9 @@
 # Testing
 
-Constellation has five test lanes, from fastest to most realistic. All
-of them run in GitHub Actions on every PR (`.github/workflows/ci.yml`).
+Constellation has seven test lanes, from fastest to most realistic. The
+fast lanes run on every PR (`.github/workflows/ci.yml`); the full matrix,
+xfstests, performance gate, audit, and macOS build run nightly and on manual
+dispatch (`.github/workflows/nightly.yml`).
 
 | Lane | Command | Backend | Needs | Speed |
 |---|---|---|---|---|
@@ -10,6 +12,8 @@ of them run in GitHub Actions on every PR (`.github/workflows/ci.yml`).
 | Host integration | `tests/integration.sh` | floci S3 (container) | + docker | ~10 s |
 | Containerized | `tests/compose-test.sh` | floci S3 (container) | docker only | ~5 min cold |
 | Fault injection | `cargo run -p constellation-harness -- run` | floci S3 via toxiproxy | Rust, fuse3, docker | ~3 min |
+| xfstests | `make xfstests` | floci S3, separate test/scratch prefixes | docker | long |
+| Performance | `make perf-gate` | local floci S3 | Rust, fuse3, docker | minutes |
 
 The containerized lane runs three suites (all by default, or pick:
 `tests/compose-test.sh smoke stress`):
@@ -446,7 +450,7 @@ The harness also hosts the census-scale import benchmark:
 
 ```bash
 cargo run -p constellation-harness -- bench \
-  --files 20000 --file-size 4096 --fanout 100 [--budget-s N]
+  --files 20000 --file-size 4096 --fanout 100 [--budget-s N] [--json]
 ```
 
 It stages a many-small-files tree, imports it (`cp -r`) into a mount
@@ -455,6 +459,26 @@ metadata-walk, and cold read-back rates; `--budget-s` turns the durable
 import time into a hard gate. Add `--e2e` to create both benchmark
 filesystems in passphrase mode (`CONSTELLATION_PASSPHRASE` is supplied by the
 harness) for an otherwise identical encryption-overhead comparison.
+
+JSON output contains import, durable import, metadata-walk, cold small-file
+read, cold sequential large-file MiB/s, and warm 4 KiB random-read IOPS.
+`tests/perf-gate.sh` runs the committed workload from
+`tests/perf-baseline.json` and fails when any rate falls more than the
+baseline's 20% tolerance. It compares the median of three runs so scheduler
+noise in the sub-second metadata and warm-cache probes does not create a
+spurious regression.
+
+## xfstests
+
+The nightly container builds pinned xfstests-dev revision
+`56c410ad0f69da5b13c5807bc47b4876dcfa02b2` and runs its generic group with
+`FSTYP=fuse`. Test and scratch mounts are independent Constellation filesystems
+on separate S3 prefixes. `tests/xfstests-exclude.txt` records tests that need
+local block-device controls or exceed the bounded network-filesystem runtime,
+with a reason on every entry.
+`tests/xfstests-baseline.txt` records reproducible semantic failures. The
+runner compares failures both ways: new failures fail the job and newly
+passing tests request baseline removal.
 
 ## CI notes
 

@@ -734,7 +734,52 @@ passed, including `gc-lifecycle`, `gc-dedup-race`, and `fsck-repair`; only
 `fio-latency` and `fio-blips` skipped because `fio` is absent. pjdfstest:
 **8798 passed, 0 failed**, empty baseline.
 
+## Phase 8b — hardening, performance gates, and packaging: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Pinned xfstests-dev generic lane with independent test/scratch S3 prefixes, reasoned exclusions, and two-way known-failure regression baseline | done | `tests/xfstests*`, `tests/docker`, `docker-compose.yml` |
+| Machine-readable benchmark plus cold sequential-read and warm random-read probes; 20% rate-floor gate | done | `harness::bench`, `tests/perf-*` |
+| Git-described CLI version and static x86_64 musl / native macOS archives containing the binary, license, and README | done | `cli/build.rs`, `Makefile`, `docs/RELEASING.md` |
+| Nightly ordered Linux matrix, cargo audit, package artifacts, native macOS build/tests, per-job logs, and final summary | done | `.github/workflows/nightly.yml` |
+| v1 documentation sweep | done | `README.md`, `docs/{TESTING,PROGRESS,RELEASING}.md` |
+
+### Phase 8 exit criteria (ROADMAP.md)
+
+- [x] `fsck --repair` and GC cover the phase-8a corruption/reclamation
+      classes, with destructive harness scenarios.
+- [x] xfstests generic coverage is pinned and regression-gated; unsupported
+      local-device operations are explicitly excluded rather than silently
+      skipped by Constellation.
+- [x] Performance rates are emitted as JSON and compared with a committed
+      current-code baseline at 20% tolerance.
+- [x] Linux static and macOS native packaging paths exist, and the nightly
+      workflow runs the complete ordered test matrix with uploaded logs.
+
+Linux is the release platform with full FUSE, fault, pjdfstest, and xfstests
+coverage. macOS CI compiles and runs mount-less workspace tests; actual mount
+operation requires macFUSE on the destination and remains less exercised than
+Linux. The native-only packaging guard prevents accidental Linux FUSE
+cross-compilation.
+
+`cargo audit` has no vulnerability-level findings after upgrading
+`object_store` to 0.14 (which removes the vulnerable quick-xml release). It
+still reports four allowed warnings: transitive unmaintained `atomic-polyfill`
+and `paste`, the longstanding fuser 0.15 initialization advisory, and a yanked
+transitive `chacha20`. fuser 0.15 is the design-pinned API and the other three
+have no direct call sites in Constellation; all remain visible in every nightly
+audit rather than being hidden with ignore flags.
+
+Validation (2026-08-30): fmt and strict clippy clean; 267 workspace tests,
+smoke, S3 integration, all runnable harness scenarios, and pjdfstest
+8798/8798 pass. The bounded generic xfstests sweep reports **139 passed, 50
+known failures, 630 excluded** (609 capability-skipped plus 21 reasoned
+exclusions), with no regressions. The three-run-median performance gate passes
+all eight rates, and `make dist-linux` produces a static-PIE musl binary whose
+`ldd` result is `statically linked`.
+
 ## Later phases
 
-Phases 5, 5a, 5b, 6a, 6b, 7, and 8a are closed. Next: phase 8b hardening and
-packaging.
+Phases 1–8 are closed. Phase 9 automated crash reporting remains future work.
+Deferred format/data-plane items remain listed in `docs/ROADMAP.md` and the
+phase-specific scope notes above.

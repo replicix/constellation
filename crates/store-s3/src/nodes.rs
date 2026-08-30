@@ -26,7 +26,7 @@
 
 use crate::error::StoreError;
 use futures::TryStreamExt;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

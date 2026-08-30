@@ -1,0 +1,19 @@
+{
+  "tolerance": 0.2,
+  "config": {
+    "files": 500,
+    "file_size": 4096,
+    "fanout": 25,
+    "repetitions": 3
+  },
+  "metrics": {
+    "import_files_per_sec": 164.56,
+    "durable_import_files_per_sec": 159.14,
+    "writeback_import_files_per_sec": 1966.52,
+    "writeback_durable_files_per_sec": 1260.42,
+    "metadata_walk_files_per_sec": 84742.19,
+    "cold_read_files_per_sec": 16339.74,
+    "sequential_cold_read_mib_per_sec": 421.10,
+    "warm_random_read_iops": 1441848.89
+  }
+}

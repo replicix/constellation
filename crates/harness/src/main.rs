@@ -58,6 +58,9 @@ enum Command {
         /// Benchmark an E2E passphrase filesystem.
         #[arg(long)]
         e2e: bool,
+        /// Emit the measured rates as a JSON object on stdout.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -81,6 +84,7 @@ fn main() -> Result<()> {
             fanout,
             budget_s,
             e2e,
+            json,
         } => {
             let cfg = bench::BenchConfig {
                 files,
@@ -88,9 +92,14 @@ fn main() -> Result<()> {
                 fanout,
                 budget_s,
                 e2e,
+                json,
             };
             cfg.validate()?;
-            bench::run(&cfg)
+            let report = bench::run(&cfg)?;
+            if cfg.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            Ok(())
         }
     }
 }

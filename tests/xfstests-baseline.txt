@@ -1,0 +1,55 @@
+# Known failures from the pinned xfstests sweep.
+#
+# Keep one `generic/NNN # triage` entry per reproducible failure. The runner
+# compares both ways: a new failure is a regression and a fixed failure asks
+# for baseline removal.
+generic/003 # timestamp/atime semantics differ; tracked as a real metadata gap
+generic/035 # rename-overwrite helper sees stale post-rename metadata
+generic/074 # known semantic mismatch from the pinned initial sweep
+generic/075 # known semantic mismatch from the pinned initial sweep
+generic/100 # file population comparison exposes write/read divergence under stress
+generic/112 # fsx direct-I/O workload is not supported by the FUSE data path
+generic/120 # atime behavior differs on executable access
+generic/125 # direct-I/O open is rejected
+generic/127 # high-volume fsx workload reports unsupported operations
+generic/184 # known semantic mismatch from the pinned initial sweep
+generic/192 # known semantic mismatch from the pinned initial sweep
+generic/193 # known semantic mismatch from the pinned initial sweep
+generic/258 # known semantic mismatch from the pinned initial sweep
+generic/263 # known semantic mismatch from the pinned initial sweep
+generic/285 # SEEK_DATA/SEEK_HOLE semantics are not implemented
+generic/294 # read-only remount semantics are unavailable to the pre-mounted FUSE lane
+generic/306 # read-only remount semantics are unavailable to the pre-mounted FUSE lane
+generic/314 # known semantic mismatch from the pinned initial sweep
+generic/317 # known semantic mismatch from the pinned initial sweep
+generic/355 # known semantic mismatch from the pinned initial sweep
+generic/394 # known semantic mismatch from the pinned initial sweep
+generic/426 # known semantic mismatch from the pinned initial sweep
+generic/434 # special-device copy returns EACCES rather than EINVAL
+generic/437 # close reports a deferred writeback I/O error
+generic/460 # known semantic mismatch from the pinned initial sweep
+generic/465 # known semantic mismatch from the pinned initial sweep
+generic/467 # known semantic mismatch from the pinned initial sweep
+generic/477 # known semantic mismatch from the pinned initial sweep
+generic/490 # known semantic mismatch from the pinned initial sweep
+generic/504 # known semantic mismatch from the pinned initial sweep
+generic/514 # known semantic mismatch from the pinned initial sweep
+generic/519 # known semantic mismatch from the pinned initial sweep
+generic/521 # known semantic mismatch from the pinned initial sweep
+generic/522 # known semantic mismatch from the pinned initial sweep
+generic/551 # known semantic mismatch from the pinned initial sweep
+generic/564 # known semantic mismatch from the pinned initial sweep
+generic/647 # known semantic mismatch from the pinned initial sweep
+generic/650 # known semantic mismatch from the pinned initial sweep
+generic/657 # known semantic mismatch from the pinned initial sweep
+generic/670 # known semantic mismatch from the pinned initial sweep
+generic/672 # known semantic mismatch from the pinned initial sweep
+generic/673 # known semantic mismatch from the pinned initial sweep
+generic/680 # unprivileged direct-I/O open is rejected
+generic/696 # known semantic mismatch from the pinned initial sweep
+generic/729 # known semantic mismatch from the pinned initial sweep
+generic/732 # known semantic mismatch from the pinned initial sweep
+generic/750 # known semantic mismatch from the pinned initial sweep
+generic/756 # known semantic mismatch from the pinned initial sweep
+generic/759 # known semantic mismatch from the pinned initial sweep
+generic/777 # known semantic mismatch from the pinned initial sweep
