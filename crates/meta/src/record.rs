@@ -4,6 +4,25 @@
 use constellation_fs_core::Ino;
 use serde::{Deserialize, Serialize};
 
+/// One eagerly materialized clone inode.  Inode numbers are allocated by
+/// the creator and carried in the single `clone` record so every replica
+/// reconstructs exactly the same ordinary subtree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneNode {
+    pub parent: Ino,
+    pub name: String,
+    pub ino: Ino,
+    pub kind: u8,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub rdev: u64,
+    pub target: Option<String>,
+    pub manifest: Option<Vec<u8>>,
+}
+
 /// One metadata operation. Field names are stable format surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -130,6 +149,24 @@ pub enum LogRecord {
     /// Void an orphan [`RenameXpartSrc`] whose dst half never landed.
     /// Only the current holder of the src partition may append this.
     RenameXpartAbort { txid: u64 },
+    SnapCreate {
+        id: String,
+        path: String,
+        name: String,
+        root_hash: String,
+        created_unix_ms: i64,
+    },
+    SnapDelete {
+        id: String,
+        path: String,
+        name: String,
+    },
+    Clone {
+        source_path: String,
+        snapshot: String,
+        root_hash: String,
+        nodes: Vec<CloneNode>,
+    },
 }
 
 #[cfg(test)]

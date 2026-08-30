@@ -357,6 +357,21 @@ baseline is 8.98 s through versus 20.61 ms back for 24 small files;
 the big-file ceiling run is 320 MiB on a 32 MiB cache with 242 MiB peak
 RSS and 32 MiB peak cache use.
 
+Phase 6a scenarios exercise immutable subtree trees and alternate mount
+roots:
+
+- `snapshot-lifecycle` advances a live file after snapshot creation and
+  proves explicit `.constellation/snapshot/<name>/` lookup still returns the
+  frozen bytes. It separately checks that `.constellation` is absent from
+  ordinary `readdir`, then deletes the snapshot and requires new frozen-view
+  reads to fail while the live file remains intact.
+- `clone-workflow` eagerly clones snapshot metadata, independently edits the
+  origin and clone, verifies both byte strings, and checks the frozen source
+  remained unchanged. Deleting the snapshot must not affect the clone.
+- `snapshot-mount` mounts `<path>@<name>` as a FUSE root, checks exact content
+  and `EROFS` on mutation, then mounts `--rw --ephemeral`, writes the clone,
+  cleanly unmounts, and verifies the temporary namespace entry disappears.
+
 Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.

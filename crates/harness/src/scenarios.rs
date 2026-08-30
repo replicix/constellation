@@ -170,6 +170,24 @@ pub const SCENARIOS: &[Scenario] = &[
         run: web_fleet,
     },
     Scenario {
+        name: "snapshot-lifecycle",
+        desc: "snapshot remains frozen behind hidden .constellation view, then becomes stale",
+        requires: &[],
+        run: snapshot_lifecycle,
+    },
+    Scenario {
+        name: "clone-workflow",
+        desc: "eager metadata clone diverges without changing its source snapshot",
+        requires: &[],
+        run: clone_workflow,
+    },
+    Scenario {
+        name: "snapshot-mount",
+        desc: "snapshot subtree mounts read-only and ephemeral rw clone is removed",
+        requires: &[],
+        run: snapshot_mount,
+    },
+    Scenario {
         name: "fresh-node-bootstrap",
         desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
         requires: &[],
@@ -461,6 +479,116 @@ fn eventually(what: &str, deadline: Duration, mut f: impl FnMut() -> Result<()>)
             Err(_) => std::thread::sleep(Duration::from_millis(250)),
         }
     }
+}
+
+fn snapshot_lifecycle(_seed: u64) -> Result<()> {
+    let (env, root) = setup("snapshot-lifecycle")?;
+    let _proxy = env.s3_proxy()?;
+    let mut client = one_client(&env, root.path(), &format!("snap-life-{}", ts()))?;
+    std::fs::create_dir(client.mnt.join("project"))?;
+    std::fs::write(client.mnt.join("project/data"), b"frozen")?;
+    client.snapshot_create("/project@first")?;
+    std::fs::write(client.mnt.join("project/data"), b"live-moved")?;
+
+    let names: Vec<_> = std::fs::read_dir(client.mnt.join("project"))?
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    anyhow::ensure!(
+        !names.iter().any(|name| name == ".constellation"),
+        "synthetic control directory leaked into readdir"
+    );
+    let frozen = client
+        .mnt
+        .join("project/.constellation/snapshot/first/data");
+    anyhow::ensure!(
+        std::fs::read(&frozen)? == b"frozen",
+        "snapshot was not frozen"
+    );
+    client.snapshot_delete("/project@first")?;
+    std::thread::sleep(Duration::from_millis(1200));
+    anyhow::ensure!(
+        std::fs::read(&frozen).is_err(),
+        "deleted snapshot still accepted new reads"
+    );
+    anyhow::ensure!(
+        std::fs::read(client.mnt.join("project/data"))? == b"live-moved",
+        "snapshot deletion changed the live tree"
+    );
+    client.unmount()
+}
+
+fn clone_workflow(_seed: u64) -> Result<()> {
+    let (env, root) = setup("clone-workflow")?;
+    let _proxy = env.s3_proxy()?;
+    let mut client = one_client(&env, root.path(), &format!("clone-{}", ts()))?;
+    std::fs::create_dir(client.mnt.join("origin"))?;
+    std::fs::write(client.mnt.join("origin/data"), b"base")?;
+    client.snapshot_create("/origin@base")?;
+    client.clone_snapshot("/origin@base", "/clone")?;
+    std::fs::write(client.mnt.join("origin/data"), b"origin-new")?;
+    std::fs::write(client.mnt.join("clone/data"), b"clone-new")?;
+    anyhow::ensure!(
+        std::fs::read(client.mnt.join("origin/data"))? == b"origin-new",
+        "origin did not diverge"
+    );
+    anyhow::ensure!(
+        std::fs::read(client.mnt.join("clone/data"))? == b"clone-new",
+        "clone did not diverge"
+    );
+    anyhow::ensure!(
+        std::fs::read(client.mnt.join("origin/.constellation/snapshot/base/data"))? == b"base",
+        "clone write touched the snapshot"
+    );
+    client.snapshot_delete("/origin@base")?;
+    anyhow::ensure!(
+        std::fs::read(client.mnt.join("clone/data"))? == b"clone-new",
+        "deleting source snapshot broke clone"
+    );
+    client.unmount()
+}
+
+fn snapshot_mount(_seed: u64) -> Result<()> {
+    let (env, root) = setup("snapshot-mount")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/snapshot-mount-{}", ts());
+    let mut source = Client::new(root.path(), "source", &env.endpoint, &backend)?;
+    source.fs_create()?;
+    source.mount()?;
+    std::fs::create_dir(source.mnt.join("project"))?;
+    std::fs::write(source.mnt.join("project/data"), b"mounted-snapshot")?;
+    source.snapshot_create("/project@release")?;
+    std::thread::sleep(Duration::from_secs(1));
+
+    let mut frozen = Client::new(root.path(), "frozen", &env.endpoint, &backend)?;
+    frozen.mount_view(Some("/project@release"), &[])?;
+    anyhow::ensure!(
+        std::fs::read(frozen.mnt.join("data"))? == b"mounted-snapshot",
+        "snapshot mount returned wrong content"
+    );
+    let error = std::fs::write(frozen.mnt.join("data"), b"no").unwrap_err();
+    anyhow::ensure!(
+        error.raw_os_error() == Some(libc::EROFS),
+        "snapshot mutation returned {error}, expected EROFS"
+    );
+    frozen.unmount()?;
+
+    let mut writable = Client::new(root.path(), "writable", &env.endpoint, &backend)?;
+    writable.mount_view(Some("/project@release"), &["--rw", "--ephemeral"])?;
+    std::fs::write(writable.mnt.join("data"), b"branch")?;
+    writable.unmount()?;
+    eventually("ephemeral clone removed", Duration::from_secs(20), || {
+        let leaked = std::fs::read_dir(&source.mnt)?
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".constellation-ephemeral-")
+            });
+        anyhow::ensure!(!leaked, "ephemeral clone remains visible");
+        Ok(())
+    })?;
+    source.unmount()
 }
 
 /// Two clients mount the SAME filesystem. Each works in its own

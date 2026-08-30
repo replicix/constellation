@@ -15,7 +15,7 @@
 //! expose a manifest whose content is absent from S3.
 
 use crate::staging::{GenCounter, Staging, StagingBudget};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
@@ -25,7 +25,7 @@ use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyWrite, Request, TimeOrNow,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -131,6 +131,30 @@ pub struct FsDependencies {
     /// open dirty inode, decoupled from the chunk cache budget: a
     /// staged write is not sealed into the cache until flush.
     pub staging_budget: Arc<StagingBudget>,
+    pub snapshots: Arc<crate::snapshot::SnapshotManager>,
+}
+
+const SYNTHETIC_INO_BIT: u64 = 1 << 63;
+
+#[derive(Debug, Clone)]
+pub(crate) enum SyntheticNode {
+    Constellation {
+        path: String,
+    },
+    SnapshotDirectory {
+        path: String,
+    },
+    Frozen {
+        snapshot_id: String,
+        kind: InodeKind,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        size: u64,
+        mtime_ns: i64,
+        target: Option<String>,
+        object: Option<ChunkHash>,
+    },
 }
 
 pub struct ConstellationFs {
@@ -152,6 +176,15 @@ pub struct ConstellationFs {
     staging_dir: PathBuf,
     staging_budget: Arc<StagingBudget>,
     staging_gen: GenCounter,
+    snapshots: Arc<crate::snapshot::SnapshotManager>,
+    synthetic: HashMap<Ino, SyntheticNode>,
+    synthetic_keys: HashMap<String, Ino>,
+    next_synthetic: Ino,
+    tree_cache: Mutex<(
+        HashMap<ChunkHash, constellation_fs_core::Tree>,
+        VecDeque<ChunkHash>,
+    )>,
+    view_root: Ino,
 }
 
 fn staging_errno(e: &crate::staging::StagingError) -> i32 {
@@ -241,7 +274,335 @@ impl ConstellationFs {
             staging_dir: deps.staging_dir,
             staging_budget: deps.staging_budget,
             staging_gen: GenCounter::default(),
+            snapshots: deps.snapshots,
+            synthetic: HashMap::new(),
+            synthetic_keys: HashMap::new(),
+            next_synthetic: SYNTHETIC_INO_BIT,
+            tree_cache: Mutex::new((HashMap::new(), VecDeque::new())),
+            view_root: constellation_fs_core::types::ROOT_INO,
         }
+    }
+
+    pub fn set_subtree_root(&mut self, path: &str) -> Result<()> {
+        let path = crate::snapshot::normalize_path(path);
+        let ino = self
+            .meta
+            .resolve_path(&path)?
+            .with_context(|| format!("mount root {path} does not exist"))?;
+        let attr = self.meta.getattr(ino)?.context("mount root disappeared")?;
+        if attr.kind != InodeKind::Dir {
+            anyhow::bail!("mount root {path} is not a directory");
+        }
+        self.view_root = ino;
+        Ok(())
+    }
+
+    pub fn set_snapshot_root(&mut self, path: &str, name: &str) -> Result<()> {
+        let path = crate::snapshot::normalize_path(path);
+        let row = self
+            .meta
+            .snapshots(Some(&path))?
+            .into_iter()
+            .find(|row| row.name == name)
+            .with_context(|| format!("snapshot {path}@{name} does not exist"))?;
+        let node = SyntheticNode::Frozen {
+            snapshot_id: row.id,
+            kind: InodeKind::Dir,
+            mode: 0o555,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime_ns: row.created_unix_ms * 1_000_000,
+            target: None,
+            object: Some(crate::snapshot::parse_hash(&row.root_hash)?),
+        };
+        self.view_root = self.intern_synthetic(format!("mount:{path}@{name}"), node);
+        Ok(())
+    }
+
+    pub(crate) fn real_ino(&self, ino: Ino) -> Ino {
+        if ino == constellation_fs_core::types::ROOT_INO {
+            self.view_root
+        } else {
+            ino
+        }
+    }
+
+    pub(crate) fn visible_attr(&self, mut attr: FileAttr) -> FileAttr {
+        if attr.ino == self.view_root {
+            attr.ino = constellation_fs_core::types::ROOT_INO;
+        }
+        attr
+    }
+
+    pub(crate) fn is_synthetic(ino: Ino) -> bool {
+        ino & SYNTHETIC_INO_BIT != 0
+    }
+
+    pub(crate) fn synthetic_node(&self, ino: Ino) -> Option<SyntheticNode> {
+        self.synthetic.get(&ino).cloned()
+    }
+
+    pub(crate) fn synthetic_active(&self, node: &SyntheticNode) -> bool {
+        let SyntheticNode::Frozen { snapshot_id, .. } = node else {
+            return true;
+        };
+        self.meta
+            .snapshots(None)
+            .map(|rows| rows.iter().any(|row| &row.id == snapshot_id))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn intern_synthetic(&mut self, key: String, node: SyntheticNode) -> Ino {
+        if let Some(ino) = self.synthetic_keys.get(&key) {
+            return *ino;
+        }
+        let ino = self.next_synthetic;
+        self.next_synthetic += 1;
+        self.synthetic.insert(ino, node);
+        self.synthetic_keys.insert(key, ino);
+        ino
+    }
+
+    pub(crate) fn synthetic_attr(&self, ino: Ino, node: &SyntheticNode) -> FileAttr {
+        let (kind, mode, uid, gid, size, mtime_ns) = match node {
+            SyntheticNode::Constellation { .. } | SyntheticNode::SnapshotDirectory { .. } => {
+                (InodeKind::Dir, 0o555, 0, 0, 0, 0)
+            }
+            SyntheticNode::Frozen {
+                kind,
+                mode,
+                uid,
+                gid,
+                size,
+                mtime_ns,
+                ..
+            } => (*kind, *mode & !0o222, *uid, *gid, *size, *mtime_ns),
+        };
+        FileAttr {
+            ino,
+            kind,
+            size,
+            mode,
+            uid,
+            gid,
+            nlink: if kind == InodeKind::Dir { 2 } else { 1 },
+            atime_ns: mtime_ns,
+            mtime_ns,
+            ctime_ns: mtime_ns,
+            rdev: 0,
+        }
+    }
+
+    pub(crate) fn snapshot_tree(
+        &self,
+        hash: ChunkHash,
+    ) -> Result<constellation_fs_core::Tree, i32> {
+        {
+            let cache = self.tree_cache.lock().unwrap();
+            if let Some(tree) = cache.0.get(&hash) {
+                return Ok(tree.clone());
+            }
+        }
+        let tree = self
+            .rt
+            .block_on(self.snapshots.load_tree(hash))
+            .map_err(|_| libc::EIO)?;
+        let mut cache = self.tree_cache.lock().unwrap();
+        if cache.0.len() >= 128 {
+            if let Some(oldest) = cache.1.pop_front() {
+                cache.0.remove(&oldest);
+            }
+        }
+        cache.0.insert(hash, tree.clone());
+        cache.1.push_back(hash);
+        Ok(tree)
+    }
+
+    pub(crate) fn lookup_synthetic(
+        &mut self,
+        parent: Ino,
+        name: &str,
+    ) -> Result<Option<(Ino, FileAttr)>, i32> {
+        let node = if !Self::is_synthetic(parent) {
+            if name != ".constellation" {
+                return Ok(None);
+            }
+            let attr = self
+                .meta
+                .getattr(parent)
+                .map_err(|error| errno(&error))?
+                .ok_or(libc::ENOENT)?;
+            if attr.kind != InodeKind::Dir {
+                return Ok(None);
+            }
+            let path = self.meta.path_of(parent).map_err(|_| libc::EIO)?;
+            SyntheticNode::Constellation { path }
+        } else {
+            let parent_node = self.synthetic_node(parent).ok_or(libc::ESTALE)?;
+            if !self.synthetic_active(&parent_node) {
+                return Err(libc::ESTALE);
+            }
+            match parent_node {
+                SyntheticNode::Constellation { path } if name == "snapshot" => {
+                    SyntheticNode::SnapshotDirectory { path }
+                }
+                SyntheticNode::SnapshotDirectory { path } => {
+                    let (row, root) = self
+                        .rt
+                        .block_on(self.snapshots.covering(&path))
+                        .map_err(|_| libc::EIO)?
+                        .into_iter()
+                        .find(|(row, _)| row.name == name)
+                        .ok_or(libc::ENOENT)?;
+                    SyntheticNode::Frozen {
+                        snapshot_id: row.id,
+                        kind: InodeKind::Dir,
+                        mode: 0o555,
+                        uid: 0,
+                        gid: 0,
+                        size: 0,
+                        mtime_ns: row.created_unix_ms * 1_000_000,
+                        target: None,
+                        object: Some(root),
+                    }
+                }
+                SyntheticNode::Frozen {
+                    snapshot_id,
+                    kind: InodeKind::Dir,
+                    object: Some(tree_hash),
+                    ..
+                } => {
+                    let tree = self.snapshot_tree(tree_hash)?;
+                    let Some(entry) = tree.entries.into_iter().find(|entry| entry.name == name)
+                    else {
+                        return Ok(None);
+                    };
+                    SyntheticNode::Frozen {
+                        snapshot_id,
+                        kind: entry.kind,
+                        mode: entry.mode,
+                        uid: entry.uid,
+                        gid: entry.gid,
+                        size: entry.size,
+                        mtime_ns: entry.mtime_ns,
+                        target: entry.target,
+                        object: entry.manifest_or_tree_hash,
+                    }
+                }
+                _ => return Ok(None),
+            }
+        };
+        let key = format!("{parent}/{name}");
+        let ino = self.intern_synthetic(key, node.clone());
+        Ok(Some((ino, self.synthetic_attr(ino, &node))))
+    }
+
+    pub(crate) fn synthetic_entries(
+        &mut self,
+        ino: Ino,
+    ) -> Result<Vec<(Ino, InodeKind, String)>, i32> {
+        let node = self.synthetic_node(ino).ok_or(libc::ESTALE)?;
+        if !self.synthetic_active(&node) {
+            return Err(libc::ESTALE);
+        }
+        let children: Vec<(String, SyntheticNode)> = match node {
+            SyntheticNode::Constellation { path } => {
+                vec![("snapshot".into(), SyntheticNode::SnapshotDirectory { path })]
+            }
+            SyntheticNode::SnapshotDirectory { path } => self
+                .rt
+                .block_on(self.snapshots.covering(&path))
+                .map_err(|_| libc::EIO)?
+                .into_iter()
+                .map(|(row, root)| {
+                    Ok((
+                        row.name,
+                        SyntheticNode::Frozen {
+                            snapshot_id: row.id,
+                            kind: InodeKind::Dir,
+                            mode: 0o555,
+                            uid: 0,
+                            gid: 0,
+                            size: 0,
+                            mtime_ns: row.created_unix_ms * 1_000_000,
+                            target: None,
+                            object: Some(root),
+                        },
+                    ))
+                })
+                .collect::<Result<_, i32>>()?,
+            SyntheticNode::Frozen {
+                snapshot_id,
+                kind: InodeKind::Dir,
+                object: Some(tree_hash),
+                ..
+            } => self
+                .snapshot_tree(tree_hash)?
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.name,
+                        SyntheticNode::Frozen {
+                            snapshot_id: snapshot_id.clone(),
+                            kind: entry.kind,
+                            mode: entry.mode,
+                            uid: entry.uid,
+                            gid: entry.gid,
+                            size: entry.size,
+                            mtime_ns: entry.mtime_ns,
+                            target: entry.target,
+                            object: entry.manifest_or_tree_hash,
+                        },
+                    )
+                })
+                .collect(),
+            _ => return Err(libc::ENOTDIR),
+        };
+        Ok(children
+            .into_iter()
+            .map(|(name, node)| {
+                let child = self.intern_synthetic(format!("{ino}/{name}"), node.clone());
+                let kind = self.synthetic_attr(child, &node).kind;
+                (child, kind, name)
+            })
+            .collect())
+    }
+
+    pub(crate) fn read_frozen(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, i32> {
+        let node = self.synthetic_node(ino).ok_or(libc::ESTALE)?;
+        if !self.synthetic_active(&node) {
+            return Err(libc::ESTALE);
+        }
+        let SyntheticNode::Frozen {
+            kind: InodeKind::File,
+            object: Some(manifest_hash),
+            ..
+        } = node
+        else {
+            return Err(libc::EISDIR);
+        };
+        let manifest = self
+            .rt
+            .block_on(self.snapshots.load_manifest(manifest_hash))
+            .map_err(|_| libc::EIO)?;
+        let hashes = self.chunk_list(&manifest)?;
+        if offset >= manifest.file_len {
+            return Ok(Vec::new());
+        }
+        let len = size.min(manifest.file_len - offset);
+        let mut out = Vec::with_capacity(len as usize);
+        for slice in manifest.layout.slices(offset, len) {
+            let chunk = self.read_committed_chunk(&hashes, slice.index)?;
+            let start = slice.offset as usize;
+            let end = (slice.offset + slice.len) as usize;
+            if chunk.len() < end {
+                return Err(libc::EIO);
+            }
+            out.extend_from_slice(&chunk[start..end]);
+        }
+        Ok(out)
     }
 
     /// Ask the sync task for an immediate round without waiting:

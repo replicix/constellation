@@ -9,8 +9,8 @@ pub mod types;
 
 pub use types::{
     CacheStatus, CoopStatus, DesignationStatus, EpochStatus, LeaseStatus, P2pStatus,
-    PartitionStatus, PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SourceStatus,
-    SpoolStatus, StatusReport, WritebackStatus,
+    PartitionStatus, PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SnapshotStatus,
+    SourceStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -65,6 +65,33 @@ pub trait StatusSource: Send + Sync + 'static {
 
     fn set_write_mode(&self, _mode: &str) -> std::result::Result<String, String> {
         Err("write-mode switching is not supported by this daemon".into())
+    }
+
+    fn snapshot_create(&self, _selector: &str) -> std::result::Result<String, String> {
+        Err("snapshots are not supported by this daemon".into())
+    }
+
+    fn snapshot_list(
+        &self,
+        _path: Option<&str>,
+    ) -> std::result::Result<Vec<SnapshotStatus>, String> {
+        Err("snapshots are not supported by this daemon".into())
+    }
+
+    fn snapshot_delete(&self, _selector: &str) -> std::result::Result<String, String> {
+        Err("snapshots are not supported by this daemon".into())
+    }
+
+    fn clone_snapshot(
+        &self,
+        _selector: &str,
+        _destination: &str,
+    ) -> std::result::Result<String, String> {
+        Err("clones are not supported by this daemon".into())
+    }
+
+    fn snap_refs(&self, _id: &str) -> std::result::Result<Vec<String>, String> {
+        Err("snapshot references are not supported by this daemon".into())
     }
 }
 
@@ -132,6 +159,29 @@ async fn handle(stream: UnixStream, source: Arc<dyn StatusSource>) -> Result<()>
             },
             Ok(Request::SetWriteMode { mode }) => match source.set_write_mode(&mode) {
                 Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
+            },
+            Ok(Request::SnapshotCreate { selector }) => match source.snapshot_create(&selector) {
+                Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
+            },
+            Ok(Request::SnapshotList { path }) => match source.snapshot_list(path.as_deref()) {
+                Ok(snapshots) => Response::Snapshots { snapshots },
+                Err(message) => Response::Error { message },
+            },
+            Ok(Request::SnapshotDelete { selector }) => match source.snapshot_delete(&selector) {
+                Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
+            },
+            Ok(Request::Clone {
+                selector,
+                destination,
+            }) => match source.clone_snapshot(&selector, &destination) {
+                Ok(detail) => Response::Ok { detail },
+                Err(message) => Response::Error { message },
+            },
+            Ok(Request::SnapRefs { id }) => match source.snap_refs(&id) {
+                Ok(hashes) => Response::Refs { hashes },
                 Err(message) => Response::Error { message },
             },
             Err(e) => Response::Error {

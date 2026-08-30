@@ -11,6 +11,7 @@ mod pin;
 mod prefetch;
 mod reintegrate;
 mod shipper;
+mod snapshot;
 mod sources;
 mod staging;
 mod writeback;
@@ -45,8 +46,10 @@ enum Command {
         /// Backend: s3://bucket/prefix, file:///path, or absolute path.
         #[arg(long)]
         s3: String,
-        /// Mountpoint directory.
-        mountpoint: PathBuf,
+        /// Legacy form: `<mountpoint>`. Subtree form:
+        /// `<inner-path-or-snapshot> <mountpoint>`.
+        #[arg(num_args = 1..=2)]
+        paths: Vec<PathBuf>,
         /// Local state directory (metadata DB + chunk cache).
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -69,6 +72,15 @@ enum Command {
         /// a continuation epoch's write-eligible roster.
         #[arg(long)]
         read_only_member: bool,
+        /// Mount a snapshot selector through an automatically created clone.
+        #[arg(long)]
+        rw: bool,
+        /// Destination path/name for `--rw`.
+        #[arg(long, requires = "rw")]
+        clone_name: Option<String>,
+        /// Create a temporary clone and remove it on clean unmount.
+        #[arg(long, requires = "rw", conflicts_with = "clone_name")]
+        ephemeral: bool,
     },
     /// Verify backend capabilities (conditional writes, filesystem state).
     Doctor {
@@ -148,6 +160,51 @@ enum Command {
     /// drains the durable pending-upload queue before it takes effect.
     WriteMode {
         mode: String,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// Create, list, and delete immutable subtree snapshots.
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotCommand,
+    },
+    /// Create an ordinary writable subtree from a snapshot.
+    Clone {
+        selector: String,
+        destination: String,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// Low-level inspection commands.
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCommand {
+    Create {
+        selector: String,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    Ls {
+        path: Option<String>,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    Delete {
+        selector: String,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugCommand {
+    SnapRefs {
+        id: String,
         #[arg(long)]
         state_dir: PathBuf,
     },
@@ -303,16 +360,61 @@ fn main() -> Result<()> {
                 },
             ))
         }
+        Command::Snapshot { command } => match command {
+            SnapshotCommand::Create {
+                selector,
+                state_dir,
+            } => rt.block_on(control_call(
+                &state_dir,
+                constellation_api::Request::SnapshotCreate { selector },
+            )),
+            SnapshotCommand::Ls { path, state_dir } => rt.block_on(control_call(
+                &state_dir,
+                constellation_api::Request::SnapshotList { path },
+            )),
+            SnapshotCommand::Delete {
+                selector,
+                state_dir,
+            } => rt.block_on(control_call(
+                &state_dir,
+                constellation_api::Request::SnapshotDelete { selector },
+            )),
+        },
+        Command::Clone {
+            selector,
+            destination,
+            state_dir,
+        } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::Clone {
+                selector,
+                destination,
+            },
+        )),
+        Command::Debug {
+            command: DebugCommand::SnapRefs { id, state_dir },
+        } => rt.block_on(control_call(
+            &state_dir,
+            constellation_api::Request::SnapRefs { id },
+        )),
         Command::Mount {
             s3,
-            mountpoint,
+            paths,
             state_dir,
             cache_size,
             allow_other,
             fsync_mode,
             write_mode,
             read_only_member,
+            rw,
+            clone_name,
+            ephemeral,
         } => {
+            let (inner_path, mountpoint) = match paths.as_slice() {
+                [mountpoint] => ("/".to_string(), mountpoint.clone()),
+                [inner, mountpoint] => (inner.to_string_lossy().into_owned(), mountpoint.clone()),
+                _ => unreachable!("clap enforces one or two mount paths"),
+            };
             let fsync_s3 = match fsync_mode.as_str() {
                 "local" => false,
                 "s3" => true,
@@ -324,12 +426,16 @@ fn main() -> Result<()> {
                 rt,
                 &s3,
                 &mountpoint,
+                &inner_path,
                 state_dir,
                 cache_size,
                 allow_other,
                 fsync_s3,
                 write_mode,
                 read_only_member,
+                rw,
+                clone_name,
+                ephemeral,
             )
         }
     }
@@ -340,12 +446,16 @@ fn mount(
     rt: tokio::runtime::Runtime,
     s3: &str,
     mountpoint: &std::path::Path,
+    inner_path: &str,
     state_dir: Option<PathBuf>,
     cache_size: u64,
     allow_other: bool,
     fsync_s3: bool,
     initial_write_mode: writeback::WriteMode,
     read_only_member: bool,
+    rw_snapshot: bool,
+    clone_name: Option<String>,
+    ephemeral: bool,
 ) -> Result<()> {
     let store = std::sync::Arc::new(ChunkStore::new(backend::open_backend(s3)?));
     let fsmeta = rt
@@ -439,6 +549,57 @@ fn mount(
         .compression
         .parse()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let snapshots = std::sync::Arc::new(snapshot::SnapshotManager::new(
+        meta.clone(),
+        store.clone(),
+        compression,
+        fsmeta.chunk_size,
+        node_id,
+    ));
+    let selector = inner_path
+        .contains('@')
+        .then(|| snapshot::split_selector(inner_path))
+        .transpose()?;
+    if rw_snapshot && selector.is_none() {
+        bail!("--rw is only valid when mounting <path>@<snapshot>");
+    }
+    let mut ephemeral_clone = None;
+    let mounted_path = if let Some((source_path, snapshot_name)) = &selector {
+        if rw_snapshot {
+            let destination = if ephemeral {
+                format!(
+                    "/.constellation-ephemeral-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis())
+                        .unwrap_or(0)
+                )
+            } else {
+                let clone_name = clone_name
+                    .as_deref()
+                    .context("--rw snapshot mounts require --clone-name or --ephemeral")?;
+                if clone_name.starts_with('/') {
+                    snapshot::normalize_path(clone_name)
+                } else {
+                    let parent = source_path
+                        .rsplit_once('/')
+                        .map(|pair| pair.0)
+                        .unwrap_or("");
+                    snapshot::normalize_path(&format!("{parent}/{clone_name}"))
+                }
+            };
+            rt.block_on(snapshots.clone_to(source_path, snapshot_name, &destination))?;
+            if ephemeral {
+                ephemeral_clone = Some(destination.clone());
+            }
+            destination
+        } else {
+            source_path.clone()
+        }
+    } else {
+        snapshot::normalize_path(inner_path)
+    };
 
     // Write authority (DESIGN.md §4/§5). Renew and takeover need
     // If-Match; a backend without it can only be driven safely by one
@@ -537,7 +698,7 @@ fn mount(
     );
 
     let departed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let fs = fusefs::ConstellationFs::new(
+    let mut fs = fusefs::ConstellationFs::new(
         fusefs::FsDependencies {
             meta: meta.clone(),
             store: store.clone(),
@@ -558,10 +719,20 @@ fn mount(
             coop: Some(coop.clone()),
             staging_dir: staging_dir.clone(),
             staging_budget: staging_budget.clone(),
+            snapshots: snapshots.clone(),
         },
         fsmeta.chunk_size,
         compression,
     );
+    if let Some((path, name)) = &selector {
+        if rw_snapshot {
+            fs.set_subtree_root(&mounted_path)?;
+        } else {
+            fs.set_snapshot_root(path, name)?;
+        }
+    } else {
+        fs.set_subtree_root(&mounted_path)?;
+    }
 
     // Background metadata sync: tail foreign segments + ship the
     // journal, every interval or on demand (close/fsync nudges).
@@ -1089,6 +1260,7 @@ fn mount(
         coop: coop.clone(),
         write_mode: write_mode.clone(),
         upload: upload.clone(),
+        snapshots: snapshots.clone(),
     });
     {
         let _guard = rt.enter();
@@ -1104,6 +1276,9 @@ fn mount(
     if allow_other {
         options.push(fuser::MountOption::AllowOther);
     }
+    if selector.is_some() && !rw_snapshot {
+        options.push(fuser::MountOption::RO);
+    }
     tracing::info!(?mountpoint, ?state_dir, fs = %fsmeta.uuid, "mounting");
     fuser::mount2(fs, mountpoint, &options).context("FUSE mount")?;
 
@@ -1111,6 +1286,10 @@ fn mount(
     // lease so a peer does not have to wait out the TTL. Skip when we
     // already flushed and retired via `leave` — the registry record is
     // a tombstone and a second ship is unnecessary.
+    if let Some(path) = ephemeral_clone {
+        remove_live_subtree(&meta, &path)
+            .with_context(|| format!("removing ephemeral clone {path}"))?;
+    }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
         return Ok(());
@@ -1139,6 +1318,33 @@ fn mount(
         r
     });
     flush.context("final log flush")?;
+    Ok(())
+}
+
+fn remove_live_subtree(meta: &SqliteMeta, path: &str) -> Result<()> {
+    let ino = meta
+        .resolve_path(path)?
+        .with_context(|| format!("clone path {path} disappeared"))?;
+    fn clear(meta: &SqliteMeta, ino: u64) -> Result<()> {
+        for entry in constellation_meta::MetaStore::readdir(meta, ino)? {
+            if entry.kind == constellation_fs_core::InodeKind::Dir {
+                clear(meta, entry.ino)?;
+                constellation_meta::MetaStore::rmdir(meta, ino, &entry.name)?;
+            } else {
+                constellation_meta::MetaStore::unlink(meta, ino, &entry.name)?;
+            }
+        }
+        Ok(())
+    }
+    clear(meta, ino)?;
+    let parent = meta
+        .parent_of(ino)?
+        .context("ephemeral clone cannot be the filesystem root")?;
+    let name = path
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .context("ephemeral clone has no basename")?;
+    constellation_meta::MetaStore::rmdir(meta, parent, name)?;
     Ok(())
 }
 
@@ -1413,6 +1619,16 @@ async fn control_call(state_dir: &std::path::Path, req: constellation_api::Reque
                 println!("no active designations");
             } else {
                 println!("{}", serde_json::to_string_pretty(&designations)?);
+            }
+            Ok(())
+        }
+        constellation_api::Response::Snapshots { snapshots } => {
+            println!("{}", serde_json::to_string_pretty(&snapshots)?);
+            Ok(())
+        }
+        constellation_api::Response::Refs { hashes } => {
+            for hash in hashes {
+                println!("{hash}");
             }
             Ok(())
         }
@@ -1788,6 +2004,39 @@ struct DaemonStatus {
     coop: std::sync::Arc<crate::coop::Coop>,
     write_mode: std::sync::Arc<writeback::WriteModeState>,
     upload: std::sync::Arc<UploadRuntime>,
+    snapshots: std::sync::Arc<snapshot::SnapshotManager>,
+}
+
+impl DaemonStatus {
+    /// Snapshot/clone control requests are metadata mutations too: acquire
+    /// the subtree partition and force its pending data + journal through
+    /// before observing or publishing an immutable root.
+    fn snapshot_barrier(&self, path: &str) -> std::result::Result<(), String> {
+        let ino = self
+            .meta
+            .resolve_path(path)
+            .map_err(|error| error.to_string())?
+            .unwrap_or(constellation_fs_core::types::ROOT_INO);
+        let part = self
+            .meta
+            .partition_of(ino)
+            .map_err(|error| error.to_string())?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sync_tx
+            .send(fusefs::SyncRequest::Acquire { part, reply })
+            .map_err(|_| "sync task is not running".to_string())?;
+        let acquired = tokio::task::block_in_place(|| self.rt.block_on(receive))
+            .map_err(|_| "lease acquisition stopped".to_string())??;
+        if !acquired {
+            return Err("subtree write lease is held by another node".into());
+        }
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sync_tx
+            .send(fusefs::SyncRequest::Barrier { ino, reply })
+            .map_err(|_| "sync task is not running".to_string())?;
+        tokio::task::block_in_place(|| self.rt.block_on(receive))
+            .map_err(|_| "snapshot barrier stopped".to_string())?
+    }
 }
 
 impl constellation_api::StatusSource for DaemonStatus {
@@ -2022,6 +2271,73 @@ impl constellation_api::StatusSource for DaemonStatus {
         }
         self.write_mode.set(requested);
         Ok(format!("write mode set to {}", requested.as_str()))
+    }
+
+    fn snapshot_create(&self, selector: &str) -> std::result::Result<String, String> {
+        let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
+        self.snapshot_barrier(&path)?;
+        let snapshots = self.snapshots.clone();
+        let result =
+            tokio::task::block_in_place(|| self.rt.block_on(snapshots.create(&path, &name)))
+                .map_err(|error| format!("{error:#}"))?;
+        let _ = self.sync_tx.send(fusefs::SyncRequest::Nudge);
+        Ok(result)
+    }
+
+    fn snapshot_list(
+        &self,
+        path: Option<&str>,
+    ) -> std::result::Result<Vec<constellation_api::SnapshotStatus>, String> {
+        self.snapshots
+            .list(path)
+            .map_err(|error| format!("{error:#}"))
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| constellation_api::SnapshotStatus {
+                        id: row.id,
+                        path: row.path,
+                        name: row.name,
+                        root_hash: row.root_hash,
+                        created_unix_ms: row.created_unix_ms,
+                    })
+                    .collect()
+            })
+    }
+
+    fn snapshot_delete(&self, selector: &str) -> std::result::Result<String, String> {
+        let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
+        self.snapshot_barrier(&path)?;
+        let snapshots = self.snapshots.clone();
+        let result =
+            tokio::task::block_in_place(|| self.rt.block_on(snapshots.delete(&path, &name)))
+                .map_err(|error| format!("{error:#}"))?;
+        let _ = self.sync_tx.send(fusefs::SyncRequest::Nudge);
+        Ok(result)
+    }
+
+    fn clone_snapshot(
+        &self,
+        selector: &str,
+        destination: &str,
+    ) -> std::result::Result<String, String> {
+        let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
+        self.snapshot_barrier(&path)?;
+        let snapshots = self.snapshots.clone();
+        let destination = destination.to_string();
+        let result = tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(snapshots.clone_to(&path, &name, &destination))
+        })
+        .map_err(|error| format!("{error:#}"))?;
+        let _ = self.sync_tx.send(fusefs::SyncRequest::Nudge);
+        Ok(result)
+    }
+
+    fn snap_refs(&self, id: &str) -> std::result::Result<Vec<String>, String> {
+        let snapshots = self.snapshots.clone();
+        let id = id.to_string();
+        tokio::task::block_in_place(|| self.rt.block_on(snapshots.refs(&id)))
+            .map_err(|error| format!("{error:#}"))
     }
 }
 

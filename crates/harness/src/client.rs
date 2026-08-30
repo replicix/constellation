@@ -114,6 +114,10 @@ impl Client {
     }
 
     pub fn mount(&mut self) -> Result<()> {
+        self.mount_view(None, &[])
+    }
+
+    pub fn mount_view(&mut self, inner: Option<&str>, extra: &[&str]) -> Result<()> {
         if self.child.is_some() {
             bail!("{} already mounted", self.name);
         }
@@ -122,10 +126,14 @@ impl Client {
             "mount".to_string(),
             "--s3".to_string(),
             self.backend.clone(),
-            self.mnt.to_str().unwrap().to_string(),
-            "--state-dir".to_string(),
-            self.state.to_str().unwrap().to_string(),
         ];
+        if let Some(inner) = inner {
+            args.push(inner.to_string());
+        }
+        args.push(self.mnt.to_str().unwrap().to_string());
+        args.push("--state-dir".to_string());
+        args.push(self.state.to_str().unwrap().to_string());
+        args.extend(extra.iter().map(|arg| (*arg).to_string()));
         if let Some(bytes) = self.cache_size {
             args.push("--cache-size".to_string());
             args.push(bytes.to_string());
@@ -156,6 +164,35 @@ impl Client {
             std::thread::sleep(Duration::from_millis(100));
         }
         bail!("{} mount did not appear", self.name)
+    }
+
+    pub fn snapshot_create(&self, selector: &str) -> Result<()> {
+        self.control_command(&["snapshot", "create", selector])
+    }
+
+    pub fn snapshot_delete(&self, selector: &str) -> Result<()> {
+        self.control_command(&["snapshot", "delete", selector])
+    }
+
+    pub fn clone_snapshot(&self, selector: &str, destination: &str) -> Result<()> {
+        self.control_command(&["clone", selector, destination])
+    }
+
+    fn control_command(&self, prefix: &[&str]) -> Result<()> {
+        let mut args: Vec<String> = prefix.iter().map(|arg| (*arg).to_string()).collect();
+        args.push("--state-dir".into());
+        args.push(self.state.display().to_string());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = self.cmd(&refs).output()?;
+        if !output.status.success() {
+            bail!(
+                "{} failed: {}{}",
+                prefix.join(" "),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
     }
 
     /// Clean unmount (flushes, exits the daemon).

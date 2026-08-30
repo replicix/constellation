@@ -8,7 +8,7 @@ pub mod replay;
 pub mod sqlite;
 
 pub use error::MetaError;
-pub use record::LogRecord;
+pub use record::{CloneNode, LogRecord};
 pub use reintegrate::{classify, materialize, Disposition, CONFLICT_DIR};
 pub use sqlite::SqliteMeta;
 
@@ -20,6 +20,42 @@ pub struct DirEntry {
     pub name: String,
     pub ino: Ino,
     pub kind: constellation_fs_core::InodeKind,
+}
+
+/// One child row used by the snapshot builder.  `snapshot_children` performs
+/// the dentry/inode join in one indexed query per directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotNode {
+    pub name: String,
+    pub attr: FileAttr,
+    pub target: Option<String>,
+    pub manifest: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRow {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    pub root_hash: String,
+    pub created_unix_ms: i64,
+}
+
+/// Parent-before-child description consumed by eager clone materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneSpec {
+    /// `None` means the clone root; otherwise an index in the preceding
+    /// portion of the same vector.
+    pub parent_index: Option<usize>,
+    pub name: String,
+    pub kind: constellation_fs_core::InodeKind,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub target: Option<String>,
+    pub manifest: Option<Vec<u8>>,
 }
 
 /// The metadata engine interface (DESIGN.md §4 "Local store").

@@ -7,11 +7,13 @@ pub mod cache;
 pub mod chunk;
 pub mod error;
 pub mod manifest;
+pub mod tree;
 pub mod types;
 
 pub use chunk::{ChunkHash, ChunkLayout, ChunkSlice};
 pub use error::CoreError;
 pub use manifest::{ChunkInfo, Manifest};
+pub use tree::{Tree, TreeEntry};
 pub use types::{FileAttr, Ino, InodeKind};
 
 /// Default chunk size for the data plane (DESIGN.md §3); per-FS setting.

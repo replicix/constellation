@@ -42,6 +42,14 @@ pub fn designations_prefix() -> Path {
     Path::from("designations")
 }
 
+pub fn snapshot(id: &str) -> Path {
+    Path::from(format!("snaps/{id}.json"))
+}
+
+pub fn snapshots_prefix() -> Path {
+    Path::from("snaps")
+}
+
 pub fn registry(node_id: &str) -> Path {
     Path::from(format!("registry/{node_id}.json"))
 }

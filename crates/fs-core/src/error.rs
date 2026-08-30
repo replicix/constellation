@@ -8,6 +8,9 @@ pub enum CoreError {
     #[error("corrupt manifest: {0}")]
     CorruptManifest(String),
 
+    #[error("corrupt snapshot tree: {0}")]
+    CorruptTree(String),
+
     #[error("chunk hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
 

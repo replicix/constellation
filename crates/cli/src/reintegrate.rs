@@ -85,18 +85,46 @@ pub async fn run(
         let mut conflicts = 0u64;
         let mut dispositions = Vec::new();
         let mut output = Vec::new();
-        for (seq, rec) in stranded {
-            let disp = classify(&shared, &rec)?;
+        for (index, (seq, rec)) in stranded.iter().enumerate() {
+            // The FUSE truncate path journals a size-only Setattr immediately
+            // before the WriteManifest that commits the replacement bytes.
+            // Treat that pair as one logical edit during reintegration. If the
+            // manifest conflicts, replaying the otherwise-"clean" truncate
+            // after the shared winner would leave the winner at size zero;
+            // if it is clean, WriteManifest already carries the final size.
+            let folded_size = matches!(
+                rec,
+                constellation_meta::LogRecord::Setattr {
+                    ino,
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: Some(_),
+                    atime_ns: None,
+                    mtime_ns: None,
+                    ..
+                } if stranded[index + 1..].iter().any(|(_, later)| matches!(
+                    later,
+                    constellation_meta::LogRecord::WriteManifest { ino: later_ino, .. }
+                        if later_ino == ino
+                ))
+            );
+            if folded_size {
+                cleaned += 1;
+                dispositions.push((*seq, "clean".into(), "folded into write_manifest".into()));
+                continue;
+            }
+            let disp = classify(&shared, rec)?;
             match &disp {
                 Disposition::Clean => {
                     // Advance the reconciled namespace in journal order;
                     // the same record is appended under a fresh local seq.
-                    shared.apply_records(std::slice::from_ref(&rec))?;
-                    output.push(rec);
+                    shared.apply_records(std::slice::from_ref(rec))?;
+                    output.push(rec.clone());
                     cleaned += 1;
                 }
                 Disposition::Conflict { reason } => {
-                    let path = materialize(&shared, &rec, node_id, ts)?;
+                    let path = materialize(&shared, rec, node_id, ts)?;
                     tracing::error!(
                         seq,
                         path,
@@ -107,7 +135,7 @@ pub async fn run(
                     flags.conflicts.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            dispositions.push((seq, disp.as_str().to_string(), disp.detail()));
+            dispositions.push((*seq, disp.as_str().to_string(), disp.detail()));
         }
         // Materialization used ordinary namespace operations on the side
         // replica; append those generated records too.

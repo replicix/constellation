@@ -43,6 +43,22 @@ pub enum Request {
     SetWriteMode {
         mode: String,
     },
+    SnapshotCreate {
+        selector: String,
+    },
+    SnapshotList {
+        path: Option<String>,
+    },
+    SnapshotDelete {
+        selector: String,
+    },
+    Clone {
+        selector: String,
+        destination: String,
+    },
+    SnapRefs {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,9 +84,24 @@ pub enum Response {
     Designations {
         designations: Vec<DesignationStatus>,
     },
+    Snapshots {
+        snapshots: Vec<SnapshotStatus>,
+    },
+    Refs {
+        hashes: Vec<String>,
+    },
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SnapshotStatus {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    pub root_hash: String,
+    pub created_unix_ms: i64,
 }
 
 /// One offline designation, as exposed by the control API.

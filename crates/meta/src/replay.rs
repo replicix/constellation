@@ -99,6 +99,13 @@ impl TouchSet {
                 self.inos.insert(*at_ino);
             }
             LogRecord::PartMerge { .. } | LogRecord::RenameXpartAbort { .. } => {}
+            LogRecord::SnapCreate { .. } | LogRecord::SnapDelete { .. } => {}
+            LogRecord::Clone { nodes, .. } => {
+                for node in nodes {
+                    self.dentries.insert((node.parent, node.name.clone()));
+                    self.inos.insert(node.ino);
+                }
+            }
             LogRecord::RenameXpartSrc {
                 from_parent,
                 name,
@@ -663,6 +670,62 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
         LogRecord::RenameXpartDst { txid, .. } => park_or_apply_xpart(tx, *txid, "dst", rec),
         LogRecord::RenameXpartAbort { txid } => {
             tx.execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
+            Ok(Applied::Done)
+        }
+        LogRecord::SnapCreate {
+            id,
+            path,
+            name,
+            root_hash,
+            created_unix_ms,
+        } => {
+            tx.execute(
+                "INSERT OR REPLACE INTO snapshot
+                 (id, path, name, root_hash, created_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, path, name, root_hash, created_unix_ms],
+            )?;
+            Ok(Applied::Done)
+        }
+        LogRecord::SnapDelete { id, .. } => {
+            tx.execute("DELETE FROM snapshot WHERE id = ?1", params![id])?;
+            Ok(Applied::Done)
+        }
+        LogRecord::Clone { nodes, .. } => {
+            for node in nodes {
+                let Some(kind) = InodeKind::from_u8(node.kind) else {
+                    return Err(MetaError::Invalid(format!(
+                        "clone inode {} has invalid kind {}",
+                        node.ino, node.kind
+                    )));
+                };
+                if !ino_exists(tx, node.parent)? {
+                    return Ok(Applied::Skipped("clone parent does not exist"));
+                }
+                tx.execute(
+                    "INSERT OR REPLACE INTO inode
+                     (ino, kind, size, mode, uid, gid, nlink, atime_ns, mtime_ns,
+                      ctime_ns, rdev, manifest, symlink_target)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, ?9, ?10, ?11)",
+                    params![
+                        node.ino,
+                        node.kind,
+                        node.size as i64,
+                        node.mode,
+                        node.uid,
+                        node.gid,
+                        if kind == InodeKind::Dir { 2 } else { 1 },
+                        node.mtime_ns,
+                        node.rdev as i64,
+                        node.manifest,
+                        node.target
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
+                    params![node.parent, node.name, node.ino],
+                )?;
+            }
             Ok(Applied::Done)
         }
     }

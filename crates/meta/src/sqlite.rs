@@ -6,7 +6,7 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::{DirEntry, MetaStore};
+use crate::{CloneNode, CloneSpec, DirEntry, MetaStore, SnapshotNode, SnapshotRow};
 use constellation_fs_core::types::{now_ns, ROOT_INO};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -81,6 +81,14 @@ CREATE TABLE IF NOT EXISTS pending_upload (
     hash BLOB NOT NULL,
     ino  INTEGER NOT NULL,
     PRIMARY KEY (hash, ino)
+);
+CREATE TABLE IF NOT EXISTS snapshot (
+    id              TEXT PRIMARY KEY,
+    path            TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    root_hash       TEXT NOT NULL,
+    created_unix_ms INTEGER NOT NULL,
+    UNIQUE(path, name)
 );
 ";
 
@@ -322,7 +330,10 @@ impl SqliteMeta {
             }
             | LogRecord::RenameXpartSrc { part, .. }
             | LogRecord::RenameXpartDst { part, .. } => Ok(part.clone()),
-            LogRecord::RenameXpartAbort { .. } => Ok("p0".into()),
+            LogRecord::RenameXpartAbort { .. }
+            | LogRecord::SnapCreate { .. }
+            | LogRecord::SnapDelete { .. }
+            | LogRecord::Clone { .. } => Ok("p0".into()),
             LogRecord::Mkdir { parent, .. }
             | LogRecord::Create { parent, .. }
             | LogRecord::Symlink { parent, .. }
@@ -484,6 +495,216 @@ impl SqliteMeta {
             }
         }
         Ok(Some(cur))
+    }
+
+    /// Fetch one directory's complete snapshot rows with one indexed join.
+    pub fn snapshot_children(&self, parent: Ino) -> Result<Vec<SnapshotNode>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT d.name, i.ino, i.kind, i.size, i.mode, i.uid, i.gid, i.nlink,
+                    i.atime_ns, i.mtime_ns, i.ctime_ns, i.rdev, i.symlink_target, i.manifest
+             FROM dentry d JOIN inode i ON i.ino = d.ino
+             WHERE d.parent = ?1 ORDER BY d.name",
+        )?;
+        let rows = stmt.query_map(params![parent], |row| {
+            let kind: u8 = row.get(2)?;
+            Ok(SnapshotNode {
+                name: row.get(0)?,
+                attr: FileAttr {
+                    ino: row.get(1)?,
+                    kind: InodeKind::from_u8(kind).expect("database kind is validated on insert"),
+                    size: row.get::<_, i64>(3)? as u64,
+                    mode: row.get(4)?,
+                    uid: row.get(5)?,
+                    gid: row.get(6)?,
+                    nlink: row.get(7)?,
+                    atime_ns: row.get(8)?,
+                    mtime_ns: row.get(9)?,
+                    ctime_ns: row.get(10)?,
+                    rdev: row.get::<_, i64>(11)? as u64,
+                },
+                target: row.get(12)?,
+                manifest: row.get(13)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Make a snapshot visible locally and journal its immutable root.
+    pub fn record_snapshot(&self, row: &SnapshotRow) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO snapshot (id, path, name, root_hash, created_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                row.id,
+                row.path,
+                row.name,
+                row.root_hash,
+                row.created_unix_ms
+            ],
+        )?;
+        Self::journal(
+            &tx,
+            &LogRecord::SnapCreate {
+                id: row.id.clone(),
+                path: row.path.clone(),
+                name: row.name.clone(),
+                root_hash: row.root_hash.clone(),
+                created_unix_ms: row.created_unix_ms,
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_snapshot(&self, path: &str, name: &str) -> Result<bool, MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let row: Option<String> = tx
+            .query_row(
+                "SELECT id FROM snapshot WHERE path = ?1 AND name = ?2",
+                params![path, name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = row else {
+            return Ok(false);
+        };
+        tx.execute("DELETE FROM snapshot WHERE id = ?1", params![id])?;
+        Self::journal(
+            &tx,
+            &LogRecord::SnapDelete {
+                id,
+                path: path.to_string(),
+                name: name.to_string(),
+            },
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn snapshots(&self, path: Option<&str>) -> Result<Vec<SnapshotRow>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if path.is_some() {
+            "SELECT id, path, name, root_hash, created_unix_ms FROM snapshot
+             WHERE path = ?1 ORDER BY path, name"
+        } else {
+            "SELECT id, path, name, root_hash, created_unix_ms FROM snapshot
+             ORDER BY path, name"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let map = |row: &rusqlite::Row<'_>| {
+            Ok(SnapshotRow {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                root_hash: row.get(3)?,
+                created_unix_ms: row.get(4)?,
+            })
+        };
+        let rows = match path {
+            Some(path) => stmt.query_map(params![path], map)?,
+            None => stmt.query_map([], map)?,
+        };
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Eager metadata clone. Data and manifest blobs stay content-addressed;
+    /// only ordinary inode/dentry rows are copied.
+    pub fn eager_clone(
+        &self,
+        source_path: &str,
+        snapshot: &str,
+        root_hash: &str,
+        destination: &str,
+        specs: &[CloneSpec],
+    ) -> Result<Ino, MetaError> {
+        if specs.is_empty() || specs[0].parent_index.is_some() {
+            return Err(MetaError::Invalid("clone tree has no root".into()));
+        }
+        let mut parts: Vec<&str> = destination.split('/').filter(|p| !p.is_empty()).collect();
+        let name = parts
+            .pop()
+            .ok_or_else(|| MetaError::Invalid("cannot clone over /".into()))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut parent = ROOT_INO;
+        for part in parts {
+            parent = Self::dentry_ino(&tx, parent, part)?.ok_or(MetaError::NoEntry)?;
+        }
+        if Self::dentry_ino(&tx, parent, name)?.is_some() {
+            return Err(MetaError::Exists);
+        }
+        let mut inos = Vec::with_capacity(specs.len());
+        let mut nodes = Vec::with_capacity(specs.len());
+        for (index, spec) in specs.iter().enumerate() {
+            let ino = Self::alloc_ino(&tx)?;
+            let node_parent = match spec.parent_index {
+                None => parent,
+                Some(parent_index) if parent_index < index => inos[parent_index],
+                _ => {
+                    return Err(MetaError::Invalid(
+                        "clone nodes are not parent-first".into(),
+                    ))
+                }
+            };
+            let node_name = if index == 0 { name } else { &spec.name };
+            tx.execute(
+                "INSERT INTO inode (ino, kind, size, mode, uid, gid, nlink, atime_ns,
+                    mtime_ns, ctime_ns, rdev, manifest, symlink_target)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10)",
+                params![
+                    ino,
+                    spec.kind.as_u8(),
+                    spec.size as i64,
+                    spec.mode,
+                    spec.uid,
+                    spec.gid,
+                    if spec.kind == InodeKind::Dir { 2 } else { 1 },
+                    spec.mtime_ns,
+                    spec.manifest,
+                    spec.target
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
+                params![node_parent, node_name, ino],
+            )?;
+            if spec.kind == InodeKind::Dir {
+                tx.execute(
+                    "UPDATE inode SET nlink = nlink + 1 WHERE ino = ?1",
+                    params![node_parent],
+                )?;
+            }
+            nodes.push(CloneNode {
+                parent: node_parent,
+                name: node_name.to_string(),
+                ino,
+                kind: spec.kind.as_u8(),
+                mode: spec.mode,
+                uid: spec.uid,
+                gid: spec.gid,
+                size: spec.size,
+                mtime_ns: spec.mtime_ns,
+                rdev: 0,
+                target: spec.target.clone(),
+                manifest: spec.manifest.clone(),
+            });
+            inos.push(ino);
+        }
+        Self::journal(
+            &tx,
+            &LogRecord::Clone {
+                source_path: source_path.to_string(),
+                snapshot: snapshot.to_string(),
+                root_hash: root_hash.to_string(),
+                nodes,
+            },
+        )?;
+        tx.commit()?;
+        Ok(inos[0])
     }
 
     /// Every manifest under `ino` (inclusive), as `(ino, manifest_bytes,

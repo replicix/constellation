@@ -11,6 +11,7 @@ pub mod layout;
 pub mod lease;
 pub mod log;
 pub mod nodes;
+pub mod snapshot;
 pub mod store;
 
 pub use codec::{Codec, CompressionSetting};
@@ -22,4 +23,5 @@ pub use nodes::{
     claim_node_id, get_node, leave_node, list_node_ids, list_nodes, publish_p2p, publish_ro,
     write_eligible_roster, NodeInfo,
 };
+pub use snapshot::{snapshot_id, SnapshotRecord, SnapshotStore};
 pub use store::{Capabilities, ChunkPutMode, ChunkPutResult, ChunkStore, FsMeta};

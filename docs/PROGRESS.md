@@ -535,7 +535,58 @@ Deferred: a LIST-seeded existence bloom for cold high-dedup imports,
 dirty peer serving, and record-bearing P2P are separate data/visibility
 plane work.
 
+## Phase 6a — snapshots, clones, and subtree mounts: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Deterministic versioned `CTR1` tree objects with sorted complete metadata entries and stable BLAKE3 identity | done | `fs-core::tree` |
+| Tree and encoded-manifest objects share the ordinary compressed, verified, content-addressed chunk path; conditional PUT makes repeated snapshots upload only changed objects | done | `cli::snapshot`, `store-s3::store` |
+| CAS-created `snaps/<stable-id>.json` records and replica `snapshot` table maintained by `snap_create` / `snap_delete` replay | done | `store-s3::snapshot`, `meta::{sqlite,replay,record}` |
+| CLI/control API snapshot create/list/delete, eager clone, and `debug snap-refs` GC-root enumeration | done | `api`, `cli::{main,snapshot}` |
+| Hidden explicit-lookup `.constellation/snapshot/<name>/` frozen views, covering ancestor snapshots, top-bit synthetic inodes, bounded decoded-tree cache, read-only enforcement, and ESTALE after deletion | done | `cli::{fusefs,fusefs_ops}` |
+| Eager metadata clones materialized atomically and replicated in one `clone` record; data chunks and immutable manifests remain shared | done | `meta::{sqlite,replay}`, `cli::snapshot` |
+| Live subtree and read-only snapshot roots accepted by `mount`; `--rw --clone-name` and `--rw --ephemeral` snapshot-mount sugar | done | `cli::{main,fusefs}`, `harness::client` |
+| Unit proofs for tree round-trip/corruption, stable unchanged-tree hash, snapshot CAS identity, and clone isolation | done | `fs-core::tree`, `store-s3::snapshot`, `cli::snapshot` |
+| Harness lifecycle, clone divergence, read-only snapshot mount, and ephemeral cleanup scenarios | done | `harness::scenarios` |
+| Reintegration folds the size-only truncate record into its following manifest edit, so an edit conflict cannot truncate the shared winner | done — regression exposed by the full phase gate | `cli::reintegrate`; harness `deposed-reintegration` |
+
+### Phase 6a exit criteria (plan 06)
+
+- [x] Snapshot creation freezes a well-defined flushed subtree and duplicate
+      `path@name` creation is rejected by backend CAS.
+- [x] The synthetic control child stays hidden from ordinary `readdir` while
+      explicit lookup serves frozen content; deletion makes new operations
+      stale without changing the live tree.
+- [x] Clones are ordinary writable subtrees and remain valid after their
+      source snapshot is deleted; clone writes do not mutate snapshot trees.
+- [x] Subtree, snapshot, named writable-clone, and ephemeral writable-clone
+      mount selectors work without changing the one-process-per-mount model.
+- [x] Snapshot trees are enumerable as future bucket-GC roots and deletion
+      deliberately leaves all content-addressed objects for phase 8 GC.
+
+**Design choices.** Tree object encoding lives in `fs-core` because it is a
+backend-independent persistent VFS format; S3 only stores the resulting bytes
+through the existing chunk path. Small manifests are also stored as immutable
+objects (rather than adding a second inline representation to `CTR1`), trading
+one deduplicated object per distinct manifest for one uniform verified read
+path. Clone metadata uses the plan's allowed eager fallback: SQLite receives
+one atomic parent-before-child copy and replicas receive one `clone` record;
+file data is never copied.
+
+Each mount remains one process. This preserves the existing replica/cache/P2P
+lifecycle and SQLite WAL behavior; sharing one daemon among several FUSE
+sessions is not needed for correctness or the snapshot-mount scenario.
+
+Deferred: courtesy gossip warning before deleting a mounted snapshot. Gossip
+does not currently advertise mount selectors, and deletion is specified as
+non-blocking even for offline mounts.
+
+Validation (2026-08-30): fmt and strict clippy clean; all workspace tests,
+smoke, and S3 integration pass. Full harness: every runnable scenario passed,
+with only `fio-latency` and `fio-blips` skipped because `fio` is absent.
+pjdfstest: **8798 passed, 0 failed**, empty baseline.
+
 ## Later phases
 
-Phases 5, 5a, and 5b are closed. Not started: phases 6–8
-(snapshots/E2E, web UI, GC). No code exists for any of these yet.
+Phases 5, 5a, 5b, and 6a are closed. Not started: phase 6b E2E, phase
+7 web UI, and phase 8 GC.
