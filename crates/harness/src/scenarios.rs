@@ -320,6 +320,12 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         run: existence_peer_hint,
     },
+    Scenario {
+        name: "fallocate-sparse",
+        desc: "large sparse extend, hole punch, SEEK_HOLE/DATA, rewrite, and fresh-node verification",
+        requires: &[],
+        run: fallocate_sparse,
+    },
 ];
 
 fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
@@ -3062,6 +3068,118 @@ fn big_file_write(seed: u64) -> Result<()> {
     let back = std::fs::read(&path)?;
     anyhow::ensure!(back == data, "readback mismatch after the big write");
     c.unmount()?;
+    Ok(())
+}
+
+fn fallocate_sparse(seed: u64) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+
+    let (env, root) = setup("fallocate-sparse")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("fallocate-sparse-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let cache_size = 32 * 1024 * 1024u64;
+    let file_len = 256 * 1024 * 1024u64;
+    let chunk = 4 * 1024 * 1024u64;
+    let mut a = Client::new(root.path(), "a", &env.endpoint, &backend)?
+        .with_cache_size(cache_size)
+        .with_env("CONSTELLATION_STAGING_BUDGET", "16777216");
+    a.fs_create()?;
+    a.mount()?;
+    let path = a.mnt.join("sparse.bin");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+
+    file.set_len(file_len)?;
+    file.write_all_at(b"HEAD", 0)?;
+    file.write_all_at(b"TAIL", file_len - 4)?;
+    for index in 0..3 {
+        let middle = pattern(seed.wrapping_add(index), chunk as usize);
+        file.write_all_at(&middle, (8 + index) * chunk)?;
+    }
+    file.sync_all()?;
+
+    let punch_offset = 9 * chunk;
+    let rc = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            punch_offset as libc::off_t,
+            chunk as libc::off_t,
+        )
+    };
+    anyhow::ensure!(
+        rc == 0,
+        "hole punch failed: {}\ndaemon log:\n{}",
+        std::io::Error::last_os_error(),
+        a.tail_log_n(30)
+    );
+    file.sync_all()?;
+    let mut punched = vec![1u8; chunk as usize];
+    file.read_exact_at(&mut punched, punch_offset)?;
+    anyhow::ensure!(
+        punched.iter().all(|byte| *byte == 0),
+        "punched chunk was not zero"
+    );
+
+    let hole = unsafe { libc::lseek(file.as_raw_fd(), punch_offset as i64, libc::SEEK_HOLE) };
+    let next_data = unsafe { libc::lseek(file.as_raw_fd(), punch_offset as i64, libc::SEEK_DATA) };
+    anyhow::ensure!(hole == punch_offset as i64, "SEEK_HOLE returned {hole}");
+    anyhow::ensure!(
+        next_data == (10 * chunk) as i64,
+        "SEEK_DATA returned {next_data}"
+    );
+
+    file.write_all_at(b"R", punch_offset + 123)?;
+    file.sync_all()?;
+    drop(file);
+    eventually("sparse uploads drain", Duration::from_secs(30), || {
+        anyhow::ensure!(a.control_status()?["writeback"]["pending_uploads"].as_u64() == Some(0));
+        Ok(())
+    })?;
+    let peak_rss = a.rss_bytes()?;
+    let chunk_objects = raw_chunk_count(&env, &prefix)?;
+    anyhow::ensure!(
+        chunk_objects < 24,
+        "sparse file materialized {chunk_objects} chunk objects"
+    );
+    anyhow::ensure!(
+        peak_rss < cache_size + 200 * 1024 * 1024,
+        "sparse file RSS {} MiB exceeded ceiling",
+        peak_rss / 1024 / 1024
+    );
+    anyhow::ensure!(std::fs::metadata(&path)?.len() == file_len);
+    a.unmount()?;
+
+    let mut b = Client::new(root.path(), "b", &env.endpoint, &backend)?.with_cache_size(cache_size);
+    b.mount()?;
+    let second = std::fs::File::open(b.mnt.join("sparse.bin"))?;
+    let mut marker = [0u8; 4];
+    second.read_exact_at(&mut marker, 0)?;
+    anyhow::ensure!(&marker == b"HEAD");
+    second.read_exact_at(&mut marker, file_len - 4)?;
+    anyhow::ensure!(&marker == b"TAIL");
+    let mut rewritten = [0u8; 3];
+    second.read_exact_at(&mut rewritten, punch_offset + 122)?;
+    anyhow::ensure!(rewritten == [0, b'R', 0], "rewrite in hole did not persist");
+    let mut zero = [1u8; 64];
+    second.read_exact_at(&mut zero, punch_offset + 4096)?;
+    anyhow::ensure!(zero == [0; 64], "fresh node did not observe sparse zeros");
+    drop(second);
+    b.unmount()?;
+
+    eprintln!(
+        "    fallocate-sparse: file_size={} MiB chunk_objects={} rss={} MiB cache={} MiB",
+        file_len / 1024 / 1024,
+        chunk_objects,
+        peak_rss / 1024 / 1024,
+        cache_size / 1024 / 1024
+    );
     Ok(())
 }
 

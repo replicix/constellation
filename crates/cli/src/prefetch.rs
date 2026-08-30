@@ -4,6 +4,7 @@
 
 use anyhow::anyhow;
 use constellation_fs_core::cache::{ChunkState, DiskCache};
+use constellation_fs_core::manifest::SparseChunks;
 use constellation_fs_core::{ChunkHash, Ino};
 use constellation_store_s3::ChunkStore;
 use std::collections::{HashMap, HashSet};
@@ -43,7 +44,7 @@ impl Prefetcher {
 
     /// Called on every read. Detects sequential access and schedules
     /// background fetches for upcoming chunks.
-    pub fn on_read(&self, ino: Ino, offset: u64, len: u64, chunk_size: u32, hashes: &[ChunkHash]) {
+    pub fn on_read(&self, ino: Ino, offset: u64, len: u64, chunk_size: u32, hashes: &SparseChunks) {
         let sequential = {
             let mut cursors = self.cursors.lock().unwrap();
             let seq = offset == 0 || cursors.get(&ino) == Some(&offset);
@@ -55,8 +56,8 @@ impl Prefetcher {
         }
         let last_read_chunk = (offset + len.max(1) - 1) / chunk_size as u64;
         for idx in last_read_chunk + 1..=last_read_chunk + DEPTH {
-            let Some(hash) = hashes.get(idx as usize).copied() else {
-                break;
+            let Some(hash) = hashes.get(&idx).copied() else {
+                continue;
             };
             if self.cache.contains(&hash) {
                 continue;

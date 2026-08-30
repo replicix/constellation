@@ -319,7 +319,7 @@ impl SnapshotManager {
                             decode_chunk_list(&self.chunks.get_chunk(&spill).await?)?
                         }
                     };
-                    refs.extend(chunks.into_iter().map(|hash| hash.to_hex()));
+                    refs.extend(chunks.into_values().map(|hash| hash.to_hex()));
                 }
             }
             Ok(())

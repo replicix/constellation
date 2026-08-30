@@ -85,7 +85,7 @@ impl PinManager {
             let m = Manifest::decode(&bytes).context("decoding a manifest")?;
             match &m.chunks {
                 ChunkInfo::Inline(list) => {
-                    for h in list {
+                    for h in list.values() {
                         if seen.insert(*h) {
                             out.chunks.push(*h);
                         }
@@ -98,7 +98,10 @@ impl PinManager {
                         out.chunks.push(*h);
                     }
                     let blob = self.get_chunk(h).await?;
-                    for c in decode_chunk_list(&blob).context("decoding a spilled chunk list")? {
+                    for c in decode_chunk_list(&blob)
+                        .context("decoding a spilled chunk list")?
+                        .into_values()
+                    {
                         if seen.insert(c) {
                             out.chunks.push(c);
                         }

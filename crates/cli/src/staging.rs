@@ -150,6 +150,26 @@ impl DirtyRuns {
         self.runs = next;
     }
 
+    pub fn clear_range(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        let mut next = Vec::with_capacity(self.runs.len() + 1);
+        for &(run_start, run_end) in &self.runs {
+            if run_end <= start || run_start >= end {
+                next.push((run_start, run_end));
+                continue;
+            }
+            if run_start < start {
+                next.push((run_start, start));
+            }
+            if run_end > end {
+                next.push((end, run_end));
+            }
+        }
+        self.runs = next;
+    }
+
     /// Drop every dirty chunk at or after `keep` (truncate-down).
     pub fn retain_below(&mut self, keep: u64) {
         let pos = self.runs.partition_point(|&(s, _)| s < keep);
@@ -184,6 +204,7 @@ pub struct Staging {
     reserved: u64,
     dirty: DirtyRuns,
     released_chunks: std::collections::HashSet<u64>,
+    admitted_chunks: std::collections::HashMap<u64, u64>,
 }
 
 impl Staging {
@@ -211,6 +232,7 @@ impl Staging {
             reserved: 0,
             dirty: DirtyRuns::default(),
             released_chunks: std::collections::HashSet::new(),
+            admitted_chunks: std::collections::HashMap::new(),
         })
     }
 
@@ -243,6 +265,7 @@ impl Staging {
     /// (shrink). A failed growth reservation rolls back cleanly; a
     /// failed `ftruncate` after a successful reservation releases it
     /// back rather than leaking budget against a file that never grew.
+    #[cfg(test)]
     pub fn set_len(&mut self, new_len: u64) -> Result<(), StagingError> {
         if new_len > self.file_len {
             let growth = new_len - self.file_len;
@@ -258,6 +281,15 @@ impl Staging {
             self.budget.release(released);
             self.reserved -= released;
         }
+        self.file_len = new_len;
+        Ok(())
+    }
+
+    /// Change the sparse staging file's logical length without charging
+    /// holes to the dirty-byte budget. Individual chunks are charged when
+    /// [`prepare_chunk`](Self::prepare_chunk) admits a write.
+    pub fn set_len_sparse(&mut self, new_len: u64) -> Result<(), StagingError> {
+        self.file.set_len(new_len)?;
         self.file_len = new_len;
         Ok(())
     }
@@ -280,16 +312,19 @@ impl Staging {
 
     /// Re-admit a previously sealed range before modifying it.
     pub fn prepare_chunk(&mut self, idx: u64, chunk_size: u32) -> Result<(), StagingError> {
-        if !self.released_chunks.remove(&idx) {
-            return Ok(());
-        }
         let start = idx * u64::from(chunk_size);
         let len = u64::from(chunk_size).min(self.file_len.saturating_sub(start));
-        if let Err(error) = self.budget.reserve(len) {
-            self.released_chunks.insert(idx);
-            return Err(error);
+        if let Some(admitted) = self.admitted_chunks.get_mut(&idx) {
+            let growth = len.saturating_sub(*admitted);
+            self.budget.reserve(growth)?;
+            self.reserved += growth;
+            *admitted = len;
+            return Ok(());
         }
+        self.released_chunks.remove(&idx);
+        self.budget.reserve(len)?;
         self.reserved += len;
+        self.admitted_chunks.insert(idx, len);
         Ok(())
     }
 
@@ -305,7 +340,10 @@ impl Staging {
         self.dirty.clear(idx);
         self.released_chunks.insert(idx);
         let start = idx * u64::from(chunk_size);
-        let len = u64::from(chunk_size).min(self.file_len.saturating_sub(start));
+        let len = self
+            .admitted_chunks
+            .remove(&idx)
+            .unwrap_or_else(|| u64::from(chunk_size).min(self.file_len.saturating_sub(start)));
         if len == 0 {
             return;
         }
@@ -329,6 +367,37 @@ impl Staging {
 
     pub fn retain_dirty_below(&mut self, keep: u64) {
         self.dirty.retain_below(keep);
+    }
+
+    /// Punch complete chunks from staging and release only chunks that had
+    /// actually been admitted against the budget.
+    pub fn punch_chunks(&mut self, start: u64, end: u64, chunk_size: u32) {
+        if start >= end {
+            return;
+        }
+        let admitted: Vec<_> = self
+            .admitted_chunks
+            .keys()
+            .copied()
+            .filter(|index| *index >= start && *index < end)
+            .collect();
+        for index in admitted {
+            self.release_chunk(index, chunk_size);
+        }
+        self.dirty.clear_range(start, end);
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let offset = start.saturating_mul(u64::from(chunk_size));
+            let len = end
+                .saturating_sub(start)
+                .saturating_mul(u64::from(chunk_size));
+            libc::fallocate(
+                std::os::fd::AsRawFd::as_raw_fd(&self.file),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset as libc::off_t,
+                len as libc::off_t,
+            );
+        }
     }
 
     #[allow(dead_code)] // part of the public shape (plan 05a); exercised by tests

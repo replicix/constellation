@@ -859,8 +859,45 @@ pjdfstest **8798 passed, 0 failed** with an empty baseline. `snapshot-churn`
 verifies, marker isolation and clone-of-clone true. Timed and no-sleep replay
 both passed.
 
+## Phase 8e — fallocate, hole punching, and sparse manifests: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| First-class holes represented by absent chunk indices; all-zero sealed chunks collapse to holes and never enter cache, pending upload, coop, pin, prefetch, or GC walks | done | `fs-core::manifest`, `cli::{fusefs,prefetch,pin,gc,fsck,snapshot}` |
+| Compact `CLH1` sparse encoding (`index u64 + hash`) for inline and spilled chunk lists, with legacy dense spilled blobs still accepted | done | `fs-core::manifest` |
+| Metadata-only truncate/fallocate extension, KEEP_SIZE, full- and partial-chunk PUNCH_HOLE, sparse ZERO_RANGE, and explicit rejection of unsupported range-moving flags | done | `cli::{fusefs_ops,staging}` |
+| `SEEK_HOLE` / `SEEK_DATA` from committed sparse maps plus dirty staging state | done | `cli::fusefs_ops`, fuser ABI 7.24 |
+| Sparse staging reservations charge admitted data chunks rather than logical hole length and preserve bounded write-back pressure | done | `cli::staging`, `cli::fusefs_ops` |
+| Cross-node sparse layout, punch/rewrite, object-count, cache, and RSS oracle | done | harness `fallocate-sparse` |
+
+### Phase 8e exit criteria (plan 14)
+
+- [x] A 1 TiB manifest with one data chunk stays inline and under 80 bytes;
+      missing indices encode holes without allocating a dense vector.
+- [x] Extension and allocation modes do not PUT zero chunks. Full chunks of
+      written zeroes and punched chunks collapse to absent indices; partial
+      punches RMW only their boundary chunks.
+- [x] Sparse reads, `SEEK_HOLE`/`SEEK_DATA`, punch, and rewrite survive a
+      fresh-node remount.
+- [x] Legacy dense spilled chunk lists decode, and every reference walk skips
+      holes by construction.
+- [x] `fallocate-sparse`, the complete harness matrix, and pjdfstest pass.
+
+The rejected zero-chunk design would have deduplicated bytes in S3 but still
+allocated one manifest slot per 4 MiB and sent meaningless cache/cooperative
+traffic. Absent sparse-map indices instead make a hole consume no object and
+no hash slot.
+
+Validation (2026-08-30): fmt and strict clippy clean; 281 workspace tests,
+smoke, S3 integration, release workspace build, all runnable harness scenarios,
+and pjdfstest **8798 passed, 0 failed** with an empty baseline.
+`fallocate-sparse` reported a 256 MiB file on a 32 MiB cache with **18 chunk
+objects** (including immutable superseded data versions, but no 64-object hole
+span) and **67 MiB RSS**. Only `fio-latency` and `fio-blips` skipped because
+`fio` is absent.
+
 ## Later phases
 
-Phases 1–8d are closed. Phase 9 automated crash reporting remains future work.
+Phases 1–8e are closed. Phase 9 automated crash reporting remains future work.
 Deferred format/data-plane items remain listed in `docs/ROADMAP.md` and the
 phase-specific scope notes above.

@@ -278,10 +278,10 @@ async fn live_roots(
     for bytes in meta.live_manifests()? {
         let manifest = Manifest::decode(&bytes)?;
         match manifest.chunks {
-            ChunkInfo::Inline(hashes) => roots.extend(hashes),
+            ChunkInfo::Inline(hashes) => roots.extend(hashes.into_values()),
             ChunkInfo::Spilled(spill) => {
                 roots.insert(spill);
-                roots.extend(decode_chunk_list(&chunks.get_chunk(&spill).await?)?);
+                roots.extend(decode_chunk_list(&chunks.get_chunk(&spill).await?)?.into_values());
             }
         }
     }
@@ -328,10 +328,12 @@ fn walk_snapshot<'a>(
                 out.insert(hash);
                 let manifest = Manifest::decode(&chunks.get_chunk(&hash).await?)?;
                 match manifest.chunks {
-                    ChunkInfo::Inline(hashes) => out.extend(hashes),
+                    ChunkInfo::Inline(hashes) => out.extend(hashes.into_values()),
                     ChunkInfo::Spilled(spill) => {
                         out.insert(spill);
-                        out.extend(decode_chunk_list(&chunks.get_chunk(&spill).await?)?);
+                        out.extend(
+                            decode_chunk_list(&chunks.get_chunk(&spill).await?)?.into_values(),
+                        );
                     }
                 }
             }

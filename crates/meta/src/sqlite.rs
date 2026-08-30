@@ -132,7 +132,7 @@ impl SqliteMeta {
             return Ok(std::collections::HashSet::new());
         };
         Ok(match manifest.chunks {
-            ChunkInfo::Inline(hashes) => hashes.into_iter().collect(),
+            ChunkInfo::Inline(hashes) => hashes.into_values().collect(),
             // The spill object is itself a bucket chunk and is the only hash
             // available without doing S3 I/O inside the SQLite transaction.
             // Its data hashes are protected by the spill while referenced and

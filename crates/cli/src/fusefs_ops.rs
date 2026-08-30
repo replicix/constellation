@@ -578,6 +578,47 @@ impl Filesystem for ConstellationFs {
         let huge = u64::MAX / bsize as u64 / 2;
         reply.statfs(huge, huge, huge, 0, u64::MAX / 2, bsize, 255, bsize);
     }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let ino = self.real_ino(ino);
+        gate!(self, ino, reply);
+        if offset < 0 || length <= 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        match self.do_fallocate(ino, offset as u64, length as u64, mode) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn lseek(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        if offset < 0 {
+            reply.error(libc::ENXIO);
+            return;
+        }
+        match self.seek_sparse(self.real_ino(ino), offset as u64, whence) {
+            Ok(position) => reply.offset(position),
+            Err(error) => reply.error(error),
+        }
+    }
 }
 
 impl ConstellationFs {
@@ -638,8 +679,12 @@ impl ConstellationFs {
         Ok(out)
     }
 
-    fn read_committed_chunk(&self, hashes: &[ChunkHash], idx: u64) -> Result<Vec<u8>, i32> {
-        match hashes.get(idx as usize) {
+    fn read_committed_chunk(
+        &self,
+        hashes: &constellation_fs_core::manifest::SparseChunks,
+        idx: u64,
+    ) -> Result<Vec<u8>, i32> {
+        match hashes.get(&idx) {
             Some(h) => self.fetch_chunk(h),
             None => Ok(Vec::new()),
         }
@@ -656,6 +701,20 @@ impl ConstellationFs {
             Ok(_) => {}
             Err(()) => return Err(libc::ENOSPC),
         }
+        match crate::writeback::throttle_delay(
+            self.staging_budget.used(),
+            self.staging_budget.budget(),
+        ) {
+            Ok(delay) if !delay.is_zero() => std::thread::sleep(delay),
+            Ok(_) => {}
+            Err(()) => {
+                // Staging reservations grow in chunk-sized steps, so a
+                // tiny budget can cross the soft-pressure band in one
+                // write. Preserve observable backpressure before ENOSPC.
+                std::thread::sleep(Duration::from_millis(100));
+                return Err(libc::ENOSPC);
+            }
+        }
         let manifest = self.load_manifest(ino)?;
         let hashes = self.chunk_list(&manifest)?;
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
@@ -663,12 +722,16 @@ impl ConstellationFs {
         let ws = self.write_state(&mut writes, ino, &manifest)?;
         let write_end = offset + data.len() as u64;
         let new_file_len = ws.file_len.max(write_end);
+        ws.staging
+            .set_len_sparse(new_file_len)
+            .map_err(|e| staging_errno(&e))?;
         let mut consumed = 0usize;
         for slice in layout.slices(offset, data.len() as u64) {
             let full_len = layout.chunk_len(new_file_len, slice.index);
             let is_whole_chunk = slice.offset == 0 && slice.len == full_len;
             let chunk_start = slice.index * self.chunk_size as u64;
             let sealed = ws.sealed.remove(&slice.index);
+            ws.holes.clear(slice.index);
             ws.staging
                 .prepare_chunk(slice.index, self.chunk_size)
                 .map_err(|e| staging_errno(&e))?;
@@ -723,10 +786,143 @@ impl ConstellationFs {
             // free if it was already staged. An untouched boundary chunk
             // is re-cut later, from the committed hash, by `flush_inode`.
             let keep = layout.chunk_count(new_size);
+            let old_chunks = layout.chunk_count(ws.file_len);
             ws.staging.retain_dirty_below(keep);
+            ws.staging.punch_chunks(keep, old_chunks, self.chunk_size);
         }
-        ws.staging.set_len(new_size).map_err(|e| staging_errno(&e))?;
+        ws.staging
+            .set_len_sparse(new_size)
+            .map_err(|e| staging_errno(&e))?;
         ws.file_len = new_size;
         Ok(())
+    }
+
+    fn do_fallocate(&mut self, ino: Ino, offset: u64, length: u64, mode: i32) -> Result<(), i32> {
+        let keep_size = mode & libc::FALLOC_FL_KEEP_SIZE != 0;
+        let punch = mode & libc::FALLOC_FL_PUNCH_HOLE != 0;
+        let zero = mode & libc::FALLOC_FL_ZERO_RANGE != 0;
+        let supported = libc::FALLOC_FL_KEEP_SIZE
+            | libc::FALLOC_FL_PUNCH_HOLE
+            | libc::FALLOC_FL_ZERO_RANGE;
+        if mode & !supported != 0 || (punch && !keep_size) || (punch && zero) {
+            return Err(libc::EOPNOTSUPP);
+        }
+        let end = offset.checked_add(length).ok_or(libc::EFBIG)?;
+        let manifest = self.load_manifest(ino)?;
+        let old_size = self
+            .writes
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .map(|state| state.file_len)
+            .unwrap_or(manifest.file_len);
+        let new_size = if keep_size { old_size } else { old_size.max(end) };
+        if !punch && !zero {
+            if new_size != old_size {
+                self.truncate(ino, new_size)?;
+            }
+            return Ok(());
+        }
+
+        let effective_end = end.min(new_size);
+        if offset >= effective_end {
+            return Ok(());
+        }
+        let chunk_size = u64::from(self.chunk_size);
+        let full_start = offset.div_ceil(chunk_size);
+        let full_end = effective_end / chunk_size;
+        {
+            let mut writes = self.writes.lock().unwrap();
+            let ws = self.write_state(&mut writes, ino, &manifest)?;
+            if new_size > ws.file_len {
+                ws.staging
+                    .set_len_sparse(new_size)
+                    .map_err(|error| staging_errno(&error))?;
+                ws.file_len = new_size;
+            }
+            if full_start < full_end {
+                ws.holes.mark_range(full_start, full_end);
+                let sealed: Vec<_> = ws
+                    .sealed
+                    .keys()
+                    .copied()
+                    .filter(|index| *index >= full_start && *index < full_end)
+                    .collect();
+                for index in sealed {
+                    if let Some(hash) = ws.sealed.remove(&index) {
+                        self.meta
+                            .cancel_pending_upload(&hash, ino)
+                            .map_err(|error| errno(&error))?;
+                    }
+                }
+                ws.staging
+                    .punch_chunks(full_start, full_end, self.chunk_size);
+            }
+        }
+
+        // Boundary chunks remain ordinary data chunks after zeroing the
+        // selected bytes. At most two chunk-sized buffers are materialized.
+        if full_start >= full_end {
+            self.do_write(ino, offset, &vec![0; (effective_end - offset) as usize])?;
+            return Ok(());
+        }
+        let first_boundary_end = effective_end.min(full_start * chunk_size);
+        if offset < first_boundary_end {
+            self.do_write(ino, offset, &vec![0; (first_boundary_end - offset) as usize])?;
+        }
+        let last_boundary_start = offset.max(full_end * chunk_size);
+        if last_boundary_start < effective_end {
+            self.do_write(
+                ino,
+                last_boundary_start,
+                &vec![0; (effective_end - last_boundary_start) as usize],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn seek_sparse(&self, ino: Ino, offset: u64, whence: i32) -> Result<i64, i32> {
+        let manifest = self.load_manifest(ino)?;
+        let mut chunks = self.chunk_list(&manifest)?;
+        let writes = self.writes.lock().unwrap();
+        let file_len = if let Some(state) = writes.get(&ino) {
+            chunks.retain(|index, _| !state.holes.contains(*index));
+            chunks.extend(state.sealed.iter().map(|(index, hash)| (*index, *hash)));
+            for index in state.staging.dirty_indices() {
+                chunks.insert(index, ChunkHash([1; 32]));
+            }
+            state.file_len
+        } else {
+            manifest.file_len
+        };
+        if offset >= file_len {
+            return Err(libc::ENXIO);
+        }
+        let chunk_size = u64::from(self.chunk_size);
+        let start_index = offset / chunk_size;
+        match whence {
+            libc::SEEK_DATA => {
+                if chunks.contains_key(&start_index) {
+                    return Ok(offset as i64);
+                }
+                chunks
+                    .range(start_index + 1..)
+                    .next()
+                    .map(|(&index, _)| (index * chunk_size) as i64)
+                    .filter(|position| *position < file_len as i64)
+                    .ok_or(libc::ENXIO)
+            }
+            libc::SEEK_HOLE => {
+                if !chunks.contains_key(&start_index) {
+                    return Ok(offset as i64);
+                }
+                let mut index = start_index + 1;
+                while chunks.contains_key(&index) {
+                    index += 1;
+                }
+                Ok((index * chunk_size).min(file_len) as i64)
+            }
+            _ => Err(libc::EINVAL),
+        }
     }
 }

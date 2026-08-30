@@ -17,13 +17,13 @@
 use crate::staging::{GenCounter, Staging, StagingBudget};
 use anyhow::{Context, Result};
 use constellation_fs_core::cache::{ChunkState, DiskCache};
-use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
+use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest, SparseChunks};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
 use constellation_meta::{MetaError, MetaStore, SqliteMeta};
 use constellation_store_s3::{ChunkStore, CompressionSetting};
 use fuser::{
-    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyWrite, Request, TimeOrNow,
+    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek,
+    ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -44,6 +44,8 @@ struct WriteState {
     file_len: u64,
     base: Option<Manifest>,
     sealed: HashMap<u64, ChunkHash>,
+    holes: crate::staging::DirtyRuns,
+    seal_buffer: Vec<u8>,
     high_water: u64,
 }
 
@@ -766,8 +768,8 @@ impl ConstellationFs {
         }
     }
 
-    /// Resolve the full chunk hash list (following manifest spill).
-    fn chunk_list(&self, m: &Manifest) -> Result<Vec<ChunkHash>, i32> {
+    /// Resolve the sparse data-chunk map (following manifest spill).
+    fn chunk_list(&self, m: &Manifest) -> Result<SparseChunks, i32> {
         match &m.chunks {
             ChunkInfo::Inline(v) => Ok(v.clone()),
             ChunkInfo::Spilled(h) => {
@@ -815,11 +817,11 @@ impl ConstellationFs {
     /// bytes before a partial (non-whole-chunk) write lands on top.
     fn committed_chunk_padded(
         &self,
-        hashes: &[ChunkHash],
+        hashes: &SparseChunks,
         idx: u64,
         len: u32,
     ) -> Result<Vec<u8>, i32> {
-        let mut data = match hashes.get(idx as usize) {
+        let mut data = match hashes.get(&idx) {
             Some(h) => self.fetch_chunk(h)?,
             None => Vec::new(),
         };
@@ -845,6 +847,8 @@ impl ConstellationFs {
                 file_len: manifest.file_len,
                 base: Some(manifest.clone()),
                 sealed: HashMap::new(),
+                holes: crate::staging::DirtyRuns::default(),
+                seal_buffer: Vec::new(),
                 high_water: manifest.file_len,
             });
         }
@@ -882,11 +886,20 @@ impl ConstellationFs {
             if !ws.staging.is_dirty(idx) || ws.sealed.contains_key(&idx) {
                 continue;
             }
-            let mut data = vec![0u8; self.chunk_size as usize];
+            let mut data = std::mem::take(&mut ws.seal_buffer);
+            data.resize(self.chunk_size as usize, 0);
             ws.staging
                 .read_at(idx * u64::from(self.chunk_size), &mut data)
                 .map_err(|error| staging_errno(&error))?;
             let hash = self.store.hash(&data);
+            if data.iter().all(|byte| *byte == 0) {
+                ws.staging.release_chunk(idx, self.chunk_size);
+                ws.holes.mark(idx);
+                data.clear();
+                ws.seal_buffer = data;
+                sealed_any = true;
+                continue;
+            }
             let known_durable = self.cache.contains(&hash)
                 && !self
                     .meta
@@ -902,6 +915,8 @@ impl ConstellationFs {
             }
             ws.staging.release_chunk(idx, self.chunk_size);
             ws.sealed.insert(idx, hash);
+            data.clear();
+            ws.seal_buffer = data;
             sealed_any = true;
         }
         if sealed_any {
@@ -970,63 +985,80 @@ impl ConstellationFs {
         let old_hashes = self.chunk_list(&base)?;
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let n_chunks = layout.chunk_count(ws.file_len);
-        let mut new_hashes: Vec<ChunkHash> = Vec::with_capacity(n_chunks as usize);
+        let mut new_hashes: SparseChunks = old_hashes
+            .iter()
+            .filter(|(index, _)| **index < n_chunks && !ws.holes.contains(**index))
+            .map(|(index, hash)| (*index, *hash))
+            .collect();
         // Every chunk this flush seals into the cache as Dirty: the
         // durable pending-upload set this manifest commit journals
         // (plan 05a step 1). Sealing one chunk at a time (read its
         // staged range, hash, insert, drop the buffer) keeps peak RSS
         // O(chunk_size), never O(file_len) — 05a's whole point.
         let mut dirty_hashes: Vec<ChunkHash> = Vec::new();
-        for idx in 0..n_chunks {
+        for (&idx, hash) in &ws.sealed {
+            if idx >= n_chunks {
+                continue;
+            }
+            if self
+                .meta
+                .upload_pending_for_hash(hash)
+                .map_err(|error| errno(&error))?
+            {
+                dirty_hashes.push(*hash);
+            }
+            new_hashes.insert(idx, *hash);
+        }
+        let dirty_indices: Vec<_> = ws.staging.dirty_indices().collect();
+        for idx in dirty_indices {
+            if idx >= n_chunks {
+                continue;
+            }
             let expect_len = layout.chunk_len(ws.file_len, idx) as usize;
-            if let Some(hash) = ws.sealed.get(&idx) {
-                if self
-                    .meta
-                    .upload_pending_for_hash(hash)
-                    .map_err(|error| errno(&error))?
-                {
-                    dirty_hashes.push(*hash);
-                }
-                new_hashes.push(*hash);
-            } else if ws.staging.is_dirty(idx) {
-                let mut data = vec![0u8; expect_len];
-                ws.staging
-                    .read_at(idx * self.chunk_size as u64, &mut data)
-                    .map_err(|e| staging_errno(&e))?;
+            let mut data = vec![0u8; expect_len];
+            ws.staging
+                .read_at(idx * self.chunk_size as u64, &mut data)
+                .map_err(|e| staging_errno(&e))?;
+            if data.iter().all(|byte| *byte == 0) {
+                new_hashes.remove(&idx);
+            } else {
                 let hash = self.store.hash(&data);
                 if self.cache_for_upload(&hash, &data)? {
                     dirty_hashes.push(hash);
                 }
-                new_hashes.push(hash);
-            } else if let Some(h) = old_hashes.get(idx as usize) {
-                // Untouched chunk: reuse. The final (possibly shortened)
-                // chunk is re-cut if the file shrank into it.
-                if idx == n_chunks - 1 {
+                new_hashes.insert(idx, hash);
+            }
+        }
+        // An untouched old tail chunk needs re-cutting after truncate-down.
+        if n_chunks > 0 {
+            let idx = n_chunks - 1;
+            if !ws.staging.is_dirty(idx) && !ws.sealed.contains_key(&idx) && !ws.holes.contains(idx)
+            {
+                if let Some(h) = old_hashes.get(&idx) {
+                    let expect_len = layout.chunk_len(ws.file_len, idx) as usize;
                     let old_len = base.layout.chunk_len(base.file_len.max(1), idx) as usize;
                     if old_len != expect_len {
                         let mut data = self.fetch_chunk(h)?;
                         data.resize(expect_len, 0);
-                        let hash = self.store.hash(&data);
-                        if self.cache_for_upload(&hash, &data)? {
-                            dirty_hashes.push(hash);
+                        if data.iter().all(|byte| *byte == 0) {
+                            new_hashes.remove(&idx);
+                        } else {
+                            let hash = self.store.hash(&data);
+                            if self.cache_for_upload(&hash, &data)? {
+                                dirty_hashes.push(hash);
+                            }
+                            new_hashes.insert(idx, hash);
                         }
-                        new_hashes.push(hash);
-                        continue;
                     }
                 }
-                new_hashes.push(*h);
-            } else {
-                // Hole created by extension without data: a zero chunk.
-                let data = vec![0u8; expect_len];
-                let hash = self.store.hash(&data);
-                if self.cache_for_upload(&hash, &data)? {
-                    dirty_hashes.push(hash);
-                }
-                new_hashes.push(hash);
             }
         }
-        let (manifest, spill) =
-            Manifest::from_chunks(self.chunk_size, ws.file_len, new_hashes, INLINE_CHUNKS_MAX);
+        let (manifest, spill) = Manifest::from_sparse_chunks(
+            self.chunk_size,
+            ws.file_len,
+            new_hashes,
+            INLINE_CHUNKS_MAX,
+        );
         if let Some(blob) = spill {
             let bh = self.store.hash(&blob);
             if self.cache_for_upload(&bh, &blob)? {

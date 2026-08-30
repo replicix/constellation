@@ -34,6 +34,8 @@ Execution protocol:
 | 10 | `10-p8b-hardening-packaging.md` | xfstests, perf gates, musl/macOS packaging, nightly matrix | 09 |
 | 12 | `12-p8c-existence-bloom.md` | LIST-seeded S3 existence bloom + peer-digest upload hints | 10 |
 | 13 | `13-p8d-snapshot-churn.md` | concurrent snapshot/clone churn oracle, audit trail, replay | 12 |
+| 14 | `14-p8e-fallocate-holes.md` | fallocate, hole punch, sparse manifests (no zero-chunk) | 13 |
+| 15 | `15-p8f-xattr.md` | POSIX xattr + virtual rsize/rcount | 14 |
 | 11 | `11-p9-crash-reporting.md` | secure crash reporting pipeline | 10 |
 
 "Committed in practice": the plan does not technically build on the

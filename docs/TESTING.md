@@ -462,6 +462,15 @@ Scale is controlled by `CONSTELLATION_SNAPCHURN_WORKERS` (default 4),
 `CONSTELLATION_SNAPCHURN_AUDIT` selects the trail directory; without it the
 scenario temp directory is used and printed.
 
+Phase 8e adds `fallocate-sparse`. It creates a 256 MiB file with a 32 MiB
+cache, writes only the endpoints and three middle chunks, punches a complete
+middle chunk, verifies `SEEK_HOLE`/`SEEK_DATA`, rewrites inside the hole, and
+cold-reads the layout through a fresh node. The direct bucket LIST must remain
+a small constant rather than gaining 64 zero objects, while daemon RSS stays
+under the fixed cache-plus-overhead ceiling. The scenario prints file size,
+chunk-object count, RSS, and cache budget; seed 42 measured 256 MiB, 18
+objects, 67 MiB RSS, and a 32 MiB cache.
+
 Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.

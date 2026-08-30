@@ -37,7 +37,7 @@ zstd = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
 object_store = { version = "0.14", features = ["aws"] }
 clap = { version = "4", features = ["derive", "env"] }
-fuser = { version = "0.15", default-features = false }
+fuser = { version = "0.15", default-features = false, features = ["abi-7-24"] }
 libc = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 futures = "0.3"

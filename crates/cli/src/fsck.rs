@@ -120,7 +120,7 @@ async fn check_manifest_refs(
                 decode_chunk_list(&chunks.get_chunk(&spill).await?)?
             }
         };
-        for hash in hashes {
+        for hash in hashes.into_values() {
             if !chunks.has_chunk(&hash).await? {
                 record_missing(store, chunks, state_dir, hash, compression, repair, issues).await?;
             }
