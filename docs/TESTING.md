@@ -311,6 +311,47 @@ toxiproxied to 200 ms so a peer hit is unambiguously cheaper than a GET.
   Aggregate `s3_fetches` on the readers stays near the unique-chunk
   count; `peer_hits` covers the rest.
 
+Phase 5a/5b scenarios exercise the write path itself, so they assert on
+process and cache *ceilings* rather than only on content. `Client` grows
+a `rss_bytes()` helper (reading `VmRSS` from `/proc/<pid>/status` for the
+pid it already derives for `kill9`/`pause`), because "RSS does not track
+bytes written" is the phase-5a exit criterion and cannot be checked from
+the mount alone.
+
+- `big-file-write`: a small `--cache-size` (64 MiB) and a file several
+  times that, with RSS sampled *during* the write. Asserts a fixed
+  ceiling and a flat slope, plus byte-exact model-verified readback.
+- `staging-crash`: `kill -9` mid-write, then remount. The mount must
+  come up, `staging/` must be empty after GC, and the file must be at
+  its last fsynced/closed size — short or absent passes, corrupt does
+  not.
+- `unmount-drain`: fails the eager upload (S3 cut scoped to the upload),
+  then unmounts cleanly; a second node must read the file with no
+  missing chunk. This one **fails on the pre-5a tree**, which is the
+  point: it is the regression test for the clean-unmount upload gap.
+- `writeback-latency`: 150 ms injected S3 latency and an rsync-shaped
+  workload (many small files, sequential closes) run once per
+  `--write-mode`. Write-back must beat write-through by at least 3x —
+  deliberately conservative against a much larger expected gap — with
+  both runs model-verified identical.
+- `writeback-bigfile`: a file ten times the cache budget under
+  write-back with eager upload, asserting an RSS ceiling *and* a
+  cache-usage ceiling while the write completes. This is the
+  "file size bounded by S3, not local disk" criterion.
+- `writeback-drain`: write under write-back, unmount cleanly; pending
+  uploads must reach zero before unmount returns, and a second node
+  must read everything.
+- `writeback-fsync`: write, `fsync`, `kill -9` under write-back. The
+  fsynced bytes must survive the remount; an unsynced, unclosed tail may
+  be missing but never corrupt.
+- `writeback-backpressure`: tiny cache, write-back, S3 cut. Writes must
+  throttle and then ENOSPC rather than grow without bound or deadlock,
+  and the mount must recover after heal.
+
+Because every one of these changes lands in the write path, pjdfstest
+(truncate, extend, and hole semantics) and the `fio-*` scenarios are the
+real regression tripwires for both phases, not just the new scenarios.
+
 `p2p-partition-tolerance` cuts P2P with the kill switch on one node
 (toxiproxy only fronts S3, so this is how plan 02 specifies simulating an
 unreachable peer) and re-runs the shared-filesystem workload: everything

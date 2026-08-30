@@ -19,6 +19,8 @@ pub struct Client {
     child: Option<Child>,
     /// Extra environment for the mount process (lease tuning etc.).
     env: Vec<(String, String)>,
+    /// `--cache-size` override; `None` keeps the binary's default.
+    cache_size: Option<u64>,
 }
 
 fn bin() -> PathBuf {
@@ -51,12 +53,19 @@ impl Client {
             state,
             child: None,
             env: Vec::new(),
+            cache_size: None,
         })
     }
 
     /// Extra env for this client's mount (e.g. a short lease TTL).
     pub fn with_env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Override `--cache-size` (bytes) at mount time.
+    pub fn with_cache_size(mut self, bytes: u64) -> Self {
+        self.cache_size = Some(bytes);
         self
     }
 
@@ -102,15 +111,21 @@ impl Client {
             bail!("{} already mounted", self.name);
         }
         let logf = std::fs::File::create(&self.log)?;
+        let mut args = vec![
+            "mount".to_string(),
+            "--s3".to_string(),
+            self.backend.clone(),
+            self.mnt.to_str().unwrap().to_string(),
+            "--state-dir".to_string(),
+            self.state.to_str().unwrap().to_string(),
+        ];
+        if let Some(bytes) = self.cache_size {
+            args.push("--cache-size".to_string());
+            args.push(bytes.to_string());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let child = self
-            .cmd(&[
-                "mount",
-                "--s3",
-                &self.backend,
-                self.mnt.to_str().unwrap(),
-                "--state-dir",
-                self.state.to_str().unwrap(),
-            ])
+            .cmd(&arg_refs)
             .stdout(Stdio::from(logf.try_clone()?))
             .stderr(Stdio::from(logf))
             .spawn()
@@ -191,6 +206,28 @@ impl Client {
     #[allow(dead_code)]
     pub fn is_mounted(&self) -> bool {
         self.child.is_some() && is_mountpoint(&self.mnt)
+    }
+
+    /// Current resident set size of the daemon process, read from
+    /// `/proc/<pid>/status` (`VmRSS`). Used by `big-file-write` to prove
+    /// RSS stays flat regardless of the size of the file being written
+    /// (plan 05a's exit criterion).
+    pub fn rss_bytes(&self) -> Result<u64> {
+        let pid = self.child.as_ref().context("not mounted")?.id();
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .with_context(|| format!("reading /proc/{pid}/status"))?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest
+                    .trim()
+                    .trim_end_matches(" kB")
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("parsing VmRSS line {line:?}"))?;
+                return Ok(kb * 1024);
+            }
+        }
+        bail!("no VmRSS line in /proc/{pid}/status")
     }
 
     pub fn tail_log(&self) -> String {

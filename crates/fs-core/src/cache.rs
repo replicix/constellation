@@ -530,8 +530,16 @@ mod tests {
         }
         let c = DiskCache::open(dir.path(), 1024).unwrap();
         assert_eq!(c.usage().used, 64);
-        // Rescan can't know dirty state; it comes back clean (the meta
-        // journal is the source of truth for pending uploads).
+        // Rescan legitimately returns Clean here: a directory listing
+        // cannot distinguish uploaded content from un-uploaded content,
+        // so the cache does not try. `constellation_meta::SqliteMeta`'s
+        // `pending_upload` table (written in the same transaction as
+        // the journal record that made the content dirty) is the real
+        // source of truth for what still owes S3 a PUT — see
+        // `cli::main::upload_dirty_chunks`, which drains that table
+        // rather than `Self::dirty_chunks`. This is not a regression:
+        // the cache's eviction guard (pinned/dirty are never evicted)
+        // is unaffected, since nothing here is pinned or pending-evict.
         assert_eq!(c.state_of(&h), Some(ChunkState::Clean));
         assert_eq!(c.get(&h).unwrap(), Some(d));
     }

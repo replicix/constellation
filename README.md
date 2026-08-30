@@ -6,8 +6,45 @@ and use encrypted P2P links between peers purely as a latency fast path.
 One static binary — FUSE mount, daemon, CLI, and web UI. The only
 infrastructure is an S3-compatible bucket with conditional-write support.
 
-**Status: design phase.** No functional code yet; the documents below are
-the deliverable so far.
+**Status:** usable single-/multi-node FUSE mounts on S3; see
+[docs/PROGRESS.md](docs/PROGRESS.md) for phase detail.
+
+## Quick start: mount a real S3 bucket
+
+S3 auth uses `object_store`'s `AmazonS3Builder::from_env()` — the usual
+`AWS_*` variables. Region is `AWS_DEFAULT_REGION` (defaults to
+`us-east-1`).
+
+**Named profiles (`AWS_PROFILE` / `aws --profile …`) do not work by
+themselves.** Constellation never reads `~/.aws/credentials` or
+`~/.aws/config`. Export the profile into the environment first:
+
+```bash
+eval "$(aws configure export-credentials --format env --profile dataiku)"
+export AWS_DEFAULT_REGION=eu-west-1   # if the profile does not set it
+```
+
+Other options that work without a profile: static
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and optional
+`AWS_SESSION_TOKEN`), or instance / IRSA / ECS task credentials.
+
+```bash
+cargo build -p constellation --release
+BIN=./target/release/constellation
+
+BUCKET=s3://my-bucket/constellation-demo   # empty prefix on first create
+mkdir -p /mnt/constellation
+
+$BIN doctor --s3 "$BUCKET"                 # checks If-None-Match / If-Match
+$BIN fs create --s3 "$BUCKET"              # once per prefix
+$BIN mount --s3 "$BUCKET" /mnt/constellation
+# … use /mnt/constellation …
+fusermount3 -u /mnt/constellation
+```
+
+Local state (metadata DB + chunk cache) defaults to
+`~/.local/share/constellation/<fs-uuid>/`; override with `--state-dir`.
+Needs FUSE (`fusermount3`) on the host.
 
 ## Documentation
 
@@ -36,6 +73,6 @@ bench/
 ## Building
 
 ```bash
-cargo build --workspace   # scaffold only for now
+cargo build --workspace
 cargo test --workspace
 ```

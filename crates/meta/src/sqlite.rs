@@ -8,7 +8,7 @@ use crate::error::MetaError;
 use crate::record::LogRecord;
 use crate::{DirEntry, MetaStore};
 use constellation_fs_core::types::{now_ns, ROOT_INO};
-use constellation_fs_core::{FileAttr, Ino, InodeKind};
+use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 use std::sync::Mutex;
@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS reintegration (
     journal_seq  INTEGER PRIMARY KEY,
     disposition  TEXT NOT NULL,
     detail       TEXT
+);
+CREATE TABLE IF NOT EXISTS pending_upload (
+    hash BLOB NOT NULL,
+    ino  INTEGER NOT NULL,
+    PRIMARY KEY (hash, ino)
 );
 ";
 
@@ -1120,6 +1125,108 @@ impl SqliteMeta {
     pub(crate) fn raw(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
     }
+
+    /// The `set_manifest` body, inside a caller-owned transaction. Shared
+    /// by the plain trait method (applying a foreign/reintegrated record
+    /// — that content's upload is another node's responsibility, so it
+    /// never touches `pending_upload`) and [`Self::set_manifest_dirty`]
+    /// (the local write path, which does).
+    fn set_manifest_tx(
+        tx: &Connection,
+        ino: Ino,
+        manifest: &[u8],
+        size: u64,
+    ) -> Result<(), MetaError> {
+        let t = now_ns();
+        let base_manifest: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT manifest FROM inode WHERE ino = ?1",
+                params![ino],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let n = tx.execute(
+            "UPDATE inode SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4 WHERE ino = ?1",
+            params![ino, manifest, size as i64, t],
+        )?;
+        if n == 0 {
+            return Err(MetaError::NoEnt(ino));
+        }
+        Self::journal(
+            tx,
+            &LogRecord::WriteManifest {
+                ino,
+                base_manifest,
+                manifest: manifest.to_vec(),
+                size,
+                time_ns: t,
+            },
+        )
+    }
+
+    /// Local-write variant of `set_manifest` (used only by the FUSE
+    /// flush path, plan 05a step 1): durably enrolls `dirty_hashes` in
+    /// `pending_upload` in the **same transaction** as the manifest
+    /// commit and journal record, so a crash between "the cache has the
+    /// bytes" and "S3 has the bytes" cannot silently drop the upload —
+    /// this is the table `pending_uploads`/`ack_upload` drain, which
+    /// replaces `DiskCache::dirty_chunks()` as `upload_dirty_chunks`'s
+    /// source of truth. `hash, ino` is a pair (not just `hash`) because
+    /// the same content can be dirty under two different inodes at
+    /// once; acking one must not disturb the other's row.
+    pub fn set_manifest_dirty(
+        &self,
+        ino: Ino,
+        manifest: &[u8],
+        size: u64,
+        dirty_hashes: &[ChunkHash],
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::set_manifest_tx(&tx, ino, manifest, size)?;
+        for h in dirty_hashes {
+            tx.execute(
+                "INSERT OR IGNORE INTO pending_upload (hash, ino) VALUES (?1, ?2)",
+                params![h.0.to_vec(), ino],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The durable not-yet-uploaded set: every `(hash, ino)` pair a
+    /// local write has journaled but this node has not yet confirmed in
+    /// S3. Survives a crash — unlike `DiskCache::rescan`, which cannot
+    /// tell dirty content from clean on a directory listing alone, this
+    /// table is written in the same transaction as the journal record
+    /// that makes the content dirty in the first place.
+    pub fn pending_uploads(&self) -> Result<Vec<(ChunkHash, Ino)>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT hash, ino FROM pending_upload")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Ino>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (bytes, ino) = row?;
+            let arr: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| MetaError::Invalid("pending_upload hash length".into()))?;
+            out.push((ChunkHash(arr), ino));
+        }
+        Ok(out)
+    }
+
+    /// Ack one pending upload. Deleting the row for `(hash, ino)` never
+    /// disturbs a different inode still pending on the same hash (dedup
+    /// across inodes is the upload side's job, not this table's).
+    pub fn ack_upload(&self, hash: &ChunkHash, ino: Ino) -> Result<(), MetaError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM pending_upload WHERE hash = ?1 AND ino = ?2",
+            params![hash.0.to_vec(), ino],
+        )?;
+        Ok(())
+    }
 }
 
 impl MetaStore for SqliteMeta {
@@ -1543,32 +1650,7 @@ impl MetaStore for SqliteMeta {
     fn set_manifest(&self, ino: Ino, manifest: &[u8], size: u64) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let t = now_ns();
-        let base_manifest: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT manifest FROM inode WHERE ino = ?1",
-                params![ino],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        let n = tx.execute(
-            "UPDATE inode SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4 WHERE ino = ?1",
-            params![ino, manifest, size as i64, t],
-        )?;
-        if n == 0 {
-            return Err(MetaError::NoEnt(ino));
-        }
-        Self::journal(
-            &tx,
-            &LogRecord::WriteManifest {
-                ino,
-                base_manifest,
-                manifest: manifest.to_vec(),
-                size,
-                time_ns: t,
-            },
-        )?;
+        Self::set_manifest_tx(&tx, ino, manifest, size)?;
         tx.commit()?;
         Ok(())
     }
@@ -2007,5 +2089,67 @@ mod tests {
         assert_eq!(m.partition_of(d.ino).unwrap(), "p1");
         assert_eq!(m.partition_of(f.ino).unwrap(), "p1");
         assert_eq!(m.partition_of(ROOT_INO).unwrap(), "p0");
+    }
+
+    /// `set_manifest_dirty` inserts `pending_upload` rows in the same
+    /// transaction as the `WriteManifest` record: a forced failure (bad
+    /// ino) must leave neither the manifest commit nor a stray pending
+    /// row (plan 05a step 1).
+    #[test]
+    fn set_manifest_dirty_journals_pending_uploads_in_the_same_tx() {
+        let m = store();
+        let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        let h1 = ChunkHash::of(b"chunk-a");
+        let h2 = ChunkHash::of(b"chunk-b");
+        m.set_manifest_dirty(f.ino, b"M1", 10, &[h1, h2]).unwrap();
+        let mut pending = m.pending_uploads().unwrap();
+        pending.sort();
+        let mut expect = vec![(h1, f.ino), (h2, f.ino)];
+        expect.sort();
+        assert_eq!(pending, expect);
+
+        let h3 = ChunkHash::of(b"chunk-c");
+        assert!(matches!(
+            m.set_manifest_dirty(999_999, b"M", 1, &[h3]),
+            Err(MetaError::NoEnt(999_999))
+        ));
+        assert!(
+            !m.pending_uploads().unwrap().iter().any(|(h, _)| *h == h3),
+            "a failed manifest commit must not leave a stray pending row"
+        );
+    }
+
+    /// Acking one inode's pending row must not disturb another inode
+    /// still pending on the exact same content hash.
+    #[test]
+    fn ack_upload_is_per_inode() {
+        let m = store();
+        let a = m.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let b = m.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+        let h = ChunkHash::of(b"shared-content");
+        m.set_manifest_dirty(a.ino, b"MA", 1, &[h]).unwrap();
+        m.set_manifest_dirty(b.ino, b"MB", 1, &[h]).unwrap();
+        m.ack_upload(&h, a.ino).unwrap();
+        assert_eq!(m.pending_uploads().unwrap(), vec![(h, b.ino)]);
+        m.ack_upload(&h, b.ino).unwrap();
+        assert!(m.pending_uploads().unwrap().is_empty());
+    }
+
+    /// The pending-upload table is the crash simulation: drop and
+    /// reopen the same DB file and the un-uploaded hash must still be
+    /// there, unlike `DiskCache::rescan`'s in-memory accounting.
+    #[test]
+    fn pending_uploads_survive_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("meta.db");
+        let (h, ino) = {
+            let m = SqliteMeta::open(&path).unwrap();
+            let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+            let h = ChunkHash::of(b"crash-content");
+            m.set_manifest_dirty(f.ino, b"M", 5, &[h]).unwrap();
+            (h, f.ino)
+        };
+        let m = SqliteMeta::open(&path).unwrap();
+        assert_eq!(m.pending_uploads().unwrap(), vec![(h, ino)]);
     }
 }

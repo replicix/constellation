@@ -179,6 +179,8 @@ mod tests {
                     used_bytes: 100,
                     budget_bytes: 1000,
                     chunks: 5,
+                    staging_bytes: 0,
+                    staging_budget_bytes: 250,
                 },
                 lease: LeaseStatus {
                     held: true,
@@ -294,6 +296,8 @@ mod tests {
                     used_bytes: 0,
                     budget_bytes: 1,
                     chunks: 0,
+                    staging_bytes: 0,
+                    staging_budget_bytes: 0,
                 },
                 lease: lease.unwrap_or_default(),
                 partitions,

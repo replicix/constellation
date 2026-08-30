@@ -444,16 +444,19 @@ impl Filesystem for ConstellationFs {
 impl ConstellationFs {
     fn do_read(&mut self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, i32> {
         // Serve pending (unflushed) state when present so read-after-write
-        // within an open handle is coherent.
-        let pending: Option<(u64, BTreeMap<u64, Vec<u8>>)> = {
-            let writes = self.writes.lock().unwrap();
-            writes.get(&ino).map(|ws| (ws.file_len, ws.chunks.clone()))
-        };
+        // within an open handle is coherent. Held for the whole read: the
+        // FUSE dispatch already serializes ops per-request, and a chunk
+        // read is bounded (a few MiB), same cost as the old full-clone.
+        let mut writes = self.writes.lock().unwrap();
+        let ws = writes.get_mut(&ino);
         let manifest = self.load_manifest(ino)?;
-        let committed_len = self.meta.getattr(ino).map_err(|e| errno(&e))?
+        let committed_len = self
+            .meta
+            .getattr(ino)
+            .map_err(|e| errno(&e))?
             .map(|a| a.size)
             .unwrap_or(manifest.file_len);
-        let file_len = pending.as_ref().map(|(l, _)| *l).unwrap_or(committed_len);
+        let file_len = ws.as_ref().map(|w| w.file_len).unwrap_or(committed_len);
         if offset >= file_len {
             return Ok(Vec::new());
         }
@@ -464,14 +467,16 @@ impl ConstellationFs {
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let mut out = Vec::with_capacity(len as usize);
         for slice in layout.slices(offset, len) {
-            let chunk: Vec<u8> = if let Some((_, chunks)) = &pending {
-                if let Some(buf) = chunks.get(&slice.index) {
-                    buf.clone()
-                } else {
-                    self.read_committed_chunk(&hashes, slice.index)?
+            let full_len = layout.chunk_len(file_len, slice.index);
+            let chunk: Vec<u8> = match &ws {
+                Some(w) if w.staging.is_dirty(slice.index) => {
+                    let mut buf = vec![0u8; full_len as usize];
+                    w.staging
+                        .read_at(slice.index * self.chunk_size as u64, &mut buf)
+                        .map_err(|e| staging_errno(&e))?;
+                    buf
                 }
-            } else {
-                self.read_committed_chunk(&hashes, slice.index)?
+                _ => self.read_committed_chunk(&hashes, slice.index)?,
             };
             let start = slice.offset as usize;
             let end = (slice.offset + slice.len) as usize;
@@ -497,55 +502,58 @@ impl ConstellationFs {
     }
 
     fn do_write(&mut self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32, i32> {
+        if data.is_empty() {
+            return Ok(0);
+        }
         let manifest = self.load_manifest(ino)?;
         let hashes = self.chunk_list(&manifest)?;
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let mut writes = self.writes.lock().unwrap();
-        let committed_len = manifest.file_len;
-        let ws = writes.entry(ino).or_insert_with(|| WriteState {
-            chunks: BTreeMap::new(),
-            file_len: committed_len,
-            base: Some(manifest.clone()),
-        });
+        let ws = self.write_state(&mut writes, ino, &manifest)?;
+        let new_file_len = ws.file_len.max(offset + data.len() as u64);
         let mut consumed = 0usize;
         for slice in layout.slices(offset, data.len() as u64) {
-            let mut chunk = self.materialize_chunk(ws, &hashes, slice.index)?;
-            let end = (slice.offset + slice.len) as usize;
-            if chunk.len() < end {
-                chunk.resize(end, 0);
+            let full_len = layout.chunk_len(new_file_len, slice.index);
+            let is_whole_chunk = slice.offset == 0 && slice.len == full_len;
+            let chunk_start = slice.index * self.chunk_size as u64;
+            // A partial (not-whole-chunk) write into a chunk this open
+            // handle has not touched yet must first seed the untouched
+            // bytes from the committed content — otherwise they would
+            // read back as a spurious hole (zero) instead of their real
+            // pre-write value.
+            if !is_whole_chunk && !ws.staging.is_dirty(slice.index) {
+                let seed = self.committed_chunk_padded(&hashes, slice.index, full_len)?;
+                ws.staging
+                    .write_at(chunk_start, &seed)
+                    .map_err(|e| staging_errno(&e))?;
             }
-            chunk[slice.offset as usize..end]
-                .copy_from_slice(&data[consumed..consumed + slice.len as usize]);
+            ws.staging
+                .write_at(
+                    chunk_start + slice.offset as u64,
+                    &data[consumed..consumed + slice.len as usize],
+                )
+                .map_err(|e| staging_errno(&e))?;
+            ws.staging.mark_dirty(slice.index);
             consumed += slice.len as usize;
-            ws.chunks.insert(slice.index, chunk);
         }
-        ws.file_len = ws.file_len.max(offset + data.len() as u64);
+        ws.file_len = new_file_len;
         Ok(data.len() as u32)
     }
 
     fn truncate(&mut self, ino: Ino, new_size: u64) -> Result<(), i32> {
         let manifest = self.load_manifest(ino)?;
-        let hashes = self.chunk_list(&manifest)?;
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let mut writes = self.writes.lock().unwrap();
-        let committed_len = manifest.file_len;
-        let ws = writes.entry(ino).or_insert_with(|| WriteState {
-            chunks: BTreeMap::new(),
-            file_len: committed_len,
-            base: Some(manifest.clone()),
-        });
+        let ws = self.write_state(&mut writes, ino, &manifest)?;
         if new_size < ws.file_len {
-            // Drop pending chunks past the new end; trim the boundary chunk.
+            // Drop dirty runs past the new end; `Staging::set_len`
+            // (ftruncate) re-cuts the boundary chunk's on-disk bytes for
+            // free if it was already staged. An untouched boundary chunk
+            // is re-cut later, from the committed hash, by `flush_inode`.
             let keep = layout.chunk_count(new_size);
-            ws.chunks.retain(|idx, _| *idx < keep);
-            if new_size > 0 {
-                let last = keep - 1;
-                let last_len = layout.chunk_len(new_size, last) as usize;
-                let mut chunk = self.materialize_chunk(ws, &hashes, last)?;
-                chunk.truncate(last_len);
-                ws.chunks.insert(last, chunk);
-            }
+            ws.staging.retain_dirty_below(keep);
         }
+        ws.staging.set_len(new_size).map_err(|e| staging_errno(&e))?;
         ws.file_len = new_size;
         Ok(())
     }

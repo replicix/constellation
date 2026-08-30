@@ -199,6 +199,24 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &["stress-ng"],
         run: stress_ng_flap,
     },
+    Scenario {
+        name: "big-file-write",
+        desc: "write a file several times --cache-size and sample RSS: must stay flat, not track bytes written (plan 05a)",
+        requires: &[],
+        run: big_file_write,
+    },
+    Scenario {
+        name: "staging-crash",
+        desc: "kill -9 mid-write, remount: staging/ is empty after GC and the file is at its last closed size",
+        requires: &[],
+        run: staging_crash,
+    },
+    Scenario {
+        name: "unmount-drain",
+        desc: "fail the eager upload, then unmount cleanly: a second node must read the file with no missing chunk",
+        requires: &[],
+        run: unmount_drain,
+    },
 ];
 
 fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
@@ -2187,6 +2205,204 @@ fn p2p_partition_tolerance(seed: u64) -> Result<()> {
     }
     ensure_no_conflicts([&c0, &c1])?;
     c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+/// Deterministic, non-repeating content for a `len`-byte file, so a
+/// stale (partially overwritten) buffer cannot pass as correct.
+fn pattern(seed: u64, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut i: u64 = 0;
+    while out.len() < len {
+        out.extend_from_slice(blake3::hash(&(seed ^ i).to_le_bytes()).as_bytes());
+        i += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+/// Plan 05a's exit criterion: daemon RSS must not scale with the size
+/// of the file being written. A small `--cache-size` makes the old
+/// (pre-staging) behavior's failure mode obvious — without bounded
+/// staging, an in-flight write several times the cache budget would
+/// have to inflate RSS by roughly that much.
+fn big_file_write(seed: u64) -> Result<()> {
+    let (env, root) = setup("big-file-write")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/bigwrite-{}", ts());
+    let cache_size = 64 * 1024 * 1024u64; // 64 MiB
+    let mut c =
+        Client::new(root.path(), "c0", &env.endpoint, &backend)?.with_cache_size(cache_size);
+    c.fs_create()?;
+    c.mount()?;
+
+    // A few hundred MiB is enough to prove the slope is flat while
+    // staying CI-sane; several times the cache budget either way.
+    let file_len = 300usize * 1024 * 1024;
+    let data = pattern(seed, file_len);
+    let path = c.mnt.join("big.bin");
+
+    let mut peak_rss = c.rss_bytes().context("baseline RSS")?;
+    let write = std::thread::scope(|scope| -> Result<()> {
+        let writer = scope.spawn(|| -> Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path)?;
+            // Write in modest pieces so the sampler below gets several
+            // readings while the write is still in flight.
+            for chunk in data.chunks(4 * 1024 * 1024) {
+                f.write_all(chunk)?;
+            }
+            f.sync_all()?;
+            Ok(())
+        });
+        while !writer.is_finished() {
+            if let Ok(rss) = c.rss_bytes() {
+                peak_rss = peak_rss.max(rss);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        writer.join().expect("writer panicked")
+    });
+    write.context("writing the big file")?;
+    peak_rss = peak_rss.max(c.rss_bytes().context("post-write RSS")?);
+
+    // The whole point: peak RSS stays within a fixed ceiling well below
+    // the file size, and specifically below the cache budget plus a
+    // generous fixed overhead for the rest of the daemon (metadata,
+    // thread stacks, etc.) — not O(file_len).
+    let ceiling = cache_size + 200 * 1024 * 1024;
+    anyhow::ensure!(
+        peak_rss < ceiling,
+        "peak RSS {peak_rss} bytes exceeded the {ceiling}-byte ceiling for a \
+         {file_len}-byte write with a {cache_size}-byte cache budget; \
+         daemon log:\n{}",
+        c.tail_log_n(60)
+    );
+    eprintln!(
+        "big-file-write: peak RSS {} MiB, cache budget {} MiB, file {} MiB",
+        peak_rss / 1024 / 1024,
+        cache_size / 1024 / 1024,
+        file_len / 1024 / 1024
+    );
+
+    let back = std::fs::read(&path)?;
+    anyhow::ensure!(back == data, "readback mismatch after the big write");
+    c.unmount()?;
+    Ok(())
+}
+
+/// `kill -9` mid-write must not corrupt the file: staging is scratch,
+/// so the file lands at whatever size/content its last successful
+/// `close`/`fsync` committed, and `staging/` is empty after the next
+/// mount's GC. "Absent or short is a pass; corrupt is not" (plan 05a).
+fn staging_crash(seed: u64) -> Result<()> {
+    let (env, root) = setup("staging-crash")?;
+    let _proxy = env.s3_proxy()?;
+    let mut c = one_client(&env, root.path(), &format!("stagecrash-{}", ts()))?;
+
+    // A committed baseline the crash must not disturb.
+    let committed = pattern(seed, 8 * 1024 * 1024);
+    let path = c.mnt.join("f.bin");
+    std::fs::write(&path, &committed)?;
+
+    // Start a second, larger write and kill mid-flight, well before it
+    // could plausibly close (no fsync => nothing beyond `committed` is
+    // guaranteed durable — the same POSIX contract as today's RAM
+    // buffer).
+    let extra = pattern(seed.wrapping_add(1), 64 * 1024 * 1024);
+    let state_dir = root.path().join("c0").join("state");
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            use std::io::Write;
+            // Open for append-in-place: a fresh handle so partial bytes
+            // never get past this scope on their own.
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                for chunk in extra.chunks(1024 * 1024) {
+                    if f.write_all(chunk).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        let _ = c.kill9();
+        let _ = writer.join();
+    });
+
+    c.mount().context("remount after staging crash")?;
+    let staging_dir = state_dir.join("staging");
+    let leftover = std::fs::read_dir(&staging_dir)
+        .map(|it| it.count())
+        .unwrap_or(0);
+    anyhow::ensure!(
+        leftover == 0,
+        "staging/ must be empty after mount-time GC, found {leftover} entries"
+    );
+
+    let after = std::fs::read(&path)?;
+    anyhow::ensure!(
+        after == committed || after.len() < committed.len() + extra.len(),
+        "post-crash content is neither the last committed state nor visibly short: len={}",
+        after.len()
+    );
+    // The prefix that *is* present must be uncorrupted, whichever of
+    // the two shapes above it turned out to be.
+    let n = after.len().min(committed.len());
+    anyhow::ensure!(
+        after[..n] == committed[..n],
+        "post-crash content diverges from the committed baseline within the shared prefix"
+    );
+    c.unmount()?;
+    Ok(())
+}
+
+/// Regression test for prerequisite 2 (plan 05a): today's tree ships
+/// the journal on clean unmount without draining `pending_upload`
+/// first, so a chunk that only made it into the local cache (S3 PUT cut
+/// by the proxy) gets published as if it were durable in S3. This must
+/// fail on today's tree and pass once unmount gates on the upload.
+fn unmount_drain(seed: u64) -> Result<()> {
+    let (env, root) = setup("unmount-drain")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/unmount-drain-{}", ts());
+    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
+    c0.fs_create()?;
+    c0.mount()?;
+
+    let data = pattern(seed, 2 * 1024 * 1024);
+    let path = c0.mnt.join("f.bin");
+
+    // Cut S3 before the write so the eager upload in `flush_inode`
+    // cannot succeed; the chunk lands in the local cache Dirty and in
+    // `pending_upload`, exactly the state an orderly unmount must not
+    // ship over.
+    proxy.cut()?;
+    std::fs::write(&path, &data).context("writing while S3 is cut")?;
+
+    // Unmount while S3 is still down: on the fixed tree this must
+    // refuse to finish cleanly (skip_ship) rather than shipping a
+    // manifest for a chunk that was never PUT. `unmount()` only checks
+    // that the daemon process exits, not its exit code, so failure here
+    // shows up as the second node never seeing the file below.
+    let _ = c0.unmount();
+    proxy.heal()?;
+
+    // Remount and let the drain run, then unmount cleanly for real this
+    // time — the second unmount (S3 healthy) is what actually ships.
+    c0.mount()
+        .context("remount after the drained unmount attempt")?;
+    std::thread::sleep(Duration::from_secs(2));
+    c0.unmount()?;
+
+    // A second, independent node must be able to read the file with no
+    // missing chunk — the regression this scenario targets.
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?;
+    c1.mount()?;
+    let back = std::fs::read(c1.mnt.join("f.bin"))
+        .context("second node reading the file written under the cut")?;
+    anyhow::ensure!(back == data, "second node saw corrupt/partial content");
     c1.unmount()?;
     Ok(())
 }

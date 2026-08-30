@@ -452,6 +452,7 @@ name = "constellation"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "constellation-api",
  "constellation-fs-core",
@@ -459,11 +460,13 @@ dependencies = [
  "constellation-net",
  "constellation-store-s3",
  "fuser",
+ "futures",
  "libc",
  "object_store",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",

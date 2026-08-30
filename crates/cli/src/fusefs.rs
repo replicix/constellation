@@ -1,6 +1,7 @@
 //! FUSE filesystem: bridges the metadata store, chunk store, and disk
 //! cache (Phase 1: single node, close/fsync-time flush).
 
+use crate::staging::{GenCounter, Staging, StagingBudget};
 use anyhow::Result;
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
@@ -11,19 +12,22 @@ use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyWrite, Request, TimeOrNow,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
 const TTL: Duration = Duration::from_secs(1);
 
-/// In-flight write state for one inode: materialized modified chunks and
-/// the pending file length (flushed at fsync/close).
-#[derive(Default)]
+/// In-flight write state for one inode: bytes live on disk in `staging`
+/// (bounded RAM regardless of file size, plan 05a), not in a `Vec` per
+/// chunk. `dirty` tracks which chunk indices actually have staged
+/// content; the rest of the file (up to `file_len`) is served from the
+/// committed manifest in `base`.
 struct WriteState {
-    chunks: BTreeMap<u64, Vec<u8>>,
+    staging: Staging,
     file_len: u64,
     base: Option<Manifest>,
 }
@@ -97,6 +101,13 @@ pub struct FsDependencies {
     pub rt: Handle,
     pub sync: Option<SyncHandle>,
     pub coop: Option<Arc<crate::coop::Coop>>,
+    /// Root of `<state_dir>/staging`; write staging files live here
+    /// (plan 05a). Callers GC this directory before mounting.
+    pub staging_dir: PathBuf,
+    /// Shared bound on in-flight (unflushed) write bytes across every
+    /// open dirty inode, decoupled from the chunk cache budget: a
+    /// staged write is not sealed into the cache until flush.
+    pub staging_budget: Arc<StagingBudget>,
 }
 
 pub struct ConstellationFs {
@@ -116,6 +127,16 @@ pub struct ConstellationFs {
     coop: Option<std::sync::Arc<crate::coop::Coop>>,
     /// Publication path to the sync task (None in tests).
     sync: Option<SyncHandle>,
+    staging_dir: PathBuf,
+    staging_budget: Arc<StagingBudget>,
+    staging_gen: GenCounter,
+}
+
+fn staging_errno(e: &crate::staging::StagingError) -> i32 {
+    match e {
+        crate::staging::StagingError::Full { .. } => libc::ENOSPC,
+        crate::staging::StagingError::Io(_) => libc::EIO,
+    }
 }
 
 fn errno(e: &MetaError) -> i32 {
@@ -196,6 +217,9 @@ impl ConstellationFs {
             prefetch,
             coop: deps.coop,
             sync: deps.sync,
+            staging_dir: deps.staging_dir,
+            staging_budget: deps.staging_budget,
+            staging_gen: GenCounter::default(),
         }
     }
 
@@ -397,23 +421,44 @@ impl ConstellationFs {
         Ok(data)
     }
 
-    /// Materialize chunk `idx` of a file for modification: pending write
-    /// buffer > cache/store > zero-fill (holes / beyond-EOF extension).
-    fn materialize_chunk(
+    /// Full content of committed chunk `idx`, zero-padded to `len`
+    /// (cache/store fetch, or zero-fill for a hole/beyond-EOF chunk that
+    /// was never written). Used to seed a staging chunk's untouched
+    /// bytes before a partial (non-whole-chunk) write lands on top.
+    fn committed_chunk_padded(
         &self,
-        ws: &WriteState,
         hashes: &[ChunkHash],
         idx: u64,
+        len: u32,
     ) -> Result<Vec<u8>, i32> {
-        if let Some(buf) = ws.chunks.get(&idx) {
-            return Ok(buf.clone());
+        let mut data = match hashes.get(idx as usize) {
+            Some(h) => self.fetch_chunk(h)?,
+            None => Vec::new(),
+        };
+        data.resize(len as usize, 0);
+        Ok(data)
+    }
+
+    /// Get-or-create the pending write state for `ino`, allocating a
+    /// fresh staging file (bounded-RAM, plan 05a) the first time this
+    /// inode is touched since its last flush.
+    fn write_state<'a>(
+        &self,
+        writes: &'a mut HashMap<Ino, WriteState>,
+        ino: Ino,
+        manifest: &Manifest,
+    ) -> Result<&'a mut WriteState, i32> {
+        if let std::collections::hash_map::Entry::Vacant(e) = writes.entry(ino) {
+            let gen = self.staging_gen.next();
+            let staging = Staging::create(&self.staging_dir, ino, gen, self.staging_budget.clone())
+                .map_err(|e| staging_errno(&e))?;
+            e.insert(WriteState {
+                staging,
+                file_len: manifest.file_len,
+                base: Some(manifest.clone()),
+            });
         }
-        if let Some(h) = hashes.get(idx as usize) {
-            let mut data = self.fetch_chunk(h)?;
-            data.resize(data.len(), 0);
-            return Ok(data);
-        }
-        Ok(Vec::new())
+        Ok(writes.get_mut(&ino).unwrap())
     }
 
     /// Flush an inode's pending writes: hash + upload chunks, write the
@@ -478,16 +523,25 @@ impl ConstellationFs {
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let n_chunks = layout.chunk_count(ws.file_len);
         let mut new_hashes: Vec<ChunkHash> = Vec::with_capacity(n_chunks as usize);
+        // Every chunk this flush seals into the cache as Dirty: the
+        // durable pending-upload set this manifest commit journals
+        // (plan 05a step 1). Sealing one chunk at a time (read its
+        // staged range, hash, insert, drop the buffer) keeps peak RSS
+        // O(chunk_size), never O(file_len) — 05a's whole point.
+        let mut dirty_hashes: Vec<ChunkHash> = Vec::new();
         for idx in 0..n_chunks {
             let expect_len = layout.chunk_len(ws.file_len, idx) as usize;
-            if let Some(buf) = ws.chunks.get(&idx) {
-                let mut data = buf.clone();
-                data.resize(expect_len, 0);
+            if ws.staging.is_dirty(idx) {
+                let mut data = vec![0u8; expect_len];
+                ws.staging
+                    .read_at(idx * self.chunk_size as u64, &mut data)
+                    .map_err(|e| staging_errno(&e))?;
                 let hash = ChunkHash::of(&data);
                 // Dirty until uploaded, then demoted to clean.
                 self.cache
                     .insert(&hash, &data, ChunkState::Dirty)
                     .map_err(|_| libc::ENOSPC)?;
+                dirty_hashes.push(hash);
                 if !epoch_active {
                     self.try_upload_dirty(&hash, &data);
                 }
@@ -504,6 +558,7 @@ impl ConstellationFs {
                         self.cache
                             .insert(&hash, &data, ChunkState::Dirty)
                             .map_err(|_| libc::ENOSPC)?;
+                        dirty_hashes.push(hash);
                         if !epoch_active {
                             self.try_upload_dirty(&hash, &data);
                         }
@@ -519,6 +574,7 @@ impl ConstellationFs {
                 self.cache
                     .insert(&hash, &data, ChunkState::Dirty)
                     .map_err(|_| libc::ENOSPC)?;
+                dirty_hashes.push(hash);
                 if !epoch_active {
                     self.try_upload_dirty(&hash, &data);
                 }
@@ -532,13 +588,18 @@ impl ConstellationFs {
             self.cache
                 .insert(&bh, &blob, ChunkState::Dirty)
                 .map_err(|_| libc::ENOSPC)?;
+            dirty_hashes.push(bh);
             if !epoch_active {
                 self.try_upload_dirty(&bh, &blob);
             }
         }
         self.meta
-            .set_manifest(ino, &manifest.encode(), ws.file_len)
+            .set_manifest_dirty(ino, &manifest.encode(), ws.file_len, &dirty_hashes)
             .map_err(|e| errno(&e))?;
+        // The staged bytes now live in the durable chunk cache (and are
+        // enrolled in `pending_upload`); the staging file is scratch
+        // and safe to drop.
+        ws.staging.discard();
         Ok(())
     }
 }

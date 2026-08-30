@@ -269,4 +269,11 @@ pub struct CacheStatus {
     pub used_bytes: u64,
     pub budget_bytes: u64,
     pub chunks: u64,
+    /// In-flight (unflushed) write bytes staged to local disk, bounded
+    /// independently of the chunk cache (plan 05a). Zero on daemons
+    /// with no open dirty inode.
+    #[serde(default)]
+    pub staging_bytes: u64,
+    #[serde(default)]
+    pub staging_budget_bytes: u64,
 }

@@ -12,6 +12,7 @@ mod prefetch;
 mod reintegrate;
 mod shipper;
 mod sources;
+mod staging;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -383,6 +384,30 @@ fn mount(
     }
     meta.set_node_prefix(node_id)?;
     tracing::info!(node_id, "node identity");
+
+    // Mount-time staging GC (plan 05a step 6): nothing under
+    // `staging/` can be live at mount start. A crash mid-write leaves
+    // no orphaned staging bytes because this always runs first.
+    let staging_dir = state_dir.join("staging");
+    let reclaimed = staging::gc(&staging_dir).context("clearing orphaned staging files")?;
+    if reclaimed > 0 {
+        tracing::info!(
+            bytes = reclaimed,
+            "reclaimed orphaned staging bytes (previous crash)"
+        );
+    }
+    // Decoupled from --cache-size: staging holds a whole in-flight
+    // write until flush/close (05a adds no streaming; that is 05b),
+    // while the cache only holds each sealed chunk briefly before eager
+    // upload demotes it. Default is a fraction of the cache budget, a
+    // reasonable starting point for ordinary interactive workloads;
+    // override for large single-file writes.
+    let staging_budget_bytes: u64 = std::env::var("CONSTELLATION_STAGING_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(cache_size / 4);
+    let staging_budget = staging::StagingBudget::new(staging_budget_bytes);
+
     let cache = std::sync::Arc::new(DiskCache::open(state_dir.join("cache"), cache_size)?);
     let compression: CompressionSetting = fsmeta
         .compression
@@ -502,6 +527,8 @@ fn mount(
                 read_only_member,
             }),
             coop: Some(coop.clone()),
+            staging_dir: staging_dir.clone(),
+            staging_budget: staging_budget.clone(),
         },
         fsmeta.chunk_size,
         compression,
@@ -823,7 +850,7 @@ fn mount(
                                     k.release_local();
                                     held
                                 } else if let Err(e) =
-                                    upload_dirty_chunks(&cache, &chunk_store, compression).await
+                                    upload_dirty_chunks(&cache, &meta, &chunk_store, compression).await
                                 {
                                     tracing::warn!(
                                         error = %e,
@@ -901,7 +928,7 @@ fn mount(
                         // self-leave does not strand content that only
                         // exists in the local cache.
                         if let Err(e) =
-                            upload_dirty_chunks(&cache, &chunk_store, compression).await
+                            upload_dirty_chunks(&cache, &meta, &chunk_store, compression).await
                         {
                             let _ = reply.send(Err(format!(
                                 "cannot upload dirty chunks before leave: {e:#}"
@@ -969,7 +996,8 @@ fn mount(
 
     let status = std::sync::Arc::new(DaemonStatus {
         meta: meta.clone(),
-        cache,
+        cache: cache.clone(),
+        staging_budget: staging_budget.clone(),
         spool,
         leases: lease_views,
         fs_uuid: fsmeta.uuid.to_string(),
@@ -1014,6 +1042,19 @@ fn mount(
         return Ok(());
     }
     let flush = rt.block_on(async {
+        // Plan 05a step 2: an orderly unmount must not publish manifests
+        // for chunks that never made it to S3. If a previous best-effort
+        // eager upload (`try_upload_dirty`) failed and only logged, this
+        // is the last chance to drain `pending_upload` before the
+        // journal ships — an unmount that refuses to finish cleanly here
+        // is strictly better than one that silently strands content.
+        if let Err(e) = upload_dirty_chunks(&cache, &meta, &store, compression).await {
+            ship.lock().await.set_skip_ship(true);
+            return Err(e).context(
+                "uploading dirty chunks before unmount; the journal was left un-shipped \
+                 (run `constellation status --state-dir ...` after remounting to drain it)",
+            );
+        }
         let mut ship = ship.lock().await;
         let mut keepers = keepers.lock().await;
         let r = ship.shutdown_all(&mut keepers).await;
@@ -1338,17 +1379,38 @@ async fn run_sync_round(
     Ok(())
 }
 
+/// Drain `SqliteMeta::pending_uploads()` — the durable not-yet-uploaded
+/// set (plan 05a step 1) — rather than `DiskCache::dirty_chunks()`,
+/// which cannot survive a crash (`DiskCache::rescan` legitimately marks
+/// everything `Clean`; only the meta journal's transaction-coupled
+/// table knows what still owes S3 a PUT).
+///
+/// A pending row whose chunk is missing from the local cache is
+/// unrecoverable content (a torn-disk case, impossible on a clean crash
+/// given the write ordering `flush_inode` uses): log loudly, leave the
+/// row, and refuse rather than silently drop it — returning an error
+/// here already makes every caller treat the round as failed and skip
+/// shipping (see `run_managed_sync_round`'s existing epoch-propose-on-
+/// failure path), which is exactly the "journal must wait" behavior.
 async fn upload_dirty_chunks(
     cache: &DiskCache,
+    meta: &SqliteMeta,
     store: &ChunkStore,
     compression: CompressionSetting,
 ) -> Result<()> {
-    for hash in cache.dirty_chunks() {
-        let data = cache
-            .get(&hash)?
-            .with_context(|| format!("dirty chunk {hash} vanished from local cache"))?;
+    for (hash, ino) in meta.pending_uploads()? {
+        let Some(data) = cache.get(&hash)? else {
+            tracing::error!(
+                %hash,
+                ino,
+                "pending upload chunk missing from local cache (unrecoverable content); \
+                 leaving the pending row and refusing to ship"
+            );
+            bail!("pending upload chunk {hash} for ino {ino} missing from local cache");
+        };
         store.put_chunk(&hash, &data, compression).await?;
         cache.set_state(&hash, constellation_fs_core::cache::ChunkState::Clean);
+        meta.ack_upload(&hash, ino)?;
     }
     Ok(())
 }
@@ -1399,7 +1461,7 @@ async fn run_managed_sync_round(
             // publication, then follows with its older local journal.
             return Ok(());
         }
-        upload_dirty_chunks(cache, store, compression).await?;
+        upload_dirty_chunks(cache, meta, store, compression).await?;
         {
             let ship = ship.lock().await;
             ship.set_skip_ship(false);
@@ -1433,7 +1495,7 @@ async fn run_managed_sync_round(
         return result;
     }
 
-    if let Err(error) = upload_dirty_chunks(cache, store, compression).await {
+    if let Err(error) = upload_dirty_chunks(cache, meta, store, compression).await {
         let base = meta.applied_vector()?;
         if epochs.maybe_propose(base).await? {
             let ship = ship.lock().await;
@@ -1535,6 +1597,7 @@ async fn adopt_root(
 struct DaemonStatus {
     meta: std::sync::Arc<SqliteMeta>,
     cache: std::sync::Arc<DiskCache>,
+    staging_budget: std::sync::Arc<staging::StagingBudget>,
     spool: std::sync::Arc<std::sync::Mutex<shipper::SpoolInfo>>,
     leases: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<lease::LeaseView>>>,
@@ -1624,6 +1687,8 @@ impl constellation_api::StatusSource for DaemonStatus {
                 used_bytes: usage.used,
                 budget_bytes: usage.budget,
                 chunks: usage.entries as u64,
+                staging_bytes: self.staging_budget.used(),
+                staging_budget_bytes: self.staging_budget.budget(),
             },
             lease: p0_lease,
             partitions,
@@ -1766,4 +1831,244 @@ fn default_state_dir(meta: &FsMeta) -> PathBuf {
             home.join(".local/share")
         });
     base.join("constellation").join(meta.uuid.to_string())
+}
+
+/// Plan 05a's `pending_upload`-driven regression tests for
+/// `upload_dirty_chunks`: the durable not-yet-uploaded set must survive
+/// a crash even though `DiskCache::rescan` legitimately reports every
+/// rediscovered chunk `Clean` (prerequisite 1), and a failed drain must
+/// leave the pending row rather than silently dropping it (the "journal
+/// must wait" state that backs prerequisite 2's unmount gate).
+#[cfg(test)]
+mod pending_upload_tests {
+    use super::*;
+    use constellation_fs_core::cache::ChunkState;
+    use constellation_fs_core::ChunkHash;
+    use constellation_meta::MetaStore;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjPath;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// Wraps an in-memory backend and can be told to fail every `put`,
+    /// simulating a cut S3 path without needing toxiproxy for a unit
+    /// test.
+    #[derive(Debug)]
+    struct FailingStore {
+        inner: InMemory,
+        fail_puts: AtomicBool,
+    }
+
+    impl FailingStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: InMemory::new(),
+                fail_puts: AtomicBool::new(false),
+            })
+        }
+
+        fn set_fail_puts(&self, fail: bool) {
+            self.fail_puts.store(fail, Ordering::SeqCst);
+        }
+    }
+
+    impl std::fmt::Display for FailingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            if self.fail_puts.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "FailingStore",
+                    source: "S3 path is cut (test injection)".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    struct Fixture {
+        meta: SqliteMeta,
+        cache: DiskCache,
+        cache_dir: PathBuf,
+        store: ChunkStore,
+        failing: Arc<FailingStore>,
+        _cache_tmp: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        /// Reopen the cache from the same directory: `DiskCache::open`
+        /// rebuilds accounting purely from what is on disk, the same
+        /// path a real remount after `kill -9` takes.
+        fn reopen_cache_simulating_crash(&mut self) {
+            self.cache = DiskCache::open(&self.cache_dir, 64 * 1024 * 1024).unwrap();
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let failing = FailingStore::new();
+        let cache_tmp = tempfile::tempdir().unwrap();
+        let cache_dir = cache_tmp.path().to_path_buf();
+        Fixture {
+            meta: SqliteMeta::open_in_memory().unwrap(),
+            cache: DiskCache::open(&cache_dir, 64 * 1024 * 1024).unwrap(),
+            cache_dir,
+            store: ChunkStore::new(failing.clone() as Arc<dyn ObjectStore>),
+            failing,
+            _cache_tmp: cache_tmp,
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Regression test for prerequisite 1: after a "crash",
+    /// `DiskCache::rescan` reports the chunk `Clean` (it cannot tell
+    /// uploaded from un-uploaded content from a directory listing
+    /// alone), but the durable `pending_upload` row must still drive the
+    /// drain to completion.
+    #[test]
+    fn drain_finds_pending_row_even_though_cache_reports_clean_after_rescan() {
+        let mut f = fixture();
+        let file = f
+            .meta
+            .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
+            .unwrap();
+        let data = b"post-crash content".to_vec();
+        let hash = ChunkHash::of(&data);
+        f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
+        f.meta
+            .set_manifest_dirty(file.ino, b"M", data.len() as u64, &[hash])
+            .unwrap();
+
+        // Simulate the crash: reopening the cache rebuilds accounting
+        // purely from disk and legitimately reports Clean (see
+        // `cache::tests::rescan_rebuilds_accounting`).
+        f.reopen_cache_simulating_crash();
+        assert_eq!(f.cache.state_of(&hash), Some(ChunkState::Clean));
+        assert_eq!(f.meta.pending_uploads().unwrap(), vec![(hash, file.ino)]);
+
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+        ))
+        .unwrap();
+
+        assert!(
+            f.meta.pending_uploads().unwrap().is_empty(),
+            "drain must ack the pending row once the chunk is uploaded"
+        );
+        let uploaded = rt().block_on(f.store.get_chunk(&hash)).unwrap();
+        assert_eq!(uploaded, data);
+    }
+
+    /// Regression test for prerequisite 2's failure mode: while S3 is
+    /// unreachable, the drain must refuse (not silently drop the
+    /// pending row), which is exactly the signal the clean-unmount path
+    /// uses to call `set_skip_ship(true)` rather than shipping a
+    /// manifest for content that never reached S3.
+    #[test]
+    fn failed_drain_leaves_the_pending_row_for_the_next_attempt() {
+        let f = fixture();
+        let file = f
+            .meta
+            .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
+            .unwrap();
+        let data = b"never uploaded".to_vec();
+        let hash = ChunkHash::of(&data);
+        f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
+        f.meta
+            .set_manifest_dirty(file.ino, b"M", data.len() as u64, &[hash])
+            .unwrap();
+
+        f.failing.set_fail_puts(true);
+        let err = rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+        ));
+        assert!(err.is_err(), "drain must fail while S3 is unreachable");
+        assert_eq!(
+            f.meta.pending_uploads().unwrap(),
+            vec![(hash, file.ino)],
+            "a failed drain must not ack the row it could not upload"
+        );
+
+        // Heal, retry: the very next attempt must succeed and ack.
+        f.failing.set_fail_puts(false);
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+        ))
+        .unwrap();
+        assert!(f.meta.pending_uploads().unwrap().is_empty());
+    }
 }

@@ -63,15 +63,68 @@ Nothing — see the exit criteria below.
 observability, and the benchmark baseline are all in and verified by
 the oracle-based harness.
 
-## Known design-debt in the current code (fix within phase 1)
+## Known design-debt in the current code
 
-- `flush_inode` re-cuts only the final chunk on shrink; a truncate to a
-  non-chunk boundary followed by extension needs a targeted test.
-- Writes buffer dirty chunks in memory per inode until flush; fine for
-  phase-1 file sizes, but the eager-upload path (DESIGN.md streaming
-  writes) is not implemented yet.
 - `setattr` journals a redundant record when invoked for truncate (size
   is also recorded by the subsequent `write_manifest`).
+
+The two bullets previously recorded here — the shrink/extend truncate
+gap and RAM scaling linearly with file size — are **closed by phase
+5a** below.
+
+## Phase 5a — bounded-memory write staging: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| `pending_upload(hash, ino)` table, written in the **same transaction** as the `WriteManifest` journal record (`set_manifest_dirty`); `pending_uploads()`/`ack_upload()` drain API | done | `meta::sqlite` |
+| `upload_dirty_chunks` drains `SqliteMeta::pending_uploads()` instead of `DiskCache::dirty_chunks()`, so the durable set — not the cache's in-memory accounting — decides what still owes S3 a PUT; a pending chunk missing from the local cache is refused loudly rather than silently dropped | done | `cli::main` |
+| Clean unmount runs `upload_dirty_chunks` before `ship.shutdown_all`; a failed drain sets `skip_ship(true)` and exits non-zero instead of shipping a manifest for un-uploaded content | done | `cli::main` |
+| `cli::staging`: one sparse file per open dirty inode (`<state_dir>/staging/<ino>.<gen>`), `pwrite`/`pread` only (no `mmap` — see the module doc for why), reserve-before-accept `StagingBudget`, run-length `DirtyRuns` (a few dozen bytes for a sequential append, not one entry per chunk) | done | `cli::staging` |
+| FUSE write path rewired onto staging: `WriteState` holds `Staging` + `file_len` + `base: Option<Manifest>` instead of a `BTreeMap<u64, Vec<u8>>`; `flush_inode` seals one chunk at a time (read staged range → hash → `cache.insert(Dirty)` → drop the buffer), so peak RSS is `O(chunk_size)`, not `O(file_len)` | done | `cli::{fusefs,fusefs_ops}` |
+| Partial writes into an untouched chunk seed the unwritten bytes from committed content first (no spurious holes); truncate maps 1:1 onto `Staging::set_len` + dirty-run retain, re-cutting the boundary chunk for free when already staged | done | `cli::fusefs_ops` |
+| `CONSTELLATION_STAGING_BUDGET` (default `--cache-size / 4`, decoupled from the chunk-cache budget); reservation failure is a clean `ENOSPC` at the FUSE boundary with no partial state | done | `cli::{main,staging}` |
+| `staging_bytes`/`staging_budget_bytes` on `CacheStatus`, surfaced through `status` | done | `crates/api::types`, `cli::main` |
+| Mount-time GC deletes everything under `<state_dir>/staging/` before the FUSE loop starts (the generation counter guarantees nothing there can be live) and logs the reclaimed byte count | done | `cli::{staging::gc,main}` |
+| `rescan_rebuilds_accounting`'s comment corrected: the cache legitimately returns `Clean` after a rescan because `pending_upload`, not the cache, is the source of truth for pending uploads | done | `fs-core::cache` |
+| Unit tests: staging round-trip across chunk boundaries + sparse-hole reads, truncate-down dirty-run recut, truncate-up-then-extend hole (closes the retargeted debt bullet), budget reserve-before-accept with no partial state, sequential-append vs. fragmenting-random-write run-count bounds, mount-time GC, `discard`, `GenCounter` monotonicity | done | `cli::staging` tests |
+| Unit tests: `set_manifest_dirty` same-tx atomicity (a forced bad-ino failure leaves neither the manifest nor a stray pending row), `ack_upload` per-inode isolation, `pending_uploads` survives a drop-and-reopen | done | `meta::sqlite` tests |
+| Unit tests: `upload_dirty_chunks` drains a pending row even though a post-crash cache reopen reports the chunk `Clean` (regression for prerequisite 1); a failed drain (S3 unreachable) leaves the pending row for the next attempt rather than acking it (regression for prerequisite 2's unmount gate) | done | `cli::pending_upload_tests` |
+| Harness scenarios: `big-file-write` (small `--cache-size`, write several times that budget, sample RSS — flat ceiling, not tracking bytes written), `staging-crash` (`kill -9` mid-write, remount, empty `staging/`, content at its last committed size), `unmount-drain` (cut S3, write, unmount, heal, remount-drain, unmount again; a second node must see no missing chunk — the regression test for prerequisite 2) | done | `crates/harness::scenarios` |
+
+### Phase 5a exit criteria (plan 05a)
+
+- [x] A file many times the cache budget is written with a flat RSS
+      ceiling — `big-file-write` writes 300 MiB against a 64 MiB
+      `--cache-size` and asserts peak RSS stays under a fixed
+      `cache_size + 200 MiB` ceiling while sampling RSS throughout the
+      write.
+- [x] `kill -9` mid-write leaves no orphaned staging bytes —
+      `staging-crash` asserts `staging/` is empty after the next
+      mount's GC and the file is at (or a strict prefix of, per the
+      no-fsync POSIX contract) its last committed size.
+
+**Verdict: phase 5a is functionally complete.** This plan deliberately
+does not add streaming/eager writeback, throttling short of the hard
+`ENOSPC` bound, or slice overlays — all out of scope, deferred to
+phase 5b (`docs/plans/05b-p5b-streaming-writeback.md`).
+
+### Known visibility limit (not scheduled)
+
+P2P carries no journal records: `Payload` (`net::message`) has
+`SegmentPublished` (a hint to tail seq N *from S3*), lease/delegation,
+epoch, digest, and chunk messages — nothing that ships records. Since
+`announce_segment` fires only after a segment is durable in S3, and
+epoch-mode handoff releases the lease locally without shipping
+(`cli::main`, gated on `epochs.writes_ok()`), **a node's writes during a
+continuation epoch are invisible to its peers until S3 returns**. The
+ordered drain keeps the log linear and divergence-free, but close-to-open
+(DESIGN.md §6) does not hold inside an epoch: a successor can take the
+lease, read a pre-epoch version of a file the previous holder modified,
+and overwrite it — a lost update, not a divergence. Peer chunk serving
+also refuses `Dirty`, so the bytes are unreachable independently of the
+manifest. Closing this needs a record-bearing P2P payload plus a
+handoff precondition, i.e. a visibility plane rather than a write-path
+change; it is deliberately out of scope for phases 5a/5b.
 
 ## Phase 2 — Second node, close-to-open: **DONE**
 
@@ -448,5 +501,7 @@ node's budget only. The digest is advisory.
 
 ## Later phases
 
-Phase 5 is closed. Not started: phases 6–8 (snapshots/E2E, web UI, GC).
-No code exists for those yet.
+Phases 5 and 5a are closed. Planned next: phase 5b (streaming writes
+and the write-through/write-back policy) — see
+`docs/plans/05b-p5b-streaming-writeback.md`. Not started: phases 6–8
+(snapshots/E2E, web UI, GC). No code exists for any of these yet.

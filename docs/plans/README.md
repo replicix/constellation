@@ -25,6 +25,8 @@ Execution protocol:
 | 04 | `04-p4b-epochs-reintegration.md` | continuation epochs, stranded-branch reintegration | 03 |
 | 04c | `04-p4c-leave.md` | `constellation leave`: permanent node departure, roster shrink | 04 |
 | 05 | `05-p5-coop-cache.md` | cooperative cache: digests, peer serving, source selection | 02 (03–04c committed in practice) |
+| 05a | `05a-p5a-write-staging.md` | bounded-memory write staging (disk-backed in-flight writes) + durable `pending_upload` | 05 |
+| 05b | `05b-p5b-streaming-writeback.md` | eager/parallel chunk upload, dedup ladder, `--write-mode through/back` | 05a |
 | 06 | `06-p6a-snapshots-clones.md` | snapshots, clones, subtree/snapshot mounts | 01 (05 committed in practice) |
 | 07 | `07-p6-e2e.md` | E2E passphrase mode | 06 |
 | 08 | `08-p7-web-ui.md` | embedded web UI + /metrics over the control API | 07 |
