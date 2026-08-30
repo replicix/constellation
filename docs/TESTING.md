@@ -427,6 +427,41 @@ Phase 8c adds two upload-existence scenarios:
   operation. A fresh `CONSTELLATION_COOP=off` node repeats the write with zero
   peer hints and exact model verification.
 
+Phase 8d adds `snapshot-churn`, a seeded out-of-core lifecycle oracle. Its
+SQLite WAL stores live rows per writable root, immutable rows per snapshot, and
+clone lineage while four concurrent workers mutate disjoint `wN` prefixes
+across `/tree` and current `/cN` roots. Every worker joins before lifecycle
+operations. Three default rounds create and delete origin and clone snapshots,
+create and delete clones, force a clone-of-clone, and write different bytes to
+the same relative `marker` in origin and clone. Each round exhaustively walks
+all live trees and explicit hidden
+`.constellation/snapshot/<name>/` views, comparing type, size, hash or symlink
+target, mtime, and mode.
+
+The final round deliberately leaves an origin file, snapshot, and clone for one
+last verification before cleanup. Cleanup requires an empty replica snapshot
+table and root namespace, empty bucket `snaps/`, then runs zero-horizon orphan
+GC and requires `chunks/` to be empty; coordination prefixes remain allowed.
+Every successful mutation and lifecycle boundary is flushed as JSONL. Preserve
+the trail outside the scenario temp directory and replay either with original
+timing or immediately:
+
+```bash
+CONSTELLATION_SNAPCHURN_AUDIT=/tmp/snap-audit \
+  target/release/harness run snapshot-churn --seed 42
+target/release/harness run snapshot-churn \
+  --replay /tmp/snap-audit/snapshot-churn-42-<timestamp>.jsonl
+target/release/harness run snapshot-churn \
+  --replay /tmp/snap-audit/snapshot-churn-42-<timestamp>.jsonl \
+  --replay-no-sleep
+```
+
+Scale is controlled by `CONSTELLATION_SNAPCHURN_WORKERS` (default 4),
+`CONSTELLATION_SNAPCHURN_ROUNDS` (default 3, minimum 3), and
+`CONSTELLATION_SNAPCHURN_OPS` (operations per worker per round, default 30).
+`CONSTELLATION_SNAPCHURN_AUDIT` selects the trail directory; without it the
+scenario temp directory is used and printed.
+
 Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.

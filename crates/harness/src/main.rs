@@ -14,6 +14,7 @@ mod docker;
 mod model;
 mod s3env;
 mod scenarios;
+mod snapchurn;
 mod suites;
 mod toxiproxy;
 mod workload;
@@ -40,6 +41,12 @@ enum Command {
         /// Workload seed; failures reproduce with the same seed.
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// Replay a snapshot-churn JSONL audit trail.
+        #[arg(long)]
+        replay: Option<std::path::PathBuf>,
+        /// Replay without preserving recorded inter-operation timing.
+        #[arg(long, requires = "replay")]
+        replay_no_sleep: bool,
     },
     /// Census-scale import benchmark (many small files).
     Bench {
@@ -77,7 +84,12 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Run { names, seed } => run(names, seed),
+        Command::Run {
+            names,
+            seed,
+            replay,
+            replay_no_sleep,
+        } => run(names, seed, replay, replay_no_sleep),
         Command::Bench {
             files,
             file_size,
@@ -104,7 +116,16 @@ fn main() -> Result<()> {
     }
 }
 
-fn run(names: Vec<String>, seed: u64) -> Result<()> {
+fn run(
+    names: Vec<String>,
+    seed: u64,
+    replay: Option<std::path::PathBuf>,
+    replay_no_sleep: bool,
+) -> Result<()> {
+    if replay.is_some() && names.as_slice() != ["snapshot-churn"] {
+        bail!("--replay is valid only with exactly one scenario: snapshot-churn");
+    }
+    snapchurn::set_replay(replay, replay_no_sleep)?;
     let selected: Vec<&scenarios::Scenario> = if names.is_empty() {
         SCENARIOS.iter().collect()
     } else {

@@ -213,6 +213,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: snapshot_mount,
     },
     Scenario {
+        name: "snapshot-churn",
+        desc: "concurrent multi-round snapshot and clone churn with a SQLite oracle and replay",
+        requires: &[],
+        run: crate::snapchurn::run,
+    },
+    Scenario {
         name: "e2e-basic",
         desc: "passphrase mount encrypts chunks and logs, cold-remounts, and rejects a wrong passphrase",
         requires: &[],

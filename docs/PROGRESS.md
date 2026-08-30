@@ -820,8 +820,47 @@ per-chunk HEAD decisions for this tree. `existence-peer-hint` reported
 `peer_hints=9` with LIST disabled; its coop-disabled beat reported zero hints.
 Only `fio-latency` and `fio-blips` skipped because `fio` is absent.
 
+## Phase 8d — concurrent snapshot and clone churn oracle: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| WAL-backed SQLite expected state for live roots, immutable snapshot entries, and writable clone lineage; payloads are represented by BLAKE3 hashes rather than retained bytes | done | `harness::snapchurn` |
+| Seeded concurrent workers with disjoint `/tree/wN` and `/cN/wN` prefixes, quiesce boundaries, mixed file/dir/symlink/rename/truncate/chmod operations, and occasional multi-chunk writes | done | `harness::snapchurn` |
+| Multi-round origin and clone snapshots, snapshot/clone deletion, clone-of-clone, and an overlapping `marker` that diverges on origin and clone without changing its frozen source | done | harness `snapshot-churn` |
+| Complete live and hidden frozen-view verification (paths, kinds, sizes, hashes/targets, mtimes, modes), plus clone survival after deleting its source snapshot and source clone | done | harness `snapshot-churn` |
+| Flushed JSONL operation/lifecycle trail with timed `--replay` and accelerated `--replay-no-sleep` | done | `harness run snapshot-churn` |
+| Final cleanup asserts an empty replica snapshot/root namespace, empty bucket `snaps/`, and no user `chunks/` after zero-horizon orphan GC | done | harness `snapshot-churn` |
+| Clone roots inherit the mount daemon's effective UID/GID instead of hard-coded root ownership; regression asserted in the existing clone-isolation unit test | done | `cli::snapshot` |
+
+### Phase 8d exit criteria (plan 13)
+
+- [x] Four workers complete three default rounds of 30 operations each, with
+      all worker I/O closed before snapshot, clone, delete, and verify phases.
+- [x] Origin snapshots and clone snapshots are frozen and exhaustive; live
+      roots diverge independently, including byte-distinct same-relative-path
+      markers and a clone-of-clone that survives deletion of both its source
+      snapshot and source clone.
+- [x] The last quiescent state retains origin files, a snapshot, and a clone;
+      cleanup then drains all three root classes and proves the replica and S3
+      user-object namespaces are empty after GC.
+- [x] The emitted 362-event seed-42 trail replays successfully both with
+      recorded timing and with `--replay-no-sleep`.
+
+The oracle records the metadata actually exposed by frozen views because those
+views intentionally mask write bits, then refreshes a materialized clone's
+ordinary writable metadata after copying its snapshot rows. This preserves the
+snapshot verifier's read-only-mode assertion without confusing it with clone
+ownership and mode semantics.
+
+Validation (2026-08-30): fmt and strict clippy clean; workspace tests, smoke,
+S3 integration, release workspace build, every runnable harness scenario, and
+pjdfstest **8798 passed, 0 failed** with an empty baseline. `snapshot-churn`
+(seed 42) reported 4/4 snapshots and 3/3 clones created/deleted, four complete
+verifies, marker isolation and clone-of-clone true. Timed and no-sleep replay
+both passed.
+
 ## Later phases
 
-Phases 1–8c are closed. Phase 9 automated crash reporting remains future work.
+Phases 1–8d are closed. Phase 9 automated crash reporting remains future work.
 Deferred format/data-plane items remain listed in `docs/ROADMAP.md` and the
 phase-specific scope notes above.

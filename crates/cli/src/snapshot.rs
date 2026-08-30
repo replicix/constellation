@@ -218,8 +218,12 @@ impl SnapshotManager {
             name: String::new(),
             kind: InodeKind::Dir,
             mode: 0o755,
-            uid: 0,
-            gid: 0,
+            // The synthetic snapshot root has no persisted owner of its own.
+            // Make the ordinary writable clone belong to the daemon's mount
+            // user; hard-coding root makes root-level clone entries
+            // undeletable on an unprivileged mount.
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
             size: 0,
             mtime_ns: row.created_unix_ms * 1_000_000,
             target: None,
@@ -410,6 +414,10 @@ mod tests {
             .clone_to("/source", "before", "/copy")
             .await
             .unwrap();
+        let clone_root = meta.resolve_path("/copy").unwrap().unwrap();
+        let clone_attr = meta.getattr(clone_root).unwrap().unwrap();
+        assert_eq!(clone_attr.uid, unsafe { libc::geteuid() });
+        assert_eq!(clone_attr.gid, unsafe { libc::getegid() });
         let clone_file = meta.resolve_path("/copy/file").unwrap().unwrap();
         let changed = Manifest::from_chunks(
             DEFAULT_CHUNK_SIZE,

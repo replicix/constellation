@@ -228,6 +228,10 @@ impl Client {
         self.control_command(&["clone", selector, destination])
     }
 
+    pub fn replica_db(&self) -> PathBuf {
+        self.state.join("meta.db")
+    }
+
     pub fn gc_process(&self, orphans: bool) -> Result<Child> {
         let mut args = vec![
             "gc",

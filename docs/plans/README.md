@@ -33,6 +33,7 @@ Execution protocol:
 | 09 | `09-p8a-gc-fsck.md` | bucket GC (lease, deref, condemned handshake) + fsck --repair | 06 (07–08 committed in practice) |
 | 10 | `10-p8b-hardening-packaging.md` | xfstests, perf gates, musl/macOS packaging, nightly matrix | 09 |
 | 12 | `12-p8c-existence-bloom.md` | LIST-seeded S3 existence bloom + peer-digest upload hints | 10 |
+| 13 | `13-p8d-snapshot-churn.md` | concurrent snapshot/clone churn oracle, audit trail, replay | 12 |
 | 11 | `11-p9-crash-reporting.md` | secure crash reporting pipeline | 10 |
 
 "Committed in practice": the plan does not technically build on the
