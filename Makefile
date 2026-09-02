@@ -29,7 +29,7 @@ BENCH_FILES ?= 20000
 
 .PHONY: help build build-release build-debug test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration compose compose-down harness harness-docker \
-	harness-list bench xfstests perf-gate dist-linux dist-macos deps
+	harness-list bench xfstests perf-gate dist-linux dist-macos deps FORCE
 
 .DEFAULT_GOAL := help
 
@@ -49,11 +49,16 @@ build-release: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Build release binaries
 
 build-debug: $(DEBUG_BIN) $(DEBUG_HARNESS) ## Build debug binaries
 
-$(RELEASE_BIN) $(RELEASE_HARNESS):
+# FORCE: make does not track Rust sources, so existing binaries would
+# otherwise make these recipes no-ops. Cargo itself is incremental.
+# `&:` = one recipe produces both outputs (GNU make 4.3+).
+$(RELEASE_BIN) $(RELEASE_HARNESS) &: FORCE
 	$(CARGO) build --release -p constellation -p constellation-harness
 
-$(DEBUG_BIN) $(DEBUG_HARNESS):
+$(DEBUG_BIN) $(DEBUG_HARNESS) &: FORCE
 	$(CARGO) build -p constellation -p constellation-harness
+
+FORCE: ;
 
 test: test-unit ## Alias for unit tests
 

@@ -61,8 +61,8 @@ enum Command {
         /// Local state directory (metadata DB + chunk cache).
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Chunk cache budget in bytes.
-        #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
+        /// Chunk cache budget (e.g. 10G, 512MiB). Suffixes are binary.
+        #[arg(long, default_value = "10G", value_parser = parse_byte_size)]
         cache_size: u64,
         /// Allow other users to access the mount.
         #[arg(long)]
@@ -2909,6 +2909,99 @@ fn default_state_dir(meta: &FsMeta) -> PathBuf {
             home.join(".local/share")
         });
     base.join("constellation").join(meta.uuid.to_string())
+}
+
+/// Parse a human-readable byte size for CLI flags (`10G`, `512MiB`, bare
+/// integer). Suffixes K/M/G/T (and KiB/MiB/…, KB/MB/…) are binary
+/// (1024-based): `10G` means 10 GiB, matching the common cache-budget
+/// convention rather than SI decimal.
+fn parse_byte_size(input: &str) -> Result<u64, String> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Err("empty byte size".into());
+    }
+    let digits = s
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .last()
+        .map(|(i, _)| i + 1)
+        .unwrap_or(0);
+    if digits == 0 {
+        return Err(format!("invalid byte size: {input}"));
+    }
+    let num: u64 = s[..digits]
+        .parse()
+        .map_err(|e| format!("invalid byte size: {e}"))?;
+    let unit = s[digits..].trim().to_ascii_lowercase();
+    let mult: u64 = match unit.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "ki" | "kib" => 1 << 10,
+        "m" | "mb" | "mi" | "mib" => 1 << 20,
+        "g" | "gb" | "gi" | "gib" => 1 << 30,
+        "t" | "tb" | "ti" | "tib" => 1 << 40,
+        _ => return Err(format!("unknown size unit in {input:?}")),
+    };
+    num.checked_mul(mult)
+        .ok_or_else(|| format!("byte size overflow: {input}"))
+}
+
+#[cfg(test)]
+mod parse_byte_size_tests {
+    use super::*;
+
+    #[test]
+    fn binary_suffixes() {
+        assert_eq!(parse_byte_size("10G").unwrap(), 10 << 30);
+        assert_eq!(parse_byte_size("10GiB").unwrap(), 10 << 30);
+        assert_eq!(parse_byte_size("10g").unwrap(), 10 << 30);
+        assert_eq!(parse_byte_size("64M").unwrap(), 64 << 20);
+        assert_eq!(parse_byte_size("64MiB").unwrap(), 64 << 20);
+        assert_eq!(parse_byte_size("512KiB").unwrap(), 512 << 10);
+        assert_eq!(parse_byte_size("1T").unwrap(), 1 << 40);
+    }
+
+    #[test]
+    fn bare_bytes_and_whitespace() {
+        assert_eq!(parse_byte_size("10737418240").unwrap(), 10 << 30);
+        assert_eq!(parse_byte_size(" 64M ").unwrap(), 64 << 20);
+        assert_eq!(parse_byte_size("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn rejects_junk() {
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("G").is_err());
+        assert!(parse_byte_size("10X").is_err());
+        assert!(parse_byte_size("10.5G").is_err());
+    }
+
+    #[test]
+    fn mount_default_is_ten_gib() {
+        let cli = Cli::try_parse_from(["constellation", "mount", "--s3", "file:///tmp/x", "/mnt"])
+            .unwrap();
+        match cli.command {
+            Command::Mount { cache_size, .. } => assert_eq!(cache_size, 10 << 30),
+            _ => panic!("expected Mount"),
+        }
+    }
+
+    #[test]
+    fn mount_accepts_human_cache_size() {
+        let cli = Cli::try_parse_from([
+            "constellation",
+            "mount",
+            "--s3",
+            "file:///tmp/x",
+            "/mnt",
+            "--cache-size",
+            "64M",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Mount { cache_size, .. } => assert_eq!(cache_size, 64 << 20),
+            _ => panic!("expected Mount"),
+        }
+    }
 }
 
 /// Plan 05a's `pending_upload`-driven regression tests for
