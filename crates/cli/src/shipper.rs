@@ -845,9 +845,44 @@ impl Shipper {
     }
 
     pub async fn shutdown_all(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<()> {
-        self.sync_all(leases).await?;
+        let initial = MetaStore::journal_len(&*self.meta).unwrap_or(0);
+        if initial > 0 {
+            tracing::info!(journal_backlog = initial, "shipping journal before unmount");
+        }
+        let mut last_progress = Instant::now();
+        loop {
+            self.tail_all().await?;
+            if matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
+                tracing::info!(
+                    journal_backlog = MetaStore::journal_len(&*self.meta).unwrap_or(0),
+                    "deposed node remains tail-only until reintegration; \
+                     journal will not ship on this unmount"
+                );
+                return Ok(());
+            }
+            self.consider_xpart_aborts_all(leases).await?;
+            let shipped_more = self.ship_all(leases).await?;
+            let remaining = MetaStore::journal_len(&*self.meta).unwrap_or(0);
+            if initial > 0
+                && (!shipped_more || last_progress.elapsed() >= std::time::Duration::from_secs(5))
+            {
+                tracing::info!(
+                    journal_backlog = remaining,
+                    initial,
+                    "journal ship progress"
+                );
+                last_progress = Instant::now();
+            }
+            if !shipped_more {
+                self.maybe_split_merge(leases).await?;
+                break;
+            }
+        }
         if self.shipped_since_ckpt > 0 {
             self.checkpoint().await?;
+        }
+        if initial > 0 {
+            tracing::info!(shipped = initial, "journal ship complete");
         }
         Ok(())
     }

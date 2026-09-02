@@ -93,7 +93,14 @@ enum Command {
         #[arg(long, requires = "rw", conflicts_with = "clone_name")]
         ephemeral: bool,
         /// Serve the embedded control UI on localhost. Zero disables it.
-        #[arg(long, env = "CONSTELLATION_WEB_UI_PORT", default_value_t = 0)]
+        /// Bare `--web-ui` listens on 8080; `--web-ui <port>` picks a port.
+        #[arg(
+            long,
+            env = "CONSTELLATION_WEB_UI_PORT",
+            default_value_t = 0,
+            num_args = 0..=1,
+            default_missing_value = "8080"
+        )]
         web_ui: u16,
     },
     /// Verify backend capabilities (conditional writes, filesystem state).
@@ -1653,14 +1660,23 @@ fn mount(
     // lease so a peer does not have to wait out the TTL. Skip when we
     // already flushed and retired via `leave` — the registry record is
     // a tombstone and a second ship is unnecessary.
+    tracing::info!("FUSE detached; draining uploads and shipping journal before exit");
     if let Some(path) = ephemeral_clone {
         remove_live_subtree(&meta, &path)
             .with_context(|| format!("removing ephemeral clone {path}"))?;
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
+        tracing::info!("node already left; skipping final drain");
         return Ok(());
     }
+    let pending = meta.pending_upload_count().unwrap_or(0);
+    let backlog = constellation_meta::MetaStore::journal_len(&*meta).unwrap_or(0);
+    tracing::info!(
+        pending_uploads = pending,
+        journal_backlog = backlog,
+        "clean unmount drain starting"
+    );
     let flush = rt.block_on(async {
         // Plan 05a step 2: an orderly unmount must not publish manifests
         // for chunks that never made it to S3. If a previous best-effort
@@ -1685,6 +1701,7 @@ fn mount(
         r
     });
     flush.context("final log flush")?;
+    tracing::info!("clean unmount drain complete");
     Ok(())
 }
 
@@ -2175,7 +2192,15 @@ async fn upload_dirty_chunks(
             Ok((hash, inos, data))
         })
         .collect::<Result<Vec<_>>>()?;
-    let results = stream::iter(jobs.into_iter().map(|(hash, inos, data)| async move {
+    let total = jobs.len() as u64;
+    if total > 0 {
+        tracing::info!(
+            pending_chunks = total,
+            concurrency = upload.concurrency,
+            "uploading pending chunks"
+        );
+    }
+    let mut stream = stream::iter(jobs.into_iter().map(|(hash, inos, data)| async move {
         let mode = upload.put_mode(&hash);
         let mut last = None;
         for attempt in 0..3 {
@@ -2189,11 +2214,11 @@ async fn upload_dirty_chunks(
         }
         Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
     }))
-    .buffer_unordered(upload.concurrency)
-    .collect::<Vec<_>>()
-    .await;
+    .buffer_unordered(upload.concurrency);
     let mut first_error = None;
-    for result in results {
+    let mut completed = 0u64;
+    let mut last_progress = std::time::Instant::now();
+    while let Some(result) = stream.next().await {
         match result {
             Ok((hash, inos, mode, existed)) => {
                 upload.existence.insert(&hash);
@@ -2213,9 +2238,20 @@ async fn upload_dirty_chunks(
                 }
             }
         }
+        completed += 1;
+        if total > 0
+            && (completed == total
+                || last_progress.elapsed() >= std::time::Duration::from_secs(5))
+        {
+            tracing::info!(completed, total, "pending chunk upload progress");
+            last_progress = std::time::Instant::now();
+        }
     }
     if let Some(error) = first_error {
         return Err(error);
+    }
+    if total > 0 {
+        tracing::info!(uploaded = total, "pending chunk upload complete");
     }
     Ok(())
 }
@@ -2999,6 +3035,35 @@ mod parse_byte_size_tests {
         .unwrap();
         match cli.command {
             Command::Mount { cache_size, .. } => assert_eq!(cache_size, 64 << 20),
+            _ => panic!("expected Mount"),
+        }
+    }
+
+    #[test]
+    fn bare_web_ui_defaults_to_8080() {
+        let cli =
+            Cli::try_parse_from(["constellation", "mount", "--s3", "file:///tmp/x", "/mnt", "--web-ui"])
+                .unwrap();
+        match cli.command {
+            Command::Mount { web_ui, .. } => assert_eq!(web_ui, 8080),
+            _ => panic!("expected Mount"),
+        }
+    }
+
+    #[test]
+    fn web_ui_port_override() {
+        let cli = Cli::try_parse_from([
+            "constellation",
+            "mount",
+            "--s3",
+            "file:///tmp/x",
+            "/mnt",
+            "--web-ui",
+            "9090",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Mount { web_ui, .. } => assert_eq!(web_ui, 9090),
             _ => panic!("expected Mount"),
         }
     }
