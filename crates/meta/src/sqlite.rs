@@ -10,7 +10,8 @@ use crate::{CloneNode, CloneSpec, DirEntry, MetaStore, SetXattrMode, SnapshotNod
 use constellation_fs_core::types::{now_ns, ROOT_INO};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Inos are `node_prefix << 40 | counter`: 24 bits of node id, 40 bits
@@ -138,7 +139,43 @@ pub struct SqliteMeta {
     path: Option<std::path::PathBuf>,
 }
 
+thread_local! {
+    /// One read-only WAL connection per thread, keyed by DB path.
+    static READER_CONN: RefCell<Option<(PathBuf, Connection)>> = const { RefCell::new(None) };
+}
+
 impl SqliteMeta {
+    fn configure_reader(conn: &Connection) -> Result<(), MetaError> {
+        conn.pragma_update(None, "query_only", "ON")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "cache_size", -524_288)?;
+        conn.pragma_update(None, "mmap_size", 268_435_456i64)?;
+        Ok(())
+    }
+
+    fn with_reader<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, MetaError>,
+    ) -> Result<T, MetaError> {
+        let Some(path) = self.path.as_ref() else {
+            let conn = self.conn.lock().unwrap();
+            return f(&conn);
+        };
+        READER_CONN.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let need_open = match slot.as_ref() {
+                Some((p, _)) => p != path,
+                None => true,
+            };
+            if need_open {
+                let conn = Connection::open(path)?;
+                Self::configure_reader(&conn)?;
+                *slot = Some((path.clone(), conn));
+            }
+            f(&slot.as_ref().unwrap().1)
+        })
+    }
+
     fn manifest_hashes(
         bytes: Option<&[u8]>,
     ) -> Result<std::collections::HashSet<ChunkHash>, MetaError> {
@@ -715,10 +752,11 @@ impl SqliteMeta {
     }
 
     pub fn partitions(&self) -> Result<Vec<(String, Ino)>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, root_ino FROM partition ORDER BY id")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        self.with_reader(|conn| {
+            let mut stmt = conn.prepare("SELECT id, root_ino FROM partition ORDER BY id")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     /// Path of a partition root, for the control API. `/` for p0.
@@ -726,25 +764,26 @@ impl SqliteMeta {
         if ino == ROOT_INO {
             return Ok("/".into());
         }
-        let conn = self.conn.lock().unwrap();
-        let mut parts = Vec::new();
-        let mut cur = ino;
-        while cur != ROOT_INO {
-            let row: Option<(Ino, String)> = conn
-                .query_row(
-                    "SELECT parent, name FROM dentry WHERE ino = ?1 LIMIT 1",
-                    params![cur],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((parent, name)) = row else {
-                break;
-            };
-            parts.push(name);
-            cur = parent;
-        }
-        parts.reverse();
-        Ok(format!("/{}", parts.join("/")))
+        self.with_reader(|conn| {
+            let mut parts = Vec::new();
+            let mut cur = ino;
+            while cur != ROOT_INO {
+                let row: Option<(Ino, String)> = conn
+                    .query_row(
+                        "SELECT parent, name FROM dentry WHERE ino = ?1 LIMIT 1",
+                        params![cur],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((parent, name)) = row else {
+                    break;
+                };
+                parts.push(name);
+                cur = parent;
+            }
+            parts.reverse();
+            Ok(format!("/{}", parts.join("/")))
+        })
     }
 
     /// Allocate the next partition id (see [`Self::alloc_part_id`]).
@@ -754,56 +793,58 @@ impl SqliteMeta {
 
     /// Resolve an absolute path to its inode. `/` is the root.
     pub fn resolve_path(&self, path: &str) -> Result<Option<Ino>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        let mut cur = ROOT_INO;
-        for part in path.split('/').filter(|s| !s.is_empty()) {
-            match Self::dentry_ino(&conn, cur, part)? {
-                Some(next) => cur = next,
-                None => return Ok(None),
+        self.with_reader(|conn| {
+            let mut cur = ROOT_INO;
+            for part in path.split('/').filter(|s| !s.is_empty()) {
+                match Self::dentry_ino(conn, cur, part)? {
+                    Some(next) => cur = next,
+                    None => return Ok(None),
+                }
             }
-        }
-        Ok(Some(cur))
+            Ok(Some(cur))
+        })
     }
 
     /// Fetch one directory's complete snapshot rows with one indexed join.
     pub fn snapshot_children(&self, parent: Ino) -> Result<Vec<SnapshotNode>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        let mut nodes = {
-            let mut stmt = conn.prepare(
-                "SELECT d.name, i.ino, i.kind, i.size, i.mode, i.uid, i.gid, i.nlink,
-                        i.atime_ns, i.mtime_ns, i.ctime_ns, i.rdev, i.symlink_target, i.manifest
-                 FROM dentry d JOIN inode i ON i.ino = d.ino
-                 WHERE d.parent = ?1 ORDER BY d.name",
-            )?;
-            let rows = stmt.query_map(params![parent], |row| {
-                let kind: u8 = row.get(2)?;
-                Ok(SnapshotNode {
-                    name: row.get(0)?,
-                    attr: FileAttr {
-                        ino: row.get(1)?,
-                        kind: InodeKind::from_u8(kind)
-                            .expect("database kind is validated on insert"),
-                        size: row.get::<_, i64>(3)? as u64,
-                        mode: row.get(4)?,
-                        uid: row.get(5)?,
-                        gid: row.get(6)?,
-                        nlink: row.get(7)?,
-                        atime_ns: row.get(8)?,
-                        mtime_ns: row.get(9)?,
-                        ctime_ns: row.get(10)?,
-                        rdev: row.get::<_, i64>(11)? as u64,
-                    },
-                    target: row.get(12)?,
-                    manifest: row.get(13)?,
-                    xattrs: Vec::new(),
-                })
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        for node in &mut nodes {
-            node.xattrs = Self::xattrs_by_ino(&conn, node.attr.ino)?;
-        }
-        Ok(nodes)
+        self.with_reader(|conn| {
+            let mut nodes = {
+                let mut stmt = conn.prepare(
+                    "SELECT d.name, i.ino, i.kind, i.size, i.mode, i.uid, i.gid, i.nlink,
+                            i.atime_ns, i.mtime_ns, i.ctime_ns, i.rdev, i.symlink_target, i.manifest
+                     FROM dentry d JOIN inode i ON i.ino = d.ino
+                     WHERE d.parent = ?1 ORDER BY d.name",
+                )?;
+                let rows = stmt.query_map(params![parent], |row| {
+                    let kind: u8 = row.get(2)?;
+                    Ok(SnapshotNode {
+                        name: row.get(0)?,
+                        attr: FileAttr {
+                            ino: row.get(1)?,
+                            kind: InodeKind::from_u8(kind)
+                                .expect("database kind is validated on insert"),
+                            size: row.get::<_, i64>(3)? as u64,
+                            mode: row.get(4)?,
+                            uid: row.get(5)?,
+                            gid: row.get(6)?,
+                            nlink: row.get(7)?,
+                            atime_ns: row.get(8)?,
+                            mtime_ns: row.get(9)?,
+                            ctime_ns: row.get(10)?,
+                            rdev: row.get::<_, i64>(11)? as u64,
+                        },
+                        target: row.get(12)?,
+                        manifest: row.get(13)?,
+                        xattrs: Vec::new(),
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for node in &mut nodes {
+                node.xattrs = Self::xattrs_by_ino(conn, node.attr.ino)?;
+            }
+            Ok(nodes)
+        })
     }
 
     /// Make a snapshot visible locally and journal its immutable root.
@@ -1831,104 +1872,109 @@ impl SqliteMeta {
 
 impl MetaStore for SqliteMeta {
     fn lookup(&self, parent: Ino, name: &str) -> Result<Option<FileAttr>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        match Self::dentry_ino(&conn, parent, name)? {
+        self.with_reader(|conn| match Self::dentry_ino(conn, parent, name)? {
             None => Ok(None),
-            Some(ino) => Self::attr_by_ino(&conn, ino),
-        }
+            Some(ino) => Self::attr_by_ino(conn, ino),
+        })
     }
 
     fn getattr(&self, ino: Ino) -> Result<Option<FileAttr>, MetaError> {
-        Self::attr_by_ino(&self.conn.lock().unwrap(), ino)
+        self.with_reader(|conn| Self::attr_by_ino(conn, ino))
     }
 
     fn readdir(&self, parent: Ino) -> Result<Vec<DirEntry>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        Self::require_dir(&conn, parent)?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT d.name, d.ino, i.kind FROM dentry d JOIN inode i ON i.ino = d.ino
-             WHERE d.parent = ?1 ORDER BY d.name",
-        )?;
-        let rows = stmt.query_map(params![parent], |r| {
-            let kind_u8: u8 = r.get(2)?;
-            Ok(DirEntry {
-                name: r.get(0)?,
-                ino: r.get(1)?,
-                kind: InodeKind::from_u8(kind_u8).unwrap_or(InodeKind::File),
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        self.with_reader(|conn| {
+            Self::require_dir(conn, parent)?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT d.name, d.ino, i.kind FROM dentry d JOIN inode i ON i.ino = d.ino
+                 WHERE d.parent = ?1 ORDER BY d.name",
+            )?;
+            let rows = stmt.query_map(params![parent], |r| {
+                let kind_u8: u8 = r.get(2)?;
+                Ok(DirEntry {
+                    name: r.get(0)?,
+                    ino: r.get(1)?,
+                    kind: InodeKind::from_u8(kind_u8).unwrap_or(InodeKind::File),
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     fn readlink(&self, ino: Ino) -> Result<Option<String>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn
-            .query_row(
-                "SELECT symlink_target FROM inode WHERE ino = ?1",
-                params![ino],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten())
+        self.with_reader(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT symlink_target FROM inode WHERE ino = ?1",
+                    params![ino],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
     }
 
     fn manifest(&self, ino: Ino) -> Result<Option<Vec<u8>>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn
-            .query_row(
-                "SELECT manifest FROM inode WHERE ino = ?1",
-                params![ino],
-                |r| r.get::<_, Option<Vec<u8>>>(0),
-            )
-            .optional()?
-            .flatten())
+        self.with_reader(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT manifest FROM inode WHERE ino = ?1",
+                    params![ino],
+                    |r| r.get::<_, Option<Vec<u8>>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
     }
 
     fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        if Self::attr_by_ino(&conn, ino)?.is_none() {
-            return Err(MetaError::NoEnt(ino));
-        }
-        Ok(conn
-            .query_row(
-                "SELECT value FROM xattr WHERE ino = ?1 AND name = ?2",
-                params![ino, name],
-                |row| row.get(0),
-            )
-            .optional()?)
+        self.with_reader(|conn| {
+            if Self::attr_by_ino(conn, ino)?.is_none() {
+                return Err(MetaError::NoEnt(ino));
+            }
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM xattr WHERE ino = ?1 AND name = ?2",
+                    params![ino, name],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
     }
 
     fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        if Self::attr_by_ino(&conn, ino)?.is_none() {
-            return Err(MetaError::NoEnt(ino));
-        }
-        Ok(Self::xattrs_by_ino(&conn, ino)?
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect())
+        self.with_reader(|conn| {
+            if Self::attr_by_ino(conn, ino)?.is_none() {
+                return Err(MetaError::NoEnt(ino));
+            }
+            Ok(Self::xattrs_by_ino(conn, ino)?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect())
+        })
     }
 
     fn recursive_size(&self, ino: Ino) -> Result<(u64, u64), MetaError> {
-        let conn = self.conn.lock().unwrap();
-        if Self::attr_by_ino(&conn, ino)?.is_none() {
-            return Err(MetaError::NoEnt(ino));
-        }
-        let file_kind = InodeKind::File.as_u8();
-        let (size, count): (i64, i64) = conn.query_row(
-            "WITH RECURSIVE subtree(ino) AS (
-                 VALUES (?1)
-                 UNION
-                 SELECT d.ino FROM dentry d JOIN subtree s ON d.parent = s.ino
-             )
-             SELECT
-                 COALESCE(SUM(CASE WHEN i.kind = ?2 THEN i.size ELSE 0 END), 0),
-                 COALESCE(SUM(CASE WHEN i.kind = ?2 THEN 1 ELSE 0 END), 0)
-             FROM subtree s JOIN inode i ON i.ino = s.ino",
-            params![ino, file_kind],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        Ok((size as u64, count as u64))
+        self.with_reader(|conn| {
+            if Self::attr_by_ino(conn, ino)?.is_none() {
+                return Err(MetaError::NoEnt(ino));
+            }
+            let file_kind = InodeKind::File.as_u8();
+            let (size, count): (i64, i64) = conn.query_row(
+                "WITH RECURSIVE subtree(ino) AS (
+                     VALUES (?1)
+                     UNION
+                     SELECT d.ino FROM dentry d JOIN subtree s ON d.parent = s.ino
+                 )
+                 SELECT
+                     COALESCE(SUM(CASE WHEN i.kind = ?2 THEN i.size ELSE 0 END), 0),
+                     COALESCE(SUM(CASE WHEN i.kind = ?2 THEN 1 ELSE 0 END), 0)
+                 FROM subtree s JOIN inode i ON i.ino = s.ino",
+                params![ino, file_kind],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok((size as u64, count as u64))
+        })
     }
 
     fn mkdir(
@@ -2426,10 +2472,11 @@ impl MetaStore for SqliteMeta {
     }
 
     fn orphans(&self) -> Result<Vec<Ino>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT ino FROM inode WHERE nlink = 0")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        self.with_reader(|conn| {
+            let mut stmt = conn.prepare("SELECT ino FROM inode WHERE nlink = 0")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     fn take_journal(&self, max: usize) -> Result<Vec<(u64, LogRecord)>, MetaError> {
