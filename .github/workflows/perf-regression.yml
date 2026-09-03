@@ -1,0 +1,186 @@
+name: Performance Regression
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Base ref for comparison (branch, tag, or SHA)"
+        required: false
+        default: "main"
+      files:
+        description: "Synthetic files to generate"
+        required: false
+        default: "20000"
+      fanout:
+        description: "Directory fanout"
+        required: false
+        default: "400"
+      file_size:
+        description: "Minimum file size (bytes)"
+        required: false
+        default: "512"
+      repetitions:
+        description: "Repetitions per profile (median reported)"
+        required: false
+        default: "1"
+      seed:
+        description: "Deterministic synthetic seed"
+        required: false
+        default: "42"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf-regression:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 rsync python3
+
+      - name: Resolve inputs
+        id: cfg
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base_ref=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base_ref=${{ github.event.inputs.base_ref || 'main' }}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "files=${{ github.event.inputs.files || '20000' }}" >> "$GITHUB_OUTPUT"
+          echo "fanout=${{ github.event.inputs.fanout || '400' }}" >> "$GITHUB_OUTPUT"
+          echo "file_size=${{ github.event.inputs.file_size || '512' }}" >> "$GITHUB_OUTPUT"
+          echo "repetitions=${{ github.event.inputs.repetitions || '1' }}" >> "$GITHUB_OUTPUT"
+          echo "seed=${{ github.event.inputs.seed || '42' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch baseline from base ref
+        run: |
+          base_ref="${{ steps.cfg.outputs.base_ref }}"
+          if git show "${base_ref}:.perf-baselines/result.json" > perf-artifacts/base.json 2>/dev/null; then
+            echo "Found existing baseline in ${base_ref}"
+            echo "baseline_exists=true" >> "$GITHUB_ENV"
+          else
+            echo "No baseline found in ${base_ref}, will generate"
+            echo "baseline_exists=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build HEAD binaries
+        run: |
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-head" cargo build --release -p constellation -p constellation-harness
+
+      - name: Prepare BASE worktree
+        run: |
+          git fetch --no-tags --depth 1 origin "${{ steps.cfg.outputs.base_ref }}"
+          git worktree add "$RUNNER_TEMP/base" FETCH_HEAD
+
+      - name: Build BASE binaries
+        run: |
+          cd "$RUNNER_TEMP/base"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-base" cargo build --release -p constellation -p constellation-harness
+
+      - name: Run HEAD performance suite
+        run: |
+          mkdir -p perf-artifacts/head-logs
+          python3 tests/perf_regression/run_suite.py \
+            --harness-bin "$RUNNER_TEMP/target-head/release/harness" \
+            --constellation-bin "$RUNNER_TEMP/target-head/release/constellation" \
+            --out perf-artifacts/head.json \
+            --logs-dir perf-artifacts/head-logs \
+            --files "${{ steps.cfg.outputs.files }}" \
+            --fanout "${{ steps.cfg.outputs.fanout }}" \
+            --file-size "${{ steps.cfg.outputs.file_size }}" \
+            --repetitions "${{ steps.cfg.outputs.repetitions }}" \
+            --seed "${{ steps.cfg.outputs.seed }}" \
+            --corpus-shape
+
+      - name: Run BASE performance suite
+        if: env.baseline_exists == 'false'
+        run: |
+          mkdir -p perf-artifacts/base-logs
+          python3 tests/perf_regression/run_suite.py \
+            --harness-bin "$RUNNER_TEMP/target-head/release/harness" \
+            --constellation-bin "$RUNNER_TEMP/target-base/release/constellation" \
+            --out perf-artifacts/base.json \
+            --logs-dir perf-artifacts/base-logs \
+            --files "${{ steps.cfg.outputs.files }}" \
+            --fanout "${{ steps.cfg.outputs.fanout }}" \
+            --file-size "${{ steps.cfg.outputs.file_size }}" \
+            --repetitions "${{ steps.cfg.outputs.repetitions }}" \
+            --seed "${{ steps.cfg.outputs.seed }}" \
+            --corpus-shape
+
+      - name: Commit baseline to current branch
+        if: success() && github.event_name == 'pull_request'
+        run: |
+          mkdir -p .perf-baselines
+          cp perf-artifacts/head.json .perf-baselines/result.json
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .perf-baselines/result.json
+          
+          if git diff --staged --quiet; then
+            echo "No changes to baseline"
+          else
+            git commit -m "Update performance baseline [skip ci]"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
+
+      - name: Render markdown comparison
+        run: |
+          python3 tests/perf_regression/compare.py \
+            --base perf-artifacts/base.json \
+            --head perf-artifacts/head.json \
+            --out perf-artifacts/report.md
+          cat perf-artifacts/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post sticky PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- perf-regression-report -->';
+            const body = marker + '\n' + fs.readFileSync('perf-artifacts/report.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Upload comparison report (14-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report-${{ github.run_id }}
+          retention-days: 14
+          path: perf-artifacts/report.md
+
+      - name: Upload logs (14-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-logs-${{ github.run_id }}
+          retention-days: 14
+          path: |
+            perf-artifacts/base-logs/
+            perf-artifacts/head-logs/

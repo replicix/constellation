@@ -65,6 +65,21 @@ enum Command {
         /// Benchmark an E2E passphrase filesystem.
         #[arg(long)]
         e2e: bool,
+        /// Deterministic seed for synthetic dataset generation.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Generate a realistic synthetic tree on the fly.
+        #[arg(long)]
+        corpus_shape: bool,
+        /// Add S3 latency via toxiproxy (applies both directions).
+        #[arg(long)]
+        s3_latency_ms: Option<u64>,
+        /// Limit S3 link throughput via toxiproxy (megabits/s).
+        #[arg(long)]
+        s3_bandwidth_mbps: Option<u64>,
+        /// Label embedded into the JSON report.
+        #[arg(long)]
+        label: Option<String>,
         /// Emit the measured rates as a JSON object on stdout.
         #[arg(long)]
         json: bool,
@@ -96,6 +111,11 @@ fn main() -> Result<()> {
             fanout,
             budget_s,
             e2e,
+            seed,
+            corpus_shape,
+            s3_latency_ms,
+            s3_bandwidth_mbps,
+            label,
             json,
         } => {
             let cfg = bench::BenchConfig {
@@ -104,6 +124,11 @@ fn main() -> Result<()> {
                 fanout,
                 budget_s,
                 e2e,
+                seed,
+                corpus_shape,
+                s3_latency_ms,
+                s3_bandwidth_mbps,
+                label,
                 json,
             };
             cfg.validate()?;

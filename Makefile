@@ -38,7 +38,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 
 .PHONY: help build build-release build-debug test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration compose compose-down harness harness-docker \
-	harness-list bench xfstests perf-gate dist-linux dist-macos deps FORCE \
+	harness-list bench perf-regression xfstests perf-gate dist-linux dist-macos deps FORCE \
 	uploadbench-build uploadbench-sim uploadbench-live
 
 .DEFAULT_GOAL := help
@@ -135,6 +135,19 @@ harness-docker: ## Fault-injection harness fully in docker (host needs docker on
 
 bench: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Census-scale import benchmark (needs docker + fuse3)
 	$(RELEASE_HARNESS) bench --files $(BENCH_FILES)
+
+perf-regression: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Run local perf-regression suite (full, latency250, bw50)
+	python3 tests/perf_regression/run_suite.py \
+		--harness-bin $(RELEASE_HARNESS) \
+		--constellation-bin $(RELEASE_BIN) \
+		--out /tmp/constellation-perf-head.json \
+		--logs-dir /tmp/constellation-perf-logs \
+		--files $(BENCH_FILES) \
+		--fanout 400 \
+		--file-size 512 \
+		--repetitions 1 \
+		--seed 42 \
+		--corpus-shape
 
 perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Check benchmark rates against baseline
 	tests/perf-gate.sh

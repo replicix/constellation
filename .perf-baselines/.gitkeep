@@ -1,0 +1,7 @@
+# Performance Baselines
+
+This directory contains benchmark results for performance regression tracking.
+
+- `result.json` - Latest benchmark results for this branch
+- Automatically updated by CI on successful benchmark runs
+- Used to compare performance changes in PRs
