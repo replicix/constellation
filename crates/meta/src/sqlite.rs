@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS deref (
     deref_seq     INTEGER NOT NULL,
     deref_unix_ms INTEGER NOT NULL
 );
+-- Reverse index chunk_hash -> referencing inode. Without it, deciding
+-- whether a hash is still referenced means decoding every manifest in the
+-- namespace, which makes a bulk delete quadratic (see `hash_is_live`).
+CREATE TABLE IF NOT EXISTS chunk_ref (
+    chunk_hash BLOB NOT NULL,
+    ino        INTEGER NOT NULL,
+    PRIMARY KEY (chunk_hash, ino)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS chunk_ref_by_ino ON chunk_ref (ino);
 ";
 
 pub type JournalBatch = Vec<(u64, LogRecord)>;
@@ -147,16 +156,70 @@ impl SqliteMeta {
         })
     }
 
+    /// Is `hash` still reachable from a linked inode? Answered from the
+    /// `chunk_ref` index: two indexed probes rather than a decode of every
+    /// manifest in the namespace.
+    ///
+    /// The index is a *hint* in the safe direction. A stale row can only
+    /// make a hash look live (delaying collection); GC never trusts this
+    /// answer on its own — it re-derives the full live set from the
+    /// manifests themselves before deleting anything.
     fn hash_is_live(conn: &Connection, hash: &ChunkHash) -> Result<bool, MetaError> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM chunk_ref JOIN inode USING (ino)
+                 WHERE chunk_ref.chunk_hash = ?1 AND inode.nlink > 0
+                 LIMIT 1",
+                params![hash.0.to_vec()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Repopulate `chunk_ref` from the manifests currently in `inode`.
+    /// Orphans (nlink = 0) are indexed too so that the reaping transition
+    /// finds its rows to remove; `hash_is_live` filters them out via the
+    /// join.
+    fn rebuild_chunk_ref(conn: &Connection) -> Result<(), MetaError> {
         let mut stmt =
-            conn.prepare("SELECT manifest FROM inode WHERE nlink > 0 AND manifest IS NOT NULL")?;
-        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            conn.prepare("SELECT ino, manifest FROM inode WHERE manifest IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Ino>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut insert =
+            conn.prepare("INSERT OR IGNORE INTO chunk_ref (chunk_hash, ino) VALUES (?1, ?2)")?;
         for row in rows {
-            if Self::manifest_hashes(Some(&row?))?.contains(hash) {
-                return Ok(true);
+            let (ino, manifest) = row?;
+            for hash in Self::manifest_hashes(Some(&manifest))? {
+                insert.execute(params![hash.0.to_vec(), ino])?;
             }
         }
-        Ok(false)
+        Ok(())
+    }
+
+    /// One-time index build for DBs written before `chunk_ref` existed.
+    /// Runs inside `init` so no code path can reach `hash_is_live` with an
+    /// unpopulated index.
+    fn backfill_chunk_ref_once(conn: &mut Connection) -> Result<(), MetaError> {
+        let done: Option<String> = conn
+            .query_row(
+                "SELECT value FROM kv WHERE key = 'chunk_ref_index_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if done.as_deref() == Some("1") {
+            return Ok(());
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::rebuild_chunk_ref(&tx)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES ('chunk_ref_index_v1', '1')",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Maintain the local indexed candidate set in the same transaction as
@@ -165,6 +228,7 @@ impl SqliteMeta {
     /// discover ordinary reference garbage.
     pub(crate) fn track_manifest_transition(
         conn: &Connection,
+        ino: Ino,
         old: Option<&[u8]>,
         new: Option<&[u8]>,
         seq: u64,
@@ -174,11 +238,19 @@ impl SqliteMeta {
         let new = Self::manifest_hashes(new)?;
         for hash in new.difference(&old) {
             conn.execute(
+                "INSERT OR IGNORE INTO chunk_ref (chunk_hash, ino) VALUES (?1, ?2)",
+                params![hash.0.to_vec(), ino],
+            )?;
+            conn.execute(
                 "DELETE FROM deref WHERE chunk_hash = ?1",
                 params![hash.0.to_vec()],
             )?;
         }
         for hash in old.difference(&new) {
+            conn.execute(
+                "DELETE FROM chunk_ref WHERE chunk_hash = ?1 AND ino = ?2",
+                params![hash.0.to_vec(), ino],
+            )?;
             if !Self::hash_is_live(conn, hash)? {
                 conn.execute(
                     "INSERT OR REPLACE INTO deref (chunk_hash, deref_seq, deref_unix_ms)
@@ -300,7 +372,7 @@ impl SqliteMeta {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self, MetaError> {
+    fn init(mut conn: Connection) -> Result<Self, MetaError> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -338,6 +410,7 @@ impl SqliteMeta {
             "INSERT OR IGNORE INTO kv (key, value) VALUES ('next_ino', ?1)",
             params![(ROOT_INO + 1).to_string()],
         )?;
+        Self::backfill_chunk_ref_once(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -884,6 +957,7 @@ impl SqliteMeta {
             }
             Self::track_manifest_transition(
                 &tx,
+                ino,
                 None,
                 spec.manifest.as_deref(),
                 Self::next_deref_seq(&tx)?,
@@ -1542,6 +1616,10 @@ impl SqliteMeta {
             tx.execute("INSERT INTO inode SELECT * FROM reintegrated.inode", [])?;
             tx.execute("INSERT INTO dentry SELECT * FROM reintegrated.dentry", [])?;
             tx.execute("INSERT INTO xattr SELECT * FROM reintegrated.xattr", [])?;
+            // The namespace was replaced wholesale, so every reverse-index
+            // row is about inodes that no longer exist.
+            tx.execute("DELETE FROM chunk_ref", [])?;
+            Self::rebuild_chunk_ref(&tx)?;
             tx.execute("DELETE FROM partition", [])?;
             tx.execute(
                 "INSERT INTO partition SELECT * FROM reintegrated.partition",
@@ -1615,6 +1693,7 @@ impl SqliteMeta {
         }
         Self::track_manifest_transition(
             tx,
+            ino,
             base_manifest.as_deref(),
             Some(manifest),
             Self::next_deref_seq(tx)?,
@@ -2070,6 +2149,7 @@ impl MetaStore for SqliteMeta {
             )?;
             Self::track_manifest_transition(
                 &tx,
+                ino,
                 manifest.as_deref(),
                 None,
                 Self::next_deref_seq(&tx)?,
@@ -2323,6 +2403,7 @@ impl MetaStore for SqliteMeta {
         )?;
         Self::track_manifest_transition(
             &tx,
+            ino,
             manifest.as_deref(),
             None,
             Self::next_deref_seq(&tx)?,
@@ -2429,6 +2510,98 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(candidate, _, _)| *candidate == hash));
+    }
+
+    /// Dedup safety: a hash referenced by a second file must not become a
+    /// collection candidate until the last reference goes away.
+    #[test]
+    fn deref_waits_for_the_last_reference_to_a_shared_hash() {
+        let meta = store();
+        let a = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+        let hash = ChunkHash::of(b"shared-by-two-files");
+        meta.set_manifest(a.ino, &one_hash_manifest(hash), 1)
+            .unwrap();
+        meta.set_manifest(b.ino, &one_hash_manifest(hash), 1)
+            .unwrap();
+
+        let is_candidate = |meta: &SqliteMeta| {
+            meta.deref_candidates(i64::MAX)
+                .unwrap()
+                .iter()
+                .any(|(candidate, _, _)| *candidate == hash)
+        };
+
+        meta.unlink(ROOT_INO, "a").unwrap();
+        meta.reap_orphan(a.ino).unwrap();
+        assert!(!is_candidate(&meta), "b still references the chunk");
+
+        meta.unlink(ROOT_INO, "b").unwrap();
+        meta.reap_orphan(b.ino).unwrap();
+        assert!(is_candidate(&meta), "last reference is gone");
+    }
+
+    /// Tripwire for the regression that made `rm -rf` quadratic: liveness
+    /// used to be answered by decoding every manifest in the namespace, so
+    /// each unlink cost a full pass over `inode`. The probe must stay
+    /// index-driven.
+    #[test]
+    fn hash_liveness_probe_does_not_scan_the_inode_table() {
+        let meta = store();
+        let conn = meta.conn.lock().unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1 FROM chunk_ref JOIN inode USING (ino)
+                 WHERE chunk_ref.chunk_hash = ?1 AND inode.nlink > 0
+                 LIMIT 1",
+            )
+            .unwrap()
+            .query_map(params![vec![0u8; 32]], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join("; ");
+        assert!(
+            !plan.to_uppercase().contains("SCAN"),
+            "liveness probe must stay indexed, got: {plan}"
+        );
+    }
+
+    /// DBs written before `chunk_ref` existed carry no reverse index. The
+    /// index must be rebuilt on open, or their live chunks would look
+    /// unreferenced.
+    #[test]
+    fn chunk_ref_index_is_backfilled_on_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("meta.db");
+        let hash = ChunkHash::of(b"written-before-the-index");
+        let ino = {
+            let meta = SqliteMeta::open(&path).unwrap();
+            let file = meta.create(ROOT_INO, "legacy", 0o644, 0, 0).unwrap();
+            meta.set_manifest(file.ino, &one_hash_manifest(hash), 1)
+                .unwrap();
+            let conn = meta.conn.lock().unwrap();
+            conn.execute("DELETE FROM chunk_ref", []).unwrap();
+            conn.execute("DELETE FROM kv WHERE key = 'chunk_ref_index_v1'", [])
+                .unwrap();
+            file.ino
+        };
+
+        let meta = SqliteMeta::open(&path).unwrap();
+        let conn = meta.conn.lock().unwrap();
+        let rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunk_ref WHERE chunk_hash = ?1 AND ino = ?2",
+                params![hash.0.to_vec(), ino],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "reopening must rebuild the reverse index");
+        assert!(
+            SqliteMeta::hash_is_live(&conn, &hash).unwrap(),
+            "a backfilled reference must read as live"
+        );
     }
 
     #[test]

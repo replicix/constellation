@@ -301,6 +301,7 @@ fn evict_dentry(tx: &Connection, parent: u64, name: &str, ino: u64) -> Result<Ap
             tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             SqliteMeta::track_manifest_transition(
                 tx,
+                ino,
                 manifest.as_deref(),
                 None,
                 0,
@@ -526,6 +527,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
                 SqliteMeta::track_manifest_transition(
                     tx,
+                    ino,
                     manifest.as_deref(),
                     None,
                     0,
@@ -713,6 +715,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             )?;
             SqliteMeta::track_manifest_transition(
                 tx,
+                *ino,
                 old.as_deref(),
                 Some(manifest),
                 0,
@@ -836,6 +839,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 }
                 SqliteMeta::track_manifest_transition(
                     tx,
+                    node.ino,
                     None,
                     node.manifest.as_deref(),
                     0,
