@@ -121,22 +121,34 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           cp "$RUNNER_TEMP/target-head/release/constellation" "$RUNNER_TEMP/bin/constellation-head"
           cp "$RUNNER_TEMP/target-head/release/harness" "$RUNNER_TEMP/bin/harness"
-          rm -rf "$RUNNER_TEMP/target-head"
+          # Keep target-head warm for BASE when we still need to generate a baseline;
+          # otherwise free it now so the suite has disk.
+          if [ "${baseline_exists}" = "true" ]; then
+            rm -rf "$RUNNER_TEMP/target-head"
+          fi
           df -h
 
       - name: Prepare BASE worktree
-        if: env.CACHE_RUST_BUILD != 'true'
+        if: env.CACHE_RUST_BUILD != 'true' && env.baseline_exists == 'false'
         run: |
           git fetch --no-tags --depth 1 origin "${{ steps.cfg.outputs.base_ref }}"
           git worktree add "$RUNNER_TEMP/base" FETCH_HEAD
 
       - name: Build BASE binaries
-        if: env.CACHE_RUST_BUILD != 'true'
+        if: env.CACHE_RUST_BUILD != 'true' && env.baseline_exists == 'false'
         run: |
-          cd "$RUNNER_TEMP/base"
-          CARGO_TARGET_DIR="$RUNNER_TEMP/target-base" cargo build --release -p constellation
-          cp "$RUNNER_TEMP/target-base/release/constellation" "$RUNNER_TEMP/bin/constellation-base"
-          rm -rf "$RUNNER_TEMP/target-base" "$RUNNER_TEMP/base"
+          head_sha="$(git rev-parse HEAD)"
+          base_sha="$(git -C "$RUNNER_TEMP/base" rev-parse HEAD)"
+          if [ "$head_sha" = "$base_sha" ]; then
+            echo "BASE == HEAD ($head_sha); reusing constellation-head"
+            cp "$RUNNER_TEMP/bin/constellation-head" "$RUNNER_TEMP/bin/constellation-base"
+          else
+            cd "$RUNNER_TEMP/base"
+            # Same target dir as HEAD so dependency artifacts stay warm.
+            CARGO_TARGET_DIR="$RUNNER_TEMP/target-head" cargo build --release -p constellation
+            cp "$RUNNER_TEMP/target-head/release/constellation" "$RUNNER_TEMP/bin/constellation-base"
+          fi
+          rm -rf "$RUNNER_TEMP/target-head" "$RUNNER_TEMP/base"
           df -h
 
       - name: Run HEAD performance suite
