@@ -2,13 +2,20 @@
 name = "dbbench"
 version = "0.1.0"
 edition = "2021"
+description = "Embedded-DB bake-off for constellation metadata (DECISIONS.md ADR-9)"
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 redb = "2"
 fjall = "2"
 heed = "0.20"
+rocksdb = "0.22"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+libc = "0.2"
 
 [profile.release]
 debug = false
-lto = false
+lto = "thin"
+codegen-units = 1

@@ -1,4 +1,5 @@
 /target
+/bench/dbbench/data
 /bench/dbbench/target
 /bench/.cargo-home
 mount.sh
