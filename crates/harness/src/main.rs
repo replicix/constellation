@@ -10,6 +10,7 @@
 
 mod bench;
 mod client;
+mod corpus;
 mod docker;
 mod model;
 mod s3env;
@@ -68,9 +69,18 @@ enum Command {
         /// Deterministic seed for synthetic dataset generation.
         #[arg(long, default_value_t = 42)]
         seed: u64,
-        /// Generate a realistic synthetic tree on the fly.
+        /// Replay the bundled anonymized corpus manifest.
         #[arg(long)]
         corpus_shape: bool,
+        /// Explicit corpus manifest (zstd JSONL of hashed paths + sizes).
+        #[arg(long)]
+        corpus_manifest: Option<std::path::PathBuf>,
+        /// Replay at most this many files from the manifest.
+        #[arg(long)]
+        corpus_limit: Option<u64>,
+        /// Cap each staged file's payload (directory shape is unchanged).
+        #[arg(long)]
+        max_file_bytes: Option<u64>,
         /// Add S3 latency via toxiproxy (applies both directions).
         #[arg(long)]
         s3_latency_ms: Option<u64>,
@@ -83,6 +93,18 @@ enum Command {
         /// Emit the measured rates as a JSON object on stdout.
         #[arg(long)]
         json: bool,
+    },
+    /// Snapshot a local directory into an anonymized corpus manifest.
+    CorpusSnapshot {
+        /// Directory to walk (`.git` / `.hg` / `.svn` skipped).
+        #[arg(long)]
+        src: std::path::PathBuf,
+        /// Output path (`.jsonl.zst`).
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Keyed-hash seed baked into path tokens.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
     },
 }
 
@@ -113,6 +135,9 @@ fn main() -> Result<()> {
             e2e,
             seed,
             corpus_shape,
+            corpus_manifest,
+            corpus_limit,
+            max_file_bytes,
             s3_latency_ms,
             s3_bandwidth_mbps,
             label,
@@ -126,6 +151,9 @@ fn main() -> Result<()> {
                 e2e,
                 seed,
                 corpus_shape,
+                corpus_manifest,
+                corpus_limit,
+                max_file_bytes,
                 s3_latency_ms,
                 s3_bandwidth_mbps,
                 label,
@@ -138,6 +166,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::CorpusSnapshot { src, out, seed } => corpus::snapshot_cmd(src, out, seed),
     }
 }
 

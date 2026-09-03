@@ -1052,6 +1052,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "zstd",
 ]
 
 [[package]]

@@ -1,10 +1,25 @@
 # Performance Regression Suite
 
-This suite runs Constellation against a synthetic dataset generated **on the fly** (never stored in git), then compares branch vs base in three network profiles:
+This suite runs Constellation against a **structure-faithful** synthetic tree: an anonymized corpus manifest records hashed path components plus exact file sizes from a real checkout. File bytes are generated on the fly (never stored in git). It then compares branch vs base in three network profiles:
 
 - `full` (no shaping)
 - `latency250` (250 ms latency via toxiproxy)
 - `bw50mbps` (50 Mbps bandwidth via toxiproxy)
+
+## Corpus
+
+`tests/perf_regression/corpus.jsonl.zst` is a zstd JSONL manifest: one metadata line, then one record per directory and file. Path components are keyed-BLAKE3 tokens (seed 42). Each file stores **exact size**. While snapshotting, original bytes are hashed only in memory so duplicates can be detected; those hashes are **not** written out. Files that shared content get the same small integer `i`; unique files omit `i`. Replay fills a file from that id (or from the anonymized path, if unique), so duplicates stay byte-identical and still exercise whole-file dedup. `.git` / `.hg` / `.svn` are skipped; symlinks are omitted.
+
+Regenerate after walking a local tree (names never enter git):
+
+```bash
+cargo run -p constellation-harness --release -- corpus-snapshot \
+  --src /path/to/tree \
+  --out tests/perf_regression/corpus.jsonl.zst \
+  --seed 42
+```
+
+`make perf-regression` and the GitHub workflow pass `--corpus-shape`, which replays that bundled manifest. Optional `--corpus-limit` / `--max-file-bytes` truncate file count or cap huge blobs without changing path shape.
 
 ## Baseline storage strategy
 

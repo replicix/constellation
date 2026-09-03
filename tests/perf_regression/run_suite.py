@@ -31,6 +31,12 @@ def run_once(args, label, extra):
     ]
     if args.corpus_shape:
         cmd.append("--corpus-shape")
+    if args.corpus_manifest:
+        cmd += ["--corpus-manifest", str(args.corpus_manifest)]
+    if args.corpus_limit is not None:
+        cmd += ["--corpus-limit", str(args.corpus_limit)]
+    if args.max_file_bytes is not None:
+        cmd += ["--max-file-bytes", str(args.max_file_bytes)]
     if "s3_latency_ms" in extra:
         cmd += ["--s3-latency-ms", str(extra["s3_latency_ms"])]
     if "s3_bandwidth_mbps" in extra:
@@ -79,6 +85,9 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--repetitions", type=int, default=1)
     ap.add_argument("--corpus-shape", action="store_true")
+    ap.add_argument("--corpus-manifest", type=Path)
+    ap.add_argument("--corpus-limit", type=int)
+    ap.add_argument("--max-file-bytes", type=int)
     args = ap.parse_args()
 
     args.logs_dir.mkdir(parents=True, exist_ok=True)

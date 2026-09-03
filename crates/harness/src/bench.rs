@@ -3,9 +3,9 @@
 //! and measure import, metadata-walk, read-back, and delete behaviour.
 
 use crate::client::Client;
+use crate::corpus;
 use crate::s3env::{S3Env, BUCKET};
 use anyhow::{Context, Result};
-use rand::{Rng, SeedableRng};
 use serde::Serialize;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,8 +22,14 @@ pub struct BenchConfig {
     pub e2e: bool,
     pub json: bool,
     pub seed: u64,
-    /// Generate an on-the-fly synthetic tree with realistic size/depth distribution.
+    /// Replay the bundled anonymized corpus manifest (exact sizes and tree shape).
     pub corpus_shape: bool,
+    /// Explicit corpus manifest path (zstd JSONL). Overrides --corpus-shape default.
+    pub corpus_manifest: Option<PathBuf>,
+    /// Replay at most this many files from the manifest (None = all).
+    pub corpus_limit: Option<u64>,
+    /// Cap each staged file's payload in bytes (directory shape is unchanged).
+    pub max_file_bytes: Option<u64>,
     /// Add one-way + return-path latency via toxiproxy.
     pub s3_latency_ms: Option<u64>,
     /// Throttle S3 link bandwidth (megabits/s) via toxiproxy.
@@ -37,6 +43,9 @@ pub struct BenchReport {
     pub label: String,
     pub seed: u64,
     pub corpus_shape: bool,
+    pub corpus_manifest: Option<String>,
+    pub corpus_limit: Option<u64>,
+    pub max_file_bytes: Option<u64>,
     pub s3_latency_ms: Option<u64>,
     pub s3_bandwidth_mbps: Option<u64>,
 
@@ -108,44 +117,44 @@ fn rate_summary(points: &[(f64, u64)], deleting: bool) -> (f64, f64, f64) {
     (pct(&rates, 0.50), pct(&rates, 0.95), *rates.first().unwrap_or(&0.0))
 }
 
-fn corpus_like_size(rng: &mut rand::rngs::StdRng, fallback: u64) -> usize {
-    let roll: u32 = rng.random_range(0..10_000);
-    let n = match roll {
-        0..=6999 => rng.random_range(300..=8 * 1024),
-        7000..=9199 => rng.random_range(8 * 1024..=128 * 1024),
-        9200..=9849 => rng.random_range(128 * 1024..=2 * 1024 * 1024),
-        _ => rng.random_range(2 * 1024 * 1024..=16 * 1024 * 1024),
-    };
-    n.max(fallback as usize)
-}
+pub const DEFAULT_CORPUS_MANIFEST: &str = "tests/perf_regression/corpus.jsonl.zst";
 
-fn staged_rel_path(rng: &mut rand::rngs::StdRng, i: u64, fanout: u64) -> PathBuf {
-    // Deterministic anonymized hierarchy with realistic depth skew.
-    let depth_roll: u32 = rng.random_range(0..10_000);
-    let depth = match depth_roll {
-        0..=6999 => 2,
-        7000..=9099 => 3,
-        9100..=9799 => 4,
-        _ => 5,
-    };
-    let mut p = PathBuf::new();
-    p.push(format!("org{:03}", i % fanout.max(1)));
-    p.push(format!("proj{:04}", rng.random_range(0..fanout.max(2) * 8)));
-    if depth >= 3 {
-        p.push(format!("team{:04}", rng.random_range(0..fanout.max(2) * 12)));
+fn resolved_manifest(cfg: &BenchConfig) -> Option<PathBuf> {
+    if let Some(p) = &cfg.corpus_manifest {
+        return Some(p.clone());
     }
-    if depth >= 4 {
-        p.push(format!("sub{:05}", rng.random_range(0..fanout.max(2) * 24)));
+    if cfg.corpus_shape {
+        return Some(PathBuf::from(DEFAULT_CORPUS_MANIFEST));
     }
-    if depth >= 5 {
-        p.push(format!("leaf{:05}", rng.random_range(0..fanout.max(2) * 40)));
-    }
-    p.push(format!("f{i:08x}.bin"));
-    p
+    None
 }
 
 fn stage_tree(root: &Path, cfg: &BenchConfig) -> Result<TreeStats> {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
+    if let Some(manifest) = resolved_manifest(cfg) {
+        let corpus = corpus::load(&manifest)?;
+        eprintln!(
+            "corpus manifest {} (files={} dirs={} bytes={})",
+            manifest.display(),
+            corpus.meta.files,
+            corpus.meta.dirs,
+            corpus.meta.bytes
+        );
+        let staged = corpus::stage(
+            root,
+            &corpus,
+            cfg.seed,
+            corpus::StageLimits {
+                max_files: cfg.corpus_limit,
+                max_file_bytes: cfg.max_file_bytes,
+            },
+        )?;
+        return Ok(TreeStats {
+            files: staged.files,
+            dirs: staged.dirs,
+            bytes: staged.bytes,
+        });
+    }
+
     let mut stats = TreeStats::default();
     let mut payload = vec![0u8; cfg.file_size.max(256) as usize];
     for (i, b) in payload.iter_mut().enumerate() {
@@ -153,20 +162,12 @@ fn stage_tree(root: &Path, cfg: &BenchConfig) -> Result<TreeStats> {
     }
 
     for i in 0..cfg.files {
-        let rel = if cfg.corpus_shape {
-            staged_rel_path(&mut rng, i, cfg.fanout)
-        } else {
-            PathBuf::from(format!("d{:03}/f{i:07}", i % cfg.fanout))
-        };
+        let rel = PathBuf::from(format!("d{:03}/f{i:07}", i % cfg.fanout));
         let path = root.join(&rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let size = if cfg.corpus_shape {
-            corpus_like_size(&mut rng, cfg.file_size)
-        } else {
-            cfg.file_size as usize
-        };
+        let size = cfg.file_size as usize;
         let mut f = std::fs::File::create(&path)?;
         // Unique prefix defeats whole-file dedup and keeps import realistic.
         writeln!(f, "file {i} seed {}", cfg.seed)?;
@@ -180,7 +181,6 @@ fn stage_tree(root: &Path, cfg: &BenchConfig) -> Result<TreeStats> {
         stats.bytes += size as u64;
     }
 
-    // Count dirs after staging.
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         stats.dirs += 1;
@@ -272,7 +272,11 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
         staged_stats.files,
         staged_stats.dirs,
         staged_stats.bytes as f64 / (1024.0 * 1024.0),
-        if cfg.corpus_shape { "corpus-like" } else { "flat" }
+        if cfg.corpus_shape || cfg.corpus_manifest.is_some() {
+            "corpus-manifest"
+        } else {
+            "flat"
+        }
     );
 
     // Import: rsync -a into the mount, then clean unmount for durable timing.
@@ -291,8 +295,9 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
     let import_points = sampler.join().unwrap_or_default();
     c.unmount()?;
     let durable_import_s = t0.elapsed().as_secs_f64();
-    let import_files_per_sec = cfg.files as f64 / import_s.max(1e-9);
-    let durable_import_files_per_sec = cfg.files as f64 / durable_import_s.max(1e-9);
+    let nfiles = staged_stats.files as f64;
+    let import_files_per_sec = nfiles / import_s.max(1e-9);
+    let durable_import_files_per_sec = nfiles / durable_import_s.max(1e-9);
 
     // Through-mode vs write-back import behavior.
     let back_backend = format!("s3://{BUCKET}/bench-back-{}", std::process::id());
@@ -314,16 +319,20 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
     back.set_write_mode("through")?;
     let back_durable_s = back_t0.elapsed().as_secs_f64();
     back.unmount()?;
-    let writeback_import_files_per_sec = cfg.files as f64 / back_import_s.max(1e-9);
-    let writeback_durable_files_per_sec = cfg.files as f64 / back_durable_s.max(1e-9);
+    let writeback_import_files_per_sec = nfiles / back_import_s.max(1e-9);
+    let writeback_durable_files_per_sec = nfiles / back_durable_s.max(1e-9);
 
     // Metadata walk over the full tree (warm replica).
     c.mount()?;
     let t1 = Instant::now();
     let n = count_tree(&c.mnt.join("census"))?;
-    anyhow::ensure!(n == cfg.files, "walk found {n} files, expected {}", cfg.files);
+    anyhow::ensure!(
+        n == staged_stats.files,
+        "walk found {n} files, expected {}",
+        staged_stats.files
+    );
     let walk_s = t1.elapsed().as_secs_f64();
-    let metadata_walk_files_per_sec = cfg.files as f64 / walk_s.max(1e-9);
+    let metadata_walk_files_per_sec = nfiles / walk_s.max(1e-9);
 
     // Cold read-back: empty chunk cache, everything pulled from S3.
     c.unmount()?;
@@ -339,7 +348,7 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
         .status()?;
     anyhow::ensure!(st.success(), "tar read-back failed");
     let cold_s = t2.elapsed().as_secs_f64();
-    let cold_read_files_per_sec = cfg.files as f64 / cold_s.max(1e-9);
+    let cold_read_files_per_sec = nfiles / cold_s.max(1e-9);
 
     // Large sequential cold read + warm random reads.
     let large_path = c.mnt.join("large-read-probe");
@@ -388,8 +397,8 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
     let delete_points = del_sampler.join().unwrap_or_default();
     c.unmount()?;
     let durable_delete_s = td.elapsed().as_secs_f64();
-    let delete_files_per_sec = cfg.files as f64 / delete_s.max(1e-9);
-    let durable_delete_files_per_sec = cfg.files as f64 / durable_delete_s.max(1e-9);
+    let delete_files_per_sec = nfiles / delete_s.max(1e-9);
+    let durable_delete_files_per_sec = nfiles / durable_delete_s.max(1e-9);
 
     let (db_bytes, db_inode_rows, db_dentry_rows, db_journal_rows) = db_stats(&c.replica_db())?;
 
@@ -408,7 +417,10 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
     Ok(BenchReport {
         label: cfg.label.clone().unwrap_or_else(|| "full".to_string()),
         seed: cfg.seed,
-        corpus_shape: cfg.corpus_shape,
+        corpus_shape: cfg.corpus_shape || cfg.corpus_manifest.is_some(),
+        corpus_manifest: resolved_manifest(cfg).map(|p| p.display().to_string()),
+        corpus_limit: cfg.corpus_limit,
+        max_file_bytes: cfg.max_file_bytes,
         s3_latency_ms: cfg.s3_latency_ms,
         s3_bandwidth_mbps: cfg.s3_bandwidth_mbps,
         staged_files: staged_stats.files,
@@ -443,8 +455,11 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
 
 impl BenchConfig {
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.files > 0 && self.fanout > 0, "files and fanout must be > 0");
         anyhow::ensure!(self.seed > 0, "seed must be > 0");
+        if resolved_manifest(self).is_some() {
+            return Ok(());
+        }
+        anyhow::ensure!(self.files > 0 && self.fanout > 0, "files and fanout must be > 0");
         (self.files.checked_mul(self.file_size.max(1)))
             .context("files * file_size overflows")
             .map(|_| ())
