@@ -1014,6 +1014,8 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
+ "futures",
  "mime_guess",
  "rust-embed",
  "serde",

@@ -5,16 +5,19 @@
 //! the bind address without adding authentication would expose destructive
 //! control requests.
 
-use crate::{dispatch, Request, Response, StatusSource};
+use crate::{dispatch, DownloadSession, Request, Response, StatusSource};
 use axum::{
     body::Body,
-    extract::State,
-    http::{header, StatusCode},
+    extract::{Query, State},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response as HttpResponse},
     routing::{get, post},
     Json, Router,
 };
+use bytes::Bytes;
+use futures::stream;
 use rust_embed::RustEmbed;
+use serde::Deserialize;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -35,6 +38,7 @@ pub async fn serve(port: u16, source: Arc<dyn StatusSource>) -> anyhow::Result<S
     let app = Router::new()
         .route("/api", post(api))
         .route("/api/status", get(status))
+        .route("/api/download", get(download))
         .route("/metrics", get(metrics))
         .route("/", get(index))
         .route("/{*path}", get(asset))
@@ -58,6 +62,66 @@ pub fn adapt(source: &dyn StatusSource, request: Request) -> Response {
 
 async fn status(State(state): State<AppState>) -> Json<Response> {
     Json(dispatch(state.source.as_ref(), Request::Status))
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadQuery {
+    path: String,
+}
+
+async fn download(
+    State(state): State<AppState>,
+    Query(query): Query<DownloadQuery>,
+) -> HttpResponse {
+    match state.source.open_download(&query.path) {
+        Ok(session) => streaming_download(session),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+
+fn streaming_download(session: DownloadSession) -> HttpResponse {
+    let DownloadSession {
+        file_name,
+        size,
+        chunks,
+    } = session;
+    let stream = stream::unfold(chunks, |mut chunks| async move {
+        match chunks.recv().await {
+            Some(Ok(buf)) => Some((Ok::<_, std::io::Error>(Bytes::from(buf)), chunks)),
+            Some(Err(message)) => Some((Err(std::io::Error::other(message)), chunks)),
+            None => None,
+        }
+    });
+    let mut response = HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, size)
+        .header(header::CONTENT_DISPOSITION, content_disposition(&file_name))
+        .body(Body::from_stream(stream))
+        .expect("download response is valid");
+    // Belt-and-suspenders: keep proxies from buffering the whole body.
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn content_disposition(file_name: &str) -> HeaderValue {
+    let safe: String = file_name
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' | '\r' | '\n' => '_',
+            c if c.is_ascii_graphic() || c == ' ' => c,
+            _ => '_',
+        })
+        .collect();
+    let name = if safe.is_empty() {
+        "download"
+    } else {
+        safe.as_str()
+    };
+    HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download\""))
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {

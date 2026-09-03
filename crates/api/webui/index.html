@@ -39,8 +39,31 @@ async function refresh(){
  leases.innerHTML=(s.partitions||[]).map(p=>`${esc(p.id)} ${esc(p.root_path)} · holder ${p.lease.holder} · epoch ${p.lease.epoch} · expires ${p.lease.expires_in_ms} ms <button onclick="releasePart('${esc(p.id)}')">Force release</button>`).join("<br>")||"p0 unavailable";
  }catch(e){health.innerHTML='<span class="bad">disconnected</span>';}
  finally{refreshing=false;}}
-async function browse(){let p=path.value,r=await call({cmd:"read_dir",path:p});if(r.resp==="error"){files.textContent=r.message;return}files.innerHTML="<table>"+r.entries.map(e=>`<tr><td><button onclick="inspectPath('${esc(e.path)}')">${esc(e.name)}</button></td><td>${esc(e.kind)}</td><td>${e.ino}</td></tr>`).join("")+"</table>";}
-async function inspectPath(p){let r=await call({cmd:"inspect",path:p});files.innerHTML="<pre>"+esc(JSON.stringify(r,null,2))+"</pre>";}
+function parentPath(p){const parts=String(p||"/").replace(/\/+$/,"").split("/").filter(Boolean);parts.pop();return"/"+parts.join("/");}
+async function browse(to){
+ if(to!=null) path.value=to;
+ const p=path.value||"/";
+ const r=await call({cmd:"read_dir",path:p});
+ if(r.resp==="error"){files.textContent=r.message;return}
+ const rows=[];
+ if(p!=="/") rows.push(`<tr><td><button onclick='browse(${JSON.stringify(parentPath(p))})'>..</button></td><td>dir</td><td></td><td></td></tr>`);
+ for(const e of r.entries||[]){
+  const open=e.kind==="dir"
+   ? `browse(${JSON.stringify(e.path)})`
+   : `inspectPath(${JSON.stringify(e.path)})`;
+  rows.push(`<tr><td><button onclick='${open}'>${esc(e.name)}</button></td><td>${esc(e.kind)}</td><td>${e.ino}</td><td><button onclick='inspectPath(${JSON.stringify(e.path)})'>stat</button></td></tr>`);
+ }
+ files.innerHTML="<table><tr><th>name</th><th>kind</th><th>ino</th><th></th></tr>"+rows.join("")+"</table>";
+}
+async function inspectPath(p){
+ const r=await call({cmd:"inspect",path:p});
+ if(r.resp==="error"){files.textContent=r.message;return}
+ const e=r.entry||{};
+ const dl=e.kind==="file"
+  ? `<a href="/api/download?path=${encodeURIComponent(e.path||p)}" download><button type="button">Download</button></a> `
+  : "";
+ files.innerHTML="<pre>"+esc(JSON.stringify(r,null,2))+"</pre><p>"+dl+"<button onclick='browse()'>Back to listing</button></p>";
+}
 async function releasePart(part){ops.textContent=JSON.stringify(await call({cmd:"force_release",part}),null,2);}
 async function loadSnaps(){let r=await call({cmd:"list_snapshots",path:null});snapshots.innerHTML=(r.snapshots||[]).map(s=>`${esc(s.path)}@${esc(s.name)} <button onclick="snapDelete('${esc(s.path+"@"+s.name)}')">Delete</button>`).join("<br>")||'<span class="muted">none</span>';}
 async function snapCreate(){ops.textContent=JSON.stringify(await call({cmd:"snapshot_create",selector:snap.value}),null,2);loadSnaps();}

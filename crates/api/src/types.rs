@@ -163,6 +163,17 @@ pub struct InspectStatus {
     pub manifest: Option<ManifestStatus>,
 }
 
+/// Streaming file download handle for the localhost web UI.
+///
+/// `chunks` yields successive buffers (typically one content-addressed
+/// chunk each). Closing the receiver cancels the producer via backpressure
+/// drop; the producer never holds the whole file.
+pub struct DownloadSession {
+    pub file_name: String,
+    pub size: u64,
+    pub chunks: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManifestStatus {
     pub chunk_size: u32,

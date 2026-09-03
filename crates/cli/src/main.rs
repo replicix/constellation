@@ -1706,7 +1706,48 @@ fn mount(
     fuse_config.acl = acl;
     fuse_config.n_threads = Some(fuse_threads);
     fuse_config.clone_fd = cfg!(target_os = "linux") && fuse_config.n_threads != Some(1);
-    fuser::mount(fs, mountpoint, &fuse_config).context("FUSE mount")?;
+    // Build an explicit Session so SIGINT/SIGTERM can unmount from inside
+    // this process (via SessionUnmounter). Plain `fuser::mount` has no hook
+    // for that; without it, Ctrl-C kills the process and leaves a dead
+    // mountpoint that needs an external `fusermount3 -u`.
+    let mut session =
+        fuser::Session::new(fs, mountpoint, &fuse_config).context("FUSE mount")?;
+    let mut unmounter = session.unmount_callable();
+    rt.spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
+                tracing::warn!("failed to install SIGINT handler; Ctrl-C will not unmount");
+                return;
+            };
+            let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+                tracing::warn!("failed to install SIGTERM handler");
+                return;
+            };
+            tokio::select! {
+                _ = sigint.recv() => tracing::info!("SIGINT received; unmounting FUSE"),
+                _ = sigterm.recv() => tracing::info!("SIGTERM received; unmounting FUSE"),
+            }
+            if let Err(e) = unmounter.unmount() {
+                tracing::warn!(error = %e, "signal-triggered FUSE unmount failed");
+            }
+            // A second signal during the post-unmount drain aborts immediately
+            // so a hung ship/upload cannot trap the process forever.
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+            tracing::error!("second signal during shutdown; exiting immediately");
+            std::process::exit(130);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = unmounter;
+            tracing::warn!("signal-driven FUSE unmount is only supported on Unix");
+        }
+    });
+    session.run().context("FUSE session")?;
 
     // Clean unmount: ship the journal tail, checkpoint, then release the
     // lease so a peer does not have to wait out the TTL. Skip when we
@@ -3065,6 +3106,105 @@ impl constellation_api::StatusSource for DaemonStatus {
             ctime_ns: attr.ctime_ns,
             rdev: attr.rdev,
             manifest,
+        })
+    }
+
+    fn open_download(
+        &self,
+        path: &str,
+    ) -> std::result::Result<constellation_api::DownloadSession, String> {
+        use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
+        use constellation_fs_core::InodeKind;
+        use constellation_meta::MetaStore;
+
+        let normalized = normalize_control_path(path);
+        let ino = self
+            .meta
+            .resolve_path(&normalized)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{normalized}: not found"))?;
+        let attr = self
+            .meta
+            .getattr(ino)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{normalized}: stale inode"))?;
+        if attr.kind != InodeKind::File {
+            return Err(format!("{normalized}: not a regular file"));
+        }
+        let file_name = normalized
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("download")
+            .to_string();
+        let size = attr.size;
+        let manifest_bytes = self.meta.manifest(ino).map_err(|error| error.to_string())?;
+        let manifest = match manifest_bytes {
+            Some(bytes) => Manifest::decode(&bytes).map_err(|error| error.to_string())?,
+            None => Manifest::empty(constellation_fs_core::DEFAULT_CHUNK_SIZE),
+        };
+        if manifest.file_len != size && size > 0 {
+            // Prefer the inode size as the wire length; still stream from the
+            // manifest's chunk map so a stale size cannot OOM the client.
+            tracing::debug!(
+                path = %normalized,
+                inode_size = size,
+                manifest_len = manifest.file_len,
+                "download size mismatch; using inode size"
+            );
+        }
+
+        let coop = self.coop.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(2);
+        self.rt.spawn(async move {
+            if size == 0 {
+                return;
+            }
+            let hashes = match &manifest.chunks {
+                ChunkInfo::Inline(map) => map.clone(),
+                ChunkInfo::Spilled(hash) => match coop.fetch(hash).await {
+                    Ok(blob) => match decode_chunk_list(&blob) {
+                        Ok(map) => map,
+                        Err(error) => {
+                            let _ = tx.send(Err(error.to_string())).await;
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(format!("fetching spilled chunk list: {error:#}")))
+                            .await;
+                        return;
+                    }
+                },
+            };
+            let layout = manifest.layout;
+            let file_len = size;
+            let count = layout.chunk_count(file_len);
+            for index in 0..count {
+                let want = layout.chunk_len(file_len, index) as usize;
+                let mut data = match hashes.get(&index) {
+                    Some(hash) => match coop.fetch(hash).await {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            let _ = tx
+                                .send(Err(format!("fetching chunk {index}: {error:#}")))
+                                .await;
+                            return;
+                        }
+                    },
+                    None => Vec::new(),
+                };
+                data.resize(want, 0);
+                if tx.send(Ok(data)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(constellation_api::DownloadSession {
+            file_name,
+            size,
+            chunks: rx,
         })
     }
 

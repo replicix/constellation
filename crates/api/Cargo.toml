@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-web = ["dep:axum", "dep:rust-embed", "dep:mime_guess"]
+web = ["dep:axum", "dep:rust-embed", "dep:mime_guess", "dep:futures", "dep:bytes"]
 
 [dependencies]
 anyhow.workspace = true
@@ -18,6 +18,8 @@ tracing.workspace = true
 axum = { version = "0.8", optional = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
+futures = { workspace = true, optional = true }
+bytes = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

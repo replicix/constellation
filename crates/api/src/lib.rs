@@ -11,9 +11,9 @@ pub mod web;
 
 pub use types::{
     CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry, DoctorStatus,
-    EpochStatus, InspectStatus, LeaseStatus, ManifestStatus, P2pStatus, PartitionStatus,
-    PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SnapshotStatus, SourceStatus,
-    SpoolStatus, StatusReport, WritebackStatus,
+    DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus, P2pStatus,
+    PartitionStatus, PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SnapshotStatus,
+    SourceStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -103,6 +103,14 @@ pub trait StatusSource: Send + Sync + 'static {
 
     fn inspect(&self, _path: &str) -> std::result::Result<InspectStatus, String> {
         Err("inspection is not supported by this daemon".into())
+    }
+
+    /// Open a streaming download of a regular file. Default refuses.
+    ///
+    /// Implementations must produce at most one chunk buffer at a time
+    /// (bounded channel) so large files are not buffered whole in RAM.
+    fn open_download(&self, _path: &str) -> std::result::Result<DownloadSession, String> {
+        Err("file download is not supported by this daemon".into())
     }
 
     fn force_release(&self, _part: &str) -> std::result::Result<String, String> {
