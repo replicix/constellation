@@ -104,8 +104,16 @@ fn snapshot_does_not_stall_concurrent_writers() {
             let mut i = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 let t = Instant::now();
-                meta.setattr(inos[i % inos.len()], Some(0o600), None, None, None, None, None)
-                    .unwrap();
+                meta.setattr(
+                    inos[i % inos.len()],
+                    Some(0o600),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
                 samples.push(t.elapsed());
                 i += 1;
             }
@@ -139,7 +147,10 @@ fn snapshot_payload_is_stripped_and_restorable() {
     let meta = SqliteMeta::open(dir.path().join("meta.db")).unwrap();
     meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
     let file = meta.create(ROOT_INO, "keep.txt", 0o644, 7, 9).unwrap();
-    assert!(meta.journal_len().unwrap() > 0, "expected journaled records");
+    assert!(
+        meta.journal_len().unwrap() > 0,
+        "expected journaled records"
+    );
 
     let snap = meta.snapshot().unwrap();
     let restored_path = dir.path().join("restored.db");

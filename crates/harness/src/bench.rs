@@ -114,7 +114,11 @@ fn rate_summary(points: &[(f64, u64)], deleting: bool) -> (f64, f64, f64) {
         rates.push(d / dt);
     }
     rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    (pct(&rates, 0.50), pct(&rates, 0.95), *rates.first().unwrap_or(&0.0))
+    (
+        pct(&rates, 0.50),
+        pct(&rates, 0.95),
+        *rates.first().unwrap_or(&0.0),
+    )
 }
 
 pub const DEFAULT_CORPUS_MANIFEST: &str = "tests/perf_regression/corpus.jsonl.zst";
@@ -210,7 +214,10 @@ fn count_tree(root: &Path) -> Result<u64> {
     Ok(n)
 }
 
-fn sample_file_counts(path: PathBuf, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec<(f64, u64)>> {
+fn sample_file_counts(
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Vec<(f64, u64)>> {
     std::thread::spawn(move || {
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -255,7 +262,9 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
         proxy.bandwidth((mbps.saturating_mul(1000) / 8).max(1))?;
     }
 
-    let root = tempfile::Builder::new().prefix("harness-bench-").tempdir()?;
+    let root = tempfile::Builder::new()
+        .prefix("harness-bench-")
+        .tempdir()?;
     let backend = format!("s3://{BUCKET}/bench-{}", std::process::id());
     let mut c = Client::new(root.path(), "bench", &env.endpoint, &backend)?;
     if cfg.e2e {
@@ -459,7 +468,10 @@ impl BenchConfig {
         if resolved_manifest(self).is_some() {
             return Ok(());
         }
-        anyhow::ensure!(self.files > 0 && self.fanout > 0, "files and fanout must be > 0");
+        anyhow::ensure!(
+            self.files > 0 && self.fanout > 0,
+            "files and fanout must be > 0"
+        );
         (self.files.checked_mul(self.file_size.max(1)))
             .context("files * file_size overflows")
             .map(|_| ())

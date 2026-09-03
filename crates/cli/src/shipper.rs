@@ -1221,12 +1221,12 @@ pub async fn bootstrap(db_path: &std::path::Path, log: &LogStore) -> Result<()> 
 mod tests {
     use super::*;
     use crate::lease::LeaseKeeper;
-    use std::time::Duration;
     use constellation_meta::MetaStore;
     use constellation_store_s3::{LeaseMode, LeaseStore, LogStore};
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
     use std::sync::Arc as StdArc;
+    use std::time::Duration;
 
     struct Node {
         meta: Arc<SqliteMeta>,
