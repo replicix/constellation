@@ -44,6 +44,9 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
           sudo docker image prune --all --force || true
+          # /mnt is the larger ephemeral disk; the runner user cannot mkdir there.
+          sudo mkdir -p /mnt/tmp
+          sudo chown "$(id -u):$(id -g)" /mnt/tmp
           df -h
 
       - uses: dtolnay/rust-toolchain@stable
