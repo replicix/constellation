@@ -28,14 +28,17 @@ button{cursor:pointer}.ok{color:#72e6a3}.bad{color:#ff8f9c}.wide{grid-column:1/-
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const call=async req=>(await fetch("/api",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(req)})).json();
 const bytes=n=>n<1024?n+" B":n<1048576?(n/1024).toFixed(1)+" KiB":(n/1048576).toFixed(1)+" MiB";
+let refreshing=false;
 async function refresh(){
+ if(refreshing)return; refreshing=true;
  try{let r=await(await fetch("/api/status")).json(),s=r.Status||r.status||r; if(r.resp==="status")s=r;
  document.querySelector("#health").innerHTML='<span class="ok">healthy</span> · '+esc(s.fs_uuid);
  dashboard.innerHTML=`node <b>${s.node_id}</b> · uptime ${s.uptime_s}s<br>${esc(s.backend)}<br>head ${s.spool.head_seq} · backlog ${s.spool.journal_backlog}<br>${s.spool.last_ship_error?'<span class="bad">'+esc(s.spool.last_ship_error)+'</span>':'sync healthy'}<br>epoch ${s.epoch.active?esc(s.epoch.epoch_id):"inactive"} · designations ${s.designations.length}`;
  peers.innerHTML=(s.p2p.peers||[]).map(p=>`node ${p.node_id}: ${p.connected?'<span class="ok">connected</span>':'disconnected'} · RTT ${p.rtt_ms??"—"} ms · seen ${p.last_seen_ms??"—"} ms`).join("<br>")||'<span class="muted">no peers</span>';
  cache.innerHTML=`${bytes(s.cache.used_bytes)} / ${bytes(s.cache.budget_bytes)} · ${s.cache.chunks} chunks<br>pinned ${bytes(s.cache.pinned_bytes||0)}<br>peer hits ${s.coop.peer_hits} · S3 ${s.coop.s3_fetches} · hedges ${s.coop.hedges_fired}<br>`+(s.coop.per_source||[]).map(x=>`${esc(x.id)}: ${x.ttfb_ms_ewma.toFixed(1)} ms, ${x.goodput_mbps_ewma.toFixed(1)} Mbps, ${(x.err_rate*100).toFixed(1)}% err`).join("<br>");
  leases.innerHTML=(s.partitions||[]).map(p=>`${esc(p.id)} ${esc(p.root_path)} · holder ${p.lease.holder} · epoch ${p.lease.epoch} · expires ${p.lease.expires_in_ms} ms <button onclick="releasePart('${esc(p.id)}')">Force release</button>`).join("<br>")||"p0 unavailable";
- }catch(e){health.innerHTML='<span class="bad">disconnected</span>';}}
+ }catch(e){health.innerHTML='<span class="bad">disconnected</span>';}
+ finally{refreshing=false;}}
 async function browse(){let p=path.value,r=await call({cmd:"read_dir",path:p});if(r.resp==="error"){files.textContent=r.message;return}files.innerHTML="<table>"+r.entries.map(e=>`<tr><td><button onclick="inspectPath('${esc(e.path)}')">${esc(e.name)}</button></td><td>${esc(e.kind)}</td><td>${e.ino}</td></tr>`).join("")+"</table>";}
 async function inspectPath(p){let r=await call({cmd:"inspect",path:p});files.innerHTML="<pre>"+esc(JSON.stringify(r,null,2))+"</pre>";}
 async function releasePart(part){ops.textContent=JSON.stringify(await call({cmd:"force_release",part}),null,2);}

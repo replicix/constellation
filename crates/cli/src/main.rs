@@ -2769,12 +2769,9 @@ impl constellation_api::StatusSource for DaemonStatus {
             pins: self.list_pins(),
             designations: self.list_designations(),
             epoch: self.epochs.status(),
-            reintegration: self.reintegration.snapshot(
-                self.meta
-                    .unmarked_journal()
-                    .map(|rows| rows.len() as u64)
-                    .unwrap_or(0),
-            ),
+            reintegration: self
+                .reintegration
+                .snapshot(self.meta.unmarked_journal_len().unwrap_or(0)),
             coop: self.coop.report(),
             writeback: {
                 let probe = self.upload.probe.lock().unwrap();

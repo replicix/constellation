@@ -1578,6 +1578,10 @@ impl SqliteMeta {
     }
 
     /// Journal rows not yet given a reintegration disposition.
+    ///
+    /// This deserializes every unmarked `LogRecord`. Callers that only
+    /// need a count (status, leave guards) must use
+    /// [`Self::unmarked_journal_len`] instead.
     pub fn unmarked_journal(&self) -> Result<Vec<(u64, LogRecord)>, MetaError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1593,6 +1597,19 @@ impl SqliteMeta {
             out.push((seq, serde_json::from_str(&json)?));
         }
         Ok(out)
+    }
+
+    /// Count of unmarked journal rows. Does not decode `record` JSON.
+    pub fn unmarked_journal_len(&self) -> Result<u64, MetaError> {
+        self.with_reader(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM journal j
+                 LEFT JOIN reintegration r ON r.journal_seq = j.seq
+                 WHERE r.journal_seq IS NULL",
+                [],
+                |r| r.get(0),
+            )?)
+        })
     }
 
     pub fn unmarked_journal_parts(&self) -> Result<Vec<String>, MetaError> {

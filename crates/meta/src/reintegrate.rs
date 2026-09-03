@@ -366,5 +366,6 @@ mod tests {
         // retrying a marked seq is a no-op.
         assert_eq!(m.reintegration_conflict_count().unwrap(), 0);
         assert_eq!(m.unmarked_journal().unwrap().len(), 1);
+        assert_eq!(m.unmarked_journal_len().unwrap(), 1);
     }
 }

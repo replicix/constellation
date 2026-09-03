@@ -122,10 +122,7 @@ pub async fn self_leave(
         meta.kv_get("lease_lost").ok().flatten().as_deref(),
         Some("1")
     ) {
-        let stranded = meta
-            .unmarked_journal()
-            .map(|rows| !rows.is_empty())
-            .unwrap_or(true);
+        let stranded = meta.unmarked_journal_len().map(|n| n > 0).unwrap_or(true);
         if stranded {
             return Err(LeaveError::StrandedJournal);
         }
