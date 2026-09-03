@@ -22,8 +22,9 @@ use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_M
 use constellation_meta::{MetaError, MetaStore, SqliteMeta};
 use constellation_store_s3::{ChunkStore, CompressionSetting};
 use fuser::{
-    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek,
-    ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    BsdFileFlags, Errno, FileHandle, FileType, Filesystem, INodeNo, InitFlags, KernelConfig,
+    LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyLseek, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -48,6 +49,25 @@ struct WriteState {
     holes: crate::staging::DirtyRuns,
     seal_buffer: Vec<u8>,
     high_water: u64,
+}
+
+const WRITE_SHARDS: usize = 256;
+
+/// Per-inode write serialization without making unrelated files contend on
+/// one process-wide mutex. FUSE can dispatch callbacks concurrently, while
+/// operations on the same inode retain their previous ordering. The shard
+/// count is deliberately larger than the maximum automatic FUSE worker count
+/// so a slow write-through flush rarely stalls an unrelated inode.
+struct WriteShards([Mutex<HashMap<Ino, WriteState>>; WRITE_SHARDS]);
+
+impl WriteShards {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| Mutex::new(HashMap::new())))
+    }
+
+    fn lock(&self, ino: Ino) -> std::sync::MutexGuard<'_, HashMap<Ino, WriteState>> {
+        self.0[ino as usize % WRITE_SHARDS].lock().unwrap()
+    }
 }
 
 /// A request to the daemon's sync task.
@@ -161,13 +181,19 @@ pub(crate) enum SyntheticNode {
     },
 }
 
+struct SyntheticRegistry {
+    nodes: HashMap<Ino, SyntheticNode>,
+    keys: HashMap<String, Ino>,
+    next: Ino,
+}
+
 pub struct ConstellationFs {
     meta: Arc<SqliteMeta>,
     store: Arc<ChunkStore>,
     cache: Arc<DiskCache>,
     rt: Handle,
     chunk_size: u32,
-    writes: Mutex<HashMap<Ino, WriteState>>,
+    writes: WriteShards,
     /// Open handle counts per inode, for orphan reaping on last close.
     opens: Mutex<HashMap<Ino, u32>>,
     /// Sequential readahead.
@@ -181,9 +207,7 @@ pub struct ConstellationFs {
     staging_budget: Arc<StagingBudget>,
     staging_gen: GenCounter,
     snapshots: Arc<crate::snapshot::SnapshotManager>,
-    synthetic: HashMap<Ino, SyntheticNode>,
-    synthetic_keys: HashMap<String, Ino>,
-    next_synthetic: Ino,
+    synthetic: Mutex<SyntheticRegistry>,
     tree_cache: Mutex<(
         HashMap<ChunkHash, constellation_fs_core::Tree>,
         VecDeque<ChunkHash>,
@@ -236,7 +260,7 @@ fn to_fuse_attr(a: &FileAttr) -> fuser::FileAttr {
         }
     };
     fuser::FileAttr {
-        ino: a.ino,
+        ino: INodeNo(a.ino),
         size: a.size,
         blocks: a.size.div_ceil(512),
         atime: ts(a.atime_ns),
@@ -278,7 +302,7 @@ impl ConstellationFs {
             cache: deps.cache,
             rt: deps.rt,
             chunk_size,
-            writes: Mutex::new(HashMap::new()),
+            writes: WriteShards::new(),
             opens: Mutex::new(HashMap::new()),
             prefetch,
             coop: deps.coop,
@@ -287,9 +311,11 @@ impl ConstellationFs {
             staging_budget: deps.staging_budget,
             staging_gen: GenCounter::default(),
             snapshots: deps.snapshots,
-            synthetic: HashMap::new(),
-            synthetic_keys: HashMap::new(),
-            next_synthetic: SYNTHETIC_INO_BIT,
+            synthetic: Mutex::new(SyntheticRegistry {
+                nodes: HashMap::new(),
+                keys: HashMap::new(),
+                next: SYNTHETIC_INO_BIT,
+            }),
             tree_cache: Mutex::new((HashMap::new(), VecDeque::new())),
             view_root: constellation_fs_core::types::ROOT_INO,
         }
@@ -353,7 +379,7 @@ impl ConstellationFs {
     }
 
     pub(crate) fn synthetic_node(&self, ino: Ino) -> Option<SyntheticNode> {
-        self.synthetic.get(&ino).cloned()
+        self.synthetic.lock().unwrap().nodes.get(&ino).cloned()
     }
 
     pub(crate) fn synthetic_active(&self, node: &SyntheticNode) -> bool {
@@ -366,14 +392,15 @@ impl ConstellationFs {
             .unwrap_or(false)
     }
 
-    pub(crate) fn intern_synthetic(&mut self, key: String, node: SyntheticNode) -> Ino {
-        if let Some(ino) = self.synthetic_keys.get(&key) {
+    pub(crate) fn intern_synthetic(&self, key: String, node: SyntheticNode) -> Ino {
+        let mut registry = self.synthetic.lock().unwrap();
+        if let Some(ino) = registry.keys.get(&key) {
             return *ino;
         }
-        let ino = self.next_synthetic;
-        self.next_synthetic += 1;
-        self.synthetic.insert(ino, node);
-        self.synthetic_keys.insert(key, ino);
+        let ino = registry.next;
+        registry.next += 1;
+        registry.nodes.insert(ino, node);
+        registry.keys.insert(key, ino);
         ino
     }
 
@@ -503,7 +530,7 @@ impl ConstellationFs {
     }
 
     pub(crate) fn lookup_synthetic(
-        &mut self,
+        &self,
         parent: Ino,
         name: &str,
     ) -> Result<Option<(Ino, FileAttr)>, i32> {
@@ -583,10 +610,7 @@ impl ConstellationFs {
         Ok(Some((ino, self.synthetic_attr(ino, &node))))
     }
 
-    pub(crate) fn synthetic_entries(
-        &mut self,
-        ino: Ino,
-    ) -> Result<Vec<(Ino, InodeKind, String)>, i32> {
+    pub(crate) fn synthetic_entries(&self, ino: Ino) -> Result<Vec<(Ino, InodeKind, String)>, i32> {
         let node = self.synthetic_node(ino).ok_or(libc::ESTALE)?;
         if !self.synthetic_active(&node) {
             return Err(libc::ESTALE);
@@ -1045,17 +1069,18 @@ impl ConstellationFs {
     /// healed S3 connection does not become application-visible EIO in
     /// local-fsync mode.
     fn flush_inode(&self, ino: Ino, force_through: bool) -> Result<(), i32> {
-        let ws = {
-            let mut writes = self.writes.lock().unwrap();
-            match writes.remove(&ino) {
-                Some(ws) => ws,
-                None => return Ok(()),
-            }
+        // Keep this inode's shard locked until publication completes. That
+        // preserves per-inode request ordering under fuser's concurrent
+        // dispatch; unrelated inodes continue through the other shards.
+        let mut writes = self.writes.lock(ino);
+        let ws = match writes.remove(&ino) {
+            Some(ws) => ws,
+            None => return Ok(()),
         };
         if let Err(e) = self.require_lease_for(ino) {
             // Put the pending state back: the data is not lost, the
             // caller sees the error and can retry.
-            self.writes.lock().unwrap().insert(ino, ws);
+            writes.insert(ino, ws);
             return Err(e);
         }
         let epoch_active = self.sync.as_ref().is_some_and(|h| {
@@ -1172,3 +1197,20 @@ impl ConstellationFs {
 
 // (Filesystem impl in fusefs_ops.rs include)
 include!("fusefs_ops.rs");
+
+#[cfg(test)]
+mod write_shard_tests {
+    use super::*;
+
+    #[test]
+    fn same_inode_serializes_while_unrelated_inode_remains_available() {
+        let writes = WriteShards::new();
+        let _same_inode_guard = writes.lock(1);
+
+        assert!(matches!(
+            writes.0[1].try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        assert!(writes.0[2].try_lock().is_ok());
+    }
+}

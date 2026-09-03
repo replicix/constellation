@@ -932,6 +932,23 @@ and `fio-blips` skipped because `fio` is absent. pjdfstest: **8798 passed,
 0 failed**, empty baseline. `xattr-roundtrip` reported `rsize=1073741831`,
 `rcount=2` for a seven-byte file plus a sparse 1 GiB logical file.
 
+## Phase 8g — adaptive multi-core dispatch: **DONE**
+
+Linux mounts now use fuser's concurrent event loops with cloned FUSE file
+descriptors. Worker count scales sublinearly from the process-visible CPU
+quota and is capped by both 64 threads and one eighth of host/cgroup memory;
+Tokio and its blocking pool are sized separately. Write state is split across
+64 inode shards, preserving same-inode ordering while allowing unrelated
+files to stage, hash, read, and flush concurrently. A 1-CPU allocation keeps
+one FUSE and one Tokio worker. The kernel background queue grows with the FUSE
+pool, and parallel directory operations are negotiated when supported. The
+three pool sizes remain operator-overridable.
+
+Validation (2026-09-03): fuser 0.18 migration, fmt, strict workspace clippy,
+release workspace build, all workspace tests, and all 102 CLI unit tests pass.
+Live mounted throughput scaling was not measured on this host because
+`/dev/fuse` is unavailable.
+
 ## Later phases
 
 Phases 1–8f are closed. Phase 9 automated crash reporting remains future work.

@@ -61,12 +61,14 @@ struct SdkCredentialProvider {
 
 impl SdkCredentialProvider {
     async fn fetch(&self) -> object_store::Result<CachedCreds> {
-        let creds = self.provider.provide_credentials().await.map_err(|source| {
-            object_store::Error::Generic {
+        let creds = self
+            .provider
+            .provide_credentials()
+            .await
+            .map_err(|source| object_store::Error::Generic {
                 store: "S3",
                 source: Box::new(source),
-            }
-        })?;
+            })?;
         Ok(CachedCreds::from_sdk(&creds))
     }
 }

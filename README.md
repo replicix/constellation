@@ -49,6 +49,18 @@ Local state (metadata DB + chunk cache) defaults to
 `~/.local/share/constellation/<fs-uuid>/`; override with `--state-dir`.
 Needs FUSE (`fusermount3`) on the host.
 
+On Linux, request handling and the Tokio runtime size themselves from the
+CPU quota visible to the process. FUSE workers grow as roughly `2×sqrt(CPUs)`
+(1 worker on a 1-CPU host, 12 on 32 CPUs, capped at 64), then shrink further
+if their 16 MiB request buffers would consume more than one eighth of the
+host or cgroup memory limit. Runtime workers scale linearly to 32 CPUs.
+`CONSTELLATION_FUSE_THREADS`, `CONSTELLATION_TOKIO_THREADS`, and
+`CONSTELLATION_BLOCKING_THREADS` provide explicit positive-integer overrides,
+bounded at 64, 32, and 256 respectively. The selected plan is logged at
+startup; blocking workers are created lazily rather than at startup. The FUSE
+kernel background queue scales with the worker count, and Linux parallel
+directory dispatch is requested when the kernel supports it.
+
 ## Documentation
 
 | doc | contents |

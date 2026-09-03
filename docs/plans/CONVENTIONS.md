@@ -78,9 +78,10 @@ Every plan ends with ALL of these green, run in this order:
 
 ## Code style
 
-- Rust 2024 edition, stable toolchain. `fuser` 0.15 with
-  `default-features = false`. tokio multithread runtime.
-- FUSE callbacks are synchronous threads: to reach async code use the
+- Rust 2024 edition, stable toolchain. `fuser` 0.18 with
+  `default-features = false`; Linux mounts use host-sized concurrent
+  event loops. tokio multithread runtime.
+- FUSE callbacks run on synchronous worker threads: to reach async code use the
   existing channel patterns (see `SyncHandle` in `cli/src/fusefs.rs`:
   unbounded mpsc + `blocking_recv` oneshot barriers). Never block the
   tokio runtime with sync waits.

@@ -8,7 +8,7 @@ macro_rules! checked_name {
     ($name:expr, $reply:expr) => {{
         let n = $name.to_string_lossy();
         if n.as_bytes().len() > NAME_MAX {
-            $reply.error(libc::ENAMETOOLONG);
+            $reply.error(Errno::from_i32(libc::ENAMETOOLONG));
             return;
         }
         n
@@ -22,44 +22,58 @@ macro_rules! checked_name {
 macro_rules! gate {
     ($self:expr, $ino:expr, $reply:expr) => {
         if ConstellationFs::is_synthetic($ino) {
-            $reply.error(libc::EROFS);
+            $reply.error(Errno::from_i32(libc::EROFS));
             return;
         }
         if let Err(e) = $self.require_lease_for($ino) {
-            $reply.error(e);
+            $reply.error(Errno::from_i32(e));
             return;
         }
     };
 }
 
 impl Filesystem for ConstellationFs {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        let threads = crate::parallelism::thread_plan();
+        let _ = config.set_max_background(threads.fuse_max_background());
+        let _ = config.set_congestion_threshold(threads.fuse_congestion_threshold());
+        if threads.fuse > 1 {
+            // Older kernels may not advertise this capability. Multi-reader
+            // dispatch still works; only directory operations remain ordered.
+            let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+        }
+        Ok(())
+    }
+
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
         match self.lookup_synthetic(parent, &name) {
             Ok(Some((_ino, attr))) => {
-                reply.entry(&TTL, &to_fuse_attr(&attr), 0);
+                reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0));
                 return;
             }
             Ok(None) => {}
             Err(error) => {
-                reply.error(error);
+                reply.error(Errno::from_i32(error));
                 return;
             }
         }
         match self.meta.lookup(parent, &name) {
-            Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
-            Ok(None) => reply.error(libc::ENOENT),
-            Err(e) => reply.error(errno(&e)),
+            Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+            Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ino = ino.0;
         let requested_ino = ino;
         let ino = self.real_ino(ino);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
-                reply.error(libc::ESTALE);
+                reply.error(Errno::from_i32(libc::ESTALE));
             } else {
                 let attr = self.visible_attr(self.synthetic_attr(ino, &node));
                 reply.attr(&TTL, &to_fuse_attr(&attr));
@@ -69,7 +83,7 @@ impl Filesystem for ConstellationFs {
         match self.meta.getattr(ino) {
             Ok(Some(mut attr)) => {
                 // Pending writes shadow the committed size.
-                if let Some(ws) = self.writes.lock().unwrap().get(&ino) {
+                if let Some(ws) = self.writes.lock(ino).get(&ino) {
                     attr.size = ws.file_len;
                 }
                 let attr = if requested_ino == constellation_fs_core::types::ROOT_INO {
@@ -79,16 +93,16 @@ impl Filesystem for ConstellationFs {
                 };
                 reply.attr(&TTL, &to_fuse_attr(&attr))
             }
-            Ok(None) => reply.error(libc::ENOENT),
-            Err(e) => reply.error(errno(&e)),
+            Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -96,36 +110,54 @@ impl Filesystem for ConstellationFs {
         _atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         // Truncate/extend goes through write state so data and metadata
         // commit together at flush.
         gate!(self, ino, reply);
-        if let Some(new_size) = size {
-            if let Err(e) = self.truncate(ino, new_size) {
-                reply.error(e);
-                return;
-            }
-        }
         let atime_ns = _atime.map(time_or_now_ns);
         let mtime_ns = mtime.map(time_or_now_ns);
-        match self.meta.setattr(ino, mode, uid, gid, size, atime_ns, mtime_ns) {
+        let result = if let Some(new_size) = size {
+            // Keep size-changing setattr and writes/flushes on this inode in
+            // one critical section. fuser may dispatch them concurrently.
+            let manifest = match self.load_manifest(ino) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    reply.error(Errno::from_i32(error));
+                    return;
+                }
+            };
+            let mut writes = self.writes.lock(ino);
+            self.truncate_locked(&mut writes, ino, new_size, &manifest)
+                .and_then(|()| {
+                    self.meta
+                        .setattr(ino, mode, uid, gid, size, atime_ns, mtime_ns)
+                        .map_err(|error| errno(&error))
+                })
+        } else {
+            self.meta
+                .setattr(ino, mode, uid, gid, size, atime_ns, mtime_ns)
+                .map_err(|error| errno(&error))
+        };
+        match result {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr)),
-            Err(e) => reply.error(errno(&e)),
+            Err(error) => reply.error(Errno::from_i32(error)),
         }
     }
 
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
-                reply.error(libc::ESTALE);
+                reply.error(Errno::from_i32(libc::ESTALE));
             } else if let SyntheticNode::Frozen {
                 kind: InodeKind::Symlink,
                 target: Some(target),
@@ -134,45 +166,47 @@ impl Filesystem for ConstellationFs {
             {
                 reply.data(target.as_bytes());
             } else {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::from_i32(libc::EINVAL));
             }
             return;
         }
         match self.meta.readlink(ino) {
             Ok(Some(target)) => reply.data(target.as_bytes()),
-            Ok(None) => reply.error(libc::EINVAL),
-            Err(e) => reply.error(errno(&e)),
+            Ok(None) => reply.error(Errno::from_i32(libc::EINVAL)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
     fn mkdir(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
         gate!(self, parent, reply);
         match self.meta.mkdir(parent, &name, mode, req.uid(), req.gid()) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
-            Err(e) => reply.error(errno(&e)),
+            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
     fn mknod(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         rdev: u32,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
         gate!(self, parent, reply);
@@ -180,8 +214,8 @@ impl Filesystem for ConstellationFs {
             libc::S_IFREG | 0 => {
                 // Some callers use mknod for regular files.
                 match self.meta.create(parent, &name, mode & 0o7777, req.uid(), req.gid()) {
-                    Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
-                    Err(e) => reply.error(errno(&e)),
+                    Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                    Err(e) => reply.error(Errno::from_i32(errno(&e))),
                 }
                 return;
             }
@@ -190,7 +224,7 @@ impl Filesystem for ConstellationFs {
             libc::S_IFBLK => InodeKind::BlockDev,
             libc::S_IFCHR => InodeKind::CharDev,
             _ => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::from_i32(libc::EINVAL));
                 return;
             }
         };
@@ -203,70 +237,81 @@ impl Filesystem for ConstellationFs {
             req.gid(),
             rdev as u64,
         ) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
-            Err(e) => reply.error(errno(&e)),
+            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
     fn link(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        newparent: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let ino = ino.0;
+        let newparent = newparent.0;
         let ino = self.real_ino(ino);
         let newparent = self.real_ino(newparent);
         let name = checked_name!(newname, reply);
         gate!(self, ino, reply);
         match self.meta.link(ino, newparent, &name) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
-            Err(e) => reply.error(errno(&e)),
+            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
     fn create(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
+        let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
         gate!(self, parent, reply);
         match self.meta.create(parent, &name, mode, req.uid(), req.gid()) {
             Ok(attr) => {
                 *self.opens.lock().unwrap().entry(attr.ino).or_insert(0) += 1;
-                reply.created(&TTL, &to_fuse_attr(&attr), 0, attr.ino, 0)
+                reply.created(
+                    &TTL,
+                    &to_fuse_attr(&attr),
+                    fuser::Generation(0),
+                    FileHandle(attr.ino),
+                    fuser::FopenFlags::empty(),
+                )
             }
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
     fn symlink(
-        &mut self,
-        req: &Request<'_>,
-        parent: u64,
+        &self,
+        req: &Request,
+        parent: INodeNo,
         link_name: &OsStr,
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(link_name, reply);
         gate!(self, parent, reply);
         let target = target.to_string_lossy();
         match self.meta.symlink(parent, &name, &target, req.uid(), req.gid()) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), 0),
-            Err(e) => reply.error(errno(&e)),
+            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
         gate!(self, parent, reply);
@@ -282,30 +327,33 @@ impl Filesystem for ConstellationFs {
                 }
                 reply.ok()
             }
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
         gate!(self, parent, reply);
         match self.meta.rmdir(parent, &name) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let parent = parent.0;
+        let newparent = newparent.0;
         let parent = self.real_ino(parent);
         let newparent = self.real_ino(newparent);
         let name = name.to_string_lossy();
@@ -325,7 +373,7 @@ impl Filesystem for ConstellationFs {
         gate!(self, first, reply);
         if first != second {
             if let Err(e) = self.require_lease_for(second) {
-                reply.error(e);
+                reply.error(Errno::from_i32(e));
                 return;
             }
         }
@@ -337,15 +385,16 @@ impl Filesystem for ConstellationFs {
         };
         match result {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(errno(&e)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
-                reply.error(libc::ESTALE);
+                reply.error(Errno::from_i32(libc::ESTALE));
             } else if matches!(
                 node,
                 SyntheticNode::Frozen {
@@ -353,111 +402,116 @@ impl Filesystem for ConstellationFs {
                     ..
                 }
             ) {
-                reply.opened(ino, 0);
+                reply.opened(FileHandle(ino), fuser::FopenFlags::empty());
             } else {
-                reply.error(libc::EISDIR);
+                reply.error(Errno::from_i32(libc::EISDIR));
             }
             return;
         }
         match self.meta.getattr(ino) {
             Ok(Some(_)) => {
                 *self.opens.lock().unwrap().entry(ino).or_insert(0) += 1;
-                reply.opened(ino, 0)
+                reply.opened(FileHandle(ino), fuser::FopenFlags::empty())
             }
-            Ok(None) => reply.error(libc::ENOENT),
-            Err(e) => reply.error(errno(&e)),
+            Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
+            Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         if Self::is_synthetic(ino) {
-            match self.read_frozen(ino, offset as u64, size as u64) {
+            match self.read_frozen(ino, offset, size as u64) {
                 Ok(data) => reply.data(&data),
-                Err(error) => reply.error(error),
+                Err(error) => reply.error(Errno::from_i32(error)),
             }
             return;
         }
-        match self.do_read(ino, offset as u64, size as u64) {
+        match self.do_read(ino, offset, size as u64) {
             Ok(data) => reply.data(&data),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         if Self::is_synthetic(ino) {
-            reply.error(libc::EROFS);
+            reply.error(Errno::from_i32(libc::EROFS));
             return;
         }
-        match self.do_write(ino, offset as u64, data) {
-            Ok(n) if flags & (libc::O_SYNC | libc::O_DSYNC) != 0 => {
+        match self.do_write(ino, offset, data) {
+            Ok(n) if flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0 => {
                 match self.flush_inode(ino, true) {
                     Ok(()) => reply.written(n),
-                    Err(error) => reply.error(error),
+                    Err(error) => reply.error(Errno::from_i32(error)),
                 }
             }
             Ok(n) => reply.written(n),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
-    fn flush(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         match self.flush_inode(ino, false) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         match self.flush_inode(ino, true) {
             Ok(()) => match self.sync_barrier(ino) {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(e),
+                Err(e) => reply.error(Errno::from_i32(e)),
             },
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         if Self::is_synthetic(ino) {
             reply.ok();
             return;
         }
-        let flush_result = self.flush_inode(ino, flags & (libc::O_SYNC | libc::O_DSYNC) != 0);
+        let flush_result = self.flush_inode(ino, flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0);
         let last = {
             let mut opens = self.opens.lock().unwrap();
             match opens.get_mut(&ino) {
@@ -487,31 +541,32 @@ impl Filesystem for ConstellationFs {
                 self.nudge_sync();
                 reply.ok()
             }
-            Err(e) => reply.error(e),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let ino = ino.0;
         let visible_ino = ino;
         let ino = self.real_ino(ino);
         if Self::is_synthetic(ino) {
             let entries = match self.synthetic_entries(ino) {
                 Ok(entries) => entries,
-                Err(error) => return reply.error(error),
+                Err(error) => return reply.error(Errno::from_i32(error)),
             };
             let mut idx = offset;
             loop {
                 let next = idx + 1;
                 let full = match idx {
-                    0 => reply.add(visible_ino, next, FileType::Directory, "."),
-                    1 => reply.add(visible_ino, next, FileType::Directory, ".."),
+                    0 => reply.add(INodeNo(visible_ino), next, FileType::Directory, "."),
+                    1 => reply.add(INodeNo(visible_ino), next, FileType::Directory, ".."),
                     _ => {
                         let Some((child_ino, kind, name)) = entries.get((idx - 2) as usize) else {
                             break;
@@ -525,7 +580,7 @@ impl Filesystem for ConstellationFs {
                             InodeKind::BlockDev => FileType::BlockDevice,
                             InodeKind::CharDev => FileType::CharDevice,
                         };
-                        reply.add(*child_ino, next, file_type, name)
+                        reply.add(INodeNo(*child_ino), next, file_type, name)
                     }
                 };
                 if full {
@@ -538,15 +593,15 @@ impl Filesystem for ConstellationFs {
         }
         let entries = match self.meta.readdir(ino) {
             Ok(e) => e,
-            Err(e) => return reply.error(errno(&e)),
+            Err(e) => return reply.error(Errno::from_i32(errno(&e))),
         };
         // Stable cursor: "." = 1, ".." = 2, children from 3.
         let mut idx = offset;
         loop {
             let next = idx + 1;
             let full = match idx {
-                0 => reply.add(visible_ino, next, FileType::Directory, "."),
-                1 => reply.add(visible_ino, next, FileType::Directory, ".."),
+                0 => reply.add(INodeNo(visible_ino), next, FileType::Directory, "."),
+                1 => reply.add(INodeNo(visible_ino), next, FileType::Directory, ".."),
                 _ => {
                     let child = match entries.get((idx - 2) as usize) {
                         Some(c) => c,
@@ -561,7 +616,7 @@ impl Filesystem for ConstellationFs {
                         InodeKind::BlockDev => FileType::BlockDevice,
                         InodeKind::CharDev => FileType::CharDevice,
                     };
-                    reply.add(child.ino, next, ft, &child.name)
+                    reply.add(INodeNo(child.ino), next, ft, &child.name)
                 }
             };
             if full {
@@ -573,41 +628,42 @@ impl Filesystem for ConstellationFs {
     }
 
     fn setxattr(
-        &mut self,
-        req: &Request<'_>,
-        ino: u64,
+        &self,
+        req: &Request,
+        ino: INodeNo,
         name: &OsStr,
         value: &[u8],
         flags: i32,
         position: u32,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         let name = match checked_xattr_name(req, name) {
             Ok(name) => name,
-            Err(error) => return reply.error(error),
+            Err(error) => return reply.error(Errno::from_i32(error)),
         };
         if virtual_xattr(&name) {
-            reply.error(libc::EPERM);
+            reply.error(Errno::from_i32(libc::EPERM));
             return;
         }
         if Self::is_synthetic(ino) {
-            reply.error(libc::EROFS);
+            reply.error(Errno::from_i32(libc::EROFS));
             return;
         }
         if value.len() > 64 * 1024 {
-            reply.error(libc::E2BIG);
+            reply.error(Errno::from_i32(libc::E2BIG));
             return;
         }
         if position != 0 {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::from_i32(libc::EINVAL));
             return;
         }
         let mode = match flags {
             0 => constellation_meta::SetXattrMode::Set,
             libc::XATTR_CREATE => constellation_meta::SetXattrMode::Create,
             libc::XATTR_REPLACE => constellation_meta::SetXattrMode::Replace,
-            _ => return reply.error(libc::EINVAL),
+            _ => return reply.error(Errno::from_i32(libc::EINVAL)),
         };
         gate!(self, ino, reply);
         match self.meta.set_xattr(ino, &name, value, mode) {
@@ -615,22 +671,23 @@ impl Filesystem for ConstellationFs {
                 self.nudge_sync();
                 reply.ok()
             }
-            Err(error) => reply.error(errno(&error)),
+            Err(error) => reply.error(Errno::from_i32(errno(&error))),
         }
     }
 
     fn getxattr(
-        &mut self,
-        req: &Request<'_>,
-        ino: u64,
+        &self,
+        req: &Request,
+        ino: INodeNo,
         name: &OsStr,
         size: u32,
         reply: ReplyXattr,
     ) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         let name = match checked_xattr_name(req, name) {
             Ok(name) => name,
-            Err(error) => return reply.error(error),
+            Err(error) => return reply.error(Errno::from_i32(error)),
         };
         let value = if virtual_xattr(&name) {
             let aggregate = if Self::is_synthetic(ino) {
@@ -646,7 +703,7 @@ impl Filesystem for ConstellationFs {
                         rcount.to_string().into_bytes()
                     }
                 }
-                Err(error) => return reply.error(error),
+                Err(error) => return reply.error(Errno::from_i32(error)),
             }
         } else {
             let result = if Self::is_synthetic(ino) {
@@ -663,14 +720,15 @@ impl Filesystem for ConstellationFs {
             };
             match result {
                 Ok(Some(value)) => value,
-                Ok(None) => return reply.error(libc::ENODATA),
-                Err(error) => return reply.error(error),
+                Ok(None) => return reply.error(Errno::from_i32(libc::ENODATA)),
+                Err(error) => return reply.error(Errno::from_i32(error)),
             }
         };
         reply_xattr(value, size, reply);
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         let names = if Self::is_synthetic(ino) {
             self.synthetic_xattrs(ino)
@@ -682,7 +740,7 @@ impl Filesystem for ConstellationFs {
         };
         let mut names: Vec<String> = match names {
             Ok(names) => names,
-            Err(error) => return reply.error(error),
+            Err(error) => return reply.error(Errno::from_i32(error)),
         };
         names.push(RSIZE_XATTR.to_string());
         names.push(RCOUNT_XATTR.to_string());
@@ -697,23 +755,24 @@ impl Filesystem for ConstellationFs {
     }
 
     fn removexattr(
-        &mut self,
-        req: &Request<'_>,
-        ino: u64,
+        &self,
+        req: &Request,
+        ino: INodeNo,
         name: &OsStr,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         let name = match checked_xattr_name(req, name) {
             Ok(name) => name,
-            Err(error) => return reply.error(error),
+            Err(error) => return reply.error(Errno::from_i32(error)),
         };
         if virtual_xattr(&name) {
-            reply.error(libc::EPERM);
+            reply.error(Errno::from_i32(libc::EPERM));
             return;
         }
         if Self::is_synthetic(ino) {
-            reply.error(libc::EROFS);
+            reply.error(Errno::from_i32(libc::EROFS));
             return;
         }
         gate!(self, ino, reply);
@@ -722,11 +781,11 @@ impl Filesystem for ConstellationFs {
                 self.nudge_sync();
                 reply.ok()
             }
-            Err(error) => reply.error(errno(&error)),
+            Err(error) => reply.error(Errno::from_i32(errno(&error))),
         }
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         // Effectively unlimited backing store; block size mirrors blksize.
         let bsize: u32 = 131072;
         let huge = u64::MAX / bsize as u64 / 2;
@@ -734,48 +793,50 @@ impl Filesystem for ConstellationFs {
     }
 
     fn fallocate(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        length: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        length: u64,
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
         let ino = self.real_ino(ino);
         gate!(self, ino, reply);
-        if offset < 0 || length <= 0 {
-            reply.error(libc::EINVAL);
+        if length == 0 {
+            reply.error(Errno::from_i32(libc::EINVAL));
             return;
         }
-        match self.do_fallocate(ino, offset as u64, length as u64, mode) {
+        match self.do_fallocate(ino, offset, length, mode) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(Errno::from_i32(error)),
         }
     }
 
     fn lseek(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
         offset: i64,
         whence: i32,
         reply: ReplyLseek,
     ) {
+        let ino = ino.0;
         if offset < 0 {
-            reply.error(libc::ENXIO);
+            reply.error(Errno::from_i32(libc::ENXIO));
             return;
         }
         match self.seek_sparse(self.real_ino(ino), offset as u64, whence) {
             Ok(position) => reply.offset(position),
-            Err(error) => reply.error(error),
+            Err(error) => reply.error(Errno::from_i32(error)),
         }
     }
 }
 
-fn checked_xattr_name(req: &Request<'_>, name: &OsStr) -> Result<String, i32> {
+fn checked_xattr_name(req: &Request, name: &OsStr) -> Result<String, i32> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > 255 {
         return Err(libc::ERANGE);
@@ -800,19 +861,19 @@ fn reply_xattr(value: Vec<u8>, size: u32, reply: ReplyXattr) {
     if size == 0 {
         reply.size(value.len() as u32);
     } else if (size as usize) < value.len() {
-        reply.error(libc::ERANGE);
+        reply.error(Errno::from_i32(libc::ERANGE));
     } else {
         reply.data(&value);
     }
 }
 
 impl ConstellationFs {
-    fn do_read(&mut self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, i32> {
+    fn do_read(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, i32> {
         // Serve pending (unflushed) state when present so read-after-write
         // within an open handle is coherent. Held for the whole read: the
         // FUSE dispatch already serializes ops per-request, and a chunk
         // read is bounded (a few MiB), same cost as the old full-clone.
-        let mut writes = self.writes.lock().unwrap();
+        let mut writes = self.writes.lock(ino);
         let ws = writes.get_mut(&ino);
         let manifest = self.load_manifest(ino)?;
         let committed_len = self
@@ -875,7 +936,7 @@ impl ConstellationFs {
         }
     }
 
-    fn do_write(&mut self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32, i32> {
+    fn do_write(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32, i32> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -903,7 +964,7 @@ impl ConstellationFs {
         let manifest = self.load_manifest(ino)?;
         let hashes = self.chunk_list(&manifest)?;
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
-        let mut writes = self.writes.lock().unwrap();
+        let mut writes = self.writes.lock(ino);
         let ws = self.write_state(&mut writes, ino, &manifest)?;
         let write_end = offset + data.len() as u64;
         let new_file_len = ws.file_len.max(write_end);
@@ -945,7 +1006,7 @@ impl ConstellationFs {
             }
             ws.staging
                 .write_at(
-                    chunk_start + slice.offset as u64,
+                    chunk_start + u64::from(slice.offset),
                     &data[consumed..consumed + slice.len as usize],
                 )
                 .map_err(|e| staging_errno(&e))?;
@@ -960,11 +1021,21 @@ impl ConstellationFs {
         Ok(data.len() as u32)
     }
 
-    fn truncate(&mut self, ino: Ino, new_size: u64) -> Result<(), i32> {
+    fn truncate(&self, ino: Ino, new_size: u64) -> Result<(), i32> {
         let manifest = self.load_manifest(ino)?;
+        let mut writes = self.writes.lock(ino);
+        self.truncate_locked(&mut writes, ino, new_size, &manifest)
+    }
+
+    fn truncate_locked(
+        &self,
+        writes: &mut HashMap<Ino, WriteState>,
+        ino: Ino,
+        new_size: u64,
+        manifest: &Manifest,
+    ) -> Result<(), i32> {
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
-        let mut writes = self.writes.lock().unwrap();
-        let ws = self.write_state(&mut writes, ino, &manifest)?;
+        let ws = self.write_state(writes, ino, manifest)?;
         if new_size < ws.file_len {
             // Drop dirty runs past the new end; `Staging::set_len`
             // (ftruncate) re-cuts the boundary chunk's on-disk bytes for
@@ -982,7 +1053,7 @@ impl ConstellationFs {
         Ok(())
     }
 
-    fn do_fallocate(&mut self, ino: Ino, offset: u64, length: u64, mode: i32) -> Result<(), i32> {
+    fn do_fallocate(&self, ino: Ino, offset: u64, length: u64, mode: i32) -> Result<(), i32> {
         let keep_size = mode & libc::FALLOC_FL_KEEP_SIZE != 0;
         let punch = mode & libc::FALLOC_FL_PUNCH_HOLE != 0;
         let zero = mode & libc::FALLOC_FL_ZERO_RANGE != 0;
@@ -994,10 +1065,7 @@ impl ConstellationFs {
         }
         let end = offset.checked_add(length).ok_or(libc::EFBIG)?;
         let manifest = self.load_manifest(ino)?;
-        let old_size = self
-            .writes
-            .lock()
-            .unwrap()
+        let old_size = self.writes.lock(ino)
             .get(&ino)
             .map(|state| state.file_len)
             .unwrap_or(manifest.file_len);
@@ -1017,7 +1085,7 @@ impl ConstellationFs {
         let full_start = offset.div_ceil(chunk_size);
         let full_end = effective_end / chunk_size;
         {
-            let mut writes = self.writes.lock().unwrap();
+            let mut writes = self.writes.lock(ino);
             let ws = self.write_state(&mut writes, ino, &manifest)?;
             if new_size > ws.file_len {
                 ws.staging
@@ -1069,7 +1137,7 @@ impl ConstellationFs {
     fn seek_sparse(&self, ino: Ino, offset: u64, whence: i32) -> Result<i64, i32> {
         let manifest = self.load_manifest(ino)?;
         let mut chunks = self.chunk_list(&manifest)?;
-        let writes = self.writes.lock().unwrap();
+        let writes = self.writes.lock(ino);
         let file_len = if let Some(state) = writes.get(&ino) {
             chunks.retain(|index, _| !state.holes.contains(*index));
             chunks.extend(state.sealed.iter().map(|(index, hash)| (*index, *hash)));

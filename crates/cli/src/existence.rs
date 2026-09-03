@@ -75,7 +75,7 @@ impl Existence {
         })
     }
 
-    /// Spawn after mount setup. The short delay lets `fuser::mount2` finish
+    /// Spawn after mount setup. The short delay lets `fuser::mount` finish
     /// attaching before LIST work begins, while uploads remain free to use
     /// the ordinary adaptive fallback until `complete` flips.
     pub fn spawn_seed(self: &Arc<Self>, store: Arc<ChunkStore>, rt: &tokio::runtime::Runtime) {

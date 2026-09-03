@@ -59,7 +59,7 @@ object_store = { version = "0.14", features = ["aws"] }
 aws-config = "1"
 aws-credential-types = "1"
 clap = { version = "4", features = ["derive", "env"] }
-fuser = { version = "0.15", default-features = false, features = ["abi-7-24"] }
+fuser = { version = "0.18", default-features = false }
 libc = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 futures = "0.3"

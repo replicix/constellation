@@ -11,6 +11,7 @@ mod gc;
 mod lease;
 mod leave;
 mod log_buffer;
+mod parallelism;
 mod pin;
 mod prefetch;
 mod reintegrate;
@@ -356,18 +357,17 @@ fn main() -> Result<()> {
         .with_writer(move || log_writer.writer())
         .init();
     let cli = Cli::parse();
-    // Compression has its own, smaller gate in ChunkStore. Keep a portable
-    // safety ceiling on the shared fallback pool as well: Tokio otherwise
-    // permits 512 blocking threads, which can retain gigabytes of allocator
-    // arenas after a burst even when all useful work has finished.
-    let max_blocking_threads = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .saturating_mul(2)
-        .clamp(16, 64);
+    let threads = parallelism::thread_plan();
+    tracing::info!(
+        cpus = threads.cpus,
+        fuse_threads = threads.fuse,
+        tokio_threads = threads.tokio,
+        blocking_threads = threads.blocking,
+        "selected host-aware thread plan"
+    );
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .max_blocking_threads(max_blocking_threads)
+        .worker_threads(threads.tokio)
+        .max_blocking_threads(threads.blocking)
         .enable_all()
         .build()?;
 
@@ -652,6 +652,7 @@ fn main() -> Result<()> {
                 write_mode.parse().map_err(anyhow::Error::msg)?;
             mount(
                 rt,
+                threads.fuse,
                 &s3,
                 &mountpoint,
                 &inner_path,
@@ -770,6 +771,7 @@ async fn run_fsck_cli(
 #[allow(clippy::too_many_arguments)]
 fn mount(
     rt: tokio::runtime::Runtime,
+    fuse_threads: usize,
     s3: &str,
     mountpoint: &std::path::Path,
     inner_path: &str,
@@ -1684,19 +1686,27 @@ fn mount(
         }
     }
 
-    let mut options = vec![
+    let options = vec![
         fuser::MountOption::FSName(fs_name),
         fuser::MountOption::DefaultPermissions,
     ];
-    if allow_other {
-        options.push(fuser::MountOption::AllowOther);
-    }
+    let acl = if allow_other {
+        fuser::SessionACL::All
+    } else {
+        fuser::SessionACL::Owner
+    };
+    let mut options = options;
     if selector.is_some() && !rw_snapshot {
         options.push(fuser::MountOption::RO);
     }
     existence.spawn_seed(store.clone(), &rt);
     tracing::info!(?mountpoint, ?state_dir, fs = %fsmeta.uuid, "mounting");
-    fuser::mount2(fs, mountpoint, &options).context("FUSE mount")?;
+    let mut fuse_config = fuser::Config::default();
+    fuse_config.mount_options = options;
+    fuse_config.acl = acl;
+    fuse_config.n_threads = Some(fuse_threads);
+    fuse_config.clone_fd = cfg!(target_os = "linux") && fuse_config.n_threads != Some(1);
+    fuser::mount(fs, mountpoint, &fuse_config).context("FUSE mount")?;
 
     // Clean unmount: ship the journal tail, checkpoint, then release the
     // lease so a peer does not have to wait out the TTL. Skip when we
