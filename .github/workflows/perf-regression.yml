@@ -21,9 +21,9 @@ on:
         required: false
         default: ""
       max_file_bytes:
-        description: "Cap each staged file's size in bytes (empty = exact)"
+        description: "Cap each staged file size (bytes). Default 2MiB keeps tree shape on runner disk."
         required: false
-        default: ""
+        default: "2097152"
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,12 +32,19 @@ jobs:
   perf-regression:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -59,7 +66,12 @@ jobs:
           echo "repetitions=${{ github.event.inputs.repetitions || '1' }}" >> "$GITHUB_OUTPUT"
           echo "seed=${{ github.event.inputs.seed || '42' }}" >> "$GITHUB_OUTPUT"
           echo "corpus_limit=${{ github.event.inputs.corpus_limit || '' }}" >> "$GITHUB_OUTPUT"
-          echo "max_file_bytes=${{ github.event.inputs.max_file_bytes || '' }}" >> "$GITHUB_OUTPUT"
+          # PRs always cap; workflow_dispatch can clear the input to use exact sizes.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "max_file_bytes=${{ github.event.inputs.max_file_bytes || '2097152' }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "max_file_bytes=${{ github.event.inputs.max_file_bytes }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Fetch baseline from base ref
         run: |
@@ -76,6 +88,11 @@ jobs:
       - name: Build HEAD binaries
         run: |
           CARGO_TARGET_DIR="$RUNNER_TEMP/target-head" cargo build --release -p constellation -p constellation-harness
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp "$RUNNER_TEMP/target-head/release/constellation" "$RUNNER_TEMP/bin/constellation-head"
+          cp "$RUNNER_TEMP/target-head/release/harness" "$RUNNER_TEMP/bin/harness"
+          rm -rf "$RUNNER_TEMP/target-head"
+          df -h
 
       - name: Prepare BASE worktree
         run: |
@@ -85,11 +102,16 @@ jobs:
       - name: Build BASE binaries
         run: |
           cd "$RUNNER_TEMP/base"
-          CARGO_TARGET_DIR="$RUNNER_TEMP/target-base" cargo build --release -p constellation -p constellation-harness
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-base" cargo build --release -p constellation
+          cp "$RUNNER_TEMP/target-base/release/constellation" "$RUNNER_TEMP/bin/constellation-base"
+          rm -rf "$RUNNER_TEMP/target-base" "$RUNNER_TEMP/base"
+          df -h
 
       - name: Run HEAD performance suite
+        env:
+          TMPDIR: /mnt/tmp
         run: |
-          mkdir -p perf-artifacts/head-logs
+          mkdir -p "$TMPDIR" perf-artifacts/head-logs
           EXTRA=()
           if [ -n "${{ steps.cfg.outputs.corpus_limit }}" ]; then
             EXTRA+=(--corpus-limit "${{ steps.cfg.outputs.corpus_limit }}")
@@ -98,19 +120,22 @@ jobs:
             EXTRA+=(--max-file-bytes "${{ steps.cfg.outputs.max_file_bytes }}")
           fi
           python3 tests/perf_regression/run_suite.py \
-            --harness-bin "$RUNNER_TEMP/target-head/release/harness" \
-            --constellation-bin "$RUNNER_TEMP/target-head/release/constellation" \
+            --harness-bin "$RUNNER_TEMP/bin/harness" \
+            --constellation-bin "$RUNNER_TEMP/bin/constellation-head" \
             --out perf-artifacts/head.json \
             --logs-dir perf-artifacts/head-logs \
             --repetitions "${{ steps.cfg.outputs.repetitions }}" \
             --seed "${{ steps.cfg.outputs.seed }}" \
             --corpus-shape \
             "${EXTRA[@]}"
+          df -h
 
       - name: Run BASE performance suite
         if: env.baseline_exists == 'false'
+        env:
+          TMPDIR: /mnt/tmp
         run: |
-          mkdir -p perf-artifacts/base-logs
+          mkdir -p "$TMPDIR" perf-artifacts/base-logs
           EXTRA=()
           if [ -n "${{ steps.cfg.outputs.corpus_limit }}" ]; then
             EXTRA+=(--corpus-limit "${{ steps.cfg.outputs.corpus_limit }}")
@@ -119,14 +144,15 @@ jobs:
             EXTRA+=(--max-file-bytes "${{ steps.cfg.outputs.max_file_bytes }}")
           fi
           python3 tests/perf_regression/run_suite.py \
-            --harness-bin "$RUNNER_TEMP/target-head/release/harness" \
-            --constellation-bin "$RUNNER_TEMP/target-base/release/constellation" \
+            --harness-bin "$RUNNER_TEMP/bin/harness" \
+            --constellation-bin "$RUNNER_TEMP/bin/constellation-base" \
             --out perf-artifacts/base.json \
             --logs-dir perf-artifacts/base-logs \
             --repetitions "${{ steps.cfg.outputs.repetitions }}" \
             --seed "${{ steps.cfg.outputs.seed }}" \
             --corpus-shape \
             "${EXTRA[@]}"
+          df -h
 
       - name: Commit baseline to current branch
         if: success() && github.event_name == 'pull_request'
@@ -187,6 +213,7 @@ jobs:
         with:
           name: perf-logs-${{ github.run_id }}
           retention-days: 14
+          if-no-files-found: ignore
           path: |
             perf-artifacts/base-logs/
             perf-artifacts/head-logs/

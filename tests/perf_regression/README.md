@@ -24,6 +24,8 @@ cargo run -p constellation-harness --release -- corpus-snapshot \
 - `--corpus-limit N` — replay only the first N files
 - `--max-file-bytes N` — cap each staged file's payload (directory shape unchanged)
 
+CI defaults to `--max-file-bytes 2097152` (~2 MiB) so the full tree shape fits on a standard GitHub runner (exact sizes are ~9 GB and do not). Clear that input on `workflow_dispatch` for an uncapped local-scale run on a larger machine.
+
 Flat `--files` / `--fanout` / `--file-size` generation remains available when corpus mode is off.
 
 ## Baseline storage strategy

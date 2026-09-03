@@ -4,6 +4,7 @@ import json
 import os
 import statistics
 import subprocess
+import sys
 from pathlib import Path
 
 PROFILES = [
@@ -48,10 +49,16 @@ def run_once(args, label, extra):
 
     env = os.environ.copy()
     env["CONSTELLATION_BIN"] = str(args.constellation_bin)
-    p = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+    p = subprocess.run(cmd, check=False, capture_output=True, text=True, env=env)
 
     (args.logs_dir / f"{label}.stderr.log").write_text(p.stderr)
     (args.logs_dir / f"{label}.stdout.log").write_text(p.stdout)
+
+    if p.returncode != 0:
+        sys.stderr.write(p.stderr)
+        if p.stdout.strip():
+            sys.stderr.write(p.stdout)
+        raise subprocess.CalledProcessError(p.returncode, p.args, p.stdout, p.stderr)
 
     try:
         return json.loads(p.stdout)
