@@ -1,5 +1,6 @@
 //! Metadata log records (DESIGN.md §4): the versioned, append-only op
-//! registry. Serialized as JSON within zstd-batched segments.
+//! registry. Serialized as postcard in the local journal and in zstd
+//! S3 log segments (same codec as P2P gossip envelopes).
 
 use constellation_fs_core::Ino;
 use serde::{Deserialize, Serialize};
@@ -21,13 +22,17 @@ pub struct CloneNode {
     pub rdev: u64,
     pub target: Option<String>,
     pub manifest: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
-/// One metadata operation. Field names are stable format surface.
+/// One metadata operation.
+///
+/// Externally tagged so the same `Serialize` impl works for postcard
+/// (non-self-describing). Do not add `skip_serializing_if`: postcard
+/// would then mis-align fields on decode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum LogRecord {
     Mkdir {
         parent: Ino,
@@ -96,7 +101,7 @@ pub enum LogRecord {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         atime_ns: Option<i64>,
         mtime_ns: Option<i64>,
         time_ns: i64,
@@ -182,12 +187,24 @@ pub enum LogRecord {
     },
 }
 
+impl LogRecord {
+    /// Encode for the local journal BLOB and for S3 segment payloads.
+    pub fn to_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+
+    /// Decode a journal / segment record.
+    pub fn from_postcard(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn json_roundtrip() {
+    fn postcard_roundtrip() {
         let r = LogRecord::Create {
             parent: 1,
             name: "hello.txt".into(),
@@ -197,8 +214,23 @@ mod tests {
             gid: 1000,
             time_ns: 123,
         };
-        let s = serde_json::to_string(&r).unwrap();
-        assert!(s.contains("\"op\":\"create\""));
-        assert_eq!(serde_json::from_str::<LogRecord>(&s).unwrap(), r);
+        let bytes = r.to_postcard().unwrap();
+        assert_eq!(LogRecord::from_postcard(&bytes).unwrap(), r);
+    }
+
+    #[test]
+    fn postcard_write_manifest_keeps_binary() {
+        let manifest = b"CMF1\0\0@\0".to_vec();
+        let r = LogRecord::WriteManifest {
+            ino: 7,
+            base_manifest: None,
+            manifest: manifest.clone(),
+            size: 99,
+            time_ns: 1,
+        };
+        let bytes = r.to_postcard().unwrap();
+        // Binary payload must appear verbatim, not as a JSON number list.
+        assert!(bytes.windows(manifest.len()).any(|w| w == manifest));
+        assert_eq!(LogRecord::from_postcard(&bytes).unwrap(), r);
     }
 }

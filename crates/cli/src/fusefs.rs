@@ -231,7 +231,7 @@ fn errno(e: &MetaError) -> i32 {
         MetaError::NotEmpty => libc::ENOTEMPTY,
         MetaError::NoData => libc::ENODATA,
         MetaError::Invalid(_) => libc::EINVAL,
-        MetaError::Sqlite(_) | MetaError::Json(_) => libc::EIO,
+        MetaError::Sqlite(_) | MetaError::Json(_) | MetaError::Postcard(_) => libc::EIO,
     }
 }
 

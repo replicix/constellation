@@ -886,15 +886,15 @@ fn park_or_apply_xpart(
     rec: &LogRecord,
 ) -> Result<Applied, MetaError> {
     let other = if half == "src" { "dst" } else { "src" };
-    let partner: Option<String> = tx
+    let partner: Option<Vec<u8>> = tx
         .query_row(
             "SELECT record FROM xpart_pending WHERE txid = ?1 AND half = ?2",
             params![txid, other],
             |r| r.get(0),
         )
         .optional()?;
-    if let Some(json) = partner {
-        let other_rec: LogRecord = serde_json::from_str(&json)?;
+    if let Some(bytes) = partner {
+        let other_rec = LogRecord::from_postcard(&bytes)?;
         tx.execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
         let (src, dst) = if half == "src" {
             (rec, &other_rec)
@@ -905,7 +905,7 @@ fn park_or_apply_xpart(
     } else {
         tx.execute(
             "INSERT OR REPLACE INTO xpart_pending (txid, half, record) VALUES (?1, ?2, ?3)",
-            params![txid, half, serde_json::to_string(rec)?],
+            params![txid, half, rec.to_postcard()?],
         )?;
         Ok(Applied::Done)
     }

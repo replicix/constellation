@@ -91,9 +91,9 @@ pub fn part_merge_idle_s() -> u64 {
         .unwrap_or(3600)
 }
 
-/// What one log segment holds: its origin node, the lease epoch under
-/// which it was written, and a batch of records. Versioned; old bare
-/// arrays decode as node 0 / epoch 0, as do pre-lease envelopes.
+/// Postcard envelope for a zstd-compressed S3 log segment. `v` is
+/// reserved so a future format bump can reject old readers without a
+/// dual decoder.
 #[derive(Serialize, Deserialize)]
 struct SegmentEnvelope {
     v: u32,
@@ -110,7 +110,7 @@ struct Segment {
 }
 
 fn encode(node: u64, epoch: u64, records: &[LogRecord]) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec(&SegmentEnvelope {
+    Ok(postcard::to_allocvec(&SegmentEnvelope {
         v: 2,
         node,
         epoch,
@@ -119,19 +119,13 @@ fn encode(node: u64, epoch: u64, records: &[LogRecord]) -> Result<Vec<u8>> {
 }
 
 fn decode(payload: &[u8]) -> Result<Segment> {
-    if let Ok(env) = serde_json::from_slice::<SegmentEnvelope>(payload) {
-        return Ok(Segment {
-            node: env.node,
-            epoch: env.epoch,
-            records: env.records,
-        });
-    }
-    // Pre-envelope segments: a bare JSON array from the genesis node.
-    let records: Vec<LogRecord> = serde_json::from_slice(payload)?;
+    let env: SegmentEnvelope = postcard::from_bytes(payload)
+        .map_err(|e| anyhow::anyhow!("log segment postcard decode: {e}"))?;
+    anyhow::ensure!(env.v == 2, "unsupported log segment version {}", env.v);
     Ok(Segment {
-        node: 0,
-        epoch: 0,
-        records,
+        node: env.node,
+        epoch: env.epoch,
+        records: env.records,
     })
 }
 

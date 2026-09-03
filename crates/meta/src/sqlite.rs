@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS xattr (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS journal (
     seq    INTEGER PRIMARY KEY AUTOINCREMENT,
-    record TEXT NOT NULL,
+    record BLOB NOT NULL,
     part   TEXT NOT NULL DEFAULT 'p0'
 );
 CREATE TABLE IF NOT EXISTS kv (
@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS partition_by_root ON partition (root_ino);
 CREATE TABLE IF NOT EXISTS xpart_pending (
     txid   INTEGER PRIMARY KEY,
     half   TEXT NOT NULL,
-    record TEXT NOT NULL
+    record BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS pin (
     path      TEXT PRIMARY KEY,
@@ -618,7 +618,7 @@ impl SqliteMeta {
         let part = Self::part_for_record(conn, record)?;
         conn.execute(
             "INSERT INTO journal (record, part) VALUES (?1, ?2)",
-            params![serde_json::to_string(record)?, part],
+            params![record.to_postcard()?, part],
         )?;
         Ok(())
     }
@@ -659,7 +659,7 @@ impl SqliteMeta {
     fn journal_on_tx(conn: &Connection, part: &str, record: &LogRecord) -> Result<(), MetaError> {
         conn.execute(
             "INSERT INTO journal (record, part) VALUES (?1, ?2)",
-            params![serde_json::to_string(record)?, part],
+            params![record.to_postcard()?, part],
         )?;
         match record {
             LogRecord::PartSplit {
@@ -1191,7 +1191,7 @@ impl SqliteMeta {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO xpart_pending (txid, half, record) VALUES (?1, ?2, ?3)",
-            params![txid, half, serde_json::to_string(rec)?],
+            params![txid, half, rec.to_postcard()?],
         )?;
         Ok(())
     }
@@ -1219,13 +1219,13 @@ impl SqliteMeta {
             Ok((
                 r.get::<_, u64>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, Vec<u8>>(2)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (txid, half, json) = row?;
-            out.push((txid, half, serde_json::from_str(&json)?));
+            let (txid, half, bytes) = row?;
+            out.push((txid, half, LogRecord::from_postcard(&bytes)?));
         }
         Ok(out)
     }
@@ -1249,14 +1249,14 @@ impl SqliteMeta {
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, u64>(0)?,
-                r.get::<_, String>(1)?,
+                r.get::<_, Vec<u8>>(1)?,
                 r.get::<_, String>(2)?,
             ))
         })?;
         let mut grouped: Vec<(String, JournalBatch)> = Vec::new();
         for row in rows {
-            let (seq, json, part) = row?;
-            let rec: LogRecord = serde_json::from_str(&json)?;
+            let (seq, bytes, part) = row?;
+            let rec = LogRecord::from_postcard(&bytes)?;
             match grouped.last_mut() {
                 Some((p, recs)) if p == &part => {
                     if recs.len() < max_per_part {
@@ -1590,16 +1590,16 @@ impl SqliteMeta {
              WHERE r.journal_seq IS NULL
              ORDER BY j.seq",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
-            let (seq, json) = row?;
-            out.push((seq, serde_json::from_str(&json)?));
+            let (seq, bytes) = row?;
+            out.push((seq, LogRecord::from_postcard(&bytes)?));
         }
         Ok(out)
     }
 
-    /// Count of unmarked journal rows. Does not decode `record` JSON.
+    /// Count of unmarked journal rows. Does not decode `record` postcard.
     pub fn unmarked_journal_len(&self) -> Result<u64, MetaError> {
         self.with_reader(|conn| {
             Ok(conn.query_row(
@@ -2500,12 +2500,12 @@ impl MetaStore for SqliteMeta {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT seq, record FROM journal ORDER BY seq LIMIT ?1")?;
         let rows = stmt.query_map(params![max.min(i64::MAX as usize) as i64], |r| {
-            Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?))
+            Ok((r.get::<_, u64>(0)?, r.get::<_, Vec<u8>>(1)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (seq, json) = row?;
-            out.push((seq, serde_json::from_str(&json)?));
+            let (seq, bytes) = row?;
+            out.push((seq, LogRecord::from_postcard(&bytes)?));
         }
         Ok(out)
     }

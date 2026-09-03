@@ -1,8 +1,8 @@
 //! Metadata log segments and checkpoints in S3 (DESIGN.md §4).
 //!
 //! Each partition has its own ordered stream:
-//! - Segments `log/<part>/<seq:016x>.zst` hold a zstd JSON array of log
-//!   records, written with conditional create (CAS): a sequence number
+//! - Segments `log/<part>/<seq:016x>.zst` hold a zstd postcard envelope of
+//!   log records, written with conditional create (CAS): a sequence number
 //!   can never be silently overwritten.
 //! - A whole-DB checkpoint lives under `checkpoints/p0/` (as in phase 1)
 //!   plus a `checkpoints/VECTOR.json` sidecar recording the applied_seq

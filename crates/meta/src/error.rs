@@ -31,4 +31,7 @@ pub enum MetaError {
 
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("postcard: {0}")]
+    Postcard(#[from] postcard::Error),
 }
