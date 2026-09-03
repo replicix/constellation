@@ -85,6 +85,25 @@ impl Default for FsMeta {
 pub struct ChunkStore {
     store: Arc<dyn ObjectStore>,
     e2e: Option<SharedE2eKeys>,
+    /// CPU-heavy encoding is a separate resource from network uploads.
+    /// The permit is moved into the blocking closure so cancelling the
+    /// async caller cannot admit replacement work while that closure runs.
+    encode_gate: Arc<tokio::sync::Semaphore>,
+}
+
+const DEFAULT_MAX_ENCODE_CONCURRENCY: usize = 8;
+
+fn encode_concurrency() -> usize {
+    std::env::var("CONSTELLATION_ENCODE_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .min(DEFAULT_MAX_ENCODE_CONCURRENCY)
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,14 +123,50 @@ pub struct ChunkPutResult {
 
 impl ChunkStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store, e2e: None }
+        Self::with_encode_concurrency(store, None, encode_concurrency())
     }
 
     pub fn new_e2e(store: Arc<dyn ObjectStore>, keys: SharedE2eKeys) -> Self {
+        Self::with_encode_concurrency(store, Some(keys), encode_concurrency())
+    }
+
+    fn with_encode_concurrency(
+        store: Arc<dyn ObjectStore>,
+        e2e: Option<SharedE2eKeys>,
+        concurrency: usize,
+    ) -> Self {
         Self {
             store,
-            e2e: Some(keys),
+            e2e,
+            encode_gate: Arc::new(tokio::sync::Semaphore::new(concurrency.max(1))),
         }
+    }
+
+    async fn encode_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError> {
+        self.encode_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| StoreError::Meta("chunk encoder gate closed".into()))
+    }
+
+    async fn run_encoder<T, F>(
+        permit: tokio::sync::OwnedSemaphorePermit,
+        encode: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, StoreError> + Send + 'static,
+    {
+        // The permit belongs to the blocking closure, not its JoinHandle.
+        // Tokio cannot cancel a blocking closure after it starts, so this
+        // placement keeps cancellation from admitting replacement work.
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            encode()
+        })
+        .await
+        .map_err(|error| StoreError::Meta(format!("chunk encoder task failed: {error}")))?
     }
 
     pub fn inner(&self) -> &Arc<dyn ObjectStore> {
@@ -225,18 +280,20 @@ impl ChunkStore {
                 Err(error) => return Err(error.into()),
             }
         }
+        // Wait for CPU admission before making the blocking closure's owned
+        // copy. Upload futures waiting here retain only cache.get's Vec.
+        let encode_permit = self.encode_permit().await?;
         let owned = data.to_vec();
         let e2e = self.e2e.clone();
         let aad = hash.0;
-        let obj = tokio::task::spawn_blocking(move || {
+        let obj = Self::run_encoder(encode_permit, move || {
             let encoded = format::encode_object(&owned, setting)?;
             match e2e {
                 Some(keys) => encrypt_object(&keys.dek("p0")?, &aad, &encoded),
                 None => Ok(encoded),
             }
         })
-        .await
-        .map_err(|error| StoreError::Meta(format!("chunk encoder task failed: {error}")))??;
+        .await?;
         let result = match mode {
             ChunkPutMode::Create => {
                 self.store
@@ -401,6 +458,47 @@ mod tests {
 
     fn store() -> ChunkStore {
         ChunkStore::new(Arc::new(InMemory::new()))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_encoder_keeps_its_permit_until_blocking_work_stops() {
+        let store = Arc::new(ChunkStore::with_encode_concurrency(
+            Arc::new(InMemory::new()),
+            None,
+            1,
+        ));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task_store = store.clone();
+        let task = tokio::spawn(async move {
+            let permit = task_store.encode_permit().await?;
+            ChunkStore::run_encoder(permit, move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+
+        task.abort();
+        tokio::task::yield_now().await;
+        assert!(
+            store.encode_gate.clone().try_acquire_owned().is_err(),
+            "cancelling the async waiter must not release a running encoder's permit"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if store.encode_gate.available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

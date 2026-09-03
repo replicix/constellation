@@ -356,8 +356,18 @@ fn main() -> Result<()> {
         .with_writer(move || log_writer.writer())
         .init();
     let cli = Cli::parse();
+    // Compression has its own, smaller gate in ChunkStore. Keep a portable
+    // safety ceiling on the shared fallback pool as well: Tokio otherwise
+    // permits 512 blocking threads, which can retain gigabytes of allocator
+    // arenas after a burst even when all useful work has finished.
+    let max_blocking_threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .saturating_mul(2)
+        .clamp(16, 64);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
+        .max_blocking_threads(max_blocking_threads)
         .enable_all()
         .build()?;
 
@@ -1337,7 +1347,7 @@ fn mount(
         );
         rt.spawn(async move {
             let mut pending: Option<fusefs::SyncRequest> = None;
-            loop {
+            'sync: loop {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
@@ -1572,30 +1582,50 @@ fn mount(
                         )).map_err(|e| e.to_string()));
                     }
                     Some(fusefs::SyncRequest::Nudge) | None => {
-                        tokio::select! {
-                            biased;
-                            msg = sync_rx.recv() => {
-                                pending = msg;
-                            }
-                            r = run_managed_sync_round(
-                                &ship,
-                                &keepers,
-                                &epochs,
-                                &meta,
-                                &cache,
-                                &chunk_store,
-                                compression,
-                                &upload,
-                            ) => {
-                                if let Err(e) = r {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "metadata sync failed; will retry"
-                                    );
-                                    spool.lock().unwrap().last_error = Some(format!("{e:#}"));
-                                } else {
-                                    pins.refresh_all().await;
+                        // Keep polling one round while draining ordinary
+                        // nudges. Dropping this future used to cancel the
+                        // async upload side while already-started
+                        // spawn_blocking encoders continued, so a close()
+                        // storm could multiply CPU work and blocking threads.
+                        let round = run_managed_sync_round(
+                            &ship,
+                            &keepers,
+                            &epochs,
+                            &meta,
+                            &cache,
+                            &chunk_store,
+                            compression,
+                            &upload,
+                        );
+                        tokio::pin!(round);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                r = &mut round => {
+                                    if let Err(e) = r {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "metadata sync failed; will retry"
+                                        );
+                                        spool.lock().unwrap().last_error = Some(format!("{e:#}"));
+                                    } else {
+                                        pins.refresh_all().await;
+                                    }
+                                    break;
                                 }
+                                msg = sync_rx.recv() => match msg {
+                                    Some(fusefs::SyncRequest::Nudge) => {
+                                        // Coalesced: the current round already
+                                        // covers the work visible at its start.
+                                    }
+                                    Some(request) => {
+                                        // Explicit operations retain their old
+                                        // prompt-response behavior.
+                                        pending = Some(request);
+                                        break;
+                                    }
+                                    None => break 'sync,
+                                },
                             }
                         }
                     }
@@ -2296,7 +2326,6 @@ async fn upload_dirty_chunks(
     upload: &UploadRuntime,
     only_ino: Option<constellation_fs_core::Ino>,
 ) -> Result<()> {
-    use futures::stream::FuturesUnordered;
     use futures::StreamExt;
     let mut grouped: std::collections::HashMap<
         constellation_fs_core::ChunkHash,
@@ -2310,63 +2339,65 @@ async fn upload_dirty_chunks(
     }
     let total = grouped.len() as u64;
     if total > 0 {
-        tracing::info!(
+        tracing::debug!(
             pending_chunks = total,
             concurrency = upload.gate.target(),
             max_concurrency = upload.max_concurrency(),
             "uploading pending chunks"
         );
     }
-    // Each queued future only holds a hash and its owning inos until it
-    // wins a permit from `upload`'s concurrency gate; the chunk's bytes
-    // are not read from the local cache until then. Memory use is thus
-    // bounded by `upload.max_concurrency()` in-flight chunk buffers, not
-    // by the size of the whole pending-upload backlog (which can be
-    // tens of thousands of rows after an unclean shutdown or a big
-    // write-back burst).
-    let mut in_flight: FuturesUnordered<_> = grouped
-        .into_iter()
-        .map(|(hash, inos)| async move {
-            let _permit = upload.permit().await;
-            let Some(data) = cache.get(&hash)? else {
-                tracing::error!(
-                    %hash,
-                    ?inos,
-                    "pending upload chunk missing from local cache (unrecoverable content); \
-                     leaving the pending row and refusing to ship"
-                );
-                bail!("pending upload chunk {hash} missing from local cache");
-            };
-            let bytes = data.len() as u64;
-            let mode = upload.put_mode(&hash);
-            let mut last = None;
-            let started = std::time::Instant::now();
-            for attempt in 0..3 {
-                match store.put_chunk_mode(&hash, &data, compression, mode).await {
-                    Ok(result) => {
-                        let now = std::time::Instant::now();
-                        // A Probe hit only performed HEAD; counting the
-                        // chunk's logical bytes as uploaded would report
-                        // impossible goodput and drive concurrency upward
-                        // during deduplicated workloads.
-                        if !result.existed {
-                            upload.record_success(bytes, now.duration_since(started), now);
-                        }
-                        return Ok((hash, inos, mode, result.existed));
+    // Materialize at most the configured maximum number of upload
+    // futures. Each one reads bytes only after winning the adaptive gate,
+    // so both future state and chunk buffers stay independent of a backlog
+    // that may contain tens of thousands of rows.
+    let in_flight = futures::stream::iter(grouped.into_iter().map(|(hash, inos)| async move {
+        let _permit = upload.permit().await;
+        let Some(data) = cache.get(&hash)? else {
+            tracing::error!(
+                %hash,
+                ?inos,
+                "pending upload chunk missing from local cache (unrecoverable content); \
+                 leaving the pending row and refusing to ship"
+            );
+            bail!("pending upload chunk {hash} missing from local cache");
+        };
+        let bytes = data.len() as u64;
+        let mode = upload.put_mode(&hash);
+        let mut last = None;
+        let started = std::time::Instant::now();
+        for attempt in 0..3 {
+            match store.put_chunk_mode(&hash, &data, compression, mode).await {
+                Ok(result) => {
+                    let now = std::time::Instant::now();
+                    // A Probe hit only performed HEAD; counting the
+                    // chunk's logical bytes as uploaded would report
+                    // impossible goodput and drive concurrency upward
+                    // during deduplicated workloads.
+                    if !result.existed {
+                        upload.record_success(bytes, now.duration_since(started), now);
                     }
-                    Err(error) => last = Some(error),
+                    return Ok((hash, inos, mode, result.existed));
                 }
-                if attempt < 2 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+                Err(error) => last = Some(error),
             }
-            upload.record_error(std::time::Instant::now());
-            Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
-        })
-        .collect();
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        upload.record_error(std::time::Instant::now());
+        Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
+    }))
+    .buffer_unordered(upload.max_concurrency());
+    futures::pin_mut!(in_flight);
     let mut first_error = None;
     let mut completed = 0u64;
     let mut last_progress = std::time::Instant::now();
+    let progress_interval = std::env::var("CONSTELLATION_UPLOAD_PROGRESS_INTERVAL_S")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(10));
     while let Some(result) = in_flight.next().await {
         match result {
             Ok((hash, inos, mode, existed)) => {
@@ -2388,9 +2419,7 @@ async fn upload_dirty_chunks(
             }
         }
         completed += 1;
-        if total > 0
-            && (completed == total || last_progress.elapsed() >= std::time::Duration::from_secs(5))
-        {
+        if total > 0 && (completed == total || last_progress.elapsed() >= progress_interval) {
             tracing::info!(
                 completed,
                 total,
@@ -2404,7 +2433,7 @@ async fn upload_dirty_chunks(
         return Err(error);
     }
     if total > 0 {
-        tracing::info!(uploaded = total, "pending chunk upload complete");
+        tracing::debug!(uploaded = total, "pending chunk upload complete");
     }
     Ok(())
 }
