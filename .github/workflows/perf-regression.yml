@@ -61,10 +61,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> ${{ runner.temp }}/target-head"
+          # workspaces joins target with path.join(workspace, target), which
+          # turns an absolute runner.temp path into
+          # $GITHUB_WORKSPACE/home/runner/work/_temp/... and caches emptiness.
+          # cache-directories keeps absolute paths as-is.
+          cache-targets: "false"
+          cache-directories: ${{ runner.temp }}/target-head
           # Full suite runs delete the target dir to free disk; only cache-only
-          # mode should write the cache, and it should persist even if later
-          # suite runs fail (cache-on-failure is irrelevant there).
+          # mode should write the cache.
           save-if: ${{ env.CACHE_RUST_BUILD == 'true' }}
 
       - name: Build constellation (Rust cache)
