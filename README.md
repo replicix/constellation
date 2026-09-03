@@ -16,24 +16,21 @@ crash reporting is future phase-9 work. See
 
 ## Quick start: mount a real S3 bucket
 
-S3 auth uses `object_store`'s `AmazonS3Builder::from_env()` — the usual
-`AWS_*` variables. Region is `AWS_DEFAULT_REGION` (defaults to
-`us-east-1`).
+S3 auth uses the official AWS SDK default credential chain via
+[`aws-config`](https://docs.rs/aws-config) (same as the AWS CLI / SDKs):
 
-**Named profiles (`AWS_PROFILE` / `aws --profile …`) do not work by
-themselves.** Constellation never reads `~/.aws/credentials` or
-`~/.aws/config`. Export the profile into the environment first:
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`)
+- Shared config/credentials files (`~/.aws/config`, `~/.aws/credentials`)
+- Named profiles via `AWS_PROFILE` (including SSO after `aws sso login`)
+- EC2 instance role / ECS task role / EKS IRSA / process credentials
 
-```bash
-eval "$(aws configure export-credentials --format env --profile dataiku)"
-export AWS_DEFAULT_REGION=eu-west-1   # if the profile does not set it
-```
-
-Other options that work without a profile: static
-`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and optional
-`AWS_SESSION_TOKEN`), or instance / IRSA / ECS task credentials.
+Region comes from the profile or `AWS_REGION` / `AWS_DEFAULT_REGION`
+(defaults to `us-east-1`). Localstack-style knobs such as `AWS_ENDPOINT`
+and `AWS_ALLOW_HTTP` still work.
 
 ```bash
+export AWS_PROFILE=my-profile          # or rely on env keys / instance role
+# aws sso login --profile my-profile   # when the profile uses SSO
 cargo build -p constellation --release
 BIN=./target/release/constellation
 

@@ -26,7 +26,10 @@ impl S3Target {
     /// cleanable. `max_retries` should normally be 0-1: uploadbench
     /// wants to see real errors itself rather than have object_store's
     /// built-in retry hide them from the controller under test.
-    pub fn new(url: &str, run_label: &str, max_retries: usize) -> Result<Self> {
+    ///
+    /// Credentials use the standard AWS SDK chain (env, `AWS_PROFILE`,
+    /// SSO, IMDS, …) via [`constellation_store_s3::amazon_s3_builder`].
+    pub async fn new(url: &str, run_label: &str, max_retries: usize) -> Result<Self> {
         let Some(rest) = url.strip_prefix("s3://") else {
             bail!("expected s3://bucket[/prefix], got {url:?}");
         };
@@ -41,8 +44,9 @@ impl S3Target {
             max_retries,
             ..RetryConfig::default()
         };
-        let s3 = object_store::aws::AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
+        let s3 = constellation_store_s3::amazon_s3_builder(bucket)
+            .await
+            .with_context(|| format!("resolving AWS credentials for {url:?}"))?
             .with_retry(retry)
             .build()
             .with_context(|| format!("building S3 client for {url:?}"))?;

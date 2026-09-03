@@ -11,6 +11,12 @@ blake3.workspace = true
 bytes.workspace = true
 futures.workspace = true
 object_store.workspace = true
+# Official AWS SDK credential chain (env, shared config/credentials,
+# AWS_PROFILE, SSO, IMDS, ECS/IRSA, process). Default features already
+# enable SSO + credentials-process.
+aws-config.workspace = true
+aws-credential-types.workspace = true
+async-trait = "0.1"
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

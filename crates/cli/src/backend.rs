@@ -7,7 +7,11 @@ use object_store::ObjectStore;
 use std::sync::Arc;
 
 /// Build an object store scoped to the filesystem prefix from a URL.
-pub fn open_backend(url: &str) -> Result<Arc<dyn ObjectStore>> {
+///
+/// For `s3://`, credentials come from the standard AWS SDK chain via
+/// [`constellation_store_s3::amazon_s3_builder`] — env vars, shared
+/// config/credentials files, `AWS_PROFILE`, SSO, IMDS, ECS/IRSA, etc.
+pub async fn open_backend(url: &str) -> Result<Arc<dyn ObjectStore>> {
     if let Some(rest) = url.strip_prefix("s3://") {
         let (bucket, prefix) = match rest.split_once('/') {
             Some((b, p)) => (b, p.trim_matches('/')),
@@ -27,8 +31,9 @@ pub fn open_backend(url: &str) -> Result<Arc<dyn ObjectStore>> {
                 retry.retry_timeout = std::time::Duration::from_millis(ms);
             }
         }
-        let s3 = object_store::aws::AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
+        let s3 = constellation_store_s3::amazon_s3_builder(bucket)
+            .await
+            .with_context(|| format!("resolving AWS credentials for {url:?}"))?
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
             .with_retry(retry)
             .build()
@@ -55,12 +60,12 @@ pub fn open_backend(url: &str) -> Result<Arc<dyn ObjectStore>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn local_paths_accepted() {
+    #[tokio::test]
+    async fn local_paths_accepted() {
         let dir = tempfile::TempDir::new().unwrap();
         let p = dir.path().to_str().unwrap().to_string();
-        assert!(open_backend(&p).is_ok());
-        assert!(open_backend(&format!("file://{p}")).is_ok());
-        assert!(open_backend("relative/path").is_err());
+        assert!(open_backend(&p).await.is_ok());
+        assert!(open_backend(&format!("file://{p}")).await.is_ok());
+        assert!(open_backend("relative/path").await.is_err());
     }
 }

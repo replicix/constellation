@@ -22,8 +22,8 @@
 //!     --duration-secs 90 --fault-start-secs 30 --fault-duration-secs 15 --fault-error-rate 0.7 \
 //!     --csv /tmp/uploadbench-sim.csv
 //!
-//! # needs AWS credentials in the environment, e.g.
-//! # eval "$(aws configure export-credentials --format env)"
+//! # needs AWS credentials the usual way: `AWS_*` env vars, or
+//! # `AWS_PROFILE=…` after `aws sso login` / shared credentials files.
 //! BUCKET=s3://your-bucket/your-prefix \
 //!     cargo run -p uploadbench --release -- live --controllers aimd,pid \
 //!     --duration-secs 60
@@ -279,6 +279,7 @@ async fn run_live(args: LiveArgs) -> Result<()> {
         );
         tracing::info!(controller = ?kind, run_label, "starting live run");
         let s3 = live::S3Target::new(&args.bucket, &run_label, args.max_retries)
+            .await
             .with_context(|| format!("opening {}", args.bucket))?;
         let s3 = std::sync::Arc::new(s3);
         let target = run::Target::Live(s3.clone());

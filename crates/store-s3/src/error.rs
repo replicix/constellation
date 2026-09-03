@@ -40,4 +40,7 @@ pub enum StoreError {
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("AWS credentials: {0}")]
+    AwsCredentials(String),
 }

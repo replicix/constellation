@@ -54,6 +54,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
 object_store = { version = "0.14", features = ["aws"] }
+# Default features include SSO + credentials-process — the same chain
+# `aws` CLI / SDKs use for env vars, ~/.aws profiles, and SSO sessions.
+aws-config = "1"
+aws-credential-types = "1"
 clap = { version = "4", features = ["derive", "env"] }
 fuser = { version = "0.15", default-features = false, features = ["abi-7-24"] }
 libc = "0.2"

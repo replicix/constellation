@@ -374,7 +374,9 @@ fn main() -> Result<()> {
             constellation_fs_core::validate_chunk_size(chunk_size)?;
             let setting: CompressionSetting =
                 compression.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let backend = backend::open_backend(&s3)?;
+            let backend = rt
+                .block_on(backend::open_backend(&s3))
+                .context("opening backend")?;
             let store = ChunkStore::new(backend.clone());
             let mut meta = FsMeta::new(chunk_size, &setting.to_string());
             meta.e2e = e2e;
@@ -394,7 +396,9 @@ fn main() -> Result<()> {
         Command::Fs {
             command: FsCommand::Passwd { s3 },
         } => {
-            let backend = backend::open_backend(&s3)?;
+            let backend = rt
+                .block_on(backend::open_backend(&s3))
+                .context("opening backend")?;
             let meta = rt.block_on(ChunkStore::new(backend.clone()).load_fs())?;
             if !meta.e2e {
                 bail!("filesystem is not in E2E mode");
@@ -410,7 +414,10 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Doctor { s3 } => {
-            let store = ChunkStore::new(backend::open_backend(&s3)?);
+            let store = ChunkStore::new(
+                rt.block_on(backend::open_backend(&s3))
+                    .context("opening backend")?,
+            );
             let caps = rt.block_on(store.probe_conditional_writes())?;
             let yn = |b: bool| if b { "ok" } else { "MISSING" };
             println!(
@@ -438,7 +445,10 @@ fn main() -> Result<()> {
         }
         Command::Status { s3, state_dir } => match (s3, state_dir) {
             (Some(s3), None) => {
-                let store = ChunkStore::new(backend::open_backend(&s3)?);
+                let store = ChunkStore::new(
+                    rt.block_on(backend::open_backend(&s3))
+                        .context("opening backend")?,
+                );
                 let meta = rt.block_on(store.load_fs())?;
                 println!("{}", serde_json::to_string_pretty(&meta)?);
                 Ok(())
@@ -658,7 +668,7 @@ async fn run_gc_cli(
     orphans: bool,
     verify_only: bool,
 ) -> Result<gc::GcReport> {
-    let backend = backend::open_backend(s3)?;
+    let backend = backend::open_backend(s3).await?;
     let plain = ChunkStore::new(backend.clone());
     let fsmeta = plain.load_fs().await?;
     let keys = if fsmeta.e2e {
@@ -698,7 +708,7 @@ async fn run_fsck_cli(
     repair: bool,
     force_release: Option<&str>,
 ) -> Result<fsck::FsckReport> {
-    let backend = backend::open_backend(s3)?;
+    let backend = backend::open_backend(s3).await?;
     let plain = ChunkStore::new(backend.clone());
     let fsmeta = plain.load_fs().await?;
     let keys = if fsmeta.e2e {
@@ -766,7 +776,9 @@ fn mount(
     web_ui: u16,
     log_buffer: log_buffer::LogBuffer,
 ) -> Result<()> {
-    let backend = backend::open_backend(s3)?;
+    let backend = rt
+        .block_on(backend::open_backend(s3))
+        .context("opening backend")?;
     let fsmeta = rt
         .block_on(ChunkStore::new(backend.clone()).load_fs())
         .context("loading filesystem (fs create first?)")?;
