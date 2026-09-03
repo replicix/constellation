@@ -142,9 +142,6 @@ perf-regression: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Run local perf-regression 
 		--constellation-bin $(RELEASE_BIN) \
 		--out /tmp/constellation-perf-head.json \
 		--logs-dir /tmp/constellation-perf-logs \
-		--files $(BENCH_FILES) \
-		--fanout 400 \
-		--file-size 512 \
 		--repetitions 1 \
 		--seed 42 \
 		--corpus-shape

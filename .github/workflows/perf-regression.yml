@@ -8,26 +8,22 @@ on:
         description: "Base ref for comparison (branch, tag, or SHA)"
         required: false
         default: "main"
-      files:
-        description: "Synthetic files to generate"
-        required: false
-        default: "20000"
-      fanout:
-        description: "Directory fanout"
-        required: false
-        default: "400"
-      file_size:
-        description: "Minimum file size (bytes)"
-        required: false
-        default: "512"
       repetitions:
         description: "Repetitions per profile (median reported)"
         required: false
         default: "1"
       seed:
-        description: "Deterministic synthetic seed"
+        description: "Corpus replay seed"
         required: false
         default: "42"
+      corpus_limit:
+        description: "Max files to replay from the corpus (empty = all)"
+        required: false
+        default: ""
+      max_file_bytes:
+        description: "Cap each staged file's size in bytes (empty = exact)"
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -60,14 +56,14 @@ jobs:
           else
             echo "base_ref=${{ github.event.inputs.base_ref || 'main' }}" >> "$GITHUB_OUTPUT"
           fi
-          echo "files=${{ github.event.inputs.files || '20000' }}" >> "$GITHUB_OUTPUT"
-          echo "fanout=${{ github.event.inputs.fanout || '400' }}" >> "$GITHUB_OUTPUT"
-          echo "file_size=${{ github.event.inputs.file_size || '512' }}" >> "$GITHUB_OUTPUT"
           echo "repetitions=${{ github.event.inputs.repetitions || '1' }}" >> "$GITHUB_OUTPUT"
           echo "seed=${{ github.event.inputs.seed || '42' }}" >> "$GITHUB_OUTPUT"
+          echo "corpus_limit=${{ github.event.inputs.corpus_limit || '' }}" >> "$GITHUB_OUTPUT"
+          echo "max_file_bytes=${{ github.event.inputs.max_file_bytes || '' }}" >> "$GITHUB_OUTPUT"
 
       - name: Fetch baseline from base ref
         run: |
+          mkdir -p perf-artifacts
           base_ref="${{ steps.cfg.outputs.base_ref }}"
           if git show "${base_ref}:.perf-baselines/result.json" > perf-artifacts/base.json 2>/dev/null; then
             echo "Found existing baseline in ${base_ref}"
@@ -94,44 +90,54 @@ jobs:
       - name: Run HEAD performance suite
         run: |
           mkdir -p perf-artifacts/head-logs
+          EXTRA=()
+          if [ -n "${{ steps.cfg.outputs.corpus_limit }}" ]; then
+            EXTRA+=(--corpus-limit "${{ steps.cfg.outputs.corpus_limit }}")
+          fi
+          if [ -n "${{ steps.cfg.outputs.max_file_bytes }}" ]; then
+            EXTRA+=(--max-file-bytes "${{ steps.cfg.outputs.max_file_bytes }}")
+          fi
           python3 tests/perf_regression/run_suite.py \
             --harness-bin "$RUNNER_TEMP/target-head/release/harness" \
             --constellation-bin "$RUNNER_TEMP/target-head/release/constellation" \
             --out perf-artifacts/head.json \
             --logs-dir perf-artifacts/head-logs \
-            --files "${{ steps.cfg.outputs.files }}" \
-            --fanout "${{ steps.cfg.outputs.fanout }}" \
-            --file-size "${{ steps.cfg.outputs.file_size }}" \
             --repetitions "${{ steps.cfg.outputs.repetitions }}" \
             --seed "${{ steps.cfg.outputs.seed }}" \
-            --corpus-shape
+            --corpus-shape \
+            "${EXTRA[@]}"
 
       - name: Run BASE performance suite
         if: env.baseline_exists == 'false'
         run: |
           mkdir -p perf-artifacts/base-logs
+          EXTRA=()
+          if [ -n "${{ steps.cfg.outputs.corpus_limit }}" ]; then
+            EXTRA+=(--corpus-limit "${{ steps.cfg.outputs.corpus_limit }}")
+          fi
+          if [ -n "${{ steps.cfg.outputs.max_file_bytes }}" ]; then
+            EXTRA+=(--max-file-bytes "${{ steps.cfg.outputs.max_file_bytes }}")
+          fi
           python3 tests/perf_regression/run_suite.py \
             --harness-bin "$RUNNER_TEMP/target-head/release/harness" \
             --constellation-bin "$RUNNER_TEMP/target-base/release/constellation" \
             --out perf-artifacts/base.json \
             --logs-dir perf-artifacts/base-logs \
-            --files "${{ steps.cfg.outputs.files }}" \
-            --fanout "${{ steps.cfg.outputs.fanout }}" \
-            --file-size "${{ steps.cfg.outputs.file_size }}" \
             --repetitions "${{ steps.cfg.outputs.repetitions }}" \
             --seed "${{ steps.cfg.outputs.seed }}" \
-            --corpus-shape
+            --corpus-shape \
+            "${EXTRA[@]}"
 
       - name: Commit baseline to current branch
         if: success() && github.event_name == 'pull_request'
         run: |
           mkdir -p .perf-baselines
           cp perf-artifacts/head.json .perf-baselines/result.json
-          
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .perf-baselines/result.json
-          
+
           if git diff --staged --quiet; then
             echo "No changes to baseline"
           else

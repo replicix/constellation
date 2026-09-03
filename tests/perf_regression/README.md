@@ -19,7 +19,12 @@ cargo run -p constellation-harness --release -- corpus-snapshot \
   --seed 42
 ```
 
-`make perf-regression` and the GitHub workflow pass `--corpus-shape`, which replays that bundled manifest. Optional `--corpus-limit` / `--max-file-bytes` truncate file count or cap huge blobs without changing path shape.
+`make perf-regression` and the GitHub workflow pass `--corpus-shape`, which replays that bundled manifest. Optional workflow inputs / flags:
+
+- `--corpus-limit N` — replay only the first N files
+- `--max-file-bytes N` — cap each staged file's payload (directory shape unchanged)
+
+Flat `--files` / `--fanout` / `--file-size` generation remains available when corpus mode is off.
 
 ## Baseline storage strategy
 

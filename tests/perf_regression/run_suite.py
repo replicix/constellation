@@ -18,25 +18,29 @@ def run_once(args, label, extra):
         str(args.harness_bin),
         "bench",
         "--json",
-        "--files",
-        str(args.files),
-        "--fanout",
-        str(args.fanout),
-        "--file-size",
-        str(args.file_size),
         "--seed",
         str(args.seed),
         "--label",
         label,
     ]
-    if args.corpus_shape:
-        cmd.append("--corpus-shape")
-    if args.corpus_manifest:
-        cmd += ["--corpus-manifest", str(args.corpus_manifest)]
-    if args.corpus_limit is not None:
-        cmd += ["--corpus-limit", str(args.corpus_limit)]
-    if args.max_file_bytes is not None:
-        cmd += ["--max-file-bytes", str(args.max_file_bytes)]
+    if args.corpus_shape or args.corpus_manifest:
+        if args.corpus_shape:
+            cmd.append("--corpus-shape")
+        if args.corpus_manifest:
+            cmd += ["--corpus-manifest", str(args.corpus_manifest)]
+        if args.corpus_limit is not None:
+            cmd += ["--corpus-limit", str(args.corpus_limit)]
+        if args.max_file_bytes is not None:
+            cmd += ["--max-file-bytes", str(args.max_file_bytes)]
+    else:
+        cmd += [
+            "--files",
+            str(args.files),
+            "--fanout",
+            str(args.fanout),
+            "--file-size",
+            str(args.file_size),
+        ]
     if "s3_latency_ms" in extra:
         cmd += ["--s3-latency-ms", str(extra["s3_latency_ms"])]
     if "s3_bandwidth_mbps" in extra:
@@ -79,15 +83,20 @@ def main():
     ap.add_argument("--constellation-bin", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--logs-dir", type=Path, required=True)
-    ap.add_argument("--files", type=int, default=20000)
-    ap.add_argument("--fanout", type=int, default=400)
-    ap.add_argument("--file-size", type=int, default=512)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--repetitions", type=int, default=1)
-    ap.add_argument("--corpus-shape", action="store_true")
+    ap.add_argument(
+        "--corpus-shape",
+        action="store_true",
+        help="Replay the bundled anonymized corpus manifest",
+    )
     ap.add_argument("--corpus-manifest", type=Path)
     ap.add_argument("--corpus-limit", type=int)
     ap.add_argument("--max-file-bytes", type=int)
+    # Flat synthetic tree (only used when --corpus-shape / --corpus-manifest is off).
+    ap.add_argument("--files", type=int, default=20000)
+    ap.add_argument("--fanout", type=int, default=400)
+    ap.add_argument("--file-size", type=int, default=512)
     args = ap.parse_args()
 
     args.logs_dir.mkdir(parents=True, exist_ok=True)
