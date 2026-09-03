@@ -209,7 +209,6 @@ impl SqliteMeta {
     /// node must not re-ship records or inherit our node id / ino
     /// counter).
     pub fn snapshot(&self) -> Result<Vec<u8>, MetaError> {
-        let conn = self.raw();
         // Unique per call: a daemon checkpoints per partition, so two
         // snapshots can be in flight at once. Sharing one scratch path
         // let them delete each other's file mid-VACUUM.
@@ -220,10 +219,36 @@ impl SqliteMeta {
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&tmp);
-        conn.execute("VACUUM INTO ?1", params![tmp.to_string_lossy()])?;
-        drop(conn);
+
+        // `VACUUM INTO` copies the whole database, which costs milliseconds
+        // per MiB and so grows with the namespace. Holding the store's
+        // connection across it stalls every metadata op — measured at 23ms
+        // for a single getattr on a 30k-file DB. A file-backed store copies
+        // through its own connection instead: WAL gives that reader a
+        // consistent view while writers keep going.
+        match self.db_path() {
+            Some(path) => {
+                let reader = Connection::open_with_flags(
+                    path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                reader.busy_timeout(std::time::Duration::from_secs(30))?;
+                reader.execute("VACUUM INTO ?1", params![tmp.to_string_lossy()])?;
+            }
+            None => {
+                let conn = self.raw();
+                conn.execute("VACUUM INTO ?1", params![tmp.to_string_lossy()])?;
+            }
+        }
+
         {
             let c = Connection::open(&tmp)?;
+            // Rollback journaling keeps these deletes in the main file, so
+            // the bytes read below are complete. Under WAL they would sit in
+            // a `-wal` sidecar that the payload does not carry.
+            c.pragma_update(None, "journal_mode", "DELETE")?;
             c.execute("DELETE FROM journal", [])?;
             // Reset AUTOINCREMENT so the restored node journals from 1.
             let _ = c.execute("DELETE FROM sqlite_sequence WHERE name = 'journal'", []);
@@ -232,7 +257,10 @@ impl SqliteMeta {
                  OR key LIKE 'applied_seq/%' OR key LIKE 'part_of/%'",
                 [],
             )?;
-            c.execute("VACUUM", [])?;
+            // No second VACUUM: `VACUUM INTO` already wrote a compact file,
+            // and reclaiming the pages those deletes freed would rewrite the
+            // whole database again for a payload the log store compresses
+            // anyway. The free pages are reused when the copy is restored.
         }
         let bytes = std::fs::read(&tmp).map_err(|e| MetaError::Invalid(e.to_string()))?;
         let _ = std::fs::remove_file(&tmp);

@@ -31,6 +31,48 @@ use std::time::Instant;
 
 /// Checkpoint after this many shipped segments (across all partitions).
 const CHECKPOINT_EVERY: u64 = 32;
+/// Floor on the gap between checkpoints; disabled by default.
+///
+/// A checkpoint copies the whole metadata DB, so it costs roughly 2ms per
+/// MiB and grows with the namespace: the segment counter alone fires it
+/// every ~100ms under a small-file rsync, and at 50k files that is ~180
+/// checkpoints and 120MB written where 1 checkpoint and 38MB would do.
+///
+/// Spacing them out is nonetheless **not** a free win, which is why the
+/// default is 0. Measured on a 50k-file mount, a 60s floor cut write
+/// amplification 3x and lifted 8-writer throughput ~8%, but made
+/// single-threaded small-file work 1.5x slower (465-501us per file to
+/// 764-786us). Frequent checkpointing was accidentally throttling the
+/// shipper; without it the shipper's other background work contends for
+/// the metadata connection that FUSE handlers also need. Until that
+/// contention is addressed, a floor trades latency for I/O rather than
+/// buying both, so it is opt-in.
+const CHECKPOINT_MIN_INTERVAL_S: u64 = 0;
+
+fn checkpoint_min_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("CONSTELLATION_CHECKPOINT_MIN_INTERVAL_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(CHECKPOINT_MIN_INTERVAL_S),
+    )
+}
+
+/// The segment count is the trigger; `min_interval` only ever delays it.
+/// A zero interval (the default) leaves the count in sole charge.
+fn checkpoint_is_due(
+    shipped_since_ckpt: u64,
+    since_last_ckpt: Option<std::time::Duration>,
+    min_interval: std::time::Duration,
+) -> bool {
+    if shipped_since_ckpt < CHECKPOINT_EVERY {
+        return false;
+    }
+    match since_last_ckpt {
+        None => true,
+        Some(elapsed) => elapsed >= min_interval,
+    }
+}
 /// Max journal records per segment.
 const SEGMENT_BATCH: usize = 10_000;
 
@@ -101,6 +143,9 @@ pub struct Shipper {
     /// Per-partition stream state (next_seq, max_epoch, log handle).
     parts: HashMap<String, PartState>,
     shipped_since_ckpt: u64,
+    /// When the last checkpoint finished; `None` until the first one.
+    /// Enforces `checkpoint_min_interval` against the segment counter.
+    last_ckpt_at: Option<Instant>,
     /// Continuation epoch: journal locally, do not CAS-create segments.
     skip_ship: Arc<std::sync::atomic::AtomicBool>,
     /// Live spool observability shared with the control API.
@@ -212,6 +257,7 @@ impl Shipper {
             lease_mode,
             parts,
             shipped_since_ckpt: 0,
+            last_ckpt_at: None,
             skip_ship: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             spool: Arc::new(std::sync::Mutex::new(SpoolInfo {
                 head_seq: head,
@@ -591,7 +637,7 @@ impl Shipper {
             spool.last_error = None;
         }
         self.shipped_since_ckpt += 1;
-        if self.shipped_since_ckpt >= CHECKPOINT_EVERY {
+        if self.checkpoint_is_due() {
             self.checkpoint().await?;
         }
         Ok(true)
@@ -807,6 +853,16 @@ impl Shipper {
         Ok(())
     }
 
+    /// Enough segments shipped *and* enough time elapsed. Shutdown and
+    /// explicit sync paths bypass this and checkpoint unconditionally.
+    fn checkpoint_is_due(&self) -> bool {
+        checkpoint_is_due(
+            self.shipped_since_ckpt,
+            self.last_ckpt_at.map(|at| at.elapsed()),
+            checkpoint_min_interval(),
+        )
+    }
+
     /// Snapshot the local DB as a checkpoint covering every partition
     /// this replica has seen, plus a VECTOR.json sidecar.
     pub async fn checkpoint(&mut self) -> Result<()> {
@@ -820,15 +876,24 @@ impl Shipper {
         if covered == 0 {
             return Ok(());
         }
-        let snap = self.meta.snapshot()?;
+        // Copying the DB takes tens of milliseconds on a large namespace, so
+        // it does not belong on a runtime worker.
+        let meta = Arc::clone(&self.meta);
+        let started = Instant::now();
+        let snap = tokio::task::spawn_blocking(move || meta.snapshot())
+            .await
+            .context("checkpoint snapshot task")??;
+        let snapshot_ms = started.elapsed().as_millis();
         self.log
             .put_checkpoint_with_vector(covered, &snap, &vector)
             .await?;
         self.shipped_since_ckpt = 0;
+        self.last_ckpt_at = Some(Instant::now());
         tracing::info!(
             seq = covered,
             bytes = snap.len(),
             parts = vector.applied.len(),
+            snapshot_ms,
             "wrote metadata checkpoint"
         );
         Ok(())
@@ -1156,6 +1221,7 @@ pub async fn bootstrap(db_path: &std::path::Path, log: &LogStore) -> Result<()> 
 mod tests {
     use super::*;
     use crate::lease::LeaseKeeper;
+    use std::time::Duration;
     use constellation_meta::MetaStore;
     use constellation_store_s3::{LeaseMode, LeaseStore, LogStore};
     use object_store::memory::InMemory;
@@ -1166,6 +1232,48 @@ mod tests {
         meta: Arc<SqliteMeta>,
         ship: Shipper,
         lease: LeaseKeeper,
+    }
+
+    /// Checkpointing every 32 shipped segments fires roughly every 100ms
+    /// under small-file writes, and each one copies the whole metadata DB.
+    /// The interval floor exists to space that out, but it costs
+    /// single-threaded latency (see `CHECKPOINT_MIN_INTERVAL_S`), so the
+    /// default must leave the segment count in sole charge.
+    #[test]
+    fn checkpoint_trigger_is_segment_count_until_a_floor_is_set() {
+        let none = Duration::from_secs(CHECKPOINT_MIN_INTERVAL_S);
+        assert_eq!(none, Duration::ZERO, "the floor must default to off");
+
+        // Below the segment count, nothing triggers a checkpoint.
+        assert!(!checkpoint_is_due(CHECKPOINT_EVERY - 1, None, none));
+        assert!(!checkpoint_is_due(
+            CHECKPOINT_EVERY - 1,
+            Some(Duration::from_secs(3600)),
+            none
+        ));
+
+        // At the count, the default fires regardless of recency.
+        assert!(checkpoint_is_due(CHECKPOINT_EVERY, None, none));
+        assert!(checkpoint_is_due(
+            CHECKPOINT_EVERY,
+            Some(Duration::ZERO),
+            none
+        ));
+
+        // A configured floor delays it, and only until the gap is met.
+        let floor = Duration::from_secs(60);
+        assert!(!checkpoint_is_due(
+            CHECKPOINT_EVERY,
+            Some(Duration::from_secs(59)),
+            floor
+        ));
+        assert!(checkpoint_is_due(
+            CHECKPOINT_EVERY,
+            Some(Duration::from_secs(60)),
+            floor
+        ));
+        // The first checkpoint of a mount has no gap to wait out.
+        assert!(checkpoint_is_due(CHECKPOINT_EVERY, None, floor));
     }
 
     fn node(store: &StdArc<InMemory>, id: u64) -> Node {

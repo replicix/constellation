@@ -131,6 +131,11 @@ pub type EpochRow = (
 /// SQLite-backed [`MetaStore`].
 pub struct SqliteMeta {
     conn: Mutex<Connection>,
+    /// Set for file-backed stores. A checkpoint snapshot reads through its
+    /// own connection to this path so it does not hold `conn` — under WAL
+    /// that reader is consistent and concurrent with writers. An in-memory
+    /// store has no second handle, so it snapshots under the lock.
+    path: Option<std::path::PathBuf>,
 }
 
 impl SqliteMeta {
@@ -363,16 +368,22 @@ impl SqliteMeta {
 
     /// Open (or create) a metadata DB. Creates the root inode on first use.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MetaError> {
-        let conn = Connection::open(path)?;
-        Self::init(conn)
+        let path = path.as_ref().to_path_buf();
+        let conn = Connection::open(&path)?;
+        Self::init(conn, Some(path))
     }
 
     /// In-memory store (tests).
     pub fn open_in_memory() -> Result<Self, MetaError> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(mut conn: Connection) -> Result<Self, MetaError> {
+    /// The backing file, if this store is not in-memory.
+    pub(crate) fn db_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    fn init(mut conn: Connection, path: Option<std::path::PathBuf>) -> Result<Self, MetaError> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -413,6 +424,7 @@ impl SqliteMeta {
         Self::backfill_chunk_ref_once(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            path,
         })
     }
 
