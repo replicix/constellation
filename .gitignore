@@ -3,3 +3,5 @@
 /bench/.cargo-home
 mount.sh
 umount.sh
+TODO.md
+local.mk

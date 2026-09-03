@@ -11,11 +11,12 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 CARGO ?= cargo
-TARGET_DIR ?= target
+TARGET_DIR ?= $(or $(CARGO_TARGET_DIR),target)
 RELEASE_BIN := $(TARGET_DIR)/release/constellation
 RELEASE_HARNESS := $(TARGET_DIR)/release/harness
 DEBUG_BIN := $(TARGET_DIR)/debug/constellation
 DEBUG_HARNESS := $(TARGET_DIR)/debug/harness
+UPLOADBENCH := $(TARGET_DIR)/release/uploadbench
 
 export CONSTELLATION_BIN ?= $(abspath $(RELEASE_BIN))
 export RUSTFLAGS ?=
@@ -26,10 +27,19 @@ COMPOSE_SUITES ?=
 HARNESS_SCENARIOS ?=
 HARNESS_SEED ?= 42
 BENCH_FILES ?= 20000
+UPLOADBENCH_LIVE_CONTROLLERS ?= aimd,pid
+UPLOADBENCH_LIVE_DURATION ?= 60
+UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
+
+# Local, machine-specific overrides (S3 buckets, etc) — gitignored, see
+# local.mk.example. Silently absent is fine; BUCKET stays unset and
+# `make uploadbench-live` will just fail with a clear "no BUCKET" error.
+-include local.mk
 
 .PHONY: help build build-release build-debug test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration compose compose-down harness harness-docker \
-	harness-list bench xfstests perf-gate dist-linux dist-macos deps FORCE
+	harness-list bench xfstests perf-gate dist-linux dist-macos deps FORCE \
+	uploadbench-build uploadbench-sim uploadbench-live
 
 .DEFAULT_GOAL := help
 
@@ -42,6 +52,10 @@ help: ## Show this help
 	@echo "  HARNESS_SCENARIOS=\"..\" scenario names (default: all)"
 	@echo "  HARNESS_SEED=$(HARNESS_SEED)         harness workload seed"
 	@echo "  BENCH_FILES=$(BENCH_FILES)       files for harness bench"
+	@echo "  BUCKET=<local.mk>       s3://bucket/prefix for uploadbench-live (see local.mk.example)"
+	@echo "  UPLOADBENCH_LIVE_CONTROLLERS=$(UPLOADBENCH_LIVE_CONTROLLERS)"
+	@echo "  UPLOADBENCH_LIVE_DURATION=$(UPLOADBENCH_LIVE_DURATION) seconds per controller"
+	@echo "  UPLOADBENCH_INITIAL_CONCURRENCY=$(UPLOADBENCH_INITIAL_CONCURRENCY)"
 
 build: build-release ## Build constellation + harness (release)
 
@@ -124,6 +138,24 @@ bench: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Census-scale import benchmark (needs
 
 perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Check benchmark rates against baseline
 	tests/perf-gate.sh
+
+uploadbench-build: ## Build the adaptive-upload-concurrency benchmark
+	$(CARGO) build -p uploadbench --release
+
+uploadbench-sim: uploadbench-build ## Compare concurrency controllers against a deterministic simulated network (no AWS needed)
+	$(UPLOADBENCH) sim --controllers fixed,aimd,pid \
+		--duration-secs 90 --fault-start-secs 30 --fault-duration-secs 15 --fault-error-rate 0.7 \
+		--csv /tmp/uploadbench-sim.csv
+
+uploadbench-live: uploadbench-build ## Compare concurrency controllers against a real S3 bucket (needs BUCKET in local.mk + AWS creds)
+	@if [ -z "$(BUCKET)" ]; then \
+		echo "BUCKET is not set. Copy local.mk.example to local.mk and set BUCKET, or pass BUCKET=s3://... on the command line." >&2; \
+		exit 1; \
+	fi
+	@BUCKET="$(BUCKET)" $(UPLOADBENCH) live --controllers "$(UPLOADBENCH_LIVE_CONTROLLERS)" \
+		--duration-secs "$(UPLOADBENCH_LIVE_DURATION)" \
+		--initial-concurrency "$(UPLOADBENCH_INITIAL_CONCURRENCY)" \
+		--csv /tmp/uploadbench-live.csv
 
 xfstests: ## Run generic xfstests lane in Docker
 	docker compose --profile test build xfstests

@@ -1,0 +1,9 @@
+[package]
+name = "constellation-upload-concurrency"
+description = "Adaptive concurrency policy and gate for chunk uploads (extracted so bench/uploadbench can exercise the real algorithm)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true

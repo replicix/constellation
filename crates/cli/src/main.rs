@@ -2085,8 +2085,37 @@ async fn run_sync_round(
 /// here already makes every caller treat the round as failed and skip
 /// shipping (see `run_managed_sync_round`'s existing epoch-propose-on-
 /// failure path), which is exactly the "journal must wait" behavior.
+use constellation_upload_concurrency::{AdaptiveConcurrency, ConcurrencyGate, ConcurrencyPermit};
+
+/// Ceiling for the adaptive search and for a user-pinned override alike.
+/// Bounds both real S3 concurrency and (via [`ConcurrencyGate`]) worst-case
+/// pending-upload memory: at most this many chunk buffers are ever held
+/// at once regardless of how many rows `pending_upload` has queued.
+const UPLOAD_CONCURRENCY_HARD_MAX: usize = 128;
+
+/// See DESIGN.md §5b step 2 / `docs/plans/05b-p5b-streaming-writeback.md`.
+/// A durable pending-upload queue in SQLite is drained by a bounded pool;
+/// the pool costs two things once it exists (dedup-probe RTT and the
+/// create-vs-overwrite decision), both handled by `put_mode` below.
+///
+/// Concurrency itself is adaptive by default
+/// (`constellation_upload_concurrency::AdaptiveConcurrency`): a single
+/// upload's latency is dominated by RTT to the bucket region, so a
+/// client far from the bucket but sitting on a fat pipe (e.g. a home
+/// connection in the EU against a `us-west-2` bucket) needs a lot more
+/// parallelism than one on a thin or nearby link to fill that
+/// bandwidth-delay product, and a fixed pool size tuned for one path is
+/// wrong for the other. `CONSTELLATION_UPLOAD_CONCURRENCY` still pins a
+/// fixed value for anyone who wants to opt out of the search entirely.
+///
+/// The policy and gate live in their own crate
+/// (`crates/upload-concurrency`) so `bench/uploadbench` can drive the
+/// exact production algorithm against a synthetic or live S3 target,
+/// rather than a reimplementation that could drift from what ships here.
 struct UploadRuntime {
-    concurrency: usize,
+    gate: ConcurrencyGate,
+    controller: Option<std::sync::Mutex<AdaptiveConcurrency>>,
+    max_concurrency: usize,
     create_if_absent: bool,
     probe: std::sync::Mutex<writeback::ProbePolicy>,
     decisions: std::sync::atomic::AtomicU64,
@@ -2100,18 +2129,91 @@ impl UploadRuntime {
         coop: Option<std::sync::Arc<crate::coop::Coop>>,
         existence: std::sync::Arc<crate::existence::Existence>,
     ) -> Self {
-        let concurrency = std::env::var("CONSTELLATION_UPLOAD_CONCURRENCY")
+        let max = std::env::var("CONSTELLATION_UPLOAD_MAX_CONCURRENCY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(8)
-            .clamp(1, 32);
+            .unwrap_or(UPLOAD_CONCURRENCY_HARD_MAX)
+            .clamp(1, UPLOAD_CONCURRENCY_HARD_MAX);
+        let fixed = std::env::var("CONSTELLATION_UPLOAD_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|n| n.clamp(1, max));
+        let (initial, controller) = match fixed {
+            Some(n) => (n, None),
+            // Start conservatively (like TCP slow start) and let the
+            // controller climb; an aggressive initial guess on a
+            // constrained link just causes early retries/backoff.
+            None => (
+                4.min(max),
+                Some(std::sync::Mutex::new(AdaptiveConcurrency::new(
+                    4.min(max),
+                    1,
+                    max,
+                ))),
+            ),
+        };
+        debug_assert!(
+            controller
+                .as_ref()
+                .is_none_or(|c| c.lock().unwrap().current() == initial),
+            "gate and controller must start in agreement"
+        );
         Self {
-            concurrency,
+            gate: ConcurrencyGate::new(initial),
+            controller,
+            max_concurrency: max,
             create_if_absent,
             probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
             decisions: std::sync::atomic::AtomicU64::new(0),
             coop,
             existence,
+        }
+    }
+
+    /// Hard ceiling on real concurrency and thus on worst-case pending-
+    /// upload memory: at most this many chunk buffers are held at once,
+    /// however many rows `pending_upload` has queued.
+    fn max_concurrency(&self) -> usize {
+        self.max_concurrency
+    }
+
+    async fn permit(&self) -> ConcurrencyPermit<'_> {
+        self.gate.acquire().await
+    }
+
+    fn record_success(&self, bytes: u64, latency: std::time::Duration, now: std::time::Instant) {
+        let Some(controller) = &self.controller else {
+            return;
+        };
+        let new_target = controller.lock().unwrap().on_success(now, bytes, latency);
+        if new_target != self.gate.target() {
+            tracing::debug!(
+                concurrency = new_target,
+                previous = self.gate.target(),
+                "adaptive upload concurrency adjusted"
+            );
+            self.gate.set_target(new_target);
+        }
+    }
+
+    fn record_error(&self, now: std::time::Instant) {
+        let Some(controller) = &self.controller else {
+            return;
+        };
+        let new_target = controller.lock().unwrap().on_error(now);
+        let previous = self.gate.target();
+        if new_target != previous {
+            tracing::debug!(
+                concurrency = new_target,
+                previous,
+                "upload failed; backing off adaptive concurrency"
+            );
+            self.gate.set_target(new_target);
+        } else {
+            tracing::debug!(
+                concurrency = new_target,
+                "upload failure coalesced with current congestion episode"
+            );
         }
     }
 
@@ -2156,6 +2258,22 @@ impl UploadRuntime {
             crate::existence::Existence::new(1024, false, false),
         )
     }
+
+    /// Test helper: pin a fixed concurrency (no adaptive controller),
+    /// bypassing environment variables so tests are hermetic.
+    #[cfg(test)]
+    fn for_test_fixed(create_if_absent: bool, concurrency: usize) -> Self {
+        Self {
+            gate: ConcurrencyGate::new(concurrency),
+            controller: None,
+            max_concurrency: concurrency.max(1),
+            create_if_absent,
+            probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
+            decisions: std::sync::atomic::AtomicU64::new(0),
+            coop: None,
+            existence: crate::existence::Existence::new(1024, false, false),
+        }
+    }
 }
 
 async fn upload_dirty_chunks(
@@ -2166,7 +2284,8 @@ async fn upload_dirty_chunks(
     upload: &UploadRuntime,
     only_ino: Option<constellation_fs_core::Ino>,
 ) -> Result<()> {
-    use futures::{stream, StreamExt};
+    use futures::stream::FuturesUnordered;
+    use futures::StreamExt;
     let mut grouped: std::collections::HashMap<
         constellation_fs_core::ChunkHash,
         Vec<constellation_fs_core::Ino>,
@@ -2177,9 +2296,26 @@ async fn upload_dirty_chunks(
         }
         grouped.entry(hash).or_default().push(ino);
     }
-    let jobs = grouped
+    let total = grouped.len() as u64;
+    if total > 0 {
+        tracing::info!(
+            pending_chunks = total,
+            concurrency = upload.gate.target(),
+            max_concurrency = upload.max_concurrency(),
+            "uploading pending chunks"
+        );
+    }
+    // Each queued future only holds a hash and its owning inos until it
+    // wins a permit from `upload`'s concurrency gate; the chunk's bytes
+    // are not read from the local cache until then. Memory use is thus
+    // bounded by `upload.max_concurrency()` in-flight chunk buffers, not
+    // by the size of the whole pending-upload backlog (which can be
+    // tens of thousands of rows after an unclean shutdown or a big
+    // write-back burst).
+    let mut in_flight: FuturesUnordered<_> = grouped
         .into_iter()
-        .map(|(hash, inos)| {
+        .map(|(hash, inos)| async move {
+            let _permit = upload.permit().await;
             let Some(data) = cache.get(&hash)? else {
                 tracing::error!(
                     %hash,
@@ -2189,36 +2325,37 @@ async fn upload_dirty_chunks(
                 );
                 bail!("pending upload chunk {hash} missing from local cache");
             };
-            Ok((hash, inos, data))
+            let bytes = data.len() as u64;
+            let mode = upload.put_mode(&hash);
+            let mut last = None;
+            let started = std::time::Instant::now();
+            for attempt in 0..3 {
+                match store.put_chunk_mode(&hash, &data, compression, mode).await {
+                    Ok(result) => {
+                        let now = std::time::Instant::now();
+                        // A Probe hit only performed HEAD; counting the
+                        // chunk's logical bytes as uploaded would report
+                        // impossible goodput and drive concurrency upward
+                        // during deduplicated workloads.
+                        if !result.existed {
+                            upload.record_success(bytes, now.duration_since(started), now);
+                        }
+                        return Ok((hash, inos, mode, result.existed));
+                    }
+                    Err(error) => last = Some(error),
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            upload.record_error(std::time::Instant::now());
+            Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
         })
-        .collect::<Result<Vec<_>>>()?;
-    let total = jobs.len() as u64;
-    if total > 0 {
-        tracing::info!(
-            pending_chunks = total,
-            concurrency = upload.concurrency,
-            "uploading pending chunks"
-        );
-    }
-    let mut stream = stream::iter(jobs.into_iter().map(|(hash, inos, data)| async move {
-        let mode = upload.put_mode(&hash);
-        let mut last = None;
-        for attempt in 0..3 {
-            match store.put_chunk_mode(&hash, &data, compression, mode).await {
-                Ok(result) => return Ok((hash, inos, mode, result.existed)),
-                Err(error) => last = Some(error),
-            }
-            if attempt < 2 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-        Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
-    }))
-    .buffer_unordered(upload.concurrency);
+        .collect();
     let mut first_error = None;
     let mut completed = 0u64;
     let mut last_progress = std::time::Instant::now();
-    while let Some(result) = stream.next().await {
+    while let Some(result) = in_flight.next().await {
         match result {
             Ok((hash, inos, mode, existed)) => {
                 upload.existence.insert(&hash);
@@ -2240,10 +2377,14 @@ async fn upload_dirty_chunks(
         }
         completed += 1;
         if total > 0
-            && (completed == total
-                || last_progress.elapsed() >= std::time::Duration::from_secs(5))
+            && (completed == total || last_progress.elapsed() >= std::time::Duration::from_secs(5))
         {
-            tracing::info!(completed, total, "pending chunk upload progress");
+            tracing::info!(
+                completed,
+                total,
+                concurrency = upload.gate.target(),
+                "pending chunk upload progress"
+            );
             last_progress = std::time::Instant::now();
         }
     }
@@ -2594,7 +2735,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                         .dirty_bytes()
                         .saturating_add(self.staging_budget.used()),
                     pending_uploads: self.meta.pending_upload_count().unwrap_or(0),
-                    upload_concurrency: self.upload.concurrency as u32,
+                    upload_concurrency: self.upload.gate.target() as u32,
                     remote_probe_enabled: probe.enabled(),
                     remote_probe_hit_rate: probe.hit_rate(),
                     existence_listed: existence.listed,
@@ -3041,9 +3182,15 @@ mod parse_byte_size_tests {
 
     #[test]
     fn bare_web_ui_defaults_to_8080() {
-        let cli =
-            Cli::try_parse_from(["constellation", "mount", "--s3", "file:///tmp/x", "/mnt", "--web-ui"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "constellation",
+            "mount",
+            "--s3",
+            "file:///tmp/x",
+            "/mnt",
+            "--web-ui",
+        ])
+        .unwrap();
         match cli.command {
             Command::Mount { web_ui, .. } => assert_eq!(web_ui, 8080),
             _ => panic!("expected Mount"),
@@ -3087,7 +3234,7 @@ mod pending_upload_tests {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     /// Wraps an in-memory backend and can be told to fail every `put`,
@@ -3362,14 +3509,7 @@ mod pending_upload_tests {
                 .set_manifest_dirty(file.ino, b"M", data.len() as u64, &[hash])
                 .unwrap();
         }
-        let upload = UploadRuntime {
-            concurrency: 3,
-            create_if_absent: true,
-            probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
-            decisions: AtomicU64::new(0),
-            coop: None,
-            existence: crate::existence::Existence::new(1024, false, false),
-        };
+        let upload = UploadRuntime::for_test_fixed(true, 3);
         rt().block_on(upload_dirty_chunks(
             &f.cache,
             &f.meta,

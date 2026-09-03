@@ -8,6 +8,23 @@ members = [
     "crates/net",
     "crates/api",
     "crates/harness",
+    "crates/upload-concurrency",
+    "bench/uploadbench",
+]
+# Bare `cargo build`/`cargo test` at the root only touch the product
+# crates, matching the pre-bench-tool build set; `bench/uploadbench` is
+# still a full member (shares the lockfile, reuses the real
+# `constellation-upload-concurrency` crate) but only builds when asked
+# for explicitly (`-p uploadbench`, `--workspace`, or `cd` + `cargo run`).
+default-members = [
+    "crates/cli",
+    "crates/fs-core",
+    "crates/meta",
+    "crates/store-s3",
+    "crates/net",
+    "crates/api",
+    "crates/harness",
+    "crates/upload-concurrency",
 ]
 exclude = ["bench/dbbench"]
 
@@ -23,6 +40,7 @@ constellation-meta = { path = "crates/meta" }
 constellation-store-s3 = { path = "crates/store-s3" }
 constellation-net = { path = "crates/net" }
 constellation-api = { path = "crates/api" }
+constellation-upload-concurrency = { path = "crates/upload-concurrency" }
 
 anyhow = "1"
 thiserror = "2"

@@ -1,0 +1,11 @@
+# Local, machine-specific settings for `make` targets that need
+# environment- or account-specific values (S3 buckets, etc).
+#
+# Copy this file to `local.mk` (gitignored — see .gitignore) and fill in
+# real values. The Makefile does `-include local.mk`, so it is picked up
+# automatically and silently skipped if absent.
+
+# s3://bucket/prefix used by `make uploadbench-live`. Needs AWS
+# credentials in the environment first, e.g.:
+#   eval "$(aws configure export-credentials --format env)"
+BUCKET ?= s3://your-bucket/your-prefix

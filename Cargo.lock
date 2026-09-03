@@ -589,6 +589,7 @@ dependencies = [
  "constellation-meta",
  "constellation-net",
  "constellation-store-s3",
+ "constellation-upload-concurrency",
  "fuser",
  "futures",
  "libc",
@@ -702,6 +703,13 @@ dependencies = [
  "uuid",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "constellation-upload-concurrency"
+version = "0.0.1"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -2982,6 +2990,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pid"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c931ef9756cd5e3fa3d395bfe09df4dfa6f0612c6ca8f6b12927d17ca34e36"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4415,6 +4432,23 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "uploadbench"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "constellation-upload-concurrency",
+ "futures",
+ "object_store",
+ "pid",
+ "rand 0.9.5",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "ureq"
