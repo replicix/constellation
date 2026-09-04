@@ -43,6 +43,38 @@ pub struct Peer {
     /// Last successful round trip, for status output.
     pub rtt_ms: Option<u64>,
     pub connected: bool,
+    /// When we last observed this peer live (gossip neighbor or RPC).
+    pub last_seen: Option<Instant>,
+    pub hostname: String,
+    pub created_unix: i64,
+    pub p2p_updated_unix: Option<i64>,
+    pub ro: bool,
+}
+
+/// Registry row used to (re)build the peer directory.
+#[derive(Debug, Clone)]
+pub struct PeerEnrollment {
+    pub node_id: u64,
+    pub pubkey_hex: String,
+    pub addr_json: serde_json::Value,
+    pub hostname: String,
+    pub created_unix: i64,
+    pub p2p_updated_unix: Option<i64>,
+    pub ro: bool,
+}
+
+impl From<(u64, String, serde_json::Value)> for PeerEnrollment {
+    fn from((node_id, pubkey_hex, addr_json): (u64, String, serde_json::Value)) -> Self {
+        Self {
+            node_id,
+            pubkey_hex,
+            addr_json,
+            hostname: String::new(),
+            created_unix: 0,
+            p2p_updated_unix: None,
+            ro: false,
+        }
+    }
 }
 
 /// Handle the daemon holds. Cloneable and cheap.
@@ -106,33 +138,39 @@ impl Peers {
     }
 
     /// Refresh the peer directory and the accept-time allowlist from the
-    /// registry. `records` is `(node_id, pubkey_hex, addr_json)`.
-    pub fn refresh_registry(&self, records: Vec<(u64, String, serde_json::Value)>) {
+    /// registry. Each record is a [`PeerEnrollment`].
+    pub fn refresh_registry(&self, records: impl IntoIterator<Item = impl Into<PeerEnrollment>>) {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
+        let records: Vec<PeerEnrollment> = records.into_iter().map(Into::into).collect();
         let mut allowed = Vec::with_capacity(records.len());
         let mut peers = HashMap::new();
-        for (node_id, pubkey_hex, addr_json) in records {
-            allowed.push(pubkey_hex.clone());
-            if node_id == inner.node_id {
+        for rec in records {
+            allowed.push(rec.pubkey_hex.clone());
+            if rec.node_id == inner.node_id {
                 continue; // never dial ourselves
             }
             // An unparseable address just means we cannot dial that peer
             // yet; it stays on the allowlist so it may still dial us.
-            if let Ok(addr) = serde_json::from_value::<EndpointAddr>(addr_json) {
+            if let Ok(addr) = serde_json::from_value::<EndpointAddr>(rec.addr_json) {
                 // Feed the address to iroh so gossip, which bootstraps
                 // from bare endpoint ids, can dial this peer at all.
                 inner.p2p.learn_addr(addr.clone());
-                let prev = inner.peers.lock().unwrap().get(&node_id).cloned();
+                let prev = inner.peers.lock().unwrap().get(&rec.node_id).cloned();
                 peers.insert(
-                    node_id,
+                    rec.node_id,
                     Peer {
-                        node_id,
-                        pubkey_hex,
+                        node_id: rec.node_id,
+                        pubkey_hex: rec.pubkey_hex,
                         addr,
                         rtt_ms: prev.as_ref().and_then(|p| p.rtt_ms),
-                        connected: prev.map(|p| p.connected).unwrap_or(false),
+                        connected: prev.as_ref().map(|p| p.connected).unwrap_or(false),
+                        last_seen: prev.and_then(|p| p.last_seen),
+                        hostname: rec.hostname,
+                        created_unix: rec.created_unix,
+                        p2p_updated_unix: rec.p2p_updated_unix,
+                        ro: rec.ro,
                     },
                 );
             }
@@ -295,8 +333,41 @@ impl Peers {
             p.connected = ok;
             if ok {
                 p.rtt_ms = Some(took.as_millis() as u64);
+                p.last_seen = Some(Instant::now());
             }
         }
+    }
+
+    /// Reflect gossip membership in the peer directory so status/UI do
+    /// not wait for an opportunistic lease/chunk RPC to flip `connected`.
+    fn mark_neighbor(&self, endpoint: iroh::EndpointId, up: bool) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        let mut map = inner.peers.lock().unwrap();
+        if let Some(p) = map.values_mut().find(|p| p.addr.id == endpoint) {
+            p.connected = up;
+            if up {
+                p.last_seen = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Ping every known peer in parallel so the UI gets fresh RTT and
+    /// connected flags even when nothing else is talking over P2P.
+    pub async fn probe_all(&self) {
+        let ids: Vec<u64> = self.snapshot().into_iter().map(|p| p.node_id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for id in ids {
+            let this = self.clone();
+            set.spawn(async move {
+                let _ = this.ping_node(id).await;
+            });
+        }
+        while set.join_next().await.is_some() {}
     }
 
     /// Send an arbitrary payload directly to a known peer address and
@@ -459,11 +530,36 @@ pub async fn run_gossip<S: PeerService>(
     let Some(inner) = peers.inner.clone() else {
         return;
     };
-    tracing::debug!("gossip receive loop started");
+    tracing::info!("gossip receive loop started");
     while let Some(event) = rx.next().await {
-        let Ok(event) = event else { continue };
-        let iroh_gossip::api::Event::Received(msg) = event else {
-            continue; // neighbor up/down: status only
+        let Ok(event) = event else {
+            tracing::warn!("gossip event stream error; continuing");
+            continue;
+        };
+        let msg = match event {
+            iroh_gossip::api::Event::NeighborUp(endpoint) => {
+                let (node_id, peer) = gossip_peer_label(&peers, endpoint);
+                tracing::info!(%endpoint, ?node_id, %peer, "gossip neighbor joined");
+                peers.mark_neighbor(endpoint, true);
+                if let Some(id) = node_id {
+                    let peers = peers.clone();
+                    tokio::spawn(async move {
+                        let _ = peers.ping_node(id).await;
+                    });
+                }
+                continue;
+            }
+            iroh_gossip::api::Event::NeighborDown(endpoint) => {
+                let (node_id, peer) = gossip_peer_label(&peers, endpoint);
+                tracing::info!(%endpoint, ?node_id, %peer, "gossip neighbor left or lost");
+                peers.mark_neighbor(endpoint, false);
+                continue;
+            }
+            iroh_gossip::api::Event::Lagged => {
+                tracing::warn!("gossip receiver lagged; some messages were missed");
+                continue;
+            }
+            iroh_gossip::api::Event::Received(msg) => msg,
         };
         // Gossip carries whole messages, so the length prefix used for
         // stream framing is not present here — decode the payload
@@ -538,6 +634,20 @@ pub async fn run_gossip<S: PeerService>(
             _ => {}
         }
     }
+    tracing::info!("gossip receive loop ended");
+}
+
+/// Resolve a gossip endpoint to `(node_id, short pubkey hex)` when the
+/// registry has already enrolled it; otherwise `node_id` is `None`.
+fn gossip_peer_label(peers: &Peers, endpoint: iroh::EndpointId) -> (Option<u64>, String) {
+    let hex = crate::identity::hex32(endpoint.as_bytes());
+    let short = hex.get(..12).unwrap_or(hex.as_str()).to_string();
+    let node_id = peers
+        .snapshot()
+        .into_iter()
+        .find(|p| p.addr.id == endpoint)
+        .map(|p| p.node_id);
+    (node_id, short)
 }
 
 /// Serve one inbound connection: enforce the allowlist, then answer

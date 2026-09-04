@@ -1231,6 +1231,7 @@ fn mount(
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     refresh_peers(&peers, store_inner.clone(), Some(&epochs)).await;
+                    peers.probe_all().await;
                     match constellation_store_s3::get_node(store_inner.clone(), node_id).await {
                         Ok(None) => {
                             tracing::error!(
@@ -2059,9 +2060,19 @@ async fn refresh_peers(
     }
     match constellation_store_s3::list_nodes(store).await {
         Ok(nodes) => {
-            let records: Vec<(u64, String, serde_json::Value)> = nodes
+            let records: Vec<constellation_net::PeerEnrollment> = nodes
                 .into_iter()
-                .filter_map(|n| Some((n.node_id, n.pubkey?, n.p2p_addr?)))
+                .filter_map(|n| {
+                    Some(constellation_net::PeerEnrollment {
+                        node_id: n.node_id,
+                        pubkey_hex: n.pubkey?,
+                        addr_json: n.p2p_addr?,
+                        hostname: n.hostname,
+                        created_unix: n.created_unix,
+                        p2p_updated_unix: n.p2p_updated_unix,
+                        ro: n.ro,
+                    })
+                })
                 .collect();
             peers.refresh_registry(records);
         }
@@ -2669,6 +2680,11 @@ async fn adopt_root(
     Ok(())
 }
 
+/// Format dial addresses for status/UI output.
+fn peer_addr_strings(addr: &constellation_net::EndpointAddr) -> Vec<String> {
+    addr.addrs.iter().map(|a| a.to_string()).collect()
+}
+
 /// Live daemon state exposed over the control socket.
 struct DaemonStatus {
     meta: std::sync::Arc<SqliteMeta>,
@@ -2759,6 +2775,9 @@ impl constellation_api::StatusSource for DaemonStatus {
                 .collect();
             (p0, parts)
         };
+        let designations = self.list_designations();
+        let epoch = self.epochs.status();
+        let coop = self.coop.report();
         let p2p = constellation_api::P2pStatus {
             enabled: self.peers.is_enabled(),
             node_addr: self
@@ -2769,11 +2788,34 @@ impl constellation_api::StatusSource for DaemonStatus {
                 .peers
                 .snapshot()
                 .into_iter()
-                .map(|p| constellation_api::PeerStatus {
-                    node_id: p.node_id,
-                    connected: p.connected,
-                    rtt_ms: p.rtt_ms,
-                    last_seen_ms: None,
+                .map(|p| {
+                    let addrs = peer_addr_strings(&p.addr);
+                    let designations: Vec<String> = designations
+                        .iter()
+                        .filter(|d| d.designee == p.node_id)
+                        .map(|d| d.path.clone())
+                        .collect();
+                    let coop = coop
+                        .per_source
+                        .iter()
+                        .find(|s| s.id == format!("peer-{}", p.node_id))
+                        .cloned();
+                    constellation_api::PeerStatus {
+                        node_id: p.node_id,
+                        connected: p.connected,
+                        rtt_ms: p.rtt_ms,
+                        last_seen_ms: p.last_seen.map(|t| t.elapsed().as_millis() as u64),
+                        hostname: (!p.hostname.is_empty()).then_some(p.hostname.clone()),
+                        pubkey: Some(p.pubkey_hex.clone()),
+                        endpoint_id: Some(p.addr.id.to_string()),
+                        addrs,
+                        created_unix: (p.created_unix > 0).then_some(p.created_unix),
+                        p2p_updated_unix: p.p2p_updated_unix,
+                        ro: p.ro,
+                        epoch_member: epoch.members.contains(&p.node_id),
+                        designations,
+                        coop,
+                    }
                 })
                 .collect(),
         };
@@ -2808,12 +2850,12 @@ impl constellation_api::StatusSource for DaemonStatus {
             partitions,
             p2p,
             pins: self.list_pins(),
-            designations: self.list_designations(),
-            epoch: self.epochs.status(),
+            designations,
+            epoch,
             reintegration: self
                 .reintegration
                 .snapshot(self.meta.unmarked_journal_len().unwrap_or(0)),
-            coop: self.coop.report(),
+            coop,
             writeback: {
                 let probe = self.upload.probe.lock().unwrap();
                 let existence = self.upload.existence.report();

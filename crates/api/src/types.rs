@@ -382,8 +382,32 @@ pub struct PeerStatus {
     pub connected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u64>,
+    /// Milliseconds since this peer was last observed live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_id: Option<String>,
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_unix: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_updated_unix: Option<i64>,
+    #[serde(default)]
+    pub ro: bool,
+    /// Whether this peer is a member of the active continuation epoch.
+    #[serde(default)]
+    pub epoch_member: bool,
+    /// Offline designations this peer currently holds (paths).
+    #[serde(default)]
+    pub designations: Vec<String>,
+    /// Cooperative-cache source stats for this peer, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coop: Option<SourceStatus>,
 }
 
 /// One partition as exposed by the control API.

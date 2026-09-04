@@ -12,12 +12,13 @@ h1{margin:0;font-size:20px}h2{margin:0 0 12px;color:#8eb7ff;font-size:16px}pre{w
 table{width:100%;border-collapse:collapse}td,th{padding:6px;text-align:left;border-bottom:1px solid #26304d}
 button,input{background:#182344;color:inherit;border:1px solid #3c4c78;border-radius:5px;padding:7px;margin:2px}
 button{cursor:pointer}.ok{color:#72e6a3}.bad{color:#ff8f9c}.wide{grid-column:1/-1}.muted{color:#8e9abb}
+.clickable{cursor:pointer}section.clickable h2::after{content:" →";color:#8eb7ff;font-weight:400}
 </style>
 </head>
 <body><header><h1>Constellation control plane</h1><span id="health">connecting…</span></header>
 <main>
 <section><h2>Dashboard</h2><div id="dashboard"></div></section>
-<section><h2>Peers</h2><div id="peers"></div></section>
+<section class="clickable" onclick="if(!event.target.closest('a'))location.href='/peers.html'" title="Open peer details"><h2>Peers</h2><div id="peers"></div></section>
 <section><h2>Cache</h2><div id="cache"></div></section>
 <section><h2>Leases / partitions</h2><div id="leases"></div></section>
 <section class="wide"><h2>Files</h2><input id="path" value="/" aria-label="path"><button onclick="browse()">Browse</button><div id="files"></div></section>
@@ -28,15 +29,28 @@ button{cursor:pointer}.ok{color:#72e6a3}.bad{color:#ff8f9c}.wide{grid-column:1/-
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const call=async req=>(await fetch("/api",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(req)})).json();
 const bytes=n=>n<1024?n+" B":n<1048576?(n/1024).toFixed(1)+" KiB":(n/1048576).toFixed(1)+" MiB";
+/** Format a millisecond duration with a unit that matches its scale. */
+function dur(ms,{ago=false}={}){
+ if(ms==null||ms==="")return"—";
+ const n=Number(ms); if(!Number.isFinite(n))return"—";
+ const a=Math.abs(n); let s;
+ if(a<1)s=(a*1000).toFixed(0)+" µs";
+ else if(a<1000)s=(Number.isInteger(a)?a:a.toFixed(0))+" ms";
+ else if(a<60e3)s=(a/1e3).toFixed(a<10e3?2:1)+" s";
+ else if(a<3600e3)s=(a/60e3).toFixed(a<600e3?1:0)+" min";
+ else if(a<86400e3)s=(a/3600e3).toFixed(1)+" h";
+ else s=(a/86400e3).toFixed(1)+" d";
+ return ago?s+" ago":s;
+}
 let refreshing=false;
 async function refresh(){
  if(refreshing)return; refreshing=true;
  try{let r=await(await fetch("/api/status")).json(),s=r.Status||r.status||r; if(r.resp==="status")s=r;
  document.querySelector("#health").innerHTML='<span class="ok">healthy</span> · '+esc(s.fs_uuid);
- dashboard.innerHTML=`node <b>${s.node_id}</b> · uptime ${s.uptime_s}s<br>${esc(s.backend)}<br>head ${s.spool.head_seq} · backlog ${s.spool.journal_backlog}<br>${s.spool.last_ship_error?'<span class="bad">'+esc(s.spool.last_ship_error)+'</span>':'sync healthy'}<br>epoch ${s.epoch.active?esc(s.epoch.epoch_id):"inactive"} · designations ${s.designations.length}`;
- peers.innerHTML=(s.p2p.peers||[]).map(p=>`node ${p.node_id}: ${p.connected?'<span class="ok">connected</span>':'disconnected'} · RTT ${p.rtt_ms??"—"} ms · seen ${p.last_seen_ms??"—"} ms`).join("<br>")||'<span class="muted">no peers</span>';
- cache.innerHTML=`${bytes(s.cache.used_bytes)} / ${bytes(s.cache.budget_bytes)} · ${s.cache.chunks} chunks<br>pinned ${bytes(s.cache.pinned_bytes||0)}<br>peer hits ${s.coop.peer_hits} · S3 ${s.coop.s3_fetches} · hedges ${s.coop.hedges_fired}<br>`+(s.coop.per_source||[]).map(x=>`${esc(x.id)}: ${x.ttfb_ms_ewma.toFixed(1)} ms, ${x.goodput_mbps_ewma.toFixed(1)} Mbps, ${(x.err_rate*100).toFixed(1)}% err`).join("<br>");
- leases.innerHTML=(s.partitions||[]).map(p=>`${esc(p.id)} ${esc(p.root_path)} · holder ${p.lease.holder} · epoch ${p.lease.epoch} · expires ${p.lease.expires_in_ms} ms <button onclick="releasePart('${esc(p.id)}')">Force release</button>`).join("<br>")||"p0 unavailable";
+ dashboard.innerHTML=`node <b>${s.node_id}</b> · uptime ${dur((s.uptime_s||0)*1000)}<br>${esc(s.backend)}<br>head ${s.spool.head_seq} · backlog ${s.spool.journal_backlog}<br>${s.spool.last_ship_error?'<span class="bad">'+esc(s.spool.last_ship_error)+'</span>':'sync healthy'}<br>epoch ${s.epoch.active?esc(s.epoch.epoch_id):"inactive"} · designations ${s.designations.length}`;
+ peers.innerHTML=(s.p2p.peers||[]).map(p=>`<a href="/peers.html#node-${p.node_id}">node ${p.node_id}</a>: ${p.connected?'<span class="ok">connected</span>':'disconnected'} · RTT ${dur(p.rtt_ms)} · seen ${dur(p.last_seen_ms,{ago:true})}${p.hostname?' · '+esc(p.hostname):''}`).join("<br>")||'<span class="muted">no peers</span>';
+ cache.innerHTML=`${bytes(s.cache.used_bytes)} / ${bytes(s.cache.budget_bytes)} · ${s.cache.chunks} chunks<br>pinned ${bytes(s.cache.pinned_bytes||0)}<br>peer hits ${s.coop.peer_hits} · S3 ${s.coop.s3_fetches} · hedges ${s.coop.hedges_fired}<br>`+(s.coop.per_source||[]).map(x=>`${esc(x.id)}: ${dur(x.ttfb_ms_ewma)}, ${x.goodput_mbps_ewma.toFixed(1)} Mbps, ${(x.err_rate*100).toFixed(1)}% err`).join("<br>");
+ leases.innerHTML=(s.partitions||[]).map(p=>`${esc(p.id)} ${esc(p.root_path)} · holder ${p.lease.holder} · epoch ${p.lease.epoch} · expires ${dur(p.lease.expires_in_ms)} <button onclick="releasePart('${esc(p.id)}')">Force release</button>`).join("<br>")||"p0 unavailable";
  }catch(e){health.innerHTML='<span class="bad">disconnected</span>';}
  finally{refreshing=false;}}
 function parentPath(p){const parts=String(p||"/").replace(/\/+$/,"").split("/").filter(Boolean);parts.pop();return"/"+parts.join("/");}

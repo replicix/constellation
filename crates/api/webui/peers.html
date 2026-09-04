@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Constellation · Peers</title>
+<style>
+:root{color-scheme:dark;font:14px system-ui;background:#0b1020;color:#dbe4ff}*{box-sizing:border-box}
+body{margin:0}header{padding:18px 24px;border-bottom:1px solid #26304d;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+main{max-width:1200px;margin:auto;padding:20px;display:grid;gap:16px}
+a{color:#8eb7ff;text-decoration:none}a:hover{text-decoration:underline}
+h1{margin:0;font-size:20px}h2{margin:0 0 12px;color:#8eb7ff;font-size:16px}
+.card{background:#111831;border:1px solid #26304d;border-radius:10px;padding:16px}
+.card.selected{border-color:#8eb7ff;box-shadow:0 0 0 1px #8eb7ff33}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.row{display:grid;grid-template-columns:140px 1fr;gap:8px;padding:4px 0;border-bottom:1px solid #1b243d}
+.row:last-child{border-bottom:0}.k{color:#8e9abb}.v{word-break:break-all}
+button,input{background:#182344;color:inherit;border:1px solid #3c4c78;border-radius:5px;padding:7px;margin:2px;cursor:pointer}
+.ok{color:#72e6a3}.bad{color:#ff8f9c}.muted{color:#8e9abb}pre{white-space:pre-wrap;overflow:auto;margin:0}
+.summary{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #3c4c78;font-size:12px}
+.pill.ok{border-color:#2f6b4d;background:#143226}.pill.bad{border-color:#6b2f3a;background:#32141a}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Peers</h1>
+    <div class="muted">Everything this node knows about the cluster roster</div>
+  </div>
+  <div>
+    <a href="/">← Dashboard</a>
+    · <span id="health">connecting…</span>
+  </div>
+</header>
+<main>
+  <section class="card">
+    <h2>This node</h2>
+    <div id="self" class="muted">loading…</div>
+  </section>
+  <section class="card">
+    <h2>Known peers <span class="muted" id="count"></span></h2>
+    <div id="list" class="grid"></div>
+  </section>
+  <section class="card" id="detailWrap" hidden>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <h2 id="detailTitle" style="margin:0">Peer detail</h2>
+      <button type="button" onclick="clearFocus()">Clear focus</button>
+    </div>
+    <div id="detail" style="margin-top:12px"></div>
+  </section>
+</main>
+<script>
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+/** Format a millisecond duration with a unit that matches its scale. */
+function dur(ms,{ago=false}={}){
+ if(ms==null||ms==="")return"—";
+ const n=Number(ms); if(!Number.isFinite(n))return"—";
+ const a=Math.abs(n); let s;
+ if(a<1)s=(a*1000).toFixed(0)+" µs";
+ else if(a<1000)s=(Number.isInteger(a)?a:a.toFixed(0))+" ms";
+ else if(a<60e3)s=(a/1e3).toFixed(a<10e3?2:1)+" s";
+ else if(a<3600e3)s=(a/60e3).toFixed(a<600e3?1:0)+" min";
+ else if(a<86400e3)s=(a/3600e3).toFixed(1)+" h";
+ else s=(a/86400e3).toFixed(1)+" d";
+ return ago?s+" ago":s;
+}
+const ago=ms=>dur(ms,{ago:true});
+const ts=u=>u==null?"—":new Date(u*1000).toISOString().replace("T"," ").replace(/\.\d+Z$/," Z");
+let lastStatus=null, focusId=null;
+
+function parseStatus(r){return r.Status||r.status||(r.resp==="status"?r:r);}
+function parseHash(){
+  const m=location.hash.match(/node[=-]?(\d+)/i)||location.hash.match(/^#(\d+)$/);
+  return m?Number(m[1]):null;
+}
+function setHash(id){
+  if(id==null) history.replaceState(null,"",location.pathname);
+  else history.replaceState(null,"",`#node-${id}`);
+}
+function clearFocus(){focusId=null;setHash(null);render();}
+function focusPeer(id){focusId=id;setHash(id);render(); window.scrollTo({top:document.body.scrollHeight,behavior:"smooth"});}
+
+function row(k,v){return `<div class="row"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;}
+
+function peerCard(p){
+  const connected=p.connected?'<span class="pill ok">connected</span>':'<span class="pill bad">disconnected</span>';
+  const host=p.hostname?esc(p.hostname):'<span class="muted">unknown host</span>';
+  const selected=focusId===p.node_id?" selected":"";
+  return `<article class="card${selected}" style="cursor:pointer;margin:0" onclick="focusPeer(${p.node_id})">
+    <div class="summary"><strong>node ${p.node_id}</strong> ${connected}${p.ro?' <span class="pill">read-only</span>':''}${p.epoch_member?' <span class="pill ok">epoch member</span>':''}</div>
+    <div class="muted" style="margin-top:8px">${host}</div>
+    <div style="margin-top:8px">RTT ${dur(p.rtt_ms)} · seen ${ago(p.last_seen_ms)}</div>
+    <div class="muted" style="margin-top:6px">${(p.addrs||[]).slice(0,2).map(esc).join("<br>")||"no dial addrs"}</div>
+  </article>`;
+}
+
+function peerDetail(p){
+  const coop=p.coop?`
+    ${row("ttfb ewma", dur(p.coop.ttfb_ms_ewma))}
+    ${row("goodput ewma", `${p.coop.goodput_mbps_ewma.toFixed(2)} Mbps`)}
+    ${row("error rate", `${(p.coop.err_rate*100).toFixed(2)}%`)}
+    ${row("transport RTT", dur(p.coop.transport_rtt_ms))}
+    ${row("path", esc(p.coop.path||"—"))}`:`${row("coop stats", '<span class="muted">none yet</span>')}`;
+  return `
+    ${row("node id", String(p.node_id))}
+    ${row("hostname", esc(p.hostname||"—"))}
+    ${row("connected", p.connected?'<span class="ok">yes</span>':'<span class="bad">no</span>')}
+    ${row("read-only", p.ro?"yes":"no")}
+    ${row("epoch member", p.epoch_member?"yes":"no")}
+    ${row("RTT", dur(p.rtt_ms))}
+    ${row("last seen", ago(p.last_seen_ms))}
+    ${row("created", ts(p.created_unix))}
+    ${row("p2p published", ts(p.p2p_updated_unix))}
+    ${row("endpoint id", `<code>${esc(p.endpoint_id||"—")}</code>`)}
+    ${row("pubkey", `<code>${esc(p.pubkey||"—")}</code>`)}
+    ${row("dial addrs", (p.addrs||[]).length?`<pre>${esc((p.addrs||[]).join("\n"))}</pre>`:"—")}
+    ${row("designations", (p.designations||[]).length?(p.designations.map(esc).join("<br>")):'<span class="muted">none</span>')}
+    <h2 style="margin:16px 0 8px">Cooperative cache</h2>
+    ${coop}
+    <h2 style="margin:16px 0 8px">Raw</h2>
+    <pre>${esc(JSON.stringify(p,null,2))}</pre>`;
+}
+
+function render(){
+  if(!lastStatus)return;
+  const s=lastStatus;
+  const peers=s.p2p?.peers||[];
+  document.getElementById("self").innerHTML=`node <b>${s.node_id}</b> · ${esc(s.backend)} · uptime ${dur((s.uptime_s||0)*1000)}<br>
+    endpoint <code>${esc((()=>{try{return JSON.parse(s.p2p?.node_addr||"null")?.id||"—"}catch{return "—"}})())}</code><br>
+    p2p ${s.p2p?.enabled?'<span class="ok">enabled</span>':'<span class="bad">disabled</span>'} · epoch ${s.epoch?.active?esc(s.epoch.epoch_id):"inactive"}`;
+  document.getElementById("count").textContent=`(${peers.length})`;
+  document.getElementById("list").innerHTML=peers.map(peerCard).join("")||'<span class="muted">no peers enrolled yet</span>';
+  const wrap=document.getElementById("detailWrap");
+  if(focusId!=null){
+    const p=peers.find(x=>x.node_id===focusId);
+    wrap.hidden=false;
+    if(!p){
+      document.getElementById("detailTitle").textContent=`Node ${focusId}`;
+      document.getElementById("detail").innerHTML='<span class="bad">not in the current peer directory (left, retired, or not yet published)</span>';
+    }else{
+      document.getElementById("detailTitle").textContent=`Node ${p.node_id}${p.hostname?" · "+p.hostname:""}`;
+      document.getElementById("detail").innerHTML=peerDetail(p);
+    }
+  }else{
+    wrap.hidden=true;
+  }
+}
+
+async function refresh(){
+  try{
+    const r=await(await fetch("/api/status")).json();
+    lastStatus=parseStatus(r);
+    document.querySelector("#health").innerHTML='<span class="ok">healthy</span> · '+esc(lastStatus.fs_uuid);
+    if(focusId==null) focusId=parseHash();
+    render();
+  }catch(e){
+    document.querySelector("#health").innerHTML='<span class="bad">disconnected</span>';
+  }
+}
+focusId=parseHash();
+refresh(); setInterval(refresh,2000);
+window.addEventListener("hashchange",()=>{focusId=parseHash();render();});
+</script>
+</body>
+</html>
