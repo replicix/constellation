@@ -10,7 +10,11 @@
 //! (the record later in the global log wins). Conflicts with *pending*
 //! (unshipped) local records are skipped by the caller via
 //! [`TouchSet`] — our own records sit later in the global log than
-//! anything we are tailing, so ours win everywhere.
+//! anything we are tailing, so ours win everywhere. That reasoning is
+//! what limits the set to *unshipped* records: a record already
+//! sequenced in the log (notably one a lease holder accepted for us as
+//! a forwarded mutation) has no such claim, and must never suppress a
+//! foreign record, or the two replicas diverge for good.
 //!
 //! ### Partition map
 //!
@@ -128,11 +132,6 @@ impl TouchSet {
                 self.inos.insert(*ino);
             }
         }
-    }
-
-    pub fn merge(&mut self, other: TouchSet) {
-        self.dentries.extend(other.dentries);
-        self.inos.extend(other.inos);
     }
 
     pub fn conflicts(&self, rec: &LogRecord) -> bool {

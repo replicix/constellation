@@ -71,6 +71,23 @@ Mounts using `--fsync-mode s3` add the existing inode/partition `Barrier`:
 The default `--fsync-mode local` only requires local durability and nudges the
 background shipper.
 
+### The shadow does not win conflicts
+
+A shadowed record is an optimism about *timing*, never about *order*. The
+holder has already sequenced it, so a peer's record for the same inode may
+legitimately follow it in the log. When the requester tails the holder's
+segment it therefore applies every record in log order, and the shadow plays
+no part in the conflict check — only genuinely *unshipped* local journal
+records may suppress a foreign record (`TouchSet`), because those alone are
+guaranteed to sort after anything being tailed.
+
+Letting the shadow suppress is a permanent divergence, not a delay: a skipped
+record is dropped as the segment is marked applied and never revisited, so
+every requester in a multi-writer duel keeps its own value forever. With N
+writers on one file you get N distinct values that never reconcile — the
+shape a chaos `chmod_duel` or `write_overlap` convergence failure takes.
+Regression test: `shipper::tests::forwarded_duel_on_one_inode_converges_on_every_replica`.
+
 ## Status and logs
 
 `constellation status` and the web UI expose:

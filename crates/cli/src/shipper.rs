@@ -515,11 +515,16 @@ impl Shipper {
             );
             self.meta.set_applied_seq_of(part, seq)?;
         } else {
-            let mut pending =
+            // Only *pending* (unshipped) local records may suppress a
+            // foreign one: ours sit later in the global log than
+            // anything we tail, so ours win everywhere. Shadowed
+            // forwarded records must NOT suppress: the holder already
+            // sequenced them, so a peer's record for the same inode can
+            // legitimately follow ours. Skipping it would drop it for
+            // good — `set_applied_seq_of` below never revisits a
+            // segment — leaving each requester pinned to its own value.
+            let pending =
                 TouchSet::from_records(self.meta.take_journal(usize::MAX)?.iter().map(|(_, r)| r));
-            if let Ok(shadow) = self.meta.shadow_touch_set() {
-                pending.merge(shadow);
-            }
             let skipped = self.meta.apply_foreign(&seg.records, &pending)?;
             self.meta.shadow_retire_matching(seg.epoch, &seg.records)?;
             if skipped > 0 {
@@ -1432,6 +1437,73 @@ mod tests {
         assert_eq!(ia, ib, "replicas must agree");
         assert_eq!(ia, fb.ino, "the later log record wins");
         assert_eq!(b.ship.spool.lock().unwrap().conflicts, 1);
+    }
+
+    /// Two non-holders forward a chmod for the *same* inode (the chaos
+    /// `chmod_duel` shape). The holder sequences both, so each
+    /// requester's shadowed record is followed in the log by its peer's.
+    /// A shadow must therefore never suppress a foreign record the way a
+    /// pending local record does: a skip here is permanent — the segment
+    /// is marked applied and never revisited — so each requester would
+    /// keep its own mode for good and the replicas would never agree.
+    #[tokio::test]
+    async fn forwarded_duel_on_one_inode_converges_on_every_replica() {
+        use constellation_meta::{execute_mutate, MutateOp};
+
+        let store = StdArc::new(InMemory::new());
+        let mut holder = node(&store, 1);
+        let mut a = node(&store, 2);
+        let mut b = node(&store, 3);
+        let part = constellation_store_s3::log::PARTITION;
+
+        // The holder owns the file; both requesters tail it in.
+        let f = holder.meta.create(1, "duel", 0o644, 0, 0).unwrap();
+        holder.sync().await;
+        a.ship.tail_to_head().await.unwrap();
+        b.ship.tail_to_head().await.unwrap();
+
+        let mode_of = |m: &SqliteMeta| m.lookup(1, "duel").unwrap().unwrap().mode & 0o777;
+        assert_eq!(mode_of(&a.meta), 0o644, "requester must see the file first");
+
+        // Each requester forwards a chmod: the holder executes and
+        // journals it, the requester shadows and applies the records so
+        // it can read its own write before the segment ships.
+        for (requester, mode) in [(&mut a, 0o600u32), (&mut b, 0o640u32)] {
+            let op = MutateOp::Setattr {
+                ino: f.ino,
+                mode: Some(mode),
+                uid: None,
+                gid: None,
+                size: None,
+                atime_ns: None,
+                mtime_ns: None,
+            };
+            let records = execute_mutate(&holder.meta, &op).unwrap();
+            crate::forward::apply_accepted(&requester.meta, part, 1, &records).unwrap();
+            assert_eq!(mode_of(&requester.meta), mode, "read-your-write");
+        }
+
+        // The holder publishes both records; the requesters tail the
+        // authoritative order.
+        holder.sync().await;
+        a.ship.tail_to_head().await.unwrap();
+        b.ship.tail_to_head().await.unwrap();
+
+        assert_eq!(
+            mode_of(&holder.meta),
+            0o640,
+            "the chmod later in the log wins at the sequencer"
+        );
+        assert_eq!(
+            mode_of(&a.meta),
+            mode_of(&holder.meta),
+            "requester A pinned its own shadowed chmod instead of converging"
+        );
+        assert_eq!(
+            mode_of(&b.meta),
+            mode_of(&holder.meta),
+            "requester B pinned its own shadowed chmod instead of converging"
+        );
     }
 
     /// Deep sequential workflow: A builds a tree and publishes; B
