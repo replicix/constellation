@@ -1027,6 +1027,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "constellation-chaos"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "libc",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "constellation-fs-core"
 version = "1.0.0"
 dependencies = [
@@ -1046,6 +1063,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "constellation-chaos",
  "libc",
  "rand 0.9.5",
  "rusqlite",

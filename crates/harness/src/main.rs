@@ -8,21 +8,13 @@
 //! Requires: docker, fusermount3, a release `constellation` binary
 //! (CONSTELLATION_BIN or target/release/constellation).
 
-mod bench;
-mod client;
-mod corpus;
-mod docker;
-mod model;
-mod s3env;
-mod scenarios;
-mod snapchurn;
-mod suites;
-mod toxiproxy;
-mod workload;
-
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use scenarios::SCENARIOS;
+use constellation_harness::bench;
+use constellation_harness::corpus;
+use constellation_harness::scenarios::{self, SCENARIOS};
+use constellation_harness::snapchurn;
+use constellation_harness::suites;
 
 #[derive(Parser)]
 #[command(name = "harness", about = "Constellation fault-injection test harness")]

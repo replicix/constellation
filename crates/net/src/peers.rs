@@ -99,6 +99,8 @@ struct Inner {
     node_id: u64,
     peers: Mutex<HashMap<u64, Peer>>,
     refresher: Mutex<Option<Refresher>>,
+    /// One-shot latch for the shared-node-key misconfiguration warning.
+    warned_shared_key: std::sync::atomic::AtomicBool,
 }
 
 impl Peers {
@@ -115,6 +117,7 @@ impl Peers {
                 node_id,
                 peers: Mutex::new(HashMap::new()),
                 refresher: Mutex::new(None),
+                warned_shared_key: std::sync::atomic::AtomicBool::new(false),
             })),
         }
     }
@@ -158,12 +161,34 @@ impl Peers {
             return;
         };
         let records: Vec<PeerEnrollment> = records.into_iter().map(Into::into).collect();
+        let own_key = inner.p2p.pubkey_hex();
         let mut allowed = Vec::with_capacity(records.len());
         let mut peers = HashMap::new();
         for rec in records {
             allowed.push(rec.pubkey_hex.clone());
             if rec.node_id == inner.node_id {
                 continue; // never dial ourselves
+            }
+            // A *different* node advertising *our* key is a fatal
+            // misconfiguration for the fast path: iroh refuses to dial
+            // its own endpoint id, so every forward/handoff/coop fetch
+            // to that peer fails and the mount silently degrades to
+            // S3-polling with full idle-release/TTL waits. Seen when
+            // several mounts on one host share the default per-user
+            // key path. Warn loudly, once.
+            if rec.pubkey_hex == own_key
+                && !inner
+                    .warned_shared_key
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    peer_node = rec.node_id,
+                    our_node = inner.node_id,
+                    pubkey = %own_key,
+                    "peer registered with OUR node key: P2P to it cannot work \
+                     (dialing ourself). Give every node its own key, e.g. via \
+                     CONSTELLATION_NODE_KEY; only the S3 slow path will be used."
+                );
             }
             // An unparseable address just means we cannot dial that peer
             // yet; it stays on the allowlist so it may still dial us.

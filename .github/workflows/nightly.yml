@@ -65,7 +65,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y fuse3 fio stress-ng
-      - run: cargo build --release -p constellation -p constellation-harness
+      - run: cargo build --release -p constellation -p constellation-harness -p constellation-chaos
       - run: target/release/harness run 2>&1 | tee harness.log
       - uses: actions/upload-artifact@v4
         if: always()

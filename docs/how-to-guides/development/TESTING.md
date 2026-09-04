@@ -11,9 +11,17 @@ dispatch (`.github/workflows/nightly.yml`).
 | Host smoke | `tests/smoke.sh` | local directory (`object_store` LocalFileSystem) | Rust, fuse3 | ~2 s |
 | Host integration | `tests/integration.sh` | floci S3 (container) | + docker | ~10 s |
 | Containerized | `tests/compose-test.sh` | floci S3 (container) | docker only | ~5 min cold |
-| Fault injection | `cargo run -p constellation-harness -- run` | floci S3 via toxiproxy | Rust, fuse3, docker | ~3 min |
+| Fault injection | `cargo run -p constellation-harness -- run` | floci S3 via toxiproxy | Rust, fuse3, docker | ~3–6 min |
 | xfstests | `make xfstests` | floci S3, separate test/scratch prefixes | docker | long |
 | Performance | `make perf-gate` | local floci S3 | Rust, fuse3, docker | minutes |
+
+The fault-injection lane includes **`chaos-ci`**: same-path conflict races
+across three local mounts of one filesystem (create/mkdir/unlink/rename
+storms, overlapping writes, close-to-open checks) via
+[`constellation-chaos`](../../reference/tools/chaos.md). Run it alone with
+`cargo run -p constellation-harness -- run chaos-ci --seed 42`. For
+multi-node hour-long soaks, see
+[Run a chaos soak](run-chaos-soak.md).
 
 The containerized lane runs three suites (all by default, or pick:
 `tests/compose-test.sh smoke stress`):
@@ -195,6 +203,27 @@ verification in both directions). Verification points sit at block
 boundaries where all files are closed, matching close-to-open
 durability semantics; cross-node checks poll with a deadline because
 propagation is asynchronous (sync interval + FUSE TTLs).
+
+### Chaos CI (`chaos-ci`)
+
+`harness run chaos-ci` mounts **three** clients on one filesystem and
+runs the shared [`constellation-chaos`](../../reference/tools/chaos.md)
+**Ci** profile: barrier-synchronized create/mkdir/unlink/rmdir/rename
+storms, overlapping and disjoint byte writes, register duels, chmod
+atomicity, and close-to-open visibility checks. Unlike
+`two-clients-shared` (disjoint subtrees + in-memory model), chaos
+targets **same-path concurrent conflicts** and checks a Jepsen-style
+history.
+
+```bash
+cargo run -p constellation-harness --release -- run chaos-ci --seed 42
+```
+
+On failure, artifacts land under the scenario tempdir's `chaos-store/`
+(`config.json`, `history.jsonl`, `failure.md`). Re-check offline with
+`chaos check --history …/history.jsonl`. Multi-node hour-long soaks
+use the same library over TCP — see
+[Run a chaos soak](run-chaos-soak.md).
 
 Phase-3 scenarios exercise the partition lease (DESIGN.md §4/§5):
 `lease-handover` (A writes, goes write-idle, and cooperatively releases

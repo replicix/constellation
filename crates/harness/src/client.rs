@@ -63,6 +63,23 @@ impl Client {
         })
     }
 
+    /// Give this client its own P2P identity, stored in its state dir.
+    ///
+    /// The binary's default key path is per-user
+    /// (~/.config/constellation/node.key), so N clients on one host
+    /// share one iroh key unless a scenario overrides it: every dial
+    /// between them then fails with "Connecting to ourself is not
+    /// supported" and the whole P2P fast path (forwards, handoffs,
+    /// coop fetch) is silently dead. Real fleets have one node per
+    /// machine and never hit this. Scenarios that exercise live
+    /// multi-node P2P must opt in; scenarios written against the
+    /// S3-only slow path deliberately keep the shared key (or set
+    /// CONSTELLATION_P2P=off).
+    pub fn with_own_node_key(self) -> Self {
+        let key = self.state.join("node.key").display().to_string();
+        self.with_env("CONSTELLATION_NODE_KEY", &key)
+    }
+
     /// Extra env for this client's mount (e.g. a short lease TTL).
     pub fn with_env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.to_string(), value.to_string()));

@@ -10,6 +10,16 @@ const WINDOW_BUCKETS: usize = 12; // 12 × 5 s = 60 s
 const BUCKET_MS: u64 = 5_000;
 const HYSTERESIS: f64 = 0.7;
 const DWELL: Duration = Duration::from_secs(60);
+/// Minimum absolute cost improvement (ms, RTT-weighted by op count)
+/// required before a migration is worth it. RTT samples are single
+/// unsmoothed readings, and several writers on the same LAN or on
+/// loopback measure near-identical, noisy round-trips; without a floor
+/// here the hysteresis ratio alone is not enough to hold still, because
+/// a ratio test is meaningless once both costs are within measurement
+/// noise of zero. That produced a live migrate-every-DWELL ping-pong
+/// among four co-located writers hammering one inode, each holder
+/// "recommending" a peer purely off sub-millisecond jitter.
+const MIN_ABS_IMPROVEMENT_MS: f64 = 5.0;
 
 pub fn placement_enabled() -> bool {
     match std::env::var("CONSTELLATION_LEASE_PLACEMENT") {
@@ -154,6 +164,9 @@ impl Placement {
             }
         }
         if best == self_id {
+            return None;
+        }
+        if self_cost - best_cost < MIN_ABS_IMPROVEMENT_MS {
             return None;
         }
         if best_cost >= HYSTERESIS * self_cost {

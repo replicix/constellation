@@ -14,11 +14,14 @@ CARGO ?= cargo
 TARGET_DIR ?= $(or $(CARGO_TARGET_DIR),target)
 RELEASE_BIN := $(TARGET_DIR)/release/constellation
 RELEASE_HARNESS := $(TARGET_DIR)/release/harness
+RELEASE_CHAOS := $(TARGET_DIR)/release/chaos
 DEBUG_BIN := $(TARGET_DIR)/debug/constellation
 DEBUG_HARNESS := $(TARGET_DIR)/debug/harness
+DEBUG_CHAOS := $(TARGET_DIR)/debug/chaos
 UPLOADBENCH := $(TARGET_DIR)/release/uploadbench
 
 export CONSTELLATION_BIN ?= $(abspath $(RELEASE_BIN))
+export CHAOS_BIN ?= $(abspath $(RELEASE_CHAOS))
 export RUSTFLAGS ?=
 export CARGO_TERM_COLOR ?= always
 
@@ -36,7 +39,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 # `make uploadbench-live` will just fail with a clear "no BUCKET" error.
 -include local.mk
 
-.PHONY: help build build-release build-debug test test-unit fmt fmt-check clippy lint \
+.PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration compose compose-down harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate dist-linux dist-macos deps FORCE \
 	uploadbench-build uploadbench-sim uploadbench-live
@@ -57,20 +60,22 @@ help: ## Show this help
 	@echo "  UPLOADBENCH_LIVE_DURATION=$(UPLOADBENCH_LIVE_DURATION) seconds per controller"
 	@echo "  UPLOADBENCH_INITIAL_CONCURRENCY=$(UPLOADBENCH_INITIAL_CONCURRENCY)"
 
-build: build-release ## Build constellation + harness (release)
+build: build-release ## Build constellation + harness + chaos (release)
 
-build-release: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Build release binaries
+build-release: $(RELEASE_BIN) $(RELEASE_HARNESS) $(RELEASE_CHAOS) ## Build release binaries
 
-build-debug: $(DEBUG_BIN) $(DEBUG_HARNESS) ## Build debug binaries
+build-debug: $(DEBUG_BIN) $(DEBUG_HARNESS) $(DEBUG_CHAOS) ## Build debug binaries
+
+build-chaos: $(RELEASE_CHAOS) ## Build chaos consistency tool (release)
 
 # FORCE: make does not track Rust sources, so existing binaries would
 # otherwise make these recipes no-ops. Cargo itself is incremental.
 # `&:` = one recipe produces both outputs (GNU make 4.3+).
-$(RELEASE_BIN) $(RELEASE_HARNESS) &: FORCE
-	$(CARGO) build --release -p constellation -p constellation-harness
+$(RELEASE_BIN) $(RELEASE_HARNESS) $(RELEASE_CHAOS) &: FORCE
+	$(CARGO) build --release -p constellation -p constellation-harness -p constellation-chaos
 
-$(DEBUG_BIN) $(DEBUG_HARNESS) &: FORCE
-	$(CARGO) build -p constellation -p constellation-harness
+$(DEBUG_BIN) $(DEBUG_HARNESS) $(DEBUG_CHAOS) &: FORCE
+	$(CARGO) build -p constellation -p constellation-harness -p constellation-chaos
 
 FORCE: ;
 

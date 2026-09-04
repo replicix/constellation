@@ -8,6 +8,7 @@ members = [
     "crates/net",
     "crates/api",
     "crates/harness",
+    "crates/chaos",
     "crates/upload-concurrency",
     "bench/uploadbench",
 ]
@@ -24,6 +25,7 @@ default-members = [
     "crates/net",
     "crates/api",
     "crates/harness",
+    "crates/chaos",
     "crates/upload-concurrency",
 ]
 exclude = ["bench/dbbench"]
@@ -41,6 +43,7 @@ constellation-store-s3 = { path = "crates/store-s3" }
 constellation-net = { path = "crates/net" }
 constellation-api = { path = "crates/api" }
 constellation-upload-concurrency = { path = "crates/upload-concurrency" }
+constellation-chaos = { path = "crates/chaos" }
 
 anyhow = "1"
 thiserror = "2"

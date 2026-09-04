@@ -12,4 +12,5 @@ Goal-oriented directions for a specific task or problem.
 ## Development
 
 - [Testing](development/TESTING.md) — test lanes, harness, compliance suites
+- [Run a chaos soak](development/run-chaos-soak.md) — multi-node conflict stress over TCP
 - [Releasing](development/RELEASING.md) — tag, build artifacts, publish checklist

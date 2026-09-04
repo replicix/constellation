@@ -1408,6 +1408,16 @@ fn mount(
         );
         rt.spawn(async move {
             let mut pending: Option<fusefs::SyncRequest> = None;
+            // The periodic poll is a *persistent* deadline, not a fresh
+            // sleep per loop iteration. A fresh sleep inside `select!`
+            // resets whenever any request arrives first, so a peer (or
+            // a FUSE thread) sending requests more often than the sync
+            // interval would starve the poll forever: this node would
+            // keep answering forwards/acquires but never tail or ship
+            // again — a livelock where every node waits for a record
+            // its holder never publishes.
+            let poll = tokio::time::sleep(std::time::Duration::from_millis(interval_ms));
+            tokio::pin!(poll);
             'sync: loop {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -1420,7 +1430,7 @@ fn mount(
                             Some(req) => Some(req),
                             None => break,
                         },
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(interval_ms)) => None,
+                        _ = poll.as_mut() => None,
                     }
                 };
                 match request {
@@ -1457,6 +1467,7 @@ fn mount(
                             keepers.insert(part.clone(), k);
                         }
                         let keeper = keepers.get_mut(&part).unwrap();
+                        keeper.note_acquire_reason("fuse-acquire");
                         let mut r = if epochs.writes_ok() {
                             if keeper.holds_authority() {
                                 Ok(true)
@@ -1480,6 +1491,7 @@ fn mount(
                             && peers.is_enabled()
                             && peers.request_lease(&part, None).await
                         {
+                            keeper.note_acquire_reason("fuse-acquire-after-handoff");
                             r = shipper::acquire_lease_for(&mut ship, keeper, &part).await;
                         }
                         if let Err(e) = &r {
@@ -1753,6 +1765,7 @@ fn mount(
                         }
                         let _ = peers.request_lease(&part, forward.cached_holder(&part)).await;
                         if let Some(keeper) = keepers.get_mut(&part) {
+                            keeper.note_acquire_reason("claim-offer");
                             if shipper::acquire_lease_for(&mut ship, keeper, &part)
                                 .await
                                 .unwrap_or(false)
@@ -1868,6 +1881,13 @@ fn mount(
                         )).map_err(|e| e.to_string()));
                     }
                     Some(fusefs::SyncRequest::Nudge) | None => {
+                        // A round is about to run; push the periodic
+                        // poll out by one interval so it only fires when
+                        // rounds have genuinely stopped happening.
+                        poll.as_mut().reset(
+                            tokio::time::Instant::now()
+                                + std::time::Duration::from_millis(interval_ms),
+                        );
                         // Keep polling one round while draining ordinary
                         // nudges. Dropping this future used to cancel the
                         // async upload side while already-started
@@ -2527,6 +2547,7 @@ async fn run_sync_round(
             continue;
         }
         if k.idle_release_due(ship.journal_backlog_of(part)) {
+            tracing::info!(part, "idle-releasing partition lease");
             k.release().await?;
         }
     }

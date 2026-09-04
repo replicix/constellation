@@ -15,4 +15,4 @@ Technical descriptions of how specific parts of Constellation work.
 
 ## Tools
 
-_(none yet)_
+- [Chaos](tools/chaos.md) — multi-node FS consistency stress (CI + soak)

@@ -7,8 +7,9 @@ use crate::model::Model;
 use crate::s3env::{S3Env, BUCKET};
 use crate::suites;
 use crate::workload::Workload;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::io::Read;
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub struct Scenario {
@@ -344,13 +345,37 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         run: fallocate_sparse,
     },
+    Scenario {
+        name: "chaos-ci",
+        desc: "same-path conflict races across 3 local mounts (constellation-chaos Ci profile)",
+        requires: &[],
+        run: chaos_ci,
+    },
+    Scenario {
+        name: "chaos-soak-4",
+        desc: "4 local mounts, soak profile (repro fleet write_disjoint; write-back + fsync s3)",
+        requires: &[],
+        run: chaos_soak_4,
+    },
+    Scenario {
+        name: "disjoint-write-4",
+        desc: "4 local mounts, data-only soak schedule (hits write_disjoint hard)",
+        requires: &[],
+        run: disjoint_write_4,
+    },
 ];
 
 fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
     let env = S3Env::start().context("starting S3 environment")?;
-    let root = tempfile::Builder::new()
+    let mut root = tempfile::Builder::new()
         .prefix(&format!("harness-{name}-"))
         .tempdir()?;
+    // CHAOS_KEEP_TMP=1 keeps mount logs + state dirs around after the
+    // scenario returns, for offline inspection of failures.
+    if std::env::var_os("CHAOS_KEEP_TMP").is_some_and(|v| v != "0") {
+        root.disable_cleanup(true);
+        eprintln!("CHAOS_KEEP_TMP: artifacts kept at {}", root.path().display());
+    }
     Ok((env, root))
 }
 
@@ -3762,5 +3787,313 @@ fn writeback_backpressure(seed: u64) -> Result<()> {
     })?;
     std::fs::write(client.mnt.join("after-heal"), b"ok")?;
     client.unmount()?;
+    Ok(())
+}
+
+/// Same-path conflict races via constellation-chaos Ci profile on three
+/// local mounts of one filesystem (no VMs).
+fn chaos_ci(seed: u64) -> Result<()> {
+    use constellation_chaos::{Coordinator, LocalCluster, Profile};
+
+    let (env, root) = setup("chaos-ci")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/chaos-{}", ts());
+    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?;
+    let mut c2 = Client::new(root.path(), "c2", &env.endpoint, &backend)?;
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    c2.mount()?;
+
+    // Brief settle so all three see the shared namespace.
+    eventually("three mounts live", Duration::from_secs(20), || {
+        std::fs::create_dir_all(c0.mnt.join(".chaos-probe")).ok();
+        anyhow::ensure!(c1.mnt.join(".chaos-probe").is_dir() || c2.mnt.join(".chaos-probe").is_dir()
+            || c0.mnt.join(".chaos-probe").is_dir());
+        Ok(())
+    })
+    .ok();
+
+    let store = root.path().join("chaos-store");
+    std::fs::create_dir_all(&store)?;
+    let mounts = vec![c0.mnt.clone(), c1.mnt.clone(), c2.mnt.clone()];
+    let mut cluster = LocalCluster::new(mounts)?;
+    let profile = Profile::ci(seed, 3);
+    Coordinator::run(&mut cluster, profile, &store)
+        .with_context(|| format!("chaos-ci artifacts under {}", store.display()))?;
+
+    c0.unmount()?;
+    c1.unmount()?;
+    c2.unmount()?;
+    Ok(())
+}
+
+/// Fleet soak shape on one host: four write-back mounts, soak profile,
+/// seed 42. Used to reproduce `disjoint_write` / `write_disjoint:wd41`
+/// without EC2.
+fn chaos_soak_4(seed: u64) -> Result<()> {
+    use constellation_chaos::{Coordinator, LocalCluster, Profile};
+
+    let (env, root) = setup("chaos-soak-4")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/chaos-soak4-{}", ts());
+    let duration_secs = std::env::var("CHAOS_SOAK_DURATION_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let mut clients = Vec::new();
+    for i in 0..4 {
+        let mut c = Client::new(root.path(), &format!("c{i}"), &env.endpoint, &backend)?
+            .with_own_node_key()
+            .with_write_mode("back");
+        if i == 0 {
+            c.fs_create()?;
+        }
+        c.mount_view(None, &["--fsync-mode", "s3"])?;
+        clients.push(c);
+    }
+
+    eventually("four mounts live", Duration::from_secs(30), || {
+        let probe = clients[0].mnt.join(".chaos-probe");
+        std::fs::create_dir_all(&probe).ok();
+        anyhow::ensure!(
+            clients
+                .iter()
+                .any(|c| c.mnt.join(".chaos-probe").is_dir())
+        );
+        Ok(())
+    })
+    .ok();
+
+    let store = PathBuf::from(format!(
+        "/tmp/chaos-soak-4-{}-{}",
+        seed,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&store)?;
+    let mounts: Vec<_> = clients.iter().map(|c| c.mnt.clone()).collect();
+    eprintln!(
+        "chaos-soak-4: seed={seed} duration={duration_secs}s mounts={mounts:?} store={}",
+        store.display()
+    );
+    let mut cluster = LocalCluster::new(mounts)?;
+    let profile = Profile::soak(seed, 4, duration_secs);
+    let result = Coordinator::run(&mut cluster, profile, &store);
+    if let Err(ref e) = result {
+        eprintln!("chaos-soak-4 FAILED: {e}");
+        eprintln!("artifacts kept at: {}", store.display());
+        for c in &clients {
+            eprintln!("--- {} mount.log (tail) ---\n{}", c.name, c.tail_log());
+        }
+    }
+    for c in &mut clients {
+        let _ = c.unmount();
+    }
+    result.with_context(|| format!("chaos-soak-4 artifacts under {}", store.display()))?;
+    Ok(())
+}
+
+/// Focused local repro of the fleet `disjoint_write` failure: four
+/// write-back mounts repeatedly run the write_disjoint shape (seeded
+/// zero file, then four concurrent disjoint WriteAts, then verify).
+fn disjoint_write_4(seed: u64) -> Result<()> {
+    use constellation_chaos::cluster::Cluster;
+    use constellation_chaos::op::{hash_bytes, Op, Outcome};
+    use constellation_chaos::LocalCluster;
+    use rand::{rngs::StdRng, RngCore, SeedableRng};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let (env, root) = setup("disjoint-write-4")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/disjoint4-{}", ts());
+    let rounds: usize = std::env::var("CHAOS_DISJOINT_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let mut clients = Vec::new();
+    for i in 0..4 {
+        let mut c = Client::new(root.path(), &format!("c{i}"), &env.endpoint, &backend)?
+            .with_own_node_key()
+            .with_write_mode("back");
+        if i == 0 {
+            c.fs_create()?;
+        }
+        // Match the fleet mount flags that produced the failure.
+        c.mount_view(None, &["--fsync-mode", "s3"])?;
+        clients.push(c);
+    }
+
+    eventually("four mounts live", Duration::from_secs(30), || {
+        let probe = clients[0].mnt.join(".chaos-probe");
+        std::fs::create_dir_all(&probe).ok();
+        anyhow::ensure!(clients.iter().any(|c| c.mnt.join(".chaos-probe").is_dir()));
+        Ok(())
+    })
+    .ok();
+
+    let work = "chaos-soak";
+    let mounts: Vec<_> = clients.iter().map(|c| c.mnt.clone()).collect();
+    let mut cluster = LocalCluster::new(mounts)?;
+    cluster.prepare("disjoint-write-4", work)?;
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let op_ids = AtomicU64::new(1);
+    let patch_len = 32usize;
+    let n = 4usize;
+    eprintln!("disjoint-write-4: seed={seed} rounds={rounds} workers={n}");
+
+    for round in 0..rounds {
+        let file_id = op_ids.fetch_add(1, Ordering::Relaxed);
+        let path = format!("{work}/wd{file_id}");
+        let t0 = std::time::Instant::now();
+
+        // Seed a zeroed file (same as chaos prep for write_disjoint).
+        let seed_id = op_ids.fetch_add(1, Ordering::Relaxed);
+        let seed_op = Op::WriteFull {
+            path: path.clone(),
+            content: vec![0u8; n * patch_len],
+        };
+        let seed_c = cluster.invoke(0, seed_id, &seed_op)?;
+        anyhow::ensure!(
+            seed_c.outcome == Outcome::Ok,
+            "round {round}: seed WriteFull failed: {seed_c:?}"
+        );
+
+        // Wait until every mount can see the seeded file. Without this,
+        // WriteAt's create(true) races create on cold mounts and returns
+        // EEXIST — a different failure mode than the fleet's lost patch.
+        let visible_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut visible = true;
+            for w in 0..n {
+                let id = op_ids.fetch_add(1, Ordering::Relaxed);
+                let c = cluster.invoke(
+                    w,
+                    id,
+                    &Op::Stat {
+                        path: path.clone(),
+                    },
+                )?;
+                if c.outcome != Outcome::Ok {
+                    visible = false;
+                    break;
+                }
+            }
+            if visible {
+                break;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < visible_deadline,
+                "round {round}: seeded file {path} not visible on all mounts within 30s"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // Four disjoint patches, one per worker — same shape as duel_write_disjoint.
+        let mut patches = Vec::with_capacity(n);
+        let mut jobs = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut patch = format!("wd{i}:{file_id}:").into_bytes();
+            while patch.len() < patch_len {
+                patch.push((rng.next_u32() & 0xff) as u8);
+            }
+            patch.truncate(patch_len);
+            let expected = hash_bytes(&patch);
+            let id = op_ids.fetch_add(1, Ordering::Relaxed);
+            jobs.push((
+                i,
+                id,
+                Op::WriteAt {
+                    path: path.clone(),
+                    offset: (i * patch_len) as u64,
+                    patch: patch.clone(),
+                },
+            ));
+            patches.push(expected);
+        }
+        for result in cluster.invoke_parallel(&jobs) {
+            let (w, id, complete) =
+                result.with_context(|| format!("round {round}: WriteAt invoke"))?;
+            anyhow::ensure!(
+                complete.outcome == Outcome::Ok,
+                "round {round}: WriteAt worker {w} op {id} failed: {complete:?}"
+            );
+        }
+
+        // Quiesce: every worker must see every patch (close-to-open).
+        let deadline = std::time::Instant::now()
+            + Duration::from_secs(
+                std::env::var("CHAOS_DISJOINT_CONVERGE_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30),
+            );
+        let mut last_mismatch = String::new();
+        loop {
+            let mut ok = true;
+            last_mismatch.clear();
+            for w in 0..n {
+                for (i, expected) in patches.iter().enumerate() {
+                    let id = op_ids.fetch_add(1, Ordering::Relaxed);
+                    let op = Op::ReadAt {
+                        path: path.clone(),
+                        offset: (i * patch_len) as u64,
+                        len: patch_len as u64,
+                    };
+                    let c = cluster.invoke(w, id, &op)?;
+                    let got = c.value_hash.as_deref().unwrap_or("");
+                    if got != expected.as_str() {
+                        ok = false;
+                        last_mismatch = format!(
+                            "worker {w} @{i}: got {got} want {expected} (outcome {:?} errno={:?}/{:?})",
+                            c.outcome, c.errno, c.errno_name
+                        );
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            if ok {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Dump what each worker sees for the offline diagnosis.
+                for w in 0..n {
+                    for i in 0..n {
+                        let id = op_ids.fetch_add(1, Ordering::Relaxed);
+                        let op = Op::ReadAt {
+                            path: path.clone(),
+                            offset: (i * patch_len) as u64,
+                            len: patch_len as u64,
+                        };
+                        let c = cluster.invoke(w, id, &op)?;
+                        eprintln!(
+                            "  final w{w}@{i} -> {:?} hash={:?} errno={:?} name={:?}",
+                            c.outcome, c.value_hash, c.errno, c.errno_name
+                        );
+                    }
+                }
+                for c in &clients {
+                    eprintln!("--- {} mount.log (tail) ---\n{}", c.name, c.tail_log_n(2000));
+                }
+                bail!(
+                    "round {round}: disjoint WriteAt {path} did not converge within 30s: {last_mismatch}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        eprintln!(
+            "disjoint-write-4: round {round} ok path={path} in {}ms",
+            t0.elapsed().as_millis()
+        );
+    }
+
+    for c in &mut clients {
+        let _ = c.unmount();
+    }
     Ok(())
 }

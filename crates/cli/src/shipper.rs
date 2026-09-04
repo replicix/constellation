@@ -576,6 +576,7 @@ impl Shipper {
                     LeaseStore::new(self.log.inner(), &part, self.lease_mode),
                     self.node_id,
                 );
+                keeper.note_acquire_reason("ship-pending-journal");
                 match acquire_lease_for(self, &mut keeper, &part).await {
                     Ok(true) => {
                         leases.insert(part.clone(), keeper);
@@ -594,6 +595,7 @@ impl Shipper {
                 .is_some_and(|keeper| !keeper.is_lost() && keeper.ship_epoch().is_none());
             if needs_reacquire {
                 let keeper = leases.get_mut(&part).expect("checked above");
+                keeper.note_acquire_reason("ship-reacquire");
                 match acquire_lease_for(self, keeper, &part).await {
                     Ok(true) => {}
                     Ok(false) => continue,

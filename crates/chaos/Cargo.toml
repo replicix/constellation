@@ -1,30 +1,29 @@
 [package]
-name = "constellation-harness"
-description = "Fault-injection and distributed test harness (not shipped)"
+name = "constellation-chaos"
+description = "Multi-node FS consistency stress tool (CI local + remote soak)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "constellation_harness"
+name = "constellation_chaos"
 path = "src/lib.rs"
 
 [[bin]]
-name = "harness"
+name = "chaos"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
-constellation-chaos.workspace = true
 libc.workspace = true
 rand.workspace = true
-rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "rt"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-ureq = { version = "2", features = ["json"] }
-zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

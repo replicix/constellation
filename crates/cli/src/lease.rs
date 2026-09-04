@@ -161,6 +161,10 @@ pub struct LeaseKeeper {
     held: Option<(Lease, LeaseTag)>,
     /// Open continuation-epoch promise forbids S3 takeover (DESIGN.md §5.3).
     takeover_gate: Arc<AtomicBool>,
+    /// Diagnostic tag naming the mechanism behind the next acquisition
+    /// (fuse-acquire, claim-offer, ship-journal, ...). Logged by
+    /// [`Self::commit`] so lease churn can be attributed from logs alone.
+    acquire_reason: &'static str,
 }
 
 impl LeaseKeeper {
@@ -173,7 +177,13 @@ impl LeaseKeeper {
             view: Arc::new(LeaseView::default()),
             held: None,
             takeover_gate: Arc::new(AtomicBool::new(false)),
+            acquire_reason: "unspecified",
         }
+    }
+
+    /// Tag the mechanism that is about to acquire (purely diagnostic).
+    pub fn note_acquire_reason(&mut self, reason: &'static str) {
+        self.acquire_reason = reason;
     }
 
     pub fn share_takeover_gate(&mut self, gate: Arc<AtomicBool>) {
@@ -349,6 +359,7 @@ impl LeaseKeeper {
                     holder = lease.holder,
                     epoch = lease.epoch,
                     ttl_ms = self.ttl_ms,
+                    reason = self.acquire_reason,
                     "acquired partition lease"
                 );
                 self.view.set_held(&lease);
@@ -488,7 +499,7 @@ impl LeaseKeeper {
         self.view.clear();
         match self.store.try_swap(&lease.released(), &tag).await {
             Ok(new_tag) => {
-                tracing::debug!(epoch = lease.epoch, "released partition lease");
+                tracing::info!(epoch = lease.epoch, "released partition lease");
                 Ok(new_tag.etag())
             }
             Err(StoreError::CasConflict) => {
