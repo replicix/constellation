@@ -11,8 +11,9 @@ leases and offline epochs, cooperative caching, snapshots, E2E encryption,
 the web UI, fsck/GC, and release hardening. Linux is the fully exercised
 platform; macOS receives build and mount-less test coverage, while FUSE
 mount behavior requires macFUSE and remains less battle-tested. Automated
-crash reporting is future phase-9 work. See
-[docs/PROGRESS.md](docs/PROGRESS.md) for detailed evidence and limitations.
+crash reporting remains future work. See
+[docs/history/v1/PROGRESS.md](docs/history/v1/PROGRESS.md) for the v1
+implementation evidence (frozen).
 
 ## Quick start: mount a real S3 bucket
 
@@ -63,14 +64,17 @@ directory dispatch is requested when the kernel supports it.
 
 ## Documentation
 
+Docs follow [Diátaxis](https://diataxis.fr/). Start at
+[docs/README.md](docs/README.md).
+
 | doc | contents |
 |---|---|
-| [docs/GOALS.md](docs/GOALS.md) | goals, non-goals, motivating scenarios, prior-art critique |
-| [docs/DESIGN.md](docs/DESIGN.md) | full architecture: data/metadata planes, leases, pin/offline/epochs, caching, compression, security, failure matrix |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | ADRs — what was rejected and why |
-| [docs/TESTING.md](docs/TESTING.md) | correctness strategy: property tests, deterministic simulation, POSIX suites, e2e scenarios |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | phased milestones to v1 |
-| [docs/RELEASING.md](docs/RELEASING.md) | release artifacts and tag checklist |
+| [docs/explanation/GOALS.md](docs/explanation/GOALS.md) | goals, non-goals, motivating scenarios, prior-art critique |
+| [docs/explanation/DESIGN.md](docs/explanation/DESIGN.md) | full architecture: data/metadata planes, leases, pin/offline/epochs, caching, compression, security, failure matrix |
+| [docs/explanation/DECISIONS.md](docs/explanation/DECISIONS.md) | ADRs — what was rejected and why |
+| [docs/how-to-guides/development/TESTING.md](docs/how-to-guides/development/TESTING.md) | correctness strategy: property tests, deterministic simulation, POSIX suites, e2e scenarios |
+| [docs/how-to-guides/development/RELEASING.md](docs/how-to-guides/development/RELEASING.md) | release artifacts and tag checklist |
+| [docs/history/v1/](docs/history/v1/) | frozen v1 roadmap, progress, and implementation plans |
 
 ## Layout
 
@@ -83,7 +87,7 @@ crates/
   net/        iroh P2P, gossip, cooperative cache, source selection
   api/        control API + embedded web UI + metrics
 bench/
-  dbbench/    embedded-DB benchmark behind DECISIONS.md ADR-9
+  dbbench/    embedded-DB benchmark behind docs/explanation/DECISIONS.md ADR-9
 ```
 
 ## Building

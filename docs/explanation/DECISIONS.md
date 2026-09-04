@@ -1,7 +1,7 @@
 # Constellation Decisions (ADRs)
 
 Each record: decision, alternatives rejected, and why. Context in
-[DESIGN.md](DESIGN.md).
+[DESIGN.md](DESIGN.md). New decisions (or changed minds) are appended here.
 
 ## ADR-1: Greenfield in Rust
 

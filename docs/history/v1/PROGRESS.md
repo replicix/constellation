@@ -1,6 +1,10 @@
 # Progress
 
-Status of the implementation against ROADMAP.md. Updated as work lands.
+> **Frozen (v1.0).** Historical status against
+> [ROADMAP.md](ROADMAP.md). Do not update for new work.
+
+Status of the implementation against ROADMAP.md as of the close of the
+initial implementation phase.
 
 ## Phase 1 — Single-node FUSE on S3: **IN PROGRESS (~90%)**
 

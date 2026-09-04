@@ -1,10 +1,13 @@
 # Implementation plans
 
+> **Frozen (v1.0).** These plans executed the initial implementation.
+> They are historical reference under `docs/history/v1/plans/`. Do not
+> start new work from them.
+
 Sequenced, self-contained work orders for finishing Constellation
-(see `../ROADMAP.md`). Each plan is executed by a coding model in a
+(see `../ROADMAP.md`). Each plan was executed by a coding model in a
 fresh session; `CONVENTIONS.md` carries the shared rules (gates, code
-style, harness checklist, reporting format) and is required reading
-before any plan.
+style, harness checklist, reporting format) that applied at the time.
 
 Execution protocol:
 

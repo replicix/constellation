@@ -2,7 +2,7 @@
 //! (invalidation, digests, lease handoff), cooperative cache, and
 //! latency-adaptive source selection.
 //!
-//! See docs/DESIGN.md §7 (cooperative cache) and §8 (security).
+//! See docs/explanation/DESIGN.md §7 (cooperative cache) and §8 (security).
 //!
 //! # Why most of this cannot break the filesystem
 //!

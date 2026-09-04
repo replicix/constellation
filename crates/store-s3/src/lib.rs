@@ -1,7 +1,7 @@
 //! S3 backend: bucket layout, conditional writes (CAS), self-describing
 //! chunk objects, the pluggable compression codec registry.
 //!
-//! See docs/DESIGN.md §2 (bucket layout) and §3 (data plane).
+//! See docs/explanation/DESIGN.md §2 (bucket layout) and §3 (data plane).
 
 pub mod aws_auth;
 pub mod codec;
