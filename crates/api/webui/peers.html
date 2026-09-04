@@ -98,6 +98,7 @@ function peerDetail(p){
   const coop=p.coop?`
     ${row("ttfb ewma", dur(p.coop.ttfb_ms_ewma))}
     ${row("goodput ewma", `${p.coop.goodput_mbps_ewma.toFixed(2)} Mbps`)}
+    ${row("miss rate", `${((p.coop.miss_rate||0)*100).toFixed(2)}%`)}
     ${row("error rate", `${(p.coop.err_rate*100).toFixed(2)}%`)}
     ${row("transport RTT", dur(p.coop.transport_rtt_ms))}
     ${row("path", esc(p.coop.path||"—"))}`:`${row("coop stats", '<span class="muted">none yet</span>')}`;

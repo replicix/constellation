@@ -1588,8 +1588,9 @@ fn coop_fallback(_seed: u64) -> Result<()> {
     let s3 = coop["s3_fetches"].as_u64().unwrap_or(0);
     let hedges = coop["hedges_fired"].as_u64().unwrap_or(0);
     eprintln!(
-        "    coop-fallback: B s3_fetches={s3} hedges_fired={hedges} peer_misses={}",
-        coop["peer_misses"]
+        "    coop-fallback: B s3_fetches={s3} hedges_fired={hedges} peer_misses={} peer_errors={}",
+        coop["peer_misses"],
+        coop["peer_errors"].as_u64().unwrap_or(0)
     );
     anyhow::ensure!(
         s3 >= 1,

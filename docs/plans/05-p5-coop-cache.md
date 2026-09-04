@@ -63,9 +63,9 @@ Implement the DESIGN.md §7 policy, kept honest and simple:
 
 ## Step 4 — Observability
 
-`StatusReport.coop: { peer_hits, peer_misses, s3_fetches,
+`StatusReport.coop: { peer_hits, peer_misses, peer_errors, s3_fetches,
 hedges_fired, bytes_served_to_peers, per_source: [{id, ttfb_ms_ewma,
-goodput_mbps_ewma, err_rate}] }`. Show in `status`. These numbers are
+goodput_mbps_ewma, miss_rate, err_rate}] }`. Show in `status`. These numbers are
 what the scenarios assert.
 
 ## Step 5 — Tests

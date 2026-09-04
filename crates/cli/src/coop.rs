@@ -101,6 +101,7 @@ impl PeerDigest {
 struct Counters {
     peer_hits: AtomicU64,
     peer_misses: AtomicU64,
+    peer_errors: AtomicU64,
     s3_fetches: AtomicU64,
     hedges_fired: AtomicU64,
     bytes_served: AtomicU64,
@@ -466,9 +467,21 @@ impl Coop {
     }
 
     fn note_fail(&self, src: SourceId, r: &FetchResult) {
-        self.selector.lock().unwrap().record_err(src);
-        if matches!(src, SourceId::Peer(_)) && !matches!(r, FetchResult::Data { .. }) {
-            self.counters.peer_misses.fetch_add(1, Ordering::Relaxed);
+        let mut sel = self.selector.lock().unwrap();
+        match r {
+            FetchResult::Miss => {
+                sel.record_miss(src);
+                if matches!(src, SourceId::Peer(_)) {
+                    self.counters.peer_misses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            FetchResult::Fail => {
+                sel.record_err(src);
+                if matches!(src, SourceId::Peer(_)) {
+                    self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            FetchResult::Data { .. } => {}
         }
     }
 
@@ -517,6 +530,7 @@ impl Coop {
                 id: id.label(),
                 ttfb_ms_ewma: s.ttfb_ewma_ms,
                 goodput_mbps_ewma: s.goodput_bps * 8.0 / 1_000_000.0,
+                miss_rate: s.miss_rate,
                 err_rate: s.err_rate,
                 transport_rtt_ms: s.transport_rtt_ms,
                 path: match s.path {
@@ -530,6 +544,7 @@ impl Coop {
         constellation_api::CoopStatus {
             peer_hits: self.counters.peer_hits.load(Ordering::Relaxed),
             peer_misses: self.counters.peer_misses.load(Ordering::Relaxed),
+            peer_errors: self.counters.peer_errors.load(Ordering::Relaxed),
             s3_fetches: self.counters.s3_fetches.load(Ordering::Relaxed),
             hedges_fired: self.counters.hedges_fired.load(Ordering::Relaxed),
             bytes_served_to_peers: self.counters.bytes_served.load(Ordering::Relaxed),

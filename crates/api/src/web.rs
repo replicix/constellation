@@ -170,6 +170,16 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.coop.peer_hits
     );
     gauge!(
+        "constellation_coop_peer_misses_total",
+        "Cooperative-cache peer declines (bloom FP, busy, absent).",
+        status.coop.peer_misses
+    );
+    gauge!(
+        "constellation_coop_peer_errors_total",
+        "Cooperative-cache peer transport/hash failures.",
+        status.coop.peer_errors
+    );
+    gauge!(
         "constellation_coop_s3_fetches_total",
         "Successful cooperative-cache S3 fetches.",
         status.coop.s3_fetches

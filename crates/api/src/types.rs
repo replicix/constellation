@@ -308,8 +308,12 @@ pub struct WritebackStatus {
 pub struct CoopStatus {
     #[serde(default)]
     pub peer_hits: u64,
+    /// Soft negatives: peer declined (bloom FP, busy, not present).
     #[serde(default)]
     pub peer_misses: u64,
+    /// Hard negatives: transport / hash failures against a peer.
+    #[serde(default)]
+    pub peer_errors: u64,
     #[serde(default)]
     pub s3_fetches: u64,
     #[serde(default)]
@@ -333,6 +337,10 @@ pub struct SourceStatus {
     pub ttfb_ms_ewma: f64,
     #[serde(default)]
     pub goodput_mbps_ewma: f64,
+    /// Soft negatives (declines). Previously folded into `err_rate`.
+    #[serde(default)]
+    pub miss_rate: f64,
+    /// Hard negatives (transport/hash failures).
     #[serde(default)]
     pub err_rate: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

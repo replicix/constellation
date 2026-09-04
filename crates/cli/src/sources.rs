@@ -1,13 +1,13 @@
 //! Latency-adaptive source selection (DESIGN.md §7).
 //!
 //! Pure scoring: no I/O. The fetch path feeds every real transfer back
-//! in through [`Selector::record_ok`] / [`Selector::record_err`] and
-//! asks [`Selector::pick`] / [`Selector::hedge_deadline_ms`] for the
-//! next decision.
+//! in through [`Selector::record_ok`] / [`Selector::record_miss`] /
+//! [`Selector::record_err`] and asks [`Selector::pick`] /
+//! [`Selector::hedge_deadline_ms`] for the next decision.
 //!
 //! Score is predicted `ETA = TTFB_ewma + size/goodput_ewma + penalties`
-//! (recent errors, in-flight queue). A challenger must beat the
-//! incumbent by more than [`HYSTERESIS`] (~20%) before we switch.
+//! (recent misses, hard errors, in-flight queue). A challenger must beat
+//! the incumbent by more than [`HYSTERESIS`] (~20%) before we switch.
 //! Hedging fires when a fetch outlives its predicted P95 first byte
 //! *plus* its predicted body time; at most one hedge per fetch (the
 //! caller enforces the cap).
@@ -37,6 +37,10 @@ const PEER_PRIOR_P95_MS: f64 = 8.0;
 const S3_PRIOR_TTFB_MS: f64 = 50.0;
 const S3_PRIOR_GOODPUT_BPS: f64 = 50.0 * 1024.0 * 1024.0;
 const S3_PRIOR_P95_MS: f64 = 80.0;
+/// ETA penalty weight for bloom/busy declines (expected negatives).
+const MISS_PENALTY_MS: f64 = 100.0;
+/// ETA penalty weight for transport/hash failures (unexpected).
+const ERR_PENALTY_MS: f64 = 200.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceId {
@@ -57,6 +61,9 @@ impl SourceId {
 pub struct SourceStats {
     pub ttfb_ewma_ms: f64,
     pub goodput_bps: f64,
+    /// Soft negatives: peer said "no" / busy (bloom FP, admission decline).
+    pub miss_rate: f64,
+    /// Hard negatives: transport, hash mismatch, S3 errors.
     pub err_rate: f64,
     pub ttfb_p95_ms: f64,
     pub in_flight: u32,
@@ -76,6 +83,7 @@ impl SourceStats {
         Self {
             ttfb_ewma_ms: PEER_PRIOR_TTFB_MS,
             goodput_bps: PEER_PRIOR_GOODPUT_BPS,
+            miss_rate: 0.0,
             err_rate: 0.0,
             ttfb_p95_ms: PEER_PRIOR_P95_MS,
             in_flight: 0,
@@ -89,6 +97,7 @@ impl SourceStats {
         Self {
             ttfb_ewma_ms: S3_PRIOR_TTFB_MS,
             goodput_bps: S3_PRIOR_GOODPUT_BPS,
+            miss_rate: 0.0,
             err_rate: 0.0,
             ttfb_p95_ms: S3_PRIOR_P95_MS,
             in_flight: 0,
@@ -111,7 +120,8 @@ impl SourceStats {
         } else {
             1_000.0
         };
-        let err_pen = self.err_rate * 200.0;
+        let miss_pen = self.miss_rate * MISS_PENALTY_MS;
+        let err_pen = self.err_rate * ERR_PENALTY_MS;
         let q_pen = f64::from(self.in_flight) * self.ttfb_ewma_ms * 0.5;
         let transport_floor = self.transport_rtt_ms.unwrap_or(0.0);
         let path_penalty = if self.path == PathKind::Relay {
@@ -119,7 +129,7 @@ impl SourceStats {
         } else {
             0.0
         };
-        self.ttfb_ewma_ms.max(transport_floor) + xfer + err_pen + q_pen + path_penalty
+        self.ttfb_ewma_ms.max(transport_floor) + xfer + miss_pen + err_pen + q_pen + path_penalty
     }
 }
 
@@ -271,11 +281,26 @@ impl Selector {
                 ALPHA * gp + (1.0 - ALPHA) * s.goodput_bps
             };
         }
+        s.miss_rate *= 1.0 - ALPHA;
         s.err_rate *= 1.0 - ALPHA;
         s.samples += 1;
         s.in_flight = s.in_flight.saturating_sub(1);
     }
 
+    /// Peer declined (bloom false positive, busy, not present). Expected;
+    /// soft ETA penalty only — does not clear the incumbent.
+    pub fn record_miss(&mut self, id: SourceId) {
+        let s = self
+            .stats
+            .entry(id)
+            .or_insert_with(|| SourceStats::prior(id));
+        s.miss_rate = ALPHA * 1.0 + (1.0 - ALPHA) * s.miss_rate;
+        s.samples += 1;
+        s.in_flight = s.in_flight.saturating_sub(1);
+    }
+
+    /// Transport/hash/S3 failure. Unexpected; clears incumbent so the
+    /// next pick can leave a dead peer.
     pub fn record_err(&mut self, id: SourceId) {
         let s = self
             .stats
@@ -402,8 +427,37 @@ mod tests {
         );
         s.record_err(SourceId::Peer(3));
         assert!(s.stats(SourceId::Peer(3)).err_rate > 0.0);
+        assert_eq!(s.stats(SourceId::Peer(3)).miss_rate, 0.0);
         // After eviction, a slow-but-reliable S3 can win against a
         // high-error peer on the next pick.
+        let pick = s.pick(&[SourceId::Peer(3), SourceId::S3], 1000);
+        assert_eq!(pick, SourceId::S3);
+    }
+
+    #[test]
+    fn miss_does_not_evict_the_incumbent() {
+        let mut s = Selector::default();
+        s.record_ok(SourceId::Peer(3), 2.0, 1000, 4.0);
+        assert_eq!(
+            s.pick(&[SourceId::Peer(3), SourceId::S3], 1000),
+            SourceId::Peer(3)
+        );
+        s.record_miss(SourceId::Peer(3));
+        assert!(s.stats(SourceId::Peer(3)).miss_rate > 0.0);
+        assert_eq!(s.stats(SourceId::Peer(3)).err_rate, 0.0);
+        // One soft miss is not enough to lose the incumbent against cold S3.
+        let pick = s.pick(&[SourceId::Peer(3), SourceId::S3], 1000);
+        assert_eq!(pick, SourceId::Peer(3));
+    }
+
+    #[test]
+    fn many_misses_can_hand_the_pick_to_s3() {
+        let mut s = Selector::default();
+        s.record_ok(SourceId::Peer(3), 2.0, 1000, 4.0);
+        s.pick(&[SourceId::Peer(3), SourceId::S3], 1000);
+        for _ in 0..12 {
+            s.record_miss(SourceId::Peer(3));
+        }
         let pick = s.pick(&[SourceId::Peer(3), SourceId::S3], 1000);
         assert_eq!(pick, SourceId::S3);
     }
@@ -417,6 +471,7 @@ mod tests {
         let stats = s.stats(id);
         assert_eq!(stats.in_flight, 0);
         assert_eq!(stats.samples, 0);
+        assert_eq!(stats.miss_rate, 0.0);
         assert_eq!(stats.err_rate, 0.0);
     }
 
