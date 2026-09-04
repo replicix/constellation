@@ -2907,8 +2907,14 @@ fn p2p_handover(_seed: u64) -> Result<()> {
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/p2phand-{}", ts());
     let idle_ms = 30_000u64;
+    // Forwarding off: this scenario measures the *takeover* path — a
+    // non-holder write escalating to a ~1 RTT P2P lease handoff. With
+    // forwarding on (the default), B's write would be validated by the
+    // holder instead and the lease would rightly stay at A; that path
+    // is `forwarded-mutations`' job.
     let tune = |c: Client, key: &str| {
         c.with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", &idle_ms.to_string())
+            .with_env("CONSTELLATION_FORWARD", "off")
             .with_env("CONSTELLATION_NODE_KEY", key)
     };
     let _ = std::fs::remove_file("/tmp/.constellation-hand-c0.key");

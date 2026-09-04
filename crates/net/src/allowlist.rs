@@ -9,6 +9,15 @@
 //! legitimately new peer may have enrolled since the last refresh. That
 //! refresh is rate-limited so an unknown key cannot turn into an S3
 //! request amplifier.
+//!
+//! Only *miss-triggered* refreshes arm that rate limit. The periodic
+//! registry refresh must not: on a cold start every node re-reads the
+//! registry the moment it comes up, which is exactly when its peers are
+//! still enrolling. If that startup read armed the cooldown, a peer
+//! that enrolled milliseconds later would be rejected for the whole
+//! cooldown window — its forwarded mutations would fail as transport
+//! errors and escalate into a lease takeover the moment two mounts
+//! start together (observed as `forwarded-mutations` flaking).
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -19,7 +28,9 @@ const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 /// The set of pubkeys currently permitted to connect.
 pub struct Allowlist {
     keys: HashSet<String>,
-    last_refresh: Option<Instant>,
+    /// When a miss last triggered a refresh; periodic refreshes via
+    /// [`Allowlist::replace`] deliberately leave this untouched.
+    last_miss_refresh: Option<Instant>,
     cooldown: Duration,
 }
 
@@ -33,7 +44,7 @@ impl Allowlist {
     pub fn new() -> Self {
         Self {
             keys: HashSet::new(),
-            last_refresh: None,
+            last_miss_refresh: None,
             cooldown: REFRESH_COOLDOWN,
         }
     }
@@ -47,9 +58,11 @@ impl Allowlist {
     }
 
     /// Replace the cached set (called after listing the registry).
+    /// Never arms the miss cooldown: a periodic or startup refresh must
+    /// leave an unknown key able to trigger its own re-read (see the
+    /// module doc for the cold-start failure that otherwise results).
     pub fn replace(&mut self, keys: impl IntoIterator<Item = String>) {
         self.keys = keys.into_iter().collect();
-        self.last_refresh = Some(Instant::now());
     }
 
     pub fn contains(&self, pubkey_hex: &str) -> bool {
@@ -68,20 +81,22 @@ impl Allowlist {
     /// inside the cooldown, so a flood of unknown keys cannot amplify
     /// into S3 list requests.
     pub fn refresh_due(&self) -> bool {
-        match self.last_refresh {
+        match self.last_miss_refresh {
             None => true,
             Some(t) => t.elapsed() >= self.cooldown,
         }
     }
 
     /// Decide about `pubkey_hex`. Returns [`Decision::Refresh`] when the
-    /// key is unknown but the cache is stale enough to be worth
-    /// re-reading; the caller then calls [`Allowlist::replace`] and asks
-    /// again.
-    pub fn check(&self, pubkey_hex: &str) -> Decision {
+    /// key is unknown and no miss has spent the cooldown yet; the caller
+    /// then calls [`Allowlist::replace`] and asks again. Returning
+    /// `Refresh` arms the cooldown, so the post-refresh re-ask (and any
+    /// unknown-key flood behind it) rejects without another S3 list.
+    pub fn check(&mut self, pubkey_hex: &str) -> Decision {
         if self.contains(pubkey_hex) {
             Decision::Accept
         } else if self.refresh_due() {
+            self.last_miss_refresh = Some(Instant::now());
             Decision::Refresh
         } else {
             Decision::Reject
@@ -136,8 +151,29 @@ mod tests {
 
     #[test]
     fn empty_registry_rejects_everyone_but_still_refreshes() {
-        let a = Allowlist::new();
+        let mut a = Allowlist::new();
         assert!(a.is_empty());
         assert_eq!(a.check("aa"), Decision::Refresh);
+    }
+
+    /// The cold-start race that flaked `forwarded-mutations`: node A
+    /// reads the registry at startup (before B enrolled), then B dials
+    /// in. A's periodic read must not have armed the cooldown, or B is
+    /// rejected for the whole window, its forwarded mutations fail as
+    /// transport errors, and the requester escalates to a lease
+    /// takeover.
+    #[test]
+    fn periodic_refresh_does_not_block_a_new_peers_first_dial() {
+        let mut a = Allowlist::with_cooldown(Duration::from_secs(3600));
+        // Startup/periodic registry read: B not enrolled yet.
+        a.replace(["aa".to_string()]);
+        assert_eq!(
+            a.check("bb"),
+            Decision::Refresh,
+            "a peer that enrolled after our periodic read deserves one re-read"
+        );
+        // The miss-triggered re-read finds B (it enrolled in between).
+        a.replace(["aa".to_string(), "bb".to_string()]);
+        assert_eq!(a.check("bb"), Decision::Accept);
     }
 }

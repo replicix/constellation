@@ -134,7 +134,10 @@ Handoff can release a reachable holder immediately; otherwise the requester
 waits for release or TTL expiry and claims through S3 CAS.
 
 The default request timeout is 500 ms
-(`CONSTELLATION_FORWARD_TIMEOUT_MS`). A holder crash after `Accepted` can
+(`CONSTELLATION_FORWARD_TIMEOUT_MS`). Setting `CONSTELLATION_FORWARD=off`
+disables requester-side forwarding entirely: every non-holder mutation
+takes the lease-acquisition path (P2P handoff, then S3 CAS), restoring
+writer-follows-lease placement. A holder crash after `Accepted` can
 strand records in its journal. Epoch fencing prevents a competing append
 history; reintegration reports and resolves the stranded branch.
 

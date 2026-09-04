@@ -21,6 +21,23 @@ pub fn forward_timeout_ms() -> u64 {
         .unwrap_or(500)
 }
 
+/// Env: `CONSTELLATION_FORWARD=off|0|false` disables requester-side
+/// forwarding. Non-holder mutations then fall back to ordinary lease
+/// acquisition (P2P handoff, then S3 CAS) — the pre-forwarding
+/// behavior. Exists for operators who want writer-follows-lease
+/// placement, and for the harness to exercise the takeover path
+/// deliberately (`p2p-handover`).
+pub fn forwarding_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("CONSTELLATION_FORWARD") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false"
+        ),
+        Err(_) => true,
+    })
+}
+
 /// Cached holder id per partition, plus forward counters for status.
 #[derive(Default)]
 pub struct ForwardState {

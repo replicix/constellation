@@ -995,32 +995,32 @@ impl ConstellationFs {
             }
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if h.tx
-            .send(SyncRequest::Forward {
-                part: part.clone(),
-                op: op.clone(),
-                reply: tx,
-            })
-            .is_err()
+        if crate::forward::forwarding_enabled()
+            && h.tx
+                .send(SyncRequest::Forward {
+                    part: part.clone(),
+                    op: op.clone(),
+                    reply: tx,
+                })
+                .is_ok()
         {
-            return Err(MutateFail::Errno(libc::EIO));
-        }
-        match rx.blocking_recv() {
-            Ok(Ok(constellation_meta::MutateOutcome::Accepted { .. })) => return Ok(()),
-            Ok(Ok(constellation_meta::MutateOutcome::Errno(e))) => {
-                return Err(MutateFail::Errno(e))
+            match rx.blocking_recv() {
+                Ok(Ok(constellation_meta::MutateOutcome::Accepted { .. })) => return Ok(()),
+                Ok(Ok(constellation_meta::MutateOutcome::Errno(e))) => {
+                    return Err(MutateFail::Errno(e))
+                }
+                Ok(Ok(constellation_meta::MutateOutcome::Conflict { manifest })) => {
+                    return Err(MutateFail::Conflict { manifest })
+                }
+                Ok(Ok(
+                    constellation_meta::MutateOutcome::Busy
+                    | constellation_meta::MutateOutcome::NotHolder { .. },
+                )) => {}
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, part, "forwarded mutation failed; acquiring lease");
+                }
+                Err(_) => return Err(MutateFail::Errno(libc::EIO)),
             }
-            Ok(Ok(constellation_meta::MutateOutcome::Conflict { manifest })) => {
-                return Err(MutateFail::Conflict { manifest })
-            }
-            Ok(Ok(
-                constellation_meta::MutateOutcome::Busy
-                | constellation_meta::MutateOutcome::NotHolder { .. },
-            )) => {}
-            Ok(Err(error)) => {
-                tracing::debug!(%error, part, "forwarded mutation failed; acquiring lease");
-            }
-            Err(_) => return Err(MutateFail::Errno(libc::EIO)),
         }
         self.require_lease_for(part_hint_ino)
             .map_err(MutateFail::Errno)?;

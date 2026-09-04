@@ -16,6 +16,7 @@ P2P fast path. Set them before mounting; values are read by the daemon.
 | `CONSTELLATION_LEASE_TTL_MS` | `60000` | milliseconds, positive | S3 lease expiry and renewal |
 | `CONSTELLATION_LEASE_IDLE_RELEASE_MS` | `30000` | milliseconds | release an idle held lease |
 | `CONSTELLATION_FORWARD_TIMEOUT_MS` | `500` | milliseconds | forwarded mutation request |
+| `CONSTELLATION_FORWARD` | `on` | boolean | requester-side mutation forwarding; `off` makes non-holder writes acquire the lease instead |
 | `CONSTELLATION_LEASE_PLACEMENT` | `on` | boolean | holder-driven placement |
 | `CONSTELLATION_SYNC_INTERVAL_MS` | `500` | milliseconds | background log tail/ship poll |
 | `CONSTELLATION_PART_SPLIT_OPS` | `512` | operations, positive | automatic partition split |
