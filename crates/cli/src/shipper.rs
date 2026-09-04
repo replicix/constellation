@@ -76,6 +76,12 @@ fn checkpoint_is_due(
 /// Max journal records per segment.
 const SEGMENT_BATCH: usize = 10_000;
 
+/// Concurrent segment-payload GETs while tailing one partition. Each
+/// GET is a full S3 round trip; a reader far from the bucket that
+/// fetched a burst's segments one at a time could not keep up with a
+/// writer sitting next to it.
+const TAIL_GET_CONCURRENCY: usize = 8;
+
 pub fn part_split_ops() -> u64 {
     std::env::var("CONSTELLATION_PART_SPLIT_OPS")
         .ok()
@@ -411,9 +417,22 @@ impl Shipper {
             if todo.is_empty() {
                 return Ok(());
             }
-            for id in todo {
-                self.ensure_part(&id);
-                self.tail_part(&id).await?;
+            for id in &todo {
+                self.ensure_part(id);
+            }
+            // One *parallel* LIST sweep across the partitions. Each
+            // partition is its own S3 prefix, so a tree that has split
+            // into N partitions costs N round trips here; sequentially
+            // that dominates the sync round on a WAN mount (~200 ms ×
+            // N per round, before a single segment is even fetched).
+            let listings = futures::future::join_all(todo.iter().map(|id| {
+                let log = self.parts[id].log.with_partition(id);
+                let next = self.parts[id].next_seq;
+                async move { log.list_segments_from(next).await }
+            }))
+            .await;
+            for (id, listing) in todo.into_iter().zip(listings) {
+                self.tail_part_listed(&id, listing?).await?;
                 seen.insert(id);
             }
         }
@@ -421,30 +440,44 @@ impl Shipper {
 
     async fn tail_part(&mut self, part: &str) -> Result<()> {
         self.ensure_part(part);
-        loop {
-            let next = self.parts[part].next_seq;
-            let seqs = self.parts[part].log.list_segments_from(next).await?;
-            let mut progressed = false;
-            for seq in seqs {
-                if seq != self.parts[part].next_seq {
-                    break;
-                }
-                self.apply_segment(part, seq).await?;
-                progressed = true;
-            }
-            if !progressed {
-                break;
-            }
-        }
-        Ok(())
+        let next = self.parts[part].next_seq;
+        let seqs = self.parts[part].log.list_segments_from(next).await?;
+        self.tail_part_listed(part, seqs).await
     }
 
-    async fn apply_segment(&mut self, part: &str, seq: u64) -> Result<()> {
-        let payload = {
-            let log = &self.parts[part].log;
-            log.get_segment(seq).await?
-        };
-        self.apply_segment_payload(part, seq, &payload)
+    /// Tail `part` starting from an already-fetched listing, re-listing
+    /// until no new contiguous segment appears. Payload GETs for the
+    /// contiguous run are pipelined ([`TAIL_GET_CONCURRENCY`] in
+    /// flight); `buffered` yields them in order, so records still apply
+    /// in strict sequence.
+    async fn tail_part_listed(&mut self, part: &str, mut seqs: Vec<u64>) -> Result<()> {
+        use futures::StreamExt;
+        loop {
+            let next = self.parts[part].next_seq;
+            let run: Vec<u64> = seqs
+                .iter()
+                .copied()
+                .enumerate()
+                .take_while(|(i, seq)| *seq == next + *i as u64)
+                .map(|(_, seq)| seq)
+                .collect();
+            if run.is_empty() {
+                return Ok(());
+            }
+            let base = self.parts[part].log.with_partition(part);
+            let mut fetched = futures::stream::iter(run.into_iter().map(|seq| {
+                let log = base.with_partition(base.partition());
+                async move { (seq, log.get_segment(seq).await) }
+            }))
+            .buffered(TAIL_GET_CONCURRENCY);
+            while let Some((seq, payload)) = fetched.next().await {
+                let payload = payload?;
+                self.apply_segment_payload(part, seq, &payload)?;
+            }
+            drop(fetched);
+            let next = self.parts[part].next_seq;
+            seqs = self.parts[part].log.list_segments_from(next).await?;
+        }
     }
 
     /// Apply a gossip-pushed segment without an S3 GET. Returns false for

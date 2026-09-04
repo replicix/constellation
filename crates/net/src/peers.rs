@@ -315,6 +315,15 @@ impl Peers {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
+        // The payload rides along only when it fits the gossip frame; an
+        // oversized segment must still produce the *hint*. Failing the
+        // whole broadcast here used to silently disable push invalidation
+        // exactly under write bursts — the big batched segments are the
+        // ones whose readers lag the most on their own poll schedule.
+        let payload = payload.filter(|p| {
+            p.len() + part.len() + crate::message::SEGMENT_PUSH_ENVELOPE
+                <= crate::message::GOSSIP_CONTENT_LIMIT
+        });
         let payload = Payload::SegmentPublished {
             part: part.to_string(),
             seq,

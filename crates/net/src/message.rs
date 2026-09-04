@@ -32,6 +32,11 @@ pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 32 * 1024;
 /// envelope. `Signed::encode_bare` enforces this before enqueue, because
 /// the gossip sender otherwise reports an oversized frame asynchronously.
 pub const GOSSIP_CONTENT_LIMIT: usize = GOSSIP_MAX_MESSAGE_SIZE - 1024;
+/// Headroom a `SegmentPublished` push needs on top of its zstd payload
+/// and partition id: enum/option tags, seq + epoch varints, postcard
+/// length prefixes, the author pubkey, and the signature. Measured well
+/// under 200 bytes; 512 keeps a safety margin.
+pub const SEGMENT_PUSH_ENVELOPE: usize = 512;
 /// Conservative delta batch under [`GOSSIP_CONTENT_LIMIT`]. Raw hashes
 /// cost 32 bytes each; the remaining headroom covers payload/envelope
 /// tags, counters, author, and signature.
@@ -432,6 +437,31 @@ mod tests {
         assert!(
             n <= GOSSIP_CONTENT_LIMIT,
             "maximum delta is {n} bytes, content limit is {GOSSIP_CONTENT_LIMIT}"
+        );
+    }
+
+    /// The largest segment push [`SEGMENT_PUSH_ENVELOPE`] admits must
+    /// really encode within the gossip budget, or `announce_segment`'s
+    /// size gate would wave through frames the sender then rejects —
+    /// re-disabling push invalidation under load, silently.
+    #[test]
+    fn a_maximum_segment_push_fits_the_real_gossip_budget() {
+        let part = "p1_20";
+        let payload = vec![0xAB; GOSSIP_CONTENT_LIMIT - SEGMENT_PUSH_ENVELOPE - part.len()];
+        let msg = Signed::new(
+            &key(),
+            &Payload::SegmentPublished {
+                part: part.to_string(),
+                seq: u64::MAX,
+                epoch: u64::MAX,
+                payload: Some(payload),
+            },
+        )
+        .unwrap();
+        let n = msg.encode_bare().unwrap().len();
+        assert!(
+            n <= GOSSIP_CONTENT_LIMIT,
+            "maximum segment push is {n} bytes, content limit is {GOSSIP_CONTENT_LIMIT}"
         );
     }
 }
