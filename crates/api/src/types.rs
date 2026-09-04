@@ -85,6 +85,13 @@ pub enum Request {
     Doctor,
     /// Enumerate local cache entries for operator inspection.
     CacheList,
+    /// Drop clean LRU chunks until total used bytes are at most
+    /// `target_bytes` (default 0: free every clean chunk). Pinned and
+    /// dirty chunks are never removed.
+    CachePrune {
+        #[serde(default)]
+        target_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +243,9 @@ pub struct StatusReport {
     /// segment origin).
     #[serde(default)]
     pub node_id: u64,
+    /// Running binary version (`git describe` / package version).
+    #[serde(default)]
+    pub version: String,
     /// Whether this node's registry record is present and not retired.
     /// False after a successful `leave`, or when an admin retired us.
     #[serde(default = "default_true")]
@@ -387,6 +397,9 @@ pub struct P2pStatus {
     /// This node's dialable address, as published to the registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_addr: Option<String>,
+    /// Active relay policy: `disabled`, `default`, or a custom URL label.
+    #[serde(default)]
+    pub relay: String,
     #[serde(default)]
     pub peers: Vec<PeerStatus>,
 }
@@ -403,6 +416,9 @@ pub struct PeerStatus {
     pub last_seen_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Peer binary version from the registry (`git describe` / package).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pubkey: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -424,6 +440,13 @@ pub struct PeerStatus {
     /// Cooperative-cache source stats for this peer, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coop: Option<SourceStatus>,
+    /// Synthetic S3 backend row (`node_id` 0). Always listed first among
+    /// [`P2pStatus::peers`] so the UI can compare lat/BW/hit% with peers.
+    #[serde(default)]
+    pub s3: bool,
+    /// Connectivity path: `direct`, `relay`, `unknown`, or empty for S3.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
 }
 
 /// One partition as exposed by the control API.

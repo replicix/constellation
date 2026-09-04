@@ -83,30 +83,48 @@ function focusPeer(id){focusId=id;setHash(id);render(); window.scrollTo({top:doc
 function row(k,v){return `<div class="row"><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`;}
 
 function peerCard(p){
+  const isS3=!!p.s3;
   const connected=p.connected?'<span class="pill ok">connected</span>':'<span class="pill bad">disconnected</span>';
-  const host=p.hostname?esc(p.hostname):'<span class="muted">unknown host</span>';
+  const host=isS3?'S3':(p.hostname?esc(p.hostname):'<span class="muted">unknown host</span>');
+  const ver=isS3?'<span class="muted">backend</span>':(p.version?esc(p.version):'<span class="muted">—</span>');
+  const title=isS3?'<strong>S3</strong>':'<strong>node '+p.node_id+'</strong>';
   const selected=focusId===p.node_id?" selected":"";
+  const seen=isS3?'durable path':`RTT ${dur(p.rtt_ms)} · ${esc(p.path||p.coop?.path||"unknown")} · seen ${ago(p.last_seen_ms)}`;
+  const addrs=isS3?'chunk store (object backend)':((p.addrs||[]).slice(0,2).map(esc).join("<br>")||"no dial addrs");
   return `<article class="card${selected}" style="cursor:pointer;margin:0" onclick="focusPeer(${p.node_id})">
-    <div class="summary"><strong>node ${p.node_id}</strong> ${connected}${p.ro?' <span class="pill">read-only</span>':''}${p.epoch_member?' <span class="pill ok">epoch member</span>':''}</div>
-    <div class="muted" style="margin-top:8px">${host}</div>
-    <div style="margin-top:8px">RTT ${dur(p.rtt_ms)} · seen ${ago(p.last_seen_ms)}</div>
-    <div class="muted" style="margin-top:6px">${(p.addrs||[]).slice(0,2).map(esc).join("<br>")||"no dial addrs"}</div>
+    <div class="summary">${title} ${connected}${p.ro?' <span class="pill">read-only</span>':''}${p.epoch_member?' <span class="pill ok">epoch member</span>':''}${isS3?' <span class="pill">source</span>':''}</div>
+    <div class="muted" style="margin-top:8px">${host} · ${ver}</div>
+    <div style="margin-top:8px">${seen}</div>
+    <div class="muted" style="margin-top:6px">${addrs}</div>
   </article>`;
 }
 
 function peerDetail(p){
+  const isS3=!!p.s3;
   const coop=p.coop?`
     ${row("ttfb ewma", p.coop.ttfb_ms_ewma!=null?dur(p.coop.ttfb_ms_ewma):'<span class="muted">unmeasured</span>')}
     ${row("goodput ewma", p.coop.goodput_mbps_ewma!=null?`${p.coop.goodput_mbps_ewma.toFixed(2)} Mbps`:'<span class="muted">unmeasured</span>')}
     ${row("hit rate", `${((p.coop.hit_rate||0)*100).toFixed(2)}%`)}
     ${row("miss rate", `${((p.coop.miss_rate||0)*100).toFixed(2)}%`)}
     ${row("error rate", `${(p.coop.err_rate*100).toFixed(2)}%`)}
+    ${row("ok samples", String(p.coop.ok_samples||0))}
     ${row("transport RTT", dur(p.coop.transport_rtt_ms))}
     ${row("path", esc(p.coop.path||"—"))}`:`${row("coop stats", '<span class="muted">none yet</span>')}`;
+  if(isS3){
+    return `
+    ${row("source", "S3 (object backend)")}
+    ${row("role", "durable last-resort chunk path")}
+    <h2 style="margin:16px 0 8px">Cooperative cache</h2>
+    ${coop}
+    <h2 style="margin:16px 0 8px">Raw</h2>
+    <pre>${esc(JSON.stringify(p,null,2))}</pre>`;
+  }
   return `
     ${row("node id", String(p.node_id))}
     ${row("hostname", esc(p.hostname||"—"))}
+    ${row("version", esc(p.version||"—"))}
     ${row("connected", p.connected?'<span class="ok">yes</span>':'<span class="bad">no</span>')}
+    ${row("path", esc(p.path||p.coop?.path||"—"))}
     ${row("read-only", p.ro?"yes":"no")}
     ${row("epoch member", p.epoch_member?"yes":"no")}
     ${row("RTT", dur(p.rtt_ms))}
@@ -127,11 +145,12 @@ function render(){
   if(!lastStatus)return;
   const s=lastStatus;
   const peers=s.p2p?.peers||[];
-  document.getElementById("self").innerHTML=`node <b>${s.node_id}</b> · ${esc(s.backend)} · uptime ${dur((s.uptime_s||0)*1000)}<br>
+  const peerCount=peers.filter(p=>!p.s3).length;
+  document.getElementById("self").innerHTML=`node <b>${s.node_id}</b> · ${esc(s.version||"—")} · ${esc(s.backend)} · uptime ${dur((s.uptime_s||0)*1000)}<br>
     endpoint <code>${esc((()=>{try{return JSON.parse(s.p2p?.node_addr||"null")?.id||"—"}catch{return "—"}})())}</code><br>
-    p2p ${s.p2p?.enabled?'<span class="ok">enabled</span>':'<span class="bad">disabled</span>'} · epoch ${s.epoch?.active?esc(s.epoch.epoch_id):"inactive"}`;
-  document.getElementById("count").textContent=`(${peers.length})`;
-  document.getElementById("list").innerHTML=peers.map(peerCard).join("")||'<span class="muted">no peers enrolled yet</span>';
+    p2p ${s.p2p?.enabled?'<span class="ok">enabled</span>':'<span class="bad">disabled</span>'} · relay ${esc(s.p2p?.relay||"disabled")} · epoch ${s.epoch?.active?esc(s.epoch.epoch_id):"inactive"}`;
+  document.getElementById("count").textContent=`(${peerCount} peers + S3)`;
+  document.getElementById("list").innerHTML=peers.map(peerCard).join("")||'<span class="muted">no sources</span>';
   const wrap=document.getElementById("detailWrap");
   if(focusId!=null){
     const p=peers.find(x=>x.node_id===focusId);
@@ -140,7 +159,7 @@ function render(){
       document.getElementById("detailTitle").textContent=`Node ${focusId}`;
       document.getElementById("detail").innerHTML='<span class="bad">not in the current peer directory (left, retired, or not yet published)</span>';
     }else{
-      document.getElementById("detailTitle").textContent=`Node ${p.node_id}${p.hostname?" · "+p.hostname:""}`;
+      document.getElementById("detailTitle").textContent=p.s3?"S3":`Node ${p.node_id}${p.hostname?" · "+p.hostname:""}`;
       document.getElementById("detail").innerHTML=peerDetail(p);
     }
   }else{

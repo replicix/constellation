@@ -166,3 +166,27 @@ write requires an unexpired authority chain (lease TTL, delegation ack,
 epoch promise) — correctness is preserved under arbitrary partitions,
 including the all-writers-on-LAN continuation epoch (all-members rule, not
 majority; see DESIGN.md §5.3).
+
+## ADR-13: Optional iroh relays; default remains registry-direct
+
+**Decision**: keep iroh `RelayMode::Disabled` as the Constellation default.
+Peers dial addresses published in the S3 node registry (LAN/VPN topologies).
+Operators may opt into n0 public relays or self-hosted relays via
+`CONSTELLATION_P2P_RELAY` so nodes with no mutual L3 path (NAT, internet-only
+EC2 private IPs vs off-VPN laptops) can still form the P2P fast path.
+
+**Rejected**: enabling n0 relays by default — would send encrypted traffic
+through third-party infrastructure without an explicit operator choice, and
+most Constellation fleets already share a VPC/VPN where direct dialing works.
+Global pkarr/DNS address publishing (iroh `N0` preset) — the registry remains
+the only peer directory and trust root (DESIGN.md §8).
+
+**Consequence**: all nodes that need to talk over relays must share the same
+relay policy (same public map, or the same custom URL list + optional token).
+Allowlist enrollment is unchanged: a relay only carries bytes between already
+enrolled endpoints. A single self-hosted relay (with or without one shared
+admission token for all tenants) is the same security shape as n0's public
+relays — tenant isolation is registry/IAM/E2E crypto, not relay tokens.
+Multiple `shared_token` values are an admission OR-list, not per-tenant
+overlays; partition capacity with separate relay URLs when needed. Details:
+[P2P relays — shared relays and multi-tenancy](../reference/features/p2p-relays.md#shared-relays-and-multi-tenancy).

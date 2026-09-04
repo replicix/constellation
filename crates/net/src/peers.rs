@@ -11,7 +11,7 @@
 //! what actually guarantees the operation completes.
 
 use crate::allowlist::Decision;
-use crate::endpoint::{P2p, PeerService};
+use crate::endpoint::{P2p, PathKind, PeerService};
 use crate::message::{read_frame, write_frame, Payload, Signed, ALPN};
 use anyhow::Result;
 use iroh::EndpointAddr;
@@ -43,9 +43,13 @@ pub struct Peer {
     /// Last successful round trip, for status output.
     pub rtt_ms: Option<u64>,
     pub connected: bool,
+    /// How the last successful QUIC path reached this peer.
+    pub path: PathKind,
     /// When we last observed this peer live (gossip neighbor or RPC).
     pub last_seen: Option<Instant>,
     pub hostname: String,
+    /// Peer binary version from the registry, when published.
+    pub version: String,
     pub created_unix: i64,
     pub p2p_updated_unix: Option<i64>,
     pub ro: bool,
@@ -58,6 +62,7 @@ pub struct PeerEnrollment {
     pub pubkey_hex: String,
     pub addr_json: serde_json::Value,
     pub hostname: String,
+    pub version: String,
     pub created_unix: i64,
     pub p2p_updated_unix: Option<i64>,
     pub ro: bool,
@@ -70,6 +75,7 @@ impl From<(u64, String, serde_json::Value)> for PeerEnrollment {
             pubkey_hex,
             addr_json,
             hostname: String::new(),
+            version: String::new(),
             created_unix: 0,
             p2p_updated_unix: None,
             ro: false,
@@ -125,6 +131,14 @@ impl Peers {
         Some(self.inner.as_ref()?.p2p.pubkey_hex())
     }
 
+    /// Relay policy label, or `"off"` when P2P is disabled.
+    pub fn relay_label(&self) -> String {
+        self.inner
+            .as_ref()
+            .map(|i| i.p2p.relay_label().to_string())
+            .unwrap_or_else(|| "off".into())
+    }
+
     /// Join the gossip topic and return the receiver to drive.
     pub async fn join_topic(
         &self,
@@ -166,8 +180,10 @@ impl Peers {
                         addr,
                         rtt_ms: prev.as_ref().and_then(|p| p.rtt_ms),
                         connected: prev.as_ref().map(|p| p.connected).unwrap_or(false),
+                        path: prev.as_ref().map(|p| p.path).unwrap_or(PathKind::Unknown),
                         last_seen: prev.and_then(|p| p.last_seen),
                         hostname: rec.hostname,
+                        version: rec.version,
                         created_unix: rec.created_unix,
                         p2p_updated_unix: rec.p2p_updated_unix,
                         ro: rec.ro,
@@ -236,9 +252,28 @@ impl Peers {
             .get(&node_id)
             .map(|p| p.addr.clone())
             .ok_or_else(|| anyhow::anyhow!("peer {node_id} has no endpoint"))?;
-        match tokio::time::timeout(timeout, inner.p2p.request_chunk(addr, hash)).await {
-            Ok(r) => r,
-            Err(_) => anyhow::bail!("chunk request to {node_id} timed out"),
+        match tokio::time::timeout(timeout, inner.p2p.request_chunk(addr.clone(), hash)).await {
+            Ok(Ok(Some(fetch))) => {
+                let rtt = fetch.rtt.unwrap_or(Duration::ZERO);
+                self.note_rtt(node_id, rtt, true, fetch.path);
+                Ok(Some(fetch))
+            }
+            Ok(Ok(None)) => {
+                // Soft miss: path still observed if the connection is live.
+                let path = inner.p2p.path_kind(addr.id).await;
+                if path != PathKind::Unknown {
+                    self.note_path(node_id, path);
+                }
+                Ok(None)
+            }
+            Ok(Err(e)) => {
+                self.note_rtt(node_id, Duration::ZERO, false, PathKind::Unknown);
+                Err(e)
+            }
+            Err(_) => {
+                self.note_rtt(node_id, timeout, false, PathKind::Unknown);
+                anyhow::bail!("chunk request to {node_id} timed out")
+            }
         }
     }
 
@@ -301,7 +336,8 @@ impl Peers {
             .await;
             match reply {
                 Ok(Ok(body)) => {
-                    self.note_rtt(peer.node_id, started.elapsed(), true);
+                    let path = inner.p2p.path_kind(peer.addr.id).await;
+                    self.note_rtt(peer.node_id, started.elapsed(), true, path);
                     if crate::interpret_reply(part, &body) == crate::RequestOutcome::ClaimNow {
                         tracing::info!(
                             part,
@@ -314,26 +350,42 @@ impl Peers {
                 }
                 Ok(Err(e)) => {
                     tracing::debug!(error = %e, peer = peer.node_id, part, "lease request failed");
-                    self.note_rtt(peer.node_id, started.elapsed(), false);
+                    self.note_rtt(peer.node_id, started.elapsed(), false, PathKind::Unknown);
                 }
                 Err(_) => {
                     tracing::debug!(peer = peer.node_id, part, "lease request timed out");
-                    self.note_rtt(peer.node_id, started.elapsed(), false);
+                    self.note_rtt(peer.node_id, started.elapsed(), false, PathKind::Unknown);
                 }
             }
         }
         false
     }
 
-    fn note_rtt(&self, node_id: u64, took: Duration, ok: bool) {
+    fn note_rtt(&self, node_id: u64, took: Duration, ok: bool, path: PathKind) {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
         if let Some(p) = inner.peers.lock().unwrap().get_mut(&node_id) {
             p.connected = ok;
             if ok {
-                p.rtt_ms = Some(took.as_millis() as u64);
+                if !took.is_zero() {
+                    p.rtt_ms = Some(took.as_millis() as u64);
+                }
+                if path != PathKind::Unknown {
+                    p.path = path;
+                }
                 p.last_seen = Some(Instant::now());
+            }
+        }
+    }
+
+    fn note_path(&self, node_id: u64, path: PathKind) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        if let Some(p) = inner.peers.lock().unwrap().get_mut(&node_id) {
+            if path != PathKind::Unknown {
+                p.path = path;
             }
         }
     }
@@ -386,23 +438,24 @@ impl Peers {
             .find(|p| p.addr.id == addr.id)
             .map(|p| p.node_id);
         let started = Instant::now();
-        let result = tokio::time::timeout(REQUEST_TIMEOUT, inner.p2p.request(addr, payload)).await;
+        let result = tokio::time::timeout(REQUEST_TIMEOUT, inner.p2p.request(addr.clone(), payload)).await;
         match result {
             Ok(Ok(reply)) => {
                 if let Some(id) = node_id {
-                    self.note_rtt(id, started.elapsed(), true);
+                    let path = inner.p2p.path_kind(addr.id).await;
+                    self.note_rtt(id, started.elapsed(), true, path);
                 }
                 Ok(reply)
             }
             Ok(Err(e)) => {
                 if let Some(id) = node_id {
-                    self.note_rtt(id, started.elapsed(), false);
+                    self.note_rtt(id, started.elapsed(), false, PathKind::Unknown);
                 }
                 Err(e)
             }
             Err(_) => {
                 if let Some(id) = node_id {
-                    self.note_rtt(id, started.elapsed(), false);
+                    self.note_rtt(id, started.elapsed(), false, PathKind::Unknown);
                 }
                 anyhow::bail!("request timed out")
             }

@@ -125,6 +125,17 @@ pub struct CacheUsage {
     pub pinned: u64,
 }
 
+/// Result of [`DiskCache::prune_to`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneReport {
+    pub freed_bytes: u64,
+    pub freed_chunks: u64,
+    pub used_bytes: u64,
+    pub pinned_bytes: u64,
+    pub dirty_bytes: u64,
+    pub entries: u64,
+}
+
 impl DiskCache {
     /// Open (or create) a cache directory and rebuild accounting from disk.
     pub fn open(root: impl Into<PathBuf>, budget: u64) -> Result<Self, CoreError> {
@@ -393,6 +404,67 @@ impl DiskCache {
         }
     }
 
+    /// Drop clean LRU chunks until `used <= target_used`, or until nothing
+    /// clean remains. Pinned and dirty entries are never removed.
+    ///
+    /// Best-effort: if non-evictable content already exceeds `target_used`,
+    /// every clean chunk is still freed and the report reflects what is
+    /// left. Digest remove events are recorded for cooperative-cache
+    /// republish.
+    pub fn prune_to(&self, target_used: u64) -> Result<PruneReport, CoreError> {
+        let (victims, report) = {
+            let mut st = self.state.lock().unwrap();
+            let before = st.used;
+            let need = st.used.saturating_sub(target_used);
+            let mut clean: Vec<(ChunkHash, u64, u64)> = st
+                .entries
+                .iter()
+                .filter(|(_, e)| e.state == ChunkState::Clean)
+                .map(|(h, e)| (*h, e.size, e.atime))
+                .collect();
+            clean.sort_by_key(|(_, _, atime)| *atime);
+            let mut freed = 0u64;
+            let mut victims = Vec::new();
+            for (h, sz, _) in clean {
+                if freed >= need {
+                    break;
+                }
+                freed += sz;
+                victims.push((h, sz));
+            }
+            for (h, sz) in &victims {
+                st.entries.remove(h);
+                st.used -= sz;
+                st.note(*h, Some(ChunkState::Clean), None);
+            }
+            let pinned: u64 = st
+                .entries
+                .values()
+                .filter(|e| e.state == ChunkState::Pinned)
+                .map(|e| e.size)
+                .sum();
+            let dirty: u64 = st
+                .entries
+                .values()
+                .filter(|e| e.state == ChunkState::Dirty)
+                .map(|e| e.size)
+                .sum();
+            let report = PruneReport {
+                freed_bytes: before - st.used,
+                freed_chunks: victims.len() as u64,
+                used_bytes: st.used,
+                pinned_bytes: pinned,
+                dirty_bytes: dirty,
+                entries: st.entries.len() as u64,
+            };
+            (victims, report)
+        };
+        for (vh, _) in &victims {
+            let _ = fs::remove_file(self.path_for(vh));
+        }
+        Ok(report)
+    }
+
     fn forget(&self, hash: &ChunkHash) {
         let mut st = self.state.lock().unwrap();
         if let Some(e) = st.entries.remove(hash) {
@@ -593,6 +665,52 @@ mod tests {
         c.set_state(&h2, ChunkState::Clean);
         c.insert(&h3, &d3, ChunkState::Clean).unwrap();
         assert!(!c.contains(&h2));
+    }
+
+    #[test]
+    fn prune_drops_clean_lru_and_spares_pinned_dirty() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 10_000).unwrap();
+        let (h1, d1) = chunk(1, 100);
+        let (h2, d2) = chunk(2, 100);
+        let (h3, d3) = chunk(3, 100);
+        c.insert(&h1, &d1, ChunkState::Clean).unwrap();
+        c.insert(&h2, &d2, ChunkState::Pinned).unwrap();
+        c.insert(&h3, &d3, ChunkState::Dirty).unwrap();
+        c.get(&h1).unwrap(); // touch so h1 is MRU among clean (only clean)
+
+        let report = c.prune_to(0).unwrap();
+        assert_eq!(report.freed_chunks, 1);
+        assert_eq!(report.freed_bytes, 100);
+        assert!(!c.contains(&h1));
+        assert!(c.contains(&h2));
+        assert!(c.contains(&h3));
+        assert_eq!(report.pinned_bytes, 100);
+        assert_eq!(report.dirty_bytes, 100);
+        assert_eq!(report.used_bytes, 200);
+
+        let again = c.prune_to(0).unwrap();
+        assert_eq!(again.freed_chunks, 0);
+        assert_eq!(again.used_bytes, 200);
+    }
+
+    #[test]
+    fn prune_to_target_keeps_newest_clean() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 10_000).unwrap();
+        let (h1, d1) = chunk(1, 100);
+        let (h2, d2) = chunk(2, 100);
+        let (h3, d3) = chunk(3, 100);
+        c.insert(&h1, &d1, ChunkState::Clean).unwrap();
+        c.insert(&h2, &d2, ChunkState::Clean).unwrap();
+        c.insert(&h3, &d3, ChunkState::Clean).unwrap();
+        // Target just under 200 so one clean chunk (LRU = h1) must go.
+        let report = c.prune_to(200).unwrap();
+        assert_eq!(report.freed_chunks, 1);
+        assert!(!c.contains(&h1));
+        assert!(c.contains(&h2));
+        assert!(c.contains(&h3));
+        assert_eq!(report.used_bytes, 200);
     }
 
     #[test]

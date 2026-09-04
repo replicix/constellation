@@ -4,7 +4,7 @@ Technical descriptions of how specific parts of Constellation work.
 
 ## Features
 
-_(none yet — add API, format, and CLI reference here as docs are written)_
+- [P2P relays](features/p2p-relays.md) — relay modes, env vars, trust model, status fields
 
 ## Project
 

@@ -128,6 +128,10 @@ pub trait StatusSource: Send + Sync + 'static {
     fn cache_list(&self) -> Vec<CacheEntryStatus> {
         Vec::new()
     }
+
+    fn cache_prune(&self, _target_bytes: u64) -> std::result::Result<String, String> {
+        Err("cache prune is not supported by this daemon".into())
+    }
 }
 
 /// The single request dispatcher shared by unix sockets and HTTP. Keeping
@@ -189,6 +193,7 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
         Request::CacheList => Response::CacheEntries {
             entries: source.cache_list(),
         },
+        Request::CachePrune { target_bytes } => result(source.cache_prune(target_bytes)),
     }
 }
 
@@ -264,6 +269,7 @@ mod tests {
                 backend: "s3://bucket/prefix".into(),
                 mountpoint: "/mnt/x".into(),
                 node_id: 1,
+                version: "1.0.0-test".into(),
                 enrolled: true,
                 uptime_s: 12,
                 spool: SpoolStatus {
@@ -369,6 +375,10 @@ mod tests {
                 state: "clean".into(),
             }]
         }
+
+        fn cache_prune(&self, target_bytes: u64) -> std::result::Result<String, String> {
+            Ok(format!("pruned to {target_bytes} bytes"))
+        }
     }
 
     /// A `StatusSource` whose lease views live behind ONE mutex that both
@@ -438,6 +448,7 @@ mod tests {
                 backend: "s3://bucket/prefix".into(),
                 mountpoint: "/mnt/x".into(),
                 node_id: 1,
+                version: "1.0.0-test".into(),
                 enrolled: true,
                 uptime_s: 1,
                 spool: SpoolStatus {
@@ -612,6 +623,7 @@ mod tests {
             Request::LogTail { lines: 10 },
             Request::Doctor,
             Request::CacheList,
+            Request::CachePrune { target_bytes: 0 },
         ];
         let dir = tempfile::tempdir().unwrap();
         let source = Arc::new(Fake);
@@ -657,6 +669,10 @@ mod tests {
         assert!(matches!(
             dispatch(&source, Request::CacheList),
             Response::CacheEntries { entries } if entries.len() == 1
+        ));
+        assert!(matches!(
+            dispatch(&source, Request::CachePrune { target_bytes: 0 }),
+            Response::Ok { detail } if detail.contains("pruned")
         ));
     }
 }

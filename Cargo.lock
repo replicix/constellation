@@ -982,7 +982,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "constellation"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-api"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-fs-core"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-harness"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-meta"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "constellation-fs-core",
  "postcard",
@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-net"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-store-s3"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-upload-concurrency"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "tokio",
 ]
@@ -4940,7 +4940,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "uploadbench"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bytes",

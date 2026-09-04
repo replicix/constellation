@@ -530,7 +530,7 @@ impl Coop {
             sel.record_transport(
                 SourceId::Peer(peer.node_id),
                 Some(Duration::from_millis(ms)),
-                PathKind::Unknown,
+                peer.path,
             );
         }
     }

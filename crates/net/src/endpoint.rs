@@ -1,21 +1,23 @@
 //! The iroh endpoint that carries the P2P fast path.
 //!
-//! One QUIC endpoint per daemon, keyed by the host node key. Address
-//! discovery is **not** published to any global service: peers learn how
-//! to dial each other from the filesystem's own node registry in S3, so
-//! the bucket stays the only directory and the only trust root
-//! (DESIGN.md §8).
+//! One QUIC endpoint per daemon, keyed by the host node key. Peers learn
+//! dial info from the filesystem's own node registry in S3, so the bucket
+//! stays the only directory and the only trust root (DESIGN.md §8).
+//! Relays are optional (`CONSTELLATION_P2P_RELAY`) and never replace the
+//! registry: they only help when published direct addresses are not
+//! mutually reachable (NAT / no shared L3).
 //!
-//! Everything here is best-effort. `spawn` returning `None`, a peer that
+//! Everything here is best-effort. `spawn` returning an error, a peer that
 //! never answers, and a gossip topic that never forms all degrade to the
 //! S3 polling path that phases 1–2 already rely on.
 
 use crate::allowlist::{Allowlist, Decision};
 use crate::message::{Payload, Signed, ALPN};
+use crate::relay::RelayPolicy;
 use anyhow::{Context, Result};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
 use std::collections::HashMap;
@@ -61,6 +63,16 @@ pub enum PathKind {
     Direct,
     Relay,
     Unknown,
+}
+
+impl PathKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// What the daemon gives the endpoint so it can serve peer requests.
@@ -163,6 +175,8 @@ pub struct P2p {
     /// peers to connect concurrently. QUIC streams multiplex over the
     /// retained connection.
     connections: ConnectionPool,
+    /// Active relay policy label (`disabled` / `default` / URL…).
+    relay: String,
 }
 
 /// Derive the gossip topic. Prefers the `gossip_secret` from
@@ -181,13 +195,26 @@ pub fn topic_for(gossip_secret: Option<&[u8; 32]>, fs_uuid: &str) -> TopicId {
 impl P2p {
     /// Bind the endpoint and spawn gossip. Errors are the caller's cue to
     /// run without a fast path.
+    ///
+    /// Relay behaviour comes from [`RelayPolicy::from_env`] unless
+    /// `relay` is passed explicitly (tests).
     pub async fn spawn(key: SecretKey, topic: TopicId) -> Result<Self> {
+        Self::spawn_with(key, topic, RelayPolicy::from_env()?).await
+    }
+
+    pub async fn spawn_with(
+        key: SecretKey,
+        topic: TopicId,
+        relay: RelayPolicy,
+    ) -> Result<Self> {
         let lookup = MemoryLookup::new();
+        let relay_mode = relay.to_iroh()?;
+        let relay_label = relay.label();
         let endpoint = Endpoint::builder(presets::Minimal)
-            // No relay and no address publishing: the registry in S3 is
-            // the only directory (DESIGN.md §8). Peer addresses from the
-            // registry are injected through `lookup`.
-            .relay_mode(RelayMode::Disabled)
+            // Registry remains the peer directory (DESIGN.md §8). Relays
+            // are optional connectivity help when direct addrs cannot
+            // reach (NAT / no shared L3). See docs/reference/features/p2p-relays.md.
+            .relay_mode(relay_mode)
             .secret_key(key.clone())
             .address_lookup(lookup.clone())
             .alpns(vec![ALPN.to_vec(), iroh_gossip::ALPN.to_vec()])
@@ -206,6 +233,7 @@ impl P2p {
             lookup,
             sender: Arc::new(tokio::sync::Mutex::new(None)),
             connections: Arc::new(Mutex::new(HashMap::new())),
+            relay: relay_label,
         })
     }
 
@@ -216,6 +244,11 @@ impl P2p {
 
     pub fn addr(&self) -> EndpointAddr {
         self.endpoint.addr()
+    }
+
+    /// Relay policy label active on this endpoint.
+    pub fn relay_label(&self) -> &str {
+        &self.relay
     }
 
     pub fn pubkey_hex(&self) -> String {
@@ -322,6 +355,19 @@ impl P2p {
                     .await
                     .with_context(|| format!("chunk stream failed after redial: {first_error:#}"))
             }
+        }
+    }
+
+    /// Selected-path kind for a pooled connection, if any.
+    pub async fn path_kind(&self, id: iroh::EndpointId) -> PathKind {
+        let gate = self.connections.lock().unwrap().get(&id).cloned();
+        let Some(gate) = gate else {
+            return PathKind::Unknown;
+        };
+        let slot = gate.lock().await;
+        match slot.as_ref() {
+            Some(conn) => transport_observation(conn).1,
+            None => PathKind::Unknown,
         }
     }
 

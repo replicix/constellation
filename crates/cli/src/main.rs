@@ -289,6 +289,16 @@ enum CacheCommand {
         #[arg(long)]
         state_dir: PathBuf,
     },
+    /// Drop clean LRU chunks from the local cache (pinned/dirty kept).
+    #[command(visible_alias = "evict")]
+    Prune {
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Keep at most this many bytes used (e.g. `1G`, `512MiB`).
+        /// Default `0` frees every clean chunk.
+        #[arg(long, default_value = "0", value_parser = parse_byte_size)]
+        target: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -543,6 +553,12 @@ fn main() -> Result<()> {
             CacheCommand::Stat { state_dir } => {
                 rt.block_on(control_call(&state_dir, constellation_api::Request::Status))
             }
+            CacheCommand::Prune { state_dir, target } => rt.block_on(control_call(
+                &state_dir,
+                constellation_api::Request::CachePrune {
+                    target_bytes: target,
+                },
+            )),
         },
         Command::Log {
             command: LogCommand::Tail { state_dir, lines },
@@ -2006,15 +2022,21 @@ async fn start_p2p(
             return constellation_net::Peers::disabled();
         }
     };
+    let relay = p2p.relay_label().to_string();
     let addr = p2p.addr();
     let pubkey = p2p.pubkey_hex();
     let peers = constellation_net::Peers::new(p2p, node_id);
     // Publish how peers reach us, then learn about them.
     match serde_json::to_value(&addr) {
         Ok(addr_json) => {
-            if let Err(e) =
-                constellation_store_s3::publish_p2p(store.clone(), node_id, &pubkey, addr_json)
-                    .await
+            if let Err(e) = constellation_store_s3::publish_p2p(
+                store.clone(),
+                node_id,
+                &pubkey,
+                addr_json,
+                env!("CONSTELLATION_VERSION"),
+            )
+            .await
             {
                 tracing::warn!(error = %e, "could not publish our P2P address; peers cannot dial us");
             }
@@ -2025,6 +2047,7 @@ async fn start_p2p(
     tracing::info!(
         node_id,
         peers = peers.snapshot().len(),
+        %relay,
         "P2P fast path ready"
     );
     peers
@@ -2068,6 +2091,7 @@ async fn refresh_peers(
                         pubkey_hex: n.pubkey?,
                         addr_json: n.p2p_addr?,
                         hostname: n.hostname,
+                        version: n.version.unwrap_or_default(),
                         created_unix: n.created_unix,
                         p2p_updated_unix: n.p2p_updated_unix,
                         ro: n.ro,
@@ -2778,17 +2802,25 @@ impl constellation_api::StatusSource for DaemonStatus {
         let designations = self.list_designations();
         let epoch = self.epochs.status();
         let coop = self.coop.report();
-        let p2p = constellation_api::P2pStatus {
-            enabled: self.peers.is_enabled(),
-            node_addr: self
-                .peers
-                .node_addr()
-                .and_then(|a| serde_json::to_string(&a).ok()),
-            peers: self
-                .peers
-                .snapshot()
-                .into_iter()
-                .map(|p| {
+        let s3_coop = coop
+            .per_source
+            .iter()
+            .find(|s| s.id == "s3")
+            .cloned();
+        let peer_snap = self.peers.snapshot();
+        let mut peers: Vec<constellation_api::PeerStatus> = Vec::with_capacity(1 + peer_snap.len());
+        // S3 is always first so operators can compare the durable path
+        // against peer lat/BW/hit% in the same table.
+        peers.push(constellation_api::PeerStatus {
+            node_id: 0,
+            connected: true,
+            hostname: Some("S3".into()),
+            coop: s3_coop,
+            s3: true,
+            path: String::new(),
+            ..Default::default()
+        });
+        peers.extend(peer_snap.into_iter().map(|p| {
                     let addrs = peer_addr_strings(&p.addr);
                     let designations: Vec<String> = designations
                         .iter()
@@ -2800,12 +2832,21 @@ impl constellation_api::StatusSource for DaemonStatus {
                         .iter()
                         .find(|s| s.id == format!("peer-{}", p.node_id))
                         .cloned();
+                    let path = match p.path {
+                        constellation_net::PathKind::Unknown => coop
+                            .as_ref()
+                            .map(|c| c.path.clone())
+                            .filter(|s| !s.is_empty() && s != "unknown")
+                            .unwrap_or_else(|| "unknown".into()),
+                        other => other.as_str().into(),
+                    };
                     constellation_api::PeerStatus {
                         node_id: p.node_id,
                         connected: p.connected,
                         rtt_ms: p.rtt_ms,
                         last_seen_ms: p.last_seen.map(|t| t.elapsed().as_millis() as u64),
                         hostname: (!p.hostname.is_empty()).then_some(p.hostname.clone()),
+                        version: (!p.version.is_empty()).then_some(p.version.clone()),
                         pubkey: Some(p.pubkey_hex.clone()),
                         endpoint_id: Some(p.addr.id.to_string()),
                         addrs,
@@ -2815,9 +2856,18 @@ impl constellation_api::StatusSource for DaemonStatus {
                         epoch_member: epoch.members.contains(&p.node_id),
                         designations,
                         coop,
+                        s3: false,
+                        path,
                     }
-                })
-                .collect(),
+                }));
+        let p2p = constellation_api::P2pStatus {
+            enabled: self.peers.is_enabled(),
+            node_addr: self
+                .peers
+                .node_addr()
+                .and_then(|a| serde_json::to_string(&a).ok()),
+            relay: self.peers.relay_label(),
+            peers,
         };
         let enrolled = !self.departed.load(std::sync::atomic::Ordering::Relaxed)
             && !matches!(
@@ -2829,6 +2879,7 @@ impl constellation_api::StatusSource for DaemonStatus {
             backend: self.backend.clone(),
             mountpoint: self.mountpoint.clone(),
             node_id: self.node_id,
+            version: env!("CONSTELLATION_VERSION").to_string(),
             enrolled,
             uptime_s: self.started.elapsed().as_secs(),
             spool: constellation_api::SpoolStatus {
@@ -3294,6 +3345,23 @@ impl constellation_api::StatusSource for DaemonStatus {
                 state: format!("{state:?}").to_lowercase(),
             })
             .collect()
+    }
+
+    fn cache_prune(&self, target_bytes: u64) -> std::result::Result<String, String> {
+        let report = self
+            .cache
+            .prune_to(target_bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(format!(
+            "pruned {} chunks ({} bytes); {} bytes remain \
+             ({} pinned, {} dirty, {} entries)",
+            report.freed_chunks,
+            report.freed_bytes,
+            report.used_bytes,
+            report.pinned_bytes,
+            report.dirty_bytes,
+            report.entries
+        ))
     }
 }
 

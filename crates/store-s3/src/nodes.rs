@@ -45,6 +45,10 @@ pub struct NodeInfo {
     /// When the P2P fields were last refreshed, for staleness checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2p_updated_unix: Option<i64>,
+    /// Running binary version (`git describe` / package version). Absent
+    /// on older records; refreshed with [`publish_p2p`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Read-only member: enrolled in the registry but not write-eligible
     /// (DESIGN.md §5.3). Continuation epochs ignore RO nodes when
     /// checking that the live P2P component covers the roster.
@@ -110,6 +114,7 @@ pub async fn claim_node_id(store: Arc<dyn ObjectStore>) -> Result<u64, StoreErro
             pubkey: None,
             p2p_addr: None,
             p2p_updated_unix: None,
+            version: None,
             ro: false,
             retired: false,
             retired_unix: None,
@@ -282,7 +287,8 @@ pub async fn list_nodes(store: Arc<dyn ObjectStore>) -> Result<Vec<NodeInfo>, St
 /// record is re-read first so a concurrent schema addition by a newer
 /// binary is not clobbered by an older one's narrower view... which it
 /// would be anyway, so instead we preserve the immutable identity fields
-/// (`created_unix`, `hostname`) and only rewrite the P2P ones.
+/// (`created_unix`, `hostname`) and only rewrite the P2P ones plus
+/// [`NodeInfo::version`].
 ///
 /// Refuses if the record is retired or missing: a departed / admin-
 /// removed node must not silently reappear as live.
@@ -291,6 +297,7 @@ pub async fn publish_p2p(
     node_id: u64,
     pubkey_hex: &str,
     addr: serde_json::Value,
+    version: &str,
 ) -> Result<(), StoreError> {
     let key = node_key(node_id);
     let existing: NodeInfo = match store.get(&key).await {
@@ -318,6 +325,7 @@ pub async fn publish_p2p(
         pubkey: Some(pubkey_hex.to_string()),
         p2p_addr: Some(addr),
         p2p_updated_unix: Some(now_unix()),
+        version: Some(version.to_string()),
         ro: existing.ro,
         retired: false,
         retired_unix: None,
@@ -364,6 +372,7 @@ pub async fn publish_ro(
         pubkey: existing.as_ref().and_then(|i| i.pubkey.clone()),
         p2p_addr: existing.as_ref().and_then(|i| i.p2p_addr.clone()),
         p2p_updated_unix: existing.as_ref().and_then(|i| i.p2p_updated_unix),
+        version: existing.as_ref().and_then(|i| i.version.clone()),
         ro,
         retired: false,
         retired_unix: None,
@@ -406,9 +415,15 @@ mod tests {
         assert!(before[0].pubkey.is_none(), "no P2P identity yet");
 
         let addr = serde_json::json!({"id": "abc", "addrs": []});
-        publish_p2p(store.clone(), id, "aa".repeat(32).as_str(), addr.clone())
-            .await
-            .unwrap();
+        publish_p2p(
+            store.clone(),
+            id,
+            "aa".repeat(32).as_str(),
+            addr.clone(),
+            "1.0.0-test",
+        )
+        .await
+        .unwrap();
         let after = list_nodes(store.clone()).await.unwrap();
         assert_eq!(after.len(), 1, "must not create a second record");
         assert_eq!(after[0].node_id, id);
@@ -416,6 +431,7 @@ mod tests {
         assert_eq!(after[0].created_unix, before[0].created_unix);
         assert_eq!(after[0].pubkey.as_deref(), Some("aa".repeat(32).as_str()));
         assert_eq!(after[0].p2p_addr, Some(addr));
+        assert_eq!(after[0].version.as_deref(), Some("1.0.0-test"));
         assert!(after[0].p2p_updated_unix.is_some());
 
         // Refresh again: still exactly one record.
@@ -424,12 +440,14 @@ mod tests {
             id,
             "bb".repeat(32).as_str(),
             serde_json::json!({"id": "def", "addrs": []}),
+            "1.0.1-test",
         )
         .await
         .unwrap();
         let again = list_nodes(store.clone()).await.unwrap();
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].pubkey.as_deref(), Some("bb".repeat(32).as_str()));
+        assert_eq!(again[0].version.as_deref(), Some("1.0.1-test"));
         // And the id stays claimed, so a new node gets the next one.
         assert_eq!(claim_node_id(store).await.unwrap(), id + 1);
     }
@@ -500,11 +518,13 @@ mod tests {
             id,
             "aa".repeat(32).as_str(),
             serde_json::json!({"id": "abc", "addrs": []}),
+            "1.0.0-test",
         )
         .await
         .unwrap();
         let nodes = list_nodes(store).await.unwrap();
         assert!(nodes[0].ro, "P2P refresh must not clear the RO flag");
+        assert_eq!(nodes[0].version.as_deref(), Some("1.0.0-test"));
     }
 
     /// One corrupt object must not hide every other peer.
@@ -572,6 +592,7 @@ mod tests {
             id,
             "aa".repeat(32).as_str(),
             serde_json::json!({"id": "x"}),
+            "1.0.0-test",
         )
         .await
         .unwrap_err();

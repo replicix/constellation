@@ -80,16 +80,29 @@ function peerLat(p){
 function peerBw(p){
  return p.coop&&p.coop.goodput_mbps_ewma!=null?bw(p.coop.goodput_mbps_ewma):"—";
 }
+function peerPath(p){
+ if(p.s3)return"—";
+ const v=(p.path||p.coop?.path||"").toLowerCase();
+ if(v==="direct")return"direct";
+ if(v==="relay")return"relay";
+ return"—";
+}
 function peerRow(p){
- const host=p.hostname||("node "+p.node_id);
+ const isS3=!!p.s3;
+ const host=isS3?"S3":(p.hostname||("node "+p.node_id));
  const st=p.connected
   ?'<span class="dot on" title="connected"></span>'
   :'<span class="dot off" title="disconnected"></span>';
  const c=p.coop||{};
+ const name=isS3
+  ?`<a href="/peers.html#node-0">${esc(host)}</a>`
+  :`<a href="/peers.html#node-${p.node_id}">${esc(host)}</a>`;
  return `<tr>
   <td class="st">${st}</td>
-  <td><a href="/peers.html#node-${p.node_id}">${esc(host)}</a></td>
-  <td class="num">${dur(p.last_seen_ms,{ago:true})}</td>
+  <td>${name}</td>
+  <td>${esc(peerPath(p))}</td>
+  <td class="num">${esc(isS3?"—":(p.version||"—"))}</td>
+  <td class="num">${isS3?"—":dur(p.last_seen_ms,{ago:true})}</td>
   <td class="num">${peerLat(p)}</td>
   <td class="num">${peerBw(p)}</td>
   <td class="num">${pct(c.hit_rate)}</td>
@@ -102,11 +115,9 @@ async function refresh(){
  if(refreshing)return; refreshing=true;
  try{let r=await(await fetch("/api/status")).json(),s=r.Status||r.status||r; if(r.resp==="status")s=r;
  document.querySelector("#health").innerHTML='<span class="ok">healthy</span> · '+esc(s.fs_uuid);
- dashboard.innerHTML=`node <b>${s.node_id}</b> · uptime ${dur((s.uptime_s||0)*1000)}<br>${esc(s.backend)}<br>head ${s.spool.head_seq} · backlog ${s.spool.journal_backlog}<br>${s.spool.last_ship_error?'<span class="bad">'+esc(s.spool.last_ship_error)+'</span>':'sync healthy'}<br>epoch ${s.epoch.active?esc(s.epoch.epoch_id):"inactive"} · designations ${s.designations.length}<br><br>${bytes(s.cache.used_bytes)} / ${bytes(s.cache.budget_bytes)} · ${s.cache.chunks} chunks<br>pinned ${bytes(s.cache.pinned_bytes||0)}<br>peer hits ${s.coop.peer_hits} · misses ${s.coop.peer_misses||0} · errs ${s.coop.peer_errors||0} · S3 ${s.coop.s3_fetches} · hedges ${s.coop.hedges_fired}`;
+ dashboard.innerHTML=`node <b>${s.node_id}</b> · ${esc(s.version||"—")} · uptime ${dur((s.uptime_s||0)*1000)}<br>${esc(s.backend)}<br>head ${s.spool.head_seq} · backlog ${s.spool.journal_backlog}<br>${s.spool.last_ship_error?'<span class="bad">'+esc(s.spool.last_ship_error)+'</span>':'sync healthy'}<br>epoch ${s.epoch.active?esc(s.epoch.epoch_id):"inactive"} · designations ${s.designations.length}<br><br>${bytes(s.cache.used_bytes)} / ${bytes(s.cache.budget_bytes)} · ${s.cache.chunks} chunks<br>pinned ${bytes(s.cache.pinned_bytes||0)}<br>peer hits ${s.coop.peer_hits} · misses ${s.coop.peer_misses||0} · errs ${s.coop.peer_errors||0} · S3 ${s.coop.s3_fetches} · hedges ${s.coop.hedges_fired}`;
  const plist=s.p2p.peers||[];
- peers.innerHTML=plist.length
-  ?`<table class="compact"><tr><th></th><th>host</th><th class="num">seen</th><th class="num">lat</th><th class="num">BW</th><th class="num">hit %</th><th class="num">miss %</th><th class="num">err %</th></tr>${plist.map(peerRow).join("")}</table>`
-  :'<span class="muted">no peers</span>';
+ peers.innerHTML=`<table class="compact"><tr><th></th><th>host</th><th>path</th><th class="num">ver</th><th class="num">seen</th><th class="num">lat</th><th class="num">BW</th><th class="num">hit %</th><th class="num">miss %</th><th class="num">err %</th></tr>${plist.map(peerRow).join("")}</table>`;
  leases.innerHTML=(s.partitions||[]).map(p=>`${esc(p.id)} ${esc(p.root_path)} · holder ${p.lease.holder} · epoch ${p.lease.epoch} · expires ${dur(p.lease.expires_in_ms)} <button onclick="releasePart('${esc(p.id)}')">Force release</button>`).join("<br>")||"p0 unavailable";
  }catch(e){health.innerHTML='<span class="bad">disconnected</span>';}
  finally{refreshing=false;}}

@@ -169,9 +169,12 @@ impl Selector {
 
     pub fn all_stats(&self) -> Vec<(SourceId, SourceStats)> {
         let mut v: Vec<_> = self.stats.iter().map(|(k, v)| (*k, v.clone())).collect();
+        if !v.iter().any(|(id, _)| *id == SourceId::S3) {
+            v.push((SourceId::S3, SourceStats::prior(SourceId::S3)));
+        }
         v.sort_by_key(|(id, _)| match id {
             SourceId::S3 => 0,
-            SourceId::Peer(n) => *n,
+            SourceId::Peer(n) => *n + 1,
         });
         v
     }
@@ -284,7 +287,10 @@ impl Selector {
             .entry(id)
             .or_insert_with(|| SourceStats::prior(id));
         stats.transport_rtt_ms = rtt.map(|value| value.as_secs_f64() * 1000.0);
-        stats.path = path;
+        // Do not wipe a known direct/relay observation with Unknown.
+        if path != PathKind::Unknown || stats.path == PathKind::Unknown {
+            stats.path = path;
+        }
     }
 
     pub fn record_ok(&mut self, id: SourceId, ttfb_ms: f64, bytes: u64, total_ms: f64) {
