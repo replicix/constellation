@@ -49,6 +49,17 @@ struct WriteState {
     holes: crate::staging::DirtyRuns,
     seal_buffer: Vec<u8>,
     high_water: u64,
+    /// Absolute half-open byte ranges this open handle's `write()`
+    /// calls actually delivered — as opposed to the padding bytes
+    /// `do_write` seeds from the committed manifest so a partial
+    /// write's untouched neighborhood reads back correctly within the
+    /// handle. Kept separate because that seed is only as fresh as the
+    /// manifest at the moment of the call: replaying just these ranges
+    /// over whatever base a flush ultimately composes or rebases onto
+    /// is what lets a chunk shared by several disjoint concurrent
+    /// writers converge instead of each writer's seed silently
+    /// clobbering the others' bytes with its own stale copy.
+    written: Vec<(u64, u64)>,
 }
 
 const WRITE_SHARDS: usize = 256;
@@ -1140,6 +1151,7 @@ impl ConstellationFs {
                 holes: crate::staging::DirtyRuns::default(),
                 seal_buffer: Vec::new(),
                 high_water: manifest.file_len,
+                written: Vec::new(),
             });
         }
         Ok(writes.get_mut(&ino).unwrap())
@@ -1343,10 +1355,40 @@ impl ConstellationFs {
                 continue;
             }
             let expect_len = layout.chunk_len(file_len, idx) as usize;
-            let mut data = vec![0u8; expect_len];
-            ws.staging
-                .read_at(idx * self.chunk_size as u64, &mut data)
-                .map_err(|e| staging_errno(&e))?;
+            let chunk_start = idx * self.chunk_size as u64;
+            let chunk_end = chunk_start + expect_len as u64;
+            // Start from `base`'s committed content for this chunk —
+            // not whatever `do_write` seeded the untouched neighborhood
+            // with at write time, which is only as fresh as the
+            // manifest at that moment — and replay just the byte
+            // ranges this flush's own `write()` calls actually
+            // delivered on top. Otherwise a chunk two nodes disjointly
+            // patch converges on whichever writer commits last, since
+            // that writer's seed silently reproduces the *other*
+            // writer's bytes as zero: the earlier content it copied in
+            // predates the sibling's patch landing.
+            let mut data = match old_hashes.get(&idx) {
+                Some(hash) => {
+                    let mut fetched = self.fetch_chunk(hash)?;
+                    fetched.resize(expect_len, 0);
+                    fetched
+                }
+                None => vec![0u8; expect_len],
+            };
+            for &(start, end) in &ws.written {
+                let start = start.max(chunk_start);
+                let end = end.min(chunk_end);
+                if end <= start {
+                    continue;
+                }
+                let len = (end - start) as usize;
+                let mut buf = vec![0u8; len];
+                ws.staging
+                    .read_at(start, &mut buf)
+                    .map_err(|e| staging_errno(&e))?;
+                let rel = (start - chunk_start) as usize;
+                data[rel..rel + len].copy_from_slice(&buf);
+            }
             if data.iter().all(|byte| *byte == 0) {
                 new_hashes.remove(&idx);
             } else {
@@ -1415,26 +1457,17 @@ impl ConstellationFs {
                 .is_some_and(|view| view.usable())
         });
         if holds_lease {
-            self.meta
-                .set_manifest_dirty(ino, &manifest_bytes, ws.file_len, &dirty_hashes)
-                .map_err(|e| errno(&e))?;
-        } else {
-            // Content-addressed chunks can be uploaded before authority is
-            // obtained. Enrol them without journaling the manifest, drain,
-            // then forward the authoritative manifest transition.
-            for hash in &dirty_hashes {
-                self.meta
-                    .add_pending_upload(hash, ino)
-                    .map_err(|e| errno(&e))?;
-            }
-            if let Err(error) = self.drain_inode(ino) {
+            if let Err(error) =
+                self.commit_manifest_local(ino, &ws, base, manifest_bytes, dirty_hashes)
+            {
                 writes.insert(ino, ws);
                 return Err(error);
             }
-            if let Err(error) = self.commit_manifest_forwarded(ino, &ws, base, manifest_bytes) {
-                writes.insert(ino, ws);
-                return Err(error);
-            }
+        } else if let Err(error) =
+            self.commit_manifest_forwarded(ino, &ws, base, manifest_bytes, dirty_hashes)
+        {
+            writes.insert(ino, ws);
+            return Err(error);
         }
         // The staged bytes now live in the durable chunk cache (and are
         // enrolled in `pending_upload`); the staging file is scratch
@@ -1452,6 +1485,39 @@ impl ConstellationFs {
         Ok(())
     }
 
+    /// Commit a whole-file manifest as the lease holder, rebasing if our
+    /// base turns out to be stale.
+    ///
+    /// A flush composes its image while it may not hold the lease; by
+    /// the time an acquisition lets this commit through, a segment
+    /// tailed from another node — or another flush forwarded through us
+    /// while we *did* hold it — can have moved the manifest on. Without
+    /// a check here, that lease thrash reproduces the disjoint-write
+    /// lost update purely locally, with no forwarding involved: this
+    /// node would overwrite whatever the tailed record wrote for the
+    /// same inode with an image that never saw it.
+    fn commit_manifest_local(
+        &self,
+        ino: Ino,
+        ws: &WriteState,
+        base: Manifest,
+        manifest_bytes: Vec<u8>,
+        dirty_hashes: Vec<ChunkHash>,
+    ) -> Result<(), i32> {
+        self.commit_manifest_with_rebase(
+            ino,
+            ws,
+            base,
+            manifest_bytes,
+            dirty_hashes,
+            |base, manifest_bytes, file_len, dirty_hashes| {
+                self.meta
+                    .set_manifest_dirty(ino, Some(&base.encode()), manifest_bytes, file_len, dirty_hashes)
+                    .map_err(mutate_fail)
+            },
+        )
+    }
+
     /// Forward a whole-file manifest commit to the lease holder,
     /// rebasing if our base turns out to be stale.
     ///
@@ -1467,31 +1533,69 @@ impl ConstellationFs {
         ws: &WriteState,
         base: Manifest,
         manifest_bytes: Vec<u8>,
+        dirty_hashes: Vec<ChunkHash>,
+    ) -> Result<(), i32> {
+        self.commit_manifest_with_rebase(
+            ino,
+            ws,
+            base,
+            manifest_bytes,
+            dirty_hashes,
+            |base, manifest_bytes, file_len, dirty_hashes| {
+                // Content-addressed chunks can be uploaded before
+                // authority is obtained. Enrol them without journaling
+                // the manifest, then drain, so the manifest this pass
+                // forwards never names a hash S3 does not have yet —
+                // including a hash a rebase just introduced by merging
+                // this flush's bytes onto a fresher base, which is not
+                // the same chunk the very first attempt (if any)
+                // already drained.
+                for hash in dirty_hashes {
+                    self.meta.add_pending_upload(hash, ino).map_err(mutate_fail)?;
+                }
+                self.drain_inode(ino).map_err(MutateFail::Errno)?;
+                self.mutate_op_rebasable(
+                    ino,
+                    constellation_meta::MutateOp::SetManifest {
+                        ino,
+                        base_manifest: Some(base.encode()),
+                        manifest: manifest_bytes.to_vec(),
+                        size: file_len,
+                    },
+                )
+            },
+        )
+    }
+
+    /// Shared rebase-and-retry loop for a whole-file manifest commit.
+    /// `attempt_commit` tries to install `manifest_bytes` (composed on
+    /// `base` for length `file_len`, with `dirty_hashes` freshly sealed
+    /// by this flush) and reports [`MutateFail::Conflict`] when that
+    /// base has been superseded. On conflict this recomposes from the
+    /// manifest that *is* current — the holder's reply, or this node's
+    /// own replica when `manifest` comes back `None` because this node
+    /// executed the mutation itself — and tries again, up to
+    /// `MANIFEST_COMMIT_ATTEMPTS` times.
+    fn commit_manifest_with_rebase(
+        &self,
+        ino: Ino,
+        ws: &WriteState,
+        mut base: Manifest,
+        mut manifest_bytes: Vec<u8>,
+        mut dirty_hashes: Vec<ChunkHash>,
+        mut attempt_commit: impl FnMut(&Manifest, &[u8], u64, &[ChunkHash]) -> Result<(), MutateFail>,
     ) -> Result<(), i32> {
         // A flush that shortened the file relative to its own base is a
         // truncate, and must not be silently re-extended by a peer's
         // length. Any other flush adopts the longer of the two so a
         // concurrent extension survives the rebase.
         let truncates = ws.base.as_ref().is_some_and(|b| ws.file_len < b.file_len);
-        let mut base = base;
-        let mut manifest_bytes = manifest_bytes;
         let mut file_len = ws.file_len;
         for attempt in 1..=MANIFEST_COMMIT_ATTEMPTS {
-            let failure = match self.mutate_op_rebasable(
-                ino,
-                constellation_meta::MutateOp::SetManifest {
-                    ino,
-                    base_manifest: Some(base.encode()),
-                    manifest: manifest_bytes.clone(),
-                    size: file_len,
-                },
-            ) {
+            let current = match attempt_commit(&base, &manifest_bytes, file_len, &dirty_hashes) {
                 Ok(()) => return Ok(()),
-                Err(failure) => failure,
-            };
-            let current = match failure {
-                MutateFail::Errno(e) => return Err(e),
-                MutateFail::Conflict { manifest } => manifest,
+                Err(MutateFail::Errno(e)) => return Err(e),
+                Err(MutateFail::Conflict { manifest }) => manifest,
             };
             // `None` means whichever node executed the mutation was us,
             // so our own replica already holds the authoritative image.
@@ -1505,10 +1609,12 @@ impl ConstellationFs {
                 ws.file_len.max(base.file_len)
             };
             // The chunks are already cached and enrolled for upload, so
-            // recomposing only rebuilds the manifest; a shorter dirty
-            // list on this pass means they are already durable.
-            let (rebased, _) = self.compose_manifest(ws, &base, file_len)?;
+            // recomposing only rebuilds the manifest; a rebased dirty
+            // list that comes back shorter just means some are already
+            // durable (already-uploaded content is not re-enrolled).
+            let (rebased, rebased_dirty) = self.compose_manifest(ws, &base, file_len)?;
             manifest_bytes = rebased;
+            dirty_hashes = rebased_dirty;
             tracing::debug!(
                 ino,
                 attempt,

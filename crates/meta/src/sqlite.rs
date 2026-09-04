@@ -1768,16 +1768,25 @@ impl SqliteMeta {
     /// The `set_manifest` body, inside a caller-owned transaction. Shared
     /// by the plain trait method (applying a foreign/reintegrated record
     /// — that content's upload is another node's responsibility, so it
-    /// never touches `pending_upload`) and [`Self::set_manifest_dirty`]
-    /// (the local write path, which does).
+    /// never touches `pending_upload`) and [`Self::set_manifest_dirty`] /
+    /// [`Self::set_manifest_with_base`] (the local write paths, which do
+    /// and which pass `expected_base`).
+    ///
+    /// `expected_base` is the optimistic-concurrency check: `manifest`
+    /// is a whole-file image composed on it, so installing it over a
+    /// manifest someone else has moved the file on from would silently
+    /// drop their chunks — the disjoint-write lost update. `None` skips
+    /// the check, which is correct for applying an already-sequenced
+    /// foreign or reintegrated record (last-wins is the intended
+    /// semantics there, not a claim about the predecessor).
     fn set_manifest_tx(
         tx: &Connection,
         ino: Ino,
+        expected_base: Option<&[u8]>,
         manifest: &[u8],
         size: u64,
     ) -> Result<(), MetaError> {
-        let t = now_ns();
-        let base_manifest: Option<Vec<u8>> = tx
+        let current: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT manifest FROM inode WHERE ino = ?1",
                 params![ino],
@@ -1785,6 +1794,16 @@ impl SqliteMeta {
             )
             .optional()?
             .flatten();
+        // A manifest that already matches is a replay of a commit that
+        // already landed (the rule reintegration applies to the same
+        // record), not a conflict.
+        if let (Some(base), Some(cur)) = (expected_base, current.as_deref()) {
+            if cur != base && cur != manifest {
+                return Err(MetaError::Conflict);
+            }
+        }
+        let journal_base = expected_base.map(Vec::from).or_else(|| current.clone());
+        let t = now_ns();
         let n = tx.execute(
             "UPDATE inode SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4 WHERE ino = ?1",
             params![ino, manifest, size as i64, t],
@@ -1795,7 +1814,7 @@ impl SqliteMeta {
         Self::track_manifest_transition(
             tx,
             ino,
-            base_manifest.as_deref(),
+            current.as_deref(),
             Some(manifest),
             Self::next_deref_seq(tx)?,
             t / 1_000_000,
@@ -1804,7 +1823,7 @@ impl SqliteMeta {
             tx,
             &LogRecord::WriteManifest {
                 ino,
-                base_manifest,
+                base_manifest: journal_base,
                 manifest: manifest.to_vec(),
                 size,
                 time_ns: t,
@@ -1822,16 +1841,27 @@ impl SqliteMeta {
     /// source of truth. `hash, ino` is a pair (not just `hash`) because
     /// the same content can be dirty under two different inodes at
     /// once; acking one must not disturb the other's row.
+    ///
+    /// `base_manifest` is the same optimistic-concurrency claim as
+    /// [`Self::set_manifest_with_base`]: this is the lease-holder path,
+    /// so the caller reaches it precisely when nothing forwards the
+    /// mutation for a CAS check elsewhere. Without it, a lease that
+    /// thrashes across writers reproduces the disjoint-write lost
+    /// update purely locally — this node composes a whole-file image
+    /// while it does not hold the lease, then commits it once a later
+    /// acquisition lets it in, overwriting whatever a tailed foreign
+    /// segment wrote for the same inode in between.
     pub fn set_manifest_dirty(
         &self,
         ino: Ino,
+        base_manifest: Option<&[u8]>,
         manifest: &[u8],
         size: u64,
         dirty_hashes: &[ChunkHash],
     ) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::set_manifest_tx(&tx, ino, manifest, size)?;
+        Self::set_manifest_tx(&tx, ino, base_manifest, manifest, size)?;
         for h in dirty_hashes {
             tx.execute(
                 "INSERT OR IGNORE INTO pending_upload (hash, ino) VALUES (?1, ?2)",
@@ -2067,56 +2097,7 @@ impl SqliteMeta {
     ) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT manifest FROM inode WHERE ino = ?1",
-                params![ino],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        // Optimistic concurrency. `manifest` is a *whole-file* image
-        // composed on `base_manifest`, so installing it over a manifest
-        // someone else has moved on from would drop their chunks with no
-        // error — the disjoint-write lost update. Reject instead and let
-        // the caller rebase onto what is current.
-        //
-        // Two cases are not conflicts: a caller that passes no base is
-        // not making a claim about the predecessor, and a manifest that
-        // already matches is a replay of a commit that landed (the rule
-        // reintegration applies to the same record).
-        if let (Some(base), Some(cur)) = (base_manifest, current.as_deref()) {
-            if cur != base && cur != manifest {
-                return Err(MetaError::Conflict);
-            }
-        }
-        let journal_base = base_manifest.map(Vec::from).or_else(|| current.clone());
-        let t = now_ns();
-        let n = tx.execute(
-            "UPDATE inode SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4 WHERE ino = ?1",
-            params![ino, manifest, size as i64, t],
-        )?;
-        if n == 0 {
-            return Err(MetaError::NoEnt(ino));
-        }
-        Self::track_manifest_transition(
-            &tx,
-            ino,
-            current.as_deref(),
-            Some(manifest),
-            Self::next_deref_seq(&tx)?,
-            t / 1_000_000,
-        )?;
-        Self::journal(
-            &tx,
-            &LogRecord::WriteManifest {
-                ino,
-                base_manifest: journal_base,
-                manifest: manifest.to_vec(),
-                size,
-                time_ns: t,
-            },
-        )?;
+        Self::set_manifest_tx(&tx, ino, base_manifest, manifest, size)?;
         tx.commit()?;
         Ok(())
     }
@@ -3085,7 +3066,7 @@ impl MetaStore for SqliteMeta {
     fn set_manifest(&self, ino: Ino, manifest: &[u8], size: u64) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::set_manifest_tx(&tx, ino, manifest, size)?;
+        Self::set_manifest_tx(&tx, ino, None, manifest, size)?;
         tx.commit()?;
         Ok(())
     }
@@ -4019,7 +4000,7 @@ mod tests {
         let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         let h1 = ChunkHash::of(b"chunk-a");
         let h2 = ChunkHash::of(b"chunk-b");
-        m.set_manifest_dirty(f.ino, b"M1", 10, &[h1, h2]).unwrap();
+        m.set_manifest_dirty(f.ino, None, b"M1", 10, &[h1, h2]).unwrap();
         let mut pending = m.pending_uploads().unwrap();
         pending.sort();
         let mut expect = vec![(h1, f.ino), (h2, f.ino)];
@@ -4028,7 +4009,7 @@ mod tests {
 
         let h3 = ChunkHash::of(b"chunk-c");
         assert!(matches!(
-            m.set_manifest_dirty(999_999, b"M", 1, &[h3]),
+            m.set_manifest_dirty(999_999, None, b"M", 1, &[h3]),
             Err(MetaError::NoEnt(999_999))
         ));
         assert!(
@@ -4045,8 +4026,8 @@ mod tests {
         let a = m.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
         let b = m.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
         let h = ChunkHash::of(b"shared-content");
-        m.set_manifest_dirty(a.ino, b"MA", 1, &[h]).unwrap();
-        m.set_manifest_dirty(b.ino, b"MB", 1, &[h]).unwrap();
+        m.set_manifest_dirty(a.ino, None, b"MA", 1, &[h]).unwrap();
+        m.set_manifest_dirty(b.ino, None, b"MB", 1, &[h]).unwrap();
         m.ack_upload(&h, a.ino).unwrap();
         assert_eq!(m.pending_uploads().unwrap(), vec![(h, b.ino)]);
         m.ack_upload(&h, b.ino).unwrap();
@@ -4064,7 +4045,7 @@ mod tests {
             let m = SqliteMeta::open(&path).unwrap();
             let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
             let h = ChunkHash::of(b"crash-content");
-            m.set_manifest_dirty(f.ino, b"M", 5, &[h]).unwrap();
+            m.set_manifest_dirty(f.ino, None, b"M", 5, &[h]).unwrap();
             (h, f.ino)
         };
         let m = SqliteMeta::open(&path).unwrap();

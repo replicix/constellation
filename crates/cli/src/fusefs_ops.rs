@@ -1288,13 +1288,16 @@ impl ConstellationFs {
                     .write_at(chunk_start, &seed)
                     .map_err(|e| staging_errno(&e))?;
             }
+            let write_start = chunk_start + u64::from(slice.offset);
+            let write_end = write_start + u64::from(slice.len);
             ws.staging
                 .write_at(
-                    chunk_start + u64::from(slice.offset),
+                    write_start,
                     &data[consumed..consumed + slice.len as usize],
                 )
                 .map_err(|e| staging_errno(&e))?;
             ws.staging.mark_dirty(slice.index);
+            ws.written.push((write_start, write_end));
             consumed += slice.len as usize;
         }
         ws.file_len = new_file_len;

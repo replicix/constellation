@@ -4056,7 +4056,7 @@ mod pending_upload_tests {
         let hash = ChunkHash::of(&data);
         f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
         f.meta
-            .set_manifest_dirty(file.ino, b"M", data.len() as u64, &[hash])
+            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
             .unwrap();
 
         // Simulate the crash: reopening the cache rebuilds accounting
@@ -4101,7 +4101,7 @@ mod pending_upload_tests {
         let hash = ChunkHash::of(&data);
         f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
         f.meta
-            .set_manifest_dirty(file.ino, b"M", data.len() as u64, &[hash])
+            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
             .unwrap();
 
         f.failing.set_fail_puts(true);
@@ -4155,7 +4155,7 @@ mod pending_upload_tests {
             let hash = ChunkHash::of(&data);
             f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
             f.meta
-                .set_manifest_dirty(file.ino, b"M", data.len() as u64, &[hash])
+                .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
                 .unwrap();
         }
         let upload = UploadRuntime::for_test_fixed(true, 3);
@@ -4184,7 +4184,7 @@ mod pending_upload_tests {
         let hash = ChunkHash::of(data);
         f.cache.insert(&hash, data, ChunkState::Dirty).unwrap();
         f.meta
-            .set_manifest_dirty(file.ino, b"M", data.len() as u64, &[hash])
+            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
             .unwrap();
         hash
     }
