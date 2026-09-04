@@ -2698,6 +2698,10 @@ fn partition_ids_from(status: &serde_json::Value) -> Vec<String> {
 fn part_env(c: Client, split_ops: u64, merge_idle_s: u64) -> Client {
     c.with_env("CONSTELLATION_PART_SPLIT_OPS", &split_ops.to_string())
         .with_env("CONSTELLATION_PART_MERGE_IDLE_S", &merge_idle_s.to_string())
+        // Heat-driven splitting is off by default (forwarded mutations
+        // made directory heat a poor proxy for lease contention). These
+        // scenarios test the split/merge machinery, so they ask for it.
+        .with_env("CONSTELLATION_PART_AUTOSPLIT", "on")
         .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "60000")
 }
 

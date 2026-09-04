@@ -97,6 +97,40 @@ pub fn part_merge_idle_s() -> u64 {
         .unwrap_or(3600)
 }
 
+/// Env: `CONSTELLATION_PART_AUTOSPLIT=on` re-enables automatic
+/// splitting of hot directories into their own partitions. **Off by
+/// default.**
+///
+/// The heuristic was written when the partition lease was the only way
+/// to write: concurrent writers on different subtrees had to pass one
+/// lease back and forth, and carving a hot subtree out gave each its
+/// own. Forwarded mutations (ADR-14) removed that motivation — a
+/// non-holder now asks the holder to journal its op in ~1 RTT and the
+/// lease stays put — so directory heat no longer implies contention.
+///
+/// What it does still imply is cost. Every partition is another stream
+/// to LIST each sync round, another lease to CAS and renew, and a merge
+/// that only reclaims it after [`part_merge_idle_s`]. A single-writer
+/// bulk ingest (rsync of a source tree, image unpack) makes every
+/// directory hot in turn and can carve out a partition per directory
+/// for no benefit at all.
+///
+/// Splitting is still the only way to scale metadata *append* across
+/// holders, and the only way two regions get a lease each, so the
+/// machinery stays. It just should not be driven by heat: a future
+/// automatic trigger belongs on holder-side evidence (sustained
+/// forwards from several distinct nodes, holder journal backlog).
+pub fn part_autosplit() -> bool {
+    matches!(
+        std::env::var("CONSTELLATION_PART_AUTOSPLIT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "1" | "true"
+    )
+}
+
 /// Postcard envelope for a zstd-compressed S3 log segment. `v` is
 /// reserved so a future format bump can reject old readers without a
 /// dual decoder.
@@ -157,6 +191,11 @@ pub struct Shipper {
     /// Per-directory write-op counts used by the split heuristic.
     /// Keyed by the directory inode under a partition root.
     dir_ops: HashMap<u64, DirTraffic>,
+    /// Whether the heat-based split trigger is armed at all (see
+    /// [`part_autosplit`]). Resolved once at attach rather than read per
+    /// ship, so tests can drive it without racing on a process-global
+    /// environment variable.
+    autosplit: bool,
     last_ship_at: HashMap<String, Instant>,
     /// P2P handle for push invalidation. Disabled by default so the
     /// existing tests and the no-P2P path need no changes.
@@ -268,6 +307,7 @@ impl Shipper {
                 ..Default::default()
             })),
             dir_ops: HashMap::new(),
+            autosplit: part_autosplit(),
             last_ship_at: HashMap::new(),
             peers: constellation_net::Peers::disabled(),
             designations: None,
@@ -277,6 +317,15 @@ impl Shipper {
     /// Attach the P2P handle so shipped segments are announced to peers.
     pub fn set_peers(&mut self, peers: constellation_net::Peers) {
         self.peers = peers;
+    }
+
+    /// Arm or disarm the heat-based split trigger, bypassing
+    /// [`part_autosplit`]'s environment lookup. Tests that exercise
+    /// splitting run in one process alongside tests that must not
+    /// split, so the switch cannot be process-global.
+    #[cfg(test)]
+    pub fn set_autosplit(&mut self, on: bool) {
+        self.autosplit = on;
     }
 
     pub fn log(&self) -> &LogStore {
@@ -726,6 +775,12 @@ impl Shipper {
 
     fn note_shipped(&mut self, part: &str, records: &[LogRecord]) {
         self.last_ship_at.insert(part.to_string(), Instant::now());
+        if !self.autosplit {
+            // Nothing consumes `dir_ops` while the trigger is disarmed,
+            // and `retain` below deliberately keeps armed entries for a
+            // later round — so tracking here would grow without bound.
+            return;
+        }
         // A directory that already is a partition root cannot split
         // again, so its traffic is not worth tracking.
         let roots: std::collections::HashSet<u64> = self
@@ -1059,7 +1114,9 @@ impl Shipper {
     }
 
     async fn maybe_split_merge(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<()> {
-        let might_split = self.dir_ops.values().any(|t| t.armed);
+        // Merging stays enabled regardless, so a filesystem that split
+        // under an earlier policy can still collapse back.
+        let might_split = self.autosplit && self.dir_ops.values().any(|t| t.armed);
         let might_merge = self.meta.partitions()?.len() > 1;
         if !might_split && !might_merge {
             return Ok(());
@@ -1361,7 +1418,12 @@ mod tests {
         let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
         meta.set_node_prefix(id).unwrap();
         let log = LogStore::new(store.clone());
-        let ship = Shipper::attach(meta.clone(), log, id).unwrap();
+        let mut ship = Shipper::attach(meta.clone(), log, id).unwrap();
+        // These tests exercise the split/merge machinery itself, so they
+        // arm the heat trigger explicitly. Production leaves it off (see
+        // `part_autosplit`); `a_hot_directory_holds_together_while_autosplit_is_off`
+        // covers that default.
+        ship.set_autosplit(true);
         let lease = LeaseKeeper::new(
             LeaseStore::new(
                 store.clone(),
@@ -2172,6 +2234,50 @@ mod tests {
             a.meta.partitions().unwrap().len(),
             1,
             "a single-node filesystem must never split"
+        );
+    }
+
+    /// The shipped default. A lone writer walking a tree (rsync, image
+    /// unpack) makes every directory hot in turn; with several nodes
+    /// merely *enrolled*, the old always-on heuristic carved a partition
+    /// out of each one — 89 of them on a `rsync -a /usr`, each costing a
+    /// LIST per sync round and a lease to renew, none of them relieving
+    /// any contention, because forwarded mutations already let the other
+    /// nodes write without taking the lease.
+    #[tokio::test]
+    async fn a_hot_directory_holds_together_while_autosplit_is_off() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        a.ship.set_autosplit(false);
+        // Two enrolled nodes: the only thing that used to stand between
+        // this workload and a split.
+        for _ in 0..2 {
+            constellation_store_s3::claim_node_id(store.clone() as StdArc<dyn ObjectStore>)
+                .await
+                .unwrap();
+        }
+        let hot = a.meta.mkdir(1, "hot", 0o755, 0, 0).unwrap();
+        a.sync().await;
+
+        let thresh = part_split_ops();
+        let mut leases = HashMap::new();
+        leases.insert(PARTITION.to_string(), a.lease);
+        for i in 0..thresh {
+            a.meta
+                .create(hot.ino, &format!("f{i}"), 0o644, 0, 0)
+                .unwrap();
+            a.ship.sync_all(&mut leases).await.unwrap();
+        }
+        a.ship.sync_all(&mut leases).await.unwrap();
+
+        assert_eq!(
+            a.meta.partitions().unwrap().len(),
+            1,
+            "heat alone must not carve a partition while autosplit is off"
+        );
+        assert!(
+            a.ship.split_candidates().is_empty(),
+            "a disarmed trigger must not accumulate candidates either"
         );
     }
 

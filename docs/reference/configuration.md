@@ -20,6 +20,7 @@ P2P fast path. Set them before mounting; values are read by the daemon.
 | `CONSTELLATION_LEASE_PLACEMENT` | `on` | boolean | holder-driven placement |
 | `CONSTELLATION_SYNC_INTERVAL_MS` | `500` | milliseconds | background log tail/ship poll |
 | `CONSTELLATION_PART_SPLIT_OPS` | `512` | operations, positive | automatic partition split |
+| `CONSTELLATION_PART_AUTOSPLIT` | `off` | boolean | heat-driven automatic partition split (see below) |
 | `CONSTELLATION_PART_MERGE_IDLE_S` | `3600` | seconds | automatic idle partition merge |
 | `CONSTELLATION_CHECKPOINT_MIN_INTERVAL_S` | `0` | seconds | minimum checkpoint spacing; `0` disables the time floor |
 | `CONSTELLATION_DIGEST_INTERVAL_S` | `30` | seconds, minimum `1` | cooperative-cache digest gossip |
