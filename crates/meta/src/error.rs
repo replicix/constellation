@@ -26,6 +26,12 @@ pub enum MetaError {
     #[error("invalid argument: {0}")]
     Invalid(String),
 
+    /// Optimistic concurrency failure: the caller composed its update on
+    /// a base that is no longer current, so applying it would silently
+    /// drop whatever landed in between. The caller must rebase and retry.
+    #[error("stale base: concurrent update")]
+    Conflict,
+
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
 

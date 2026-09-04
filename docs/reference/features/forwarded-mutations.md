@@ -88,6 +88,27 @@ writers on one file you get N distinct values that never reconcile — the
 shape a chaos `chmod_duel` or `write_overlap` convergence failure takes.
 Regression test: `shipper::tests::forwarded_duel_on_one_inode_converges_on_every_replica`.
 
+### Manifest commits are optimistic
+
+`SetManifest` carries a whole-file manifest plus the `base_manifest` it was
+composed on. The holder installs it only if that base is still current;
+otherwise it refuses with `Conflict`, carrying the manifest that *is* current.
+Without the check, a whole-file image composed on an old base silently drops
+every chunk that landed in between — which is how concurrent disjoint
+`WriteAt`s from several nodes lost all but the last patch.
+
+The requester rebases rather than failing: it lays this flush's own chunks
+over the returned image and retries, up to `MANIFEST_COMMIT_ATTEMPTS`, then
+gives up with `EAGAIN`. Carrying the current manifest in the refusal is what
+makes one round trip enough; waiting to tail the holder's segment instead
+would make progress depend on shipping. A `Conflict { manifest: None }` means
+this node executed the mutation itself, so its own replica is already
+authoritative and the rebase reads from there.
+
+Rebasing adopts the longer of the two file lengths, so a peer's concurrent
+extension survives. A flush that *shortened* the file relative to its own
+base is a truncate and keeps its own length instead.
+
 ## Status and logs
 
 `constellation status` and the web UI expose:

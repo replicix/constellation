@@ -126,10 +126,26 @@ impl MutateOp {
 /// Holder's answer, before it is packed into a wire `Payload`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutateOutcome {
-    Accepted { epoch: u64, records: Vec<LogRecord> },
+    Accepted {
+        epoch: u64,
+        records: Vec<LogRecord>,
+    },
     Errno(i32),
-    NotHolder { holder: u64 },
+    NotHolder {
+        holder: u64,
+    },
     Busy,
+    /// The holder refused an optimistic whole-file manifest commit
+    /// because its base is stale. Carries the manifest that *is*
+    /// current, so the requester can rebase in the same round trip
+    /// rather than wait for the holder's segment to ship.
+    ///
+    /// Appended last on purpose: a peer too old to decode this variant
+    /// falls back to `Busy` (the documented handling of an undecodable
+    /// outcome), which costs a lease rotation but stays correct.
+    Conflict {
+        manifest: Option<Vec<u8>>,
+    },
 }
 
 impl MutateOutcome {

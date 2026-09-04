@@ -2075,6 +2075,21 @@ impl SqliteMeta {
             )
             .optional()?
             .flatten();
+        // Optimistic concurrency. `manifest` is a *whole-file* image
+        // composed on `base_manifest`, so installing it over a manifest
+        // someone else has moved on from would drop their chunks with no
+        // error — the disjoint-write lost update. Reject instead and let
+        // the caller rebase onto what is current.
+        //
+        // Two cases are not conflicts: a caller that passes no base is
+        // not making a claim about the predecessor, and a manifest that
+        // already matches is a replay of a commit that landed (the rule
+        // reintegration applies to the same record).
+        if let (Some(base), Some(cur)) = (base_manifest, current.as_deref()) {
+            if cur != base && cur != manifest {
+                return Err(MetaError::Conflict);
+            }
+        }
         let journal_base = base_manifest.map(Vec::from).or_else(|| current.clone());
         let t = now_ns();
         let n = tx.execute(
@@ -3679,6 +3694,41 @@ mod tests {
             m.lookup(ROOT_INO, "published").unwrap().unwrap().ino,
             existing.ino
         );
+    }
+
+    /// A whole-file manifest composed on a stale base must be rejected,
+    /// not silently installed: it would drop every chunk another writer
+    /// committed in the meantime. This is what makes concurrent disjoint
+    /// `WriteAt`s from several nodes compose instead of losing all but
+    /// the last one.
+    #[test]
+    fn set_manifest_with_base_rejects_a_stale_base() {
+        let m = store();
+        let f = m.create(ROOT_INO, "wd", 0o644, 0, 0).unwrap();
+
+        // First writer commits against the empty file: no base to claim.
+        m.set_manifest_with_base(f.ino, None, b"A", 1).unwrap();
+
+        // A second writer that still believes the manifest is "A" wins.
+        m.set_manifest_with_base(f.ino, Some(b"A"), b"B", 1)
+            .unwrap();
+        assert_eq!(m.manifest(f.ino).unwrap().as_deref(), Some(&b"B"[..]));
+
+        // A third writer composed on the now-stale "A" must be rejected
+        // rather than clobber "B".
+        let err = m
+            .set_manifest_with_base(f.ino, Some(b"A"), b"C", 1)
+            .expect_err("stale base must not commit");
+        assert!(matches!(err, MetaError::Conflict), "got {err:?}");
+        assert_eq!(
+            m.manifest(f.ino).unwrap().as_deref(),
+            Some(&b"B"[..]),
+            "the rejected commit must not have changed anything"
+        );
+
+        // Replaying a commit that already landed is not a conflict.
+        m.set_manifest_with_base(f.ino, Some(b"A"), b"B", 1)
+            .unwrap();
     }
 
     #[test]

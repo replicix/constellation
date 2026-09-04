@@ -53,6 +53,13 @@ struct WriteState {
 
 const WRITE_SHARDS: usize = 256;
 
+/// How many times a forwarded whole-file manifest commit may rebase
+/// onto a concurrent update before giving up with `EAGAIN`. Each pass
+/// costs one round trip to the holder and loses only to a writer that
+/// committed in between, so a handful of attempts absorbs a conflict
+/// storm across a realistic writer set without spinning forever.
+const MANIFEST_COMMIT_ATTEMPTS: u32 = 8;
+
 /// Per-inode write serialization without making unrelated files contend on
 /// one process-wide mutex. FUSE can dispatch callbacks concurrently, while
 /// operations on the same inode retain their previous ordering. The shard
@@ -262,7 +269,28 @@ fn errno(e: &MetaError) -> i32 {
         MetaError::NotEmpty => libc::ENOTEMPTY,
         MetaError::NoData => libc::ENODATA,
         MetaError::Invalid(_) => libc::EINVAL,
+        MetaError::Conflict => libc::EAGAIN,
         MetaError::Sqlite(_) | MetaError::Json(_) | MetaError::Postcard(_) => libc::EIO,
+    }
+}
+
+/// Why a mutation did not commit. Separate from a bare errno so that an
+/// optimistic-concurrency rejection can carry the state to rebase onto.
+pub(crate) enum MutateFail {
+    Errno(i32),
+    /// The base this update was composed on is no longer current.
+    /// `manifest` is the holder's image when it came back over the wire;
+    /// `None` means rebase from the local replica, which is
+    /// authoritative whenever this node executed the mutation itself.
+    Conflict {
+        manifest: Option<Vec<u8>>,
+    },
+}
+
+fn mutate_fail(e: MetaError) -> MutateFail {
+    match e {
+        MetaError::Conflict => MutateFail::Conflict { manifest: None },
+        other => MutateFail::Errno(errno(&other)),
     }
 }
 
@@ -880,28 +908,45 @@ impl ConstellationFs {
         part_hint_ino: Ino,
         op: constellation_meta::MutateOp,
     ) -> Result<(), i32> {
+        self.mutate_op_rebasable(part_hint_ino, op)
+            .map_err(|failure| match failure {
+                MutateFail::Errno(e) => e,
+                // Callers that cannot rebase surface the conflict as a
+                // retryable error rather than losing the update.
+                MutateFail::Conflict { .. } => libc::EAGAIN,
+            })
+    }
+
+    /// As [`Self::mutate_op`], but reporting an optimistic-concurrency
+    /// rejection as [`MutateFail::Conflict`] so a caller holding the
+    /// material to recompose its update can rebase and retry.
+    pub(crate) fn mutate_op_rebasable(
+        &self,
+        part_hint_ino: Ino,
+        op: constellation_meta::MutateOp,
+    ) -> Result<(), MutateFail> {
         if Self::is_synthetic(part_hint_ino) {
-            return Err(libc::EROFS);
+            return Err(MutateFail::Errno(libc::EROFS));
         }
         let Some(h) = &self.sync else {
             return constellation_meta::execute_mutate(&self.meta, &op)
                 .map(|_| ())
-                .map_err(|e| errno(&e));
+                .map_err(mutate_fail);
         };
         if h.read_only_member {
-            return Err(libc::EROFS);
+            return Err(MutateFail::Errno(libc::EROFS));
         }
         if h.departed
             .as_ref()
             .is_some_and(|departed| departed.load(std::sync::atomic::Ordering::Relaxed))
         {
-            return Err(libc::EIO);
+            return Err(MutateFail::Errno(libc::EIO));
         }
         if h.epoch_frozen
             .as_ref()
             .is_some_and(|frozen| frozen.load(std::sync::atomic::Ordering::Relaxed))
         {
-            return Err(libc::EROFS);
+            return Err(MutateFail::Errno(libc::EROFS));
         }
         if let Some(designations) = &h.designations {
             let path = self
@@ -913,10 +958,10 @@ impl ConstellationFs {
                 crate::designation::GateDecision::Proceed => {
                     return constellation_meta::execute_mutate(&self.meta, &op)
                         .map(|_| ())
-                        .map_err(|e| errno(&e));
+                        .map_err(mutate_fail);
                 }
                 crate::designation::GateDecision::ReadOnly { .. } => {
-                    return Err(libc::EROFS);
+                    return Err(MutateFail::Errno(libc::EROFS));
                 }
             }
         }
@@ -928,14 +973,14 @@ impl ConstellationFs {
             if view.usable() {
                 let result = constellation_meta::execute_mutate(&self.meta, &op)
                     .map(|_| ())
-                    .map_err(|e| errno(&e));
+                    .map_err(mutate_fail);
                 if result.is_ok() {
                     view.touch();
                 }
                 return result;
             }
             if view.is_lost() {
-                return Err(libc::EIO);
+                return Err(MutateFail::Errno(libc::EIO));
             }
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -947,11 +992,16 @@ impl ConstellationFs {
             })
             .is_err()
         {
-            return Err(libc::EIO);
+            return Err(MutateFail::Errno(libc::EIO));
         }
         match rx.blocking_recv() {
             Ok(Ok(constellation_meta::MutateOutcome::Accepted { .. })) => return Ok(()),
-            Ok(Ok(constellation_meta::MutateOutcome::Errno(e))) => return Err(e),
+            Ok(Ok(constellation_meta::MutateOutcome::Errno(e))) => {
+                return Err(MutateFail::Errno(e))
+            }
+            Ok(Ok(constellation_meta::MutateOutcome::Conflict { manifest })) => {
+                return Err(MutateFail::Conflict { manifest })
+            }
             Ok(Ok(
                 constellation_meta::MutateOutcome::Busy
                 | constellation_meta::MutateOutcome::NotHolder { .. },
@@ -959,12 +1009,13 @@ impl ConstellationFs {
             Ok(Err(error)) => {
                 tracing::debug!(%error, part, "forwarded mutation failed; acquiring lease");
             }
-            Err(_) => return Err(libc::EIO),
+            Err(_) => return Err(MutateFail::Errno(libc::EIO)),
         }
-        self.require_lease_for(part_hint_ino)?;
+        self.require_lease_for(part_hint_ino)
+            .map_err(MutateFail::Errno)?;
         constellation_meta::execute_mutate(&self.meta, &op)
             .map(|_| ())
-            .map_err(|e| errno(&e))
+            .map_err(mutate_fail)
     }
 
     /// fsync() barrier. In `--fsync-mode s3`, block until the journal
@@ -1216,9 +1267,52 @@ impl ConstellationFs {
             Some(m) => m.clone(),
             None => self.load_manifest(ino)?,
         };
-        let old_hashes = self.chunk_list(&base)?;
+        let (manifest_bytes, dirty_hashes) = self.compose_manifest(&ws, &base, ws.file_len)?;
+        if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+            for hash in &dirty_hashes {
+                self.meta
+                    .add_pending_upload(hash, ino)
+                    .map_err(|e| errno(&e))?;
+            }
+            self.meta
+                .scratch_set_manifest(ino, &manifest_bytes, ws.file_len)
+                .map_err(|e| errno(&e))?;
+            ws.staging.discard();
+            if force_through {
+                self.drain_inode(ino)?;
+            }
+            return Ok(());
+        }
+        self.finish_flush(
+            ino,
+            ws,
+            &mut writes,
+            base,
+            manifest_bytes,
+            dirty_hashes,
+            force_through,
+            epoch_active,
+        )
+    }
+
+    /// Compose the whole-file manifest this flush publishes: `base`'s
+    /// chunks, minus holes and anything past `file_len`, with this
+    /// flush's sealed and staged chunks laid over the top. Also returns
+    /// the chunks newly sealed into the cache as dirty, which the
+    /// manifest commit enrols as pending uploads.
+    ///
+    /// Separate from [`Self::flush_inode`] so that a commit the holder
+    /// rejects for a stale base can be recomposed against the manifest
+    /// that *is* current, without a second copy of this logic.
+    fn compose_manifest(
+        &self,
+        ws: &WriteState,
+        base: &Manifest,
+        file_len: u64,
+    ) -> Result<(Vec<u8>, Vec<ChunkHash>), i32> {
+        let old_hashes = self.chunk_list(base)?;
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
-        let n_chunks = layout.chunk_count(ws.file_len);
+        let n_chunks = layout.chunk_count(file_len);
         let mut new_hashes: SparseChunks = old_hashes
             .iter()
             .filter(|(index, _)| **index < n_chunks && !ws.holes.contains(**index))
@@ -1248,7 +1342,7 @@ impl ConstellationFs {
             if idx >= n_chunks {
                 continue;
             }
-            let expect_len = layout.chunk_len(ws.file_len, idx) as usize;
+            let expect_len = layout.chunk_len(file_len, idx) as usize;
             let mut data = vec![0u8; expect_len];
             ws.staging
                 .read_at(idx * self.chunk_size as u64, &mut data)
@@ -1269,7 +1363,7 @@ impl ConstellationFs {
             if !ws.staging.is_dirty(idx) && !ws.sealed.contains_key(&idx) && !ws.holes.contains(idx)
             {
                 if let Some(h) = old_hashes.get(&idx) {
-                    let expect_len = layout.chunk_len(ws.file_len, idx) as usize;
+                    let expect_len = layout.chunk_len(file_len, idx) as usize;
                     let old_len = base.layout.chunk_len(base.file_len.max(1), idx) as usize;
                     if old_len != expect_len {
                         let mut data = self.fetch_chunk(h)?;
@@ -1287,34 +1381,30 @@ impl ConstellationFs {
                 }
             }
         }
-        let (manifest, spill) = Manifest::from_sparse_chunks(
-            self.chunk_size,
-            ws.file_len,
-            new_hashes,
-            INLINE_CHUNKS_MAX,
-        );
+        let (manifest, spill) =
+            Manifest::from_sparse_chunks(self.chunk_size, file_len, new_hashes, INLINE_CHUNKS_MAX);
         if let Some(blob) = spill {
             let bh = self.store.hash(&blob);
             if self.cache_for_upload(&bh, &blob)? {
                 dirty_hashes.push(bh);
             }
         }
-        let manifest_bytes = manifest.encode();
-        if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
-            for hash in &dirty_hashes {
-                self.meta
-                    .add_pending_upload(hash, ino)
-                    .map_err(|e| errno(&e))?;
-            }
-            self.meta
-                .scratch_set_manifest(ino, &manifest_bytes, ws.file_len)
-                .map_err(|e| errno(&e))?;
-            ws.staging.discard();
-            if force_through {
-                self.drain_inode(ino)?;
-            }
-            return Ok(());
-        }
+        Ok((manifest.encode(), dirty_hashes))
+    }
+
+    /// Publish a composed manifest and retire the write state.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_flush(
+        &self,
+        ino: Ino,
+        ws: WriteState,
+        writes: &mut HashMap<Ino, WriteState>,
+        base: Manifest,
+        manifest_bytes: Vec<u8>,
+        dirty_hashes: Vec<ChunkHash>,
+        force_through: bool,
+        epoch_active: bool,
+    ) -> Result<(), i32> {
         let holds_lease = self.sync.as_ref().is_none_or(|handle| {
             let part = self.meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
             handle
@@ -1341,15 +1431,7 @@ impl ConstellationFs {
                 writes.insert(ino, ws);
                 return Err(error);
             }
-            if let Err(error) = self.mutate_op(
-                ino,
-                constellation_meta::MutateOp::SetManifest {
-                    ino,
-                    base_manifest: Some(base.encode()),
-                    manifest: manifest_bytes,
-                    size: ws.file_len,
-                },
-            ) {
+            if let Err(error) = self.commit_manifest_forwarded(ino, &ws, base, manifest_bytes) {
                 writes.insert(ino, ws);
                 return Err(error);
             }
@@ -1368,6 +1450,78 @@ impl ConstellationFs {
             self.drain_inode(ino)?;
         }
         Ok(())
+    }
+
+    /// Forward a whole-file manifest commit to the lease holder,
+    /// rebasing if our base turns out to be stale.
+    ///
+    /// The holder rejects an image composed on a superseded manifest
+    /// instead of installing it, because a whole-file image built on an
+    /// old base drops whatever chunks landed in between — that is how
+    /// concurrent disjoint `WriteAt`s from several nodes used to lose
+    /// every patch but the last. On rejection, lay this flush's own
+    /// chunks over the manifest that is current and try again.
+    fn commit_manifest_forwarded(
+        &self,
+        ino: Ino,
+        ws: &WriteState,
+        base: Manifest,
+        manifest_bytes: Vec<u8>,
+    ) -> Result<(), i32> {
+        // A flush that shortened the file relative to its own base is a
+        // truncate, and must not be silently re-extended by a peer's
+        // length. Any other flush adopts the longer of the two so a
+        // concurrent extension survives the rebase.
+        let truncates = ws.base.as_ref().is_some_and(|b| ws.file_len < b.file_len);
+        let mut base = base;
+        let mut manifest_bytes = manifest_bytes;
+        let mut file_len = ws.file_len;
+        for attempt in 1..=MANIFEST_COMMIT_ATTEMPTS {
+            let failure = match self.mutate_op_rebasable(
+                ino,
+                constellation_meta::MutateOp::SetManifest {
+                    ino,
+                    base_manifest: Some(base.encode()),
+                    manifest: manifest_bytes.clone(),
+                    size: file_len,
+                },
+            ) {
+                Ok(()) => return Ok(()),
+                Err(failure) => failure,
+            };
+            let current = match failure {
+                MutateFail::Errno(e) => return Err(e),
+                MutateFail::Conflict { manifest } => manifest,
+            };
+            // `None` means whichever node executed the mutation was us,
+            // so our own replica already holds the authoritative image.
+            base = match current {
+                Some(bytes) => Manifest::decode(&bytes).map_err(|_| libc::EIO)?,
+                None => self.load_manifest(ino)?,
+            };
+            file_len = if truncates {
+                ws.file_len
+            } else {
+                ws.file_len.max(base.file_len)
+            };
+            // The chunks are already cached and enrolled for upload, so
+            // recomposing only rebuilds the manifest; a shorter dirty
+            // list on this pass means they are already durable.
+            let (rebased, _) = self.compose_manifest(ws, &base, file_len)?;
+            manifest_bytes = rebased;
+            tracing::debug!(
+                ino,
+                attempt,
+                file_len,
+                "manifest commit rebased onto a concurrent update"
+            );
+        }
+        tracing::warn!(
+            ino,
+            attempts = MANIFEST_COMMIT_ATTEMPTS,
+            "manifest commit kept losing its base; giving up"
+        );
+        Err(libc::EAGAIN)
     }
 }
 

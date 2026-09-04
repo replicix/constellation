@@ -4,7 +4,9 @@
 //! Safety still comes from the S3 lease (ADR-2): the holder is the only
 //! appender. This module is the requester/holder glue around that rule.
 
-use constellation_meta::{execute_mutate, MutateOp, MutateOutcome, SqliteMeta, TouchSet};
+use constellation_meta::{
+    execute_mutate, MetaStore, MutateOp, MutateOutcome, SqliteMeta, TouchSet,
+};
 use constellation_net::{Payload, Peers};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,6 +91,7 @@ pub fn meta_errno(e: &constellation_meta::MetaError) -> i32 {
         NotEmpty => libc::ENOTEMPTY,
         NoData => libc::ENODATA,
         Invalid(_) => libc::EINVAL,
+        Conflict => libc::EAGAIN,
         Sqlite(_) | Json(_) | Postcard(_) => libc::EIO,
     }
 }
@@ -115,6 +118,14 @@ pub fn holder_execute(
     };
     match execute_mutate(meta, &op) {
         Ok(records) => MutateOutcome::Accepted { epoch, records },
+        // Hand back what is current so the requester can rebase its
+        // whole-file manifest without waiting to tail our segment.
+        Err(constellation_meta::MetaError::Conflict) => match &op {
+            MutateOp::SetManifest { ino, .. } => MutateOutcome::Conflict {
+                manifest: meta.manifest(*ino).unwrap_or(None),
+            },
+            _ => MutateOutcome::Errno(libc::EAGAIN),
+        },
         Err(e) => MutateOutcome::Errno(meta_errno(&e)),
     }
 }
@@ -207,5 +218,39 @@ mod tests {
             MutateOutcome::NotHolder { holder: 7 } => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A requester composes a whole-file manifest on the image it last
+    /// saw. If that image has moved on, installing it would drop the
+    /// chunks that landed in between, so the holder must refuse *and*
+    /// hand back what is current — otherwise the requester cannot
+    /// rebase without waiting to tail the holder's segment.
+    #[test]
+    fn holder_execute_returns_the_current_manifest_on_a_stale_base() {
+        let meta = SqliteMeta::open_in_memory().unwrap();
+        let f = meta.create(1, "wd", 0o644, 0, 0).unwrap();
+        meta.set_manifest_with_base(f.ino, None, b"current", 7)
+            .unwrap();
+
+        let op = MutateOp::SetManifest {
+            ino: f.ino,
+            base_manifest: Some(b"stale".to_vec()),
+            manifest: b"mine".to_vec(),
+            size: 4,
+        }
+        .to_postcard()
+        .unwrap();
+
+        match holder_execute(&meta, Some(1), false, 0, &op) {
+            MutateOutcome::Conflict { manifest } => {
+                assert_eq!(manifest.as_deref(), Some(&b"current"[..]))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            meta.manifest(f.ino).unwrap().as_deref(),
+            Some(&b"current"[..]),
+            "the refused commit must not have landed"
+        );
     }
 }

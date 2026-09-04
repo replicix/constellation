@@ -1613,6 +1613,13 @@ fn mount(
                                     placement.note_local(node_id);
                                     constellation_meta::MutateOutcome::Accepted { epoch, records }
                                 }
+                                Err(constellation_meta::MetaError::Conflict) => {
+                                    // We are the holder, so our own replica is
+                                    // authoritative; the requester rebases from it.
+                                    constellation_meta::MutateOutcome::Conflict {
+                                        manifest: None,
+                                    }
+                                }
                                 Err(error) => {
                                     constellation_meta::MutateOutcome::Errno(
                                         forward::meta_errno(&error),
