@@ -141,6 +141,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: p2p_handover,
     },
     Scenario {
+        name: "forwarded-mutations",
+        desc: "non-holder writes forward to the sticky lease holder; lease epoch does not thrash",
+        requires: &[],
+        run: forwarded_mutations,
+    },
+    Scenario {
+        name: "scratch-publish",
+        desc: "scratch dir contents are local; publish rename makes the file cluster-visible",
+        requires: &[],
+        run: scratch_publish,
+    },
+    Scenario {
         name: "p2p-partition-tolerance",
         desc: "with P2P disabled on one node, shared-filesystem correctness still holds on the S3 slow path",
         requires: &[],
@@ -2931,6 +2943,151 @@ fn p2p_handover(_seed: u64) -> Result<()> {
         model.verify(&c1.mnt).context("via c1")?;
         Ok(())
     })?;
+    ensure_no_conflicts([&c0, &c1])?;
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+fn forwarded_mutations(_seed: u64) -> Result<()> {
+    let (env, root) = setup("forwarded-mutations")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/forwarded-{}", ts());
+    let idle_ms = 30_000u64;
+    let tune = |c: Client, key: &str| {
+        c.with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", &idle_ms.to_string())
+            .with_env("CONSTELLATION_NODE_KEY", key)
+    };
+    let c0_key = "/tmp/.constellation-forward-c0.key";
+    let c1_key = "/tmp/.constellation-forward-c1.key";
+    let _ = std::fs::remove_file(c0_key);
+    let _ = std::fs::remove_file(c1_key);
+    let mut c0 = tune(
+        Client::new(root.path(), "c0", &env.endpoint, &backend)?,
+        c0_key,
+    );
+    let mut c1 = tune(
+        Client::new(root.path(), "c1", &env.endpoint, &backend)?,
+        c1_key,
+    );
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    wait_for_p2p([&c0, &c1])?;
+
+    std::fs::write(c0.mnt.join("a-owns"), b"a")?;
+    eventually("c0 holds the lease", Duration::from_secs(20), || {
+        let lease = lease_of(&c0)?;
+        anyhow::ensure!(lease["held"] == true, "c0 does not hold the lease: {lease}");
+        Ok(())
+    })?;
+    let epoch_before = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
+
+    let mut model = Model::default();
+    model.write_file(std::path::Path::new("a-owns"), b"a".to_vec());
+    for i in 0..20 {
+        let name = format!("b-{i}");
+        let data = format!("value-{i}").into_bytes();
+        std::fs::write(c1.mnt.join(&name), &data)?;
+        model.write_file(std::path::Path::new(&name), data);
+    }
+
+    let c0_lease = lease_of(&c0)?;
+    let c1_lease = lease_of(&c1)?;
+    anyhow::ensure!(
+        c0_lease["held"] == true || c1_lease["held"] != true,
+        "forward burst handed the lease to c1: c0={c0_lease}, c1={c1_lease}"
+    );
+    let epoch_after = c0_lease["epoch"]
+        .as_u64()
+        .unwrap_or(0)
+        .max(c1_lease["epoch"].as_u64().unwrap_or(0));
+    anyhow::ensure!(
+        epoch_after <= epoch_before + 3,
+        "20 forwarded writes thrashed the lease epoch ({epoch_before} -> {epoch_after})"
+    );
+    eventually(
+        "requester records successful forwards",
+        Duration::from_secs(20),
+        || {
+            let status = c1.control_status()?;
+            anyhow::ensure!(
+                status["forwarded_ok"].as_u64().unwrap_or(0) > 0,
+                "c1 has no successful forwarded mutations: {status}"
+            );
+            Ok(())
+        },
+    )?;
+    eventually("both nodes converge", Duration::from_secs(30), || {
+        model.verify(&c0.mnt).context("via c0")?;
+        model.verify(&c1.mnt).context("via c1")?;
+        Ok(())
+    })?;
+    ensure_no_conflicts([&c0, &c1])?;
+    c0.unmount()?;
+    c1.unmount()?;
+    Ok(())
+}
+
+fn scratch_publish(_seed: u64) -> Result<()> {
+    let (env, root) = setup("scratch-publish")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/scratch-publish-{}", ts());
+    let c0_key = "/tmp/.constellation-scratch-c0.key";
+    let c1_key = "/tmp/.constellation-scratch-c1.key";
+    let _ = std::fs::remove_file(c0_key);
+    let _ = std::fs::remove_file(c1_key);
+    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_NODE_KEY", c0_key);
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_NODE_KEY", c1_key);
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    wait_for_p2p([&c0, &c1])?;
+
+    let scratch = c0.mnt.join("tmp");
+    std::fs::create_dir(&scratch)?;
+    set_xattr(&scratch, "user.constellation.scratch", b"1")?;
+    eventually(
+        "scratch marker visible on c1",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(
+                get_xattr(&c1.mnt.join("tmp"), "user.constellation.scratch")? == b"1",
+                "scratch marker not visible"
+            );
+            Ok(())
+        },
+    )?;
+
+    std::fs::write(scratch.join("local-only"), b"private")?;
+    std::fs::write(scratch.join("obj"), b"published")?;
+    anyhow::ensure!(
+        !c1.mnt.join("tmp/local-only").exists(),
+        "scratch file was immediately visible on c1"
+    );
+
+    std::fs::rename(scratch.join("obj"), c0.mnt.join("cache-hash"))?;
+    eventually(
+        "published file visible but scratch file private",
+        Duration::from_secs(30),
+        || {
+            anyhow::ensure!(
+                std::fs::read(c1.mnt.join("cache-hash"))? == b"published",
+                "published content mismatch"
+            );
+            anyhow::ensure!(
+                !c1.mnt.join("tmp/local-only").exists(),
+                "node-private scratch file appeared on c1"
+            );
+            Ok(())
+        },
+    )?;
+    anyhow::ensure!(
+        std::fs::read(c0.mnt.join("tmp/local-only"))? == b"private",
+        "local scratch content changed"
+    );
     ensure_no_conflicts([&c0, &c1])?;
     c0.unmount()?;
     c1.unmount()?;

@@ -6,6 +6,7 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
+use crate::replay::TouchSet;
 use crate::{CloneNode, CloneSpec, DirEntry, MetaStore, SetXattrMode, SnapshotNode, SnapshotRow};
 use constellation_fs_core::types::{now_ns, ROOT_INO};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind};
@@ -18,6 +19,7 @@ use std::sync::Mutex;
 /// (~1.1e12) of per-node allocations. Prefix 0 belongs to `fs create`
 /// genesis (the root inode is 1).
 pub const INO_PREFIX_SHIFT: u32 = 40;
+pub const SCRATCH_XATTR: &str = "user.constellation.scratch";
 
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
@@ -118,6 +120,35 @@ CREATE TABLE IF NOT EXISTS chunk_ref (
     PRIMARY KEY (chunk_hash, ino)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS chunk_ref_by_ino ON chunk_ref (ino);
+CREATE TABLE IF NOT EXISTS scratch_inode (
+    ino INTEGER PRIMARY KEY,
+    kind INTEGER NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    mode INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    gid INTEGER NOT NULL,
+    nlink INTEGER NOT NULL,
+    atime_ns INTEGER NOT NULL DEFAULT 0,
+    mtime_ns INTEGER NOT NULL,
+    ctime_ns INTEGER NOT NULL,
+    rdev INTEGER NOT NULL DEFAULT 0,
+    manifest BLOB,
+    symlink_target TEXT
+);
+CREATE TABLE IF NOT EXISTS scratch_dentry (
+    parent INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    ino INTEGER NOT NULL,
+    PRIMARY KEY (parent, name)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS scratch_dentry_by_ino ON scratch_dentry (ino);
+CREATE TABLE IF NOT EXISTS shadow (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    part TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    records BLOB NOT NULL,
+    created_ms INTEGER NOT NULL
+);
 ";
 
 pub type JournalBatch = Vec<(u64, LogRecord)>;
@@ -1811,6 +1842,668 @@ impl SqliteMeta {
         Ok(())
     }
 
+    pub fn allocate_ino(&self) -> Result<Ino, MetaError> {
+        Self::alloc_ino(&self.conn.lock().unwrap())
+    }
+
+    pub fn max_journal_seq(&self) -> Result<u64, MetaError> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM journal",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn peek_journal_after(&self, after_seq: u64) -> Result<Vec<(u64, LogRecord)>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT seq, record FROM journal WHERE seq > ?1 ORDER BY seq")?;
+        let rows = stmt.query_map(params![after_seq], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, bytes) = row?;
+            out.push((seq, LogRecord::from_postcard(&bytes)?));
+        }
+        Ok(out)
+    }
+
+    pub fn mkdir_at(
+        &self,
+        parent: Ino,
+        name: &str,
+        ino: Ino,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_dir(&tx, parent)?;
+        if Self::attr_by_ino(&tx, ino)?.is_some() {
+            return Err(MetaError::Exists);
+        }
+        let t = now_ns();
+        let attr = FileAttr::new_dir(ino, mode, uid, gid, t);
+        Self::insert_dentry(&tx, parent, name, ino)?;
+        tx.execute(
+            "INSERT INTO inode (ino, kind, mode, uid, gid, nlink, atime_ns, mtime_ns, ctime_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, 2, ?6, ?6, ?6)",
+            params![ino, InodeKind::Dir.as_u8(), attr.mode, uid, gid, t],
+        )?;
+        tx.execute(
+            "UPDATE inode SET nlink = nlink + 1, mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
+            params![parent, t],
+        )?;
+        Self::journal(
+            &tx,
+            &LogRecord::Mkdir {
+                parent,
+                name: name.into(),
+                ino,
+                mode: attr.mode,
+                uid,
+                gid,
+                time_ns: t,
+            },
+        )?;
+        tx.commit()?;
+        Ok(attr)
+    }
+
+    pub fn create_at(
+        &self,
+        parent: Ino,
+        name: &str,
+        ino: Ino,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_dir(&tx, parent)?;
+        if Self::attr_by_ino(&tx, ino)?.is_some() {
+            return Err(MetaError::Exists);
+        }
+        let t = now_ns();
+        let attr = FileAttr::new_file(ino, mode, uid, gid, t);
+        Self::insert_dentry(&tx, parent, name, ino)?;
+        tx.execute(
+            "INSERT INTO inode (ino, kind, mode, uid, gid, nlink, atime_ns, mtime_ns, ctime_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, ?6)",
+            params![ino, InodeKind::File.as_u8(), attr.mode, uid, gid, t],
+        )?;
+        tx.execute(
+            "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
+            params![parent, t],
+        )?;
+        Self::journal(
+            &tx,
+            &LogRecord::Create {
+                parent,
+                name: name.into(),
+                ino,
+                mode: attr.mode,
+                uid,
+                gid,
+                time_ns: t,
+            },
+        )?;
+        tx.commit()?;
+        Ok(attr)
+    }
+
+    pub fn symlink_at(
+        &self,
+        parent: Ino,
+        name: &str,
+        ino: Ino,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_dir(&tx, parent)?;
+        if Self::attr_by_ino(&tx, ino)?.is_some() {
+            return Err(MetaError::Exists);
+        }
+        let t = now_ns();
+        let attr = FileAttr::new_symlink(ino, uid, gid, t, target.len() as u64);
+        Self::insert_dentry(&tx, parent, name, ino)?;
+        tx.execute(
+            "INSERT INTO inode (ino, kind, size, mode, uid, gid, nlink, atime_ns, mtime_ns, ctime_ns, symlink_target)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?7, ?8)",
+            params![
+                ino,
+                InodeKind::Symlink.as_u8(),
+                attr.size,
+                attr.mode,
+                uid,
+                gid,
+                t,
+                target
+            ],
+        )?;
+        tx.execute(
+            "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
+            params![parent, t],
+        )?;
+        Self::journal(
+            &tx,
+            &LogRecord::Symlink {
+                parent,
+                name: name.into(),
+                ino,
+                target: target.into(),
+                uid,
+                gid,
+                time_ns: t,
+            },
+        )?;
+        tx.commit()?;
+        Ok(attr)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mknod_at(
+        &self,
+        parent: Ino,
+        name: &str,
+        ino: Ino,
+        kind: InodeKind,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u64,
+    ) -> Result<FileAttr, MetaError> {
+        if !kind.is_special() {
+            return Err(MetaError::Invalid("mknod kind".into()));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_dir(&tx, parent)?;
+        if Self::attr_by_ino(&tx, ino)?.is_some() {
+            return Err(MetaError::Exists);
+        }
+        let t = now_ns();
+        let attr = FileAttr::new_special(ino, kind, mode, uid, gid, rdev, t);
+        Self::insert_dentry(&tx, parent, name, ino)?;
+        tx.execute(
+            "INSERT INTO inode (ino, kind, mode, uid, gid, nlink, atime_ns, mtime_ns, ctime_ns, rdev)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, ?6, ?7)",
+            params![ino, kind.as_u8(), attr.mode, uid, gid, t, rdev as i64],
+        )?;
+        tx.execute(
+            "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
+            params![parent, t],
+        )?;
+        Self::journal(
+            &tx,
+            &LogRecord::Mknod {
+                parent,
+                name: name.into(),
+                ino,
+                kind: kind.as_u8(),
+                mode: attr.mode,
+                uid,
+                gid,
+                rdev,
+                time_ns: t,
+            },
+        )?;
+        tx.commit()?;
+        Ok(attr)
+    }
+
+    pub fn set_manifest_with_base(
+        &self,
+        ino: Ino,
+        base_manifest: Option<&[u8]>,
+        manifest: &[u8],
+        size: u64,
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT manifest FROM inode WHERE ino = ?1",
+                params![ino],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let journal_base = base_manifest.map(Vec::from).or_else(|| current.clone());
+        let t = now_ns();
+        let n = tx.execute(
+            "UPDATE inode SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4 WHERE ino = ?1",
+            params![ino, manifest, size as i64, t],
+        )?;
+        if n == 0 {
+            return Err(MetaError::NoEnt(ino));
+        }
+        Self::track_manifest_transition(
+            &tx,
+            ino,
+            current.as_deref(),
+            Some(manifest),
+            Self::next_deref_seq(&tx)?,
+            t / 1_000_000,
+        )?;
+        Self::journal(
+            &tx,
+            &LogRecord::WriteManifest {
+                ino,
+                base_manifest: journal_base,
+                manifest: manifest.to_vec(),
+                size,
+                time_ns: t,
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_file(
+        &self,
+        parent: Ino,
+        name: &str,
+        ino: Ino,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        mtime_ns: i64,
+        manifest: &[u8],
+        size: u64,
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::require_dir(&tx, parent)?;
+        if let Some(old_ino) = Self::dentry_ino(&tx, parent, name)? {
+            let old_attr = Self::attr_by_ino(&tx, old_ino)?.ok_or(MetaError::NoEnt(old_ino))?;
+            if old_attr.kind == InodeKind::File {
+                let old_manifest: Option<Vec<u8>> = tx.query_row(
+                    "SELECT manifest FROM inode WHERE ino = ?1",
+                    params![old_ino],
+                    |row| row.get(0),
+                )?;
+                if old_manifest.as_deref() == Some(manifest) {
+                    return Ok(());
+                }
+            } else if old_attr.kind == InodeKind::Dir {
+                return Err(MetaError::IsDir);
+            }
+            let t = now_ns();
+            tx.execute(
+                "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
+                params![parent, name],
+            )?;
+            tx.execute(
+                "UPDATE inode SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1",
+                params![old_ino, t],
+            )?;
+            if old_attr.nlink == 1 {
+                tx.execute("DELETE FROM xattr WHERE ino = ?1", params![old_ino])?;
+                let old_manifest: Option<Vec<u8>> = tx.query_row(
+                    "SELECT manifest FROM inode WHERE ino = ?1",
+                    params![old_ino],
+                    |row| row.get(0),
+                )?;
+                Self::track_manifest_transition(
+                    &tx,
+                    old_ino,
+                    old_manifest.as_deref(),
+                    None,
+                    Self::next_deref_seq(&tx)?,
+                    t / 1_000_000,
+                )?;
+            }
+            Self::journal(
+                &tx,
+                &LogRecord::Unlink {
+                    parent,
+                    name: name.into(),
+                    time_ns: t,
+                },
+            )?;
+        }
+        if Self::attr_by_ino(&tx, ino)?.is_some() {
+            return Err(MetaError::Exists);
+        }
+        let ctime_ns = now_ns();
+        let attr = FileAttr::new_file(ino, mode, uid, gid, mtime_ns);
+        Self::insert_dentry(&tx, parent, name, ino)?;
+        tx.execute(
+            "INSERT INTO inode
+             (ino, kind, size, mode, uid, gid, nlink, atime_ns, mtime_ns, ctime_ns, manifest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8, ?9)",
+            params![
+                ino,
+                InodeKind::File.as_u8(),
+                size as i64,
+                attr.mode,
+                uid,
+                gid,
+                mtime_ns,
+                ctime_ns,
+                manifest
+            ],
+        )?;
+        tx.execute(
+            "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?3 WHERE ino = ?1",
+            params![parent, mtime_ns, ctime_ns],
+        )?;
+        Self::journal(
+            &tx,
+            &LogRecord::Create {
+                parent,
+                name: name.into(),
+                ino,
+                mode: attr.mode,
+                uid,
+                gid,
+                time_ns: mtime_ns,
+            },
+        )?;
+        Self::track_manifest_transition(
+            &tx,
+            ino,
+            None,
+            Some(manifest),
+            Self::next_deref_seq(&tx)?,
+            mtime_ns / 1_000_000,
+        )?;
+        Self::journal(
+            &tx,
+            &LogRecord::WriteManifest {
+                ino,
+                base_manifest: None,
+                manifest: manifest.to_vec(),
+                size,
+                time_ns: mtime_ns,
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn is_scratch_dir(&self, ino: Ino) -> Result<bool, MetaError> {
+        Ok(self.get_xattr(ino, SCRATCH_XATTR)?.as_deref() == Some(b"1"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scratch_create(
+        &self,
+        parent: Ino,
+        name: &str,
+        ino: Ino,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if tx
+            .query_row(
+                "SELECT 1 FROM scratch_inode WHERE ino = ?1",
+                params![ino],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(MetaError::Exists);
+        }
+        let t = now_ns();
+        let attr = FileAttr::new_file(ino, mode, uid, gid, t);
+        tx.execute(
+            "INSERT INTO scratch_dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
+            params![parent, name, ino],
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::SqliteFailure(ref e, _)
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                MetaError::Exists
+            }
+            other => other.into(),
+        })?;
+        tx.execute(
+            "INSERT INTO scratch_inode
+             (ino, kind, mode, uid, gid, nlink, atime_ns, mtime_ns, ctime_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, ?6)",
+            params![ino, InodeKind::File.as_u8(), attr.mode, uid, gid, t],
+        )?;
+        tx.commit()?;
+        Ok(attr)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scratch_mkdir(
+        &self,
+        parent: Ino,
+        name: &str,
+        ino: Ino,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let t = now_ns();
+        let attr = FileAttr::new_dir(ino, mode, uid, gid, t);
+        tx.execute(
+            "INSERT INTO scratch_dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
+            params![parent, name, ino],
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::SqliteFailure(ref e, _)
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                MetaError::Exists
+            }
+            other => other.into(),
+        })?;
+        tx.execute(
+            "INSERT INTO scratch_inode
+             (ino, kind, mode, uid, gid, nlink, atime_ns, mtime_ns, ctime_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, 2, ?6, ?6, ?6)",
+            params![ino, InodeKind::Dir.as_u8(), attr.mode, uid, gid, t],
+        )?;
+        tx.commit()?;
+        Ok(attr)
+    }
+
+    pub fn scratch_lookup(&self, parent: Ino, name: &str) -> Result<Option<FileAttr>, MetaError> {
+        self.with_reader(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT i.ino, i.kind, i.size, i.mode, i.uid, i.gid, i.nlink,
+                            i.atime_ns, i.mtime_ns, i.ctime_ns, i.rdev
+                     FROM scratch_dentry d JOIN scratch_inode i ON i.ino = d.ino
+                     WHERE d.parent = ?1 AND d.name = ?2",
+                    params![parent, name],
+                    Self::row_to_attr,
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn scratch_unlink(&self, parent: Ino, name: &str) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ino: Ino = tx
+            .query_row(
+                "SELECT ino FROM scratch_dentry WHERE parent = ?1 AND name = ?2",
+                params![parent, name],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(MetaError::NoEntry)?;
+        tx.execute(
+            "DELETE FROM scratch_dentry WHERE parent = ?1 AND name = ?2",
+            params![parent, name],
+        )?;
+        tx.execute("DELETE FROM scratch_inode WHERE ino = ?1", params![ino])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn scratch_rename(
+        &self,
+        parent: Ino,
+        name: &str,
+        new_parent: Ino,
+        new_name: &str,
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE scratch_dentry
+             SET parent = ?3, name = ?4
+             WHERE parent = ?1 AND name = ?2",
+            params![parent, name, new_parent, new_name],
+        )?;
+        if changed == 0 {
+            return Err(MetaError::NoEntry);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn scratch_readdir(&self, parent: Ino) -> Result<Vec<DirEntry>, MetaError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT d.name, d.ino, i.kind
+                 FROM scratch_dentry d JOIN scratch_inode i ON i.ino = d.ino
+                 WHERE d.parent = ?1 ORDER BY d.name",
+            )?;
+            let rows = stmt.query_map(params![parent], |row| {
+                let kind: u8 = row.get(2)?;
+                Ok(DirEntry {
+                    name: row.get(0)?,
+                    ino: row.get(1)?,
+                    kind: InodeKind::from_u8(kind).unwrap_or(InodeKind::File),
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    pub fn scratch_getattr(&self, ino: Ino) -> Result<Option<FileAttr>, MetaError> {
+        self.with_reader(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT ino, kind, size, mode, uid, gid, nlink,
+                            atime_ns, mtime_ns, ctime_ns, rdev
+                     FROM scratch_inode WHERE ino = ?1",
+                    params![ino],
+                    Self::row_to_attr,
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn scratch_set_manifest(
+        &self,
+        ino: Ino,
+        manifest: &[u8],
+        size: u64,
+    ) -> Result<(), MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let t = now_ns();
+        let changed = conn.execute(
+            "UPDATE scratch_inode
+             SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4 WHERE ino = ?1",
+            params![ino, manifest, size as i64, t],
+        )?;
+        if changed == 0 {
+            return Err(MetaError::NoEnt(ino));
+        }
+        Ok(())
+    }
+
+    pub fn scratch_manifest(&self, ino: Ino) -> Result<Option<Vec<u8>>, MetaError> {
+        self.with_reader(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT manifest FROM scratch_inode WHERE ino = ?1",
+                    params![ino],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten())
+        })
+    }
+
+    pub fn scratch_purge_all(&self) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM scratch_dentry", [])?;
+        tx.execute("DELETE FROM scratch_inode", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn shadow_insert(
+        &self,
+        part: &str,
+        epoch: u64,
+        records: &[LogRecord],
+    ) -> Result<(), MetaError> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO shadow (part, epoch, records, created_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![part, epoch, postcard::to_allocvec(&records)?, now_unix_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn shadow_touch_set(&self) -> Result<TouchSet, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT records FROM shadow ORDER BY id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.extend(postcard::from_bytes::<Vec<LogRecord>>(&row?)?);
+        }
+        Ok(TouchSet::from_records(records.iter()))
+    }
+
+    pub fn shadow_retire_matching(
+        &self,
+        epoch: u64,
+        records: &[LogRecord],
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows = {
+            let mut stmt = tx.prepare("SELECT id, records FROM shadow WHERE epoch <= ?1")?;
+            let rows = stmt.query_map(params![epoch], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, bytes) in rows {
+            let shadow_records: Vec<LogRecord> = postcard::from_bytes(&bytes)?;
+            if shadow_records.iter().all(|record| records.contains(record)) {
+                tx.execute("DELETE FROM shadow WHERE id = ?1", params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn shadow_expire(&self, older_than_ms: i64) -> Result<(), MetaError> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM shadow WHERE created_ms < ?1",
+            params![older_than_ms],
+        )?;
+        Ok(())
+    }
+
     /// The durable not-yet-uploaded set: every `(hash, ino)` pair a
     /// local write has journaled but this node has not yet confirmed in
     /// S3. Survives a crash — unlike `DiskCache::rescan`, which cannot
@@ -2910,6 +3603,105 @@ mod tests {
         // Ack drains.
         m.ack_journal(recs[3].0).unwrap();
         assert_eq!(m.journal_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn scratch_is_node_private_and_purgeable() {
+        let m = store();
+        let ino = m.allocate_ino().unwrap();
+        m.scratch_create(ROOT_INO, "local", ino, 0o644, 1000, 1000)
+            .unwrap();
+
+        assert_eq!(
+            m.scratch_lookup(ROOT_INO, "local").unwrap().unwrap().ino,
+            ino
+        );
+        assert!(m.lookup(ROOT_INO, "local").unwrap().is_none());
+        assert_eq!(m.journal_len().unwrap(), 0);
+
+        m.scratch_purge_all().unwrap();
+        assert!(m.scratch_lookup(ROOT_INO, "local").unwrap().is_none());
+        assert!(m.scratch_getattr(ino).unwrap().is_none());
+    }
+
+    #[test]
+    fn publish_file_creates_shared_inode() {
+        let m = store();
+        let ino = m.allocate_ino().unwrap();
+        m.publish_file(
+            ROOT_INO,
+            "published",
+            ino,
+            0o640,
+            1000,
+            1001,
+            123,
+            b"MANIFEST",
+            42,
+        )
+        .unwrap();
+
+        let attr = m.lookup(ROOT_INO, "published").unwrap().unwrap();
+        assert_eq!(attr.ino, ino);
+        assert_eq!(attr.size, 42);
+        assert_eq!(
+            m.manifest(ino).unwrap().as_deref(),
+            Some(b"MANIFEST".as_slice())
+        );
+        let records = m.take_journal(10).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[0].1, LogRecord::Create { .. }));
+        assert!(matches!(records[1].1, LogRecord::WriteManifest { .. }));
+    }
+
+    #[test]
+    fn publish_file_identical_manifest_dedupes() {
+        let m = store();
+        let existing = m.create(ROOT_INO, "published", 0o644, 1000, 1000).unwrap();
+        m.set_manifest(existing.ino, b"MANIFEST", 42).unwrap();
+        let journal_len = m.journal_len().unwrap();
+
+        m.publish_file(
+            ROOT_INO,
+            "published",
+            m.allocate_ino().unwrap(),
+            0o600,
+            2000,
+            2000,
+            456,
+            b"MANIFEST",
+            42,
+        )
+        .unwrap();
+
+        assert_eq!(m.journal_len().unwrap(), journal_len);
+        assert_eq!(
+            m.lookup(ROOT_INO, "published").unwrap().unwrap().ino,
+            existing.ino
+        );
+    }
+
+    #[test]
+    fn shadow_insert_and_retire() {
+        let m = store();
+        let record = LogRecord::Unlink {
+            parent: ROOT_INO,
+            name: "shadowed".into(),
+            time_ns: 123,
+        };
+        m.shadow_insert("p0", 7, std::slice::from_ref(&record))
+            .unwrap();
+
+        let touches = m.shadow_touch_set().unwrap();
+        assert!(touches
+            .dentries
+            .contains(&(ROOT_INO, "shadowed".to_string())));
+
+        m.shadow_retire_matching(7, std::slice::from_ref(&record))
+            .unwrap();
+        let touches = m.shadow_touch_set().unwrap();
+        assert!(touches.dentries.is_empty());
+        assert!(touches.inos.is_empty());
     }
 
     #[test]

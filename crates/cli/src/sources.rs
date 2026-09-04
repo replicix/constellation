@@ -142,7 +142,9 @@ impl SourceStats {
         };
         let miss_pen = self.miss_rate * MISS_PENALTY_MS;
         let err_pen = self.err_rate * ERR_PENALTY_MS;
-        let q_pen = f64::from(self.in_flight) * self.ttfb_ewma_ms.max(self.transport_rtt_ms.unwrap_or(0.0)) * 0.5;
+        let q_pen = f64::from(self.in_flight)
+            * self.ttfb_ewma_ms.max(self.transport_rtt_ms.unwrap_or(0.0))
+            * 0.5;
         let transport_floor = self.transport_rtt_ms.unwrap_or(0.0);
         let path_penalty = if self.path == PathKind::Relay {
             20.0
@@ -542,10 +544,7 @@ mod tests {
         // Never transferred: ETA must not look like a LAN peer.
         let eta = s.eta_ms(peer, 4 * MIB);
         let s3_eta = s.eta_ms(SourceId::S3, 4 * MIB);
-        assert!(
-            eta > 200.0,
-            "cold WAN peer ETA {eta} still looks LAN-local"
-        );
+        assert!(eta > 200.0, "cold WAN peer ETA {eta} still looks LAN-local");
         assert!(
             eta > s3_eta * 0.5,
             "cold WAN peer should not dominate cold S3 (peer={eta} s3={s3_eta})"

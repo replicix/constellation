@@ -6,6 +6,8 @@ Goal-oriented directions for a specific task or problem.
 
 - [Enable P2P relays](operations/enable-p2p-relays.md) — public or self-hosted iroh relays for NAT / no-shared-L3 fleets
 - [Run a self-hosted iroh relay](operations/run-iroh-relay.md) — build and operate `iroh-relay` for Constellation
+- [Run a shared cache workload](operations/shared-cache-workload.md) — node-local staging and atomic Publish
+- [Diagnose lease thrash](operations/diagnose-lease-thrash.md) — forwarding counters, handoff logs, placement
 
 ## Development
 

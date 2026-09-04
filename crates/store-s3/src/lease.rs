@@ -135,6 +135,13 @@ impl Lease {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseTag(UpdateVersion);
 
+impl LeaseTag {
+    /// S3 object ETag, if the backend supplied one.
+    pub fn etag(&self) -> Option<String> {
+        self.0.e_tag.clone()
+    }
+}
+
 /// How [`LeaseStore`] commits a swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseMode {

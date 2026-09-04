@@ -157,6 +157,23 @@ definition (admission-checked), and **offline writes** cannot drain
 eagerly, so disconnected write capacity ≤ free cache space — the spool
 bound of §9.
 
+### Scratch directories
+
+A shared directory marked with `user.constellation.scratch=1` is a
+node-private staging namespace. Creates, writes, renames within the scratch
+tree, and unlinks update only the local replica and cache: they do not acquire
+a lease or append shared log records. Scratch contents are purged on every
+mount and are never visible from another node.
+
+Renaming a regular file from scratch into the shared namespace is an explicit
+**Publish** operation. It uploads the file's chunks, then atomically creates
+the shared inode and manifest through the ordinary mutation path. Existing
+content-addressed chunks are reused. Moving shared content into scratch, or
+publishing directories and other unsupported file types, fails with `EXDEV`;
+hard links cannot cross the boundary. A crash before Publish can leave only
+local scratch state and unreferenced content-addressed chunks for normal GC —
+never a shared-log record that names an incomplete file.
+
 ### Unlink while open (orphan inodes)
 
 POSIX semantics — `unlink` removes the *name* immediately; the inode and
@@ -266,10 +283,20 @@ final, with a documented recovery rule for half-committed pairs).
 ### Leases (the authority mechanism)
 
 A lease on `leases/<part>.json` (CAS-updated, TTL ~60 s, renewed at half-TTL)
-grants one node exclusive write authority over a partition:
+grants one node exclusive write authority over a partition. The holder is
+also the partition's **sequencer**: other nodes normally forward mutations to
+it over iroh instead of moving the lease for each writer.
 
-- The holder journals ops locally at local-FS speed and flushes segments
-  asynchronously (bounded lag, default ~5 s / ~4 MiB).
+- The sequencer validates and journals both local and forwarded ops at
+  local-FS speed, then flushes segments asynchronously (bounded lag, default
+  ~5 s / ~4 MiB). A forwarded ack means the holder journal contains the
+  records; it does not mean the segment is already on S3.
+- Leases are sticky across brief idle periods. A holder releases after about
+  30 seconds without a mutation, avoiding churn between bursty writers.
+- The holder observes recent per-writer operation rates and peer RTT vectors.
+  It may migrate placement to the write-rate-weighted medoid of the writers,
+  after hysteresis and dwell checks, so forwarding cost falls without an
+  election.
 - Acquire: CAS-create or CAS-swap an expired/released lease, after applying
   the previous holder's flushed log. Transfer is P2P-accelerated (holder
   flushes + hands off in one RTT) with the S3 CAS as the commit point.
@@ -288,6 +315,12 @@ grants one node exclusive write authority over a partition:
 Three roots exist; all transitions between them are explicit, signed, and
 persisted before activation. Safety never depends on failure detection —
 heartbeats (`heartbeat/*`, P2P keepalives) feed status UX only.
+
+Forwarding adds **requesters**, not appenders. The lease holder remains the
+only node that assigns authoritative order and appends the partition log.
+S3 CAS lease ownership, fencing epochs, and takeover rules are unchanged.
+An unreachable or declining holder makes the requester fall back to the
+ordinary S3-backed lease path.
 
 ### 5.1 Leases (default)
 
@@ -363,11 +396,20 @@ Two invariants define what "stale" can and cannot mean here:
    records apply in log order, a node's view is always a consistent
    *prefix* of the authoritative history — "the world as of txid N,"
    never a mix.
-2. **Reads may be stale; writes never act on stale state.** Any conflicting
-   write needs the partition lease, and acquiring/holding it requires having
-   applied the previous holder's flushed log (§4). A write based on an
-   outdated view is therefore impossible: it serializes after the change it
-   didn't see and fails cleanly (e.g. ENOENT), rather than conflicting.
+2. **Reads may be stale; writes never act on stale state.** Every conflicting
+   write is validated by the partition lease holder, either locally or as a
+   forwarded request. Holding or acquiring the lease requires applying the
+   predecessor's flushed log (§4). A write based on an outdated requester
+   view therefore serializes against the holder's authoritative state and
+   fails cleanly (e.g. ENOENT), rather than conflicting.
+
+For a forwarded mutation, the requester immediately stores the acked records
+as a local **shadow** and applies them to its replica. It therefore sees its
+own accepted operation before the holder's segment reaches S3. When the
+holder publishes a small segment, `SegmentPublished` may carry the compressed
+segment bytes; peers can apply that payload directly. Larger segments carry
+only the usual hint to tail S3. In both cases S3 remains the durable source,
+and later tailing reconciles the shadow with the authoritative stream.
 
 Worked example: node A deletes a file at t=0; node B `stat()`s it 1 ns
 later and still sees it. Correct: no signal from A has reached B, so there
@@ -502,7 +544,8 @@ keeping an emergency reserve so pending segments can still flush to S3.
 |---|---|
 | node crash | journal + epoch promises replay from local DB; dirty chunks re-upload; leases re-acquired or expire naturally |
 | S3 outage | reads from cache; writes continue under held leases/epoch; flush resumes on return |
-| lease holder vanishes | takeover after applying its flushed log (fenced by epoch counter); bounded unflushed tail surfaces via reintegration rules |
+| lease holder unreachable | requester tries handoff, then falls back to lease release/TTL and S3 CAS takeover after applying the flushed log |
+| holder crashes after forwarding ack | acked records may remain in its stranded journal; lease fencing prevents a second history and reintegration surfaces the stranded branch |
 | P2P down, S3 up | everything works, minus the fast path (higher latencies) |
 | clock skew | TTLs measured with margins; correctness relies on CAS ordering, never wall clocks |
 | cache disk full | evict clean → throttle → ENOSPC (reads still stream uncached) |
@@ -633,15 +676,14 @@ an indexed, transactional replica answers directly.
 - **`READDIRPLUS`**: attributes returned with each dentry from a single
   `dentry JOIN inode` query — kills the stat-storm that slows `ls -la`,
   `find`, and rsync on every network FS.
-- **Long kernel TTLs + push invalidation**: entry/attr timeouts in minutes
-  instead of seconds, with `notify_inval_entry`/`notify_inval_inode` called
-  precisely when a remote log record applies. Metadata hot paths run
-  in-kernel; correctness by push, not polling.
-- **Negative dentry caching**: the replica is authoritative, so ENOENT is a
-  certain answer and safely kernel-cached — compilers, linkers, and `$PATH`
-  searches issue huge volumes of failed lookups most network FSs can't
-  cache. Invalidated by the `create`/`rename` record applying (the TTL is
-  only a backstop); consistency argument in §6 "Staleness, precisely".
+- **Long kernel TTLs + push invalidation**: entry/attr timeouts can be long
+  once `notify_inval_entry`/`notify_inval_inode` is wired for every remote
+  record. That notification coverage may still be incomplete, so current
+  correctness must not assume every kernel cache is invalidated immediately.
+- **Negative dentry caching**: ENOENT answers use a short polling backstop
+  until notification coverage is complete. Segment push — including direct
+  application of small `SegmentPublished` payloads — shortens the freshness
+  window; eventual S3 polling closes it when P2P is unavailable.
 - **`copy_file_range` / reflink as pure metadata**: content addressing makes
   every copy a manifest copy (`copy_manifest`, §4) with chunks shared
   automatically — instant, zero-I/O copies of any size.

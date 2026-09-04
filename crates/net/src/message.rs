@@ -43,10 +43,13 @@ pub const MAX_GOSSIP_DELTA_ADDS: usize = 900;
 pub enum Payload {
     /// Gossiped after a segment PUT succeeds: recipients tail
     /// immediately instead of waiting for their next poll.
+    /// `payload` is the zstd segment bytes when small enough to fit
+    /// the gossip budget; recipients may apply it directly.
     SegmentPublished {
         part: String,
         seq: u64,
         epoch: u64,
+        payload: Option<Vec<u8>>,
     },
     /// GC has CAS-published `gc/condemned.json`. Writers still re-read S3;
     /// this is only a freshness nudge, never the authority.
@@ -60,10 +63,14 @@ pub enum Payload {
     },
     /// Holder's answer: it flushed and released, so the requester can
     /// CAS-claim now. `released: false` means it declined (still busy).
+    /// `etag` / `head_seq` are optional accelerators so the requester
+    /// can skip a classify GET.
     LeaseHandoff {
         part: String,
         epoch: u64,
         released: bool,
+        etag: Option<String>,
+        head_seq: Option<u64>,
     },
     /// Liveness for status UX only — never a safety input.
     Ping {
@@ -160,6 +167,33 @@ pub enum Payload {
     ChunkResponse {
         hash: [u8; 32],
         found: bool,
+    },
+    /// Non-holder asks the lease holder to validate and journal `op`
+    /// (postcard-encoded `MutateOp` from constellation-meta).
+    MutateRequest {
+        part: String,
+        requester: u64,
+        req_id: u64,
+        epoch_seen: u64,
+        /// Postcard bytes of `constellation_meta::MutateOp`.
+        op: Vec<u8>,
+    },
+    /// Holder's answer: postcard-encoded `MutateOutcome`.
+    MutateReply {
+        req_id: u64,
+        /// Postcard bytes of `constellation_meta::MutateOutcome`.
+        outcome: Vec<u8>,
+    },
+    /// Gossiped RTT vector for holder-driven lease placement.
+    PeerRtts {
+        node_id: u64,
+        /// `(peer_id, rtt_ms)` samples.
+        rtts: Vec<(u64, u16)>,
+    },
+    /// Holder offers the lease to a better-placed writer (placement).
+    LeaseOffer {
+        part: String,
+        epoch: u64,
     },
 }
 
@@ -261,6 +295,7 @@ mod tests {
             part: "p0".into(),
             seq: 7,
             epoch: 3,
+            payload: None,
         };
         let signed = Signed::new(&k, &payload).unwrap();
         let (author, got) = signed.verify().unwrap();
@@ -326,6 +361,7 @@ mod tests {
             part: "p0".into(),
             seq: 3,
             epoch: 1,
+            payload: None,
         };
         let signed = Signed::new(&k, &payload).unwrap();
         let bare = signed.encode_bare().unwrap();
@@ -349,6 +385,7 @@ mod tests {
                 part: "p".repeat(MAX_FRAME),
                 seq: 1,
                 epoch: 1,
+                payload: None,
             },
         )
         .unwrap();

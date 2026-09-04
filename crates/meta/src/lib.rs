@@ -2,15 +2,18 @@
 //! (DECISIONS.md ADR-9), log records and the local journal (DESIGN.md §4).
 
 pub mod error;
+pub mod mutate;
 pub mod record;
 pub mod reintegrate;
 pub mod replay;
 pub mod sqlite;
 
 pub use error::MetaError;
+pub use mutate::{execute as execute_mutate, MutateOp, MutateOutcome};
 pub use record::{CloneNode, LogRecord};
 pub use reintegrate::{classify, materialize, Disposition, CONFLICT_DIR};
-pub use sqlite::SqliteMeta;
+pub use replay::TouchSet;
+pub use sqlite::{SqliteMeta, SCRATCH_XATTR};
 
 use constellation_fs_core::{FileAttr, Ino};
 

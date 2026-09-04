@@ -16,8 +16,10 @@ Go — weaker fit: no iroh equivalent (libp2p is heavier, ~70% hole-punch vs
 
 **Decision**: S3 conditional writes are the only linearizable arbiter; every
 node has a full local metadata replica; subtree leases give holders
-local-speed writes; iroh accelerates handoff/invalidation but is never
-required for correctness.
+local-speed writes; iroh accelerates forwarded mutations,
+handoff/invalidation, and segment delivery but is never required for
+correctness. An empty `MutateReply`, refusal, timeout, or unreachable holder
+makes the requester use the S3-backed lease path.
 **Rejected**: central metadata service — load-bearing extra infrastructure;
 if it's unreachable nothing can lock even though S3 is fine; and the offline
 machinery is needed anyway, making the service redundant. Pure gossip/CRDT —
@@ -190,3 +192,52 @@ relays — tenant isolation is registry/IAM/E2E crypto, not relay tokens.
 Multiple `shared_token` values are an admission OR-list, not per-tenant
 overlays; partition capacity with separate relay URLs when needed. Details:
 [P2P relays — shared relays and multi-tenancy](../reference/features/p2p-relays.md#shared-relays-and-multi-tenancy).
+
+## ADR-14: Forward mutations to the lease holder instead of moving the lease
+
+**Decision**: a node without the partition lease sends its mutation to the
+holder. The holder validates and journals the operation as the sole
+sequencer, then returns the accepted records for the requester to shadow
+locally. S3 lease CAS, epochs, and log fencing remain the authority.
+
+**Rejected**: handoff-only operation — alternating writers move the lease on
+every burst and pay flush plus CAS latency. Multi-appender or CRDT metadata —
+either weakens the single ordered history or requires conflict semantics the
+filesystem is designed to avoid. Per-node partitions — path placement would
+leak into the namespace and cross-node operations would become distributed
+transactions.
+
+## ADR-15: Holder-driven placement, no election
+
+**Decision**: the current holder computes
+`cost(candidate) = sum(ops_writer * RTT(candidate, writer))` over recent
+writers and offers the lease to the lowest-cost direct-path writer when the
+improvement passes hysteresis and dwell limits. The holder already owns the
+right to sequence the transition, so no election protocol is needed.
+
+**Rejected**: CPU load or S3 distance as placement inputs — forwarding cost is
+the latency between writers and sequencer; S3 shipping remains asynchronous,
+and CPU is not currently the limiting signal. A distributed election adds
+failure and tie-breaking states without adding authority.
+
+## ADR-16: Scratch directories are explicit and node-private
+
+**Decision**: only directories marked `user.constellation.scratch=1` contain
+node-private entries. Their local create/write/unlink operations produce no
+shared metadata. Renaming a regular file out is the explicit Publish boundary;
+unsupported boundary crossings fail rather than partially sharing state.
+
+**Rejected**: implicit deferred-create based on filename or write pattern —
+applications and peers could not tell whether a path was shared, crash
+recovery would have to infer intent, and close or rename could unexpectedly
+publish temporary files.
+
+## ADR-17: Segment payload push is an accelerator; S3 remains the source
+
+**Decision**: `SegmentPublished` includes compressed segment bytes when they
+fit the gossip budget. Receivers may apply the payload immediately, while the
+same segment is still committed and recoverable from S3.
+
+**Rejected**: treating gossip delivery as the commit or only copy — offline
+and P2P-disabled nodes would lose history, retries would need a new durable
+protocol, and ADR-2's single S3 authority would no longer hold.

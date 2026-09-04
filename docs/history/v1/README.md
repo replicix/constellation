@@ -6,6 +6,9 @@ work plans that executed them). Do not extend these documents for new
 work; update living docs under `docs/explanation/`,
 `docs/how-to-guides/`, `docs/reference/`, and `docs/tutorials/` instead.
 
+The M3.3 handoff-centric design is superseded by forwarded mutations; the
+archived roadmap, progress log, and plans remain frozen.
+
 | Document | Role |
 |---|---|
 | [ROADMAP.md](ROADMAP.md) | Phased milestones that defined v1 — **closed** |

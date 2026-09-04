@@ -5,6 +5,7 @@ mod coop;
 mod designation;
 mod epoch;
 mod existence;
+mod forward;
 mod fsck;
 mod fusefs;
 mod gc;
@@ -13,6 +14,7 @@ mod leave;
 mod log_buffer;
 mod parallelism;
 mod pin;
+mod placement;
 mod prefetch;
 mod reintegrate;
 mod shipper;
@@ -837,6 +839,7 @@ fn mount(
     }
     let meta = std::sync::Arc::new(SqliteMeta::open(&db_path)?);
     meta.backfill_deref_once()?;
+    meta.scratch_purge_all()?;
     if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
         bail!(
             "this state directory has permanently left the cluster \
@@ -1102,6 +1105,8 @@ fn mount(
         Some(coop.clone()),
         existence.clone(),
     ));
+    let forward = forward::ForwardState::new();
+    let placement = std::sync::Arc::new(placement::Placement::new());
 
     let departed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut fs = fusefs::ConstellationFs::new(
@@ -1181,6 +1186,8 @@ fn mount(
         meta: meta.clone(),
         epochs: epochs.clone(),
         coop: coop.clone(),
+        forward: forward.clone(),
+        placement: placement.clone(),
     });
     if peers.is_enabled() {
         // Refresh-on-miss: an unknown key may be a peer that mounted
@@ -1325,6 +1332,37 @@ fn mount(
             }
         });
     }
+    if peers.is_enabled() {
+        let (placement, peers, keepers) = (placement.clone(), peers.clone(), keepers.clone());
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let held: Vec<(String, u64)> = {
+                    let keepers = keepers.lock().await;
+                    keepers
+                        .iter()
+                        .filter_map(|(part, keeper)| {
+                            keeper.ship_epoch().map(|epoch| (part.clone(), epoch))
+                        })
+                        .collect()
+                };
+                if held.is_empty() {
+                    continue;
+                }
+                placement.gossip_rtts(&peers, node_id).await;
+                for (part, epoch) in held {
+                    if let Some(best) = placement.recommend(node_id, &peers) {
+                        let _ = peers
+                            .request_to_node(
+                                best,
+                                &constellation_net::Payload::LeaseOffer { part, epoch },
+                            )
+                            .await;
+                    }
+                }
+            }
+        });
+    }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let (
@@ -1345,6 +1383,8 @@ fn mount(
             state_dir,
             designations,
             upload,
+            forward,
+            placement,
         ) = (
             ship.clone(),
             stop.clone(),
@@ -1363,6 +1403,8 @@ fn mount(
             state_dir.clone(),
             designations.clone(),
             upload.clone(),
+            forward.clone(),
+            placement.clone(),
         );
         rt.spawn(async move {
             let mut pending: Option<fusefs::SyncRequest> = None;
@@ -1418,7 +1460,7 @@ fn mount(
                         let mut r = if epochs.writes_ok() {
                             if keeper.holds_authority() {
                                 Ok(true)
-                            } else if peers.request_lease(&part).await {
+                            } else if peers.request_lease(&part, None).await {
                                 keeper.adopt_epoch_hold(keeper.authority_epoch());
                                 Ok(true)
                             } else {
@@ -1436,7 +1478,7 @@ fn mount(
                         if !epochs.is_open()
                             && matches!(r, Ok(false))
                             && peers.is_enabled()
-                            && peers.request_lease(&part).await
+                            && peers.request_lease(&part, None).await
                         {
                             r = shipper::acquire_lease_for(&mut ship, keeper, &part).await;
                         }
@@ -1452,22 +1494,26 @@ fn mount(
                         // requester waits the lease out through S3.
                         let mut ship = ship.lock().await;
                         let mut keepers = keepers.lock().await;
-                        let epoch = match keepers.get_mut(&part) {
+                        let result = match keepers.get_mut(&part) {
                             Some(k) if k.ship_epoch().is_some() && !k.is_lost() => {
-                                let held = k.ship_epoch();
+                                let epoch = k.ship_epoch().unwrap();
                                 if epochs.writes_ok() {
                                     k.release_local();
-                                    held
-                                } else if let Err(e) =
-                                    upload_dirty_chunks(
-                                        &cache,
-                                        &meta,
-                                        &chunk_store,
-                                        compression,
-                                        &upload,
-                                        None,
-                                    )
-                                    .await
+                                    Some(fusefs::HandoffResult {
+                                        epoch,
+                                        etag: None,
+                                        head_seq: ship.last_shipped_seq(&part),
+                                    })
+                                } else if let Err(e) = upload_dirty_chunks(
+                                    &cache,
+                                    &meta,
+                                    &chunk_store,
+                                    compression,
+                                    &upload,
+                                    None,
+                                    Some(&part),
+                                )
+                                .await
                                 {
                                     tracing::warn!(
                                         error = %e,
@@ -1477,25 +1523,236 @@ fn mount(
                                     None
                                 } else {
                                     match ship.sync_one(&part, k).await {
-                                    Ok(()) => match k.release().await {
-                                        Ok(()) => held,
+                                        Ok(()) => match k.release().await {
+                                            Ok(etag) => Some(fusefs::HandoffResult {
+                                                epoch,
+                                                etag,
+                                                head_seq: ship.last_shipped_seq(&part),
+                                            }),
+                                            Err(e) => {
+                                                tracing::warn!(error = %e, part,
+                                                    "lease release failed; keeping it");
+                                                None
+                                            }
+                                        },
                                         Err(e) => {
                                             tracing::warn!(error = %e, part,
-                                                "lease release failed; keeping it");
+                                                "flush before handoff failed; keeping the lease");
                                             None
                                         }
-                                    },
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, part,
-                                            "flush before handoff failed; keeping the lease");
-                                        None
-                                    }
                                     }
                                 }
                             }
                             _ => None,
                         };
-                        let _ = reply.send(epoch);
+                        let _ = reply.send(result);
+                    }
+                    Some(fusefs::SyncRequest::Mutate {
+                        part,
+                        requester,
+                        op,
+                        reply,
+                    }) => {
+                        // Only inspect lease state under the keeper lock. The
+                        // metadata transaction must not serialize unrelated
+                        // lease maintenance or network requests.
+                        let (ship_epoch, is_lost) = {
+                            let keepers = keepers.lock().await;
+                            keepers
+                                .get(&part)
+                                .map(|keeper| (keeper.ship_epoch(), keeper.is_lost()))
+                                .unwrap_or((None, false))
+                        };
+                        let known_holder = if ship_epoch.is_some() {
+                            node_id
+                        } else if let Some(holder) = forward.cached_holder(&part) {
+                            holder
+                        } else {
+                            constellation_store_s3::LeaseStore::new(
+                                store_inner.clone(),
+                                &part,
+                                lease_mode,
+                            )
+                            .get()
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|(lease, _)| lease.holder)
+                            .unwrap_or(0)
+                        };
+                        let outcome = forward::holder_execute(
+                            &meta,
+                            ship_epoch,
+                            is_lost,
+                            known_holder,
+                            &op,
+                        );
+                        if matches!(
+                            outcome,
+                            constellation_meta::MutateOutcome::Accepted { .. }
+                        ) {
+                            if let Some(view) = lease_views.lock().unwrap().get(&part) {
+                                view.touch();
+                            }
+                            placement.note_forwarded(requester);
+                            pending = Some(fusefs::SyncRequest::Nudge);
+                        }
+                        let _ = reply.send(outcome);
+                    }
+                    Some(fusefs::SyncRequest::Forward { part, op, reply }) => {
+                        let local_epoch = {
+                            let keepers = keepers.lock().await;
+                            keepers.get(&part).and_then(|keeper| keeper.ship_epoch())
+                        };
+                        let outcome = if let Some(epoch) = local_epoch {
+                            match constellation_meta::execute_mutate(&meta, &op) {
+                                Ok(records) => {
+                                    if let Some(view) = lease_views.lock().unwrap().get(&part) {
+                                        view.touch();
+                                    }
+                                    placement.note_local(node_id);
+                                    constellation_meta::MutateOutcome::Accepted { epoch, records }
+                                }
+                                Err(error) => {
+                                    constellation_meta::MutateOutcome::Errno(
+                                        forward::meta_errno(&error),
+                                    )
+                                }
+                            }
+                        } else {
+                            let mut holder = forward.cached_holder(&part);
+                            if holder.is_none() {
+                                let store = constellation_store_s3::LeaseStore::new(
+                                    store_inner.clone(),
+                                    &part,
+                                    lease_mode,
+                                );
+                                holder = store
+                                    .get()
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|(lease, _)| lease.holder)
+                                    .filter(|holder| *holder != 0);
+                                if let Some(holder) = holder {
+                                    forward.note_holder(&part, holder);
+                                }
+                            }
+                            if let Some(mut holder) = holder {
+                                let mut outcome = forward::request_mutate(
+                                    &peers,
+                                    &forward,
+                                    &part,
+                                    node_id,
+                                    holder,
+                                    &op,
+                                )
+                                .await;
+                                if let constellation_meta::MutateOutcome::NotHolder {
+                                    holder: next,
+                                } = outcome
+                                {
+                                    if next != 0 && next != holder {
+                                        holder = next;
+                                        outcome = forward::request_mutate(
+                                            &peers,
+                                            &forward,
+                                            &part,
+                                            node_id,
+                                            holder,
+                                            &op,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                if let constellation_meta::MutateOutcome::Accepted {
+                                    epoch,
+                                    ref records,
+                                } = outcome
+                                {
+                                    if let Err(error) =
+                                        forward::apply_accepted(&meta, &part, epoch, records)
+                                    {
+                                        tracing::warn!(
+                                            %error,
+                                            part,
+                                            "failed to apply accepted forwarded mutation"
+                                        );
+                                        let _ = reply.send(Err(error.to_string()));
+                                        continue;
+                                    }
+                                }
+                                outcome
+                            } else {
+                                forward.clear_holder(&part);
+                                constellation_meta::MutateOutcome::Busy
+                            }
+                        };
+                        if matches!(
+                            outcome,
+                            constellation_meta::MutateOutcome::Accepted { .. }
+                        ) {
+                            pending = Some(fusefs::SyncRequest::Nudge);
+                        }
+                        let _ = reply.send(Ok(outcome));
+                    }
+                    Some(fusefs::SyncRequest::ApplyPushed {
+                        part,
+                        seq,
+                        epoch,
+                        holder_node,
+                        payload,
+                    }) => {
+                        let holder_node = (holder_node != 0)
+                            .then_some(holder_node)
+                            .or_else(|| shipper::segment_node(&payload))
+                            .unwrap_or(0);
+                        let applied = ship
+                            .lock()
+                            .await
+                            .try_apply_pushed(&part, seq, epoch, &payload)
+                            .unwrap_or(false);
+                        if applied {
+                            forward.pushed_applied.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            if holder_node != 0 {
+                                forward.note_holder(&part, holder_node);
+                            }
+                        } else {
+                            pending = Some(fusefs::SyncRequest::Nudge);
+                        }
+                    }
+                    Some(fusefs::SyncRequest::ClaimOffer { part, epoch }) => {
+                        tracing::debug!(part, epoch, "claiming offered lease");
+                        let mut ship = ship.lock().await;
+                        let mut keepers = keepers.lock().await;
+                        if !keepers.contains_key(&part) {
+                            let mut keeper = lease::LeaseKeeper::new(
+                                constellation_store_s3::LeaseStore::new(
+                                    store_inner.clone(),
+                                    &part,
+                                    lease_mode,
+                                ),
+                                node_id,
+                            );
+                            keeper.share_takeover_gate(epochs.blocks_takeover.clone());
+                            lease_views
+                                .lock()
+                                .unwrap()
+                                .insert(part.clone(), keeper.view());
+                            keepers.insert(part.clone(), keeper);
+                        }
+                        let _ = peers.request_lease(&part, forward.cached_holder(&part)).await;
+                        if let Some(keeper) = keepers.get_mut(&part) {
+                            if shipper::acquire_lease_for(&mut ship, keeper, &part)
+                                .await
+                                .unwrap_or(false)
+                            {
+                                placement.mark_migrated();
+                            }
+                        }
                     }
                     Some(fusefs::SyncRequest::DrainInode { ino, reply }) => {
                         let result = upload_dirty_chunks(
@@ -1505,6 +1762,7 @@ fn mount(
                             compression,
                             &upload,
                             (ino != 0).then_some(ino),
+                            None,
                         )
                         .await;
                         let _ = reply.send(result.map_err(|error| format!("{error:#}")));
@@ -1519,6 +1777,7 @@ fn mount(
                             compression,
                             &upload,
                             Some(ino),
+                            None,
                         )
                         .await;
                         if r.is_ok() {
@@ -1575,6 +1834,7 @@ fn mount(
                                 &chunk_store,
                                 compression,
                                 &upload,
+                                None,
                                 None,
                             )
                             .await
@@ -1689,6 +1949,8 @@ fn mount(
         upload: upload.clone(),
         snapshots: snapshots.clone(),
         log_buffer,
+        forward: forward.clone(),
+        placement: placement.clone(),
     });
     {
         let _guard = rt.enter();
@@ -1727,8 +1989,7 @@ fn mount(
     // this process (via SessionUnmounter). Plain `fuser::mount` has no hook
     // for that; without it, Ctrl-C kills the process and leaves a dead
     // mountpoint that needs an external `fusermount3 -u`.
-    let mut session =
-        fuser::Session::new(fs, mountpoint, &fuse_config).context("FUSE mount")?;
+    let mut session = fuser::Session::new(fs, mountpoint, &fuse_config).context("FUSE mount")?;
     let mut unmounter = session.unmount_callable();
     rt.spawn(async move {
         #[cfg(unix)]
@@ -1794,7 +2055,8 @@ fn mount(
         // is the last chance to drain `pending_upload` before the
         // journal ships — an unmount that refuses to finish cleanly here
         // is strictly better than one that silently strands content.
-        if let Err(e) = upload_dirty_chunks(&cache, &meta, &store, compression, &upload, None).await
+        if let Err(e) =
+            upload_dirty_chunks(&cache, &meta, &store, compression, &upload, None, None).await
         {
             ship.lock().await.set_skip_ship(true);
             return Err(e).context(
@@ -1855,14 +2117,24 @@ struct P2pBridge {
     meta: std::sync::Arc<SqliteMeta>,
     epochs: std::sync::Arc<epoch::EpochManager>,
     coop: std::sync::Arc<crate::coop::Coop>,
+    forward: std::sync::Arc<forward::ForwardState>,
+    placement: std::sync::Arc<placement::Placement>,
 }
 
 impl constellation_net::PeerService for P2pBridge {
-    fn segment_published(&self, part: &str, seq: u64, epoch: u64) {
+    fn segment_published(&self, part: &str, seq: u64, epoch: u64, payload: Option<Vec<u8>>) {
         tracing::debug!(part, seq, epoch, "peer published a segment; syncing now");
-        // Nudge, never block: if the channel is gone the periodic sync
-        // still picks the segment up.
-        let _ = self.nudge.send(fusefs::SyncRequest::Nudge);
+        let request = match payload {
+            Some(payload) => fusefs::SyncRequest::ApplyPushed {
+                part: part.to_string(),
+                seq,
+                epoch,
+                holder_node: 0,
+                payload,
+            },
+            None => fusefs::SyncRequest::Nudge,
+        };
+        let _ = self.nudge.send(request);
     }
 
     fn lease_requested(
@@ -1876,6 +2148,8 @@ impl constellation_net::PeerService for P2pBridge {
                 part: part.clone(),
                 epoch: 0,
                 released: false,
+                etag: None,
+                head_seq: None,
             };
             let (tx, rx) = tokio::sync::oneshot::channel();
             if self
@@ -1889,12 +2163,19 @@ impl constellation_net::PeerService for P2pBridge {
                 return declined;
             }
             match rx.await {
-                Ok(Some(epoch)) => {
-                    tracing::info!(part, requester, epoch, "handed the lease to a peer");
+                Ok(Some(handed)) => {
+                    tracing::info!(
+                        part,
+                        requester,
+                        epoch = handed.epoch,
+                        "handed the lease to a peer"
+                    );
                     constellation_net::Payload::LeaseHandoff {
                         part,
-                        epoch,
+                        epoch: handed.epoch,
                         released: true,
+                        etag: handed.etag,
+                        head_seq: handed.head_seq,
                     }
                 }
                 // Not ours, flush failed, or the task went away: the
@@ -1977,6 +2258,51 @@ impl constellation_net::PeerService for P2pBridge {
 
     fn node_id(&self) -> u64 {
         self.node_id
+    }
+
+    fn mutate_requested(
+        &self,
+        part: String,
+        requester: u64,
+        req_id: u64,
+        _epoch_seen: u64,
+        op: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            self.forward.note_holder(&part, self.node_id);
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let outcome = if self
+                .nudge
+                .send(fusefs::SyncRequest::Mutate {
+                    part,
+                    requester,
+                    op,
+                    reply,
+                })
+                .is_ok()
+            {
+                receive
+                    .await
+                    .unwrap_or(constellation_meta::MutateOutcome::Busy)
+            } else {
+                constellation_meta::MutateOutcome::Busy
+            };
+            constellation_net::Payload::MutateReply {
+                req_id,
+                outcome: outcome.to_postcard().unwrap_or_default(),
+            }
+        })
+    }
+
+    fn lease_offered(&self, part: String, epoch: u64) {
+        let _ = self
+            .nudge
+            .send(fusefs::SyncRequest::ClaimOffer { part, epoch });
+    }
+
+    fn peer_rtts(&self, node_id: u64, rtts: Vec<(u64, u16)>) {
+        self.placement.note_peer_rtts(node_id, rtts);
     }
 }
 
@@ -2411,6 +2737,7 @@ async fn upload_dirty_chunks(
     compression: CompressionSetting,
     upload: &UploadRuntime,
     only_ino: Option<constellation_fs_core::Ino>,
+    only_part: Option<&str>,
 ) -> Result<()> {
     use futures::StreamExt;
     let mut grouped: std::collections::HashMap<
@@ -2420,6 +2747,11 @@ async fn upload_dirty_chunks(
     for (hash, ino) in meta.pending_uploads()? {
         if only_ino.is_some_and(|wanted| ino != wanted) {
             continue;
+        }
+        if let Some(wanted) = only_part {
+            if meta.partition_of(ino).ok().as_deref() != Some(wanted) {
+                continue;
+            }
         }
         grouped.entry(hash).or_default().push(ino);
     }
@@ -2572,7 +2904,7 @@ async fn run_managed_sync_round(
             // publication, then follows with its older local journal.
             return Ok(());
         }
-        upload_dirty_chunks(cache, meta, store, compression, upload, None).await?;
+        upload_dirty_chunks(cache, meta, store, compression, upload, None, None).await?;
         {
             let ship = ship.lock().await;
             ship.set_skip_ship(false);
@@ -2606,7 +2938,9 @@ async fn run_managed_sync_round(
         return result;
     }
 
-    if let Err(error) = upload_dirty_chunks(cache, meta, store, compression, upload, None).await {
+    if let Err(error) =
+        upload_dirty_chunks(cache, meta, store, compression, upload, None, None).await
+    {
         let base = meta.applied_vector()?;
         if epochs.maybe_propose(base).await? {
             let ship = ship.lock().await;
@@ -2738,6 +3072,8 @@ struct DaemonStatus {
     upload: std::sync::Arc<UploadRuntime>,
     snapshots: std::sync::Arc<snapshot::SnapshotManager>,
     log_buffer: log_buffer::LogBuffer,
+    forward: std::sync::Arc<forward::ForwardState>,
+    placement: std::sync::Arc<placement::Placement>,
 }
 
 impl DaemonStatus {
@@ -2802,11 +3138,7 @@ impl constellation_api::StatusSource for DaemonStatus {
         let designations = self.list_designations();
         let epoch = self.epochs.status();
         let coop = self.coop.report();
-        let s3_coop = coop
-            .per_source
-            .iter()
-            .find(|s| s.id == "s3")
-            .cloned();
+        let s3_coop = coop.per_source.iter().find(|s| s.id == "s3").cloned();
         let peer_snap = self.peers.snapshot();
         let mut peers: Vec<constellation_api::PeerStatus> = Vec::with_capacity(1 + peer_snap.len());
         // S3 is always first so operators can compare the durable path
@@ -2821,45 +3153,45 @@ impl constellation_api::StatusSource for DaemonStatus {
             ..Default::default()
         });
         peers.extend(peer_snap.into_iter().map(|p| {
-                    let addrs = peer_addr_strings(&p.addr);
-                    let designations: Vec<String> = designations
-                        .iter()
-                        .filter(|d| d.designee == p.node_id)
-                        .map(|d| d.path.clone())
-                        .collect();
-                    let coop = coop
-                        .per_source
-                        .iter()
-                        .find(|s| s.id == format!("peer-{}", p.node_id))
-                        .cloned();
-                    let path = match p.path {
-                        constellation_net::PathKind::Unknown => coop
-                            .as_ref()
-                            .map(|c| c.path.clone())
-                            .filter(|s| !s.is_empty() && s != "unknown")
-                            .unwrap_or_else(|| "unknown".into()),
-                        other => other.as_str().into(),
-                    };
-                    constellation_api::PeerStatus {
-                        node_id: p.node_id,
-                        connected: p.connected,
-                        rtt_ms: p.rtt_ms,
-                        last_seen_ms: p.last_seen.map(|t| t.elapsed().as_millis() as u64),
-                        hostname: (!p.hostname.is_empty()).then_some(p.hostname.clone()),
-                        version: (!p.version.is_empty()).then_some(p.version.clone()),
-                        pubkey: Some(p.pubkey_hex.clone()),
-                        endpoint_id: Some(p.addr.id.to_string()),
-                        addrs,
-                        created_unix: (p.created_unix > 0).then_some(p.created_unix),
-                        p2p_updated_unix: p.p2p_updated_unix,
-                        ro: p.ro,
-                        epoch_member: epoch.members.contains(&p.node_id),
-                        designations,
-                        coop,
-                        s3: false,
-                        path,
-                    }
-                }));
+            let addrs = peer_addr_strings(&p.addr);
+            let designations: Vec<String> = designations
+                .iter()
+                .filter(|d| d.designee == p.node_id)
+                .map(|d| d.path.clone())
+                .collect();
+            let coop = coop
+                .per_source
+                .iter()
+                .find(|s| s.id == format!("peer-{}", p.node_id))
+                .cloned();
+            let path = match p.path {
+                constellation_net::PathKind::Unknown => coop
+                    .as_ref()
+                    .map(|c| c.path.clone())
+                    .filter(|s| !s.is_empty() && s != "unknown")
+                    .unwrap_or_else(|| "unknown".into()),
+                other => other.as_str().into(),
+            };
+            constellation_api::PeerStatus {
+                node_id: p.node_id,
+                connected: p.connected,
+                rtt_ms: p.rtt_ms,
+                last_seen_ms: p.last_seen.map(|t| t.elapsed().as_millis() as u64),
+                hostname: (!p.hostname.is_empty()).then_some(p.hostname.clone()),
+                version: (!p.version.is_empty()).then_some(p.version.clone()),
+                pubkey: Some(p.pubkey_hex.clone()),
+                endpoint_id: Some(p.addr.id.to_string()),
+                addrs,
+                created_unix: (p.created_unix > 0).then_some(p.created_unix),
+                p2p_updated_unix: p.p2p_updated_unix,
+                ro: p.ro,
+                epoch_member: epoch.members.contains(&p.node_id),
+                designations,
+                coop,
+                s3: false,
+                path,
+            }
+        }));
         let p2p = constellation_api::P2pStatus {
             enabled: self.peers.is_enabled(),
             node_addr: self
@@ -2927,6 +3259,14 @@ impl constellation_api::StatusSource for DaemonStatus {
                     existence_peer_hints: existence.peer_hints,
                 }
             },
+            forwarded_ok: self.forward.ok.load(std::sync::atomic::Ordering::Relaxed),
+            forwarded_err: self.forward.err.load(std::sync::atomic::Ordering::Relaxed),
+            forward_p50_ms: self.forward.p50_ms(),
+            pushed_segments_applied: self
+                .forward
+                .pushed_applied
+                .load(std::sync::atomic::Ordering::Relaxed),
+            placement_reason: self.placement.last_reason.lock().unwrap().clone(),
         }
     }
 
@@ -3309,11 +3649,12 @@ impl constellation_api::StatusSource for DaemonStatus {
                 reply,
             })
             .map_err(|_| "sync task is not running".to_string())?;
-        let epoch = tokio::task::block_in_place(|| self.rt.block_on(receive))
+        let handed = tokio::task::block_in_place(|| self.rt.block_on(receive))
             .map_err(|_| "lease release task stopped".to_string())?;
-        match epoch {
-            Some(epoch) => Ok(format!(
-                "voluntarily released {part} at epoch {epoch}; this was cooperative, not fencing"
+        match handed {
+            Some(handed) => Ok(format!(
+                "voluntarily released {part} at epoch {}; this was cooperative, not fencing",
+                handed.epoch
             )),
             None => Err(format!(
                 "{part} was not held locally or could not be flushed; no fencing was attempted"
@@ -3725,6 +4066,7 @@ mod pending_upload_tests {
             CompressionSetting::RAW,
             &UploadRuntime::for_test(true),
             None,
+            None,
         ))
         .unwrap();
 
@@ -3763,6 +4105,7 @@ mod pending_upload_tests {
             CompressionSetting::RAW,
             &UploadRuntime::for_test(true),
             None,
+            None,
         ));
         assert!(err.is_err(), "drain must fail while S3 is unreachable");
         assert_eq!(
@@ -3779,6 +4122,7 @@ mod pending_upload_tests {
             &f.store,
             CompressionSetting::RAW,
             &UploadRuntime::for_test(true),
+            None,
             None,
         ))
         .unwrap();
@@ -3814,6 +4158,7 @@ mod pending_upload_tests {
             &f.store,
             CompressionSetting::RAW,
             &upload,
+            None,
             None,
         ))
         .unwrap();
@@ -3864,6 +4209,7 @@ mod pending_upload_tests {
             CompressionSetting::RAW,
             &upload,
             None,
+            None,
         ))
         .unwrap();
 
@@ -3887,6 +4233,7 @@ mod pending_upload_tests {
             &f.store,
             CompressionSetting::RAW,
             &upload,
+            None,
             None,
         ))
         .unwrap();
@@ -3948,6 +4295,7 @@ mod pending_upload_tests {
             &f.store,
             CompressionSetting::RAW,
             &upload,
+            None,
             None,
         ))
         .unwrap();

@@ -70,6 +70,14 @@ impl WriteShards {
     }
 }
 
+/// Outcome of a successful partition handoff (flush + lease release).
+#[derive(Debug, Clone)]
+pub struct HandoffResult {
+    pub epoch: u64,
+    pub etag: Option<String>,
+    pub head_seq: Option<u64>,
+}
+
 /// A request to the daemon's sync task.
 pub enum SyncRequest {
     /// Run a sync round soon; the sender does not wait.
@@ -91,12 +99,35 @@ pub enum SyncRequest {
     },
     /// A peer asked us to hand `part`'s lease over (M3.3 fast path):
     /// flush that partition's journal to S3 and release the lease.
-    /// Replies with the epoch we held, or `None` if we do not hold it or
-    /// the flush failed — in which case the requester falls back to
-    /// waiting the lease out through S3, which is always correct.
+    /// Replies with the epoch, etag, and last shipped seq we held, or
+    /// `None` if we do not hold it or the flush failed — in which case
+    /// the requester falls back to waiting the lease out through S3,
+    /// which is always correct.
     HandOff {
         part: String,
-        reply: tokio::sync::oneshot::Sender<Option<u64>>,
+        reply: tokio::sync::oneshot::Sender<Option<HandoffResult>>,
+    },
+    Mutate {
+        part: String,
+        requester: u64,
+        op: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<constellation_meta::MutateOutcome>,
+    },
+    Forward {
+        part: String,
+        op: constellation_meta::MutateOp,
+        reply: tokio::sync::oneshot::Sender<Result<constellation_meta::MutateOutcome, String>>,
+    },
+    ApplyPushed {
+        part: String,
+        seq: u64,
+        epoch: u64,
+        holder_node: u64,
+        payload: Vec<u8>,
+    },
+    ClaimOffer {
+        part: String,
+        epoch: u64,
     },
     /// Reintegrate a stranded branch, either from the control API or
     /// automatically after mounting a persisted deposed state dir.
@@ -841,6 +872,101 @@ impl ConstellationFs {
         }
     }
 
+    /// Execute a namespace mutation locally when we hold the partition,
+    /// otherwise ask the holder to validate and journal it. Busy or stale
+    /// holder information falls back to the ordinary lease acquisition path.
+    pub(crate) fn mutate_op(
+        &self,
+        part_hint_ino: Ino,
+        op: constellation_meta::MutateOp,
+    ) -> Result<(), i32> {
+        if Self::is_synthetic(part_hint_ino) {
+            return Err(libc::EROFS);
+        }
+        let Some(h) = &self.sync else {
+            return constellation_meta::execute_mutate(&self.meta, &op)
+                .map(|_| ())
+                .map_err(|e| errno(&e));
+        };
+        if h.read_only_member {
+            return Err(libc::EROFS);
+        }
+        if h.departed
+            .as_ref()
+            .is_some_and(|departed| departed.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(libc::EIO);
+        }
+        if h.epoch_frozen
+            .as_ref()
+            .is_some_and(|frozen| frozen.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(libc::EROFS);
+        }
+        if let Some(designations) = &h.designations {
+            let path = self
+                .meta
+                .path_of(part_hint_ino)
+                .unwrap_or_else(|_| "/".into());
+            match self.rt.block_on(designations.check(&path)) {
+                crate::designation::GateDecision::NoDesignation => {}
+                crate::designation::GateDecision::Proceed => {
+                    return constellation_meta::execute_mutate(&self.meta, &op)
+                        .map(|_| ())
+                        .map_err(|e| errno(&e));
+                }
+                crate::designation::GateDecision::ReadOnly { .. } => {
+                    return Err(libc::EROFS);
+                }
+            }
+        }
+        let part = self
+            .meta
+            .partition_of(part_hint_ino)
+            .unwrap_or_else(|_| "p0".into());
+        if let Some(view) = h.leases.lock().unwrap().get(&part) {
+            if view.usable() {
+                let result = constellation_meta::execute_mutate(&self.meta, &op)
+                    .map(|_| ())
+                    .map_err(|e| errno(&e));
+                if result.is_ok() {
+                    view.touch();
+                }
+                return result;
+            }
+            if view.is_lost() {
+                return Err(libc::EIO);
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if h.tx
+            .send(SyncRequest::Forward {
+                part: part.clone(),
+                op: op.clone(),
+                reply: tx,
+            })
+            .is_err()
+        {
+            return Err(libc::EIO);
+        }
+        match rx.blocking_recv() {
+            Ok(Ok(constellation_meta::MutateOutcome::Accepted { .. })) => return Ok(()),
+            Ok(Ok(constellation_meta::MutateOutcome::Errno(e))) => return Err(e),
+            Ok(Ok(
+                constellation_meta::MutateOutcome::Busy
+                | constellation_meta::MutateOutcome::NotHolder { .. },
+            )) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, part, "forwarded mutation failed; acquiring lease");
+            }
+            Err(_) => return Err(libc::EIO),
+        }
+        self.require_lease_for(part_hint_ino)?;
+        constellation_meta::execute_mutate(&self.meta, &op)
+            .map(|_| ())
+            .map_err(|e| errno(&e))
+    }
+
     /// fsync() barrier. In `--fsync-mode s3`, block until the journal
     /// (up to now) is durable in the shared log; otherwise just nudge.
     pub(crate) fn sync_barrier(&self, ino: Ino) -> Result<(), i32> {
@@ -872,7 +998,11 @@ impl ConstellationFs {
     fn load_manifest(&self, ino: Ino) -> Result<Manifest, i32> {
         match self.meta.manifest(ino) {
             Ok(Some(bytes)) => Manifest::decode(&bytes).map_err(|_| libc::EIO),
-            Ok(None) => Ok(Manifest::empty(self.chunk_size)),
+            Ok(None) => match self.meta.scratch_manifest(ino) {
+                Ok(Some(bytes)) => Manifest::decode(&bytes).map_err(|_| libc::EIO),
+                Ok(None) => Ok(Manifest::empty(self.chunk_size)),
+                Err(e) => Err(errno(&e)),
+            },
             Err(e) => Err(errno(&e)),
         }
     }
@@ -1077,12 +1207,6 @@ impl ConstellationFs {
             Some(ws) => ws,
             None => return Ok(()),
         };
-        if let Err(e) = self.require_lease_for(ino) {
-            // Put the pending state back: the data is not lost, the
-            // caller sees the error and can retry.
-            writes.insert(ino, ws);
-            return Err(e);
-        }
         let epoch_active = self.sync.as_ref().is_some_and(|h| {
             h.epoch_active
                 .as_ref()
@@ -1175,9 +1299,61 @@ impl ConstellationFs {
                 dirty_hashes.push(bh);
             }
         }
-        self.meta
-            .set_manifest_dirty(ino, &manifest.encode(), ws.file_len, &dirty_hashes)
-            .map_err(|e| errno(&e))?;
+        let manifest_bytes = manifest.encode();
+        if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+            for hash in &dirty_hashes {
+                self.meta
+                    .add_pending_upload(hash, ino)
+                    .map_err(|e| errno(&e))?;
+            }
+            self.meta
+                .scratch_set_manifest(ino, &manifest_bytes, ws.file_len)
+                .map_err(|e| errno(&e))?;
+            ws.staging.discard();
+            if force_through {
+                self.drain_inode(ino)?;
+            }
+            return Ok(());
+        }
+        let holds_lease = self.sync.as_ref().is_none_or(|handle| {
+            let part = self.meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
+            handle
+                .leases
+                .lock()
+                .unwrap()
+                .get(&part)
+                .is_some_and(|view| view.usable())
+        });
+        if holds_lease {
+            self.meta
+                .set_manifest_dirty(ino, &manifest_bytes, ws.file_len, &dirty_hashes)
+                .map_err(|e| errno(&e))?;
+        } else {
+            // Content-addressed chunks can be uploaded before authority is
+            // obtained. Enrol them without journaling the manifest, drain,
+            // then forward the authoritative manifest transition.
+            for hash in &dirty_hashes {
+                self.meta
+                    .add_pending_upload(hash, ino)
+                    .map_err(|e| errno(&e))?;
+            }
+            if let Err(error) = self.drain_inode(ino) {
+                writes.insert(ino, ws);
+                return Err(error);
+            }
+            if let Err(error) = self.mutate_op(
+                ino,
+                constellation_meta::MutateOp::SetManifest {
+                    ino,
+                    base_manifest: Some(base.encode()),
+                    manifest: manifest_bytes,
+                    size: ws.file_len,
+                },
+            ) {
+                writes.insert(ino, ws);
+                return Err(error);
+            }
+        }
         // The staged bytes now live in the durable chunk cache (and are
         // enrolled in `pending_upload`); the staging file is scratch
         // and safe to drop.

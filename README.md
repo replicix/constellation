@@ -15,6 +15,14 @@ crash reporting remains future work. See
 [docs/history/v1/PROGRESS.md](docs/history/v1/PROGRESS.md) for the v1
 implementation evidence (frozen).
 
+Current write-path features include:
+
+- **Forwarded mutations:** non-holders send writes to the current lease holder
+  over iroh, avoiding handoff churn while S3 CAS remains authoritative.
+- **Scratch directories:** mark a shared directory with
+  `user.constellation.scratch=1` for node-private temporary files, then rename
+  a completed regular file out to publish it atomically.
+
 ## Quick start: mount a real S3 bucket
 
 S3 auth uses the official AWS SDK default credential chain via
@@ -74,6 +82,7 @@ Docs follow [Diátaxis](https://diataxis.fr/). Start at
 | [docs/explanation/DECISIONS.md](docs/explanation/DECISIONS.md) | ADRs — what was rejected and why |
 | [docs/how-to-guides/development/TESTING.md](docs/how-to-guides/development/TESTING.md) | correctness strategy: property tests, deterministic simulation, POSIX suites, e2e scenarios |
 | [docs/how-to-guides/development/RELEASING.md](docs/how-to-guides/development/RELEASING.md) | release artifacts and tag checklist |
+| [docs/reference/configuration.md](docs/reference/configuration.md) | runtime environment variables and defaults |
 | [docs/history/v1/](docs/history/v1/) | frozen v1 roadmap, progress, and implementation plans |
 
 ## Layout

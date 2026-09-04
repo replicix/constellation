@@ -41,12 +41,16 @@ pub fn handle_request<H: Handoff>(holder: &mut H, part: &str, requester: u64) ->
                 part: part.to_string(),
                 epoch,
                 released: true,
+                etag: None,
+                head_seq: None,
             })
         }
         Ok(None) => Ok(Payload::LeaseHandoff {
             part: part.to_string(),
             epoch: 0,
             released: false,
+            etag: None,
+            head_seq: None,
         }),
         Err(e) => {
             // Declining on error is safe: the requester falls back to
@@ -56,6 +60,8 @@ pub fn handle_request<H: Handoff>(holder: &mut H, part: &str, requester: u64) ->
                 part: part.to_string(),
                 epoch: 0,
                 released: false,
+                etag: None,
+                head_seq: None,
             })
         }
     }
@@ -120,7 +126,9 @@ mod tests {
             Payload::LeaseHandoff {
                 part: "p0".into(),
                 epoch: 4,
-                released: true
+                released: true,
+                etag: None,
+                head_seq: None,
             }
         );
         assert_eq!(interpret_reply("p0", &reply), RequestOutcome::ClaimNow);
@@ -158,6 +166,8 @@ mod tests {
             part: "p1".into(),
             epoch: 2,
             released: true,
+            etag: None,
+            head_seq: None,
         };
         assert_eq!(interpret_reply("p0", &reply), RequestOutcome::KeepWaiting);
     }

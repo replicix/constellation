@@ -129,6 +129,10 @@ fn decode(payload: &[u8]) -> Result<Segment> {
     })
 }
 
+pub fn segment_node(payload: &[u8]) -> Option<u64> {
+    decode(payload).ok().map(|segment| segment.node)
+}
+
 pub struct Shipper {
     meta: Arc<SqliteMeta>,
     log: LogStore,
@@ -316,6 +320,11 @@ impl Shipper {
         self.parts.get(PARTITION).map(|p| p.next_seq).unwrap_or(1)
     }
 
+    /// Last shipped sequence for `part` (`next_seq - 1`), if known.
+    pub fn last_shipped_seq(&self, part: &str) -> Option<u64> {
+        self.parts.get(part).map(|p| p.next_seq.saturating_sub(1))
+    }
+
     /// One full ordinary sync round. A persisted deposition is terminal:
     /// tailing may continue, but no lease may be acquired and no local
     /// journal may ship until explicit reintegration succeeds.
@@ -435,7 +444,39 @@ impl Shipper {
             let log = &self.parts[part].log;
             log.get_segment(seq).await?
         };
-        let seg = decode(&payload)?;
+        self.apply_segment_payload(part, seq, &payload)
+    }
+
+    /// Apply a gossip-pushed segment without an S3 GET. Returns false for
+    /// a gap so the caller can nudge the ordinary tailer.
+    pub fn try_apply_pushed(
+        &mut self,
+        part: &str,
+        seq: u64,
+        advertised_epoch: u64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        self.ensure_part(part);
+        if seq != self.parts[part].next_seq {
+            return Ok(false);
+        }
+        let seg = decode(payload)?;
+        if seg.epoch != advertised_epoch {
+            bail!(
+                "pushed segment epoch mismatch: advertised {advertised_epoch}, payload {}",
+                seg.epoch
+            );
+        }
+        self.apply_decoded_segment(part, seq, seg)?;
+        Ok(true)
+    }
+
+    fn apply_segment_payload(&mut self, part: &str, seq: u64, payload: &[u8]) -> Result<()> {
+        let seg = decode(payload)?;
+        self.apply_decoded_segment(part, seq, seg)
+    }
+
+    fn apply_decoded_segment(&mut self, part: &str, seq: u64, seg: Segment) -> Result<()> {
         if seg.node == self.node_id {
             let grouped = self.meta.take_journal_grouped(seg.records.len())?;
             let journal = grouped
@@ -474,9 +515,13 @@ impl Shipper {
             );
             self.meta.set_applied_seq_of(part, seq)?;
         } else {
-            let pending =
+            let mut pending =
                 TouchSet::from_records(self.meta.take_journal(usize::MAX)?.iter().map(|(_, r)| r));
+            if let Ok(shadow) = self.meta.shadow_touch_set() {
+                pending.merge(shadow);
+            }
             let skipped = self.meta.apply_foreign(&seg.records, &pending)?;
+            self.meta.shadow_retire_matching(seg.epoch, &seg.records)?;
             if skipped > 0 {
                 self.spool.lock().unwrap().conflicts += skipped as u64;
             }
@@ -605,7 +650,9 @@ impl Shipper {
         // Push invalidation: tell peers the segment is durable so they
         // tail now rather than at their next poll. Best effort by
         // design — the poll is what guarantees they converge.
-        self.peers.announce_segment(part, next_seq, epoch).await;
+        self.peers
+            .announce_segment(part, next_seq, epoch, Some(payload.clone()))
+            .await;
         // Offline designation flush-ack (DESIGN.md §5.2, phase 4a): if
         // any shipped record touches a path designated to a different
         // node, wait (bounded) for that designee's ack. The segment is

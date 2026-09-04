@@ -84,7 +84,8 @@ impl PathKind {
 /// runtime worker.
 pub trait PeerService: Send + Sync + 'static {
     /// A peer published a segment: tail now instead of at the next poll.
-    fn segment_published(&self, part: &str, seq: u64, epoch: u64);
+    /// `payload` is the zstd segment body when it fit the gossip budget.
+    fn segment_published(&self, part: &str, seq: u64, epoch: u64, payload: Option<Vec<u8>>);
     /// A peer wants `part`'s lease. Returns the reply to send.
     fn lease_requested(
         &self,
@@ -154,6 +155,27 @@ pub trait PeerService: Send + Sync + 'static {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
         Box::pin(async move { None })
     }
+    /// Non-holder asked us to journal `op`. Default declines with an
+    /// empty outcome; callers treat that as `MutateOutcome::Busy`.
+    fn mutate_requested(
+        &self,
+        _part: String,
+        _requester: u64,
+        req_id: u64,
+        _epoch_seen: u64,
+        _op: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::MutateReply {
+                req_id,
+                outcome: Vec::new(),
+            }
+        })
+    }
+    /// Holder offered us this lease (placement). Default ignores it.
+    fn lease_offered(&self, _part: String, _epoch: u64) {}
+    /// A peer gossiped its RTT vector. Default ignores it.
+    fn peer_rtts(&self, _node_id: u64, _rtts: Vec<(u64, u16)>) {}
     /// This node's id, for `Ping`/`Pong`.
     fn node_id(&self) -> u64;
 }
@@ -202,11 +224,7 @@ impl P2p {
         Self::spawn_with(key, topic, RelayPolicy::from_env()?).await
     }
 
-    pub async fn spawn_with(
-        key: SecretKey,
-        topic: TopicId,
-        relay: RelayPolicy,
-    ) -> Result<Self> {
+    pub async fn spawn_with(key: SecretKey, topic: TopicId, relay: RelayPolicy) -> Result<Self> {
         let lookup = MemoryLookup::new();
         let relay_mode = relay.to_iroh()?;
         let relay_label = relay.label();
@@ -542,6 +560,8 @@ mod tests {
                     part,
                     epoch: 11,
                     released: true,
+                    etag: None,
+                    head_seq: None,
                 },
                 other => panic!("unexpected {other:?}"),
             };

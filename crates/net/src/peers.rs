@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 /// How long to wait for a peer's answer to a lease request before
 /// falling back to the S3 path. Generous enough for a WAN round trip,
 /// short enough that it never dominates the idle-release window.
-const REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 /// A chunk includes its body, unlike the small control requests above.
 /// Keep this named and single-layered so source hedging/cancellation has
 /// one predictable upper bound.
@@ -279,7 +279,14 @@ impl Peers {
 
     /// Tell peers a segment is durable so they tail now instead of at
     /// their next poll. Failure is fine: the poll still happens.
-    pub async fn announce_segment(&self, part: &str, seq: u64, epoch: u64) {
+    /// `payload` is the zstd segment bytes when they fit the gossip budget.
+    pub async fn announce_segment(
+        &self,
+        part: &str,
+        seq: u64,
+        epoch: u64,
+        payload: Option<Vec<u8>>,
+    ) {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
@@ -287,6 +294,7 @@ impl Peers {
             part: part.to_string(),
             seq,
             epoch,
+            payload,
         };
         match inner.p2p.broadcast(&payload).await {
             Ok(()) => tracing::debug!(part, seq, epoch, "announced segment to peers"),
@@ -315,13 +323,18 @@ impl Peers {
     /// the caller should attempt its CAS immediately. Everything else —
     /// no peers, no answer, a decline, a forged reply — returns `false`
     /// and leaves the caller on the S3 path.
-    pub async fn request_lease(&self, part: &str) -> bool {
+    ///
+    /// When `holder_id` is known, that peer is asked first.
+    pub async fn request_lease(&self, part: &str, holder_id: Option<u64>) -> bool {
         let Some(inner) = self.inner.as_ref() else {
             return false;
         };
-        let peers = self.snapshot();
+        let mut peers = self.snapshot();
         if peers.is_empty() {
             return false;
+        }
+        if let Some(id) = holder_id {
+            peers.sort_by_key(|p| if p.node_id == id { 0u8 } else { 1 });
         }
         let payload = Payload::LeaseRequest {
             part: part.to_string(),
@@ -438,7 +451,8 @@ impl Peers {
             .find(|p| p.addr.id == addr.id)
             .map(|p| p.node_id);
         let started = Instant::now();
-        let result = tokio::time::timeout(REQUEST_TIMEOUT, inner.p2p.request(addr.clone(), payload)).await;
+        let result =
+            tokio::time::timeout(REQUEST_TIMEOUT, inner.p2p.request(addr.clone(), payload)).await;
         match result {
             Ok(Ok(reply)) => {
                 if let Some(id) = node_id {
@@ -637,8 +651,30 @@ pub async fn run_gossip<S: PeerService>(
             continue;
         }
         match &payload {
-            Payload::SegmentPublished { part, seq, epoch } => {
-                service.segment_published(part, *seq, *epoch);
+            Payload::SegmentPublished {
+                part,
+                seq,
+                epoch,
+                payload: body,
+            } => {
+                service.segment_published(part, *seq, *epoch, body.clone());
+            }
+            Payload::MutateRequest {
+                part,
+                requester,
+                req_id,
+                epoch_seen,
+                op,
+            } => {
+                let _ = service
+                    .mutate_requested(part.clone(), *requester, *req_id, *epoch_seen, op.clone())
+                    .await;
+            }
+            Payload::LeaseOffer { part, epoch } => {
+                service.lease_offered(part.clone(), *epoch);
+            }
+            Payload::PeerRtts { node_id, rtts } => {
+                service.peer_rtts(*node_id, rtts.clone());
             }
             Payload::CondemnedPublished { epoch } => {
                 tracing::debug!(epoch, "GC condemned pointer was published");
@@ -779,13 +815,37 @@ async fn handle_stream<S: PeerService>(
         return Ok(());
     }
     let reply = match payload {
-        Payload::SegmentPublished { part, seq, epoch } => {
-            service.segment_published(&part, seq, epoch);
+        Payload::SegmentPublished {
+            part,
+            seq,
+            epoch,
+            payload,
+        } => {
+            service.segment_published(&part, seq, epoch, payload);
             None
         }
         Payload::CondemnedPublished { .. } => None,
         Payload::LeaseRequest { part, requester } => {
             Some(service.lease_requested(part, requester).await)
+        }
+        Payload::MutateRequest {
+            part,
+            requester,
+            req_id,
+            epoch_seen,
+            op,
+        } => Some(
+            service
+                .mutate_requested(part, requester, req_id, epoch_seen, op)
+                .await,
+        ),
+        Payload::LeaseOffer { part, epoch } => {
+            service.lease_offered(part, epoch);
+            None
+        }
+        Payload::PeerRtts { node_id, rtts } => {
+            service.peer_rtts(node_id, rtts);
+            None
         }
         Payload::DelegationRequest { path, requester } => {
             Some(service.delegation_requested(path, requester).await)
@@ -845,7 +905,8 @@ async fn handle_stream<S: PeerService>(
         | Payload::EpochAck { .. }
         | Payload::CacheDigest { .. }
         | Payload::CacheDigestDelta { .. }
-        | Payload::ChunkResponse { .. } => None,
+        | Payload::ChunkResponse { .. }
+        | Payload::MutateReply { .. } => None,
     };
     if let Some(reply) = reply {
         let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
@@ -872,7 +933,7 @@ mod tests {
     }
 
     impl PeerService for Recorder {
-        fn segment_published(&self, part: &str, seq: u64, epoch: u64) {
+        fn segment_published(&self, part: &str, seq: u64, epoch: u64, _payload: Option<Vec<u8>>) {
             self.segments
                 .lock()
                 .unwrap()
@@ -893,6 +954,8 @@ mod tests {
                     part,
                     epoch: 5,
                     released,
+                    etag: None,
+                    head_seq: None,
                 }
             })
         }
@@ -946,9 +1009,9 @@ mod tests {
         assert!(p.pubkey_hex().is_none());
         assert!(p.snapshot().is_empty());
         p.refresh_registry(vec![(1, "aa".into(), serde_json::json!({}))]);
-        p.announce_segment("p0", 1, 1).await;
+        p.announce_segment("p0", 1, 1, None).await;
         assert!(
-            !p.request_lease("p0").await,
+            !p.request_lease("p0", None).await,
             "no fast path means the caller must use S3"
         );
     }
@@ -959,7 +1022,7 @@ mod tests {
     async fn lease_request_reaches_the_holder_and_releases() {
         let (_holder, asker, service) = pair(true).await;
         assert!(
-            asker.request_lease("p0").await,
+            asker.request_lease("p0", None).await,
             "a released lease must tell the caller to CAS now"
         );
         assert_eq!(
@@ -979,7 +1042,7 @@ mod tests {
     #[tokio::test]
     async fn declined_lease_request_keeps_the_caller_waiting() {
         let (_holder, asker, service) = pair(false).await;
-        assert!(!asker.request_lease("p0").await);
+        assert!(!asker.request_lease("p0", None).await);
         assert_eq!(service.lease_asks.lock().unwrap().len(), 1);
     }
 
@@ -1036,6 +1099,7 @@ mod tests {
                 part: "after-digest".into(),
                 seq: 1,
                 epoch: 1,
+                payload: None,
             })
             .await
             .unwrap();
@@ -1091,7 +1155,7 @@ mod tests {
             ),
         ]);
         assert!(
-            !stranger.request_lease("p0").await,
+            !stranger.request_lease("p0", None).await,
             "an unenrolled peer must not get a handoff"
         );
         assert!(
@@ -1121,7 +1185,14 @@ mod tests {
     }
 
     impl PeerService for ChunkServer {
-        fn segment_published(&self, _part: &str, _seq: u64, _epoch: u64) {}
+        fn segment_published(
+            &self,
+            _part: &str,
+            _seq: u64,
+            _epoch: u64,
+            _payload: Option<Vec<u8>>,
+        ) {
+        }
         fn lease_requested(
             &self,
             part: String,
@@ -1132,6 +1203,8 @@ mod tests {
                     part,
                     epoch: 0,
                     released: false,
+                    etag: None,
+                    head_seq: None,
                 }
             })
         }
@@ -1382,7 +1455,7 @@ mod tests {
             serde_json::to_value(&own_addr).unwrap(),
         )]);
         assert!(peers.snapshot().is_empty(), "must not dial ourselves");
-        assert!(!peers.request_lease("p0").await, "nobody else to ask");
+        assert!(!peers.request_lease("p0", None).await, "nobody else to ask");
     }
 
     /// A registry record whose address will not parse must not drop the

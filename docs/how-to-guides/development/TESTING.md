@@ -549,6 +549,43 @@ with a reason on every entry.
 runner compares failures both ways: new failures fail the job and newly
 passing tests request baseline removal.
 
+## Forwarded mutations and scratch directories
+
+Run the metadata mutation unit tests directly while changing the forwarded
+operation schema or holder execution:
+
+```bash
+cargo test -p constellation-meta mutate
+```
+
+These tests cover postcard round trips and authoritative
+validate-and-journal behavior for `MutateOp`. The full workspace tests cover
+the surrounding shipper, lease fencing, replay, and FUSE helpers:
+
+```bash
+cargo test --workspace
+```
+
+For forwarding changes, also exercise two mounted nodes against one S3 prefix.
+Keep a partition leased by node A, mutate it from node B, and assert:
+
+- B's `forwarded_ok` rises without repeated `handed the lease to a peer`;
+- B reads the accepted shadow immediately;
+- both replicas converge after the holder ships;
+- `CONSTELLATION_P2P=off` or an unreachable holder falls back through S3; and
+- `--fsync-mode s3` does not return before the barrier is durable.
+
+For scratch changes, mark a shared directory with
+`user.constellation.scratch=1`, then verify local create/write/rename/unlink,
+cross-node invisibility, regular-file Publish, `EXDEV` boundary failures,
+identical-manifest dedupe, and purge after remount.
+
+There are currently no dedicated forwarded-mutation, placement, or
+scratch-directory scenarios in `constellation-harness`; its existing
+multi-client and P2P-invalidation scenarios test adjacent fallback and
+convergence behavior only. Add a named harness scenario before relying on
+fault-injection coverage for holder crash-after-ack or Publish crash windows.
+
 ## CI notes
 
 - The `integration` job builds the runner image via buildx with

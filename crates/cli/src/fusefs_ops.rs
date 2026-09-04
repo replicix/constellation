@@ -60,6 +60,27 @@ impl Filesystem for ConstellationFs {
                 return;
             }
         }
+        let scratch_parent = self.meta.is_scratch_dir(parent).unwrap_or(false)
+            || self
+                .meta
+                .scratch_getattr(parent)
+                .ok()
+                .flatten()
+                .is_some_and(|attr| attr.kind == InodeKind::Dir);
+        let scratch = scratch_parent
+            .then(|| self.meta.scratch_lookup(parent, &name))
+            .transpose();
+        match scratch {
+            Ok(Some(Some(attr))) => {
+                reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0));
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                reply.error(Errno::from_i32(errno(&e)));
+                return;
+            }
+        }
         match self.meta.lookup(parent, &name) {
             Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
             Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
@@ -80,7 +101,17 @@ impl Filesystem for ConstellationFs {
             }
             return;
         }
-        match self.meta.getattr(ino) {
+        let attr = self
+            .meta
+            .getattr(ino)
+            .and_then(|attr| {
+                if attr.is_some() {
+                    Ok(attr)
+                } else {
+                    self.meta.scratch_getattr(ino)
+                }
+            });
+        match attr {
             Ok(Some(mut attr)) => {
                 // Pending writes shadow the committed size.
                 if let Some(ws) = self.writes.lock(ino).get(&ino) {
@@ -119,33 +150,33 @@ impl Filesystem for ConstellationFs {
     ) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
-        // Truncate/extend goes through write state so data and metadata
-        // commit together at flush.
-        gate!(self, ino, reply);
         let atime_ns = _atime.map(time_or_now_ns);
         let mtime_ns = mtime.map(time_or_now_ns);
-        let result = if let Some(new_size) = size {
-            // Keep size-changing setattr and writes/flushes on this inode in
-            // one critical section. fuser may dispatch them concurrently.
-            let manifest = match self.load_manifest(ino) {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    reply.error(Errno::from_i32(error));
-                    return;
-                }
-            };
-            let mut writes = self.writes.lock(ino);
-            self.truncate_locked(&mut writes, ino, new_size, &manifest)
-                .and_then(|()| {
-                    self.meta
-                        .setattr(ino, mode, uid, gid, size, atime_ns, mtime_ns)
-                        .map_err(|error| errno(&error))
-                })
-        } else {
-            self.meta
-                .setattr(ino, mode, uid, gid, size, atime_ns, mtime_ns)
-                .map_err(|error| errno(&error))
-        };
+        if let Some(new_size) = size {
+            if let Err(error) = self.truncate(ino, new_size) {
+                reply.error(Errno::from_i32(error));
+                return;
+            }
+        }
+        let result = self
+            .mutate_op(
+                ino,
+                constellation_meta::MutateOp::Setattr {
+                    ino,
+                    mode,
+                    uid,
+                    gid,
+                    size,
+                    atime_ns,
+                    mtime_ns,
+                },
+            )
+            .and_then(|()| {
+                self.meta
+                    .getattr(ino)
+                    .map_err(|error| errno(&error))?
+                    .ok_or(libc::ENOENT)
+            });
         match result {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr)),
             Err(error) => reply.error(Errno::from_i32(error)),
@@ -189,10 +220,36 @@ impl Filesystem for ConstellationFs {
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
-        gate!(self, parent, reply);
-        match self.meta.mkdir(parent, &name, mode, req.uid(), req.gid()) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+        let ino = match self.meta.allocate_ino() {
+            Ok(ino) => ino,
+            Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+        };
+        if self.meta.is_scratch_dir(parent).unwrap_or(false)
+            || self.meta.scratch_getattr(parent).ok().flatten().is_some()
+        {
+            return match self
+                .meta
+                .scratch_mkdir(parent, &name, ino, mode, req.uid(), req.gid())
+            {
+                Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            };
+        }
+        let op = constellation_meta::MutateOp::Mkdir {
+            parent,
+            name: name.into_owned(),
+            ino,
+            mode,
+            uid: req.uid(),
+            gid: req.gid(),
+        };
+        match self.mutate_op(parent, op) {
+            Ok(()) => match self.meta.getattr(ino) {
+                Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                Ok(None) => reply.error(Errno::from_i32(libc::EIO)),
+                Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            },
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
@@ -209,16 +266,8 @@ impl Filesystem for ConstellationFs {
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
-        gate!(self, parent, reply);
         let kind = match mode & libc::S_IFMT {
-            libc::S_IFREG | 0 => {
-                // Some callers use mknod for regular files.
-                match self.meta.create(parent, &name, mode & 0o7777, req.uid(), req.gid()) {
-                    Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
-                    Err(e) => reply.error(Errno::from_i32(errno(&e))),
-                }
-                return;
-            }
+            libc::S_IFREG | 0 => InodeKind::File,
             libc::S_IFIFO => InodeKind::Fifo,
             libc::S_IFSOCK => InodeKind::Socket,
             libc::S_IFBLK => InodeKind::BlockDev,
@@ -228,17 +277,38 @@ impl Filesystem for ConstellationFs {
                 return;
             }
         };
-        match self.meta.mknod(
-            parent,
-            &name,
-            kind,
-            mode & 0o7777,
-            req.uid(),
-            req.gid(),
-            rdev as u64,
-        ) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+        let ino = match self.meta.allocate_ino() {
+            Ok(ino) => ino,
+            Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+        };
+        let op = if kind == InodeKind::File {
+            constellation_meta::MutateOp::Create {
+                parent,
+                name: name.into_owned(),
+                ino,
+                mode: mode & 0o7777,
+                uid: req.uid(),
+                gid: req.gid(),
+            }
+        } else {
+            constellation_meta::MutateOp::Mknod {
+                parent,
+                name: name.into_owned(),
+                ino,
+                kind: kind.as_u8(),
+                mode: mode & 0o7777,
+                uid: req.uid(),
+                gid: req.gid(),
+                rdev: rdev as u64,
+            }
+        };
+        match self.mutate_op(parent, op) {
+            Ok(()) => match self.meta.getattr(ino) {
+                Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                Ok(None) => reply.error(Errno::from_i32(libc::EIO)),
+                Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            },
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
@@ -255,10 +325,18 @@ impl Filesystem for ConstellationFs {
         let ino = self.real_ino(ino);
         let newparent = self.real_ino(newparent);
         let name = checked_name!(newname, reply);
-        gate!(self, ino, reply);
-        match self.meta.link(ino, newparent, &name) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+        let op = constellation_meta::MutateOp::Link {
+            ino,
+            parent: newparent,
+            name: name.into_owned(),
+        };
+        match self.mutate_op(newparent, op) {
+            Ok(()) => match self.meta.getattr(ino) {
+                Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
+                Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            },
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
@@ -275,8 +353,36 @@ impl Filesystem for ConstellationFs {
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
-        gate!(self, parent, reply);
-        match self.meta.create(parent, &name, mode, req.uid(), req.gid()) {
+        let ino = match self.meta.allocate_ino() {
+            Ok(ino) => ino,
+            Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+        };
+        let result = if self.meta.is_scratch_dir(parent).unwrap_or(false)
+            || self.meta.scratch_getattr(parent).ok().flatten().is_some()
+        {
+            self.meta
+                .scratch_create(parent, &name, ino, mode, req.uid(), req.gid())
+                .map_err(|e| errno(&e))
+        } else {
+            self.mutate_op(
+                parent,
+                constellation_meta::MutateOp::Create {
+                    parent,
+                    name: name.into_owned(),
+                    ino,
+                    mode,
+                    uid: req.uid(),
+                    gid: req.gid(),
+                },
+            )
+            .and_then(|()| {
+                self.meta
+                    .getattr(ino)
+                    .map_err(|e| errno(&e))?
+                    .ok_or(libc::EIO)
+            })
+        };
+        match result {
             Ok(attr) => {
                 *self.opens.lock().unwrap().entry(attr.ino).or_insert(0) += 1;
                 reply.created(
@@ -287,7 +393,7 @@ impl Filesystem for ConstellationFs {
                     fuser::FopenFlags::empty(),
                 )
             }
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
@@ -302,11 +408,26 @@ impl Filesystem for ConstellationFs {
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(link_name, reply);
-        gate!(self, parent, reply);
         let target = target.to_string_lossy();
-        match self.meta.symlink(parent, &name, &target, req.uid(), req.gid()) {
-            Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+        let ino = match self.meta.allocate_ino() {
+            Ok(ino) => ino,
+            Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+        };
+        let op = constellation_meta::MutateOp::Symlink {
+            parent,
+            name: name.into_owned(),
+            ino,
+            target: target.into_owned(),
+            uid: req.uid(),
+            gid: req.gid(),
+        };
+        match self.mutate_op(parent, op) {
+            Ok(()) => match self.meta.getattr(ino) {
+                Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                Ok(None) => reply.error(Errno::from_i32(libc::EIO)),
+                Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            },
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
@@ -314,9 +435,39 @@ impl Filesystem for ConstellationFs {
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
-        gate!(self, parent, reply);
         let target = self.meta.lookup(parent, &name);
-        match self.meta.unlink(parent, &name) {
+        let result = if (self.meta.is_scratch_dir(parent).unwrap_or(false)
+            || self.meta.scratch_getattr(parent).ok().flatten().is_some())
+            && self.meta.scratch_lookup(parent, &name).ok().flatten().is_some()
+        {
+            match self.meta.scratch_lookup(parent, &name) {
+                Ok(Some(attr))
+                    if attr.kind == InodeKind::Dir
+                        && !self
+                            .meta
+                            .scratch_readdir(attr.ino)
+                            .unwrap_or_default()
+                            .is_empty() =>
+                {
+                    Err(libc::ENOTEMPTY)
+                }
+                Ok(Some(_)) => self
+                    .meta
+                    .scratch_unlink(parent, &name)
+                    .map_err(|e| errno(&e)),
+                Ok(None) => Err(libc::ENOENT),
+                Err(e) => Err(errno(&e)),
+            }
+        } else {
+            self.mutate_op(
+                parent,
+                constellation_meta::MutateOp::Unlink {
+                    parent,
+                    name: name.into_owned(),
+                },
+            )
+        };
+        match result {
             Ok(()) => {
                 // No open handles anywhere (single node): reap now.
                 if let Ok(Some(attr)) = target {
@@ -327,7 +478,7 @@ impl Filesystem for ConstellationFs {
                 }
                 reply.ok()
             }
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
@@ -335,10 +486,31 @@ impl Filesystem for ConstellationFs {
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
-        gate!(self, parent, reply);
-        match self.meta.rmdir(parent, &name) {
+        let result = if (self.meta.is_scratch_dir(parent).unwrap_or(false)
+            || self.meta.scratch_getattr(parent).ok().flatten().is_some())
+            && self.meta.scratch_lookup(parent, &name).ok().flatten().is_some()
+        {
+            match self.meta.scratch_lookup(parent, &name) {
+                Ok(Some(attr)) if attr.kind == InodeKind::Dir => Err(libc::EISDIR),
+                Ok(Some(_)) => self
+                    .meta
+                    .scratch_unlink(parent, &name)
+                    .map_err(|e| errno(&e)),
+                Ok(None) => Err(libc::ENOENT),
+                Err(e) => Err(errno(&e)),
+            }
+        } else {
+            self.mutate_op(
+                parent,
+                constellation_meta::MutateOp::Rmdir {
+                    parent,
+                    name: name.into_owned(),
+                },
+            )
+        };
+        match result {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 
@@ -356,8 +528,81 @@ impl Filesystem for ConstellationFs {
         let newparent = newparent.0;
         let parent = self.real_ino(parent);
         let newparent = self.real_ino(newparent);
-        let name = name.to_string_lossy();
-        let newname = newname.to_string_lossy();
+        let name = name.to_string_lossy().into_owned();
+        let newname = newname.to_string_lossy().into_owned();
+        let src_scratch = self.meta.is_scratch_dir(parent).unwrap_or(false)
+            || self.meta.scratch_getattr(parent).ok().flatten().is_some();
+        let dst_scratch = self.meta.is_scratch_dir(newparent).unwrap_or(false)
+            || self
+                .meta
+                .scratch_getattr(newparent)
+                .ok()
+                .flatten()
+                .is_some();
+        if src_scratch && dst_scratch {
+            return match self
+                .meta
+                .scratch_rename(parent, &name, newparent, &newname)
+            {
+                Ok(()) => reply.ok(),
+                Err(error) => reply.error(Errno::from_i32(errno(&error))),
+            };
+        }
+        if dst_scratch {
+            reply.error(Errno::from_i32(libc::EXDEV));
+            return;
+        }
+        if src_scratch {
+            let attr = match self.meta.scratch_lookup(parent, &name) {
+                Ok(Some(attr)) => attr,
+                Ok(None) => {
+                    reply.error(Errno::from_i32(libc::ENOENT));
+                    return;
+                }
+                Err(error) => {
+                    reply.error(Errno::from_i32(errno(&error)));
+                    return;
+                }
+            };
+            if attr.kind != InodeKind::File {
+                reply.error(Errno::from_i32(libc::EXDEV));
+                return;
+            }
+            if let Err(error) = self.flush_inode(attr.ino, true) {
+                reply.error(Errno::from_i32(error));
+                return;
+            }
+            if let Err(error) = self.drain_inode(attr.ino) {
+                reply.error(Errno::from_i32(error));
+                return;
+            }
+            let manifest = match self.meta.scratch_manifest(attr.ino) {
+                Ok(Some(manifest)) => manifest,
+                Ok(None) => Manifest::empty(self.chunk_size).encode(),
+                Err(error) => {
+                    reply.error(Errno::from_i32(errno(&error)));
+                    return;
+                }
+            };
+            let op = constellation_meta::MutateOp::Publish {
+                ino: attr.ino,
+                parent: newparent,
+                name: newname,
+                mode: attr.mode,
+                uid: attr.uid,
+                gid: attr.gid,
+                mtime_ns: attr.mtime_ns,
+                manifest,
+                size: attr.size,
+            };
+            return match self.mutate_op(newparent, op) {
+                Ok(()) => match self.meta.scratch_unlink(parent, &name) {
+                    Ok(()) => reply.ok(),
+                    Err(error) => reply.error(Errno::from_i32(errno(&error))),
+                },
+                Err(error) => reply.error(Errno::from_i32(error)),
+            };
+        }
         let src_part = self.meta.partition_of(parent).unwrap_or_else(|_| "p0".into());
         let dst_part = self
             .meta
@@ -370,6 +615,18 @@ impl Filesystem for ConstellationFs {
         } else {
             (newparent, parent)
         };
+        if src_part == dst_part {
+            let op = constellation_meta::MutateOp::Rename {
+                parent,
+                name,
+                new_parent: newparent,
+                new_name: newname,
+            };
+            return match self.mutate_op(parent, op) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            };
+        }
         gate!(self, first, reply);
         if first != second {
             if let Err(e) = self.require_lease_for(second) {
@@ -377,12 +634,9 @@ impl Filesystem for ConstellationFs {
                 return;
             }
         }
-        let result = if src_part == dst_part {
-            self.meta.rename(parent, &name, newparent, &newname)
-        } else {
-            self.meta
-                .rename_xpart(parent, &name, newparent, &newname, &src_part, &dst_part)
-        };
+        let result = self
+            .meta
+            .rename_xpart(parent, &name, newparent, &newname, &src_part, &dst_part);
         match result {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(errno(&e))),
@@ -408,7 +662,17 @@ impl Filesystem for ConstellationFs {
             }
             return;
         }
-        match self.meta.getattr(ino) {
+        let attr = self
+            .meta
+            .getattr(ino)
+            .and_then(|attr| {
+                if attr.is_some() {
+                    Ok(attr)
+                } else {
+                    self.meta.scratch_getattr(ino)
+                }
+            });
+        match attr {
             Ok(Some(_)) => {
                 *self.opens.lock().unwrap().entry(ino).or_insert(0) += 1;
                 reply.opened(FileHandle(ino), fuser::FopenFlags::empty())
@@ -591,7 +855,13 @@ impl Filesystem for ConstellationFs {
             reply.ok();
             return;
         }
-        let entries = match self.meta.readdir(ino) {
+        let entries = match if self.meta.is_scratch_dir(ino).unwrap_or(false)
+            || self.meta.scratch_getattr(ino).ok().flatten().is_some()
+        {
+            self.meta.scratch_readdir(ino)
+        } else {
+            self.meta.readdir(ino)
+        } {
             Ok(e) => e,
             Err(e) => return reply.error(Errno::from_i32(errno(&e))),
         };
@@ -665,13 +935,25 @@ impl Filesystem for ConstellationFs {
             libc::XATTR_REPLACE => constellation_meta::SetXattrMode::Replace,
             _ => return reply.error(Errno::from_i32(libc::EINVAL)),
         };
-        gate!(self, ino, reply);
-        match self.meta.set_xattr(ino, &name, value, mode) {
+        let wire_mode = match mode {
+            constellation_meta::SetXattrMode::Create => 1,
+            constellation_meta::SetXattrMode::Replace => 2,
+            constellation_meta::SetXattrMode::Set => 0,
+        };
+        match self.mutate_op(
+            ino,
+            constellation_meta::MutateOp::SetXattr {
+                ino,
+                name,
+                value: value.to_vec(),
+                mode: wire_mode,
+            },
+        ) {
             Ok(()) => {
                 self.nudge_sync();
                 reply.ok()
             }
-            Err(error) => reply.error(Errno::from_i32(errno(&error))),
+            Err(error) => reply.error(Errno::from_i32(error)),
         }
     }
 
@@ -775,13 +1057,15 @@ impl Filesystem for ConstellationFs {
             reply.error(Errno::from_i32(libc::EROFS));
             return;
         }
-        gate!(self, ino, reply);
-        match self.meta.remove_xattr(ino, &name) {
+        match self.mutate_op(
+            ino,
+            constellation_meta::MutateOp::RemoveXattr { ino, name },
+        ) {
             Ok(()) => {
                 self.nudge_sync();
                 reply.ok()
             }
-            Err(error) => reply.error(Errno::from_i32(errno(&error))),
+            Err(error) => reply.error(Errno::from_i32(error)),
         }
     }
 

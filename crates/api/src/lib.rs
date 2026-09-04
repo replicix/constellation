@@ -301,6 +301,11 @@ mod tests {
                 reintegration: ReintegrationStatus::default(),
                 coop: CoopStatus::default(),
                 writeback: WritebackStatus::default(),
+                forwarded_ok: 0,
+                forwarded_err: 0,
+                forward_p50_ms: None,
+                pushed_segments_applied: 0,
+                placement_reason: None,
             }
         }
 
@@ -474,6 +479,11 @@ mod tests {
                 reintegration: ReintegrationStatus::default(),
                 coop: CoopStatus::default(),
                 writeback: WritebackStatus::default(),
+                forwarded_ok: 0,
+                forwarded_err: 0,
+                forward_p50_ms: None,
+                pushed_segments_applied: 0,
+                placement_reason: None,
             }
         }
     }

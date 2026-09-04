@@ -130,6 +130,11 @@ impl TouchSet {
         }
     }
 
+    pub fn merge(&mut self, other: TouchSet) {
+        self.dentries.extend(other.dentries);
+        self.inos.extend(other.inos);
+    }
+
     pub fn conflicts(&self, rec: &LogRecord) -> bool {
         let mut single = TouchSet::default();
         single.add(rec);
@@ -250,6 +255,11 @@ impl SqliteMeta {
             // a `-wal` sidecar that the payload does not carry.
             c.pragma_update(None, "journal_mode", "DELETE")?;
             c.execute("DELETE FROM journal", [])?;
+            c.execute_batch(
+                "DROP TABLE IF EXISTS scratch_inode;
+                 DROP TABLE IF EXISTS scratch_dentry;
+                 DROP TABLE IF EXISTS shadow;",
+            )?;
             // Reset AUTOINCREMENT so the restored node journals from 1.
             let _ = c.execute("DELETE FROM sqlite_sequence WHERE name = 'journal'", []);
             c.execute(

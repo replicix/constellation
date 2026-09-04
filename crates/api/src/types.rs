@@ -286,6 +286,16 @@ pub struct StatusReport {
     /// Phase 5b write-back queue and adaptive upload policy.
     #[serde(default)]
     pub writeback: WritebackStatus,
+    #[serde(default)]
+    pub forwarded_ok: u64,
+    #[serde(default)]
+    pub forwarded_err: u64,
+    #[serde(default)]
+    pub forward_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub pushed_segments_applied: u64,
+    #[serde(default)]
+    pub placement_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

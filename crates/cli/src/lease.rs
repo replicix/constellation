@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 /// Default write-idle period after which a holder hands the lease back
 /// so a peer can take it without waiting out the TTL.
-pub const DEFAULT_IDLE_RELEASE_MS: u64 = 2_000;
+pub const DEFAULT_IDLE_RELEASE_MS: u64 = 30_000;
 
 /// Treat the lease as unusable this close to expiry: renewal happens at
 /// half-TTL, so a mutation landing inside the margin should route
@@ -478,19 +478,22 @@ impl LeaseKeeper {
     /// Give the lease up (idle release, or clean unmount after the final
     /// flush). Best effort: an unreleased lease merely costs the next
     /// holder a TTL wait.
-    pub async fn release(&mut self) -> Result<()> {
+    ///
+    /// On a successful CAS swap, returns the new object's ETag so a
+    /// peer can skip a classify GET and claim against that version.
+    pub async fn release(&mut self) -> Result<Option<String>> {
         let Some((lease, tag)) = self.held.take() else {
-            return Ok(());
+            return Ok(None);
         };
         self.view.clear();
         match self.store.try_swap(&lease.released(), &tag).await {
-            Ok(_) => {
+            Ok(new_tag) => {
                 tracing::debug!(epoch = lease.epoch, "released partition lease");
-                Ok(())
+                Ok(new_tag.etag())
             }
             Err(StoreError::CasConflict) => {
                 self.diagnose_lost_renew(&lease).await?;
-                Ok(())
+                Ok(None)
             }
             Err(e) => Err(e.into()),
         }
