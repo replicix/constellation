@@ -2,6 +2,7 @@
 /bench/dbbench/data
 /bench/dbbench/target
 /bench/.cargo-home
+/.scratch
 mount.sh
 umount.sh
 TODO.md
