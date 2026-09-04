@@ -367,6 +367,7 @@ impl Coop {
         let size = u64::from(self.chunk_size);
         let (primary, hedge, deadline) = {
             let mut sel = self.selector.lock().unwrap();
+            self.sync_probe_rtts(&mut sel);
             let primary = sel.pick(&cands, size);
             let hedge = sel.next_best(&cands, primary, size);
             let deadline = sel.hedge_deadline_ms(primary, size);
@@ -519,19 +520,37 @@ impl Coop {
         }
     }
 
+    /// Push measured probe RTTs into the selector so cold peers are not
+    /// scored with LAN priors while the Peers panel already knows ~180 ms.
+    fn sync_probe_rtts(&self, sel: &mut Selector) {
+        for peer in self.peers.snapshot() {
+            let Some(ms) = peer.rtt_ms else {
+                continue;
+            };
+            sel.record_transport(
+                SourceId::Peer(peer.node_id),
+                Some(Duration::from_millis(ms)),
+                PathKind::Unknown,
+            );
+        }
+    }
+
     pub fn report(&self) -> constellation_api::CoopStatus {
-        let per_source = self
-            .selector
-            .lock()
-            .unwrap()
+        let mut sel = self.selector.lock().unwrap();
+        self.sync_probe_rtts(&mut sel);
+        let per_source = sel
             .all_stats()
             .into_iter()
             .map(|(id, s)| constellation_api::SourceStatus {
                 id: id.label(),
-                ttfb_ms_ewma: s.ttfb_ewma_ms,
-                goodput_mbps_ewma: s.goodput_bps * 8.0 / 1_000_000.0,
+                // Lat/BW stay None until a real transfer — priors must not
+                // look like measurements next to probe RTT.
+                ttfb_ms_ewma: (s.ok_samples > 0).then_some(s.ttfb_ewma_ms),
+                goodput_mbps_ewma: (s.ok_samples > 0).then_some(s.goodput_bps * 8.0 / 1_000_000.0),
+                hit_rate: s.hit_rate,
                 miss_rate: s.miss_rate,
                 err_rate: s.err_rate,
+                ok_samples: s.ok_samples,
                 transport_rtt_ms: s.transport_rtt_ms,
                 path: match s.path {
                     PathKind::Direct => "direct",
@@ -541,6 +560,7 @@ impl Coop {
                 .into(),
             })
             .collect();
+        drop(sel);
         constellation_api::CoopStatus {
             peer_hits: self.counters.peer_hits.load(Ordering::Relaxed),
             peer_misses: self.counters.peer_misses.load(Ordering::Relaxed),

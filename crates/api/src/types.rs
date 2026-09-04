@@ -333,16 +333,24 @@ pub struct CoopStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceStatus {
     pub id: String,
+    /// First-byte EWMA from successful transfers only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms_ewma: Option<f64>,
+    /// Goodput EWMA from successful transfers only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goodput_mbps_ewma: Option<f64>,
+    /// Successful fetches (EWMA complementary to miss/err).
     #[serde(default)]
-    pub ttfb_ms_ewma: f64,
-    #[serde(default)]
-    pub goodput_mbps_ewma: f64,
+    pub hit_rate: f64,
     /// Soft negatives (declines). Previously folded into `err_rate`.
     #[serde(default)]
     pub miss_rate: f64,
     /// Hard negatives (transport/hash failures).
     #[serde(default)]
     pub err_rate: f64,
+    /// Successful transfers contributing to lat/BW EWMAs.
+    #[serde(default)]
+    pub ok_samples: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_rtt_ms: Option<f64>,
     #[serde(default)]

@@ -96,8 +96,9 @@ function peerCard(p){
 
 function peerDetail(p){
   const coop=p.coop?`
-    ${row("ttfb ewma", dur(p.coop.ttfb_ms_ewma))}
-    ${row("goodput ewma", `${p.coop.goodput_mbps_ewma.toFixed(2)} Mbps`)}
+    ${row("ttfb ewma", p.coop.ttfb_ms_ewma!=null?dur(p.coop.ttfb_ms_ewma):'<span class="muted">unmeasured</span>')}
+    ${row("goodput ewma", p.coop.goodput_mbps_ewma!=null?`${p.coop.goodput_mbps_ewma.toFixed(2)} Mbps`:'<span class="muted">unmeasured</span>')}
+    ${row("hit rate", `${((p.coop.hit_rate||0)*100).toFixed(2)}%`)}
     ${row("miss rate", `${((p.coop.miss_rate||0)*100).toFixed(2)}%`)}
     ${row("error rate", `${(p.coop.err_rate*100).toFixed(2)}%`)}
     ${row("transport RTT", dur(p.coop.transport_rtt_ms))}

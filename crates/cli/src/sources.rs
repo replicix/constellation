@@ -61,13 +61,18 @@ impl SourceId {
 pub struct SourceStats {
     pub ttfb_ewma_ms: f64,
     pub goodput_bps: f64,
+    /// Successful fetches (EWMA; rises on ok, decays on miss/err).
+    pub hit_rate: f64,
     /// Soft negatives: peer said "no" / busy (bloom FP, admission decline).
     pub miss_rate: f64,
     /// Hard negatives: transport, hash mismatch, S3 errors.
     pub err_rate: f64,
     pub ttfb_p95_ms: f64,
     pub in_flight: u32,
+    /// Outcomes recorded (ok + miss + err). Cancelled races do not count.
     pub samples: u64,
+    /// Successful transfers only — lat/BW EWMAs are priors until this is > 0.
+    pub ok_samples: u64,
     pub transport_rtt_ms: Option<f64>,
     pub path: PathKind,
 }
@@ -83,11 +88,13 @@ impl SourceStats {
         Self {
             ttfb_ewma_ms: PEER_PRIOR_TTFB_MS,
             goodput_bps: PEER_PRIOR_GOODPUT_BPS,
+            hit_rate: 0.0,
             miss_rate: 0.0,
             err_rate: 0.0,
             ttfb_p95_ms: PEER_PRIOR_P95_MS,
             in_flight: 0,
             samples: 0,
+            ok_samples: 0,
             transport_rtt_ms: None,
             path: PathKind::Unknown,
         }
@@ -97,11 +104,13 @@ impl SourceStats {
         Self {
             ttfb_ewma_ms: S3_PRIOR_TTFB_MS,
             goodput_bps: S3_PRIOR_GOODPUT_BPS,
+            hit_rate: 0.0,
             miss_rate: 0.0,
             err_rate: 0.0,
             ttfb_p95_ms: S3_PRIOR_P95_MS,
             in_flight: 0,
             samples: 0,
+            ok_samples: 0,
             transport_rtt_ms: None,
             path: PathKind::Unknown,
         }
@@ -115,14 +124,25 @@ impl SourceStats {
     }
 
     pub fn eta_ms(&self, size: u64) -> f64 {
-        let xfer = if self.goodput_bps > 1.0 {
-            (size as f64) / self.goodput_bps * 1000.0
+        // Until a real transfer lands, do not claim LAN goodput. A known
+        // probe RTT means we are likely on a WAN path — budget a slow
+        // body so S3 can compete; otherwise keep the cold prior.
+        let goodput = if self.ok_samples == 0 {
+            match self.transport_rtt_ms {
+                Some(rtt) if rtt >= 50.0 => S3_PRIOR_GOODPUT_BPS,
+                _ => self.goodput_bps,
+            }
+        } else {
+            self.goodput_bps
+        };
+        let xfer = if goodput > 1.0 {
+            (size as f64) / goodput * 1000.0
         } else {
             1_000.0
         };
         let miss_pen = self.miss_rate * MISS_PENALTY_MS;
         let err_pen = self.err_rate * ERR_PENALTY_MS;
-        let q_pen = f64::from(self.in_flight) * self.ttfb_ewma_ms * 0.5;
+        let q_pen = f64::from(self.in_flight) * self.ttfb_ewma_ms.max(self.transport_rtt_ms.unwrap_or(0.0)) * 0.5;
         let transport_floor = self.transport_rtt_ms.unwrap_or(0.0);
         let path_penalty = if self.path == PathKind::Relay {
             20.0
@@ -217,12 +237,21 @@ impl Selector {
     /// still running.
     pub fn hedge_deadline_ms(&self, id: SourceId, size: u64) -> u64 {
         let s = self.stats(id);
-        let xfer = if s.goodput_bps > 1.0 {
-            (size as f64) / s.goodput_bps * 1000.0
+        let goodput = if s.ok_samples == 0 {
+            match s.transport_rtt_ms {
+                Some(rtt) if rtt >= 50.0 => S3_PRIOR_GOODPUT_BPS,
+                _ => s.goodput_bps,
+            }
+        } else {
+            s.goodput_bps
+        };
+        let xfer = if goodput > 1.0 {
+            (size as f64) / goodput * 1000.0
         } else {
             1_000.0
         };
-        ((s.ttfb_p95_ms + xfer) * HEDGE_SLACK).max(1.0).ceil() as u64
+        let first = s.ttfb_p95_ms.max(s.transport_rtt_ms.unwrap_or(0.0));
+        ((first + xfer) * HEDGE_SLACK).max(1.0).ceil() as u64
     }
 
     pub fn begin(&mut self, id: SourceId) {
@@ -263,7 +292,7 @@ impl Selector {
             .stats
             .entry(id)
             .or_insert_with(|| SourceStats::prior(id));
-        if s.samples == 0 {
+        if s.ok_samples == 0 {
             s.ttfb_ewma_ms = ttfb_ms.max(0.1);
             s.ttfb_p95_ms = (ttfb_ms * 2.0).max(ttfb_ms + 1.0);
         } else {
@@ -275,15 +304,17 @@ impl Selector {
         if total_ms > ttfb_ms && bytes > 0 {
             let body_s = ((total_ms - ttfb_ms) / 1000.0).max(0.000_001);
             let gp = bytes as f64 / body_s;
-            s.goodput_bps = if s.samples == 0 {
+            s.goodput_bps = if s.ok_samples == 0 {
                 gp
             } else {
                 ALPHA * gp + (1.0 - ALPHA) * s.goodput_bps
             };
         }
+        s.hit_rate = ALPHA * 1.0 + (1.0 - ALPHA) * s.hit_rate;
         s.miss_rate *= 1.0 - ALPHA;
         s.err_rate *= 1.0 - ALPHA;
         s.samples += 1;
+        s.ok_samples += 1;
         s.in_flight = s.in_flight.saturating_sub(1);
     }
 
@@ -294,6 +325,7 @@ impl Selector {
             .stats
             .entry(id)
             .or_insert_with(|| SourceStats::prior(id));
+        s.hit_rate *= 1.0 - ALPHA;
         s.miss_rate = ALPHA * 1.0 + (1.0 - ALPHA) * s.miss_rate;
         s.samples += 1;
         s.in_flight = s.in_flight.saturating_sub(1);
@@ -306,6 +338,7 @@ impl Selector {
             .stats
             .entry(id)
             .or_insert_with(|| SourceStats::prior(id));
+        s.hit_rate *= 1.0 - ALPHA;
         s.err_rate = ALPHA * 1.0 + (1.0 - ALPHA) * s.err_rate;
         s.samples += 1;
         s.in_flight = s.in_flight.saturating_sub(1);
@@ -428,6 +461,7 @@ mod tests {
         s.record_err(SourceId::Peer(3));
         assert!(s.stats(SourceId::Peer(3)).err_rate > 0.0);
         assert_eq!(s.stats(SourceId::Peer(3)).miss_rate, 0.0);
+        assert!(s.stats(SourceId::Peer(3)).hit_rate < 1.0);
         // After eviction, a slow-but-reliable S3 can win against a
         // high-error peer on the next pick.
         let pick = s.pick(&[SourceId::Peer(3), SourceId::S3], 1000);
@@ -445,6 +479,7 @@ mod tests {
         s.record_miss(SourceId::Peer(3));
         assert!(s.stats(SourceId::Peer(3)).miss_rate > 0.0);
         assert_eq!(s.stats(SourceId::Peer(3)).err_rate, 0.0);
+        assert!(s.stats(SourceId::Peer(3)).hit_rate < 1.0);
         // One soft miss is not enough to lose the incumbent against cold S3.
         let pick = s.pick(&[SourceId::Peer(3), SourceId::S3], 1000);
         assert_eq!(pick, SourceId::Peer(3));
@@ -471,8 +506,45 @@ mod tests {
         let stats = s.stats(id);
         assert_eq!(stats.in_flight, 0);
         assert_eq!(stats.samples, 0);
+        assert_eq!(stats.ok_samples, 0);
+        assert_eq!(stats.hit_rate, 0.0);
         assert_eq!(stats.miss_rate, 0.0);
         assert_eq!(stats.err_rate, 0.0);
+    }
+
+    #[test]
+    fn hit_rate_rises_on_ok_and_falls_on_miss() {
+        let mut s = Selector::default();
+        let id = SourceId::Peer(1);
+        s.record_ok(id, 2.0, 1000, 4.0);
+        assert!(s.stats(id).hit_rate > 0.0);
+        assert_eq!(s.stats(id).ok_samples, 1);
+        let after_hit = s.stats(id).hit_rate;
+        s.record_miss(id);
+        assert!(s.stats(id).hit_rate < after_hit);
+    }
+
+    #[test]
+    fn probe_rtt_displaces_lan_prior_on_a_cold_peer() {
+        let mut s = Selector::default();
+        let peer = SourceId::Peer(2);
+        s.record_transport(
+            peer,
+            Some(std::time::Duration::from_millis(181)),
+            PathKind::Unknown,
+        );
+        // Never transferred: ETA must not look like a LAN peer.
+        let eta = s.eta_ms(peer, 4 * MIB);
+        let s3_eta = s.eta_ms(SourceId::S3, 4 * MIB);
+        assert!(
+            eta > 200.0,
+            "cold WAN peer ETA {eta} still looks LAN-local"
+        );
+        assert!(
+            eta > s3_eta * 0.5,
+            "cold WAN peer should not dominate cold S3 (peer={eta} s3={s3_eta})"
+        );
+        assert_eq!(s.stats(peer).ok_samples, 0);
     }
 
     #[test]

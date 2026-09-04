@@ -10,16 +10,23 @@ main{max-width:1400px;margin:auto;padding:20px;display:grid;grid-template-column
 section{background:#111831;border:1px solid #26304d;border-radius:10px;padding:16px;min-height:120px}
 h1{margin:0;font-size:20px}h2{margin:0 0 12px;color:#8eb7ff;font-size:16px}pre{white-space:pre-wrap;overflow:auto}
 table{width:100%;border-collapse:collapse}td,th{padding:6px;text-align:left;border-bottom:1px solid #26304d}
+table.compact{margin-top:0;font-variant-numeric:tabular-nums}table.compact th,table.compact td{padding:4px 8px;font-size:13px}
+table.compact th{color:#8e9abb;font-weight:500;border-bottom-color:#3c4c78}
+table.compact td.num,table.compact th.num{text-align:right}
+table.compact td.st{width:1.4em;text-align:center;padding-right:2px}
 button,input{background:#182344;color:inherit;border:1px solid #3c4c78;border-radius:5px;padding:7px;margin:2px}
-button{cursor:pointer}.ok{color:#72e6a3}.bad{color:#ff8f9c}.wide{grid-column:1/-1}.muted{color:#8e9abb}
+button{cursor:pointer}.ok{color:#72e6a3}.bad{color:#ff8f9c}.wide{grid-column:1/-1}.span2{grid-column:span 2}.muted{color:#8e9abb}
 .clickable{cursor:pointer}section.clickable h2::after{content:" →";color:#8eb7ff;font-weight:400}
+a{color:#8eb7ff;text-decoration:none}a:hover{text-decoration:underline}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;vertical-align:middle}
+.dot.on{background:#72e6a3;box-shadow:0 0 0 2px rgba(114,230,163,.2)}
+.dot.off{background:#5a657f}
 </style>
 </head>
 <body><header><h1>Constellation control plane</h1><span id="health">connecting…</span></header>
 <main>
 <section><h2>Dashboard</h2><div id="dashboard"></div></section>
-<section class="clickable" onclick="if(!event.target.closest('a'))location.href='/peers.html'" title="Open peer details"><h2>Peers</h2><div id="peers"></div></section>
-<section><h2>Cache</h2><div id="cache"></div></section>
+<section class="span2 clickable" onclick="if(!event.target.closest('a'))location.href='/peers.html'" title="Open peer details"><h2>Peers</h2><div id="peers"></div></section>
 <section><h2>Leases / partitions</h2><div id="leases"></div></section>
 <section class="wide"><h2>Files</h2><input id="path" value="/" aria-label="path"><button onclick="browse()">Browse</button><div id="files"></div></section>
 <section><h2>Snapshots</h2><input id="snap" placeholder="/path@name"><button onclick="snapCreate()">Create</button><div id="snapshots"></div></section>
@@ -28,7 +35,28 @@ button{cursor:pointer}.ok{color:#72e6a3}.bad{color:#ff8f9c}.wide{grid-column:1/-
 <script>
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const call=async req=>(await fetch("/api",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(req)})).json();
-const bytes=n=>n<1024?n+" B":n<1048576?(n/1024).toFixed(1)+" KiB":(n/1048576).toFixed(1)+" MiB";
+/** Auto-scale a byte count: B → KiB → MiB → GiB → TiB. */
+function bytes(n){
+ n=Number(n); if(!Number.isFinite(n)||n<0)n=0;
+ const u=["B","KiB","MiB","GiB","TiB"];
+ let v=n,i=0;
+ while(v>=1024 && i<u.length-1){v/=1024;i++}
+ if(i===0)return Math.round(v)+" B";
+ const d=v>=100?0:v>=10?1:2;
+ return v.toFixed(d).replace(/\.?0+$/,"")+" "+u[i];
+}
+/** Auto-scale a bit-rate already expressed in Mbps. */
+function bw(mbps){
+ if(mbps==null||mbps==="")return"—";
+ const n=Number(mbps); if(!Number.isFinite(n))return"—";
+ if(Math.abs(n)>=1000){
+  const g=n/1000,d=Math.abs(g)>=100?0:Math.abs(g)>=10?1:2;
+  return g.toFixed(d).replace(/\.?0+$/,"")+" Gbps";
+ }
+ if(Math.abs(n)>=1)return (Number.isInteger(n)?n:n.toFixed(1).replace(/\.0$/,""))+" Mbps";
+ if(Math.abs(n)>=0.001)return (n*1000).toFixed(0)+" kbps";
+ return "0 Mbps";
+}
 /** Format a millisecond duration with a unit that matches its scale. */
 function dur(ms,{ago=false}={}){
  if(ms==null||ms==="")return"—";
@@ -42,14 +70,43 @@ function dur(ms,{ago=false}={}){
  else s=(a/86400e3).toFixed(1)+" d";
  return ago?s+" ago":s;
 }
+const pct=x=>((x||0)*100).toFixed(1);
+function peerLat(p){
+ const c=p.coop;
+ if(c&&c.ttfb_ms_ewma!=null)return dur(c.ttfb_ms_ewma);
+ if(c&&c.transport_rtt_ms!=null)return dur(c.transport_rtt_ms);
+ return dur(p.rtt_ms);
+}
+function peerBw(p){
+ return p.coop&&p.coop.goodput_mbps_ewma!=null?bw(p.coop.goodput_mbps_ewma):"—";
+}
+function peerRow(p){
+ const host=p.hostname||("node "+p.node_id);
+ const st=p.connected
+  ?'<span class="dot on" title="connected"></span>'
+  :'<span class="dot off" title="disconnected"></span>';
+ const c=p.coop||{};
+ return `<tr>
+  <td class="st">${st}</td>
+  <td><a href="/peers.html#node-${p.node_id}">${esc(host)}</a></td>
+  <td class="num">${dur(p.last_seen_ms,{ago:true})}</td>
+  <td class="num">${peerLat(p)}</td>
+  <td class="num">${peerBw(p)}</td>
+  <td class="num">${pct(c.hit_rate)}</td>
+  <td class="num">${pct(c.miss_rate)}</td>
+  <td class="num">${pct(c.err_rate)}</td>
+ </tr>`;
+}
 let refreshing=false;
 async function refresh(){
  if(refreshing)return; refreshing=true;
  try{let r=await(await fetch("/api/status")).json(),s=r.Status||r.status||r; if(r.resp==="status")s=r;
  document.querySelector("#health").innerHTML='<span class="ok">healthy</span> · '+esc(s.fs_uuid);
- dashboard.innerHTML=`node <b>${s.node_id}</b> · uptime ${dur((s.uptime_s||0)*1000)}<br>${esc(s.backend)}<br>head ${s.spool.head_seq} · backlog ${s.spool.journal_backlog}<br>${s.spool.last_ship_error?'<span class="bad">'+esc(s.spool.last_ship_error)+'</span>':'sync healthy'}<br>epoch ${s.epoch.active?esc(s.epoch.epoch_id):"inactive"} · designations ${s.designations.length}`;
- peers.innerHTML=(s.p2p.peers||[]).map(p=>`<a href="/peers.html#node-${p.node_id}">node ${p.node_id}</a>: ${p.connected?'<span class="ok">connected</span>':'disconnected'} · RTT ${dur(p.rtt_ms)} · seen ${dur(p.last_seen_ms,{ago:true})}${p.hostname?' · '+esc(p.hostname):''}`).join("<br>")||'<span class="muted">no peers</span>';
- cache.innerHTML=`${bytes(s.cache.used_bytes)} / ${bytes(s.cache.budget_bytes)} · ${s.cache.chunks} chunks<br>pinned ${bytes(s.cache.pinned_bytes||0)}<br>peer hits ${s.coop.peer_hits} · misses ${s.coop.peer_misses||0} · errs ${s.coop.peer_errors||0} · S3 ${s.coop.s3_fetches} · hedges ${s.coop.hedges_fired}<br>`+(s.coop.per_source||[]).map(x=>`${esc(x.id)}: ${dur(x.ttfb_ms_ewma)}, ${x.goodput_mbps_ewma.toFixed(1)} Mbps, ${((x.miss_rate||0)*100).toFixed(1)}% miss, ${(x.err_rate*100).toFixed(1)}% err`).join("<br>");
+ dashboard.innerHTML=`node <b>${s.node_id}</b> · uptime ${dur((s.uptime_s||0)*1000)}<br>${esc(s.backend)}<br>head ${s.spool.head_seq} · backlog ${s.spool.journal_backlog}<br>${s.spool.last_ship_error?'<span class="bad">'+esc(s.spool.last_ship_error)+'</span>':'sync healthy'}<br>epoch ${s.epoch.active?esc(s.epoch.epoch_id):"inactive"} · designations ${s.designations.length}<br><br>${bytes(s.cache.used_bytes)} / ${bytes(s.cache.budget_bytes)} · ${s.cache.chunks} chunks<br>pinned ${bytes(s.cache.pinned_bytes||0)}<br>peer hits ${s.coop.peer_hits} · misses ${s.coop.peer_misses||0} · errs ${s.coop.peer_errors||0} · S3 ${s.coop.s3_fetches} · hedges ${s.coop.hedges_fired}`;
+ const plist=s.p2p.peers||[];
+ peers.innerHTML=plist.length
+  ?`<table class="compact"><tr><th></th><th>host</th><th class="num">seen</th><th class="num">lat</th><th class="num">BW</th><th class="num">hit %</th><th class="num">miss %</th><th class="num">err %</th></tr>${plist.map(peerRow).join("")}</table>`
+  :'<span class="muted">no peers</span>';
  leases.innerHTML=(s.partitions||[]).map(p=>`${esc(p.id)} ${esc(p.root_path)} · holder ${p.lease.holder} · epoch ${p.lease.epoch} · expires ${dur(p.lease.expires_in_ms)} <button onclick="releasePart('${esc(p.id)}')">Force release</button>`).join("<br>")||"p0 unavailable";
  }catch(e){health.innerHTML='<span class="bad">disconnected</span>';}
  finally{refreshing=false;}}
