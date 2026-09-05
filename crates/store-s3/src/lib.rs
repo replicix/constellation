@@ -5,6 +5,7 @@
 
 pub mod aws_auth;
 pub mod codec;
+pub mod decode_gate;
 pub mod designation;
 pub mod e2e;
 pub mod error;
@@ -21,6 +22,7 @@ pub mod store;
 pub use aws_auth::amazon_s3_builder;
 
 pub use codec::{Codec, CompressionSetting};
+pub use decode_gate::{DecodeGate, DecodeGatePermit, Priority as DecodePriority};
 pub use designation::{Designation, DesignationMode, DesignationStore, DesignationTag};
 pub use e2e::{
     change_passphrase, load_keyring, put_keyring, Argon2Params, E2eKeys, Keyring, SharedE2eKeys,

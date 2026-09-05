@@ -19,7 +19,7 @@ use constellation_net::bloom::{
     bucket_count_for, bucket_index, ENTRIES_PER_BUCKET, MAX_BITS_BYTES, MAX_BUCKETS,
 };
 use constellation_net::{Bloom, PathKind, Payload, Peers};
-use constellation_store_s3::ChunkStore;
+use constellation_store_s3::{ChunkStore, DecodePriority};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -399,6 +399,16 @@ impl Coop {
     }
 
     async fn fetch_uncached(&self, hash: &ChunkHash, read_back: bool) -> Result<Fetched> {
+        // `read_back` already tells us whether the application is blocked
+        // on this fetch (`fetch`) or it is speculative readahead nobody is
+        // waiting on yet (`fetch_for_prefetch`) — reuse that as the E2E
+        // decode-gate priority rather than threading a second flag with
+        // the same meaning through every helper below.
+        let priority = if read_back {
+            DecodePriority::Demand
+        } else {
+            DecodePriority::Background
+        };
         let cands = self.candidates(hash);
         let size = u64::from(self.chunk_size);
         let (primary, hedge, deadline) = {
@@ -411,7 +421,7 @@ impl Coop {
             (primary, hedge, deadline)
         };
 
-        let primary_f = self.fetch_from(primary, hash);
+        let primary_f = self.fetch_from(primary, hash, priority);
         tokio::pin!(primary_f);
         let result = if let Some(hsrc) = hedge {
             let sleep = tokio::time::sleep(Duration::from_millis(deadline));
@@ -420,7 +430,7 @@ impl Coop {
                 _ = sleep => {
                     self.counters.hedges_fired.fetch_add(1, Ordering::Relaxed);
                     self.selector.lock().unwrap().begin(hsrc);
-                    let hedge_f = self.fetch_from(hsrc, hash);
+                    let hedge_f = self.fetch_from(hsrc, hash, priority);
                     tokio::pin!(hedge_f);
                     tokio::select! {
                         r = &mut primary_f => {
@@ -464,7 +474,7 @@ impl Coop {
                     match self.settle(
                         hash,
                         SourceId::S3,
-                        self.fetch_from(SourceId::S3, hash).await,
+                        self.fetch_from(SourceId::S3, hash, priority).await,
                         read_back,
                     ) {
                         Some(fetched) => Ok(fetched),
@@ -570,9 +580,14 @@ impl Coop {
     /// Both arms report first-byte and end-to-end separately, because
     /// the selector learns TTFB and goodput as independent terms — one
     /// combined duration would leave goodput frozen at its prior.
-    async fn fetch_from(&self, src: SourceId, hash: &ChunkHash) -> FetchResult {
+    async fn fetch_from(
+        &self,
+        src: SourceId,
+        hash: &ChunkHash,
+        priority: DecodePriority,
+    ) -> FetchResult {
         if src == SourceId::S3 {
-            return self.fetch_s3_spilled(hash).await;
+            return self.fetch_s3_spilled(hash, priority).await;
         }
         let t0 = Instant::now();
         let (data, ttfb, rtt, path) = match src {
@@ -601,7 +616,7 @@ impl Coop {
         }
     }
 
-    async fn fetch_s3_spilled(&self, hash: &ChunkHash) -> FetchResult {
+    async fn fetch_s3_spilled(&self, hash: &ChunkHash, priority: DecodePriority) -> FetchResult {
         for attempt in 0..S3_FETCH_ATTEMPTS {
             let Ok(mut spill) = self.cache.begin_spill() else {
                 return FetchResult::Fail;
@@ -611,7 +626,7 @@ impl Coop {
                     return FetchResult::Fail;
                 };
                 self.store
-                    .get_chunk_to_writer_e2e(hash, &mut cipher, &mut spill)
+                    .get_chunk_to_writer_e2e(hash, &mut cipher, &mut spill, priority)
                     .await
             } else {
                 self.store.get_chunk_to_writer(hash, &mut spill).await

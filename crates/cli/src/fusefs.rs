@@ -20,7 +20,7 @@ use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest, SparseChunks};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
 use constellation_meta::{MetaError, MetaStore, SqliteMeta};
-use constellation_store_s3::{ChunkStore, CompressionSetting};
+use constellation_store_s3::{ChunkStore, CompressionSetting, DecodePriority};
 use fuser::{
     BsdFileFlags, Errno, FileHandle, FileType, Filesystem, INodeNo, InitFlags, KernelConfig,
     LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -1113,40 +1113,68 @@ impl ConstellationFs {
             self.scan.note_stall(ino);
         }
         if let Some(coop) = &self.coop {
-            return self.rt.block_on(coop.fetch(hash)).map_err(|_| libc::EIO);
+            return self.rt.block_on(coop.fetch(hash)).map_err(|error| {
+                tracing::warn!(
+                    hash = %hash.to_hex(),
+                    error = %error,
+                    "coop fetch failed"
+                );
+                libc::EIO
+            });
         }
         let mut data = None;
+        let mut last_error = None;
         for attempt in 0..3 {
             let fetched = (|| {
-                let mut spill = self.cache.begin_spill().map_err(|_| ())?;
+                let mut spill = self
+                    .cache
+                    .begin_spill()
+                    .map_err(|e| format!("begin_spill (plain): {e}"))?;
                 let result = if self.store.is_e2e() {
-                    let mut cipher = self.cache.begin_spill().map_err(|_| ())?;
+                    let mut cipher = self
+                        .cache
+                        .begin_spill()
+                        .map_err(|e| format!("begin_spill (cipher): {e}"))?;
                     self.rt.block_on(self.store.get_chunk_to_writer_e2e(
                         hash,
                         &mut cipher,
                         &mut spill,
+                        DecodePriority::Demand,
                     ))
                 } else {
                     self.rt
                         .block_on(self.store.get_chunk_to_writer(hash, &mut spill))
                 }
-                .map_err(|_| ())?;
+                .map_err(|e| format!("get_chunk_to_writer: {e}"))?;
                 let _ = result;
-                spill.rewind().map_err(|_| ())?;
+                spill.rewind().map_err(|e| format!("spill rewind: {e}"))?;
                 let mut bytes = Vec::new();
-                spill.read_to_end(&mut bytes).map_err(|_| ())?;
+                spill
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| format!("spill read_to_end: {e}"))?;
                 let _ = self.cache.commit_spill(hash, spill, ChunkState::Clean);
-                Ok::<_, ()>(bytes)
+                Ok::<_, String>(bytes)
             })();
-            if let Ok(bytes) = fetched {
-                data = Some(bytes);
-                break;
+            match fetched {
+                Ok(bytes) => {
+                    data = Some(bytes);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
             }
             if attempt < 2 {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
-        let data = data.ok_or(libc::EIO)?;
+        let data = data.ok_or_else(|| {
+            tracing::warn!(
+                hash = %hash.to_hex(),
+                attempts = 3,
+                error = last_error.as_deref().unwrap_or("unknown"),
+                "direct S3 chunk fetch failed after retries"
+            );
+            libc::EIO
+        })?;
         Ok(data)
     }
 
@@ -1557,7 +1585,13 @@ impl ConstellationFs {
             dirty_hashes,
             |base, manifest_bytes, file_len, dirty_hashes| {
                 self.meta
-                    .set_manifest_dirty(ino, Some(&base.encode()), manifest_bytes, file_len, dirty_hashes)
+                    .set_manifest_dirty(
+                        ino,
+                        Some(&base.encode()),
+                        manifest_bytes,
+                        file_len,
+                        dirty_hashes,
+                    )
                     .map_err(mutate_fail)
             },
         )
@@ -1596,7 +1630,9 @@ impl ConstellationFs {
                 // the same chunk the very first attempt (if any)
                 // already drained.
                 for hash in dirty_hashes {
-                    self.meta.add_pending_upload(hash, ino).map_err(mutate_fail)?;
+                    self.meta
+                        .add_pending_upload(hash, ino)
+                        .map_err(mutate_fail)?;
                 }
                 self.drain_inode(ino).map_err(MutateFail::Errno)?;
                 self.mutate_op_rebasable(

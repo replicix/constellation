@@ -268,6 +268,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: e2e_spilled_manifest_cold_read,
     },
     Scenario {
+        name: "e2e-decode-priority",
+        desc: "a demand read stays fast while a concurrent bulk E2E download saturates the decode gate",
+        requires: &[],
+        run: e2e_decode_priority,
+    },
+    Scenario {
         name: "scan-ahead",
         desc: "ordered cold reads of many small files pipeline across file boundaries",
         requires: &[],
@@ -2690,6 +2696,102 @@ fn e2e_spilled_manifest_cold_read(_seed: u64) -> Result<()> {
         "    e2e-spilled-manifest: {n_chunks}-chunk E2E file cold-read intact \
          ({} bytes)",
         read.len()
+    );
+    c.unmount()?;
+    Ok(())
+}
+
+/// A demand read of an unrelated file must not queue behind a concurrent
+/// bulk E2E download's decrypts.
+///
+/// Whole-object E2E decrypt is serialized (`decode_gate` in `store.rs`) to
+/// bound peak RSS: only one chunk's plaintext may be materializing at a
+/// time. Before this fix that gate was a plain FIFO semaphore, so a demand
+/// read landing after a deep background prefetch backlog had already
+/// queued its decrypts would wait its turn behind all of them. The gate
+/// now gives a demand (foreground) decrypt priority over background
+/// (prefetch) ones — see `decode_gate.rs` for the unit-level proof of the
+/// ordering; this scenario is the end-to-end sanity check that the wiring
+/// (prefetch, the direct fetch fallback, and cooperative-cache fetch all
+/// pass the right priority) actually works and nothing deadlocks or
+/// corrupts data under real concurrent load.
+fn e2e_decode_priority(_seed: u64) -> Result<()> {
+    let (env, root) = setup("e2e-decode-priority")?;
+    let proxy = env.s3_proxy()?;
+    let prefix = format!("e2e-decode-prio-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut c = Client::new(root.path(), "c0", &env.endpoint, &backend)?
+        .with_e2e()
+        .with_cache_size(1 << 30);
+    c.fs_create()?;
+    c.mount()?;
+
+    // A wide bulk file so the prefetcher's adaptive window ramps up and
+    // keeps a non-trivial number of chunks in flight/decoding at once.
+    let n_bulk_chunks = 64u64;
+    let mut bulk = vec![0u8; (n_bulk_chunks * (1 << 20)) as usize];
+    for (i, byte) in bulk.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
+    let bulk_expected = blake3::hash(&bulk);
+    std::fs::write(c.mnt.join("bulk"), &bulk)?;
+    drop(bulk);
+
+    // A small, unrelated file. Its chunk is never touched by the bulk
+    // file's readahead, so this is a clean read of "someone else's data"
+    // contending only for the decode gate, not for a shared prefetch
+    // stream or the same bytes.
+    let small = b"a demand read must not wait behind a bulk backlog".repeat(64);
+    let small_expected = blake3::hash(&small);
+    std::fs::write(c.mnt.join("small"), &small)?;
+
+    c.unmount()?;
+    c.drop_cache()?;
+    c.mount().context("cold remount")?;
+    let latency_ms = 80u64;
+    proxy.latency(latency_ms, 0)?;
+
+    let (bulk_read, small_read, small_elapsed) = std::thread::scope(|scope| {
+        let bulk_task = scope.spawn(|| -> Result<Vec<u8>> {
+            std::fs::read(c.mnt.join("bulk")).context("bulk background read")
+        });
+        // Give the bulk prefetcher a moment to ramp concurrency and start
+        // queuing decrypts before the demand read arrives.
+        std::thread::sleep(Duration::from_millis(latency_ms * 2));
+        let started = std::time::Instant::now();
+        let small_read = std::fs::read(c.mnt.join("small")).context("demand read of small file");
+        let small_elapsed = started.elapsed();
+        let bulk_read = bulk_task.join().unwrap();
+        (bulk_read, small_read, small_elapsed)
+    });
+    proxy.heal()?;
+
+    let bulk_read = bulk_read?;
+    let small_read = small_read?;
+    anyhow::ensure!(
+        blake3::hash(&bulk_read) == bulk_expected,
+        "bulk background read was corrupted by concurrent demand traffic"
+    );
+    anyhow::ensure!(
+        blake3::hash(&small_read) == small_expected,
+        "demand read returned the wrong bytes"
+    );
+
+    // The demand read is one chunk: one GET RTT plus a near-instant
+    // decrypt if it did not queue behind the bulk backlog. A generous
+    // multiple of the injected RTT (not of the bulk file's total transfer
+    // time) tells apart "waited its turn" from "queued behind dozens of
+    // background decrypts."
+    let bound = Duration::from_millis(latency_ms * 6);
+    anyhow::ensure!(
+        small_elapsed < bound,
+        "demand read of an unrelated file took {small_elapsed:.1?} under a {n_bulk_chunks}-chunk \
+         concurrent bulk download ({latency_ms}ms RTT); bound was {bound:.1?} — the decode gate is \
+         not prioritizing demand reads"
+    );
+    eprintln!(
+        "    e2e-decode-priority: demand read finished in {small_elapsed:.1?} while a \
+         {n_bulk_chunks}-chunk bulk E2E download was in flight (bound {bound:.1?})"
     );
     c.unmount()?;
     Ok(())

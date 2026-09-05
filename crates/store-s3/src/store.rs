@@ -2,6 +2,7 @@
 //! (`meta.json`) lifecycle with conditional-create.
 
 use crate::codec::CompressionSetting;
+use crate::decode_gate::{DecodeGate, Priority as DecodePriority};
 use crate::e2e::{decrypt_object, encrypt_object, SharedE2eKeys};
 use crate::error::StoreError;
 use crate::{format, layout};
@@ -94,7 +95,9 @@ pub struct ChunkStore {
     encode_gate: Arc<tokio::sync::Semaphore>,
     /// Whole-object E2E decrypt briefly materializes encoded plaintext.
     /// Serialize it so simultaneous GET completions cannot multiply RSS.
-    decode_gate: Arc<tokio::sync::Semaphore>,
+    /// A demand (foreground) decrypt always cuts ahead of queued
+    /// background (prefetch) decrypts — see `decode_gate.rs`.
+    decode_gate: Arc<DecodeGate>,
 }
 
 const DEFAULT_MAX_ENCODE_CONCURRENCY: usize = 8;
@@ -145,7 +148,7 @@ impl ChunkStore {
             store,
             e2e,
             encode_gate: Arc::new(tokio::sync::Semaphore::new(concurrency.max(1))),
-            decode_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            decode_gate: Arc::new(DecodeGate::new(1)),
         }
     }
 
@@ -421,11 +424,20 @@ impl ChunkStore {
     ///
     /// Ciphertext streams into `cipher_spill`; only after the complete AEAD
     /// envelope is present is it mapped and authenticated in one shot.
+    ///
+    /// `priority` decides queue order at the decode gate, not the total
+    /// number of concurrent decrypts (that stays capped at 1 to bound
+    /// RSS). Pass [`DecodePriority::Demand`] for a read the caller is
+    /// blocked on right now, [`DecodePriority::Background`] for prefetch,
+    /// scan-ahead, or cooperative-cache warm — so a bulk background
+    /// backlog cannot make a foreground read wait behind an arbitrarily
+    /// deep decrypt queue.
     pub async fn get_chunk_to_writer_e2e(
         &self,
         hash: &ChunkHash,
         cipher_spill: &mut SpillFile,
         out: &mut (impl Write + Send),
+        priority: DecodePriority,
     ) -> Result<(u64, std::time::Duration, std::time::Duration), StoreError> {
         let Some(keys) = &self.e2e else {
             return self.get_chunk_to_writer(hash, out).await;
@@ -440,12 +452,7 @@ impl ChunkStore {
         }
         cipher_spill.flush()?;
 
-        let permit = self
-            .decode_gate
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| StoreError::Meta("chunk decoder gate closed".into()))?;
+        let permit = self.decode_gate.clone().acquire(priority).await;
         let mapping = unsafe { memmap2::Mmap::map(cipher_spill.as_file())? };
         let dek = keys.dek("p0")?;
         let aad = hash.0;
@@ -732,7 +739,7 @@ mod tests {
         let mut cipher = cache.begin_spill().unwrap();
         let mut plain = cache.begin_spill().unwrap();
         let (bytes, _, _) = s
-            .get_chunk_to_writer_e2e(&hash, &mut cipher, &mut plain)
+            .get_chunk_to_writer_e2e(&hash, &mut cipher, &mut plain, DecodePriority::Demand)
             .await
             .unwrap();
         assert_eq!(bytes, data.len() as u64);
