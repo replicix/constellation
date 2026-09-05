@@ -1,6 +1,6 @@
 # Plan 15 — Phase 8f: extended attributes
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plan 14 (8e)
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plan 14 (8e)
 committed (same FUSE files). Spec: `docs/DESIGN.md` §12
 (`user.constellation.rsize` xattr; unix metadata). Do not edit
 DESIGN.md.

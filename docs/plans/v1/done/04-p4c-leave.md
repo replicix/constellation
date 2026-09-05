@@ -1,6 +1,6 @@
 # Plan 04c — Phase 4c: `constellation leave`
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plans 00–04
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–04
 committed (leases, P2P, pin/offline, continuation epochs). Spec:
 `docs/DESIGN.md` §1 / §8 (membership = bucket access, self-enrollment),
 §5.3 (write-eligible roster is every non-RO registry record), §9

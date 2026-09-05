@@ -1,10 +1,6 @@
 # Progress
 
-> **Frozen (v1.0).** Historical status against
-> [ROADMAP.md](ROADMAP.md). Do not update for new work.
-
-Status of the implementation against ROADMAP.md as of the close of the
-initial implementation phase.
+Status of the implementation against [ROADMAP.md](ROADMAP.md).
 
 ## Phase 1 — Single-node FUSE on S3: **IN PROGRESS (~90%)**
 
@@ -110,7 +106,7 @@ gap and RAM scaling linearly with file size — are **closed by phase
 **Verdict: phase 5a is functionally complete.** This plan deliberately
 does not add streaming/eager writeback, throttling short of the hard
 `ENOSPC` bound, or slice overlays — all out of scope, deferred to
-phase 5b (`docs/plans/05b-p5b-streaming-writeback.md`).
+phase 5b (`docs/plans/v1/done/05b-p5b-streaming-writeback.md`).
 
 ### Known visibility limit (not scheduled)
 
@@ -956,5 +952,5 @@ Live mounted throughput scaling was not measured on this host because
 ## Later phases
 
 Phases 1–8f are closed. Phase 9 automated crash reporting remains future work.
-Deferred format/data-plane items remain listed in `docs/ROADMAP.md` and the
+Deferred format/data-plane items remain listed in `docs/plans/v1/ROADMAP.md` and the
 phase-specific scope notes above.

@@ -1,6 +1,6 @@
 # Plan 12 — Phase 8c: existence bloom for cold high-dedup uploads
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plans 00–10
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–10
 committed (phase 8b is `8d98ac8` / `4c77b4a`). Spec: `docs/DESIGN.md`
 §2 (chunk key sharding / LIST parallelism), §7 (bloom parameters;
 peer digests are cache membership, not S3 membership), §14 rule 2

@@ -2,7 +2,7 @@
 
 You are executing one implementation plan for **Constellation**, a
 distributed POSIX filesystem on S3, written in Rust, living at the repo
-root (this file is `docs/plans/CONVENTIONS.md`). Read this file fully
+root (this file is `docs/plans/v1/CONVENTIONS.md`). Read this file fully
 before starting any plan. Every plan file assumes you did.
 
 ## Ground rules
@@ -19,15 +19,15 @@ before starting any plan. Every plan file assumes you did.
 4. Never weaken an existing test/scenario to make it pass unless the
    plan explicitly authorizes it. Fixing a test's *bug* is fine —
    loosening its assertion is not.
-5. Do not edit `docs/DESIGN.md` (the spec). If you find a genuine
+5. Do not edit `docs/explanation/DESIGN.md` (the spec). If you find a genuine
    contradiction between the spec and reality, implement what the plan
-   says and record the contradiction in `docs/PROGRESS.md`.
+   says and record the contradiction in `docs/plans/v1/PROGRESS.md`.
 
 ## Orientation (read in this order, skim where obvious)
 
-- `docs/DESIGN.md` — the system spec. Each plan names its sections.
-- `docs/ROADMAP.md`, `docs/PROGRESS.md` — what exists, what is next.
-- `docs/TESTING.md` — the test lanes and the fault-injection harness.
+- `docs/explanation/DESIGN.md` — the system spec. Each plan names its sections.
+- `docs/plans/v1/ROADMAP.md`, `docs/plans/v1/PROGRESS.md` — what exists, what is next.
+- `docs/how-to-guides/development/TESTING.md` — the test lanes and the fault-injection harness.
 - Crates: `fs-core` (chunking, manifests, disk cache), `store-s3`
   (S3 layout/chunk store/log store/nodes/lease), `meta` (SQLite
   replica, log records, convergent replay), `api` (control API types +
@@ -72,9 +72,9 @@ Every plan ends with ALL of these green, run in this order:
 5. `docker compose --profile test run --rm compliance` — pjdfstest
    stays a FULL pass (8798/8798, empty baseline). Constellation has no
    compliance exceptions; do not add any.
-6. `docs/PROGRESS.md` updated: add your milestone's table rows
+6. `docs/plans/v1/PROGRESS.md` updated: add your milestone's table rows
    (item / state / where) and exit-criteria checklist in the
-   established style. `docs/TESTING.md` updated if you added scenarios.
+   established style. `docs/how-to-guides/development/TESTING.md` updated if you added scenarios.
 
 ## Code style
 

@@ -1,6 +1,6 @@
 # Plan 03 — Phase 4a: pin/unpin + offline designation
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plans 00–02
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–02
 committed (leases, partitions, P2P). Spec: `docs/DESIGN.md` §7
 (pin/unpin), §5.2 (offline designation), §5 availability matrix.
 Continuation epochs and reintegration are plan 04 — NOT here.

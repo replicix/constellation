@@ -13,5 +13,6 @@ that matches what you need:
 Meta: [Documentation guide](documentation-guide/) — where new docs go and
 templates to use.
 
-Historical: [history/v1/](history/v1/) — frozen record of the initial
-implementation phase (roadmap, progress, work plans). Do not extend it.
+Plans: [plans/v1/](plans/v1/) — sequenced implementation plans
+([done](plans/v1/done/), [wip](plans/v1/wip/)), plus the v1 roadmap and
+progress log.

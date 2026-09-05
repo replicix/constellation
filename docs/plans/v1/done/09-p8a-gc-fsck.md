@@ -1,6 +1,6 @@
 # Plan 09 — Phase 8a: garbage collection + fsck --repair
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plans 00–08
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–08
 committed. Spec: `docs/DESIGN.md` §14 "Garbage Collection" (follow it
 rule by rule — it is prescriptive about the race defenses) and §10
 (`gc run|verify`, `fsck [--repair]`).

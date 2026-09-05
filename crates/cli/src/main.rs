@@ -2578,7 +2578,7 @@ use constellation_upload_concurrency::{AdaptiveConcurrency, ConcurrencyGate, Con
 /// at once regardless of how many rows `pending_upload` has queued.
 const UPLOAD_CONCURRENCY_HARD_MAX: usize = 128;
 
-/// See docs/explanation/DESIGN.md §5b step 2 / `docs/history/v1/plans/05b-p5b-streaming-writeback.md`.
+/// See docs/explanation/DESIGN.md §5b step 2 / `docs/plans/v1/done/05b-p5b-streaming-writeback.md`.
 /// A durable pending-upload queue in SQLite is drained by a bounded pool;
 /// the pool costs two things once it exists (dedup-probe RTT and the
 /// create-vs-overwrite decision), both handled by `put_mode` below.

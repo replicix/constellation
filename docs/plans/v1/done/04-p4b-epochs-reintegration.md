@@ -1,6 +1,6 @@
 # Plan 04 — Phase 4b: continuation epochs + reintegration
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plans 00–03
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–03
 committed. Spec: `docs/DESIGN.md` §5.3 (continuation epochs), §9
 failure table ("lease holder vanishes", S3-outage rows), §6 relaxed
 mode's "conflicts detected and materialized, never silent". This plan

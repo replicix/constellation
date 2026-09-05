@@ -1,6 +1,6 @@
 # Plan 06 — Phase 6a: snapshots, clones, subtree mounts
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plans 00–05
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–05
 committed. Spec: `docs/DESIGN.md` §13 "Snapshots and Clones" —
 follow it precisely; the section is prescriptive. Log ops
 `snap_create`, `snap_delete`, `clone` are already reserved in the op

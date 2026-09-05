@@ -1,8 +1,8 @@
 # Constellation Design
 
 Companion documents: [GOALS.md](GOALS.md), [DECISIONS.md](DECISIONS.md),
-[TESTING.md](../how-to-guides/development/TESTING.md). The original v1
-phased roadmap is frozen at [ROADMAP.md](../history/v1/ROADMAP.md).
+[TESTING.md](../how-to-guides/development/TESTING.md). The v1 phased
+roadmap is at [ROADMAP.md](../plans/v1/ROADMAP.md).
 
 ## 1. Overview
 

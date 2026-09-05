@@ -1,6 +1,6 @@
 # Plan 00 — Verify and finish milestone M3.1 (lease-based write authority)
 
-Read `docs/plans/CONVENTIONS.md` first. This plan is special: the
+Read `docs/plans/v1/CONVENTIONS.md` first. This plan is special: the
 working tree ALREADY CONTAINS the milestone's implementation,
 uncommitted. Your job is to verify it end-to-end, fix what is broken,
 and finish its documentation. Expect mostly-working code; do not

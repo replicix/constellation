@@ -12,8 +12,8 @@ the web UI, fsck/GC, and release hardening. Linux is the fully exercised
 platform; macOS receives build and mount-less test coverage, while FUSE
 mount behavior requires macFUSE and remains less battle-tested. Automated
 crash reporting remains future work. See
-[docs/history/v1/PROGRESS.md](docs/history/v1/PROGRESS.md) for the v1
-implementation evidence (frozen).
+[docs/plans/v1/PROGRESS.md](docs/plans/v1/PROGRESS.md) for the v1
+implementation evidence.
 
 Current write-path features include:
 
@@ -83,7 +83,7 @@ Docs follow [Diátaxis](https://diataxis.fr/). Start at
 | [docs/how-to-guides/development/TESTING.md](docs/how-to-guides/development/TESTING.md) | correctness strategy: property tests, deterministic simulation, POSIX suites, e2e scenarios |
 | [docs/how-to-guides/development/RELEASING.md](docs/how-to-guides/development/RELEASING.md) | release artifacts and tag checklist |
 | [docs/reference/configuration.md](docs/reference/configuration.md) | runtime environment variables and defaults |
-| [docs/history/v1/](docs/history/v1/) | frozen v1 roadmap, progress, and implementation plans |
+| [docs/plans/v1/](docs/plans/v1/) | v1 roadmap, progress, and implementation plans (`done/` / `wip/`) |
 
 ## Layout
 

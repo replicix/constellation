@@ -1,6 +1,6 @@
 # Plan 01 — M3.2: Partitions (automatic split/merge, cross-partition rename)
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisite: plan 00 done
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisite: plan 00 done
 (leases verified and committed). Spec: `docs/DESIGN.md` §4
 "Partitions", §4 "Metadata log" (per-partition streams), and the log
 op registry (`part_split`, `part_merge`, `rename_xpart`).

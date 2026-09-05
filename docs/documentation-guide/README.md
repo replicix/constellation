@@ -14,7 +14,8 @@ explanations of what belongs in each section:
 - **reference**: technical description of how specific things within this
   project work (APIs, formats, CLI surfaces)
 - **tutorials**: learning-oriented experiences to get you up to speed
-- **history**: frozen archives of completed phases; not living docs
+- **plans**: sequenced implementation plans under `plans/vX/{wip,done}`,
+  with companion roadmap and progress logs per version
 
 ## Documentation templates
 

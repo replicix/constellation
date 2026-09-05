@@ -1,7 +1,7 @@
 # Plan 11 — Phase 9: secure automated crash reporting pipeline
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plans 00–10
-committed (this is post-v1 work). Spec: `docs/ROADMAP.md` phase 9 —
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–10
+committed (this is post-v1 work). Spec: `docs/plans/v1/ROADMAP.md` phase 9 —
 capture and centralize crashes without exposing customer PII or
 proprietary strings in the client binary.
 

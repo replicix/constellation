@@ -1,8 +1,7 @@
 # Plan 16 — Phase 10a: adaptive prefetch, streaming fetch, scan-ahead
 
-Read `docs/history/v1/plans/CONVENTIONS.md` first (ground rules, gates,
-build commands — they all still apply; the plans directory moved, the
-rules did not). Spec: `docs/explanation/DESIGN.md` §7 ("Prefetcher
+Read `docs/plans/v1/CONVENTIONS.md` first (ground rules, gates,
+build commands). Spec: `docs/explanation/DESIGN.md` §7 ("Prefetcher
 (after mountpoint-s3): per-handle sequential detection, adaptive
 readahead … reset on seek"). The current implementation falls short of
 that spec; this plan implements it properly and extends it. Do not

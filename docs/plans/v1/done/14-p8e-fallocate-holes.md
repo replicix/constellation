@@ -1,6 +1,6 @@
 # Plan 14 — Phase 8e: fallocate, hole punching, sparse manifests
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plan 13 (8d)
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plan 13 (8d)
 committed. Spec: `docs/DESIGN.md` §3 (manifests, holes), §12
 (`fallocate`/`truncate` as metadata-only; `SEEK_HOLE`/`SEEK_DATA`).
 Do not edit DESIGN.md.

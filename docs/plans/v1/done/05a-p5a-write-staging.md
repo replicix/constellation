@@ -1,6 +1,6 @@
 # Plan 05a — Phase 5a: bounded-memory write staging
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plans 00–05
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–05
 committed. Spec: `docs/DESIGN.md` §7 (cache states: `dirty` is never
 evicted until uploaded), §9 (reserve-before-accept, the "evict → throttle
 → ENOSPC" ladder), §6 (close-to-open). Roadmap exit: a file many times

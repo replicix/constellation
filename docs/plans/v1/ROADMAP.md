@@ -1,8 +1,7 @@
-# Constellation Roadmap
+# Constellation Roadmap (v1)
 
-> **Closed (v1.0).** This roadmap covered the initial implementation through
-> phases 1–8. It is frozen historical reference under `docs/history/v1/`.
-> Do not extend it; future work belongs in the living Diátaxis docs tree.
+Phased milestones for the v1 implementation. Sequenced work orders live
+under [`done/`](done/) and [`wip/`](wip/); see [`README.md`](README.md).
 
 Phases build strictly on each other; each ends with its TESTING.md layers
 green. The control API exists from phase 1 (the CLI is its first client).

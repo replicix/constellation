@@ -1,6 +1,6 @@
 # Plan 08 — Phase 7: web UI over the control API
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plans 00–07
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–07
 committed. Spec: `docs/DESIGN.md` §10 "Control Plane". Roadmap exit:
 UI feature parity with the CLI, same API, verified by shared tests.
 

@@ -1,6 +1,6 @@
 # Plan 05b — Phase 5b: streaming writes and the write-back policy
 
-Read `docs/plans/CONVENTIONS.md` first. Prerequisites: plans 00–05 and
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–05 and
 **05a** committed — this plan drains the staging area chunk by chunk and
 relies on the durable `pending_upload` table for crash-safe tracking of
 what still owes S3 a PUT. Spec: `docs/DESIGN.md` "Streaming writes:
