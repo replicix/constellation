@@ -18,7 +18,13 @@ const DEFAULT_MIN_WINDOW: u64 = 8 << 20;
 const DEFAULT_MAX_WINDOW: u64 = 2 << 30;
 const DEFAULT_MAX_CONCURRENCY: usize = 128;
 const ABSOLUTE_MAX_CONCURRENCY: usize = 512;
-const INITIAL_CONCURRENCY: usize = 8;
+/// Opening background-fetch concurrency. A high-latency S3 path needs many
+/// requests in flight before it delivers useful throughput (measured: ~1.3 s
+/// per 4 MiB GET, so 8 requests cap a cold stream near 24 Mbps). Slow-start
+/// from 8 wasted tens of seconds on a 200 ms path before the controller found
+/// the knee, so open at a value the sweep shows is safe on a thin link and let
+/// AIMD search upward from there.
+const INITIAL_CONCURRENCY: usize = 32;
 const QUEUE_ROUNDS: usize = 2;
 
 struct Stream {
@@ -26,6 +32,10 @@ struct Stream {
     window: u64,
     last_hit: Instant,
     sequential: bool,
+    /// First chunk index not yet handed to the scheduler. Readahead is
+    /// enqueued incrementally from here, so a grown window costs one pass
+    /// over its leading edge rather than a full rescan on every read.
+    next_index: u64,
 }
 
 #[derive(Default)]
@@ -372,6 +382,7 @@ impl Prefetcher {
     /// background fetches for upcoming chunks.
     pub fn on_read(&self, ino: Ino, offset: u64, len: u64, chunk_size: u32, hashes: &SparseChunks) {
         let now = Instant::now();
+        let chunk_bytes = u64::from(chunk_size).max(1);
         let (sequential, cursor, window, active_streams) = {
             let mut streams = self.streams.lock().unwrap();
             let stale: Vec<Ino> = streams
@@ -411,6 +422,7 @@ impl Prefetcher {
                         window: self.min_window,
                         last_hit: now,
                         sequential: false,
+                        next_index: end / chunk_bytes,
                     };
                 }
                 None => {
@@ -422,6 +434,7 @@ impl Prefetcher {
                             window: self.min_window,
                             last_hit: now,
                             sequential,
+                            next_index: end / chunk_bytes,
                         },
                     );
                 }
@@ -441,20 +454,31 @@ impl Prefetcher {
         if !sequential || hashes.is_empty() {
             return;
         }
-        let chunk_size = u64::from(chunk_size);
         let window = scheduled_window(
             window,
-            chunk_size,
+            chunk_bytes,
             self.scheduler.gate.target(),
             active_streams,
             self.max_window,
         );
-        if let Some(stream) = self.streams.lock().unwrap().get_mut(&ino) {
+        // Enqueue only the newly exposed leading edge. `next_index` also
+        // skips forward past the reader's cursor so a stream that outran its
+        // own readahead does not re-offer chunks it has already consumed.
+        let last = cursor.saturating_add(window).div_ceil(chunk_bytes);
+        let first = {
+            let mut streams = self.streams.lock().unwrap();
+            let Some(stream) = streams.get_mut(&ino) else {
+                return;
+            };
             stream.window = stream.window.max(window);
-        }
+            let first = stream.next_index.max(cursor.div_ceil(chunk_bytes));
+            stream.next_index = first.max(last);
+            first
+        };
         self.stats.windows.lock().unwrap().insert(ino, window);
-        let first = cursor.div_ceil(chunk_size);
-        let last = cursor.saturating_add(window).div_ceil(chunk_size);
+        if first >= last {
+            return;
+        }
         self.scheduler.enqueue(
             ino,
             (first..last).filter_map(|index| hashes.get(&index).copied()),
@@ -462,8 +486,13 @@ impl Prefetcher {
     }
 
     /// Grow a live stream's byte window when a demand read waits for data.
+    /// Random-access streams are left alone: a miss there is not evidence
+    /// that readahead is running behind.
     pub fn note_stall(&self, ino: Ino) {
         if let Some(stream) = self.streams.lock().unwrap().get_mut(&ino) {
+            if !stream.sequential {
+                return;
+            }
             stream.window = stream.window.saturating_mul(2).min(self.max_window);
             self.stats.stalls.fetch_add(1, Ordering::Relaxed);
             self.stats
@@ -691,6 +720,57 @@ mod tests {
         hashes.insert(17, hash(1));
         prefetch.on_read(7, 64 << 20, 128 << 10, 4 << 20, &hashes);
         assert!(prefetch.scheduler.queues.lock().unwrap().ready.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sequential_reads_enqueue_each_chunk_at_most_once() {
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::open(dir.path(), 1 << 30).unwrap());
+        let prefetch = Prefetcher::new(
+            Handle::current(),
+            Arc::new(ChunkStore::new(Arc::new(InMemory::new()))),
+            cache,
+            None,
+        );
+        let mut hashes = SparseChunks::new();
+        for index in 0..64 {
+            hashes.insert(index, hash(index as u8));
+        }
+        // Walk the first four chunks in 1 MiB steps. Re-enqueue attempts show
+        // up as repeated queue growth for already-offered chunks.
+        for step in 0..16u64 {
+            prefetch.on_read(7, step << 20, 1 << 20, 4 << 20, &hashes);
+        }
+        let queues = prefetch.scheduler.queues.lock().unwrap();
+        let queued = queues.by_stream.get(&7).map_or(0, |pending| pending.len());
+        assert_eq!(
+            queued,
+            queues.reserved.len(),
+            "every reserved chunk must be queued exactly once"
+        );
+        let unique: HashSet<_> = queues.by_stream[&7].iter().copied().collect();
+        assert_eq!(unique.len(), queued, "a chunk was enqueued twice");
+    }
+
+    #[tokio::test]
+    async fn random_access_stalls_do_not_inflate_the_window() {
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::open(dir.path(), 1 << 30).unwrap());
+        let prefetch = Prefetcher::new(
+            Handle::current(),
+            Arc::new(ChunkStore::new(Arc::new(InMemory::new()))),
+            cache,
+            None,
+        );
+        let mut hashes = SparseChunks::new();
+        hashes.insert(17, hash(1));
+        prefetch.on_read(7, 64 << 20, 128 << 10, 4 << 20, &hashes);
+        prefetch.note_stall(7);
+        assert_eq!(
+            prefetch.streams.lock().unwrap()[&7].window,
+            prefetch.min_window
+        );
+        assert_eq!(prefetch.stats.snapshot().stalls, 0);
     }
 
     #[tokio::test]

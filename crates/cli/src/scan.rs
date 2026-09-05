@@ -16,7 +16,7 @@ const MAX_FORWARD_SKIP: usize = 8;
 const MAX_SCANS: usize = 512;
 const MAX_ORDER_ENTRIES: usize = 65_536;
 const MAX_DFS_DEPTH: usize = 16;
-const SCAN_IDLE: Duration = Duration::from_secs(2);
+const SCAN_IDLE: Duration = Duration::from_secs(60);
 const MIN_WINDOW: u64 = 16 << 20;
 const MAX_WINDOW: u64 = 256 << 20;
 

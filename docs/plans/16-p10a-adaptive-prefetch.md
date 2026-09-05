@@ -16,6 +16,14 @@ remains a manual follow-up. Follow-up tuning keeps slow WAN fetches alive for
 rebalances active requests when another stream appears, and lets demand reads
 claim queued chunks without issuing duplicate GETs.
 
+Measured on the real EU→us-west-2 path (1 GiB cold sequential read of
+`bigfile`, `cache prune` between runs) the tuning moved a mount from
+9.22 MiB/s to 23.63 MiB/s, against a 27.74 MiB/s direct-boto3 ceiling at the
+same concurrency of 128. The last two thirds of that gain came from raising the
+opening gate to 32 and enqueueing only each read's newly exposed leading edge —
+slow-start from 8 left the first ~33 s below 3 MiB/s, and rescanning a
+multi-hundred-chunk window on every 1 MiB read held the dispatcher's lock.
+
 ## Problem (measured)
 
 Cold sequential read of a large file from an EU client against a
@@ -218,7 +226,9 @@ growth would stampede. Add one global scheduler owned by the
   ConcurrencyGate}` for one mount-wide S3 background-fetch gate. Start
   at 8 (the existing readahead depth and the latency-efficient floor in
   the local mountpoint-S3 benchmark) and slow-start toward
-  `prefetch_max_concurrency` (default 128).
+  `prefetch_max_concurrency` (default 128). Revised after WAN measurement:
+  the opening target is 32, because slow-start from 8 held a cold 200 ms
+  path under 3 MiB/s for its first ~33 seconds.
   Feed it actual S3-leg bytes and service time only: a peer completion,
   cache hit, losing hedge, or logical bytes not transferred must not
   inflate measured goodput. Errors/timeouts are congestion signals.
