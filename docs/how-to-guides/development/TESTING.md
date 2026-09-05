@@ -183,7 +183,11 @@ criterion), `cold-cache`, `two-clients-disjoint`,
 data purely from S3 — checkpoint restore plus log replay — and must
 match the model exactly), `readahead` (cold sequential read of a
 multi-chunk file under injected latency must beat the serial-fetch
-floor, proving the prefetcher pipelines). Suite-under-fault scenarios
+floor, proving the prefetcher pipelines), `readahead-adaptive` (a
+128-chunk read under 200 ms latency must expand the byte window and beat
+one-sixth of the serial floor), and `scan-ahead` (200 small files read
+in directory order under 60 ms latency must beat one-quarter of the
+serial floor). Suite-under-fault scenarios
 run the external tools from the stress lane through the same fault
 injector: `fio-latency` (crc32c-verified random writes under 80 ms S3
 latency), `fio-blips` (fio verify while S3 is cut for 800 ms every

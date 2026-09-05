@@ -12,8 +12,8 @@ pub mod web;
 pub use types::{
     CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry, DoctorStatus,
     DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus, P2pStatus,
-    PartitionStatus, PeerStatus, PinStatus, ReintegrationStatus, Request, Response, SnapshotStatus,
-    SourceStatus, SpoolStatus, StatusReport, WritebackStatus,
+    PartitionStatus, PeerStatus, PinStatus, PrefetchStatus, ReintegrationStatus, Request, Response,
+    SnapshotStatus, SourceStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -300,6 +300,7 @@ mod tests {
                 epoch: EpochStatus::default(),
                 reintegration: ReintegrationStatus::default(),
                 coop: CoopStatus::default(),
+                prefetch: PrefetchStatus::default(),
                 writeback: WritebackStatus::default(),
                 forwarded_ok: 0,
                 forwarded_err: 0,
@@ -478,6 +479,7 @@ mod tests {
                 epoch: EpochStatus::default(),
                 reintegration: ReintegrationStatus::default(),
                 coop: CoopStatus::default(),
+                prefetch: PrefetchStatus::default(),
                 writeback: WritebackStatus::default(),
                 forwarded_ok: 0,
                 forwarded_err: 0,

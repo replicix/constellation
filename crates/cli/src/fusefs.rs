@@ -248,6 +248,8 @@ pub struct ConstellationFs {
     opens: Mutex<HashMap<Ino, u32>>,
     /// Sequential readahead.
     pub(crate) prefetch: crate::prefetch::Prefetcher,
+    /// Cross-file readahead for ordered directory walks.
+    scan: crate::scan::ScanAhead,
     /// Cooperative cache (phase 5). `None` only in unit tests that
     /// construct a filesystem without a live store/P2P stack.
     coop: Option<std::sync::Arc<crate::coop::Coop>>,
@@ -367,6 +369,7 @@ impl ConstellationFs {
             deps.cache.clone(),
             deps.coop.clone(),
         );
+        let scan = crate::scan::ScanAhead::new(deps.meta.clone(), deps.cache.usage().budget);
         Self {
             meta: deps.meta,
             store: deps.store,
@@ -376,6 +379,7 @@ impl ConstellationFs {
             writes: WriteShards::new(),
             opens: Mutex::new(HashMap::new()),
             prefetch,
+            scan,
             coop: deps.coop,
             sync: deps.sync,
             staging_dir: deps.staging_dir,
@@ -1095,6 +1099,7 @@ impl ConstellationFs {
         if self.prefetch.is_inflight(hash) {
             if let Some(ino) = ino {
                 self.prefetch.note_stall(ino);
+                self.scan.note_stall(ino);
             }
         }
         while self.prefetch.is_inflight(hash) {
@@ -1105,6 +1110,7 @@ impl ConstellationFs {
         }
         if let Some(ino) = ino {
             self.prefetch.note_stall(ino);
+            self.scan.note_stall(ino);
         }
         if let Some(coop) = &self.coop {
             return self.rt.block_on(coop.fetch(hash)).map_err(|_| libc::EIO);

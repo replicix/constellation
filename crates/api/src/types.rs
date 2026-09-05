@@ -283,6 +283,9 @@ pub struct StatusReport {
     /// Cooperative cache (phase 5, DESIGN.md §7).
     #[serde(default)]
     pub coop: CoopStatus,
+    /// Adaptive sequential and directory readahead.
+    #[serde(default)]
+    pub prefetch: PrefetchStatus,
     /// Phase 5b write-back queue and adaptive upload policy.
     #[serde(default)]
     pub writeback: WritebackStatus,
@@ -296,6 +299,22 @@ pub struct StatusReport {
     pub pushed_segments_applied: u64,
     #[serde(default)]
     pub placement_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrefetchStatus {
+    #[serde(default)]
+    pub inflight: u64,
+    #[serde(default)]
+    pub window_bytes: u64,
+    #[serde(default)]
+    pub stalls: u64,
+    #[serde(default)]
+    pub gate_target: u32,
+    #[serde(default)]
+    pub scan_ahead_files: u64,
+    #[serde(default)]
+    pub scan_ahead_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

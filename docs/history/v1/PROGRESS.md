@@ -36,7 +36,7 @@ initial implementation phase.
 | Metadata checkpoints (DB snapshot + LATEST pointer, auto every 32 segments + on unmount) | done | `meta::replay`, `cli::shipper` |
 | Fresh-node bootstrap (checkpoint restore + log replay, ino continuation) | done | `cli::shipper::bootstrap`, `meta::replay` |
 | kill -9 + remount recovery | done — harness `kill9-remount` scenario | `crates/harness` |
-| Prefetcher: sequential readahead, in-flight dedup with the read path | done — harness `readahead` scenario proves pipelining under injected latency | `cli::prefetch` |
+| Prefetcher: adaptive byte-window sequential readahead, fair global AIMD fetch gate, streaming spill decode, and ordered directory scan-ahead | done — harness `readahead`, `readahead-adaptive`, and `scan-ahead` scenarios cover pipelining under injected latency | `cli::{prefetch,scan,coop}`, `fs-core::cache`, `store-s3` |
 | Control API skeleton + spool observability | done — unix-socket JSON API (`status --state-dir`), backlog/error asserted by the `s3-outage` scenario | `crates/api`, `cli::main` |
 | Census-scale import benchmark | done — `harness bench` (files/fanout/size/budget configurable) | `crates/harness/src/bench.rs` |
 

@@ -190,6 +190,36 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.coop.hedges_fired
     );
     gauge!(
+        "constellation_prefetch_inflight",
+        "Background chunk fetches currently active.",
+        status.prefetch.inflight
+    );
+    gauge!(
+        "constellation_prefetch_window_bytes",
+        "Largest live sequential prefetch window.",
+        status.prefetch.window_bytes
+    );
+    gauge!(
+        "constellation_prefetch_stalls_total",
+        "Demand reads that expanded a prefetch window.",
+        status.prefetch.stalls
+    );
+    gauge!(
+        "constellation_prefetch_gate_target",
+        "Current adaptive background-fetch concurrency target.",
+        status.prefetch.gate_target
+    );
+    gauge!(
+        "constellation_scan_ahead_files_total",
+        "Files submitted by directory scan-ahead.",
+        status.prefetch.scan_ahead_files
+    );
+    gauge!(
+        "constellation_scan_ahead_bytes_total",
+        "Logical bytes submitted by directory scan-ahead.",
+        status.prefetch.scan_ahead_bytes
+    );
+    gauge!(
         "constellation_existence_listed",
         "Chunk keys admitted by the mount-time S3 LIST seed.",
         status.writeback.existence_listed

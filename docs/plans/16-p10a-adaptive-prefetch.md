@@ -8,6 +8,11 @@ readahead … reset on seek"). The current implementation falls short of
 that spec; this plan implements it properly and extends it. Do not
 edit DESIGN.md.
 
+Status: implemented on `feat/adaptive-prefetch` (adaptive/fair scheduler,
+streaming decode and E2E spill, cooperative-cache spill hedging, directory
+scan-ahead, status/UI counters, and harness coverage). Live WAN validation
+remains a manual follow-up.
+
 ## Problem (measured)
 
 Cold sequential read of a large file from an EU client against a
@@ -387,7 +392,7 @@ resume from a remembered index, not from `pos`).
   from there.
 
 **3c. Metadata prefetch is explicitly *not* needed** — readdir,
-getattr, manifests are all redb-local. If profiling during validation
+getattr, manifests are all SQLite-local. If profiling during validation
 shows `lookup`/`getattr` round trips dominating tar on a warm data
 cache, record it in the report; do not chase it in this plan.
 

@@ -6,6 +6,7 @@ use constellation_fs_core::{ChunkHash, Ino};
 use constellation_store_s3::ChunkStore;
 use constellation_upload_concurrency::{AdaptiveConcurrency, ConcurrencyGate};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
@@ -24,6 +25,41 @@ struct Stream {
     last_hit: Instant,
 }
 
+#[derive(Default)]
+pub(crate) struct PrefetchStats {
+    inflight: AtomicU64,
+    stalls: AtomicU64,
+    gate_target: AtomicU64,
+    scan_ahead_files: AtomicU64,
+    scan_ahead_bytes: AtomicU64,
+    windows: Mutex<HashMap<Ino, u64>>,
+}
+
+impl PrefetchStats {
+    pub(crate) fn snapshot(&self) -> constellation_api::PrefetchStatus {
+        constellation_api::PrefetchStatus {
+            inflight: self.inflight.load(Ordering::Relaxed),
+            window_bytes: self
+                .windows
+                .lock()
+                .unwrap()
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0),
+            stalls: self.stalls.load(Ordering::Relaxed),
+            gate_target: self.gate_target.load(Ordering::Relaxed) as u32,
+            scan_ahead_files: self.scan_ahead_files.load(Ordering::Relaxed),
+            scan_ahead_bytes: self.scan_ahead_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn note_scan(&self, files: u64, bytes: u64) {
+        self.scan_ahead_files.fetch_add(files, Ordering::Relaxed);
+        self.scan_ahead_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
 struct Queues {
     by_stream: HashMap<Ino, VecDeque<ChunkHash>>,
     ready: VecDeque<Ino>,
@@ -37,6 +73,7 @@ struct Scheduler {
     coop: Option<Arc<crate::coop::Coop>>,
     gate: Arc<ConcurrencyGate>,
     controller: Option<Mutex<AdaptiveConcurrency>>,
+    stats: Arc<PrefetchStats>,
     queues: Mutex<Queues>,
     wake: tokio::sync::Notify,
 }
@@ -70,6 +107,7 @@ impl Scheduler {
             queues.ready.push_back(ino);
         }
         queues.active.insert(hash);
+        self.stats.inflight.fetch_add(1, Ordering::Relaxed);
         Some(hash)
     }
 
@@ -77,6 +115,7 @@ impl Scheduler {
         let mut queues = self.queues.lock().unwrap();
         queues.active.remove(hash);
         queues.reserved.remove(hash);
+        self.stats.inflight.fetch_sub(1, Ordering::Relaxed);
         self.wake.notify_one();
     }
 
@@ -103,6 +142,9 @@ impl Scheduler {
             .unwrap()
             .on_success(Instant::now(), bytes, service_time);
         self.gate.set_target(target);
+        self.stats
+            .gate_target
+            .store(target as u64, Ordering::Relaxed);
     }
 
     fn record_error(&self) {
@@ -111,6 +153,9 @@ impl Scheduler {
         };
         let target = controller.lock().unwrap().on_error(Instant::now());
         self.gate.set_target(target);
+        self.stats
+            .gate_target
+            .store(target as u64, Ordering::Relaxed);
     }
 
     async fn run(self: Arc<Self>) {
@@ -184,10 +229,12 @@ impl Scheduler {
 }
 
 pub struct Prefetcher {
+    rt: Handle,
     streams: Mutex<HashMap<Ino, Stream>>,
     scheduler: Arc<Scheduler>,
     min_window: u64,
     max_window: u64,
+    stats: Arc<PrefetchStats>,
 }
 
 impl Prefetcher {
@@ -211,6 +258,8 @@ impl Prefetcher {
             .and_then(|value| value.parse::<usize>().ok())
             .map(|value| value.clamp(1, max_concurrency));
         let initial = fixed.unwrap_or_else(|| INITIAL_CONCURRENCY.min(max_concurrency));
+        let stats = Arc::new(PrefetchStats::default());
+        stats.gate_target.store(initial as u64, Ordering::Relaxed);
         let scheduler = Arc::new(Scheduler {
             store,
             cache,
@@ -218,14 +267,17 @@ impl Prefetcher {
             gate: Arc::new(ConcurrencyGate::new(initial)),
             controller: fixed.map_or_else(
                 || {
-                    Some(Mutex::new(AdaptiveConcurrency::new(
+                    Some(Mutex::new(AdaptiveConcurrency::with_intervals(
                         initial,
                         1,
                         max_concurrency,
+                        Duration::from_millis(500),
+                        Duration::from_secs(2),
                     )))
                 },
                 |_| None,
             ),
+            stats: stats.clone(),
             queues: Mutex::new(Queues {
                 by_stream: HashMap::new(),
                 ready: VecDeque::new(),
@@ -236,10 +288,12 @@ impl Prefetcher {
         });
         rt.spawn(scheduler.clone().run());
         Self {
+            rt,
             streams: Mutex::new(HashMap::new()),
             scheduler,
             min_window,
             max_window,
+            stats,
         }
     }
 
@@ -249,7 +303,16 @@ impl Prefetcher {
         let now = Instant::now();
         let (sequential, cursor, window) = {
             let mut streams = self.streams.lock().unwrap();
-            streams.retain(|_, stream| now.duration_since(stream.last_hit) <= STREAM_IDLE);
+            let stale: Vec<Ino> = streams
+                .iter()
+                .filter(|(_, stream)| now.duration_since(stream.last_hit) > STREAM_IDLE)
+                .map(|(ino, _)| *ino)
+                .collect();
+            for stale_ino in stale {
+                streams.remove(&stale_ino);
+                self.stats.windows.lock().unwrap().remove(&stale_ino);
+                self.scheduler.forget(stale_ino);
+            }
             if streams.len() >= MAX_STREAMS && !streams.contains_key(&ino) {
                 if let Some(oldest) = streams
                     .iter()
@@ -257,6 +320,7 @@ impl Prefetcher {
                     .map(|(ino, _)| *ino)
                 {
                     streams.remove(&oldest);
+                    self.stats.windows.lock().unwrap().remove(&oldest);
                     self.scheduler.forget(oldest);
                 }
             }
@@ -294,6 +358,7 @@ impl Prefetcher {
         if !sequential || hashes.is_empty() {
             return;
         }
+        self.stats.windows.lock().unwrap().insert(ino, window);
         let chunk_size = u64::from(chunk_size);
         let first = cursor.div_ceil(chunk_size);
         let last = cursor.saturating_add(window).div_ceil(chunk_size);
@@ -307,6 +372,12 @@ impl Prefetcher {
     pub fn note_stall(&self, ino: Ino) {
         if let Some(stream) = self.streams.lock().unwrap().get_mut(&ino) {
             stream.window = stream.window.saturating_mul(2).min(self.max_window);
+            self.stats.stalls.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .windows
+                .lock()
+                .unwrap()
+                .insert(ino, stream.window);
         }
     }
 
@@ -319,7 +390,43 @@ impl Prefetcher {
     /// Forget an inode's cursor (last close).
     pub fn forget(&self, ino: Ino) {
         self.streams.lock().unwrap().remove(&ino);
+        self.stats.windows.lock().unwrap().remove(&ino);
         self.scheduler.forget(ino);
+    }
+
+    pub(crate) fn stats(&self) -> Arc<PrefetchStats> {
+        self.stats.clone()
+    }
+
+    pub(crate) fn enqueue_scan(&self, files: Vec<crate::scan::ScanFile>) {
+        let mut count = 0u64;
+        let mut bytes = 0u64;
+        for file in files {
+            count += 1;
+            bytes = bytes.saturating_add(file.bytes);
+            self.scheduler.enqueue(file.ino, file.hashes);
+            if let Some(list_hash) = file.chunk_list {
+                let cache = self.scheduler.cache.clone();
+                let scheduler = self.scheduler.clone();
+                self.rt.spawn(async move {
+                    for _ in 0..3000 {
+                        match cache.get(&list_hash) {
+                            Ok(Some(encoded)) => {
+                                if let Ok(chunks) =
+                                    constellation_fs_core::manifest::decode_chunk_list(&encoded)
+                                {
+                                    scheduler.enqueue(file.ino, chunks.values().take(2).copied());
+                                }
+                                return;
+                            }
+                            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+        }
+        self.stats.note_scan(count, bytes);
     }
 }
 
@@ -356,6 +463,7 @@ mod tests {
             coop: None,
             gate: Arc::new(ConcurrencyGate::new(4)),
             controller: None,
+            stats: Arc::new(PrefetchStats::default()),
             queues: Mutex::new(Queues {
                 by_stream: HashMap::new(),
                 ready: VecDeque::new(),

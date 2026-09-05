@@ -13,7 +13,7 @@
 
 use crate::sources::{Selector, SourceId};
 use anyhow::{bail, Result};
-use constellation_fs_core::cache::{ChunkState, DigestBatch, DigestChange, DiskCache};
+use constellation_fs_core::cache::{ChunkState, DigestBatch, DigestChange, DiskCache, SpillFile};
 use constellation_fs_core::ChunkHash;
 use constellation_net::bloom::{
     bucket_count_for, bucket_index, ENTRIES_PER_BUCKET, MAX_BITS_BYTES, MAX_BUCKETS,
@@ -139,12 +139,26 @@ enum FetchResult {
         rtt: Option<Duration>,
         path: PathKind,
     },
+    Spilled {
+        hash: ChunkHash,
+        spill: SpillFile,
+        bytes: u64,
+        ttfb_ms: f64,
+        total_ms: f64,
+    },
     Miss,
     Fail,
 }
 
+impl FetchResult {
+    fn is_success(&self) -> bool {
+        matches!(self, Self::Data { .. } | Self::Spilled { .. })
+    }
+}
+
 struct Fetched {
-    data: Vec<u8>,
+    data: Option<Vec<u8>>,
+    bytes: u64,
     source: SourceId,
     service_time: Duration,
 }
@@ -363,9 +377,10 @@ impl Coop {
         if let Ok(Some(d)) = self.cache.get(hash) {
             return Ok(d);
         }
-        let fetched = self.fetch_uncached(hash).await?;
-        let _ = self.cache.insert(hash, &fetched.data, ChunkState::Clean);
-        Ok(fetched.data)
+        let fetched = self.fetch_uncached(hash, true).await?;
+        fetched
+            .data
+            .ok_or_else(|| anyhow::anyhow!("successful demand fetch returned no data"))
     }
 
     /// Fetch for background readahead and report only an actual winning S3
@@ -377,14 +392,13 @@ impl Coop {
         if self.cache.contains(hash) {
             return Ok(None);
         }
-        let fetched = self.fetch_uncached(hash).await?;
-        let bytes = fetched.data.len() as u64;
+        let fetched = self.fetch_uncached(hash, false).await?;
+        let bytes = fetched.bytes;
         let telemetry = (fetched.source == SourceId::S3).then_some((bytes, fetched.service_time));
-        let _ = self.cache.insert(hash, &fetched.data, ChunkState::Clean);
         Ok(telemetry)
     }
 
-    async fn fetch_uncached(&self, hash: &ChunkHash) -> Result<Fetched> {
+    async fn fetch_uncached(&self, hash: &ChunkHash, read_back: bool) -> Result<Fetched> {
         let cands = self.candidates(hash);
         let size = u64::from(self.chunk_size);
         let (primary, hedge, deadline) = {
@@ -402,7 +416,7 @@ impl Coop {
         let result = if let Some(hsrc) = hedge {
             let sleep = tokio::time::sleep(Duration::from_millis(deadline));
             tokio::select! {
-                r = &mut primary_f => self.settle(primary, r),
+                r = &mut primary_f => self.settle(hash, primary, r, read_back),
                 _ = sleep => {
                     self.counters.hedges_fired.fetch_add(1, Ordering::Relaxed);
                     self.selector.lock().unwrap().begin(hsrc);
@@ -411,26 +425,26 @@ impl Coop {
                     tokio::select! {
                         r = &mut primary_f => {
                             match r {
-                                FetchResult::Data { .. } => {
+                                result if result.is_success() => {
                                     self.selector.lock().unwrap().end(hsrc);
-                                    self.settle(primary, r)
+                                    self.settle(hash, primary, result, read_back)
                                 }
                                 other => {
                                     self.note_fail(primary, &other);
-                                    self.settle(hsrc, hedge_f.await)
+                                    self.settle(hash, hsrc, hedge_f.await, read_back)
                                 }
                             }
                         }
                         r = &mut hedge_f => {
                             match r {
-                                FetchResult::Data { .. } => {
+                                result if result.is_success() => {
                                     self.selector.lock().unwrap().record_cancelled(primary);
-                                    self.settle(hsrc, r)
+                                    self.settle(hash, hsrc, result, read_back)
                                 }
                                 other => {
                                     self.selector.lock().unwrap().end(hsrc);
                                     self.note_fail(hsrc, &other);
-                                    self.settle(primary, primary_f.await)
+                                    self.settle(hash, primary, primary_f.await, read_back)
                                 }
                             }
                         }
@@ -438,7 +452,7 @@ impl Coop {
                 }
             }
         } else {
-            self.settle(primary, primary_f.await)
+            self.settle(hash, primary, primary_f.await, read_back)
         };
 
         match result {
@@ -447,7 +461,12 @@ impl Coop {
                 // Last resort: S3 if we have not already succeeded via it.
                 if primary != SourceId::S3 && hedge != Some(SourceId::S3) {
                     self.selector.lock().unwrap().begin(SourceId::S3);
-                    match self.settle(SourceId::S3, self.fetch_from(SourceId::S3, hash).await) {
+                    match self.settle(
+                        hash,
+                        SourceId::S3,
+                        self.fetch_from(SourceId::S3, hash).await,
+                        read_back,
+                    ) {
                         Some(fetched) => Ok(fetched),
                         None => bail!("chunk {} unavailable from peers and S3", hash.to_hex()),
                     }
@@ -458,7 +477,13 @@ impl Coop {
         }
     }
 
-    fn settle(&self, src: SourceId, r: FetchResult) -> Option<Fetched> {
+    fn settle(
+        &self,
+        requested: &ChunkHash,
+        src: SourceId,
+        r: FetchResult,
+        read_back: bool,
+    ) -> Option<Fetched> {
         match r {
             FetchResult::Data {
                 data,
@@ -472,16 +497,46 @@ impl Coop {
                 selector.record_transport(src, rtt, path);
                 selector.record_ok(src, ttfb_ms, n, total_ms);
                 drop(selector);
-                match src {
-                    SourceId::S3 => {
-                        self.counters.s3_fetches.fetch_add(1, Ordering::Relaxed);
-                    }
-                    SourceId::Peer(_) => {
-                        self.counters.peer_hits.fetch_add(1, Ordering::Relaxed);
-                    }
+                if matches!(src, SourceId::Peer(_)) {
+                    self.counters.peer_hits.fetch_add(1, Ordering::Relaxed);
                 }
+                let bytes = data.len() as u64;
+                let _ = self.cache.insert(requested, &data, ChunkState::Clean);
+                let demand_data = read_back.then_some(data);
+                Some(Fetched {
+                    data: demand_data,
+                    bytes,
+                    source: src,
+                    service_time: Duration::from_secs_f64(total_ms / 1000.0),
+                })
+            }
+            FetchResult::Spilled {
+                hash,
+                spill,
+                bytes,
+                ttfb_ms,
+                total_ms,
+            } => {
+                debug_assert_eq!(&hash, requested);
+                self.cache
+                    .commit_spill(requested, spill, ChunkState::Clean)
+                    .ok()?;
+                let data = if read_back {
+                    self.cache.get(requested).ok().flatten()
+                } else {
+                    None
+                };
+                if read_back && data.is_none() {
+                    return None;
+                }
+                let mut selector = self.selector.lock().unwrap();
+                selector.record_transport(src, None, PathKind::Unknown);
+                selector.record_ok(src, ttfb_ms, bytes, total_ms);
+                drop(selector);
+                self.counters.s3_fetches.fetch_add(1, Ordering::Relaxed);
                 Some(Fetched {
                     data,
+                    bytes,
                     source: src,
                     service_time: Duration::from_secs_f64(total_ms / 1000.0),
                 })
@@ -508,7 +563,7 @@ impl Coop {
                     self.counters.peer_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            FetchResult::Data { .. } => {}
+            FetchResult::Data { .. } | FetchResult::Spilled { .. } => {}
         }
     }
 
@@ -516,12 +571,12 @@ impl Coop {
     /// the selector learns TTFB and goodput as independent terms — one
     /// combined duration would leave goodput frozen at its prior.
     async fn fetch_from(&self, src: SourceId, hash: &ChunkHash) -> FetchResult {
+        if src == SourceId::S3 {
+            return self.fetch_s3_spilled(hash).await;
+        }
         let t0 = Instant::now();
         let (data, ttfb, rtt, path) = match src {
-            SourceId::S3 => match retry_s3(|| self.store.get_chunk_timed(hash)).await {
-                Ok((data, ttfb)) => (data, ttfb, None, PathKind::Unknown),
-                Err(_) => return FetchResult::Fail,
-            },
+            SourceId::S3 => unreachable!(),
             SourceId::Peer(id) => match self.peers.request_chunk(id, &hash.0).await {
                 Ok(Some(fetch)) => {
                     let Ok(data) = self.store.open_peer_chunk(hash, &fetch.data) else {
@@ -544,6 +599,40 @@ impl Coop {
             rtt,
             path,
         }
+    }
+
+    async fn fetch_s3_spilled(&self, hash: &ChunkHash) -> FetchResult {
+        for attempt in 0..S3_FETCH_ATTEMPTS {
+            let Ok(mut spill) = self.cache.begin_spill() else {
+                return FetchResult::Fail;
+            };
+            let fetched = if self.store.is_e2e() {
+                let Ok(mut cipher) = self.cache.begin_spill() else {
+                    return FetchResult::Fail;
+                };
+                self.store
+                    .get_chunk_to_writer_e2e(hash, &mut cipher, &mut spill)
+                    .await
+            } else {
+                self.store.get_chunk_to_writer(hash, &mut spill).await
+            };
+            match fetched {
+                Ok((bytes, ttfb, total)) => {
+                    return FetchResult::Spilled {
+                        hash: *hash,
+                        spill,
+                        bytes,
+                        ttfb_ms: ttfb.as_secs_f64() * 1000.0,
+                        total_ms: total.as_secs_f64() * 1000.0,
+                    };
+                }
+                Err(_) if attempt + 1 < S3_FETCH_ATTEMPTS => {
+                    tokio::time::sleep(S3_RETRY_BACKOFF).await;
+                }
+                Err(_) => return FetchResult::Fail,
+            }
+        }
+        FetchResult::Fail
     }
 
     /// Push measured probe RTTs into the selector so cold peers are not
@@ -695,6 +784,7 @@ impl Coop {
 
 /// Retry only the S3 leg. Retrying `fetch_uncached` would re-run source
 /// selection and could contact the same peer and hedge several times.
+#[cfg(test)]
 async fn retry_s3<T, E, F, Fut>(mut operation: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,

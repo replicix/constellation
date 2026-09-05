@@ -256,6 +256,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: readahead,
     },
     Scenario {
+        name: "readahead-adaptive",
+        desc: "128-chunk cold sequential read under 200ms S3 latency expands the adaptive window",
+        requires: &[],
+        run: readahead_adaptive,
+    },
+    Scenario {
+        name: "scan-ahead",
+        desc: "ordered cold reads of many small files pipeline across file boundaries",
+        requires: &[],
+        run: scan_ahead,
+    },
+    Scenario {
         name: "fio-latency",
         desc: "fio randwrite + crc32c verify under 80ms S3 latency",
         requires: &["fio"],
@@ -2573,6 +2585,115 @@ fn readahead(_seed: u64) -> Result<()> {
     );
     eprintln!(
         "    readahead: {n_chunks} chunks under {latency_ms}ms latency read in {elapsed:.1?} \
+         (serial estimate {serial:.1?})"
+    );
+    c.unmount()?;
+    Ok(())
+}
+
+/// A long high-BDP read must grow beyond the minimum byte window and
+/// keep enough S3 requests in flight to beat a serial transfer decisively.
+fn readahead_adaptive(_seed: u64) -> Result<()> {
+    let (env, root) = setup("readahead-adaptive")?;
+    let proxy = env.s3_proxy()?;
+    let mut c = one_client(&env, root.path(), &format!("raa-{}", ts()))?;
+
+    let n_chunks = 128u64;
+    let mut data = vec![0u8; (n_chunks * (1 << 20)) as usize];
+    for (i, byte) in data.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
+    let expected = blake3::hash(&data);
+    std::fs::write(c.mnt.join("big"), &data)?;
+    drop(data);
+
+    c.unmount()?;
+    c.drop_cache()?;
+    c.mount()?;
+    let latency_ms = 200u64;
+    proxy.latency(latency_ms, 0)?;
+
+    let started = std::time::Instant::now();
+    let read = std::fs::read(c.mnt.join("big"))?;
+    let elapsed = started.elapsed();
+    proxy.heal()?;
+    anyhow::ensure!(
+        blake3::hash(&read) == expected,
+        "content corrupted on adaptive cold read"
+    );
+    let serial = Duration::from_millis(n_chunks * latency_ms);
+    anyhow::ensure!(
+        elapsed < serial / 6,
+        "adaptive cold read took {elapsed:.1?}; serial estimate is {serial:.1?}"
+    );
+    eprintln!(
+        "    readahead-adaptive: {n_chunks} chunks under {latency_ms}ms latency read in \
+         {elapsed:.1?} (serial estimate {serial:.1?})"
+    );
+    c.unmount()?;
+    Ok(())
+}
+
+/// A tar-like lexicographic walk should trigger directory scan-ahead after
+/// its first few files and pipeline the remaining single-chunk objects.
+fn scan_ahead(_seed: u64) -> Result<()> {
+    let (env, root) = setup("scan-ahead")?;
+    let proxy = env.s3_proxy()?;
+    let mut c = one_client(&env, root.path(), &format!("scan-{}", ts()))?;
+
+    let directory = c.mnt.join("walk");
+    std::fs::create_dir(&directory)?;
+    let files = 200u64;
+    let file_size = 256usize << 10;
+    let mut expected = Vec::with_capacity(files as usize);
+    for index in 0..files {
+        let name = format!("{index:04}");
+        let marker = format!("scan-{index:04}-").into_bytes();
+        let mut data = Vec::with_capacity(file_size);
+        while data.len() < file_size {
+            data.extend_from_slice(&marker);
+        }
+        data.truncate(file_size);
+        expected.push((name.clone(), blake3::hash(&data)));
+        std::fs::write(directory.join(name), data)?;
+    }
+
+    c.unmount()?;
+    c.drop_cache()?;
+    c.mount()?;
+    let latency_ms = 60u64;
+    proxy.latency(latency_ms, 0)?;
+
+    let started = std::time::Instant::now();
+    let mut entries =
+        std::fs::read_dir(c.mnt.join("walk"))?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for (entry, (name, hash)) in entries.into_iter().zip(&expected) {
+        anyhow::ensure!(
+            entry.file_name().to_string_lossy() == name.as_str(),
+            "directory order mismatch"
+        );
+        let data = std::fs::read(entry.path())?;
+        anyhow::ensure!(
+            blake3::hash(&data) == *hash,
+            "content corrupted in scan-ahead file {name}"
+        );
+    }
+    let elapsed = started.elapsed();
+    proxy.heal()?;
+    let status = c.control_status()?;
+    eprintln!(
+        "    scan-ahead status: {}",
+        serde_json::to_string(&status["prefetch"])?
+    );
+
+    let serial = Duration::from_millis(files * latency_ms);
+    anyhow::ensure!(
+        elapsed < serial / 4,
+        "ordered small-file walk took {elapsed:.1?}; serial estimate is {serial:.1?}"
+    );
+    eprintln!(
+        "    scan-ahead: {files} files under {latency_ms}ms latency read in {elapsed:.1?} \
          (serial estimate {serial:.1?})"
     );
     c.unmount()?;

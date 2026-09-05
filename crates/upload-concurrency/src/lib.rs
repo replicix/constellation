@@ -60,6 +60,9 @@ pub struct AdaptiveConcurrency {
     /// otherwise fail a 5% gain test on noise and stall at the start
     /// concurrency.
     probe_inconclusive: u32,
+    probe_interval: Duration,
+    max_window: Duration,
+    error_backoff_interval: Duration,
 }
 
 impl AdaptiveConcurrency {
@@ -91,15 +94,27 @@ impl AdaptiveConcurrency {
     const INCONCLUSIVE_BEFORE_DECIDE: u32 = 2;
     /// One full observation window is discarded after every target change.
     const SETTLING_WINDOWS: u32 = 1;
-    /// Do not multiplicatively decrease more than once per observation
-    /// interval. A single S3 slowdown episode commonly fails many requests
-    /// that were already in flight; treating each as independent congestion
-    /// collapses the target all the way to one.
+    #[cfg(test)]
     const ERROR_BACKOFF_INTERVAL: Duration = Self::MAX_WINDOW;
 
     pub fn new(initial: usize, min: usize, max: usize) -> Self {
+        Self::with_intervals(initial, min, max, Self::PROBE_INTERVAL, Self::MAX_WINDOW)
+    }
+
+    /// Construct the same controller with observation windows tuned to the
+    /// caller's transfer duration. Fetch readahead uses shorter windows than
+    /// multi-second uploads so a finite read can adapt before it completes.
+    pub fn with_intervals(
+        initial: usize,
+        min: usize,
+        max: usize,
+        probe_interval: Duration,
+        max_window: Duration,
+    ) -> Self {
         let min = min.max(1);
         let max = max.max(min);
+        let probe_interval = probe_interval.max(Duration::from_millis(1));
+        let max_window = max_window.max(probe_interval);
         Self {
             current: initial.clamp(min, max),
             min,
@@ -115,6 +130,9 @@ impl AdaptiveConcurrency {
             next_probe_step: None,
             last_backoff: None,
             probe_inconclusive: 0,
+            probe_interval,
+            max_window,
+            error_backoff_interval: max_window,
         }
     }
 
@@ -138,8 +156,8 @@ impl AdaptiveConcurrency {
         self.window_completed += 1;
         let elapsed = now.saturating_duration_since(self.window_start);
         let min_samples = Self::MIN_WINDOW_SAMPLES.max((self.current as u64 / 2).min(12));
-        let ready = (elapsed >= Self::PROBE_INTERVAL && self.window_completed >= min_samples)
-            || elapsed >= Self::MAX_WINDOW;
+        let ready = (elapsed >= self.probe_interval && self.window_completed >= min_samples)
+            || elapsed >= self.max_window;
         if !ready {
             return self.current;
         }
@@ -155,7 +173,7 @@ impl AdaptiveConcurrency {
     pub fn on_error(&mut self, now: Instant) -> usize {
         if self
             .last_backoff
-            .is_some_and(|last| now.saturating_duration_since(last) < Self::ERROR_BACKOFF_INTERVAL)
+            .is_some_and(|last| now.saturating_duration_since(last) < self.error_backoff_interval)
         {
             return self.current;
         }

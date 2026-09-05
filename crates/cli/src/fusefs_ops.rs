@@ -1172,6 +1172,10 @@ impl ConstellationFs {
         }
         let len = size.min(file_len - offset);
         let hashes = self.chunk_list(&manifest)?;
+        if offset == 0 {
+            let files = self.scan.note_read(ino);
+            self.prefetch.enqueue_scan(files);
+        }
         // Kick sequential readahead for upcoming committed chunks.
         self.prefetch.on_read(ino, offset, len, self.chunk_size, &hashes);
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);

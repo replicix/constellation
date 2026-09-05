@@ -17,6 +17,7 @@ mod pin;
 mod placement;
 mod prefetch;
 mod reintegrate;
+mod scan;
 mod shipper;
 mod snapshot;
 mod sources;
@@ -1135,6 +1136,7 @@ fn mount(
         fsmeta.chunk_size,
         compression,
     );
+    let prefetch_stats = fs.prefetch.stats();
     if let Some((path, name)) = &selector {
         if rw_snapshot {
             fs.set_subtree_root(&mounted_path)?;
@@ -1972,6 +1974,7 @@ fn mount(
         departed: departed.clone(),
         rt: rt.handle().clone(),
         coop: coop.clone(),
+        prefetch_stats,
         write_mode: write_mode.clone(),
         upload: upload.clone(),
         snapshots: snapshots.clone(),
@@ -3096,6 +3099,7 @@ struct DaemonStatus {
     /// Handle for the blocking control-API calls that need to await.
     rt: tokio::runtime::Handle,
     coop: std::sync::Arc<crate::coop::Coop>,
+    prefetch_stats: std::sync::Arc<crate::prefetch::PrefetchStats>,
     write_mode: std::sync::Arc<writeback::WriteModeState>,
     upload: std::sync::Arc<UploadRuntime>,
     snapshots: std::sync::Arc<snapshot::SnapshotManager>,
@@ -3267,6 +3271,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                 .reintegration
                 .snapshot(self.meta.unmarked_journal_len().unwrap_or(0)),
             coop,
+            prefetch: self.prefetch_stats.snapshot(),
             writeback: {
                 let probe = self.upload.probe.lock().unwrap();
                 let existence = self.upload.existence.report();
