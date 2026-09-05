@@ -28,6 +28,7 @@ use fuser::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
+use std::io::{Read, Seek};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -775,7 +776,7 @@ impl ConstellationFs {
         let len = size.min(manifest.file_len - offset);
         let mut out = Vec::with_capacity(len as usize);
         for slice in manifest.layout.slices(offset, len) {
-            let chunk = self.read_committed_chunk(&hashes, slice.index)?;
+            let chunk = self.read_committed_chunk(ino, &hashes, slice.index)?;
             let start = slice.offset as usize;
             let end = (slice.offset + slice.len) as usize;
             if chunk.len() < end {
@@ -1084,8 +1085,17 @@ impl ConstellationFs {
     /// An in-flight prefetch for the same chunk is awaited rather than
     /// duplicated.
     fn fetch_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, i32> {
+        self.fetch_chunk_for_inode(None, hash)
+    }
+
+    fn fetch_chunk_for_inode(&self, ino: Option<Ino>, hash: &ChunkHash) -> Result<Vec<u8>, i32> {
         if let Ok(Some(data)) = self.cache.get(hash) {
             return Ok(data);
+        }
+        if self.prefetch.is_inflight(hash) {
+            if let Some(ino) = ino {
+                self.prefetch.note_stall(ino);
+            }
         }
         while self.prefetch.is_inflight(hash) {
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1093,12 +1103,36 @@ impl ConstellationFs {
         if let Ok(Some(data)) = self.cache.get(hash) {
             return Ok(data);
         }
+        if let Some(ino) = ino {
+            self.prefetch.note_stall(ino);
+        }
         if let Some(coop) = &self.coop {
             return self.rt.block_on(coop.fetch(hash)).map_err(|_| libc::EIO);
         }
         let mut data = None;
         for attempt in 0..3 {
-            if let Ok(bytes) = self.rt.block_on(self.store.get_chunk(hash)) {
+            let fetched = (|| {
+                let mut spill = self.cache.begin_spill().map_err(|_| ())?;
+                let result = if self.store.is_e2e() {
+                    let mut cipher = self.cache.begin_spill().map_err(|_| ())?;
+                    self.rt.block_on(self.store.get_chunk_to_writer_e2e(
+                        hash,
+                        &mut cipher,
+                        &mut spill,
+                    ))
+                } else {
+                    self.rt
+                        .block_on(self.store.get_chunk_to_writer(hash, &mut spill))
+                }
+                .map_err(|_| ())?;
+                let _ = result;
+                spill.rewind().map_err(|_| ())?;
+                let mut bytes = Vec::new();
+                spill.read_to_end(&mut bytes).map_err(|_| ())?;
+                let _ = self.cache.commit_spill(hash, spill, ChunkState::Clean);
+                Ok::<_, ()>(bytes)
+            })();
+            if let Ok(bytes) = fetched {
                 data = Some(bytes);
                 break;
             }
@@ -1107,8 +1141,6 @@ impl ConstellationFs {
             }
         }
         let data = data.ok_or(libc::EIO)?;
-        // Best effort: cache full just means we stream through.
-        let _ = self.cache.insert(hash, &data, ChunkState::Clean);
         Ok(data)
     }
 

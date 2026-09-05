@@ -69,6 +69,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 futures = "0.3"
 tempfile = "3"
 rand = "0.9"
+memmap2 = "0.9"
 
 # P2P fast path (M3.3): QUIC endpoint keyed by node pubkey plus a gossip
 # topic for push invalidation and lease handoff.

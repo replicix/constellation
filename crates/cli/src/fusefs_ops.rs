@@ -1191,7 +1191,7 @@ impl ConstellationFs {
                         .map_err(|e| staging_errno(&e))?;
                     buf
                 }
-                _ => self.read_committed_chunk(&hashes, slice.index)?,
+                _ => self.read_committed_chunk(ino, &hashes, slice.index)?,
             };
             let start = slice.offset as usize;
             let end = (slice.offset + slice.len) as usize;
@@ -1211,11 +1211,12 @@ impl ConstellationFs {
 
     fn read_committed_chunk(
         &self,
+        ino: Ino,
         hashes: &constellation_fs_core::manifest::SparseChunks,
         idx: u64,
     ) -> Result<Vec<u8>, i32> {
         match hashes.get(&idx) {
-            Some(h) => self.fetch_chunk(h),
+            Some(h) => self.fetch_chunk_for_inode(Some(ino), h),
             None => Ok(Vec::new()),
         }
     }

@@ -12,10 +12,105 @@
 
 use crate::codec::{self, Codec, CompressionSetting};
 use crate::error::StoreError;
+use std::io::Write;
 
 const MAGIC: &[u8; 4] = b"CCH1";
 const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 16;
+
+struct HashWriter<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+    bytes: u64,
+}
+
+impl<W: Write> Write for HashWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        self.bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+enum DecoderInner<W: Write> {
+    Raw(HashWriter<W>),
+    Zstd(zstd::stream::write::Decoder<'static, HashWriter<W>>),
+}
+
+/// Incrementally decodes one stored chunk object into a caller-owned writer.
+pub struct StreamingDecoder<W: Write> {
+    inner: DecoderInner<W>,
+    expected_len: u64,
+}
+
+impl<W: Write> StreamingDecoder<W> {
+    pub fn new(
+        header: &[u8; HEADER_LEN],
+        out: W,
+        hasher: blake3::Hasher,
+    ) -> Result<Self, StoreError> {
+        if &header[..4] != MAGIC {
+            return Err(StoreError::CorruptObject("bad magic".into()));
+        }
+        if header[4] != VERSION {
+            return Err(StoreError::CorruptObject(format!(
+                "unsupported format version {}; upgrade constellation",
+                header[4]
+            )));
+        }
+        let codec = Codec::from_id(u16::from_le_bytes(header[5..7].try_into().unwrap()))?;
+        let expected_len = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let writer = HashWriter {
+            inner: out,
+            hasher,
+            bytes: 0,
+        };
+        let inner = match codec {
+            Codec::Raw => DecoderInner::Raw(writer),
+            Codec::Zstd => DecoderInner::Zstd(
+                zstd::stream::write::Decoder::new(writer)
+                    .map_err(|error| StoreError::Compression(error.to_string()))?,
+            ),
+        };
+        Ok(Self {
+            inner,
+            expected_len,
+        })
+    }
+
+    pub fn write_payload(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        match &mut self.inner {
+            DecoderInner::Raw(writer) => writer.write_all(bytes)?,
+            DecoderInner::Zstd(decoder) => decoder.write_all(bytes)?,
+        }
+        Ok(())
+    }
+
+    /// Finish decoding and return `(plaintext bytes, plaintext hash)`.
+    pub fn finish(self) -> Result<(u64, blake3::Hash), StoreError> {
+        let writer = match self.inner {
+            DecoderInner::Raw(writer) => writer,
+            DecoderInner::Zstd(mut decoder) => {
+                decoder
+                    .flush()
+                    .map_err(|error| StoreError::Compression(error.to_string()))?;
+                decoder.into_inner()
+            }
+        };
+        if writer.bytes != self.expected_len {
+            return Err(StoreError::CorruptObject(format!(
+                "decoded length {} != header {}",
+                writer.bytes, self.expected_len
+            )));
+        }
+        Ok((writer.bytes, writer.hasher.finalize()))
+    }
+}
 
 /// Encode plaintext chunk data into a stored object, applying the given
 /// compression setting (with the incompressible guard).
@@ -116,5 +211,40 @@ mod tests {
             decode_object(&obj3),
             Err(StoreError::UnknownCodec(_))
         ));
+    }
+
+    #[test]
+    fn streaming_decode_matches_buffered_for_raw_and_zstd() {
+        for setting in [
+            CompressionSetting::RAW,
+            CompressionSetting::zstd(3).unwrap(),
+        ] {
+            let data = vec![7u8; 65_537];
+            let encoded = encode_object(&data, setting).unwrap();
+            let header: [u8; HEADER_LEN] = encoded[..HEADER_LEN].try_into().unwrap();
+            let mut out = Vec::new();
+            let mut decoder =
+                StreamingDecoder::new(&header, &mut out, blake3::Hasher::new()).unwrap();
+            for piece in encoded[HEADER_LEN..].chunks(257) {
+                decoder.write_payload(piece).unwrap();
+            }
+            let (bytes, hash) = decoder.finish().unwrap();
+            assert_eq!(bytes, data.len() as u64);
+            assert_eq!(hash, blake3::hash(&data));
+            assert_eq!(out, data);
+        }
+    }
+
+    #[test]
+    fn streaming_decode_rejects_truncation() {
+        let data = vec![9u8; 65_537];
+        let encoded = encode_object(&data, CompressionSetting::zstd(3).unwrap()).unwrap();
+        let header: [u8; HEADER_LEN] = encoded[..HEADER_LEN].try_into().unwrap();
+        let mut out = Vec::new();
+        let mut decoder = StreamingDecoder::new(&header, &mut out, blake3::Hasher::new()).unwrap();
+        decoder
+            .write_payload(&encoded[HEADER_LEN..encoded.len() - 2])
+            .unwrap();
+        assert!(decoder.finish().is_err());
     }
 }

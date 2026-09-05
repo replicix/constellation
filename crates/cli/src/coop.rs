@@ -143,6 +143,12 @@ enum FetchResult {
     Fail,
 }
 
+struct Fetched {
+    data: Vec<u8>,
+    source: SourceId,
+    service_time: Duration,
+}
+
 impl Coop {
     pub fn new(
         cache: Arc<DiskCache>,
@@ -357,12 +363,28 @@ impl Coop {
         if let Ok(Some(d)) = self.cache.get(hash) {
             return Ok(d);
         }
-        let data = self.fetch_uncached(hash).await?;
-        let _ = self.cache.insert(hash, &data, ChunkState::Clean);
-        Ok(data)
+        let fetched = self.fetch_uncached(hash).await?;
+        let _ = self.cache.insert(hash, &fetched.data, ChunkState::Clean);
+        Ok(fetched.data)
     }
 
-    async fn fetch_uncached(&self, hash: &ChunkHash) -> Result<Vec<u8>> {
+    /// Fetch for background readahead and report only an actual winning S3
+    /// transfer to the adaptive S3 concurrency controller.
+    pub(crate) async fn fetch_for_prefetch(
+        &self,
+        hash: &ChunkHash,
+    ) -> Result<Option<(u64, Duration)>> {
+        if self.cache.contains(hash) {
+            return Ok(None);
+        }
+        let fetched = self.fetch_uncached(hash).await?;
+        let bytes = fetched.data.len() as u64;
+        let telemetry = (fetched.source == SourceId::S3).then_some((bytes, fetched.service_time));
+        let _ = self.cache.insert(hash, &fetched.data, ChunkState::Clean);
+        Ok(telemetry)
+    }
+
+    async fn fetch_uncached(&self, hash: &ChunkHash) -> Result<Fetched> {
         let cands = self.candidates(hash);
         let size = u64::from(self.chunk_size);
         let (primary, hedge, deadline) = {
@@ -420,13 +442,13 @@ impl Coop {
         };
 
         match result {
-            Some(data) => Ok(data),
+            Some(fetched) => Ok(fetched),
             None => {
                 // Last resort: S3 if we have not already succeeded via it.
                 if primary != SourceId::S3 && hedge != Some(SourceId::S3) {
                     self.selector.lock().unwrap().begin(SourceId::S3);
                     match self.settle(SourceId::S3, self.fetch_from(SourceId::S3, hash).await) {
-                        Some(data) => Ok(data),
+                        Some(fetched) => Ok(fetched),
                         None => bail!("chunk {} unavailable from peers and S3", hash.to_hex()),
                     }
                 } else {
@@ -436,7 +458,7 @@ impl Coop {
         }
     }
 
-    fn settle(&self, src: SourceId, r: FetchResult) -> Option<Vec<u8>> {
+    fn settle(&self, src: SourceId, r: FetchResult) -> Option<Fetched> {
         match r {
             FetchResult::Data {
                 data,
@@ -458,7 +480,11 @@ impl Coop {
                         self.counters.peer_hits.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Some(data)
+                Some(Fetched {
+                    data,
+                    source: src,
+                    service_time: Duration::from_secs_f64(total_ms / 1000.0),
+                })
             }
             other => {
                 self.note_fail(src, &other);

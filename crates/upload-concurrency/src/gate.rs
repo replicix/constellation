@@ -1,6 +1,7 @@
 //! Elastic semaphore whose target can change at any time.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// A concurrency gate is a semaphore where the permit count (`target`)
 /// can be adjusted live. An `acquire()` call blocks until fewer than
@@ -56,6 +57,26 @@ impl ConcurrencyGate {
             notified.await;
         }
     }
+
+    /// Acquire a permit that can be moved into a spawned task.
+    pub async fn acquire_owned(self: &Arc<Self>) -> OwnedConcurrencyPermit {
+        loop {
+            let notified = self.notify.notified();
+            let target = self.target().max(1);
+            let cur = self.in_flight.load(Ordering::Acquire);
+            if cur < target {
+                if self
+                    .in_flight
+                    .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return OwnedConcurrencyPermit { gate: self.clone() };
+                }
+                continue;
+            }
+            notified.await;
+        }
+    }
 }
 
 pub struct ConcurrencyPermit<'a> {
@@ -63,6 +84,17 @@ pub struct ConcurrencyPermit<'a> {
 }
 
 impl Drop for ConcurrencyPermit<'_> {
+    fn drop(&mut self) {
+        self.gate.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.gate.notify.notify_waiters();
+    }
+}
+
+pub struct OwnedConcurrencyPermit {
+    gate: Arc<ConcurrencyGate>,
+}
+
+impl Drop for OwnedConcurrencyPermit {
     fn drop(&mut self) {
         self.gate.in_flight.fetch_sub(1, Ordering::AcqRel);
         self.gate.notify.notify_waiters();
@@ -108,5 +140,16 @@ mod tests {
         assert!(!waiter.is_finished());
         gate.set_target(2);
         waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_permit_can_move_to_a_task() {
+        let gate = Arc::new(ConcurrencyGate::new(1));
+        let permit = gate.acquire_owned().await;
+        let task = tokio::spawn(async move {
+            drop(permit);
+        });
+        task.await.unwrap();
+        assert_eq!(gate.in_flight(), 0);
     }
 }

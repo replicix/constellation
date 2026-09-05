@@ -26,7 +26,7 @@
 
 mod gate;
 
-pub use gate::{ConcurrencyGate, ConcurrencyPermit};
+pub use gate::{ConcurrencyGate, ConcurrencyPermit, OwnedConcurrencyPermit};
 
 use std::time::{Duration, Instant};
 

@@ -29,6 +29,7 @@ argon2 = "0.6.0"
 zeroize = "1.9.0"
 region = "4.0.0"
 tracing.workspace = true
+memmap2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

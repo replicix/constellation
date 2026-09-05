@@ -10,8 +10,9 @@ use crate::chunk::ChunkHash;
 use crate::error::CoreError;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use zeroize::Zeroize;
 
@@ -46,6 +47,51 @@ struct State {
 /// Past this the log collapses to [`DigestLog::Invalidated`] and the
 /// next drain is a one-shot snapshot.
 const MAX_DIGEST_LOG: usize = 65_536;
+static SPILL_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Cache-owned temporary file used to receive a chunk incrementally.
+///
+/// The file lives under the cache root, so committing it can use an atomic
+/// rename. Dropping an uncommitted spill removes it.
+pub struct SpillFile {
+    file: Option<fs::File>,
+    path: PathBuf,
+}
+
+impl Write for SpillFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.as_mut().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.as_mut().unwrap().flush()
+    }
+}
+
+impl Read for SpillFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.as_mut().unwrap().read(buf)
+    }
+}
+
+impl Seek for SpillFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.as_mut().unwrap().seek(pos)
+    }
+}
+
+impl SpillFile {
+    pub fn as_file(&self) -> &fs::File {
+        self.file.as_ref().unwrap()
+    }
+}
+
+impl Drop for SpillFile {
+    fn drop(&mut self) {
+        let _ = self.file.take();
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Debug)]
 enum DigestLog {
@@ -177,6 +223,9 @@ impl DiskCache {
     ) -> Result<Self, CoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        let spill_dir = root.join(".spill");
+        let _ = fs::remove_dir_all(&spill_dir);
+        fs::create_dir_all(&spill_dir)?;
         let cache = Self {
             root,
             budget,
@@ -315,6 +364,77 @@ impl DiskCache {
             return Ok(None);
         }
         Ok(Some(data))
+    }
+
+    /// Begin receiving a chunk into cache-owned storage.
+    pub fn begin_spill(&self) -> Result<SpillFile, CoreError> {
+        let nonce = SPILL_NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = self
+            .root
+            .join(".spill")
+            .join(format!("{}-{nonce}", std::process::id()));
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(SpillFile {
+            file: Some(file),
+            path,
+        })
+    }
+
+    /// Commit a fully written and externally verified spill into the cache.
+    ///
+    /// Accounting and eviction match [`Self::insert`]. If another fetch won
+    /// the same-hash race, its entry is retained and this spill is discarded.
+    pub fn commit_spill(
+        &self,
+        hash: &ChunkHash,
+        mut spill: SpillFile,
+        state: ChunkState,
+    ) -> Result<(), CoreError> {
+        let file = spill.file.as_mut().unwrap();
+        file.flush()?;
+        file.sync_data()?;
+        let size = file.metadata()?.len();
+        let path = self.path_for(hash);
+        fs::create_dir_all(path.parent().unwrap())?;
+        drop(spill.file.take());
+
+        let victims = {
+            let mut st = self.state.lock().unwrap();
+            if let Some((old, now)) = st.entries.get_mut(hash).map(|entry| {
+                let old = entry.state;
+                entry.state = merge_state(entry.state, state);
+                (old, entry.state)
+            }) {
+                st.note(*hash, Some(old), Some(now));
+                return Ok(());
+            }
+            let victims = plan_eviction(&mut st, size, self.budget)?;
+            for (victim, _) in &victims {
+                st.note(*victim, Some(ChunkState::Clean), None);
+            }
+            st.used += size;
+            st.clock += 1;
+            let atime = st.clock;
+            st.entries.insert(*hash, Entry { size, state, atime });
+            st.note(*hash, None, Some(state));
+            if let Err(error) = fs::rename(&spill.path, &path) {
+                if let Some(entry) = st.entries.remove(hash) {
+                    st.used -= entry.size;
+                    st.note(*hash, Some(entry.state), None);
+                }
+                return Err(error.into());
+            }
+            victims
+        };
+
+        for (victim, _) in &victims {
+            let _ = fs::remove_file(self.path_for(victim));
+        }
+        Ok(())
     }
 
     /// Insert a chunk with reserve-before-accept: evicts clean LRU entries
@@ -628,6 +748,44 @@ mod tests {
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         assert_eq!(c.get(&h).unwrap(), Some(d));
         assert_eq!(c.usage().used, 100);
+    }
+
+    #[test]
+    fn spill_commit_matches_insert_accounting() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        let (hash, data) = chunk(4, 100);
+        let mut spill = c.begin_spill().unwrap();
+        spill.write_all(&data).unwrap();
+        c.commit_spill(&hash, spill, ChunkState::Clean).unwrap();
+        assert_eq!(c.get(&hash).unwrap(), Some(data));
+        assert_eq!(c.usage().used, 100);
+    }
+
+    #[test]
+    fn dropped_spill_cleans_up() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        {
+            let mut spill = c.begin_spill().unwrap();
+            spill.write_all(b"incomplete").unwrap();
+        }
+        assert_eq!(fs::read_dir(dir.path().join(".spill")).unwrap().count(), 0);
+        assert_eq!(c.usage().used, 0);
+    }
+
+    #[test]
+    fn spill_commit_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        let (hash, data) = chunk(5, 100);
+        c.insert(&hash, &data, ChunkState::Clean).unwrap();
+        let mut spill = c.begin_spill().unwrap();
+        spill.write_all(&data).unwrap();
+        c.commit_spill(&hash, spill, ChunkState::Pinned).unwrap();
+        assert_eq!(c.usage().used, 100);
+        assert_eq!(c.state_of(&hash), Some(ChunkState::Pinned));
+        assert_eq!(fs::read_dir(dir.path().join(".spill")).unwrap().count(), 0);
     }
 
     #[test]

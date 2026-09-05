@@ -5,9 +5,12 @@ use crate::codec::CompressionSetting;
 use crate::e2e::{decrypt_object, encrypt_object, SharedE2eKeys};
 use crate::error::StoreError;
 use crate::{format, layout};
+use constellation_fs_core::cache::SpillFile;
 use constellation_fs_core::{ChunkHash, DEFAULT_CHUNK_SIZE};
+use futures::StreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -89,6 +92,9 @@ pub struct ChunkStore {
     /// The permit is moved into the blocking closure so cancelling the
     /// async caller cannot admit replacement work while that closure runs.
     encode_gate: Arc<tokio::sync::Semaphore>,
+    /// Whole-object E2E decrypt briefly materializes encoded plaintext.
+    /// Serialize it so simultaneous GET completions cannot multiply RSS.
+    decode_gate: Arc<tokio::sync::Semaphore>,
 }
 
 const DEFAULT_MAX_ENCODE_CONCURRENCY: usize = 8;
@@ -139,6 +145,7 @@ impl ChunkStore {
             store,
             e2e,
             encode_gate: Arc::new(tokio::sync::Semaphore::new(concurrency.max(1))),
+            decode_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -171,6 +178,10 @@ impl ChunkStore {
 
     pub fn inner(&self) -> &Arc<dyn ObjectStore> {
         &self.store
+    }
+
+    pub fn is_e2e(&self) -> bool {
+        self.e2e.is_some()
     }
 
     /// Compute the filesystem's chunk identity. All callers which mint a
@@ -347,6 +358,118 @@ impl ChunkStore {
             });
         }
         Ok((data, ttfb))
+    }
+
+    /// Fetch, decode, hash, and write a chunk without buffering the S3 body.
+    pub async fn get_chunk_to_writer(
+        &self,
+        hash: &ChunkHash,
+        out: &mut (impl Write + Send),
+    ) -> Result<(u64, std::time::Duration, std::time::Duration), StoreError> {
+        let started = std::time::Instant::now();
+
+        // Whole-object AEAD still needs a one-shot authenticated decrypt.
+        // The cache fetch path will replace this compatibility fallback with
+        // ciphertext spill + serialized decrypt before enabling e2e prefetch.
+        if self.e2e.is_some() {
+            let (data, ttfb) = self.get_chunk_timed(hash).await?;
+            out.write_all(&data)?;
+            return Ok((data.len() as u64, ttfb, started.elapsed()));
+        }
+
+        let key = layout::chunk_key(hash);
+        let result = self.store.get(&key).await?;
+        let ttfb = started.elapsed();
+        let mut stream = result.into_stream();
+        let mut header = Vec::with_capacity(format::HEADER_LEN);
+        let mut decoder = None;
+
+        while let Some(piece) = stream.next().await {
+            let piece = piece?;
+            let mut payload = piece.as_ref();
+            if decoder.is_none() {
+                let needed = format::HEADER_LEN - header.len();
+                let take = needed.min(payload.len());
+                header.extend_from_slice(&payload[..take]);
+                payload = &payload[take..];
+                if header.len() == format::HEADER_LEN {
+                    let header: [u8; format::HEADER_LEN] = header.as_slice().try_into().unwrap();
+                    decoder = Some(format::StreamingDecoder::new(
+                        &header,
+                        &mut *out,
+                        blake3::Hasher::new(),
+                    )?);
+                }
+            }
+            if !payload.is_empty() {
+                decoder.as_mut().unwrap().write_payload(payload)?;
+            }
+        }
+
+        let decoder =
+            decoder.ok_or_else(|| StoreError::CorruptObject("truncated header".into()))?;
+        let (bytes, actual) = decoder.finish()?;
+        if actual.as_bytes() != &hash.0 {
+            return Err(StoreError::HashMismatch {
+                key: key.to_string(),
+            });
+        }
+        Ok((bytes, ttfb, started.elapsed()))
+    }
+
+    /// E2E variant which keeps the network-lifetime ciphertext out of RAM.
+    ///
+    /// Ciphertext streams into `cipher_spill`; only after the complete AEAD
+    /// envelope is present is it mapped and authenticated in one shot.
+    pub async fn get_chunk_to_writer_e2e(
+        &self,
+        hash: &ChunkHash,
+        cipher_spill: &mut SpillFile,
+        out: &mut (impl Write + Send),
+    ) -> Result<(u64, std::time::Duration, std::time::Duration), StoreError> {
+        let Some(keys) = &self.e2e else {
+            return self.get_chunk_to_writer(hash, out).await;
+        };
+        let key = layout::chunk_key(hash);
+        let started = std::time::Instant::now();
+        let result = self.store.get(&key).await?;
+        let ttfb = started.elapsed();
+        let mut stream = result.into_stream();
+        while let Some(piece) = stream.next().await {
+            cipher_spill.write_all(&piece?)?;
+        }
+        cipher_spill.flush()?;
+
+        let permit = self
+            .decode_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| StoreError::Meta("chunk decoder gate closed".into()))?;
+        let mapping = unsafe { memmap2::Mmap::map(cipher_spill.as_file())? };
+        let dek = keys.dek("p0")?;
+        let aad = hash.0;
+        let encoded = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            decrypt_object(&dek, &aad, &mapping)
+        })
+        .await
+        .map_err(|error| StoreError::Meta(format!("chunk decoder task failed: {error}")))??;
+
+        if encoded.len() < format::HEADER_LEN {
+            return Err(StoreError::CorruptObject("truncated header".into()));
+        }
+        let header: [u8; format::HEADER_LEN] = encoded[..format::HEADER_LEN].try_into().unwrap();
+        let hasher = blake3::Hasher::new_keyed(keys.addressing_key());
+        let mut decoder = format::StreamingDecoder::new(&header, out, hasher)?;
+        decoder.write_payload(&encoded[format::HEADER_LEN..])?;
+        let (bytes, actual) = decoder.finish()?;
+        if actual.as_bytes() != &hash.0 {
+            return Err(StoreError::HashMismatch {
+                key: key.to_string(),
+            });
+        }
+        Ok((bytes, ttfb, started.elapsed()))
     }
 
     pub async fn has_chunk(&self, hash: &ChunkHash) -> Result<bool, StoreError> {
@@ -570,6 +693,57 @@ mod tests {
         // Idempotent re-put (dedup path).
         s.put_chunk(&hash, &data, setting).await.unwrap();
         assert_eq!(s.get_chunk(&hash).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn chunk_streams_to_writer() {
+        let s = store();
+        let data = vec![9u8; 100_000];
+        let hash = ChunkHash::of(&data);
+        s.put_chunk(&hash, &data, CompressionSetting::zstd(3).unwrap())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let (bytes, _, _) = s.get_chunk_to_writer(&hash, &mut out).await.unwrap();
+        assert_eq!(bytes, data.len() as u64);
+        assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn e2e_chunk_streams_ciphertext_via_spill() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let keys = crate::e2e::put_keyring(&inner, "test-passphrase")
+            .await
+            .unwrap();
+        let s = ChunkStore::new_e2e(inner, keys.clone());
+        let data = vec![7u8; 100_000];
+        let hash = s.hash(&data);
+        s.put_chunk(&hash, &data, CompressionSetting::zstd(3).unwrap())
+            .await
+            .unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = constellation_fs_core::cache::DiskCache::open_keyed(
+            dir.path(),
+            1 << 20,
+            *keys.addressing_key(),
+        )
+        .unwrap();
+        let mut cipher = cache.begin_spill().unwrap();
+        let mut plain = cache.begin_spill().unwrap();
+        let (bytes, _, _) = s
+            .get_chunk_to_writer_e2e(&hash, &mut cipher, &mut plain)
+            .await
+            .unwrap();
+        assert_eq!(bytes, data.len() as u64);
+        cache
+            .commit_spill(
+                &hash,
+                plain,
+                constellation_fs_core::cache::ChunkState::Clean,
+            )
+            .unwrap();
+        assert_eq!(cache.get(&hash).unwrap(), Some(data));
     }
 
     #[tokio::test]
