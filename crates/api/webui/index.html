@@ -35,6 +35,11 @@ a{color:#8eb7ff;text-decoration:none}a:hover{text-decoration:underline}
 <script>
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const call=async req=>(await fetch("/api",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(req)})).json();
+/** Strip only fractional trailing zeros ("10.50"→"10.5", "10.0"→"10").
+ *  Must NOT use /\.?0+$/ — that also eats integer zeros ("1000"→"1"). */
+function trimFrac(s){
+ return s.includes(".")?s.replace(/0+$/,"").replace(/\.$/,""):s;
+}
 /** Auto-scale a byte count: B → KiB → MiB → GiB → TiB. */
 function bytes(n){
  n=Number(n); if(!Number.isFinite(n)||n<0)n=0;
@@ -43,7 +48,7 @@ function bytes(n){
  while(v>=1024 && i<u.length-1){v/=1024;i++}
  if(i===0)return Math.round(v)+" B";
  const d=v>=100?0:v>=10?1:2;
- return v.toFixed(d).replace(/\.?0+$/,"")+" "+u[i];
+ return trimFrac(v.toFixed(d))+" "+u[i];
 }
 /** Auto-scale a bit-rate already expressed in Mbps. */
 function bw(mbps){
@@ -51,9 +56,9 @@ function bw(mbps){
  const n=Number(mbps); if(!Number.isFinite(n))return"—";
  if(Math.abs(n)>=1000){
   const g=n/1000,d=Math.abs(g)>=100?0:Math.abs(g)>=10?1:2;
-  return g.toFixed(d).replace(/\.?0+$/,"")+" Gbps";
+  return trimFrac(g.toFixed(d))+" Gbps";
  }
- if(Math.abs(n)>=1)return (Number.isInteger(n)?n:n.toFixed(1).replace(/\.0$/,""))+" Mbps";
+ if(Math.abs(n)>=1)return (Number.isInteger(n)?n:trimFrac(n.toFixed(1)))+" Mbps";
  if(Math.abs(n)>=0.001)return (n*1000).toFixed(0)+" kbps";
  return "0 Mbps";
 }
@@ -78,6 +83,9 @@ function peerLat(p){
  return dur(p.rtt_ms);
 }
 function peerBw(p){
+ // Prefer aggregate path rate (matches bench throughput under concurrency);
+ // fall back to per-stream goodput when no aggregate sample exists yet.
+ if(p.coop&&p.coop.aggregate_mbps_ewma!=null)return bw(p.coop.aggregate_mbps_ewma);
  return p.coop&&p.coop.goodput_mbps_ewma!=null?bw(p.coop.goodput_mbps_ewma):"—";
 }
 function peerPath(p){

@@ -451,6 +451,12 @@ impl ChunkStore {
             cipher_spill.write_all(&piece?)?;
         }
         cipher_spill.flush()?;
+        // Goodput for the source selector is a *network* quantity: bytes over
+        // the wire divided by body time. Stop the transfer clock here — before
+        // the decode gate and the CPU decrypt — otherwise a deep decrypt queue
+        // (capacity 1 by design, to bound RSS) makes every stream look like a
+        // few Mbps even while aggregate WAN throughput is hundreds of Mbps.
+        let transfer_done = started.elapsed();
 
         let permit = self.decode_gate.clone().acquire(priority).await;
         let mapping = unsafe { memmap2::Mmap::map(cipher_spill.as_file())? };
@@ -476,7 +482,7 @@ impl ChunkStore {
                 key: key.to_string(),
             });
         }
-        Ok((bytes, ttfb, started.elapsed()))
+        Ok((bytes, ttfb, transfer_done))
     }
 
     pub async fn has_chunk(&self, hash: &ChunkHash) -> Result<bool, StoreError> {

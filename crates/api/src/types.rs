@@ -379,9 +379,13 @@ pub struct SourceStatus {
     /// First-byte EWMA from successful transfers only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttfb_ms_ewma: Option<f64>,
-    /// Goodput EWMA from successful transfers only.
+    /// Goodput EWMA from successful transfers only (per-stream body rate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goodput_mbps_ewma: Option<f64>,
+    /// Aggregate path throughput across concurrent streams (wall-clock).
+    /// Prefer this over `goodput_mbps_ewma` when displaying "S3 BW" to operators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_mbps_ewma: Option<f64>,
     /// Successful fetches (EWMA complementary to miss/err).
     #[serde(default)]
     pub hit_rate: f64,

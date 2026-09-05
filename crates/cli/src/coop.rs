@@ -677,6 +677,8 @@ impl Coop {
                 // look like measurements next to probe RTT.
                 ttfb_ms_ewma: (s.ok_samples > 0).then_some(s.ttfb_ewma_ms),
                 goodput_mbps_ewma: (s.ok_samples > 0).then_some(s.goodput_bps * 8.0 / 1_000_000.0),
+                aggregate_mbps_ewma: (s.ok_samples > 0)
+                    .then_some(s.aggregate_bps_live() * 8.0 / 1_000_000.0),
                 hit_rate: s.hit_rate,
                 miss_rate: s.miss_rate,
                 err_rate: s.err_rate,

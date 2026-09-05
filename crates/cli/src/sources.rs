@@ -18,6 +18,7 @@
 
 use constellation_net::PathKind;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// Switch only when the challenger is this much faster than the incumbent.
 pub const HYSTERESIS: f64 = 0.20;
@@ -41,6 +42,10 @@ const S3_PRIOR_P95_MS: f64 = 80.0;
 const MISS_PENALTY_MS: f64 = 100.0;
 /// ETA penalty weight for transport/hash failures (unexpected).
 const ERR_PENALTY_MS: f64 = 200.0;
+/// Wall-clock window over which concurrent-stream completions are summed
+/// into [`SourceStats::aggregate_bps`]. Short enough to track a burst,
+/// long enough that a single chunk finishing does not spike the reading.
+const AGGREGATE_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceId {
@@ -60,7 +65,14 @@ impl SourceId {
 #[derive(Debug, Clone)]
 pub struct SourceStats {
     pub ttfb_ewma_ms: f64,
+    /// Per-stream body goodput (bytes / (total − TTFB)). The selector's ETA
+    /// uses this: one GET's expected body time is `size / goodput_bps`.
     pub goodput_bps: f64,
+    /// Aggregate path throughput across concurrent streams: bytes completed
+    /// in recent wall-clock windows. This is what an operator reading "S3 BW"
+    /// expects (matches `fs_read_bench` rates); `goodput_bps` alone under-reports
+    /// by roughly the concurrency factor on a saturated WAN path.
+    pub aggregate_bps: f64,
     /// Successful fetches (EWMA; rises on ok, decays on miss/err).
     pub hit_rate: f64,
     /// Soft negatives: peer said "no" / busy (bloom FP, admission decline).
@@ -75,6 +87,9 @@ pub struct SourceStats {
     pub ok_samples: u64,
     pub transport_rtt_ms: Option<f64>,
     pub path: PathKind,
+    /// Open wall-clock window for [`aggregate_bps`].
+    window_started: Instant,
+    window_bytes: u64,
 }
 
 impl Default for SourceStats {
@@ -88,6 +103,7 @@ impl SourceStats {
         Self {
             ttfb_ewma_ms: PEER_PRIOR_TTFB_MS,
             goodput_bps: PEER_PRIOR_GOODPUT_BPS,
+            aggregate_bps: 0.0,
             hit_rate: 0.0,
             miss_rate: 0.0,
             err_rate: 0.0,
@@ -97,6 +113,8 @@ impl SourceStats {
             ok_samples: 0,
             transport_rtt_ms: None,
             path: PathKind::Unknown,
+            window_started: Instant::now(),
+            window_bytes: 0,
         }
     }
 
@@ -104,6 +122,7 @@ impl SourceStats {
         Self {
             ttfb_ewma_ms: S3_PRIOR_TTFB_MS,
             goodput_bps: S3_PRIOR_GOODPUT_BPS,
+            aggregate_bps: 0.0,
             hit_rate: 0.0,
             miss_rate: 0.0,
             err_rate: 0.0,
@@ -113,6 +132,26 @@ impl SourceStats {
             ok_samples: 0,
             transport_rtt_ms: None,
             path: PathKind::Unknown,
+            window_started: Instant::now(),
+            window_bytes: 0,
+        }
+    }
+
+    /// Aggregate path throughput including the open window, so a status poll
+    /// mid-burst does not report only the previous closed window's rate.
+    pub fn aggregate_bps_live(&self) -> f64 {
+        let elapsed = self.window_started.elapsed();
+        let live = if self.window_bytes > 0 && elapsed.as_millis() >= 100 {
+            self.window_bytes as f64 / elapsed.as_secs_f64().max(1e-6)
+        } else {
+            0.0
+        };
+        if live > 0.0 && self.aggregate_bps > 0.0 {
+            ALPHA * live + (1.0 - ALPHA) * self.aggregate_bps
+        } else if live > 0.0 {
+            live
+        } else {
+            self.aggregate_bps
         }
     }
 
@@ -318,6 +357,21 @@ impl Selector {
                 ALPHA * gp + (1.0 - ALPHA) * s.goodput_bps
             };
         }
+        // Aggregate path rate: sum bytes across concurrent completions in a
+        // wall-clock window. Per-stream `goodput_bps` alone looks like a few
+        // Mbps under high concurrency even while the path carries hundreds.
+        s.window_bytes = s.window_bytes.saturating_add(bytes);
+        let elapsed = s.window_started.elapsed();
+        if elapsed >= AGGREGATE_WINDOW {
+            let rate = s.window_bytes as f64 / elapsed.as_secs_f64().max(1e-6);
+            s.aggregate_bps = if s.aggregate_bps <= 0.0 {
+                rate
+            } else {
+                ALPHA * rate + (1.0 - ALPHA) * s.aggregate_bps
+            };
+            s.window_bytes = 0;
+            s.window_started = Instant::now();
+        }
         s.hit_rate = ALPHA * 1.0 + (1.0 - ALPHA) * s.hit_rate;
         s.miss_rate *= 1.0 - ALPHA;
         s.err_rate *= 1.0 - ALPHA;
@@ -445,6 +499,27 @@ mod tests {
         assert!(
             (learned - expected).abs() / expected < 0.01,
             "learned {learned} B/s, expected ~{expected} B/s (prior was {prior})"
+        );
+    }
+
+    /// Concurrent completions in one wall-clock window must sum into
+    /// `aggregate_bps`, not stay at per-stream fair-share. Otherwise the
+    /// Peers "BW" column reports ~2 Mbps while a bench measures ~170 Mbps.
+    #[test]
+    fn aggregate_sums_concurrent_completions_over_wall_clock() {
+        let mut s = Selector::default();
+        // Fifty 1 MiB completions whose per-stream body time is 100 ms each.
+        // Dumped into one aggregate window they look like ~50× the stream rate.
+        for _ in 0..50 {
+            s.record_ok(SourceId::S3, 100.0, MIB, 200.0);
+        }
+        std::thread::sleep(AGGREGATE_WINDOW + Duration::from_millis(50));
+        s.record_ok(SourceId::S3, 100.0, MIB, 200.0);
+        let agg = s.stats(SourceId::S3).aggregate_bps;
+        let per_stream = s.stats(SourceId::S3).goodput_bps;
+        assert!(
+            agg > per_stream * 5.0,
+            "aggregate {agg} B/s should far exceed per-stream {per_stream} B/s when many complete together"
         );
     }
 
