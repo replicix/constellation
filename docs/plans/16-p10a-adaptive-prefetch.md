@@ -11,7 +11,10 @@ edit DESIGN.md.
 Status: implemented on `feat/adaptive-prefetch` (adaptive/fair scheduler,
 streaming decode and E2E spill, cooperative-cache spill hedging, directory
 scan-ahead, status/UI counters, and harness coverage). Live WAN validation
-remains a manual follow-up.
+remains a manual follow-up. Follow-up tuning keeps slow WAN fetches alive for
+60 seconds, couples each stream's queued-byte floor to its fair gate share,
+rebalances active requests when another stream appears, and lets demand reads
+claim queued chunks without issuing duplicate GETs.
 
 ## Problem (measured)
 
@@ -201,6 +204,11 @@ benefit), `max_window` = 256 MiB, and `max_window` is additionally
 clamped to ¼ of the disk-cache budget so prefetch can never churn the
 cache it feeds (zfetch's ARC guard, translated).
 
+Implementation follow-up: the stream cap is now 2 GiB (still clamped
+to ¼ of cache budget), and the effective window is raised to two fair
+shares of the current gate target. The original 256 MiB cap could only
+feed 64 default-sized chunks even when the controller asked for more.
+
 **1c. Scheduling: adaptive bounded concurrency, fairness, demand
 priority.** Today every prefetched chunk is a naked `rt.spawn` — window
 growth would stampede. Add one global scheduler owned by the
@@ -243,7 +251,7 @@ growth would stampede. Add one global scheduler owned by the
   reader needs next tends to complete first.
 
 **1d. Stream reaping.** In `on_read` (cheap, amortized): drop streams
-with `last_hit` older than 2 s (zfetch `zfetch_min_sec_reap`), and
+with `last_hit` older than 60 s (longer than measured WAN GET latency), and
 keep `forget(ino)` on last close as today. Bound the map (e.g. 512
 streams, evict oldest) — tar walks touch hundreds of thousands of
 inodes.
@@ -405,15 +413,16 @@ New env knobs (parse in the owning module, mirror
 | var | default | meaning |
 |---|---|---|
 | `CONSTELLATION_PREFETCH_MIN_BYTES` | `8388608` | initial/floor window per stream |
-| `CONSTELLATION_PREFETCH_MAX_BYTES` | `268435456` | window cap (also clamped to cache_budget/4) |
+| `CONSTELLATION_PREFETCH_MAX_BYTES` | `2147483648` | window cap (also clamped to cache_budget/4) |
 | `CONSTELLATION_PREFETCH_CONCURRENCY` | unset | pin global background-fetch concurrency; otherwise adaptive |
-| `CONSTELLATION_PREFETCH_MAX_CONCURRENCY` | `128` | adaptive background-fetch ceiling |
+| `CONSTELLATION_PREFETCH_MAX_CONCURRENCY` | `128` | adaptive background-fetch ceiling (configurable through 512) |
 | `CONSTELLATION_SCAN_AHEAD` | `on` | scan-ahead master switch |
 
 Counters on the existing status path (`Coop::report` /
 `constellation status` / web UI, wherever the peers panel gets its
-numbers): per-mount `prefetch_inflight`, `prefetch_window_bytes`
-(max over live streams), `prefetch_stalls`, `prefetch_gate_target`,
+numbers): per-mount `prefetch_inflight`, `prefetch_queued`,
+`prefetch_streams`, `prefetch_window_bytes` (max over live streams),
+`prefetch_stalls`, `prefetch_gate_target`,
 `scan_ahead_files`, `scan_ahead_bytes`. The dd-style investigation
 above was only possible because the panel existed — extend it.
 

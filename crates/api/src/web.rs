@@ -195,6 +195,16 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.prefetch.inflight
     );
     gauge!(
+        "constellation_prefetch_queued",
+        "Background chunks queued behind the active fetches.",
+        status.prefetch.queued
+    );
+    gauge!(
+        "constellation_prefetch_streams",
+        "Live sequential prefetch streams.",
+        status.prefetch.streams
+    );
+    gauge!(
         "constellation_prefetch_window_bytes",
         "Largest live sequential prefetch window.",
         status.prefetch.window_bytes

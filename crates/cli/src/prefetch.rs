@@ -12,22 +12,26 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
 const REORDER_WINDOW: u64 = 16 << 20;
-const STREAM_IDLE: Duration = Duration::from_secs(2);
+const STREAM_IDLE: Duration = Duration::from_secs(60);
 const MAX_STREAMS: usize = 512;
 const DEFAULT_MIN_WINDOW: u64 = 8 << 20;
-const DEFAULT_MAX_WINDOW: u64 = 256 << 20;
+const DEFAULT_MAX_WINDOW: u64 = 2 << 30;
 const DEFAULT_MAX_CONCURRENCY: usize = 128;
+const ABSOLUTE_MAX_CONCURRENCY: usize = 512;
 const INITIAL_CONCURRENCY: usize = 8;
+const QUEUE_ROUNDS: usize = 2;
 
 struct Stream {
     cursor: u64,
     window: u64,
     last_hit: Instant,
+    sequential: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct PrefetchStats {
     inflight: AtomicU64,
+    queued: AtomicU64,
     stalls: AtomicU64,
     gate_target: AtomicU64,
     scan_ahead_files: AtomicU64,
@@ -37,16 +41,15 @@ pub(crate) struct PrefetchStats {
 
 impl PrefetchStats {
     pub(crate) fn snapshot(&self) -> constellation_api::PrefetchStatus {
+        let windows = self.windows.lock().unwrap();
+        let streams = windows.len() as u64;
+        let window_bytes = windows.values().copied().max().unwrap_or(0);
+        drop(windows);
         constellation_api::PrefetchStatus {
             inflight: self.inflight.load(Ordering::Relaxed),
-            window_bytes: self
-                .windows
-                .lock()
-                .unwrap()
-                .values()
-                .copied()
-                .max()
-                .unwrap_or(0),
+            queued: self.queued.load(Ordering::Relaxed),
+            streams,
+            window_bytes,
             stalls: self.stalls.load(Ordering::Relaxed),
             gate_target: self.gate_target.load(Ordering::Relaxed) as u32,
             scan_ahead_files: self.scan_ahead_files.load(Ordering::Relaxed),
@@ -64,7 +67,8 @@ struct Queues {
     by_stream: HashMap<Ino, VecDeque<ChunkHash>>,
     ready: VecDeque<Ino>,
     reserved: HashSet<ChunkHash>,
-    active: HashSet<ChunkHash>,
+    active: HashMap<ChunkHash, Ino>,
+    active_by_stream: HashMap<Ino, usize>,
 }
 
 struct Scheduler {
@@ -81,6 +85,7 @@ struct Scheduler {
 impl Scheduler {
     fn enqueue(&self, ino: Ino, hashes: impl IntoIterator<Item = ChunkHash>) {
         let mut queues = self.queues.lock().unwrap();
+        let mut added = 0u64;
         for hash in hashes {
             if self.cache.contains(&hash) || !queues.reserved.insert(hash) {
                 continue;
@@ -88,17 +93,34 @@ impl Scheduler {
             let queue = queues.by_stream.entry(ino).or_default();
             let was_empty = queue.is_empty();
             queue.push_back(hash);
+            added += 1;
             if was_empty {
                 queues.ready.push_back(ino);
             }
         }
+        self.stats.queued.fetch_add(added, Ordering::Relaxed);
         drop(queues);
         self.wake.notify_one();
     }
 
     fn pop(&self) -> Option<ChunkHash> {
         let mut queues = self.queues.lock().unwrap();
-        let ino = queues.ready.pop_front()?;
+        let quota = self
+            .gate
+            .target()
+            .div_ceil(queues.by_stream.len().max(1))
+            .max(2);
+        let ready = queues.ready.len();
+        let ino = (0..ready).find_map(|_| {
+            let ino = queues.ready.pop_front()?;
+            let active = queues.active_by_stream.get(&ino).copied().unwrap_or(0);
+            if active < quota {
+                Some(ino)
+            } else {
+                queues.ready.push_back(ino);
+                None
+            }
+        })?;
         let queue = queues.by_stream.get_mut(&ino).unwrap();
         let hash = queue.pop_front().unwrap();
         if queue.is_empty() {
@@ -106,22 +128,38 @@ impl Scheduler {
         } else {
             queues.ready.push_back(ino);
         }
-        queues.active.insert(hash);
+        queues.active.insert(hash, ino);
+        *queues.active_by_stream.entry(ino).or_default() += 1;
+        self.stats.queued.fetch_sub(1, Ordering::Relaxed);
         self.stats.inflight.fetch_add(1, Ordering::Relaxed);
         Some(hash)
     }
 
     fn finish(&self, hash: &ChunkHash) {
         let mut queues = self.queues.lock().unwrap();
-        queues.active.remove(hash);
+        let finished = if let Some(ino) = queues.active.remove(hash) {
+            let active = queues.active_by_stream.get_mut(&ino).unwrap();
+            *active -= 1;
+            if *active == 0 {
+                queues.active_by_stream.remove(&ino);
+            }
+            true
+        } else {
+            false
+        };
         queues.reserved.remove(hash);
-        self.stats.inflight.fetch_sub(1, Ordering::Relaxed);
+        if finished {
+            self.stats.inflight.fetch_sub(1, Ordering::Relaxed);
+        }
         self.wake.notify_one();
     }
 
     fn forget(&self, ino: Ino) {
         let mut queues = self.queues.lock().unwrap();
         if let Some(pending) = queues.by_stream.remove(&ino) {
+            self.stats
+                .queued
+                .fetch_sub(pending.len() as u64, Ordering::Relaxed);
             for hash in pending {
                 queues.reserved.remove(&hash);
             }
@@ -130,7 +168,39 @@ impl Scheduler {
     }
 
     fn is_inflight(&self, hash: &ChunkHash) -> bool {
-        self.queues.lock().unwrap().active.contains(hash)
+        self.queues.lock().unwrap().active.contains_key(hash)
+    }
+
+    /// Give a demand read ownership of a queued chunk, or report that an
+    /// already-running background transfer should be awaited. This closes the
+    /// queued-but-not-active race without putting foreground I/O behind the
+    /// background concurrency gate.
+    fn claim_for_demand(&self, hash: &ChunkHash) -> bool {
+        let mut queues = self.queues.lock().unwrap();
+        if queues.active.contains_key(hash) {
+            return true;
+        }
+        if !queues.reserved.remove(hash) {
+            return false;
+        }
+        self.stats.queued.fetch_sub(1, Ordering::Relaxed);
+        let owner = queues
+            .by_stream
+            .iter()
+            .find(|(_, pending)| pending.contains(hash))
+            .map(|(ino, _)| *ino);
+        if let Some(ino) = owner {
+            let empty = {
+                let pending = queues.by_stream.get_mut(&ino).unwrap();
+                pending.retain(|candidate| candidate != hash);
+                pending.is_empty()
+            };
+            if empty {
+                queues.by_stream.remove(&ino);
+                queues.ready.retain(|candidate| *candidate != ino);
+            }
+        }
+        false
     }
 
     fn record_success(&self, bytes: u64, service_time: Duration) {
@@ -252,7 +322,7 @@ impl Prefetcher {
             "CONSTELLATION_PREFETCH_MAX_CONCURRENCY",
             DEFAULT_MAX_CONCURRENCY,
         )
-        .clamp(1, DEFAULT_MAX_CONCURRENCY);
+        .clamp(1, ABSOLUTE_MAX_CONCURRENCY);
         let fixed = std::env::var("CONSTELLATION_PREFETCH_CONCURRENCY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -282,7 +352,8 @@ impl Prefetcher {
                 by_stream: HashMap::new(),
                 ready: VecDeque::new(),
                 reserved: HashSet::new(),
-                active: HashSet::new(),
+                active: HashMap::new(),
+                active_by_stream: HashMap::new(),
             }),
             wake: tokio::sync::Notify::new(),
         });
@@ -301,7 +372,7 @@ impl Prefetcher {
     /// background fetches for upcoming chunks.
     pub fn on_read(&self, ino: Ino, offset: u64, len: u64, chunk_size: u32, hashes: &SparseChunks) {
         let now = Instant::now();
-        let (sequential, cursor, window) = {
+        let (sequential, cursor, window, active_streams) = {
             let mut streams = self.streams.lock().unwrap();
             let stale: Vec<Ino> = streams
                 .iter()
@@ -332,34 +403,56 @@ impl Prefetcher {
                 {
                     stream.cursor = stream.cursor.max(end);
                     stream.last_hit = now;
-                    (true, stream.cursor, stream.window)
+                    stream.sequential = true;
                 }
                 Some(stream) => {
                     *stream = Stream {
                         cursor: end,
                         window: self.min_window,
                         last_hit: now,
+                        sequential: false,
                     };
-                    (false, end, self.min_window)
                 }
                 None => {
+                    let sequential = offset == 0;
                     streams.insert(
                         ino,
                         Stream {
                             cursor: end,
                             window: self.min_window,
                             last_hit: now,
+                            sequential,
                         },
                     );
-                    (offset == 0, end, self.min_window)
                 }
             }
+            let stream = streams.get(&ino).unwrap();
+            (
+                stream.sequential,
+                stream.cursor,
+                stream.window,
+                streams
+                    .values()
+                    .filter(|candidate| candidate.sequential)
+                    .count()
+                    .max(1),
+            )
         };
         if !sequential || hashes.is_empty() {
             return;
         }
-        self.stats.windows.lock().unwrap().insert(ino, window);
         let chunk_size = u64::from(chunk_size);
+        let window = scheduled_window(
+            window,
+            chunk_size,
+            self.scheduler.gate.target(),
+            active_streams,
+            self.max_window,
+        );
+        if let Some(stream) = self.streams.lock().unwrap().get_mut(&ino) {
+            stream.window = stream.window.max(window);
+        }
+        self.stats.windows.lock().unwrap().insert(ino, window);
         let first = cursor.div_ceil(chunk_size);
         let last = cursor.saturating_add(window).div_ceil(chunk_size);
         self.scheduler.enqueue(
@@ -385,6 +478,10 @@ impl Prefetcher {
     /// The read path waits for it instead of issuing a duplicate GET.
     pub fn is_inflight(&self, hash: &ChunkHash) -> bool {
         self.scheduler.is_inflight(hash)
+    }
+
+    pub fn claim_for_demand(&self, hash: &ChunkHash) -> bool {
+        self.scheduler.claim_for_demand(hash)
     }
 
     /// Forget an inode's cursor (last close).
@@ -446,6 +543,20 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn scheduled_window(
+    current: u64,
+    chunk_size: u64,
+    gate_target: usize,
+    active_streams: usize,
+    max_window: u64,
+) -> u64 {
+    let fair_slots = gate_target.div_ceil(active_streams.max(1));
+    let target_bytes = chunk_size
+        .saturating_mul(fair_slots as u64)
+        .saturating_mul(QUEUE_ROUNDS as u64);
+    current.max(target_bytes).min(max_window)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,7 +579,8 @@ mod tests {
                 by_stream: HashMap::new(),
                 ready: VecDeque::new(),
                 reserved: HashSet::new(),
-                active: HashSet::new(),
+                active: HashMap::new(),
+                active_by_stream: HashMap::new(),
             }),
             wake: tokio::sync::Notify::new(),
         })
@@ -483,6 +595,61 @@ mod tests {
         assert_eq!(scheduler.pop(), Some(hash(1)));
         assert_eq!(scheduler.pop(), Some(hash(3)));
         assert_eq!(scheduler.pop(), Some(hash(2)));
+    }
+
+    #[test]
+    fn a_new_stream_gets_completions_until_inflight_shares_rebalance() {
+        let dir = TempDir::new().unwrap();
+        let scheduler = scheduler(Arc::new(DiskCache::open(dir.path(), 1 << 20).unwrap()));
+        scheduler.enqueue(1, [hash(1), hash(2), hash(3), hash(4), hash(7), hash(8)]);
+        let active: Vec<_> = (0..4).map(|_| scheduler.pop().unwrap()).collect();
+        scheduler.enqueue(2, [hash(5), hash(6)]);
+
+        scheduler.finish(&active[0]);
+        assert_eq!(scheduler.pop(), Some(hash(5)));
+        scheduler.finish(&active[1]);
+        assert_eq!(scheduler.pop(), Some(hash(6)));
+        scheduler.finish(&active[2]);
+        assert_eq!(scheduler.pop(), Some(hash(7)));
+    }
+
+    #[test]
+    fn demand_claim_removes_a_queued_fetch_without_disturbing_other_streams() {
+        let dir = TempDir::new().unwrap();
+        let scheduler = scheduler(Arc::new(DiskCache::open(dir.path(), 1 << 20).unwrap()));
+        scheduler.enqueue(1, [hash(1), hash(2)]);
+        scheduler.enqueue(2, [hash(3)]);
+
+        assert!(!scheduler.claim_for_demand(&hash(2)));
+        assert!(!scheduler.queues.lock().unwrap().reserved.contains(&hash(2)));
+        assert_eq!(scheduler.pop(), Some(hash(1)));
+        assert_eq!(scheduler.pop(), Some(hash(3)));
+    }
+
+    #[test]
+    fn demand_waits_when_the_background_fetch_is_already_active() {
+        let dir = TempDir::new().unwrap();
+        let scheduler = scheduler(Arc::new(DiskCache::open(dir.path(), 1 << 20).unwrap()));
+        scheduler.enqueue(1, [hash(1)]);
+        assert_eq!(scheduler.pop(), Some(hash(1)));
+        assert!(scheduler.claim_for_demand(&hash(1)));
+    }
+
+    #[test]
+    fn gate_target_sets_a_fair_per_stream_queue_floor() {
+        assert_eq!(scheduled_window(8 << 20, 4 << 20, 8, 1, 2 << 30), 64 << 20);
+        assert_eq!(scheduled_window(8 << 20, 4 << 20, 8, 2, 2 << 30), 32 << 20);
+        assert_eq!(scheduled_window(8 << 20, 4 << 20, 512, 1, 1 << 30), 1 << 30);
+    }
+
+    #[test]
+    fn status_reports_live_streams_and_largest_window() {
+        let stats = PrefetchStats::default();
+        stats.windows.lock().unwrap().insert(1, 32 << 20);
+        stats.windows.lock().unwrap().insert(2, 64 << 20);
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.streams, 2);
+        assert_eq!(snapshot.window_bytes, 64 << 20);
     }
 
     #[tokio::test]
@@ -524,5 +691,34 @@ mod tests {
         hashes.insert(17, hash(1));
         prefetch.on_read(7, 64 << 20, 128 << 10, 4 << 20, &hashes);
         assert!(prefetch.scheduler.queues.lock().unwrap().ready.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_second_fetch_does_not_expire_a_live_stream() {
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::open(dir.path(), 1 << 30).unwrap());
+        let prefetch = Prefetcher::new(
+            Handle::current(),
+            Arc::new(ChunkStore::new(Arc::new(InMemory::new()))),
+            cache,
+            None,
+        );
+        let mut hashes = SparseChunks::new();
+        for index in 0..64 {
+            hashes.insert(index, hash(index as u8));
+        }
+        prefetch.on_read(7, 0, 1 << 20, 4 << 20, &hashes);
+        prefetch.note_stall(7);
+        let grown = prefetch.streams.lock().unwrap()[&7].window;
+        prefetch
+            .streams
+            .lock()
+            .unwrap()
+            .get_mut(&7)
+            .unwrap()
+            .last_hit = Instant::now() - Duration::from_secs(5);
+
+        prefetch.on_read(7, 1 << 20, 1 << 20, 4 << 20, &hashes);
+        assert!(prefetch.streams.lock().unwrap()[&7].window >= grown);
     }
 }

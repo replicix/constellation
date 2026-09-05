@@ -1096,7 +1096,7 @@ impl ConstellationFs {
         if let Ok(Some(data)) = self.cache.get(hash) {
             return Ok(data);
         }
-        if self.prefetch.is_inflight(hash) {
+        if self.prefetch.claim_for_demand(hash) {
             if let Some(ino) = ino {
                 self.prefetch.note_stall(ino);
                 self.scan.note_stall(ino);

@@ -2655,33 +2655,42 @@ fn scan_ahead(_seed: u64) -> Result<()> {
         }
         data.truncate(file_size);
         expected.push((name.clone(), blake3::hash(&data)));
-        std::fs::write(directory.join(name), data)?;
+        std::fs::write(directory.join(&name), data)
+            .with_context(|| format!("writing scan-ahead fixture {name}"))?;
     }
 
-    c.unmount()?;
-    c.drop_cache()?;
-    c.mount()?;
+    c.unmount()
+        .context("unmounting scan-ahead fixture writer")?;
+    c.drop_cache().context("dropping scan-ahead cache")?;
+    c.mount().context("remounting scan-ahead reader")?;
     let latency_ms = 60u64;
-    proxy.latency(latency_ms, 0)?;
+    proxy
+        .latency(latency_ms, 0)
+        .context("installing scan-ahead latency toxic")?;
 
     let started = std::time::Instant::now();
-    let mut entries =
-        std::fs::read_dir(c.mnt.join("walk"))?.collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut entries = std::fs::read_dir(c.mnt.join("walk"))
+        .context("opening scan-ahead directory")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("collecting scan-ahead directory entries")?;
     entries.sort_by_key(|entry| entry.file_name());
     for (entry, (name, hash)) in entries.into_iter().zip(&expected) {
         anyhow::ensure!(
             entry.file_name().to_string_lossy() == name.as_str(),
             "directory order mismatch"
         );
-        let data = std::fs::read(entry.path())?;
+        let data = std::fs::read(entry.path())
+            .with_context(|| format!("reading scan-ahead file {name}"))?;
         anyhow::ensure!(
             blake3::hash(&data) == *hash,
             "content corrupted in scan-ahead file {name}"
         );
     }
     let elapsed = started.elapsed();
-    proxy.heal()?;
-    let status = c.control_status()?;
+    proxy.heal().context("healing scan-ahead proxy")?;
+    let status = c
+        .control_status()
+        .context("reading scan-ahead daemon status")?;
     eprintln!(
         "    scan-ahead status: {}",
         serde_json::to_string(&status["prefetch"])?

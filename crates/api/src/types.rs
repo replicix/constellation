@@ -306,6 +306,10 @@ pub struct PrefetchStatus {
     #[serde(default)]
     pub inflight: u64,
     #[serde(default)]
+    pub queued: u64,
+    #[serde(default)]
+    pub streams: u64,
+    #[serde(default)]
     pub window_bytes: u64,
     #[serde(default)]
     pub stalls: u64,

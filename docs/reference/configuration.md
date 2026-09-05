@@ -29,9 +29,9 @@ P2P fast path. Set them before mounting; values are read by the daemon.
 | `CONSTELLATION_P2P_RELAY` | `off` | `off`, `default`/`public`/`n0`, or comma-separated relay URLs | iroh relay policy |
 | `CONSTELLATION_P2P_RELAY_TOKEN` | unset | string | optional bearer token for custom relays |
 | `CONSTELLATION_PREFETCH_MIN_BYTES` | `8388608` | bytes, positive | initial adaptive sequential-read window |
-| `CONSTELLATION_PREFETCH_MAX_BYTES` | `268435456` | bytes, positive | window ceiling, additionally capped at one quarter of cache budget |
+| `CONSTELLATION_PREFETCH_MAX_BYTES` | `2147483648` | bytes, positive | window ceiling, additionally capped at one quarter of cache budget |
 | `CONSTELLATION_PREFETCH_CONCURRENCY` | unset | requests, positive | pin background-fetch concurrency instead of adapting it |
-| `CONSTELLATION_PREFETCH_MAX_CONCURRENCY` | `128` | requests, `1..128` | adaptive background-fetch ceiling |
+| `CONSTELLATION_PREFETCH_MAX_CONCURRENCY` | `128` | requests, `1..512` | adaptive background-fetch ceiling |
 | `CONSTELLATION_SCAN_AHEAD` | `on` | boolean | ordered directory-walk readahead |
 
 `CONSTELLATION_P2P=off` disables forwarding, placement messages, segment
