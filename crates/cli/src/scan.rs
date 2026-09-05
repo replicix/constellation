@@ -271,6 +271,7 @@ mod tests {
                 chunks as u64 * u64::from(DEFAULT_CHUNK_SIZE),
                 hashes,
                 INLINE_CHUNKS_MAX,
+                ChunkHash::of,
             );
             assert!(spill.is_none());
             meta.set_manifest(attr.ino, &manifest.encode(), manifest.file_len)
@@ -319,6 +320,7 @@ mod tests {
                 u64::from(DEFAULT_CHUNK_SIZE),
                 vec![ChunkHash::of(&ino.to_le_bytes())],
                 INLINE_CHUNKS_MAX,
+                ChunkHash::of,
             );
             meta.set_manifest(ino, &manifest.encode(), manifest.file_len)
                 .unwrap();

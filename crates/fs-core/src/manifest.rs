@@ -57,11 +57,19 @@ impl Manifest {
     /// Build a manifest from a full chunk list, spilling if it exceeds
     /// `inline_max`. Returns the manifest and, when spilled, the blob that
     /// must be stored in the chunk store under its hash.
+    ///
+    /// `hash_blob` computes the identity of the spill object. It must be the
+    /// same function the caller uses to *store* that object: on an E2E
+    /// filesystem chunk identity is a keyed hash, so passing plain
+    /// [`ChunkHash::of`] there would record a reference nothing can resolve.
+    /// It is a parameter rather than an internal default precisely so the
+    /// choice cannot be made silently.
     pub fn from_chunks(
         chunk_size: u32,
         file_len: u64,
         hashes: Vec<ChunkHash>,
         inline_max: usize,
+        hash_blob: impl Fn(&[u8]) -> ChunkHash,
     ) -> (Self, Option<Vec<u8>>) {
         let layout = ChunkLayout::new(chunk_size);
         debug_assert_eq!(layout.chunk_count(file_len), hashes.len() as u64);
@@ -70,16 +78,19 @@ impl Manifest {
             .enumerate()
             .map(|(i, h)| (i as u64, h))
             .collect();
-        Self::from_sparse_chunks(chunk_size, file_len, chunks, inline_max)
+        Self::from_sparse_chunks(chunk_size, file_len, chunks, inline_max, hash_blob)
     }
 
     /// Build a manifest from only the present data chunks. Missing indices
     /// are holes and consume no manifest slots or chunk-store objects.
+    ///
+    /// See [`Self::from_chunks`] for the contract on `hash_blob`.
     pub fn from_sparse_chunks(
         chunk_size: u32,
         file_len: u64,
         chunks: SparseChunks,
         inline_max: usize,
+        hash_blob: impl Fn(&[u8]) -> ChunkHash,
     ) -> (Self, Option<Vec<u8>>) {
         let layout = ChunkLayout::new(chunk_size);
         debug_assert!(chunks
@@ -96,7 +107,7 @@ impl Manifest {
             )
         } else {
             let blob = encode_chunk_list(&chunks);
-            let blob_hash = ChunkHash::of(&blob);
+            let blob_hash = hash_blob(&blob);
             (
                 Self {
                     layout,
@@ -250,7 +261,8 @@ mod tests {
         let cs = DEFAULT_CHUNK_SIZE;
         let hs = hashes(3);
         let file_len = cs as u64 * 2 + 5;
-        let (m, blob) = Manifest::from_chunks(cs, file_len, hs.clone(), INLINE_CHUNKS_MAX);
+        let (m, blob) =
+            Manifest::from_chunks(cs, file_len, hs.clone(), INLINE_CHUNKS_MAX, ChunkHash::of);
         assert!(blob.is_none());
         assert!(!m.is_spilled());
         let decoded = Manifest::decode(&m.encode()).unwrap();
@@ -267,12 +279,42 @@ mod tests {
     }
 
     #[test]
+    fn the_spill_reference_uses_the_callers_hash_domain() {
+        // Regression: the spill reference was hardcoded to plain
+        // `ChunkHash::of`, while an E2E mount stores chunks under a keyed
+        // addressing hash. The manifest then pointed at an object that was
+        // never written under that name, so any cold read of a file with more
+        // than `inline_max` chunks failed with EIO on a fresh mount.
+        let cs = DEFAULT_CHUNK_SIZE;
+        let n = INLINE_CHUNKS_MAX + 1;
+        let hs = hashes(n);
+        let file_len = cs as u64 * n as u64;
+        // Stand in for a keyed hash: any function distinguishable from the
+        // plain one is enough to catch a hardcoded default.
+        let keyed = |data: &[u8]| ChunkHash::keyed(&[7u8; 32], data);
+        let (m, blob) = Manifest::from_chunks(cs, file_len, hs, INLINE_CHUNKS_MAX, keyed);
+        let blob = blob.expect("must spill");
+        match Manifest::decode(&m.encode()).unwrap().chunks {
+            ChunkInfo::Spilled(h) => {
+                assert_eq!(h, keyed(&blob), "spill reference must use caller's hash");
+                assert_ne!(
+                    h,
+                    ChunkHash::of(&blob),
+                    "spill reference must not silently fall back to the plain hash"
+                );
+            }
+            other => panic!("expected a spilled manifest, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn spill_roundtrip() {
         let cs = DEFAULT_CHUNK_SIZE;
         let n = INLINE_CHUNKS_MAX + 1;
         let hs = hashes(n);
         let file_len = cs as u64 * n as u64;
-        let (m, blob) = Manifest::from_chunks(cs, file_len, hs.clone(), INLINE_CHUNKS_MAX);
+        let (m, blob) =
+            Manifest::from_chunks(cs, file_len, hs.clone(), INLINE_CHUNKS_MAX, ChunkHash::of);
         let blob = blob.expect("must spill");
         assert!(m.is_spilled());
         assert_eq!(
@@ -324,6 +366,7 @@ mod tests {
             1 << 40,
             chunks.clone(),
             INLINE_CHUNKS_MAX,
+            ChunkHash::of,
         );
         assert!(spill.is_none());
         assert!(manifest.encode().len() < 80);

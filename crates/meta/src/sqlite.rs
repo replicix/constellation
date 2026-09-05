@@ -3234,6 +3234,7 @@ mod tests {
             1,
             vec![hash],
             constellation_fs_core::INLINE_CHUNKS_MAX,
+            ChunkHash::of,
         )
         .0
         .encode()
@@ -4000,7 +4001,8 @@ mod tests {
         let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         let h1 = ChunkHash::of(b"chunk-a");
         let h2 = ChunkHash::of(b"chunk-b");
-        m.set_manifest_dirty(f.ino, None, b"M1", 10, &[h1, h2]).unwrap();
+        m.set_manifest_dirty(f.ino, None, b"M1", 10, &[h1, h2])
+            .unwrap();
         let mut pending = m.pending_uploads().unwrap();
         pending.sort();
         let mut expect = vec![(h1, f.ino), (h2, f.ino)];

@@ -421,6 +421,7 @@ mod tests {
             3,
             vec![ChunkHash::of(b"old")],
             constellation_fs_core::INLINE_CHUNKS_MAX,
+            ChunkHash::of,
         )
         .0
         .encode();
@@ -458,6 +459,7 @@ mod tests {
             3,
             vec![ChunkHash::of(b"new")],
             constellation_fs_core::INLINE_CHUNKS_MAX,
+            ChunkHash::of,
         )
         .0
         .encode();

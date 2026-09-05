@@ -262,6 +262,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: readahead_adaptive,
     },
     Scenario {
+        name: "e2e-spilled-manifest",
+        desc: "cold read of an E2E file whose manifest spilled its chunk list",
+        requires: &[],
+        run: e2e_spilled_manifest_cold_read,
+    },
+    Scenario {
         name: "scan-ahead",
         desc: "ordered cold reads of many small files pipeline across file boundaries",
         requires: &[],
@@ -386,7 +392,10 @@ fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
     // scenario returns, for offline inspection of failures.
     if std::env::var_os("CHAOS_KEEP_TMP").is_some_and(|v| v != "0") {
         root.disable_cleanup(true);
-        eprintln!("CHAOS_KEEP_TMP: artifacts kept at {}", root.path().display());
+        eprintln!(
+            "CHAOS_KEEP_TMP: artifacts kept at {}",
+            root.path().display()
+        );
     }
     Ok((env, root))
 }
@@ -2634,6 +2643,58 @@ fn readahead_adaptive(_seed: u64) -> Result<()> {
     Ok(())
 }
 
+/// A cold read of an E2E file large enough to spill its manifest must work.
+///
+/// Regression: the spilled chunk-list reference was minted with a plain
+/// `ChunkHash::of` while the blob was stored under the E2E keyed addressing
+/// hash, so the manifest pointed at an object that did not exist. Every cold
+/// read of a >`INLINE_CHUNKS_MAX`-chunk file failed with EIO on a fresh mount,
+/// while the same file read fine from a warm cache and non-E2E filesystems
+/// were unaffected — which is why the existing E2E coverage, all of it under
+/// the inline-manifest limit, never saw it.
+fn e2e_spilled_manifest_cold_read(_seed: u64) -> Result<()> {
+    let (env, root) = setup("e2e-spilled-manifest")?;
+    let proxy = env.s3_proxy()?;
+    let prefix = format!("e2e-spill-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut c = Client::new(root.path(), "c0", &env.endpoint, &backend)?
+        .with_e2e()
+        // E2E cold reads spill ciphertext and plaintext separately, so the
+        // budget must cover well over the file size.
+        .with_cache_size(1 << 30);
+    c.fs_create()?;
+    c.mount()?;
+
+    // Comfortably above INLINE_CHUNKS_MAX (8) so the manifest must spill.
+    let n_chunks = 16u64;
+    let mut data = vec![0u8; (n_chunks * (1 << 20)) as usize];
+    for (i, byte) in data.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
+    let expected = blake3::hash(&data);
+    std::fs::write(c.mnt.join("spilled"), &data).context("writing spilled-manifest E2E file")?;
+    drop(data);
+
+    c.unmount()?;
+    c.drop_cache()?;
+    c.mount().context("cold remount")?;
+    proxy.latency(20, 0)?;
+
+    let read = std::fs::read(c.mnt.join("spilled")).context("cold read of spilled E2E manifest")?;
+    proxy.heal()?;
+    anyhow::ensure!(
+        blake3::hash(&read) == expected,
+        "cold E2E spilled-manifest read returned different bytes"
+    );
+    eprintln!(
+        "    e2e-spilled-manifest: {n_chunks}-chunk E2E file cold-read intact \
+         ({} bytes)",
+        read.len()
+    );
+    c.unmount()?;
+    Ok(())
+}
+
 /// A tar-like lexicographic walk should trigger directory scan-ahead after
 /// its first few files and pipeline the remaining single-chunk objects.
 fn scan_ahead(_seed: u64) -> Result<()> {
@@ -3949,8 +4010,11 @@ fn chaos_ci(seed: u64) -> Result<()> {
     // Brief settle so all three see the shared namespace.
     eventually("three mounts live", Duration::from_secs(20), || {
         std::fs::create_dir_all(c0.mnt.join(".chaos-probe")).ok();
-        anyhow::ensure!(c1.mnt.join(".chaos-probe").is_dir() || c2.mnt.join(".chaos-probe").is_dir()
-            || c0.mnt.join(".chaos-probe").is_dir());
+        anyhow::ensure!(
+            c1.mnt.join(".chaos-probe").is_dir()
+                || c2.mnt.join(".chaos-probe").is_dir()
+                || c0.mnt.join(".chaos-probe").is_dir()
+        );
         Ok(())
     })
     .ok();
@@ -3997,20 +4061,12 @@ fn chaos_soak_4(seed: u64) -> Result<()> {
     eventually("four mounts live", Duration::from_secs(30), || {
         let probe = clients[0].mnt.join(".chaos-probe");
         std::fs::create_dir_all(&probe).ok();
-        anyhow::ensure!(
-            clients
-                .iter()
-                .any(|c| c.mnt.join(".chaos-probe").is_dir())
-        );
+        anyhow::ensure!(clients.iter().any(|c| c.mnt.join(".chaos-probe").is_dir()));
         Ok(())
     })
     .ok();
 
-    let store = PathBuf::from(format!(
-        "/tmp/chaos-soak-4-{}-{}",
-        seed,
-        std::process::id()
-    ));
+    let store = PathBuf::from(format!("/tmp/chaos-soak-4-{}-{}", seed, std::process::id()));
     std::fs::create_dir_all(&store)?;
     let mounts: Vec<_> = clients.iter().map(|c| c.mnt.clone()).collect();
     eprintln!(
@@ -4108,13 +4164,7 @@ fn disjoint_write_4(seed: u64) -> Result<()> {
             let mut visible = true;
             for w in 0..n {
                 let id = op_ids.fetch_add(1, Ordering::Relaxed);
-                let c = cluster.invoke(
-                    w,
-                    id,
-                    &Op::Stat {
-                        path: path.clone(),
-                    },
-                )?;
+                let c = cluster.invoke(w, id, &Op::Stat { path: path.clone() })?;
                 if c.outcome != Outcome::Ok {
                     visible = false;
                     break;
@@ -4217,7 +4267,11 @@ fn disjoint_write_4(seed: u64) -> Result<()> {
                     }
                 }
                 for c in &clients {
-                    eprintln!("--- {} mount.log (tail) ---\n{}", c.name, c.tail_log_n(2000));
+                    eprintln!(
+                        "--- {} mount.log (tail) ---\n{}",
+                        c.name,
+                        c.tail_log_n(2000)
+                    );
                 }
                 bail!(
                     "round {round}: disjoint WriteAt {path} did not converge within 30s: {last_mismatch}"

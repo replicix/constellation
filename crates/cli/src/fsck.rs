@@ -405,7 +405,10 @@ mod tests {
         let meta = SqliteMeta::open_in_memory().unwrap();
         let file = meta.create(1, "lost", 0o644, 0, 0).unwrap();
         let hash = chunks.hash(b"missing");
-        let manifest = Manifest::from_chunks(DEFAULT_CHUNK_SIZE, 7, vec![hash], INLINE_CHUNKS_MAX)
+        let manifest =
+            Manifest::from_chunks(DEFAULT_CHUNK_SIZE, 7, vec![hash], INLINE_CHUNKS_MAX, |b| {
+                ChunkHash::of(b)
+            })
             .0
             .encode();
         meta.set_manifest(file.ino, &manifest, 7).unwrap();

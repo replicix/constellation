@@ -1461,8 +1461,15 @@ impl ConstellationFs {
                 }
             }
         }
-        let (manifest, spill) =
-            Manifest::from_sparse_chunks(self.chunk_size, file_len, new_hashes, INLINE_CHUNKS_MAX);
+        let (manifest, spill) = Manifest::from_sparse_chunks(
+            self.chunk_size,
+            file_len,
+            new_hashes,
+            INLINE_CHUNKS_MAX,
+            // Must match the identity the blob is stored under below, which
+            // on an E2E mount is the keyed addressing hash, not a plain one.
+            |blob| self.store.hash(blob),
+        );
         if let Some(blob) = spill {
             let bh = self.store.hash(&blob);
             if self.cache_for_upload(&bh, &blob)? {
