@@ -259,9 +259,7 @@ fn db_stats(db: &Path) -> Result<(u64, u64, u64, u64)> {
     Ok((bytes, inode_rows, dentry_rows, journal_rows))
 }
 
-pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
-    let env = S3Env::start()?;
-    let proxy = env.s3_proxy()?;
+fn apply_s3_shape(proxy: &crate::toxiproxy::Proxy<'_>, cfg: &BenchConfig) -> Result<()> {
     if let Some(ms) = cfg.s3_latency_ms {
         proxy.latency(ms, 15)?;
     }
@@ -269,6 +267,16 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
         // toxiproxy bandwidth toxic takes KB/s.
         proxy.bandwidth((mbps.saturating_mul(1000) / 8).max(1))?;
     }
+    Ok(())
+}
+
+pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
+    let env = S3Env::start()?;
+    let proxy = env.s3_proxy()?;
+    // Latency / bandwidth toxics stay off through the census + probe-file
+    // writes so shaped profiles (latency250 / bw50mbps) can finish the
+    // durable sync quickly. Shaping is applied once those bytes are on S3,
+    // before the read / delete measurements that the profiles care about.
 
     let mut root = tempfile::Builder::new()
         .prefix("harness-bench-")
@@ -348,6 +356,30 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
     let writeback_import_files_per_sec = nfiles / back_import_s.max(1e-9);
     let writeback_durable_files_per_sec = nfiles / back_durable_s.max(1e-9);
 
+    // Seed the 256 MiB sequential-read probe while S3 is still unshaped so
+    // the durable write is not RTT-bound; cold read-back below is what the
+    // latency / bandwidth profiles are meant to stress.
+    c.mount()?;
+    let large_path = c.mnt.join("large-read-probe");
+    let large_bytes = 256 * 1024 * 1024_u64;
+    let block = vec![0x5a; 1024 * 1024];
+    let mut large = std::fs::File::create(&large_path)?;
+    for _ in 0..(large_bytes / block.len() as u64) {
+        large.write_all(&block)?;
+    }
+    large.sync_all()?;
+    drop(large);
+    c.unmount()?;
+    c.drop_cache()?;
+
+    apply_s3_shape(&proxy, cfg)?;
+    if cfg.s3_latency_ms.is_some() || cfg.s3_bandwidth_mbps.is_some() {
+        eprintln!(
+            "S3 shaping enabled (latency_ms={:?}, bandwidth_mbps={:?})",
+            cfg.s3_latency_ms, cfg.s3_bandwidth_mbps
+        );
+    }
+
     // Metadata walk over the full tree (warm replica).
     c.mount()?;
     let t1 = Instant::now();
@@ -380,16 +412,7 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
     // adaptive prefetcher enough runway to reach steady state and for a
     // stall to show up as more than timing noise (64 MiB used to complete
     // in a fraction of a second on an unconstrained path, which buried
-    // swings in noise).
-    let large_path = c.mnt.join("large-read-probe");
-    let large_bytes = 256 * 1024 * 1024_u64;
-    let block = vec![0x5a; 1024 * 1024];
-    let mut large = std::fs::File::create(&large_path)?;
-    for _ in 0..(large_bytes / block.len() as u64) {
-        large.write_all(&block)?;
-    }
-    large.sync_all()?;
-    drop(large);
+    // swings in noise). Probe bytes were written above before shaping.
     c.unmount()?;
     c.drop_cache()?;
     c.mount()?;
