@@ -17,9 +17,9 @@ on:
         required: false
         default: "42"
       corpus_limit:
-        description: "Max files to replay from the corpus (empty = all)"
+        description: "Max corpus files (default 20k for hosted-runner limits; use 120367 for full)"
         required: false
-        default: ""
+        default: "20000"
       max_file_bytes:
         description: "Cap each staged file size (bytes). Default 2MiB keeps tree shape on runner disk."
         required: false
@@ -93,7 +93,13 @@ jobs:
           fi
           echo "repetitions=${{ github.event.inputs.repetitions || '1' }}" >> "$GITHUB_OUTPUT"
           echo "seed=${{ github.event.inputs.seed || '42' }}" >> "$GITHUB_OUTPUT"
-          echo "corpus_limit=${{ github.event.inputs.corpus_limit || '' }}" >> "$GITHUB_OUTPUT"
+          # Replaying all 120k files three times for HEAD and again for BASE
+          # takes many hours on a hosted runner and exhausted process/memory
+          # resources before rsync could even start. 20k preserves the real
+          # corpus shape and is large enough for stable rates while keeping
+          # the routine regression job bounded. A manual dispatch can still
+          # request the full 120367-entry corpus explicitly.
+          echo "corpus_limit=${{ github.event.inputs.corpus_limit || '20000' }}" >> "$GITHUB_OUTPUT"
           # PRs always cap; workflow_dispatch can clear the input to use exact sizes.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "max_file_bytes=${{ github.event.inputs.max_file_bytes || '2097152' }}" >> "$GITHUB_OUTPUT"
