@@ -64,6 +64,14 @@ pub struct BenchReport {
     pub metadata_walk_files_per_sec: f64,
     pub cold_read_files_per_sec: f64,
     pub sequential_cold_read_mib_per_sec: f64,
+    /// 10th percentile of per-block (1 MiB) instantaneous throughput during
+    /// the cold sequential read, after discarding the first block (cold
+    /// TTFB ramp-up isn't a "swing", it's unavoidable RTT). Big gaps between
+    /// this and `sequential_cold_read_mib_per_sec` mean the prefetcher is
+    /// stalling and bursting rather than delivering steady throughput —
+    /// exactly the "big swings" a bandwidth-delay-product-aware window is
+    /// supposed to avoid.
+    pub sequential_cold_read_p10_mib_per_sec: f64,
     pub warm_random_read_iops: f64,
 
     pub delete_s: f64,
@@ -262,9 +270,18 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
         proxy.bandwidth((mbps.saturating_mul(1000) / 8).max(1))?;
     }
 
-    let root = tempfile::Builder::new()
+    let mut root = tempfile::Builder::new()
         .prefix("harness-bench-")
         .tempdir()?;
+    // CHAOS_KEEP_TMP=1 keeps mount logs + state dirs around after a
+    // failure, for offline inspection (mirrors scenarios::setup()).
+    if std::env::var_os("CHAOS_KEEP_TMP").is_some_and(|v| v != "0") {
+        root.disable_cleanup(true);
+        eprintln!(
+            "CHAOS_KEEP_TMP: artifacts kept at {}",
+            root.path().display()
+        );
+    }
     let backend = format!("s3://{BUCKET}/bench-{}", std::process::id());
     let mut c = Client::new(root.path(), "bench", &env.endpoint, &backend)?;
     if cfg.e2e {
@@ -359,9 +376,13 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
     let cold_s = t2.elapsed().as_secs_f64();
     let cold_read_files_per_sec = nfiles / cold_s.max(1e-9);
 
-    // Large sequential cold read + warm random reads.
+    // Large sequential cold read + warm random reads. 256 MiB gives the
+    // adaptive prefetcher enough runway to reach steady state and for a
+    // stall to show up as more than timing noise (64 MiB used to complete
+    // in a fraction of a second on an unconstrained path, which buried
+    // swings in noise).
     let large_path = c.mnt.join("large-read-probe");
-    let large_bytes = 64 * 1024 * 1024_u64;
+    let large_bytes = 256 * 1024 * 1024_u64;
     let block = vec![0x5a; 1024 * 1024];
     let mut large = std::fs::File::create(&large_path)?;
     for _ in 0..(large_bytes / block.len() as u64) {
@@ -376,9 +397,27 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
     let mut large = std::fs::File::open(&large_path)?;
     let mut read_buf = vec![0_u8; 1024 * 1024];
     let seq_t0 = Instant::now();
-    while large.read(&mut read_buf)? != 0 {}
+    let mut block_secs = Vec::with_capacity((large_bytes / read_buf.len() as u64) as usize);
+    loop {
+        let block_t0 = Instant::now();
+        let n = large.read(&mut read_buf)?;
+        if n == 0 {
+            break;
+        }
+        block_secs.push(block_t0.elapsed().as_secs_f64());
+    }
     let seq_s = seq_t0.elapsed().as_secs_f64();
-    let sequential_cold_read_mib_per_sec = 64.0 / seq_s.max(1e-9);
+    let large_mib = large_bytes as f64 / (1024.0 * 1024.0);
+    let sequential_cold_read_mib_per_sec = large_mib / seq_s.max(1e-9);
+    // Drop the first block: cold TTFB (one RTT plus S3 first-byte latency)
+    // is unavoidable and isn't the "swing" this metric is meant to catch.
+    let mut block_rates: Vec<f64> = block_secs
+        .iter()
+        .skip(1)
+        .map(|secs| 1.0 / secs.max(1e-9))
+        .collect();
+    block_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let sequential_cold_read_p10_mib_per_sec = pct(&block_rates, 0.10);
 
     let mut small = [0_u8; 4096];
     let random_ops = 4096_u64;
@@ -444,6 +483,7 @@ pub fn run(cfg: &BenchConfig) -> Result<BenchReport> {
         metadata_walk_files_per_sec,
         cold_read_files_per_sec,
         sequential_cold_read_mib_per_sec,
+        sequential_cold_read_p10_mib_per_sec,
         warm_random_read_iops,
         delete_s,
         durable_delete_s,

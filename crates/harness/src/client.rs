@@ -5,7 +5,29 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long `mount_view` polls for the mountpoint to appear, and `unmount`/
+/// `leave` poll for the daemon to exit, before giving up. Both loops return
+/// as soon as the condition is met, so a generous ceiling costs nothing for
+/// the common case of small, fast fault-injection scenarios — it only
+/// raises the bound for genuinely slow or hung cases. Full-corpus
+/// perf-regression runs (120k+ files, GB-scale write-back drains) routinely
+/// need well over the 10s this used to allow: draining that many pending
+/// uploads, shipping the journal tail, and writing a checkpoint on a large
+/// SQLite replica are all legitimately slow, not hung, and the old bound
+/// turned "still finishing" into a flaky "daemon did not exit after
+/// unmount"/"mount did not appear" failure. Override with
+/// `CONSTELLATION_HARNESS_MOUNT_TIMEOUT_S` for scenario-specific tuning.
+fn client_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("CONSTELLATION_HARNESS_MOUNT_TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &u64| *v > 0)
+            .unwrap_or(120),
+    )
+}
 
 pub struct Client {
     pub name: String,
@@ -217,7 +239,8 @@ impl Client {
             .spawn()
             .context("spawning mount")?;
         self.child = Some(child);
-        for _ in 0..100 {
+        let deadline = Instant::now() + client_timeout();
+        while Instant::now() < deadline {
             if is_mountpoint(&self.mnt) {
                 return Ok(());
             }
@@ -230,7 +253,12 @@ impl Client {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        bail!("{} mount did not appear", self.name)
+        bail!(
+            "{} mount did not appear within {:?}: {}",
+            self.name,
+            client_timeout(),
+            self.tail_log()
+        )
     }
 
     pub fn snapshot_create(&self, selector: &str) -> Result<()> {
@@ -310,14 +338,20 @@ impl Client {
             .arg(&self.mnt)
             .status();
         if let Some(mut child) = self.child.take() {
-            for _ in 0..100 {
+            let deadline = Instant::now() + client_timeout();
+            while Instant::now() < deadline {
                 if child.try_wait()?.is_some() {
                     return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
             child.kill().ok();
-            bail!("{} daemon did not exit after unmount", self.name);
+            bail!(
+                "{} daemon did not exit after unmount within {:?}: {}",
+                self.name,
+                client_timeout(),
+                self.tail_log()
+            );
         }
         Ok(())
     }
@@ -487,14 +521,19 @@ impl Client {
         // Self-leave triggers fusermount; wait for the daemon to exit.
         if node_id.is_none() {
             if let Some(mut child) = self.child.take() {
-                for _ in 0..100 {
+                let deadline = Instant::now() + client_timeout();
+                while Instant::now() < deadline {
                     if child.try_wait()?.is_some() {
                         return Ok(());
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 child.kill().ok();
-                bail!("{} daemon did not exit after leave", self.name);
+                bail!(
+                    "{} daemon did not exit after leave within {:?}",
+                    self.name,
+                    client_timeout()
+                );
             }
         }
         Ok(())

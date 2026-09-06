@@ -319,6 +319,14 @@ pub struct PrefetchStatus {
     pub scan_ahead_files: u64,
     #[serde(default)]
     pub scan_ahead_bytes: u64,
+    /// Times a stream's queued readahead was cancelled because the reader
+    /// stopped consuming it (DESIGN.md §7 "abandoned reader").
+    #[serde(default)]
+    pub abandoned: u64,
+    /// Chunks dropped from queues by those cancellations — GETs saved from
+    /// readers that never came back for them.
+    #[serde(default)]
+    pub abandoned_chunks: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

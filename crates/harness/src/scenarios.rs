@@ -10,6 +10,7 @@ use crate::workload::Workload;
 use anyhow::{bail, Context, Result};
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub struct Scenario {
@@ -278,6 +279,36 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "ordered cold reads of many small files pipeline across file boundaries",
         requires: &[],
         run: scan_ahead,
+    },
+    Scenario {
+        name: "distant-bigfile-stable",
+        desc: "sequential cold download of a big file over a 200ms 'distant S3' path stays fast and doesn't swing wildly",
+        requires: &[],
+        run: distant_bigfile_stable,
+    },
+    Scenario {
+        name: "distant-bigfile-stable-e2e",
+        desc: "distant-bigfile-stable, but through an E2E-encrypted filesystem",
+        requires: &[],
+        run: distant_bigfile_stable_e2e,
+    },
+    Scenario {
+        name: "prefetch-abandon",
+        desc: "a reader that stops mid-file must not keep pulling the rest over the network into cache",
+        requires: &[],
+        run: prefetch_abandon,
+    },
+    Scenario {
+        name: "prefetch-abandon-e2e",
+        desc: "prefetch-abandon, but through an E2E-encrypted filesystem",
+        requires: &[],
+        run: prefetch_abandon_e2e,
+    },
+    Scenario {
+        name: "prefetch-fairness",
+        desc: "a big-file prefetch saturating a capped link must not stall concurrent small-file reads",
+        requires: &[],
+        run: prefetch_fairness,
     },
     Scenario {
         name: "fio-latency",
@@ -2869,6 +2900,384 @@ fn scan_ahead(_seed: u64) -> Result<()> {
          (serial estimate {serial:.1?})"
     );
     c.unmount()?;
+    Ok(())
+}
+
+/// Shared implementation for `distant-bigfile-stable[-e2e]`: a sequential
+/// cold download of a sizable file over an emulated "distant" S3 path (200ms
+/// latency, no bandwidth cap) must reach high throughput and *hold* it —
+/// no long stalls followed by bursts. We sample per-block (4 MiB) wall time
+/// through the read and require both a high overall rate and a bounded
+/// worst-case/best-case ratio among the post-ramp-up samples.
+fn distant_bigfile_stable_inner(e2e: bool) -> Result<()> {
+    let label = if e2e {
+        "distant-bigfile-stable-e2e"
+    } else {
+        "distant-bigfile-stable"
+    };
+    let (env, root) = setup(label)?;
+    let proxy = env.s3_proxy()?;
+    let prefix = format!("{label}-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut c = Client::new(root.path(), "c0", &env.endpoint, &backend)?.with_cache_size(1 << 30);
+    if e2e {
+        c = c.with_e2e();
+    }
+    c.fs_create()?;
+    c.mount()?;
+
+    // 192 MiB: big enough that the adaptive window reaches steady state and
+    // a real stall shows up as more than timing noise, small enough to stay
+    // CI-sane at 200ms RTT.
+    let n_chunks = 192u64;
+    let data = pattern(1, (n_chunks * (1 << 20)) as usize);
+    let expected = blake3::hash(&data);
+    std::fs::write(c.mnt.join("distant"), &data)?;
+    drop(data);
+
+    c.unmount()?;
+    c.drop_cache()?;
+    c.mount().context("cold remount")?;
+    let latency_ms = 200u64;
+    proxy.latency(latency_ms, 0)?;
+
+    let mut file = std::fs::File::open(c.mnt.join("distant")).context("opening distant file")?;
+    let mut block = vec![0u8; 4 << 20];
+    let mut read = Vec::with_capacity((n_chunks << 20) as usize);
+    let mut block_secs = Vec::new();
+    let started = std::time::Instant::now();
+    loop {
+        let block_t0 = std::time::Instant::now();
+        let n = std::io::Read::read(&mut file, &mut block).context("reading distant file")?;
+        if n == 0 {
+            break;
+        }
+        block_secs.push(block_t0.elapsed().as_secs_f64());
+        read.extend_from_slice(&block[..n]);
+    }
+    let elapsed = started.elapsed();
+    proxy.heal()?;
+
+    anyhow::ensure!(
+        blake3::hash(&read) == expected,
+        "distant-bigfile-stable: content corrupted on cold read"
+    );
+
+    let mib_per_sec: Vec<f64> = block_secs
+        .iter()
+        .skip(1) // cold TTFB is one RTT, not a "swing"
+        .map(|secs| (4.0) / secs.max(1e-9))
+        .collect();
+    anyhow::ensure!(
+        mib_per_sec.len() >= 4,
+        "not enough post-ramp-up samples to judge stability ({} blocks)",
+        block_secs.len()
+    );
+    let min_rate = mib_per_sec.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_rate = mib_per_sec.iter().copied().fold(0.0, f64::max);
+    let mean_rate: f64 = mib_per_sec.iter().sum::<f64>() / mib_per_sec.len() as f64;
+
+    let overall_mib_s = (n_chunks as f64) / elapsed.as_secs_f64().max(1e-9);
+    eprintln!(
+        "    {label}: {n_chunks} MiB in {elapsed:.1?} ({overall_mib_s:.1} MiB/s overall); \
+         per-block min={min_rate:.1} mean={mean_rate:.1} max={max_rate:.1} MiB/s"
+    );
+
+    // Serial one-RTT-per-chunk floor: pipelining must beat it decisively.
+    let serial = Duration::from_millis(n_chunks * latency_ms);
+    anyhow::ensure!(
+        elapsed < serial / 8,
+        "{label}: cold read took {elapsed:.1?}; naive serial estimate is {serial:.1?} — the \
+         prefetcher is not pipelining enough to call this a healthy distant path"
+    );
+    // "No big swings" means no *stalls* — a block that was already sitting
+    // fully prefetched can legitimately be served at memory speed, so a
+    // high max is a feature, not a bug. What must not happen is a block
+    // whose bytes were not yet in flight taking many RTTs to arrive one at
+    // a time instead of the pipeline having kept multiple chunks in
+    // flight. Floor: a 4 MiB block split across four 1 MiB chunks, even if
+    // every one of them had to be fetched from a cold start with no
+    // parallelism at all, still finishes inside 2 RTTs if the pipeline
+    // keeps only two requests concurrently — well under what a genuinely
+    // stalled/serialized path would show.
+    let min_floor_mib_s = 4.0 / (2.0 * latency_ms as f64 / 1000.0);
+    anyhow::ensure!(
+        min_rate > min_floor_mib_s,
+        "{label}: worst post-ramp-up block ran at {min_rate:.1} MiB/s (floor {min_floor_mib_s:.1} \
+         MiB/s for a 4 MiB block under {latency_ms}ms RTT) — that's a stall, not steady \
+         pipelining (mean was {mean_rate:.1} MiB/s)"
+    );
+    // Drop must happen before unmount: Rust only frees the fd at scope end,
+    // and `file` is otherwise still alive here — an open fd on the mount
+    // makes fusermount3 report "Device or resource busy" and hang the
+    // harness for the full unmount timeout.
+    drop(file);
+    c.unmount()?;
+    Ok(())
+}
+
+fn distant_bigfile_stable(_seed: u64) -> Result<()> {
+    distant_bigfile_stable_inner(false)
+}
+
+fn distant_bigfile_stable_e2e(_seed: u64) -> Result<()> {
+    distant_bigfile_stable_inner(true)
+}
+
+/// Shared implementation for `prefetch-abandon[-e2e]`: a reader that reads
+/// the first slice of a big sequential file and then goes quiet (without
+/// closing the fd) must not keep costing us S3 GETs and cache space for the
+/// rest of the file. See `PREFETCH_ABANDON_IDLE` in `prefetch.rs` for the
+/// mechanism under test.
+fn prefetch_abandon_inner(e2e: bool) -> Result<()> {
+    let label = if e2e {
+        "prefetch-abandon-e2e"
+    } else {
+        "prefetch-abandon"
+    };
+    let (env, root) = setup(label)?;
+    let proxy = env.s3_proxy()?;
+    let prefix = format!("{label}-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut c = Client::new(root.path(), "c0", &env.endpoint, &backend)?.with_cache_size(2 << 30);
+    if e2e {
+        c = c.with_e2e();
+    }
+    c.fs_create()?;
+    c.mount()?;
+
+    // 1 GiB, deliberately much larger than any plausible concurrency
+    // ceiling. toxiproxy's bandwidth toxic caps each *connection*
+    // independently (there is no proxy-wide aggregate limiter), so with
+    // `INITIAL_CONCURRENCY` (32) simultaneous GETs the effective aggregate
+    // rate is ~32x the configured cap. If the file were small enough that
+    // its whole chunk count fit within one concurrency generation (e.g.
+    // 128 MiB / 4 MiB chunks = 32 chunks == INITIAL_CONCURRENCY), every
+    // chunk would be dispatched (moved from "queued" to "in flight") the
+    // instant the window is scheduled — leaving nothing in the queue for
+    // the idle-abandon sweep to cancel, no matter how slow each individual
+    // connection is. At 1 GiB / 4 MiB chunks = 256 chunks, only a fraction
+    // can be in flight at once; the rest are genuinely queued long enough
+    // for PREFETCH_ABANDON_IDLE to catch them.
+    let n_chunks = 1024u64;
+    let data = pattern(2, (n_chunks << 20) as usize);
+    let expected = blake3::hash(&data);
+    std::fs::write(c.mnt.join("abandoned"), &data)?;
+
+    c.unmount()?;
+    c.drop_cache()?;
+    c.mount().context("cold remount")?;
+    // Modest latency plus a real bandwidth cap. toxiproxy's bandwidth toxic
+    // caps each *connection* independently — there is no aggregate/proxy-
+    // wide limiter — so the *effective* aggregate rate scales with
+    // concurrency. The prefetcher's AIMD controller ramps concurrency into
+    // the dozens within a few successful fetches, so a cap that looks
+    // "slow" per-connection (e.g. 16 Mbps) becomes gigabit-class in
+    // aggregate and drains the whole scheduled window in a few hundred
+    // milliseconds — faster than the idle-sweep tick can react, which
+    // would make this test pass or fail on pure timing luck. Use a per-
+    // connection rate slow enough that even at the concurrency ceiling
+    // (ABSOLUTE_MAX_CONCURRENCY) a chunk takes seconds, not milliseconds,
+    // to complete, so the sweep reliably catches real queued backlog.
+    proxy.latency(20, 0)?;
+    proxy.bandwidth(50)?; // ~400 Kbps per connection
+
+    let cache_before = c.control_status()?["cache"]["used_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+
+    // Read the first slice sequentially, keep the fd open, then go quiet.
+    // A real reader that paused a video/scrub or a killed-but-not-yet-
+    // reaped process looks exactly like this: readable fd, no more reads.
+    let mut file = std::fs::File::open(c.mnt.join("abandoned")).context("opening file")?;
+    let mut prefix_buf = vec![0u8; 8 << 20];
+    std::io::Read::read_exact(&mut file, &mut prefix_buf).context("reading prefix")?;
+
+    // Let a couple of abandon-sweep ticks pass (PREFETCH_ABANDON_IDLE is
+    // 2s; give it a healthy multiple so this isn't a timing coin-flip).
+    std::thread::sleep(Duration::from_secs(5));
+    let cache_after_idle = c.control_status()?["cache"]["used_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    let abandoned_chunks = c.control_status()?["prefetch"]["abandoned_chunks"]
+        .as_u64()
+        .unwrap_or(0);
+
+    let file_bytes = data.len() as u64;
+    let fetched_while_idle = cache_after_idle.saturating_sub(cache_before);
+    eprintln!(
+        "    {label}: {file_bytes} B file, read {} B, fetched {fetched_while_idle} B into cache \
+         while idle, prefetch reported {abandoned_chunks} abandoned chunks",
+        prefix_buf.len()
+    );
+
+    anyhow::ensure!(
+        abandoned_chunks > 0,
+        "{label}: prefetcher reported zero abandoned chunks; the idle-abandon sweep did not \
+         trim the queued backlog for this stream"
+    );
+    // The whole point: an idle reader must not cause the whole file to
+    // land in cache. Bound generously above the read prefix plus one full
+    // window's worth of legitimately-in-flight chunks, but nowhere near
+    // "the entire file" — that's exactly the waste being tested for.
+    let waste_ceiling = file_bytes / 2;
+    anyhow::ensure!(
+        fetched_while_idle < waste_ceiling,
+        "{label}: {fetched_while_idle} B landed in cache while the reader was idle, out of a \
+         {file_bytes} B file (ceiling {waste_ceiling} B) — the abandoned stream's backlog was \
+         not cancelled in time"
+    );
+
+    // Cache should also settle — no straggling background fetches still
+    // trickling in chunks well after the sweep has run.
+    std::thread::sleep(Duration::from_millis(500));
+    let cache_settled = c.control_status()?["cache"]["used_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    anyhow::ensure!(
+        cache_settled == cache_after_idle,
+        "{label}: cache kept growing after the idle sweep ({cache_after_idle} -> \
+         {cache_settled} B) — background fetches did not actually stop"
+    );
+
+    // Correctness after abandonment: resuming the read must still produce
+    // exactly the right bytes, proving the trimmed backlog is re-offered
+    // rather than silently skipped. Heal the proxy *before* the resumed
+    // read, not after: at the throttled per-connection rate used above to
+    // force real queuing, reading the remaining ~1 GiB through the toxic
+    // would take minutes (aggregate throughput is bounded by
+    // gate_target * rate, not by wall-clock patience). The abandon/resume
+    // behavior under test only concerns the idle window; the resumed read
+    // itself just needs to prove correctness, which it can do at full
+    // speed.
+    proxy.heal()?;
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut rest).context("resuming read after abandonment")?;
+    let mut full = prefix_buf;
+    full.extend_from_slice(&rest);
+    anyhow::ensure!(
+        blake3::hash(&full) == expected,
+        "{label}: resumed read returned different bytes than were written — abandonment must \
+         not corrupt or skip data, only defer fetching it"
+    );
+    drop(file);
+    c.unmount()?;
+    Ok(())
+}
+
+fn prefetch_abandon(_seed: u64) -> Result<()> {
+    prefetch_abandon_inner(false)
+}
+
+fn prefetch_abandon_e2e(_seed: u64) -> Result<()> {
+    prefetch_abandon_inner(true)
+}
+
+/// A big-file prefetcher saturating a bandwidth-capped S3 path must not
+/// starve small, unrelated foreground reads. Continuous small-file reads
+/// run on a background thread while a big file is cold-read in the
+/// foreground; small-file latency must stay bounded throughout.
+fn prefetch_fairness(_seed: u64) -> Result<()> {
+    let (env, root) = setup("prefetch-fairness")?;
+    let proxy = env.s3_proxy()?;
+    let mut c = one_client(&env, root.path(), &format!("fair-{}", ts()))?;
+
+    let small_dir = c.mnt.join("small");
+    std::fs::create_dir(&small_dir)?;
+    let n_small = 64u64;
+    let small_size = 8usize << 10;
+    let mut small_expected = Vec::with_capacity(n_small as usize);
+    for i in 0..n_small {
+        let name = format!("s{i:04}");
+        let data = pattern(100 + i, small_size);
+        small_expected.push((name.clone(), blake3::hash(&data)));
+        std::fs::write(small_dir.join(&name), &data)?;
+    }
+
+    let n_chunks = 96u64;
+    let big_data = pattern(3, (n_chunks << 20) as usize);
+    let big_expected = blake3::hash(&big_data);
+    std::fs::write(c.mnt.join("big"), &big_data)?;
+    drop(big_data);
+
+    c.unmount()?;
+    c.drop_cache()?;
+    c.mount().context("cold remount")?;
+    // 100 Mbps cap shared between the big prefetcher and the small reads —
+    // toxiproxy's bandwidth toxic takes the rate in KB/s.
+    proxy.bandwidth(12_500)?;
+
+    let mnt = c.mnt.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_reader = stop.clone();
+    let small_expected_reader = small_expected.clone();
+    let reader = std::thread::spawn(move || -> Result<Vec<Duration>> {
+        let mut latencies = Vec::new();
+        let mut i = 0usize;
+        while !stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
+            let (name, hash) = &small_expected_reader[i % small_expected_reader.len()];
+            let t0 = std::time::Instant::now();
+            let data = std::fs::read(mnt.join("small").join(name))
+                .with_context(|| format!("small read of {name}"))?;
+            latencies.push(t0.elapsed());
+            anyhow::ensure!(blake3::hash(&data) == *hash, "small file {name} corrupted");
+            i += 1;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(latencies)
+    });
+
+    // Give the small-file reader a moment to establish a quiet baseline
+    // before the big prefetcher starts contending for the capped link.
+    std::thread::sleep(Duration::from_millis(500));
+    let big_started = std::time::Instant::now();
+    let big_read = std::fs::read(c.mnt.join("big")).context("big-file read under bandwidth cap")?;
+    let big_elapsed = big_started.elapsed();
+    anyhow::ensure!(
+        blake3::hash(&big_read) == big_expected,
+        "big file corrupted under contended bandwidth cap"
+    );
+
+    // Let the small reader keep going a bit past the big read so we can
+    // see it return to a quiet baseline, then stop it.
+    std::thread::sleep(Duration::from_millis(500));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let latencies = reader.join().unwrap()?;
+    proxy.heal()?;
+    c.unmount()?;
+
+    anyhow::ensure!(
+        latencies.len() > 20,
+        "small-file reader only completed {} reads; scenario didn't run long enough",
+        latencies.len()
+    );
+    let mut sorted: Vec<Duration> = latencies.clone();
+    sorted.sort();
+    let p50 = sorted[sorted.len() / 2];
+    let p95 = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)];
+    let max = *sorted.last().unwrap();
+    eprintln!(
+        "    prefetch-fairness: big file ({} MiB) read in {big_elapsed:.1?} under a 100 Mbps \
+         cap; concurrent small reads n={} p50={p50:.1?} p95={p95:.1?} max={max:.1?}",
+        big_read.len() / (1 << 20),
+        latencies.len()
+    );
+
+    // A small 8 KiB read sharing a 100 Mbps link with a saturating big-file
+    // prefetch should still land well under a second — if it doesn't, the
+    // prefetcher's concurrency gate is starving demand-path traffic instead
+    // of yielding to it (this is exactly what the coop decode-priority gate
+    // and the per-stream fairness in the scheduler's `pop()` are for).
+    anyhow::ensure!(
+        p95 < Duration::from_millis(1500),
+        "prefetch-fairness: small-file p95 latency was {p95:.1?} while a big-file prefetch \
+         saturated a 100 Mbps link — small reads are stalling behind the prefetcher"
+    );
+    anyhow::ensure!(
+        max < Duration::from_secs(5),
+        "prefetch-fairness: worst small-file read took {max:.1?} — far outside a healthy \
+         fairness bound even accounting for scheduling jitter"
+    );
     Ok(())
 }
 

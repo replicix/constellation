@@ -13,6 +13,20 @@ use tokio::runtime::Handle;
 
 const REORDER_WINDOW: u64 = 16 << 20;
 const STREAM_IDLE: Duration = Duration::from_secs(60);
+/// How long a sequential stream may go without a read before its
+/// not-yet-started readahead backlog is cancelled (DESIGN.md §7 "abandoned
+/// reader"). This is deliberately much shorter than `STREAM_IDLE`: the
+/// latter only reclaims bookkeeping after a full minute, but a reader that
+/// stops consuming should stop costing us bandwidth and cache space almost
+/// immediately, not a minute later. Chunks already popped into flight are
+/// left to finish (they are bounded by the concurrency gate and cheap to
+/// keep — cancelling a part-way GET would need to plumb abort handles
+/// through the fetch future and clean up a torn spill file for a marginal
+/// saving). Only *queued* work — chunks reserved but not yet dispatched —
+/// is dropped. The stream's cursor/window bookkeeping survives so a reader
+/// that resumes is recognized as still sequential and does not cold-start
+/// from `min_window`.
+const PREFETCH_ABANDON_IDLE: Duration = Duration::from_millis(2000);
 const MAX_STREAMS: usize = 512;
 const DEFAULT_MIN_WINDOW: u64 = 8 << 20;
 const DEFAULT_MAX_WINDOW: u64 = 2 << 30;
@@ -36,6 +50,10 @@ struct Stream {
     /// enqueued incrementally from here, so a grown window costs one pass
     /// over its leading edge rather than a full rescan on every read.
     next_index: u64,
+    /// Chunk size in effect for this stream, so the idle-abandon sweep can
+    /// re-derive `next_index` from `cursor` after trimming the window
+    /// without needing a `read()` to supply it.
+    chunk_bytes: u64,
 }
 
 #[derive(Default)]
@@ -46,6 +64,14 @@ pub(crate) struct PrefetchStats {
     gate_target: AtomicU64,
     scan_ahead_files: AtomicU64,
     scan_ahead_bytes: AtomicU64,
+    /// Times a stream's queued (not-yet-started) readahead backlog was
+    /// cancelled because the reader stopped consuming (see
+    /// `PREFETCH_ABANDON_IDLE`). Chunks already in flight are not counted
+    /// here — only work that never hit the network.
+    abandoned: AtomicU64,
+    /// Chunks dropped from queues by those cancellations — the number of
+    /// GETs saved from a reader that never came back for them.
+    abandoned_chunks: AtomicU64,
     windows: Mutex<HashMap<Ino, u64>>,
 }
 
@@ -64,12 +90,22 @@ impl PrefetchStats {
             gate_target: self.gate_target.load(Ordering::Relaxed) as u32,
             scan_ahead_files: self.scan_ahead_files.load(Ordering::Relaxed),
             scan_ahead_bytes: self.scan_ahead_bytes.load(Ordering::Relaxed),
+            abandoned: self.abandoned.load(Ordering::Relaxed),
+            abandoned_chunks: self.abandoned_chunks.load(Ordering::Relaxed),
         }
     }
 
     pub(crate) fn note_scan(&self, files: u64, bytes: u64) {
         self.scan_ahead_files.fetch_add(files, Ordering::Relaxed);
         self.scan_ahead_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn note_abandon(&self, chunks: u64) {
+        if chunks == 0 {
+            return;
+        }
+        self.abandoned.fetch_add(1, Ordering::Relaxed);
+        self.abandoned_chunks.fetch_add(chunks, Ordering::Relaxed);
     }
 }
 
@@ -164,17 +200,22 @@ impl Scheduler {
         self.wake.notify_one();
     }
 
-    fn forget(&self, ino: Ino) {
+    /// Drop this stream's not-yet-started queued backlog (used both on file
+    /// close and by the idle-abandon sweep). Returns how many chunks were
+    /// dropped, so callers can distinguish "reader closed a spent stream"
+    /// from "reader stopped mid-file with a live backlog".
+    fn forget(&self, ino: Ino) -> u64 {
         let mut queues = self.queues.lock().unwrap();
+        let mut dropped = 0u64;
         if let Some(pending) = queues.by_stream.remove(&ino) {
-            self.stats
-                .queued
-                .fetch_sub(pending.len() as u64, Ordering::Relaxed);
+            dropped = pending.len() as u64;
+            self.stats.queued.fetch_sub(dropped, Ordering::Relaxed);
             for hash in pending {
                 queues.reserved.remove(&hash);
             }
         }
         queues.ready.retain(|candidate| *candidate != ino);
+        dropped
     }
 
     fn is_inflight(&self, hash: &ChunkHash) -> bool {
@@ -315,7 +356,7 @@ impl Scheduler {
 
 pub struct Prefetcher {
     rt: Handle,
-    streams: Mutex<HashMap<Ino, Stream>>,
+    streams: Arc<Mutex<HashMap<Ino, Stream>>>,
     scheduler: Arc<Scheduler>,
     min_window: u64,
     max_window: u64,
@@ -373,9 +414,11 @@ impl Prefetcher {
             wake: tokio::sync::Notify::new(),
         });
         rt.spawn(scheduler.clone().run());
+        let streams: Arc<Mutex<HashMap<Ino, Stream>>> = Arc::new(Mutex::new(HashMap::new()));
+        rt.spawn(sweep_abandoned_streams(streams.clone(), scheduler.clone()));
         Self {
             rt,
-            streams: Mutex::new(HashMap::new()),
+            streams,
             scheduler,
             min_window,
             max_window,
@@ -428,6 +471,7 @@ impl Prefetcher {
                         last_hit: now,
                         sequential: false,
                         next_index: end / chunk_bytes,
+                        chunk_bytes,
                     };
                 }
                 None => {
@@ -440,6 +484,7 @@ impl Prefetcher {
                             last_hit: now,
                             sequential,
                             next_index: end / chunk_bytes,
+                            chunk_bytes,
                         },
                     );
                 }
@@ -558,6 +603,72 @@ impl Prefetcher {
             }
         }
         self.stats.note_scan(count, bytes);
+    }
+}
+
+/// Background sweep: cancel a sequential stream's not-yet-started readahead
+/// once the reader has gone quiet for `PREFETCH_ABANDON_IDLE`.
+///
+/// Why this exists (DESIGN.md §7 "abandoned reader"): the scheduler enqueues
+/// readahead up to `window` bytes ahead of the cursor on every read, but
+/// nothing previously un-enqueued that work if the reader simply stopped —
+/// e.g. an rsync/tar that got killed, a video scrub that abandoned a seek
+/// target, or a client that closed the fd without EOF. `STREAM_IDLE` (60s)
+/// eventually reaps the whole stream, but by then a wide window (up to
+/// `max_window`, gated by `CONSTELLATION_PREFETCH_MAX_BYTES`) may have
+/// already queued tens to hundreds of chunks that will never be read —
+/// wasted S3 GETs and cache evictions of data someone else still wants.
+///
+/// This sweep runs far more often and only trims the *queue*: chunks already
+/// popped into flight are left to finish (see `PREFETCH_ABANDON_IDLE`'s
+/// doc-comment for why), and the stream's cursor/window survive so a reader
+/// that resumes mid-file is still recognized as sequential.
+async fn sweep_abandoned_streams(
+    streams: Arc<Mutex<HashMap<Ino, Stream>>>,
+    scheduler: Arc<Scheduler>,
+) {
+    let tick = (PREFETCH_ABANDON_IDLE / 4).max(Duration::from_millis(1));
+    loop {
+        tokio::time::sleep(tick).await;
+        abandon_idle_streams(&streams, &scheduler, Instant::now());
+    }
+}
+
+/// One pass of the idle-abandon sweep, factored out so it can be driven
+/// deterministically from tests without needing to wait on a real timer or
+/// spin up the scheduler's fetch loop.
+fn abandon_idle_streams(
+    streams: &Mutex<HashMap<Ino, Stream>>,
+    scheduler: &Scheduler,
+    now: Instant,
+) {
+    let idle: Vec<Ino> = {
+        let streams = streams.lock().unwrap();
+        streams
+            .iter()
+            .filter(|(_, stream)| {
+                stream.sequential && now.duration_since(stream.last_hit) > PREFETCH_ABANDON_IDLE
+            })
+            .map(|(ino, _)| *ino)
+            .collect()
+    };
+    for ino in idle {
+        let dropped = scheduler.forget(ino);
+        if dropped == 0 {
+            continue;
+        }
+        scheduler.stats.note_abandon(dropped);
+        // Rewind next_index to the cursor so a resumed reader is
+        // re-offered the chunks we just dropped instead of skipping
+        // them as "already enqueued".
+        if let Some(stream) = streams.lock().unwrap().get_mut(&ino) {
+            stream.next_index = stream.cursor / stream.chunk_bytes.max(1);
+        }
+        tracing::debug!(
+            ino,
+            chunks = dropped,
+            "prefetch: abandoned reader, dropped queued readahead"
+        );
     }
 }
 
@@ -805,5 +916,116 @@ mod tests {
 
         prefetch.on_read(7, 1 << 20, 1 << 20, 4 << 20, &hashes);
         assert!(prefetch.streams.lock().unwrap()[&7].window >= grown);
+    }
+
+    /// The idle-abandon sweep must cancel a sequential stream's queued
+    /// (not-yet-started) readahead once the reader goes quiet for longer
+    /// than `PREFETCH_ABANDON_IDLE`, without touching the stream's
+    /// cursor/window bookkeeping (a resumed reader should not cold-start).
+    /// Uses the bare `scheduler()` test helper (no `run()` fetch loop
+    /// attached) and drives one sweep pass directly so the assertions are
+    /// deterministic instead of racing a real background timer against a
+    /// mock store that would otherwise drain the queue via fetch failures.
+    #[test]
+    fn idle_reader_backlog_is_abandoned_but_stream_state_survives() {
+        let dir = TempDir::new().unwrap();
+        let scheduler = scheduler(Arc::new(DiskCache::open(dir.path(), 1 << 30).unwrap()));
+        scheduler.enqueue(7, [hash(1), hash(2), hash(3)]);
+        assert_eq!(
+            scheduler.queues.lock().unwrap().by_stream[&7].len(),
+            3,
+            "expected the readahead to still be queued, not yet fetched"
+        );
+
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let cursor_before = 4 << 20;
+        let window_before = 64 << 20;
+        streams.lock().unwrap().insert(
+            7,
+            Stream {
+                cursor: cursor_before,
+                window: window_before,
+                last_hit: Instant::now() - PREFETCH_ABANDON_IDLE - Duration::from_millis(1),
+                sequential: true,
+                next_index: 20,
+                chunk_bytes: 4 << 20,
+            },
+        );
+
+        abandon_idle_streams(&streams, &scheduler, Instant::now());
+
+        assert_eq!(
+            scheduler.queues.lock().unwrap().by_stream.get(&7),
+            None,
+            "queued backlog should be fully dropped"
+        );
+        assert_eq!(scheduler.stats.snapshot().abandoned_chunks, 3);
+        assert_eq!(scheduler.stats.snapshot().abandoned, 1);
+
+        // Cursor/window survive: a resumed reader is still sequential and
+        // does not cold-start from min_window. next_index rewinds to the
+        // cursor so the dropped chunks get re-offered, not skipped.
+        let locked = streams.lock().unwrap();
+        let stream = &locked[&7];
+        assert_eq!(stream.cursor, cursor_before);
+        assert_eq!(stream.window, window_before);
+        assert!(stream.sequential);
+        assert_eq!(stream.next_index, cursor_before / stream.chunk_bytes);
+    }
+
+    /// A stream that is idle but has nothing queued (already fully served,
+    /// or never had backlog) must not be reported as "abandoned" — that
+    /// counter should only reflect readahead actually cancelled.
+    #[test]
+    fn idle_stream_with_empty_queue_is_not_counted_as_abandoned() {
+        let dir = TempDir::new().unwrap();
+        let scheduler = scheduler(Arc::new(DiskCache::open(dir.path(), 1 << 30).unwrap()));
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        streams.lock().unwrap().insert(
+            7,
+            Stream {
+                cursor: 4 << 20,
+                window: 8 << 20,
+                last_hit: Instant::now() - PREFETCH_ABANDON_IDLE - Duration::from_millis(1),
+                sequential: true,
+                next_index: 1,
+                chunk_bytes: 4 << 20,
+            },
+        );
+
+        abandon_idle_streams(&streams, &scheduler, Instant::now());
+
+        assert_eq!(scheduler.stats.snapshot().abandoned, 0);
+        assert_eq!(scheduler.stats.snapshot().abandoned_chunks, 0);
+    }
+
+    /// A recently-active stream (idle for less than the threshold) must be
+    /// left alone even if it has a live backlog.
+    #[test]
+    fn recently_active_stream_is_not_abandoned() {
+        let dir = TempDir::new().unwrap();
+        let scheduler = scheduler(Arc::new(DiskCache::open(dir.path(), 1 << 30).unwrap()));
+        scheduler.enqueue(7, [hash(1)]);
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        streams.lock().unwrap().insert(
+            7,
+            Stream {
+                cursor: 4 << 20,
+                window: 8 << 20,
+                last_hit: Instant::now(),
+                sequential: true,
+                next_index: 1,
+                chunk_bytes: 4 << 20,
+            },
+        );
+
+        abandon_idle_streams(&streams, &scheduler, Instant::now());
+
+        assert_eq!(
+            scheduler.queues.lock().unwrap().by_stream[&7].len(),
+            1,
+            "an actively-read stream's backlog must not be trimmed"
+        );
+        assert_eq!(scheduler.stats.snapshot().abandoned, 0);
     }
 }

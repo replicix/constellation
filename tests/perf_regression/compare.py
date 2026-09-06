@@ -9,6 +9,7 @@ METRICS = [
     ("metadata_walk_files_per_sec", "Metadata walk files/s", True),
     ("cold_read_files_per_sec", "Cold read files/s", True),
     ("sequential_cold_read_mib_per_sec", "Cold sequential MiB/s", True),
+    ("sequential_cold_read_p10_mib_per_sec", "Cold sequential p10 MiB/s (swing floor)", True),
     ("warm_random_read_iops", "Warm random IOPS", True),
     ("durable_delete_files_per_sec", "Durable delete files/s", True),
     ("delete_window_p95_fps", "Delete window p95 files/s", True),
