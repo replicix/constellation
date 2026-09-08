@@ -1,4 +1,4 @@
-# Plan 04c — Phase 4c: `constellation leave`
+# Plan 05 — Phase 4c: `constellation leave`
 
 Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–04
 committed (leases, P2P, pin/offline, continuation epochs). Spec:
@@ -197,7 +197,7 @@ Harness:
 ## Scope limits (honest, leave them as limits)
 
 - Heartbeats / `heartbeat/<node-id>` objects: not this plan. Status
-  UX for "seen 12s ago" can wait for the web UI (plan 08) or a later
+  UX for "seen 12s ago" can wait for the web UI (plan 11) or a later
   polish pass.
 - Automatic retirement of unreachable nodes: never. Operator `leave
   --node-id` is the tool.
@@ -212,4 +212,4 @@ Per CONVENTIONS.md. Add the milestone table to `docs/PROGRESS.md`
 as **Phase 4c** under phase 4 (do not reopen 4b's "functionally
 complete" verdict; this is additive). Update `docs/TESTING.md` with
 the new scenario(s). Update this file's row in `docs/plans/README.md`
-is already done; do not renumber plans 05–11.
+is already done (plans are numbered continuously 00–21).

@@ -946,7 +946,7 @@ fn mount(
     meta.set_node_prefix(node_id)?;
     tracing::info!(node_id, "node identity");
 
-    // Mount-time staging GC (plan 05a step 6): nothing under
+    // Mount-time staging GC (plan 07 step 6): nothing under
     // `staging/` can be live at mount start. A crash mid-write leaves
     // no orphaned staging bytes because this always runs first.
     let staging_dir = state_dir.join("staging");
@@ -958,7 +958,7 @@ fn mount(
         );
     }
     // Decoupled from --cache-size: staging holds a whole in-flight
-    // write until flush/close (05a adds no streaming; that is 05b),
+    // write until flush/close (07 adds no streaming; that is 08),
     // while the cache only holds each sealed chunk briefly before eager
     // upload demotes it. Default is a fraction of the cache budget, a
     // reasonable starting point for ordinary interactive workloads;
@@ -2136,7 +2136,7 @@ fn mount(
         "clean unmount drain starting"
     );
     let flush = rt.block_on(async {
-        // Plan 05a step 2: an orderly unmount must not publish manifests
+        // Plan 07 step 2: an orderly unmount must not publish manifests
         // for chunks that never made it to S3. If a previous best-effort
         // eager upload (`try_upload_dirty`) failed and only logged, this
         // is the last chance to drain `pending_upload` before the
@@ -2625,7 +2625,7 @@ async fn run_sync_round(
 }
 
 /// Drain `SqliteMeta::pending_uploads()` — the durable not-yet-uploaded
-/// set (plan 05a step 1) — rather than `DiskCache::dirty_chunks()`,
+/// set (plan 07 step 1) — rather than `DiskCache::dirty_chunks()`,
 /// which cannot survive a crash (`DiskCache::rescan` legitimately marks
 /// everything `Clean`; only the meta journal's transaction-coupled
 /// table knows what still owes S3 a PUT).
@@ -2645,7 +2645,7 @@ use constellation_upload_concurrency::{AdaptiveConcurrency, ConcurrencyGate, Con
 /// at once regardless of how many rows `pending_upload` has queued.
 const UPLOAD_CONCURRENCY_HARD_MAX: usize = 128;
 
-/// See docs/explanation/DESIGN.md §5b step 2 / `docs/plans/v1/done/05b-p5b-streaming-writeback.md`.
+/// See docs/explanation/DESIGN.md §5b step 2 / `docs/plans/v1/done/08-p5b-streaming-writeback.md`.
 /// A durable pending-upload queue in SQLite is drained by a bounded pool;
 /// the pool costs two things once it exists (dedup-probe RTT and the
 /// create-vs-overwrite decision), both handled by `put_mode` below.
@@ -3999,7 +3999,7 @@ mod parse_byte_size_tests {
     }
 }
 
-/// Plan 05a's `pending_upload`-driven regression tests for
+/// Plan 07's `pending_upload`-driven regression tests for
 /// `upload_dirty_chunks`: the durable not-yet-uploaded set must survive
 /// a crash even though `DiskCache::rescan` legitimately reports every
 /// rediscovered chunk `Clean` (prerequisite 1), and a failed drain must

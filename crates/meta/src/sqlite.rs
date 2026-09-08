@@ -2010,7 +2010,7 @@ impl SqliteMeta {
     }
 
     /// Local-write variant of `set_manifest` (used only by the FUSE
-    /// flush path, plan 05a step 1): durably enrolls `dirty_hashes` in
+    /// flush path, plan 07 step 1): durably enrolls `dirty_hashes` in
     /// `pending_upload` in the **same transaction** as the manifest
     /// commit and journal record, so a crash between "the cache has the
     /// bytes" and "S3 has the bytes" cannot silently drop the upload —
@@ -4469,7 +4469,7 @@ mod tests {
     /// `set_manifest_dirty` inserts `pending_upload` rows in the same
     /// transaction as the `WriteManifest` record: a forced failure (bad
     /// ino) must leave neither the manifest commit nor a stray pending
-    /// row (plan 05a step 1).
+    /// row (plan 07 step 1).
     #[test]
     fn set_manifest_dirty_journals_pending_uploads_in_the_same_tx() {
         let m = store();

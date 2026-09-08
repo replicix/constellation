@@ -1,6 +1,6 @@
-# Plan 13 — Phase 8d: concurrent snapshot and clone churn oracle
+# Plan 15 — Phase 8d: concurrent snapshot and clone churn oracle
 
-Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plan 12 (8c)
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plan 14 (8c)
 on `main`. Spec: `docs/DESIGN.md` §13 (snapshots are frozen trees;
 delete does not touch other snapshots, clones, or the live tree;
 clones are ordinary writable subtrees sharing data chunks;

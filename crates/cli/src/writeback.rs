@@ -1,4 +1,4 @@
-//! Streaming-write and write-back policy (plan 05b).
+//! Streaming-write and write-back policy (plan 08).
 //!
 //! The data plane has one durable queue: SQLite's `pending_upload`
 //! table. Write-through waits for that queue (scoped to the inode when

@@ -1,4 +1,4 @@
-//! Bounded-memory write staging (plan 05a, DESIGN.md §7/§9).
+//! Bounded-memory write staging (plan 07, DESIGN.md §7/§9).
 //!
 //! One sparse file per open, dirty inode at
 //! `<state_dir>/staging/<ino>.<gen>`. `<gen>` is a per-mount monotonic
@@ -45,8 +45,8 @@ pub enum StagingError {
 /// Shared budget across every open dirty inode's staging file on this
 /// mount. `CONSTELLATION_STAGING_BUDGET` (bytes) overrides the default
 /// of a quarter of `--cache-size` — decoupled from the chunk cache
-/// because staging must hold a whole in-flight write until flush (05a
-/// adds no streaming; that is 05b), while the chunk cache only holds
+/// because staging must hold a whole in-flight write until flush (07
+/// adds no streaming; that is 08), while the chunk cache only holds
 /// each sealed chunk briefly before eager upload demotes it.
 pub struct StagingBudget {
     budget: u64,
@@ -181,12 +181,12 @@ impl DirtyRuns {
         }
     }
 
-    #[allow(dead_code)] // part of the public shape (plan 05a); exercised by tests
+    #[allow(dead_code)] // part of the public shape (plan 07); exercised by tests
     pub fn run_count(&self) -> usize {
         self.runs.len()
     }
 
-    #[allow(dead_code)] // part of the public shape (plan 05a); used via Staging::dirty_indices
+    #[allow(dead_code)] // part of the public shape (plan 07); used via Staging::dirty_indices
     pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         self.runs.iter().flat_map(|&(s, e)| s..e)
     }
@@ -294,14 +294,14 @@ impl Staging {
         Ok(())
     }
 
-    #[allow(dead_code)] // part of the public shape (plan 05a); exercised by tests
+    #[allow(dead_code)] // part of the public shape (plan 07); exercised by tests
     pub fn file_len(&self) -> u64 {
         self.file_len
     }
 
     /// Bytes currently reserved against the shared budget for this
     /// staging file (== its logical length; see the module doc).
-    #[allow(dead_code)] // part of the public shape (plan 05a)
+    #[allow(dead_code)] // part of the public shape (plan 07)
     pub fn reserved_bytes(&self) -> u64 {
         self.reserved
     }
@@ -400,7 +400,7 @@ impl Staging {
         }
     }
 
-    #[allow(dead_code)] // part of the public shape (plan 05a); exercised by tests
+    #[allow(dead_code)] // part of the public shape (plan 07); exercised by tests
     pub fn dirty_indices(&self) -> impl Iterator<Item = u64> + '_ {
         self.dirty.iter()
     }
@@ -419,7 +419,7 @@ impl Staging {
     }
 }
 
-/// Mount-time GC (plan 05a step 6): nothing under the staging root can
+/// Mount-time GC (plan 07 step 6): nothing under the staging root can
 /// be live at mount start — the generation counter guarantees a fresh
 /// mount never reuses a name, and staging holds only bytes POSIX
 /// permits losing on a crash. Returns the reclaimed byte count so the

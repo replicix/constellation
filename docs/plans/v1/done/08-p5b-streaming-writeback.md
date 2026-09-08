@@ -1,7 +1,7 @@
-# Plan 05b — Phase 5b: streaming writes and the write-back policy
+# Plan 08 — Phase 5b: streaming writes and the write-back policy
 
-Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–05 and
-**05a** committed — this plan drains the staging area chunk by chunk and
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–06 and
+**07** committed — this plan drains the staging area chunk by chunk and
 relies on the durable `pending_upload` table for crash-safe tracking of
 what still owes S3 a PUT. Spec: `docs/DESIGN.md` "Streaming writes:
 files larger than the cache" (already specified — implement it, do not
@@ -73,7 +73,7 @@ ladder, cheapest tier first:
    `pending_upload` is known durable in S3: skip the HEAD *and* the PUT.
    This covers re-copies, repeated edits to one chunk, and retries after
    a failed upload, which together are most real hits. This tier is only
-   safe because 05a landed — before it, `rescan` called a never-uploaded
+   safe because 07 landed — before it, `rescan` called a never-uploaded
    chunk `Clean`.
 2. **`PutMode::Create` — 1 RTT** for chunks not locally known. The
    backend is already built `.with_conditional_put(ETagMatch)`
@@ -96,7 +96,7 @@ Follow-up, explicitly **not** this phase: `layout::chunk_key`'s comment
 notes the `chunks/<aa>/<bb>/` levels exist "for LIST parallelism", so a
 cold node facing a high-dedup import could seed a local bloom of S3
 contents with paged LISTs (1000 keys/request) and skip probing
-altogether, reusing plan 05's bloom code. Note it in PROGRESS.md as a
+altogether, reusing plan 06's bloom code. Note it in PROGRESS.md as a
 lever, do not build it.
 
 ### 2b. Compression runs on the async runtime
@@ -255,7 +255,7 @@ clock and no I/O.
 - `writeback-bigfile`: a file ten times the cache budget under `back`
   with eager upload. Assert an RSS ceiling *and* a cache-usage ceiling
   while the write completes — the "bounded by S3, not local disk" exit
-  criterion. Reuse `Client::rss_bytes()` from 05a.
+  criterion. Reuse `Client::rss_bytes()` from 07.
 - `writeback-drain`: write under `back`, unmount cleanly, assert
   `status` showed pending uploads returning to zero before unmount
   finished, and a second node reads everything.

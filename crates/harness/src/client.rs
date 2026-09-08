@@ -401,7 +401,7 @@ impl Client {
     /// Current resident set size of the daemon process, read from
     /// `/proc/<pid>/status` (`VmRSS`). Used by `big-file-write` to prove
     /// RSS stays flat regardless of the size of the file being written
-    /// (plan 05a's exit criterion).
+    /// (plan 07's exit criterion).
     pub fn rss_bytes(&self) -> Result<u64> {
         let pid = self.child.as_ref().context("not mounted")?.id();
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))

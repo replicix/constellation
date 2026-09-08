@@ -115,4 +115,4 @@ Harness scenarios:
 
 Per CONVENTIONS.md. This closes phase 4's availability matrix and
 reintegration. Permanent membership shrinkage (`constellation leave`)
-is plan 04c — NOT here.
+is plan 05 — NOT here.

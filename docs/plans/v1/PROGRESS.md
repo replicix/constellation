@@ -91,7 +91,7 @@ gap and RAM scaling linearly with file size — are **closed by phase
 | Unit tests: `upload_dirty_chunks` drains a pending row even though a post-crash cache reopen reports the chunk `Clean` (regression for prerequisite 1); a failed drain (S3 unreachable) leaves the pending row for the next attempt rather than acking it (regression for prerequisite 2's unmount gate) | done | `cli::pending_upload_tests` |
 | Harness scenarios: `big-file-write` (small `--cache-size`, write several times that budget, sample RSS — flat ceiling, not tracking bytes written), `staging-crash` (`kill -9` mid-write, remount, empty `staging/`, content at its last committed size), `unmount-drain` (cut S3, write, unmount, heal, remount-drain, unmount again; a second node must see no missing chunk — the regression test for prerequisite 2) | done | `crates/harness::scenarios` |
 
-### Phase 5a exit criteria (plan 05a)
+### Phase 5a exit criteria (plan 07)
 
 - [x] A file many times the cache budget is written with a flat RSS
       ceiling — `big-file-write` writes 300 MiB against a 64 MiB
@@ -106,7 +106,7 @@ gap and RAM scaling linearly with file size — are **closed by phase
 **Verdict: phase 5a is functionally complete.** This plan deliberately
 does not add streaming/eager writeback, throttling short of the hard
 `ENOSPC` bound, or slice overlays — all out of scope, deferred to
-phase 5b (`docs/plans/v1/done/05b-p5b-streaming-writeback.md`).
+phase 5b (`docs/plans/v1/done/08-p5b-streaming-writeback.md`).
 
 ### Known visibility limit (not scheduled)
 
@@ -514,7 +514,7 @@ node's budget only. The digest is advisory.
 | Increasing dirty-pressure throttle before hard-limit ENOSPC | done | `cli::writeback` |
 | Five write-back scenarios and through-vs-back census benchmark | done | `harness::{scenarios,bench}`, `docs/TESTING.md` |
 
-### Phase 5b exit criteria (plan 05b)
+### Phase 5b exit criteria (plan 08)
 
 - [x] `writeback-bigfile`: 320 MiB (10x a 32 MiB cache), peak daemon
   RSS 242 MiB and peak cache usage 32 MiB.
@@ -553,7 +553,7 @@ plane work.
 | Harness lifecycle, clone divergence, read-only snapshot mount, and ephemeral cleanup scenarios | done | `harness::scenarios` |
 | Reintegration folds the size-only truncate record into its following manifest edit, so an edit conflict cannot truncate the shared winner | done — regression exposed by the full phase gate | `cli::reintegrate`; harness `deposed-reintegration` |
 
-### Phase 6a exit criteria (plan 06)
+### Phase 6a exit criteria (plan 09)
 
 - [x] Snapshot creation freezes a well-defined flushed subtree and duplicate
       `path@name` creation is rejected by backend CAS.
@@ -606,7 +606,7 @@ pjdfstest: **8798 passed, 0 failed**, empty baseline.
 | Unit proofs cover keyring/wrong passphrase, passphrase change without DEK rotation, partition-DEK persistence, AAD rejection, metadata ciphertext, and keyed addressing | done | `store-s3::{e2e,log}`, `fs-core::chunk` |
 | End-to-end scenarios cover ciphertext inspection, cold remount, wrong-passphrase rejection, two-node convergence, and cooperative peer hits | done | `harness::scenarios::{e2e-basic,e2e-two-nodes}` |
 
-### Phase 6b exit criteria (plan 07)
+### Phase 6b exit criteria (plan 10)
 
 - [x] E2E mode is fixed at filesystem creation and requires credentials plus
       the passphrase on every mount.
@@ -661,7 +661,7 @@ failed**, empty baseline.
 | In-memory bounded tracing ring; CLI `inspect`, `cache ls\|stat`, and `log tail` parity | done | `cli::log_buffer`, `cli::main` |
 | Exhaustive unix/HTTP adapter parity table and HTTP-level harness smoke | done | `api` tests; harness `web-ui-smoke` |
 
-### Phase 7 exit criteria (plan 08)
+### Phase 7 exit criteria (plan 11)
 
 - [x] The daemon serves the embedded UI only when explicitly enabled and
       binds `127.0.0.1`; it has no authentication by design. Remote access
@@ -678,7 +678,7 @@ failed**, empty baseline.
 ### Phase 7 scope notes
 
 - File-panel rename/delete/upload/download mutations are deliberately deferred:
-  plan 08 marks them stretch, while `ReadDir` and `Inspect` provide the required
+  plan 11 marks them stretch, while `ReadDir` and `Inspect` provide the required
   read-only browser.
 - Snapshot clone/browse/mount actions remain CLI/FUSE operations; phase 7's
   required web panel is list/create/delete.
@@ -706,7 +706,7 @@ failed**, empty baseline.
 | Unit coverage for deref transitions, horizon/exemption filtering, condemned dedup resurrection, and corrupt fixtures | done | `meta::sqlite`, `store-s3::{gc,store}`, `cli::{gc,fsck}` tests |
 | Fault scenarios for lifecycle roots, the condemned dedup race, and repair exit-code lifecycle | done | `harness::{gc-lifecycle,gc-dedup-race,fsck-repair}` |
 
-### Phase 8a exit criteria (plan 09)
+### Phase 8a exit criteria (plan 12)
 
 - [x] Reference GC discovers ordinary garbage from the replica index without
       listing chunks; only `--orphans` performs the expensive chunk LIST.
@@ -794,7 +794,7 @@ all eight rates, and `make dist-linux` produces a static-PIE musl binary whose
 | Counting-store unit coverage for hit/miss request shape, false-positive safety, peer hint/fallback, incomplete cap, canonical parsing, and condemned overwrite | done | `store-s3::{existence,store}`, `cli::{existence,main}` tests |
 | Fault scenarios for cold duplicate import and LIST-disabled peer hints | done | `harness::{existence-bloom-dedup,existence-peer-hint}` |
 
-### Phase 8c exit criteria (plan 12)
+### Phase 8c exit criteria (plan 14)
 
 - [x] A complete S3 LIST seed can prove absence and choose a conditional
       Create without HEAD; every bloom or peer-digest hit still performs a
@@ -835,7 +835,7 @@ Only `fio-latency` and `fio-blips` skipped because `fio` is absent.
 | Final cleanup asserts an empty replica snapshot/root namespace, empty bucket `snaps/`, and no user `chunks/` after zero-horizon orphan GC | done | harness `snapshot-churn` |
 | Clone roots inherit the mount daemon's effective UID/GID instead of hard-coded root ownership; regression asserted in the existing clone-isolation unit test | done | `cli::snapshot` |
 
-### Phase 8d exit criteria (plan 13)
+### Phase 8d exit criteria (plan 15)
 
 - [x] Four workers complete three default rounds of 30 operations each, with
       all worker I/O closed before snapshot, clone, delete, and verify phases.
@@ -873,7 +873,7 @@ both passed.
 | Sparse staging reservations charge admitted data chunks rather than logical hole length and preserve bounded write-back pressure | done | `cli::staging`, `cli::fusefs_ops` |
 | Cross-node sparse layout, punch/rewrite, object-count, cache, and RSS oracle | done | harness `fallocate-sparse` |
 
-### Phase 8e exit criteria (plan 14)
+### Phase 8e exit criteria (plan 16)
 
 - [x] A 1 TiB manifest with one data chunk stays inline and under 80 bytes;
       missing indices encode holes without allocating a dense vector.
@@ -909,7 +909,7 @@ span) and **67 MiB RSS**. Only `fio-latency` and `fio-blips` skipped because
 | Backward-readable `CTR2` snapshot trees carrying directory and entry xattrs; frozen views expose them and eager clones restore them | done | `fs-core::tree`, `cli::{snapshot,fusefs}` |
 | Two-node file/directory round-trip, removal propagation, and sparse logical-size oracle | done | harness `xattr-roundtrip` |
 
-### Phase 8f exit criteria (plan 15)
+### Phase 8f exit criteria (plan 17)
 
 - [x] User xattrs set, list, replace, remove, survive SQLite reopen, replay to
       another replica, disappear on final unlink, and copy into eager clones.

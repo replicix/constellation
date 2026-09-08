@@ -336,7 +336,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "big-file-write",
-        desc: "write a file several times --cache-size and sample RSS: must stay flat, not track bytes written (plan 05a)",
+        desc: "write a file several times --cache-size and sample RSS: must stay flat, not track bytes written (plan 07)",
         requires: &[],
         run: big_file_write,
     },
@@ -3949,7 +3949,7 @@ fn pattern(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
-/// Plan 05a's exit criterion: daemon RSS must not scale with the size
+/// Plan 07's exit criterion: daemon RSS must not scale with the size
 /// of the file being written. A small `--cache-size` makes the old
 /// (pre-staging) behavior's failure mode obvious — without bounded
 /// staging, an in-flight write several times the cache budget would
@@ -4252,7 +4252,7 @@ fn fallocate_sparse(seed: u64) -> Result<()> {
 /// `kill -9` mid-write must not corrupt the file: staging is scratch,
 /// so the file lands at whatever size/content its last successful
 /// `close`/`fsync` committed, and `staging/` is empty after the next
-/// mount's GC. "Absent or short is a pass; corrupt is not" (plan 05a).
+/// mount's GC. "Absent or short is a pass; corrupt is not" (plan 07).
 fn staging_crash(seed: u64) -> Result<()> {
     let (env, root) = setup("staging-crash")?;
     let _proxy = env.s3_proxy()?;
@@ -4315,7 +4315,7 @@ fn staging_crash(seed: u64) -> Result<()> {
     Ok(())
 }
 
-/// Regression test for prerequisite 2 (plan 05a): today's tree ships
+/// Regression test for prerequisite 2 (plan 07): today's tree ships
 /// the journal on clean unmount without draining `pending_upload`
 /// first, so a chunk that only made it into the local cache (S3 PUT cut
 /// by the proxy) gets published as if it were durable in S3. This must

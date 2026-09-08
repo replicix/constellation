@@ -1,5 +1,5 @@
 //! Cooperative cache: digest gossip, peer serving, source-selecting fetch
-//! (DESIGN.md §7, plan 05).
+//! (DESIGN.md §7, plan 06).
 //!
 //! A local miss consults in-memory peer blooms (zero extra messages),
 //! then the latency-adaptive selector in [`crate::sources`] ranks S3

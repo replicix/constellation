@@ -1,12 +1,12 @@
-# Plan 12 — Phase 8c: existence bloom for cold high-dedup uploads
+# Plan 14 — Phase 8c: existence bloom for cold high-dedup uploads
 
-Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–10
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–13
 committed (phase 8b is `8d98ac8` / `4c77b4a`). Spec: `docs/DESIGN.md`
 §2 (chunk key sharding / LIST parallelism), §7 (bloom parameters;
 peer digests are cache membership, not S3 membership), §14 rule 2
 (condemned hashes are absent for dedup). Do not edit DESIGN.md.
 
-This is the follow-up named in plan 05b step 2a and in
+This is the follow-up named in plan 08 step 2a and in
 `docs/PROGRESS.md` phase 5b deferred notes.
 
 ## Problem

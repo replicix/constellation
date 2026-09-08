@@ -1,6 +1,6 @@
-# Plan 08 — Phase 7: web UI over the control API
+# Plan 11 — Phase 7: web UI over the control API
 
-Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–07
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–10
 committed. Spec: `docs/DESIGN.md` §10 "Control Plane". Roadmap exit:
 UI feature parity with the CLI, same API, verified by shared tests.
 
@@ -49,7 +49,7 @@ UI feature parity with the CLI, same API, verified by shared tests.
 
 `ReadDir`, `Inspect`, `ListSnapshots`, `SnapshotCreate/Delete`,
 `ForceRelease`, `LogTail`, plus
-whatever plans 03–07 already added — keep one enum, serde-tagged as
+whatever plans 03–10 already added — keep one enum, serde-tagged as
 established, versioned by additive change only. The CLI gains
 matching subcommands where DESIGN §10 lists them (`inspect`,
 `cache ls|stat`, `log tail`) so CLI parity holds too.

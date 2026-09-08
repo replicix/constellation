@@ -1,4 +1,4 @@
-# Plan 16 — Phase 10a: adaptive prefetch, streaming fetch, scan-ahead
+# Plan 18 — Phase 10a: adaptive prefetch, streaming fetch, scan-ahead
 
 Read `docs/plans/v1/CONVENTIONS.md` first (ground rules, gates,
 build commands). Spec: `docs/explanation/DESIGN.md` §7 ("Prefetcher
@@ -61,7 +61,7 @@ Third defect, orthogonal: every fetch buffers the whole chunk in RAM
 copy for decode). Raising parallelism without fixing this turns a
 256 MiB read window into ≥ 512 MiB of transient RSS. Inflight data
 must stream to disk in small pieces, as the write path already does
-(plan 05a bounded-RAM staging; xs3lerator does the same on the proxy
+(plan 07 bounded-RAM staging; xs3lerator does the same on the proxy
 side).
 
 ## What the reference implementations do (read them, they are local)

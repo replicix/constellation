@@ -1,6 +1,6 @@
-# Plan 05 — Phase 5: cooperative cache
+# Plan 06 — Phase 5: cooperative cache
 
-Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–04c
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–05
 committed. Spec: `docs/DESIGN.md` §7 "Cooperative cache" and
 "Latency-adaptive source selection". Roadmap exit: web-fleet scenario
 meets TTFB targets; latency-matrix behavior converges (S3-near nodes

@@ -1,6 +1,6 @@
-# Plan 10 — Phase 8b: hardening, performance gates, packaging (v1)
+# Plan 13 — Phase 8b: hardening, performance gates, packaging (v1)
 
-Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–09
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–12
 committed. Spec: `docs/ROADMAP.md` phase 8 ("xfstests sweep,
 performance regression gates, packaging (static musl builds, Linux +
 macOS). Exit: nightly full matrix green; v1"). This is the closing

@@ -1,6 +1,6 @@
-# Plan 14 — Phase 8e: fallocate, hole punching, sparse manifests
+# Plan 16 — Phase 8e: fallocate, hole punching, sparse manifests
 
-Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plan 13 (8d)
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plan 15 (8d)
 committed. Spec: `docs/DESIGN.md` §3 (manifests, holes), §12
 (`fallocate`/`truncate` as metadata-only; `SEEK_HOLE`/`SEEK_DATA`).
 Do not edit DESIGN.md.
@@ -130,7 +130,7 @@ pjdfstest must stay 8798/8798. Do not add exclusions.
 
 ## Out of scope
 
-- xattr (plan 15 / 8f).
+- xattr (plan 17 / 8f).
 - Slice overlays, pack, CDC.
 - Changing DESIGN.md.
 

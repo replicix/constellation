@@ -73,7 +73,7 @@ fn statfs_blocks(view_used: u64, fs_used: u64, cap: Option<u64>, block: u64) -> 
 pub type QuotaCache = Arc<Mutex<Option<(Instant, Option<u64>)>>>;
 
 /// In-flight write state for one inode: bytes live on disk in `staging`
-/// (bounded RAM regardless of file size, plan 05a), not in a `Vec` per
+/// (bounded RAM regardless of file size, plan 07), not in a `Vec` per
 /// chunk. `dirty` tracks which chunk indices actually have staged
 /// content; the rest of the file (up to `file_len`) is served from the
 /// committed manifest in `base`.
@@ -233,7 +233,7 @@ pub struct FsDependencies {
     pub sync: Option<SyncHandle>,
     pub coop: Option<Arc<crate::coop::Coop>>,
     /// Root of `<state_dir>/staging`; write staging files live here
-    /// (plan 05a). Callers GC this directory before mounting.
+    /// (plan 07). Callers GC this directory before mounting.
     pub staging_dir: PathBuf,
     /// Shared bound on in-flight (unflushed) write bytes across every
     /// open dirty inode, decoupled from the chunk cache budget: a
@@ -1328,7 +1328,7 @@ impl ConstellationFs {
     }
 
     /// Get-or-create the pending write state for `ino`, allocating a
-    /// fresh staging file (bounded-RAM, plan 05a) the first time this
+    /// fresh staging file (bounded-RAM, plan 07) the first time this
     /// inode is touched since its last flush.
     fn write_state<'a>(
         &self,
@@ -1529,9 +1529,9 @@ impl ConstellationFs {
             .collect();
         // Every chunk this flush seals into the cache as Dirty: the
         // durable pending-upload set this manifest commit journals
-        // (plan 05a step 1). Sealing one chunk at a time (read its
+        // (plan 07 step 1). Sealing one chunk at a time (read its
         // staged range, hash, insert, drop the buffer) keeps peak RSS
-        // O(chunk_size), never O(file_len) — 05a's whole point.
+        // O(chunk_size), never O(file_len) — 07's whole point.
         let mut dirty_hashes: Vec<ChunkHash> = Vec::new();
         for (&idx, hash) in &ws.sealed {
             if idx >= n_chunks {

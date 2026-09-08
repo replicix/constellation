@@ -1,6 +1,6 @@
-# Plan 05a — Phase 5a: bounded-memory write staging
+# Plan 07 — Phase 5a: bounded-memory write staging
 
-Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–05
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–06
 committed. Spec: `docs/DESIGN.md` §7 (cache states: `dirty` is never
 evicted until uploaded), §9 (reserve-before-accept, the "evict → throttle
 → ENOSPC" ladder), §6 (close-to-open). Roadmap exit: a file many times
@@ -10,16 +10,16 @@ mid-write leaves no orphaned staging bytes.
 **Goal: daemon RSS must not scale with the size of the file being
 written.** Today it does, linearly, and a 10 GB copy grows the process
 until the writer stops. This plan does not add streaming uploads (that
-is 05b) — it only moves in-flight bytes out of RAM and onto disk, and
-fixes two correctness gaps that become the normal path once 05b makes
+is 08) — it only moves in-flight bytes out of RAM and onto disk, and
+fixes two correctness gaps that become the normal path once 08 makes
 deferred uploads routine.
 
 ## Why the two prerequisite fixes belong here
 
 Both are real, verified in tree, and narrow *today* only because eager
-upload almost always succeeds on the first try. Under 05b's write-back
-they are the common case, so 05b is unsafe without them. They also
-supply the durable "not yet uploaded" set that 05b's zero-RTT dedup
+upload almost always succeeds on the first try. Under 08's write-back
+they are the common case, so 08 is unsafe without them. They also
+supply the durable "not yet uploaded" set that 08's zero-RTT dedup
 tier and drain accounting both read.
 
 **1. Dirty state does not survive a crash.** `DiskCache::rescan`
@@ -151,7 +151,7 @@ set. The surrounding logic keeps its shape:
   back, hash it, `cache.insert(&hash, &data, ChunkState::Dirty)`, drop
   the buffer, next. Never build a `Vec` of all chunk bodies. The
   existing `epoch_active` check and `try_upload_dirty` call stay exactly
-  as they are — 05b changes them, 5a does not.
+  as they are — 08 changes them, 5a does not.
 
 Ordering that must hold: a chunk's bytes are in the cache (durable,
 `write_atomic` does `sync_data` + rename) **before** `set_manifest`
@@ -184,7 +184,7 @@ cache lives on:
   (`crates/api/src/types.rs`) and show them in `status`. The harness
   asserts against these, so they are not decoration.
 
-Throttling before ENOSPC is 05b's dirty-budget work; 5a only needs the
+Throttling before ENOSPC is 08's dirty-budget work; 5a only needs the
 hard bound and a clean errno.
 
 ## Step 6 — mount-time GC
@@ -281,9 +281,9 @@ routed through staging) are the second tripwire.
 ## Out of scope
 
 - Eager/streaming upload, parallel uploads, the dedup ladder, and the
-  write-through/write-back policy: all 05b. Leave `try_upload_dirty`
+  write-through/write-back policy: all 08. Leave `try_upload_dirty`
   and `upload_dirty_chunks` serial here.
-- Throttling as dirty bytes approach the budget: 05b. 5a stops at a
+- Throttling as dirty bytes approach the budget: 08. 5a stops at a
   hard bound with a clean ENOSPC.
 - Serving dirty chunks to peers: `get_servable` deliberately excludes
   them, and `dirty_chunks_are_not_servable` asserts it. Unchanged.

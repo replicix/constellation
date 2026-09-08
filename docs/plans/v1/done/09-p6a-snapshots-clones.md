@@ -1,6 +1,6 @@
-# Plan 06 — Phase 6a: snapshots, clones, subtree mounts
+# Plan 09 — Phase 6a: snapshots, clones, subtree mounts
 
-Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–05
+Read `docs/plans/v1/CONVENTIONS.md` first. Prerequisites: plans 00–06
 committed. Spec: `docs/DESIGN.md` §13 "Snapshots and Clones" —
 follow it precisely; the section is prescriptive. Log ops
 `snap_create`, `snap_delete`, `clone` are already reserved in the op
@@ -93,7 +93,7 @@ registry (§4).
 
 ## Step 6 — GC roots (bookkeeping only)
 
-Full GC is plan 09. Here: make snapshot trees enumerable as GC roots
+Full GC is plan 12. Here: make snapshot trees enumerable as GC roots
 (a `constellation debug snap-refs <snap-id>` walking a tree and
 listing referenced chunk hashes — the GC plan builds on it) and make
 sure `snap_delete` leaves the blobs alone (grace-period reclamation
