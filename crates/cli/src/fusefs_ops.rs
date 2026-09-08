@@ -1103,9 +1103,14 @@ impl Filesystem for ConstellationFs {
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         // Effectively unlimited backing store; block size mirrors blksize.
+        // Used space is logical bytes under the mount root (same as rsize).
         let bsize: u32 = 131072;
         let huge = u64::MAX / bsize as u64 / 2;
-        reply.statfs(huge, huge, huge, 0, u64::MAX / 2, bsize, 255, bsize);
+        let (used_bytes, file_count) = self.cached_usage();
+        let used_blocks = used_bytes.div_ceil(bsize as u64);
+        let bfree = huge.saturating_sub(used_blocks);
+        let ffree = (u64::MAX / 2).saturating_sub(file_count);
+        reply.statfs(huge, bfree, bfree, file_count, ffree, bsize, 255, bsize);
     }
 
     fn fallocate(

@@ -32,10 +32,20 @@ use std::io::{Read, Seek};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
 const TTL: Duration = Duration::from_secs(1);
+const DEFAULT_STATFS_TTL_S: u64 = 5;
+
+fn parse_statfs_ttl_secs(raw: Option<&str>) -> Duration {
+    let secs = raw.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_STATFS_TTL_S);
+    Duration::from_secs(secs)
+}
+
+fn statfs_ttl_from_env() -> Duration {
+    parse_statfs_ttl_secs(std::env::var("CONSTELLATION_STATFS_TTL_S").ok().as_deref())
+}
 
 /// In-flight write state for one inode: bytes live on disk in `staging`
 /// (bounded RAM regardless of file size, plan 05a), not in a `Vec` per
@@ -265,6 +275,11 @@ pub struct ConstellationFs {
         VecDeque<ChunkHash>,
     )>,
     view_root: Ino,
+    /// Cached `(bytes, files)` for [`Self::statfs`], refreshed at most
+    /// every [`Self::statfs_ttl`]. `None` means never populated.
+    usage_cache: Mutex<Option<(Instant, u64, u64)>>,
+    /// From `CONSTELLATION_STATFS_TTL_S` (default 5s). Zero disables caching.
+    statfs_ttl: Duration,
 }
 
 fn staging_errno(e: &crate::staging::StagingError) -> i32 {
@@ -393,7 +408,32 @@ impl ConstellationFs {
             }),
             tree_cache: Mutex::new((HashMap::new(), VecDeque::new())),
             view_root: constellation_fs_core::types::ROOT_INO,
+            usage_cache: Mutex::new(None),
+            statfs_ttl: statfs_ttl_from_env(),
         }
+    }
+
+    /// Logical used space under the mount root: `(bytes, file_count)`.
+    /// Results are cached for [`Self::statfs_ttl`] (env
+    /// `CONSTELLATION_STATFS_TTL_S`, default 5s; `0` disables the cache).
+    pub(crate) fn cached_usage(&self) -> (u64, u64) {
+        if !self.statfs_ttl.is_zero() {
+            if let Some((fetched_at, bytes, files)) = *self.usage_cache.lock().unwrap() {
+                if fetched_at.elapsed() < self.statfs_ttl {
+                    return (bytes, files);
+                }
+            }
+        }
+        let root = self.real_ino(constellation_fs_core::types::ROOT_INO);
+        let usage = if Self::is_synthetic(root) {
+            self.synthetic_recursive_size(root).unwrap_or((0, 0))
+        } else {
+            self.meta.recursive_size(root).unwrap_or((0, 0))
+        };
+        if !self.statfs_ttl.is_zero() {
+            *self.usage_cache.lock().unwrap() = Some((Instant::now(), usage.0, usage.1));
+        }
+        usage
     }
 
     pub fn set_subtree_root(&mut self, path: &str) -> Result<()> {
@@ -407,6 +447,7 @@ impl ConstellationFs {
             anyhow::bail!("mount root {path} is not a directory");
         }
         self.view_root = ino;
+        *self.usage_cache.lock().unwrap() = None;
         Ok(())
     }
 
@@ -431,6 +472,7 @@ impl ConstellationFs {
             xattrs: Vec::new(),
         };
         self.view_root = self.intern_synthetic(format!("mount:{path}@{name}"), node);
+        *self.usage_cache.lock().unwrap() = None;
         Ok(())
     }
 
@@ -1729,5 +1771,189 @@ mod write_shard_tests {
             Err(std::sync::TryLockError::WouldBlock)
         ));
         assert!(writes.0[2].try_lock().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use constellation_fs_core::types::ROOT_INO;
+    use constellation_fs_core::DEFAULT_CHUNK_SIZE;
+    use object_store::memory::InMemory;
+    use tempfile::TempDir;
+
+    fn test_fs(meta: Arc<SqliteMeta>) -> (ConstellationFs, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(
+            DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap(),
+        );
+        let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
+        let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
+            meta.clone(),
+            store.clone(),
+            CompressionSetting::RAW,
+            DEFAULT_CHUNK_SIZE,
+            1,
+        ));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        let _enter = handle.enter();
+        let fs = ConstellationFs::new(
+            FsDependencies {
+                meta,
+                store,
+                cache,
+                rt: handle,
+                sync: None,
+                coop: None,
+                staging_dir: dir.path().join("staging"),
+                staging_budget: StagingBudget::new(1 << 30),
+                snapshots,
+            },
+            DEFAULT_CHUNK_SIZE,
+            CompressionSetting::RAW,
+        );
+        // Prefetcher holds a Handle; keep the runtime alive for the test.
+        std::mem::forget(rt);
+        (fs, dir)
+    }
+
+    #[test]
+    fn parse_statfs_ttl_defaults_to_five_seconds() {
+        assert_eq!(parse_statfs_ttl_secs(None), Duration::from_secs(5));
+        assert_eq!(parse_statfs_ttl_secs(Some("")), Duration::from_secs(5));
+        assert_eq!(parse_statfs_ttl_secs(Some("bogus")), Duration::from_secs(5));
+        assert_eq!(parse_statfs_ttl_secs(Some("0")), Duration::from_secs(0));
+        assert_eq!(parse_statfs_ttl_secs(Some("12")), Duration::from_secs(12));
+    }
+
+    #[test]
+    fn cached_usage_sums_logical_file_sizes() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        let a = meta.create(dir.ino, "a", 0o644, 0, 0).unwrap();
+        let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+        meta.setattr(a.ino, None, None, None, Some(7), None, None)
+            .unwrap();
+        meta.setattr(b.ino, None, None, None, Some(100), None, None)
+            .unwrap();
+
+        let (fs, _tmpdir) = test_fs(meta);
+        assert_eq!(fs.cached_usage(), (107, 2));
+
+        let bsize = 131072u64;
+        let used_blocks = 107u64.div_ceil(bsize);
+        assert_eq!(used_blocks, 1);
+    }
+
+    #[test]
+    fn cached_usage_scopes_to_subtree_mount() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        let a = meta.create(dir.ino, "a", 0o644, 0, 0).unwrap();
+        let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+        meta.setattr(a.ino, None, None, None, Some(7), None, None)
+            .unwrap();
+        meta.setattr(b.ino, None, None, None, Some(100), None, None)
+            .unwrap();
+
+        let (mut fs, _tmpdir) = test_fs(meta);
+        assert_eq!(fs.cached_usage(), (107, 2));
+        fs.set_subtree_root("/d").unwrap();
+        assert_eq!(fs.cached_usage(), (7, 1));
+    }
+
+    #[test]
+    fn zero_ttl_disables_cache_while_positive_ttl_caches() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        meta.setattr(f.ino, None, None, None, Some(10), None, None)
+            .unwrap();
+
+        let (mut fs, _tmpdir) = test_fs(meta.clone());
+        fs.statfs_ttl = Duration::from_secs(60);
+        assert_eq!(fs.cached_usage(), (10, 1));
+        meta.setattr(f.ino, None, None, None, Some(99), None, None)
+            .unwrap();
+        assert_eq!(
+            fs.cached_usage(),
+            (10, 1),
+            "positive TTL must serve the stale aggregate"
+        );
+
+        fs.statfs_ttl = Duration::from_secs(0);
+        *fs.usage_cache.lock().unwrap() = None;
+        assert_eq!(fs.cached_usage(), (99, 1));
+        meta.setattr(f.ino, None, None, None, Some(1), None, None)
+            .unwrap();
+        assert_eq!(
+            fs.cached_usage(),
+            (1, 1),
+            "TTL 0 must recompute on every call"
+        );
+    }
+
+    #[test]
+    fn cached_usage_scopes_to_snapshot_mount() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let source = meta.mkdir(ROOT_INO, "source", 0o755, 0, 0).unwrap();
+        let file = meta.create(source.ino, "file", 0o644, 0, 0).unwrap();
+        meta.setattr(file.ino, None, None, None, Some(42), None, None)
+            .unwrap();
+        let outside = meta.create(ROOT_INO, "outside", 0o644, 0, 0).unwrap();
+        meta.setattr(outside.ino, None, None, None, Some(1000), None, None)
+            .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(
+            DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap(),
+        );
+        let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
+        let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
+            meta.clone(),
+            store.clone(),
+            CompressionSetting::RAW,
+            DEFAULT_CHUNK_SIZE,
+            1,
+        ));
+        // Create the snapshot on a throwaway runtime so the FUSE handle's
+        // runtime is idle when cached_usage later block_on's tree loads.
+        {
+            let setup = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            setup
+                .block_on(snapshots.create("/source", "snap"))
+                .unwrap();
+        }
+
+        let fs_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut fs = ConstellationFs::new(
+            FsDependencies {
+                meta,
+                store,
+                cache,
+                rt: fs_rt.handle().clone(),
+                sync: None,
+                coop: None,
+                staging_dir: dir.path().join("staging"),
+                staging_budget: StagingBudget::new(1 << 30),
+                snapshots,
+            },
+            DEFAULT_CHUNK_SIZE,
+            CompressionSetting::RAW,
+        );
+        std::mem::forget(fs_rt);
+        fs.statfs_ttl = Duration::from_secs(0);
+        assert_eq!(fs.cached_usage(), (1042, 2));
+        fs.set_snapshot_root("/source", "snap").unwrap();
+        assert_eq!(fs.cached_usage(), (42, 1));
     }
 }
