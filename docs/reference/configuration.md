@@ -129,15 +129,35 @@ eventual convergence continue through S3.
 | `CONSTELLATION_TOKIO_THREADS` | `min(CPUs, 32)` | threads, `1..32` | multi-thread Tokio worker count |
 | `CONSTELLATION_BLOCKING_THREADS` | `clamp(4×CPUs, 4..256)` | threads | Tokio blocking-pool ceiling |
 
-### Filesystem stats
+### Filesystem stats and quota
 
-| Variable | Default | Unit / values | Subsystem |
-|---|---:|---|---|
-| `CONSTELLATION_STATFS_TTL_S` | `5` | seconds | cache TTL for `statfs`/`df` used-space aggregate; `0` disables caching |
+Used space reported by `df`/`statfs` is the logical sum of reachable file
+sizes across the whole filesystem (same semantics as
+`user.constellation.rsize` at `/`), maintained as an in-memory counter
+updated on commit — not a periodically recomputed CTE, and not scoped to
+subtree/snapshot mount views. Physical S3 bytes after dedup or compression
+are not what `df` shows.
 
-Used space is the logical sum of file sizes under the mount root (same
-semantics as `user.constellation.rsize`), not physical S3 bytes after
-dedup or compression. Total capacity remains effectively unbounded.
+By default capacity is effectively unbounded. An optional cluster-wide
+logical byte cap can be set:
+
+- At create time: `constellation fs create --max-size <SIZE> ...`
+- Live on a mount: `constellation quota get|set --state-dir <dir> ...`
+
+`quota set` accepts a byte size (`10G`), or `unlimited` / `0` to clear the
+cap. Enforcement is best-effort (local admission check against this node's
+replica plus the current inode's uncommitted growth beyond its committed
+size); concurrent writers on other nodes can overshoot slightly until
+journals catch up. Growth through `write`, `ftruncate`, and `fallocate` is
+gated; shrinking never is.
+
+Live quota changes are journaled on `p0` and do **not** rewrite
+`meta.json`. The two sources compose by precedence: a replicated
+`SetQuota` always wins, and the creation-time `--max-size` applies only
+while no such record exists. Each node mirrors `meta.json`'s cap into
+node-local state at mount rather than seeding it into the journal, so a
+node that has not yet tailed a live change can never re-publish a cap an
+operator has cleared.
 
 ### Control UI
 

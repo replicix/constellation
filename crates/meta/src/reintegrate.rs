@@ -129,7 +129,8 @@ pub fn classify(view: &SqliteMeta, rec: &LogRecord) -> Result<Disposition, MetaE
         | LogRecord::RenameXpartAbort { .. }
         | LogRecord::SnapCreate { .. }
         | LogRecord::SnapDelete { .. }
-        | LogRecord::Clone { .. } => Ok(Disposition::Clean),
+        | LogRecord::Clone { .. }
+        | LogRecord::SetQuota { .. } => Ok(Disposition::Clean),
     }
 }
 

@@ -77,6 +77,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: two_clients_shared,
     },
     Scenario {
+        name: "quota-enforcement",
+        desc: "live quota set blocks growth with ENOSPC; clearing resumes; replicates to a second node",
+        requires: &[],
+        run: quota_enforcement,
+    },
+    Scenario {
         name: "git-workflow",
         desc: "stage/publish/edit ping-pong between two nodes of one filesystem",
         requires: &[],
@@ -1087,6 +1093,47 @@ fn two_clients_shared(seed: u64) -> Result<()> {
     );
     c0.unmount()?;
     c1.unmount()?;
+    Ok(())
+}
+
+fn quota_enforcement(_seed: u64) -> Result<()> {
+    let (env, root) = setup("quota")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/quota-{}", ts());
+    let mut a = Client::new(root.path(), "qa", &env.endpoint, &backend)?;
+    let mut b = Client::new(root.path(), "qb", &env.endpoint, &backend)?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+
+    // Tiny cap so a single write overshoots.
+    a.set_quota(Some(64 * 1024))?;
+    let (max, _) = a.get_quota()?;
+    anyhow::ensure!(max == Some(64 * 1024), "quota not visible on setter: {max:?}");
+
+    eventually("quota replicates to peer", Duration::from_secs(30), || {
+        let (max, _) = b.get_quota()?;
+        anyhow::ensure!(max == Some(64 * 1024), "peer still sees {max:?}");
+        Ok(())
+    })?;
+
+    let path = a.mnt.join("big.bin");
+    let big = vec![b'Q'; 128 * 1024];
+    let err = std::fs::write(&path, &big).expect_err("write past quota must fail");
+    anyhow::ensure!(
+        err.raw_os_error() == Some(libc::ENOSPC),
+        "expected ENOSPC, got {err}"
+    );
+
+    a.set_quota(None)?;
+    eventually("cleared quota replicates", Duration::from_secs(30), || {
+        let (max, _) = b.get_quota()?;
+        anyhow::ensure!(max.is_none(), "peer still capped: {max:?}");
+        Ok(())
+    })?;
+    std::fs::write(&path, &big).context("write after clearing quota")?;
+    a.unmount()?;
+    b.unmount()?;
     Ok(())
 }
 

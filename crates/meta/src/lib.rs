@@ -84,6 +84,12 @@ pub trait MetaStore: Send + Sync {
     fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>, MetaError>;
     fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>, MetaError>;
     fn recursive_size(&self, ino: Ino) -> Result<(u64, u64), MetaError>;
+    /// Whole-FS logical usage from the maintained counter: `(bytes, files)`.
+    fn usage(&self) -> (u64, u64);
+    /// Cluster-wide logical byte cap; `None` = unlimited.
+    fn quota(&self) -> Result<Option<u64>, MetaError>;
+    /// Journal `SetQuota` on p0 and apply locally.
+    fn set_quota(&self, max_logical_bytes: Option<u64>) -> Result<(), MetaError>;
 
     // --- namespace writes (journaled) ---
     fn mkdir(

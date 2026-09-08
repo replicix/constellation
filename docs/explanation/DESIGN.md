@@ -540,6 +540,16 @@ no partial state. Chunk files are written temp-name + atomic rename; startup
 GC and `fsck` remove identifiable cruft. DB-full flips the mount read-only,
 keeping an emergency reserve so pending segments can still flush to S3.
 
+An optional **logical size cap** (`fs create --max-size` /
+`constellation quota set`) adds one more ENOSPC gate on the write path:
+each node checks its maintained whole-FS usage counter plus the current
+inode's uncommitted growth against the replicated quota. Enforcement is
+best-effort — there is no synchronous cross-node reservation — so concurrent
+writers can overshoot slightly until journals catch up. The counter itself
+is safe at global scope (renames never change the total); that is why a
+maintained aggregate was deferred for per-directory `rsize`/`rcount` but is
+acceptable here.
+
 | failure | behavior |
 |---|---|
 | node crash | journal + epoch promises replay from local DB; dirty chunks re-upload; leases re-acquired or expire naturally |
@@ -549,6 +559,7 @@ keeping an emergency reserve so pending segments can still flush to S3.
 | P2P down, S3 up | everything works, minus the fast path (higher latencies) |
 | clock skew | TTLs measured with margins; correctness relies on CAS ordering, never wall clocks |
 | cache disk full | evict clean → throttle → ENOSPC (reads still stream uncached) |
+| logical quota exceeded | ENOSPC on write/truncate/fallocate growth (best-effort; see above) |
 | DB disk full | read-only mode + flush-to-recover; alarms in status/UI |
 | corrupted chunk (local or S3) | hash verification on every read; local → refetch, S3 → error + fsck report (peer copies may heal) |
 

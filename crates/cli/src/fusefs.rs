@@ -36,16 +36,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
 const TTL: Duration = Duration::from_secs(1);
-const DEFAULT_STATFS_TTL_S: u64 = 5;
+const QUOTA_CACHE_TTL: Duration = Duration::from_secs(5);
 
-fn parse_statfs_ttl_secs(raw: Option<&str>) -> Duration {
-    let secs = raw.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_STATFS_TTL_S);
-    Duration::from_secs(secs)
-}
-
-fn statfs_ttl_from_env() -> Duration {
-    parse_statfs_ttl_secs(std::env::var("CONSTELLATION_STATFS_TTL_S").ok().as_deref())
-}
+/// Cached effective quota shared between the filesystem and the control
+/// plane: `(fetched_at, cap)`, where `cap: None` is unlimited and the
+/// outer `None` means "not populated" (a live `SetQuota` clears it).
+pub type QuotaCache = Arc<Mutex<Option<(Instant, Option<u64>)>>>;
 
 /// In-flight write state for one inode: bytes live on disk in `staging`
 /// (bounded RAM regardless of file size, plan 05a), not in a `Vec` per
@@ -275,11 +271,10 @@ pub struct ConstellationFs {
         VecDeque<ChunkHash>,
     )>,
     view_root: Ino,
-    /// Cached `(bytes, files)` for [`Self::statfs`], refreshed at most
-    /// every [`Self::statfs_ttl`]. `None` means never populated.
-    usage_cache: Mutex<Option<(Instant, u64, u64)>>,
-    /// From `CONSTELLATION_STATFS_TTL_S` (default 5s). Zero disables caching.
-    statfs_ttl: Duration,
+    /// Cached effective quota (`None` = unlimited), refreshed at most
+    /// every [`QUOTA_CACHE_TTL`]. Shared with the control plane so a live
+    /// `SetQuota` can invalidate without waiting for the TTL.
+    quota_cache: QuotaCache,
 }
 
 fn staging_errno(e: &crate::staging::StagingError) -> i32 {
@@ -408,32 +403,59 @@ impl ConstellationFs {
             }),
             tree_cache: Mutex::new((HashMap::new(), VecDeque::new())),
             view_root: constellation_fs_core::types::ROOT_INO,
-            usage_cache: Mutex::new(None),
-            statfs_ttl: statfs_ttl_from_env(),
+            quota_cache: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Logical used space under the mount root: `(bytes, file_count)`.
-    /// Results are cached for [`Self::statfs_ttl`] (env
-    /// `CONSTELLATION_STATFS_TTL_S`, default 5s; `0` disables the cache).
-    pub(crate) fn cached_usage(&self) -> (u64, u64) {
-        if !self.statfs_ttl.is_zero() {
-            if let Some((fetched_at, bytes, files)) = *self.usage_cache.lock().unwrap() {
-                if fetched_at.elapsed() < self.statfs_ttl {
-                    return (bytes, files);
+    /// Shared handle so the control plane can invalidate after `SetQuota`.
+    pub fn quota_cache_handle(&self) -> QuotaCache {
+        self.quota_cache.clone()
+    }
+
+    /// Effective quota, cached briefly (quota changes are rare).
+    pub(crate) fn cached_quota(&self) -> Option<u64> {
+        {
+            let guard = self.quota_cache.lock().unwrap();
+            if let Some((fetched_at, cap)) = *guard {
+                if fetched_at.elapsed() < QUOTA_CACHE_TTL {
+                    return cap;
                 }
             }
         }
-        let root = self.real_ino(constellation_fs_core::types::ROOT_INO);
-        let usage = if Self::is_synthetic(root) {
-            self.synthetic_recursive_size(root).unwrap_or((0, 0))
-        } else {
-            self.meta.recursive_size(root).unwrap_or((0, 0))
+        let cap = self.meta.quota().ok().flatten();
+        *self.quota_cache.lock().unwrap() = Some((Instant::now(), cap));
+        cap
+    }
+
+    /// Invalidate the quota cache after a live `SetQuota`.
+    pub fn invalidate_quota_cache(cache: &Mutex<Option<(Instant, Option<u64>)>>) {
+        *cache.lock().unwrap() = None;
+    }
+
+    /// Best-effort admission check against the cluster-wide logical byte
+    /// cap. Growth is measured against `inode.size` -- the same value the
+    /// usage counter already accounts for -- and not against the manifest,
+    /// whose `file_len` still trails after a sparse `ftruncate` and would
+    /// charge the same bytes twice. Not additive across writes on the same
+    /// handle: `new_file_len` is the whole intended length.
+    pub(crate) fn quota_check(&self, ino: Ino, new_file_len: u64) -> Result<(), i32> {
+        let Some(cap) = self.cached_quota() else {
+            return Ok(());
         };
-        if !self.statfs_ttl.is_zero() {
-            *self.usage_cache.lock().unwrap() = Some((Instant::now(), usage.0, usage.1));
+        let (used, _) = self.meta.usage();
+        // Only paid for when a cap is actually configured.
+        let committed = self
+            .meta
+            .getattr(ino)
+            .ok()
+            .flatten()
+            .map(|attr| attr.size)
+            .unwrap_or(0);
+        let pending_growth = new_file_len.saturating_sub(committed);
+        if used.saturating_add(pending_growth) > cap {
+            return Err(libc::ENOSPC);
         }
-        usage
+        Ok(())
     }
 
     pub fn set_subtree_root(&mut self, path: &str) -> Result<()> {
@@ -447,7 +469,6 @@ impl ConstellationFs {
             anyhow::bail!("mount root {path} is not a directory");
         }
         self.view_root = ino;
-        *self.usage_cache.lock().unwrap() = None;
         Ok(())
     }
 
@@ -472,7 +493,6 @@ impl ConstellationFs {
             xattrs: Vec::new(),
         };
         self.view_root = self.intern_synthetic(format!("mount:{path}@{name}"), node);
-        *self.usage_cache.lock().unwrap() = None;
         Ok(())
     }
 
@@ -1775,7 +1795,7 @@ mod write_shard_tests {
 }
 
 #[cfg(test)]
-mod usage_tests {
+mod quota_tests {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
     use constellation_fs_core::DEFAULT_CHUNK_SIZE;
@@ -1816,144 +1836,122 @@ mod usage_tests {
             DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,
         );
-        // Prefetcher holds a Handle; keep the runtime alive for the test.
         std::mem::forget(rt);
         (fs, dir)
     }
 
     #[test]
-    fn parse_statfs_ttl_defaults_to_five_seconds() {
-        assert_eq!(parse_statfs_ttl_secs(None), Duration::from_secs(5));
-        assert_eq!(parse_statfs_ttl_secs(Some("")), Duration::from_secs(5));
-        assert_eq!(parse_statfs_ttl_secs(Some("bogus")), Duration::from_secs(5));
-        assert_eq!(parse_statfs_ttl_secs(Some("0")), Duration::from_secs(0));
-        assert_eq!(parse_statfs_ttl_secs(Some("12")), Duration::from_secs(12));
-    }
-
-    #[test]
-    fn cached_usage_sums_logical_file_sizes() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
-        let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
-        let a = meta.create(dir.ino, "a", 0o644, 0, 0).unwrap();
-        let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
-        meta.setattr(a.ino, None, None, None, Some(7), None, None)
-            .unwrap();
-        meta.setattr(b.ino, None, None, None, Some(100), None, None)
-            .unwrap();
-
-        let (fs, _tmpdir) = test_fs(meta);
-        assert_eq!(fs.cached_usage(), (107, 2));
-
-        let bsize = 131072u64;
-        let used_blocks = 107u64.div_ceil(bsize);
-        assert_eq!(used_blocks, 1);
-    }
-
-    #[test]
-    fn cached_usage_scopes_to_subtree_mount() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
-        let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
-        let a = meta.create(dir.ino, "a", 0o644, 0, 0).unwrap();
-        let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
-        meta.setattr(a.ino, None, None, None, Some(7), None, None)
-            .unwrap();
-        meta.setattr(b.ino, None, None, None, Some(100), None, None)
-            .unwrap();
-
-        let (mut fs, _tmpdir) = test_fs(meta);
-        assert_eq!(fs.cached_usage(), (107, 2));
-        fs.set_subtree_root("/d").unwrap();
-        assert_eq!(fs.cached_usage(), (7, 1));
-    }
-
-    #[test]
-    fn zero_ttl_disables_cache_while_positive_ttl_caches() {
+    fn quota_check_unlimited_always_ok() {
         let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
         let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
-        meta.setattr(f.ino, None, None, None, Some(10), None, None)
-            .unwrap();
-
-        let (mut fs, _tmpdir) = test_fs(meta.clone());
-        fs.statfs_ttl = Duration::from_secs(60);
-        assert_eq!(fs.cached_usage(), (10, 1));
-        meta.setattr(f.ino, None, None, None, Some(99), None, None)
-            .unwrap();
-        assert_eq!(
-            fs.cached_usage(),
-            (10, 1),
-            "positive TTL must serve the stale aggregate"
-        );
-
-        fs.statfs_ttl = Duration::from_secs(0);
-        *fs.usage_cache.lock().unwrap() = None;
-        assert_eq!(fs.cached_usage(), (99, 1));
-        meta.setattr(f.ino, None, None, None, Some(1), None, None)
-            .unwrap();
-        assert_eq!(
-            fs.cached_usage(),
-            (1, 1),
-            "TTL 0 must recompute on every call"
-        );
+        let (fs, _tmpdir) = test_fs(meta);
+        assert!(fs.quota_check(f.ino, 1 << 40).is_ok());
     }
 
     #[test]
-    fn cached_usage_scopes_to_snapshot_mount() {
+    fn quota_check_under_cap_ok_over_cap_enospc() {
         let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
-        let source = meta.mkdir(ROOT_INO, "source", 0o755, 0, 0).unwrap();
-        let file = meta.create(source.ino, "file", 0o644, 0, 0).unwrap();
-        meta.setattr(file.ino, None, None, None, Some(42), None, None)
+        meta.set_quota(Some(100)).unwrap();
+        let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        meta.setattr(f.ino, None, None, None, Some(40), None, None)
             .unwrap();
-        let outside = meta.create(ROOT_INO, "outside", 0o644, 0, 0).unwrap();
-        meta.setattr(outside.ino, None, None, None, Some(1000), None, None)
-            .unwrap();
+        let (fs, _tmpdir) = test_fs(meta);
+        ConstellationFs::invalidate_quota_cache(&fs.quota_cache);
+        assert!(fs.quota_check(f.ino, 90).is_ok());
+        assert!(fs.quota_check(f.ino, 100).is_ok());
+        assert_eq!(fs.quota_check(f.ino, 101).unwrap_err(), libc::ENOSPC);
+        // Shrinking never grows past the cap: pending growth is zero once
+        // the intended length is at or below the committed size.
+        assert!(fs.quota_check(f.ino, 10).is_ok());
+    }
 
-        let dir = TempDir::new().unwrap();
-        let cache = Arc::new(
-            DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap(),
-        );
-        let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
-        let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
-            meta.clone(),
-            store.clone(),
-            CompressionSetting::RAW,
-            DEFAULT_CHUNK_SIZE,
-            1,
-        ));
-        // Create the snapshot on a throwaway runtime so the FUSE handle's
-        // runtime is idle when cached_usage later block_on's tree loads.
-        {
-            let setup = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            setup
-                .block_on(snapshots.create("/source", "snap"))
-                .unwrap();
-        }
-
-        let fs_rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    /// The committed length is `inode.size`, not the manifest's: after a
+    /// sparse `ftruncate` the manifest still reads 0, and charging growth
+    /// against it would bill the same bytes twice.
+    #[test]
+    fn quota_check_does_not_double_count_a_sparse_truncate() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        meta.set_quota(Some(100)).unwrap();
+        let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        // `truncate -s 60` with no manifest committed yet.
+        meta.setattr(f.ino, None, None, None, Some(60), None, None)
             .unwrap();
-        let mut fs = ConstellationFs::new(
-            FsDependencies {
-                meta,
-                store,
-                cache,
-                rt: fs_rt.handle().clone(),
-                sync: None,
-                coop: None,
-                staging_dir: dir.path().join("staging"),
-                staging_budget: StagingBudget::new(1 << 30),
-                snapshots,
-            },
-            DEFAULT_CHUNK_SIZE,
-            CompressionSetting::RAW,
-        );
-        std::mem::forget(fs_rt);
-        fs.statfs_ttl = Duration::from_secs(0);
-        assert_eq!(fs.cached_usage(), (1042, 2));
-        fs.set_snapshot_root("/source", "snap").unwrap();
-        assert_eq!(fs.cached_usage(), (42, 1));
+        assert_eq!(meta.usage(), (60, 1));
+        assert!(meta.manifest(f.ino).unwrap().is_none());
+        let (fs, _tmpdir) = test_fs(meta);
+        ConstellationFs::invalidate_quota_cache(&fs.quota_cache);
+        // Writing inside the truncated length adds nothing to the total.
+        assert!(fs.quota_check(f.ino, 60).is_ok());
+        // Growing to 100 fits exactly; 101 does not.
+        assert!(fs.quota_check(f.ino, 100).is_ok());
+        assert_eq!(fs.quota_check(f.ino, 101).unwrap_err(), libc::ENOSPC);
+    }
+
+    #[test]
+    fn usage_counter_tracks_create_setattr_unlink() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        assert_eq!(meta.usage(), (0, 0));
+        let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        assert_eq!(meta.usage(), (0, 1));
+        meta.setattr(f.ino, None, None, None, Some(50), None, None)
+            .unwrap();
+        assert_eq!(meta.usage(), (50, 1));
+        meta.set_manifest(f.ino, b"m", 80).unwrap();
+        assert_eq!(meta.usage(), (80, 1));
+        meta.unlink(ROOT_INO, "f").unwrap();
+        assert_eq!(meta.usage(), (0, 0));
+        let recomputed = meta.recursive_size(ROOT_INO).unwrap();
+        assert_eq!(meta.usage(), recomputed);
+    }
+
+    /// A rename that replaces an existing file drops that file from the
+    /// reachable set, so the counter has to shed it (replay's
+    /// `evict_dentry` does the same on every peer).
+    #[test]
+    fn usage_counter_tracks_replacing_rename() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let a = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+        meta.setattr(a.ino, None, None, None, Some(100), None, None)
+            .unwrap();
+        meta.setattr(b.ino, None, None, None, Some(7), None, None)
+            .unwrap();
+        assert_eq!(meta.usage(), (107, 2));
+        meta.rename(ROOT_INO, "b", ROOT_INO, "a").unwrap();
+        assert_eq!(meta.usage(), (7, 1));
+        assert_eq!(meta.usage(), meta.recursive_size(ROOT_INO).unwrap());
+
+        // A rename onto a still-linked target only unlinks one name.
+        let c = meta.create(ROOT_INO, "c", 0o644, 0, 0).unwrap();
+        meta.setattr(c.ino, None, None, None, Some(9), None, None)
+            .unwrap();
+        meta.link(c.ino, ROOT_INO, "c2").unwrap();
+        let d = meta.create(ROOT_INO, "d", 0o644, 0, 0).unwrap();
+        assert_eq!(meta.usage(), (16, 3));
+        meta.rename(ROOT_INO, "d", ROOT_INO, "c").unwrap();
+        assert_eq!(meta.usage(), (16, 3));
+        assert_eq!(meta.usage(), meta.recursive_size(ROOT_INO).unwrap());
+        let _ = d;
+    }
+
+    #[test]
+    fn set_quota_round_trip_and_replay() {
+        let src = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        src.set_quota(Some(1234)).unwrap();
+        assert_eq!(src.quota().unwrap(), Some(1234));
+        src.set_quota(None).unwrap();
+        assert_eq!(src.quota().unwrap(), None);
+
+        let src2 = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        src2.set_quota(Some(999)).unwrap();
+        let records: Vec<_> = src2
+            .take_journal(100)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        let dst = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        dst.apply_records(&records).unwrap();
+        assert_eq!(dst.quota().unwrap(), Some(999));
     }
 }

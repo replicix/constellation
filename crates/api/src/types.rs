@@ -92,6 +92,12 @@ pub enum Request {
         #[serde(default)]
         target_bytes: u64,
     },
+    /// Set the cluster-wide logical byte cap. `None` clears it (unlimited).
+    SetQuota {
+        max_bytes: Option<u64>,
+    },
+    /// Read the current quota and used bytes.
+    GetQuota,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +144,10 @@ pub enum Response {
     },
     Refs {
         hashes: Vec<String>,
+    },
+    Quota {
+        max_bytes: Option<u64>,
+        used_bytes: u64,
     },
     Error {
         message: String,
@@ -299,6 +309,18 @@ pub struct StatusReport {
     pub pushed_segments_applied: u64,
     #[serde(default)]
     pub placement_reason: Option<String>,
+    /// Optional cluster-wide logical byte cap and current used bytes.
+    #[serde(default)]
+    pub quota: QuotaStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuotaStatus {
+    /// `None` = unlimited.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub used_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

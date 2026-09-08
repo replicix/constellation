@@ -41,7 +41,7 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::sqlite::{SqliteMeta, INO_PREFIX_SHIFT};
+use crate::sqlite::{SqliteMeta, UsageTracker, INO_PREFIX_SHIFT, QUOTA_KV_KEY};
 use constellation_fs_core::InodeKind;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
@@ -105,7 +105,9 @@ impl TouchSet {
             LogRecord::PartSplit { at_ino, .. } => {
                 self.inos.insert(*at_ino);
             }
-            LogRecord::PartMerge { .. } | LogRecord::RenameXpartAbort { .. } => {}
+            LogRecord::PartMerge { .. }
+            | LogRecord::RenameXpartAbort { .. }
+            | LogRecord::SetQuota { .. } => {}
             LogRecord::SnapCreate { .. } | LogRecord::SnapDelete { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
@@ -161,6 +163,10 @@ impl SqliteMeta {
     ) -> Result<usize, MetaError> {
         let mut conn = self.raw();
         let tx = conn.transaction()?;
+        // Usage deltas are staged and only folded into the live counter
+        // after the commit below: an aborted batch rolls the rows back,
+        // and the counter has to roll back with them.
+        let staged = UsageTracker::staging();
         let mut skipped = 0usize;
         for rec in records {
             if pending.conflicts(rec) {
@@ -168,7 +174,7 @@ impl SqliteMeta {
                 skipped += 1;
                 continue;
             }
-            match apply_one(&tx, rec) {
+            match apply_one(&tx, rec, &staged) {
                 Ok(Applied::Done) => {}
                 Ok(Applied::Skipped(why)) => {
                     tracing::warn!(?rec, why, "skipped foreign record");
@@ -205,6 +211,7 @@ impl SqliteMeta {
             )?;
         }
         tx.commit()?;
+        staged.drain_into(self.usage_tracker());
         Ok(skipped)
     }
 
@@ -307,7 +314,13 @@ fn ino_exists(tx: &Connection, ino: u64) -> Result<bool, MetaError> {
 /// Drop an existing dentry so a later log record can claim the name
 /// (last-wins). Non-empty directories refuse: replacing them silently
 /// would drop a subtree.
-fn evict_dentry(tx: &Connection, parent: u64, name: &str, ino: u64) -> Result<Applied, MetaError> {
+fn evict_dentry(
+    tx: &Connection,
+    usage: &UsageTracker,
+    parent: u64,
+    name: &str,
+    ino: u64,
+) -> Result<Applied, MetaError> {
     if kind_of(tx, ino)? == Some(InodeKind::Dir.as_u8()) {
         let children: u64 = tx.query_row(
             "SELECT COUNT(*) FROM dentry WHERE parent = ?1",
@@ -325,10 +338,10 @@ fn evict_dentry(tx: &Connection, parent: u64, name: &str, ino: u64) -> Result<Ap
         )?;
     } else {
         // nlink drops; a 0-nlink inode is an orphan, reaped at mount.
-        let (nlink, manifest): (u32, Option<Vec<u8>>) = tx.query_row(
-            "SELECT nlink, manifest FROM inode WHERE ino = ?1",
+        let (nlink, size, kind, manifest): (u32, i64, u8, Option<Vec<u8>>) = tx.query_row(
+            "SELECT nlink, size, kind, manifest FROM inode WHERE ino = ?1",
             params![ino],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         tx.execute(
             "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
@@ -344,6 +357,9 @@ fn evict_dentry(tx: &Connection, parent: u64, name: &str, ino: u64) -> Result<Ap
                 0,
                 constellation_fs_core::types::now_ns() / 1_000_000,
             )?;
+            if kind == InodeKind::File.as_u8() {
+                usage.adjust(-size, -1);
+            }
         }
     }
     tx.execute(
@@ -356,6 +372,7 @@ fn evict_dentry(tx: &Connection, parent: u64, name: &str, ino: u64) -> Result<Ap
 #[allow(clippy::too_many_arguments)]
 fn insert_node(
     tx: &Connection,
+    usage: &UsageTracker,
     parent: u64,
     name: &str,
     ino: u64,
@@ -378,11 +395,13 @@ fn insert_node(
         if existing != ino {
             // Last-wins: this record is later in the log than whatever
             // holds the name now.
-            if let Applied::Skipped(why) = evict_dentry(tx, parent, name, existing)? {
+            if let Applied::Skipped(why) = evict_dentry(tx, usage, parent, name, existing)? {
                 return Ok(Applied::Skipped(why));
             }
         }
     }
+    let prior_file = kind == InodeKind::File
+        && kind_of(tx, ino)? == Some(InodeKind::File.as_u8());
     // OR REPLACE: idempotent under checkpoint/segment overlap.
     tx.execute(
         "INSERT OR REPLACE INTO inode (ino, kind, size, mode, uid, gid, nlink, atime_ns,
@@ -415,10 +434,17 @@ fn insert_node(
         "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
         params![parent, t],
     )?;
+    if kind == InodeKind::File && !prior_file {
+        usage.adjust(size as i64, 1);
+    }
     Ok(Applied::Done)
 }
 
-fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
+fn apply_one(
+    tx: &Connection,
+    rec: &LogRecord,
+    usage: &UsageTracker,
+) -> Result<Applied, MetaError> {
     match rec {
         LogRecord::Mkdir {
             parent,
@@ -430,6 +456,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             time_ns,
         } => insert_node(
             tx,
+            usage,
             *parent,
             name,
             *ino,
@@ -453,6 +480,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             time_ns,
         } => insert_node(
             tx,
+            usage,
             *parent,
             name,
             *ino,
@@ -476,6 +504,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             time_ns,
         } => insert_node(
             tx,
+            usage,
             *parent,
             name,
             *ino,
@@ -503,7 +532,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             let k = InodeKind::from_u8(*kind)
                 .ok_or_else(|| MetaError::Invalid(format!("mknod kind {kind} in log")))?;
             insert_node(
-                tx, *parent, name, *ino, k, *mode, *uid, *gid, *rdev, 1, 0, None, *time_ns,
+                tx, usage, *parent, name, *ino, k, *mode, *uid, *gid, *rdev, 1, 0, None, *time_ns,
             )
         }
         LogRecord::Link {
@@ -519,7 +548,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 if existing == *ino {
                     return Ok(Applied::Done); // idempotent re-apply
                 }
-                if let Applied::Skipped(why) = evict_dentry(tx, *parent, name, existing)? {
+                if let Applied::Skipped(why) = evict_dentry(tx, usage, *parent, name, existing)? {
                     return Ok(Applied::Skipped(why));
                 }
             }
@@ -545,10 +574,10 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             let Some(ino) = dentry_ino(tx, *parent, name)? else {
                 return Ok(Applied::Done); // already gone: idempotent
             };
-            let (nlink, manifest): (u32, Option<Vec<u8>>) = tx.query_row(
-                "SELECT nlink, manifest FROM inode WHERE ino = ?1",
+            let (nlink, size, kind, manifest): (u32, i64, u8, Option<Vec<u8>>) = tx.query_row(
+                "SELECT nlink, size, kind, manifest FROM inode WHERE ino = ?1",
                 params![ino],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
             tx.execute(
                 "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
@@ -570,6 +599,9 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                     0,
                     time_ns / 1_000_000,
                 )?;
+                if kind == InodeKind::File.as_u8() {
+                    usage.adjust(-size, -1);
+                }
             }
             tx.execute(
                 "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
@@ -624,7 +656,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 if existing == ino {
                     return Ok(Applied::Done); // hardlink pair: POSIX no-op
                 }
-                if let Applied::Skipped(why) = evict_dentry(tx, *new_parent, new_name, existing)? {
+                if let Applied::Skipped(why) = evict_dentry(tx, usage, *new_parent, new_name, existing)? {
                     return Ok(Applied::Skipped(why));
                 }
             }
@@ -677,10 +709,18 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 tx.execute("UPDATE inode SET gid = ?2 WHERE ino = ?1", params![ino, g])?;
             }
             if let Some(s) = size {
+                let (old_size, kind): (i64, u8) = tx.query_row(
+                    "SELECT size, kind FROM inode WHERE ino = ?1",
+                    params![ino],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
                 tx.execute(
                     "UPDATE inode SET size = ?2, mtime_ns = ?3 WHERE ino = ?1",
                     params![ino, *s as i64, time_ns],
                 )?;
+                if kind == InodeKind::File.as_u8() {
+                    usage.adjust(*s as i64 - old_size, 0);
+                }
             }
             if let Some(a) = atime_ns {
                 tx.execute(
@@ -740,16 +780,17 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             if !ino_exists(tx, *ino)? {
                 return Ok(Applied::Done); // inode gone: data moot
             }
-            let old: Option<Vec<u8>> = tx.query_row(
-                "SELECT manifest FROM inode WHERE ino = ?1",
+            let (old, old_size): (Option<Vec<u8>>, i64) = tx.query_row(
+                "SELECT manifest, size FROM inode WHERE ino = ?1",
                 params![ino],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             tx.execute(
                 "UPDATE inode SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4
                  WHERE ino = ?1",
                 params![ino, manifest, *size as i64, time_ns],
             )?;
+            usage.adjust(*size as i64 - old_size, 0);
             SqliteMeta::track_manifest_transition(
                 tx,
                 *ino,
@@ -783,8 +824,8 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
             tx.execute("DELETE FROM kv WHERE key LIKE 'part_of/%'", [])?;
             Ok(Applied::Done)
         }
-        LogRecord::RenameXpartSrc { txid, .. } => park_or_apply_xpart(tx, *txid, "src", rec),
-        LogRecord::RenameXpartDst { txid, .. } => park_or_apply_xpart(tx, *txid, "dst", rec),
+        LogRecord::RenameXpartSrc { txid, .. } => park_or_apply_xpart(tx, usage, *txid, "src", rec),
+        LogRecord::RenameXpartDst { txid, .. } => park_or_apply_xpart(tx, usage, *txid, "dst", rec),
         LogRecord::RenameXpartAbort { txid } => {
             tx.execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
             Ok(Applied::Done)
@@ -844,6 +885,13 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                 if !ino_exists(tx, node.parent)? {
                     return Ok(Applied::Skipped("clone parent does not exist"));
                 }
+                let prior: Option<(i64, u8)> = tx
+                    .query_row(
+                        "SELECT size, kind FROM inode WHERE ino = ?1",
+                        params![node.ino],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
                 tx.execute(
                     "INSERT OR REPLACE INTO inode
                      (ino, kind, size, mode, uid, gid, nlink, atime_ns, mtime_ns,
@@ -882,7 +930,33 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
                     0,
                     node.mtime_ns / 1_000_000,
                 )?;
+                let prior_file_bytes = prior
+                    .filter(|(_, k)| *k == InodeKind::File.as_u8())
+                    .map(|(s, _)| s)
+                    .unwrap_or(0);
+                let prior_file = prior
+                    .map(|(_, k)| k == InodeKind::File.as_u8())
+                    .unwrap_or(false);
+                if kind == InodeKind::File {
+                    usage.adjust(
+                        node.size as i64 - prior_file_bytes,
+                        if prior_file { 0 } else { 1 },
+                    );
+                } else if prior_file {
+                    usage.adjust(-prior_file_bytes, -1);
+                }
             }
+            Ok(Applied::Done)
+        }
+        LogRecord::SetQuota { max_logical_bytes } => {
+            let value = match max_logical_bytes {
+                Some(n) => n.to_string(),
+                None => String::new(),
+            };
+            tx.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+                params![QUOTA_KV_KEY, value],
+            )?;
             Ok(Applied::Done)
         }
     }
@@ -890,6 +964,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord) -> Result<Applied, MetaError> {
 
 fn park_or_apply_xpart(
     tx: &Connection,
+    usage: &UsageTracker,
     txid: u64,
     half: &str,
     rec: &LogRecord,
@@ -910,7 +985,7 @@ fn park_or_apply_xpart(
         } else {
             (&other_rec, rec)
         };
-        apply_xpart_pair(tx, src, dst)
+        apply_xpart_pair(tx, usage, src, dst)
     } else {
         tx.execute(
             "INSERT OR REPLACE INTO xpart_pending (txid, half, record) VALUES (?1, ?2, ?3)",
@@ -922,6 +997,7 @@ fn park_or_apply_xpart(
 
 fn apply_xpart_pair(
     tx: &Connection,
+    usage: &UsageTracker,
     src: &LogRecord,
     dst: &LogRecord,
 ) -> Result<Applied, MetaError> {
@@ -954,6 +1030,7 @@ fn apply_xpart_pair(
             new_name: new_name.clone(),
             time_ns: *time_ns,
         },
+        usage,
     )?;
     SqliteMeta::invalidate_part_cache(tx, *ino)?;
     Ok(Applied::Done)
@@ -962,6 +1039,69 @@ fn apply_xpart_pair(
 #[cfg(test)]
 mod tests {
     use crate::{LogRecord, MetaStore, SqliteMeta};
+
+    /// A batch that fails part way rolls the rows back; the usage counter
+    /// has to roll back with them, or the node mis-reports `df` and
+    /// mis-enforces the quota until it is remounted.
+    #[test]
+    fn failed_batch_leaves_the_usage_counter_untouched() {
+        let dst = SqliteMeta::open_in_memory().unwrap();
+        let before = dst.usage();
+        let records = vec![
+            LogRecord::Create {
+                parent: 1,
+                name: "f".into(),
+                ino: 4242,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            // Undecodable kind: `apply_one` errors, aborting the batch.
+            LogRecord::Mknod {
+                parent: 1,
+                name: "bad".into(),
+                ino: 4243,
+                kind: 99,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                time_ns: 2,
+            },
+        ];
+        assert!(dst.apply_records(&records).is_err());
+        assert!(dst.lookup(1, "f").unwrap().is_none(), "rows rolled back");
+        assert_eq!(dst.usage(), before, "counter rolled back with the rows");
+        assert_eq!(dst.usage(), dst.recursive_size(1).unwrap());
+    }
+
+    /// The same batch applied cleanly does move the counter.
+    #[test]
+    fn applied_batch_moves_the_usage_counter() {
+        let dst = SqliteMeta::open_in_memory().unwrap();
+        dst.apply_records(&[LogRecord::Create {
+            parent: 1,
+            name: "f".into(),
+            ino: 4242,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }])
+        .unwrap();
+        assert_eq!(dst.usage(), (0, 1));
+        dst.apply_records(&[LogRecord::WriteManifest {
+            ino: 4242,
+            base_manifest: None,
+            manifest: b"m".to_vec(),
+            size: 500,
+            time_ns: 2,
+        }])
+        .unwrap();
+        assert_eq!(dst.usage(), (500, 1));
+        assert_eq!(dst.usage(), dst.recursive_size(1).unwrap());
+    }
 
     /// Mutate one store, replay its journal into another, and compare.
     #[test]

@@ -34,6 +34,10 @@ pub struct FsMeta {
     /// connections are gated by the registry allowlist regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gossip_secret: Option<String>,
+    /// Optional creation-time logical byte cap. Seeded into the replicated
+    /// journal on first mount; live changes do not rewrite `meta.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_logical_bytes: Option<u64>,
 }
 
 impl FsMeta {
@@ -49,6 +53,7 @@ impl FsMeta {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             gossip_secret: Some(random_hex32()),
+            max_logical_bytes: None,
         }
     }
 

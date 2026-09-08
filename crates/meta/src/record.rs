@@ -185,6 +185,11 @@ pub enum LogRecord {
         root_hash: String,
         nodes: Vec<CloneNode>,
     },
+    /// Cluster-wide logical byte cap. `None` clears the quota (unlimited).
+    /// Journaled on `p0`; replay upserts `kv.quota_max_bytes`.
+    SetQuota {
+        max_logical_bytes: Option<u64>,
+    },
 }
 
 impl LogRecord {

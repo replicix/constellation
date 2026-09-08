@@ -1102,15 +1102,28 @@ impl Filesystem for ConstellationFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
-        // Effectively unlimited backing store; block size mirrors blksize.
-        // Used space is logical bytes under the mount root (same as rsize).
+        // Used space comes from the maintained whole-FS counter. When a
+        // quota is set, report that as capacity; otherwise stay effectively
+        // unbounded.
         let bsize: u32 = 131072;
-        let huge = u64::MAX / bsize as u64 / 2;
-        let (used_bytes, file_count) = self.cached_usage();
+        let (used_bytes, file_count) = self.meta.usage();
         let used_blocks = used_bytes.div_ceil(bsize as u64);
-        let bfree = huge.saturating_sub(used_blocks);
+        let total_blocks = match self.cached_quota() {
+            Some(cap) => cap.div_ceil(bsize as u64).max(used_blocks),
+            None => u64::MAX / bsize as u64 / 2,
+        };
+        let bfree = total_blocks.saturating_sub(used_blocks);
         let ffree = (u64::MAX / 2).saturating_sub(file_count);
-        reply.statfs(huge, bfree, bfree, file_count, ffree, bsize, 255, bsize);
+        reply.statfs(
+            total_blocks,
+            bfree,
+            bfree,
+            file_count,
+            ffree,
+            bsize,
+            255,
+            bsize,
+        );
     }
 
     fn fallocate(
@@ -1294,6 +1307,7 @@ impl ConstellationFs {
         let ws = self.write_state(&mut writes, ino, &manifest)?;
         let write_end = offset + data.len() as u64;
         let new_file_len = ws.file_len.max(write_end);
+        self.quota_check(ino, new_file_len)?;
         ws.staging
             .set_len_sparse(new_file_len)
             .map_err(|e| staging_errno(&e))?;
@@ -1365,6 +1379,7 @@ impl ConstellationFs {
     ) -> Result<(), i32> {
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let ws = self.write_state(writes, ino, manifest)?;
+        self.quota_check(ino, new_size)?;
         if new_size < ws.file_len {
             // Drop dirty runs past the new end; `Staging::set_len`
             // (ftruncate) re-cuts the boundary chunk's on-disk bytes for
@@ -1399,6 +1414,11 @@ impl ConstellationFs {
             .map(|state| state.file_len)
             .unwrap_or(manifest.file_len);
         let new_size = if keep_size { old_size } else { old_size.max(end) };
+        // Gate growth before any staging mutation: the zero-range branch
+        // below extends the file itself and never reaches `truncate`.
+        if new_size > old_size {
+            self.quota_check(ino, new_size)?;
+        }
         if !punch && !zero {
             if new_size != old_size {
                 self.truncate(ino, new_size)?;

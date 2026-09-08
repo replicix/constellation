@@ -188,6 +188,11 @@ enum Command {
         #[arg(long)]
         state_dir: PathBuf,
     },
+    /// Get or set the cluster-wide logical size cap.
+    Quota {
+        #[command(subcommand)]
+        command: QuotaCommand,
+    },
     /// Inspect one file or directory through the running daemon.
     Inspect {
         path: String,
@@ -283,6 +288,22 @@ enum SnapshotCommand {
 }
 
 #[derive(Subcommand)]
+enum QuotaCommand {
+    /// Show the current cap and used logical bytes.
+    Get {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// Set the cap (`10G`, `unlimited`, or `0` to clear).
+    Set {
+        /// Byte size (`10G`), or `unlimited`/`0` to clear the cap.
+        size: String,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum CacheCommand {
     Ls {
         #[arg(long)]
@@ -338,6 +359,9 @@ enum FsCommand {
         /// Protect content and filename-bearing metadata with a passphrase.
         #[arg(long)]
         e2e: bool,
+        /// Optional logical size cap (e.g. 10G). Unbounded when omitted.
+        #[arg(long, value_parser = parse_byte_size)]
+        max_size: Option<u64>,
     },
     /// Change an E2E filesystem's passphrase without re-encrypting data.
     Passwd {
@@ -392,6 +416,7 @@ fn main() -> Result<()> {
                     chunk_size,
                     compression,
                     e2e,
+                    max_size,
                 },
         } => {
             constellation_fs_core::validate_chunk_size(chunk_size)?;
@@ -403,6 +428,7 @@ fn main() -> Result<()> {
             let store = ChunkStore::new(backend.clone());
             let mut meta = FsMeta::new(chunk_size, &setting.to_string());
             meta.e2e = e2e;
+            meta.max_logical_bytes = max_size.filter(|&n| n > 0);
             rt.block_on(store.create_fs(&meta))
                 .context("creating filesystem")?;
             if e2e {
@@ -414,6 +440,9 @@ fn main() -> Result<()> {
             println!("  chunk_size:  {chunk_size}");
             println!("  compression: {setting}");
             println!("  e2e:         {e2e}");
+            if let Some(cap) = meta.max_logical_bytes {
+                println!("  max_size:    {cap}");
+            }
             Ok(())
         }
         Command::Fs {
@@ -544,6 +573,18 @@ fn main() -> Result<()> {
                 },
             ))
         }
+        Command::Quota { command } => match command {
+            QuotaCommand::Get { state_dir } => {
+                rt.block_on(control_call(&state_dir, constellation_api::Request::GetQuota))
+            }
+            QuotaCommand::Set { size, state_dir } => {
+                let max_bytes = parse_quota_arg(&size)?;
+                rt.block_on(control_call(
+                    &state_dir,
+                    constellation_api::Request::SetQuota { max_bytes },
+                ))
+            }
+        },
         Command::Inspect { path, state_dir } => rt.block_on(control_call(
             &state_dir,
             constellation_api::Request::Inspect { path },
@@ -888,6 +929,20 @@ fn mount(
     } else if read_only_member != matches!(meta.kv_get("read_only_member")?.as_deref(), Some("1")) {
         bail!("--read-only-member is fixed on first mount for this state directory");
     }
+    // Mirror the creation-time cap from meta.json into node-local kv.
+    // `read_quota` falls back to it only while no replicated `SetQuota`
+    // exists, so this never journals, never needs a lease, and cannot
+    // resurrect a cap an operator cleared live.
+    match fsmeta.max_logical_bytes {
+        Some(cap) => {
+            meta.kv_set(
+                constellation_meta::sqlite::QUOTA_CREATION_KV_KEY,
+                &cap.to_string(),
+            )?;
+            tracing::info!(cap, "filesystem quota from meta.json");
+        }
+        None => meta.kv_del(constellation_meta::sqlite::QUOTA_CREATION_KV_KEY)?,
+    }
     meta.set_node_prefix(node_id)?;
     tracing::info!(node_id, "node identity");
 
@@ -1137,6 +1192,7 @@ fn mount(
         compression,
     );
     let prefetch_stats = fs.prefetch.stats();
+    let quota_cache = fs.quota_cache_handle();
     if let Some((path, name)) = &selector {
         if rw_snapshot {
             fs.set_subtree_root(&mounted_path)?;
@@ -1981,6 +2037,7 @@ fn mount(
         log_buffer,
         forward: forward.clone(),
         placement: placement.clone(),
+        quota_cache,
     });
     {
         let _guard = rt.enter();
@@ -2515,6 +2572,16 @@ async fn control_call(state_dir: &std::path::Path, req: constellation_api::Reque
         constellation_api::Response::Logs { lines } => {
             for line in lines {
                 println!("{line}");
+            }
+            Ok(())
+        }
+        constellation_api::Response::Quota {
+            max_bytes,
+            used_bytes,
+        } => {
+            match max_bytes {
+                Some(cap) => println!("quota: {used_bytes} / {cap} bytes used"),
+                None => println!("quota: {used_bytes} bytes used (unlimited)"),
             }
             Ok(())
         }
@@ -3106,6 +3173,7 @@ struct DaemonStatus {
     log_buffer: log_buffer::LogBuffer,
     forward: std::sync::Arc<forward::ForwardState>,
     placement: std::sync::Arc<placement::Placement>,
+    quota_cache: fusefs::QuotaCache,
 }
 
 impl DaemonStatus {
@@ -3300,6 +3368,13 @@ impl constellation_api::StatusSource for DaemonStatus {
                 .pushed_applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             placement_reason: self.placement.last_reason.lock().unwrap().clone(),
+            quota: {
+                use constellation_meta::MetaStore;
+                constellation_api::QuotaStatus {
+                    max_bytes: self.meta.quota().ok().flatten(),
+                    used_bytes: self.meta.usage().0,
+                }
+            },
         }
     }
 
@@ -3737,6 +3812,27 @@ impl constellation_api::StatusSource for DaemonStatus {
             report.entries
         ))
     }
+
+    fn set_quota(&self, max_bytes: Option<u64>) -> std::result::Result<String, String> {
+        use constellation_meta::MetaStore;
+        self.snapshot_barrier("/")?;
+        self.meta
+            .set_quota(max_bytes)
+            .map_err(|e| format!("{e:#}"))?;
+        fusefs::ConstellationFs::invalidate_quota_cache(&self.quota_cache);
+        let _ = self.sync_tx.send(fusefs::SyncRequest::Nudge);
+        Ok(match max_bytes {
+            Some(cap) => format!("quota set to {cap} bytes"),
+            None => "quota cleared (unlimited)".into(),
+        })
+    }
+
+    fn get_quota(&self) -> std::result::Result<(Option<u64>, u64), String> {
+        use constellation_meta::MetaStore;
+        let max = self.meta.quota().map_err(|e| format!("{e:#}"))?;
+        let (used, _) = self.meta.usage();
+        Ok((max, used))
+    }
 }
 
 fn normalize_control_path(path: &str) -> String {
@@ -3792,6 +3888,21 @@ fn parse_byte_size(input: &str) -> Result<u64, String> {
     };
     num.checked_mul(mult)
         .ok_or_else(|| format!("byte size overflow: {input}"))
+}
+
+/// Parse `constellation quota set` argument: `unlimited`/`0` → clear,
+/// otherwise a byte size via [`parse_byte_size`].
+fn parse_quota_arg(input: &str) -> Result<Option<u64>> {
+    let s = input.trim();
+    if s.eq_ignore_ascii_case("unlimited") || s == "0" {
+        return Ok(None);
+    }
+    let n = parse_byte_size(s).map_err(anyhow::Error::msg)?;
+    if n == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(n))
+    }
 }
 
 #[cfg(test)]

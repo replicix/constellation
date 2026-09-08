@@ -12,8 +12,8 @@ pub mod web;
 pub use types::{
     CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry, DoctorStatus,
     DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus, P2pStatus,
-    PartitionStatus, PeerStatus, PinStatus, PrefetchStatus, ReintegrationStatus, Request, Response,
-    SnapshotStatus, SourceStatus, SpoolStatus, StatusReport, WritebackStatus,
+    PartitionStatus, PeerStatus, PinStatus, PrefetchStatus, QuotaStatus, ReintegrationStatus,
+    Request, Response, SnapshotStatus, SourceStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -132,6 +132,14 @@ pub trait StatusSource: Send + Sync + 'static {
     fn cache_prune(&self, _target_bytes: u64) -> std::result::Result<String, String> {
         Err("cache prune is not supported by this daemon".into())
     }
+
+    fn set_quota(&self, _max_bytes: Option<u64>) -> std::result::Result<String, String> {
+        Err("quota is not supported by this daemon".into())
+    }
+
+    fn get_quota(&self) -> std::result::Result<(Option<u64>, u64), String> {
+        Err("quota is not supported by this daemon".into())
+    }
 }
 
 /// The single request dispatcher shared by unix sockets and HTTP. Keeping
@@ -194,6 +202,14 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
             entries: source.cache_list(),
         },
         Request::CachePrune { target_bytes } => result(source.cache_prune(target_bytes)),
+        Request::SetQuota { max_bytes } => result(source.set_quota(max_bytes)),
+        Request::GetQuota => match source.get_quota() {
+            Ok((max_bytes, used_bytes)) => Response::Quota {
+                max_bytes,
+                used_bytes,
+            },
+            Err(message) => Response::Error { message },
+        },
     }
 }
 
@@ -307,6 +323,7 @@ mod tests {
                 forward_p50_ms: None,
                 pushed_segments_applied: 0,
                 placement_reason: None,
+                quota: QuotaStatus::default(),
             }
         }
 
@@ -486,6 +503,7 @@ mod tests {
                 forward_p50_ms: None,
                 pushed_segments_applied: 0,
                 placement_reason: None,
+                quota: QuotaStatus::default(),
             }
         }
     }

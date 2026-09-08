@@ -13,6 +13,7 @@ use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
 /// Inos are `node_prefix << 40 | counter`: 24 bits of node id, 40 bits
@@ -20,6 +21,64 @@ use std::sync::Mutex;
 /// genesis (the root inode is 1).
 pub const INO_PREFIX_SHIFT: u32 = 40;
 pub const SCRATCH_XATTR: &str = "user.constellation.scratch";
+pub const QUOTA_KV_KEY: &str = "quota_max_bytes";
+/// Node-local mirror of `meta.json`'s creation-time cap. Never journaled:
+/// every node re-derives it from `meta.json` at mount, so it needs no
+/// replication and a node that has not yet tailed a live `SetQuota` still
+/// enforces the cap the filesystem was created with.
+pub const QUOTA_CREATION_KV_KEY: &str = "quota_creation_bytes";
+
+/// Whole-FS logical usage: sum of reachable file `inode.size` values and
+/// file count. Seeded from `recursive_size(ROOT_INO)` at open, then
+/// adjusted at the sites that change reachable file bytes/count.
+pub struct UsageTracker {
+    bytes: AtomicI64,
+    files: AtomicI64,
+}
+
+impl UsageTracker {
+    fn new(bytes: u64, files: u64) -> Self {
+        Self {
+            bytes: AtomicI64::new(bytes as i64),
+            files: AtomicI64::new(files as i64),
+        }
+    }
+
+    pub fn load(&self) -> (u64, u64) {
+        (
+            self.bytes.load(Ordering::Relaxed).max(0) as u64,
+            self.files.load(Ordering::Relaxed).max(0) as u64,
+        )
+    }
+
+    pub fn adjust(&self, d_bytes: i64, d_files: i64) {
+        if d_bytes != 0 {
+            self.bytes.fetch_add(d_bytes, Ordering::Relaxed);
+        }
+        if d_files != 0 {
+            self.files.fetch_add(d_files, Ordering::Relaxed);
+        }
+    }
+
+    pub fn reseat(&self, bytes: u64, files: u64) {
+        self.bytes.store(bytes as i64, Ordering::Relaxed);
+        self.files.store(files as i64, Ordering::Relaxed);
+    }
+
+    /// A zeroed accumulator. Replay stages its deltas in one of these and
+    /// only folds them into the live counter once its transaction commits,
+    /// so a rolled-back batch cannot leave the counter shifted.
+    pub(crate) fn staging() -> Self {
+        Self::new(0, 0)
+    }
+
+    /// Fold staged deltas into `live`, resetting this accumulator.
+    pub(crate) fn drain_into(&self, live: &UsageTracker) {
+        let bytes = self.bytes.swap(0, Ordering::Relaxed);
+        let files = self.files.swap(0, Ordering::Relaxed);
+        live.adjust(bytes, files);
+    }
+}
 
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
@@ -174,6 +233,8 @@ pub struct SqliteMeta {
     /// that reader is consistent and concurrent with writers. An in-memory
     /// store has no second handle, so it snapshots under the lock.
     path: Option<std::path::PathBuf>,
+    /// Whole-FS `(bytes, files)` maintained counter; see [`UsageTracker`].
+    usage: UsageTracker,
 }
 
 thread_local! {
@@ -496,10 +557,92 @@ impl SqliteMeta {
             params![(ROOT_INO + 1).to_string()],
         )?;
         Self::backfill_chunk_ref_once(&mut conn)?;
+        let (bytes, files) = Self::recursive_size_conn(&conn, ROOT_INO).unwrap_or((0, 0));
         Ok(Self {
             conn: Mutex::new(conn),
             path,
+            usage: UsageTracker::new(bytes, files),
         })
+    }
+
+    /// Compute `(bytes, files)` under `ino` without the reader pool
+    /// (used at open, before `Self` exists).
+    fn recursive_size_conn(conn: &Connection, ino: Ino) -> Result<(u64, u64), MetaError> {
+        let file_kind = InodeKind::File.as_u8();
+        let (size, count): (i64, i64) = conn.query_row(
+            "WITH RECURSIVE subtree(ino) AS (
+                 VALUES (?1)
+                 UNION
+                 SELECT d.ino FROM dentry d JOIN subtree s ON d.parent = s.ino
+             )
+             SELECT
+                 COALESCE(SUM(CASE WHEN i.kind = ?2 THEN i.size ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN i.kind = ?2 THEN 1 ELSE 0 END), 0)
+             FROM subtree s JOIN inode i ON i.ino = s.ino",
+            params![ino, file_kind],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((size as u64, count as u64))
+    }
+
+    /// O(1) whole-FS logical usage from the maintained counter.
+    pub fn usage_bytes_files(&self) -> (u64, u64) {
+        self.usage.load()
+    }
+
+    /// Re-seed the usage counter from a full `recursive_size(ROOT_INO)`.
+    /// Used by tests and after restoring a checkpoint into a live store.
+    pub fn reseat_usage(&self) -> Result<(u64, u64), MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let (bytes, files) = Self::recursive_size_conn(&conn, ROOT_INO)?;
+        drop(conn);
+        self.usage.reseat(bytes, files);
+        Ok((bytes, files))
+    }
+
+    /// Cluster-wide logical byte cap. `None` = unlimited.
+    ///
+    /// A replicated `SetQuota` (`QUOTA_KV_KEY`, empty string = cleared)
+    /// always wins. With no such record the creation-time cap from
+    /// `meta.json` applies, mirrored locally at mount. Reading through
+    /// that fallback rather than seeding the journal keeps a node that
+    /// has not yet tailed a live change from re-publishing a stale cap.
+    pub fn read_quota(&self) -> Result<Option<u64>, MetaError> {
+        let raw = match self.kv_get(QUOTA_KV_KEY)? {
+            Some(s) => s,
+            None => match self.kv_get(QUOTA_CREATION_KV_KEY)? {
+                Some(s) => s,
+                None => return Ok(None),
+            },
+        };
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let n: u64 = raw
+            .parse()
+            .map_err(|_| MetaError::Invalid(format!("quota bytes={raw}")))?;
+        Ok(Some(n))
+    }
+
+    /// Journal `SetQuota` on p0 and apply locally (mirrors `record_snapshot`).
+    pub fn write_quota(&self, max_logical_bytes: Option<u64>) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let value = match max_logical_bytes {
+            Some(n) => n.to_string(),
+            None => String::new(),
+        };
+        tx.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+            params![QUOTA_KV_KEY, value],
+        )?;
+        Self::journal(&tx, &LogRecord::SetQuota { max_logical_bytes })?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn usage_tracker(&self) -> &UsageTracker {
+        &self.usage
     }
 
     fn alloc_ino(conn: &Connection) -> Result<Ino, MetaError> {
@@ -633,6 +776,12 @@ impl SqliteMeta {
         Ok(())
     }
 
+    pub fn kv_del(&self, key: &str) -> Result<(), MetaError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     pub fn kv_get(&self, key: &str) -> Result<Option<String>, MetaError> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -674,7 +823,8 @@ impl SqliteMeta {
             LogRecord::RenameXpartAbort { .. }
             | LogRecord::SnapCreate { .. }
             | LogRecord::SnapDelete { .. }
-            | LogRecord::Clone { .. } => Ok("p0".into()),
+            | LogRecord::Clone { .. }
+            | LogRecord::SetQuota { .. } => Ok("p0".into()),
             LogRecord::Mkdir { parent, .. }
             | LogRecord::Create { parent, .. }
             | LogRecord::Symlink { parent, .. }
@@ -1085,7 +1235,15 @@ impl SqliteMeta {
                 nodes,
             },
         )?;
+        let (clone_bytes, clone_files) = specs.iter().fold((0i64, 0i64), |(b, f), spec| {
+            if spec.kind == InodeKind::File {
+                (b + spec.size as i64, f + 1)
+            } else {
+                (b, f)
+            }
+        });
         tx.commit()?;
+        self.usage.adjust(clone_bytes, clone_files);
         Ok(inos[0])
     }
 
@@ -1377,7 +1535,10 @@ impl SqliteMeta {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // A POSIX no-op (both names are the same inode) journals nothing:
         // there is no namespace change to replicate.
-        let Some((ino, t)) = Self::rename_in_tx(&tx, parent, name, new_parent, new_name)? else {
+        let mut delta = (0i64, 0i64);
+        let Some((ino, t)) =
+            Self::rename_in_tx(&tx, parent, name, new_parent, new_name, &mut delta)?
+        else {
             tx.commit()?;
             return Ok(());
         };
@@ -1407,6 +1568,7 @@ impl SqliteMeta {
             },
         )?;
         tx.commit()?;
+        self.usage.adjust(delta.0, delta.1);
         Ok(())
     }
 
@@ -1439,6 +1601,7 @@ impl SqliteMeta {
         name: &str,
         new_parent: Ino,
         new_name: &str,
+        usage_delta: &mut (i64, i64),
     ) -> Result<Option<(Ino, i64)>, MetaError> {
         let ino = Self::dentry_ino(tx, parent, name)?.ok_or(MetaError::NoEntry)?;
         let src = Self::attr_by_ino(tx, ino)?.ok_or(MetaError::NoEnt(ino))?;
@@ -1496,6 +1659,13 @@ impl SqliteMeta {
             } else {
                 if ex.nlink == 1 {
                     tx.execute("DELETE FROM xattr WHERE ino = ?1", params![existing])?;
+                    // Last link to the replaced file is gone: it leaves the
+                    // reachable set, so the whole-FS counter must shed it
+                    // (replay's `evict_dentry` does the same for peers).
+                    if ex.kind == InodeKind::File {
+                        usage_delta.0 -= ex.size as i64;
+                        usage_delta.1 -= 1;
+                    }
                 }
                 tx.execute(
                     "UPDATE inode SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1",
@@ -1787,19 +1957,20 @@ impl SqliteMeta {
     /// semantics there, not a claim about the predecessor).
     fn set_manifest_tx(
         tx: &Connection,
+        usage: &UsageTracker,
         ino: Ino,
         expected_base: Option<&[u8]>,
         manifest: &[u8],
         size: u64,
     ) -> Result<(), MetaError> {
-        let current: Option<Vec<u8>> = tx
+        let (current, old_size): (Option<Vec<u8>>, i64) = tx
             .query_row(
-                "SELECT manifest FROM inode WHERE ino = ?1",
+                "SELECT manifest, size FROM inode WHERE ino = ?1",
                 params![ino],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)?)),
             )
             .optional()?
-            .flatten();
+            .unwrap_or((None, 0));
         // A manifest that already matches is a replay of a commit that
         // already landed (the rule reintegration applies to the same
         // record), not a conflict.
@@ -1817,6 +1988,7 @@ impl SqliteMeta {
         if n == 0 {
             return Err(MetaError::NoEnt(ino));
         }
+        usage.adjust(size as i64 - old_size, 0);
         Self::track_manifest_transition(
             tx,
             ino,
@@ -1867,7 +2039,7 @@ impl SqliteMeta {
     ) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::set_manifest_tx(&tx, ino, base_manifest, manifest, size)?;
+        Self::set_manifest_tx(&tx, &self.usage, ino, base_manifest, manifest, size)?;
         for h in dirty_hashes {
             tx.execute(
                 "INSERT OR IGNORE INTO pending_upload (hash, ino) VALUES (?1, ?2)",
@@ -2103,7 +2275,7 @@ impl SqliteMeta {
     ) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::set_manifest_tx(&tx, ino, base_manifest, manifest, size)?;
+        Self::set_manifest_tx(&tx, &self.usage, ino, base_manifest, manifest, size)?;
         tx.commit()?;
         Ok(())
     }
@@ -2125,6 +2297,8 @@ impl SqliteMeta {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::require_dir(&tx, parent)?;
+        let mut delta_bytes: i64 = 0;
+        let mut delta_files: i64 = 0;
         if let Some(old_ino) = Self::dentry_ino(&tx, parent, name)? {
             let old_attr = Self::attr_by_ino(&tx, old_ino)?.ok_or(MetaError::NoEnt(old_ino))?;
             if old_attr.kind == InodeKind::File {
@@ -2163,6 +2337,10 @@ impl SqliteMeta {
                     Self::next_deref_seq(&tx)?,
                     t / 1_000_000,
                 )?;
+                if old_attr.kind == InodeKind::File {
+                    delta_bytes -= old_attr.size as i64;
+                    delta_files -= 1;
+                }
             }
             Self::journal(
                 &tx,
@@ -2244,7 +2422,10 @@ impl SqliteMeta {
                 },
             )?;
         }
+        delta_bytes += size as i64;
+        delta_files += 1;
         tx.commit()?;
+        self.usage.adjust(delta_bytes, delta_files);
         Ok(())
     }
 
@@ -2803,22 +2984,20 @@ impl MetaStore for SqliteMeta {
             if Self::attr_by_ino(conn, ino)?.is_none() {
                 return Err(MetaError::NoEnt(ino));
             }
-            let file_kind = InodeKind::File.as_u8();
-            let (size, count): (i64, i64) = conn.query_row(
-                "WITH RECURSIVE subtree(ino) AS (
-                     VALUES (?1)
-                     UNION
-                     SELECT d.ino FROM dentry d JOIN subtree s ON d.parent = s.ino
-                 )
-                 SELECT
-                     COALESCE(SUM(CASE WHEN i.kind = ?2 THEN i.size ELSE 0 END), 0),
-                     COALESCE(SUM(CASE WHEN i.kind = ?2 THEN 1 ELSE 0 END), 0)
-                 FROM subtree s JOIN inode i ON i.ino = s.ino",
-                params![ino, file_kind],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            Ok((size as u64, count as u64))
+            Self::recursive_size_conn(conn, ino)
         })
+    }
+
+    fn usage(&self) -> (u64, u64) {
+        self.usage_bytes_files()
+    }
+
+    fn quota(&self) -> Result<Option<u64>, MetaError> {
+        self.read_quota()
+    }
+
+    fn set_quota(&self, max_logical_bytes: Option<u64>) -> Result<(), MetaError> {
+        self.write_quota(max_logical_bytes)
     }
 
     fn mkdir(
@@ -2898,6 +3077,8 @@ impl MetaStore for SqliteMeta {
             },
         )?;
         tx.commit()?;
+        // Empty file: 0 bytes, +1 to the reachable file count.
+        self.usage.adjust(0, 1);
         Ok(attr)
     }
 
@@ -3042,7 +3223,8 @@ impl MetaStore for SqliteMeta {
             "UPDATE inode SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1",
             params![ino, t],
         )?;
-        if attr.nlink == 1 {
+        let last_link = attr.nlink == 1;
+        if last_link {
             tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
             let manifest: Option<Vec<u8>> = tx.query_row(
                 "SELECT manifest FROM inode WHERE ino = ?1",
@@ -3071,6 +3253,9 @@ impl MetaStore for SqliteMeta {
             },
         )?;
         tx.commit()?;
+        if last_link && attr.kind == InodeKind::File {
+            self.usage.adjust(-(attr.size as i64), -1);
+        }
         Ok(())
     }
 
@@ -3122,7 +3307,10 @@ impl MetaStore for SqliteMeta {
     ) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some((_, t)) = Self::rename_in_tx(&tx, parent, name, new_parent, new_name)? {
+        let mut delta = (0i64, 0i64);
+        if let Some((_, t)) =
+            Self::rename_in_tx(&tx, parent, name, new_parent, new_name, &mut delta)?
+        {
             Self::journal(
                 &tx,
                 &LogRecord::Rename {
@@ -3135,6 +3323,7 @@ impl MetaStore for SqliteMeta {
             )?;
         }
         tx.commit()?;
+        self.usage.adjust(delta.0, delta.1);
         Ok(())
     }
 
@@ -3152,6 +3341,7 @@ impl MetaStore for SqliteMeta {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut attr = Self::attr_by_ino(&tx, ino)?.ok_or(MetaError::NoEnt(ino))?;
+        let old_size = attr.size;
         let t = now_ns();
         if let Some(m) = mode {
             attr.mode = m & 0o7777;
@@ -3198,13 +3388,16 @@ impl MetaStore for SqliteMeta {
             },
         )?;
         tx.commit()?;
+        if size.is_some() && attr.kind == InodeKind::File {
+            self.usage.adjust(attr.size as i64 - old_size as i64, 0);
+        }
         Ok(attr)
     }
 
     fn set_manifest(&self, ino: Ino, manifest: &[u8], size: u64) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::set_manifest_tx(&tx, ino, None, manifest, size)?;
+        Self::set_manifest_tx(&tx, &self.usage, ino, None, manifest, size)?;
         tx.commit()?;
         Ok(())
     }
@@ -4334,5 +4527,39 @@ mod tests {
         };
         let m = SqliteMeta::open(&path).unwrap();
         assert_eq!(m.pending_uploads().unwrap(), vec![(h, ino)]);
+    }
+
+    /// The creation-time cap is a node-local fallback, not a journal
+    /// seed: a replicated `SetQuota` always wins, including the empty
+    /// value that means "cleared", so a node that has not yet tailed a
+    /// live change can never re-publish the cap it was created with.
+    #[test]
+    fn creation_quota_is_a_fallback_that_setquota_overrides() {
+        let m = SqliteMeta::open_in_memory().unwrap();
+        assert_eq!(m.read_quota().unwrap(), None);
+
+        m.kv_set(QUOTA_CREATION_KV_KEY, "1000").unwrap();
+        assert_eq!(m.read_quota().unwrap(), Some(1000));
+        // Mirroring the cap must not journal anything to replicate.
+        assert!(m.take_journal(10).unwrap().is_empty());
+
+        m.write_quota(Some(500)).unwrap();
+        assert_eq!(m.read_quota().unwrap(), Some(500));
+
+        // Cleared live: the creation-time value must not come back.
+        m.write_quota(None).unwrap();
+        assert_eq!(m.read_quota().unwrap(), None);
+
+        // A fresh replica that only sees the clear record agrees.
+        let peer = SqliteMeta::open_in_memory().unwrap();
+        peer.kv_set(QUOTA_CREATION_KV_KEY, "1000").unwrap();
+        peer.apply_records(&[LogRecord::SetQuota {
+            max_logical_bytes: None,
+        }])
+        .unwrap();
+        assert_eq!(peer.read_quota().unwrap(), None);
+
+        m.kv_del(QUOTA_CREATION_KV_KEY).unwrap();
+        assert_eq!(m.read_quota().unwrap(), None);
     }
 }

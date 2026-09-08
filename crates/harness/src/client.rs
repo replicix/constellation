@@ -495,6 +495,41 @@ impl Client {
         Ok(())
     }
 
+    pub fn set_quota(&self, max_bytes: Option<u64>) -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        let sock = self.state.join("control.sock");
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
+        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+        let body = match max_bytes {
+            Some(n) => format!(r#"{{"cmd":"set_quota","max_bytes":{n}}}"#),
+            None => r#"{"cmd":"set_quota","max_bytes":null}"#.to_string(),
+        };
+        writeln!(stream, "{body}")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        let response: serde_json::Value = serde_json::from_str(&line)?;
+        anyhow::ensure!(response["resp"] == "ok", "set_quota failed: {response}");
+        Ok(())
+    }
+
+    pub fn get_quota(&self) -> Result<(Option<u64>, u64)> {
+        use std::io::{BufRead, BufReader, Write};
+        let sock = self.state.join("control.sock");
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.write_all(b"{\"cmd\":\"get_quota\"}\n")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        let response: serde_json::Value = serde_json::from_str(&line)?;
+        anyhow::ensure!(
+            response["resp"] == "quota",
+            "get_quota failed: {response}"
+        );
+        let max = response["max_bytes"].as_u64();
+        let used = response["used_bytes"].as_u64().unwrap_or(0);
+        Ok((max, used))
+    }
+
     /// Permanently leave the cluster (self), or admin-retire `node_id`.
     pub fn leave(&mut self, node_id: Option<u64>, force: bool) -> Result<()> {
         let mut args = vec![
