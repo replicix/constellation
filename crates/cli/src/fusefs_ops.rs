@@ -584,6 +584,13 @@ impl Filesystem for ConstellationFs {
                     return;
                 }
             };
+            let xattrs = match self.meta.scratch_xattrs(attr.ino) {
+                Ok(xattrs) => xattrs,
+                Err(error) => {
+                    reply.error(Errno::from_i32(errno(&error)));
+                    return;
+                }
+            };
             let op = constellation_meta::MutateOp::Publish {
                 ino: attr.ino,
                 parent: newparent,
@@ -594,6 +601,7 @@ impl Filesystem for ConstellationFs {
                 mtime_ns: attr.mtime_ns,
                 manifest,
                 size: attr.size,
+                xattrs,
             };
             return match self.mutate_op(newparent, op) {
                 Ok(()) => match self.meta.scratch_unlink(parent, &name) {
@@ -940,6 +948,16 @@ impl Filesystem for ConstellationFs {
             constellation_meta::SetXattrMode::Replace => 2,
             constellation_meta::SetXattrMode::Set => 0,
         };
+        // Scratch files are node-private (scratch-directories.md) and
+        // live outside the shared inode/xattr tables until `Publish`, so
+        // their xattrs are staged locally here rather than mutated
+        // through the lease-gated shared path.
+        if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+            return match self.meta.scratch_set_xattr(ino, &name, value, mode) {
+                Ok(()) => reply.ok(),
+                Err(error) => reply.error(Errno::from_i32(errno(&error))),
+            };
+        }
         match self.mutate_op(
             ino,
             constellation_meta::MutateOp::SetXattr {
@@ -995,6 +1013,10 @@ impl Filesystem for ConstellationFs {
                         .find(|(key, _)| key == &name)
                         .map(|x| x.1)
                 })
+            } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+                self.meta
+                    .scratch_get_xattr(ino, &name)
+                    .map_err(|error| errno(&error))
             } else {
                 self.meta
                     .get_xattr(ino, &name)
@@ -1015,6 +1037,10 @@ impl Filesystem for ConstellationFs {
         let names = if Self::is_synthetic(ino) {
             self.synthetic_xattrs(ino)
                 .map(|attrs| attrs.into_iter().map(|(name, _)| name).collect())
+        } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+            self.meta
+                .scratch_list_xattrs(ino)
+                .map_err(|error| errno(&error))
         } else {
             self.meta
                 .list_xattrs(ino)
@@ -1056,6 +1082,12 @@ impl Filesystem for ConstellationFs {
         if Self::is_synthetic(ino) {
             reply.error(Errno::from_i32(libc::EROFS));
             return;
+        }
+        if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+            return match self.meta.scratch_remove_xattr(ino, &name) {
+                Ok(()) => reply.ok(),
+                Err(error) => reply.error(Errno::from_i32(errno(&error))),
+            };
         }
         match self.mutate_op(
             ino,

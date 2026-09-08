@@ -99,7 +99,8 @@ pub enum MutateOp {
         name: String,
     },
     /// Scratch → shared publish: create the inode at `parent/name` with
-    /// the given attrs and commit its manifest in one transaction.
+    /// the given attrs and commit its manifest (and any xattrs staged on
+    /// the scratch file) in one transaction.
     Publish {
         ino: Ino,
         parent: Ino,
@@ -110,6 +111,7 @@ pub enum MutateOp {
         mtime_ns: i64,
         manifest: Vec<u8>,
         size: u64,
+        xattrs: Vec<(String, Vec<u8>)>,
     },
 }
 
@@ -270,9 +272,10 @@ pub fn execute(meta: &SqliteMeta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaE
             mtime_ns,
             manifest,
             size,
+            xattrs,
         } => {
             meta.publish_file(
-                *parent, name, *ino, *mode, *uid, *gid, *mtime_ns, manifest, *size,
+                *parent, name, *ino, *mode, *uid, *gid, *mtime_ns, manifest, *size, xattrs,
             )?;
         }
     }
@@ -320,5 +323,38 @@ mod tests {
             LogRecord::Create { name, ino, .. } if name == "f" && *ino == (1 << 40) | 7
         ));
         assert!(m.lookup(ROOT_INO, "f").unwrap().is_some());
+    }
+
+    #[test]
+    fn execute_publish_carries_xattrs_and_roundtrips() {
+        let m = SqliteMeta::open_in_memory().unwrap();
+        let ino = (1 << 40) | 9;
+        let op = MutateOp::Publish {
+            ino,
+            parent: ROOT_INO,
+            name: "published".into(),
+            mode: 0o640,
+            uid: 1000,
+            gid: 1000,
+            mtime_ns: 123,
+            manifest: b"MANIFEST".to_vec(),
+            size: 42,
+            xattrs: vec![("user.passsage.meta".into(), b"blob".to_vec())],
+        };
+        let bytes = op.to_postcard().unwrap();
+        assert_eq!(MutateOp::from_postcard(&bytes).unwrap(), op);
+
+        let records = execute(&m, &op).unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(matches!(records[0], LogRecord::Create { .. }));
+        assert!(matches!(records[1], LogRecord::WriteManifest { .. }));
+        assert!(matches!(
+            &records[2],
+            LogRecord::SetXattr { name, .. } if name == "user.passsage.meta"
+        ));
+        assert_eq!(
+            m.get_xattr(ino, "user.passsage.meta").unwrap().as_deref(),
+            Some(b"blob".as_slice())
+        );
     }
 }

@@ -142,6 +142,12 @@ CREATE TABLE IF NOT EXISTS scratch_dentry (
     PRIMARY KEY (parent, name)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS scratch_dentry_by_ino ON scratch_dentry (ino);
+CREATE TABLE IF NOT EXISTS scratch_xattr (
+    ino   INTEGER NOT NULL,
+    name  TEXT NOT NULL,
+    value BLOB NOT NULL,
+    PRIMARY KEY (ino, name)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS shadow (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     part TEXT NOT NULL,
@@ -2114,6 +2120,7 @@ impl SqliteMeta {
         mtime_ns: i64,
         manifest: &[u8],
         size: u64,
+        xattrs: &[(String, Vec<u8>)],
     ) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2222,6 +2229,21 @@ impl SqliteMeta {
                 time_ns: mtime_ns,
             },
         )?;
+        for (xattr_name, value) in xattrs {
+            tx.execute(
+                "INSERT OR REPLACE INTO xattr (ino, name, value) VALUES (?1, ?2, ?3)",
+                params![ino, xattr_name, value],
+            )?;
+            Self::journal(
+                &tx,
+                &LogRecord::SetXattr {
+                    ino,
+                    name: xattr_name.clone(),
+                    value: value.clone(),
+                    time_ns: mtime_ns,
+                },
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2344,6 +2366,7 @@ impl SqliteMeta {
             params![parent, name],
         )?;
         tx.execute("DELETE FROM scratch_inode WHERE ino = ?1", params![ino])?;
+        tx.execute("DELETE FROM scratch_xattr WHERE ino = ?1", params![ino])?;
         tx.commit()?;
         Ok(())
     }
@@ -2435,11 +2458,126 @@ impl SqliteMeta {
         })
     }
 
+    fn scratch_exists(conn: &Connection, ino: Ino) -> Result<bool, MetaError> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM scratch_inode WHERE ino = ?1",
+                params![ino],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Node-private xattr read. Scratch entries live outside the shared
+    /// `inode`/`xattr` tables (`scratch-directories.md`), so this never
+    /// journals and never requires a partition lease.
+    pub fn scratch_get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>, MetaError> {
+        self.with_reader(|conn| {
+            if !Self::scratch_exists(conn, ino)? {
+                return Err(MetaError::NoEnt(ino));
+            }
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM scratch_xattr WHERE ino = ?1 AND name = ?2",
+                    params![ino, name],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn scratch_list_xattrs(&self, ino: Ino) -> Result<Vec<String>, MetaError> {
+        self.with_reader(|conn| {
+            if !Self::scratch_exists(conn, ino)? {
+                return Err(MetaError::NoEnt(ino));
+            }
+            let mut stmt = conn
+                .prepare_cached("SELECT name FROM scratch_xattr WHERE ino = ?1 ORDER BY name")?;
+            let rows = stmt.query_map(params![ino], |row| row.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// All (name, value) pairs for a scratch inode, ordered by name. Used
+    /// by `Publish` (fusefs_ops.rs's scratch→shared rename) to carry a
+    /// scratch file's node-private xattrs into the shared inode atomically
+    /// rather than as a follow-up `SetXattr` mutation.
+    pub fn scratch_xattrs(&self, ino: Ino) -> Result<Vec<(String, Vec<u8>)>, MetaError> {
+        self.with_reader(|conn| Self::scratch_xattrs_by_ino(conn, ino))
+    }
+
+    fn scratch_xattrs_by_ino(conn: &Connection, ino: Ino) -> Result<Vec<(String, Vec<u8>)>, MetaError> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT name, value FROM scratch_xattr WHERE ino = ?1 ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![ino], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn scratch_set_xattr(
+        &self,
+        ino: Ino,
+        name: &str,
+        value: &[u8],
+        mode: SetXattrMode,
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::scratch_exists(&tx, ino)? {
+            return Err(MetaError::NoEnt(ino));
+        }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scratch_xattr WHERE ino = ?1 AND name = ?2)",
+            params![ino, name],
+            |row| row.get(0),
+        )?;
+        match (mode, exists) {
+            (SetXattrMode::Create, true) => return Err(MetaError::Exists),
+            (SetXattrMode::Replace, false) => return Err(MetaError::NoData),
+            _ => {}
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO scratch_xattr (ino, name, value) VALUES (?1, ?2, ?3)",
+            params![ino, name, value],
+        )?;
+        let t = now_ns();
+        tx.execute(
+            "UPDATE scratch_inode SET ctime_ns = ?2 WHERE ino = ?1",
+            params![ino, t],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn scratch_remove_xattr(&self, ino: Ino, name: &str) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::scratch_exists(&tx, ino)? {
+            return Err(MetaError::NoEnt(ino));
+        }
+        if tx.execute(
+            "DELETE FROM scratch_xattr WHERE ino = ?1 AND name = ?2",
+            params![ino, name],
+        )? == 0
+        {
+            return Err(MetaError::NoData);
+        }
+        let t = now_ns();
+        tx.execute(
+            "UPDATE scratch_inode SET ctime_ns = ?2 WHERE ino = ?1",
+            params![ino, t],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn scratch_purge_all(&self) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM scratch_dentry", [])?;
         tx.execute("DELETE FROM scratch_inode", [])?;
+        tx.execute("DELETE FROM scratch_xattr", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -3621,6 +3759,100 @@ mod tests {
         assert!(m.scratch_getattr(ino).unwrap().is_none());
     }
 
+    /// Xattrs on a scratch file are node-private, exactly like the rest
+    /// of scratch state: they never touch the shared `xattr` table and
+    /// never journal a `LogRecord`, so no partition lease is required to
+    /// stage them ahead of a `Publish`.
+    #[test]
+    fn scratch_xattr_roundtrip_flags_and_cleanup() {
+        let m = store();
+        let ino = m.allocate_ino().unwrap();
+        m.scratch_create(ROOT_INO, "local", ino, 0o644, 1000, 1000)
+            .unwrap();
+
+        assert_eq!(m.scratch_get_xattr(ino, "user.foo").unwrap(), None);
+        m.scratch_set_xattr(ino, "user.foo", b"one", SetXattrMode::Create)
+            .unwrap();
+        assert!(matches!(
+            m.scratch_set_xattr(ino, "user.foo", b"two", SetXattrMode::Create),
+            Err(MetaError::Exists)
+        ));
+        m.scratch_set_xattr(ino, "user.foo", b"two", SetXattrMode::Replace)
+            .unwrap();
+        assert!(matches!(
+            m.scratch_set_xattr(ino, "user.missing", b"x", SetXattrMode::Replace),
+            Err(MetaError::NoData)
+        ));
+        m.scratch_set_xattr(ino, "user.other", b"x", SetXattrMode::Set)
+            .unwrap();
+        assert_eq!(
+            m.scratch_list_xattrs(ino).unwrap(),
+            vec!["user.foo".to_string(), "user.other".to_string()]
+        );
+        assert_eq!(
+            m.scratch_xattrs(ino).unwrap(),
+            vec![
+                ("user.foo".to_string(), b"two".to_vec()),
+                ("user.other".to_string(), b"x".to_vec()),
+            ]
+        );
+
+        // Setting/reading/removing a scratch xattr never journals: it is
+        // node-private state, the same as the scratch inode itself.
+        assert_eq!(m.journal_len().unwrap(), 0);
+
+        m.scratch_remove_xattr(ino, "user.other").unwrap();
+        assert!(matches!(
+            m.scratch_remove_xattr(ino, "user.other"),
+            Err(MetaError::NoData)
+        ));
+        assert_eq!(
+            m.scratch_list_xattrs(ino).unwrap(),
+            vec!["user.foo".to_string()]
+        );
+
+        // A scratch xattr op on an inode that isn't a scratch inode (or
+        // no longer exists) surfaces NoEnt, matching the shared-xattr
+        // behavior for a missing ino.
+        let missing = m.allocate_ino().unwrap();
+        assert!(matches!(
+            m.scratch_get_xattr(missing, "user.foo"),
+            Err(MetaError::NoEnt(_))
+        ));
+
+        // scratch_unlink purges the xattr rows along with the inode/dentry.
+        m.scratch_unlink(ROOT_INO, "local").unwrap();
+        assert!(matches!(
+            m.scratch_get_xattr(ino, "user.foo"),
+            Err(MetaError::NoEnt(_))
+        ));
+    }
+
+    /// `scratch_purge_all` (mount-startup cleanup of any scratch state
+    /// left behind by a crashed node) must also drop scratch xattr rows,
+    /// not just the dentry/inode rows.
+    #[test]
+    fn scratch_purge_all_clears_xattrs() {
+        let m = store();
+        let ino = m.allocate_ino().unwrap();
+        m.scratch_create(ROOT_INO, "local", ino, 0o644, 1000, 1000)
+            .unwrap();
+        m.scratch_set_xattr(ino, "user.foo", b"one", SetXattrMode::Set)
+            .unwrap();
+
+        m.scratch_purge_all().unwrap();
+
+        assert!(m.scratch_getattr(ino).unwrap().is_none());
+        // The inode row is gone entirely now, so this is a NoEnt, not an
+        // empty list -- but the important part is nothing panics or
+        // leaves a dangling scratch_xattr row an `ino` could later collide
+        // with when reallocated.
+        assert!(matches!(
+            m.scratch_get_xattr(ino, "user.foo"),
+            Err(MetaError::NoEnt(_))
+        ));
+    }
+
     #[test]
     fn publish_file_creates_shared_inode() {
         let m = store();
@@ -3635,6 +3867,7 @@ mod tests {
             123,
             b"MANIFEST",
             42,
+            &[],
         )
         .unwrap();
 
@@ -3649,6 +3882,54 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(matches!(records[0].1, LogRecord::Create { .. }));
         assert!(matches!(records[1].1, LogRecord::WriteManifest { .. }));
+    }
+
+    /// The whole point of the fix: a reader that observes the published
+    /// inode (e.g. right after the `Publish` mutation's `rename` returns)
+    /// must never see it without its xattrs, because they are committed
+    /// in the very same transaction — there is no "file exists, metadata
+    /// doesn't" window to race against.
+    #[test]
+    fn publish_file_carries_xattrs_atomically() {
+        let m = store();
+        let ino = m.allocate_ino().unwrap();
+        m.publish_file(
+            ROOT_INO,
+            "published",
+            ino,
+            0o640,
+            1000,
+            1001,
+            123,
+            b"MANIFEST",
+            42,
+            &[
+                ("user.passsage.meta".to_string(), b"blob".to_vec()),
+                ("user.passsage.vary".to_string(), b"accept-encoding".to_vec()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            m.get_xattr(ino, "user.passsage.meta").unwrap().as_deref(),
+            Some(b"blob".as_slice())
+        );
+        assert_eq!(
+            m.list_xattrs(ino).unwrap(),
+            vec!["user.passsage.meta".to_string(), "user.passsage.vary".to_string()]
+        );
+        let records = m.take_journal(10).unwrap();
+        assert_eq!(records.len(), 4);
+        assert!(matches!(records[0].1, LogRecord::Create { .. }));
+        assert!(matches!(records[1].1, LogRecord::WriteManifest { .. }));
+        assert!(matches!(
+            records[2].1,
+            LogRecord::SetXattr { ref name, .. } if name == "user.passsage.meta"
+        ));
+        assert!(matches!(
+            records[3].1,
+            LogRecord::SetXattr { ref name, .. } if name == "user.passsage.vary"
+        ));
     }
 
     #[test]
@@ -3668,6 +3949,7 @@ mod tests {
             456,
             b"MANIFEST",
             42,
+            &[],
         )
         .unwrap();
 
