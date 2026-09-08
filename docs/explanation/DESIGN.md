@@ -546,9 +546,12 @@ each node checks its maintained whole-FS usage counter plus the current
 inode's uncommitted growth against the replicated quota. Enforcement is
 best-effort — there is no synchronous cross-node reservation — so concurrent
 writers can overshoot slightly until journals catch up. The counter itself
-is safe at global scope (renames never change the total); that is why a
-maintained aggregate was deferred for per-directory `rsize`/`rcount` but is
-acceptable here.
+is safe at global scope (a rename never changes the total, only which name
+holds the bytes); that is why a maintained aggregate was deferred for
+per-directory `rsize`/`rcount` but is acceptable here. `statfs` still
+scopes *used* space to the mounted view — a subtree or snapshot mount
+walks its own root — while free space reports whole-filesystem headroom
+under the cap, which is what a writer can actually consume.
 
 | failure | behavior |
 |---|---|

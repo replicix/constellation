@@ -132,11 +132,21 @@ eventual convergence continue through S3.
 ### Filesystem stats and quota
 
 Used space reported by `df`/`statfs` is the logical sum of reachable file
-sizes across the whole filesystem (same semantics as
-`user.constellation.rsize` at `/`), maintained as an in-memory counter
-updated on commit — not a periodically recomputed CTE, and not scoped to
-subtree/snapshot mount views. Physical S3 bytes after dedup or compression
-are not what `df` shows.
+sizes under the mounted view (same semantics as `user.constellation.rsize`
+at the mount root), not physical S3 bytes after dedup or compression.
+
+A whole-filesystem mount answers from an in-memory counter maintained on
+commit, so it is exact and costs nothing. A subtree or snapshot mount has
+to walk its own root instead, and that aggregate is cached:
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_STATFS_TTL_S` | `5` | seconds | cache TTL for a *scoped* mount's `statfs`/`df` used-space aggregate; `0` disables caching. Ignored by a whole-filesystem mount, which needs no cache |
+
+Free space is deliberately *not* scoped to the view: it reports what a
+writer can still consume, which is whole-filesystem headroom under the cap
+below. `df`'s Size column is therefore used + free, which collapses to the
+cap for a whole-filesystem mount.
 
 By default capacity is effectively unbounded. An optional cluster-wide
 logical byte cap can be set:

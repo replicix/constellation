@@ -37,6 +37,35 @@ use tokio::runtime::Handle;
 
 const TTL: Duration = Duration::from_secs(1);
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(5);
+const DEFAULT_STATFS_TTL_S: u64 = 5;
+
+fn parse_statfs_ttl_secs(raw: Option<&str>) -> Duration {
+    let secs = raw.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_STATFS_TTL_S);
+    Duration::from_secs(secs)
+}
+
+fn statfs_ttl_from_env() -> Duration {
+    parse_statfs_ttl_secs(std::env::var("CONSTELLATION_STATFS_TTL_S").ok().as_deref())
+}
+
+/// `statfs` block arithmetic, as `(total, free)`.
+///
+/// The two columns answer different questions and so read different
+/// numbers. Used (which the kernel derives as `total - free`) is logical
+/// bytes under the *mounted view*, so a subtree mount reports its own
+/// subtree. Free is what a writer can actually still consume: headroom
+/// under the cluster-wide cap, a whole-filesystem property no matter how
+/// narrow the view is. Total is their sum, which keeps both truthful and
+/// collapses to the cap for a whole-filesystem mount.
+fn statfs_blocks(view_used: u64, fs_used: u64, cap: Option<u64>, block: u64) -> (u64, u64) {
+    let used_blocks = view_used.div_ceil(block);
+    // Round free down and used up: never promise a block that is not there.
+    let free_blocks = match cap {
+        Some(cap) => cap.saturating_sub(fs_used) / block,
+        None => u64::MAX / block / 2,
+    };
+    (used_blocks.saturating_add(free_blocks), free_blocks)
+}
 
 /// Cached effective quota shared between the filesystem and the control
 /// plane: `(fetched_at, cap)`, where `cap: None` is unlimited and the
@@ -275,6 +304,13 @@ pub struct ConstellationFs {
     /// every [`QUOTA_CACHE_TTL`]. Shared with the control plane so a live
     /// `SetQuota` can invalidate without waiting for the TTL.
     quota_cache: QuotaCache,
+    /// Cached `(bytes, files)` for a *scoped* mount's [`Self::statfs`],
+    /// refreshed at most every [`Self::statfs_ttl`]. `None` means never
+    /// populated. Unused by a whole-filesystem mount, which reads the
+    /// maintained counter instead.
+    usage_cache: Mutex<Option<(Instant, u64, u64)>>,
+    /// From `CONSTELLATION_STATFS_TTL_S` (default 5s). Zero disables caching.
+    statfs_ttl: Duration,
 }
 
 fn staging_errno(e: &crate::staging::StagingError) -> i32 {
@@ -404,7 +440,38 @@ impl ConstellationFs {
             tree_cache: Mutex::new((HashMap::new(), VecDeque::new())),
             view_root: constellation_fs_core::types::ROOT_INO,
             quota_cache: Arc::new(Mutex::new(None)),
+            usage_cache: Mutex::new(None),
+            statfs_ttl: statfs_ttl_from_env(),
         }
+    }
+
+    /// Logical used space for the *mounted view*: `(bytes, file_count)`.
+    ///
+    /// A whole-filesystem mount reads the maintained counter, which is
+    /// exact and O(1). A subtree or snapshot mount has to walk its own
+    /// root, so that result is cached for [`Self::statfs_ttl`] (env
+    /// `CONSTELLATION_STATFS_TTL_S`, default 5s; `0` disables the cache).
+    pub(crate) fn view_usage(&self) -> (u64, u64) {
+        let root = self.real_ino(constellation_fs_core::types::ROOT_INO);
+        if root == constellation_fs_core::types::ROOT_INO {
+            return self.meta.usage();
+        }
+        if !self.statfs_ttl.is_zero() {
+            if let Some((fetched_at, bytes, files)) = *self.usage_cache.lock().unwrap() {
+                if fetched_at.elapsed() < self.statfs_ttl {
+                    return (bytes, files);
+                }
+            }
+        }
+        let usage = if Self::is_synthetic(root) {
+            self.synthetic_recursive_size(root).unwrap_or((0, 0))
+        } else {
+            self.meta.recursive_size(root).unwrap_or((0, 0))
+        };
+        if !self.statfs_ttl.is_zero() {
+            *self.usage_cache.lock().unwrap() = Some((Instant::now(), usage.0, usage.1));
+        }
+        usage
     }
 
     /// Shared handle so the control plane can invalidate after `SetQuota`.
@@ -469,6 +536,7 @@ impl ConstellationFs {
             anyhow::bail!("mount root {path} is not a directory");
         }
         self.view_root = ino;
+        *self.usage_cache.lock().unwrap() = None;
         Ok(())
     }
 
@@ -493,6 +561,7 @@ impl ConstellationFs {
             xattrs: Vec::new(),
         };
         self.view_root = self.intern_synthetic(format!("mount:{path}@{name}"), node);
+        *self.usage_cache.lock().unwrap() = None;
         Ok(())
     }
 
@@ -1953,5 +2022,172 @@ mod quota_tests {
         let dst = Arc::new(SqliteMeta::open_in_memory().unwrap());
         dst.apply_records(&records).unwrap();
         assert_eq!(dst.quota().unwrap(), Some(999));
+    }
+
+    #[test]
+    fn statfs_reports_view_usage_against_whole_fs_headroom() {
+        let block = 131072u64;
+        // Whole-filesystem mount under a cap: total collapses to the cap.
+        let (total, free) = statfs_blocks(40 * block, 40 * block, Some(100 * block), block);
+        assert_eq!((total, free), (100, 60));
+        assert_eq!(total - free, 40, "used is the view's own bytes");
+
+        // Subtree mount holding 10 blocks of a filesystem using 40: used
+        // scopes to the view, free still reflects the cluster-wide cap.
+        let (total, free) = statfs_blocks(10 * block, 40 * block, Some(100 * block), block);
+        assert_eq!((total - free, free), (10, 60));
+
+        // Overshooting the cap reports full rather than negative free.
+        let (total, free) = statfs_blocks(120 * block, 120 * block, Some(100 * block), block);
+        assert_eq!((total, free), (120, 0));
+
+        // Uncapped: effectively unbounded free space, exact used.
+        let huge = u64::MAX / block / 2;
+        let (total, free) = statfs_blocks(7 * block, 7 * block, None, block);
+        assert_eq!((total, free), (huge + 7, huge));
+
+        // Partial blocks round used up and free down.
+        let (total, free) = statfs_blocks(1, 1, Some(2 * block), block);
+        assert_eq!((total - free, free), (1, 1));
+    }
+
+    #[test]
+    fn parse_statfs_ttl_defaults_to_five_seconds() {
+        assert_eq!(parse_statfs_ttl_secs(None), Duration::from_secs(5));
+        assert_eq!(parse_statfs_ttl_secs(Some("")), Duration::from_secs(5));
+        assert_eq!(parse_statfs_ttl_secs(Some("bogus")), Duration::from_secs(5));
+        assert_eq!(parse_statfs_ttl_secs(Some("0")), Duration::from_secs(0));
+        assert_eq!(parse_statfs_ttl_secs(Some("12")), Duration::from_secs(12));
+    }
+
+    /// A whole-filesystem mount answers from the maintained counter, so it
+    /// is exact and never serves a stale aggregate.
+    #[test]
+    fn view_usage_of_a_full_mount_tracks_the_counter() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        let a = meta.create(dir.ino, "a", 0o644, 0, 0).unwrap();
+        let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+        meta.setattr(a.ino, None, None, None, Some(7), None, None)
+            .unwrap();
+        meta.setattr(b.ino, None, None, None, Some(100), None, None)
+            .unwrap();
+
+        let (fs, _tmpdir) = test_fs(meta.clone());
+        assert_eq!(fs.view_usage(), (107, 2));
+        meta.setattr(b.ino, None, None, None, Some(1), None, None)
+            .unwrap();
+        assert_eq!(fs.view_usage(), (8, 2), "no TTL between a write and df");
+    }
+
+    #[test]
+    fn view_usage_scopes_to_subtree_mount() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        let a = meta.create(dir.ino, "a", 0o644, 0, 0).unwrap();
+        let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+        meta.setattr(a.ino, None, None, None, Some(7), None, None)
+            .unwrap();
+        meta.setattr(b.ino, None, None, None, Some(100), None, None)
+            .unwrap();
+
+        let (mut fs, _tmpdir) = test_fs(meta);
+        assert_eq!(fs.view_usage(), (107, 2));
+        fs.set_subtree_root("/d").unwrap();
+        assert_eq!(fs.view_usage(), (7, 1));
+    }
+
+    #[test]
+    fn zero_ttl_disables_cache_while_positive_ttl_caches() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        let f = meta.create(dir.ino, "f", 0o644, 0, 0).unwrap();
+        meta.setattr(f.ino, None, None, None, Some(10), None, None)
+            .unwrap();
+
+        // Only a scoped mount pays for (and caches) the recursive walk.
+        let (mut fs, _tmpdir) = test_fs(meta.clone());
+        fs.set_subtree_root("/d").unwrap();
+        fs.statfs_ttl = Duration::from_secs(60);
+        assert_eq!(fs.view_usage(), (10, 1));
+        meta.setattr(f.ino, None, None, None, Some(99), None, None)
+            .unwrap();
+        assert_eq!(
+            fs.view_usage(),
+            (10, 1),
+            "positive TTL must serve the stale aggregate"
+        );
+
+        fs.statfs_ttl = Duration::from_secs(0);
+        *fs.usage_cache.lock().unwrap() = None;
+        assert_eq!(fs.view_usage(), (99, 1));
+        meta.setattr(f.ino, None, None, None, Some(1), None, None)
+            .unwrap();
+        assert_eq!(
+            fs.view_usage(),
+            (1, 1),
+            "TTL 0 must recompute on every call"
+        );
+    }
+
+    #[test]
+    fn view_usage_scopes_to_snapshot_mount() {
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let source = meta.mkdir(ROOT_INO, "source", 0o755, 0, 0).unwrap();
+        let file = meta.create(source.ino, "file", 0o644, 0, 0).unwrap();
+        meta.setattr(file.ino, None, None, None, Some(42), None, None)
+            .unwrap();
+        let outside = meta.create(ROOT_INO, "outside", 0o644, 0, 0).unwrap();
+        meta.setattr(outside.ino, None, None, None, Some(1000), None, None)
+            .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(
+            DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap(),
+        );
+        let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
+        let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
+            meta.clone(),
+            store.clone(),
+            CompressionSetting::RAW,
+            DEFAULT_CHUNK_SIZE,
+            1,
+        ));
+        // Create the snapshot on a throwaway runtime so the FUSE handle's
+        // runtime is idle when view_usage later block_on's tree loads.
+        {
+            let setup = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            setup
+                .block_on(snapshots.create("/source", "snap"))
+                .unwrap();
+        }
+
+        let fs_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut fs = ConstellationFs::new(
+            FsDependencies {
+                meta,
+                store,
+                cache,
+                rt: fs_rt.handle().clone(),
+                sync: None,
+                coop: None,
+                staging_dir: dir.path().join("staging"),
+                staging_budget: StagingBudget::new(1 << 30),
+                snapshots,
+            },
+            DEFAULT_CHUNK_SIZE,
+            CompressionSetting::RAW,
+        );
+        std::mem::forget(fs_rt);
+        fs.statfs_ttl = Duration::from_secs(0);
+        assert_eq!(fs.view_usage(), (1042, 2));
+        fs.set_snapshot_root("/source", "snap").unwrap();
+        assert_eq!(fs.view_usage(), (42, 1));
     }
 }

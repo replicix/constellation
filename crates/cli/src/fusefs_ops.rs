@@ -1102,17 +1102,17 @@ impl Filesystem for ConstellationFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
-        // Used space comes from the maintained whole-FS counter. When a
-        // quota is set, report that as capacity; otherwise stay effectively
-        // unbounded.
+        // Used space is logical bytes under the mounted view; free space
+        // is whole-filesystem headroom under the cap. See `statfs_blocks`.
+        // Block size mirrors blksize.
         let bsize: u32 = 131072;
-        let (used_bytes, file_count) = self.meta.usage();
-        let used_blocks = used_bytes.div_ceil(bsize as u64);
-        let total_blocks = match self.cached_quota() {
-            Some(cap) => cap.div_ceil(bsize as u64).max(used_blocks),
-            None => u64::MAX / bsize as u64 / 2,
-        };
-        let bfree = total_blocks.saturating_sub(used_blocks);
+        let (used_bytes, file_count) = self.view_usage();
+        let (total_blocks, bfree) = statfs_blocks(
+            used_bytes,
+            self.meta.usage().0,
+            self.cached_quota(),
+            bsize as u64,
+        );
         let ffree = (u64::MAX / 2).saturating_sub(file_count);
         reply.statfs(
             total_blocks,
