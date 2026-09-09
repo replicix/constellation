@@ -57,13 +57,15 @@ enum Command {
         #[command(subcommand)]
         command: FsCommand,
     },
-    /// Mount a filesystem. `TARGET` is a registered name ("myfs"), a
-    /// name with a subtree/snapshot selector ("myfs:/data"), or (with
-    /// `--s3`/`--state-dir`) a literal path/selector for an ad-hoc,
-    /// unregistered mount. A bare `mount myfs` (no MOUNTPOINT) mounts
-    /// every view already registered for that name.
+    /// Mount a filesystem by name — see below for `TARGET`/`MOUNTPOINT`.
     Mount {
+        /// A registered name ("myfs"), a name with a subtree/snapshot
+        /// selector ("myfs:/data"), or (with `--s3`/`--state-dir`) a
+        /// literal path/selector for an ad-hoc, unregistered mount.
         target: String,
+        /// Where to mount. Omit to reuse the target's stored mountpoint,
+        /// or (for a bare name with no subtree) to mount every view
+        /// already registered for that name.
         mountpoint: Option<PathBuf>,
         /// Backend: s3://bucket/prefix, file:///path, or absolute path.
         /// Refused if it contradicts an already-populated state dir
@@ -74,9 +76,7 @@ enum Command {
         /// escape hatch for an ad-hoc, unregistered mount.
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Run in the foreground instead of backgrounding (JuiceFS-style
-        /// daemonization is the default; this is what the test harness
-        /// and interactive debugging want instead).
+        /// Run in the foreground instead of backgrounding.
         #[arg(long, short = 'f')]
         foreground: bool,
         /// Chunk cache budget (e.g. 10G, 512MiB). Suffixes are binary.
@@ -124,6 +124,8 @@ enum Command {
     /// view (`unmount myfs`). The daemon exits once its last view is
     /// gone.
     Unmount {
+        /// A registered name ("myfs") or a name with a subtree selector
+        /// ("myfs:/data") identifying the view(s) to detach.
         target: String,
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -178,7 +180,7 @@ enum Command {
         state_dir: Option<PathBuf>,
     },
     /// Designate this node for exclusive local-speed writes under a
-    /// subtree while it stays reachable (DESIGN.md §5.2).
+    /// subtree while it stays reachable.
     Offline {
         target: String,
         #[arg(long)]
@@ -318,7 +320,7 @@ enum GcCommand {
 #[derive(Subcommand)]
 enum SnapshotCommand {
     /// `myfs:/path@name` — a selector always names a path; `@name` is
-    /// required independent of this plan.
+    /// required.
     Create {
         target: String,
         #[arg(long)]
@@ -430,7 +432,7 @@ enum FsCommand {
         #[arg(long)]
         s3: Option<String>,
     },
-    /// List every registered filesystem and its views (`zfs list`).
+    /// List every registered filesystem and its views.
     List,
 }
 
@@ -1050,7 +1052,25 @@ fn cmd_mount(
     } = args;
 
     let mut reg = registry::Registry::load_locked()?;
-    let resolved = target::resolve(&target, &reg);
+    let mut resolved = target::resolve(&target, &reg);
+    // `mount` is the one command allowed to *create* a name: a target
+    // that is syntactically name-shaped but not yet registered (first
+    // `mount myfs --s3 ...` for that name) must not fall into the
+    // ad-hoc/`--state-dir`-required path just because `resolve` only
+    // returns `Named` for names that already exist. An explicit
+    // `--state-dir` still takes the ad-hoc escape hatch, matching
+    // `target::state_dir`'s own precedence (explicit wins).
+    if state_dir.is_none() {
+        if let target::Target::Raw(raw) = &resolved {
+            if let Some((name, path)) = target::split_name(raw) {
+                resolved = target::Target::Named {
+                    name,
+                    path,
+                    entry: registry::FsEntry::default(),
+                };
+            }
+        }
+    }
 
     // Build the plan: which views to bring up, the node-level config,
     // and (for a named target) the registry writes to make first.

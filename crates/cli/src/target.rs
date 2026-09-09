@@ -21,30 +21,36 @@ pub enum Target {
     Raw(String),
 }
 
+/// Pure syntax check, no registry lookup: does `raw` have the shape of a
+/// filesystem name, optionally followed by `:` and a path/selector? Same
+/// rule as [`resolve`] — a bare token before `:` with no `/` in it is a
+/// name, and a leading `/` is never reinterpreted. Used by callers (like
+/// `mount`) that must tell "a name, just not registered yet" apart from
+/// "not name-shaped at all" even though [`resolve`] itself only ever
+/// returns [`Target::Named`] for names that already exist.
+pub fn split_name(raw: &str) -> Option<(String, Option<String>)> {
+    if let Some((before, after)) = raw.split_once(':') {
+        if !before.is_empty() && !before.contains('/') {
+            let path = (!after.is_empty()).then(|| after.to_string());
+            return Some((before.to_string(), path));
+        }
+    } else if !raw.is_empty() && !raw.contains('/') {
+        return Some((raw.to_string(), None));
+    }
+    None
+}
+
 /// Split `raw` on `:` **only** when the part before it contains no `/`,
 /// then look the candidate name up in `registry`. A leading `/` is never
 /// reinterpreted (`/myfs:backup` stays one raw string; `myfs` cannot
 /// contain `/`, so `part.before` containing one rules out the name
 /// reading on its own, without a special case).
 pub fn resolve(raw: &str, registry: &Registry) -> Target {
-    if let Some((before, after)) = raw.split_once(':') {
-        if !before.is_empty() && !before.contains('/') {
-            if let Some(entry) = registry.entry(before) {
-                let path = (!after.is_empty()).then(|| after.to_string());
-                return Target::Named {
-                    name: before.to_string(),
-                    path,
-                    entry: entry.clone(),
-                };
-            }
-        }
-    } else if !raw.is_empty() && !raw.contains('/') {
-        // Bare token, no colon at all: still worth a registry lookup —
-        // `mount myfs` (no subtree) is exactly this shape.
-        if let Some(entry) = registry.entry(raw) {
+    if let Some((name, path)) = split_name(raw) {
+        if let Some(entry) = registry.entry(&name) {
             return Target::Named {
-                name: raw.to_string(),
-                path: None,
+                name,
+                path,
                 entry: entry.clone(),
             };
         }

@@ -54,9 +54,15 @@ escape hatches for an ad-hoc, unregistered target.
 ## `mount` and `unmount`
 
 ```
-constellation mount NAME [MOUNTPOINT] [--s3 URL] [--state-dir DIR] [--foreground]
-constellation unmount NAME[:/sub]
+constellation mount TARGET [MOUNTPOINT] [--s3 URL] [--state-dir DIR] [--foreground]
+constellation unmount TARGET
 ```
+
+`TARGET` is a registered name (`myfs`), a name with a subtree/snapshot
+selector (`myfs:/data`), or — only together with `--s3`/`--state-dir` — a
+literal path/selector for an ad-hoc, unregistered mount (see below). It's
+the same argument shape for both commands; `unmount` just never takes a
+`MOUNTPOINT`, since a view is already uniquely identified by name(:subtree).
 
 - `mount NAME:/sub MOUNTPOINT` mounts (or updates) exactly that one view.
 - `mount NAME[:/sub]` with no mountpoint reuses that view's stored
