@@ -620,10 +620,21 @@ fn main() -> Result<()> {
             let mut meta = FsMeta::new(chunk_size, &setting.to_string());
             meta.e2e = e2e;
             meta.max_logical_bytes = max_size.filter(|&n| n > 0);
+            // Collect the passphrase before writing anything: an abort at
+            // the prompt (Ctrl-C, empty input) must leave no orphan
+            // `meta.json` behind, which would mark the prefix as an
+            // unusable E2E filesystem and block re-creation.
+            let secret = if e2e {
+                Some(passphrase(
+                    "CONSTELLATION_PASSPHRASE",
+                    "New filesystem passphrase: ",
+                )?)
+            } else {
+                None
+            };
             rt.block_on(store.create_fs(&meta))
                 .context("creating filesystem")?;
-            if e2e {
-                let secret = passphrase("CONSTELLATION_PASSPHRASE", "New filesystem passphrase: ")?;
+            if let Some(secret) = secret {
                 rt.block_on(put_keyring(&backend, &secret))
                     .context("creating E2E keyring")?;
             }
