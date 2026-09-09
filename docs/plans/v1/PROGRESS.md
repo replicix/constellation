@@ -1366,3 +1366,68 @@ namespace. Default (no marked roots) is inert.
   in-process tests for each were not added (the pruner engine needs the
   full `NodeRuntime` stack, which the shipper-style test harness does not
   provide).
+
+## Plan 24 — E2E single-file keyring, one master key, everything derived: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Master key (KMK) wrapped in `meta.json`; no `keys/keyring.json` | done | `store-s3::e2e`, `store-s3::store` (`FsMeta.keyring`) |
+| Derived subkeys (addressing, per-partition DEK, gossip seed) via domain-separated BLAKE3 | done | `store-s3::e2e` (`KeyPurpose`, `derive_from_master`) |
+| `create_keyring_block` / `unlock` / `rewrap_master`; `FsMeta::unlock`; `ChunkStore::change_passphrase` (CAS on `meta.json`) | done | `store-s3::e2e`, `store-s3::store` |
+| Deleted: `keyring.json`, `put/load_keyring`, `WrappedKeys`/`Keyring`, `ensure_partition`/`refresh_partition`/`ensure_partition_key` | done | `store-s3::e2e`, `store-s3::log` |
+| Partition split no longer writes a key (DEK derived) | done | `cli::shipper` |
+| `fs create --e2e` builds the keyring block into `meta.json` (single conditional PUT) | done | `cli::main` |
+| Passphrase collected in the foreground before the daemon fork | done | `cli::main`, `cli::node_runtime` (`NodeConfig.passphrase`) |
+| Unit tests: derivation determinism, purpose-collision guard, unlock round-trip, live-`passwd` rewrap, secret hygiene | done | `store-s3::e2e` |
+| Harness scenario `passwd-live-cluster` | done — PASSED | `harness::scenarios`, `harness::client` |
+
+### Design decisions
+
+- **Everything derived from one master key** (option A of the design
+  discussion), rather than storing random per-partition DEKs. Removes the
+  keyring's mutability — a split derives its DEK locally — so the secret
+  material collapses to a single wrapped value that lives in `meta.json`.
+  The trade-off (no independent per-key rotation) costs nothing today:
+  `passwd` never rotated DEKs and no per-partition rotation exists.
+- **Domain separation is collision-free by construction and tested.**
+  `derive_from_master` builds `KDF_DOMAIN` + a one-byte purpose tag, and
+  only a DEK appends the partition name after the distinct `PURPOSE_DEK`
+  tag — so no partition name can collide with a fixed purpose or another
+  partition. `key_purposes_never_collide` throws adversarial names
+  (`"addressing"`, `"gossip"`, raw tag bytes, `/`, empty, very long) at it.
+- **`fs passwd` is a live operation.** It rewrites only `wrapped_master`
+  in `meta.json` under a CAS update; the KMK and every derived key are
+  unchanged, so mounted nodes (which hold the KMK in memory) keep
+  running — including across a partition split — with no remount. The
+  `passwd-live-cluster` scenario proves this with the model oracle across
+  two un-remounted nodes, then confirms the old passphrase is refused and
+  a fresh mount needs the new one.
+- **Passphrase prompt moved before the daemon fork.** `daemonize`
+  `setsid()`s the daemon child away from its controlling terminal, so the
+  previous in-daemon prompt could never reach a TTY — interactive E2E
+  mount silently depended on `CONSTELLATION_PASSPHRASE`. The passphrase is
+  now collected in the foreground (via a throwaway runtime that reads
+  `meta.json`, fully dropped before the fork) and inherited by the child;
+  skipped in `--foreground`, when the env var is set (it survives the
+  fork), and when a live daemon socket means we will attach rather than
+  unlock.
+
+### Gates run in this environment
+
+- `cargo fmt --all` — clean; `cargo clippy --workspace --all-targets -- -D
+  warnings` — clean.
+- `cargo test --workspace` — all pass (added e2e unit tests; existing
+  store/log/cli suites updated for the derived-key API).
+- `bash tests/smoke.sh`, `bash tests/integration.sh` (floci S3) — pass.
+- `target/release/harness run e2e-basic e2e-two-nodes passwd-live-cluster`
+  — all PASSED.
+- Manual interactive check: `fs create --e2e` (env passphrase), then
+  `mount` on a fresh state dir over a pty with **no** env var — the
+  foreground `Filesystem passphrase:` prompt is answered, the daemon
+  backgrounds, and a file round-trips.
+
+### Pending (validate in CI)
+
+- Full `target/release/harness run` matrix (E2E + `passwd-live-cluster`
+  run individually here; full matrix in progress).
+- pjdfstest compliance lane.

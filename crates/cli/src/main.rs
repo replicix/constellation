@@ -35,10 +35,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::SqliteMeta;
-use constellation_store_s3::{
-    change_passphrase, load_keyring, put_keyring, ChunkStore, CompressionSetting, FsMeta,
-    StoreError,
-};
+use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta, StoreError};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -523,6 +520,41 @@ fn passphrase(env: &str, prompt: &str) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(value))
 }
 
+/// Is a daemon already serving this state dir? A successful connect to the
+/// control socket means yes — a new `mount` will attach to it rather than
+/// unlock the keyring itself, so it needs no passphrase.
+fn daemon_socket_is_live(state_dir: &Path) -> bool {
+    let sock = state_dir.join(constellation_api::SOCKET_NAME);
+    std::os::unix::net::UnixStream::connect(sock).is_ok()
+}
+
+/// For an interactive E2E mount, prompt for the passphrase *before* the
+/// daemon fork (the child has no terminal). Returns `None` — deferring to
+/// the env var or an in-daemon prompt — when the env var is set (it
+/// survives the fork) or the filesystem is not E2E. Reads `meta.json`
+/// through a throwaway runtime that is fully dropped before the caller
+/// forks, so no runtime threads leak into the daemon child.
+fn prompt_e2e_passphrase_if_needed(s3: &str) -> Result<Option<Zeroizing<String>>> {
+    if std::env::var_os("CONSTELLATION_PASSPHRASE").is_some() {
+        return Ok(None);
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let e2e = rt.block_on(async {
+        let backend = backend::open_backend(s3).await?;
+        anyhow::Ok(ChunkStore::new(backend).load_fs().await?.e2e)
+    })?;
+    drop(rt);
+    if !e2e {
+        return Ok(None);
+    }
+    Ok(Some(passphrase(
+        "CONSTELLATION_PASSPHRASE",
+        "Filesystem passphrase: ",
+    )?))
+}
+
 fn main() -> Result<()> {
     let log_buffer = log_buffer::LogBuffer::default();
     let log_writer = log_buffer.clone();
@@ -619,25 +651,28 @@ fn main() -> Result<()> {
             let store = ChunkStore::new(backend.clone());
             let mut meta = FsMeta::new(chunk_size, &setting.to_string());
             meta.e2e = e2e;
+            // E2E filesystems seed the gossip topic from the passphrase-
+            // protected keyring, not plaintext `meta.json`; leaving it here
+            // would let a bucket reader join the topic. Non-E2E keeps it in
+            // `meta.json` (S3 is the trust boundary there anyway).
+            if e2e {
+                meta.gossip_secret = None;
+            }
             meta.max_logical_bytes = max_size.filter(|&n| n > 0);
             // Collect the passphrase before writing anything: an abort at
             // the prompt (Ctrl-C, empty input) must leave no orphan
-            // `meta.json` behind, which would mark the prefix as an
-            // unusable E2E filesystem and block re-creation.
-            let secret = if e2e {
-                Some(passphrase(
-                    "CONSTELLATION_PASSPHRASE",
-                    "New filesystem passphrase: ",
-                )?)
-            } else {
-                None
-            };
+            // `meta.json` behind. The keyring block is built into `meta`,
+            // so the whole E2E filesystem — identity and keys — is created
+            // by a single conditional PUT with no orphan window.
+            if e2e {
+                let secret = passphrase("CONSTELLATION_PASSPHRASE", "New filesystem passphrase: ")?;
+                meta.keyring = Some(
+                    constellation_store_s3::create_keyring_block(&secret)
+                        .context("creating E2E keyring")?,
+                );
+            }
             rt.block_on(store.create_fs(&meta))
                 .context("creating filesystem")?;
-            if let Some(secret) = secret {
-                rt.block_on(put_keyring(&backend, &secret))
-                    .context("creating E2E keyring")?;
-            }
             registry::Registry::load_locked()?
                 .merge_and_save(
                     &name,
@@ -666,7 +701,8 @@ fn main() -> Result<()> {
             let backend = rt
                 .block_on(backend::open_backend(&s3))
                 .context("opening backend")?;
-            let meta = rt.block_on(ChunkStore::new(backend.clone()).load_fs())?;
+            let store = ChunkStore::new(backend.clone());
+            let meta = rt.block_on(store.load_fs())?;
             if !meta.e2e {
                 bail!("filesystem is not in E2E mode");
             }
@@ -675,9 +711,12 @@ fn main() -> Result<()> {
                 "CONSTELLATION_NEW_PASSPHRASE",
                 "New filesystem passphrase: ",
             )?;
-            rt.block_on(change_passphrase(&backend, &old, &new))
+            rt.block_on(store.change_passphrase(&old, &new))
                 .context("changing E2E passphrase")?;
-            println!("passphrase changed; data-encryption keys were not rotated");
+            println!(
+                "passphrase changed; data-encryption keys were not rotated \
+                 and mounted nodes need no remount"
+            );
             Ok(())
         }
         Command::Fs {
@@ -1300,6 +1339,17 @@ fn cmd_mount(
     let initial_write_mode: writeback::WriteMode =
         node_write_mode.parse().map_err(anyhow::Error::msg)?;
 
+    // Collect the E2E passphrase in the FOREGROUND, before the fork: the
+    // daemon child is `setsid()`'d away from its controlling terminal and
+    // cannot prompt. `fork()` inherits the secret in memory. Skipped in
+    // `--foreground` (the body keeps the terminal) and when a daemon
+    // already serves this state dir (we will attach, not unlock).
+    let mount_passphrase = if foreground || daemon_socket_is_live(&state_dir) {
+        None
+    } else {
+        prompt_e2e_passphrase_if_needed(&node_s3)?
+    };
+
     match daemonize::fork_if_needed(foreground, &state_dir)? {
         daemonize::Outcome::Foreground => cmd_mount_body(
             threads,
@@ -1313,6 +1363,7 @@ fn cmd_mount(
             web_ui.unwrap_or(0),
             log_buffer,
             views,
+            mount_passphrase,
             None,
         ),
         daemonize::Outcome::Daemon(verdict) => {
@@ -1328,6 +1379,7 @@ fn cmd_mount(
                 web_ui.unwrap_or(0),
                 log_buffer,
                 views,
+                mount_passphrase,
                 Some(verdict),
             );
             // `cmd_mount_body` already reported success/failure through
@@ -1401,6 +1453,7 @@ fn cmd_mount_body(
     web_ui: u16,
     log_buffer: log_buffer::LogBuffer,
     views: Vec<ViewSpec>,
+    passphrase: Option<Zeroizing<String>>,
     verdict: Option<daemonize::Verdict>,
 ) -> Result<()> {
     let fuse_threads = threads.fuse;
@@ -1448,6 +1501,7 @@ fn cmd_mount_body(
                     web_ui,
                     log_buffer,
                     atime_mode,
+                    passphrase,
                 },
                 handle,
             ) {
@@ -1779,7 +1833,7 @@ async fn run_gc_cli(
     let fsmeta = plain.load_fs().await?;
     let keys = if fsmeta.e2e {
         let secret = passphrase("CONSTELLATION_PASSPHRASE", "Filesystem passphrase: ")?;
-        Some(load_keyring(&backend, &secret).await?)
+        Some(fsmeta.unlock(&secret)?)
     } else {
         None
     };
@@ -1819,7 +1873,7 @@ async fn run_fsck_cli(
     let fsmeta = plain.load_fs().await?;
     let keys = if fsmeta.e2e {
         let secret = passphrase("CONSTELLATION_PASSPHRASE", "Filesystem passphrase: ")?;
-        Some(load_keyring(&backend, &secret).await?)
+        Some(fsmeta.unlock(&secret)?)
     } else {
         None
     };
@@ -2100,6 +2154,7 @@ impl constellation_net::PeerService for P2pBridge {
 /// mount. `CONSTELLATION_P2P=off` skips it entirely.
 async fn start_p2p(
     fsmeta: &constellation_store_s3::FsMeta,
+    e2e_keys: Option<&constellation_store_s3::SharedE2eKeys>,
     store: std::sync::Arc<dyn object_store::ObjectStore>,
     node_id: u64,
 ) -> constellation_net::Peers {
@@ -2119,9 +2174,13 @@ async fn start_p2p(
     if generated {
         tracing::info!(path = %key_path.display(), "generated a host node key");
     }
-    let topic =
-        constellation_net::topic_for(fsmeta.gossip_seed().as_ref(), &fsmeta.uuid.to_string());
-    if fsmeta.gossip_seed().is_none() {
+    // E2E filesystems seed the topic from the keyring (never on S3 in the
+    // clear); non-E2E uses `meta.json`. A pre-secret filesystem with no
+    // seed at all falls back to the UUID.
+    let e2e_seed = e2e_keys.map(|keys| *keys.gossip_secret());
+    let seed = e2e_seed.or_else(|| fsmeta.gossip_seed());
+    let topic = constellation_net::topic_for(seed.as_ref(), &fsmeta.uuid.to_string());
+    if seed.is_none() {
         tracing::info!(
             "filesystem predates gossip_secret; deriving the topic from its UUID \
              (weaker: the UUID is not a secret)"

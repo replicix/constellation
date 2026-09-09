@@ -60,6 +60,11 @@ pub struct NodeConfig {
     pub log_buffer: log_buffer::LogBuffer,
     /// Resolved read-time atime mode (plan 20). `Off` by default.
     pub atime_mode: crate::atime::AtimeMode,
+    /// E2E passphrase collected in the foreground before daemonizing, so
+    /// the setsid'd daemon child never has to prompt on a terminal it no
+    /// longer has. `None` falls back to the env var / an interactive
+    /// prompt (fine in `--foreground`, or when driven by the env var).
+    pub passphrase: Option<zeroize::Zeroizing<String>>,
 }
 
 /// Everything needed to mount one view (root, subtree, or snapshot
@@ -192,6 +197,7 @@ impl NodeRuntime {
             web_ui,
             log_buffer,
             atime_mode,
+            passphrase,
         } = cfg;
 
         let backend = rt
@@ -201,9 +207,16 @@ impl NodeRuntime {
             .block_on(ChunkStore::new(backend.clone()).load_fs())
             .context("loading filesystem (fs create first?)")?;
         let e2e_keys = if fsmeta.e2e {
-            let secret = crate::passphrase("CONSTELLATION_PASSPHRASE", "Filesystem passphrase: ")?;
+            // Prefer the passphrase collected in the foreground before the
+            // fork; fall back to the env var / a prompt (works in
+            // `--foreground`, where the terminal is still attached).
+            let secret = match passphrase {
+                Some(secret) => secret,
+                None => crate::passphrase("CONSTELLATION_PASSPHRASE", "Filesystem passphrase: ")?,
+            };
             Some(
-                rt.block_on(constellation_store_s3::load_keyring(&backend, &secret))
+                fsmeta
+                    .unlock(&secret)
                     .context("unlocking E2E keyring (wrong passphrase?)")?,
             )
         } else {
@@ -384,7 +397,12 @@ impl NodeRuntime {
         // reaching other nodes through S3 polling. Built before `fs` because
         // the offline-designation gate (phase 4a) needs it for delegation
         // requests.
-        let peers = rt.block_on(crate::start_p2p(&fsmeta, store.inner().clone(), node_id));
+        let peers = rt.block_on(crate::start_p2p(
+            &fsmeta,
+            e2e_keys.as_ref(),
+            store.inner().clone(),
+            node_id,
+        ));
         let _gc_task = {
             let interval = std::env::var("CONSTELLATION_GC_INTERVAL_S")
                 .ok()
@@ -1987,6 +2005,7 @@ mod tests {
                 web_ui: 0,
                 log_buffer: log_buffer::LogBuffer::default(),
                 atime_mode: crate::atime::AtimeMode::Off,
+                passphrase: None,
             },
             rt.clone(),
         )

@@ -179,9 +179,31 @@ impl Client {
         Ok(())
     }
 
+    /// Change the E2E passphrase via `fs passwd`, without touching any
+    /// mounted node. The target positional is a throwaway — `--s3` selects
+    /// the backend directly (as everywhere else in the harness).
+    pub fn passwd(&self, old: &str, new: &str) -> Result<()> {
+        let out = self
+            .cmd(&["fs", "passwd", "harness", "--s3", &self.backend])
+            .env("CONSTELLATION_PASSPHRASE", old)
+            .env("CONSTELLATION_NEW_PASSPHRASE", new)
+            .output()?;
+        if !out.status.success() {
+            bail!("fs passwd failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(())
+    }
+
     pub fn assert_wrong_passphrase_rejected(&self) -> Result<()> {
-        let wrong_state = self.work.join("wrong-state");
-        let wrong_mnt = self.work.join("wrong-mnt");
+        self.assert_passphrase_rejected("definitely-wrong")
+    }
+
+    /// A cold mount with `passphrase` must fail cleanly at keyring unlock.
+    /// Used after `fs passwd` to prove the old passphrase no longer opens
+    /// the filesystem.
+    pub fn assert_passphrase_rejected(&self, passphrase: &str) -> Result<()> {
+        let wrong_state = self.work.join(format!("rej-state-{passphrase}"));
+        let wrong_mnt = self.work.join(format!("rej-mnt-{passphrase}"));
         std::fs::create_dir_all(&wrong_state)?;
         std::fs::create_dir_all(&wrong_mnt)?;
         let output = self
@@ -195,14 +217,14 @@ impl Client {
                 wrong_state.to_str().unwrap(),
                 "--foreground",
             ])
-            .env("CONSTELLATION_PASSPHRASE", "definitely-wrong")
+            .env("CONSTELLATION_PASSPHRASE", passphrase)
             .output()?;
         if output.status.success() {
-            bail!("mount unexpectedly accepted a wrong E2E passphrase");
+            bail!("mount unexpectedly accepted passphrase {passphrase:?}");
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.contains("unlocking E2E keyring") {
-            bail!("wrong-passphrase failure was not clean: {stderr}");
+            bail!("passphrase rejection was not clean: {stderr}");
         }
         Ok(())
     }

@@ -94,28 +94,54 @@ impl LogStore {
         self.store.clone()
     }
 
-    /// Persist a newly generated partition DEK before the split record can
-    /// direct any metadata into that partition's encrypted stream.
-    pub async fn ensure_partition_key(&self, partition: &str) -> Result<(), StoreError> {
-        if let Some(keys) = &self.e2e {
-            keys.ensure_partition(&self.store, partition).await?;
+    /// Whether this stream seals segments under an E2E partition DEK.
+    pub fn is_e2e(&self) -> bool {
+        self.e2e.is_some()
+    }
+
+    /// Encode a plaintext segment body to its at-rest / on-wire form:
+    /// zstd, then (E2E) AEAD-seal under the partition DEK with the S3
+    /// object path as AAD. [`put_segment`] and the gossip fast path share
+    /// this, so a pushed E2E segment is byte-identical to what a peer would
+    /// GET from S3 — and topic membership alone (the `gossip_secret` in
+    /// `meta.json`) cannot read it without the passphrase-derived DEK.
+    pub fn seal_segment(&self, seq: u64, payload: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let key = layout::log_segment(&self.partition, seq);
+        let compressed = zstd::encode_all(payload, ZSTD_LEVEL)?;
+        match &self.e2e {
+            Some(keys) => Ok(encrypt_object(
+                &keys.dek(&self.partition),
+                key.as_ref().as_bytes(),
+                &compressed,
+            )?),
+            None => Ok(compressed),
         }
-        Ok(())
+    }
+
+    /// Inverse of [`seal_segment`]: (E2E) AEAD-open under the partition
+    /// DEK, then zstd-decompress. The caller must already hold the
+    /// partition key; a missing DEK surfaces as an error so a gossip
+    /// receiver can fall back to the ordinary S3 tailer (which refreshes
+    /// the key first).
+    pub fn open_segment(&self, seq: u64, body: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let compressed = match &self.e2e {
+            Some(keys) => decrypt_object(
+                &keys.dek(&self.partition),
+                layout::log_segment(&self.partition, seq)
+                    .as_ref()
+                    .as_bytes(),
+                body,
+            )?,
+            None => body.to_vec(),
+        };
+        Ok(zstd::decode_all(&compressed[..])?)
     }
 
     /// CAS-create segment `seq`. `AlreadyExists` when the sequence was
     /// already written (crash replay or a second writer).
     pub async fn put_segment(&self, seq: u64, payload: &[u8]) -> Result<(), StoreError> {
         let key = layout::log_segment(&self.partition, seq);
-        let compressed = zstd::encode_all(payload, ZSTD_LEVEL)?;
-        let body = match &self.e2e {
-            Some(keys) => encrypt_object(
-                &keys.dek(&self.partition)?,
-                key.as_ref().as_bytes(),
-                &compressed,
-            )?,
-            None => compressed,
-        };
+        let body = self.seal_segment(seq, payload)?;
         match self
             .store
             .put_opts(
@@ -137,20 +163,7 @@ impl LogStore {
             .get(&layout::log_segment(&self.partition, seq))
             .await?;
         let body = res.bytes().await?;
-        let compressed = match &self.e2e {
-            Some(keys) => {
-                keys.refresh_partition(&self.store, &self.partition).await?;
-                decrypt_object(
-                    &keys.dek(&self.partition)?,
-                    layout::log_segment(&self.partition, seq)
-                        .as_ref()
-                        .as_bytes(),
-                    &body,
-                )?
-            }
-            None => body.to_vec(),
-        };
-        Ok(zstd::decode_all(&compressed[..])?)
+        self.open_segment(seq, &body)
     }
 
     /// All segment sequence numbers, ascending.
@@ -216,7 +229,7 @@ impl LogStore {
         let compressed = zstd::encode_all(snapshot, ZSTD_LEVEL)?;
         let body = match &self.e2e {
             Some(keys) => {
-                encrypt_object(&keys.dek(PARTITION)?, key.as_ref().as_bytes(), &compressed)?
+                encrypt_object(&keys.dek(PARTITION), key.as_ref().as_bytes(), &compressed)?
             }
             None => compressed,
         };
@@ -245,7 +258,7 @@ impl LogStore {
         let body = res.bytes().await?;
         let compressed = match &self.e2e {
             Some(keys) => decrypt_object(
-                &keys.dek(PARTITION)?,
+                &keys.dek(PARTITION),
                 layout::checkpoint(PARTITION, r.seq).as_ref().as_bytes(),
                 &body,
             )?,
@@ -328,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn e2e_segments_and_checkpoints_are_ciphertext() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let keys = crate::e2e::put_keyring(&store, "test-pass").await.unwrap();
+        let keys = Arc::new(crate::e2e::E2eKeys::generate());
         let logs = LogStore::new_e2e(store.clone(), keys);
         logs.put_segment(1, b"secret filename").await.unwrap();
         logs.put_checkpoint(1, b"checkpoint filename")
@@ -349,5 +362,45 @@ mod tests {
         assert!(!raw_log
             .windows(b"secret filename".len())
             .any(|window| window == b"secret filename"));
+    }
+
+    #[tokio::test]
+    async fn e2e_sealed_push_matches_s3_and_hides_plaintext() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let keys = Arc::new(crate::e2e::E2eKeys::generate());
+        let logs = LogStore::new_e2e(store.clone(), keys);
+        let plaintext = b"secret filename in a gossip push";
+        logs.put_segment(1, plaintext).await.unwrap();
+
+        // The gossip fast path pushes the segment sealed under the same DEK
+        // and AAD as the S3 object (a fresh AEAD nonce makes the bytes
+        // differ, but both open with the partition key), so a topic member
+        // without the DEK sees only ciphertext.
+        let sealed = logs.seal_segment(1, plaintext).unwrap();
+        assert!(!sealed
+            .windows(plaintext.len())
+            .any(|w| w == plaintext.as_slice()));
+
+        // A holder of the DEK opens the push — and the S3 object — back to
+        // plaintext.
+        assert_eq!(logs.open_segment(1, &sealed).unwrap(), plaintext);
+        assert_eq!(logs.get_segment(1).await.unwrap(), plaintext);
+
+        // A member of the topic without the passphrase (no partition DEK)
+        // cannot open the pushed body.
+        let other_keys = Arc::new(crate::e2e::E2eKeys::generate());
+        let outsider = LogStore::new_e2e(store.clone(), other_keys);
+        assert!(outsider.open_segment(1, &sealed).is_err());
+    }
+
+    #[tokio::test]
+    async fn non_e2e_push_is_plaintext_encoded() {
+        // Non-E2E behaviour is unchanged: no sealing, plain zstd only, and
+        // the sealed form round-trips through open.
+        let s = ls();
+        let payload = b"plain segment";
+        let sealed = s.seal_segment(1, payload).unwrap();
+        assert_eq!(s.open_segment(1, &sealed).unwrap(), payload);
+        assert!(!s.is_e2e());
     }
 }

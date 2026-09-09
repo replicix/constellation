@@ -263,6 +263,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: e2e_two_nodes,
     },
     Scenario {
+        name: "passwd-live-cluster",
+        desc: "fs passwd on a live E2E cluster: both nodes keep converging (incl. across a split) with no remount",
+        requires: &[],
+        run: passwd_live_cluster,
+    },
+    Scenario {
         name: "fresh-node-bootstrap",
         desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
         requires: &[],
@@ -600,6 +606,104 @@ fn e2e_two_nodes(_seed: u64) -> Result<()> {
         "E2E cold reader did not use its encrypted peer path: {status}"
     );
     proxy.heal()?;
+    a.unmount()?;
+    b.unmount()
+}
+
+/// `fs passwd` must be a live operation: with two E2E nodes mounted,
+/// changing the passphrase rewraps only the master key, so both keep
+/// deriving the same DEKs and gossip seed and keep converging — including
+/// across a partition split, whose new DEK is derived (never a keyring
+/// write) — with no remount. Afterwards a fresh mount needs the new
+/// passphrase and the old one is refused.
+fn passwd_live_cluster(seed: u64) -> Result<()> {
+    let (env, root) = setup("passwd-live-cluster")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("passwd-live-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    // `with_e2e` sets this passphrase; `passwd` rotates it.
+    let old = "harness-correct-passphrase";
+    let new = "harness-rotated-passphrase";
+
+    // Autosplit on with a low threshold so a hot directory carves out a
+    // second partition — exercising the derived-DEK-on-split path.
+    let mk = |name: &str| -> Result<Client> {
+        Ok(coop_client(root.path(), name, &env.endpoint, &backend)?
+            .with_e2e()
+            .with_env("CONSTELLATION_PART_AUTOSPLIT", "on")
+            .with_env("CONSTELLATION_PART_SPLIT_OPS", "25"))
+    };
+    let mut a = mk("passwd-a")?;
+    let mut b = mk("passwd-b")?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+
+    let marker = vec![b'Z'; 2 << 20];
+    std::fs::write(a.mnt.join("known-marker"), &marker)?;
+    std::fs::create_dir(a.mnt.join("hot"))?;
+    for i in 0..60 {
+        std::fs::write(a.mnt.join("hot").join(format!("f{i}")), format!("v{i}"))?;
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    eventually(
+        "pre-passwd split visible on B",
+        Duration::from_secs(40),
+        || {
+            let st = b.control_status()?;
+            let parts = st["partitions"].as_array().map(|p| p.len()).unwrap_or(0);
+            anyhow::ensure!(parts > 1, "hot dir never split into a 2nd partition: {st}");
+            anyhow::ensure!(
+                b.mnt.join("hot").join("f59").exists(),
+                "pre-passwd tail incomplete"
+            );
+            Ok(())
+        },
+    )?;
+
+    // Change the passphrase with BOTH nodes still mounted.
+    a.passwd(old, new)?;
+    anyhow::ensure!(
+        a.is_mounted() && b.is_mounted(),
+        "a node dropped during passwd"
+    );
+
+    // The live nodes must keep working with the keys they already hold:
+    // A writes new metadata (into the split partition and a fresh model
+    // dir), B tails and decrypts it. No remount anywhere.
+    let mut model = Model::default();
+    let mut workload = Workload::new(seed, "w");
+    std::fs::create_dir(a.mnt.join("model"))?;
+    workload.run_block(&a.mnt.join("model"), &mut model, 40)?;
+    for i in 60..90 {
+        std::fs::write(a.mnt.join("hot").join(format!("f{i}")), format!("v{i}"))?;
+    }
+    eventually(
+        "post-passwd convergence on B without remount",
+        Duration::from_secs(40),
+        || {
+            anyhow::ensure!(a.is_mounted() && b.is_mounted(), "a node was remounted");
+            anyhow::ensure!(
+                b.mnt.join("hot").join("f89").exists(),
+                "post-passwd tail incomplete"
+            );
+            model.verify(&b.mnt.join("model"))
+        },
+    )?;
+
+    // The passphrase really changed: the old one is refused, and a fresh
+    // cold mount with the new one reads the data.
+    a.assert_passphrase_rejected(old)?;
+    let mut cold = coop_client(root.path(), "passwd-cold", &env.endpoint, &backend)?
+        .with_e2e()
+        .with_env("CONSTELLATION_PASSPHRASE", new);
+    cold.mount()?;
+    anyhow::ensure!(
+        std::fs::read(cold.mnt.join("known-marker"))? == marker,
+        "cold mount with the new passphrase returned different bytes"
+    );
+    cold.unmount()?;
+
     a.unmount()?;
     b.unmount()
 }

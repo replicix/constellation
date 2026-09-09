@@ -24,9 +24,7 @@ pub use aws_auth::amazon_s3_builder;
 pub use codec::{Codec, CompressionSetting};
 pub use decode_gate::{DecodeGate, DecodeGatePermit, Priority as DecodePriority};
 pub use designation::{Designation, DesignationMode, DesignationStore, DesignationTag};
-pub use e2e::{
-    change_passphrase, load_keyring, put_keyring, Argon2Params, E2eKeys, Keyring, SharedE2eKeys,
-};
+pub use e2e::{create_keyring_block, unlock, Argon2Params, E2eKeys, KeyringBlock, SharedE2eKeys};
 pub use error::StoreError;
 pub use existence::{parse_chunk_key, scan_chunk_hashes, ChunkHashScan};
 pub use gc::{

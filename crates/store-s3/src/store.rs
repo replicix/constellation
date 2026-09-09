@@ -3,13 +3,13 @@
 
 use crate::codec::CompressionSetting;
 use crate::decode_gate::{DecodeGate, Priority as DecodePriority};
-use crate::e2e::{decrypt_object, encrypt_object, SharedE2eKeys};
+use crate::e2e::{decrypt_object, encrypt_object, KeyringBlock, SharedE2eKeys};
 use crate::error::StoreError;
 use crate::{format, layout};
 use constellation_fs_core::cache::SpillFile;
 use constellation_fs_core::{ChunkHash, DEFAULT_CHUNK_SIZE};
 use futures::StreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::sync::Arc;
@@ -34,6 +34,12 @@ pub struct FsMeta {
     /// connections are gated by the registry allowlist regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gossip_secret: Option<String>,
+    /// E2E secret block: the passphrase-wrapped master key. Present iff
+    /// `e2e`. All usable keys (addressing, per-partition DEKs, gossip
+    /// seed) are derived from the master, so this is the only secret
+    /// material stored, and `fs passwd` rewrites only this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyring: Option<KeyringBlock>,
     /// Optional creation-time logical byte cap. Seeded into the replicated
     /// journal on first mount; live changes do not rewrite `meta.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,8 +59,19 @@ impl FsMeta {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             gossip_secret: Some(random_hex32()),
+            keyring: None,
             max_logical_bytes: None,
         }
+    }
+
+    /// Unwrap the E2E keys from this filesystem's keyring block with the
+    /// passphrase. Errors if the filesystem is E2E but has no block.
+    pub fn unlock(&self, passphrase: &str) -> Result<SharedE2eKeys, StoreError> {
+        let block = self
+            .keyring
+            .as_ref()
+            .ok_or_else(|| StoreError::Meta("E2E filesystem has no keyring block".into()))?;
+        crate::e2e::unlock(block, passphrase)
     }
 
     /// The gossip topic seed, if this filesystem has one.
@@ -207,14 +224,14 @@ impl ChunkStore {
     /// plaintext on the application stream.
     pub fn protect_peer_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<Vec<u8>, StoreError> {
         match &self.e2e {
-            Some(keys) => encrypt_object(&keys.dek("p0")?, &hash.0, data),
+            Some(keys) => encrypt_object(&keys.dek("p0"), &hash.0, data),
             None => Ok(data.to_vec()),
         }
     }
 
     pub fn open_peer_chunk(&self, hash: &ChunkHash, data: &[u8]) -> Result<Vec<u8>, StoreError> {
         match &self.e2e {
-            Some(keys) => decrypt_object(&keys.dek("p0")?, &hash.0, data),
+            Some(keys) => decrypt_object(&keys.dek("p0"), &hash.0, data),
             None => Ok(data.to_vec()),
         }
     }
@@ -251,6 +268,37 @@ impl ChunkStore {
             )));
         }
         Ok(meta)
+    }
+
+    /// Change the E2E passphrase: rewrap the master key in `meta.json`
+    /// under a CAS update. Only the keyring block moves — the master key,
+    /// and therefore every derived key and the gossip topic, is unchanged,
+    /// so mounted nodes (which hold the master in memory) keep running
+    /// with no remount.
+    pub async fn change_passphrase(&self, old: &str, new: &str) -> Result<(), StoreError> {
+        let key = layout::meta_json();
+        let object = self.store.get(&key).await?;
+        let version = UpdateVersion {
+            e_tag: object.meta.e_tag.clone(),
+            version: object.meta.version.clone(),
+        };
+        let mut meta: FsMeta = serde_json::from_slice(&object.bytes().await?)?;
+        if !meta.e2e {
+            return Err(StoreError::Meta("filesystem is not in E2E mode".into()));
+        }
+        let block = meta
+            .keyring
+            .as_ref()
+            .ok_or_else(|| StoreError::Meta("E2E filesystem has no keyring block".into()))?;
+        meta.keyring = Some(crate::e2e::rewrap_master(block, old, new)?);
+        self.store
+            .put_opts(
+                &key,
+                PutPayload::from(serde_json::to_vec_pretty(&meta)?),
+                PutOptions::from(PutMode::Update(version)),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Store a chunk under its content address. Skips the upload when the
@@ -308,7 +356,7 @@ impl ChunkStore {
         let obj = Self::run_encoder(encode_permit, move || {
             let encoded = format::encode_object(&owned, setting)?;
             match e2e {
-                Some(keys) => encrypt_object(&keys.dek("p0")?, &aad, &encoded),
+                Some(keys) => encrypt_object(&keys.dek("p0"), &aad, &encoded),
                 None => Ok(encoded),
             }
         })
@@ -356,7 +404,7 @@ impl ChunkStore {
         let ttfb = started.elapsed();
         let obj = res.bytes().await?;
         let encoded = match &self.e2e {
-            Some(keys) => decrypt_object(&keys.dek("p0")?, &hash.0, &obj)?,
+            Some(keys) => decrypt_object(&keys.dek("p0"), &hash.0, &obj)?,
             None => obj.to_vec(),
         };
         let data = format::decode_object(&encoded)?;
@@ -465,7 +513,7 @@ impl ChunkStore {
 
         let permit = self.decode_gate.clone().acquire(priority).await;
         let mapping = unsafe { memmap2::Mmap::map(cipher_spill.as_file())? };
-        let dek = keys.dek("p0")?;
+        let dek = keys.dek("p0");
         let aad = hash.0;
         let encoded = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -730,9 +778,7 @@ mod tests {
     #[tokio::test]
     async fn e2e_chunk_streams_ciphertext_via_spill() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let keys = crate::e2e::put_keyring(&inner, "test-passphrase")
-            .await
-            .unwrap();
+        let keys = Arc::new(crate::e2e::E2eKeys::generate());
         let s = ChunkStore::new_e2e(inner, keys.clone());
         let data = vec![7u8; 100_000];
         let hash = s.hash(&data);

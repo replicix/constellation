@@ -47,6 +47,7 @@ Execution protocol:
 | 21 | `done/21-fs-registry-and-daemon.md` | done | named filesystems, shared mount daemon, local registry | 18 |
 | 22 | `done/22-prune-policies.md` | done | prune policies as xattr expressions, run by a singleton pruner | 20 (`age`/`keep` rules independent) |
 | 23 | `wip/23-remote-support-mode.md` | wip | compile-time-gated remote support mode: mount-armed `ro`/`rw` P2P sessions | 02 (independent of 19–22) |
+| 24 | `done/24-e2e-keyring-master-key.md` | done | single-file keyring: one wrapped master key in meta.json, all keys derived; live `fs passwd`, no keyring.json | 10 |
 
 "Committed in practice": the plan does not technically build on the
 intermediate milestones, but the protocol is strictly sequential, so

@@ -542,6 +542,21 @@ impl Shipper {
         if seq != self.parts[part].next_seq {
             return Ok(false);
         }
+        // E2E pushes carry the sealed segment (see `ship_segment`). Open it
+        // with the partition DEK. A missing key or any open failure falls
+        // back to the ordinary S3 tailer, which refreshes the key first.
+        let opened;
+        let payload = if self.parts[part].log.is_e2e() {
+            match self.parts[part].log.open_segment(seq, payload) {
+                Ok(p) => {
+                    opened = p;
+                    &opened[..]
+                }
+                Err(_) => return Ok(false),
+            }
+        } else {
+            payload
+        };
         let seg = decode(payload)?;
         if seg.epoch != advertised_epoch {
             bail!(
@@ -759,8 +774,21 @@ impl Shipper {
         // Push invalidation: tell peers the segment is durable so they
         // tail now rather than at their next poll. Best effort by
         // design — the poll is what guarantees they converge.
+        //
+        // In E2E mode the pushed body is the *sealed* segment (identical
+        // to the S3 object), not plaintext: the gossip topic is joinable
+        // by anyone who read `gossip_secret` from `meta.json`, so an
+        // unsealed push would leak filenames and structure to a bucket
+        // reader. A peer opens it with the passphrase-derived DEK; without
+        // the DEK it is as opaque as the S3 object. Encode failure just
+        // drops the hint (peers still converge via the S3 poll).
+        let pushed = if self.parts[part].log.is_e2e() {
+            self.parts[part].log.seal_segment(next_seq, &payload).ok()
+        } else {
+            Some(payload.clone())
+        };
         self.peers
-            .announce_segment(part, next_seq, epoch, Some(payload.clone()))
+            .announce_segment(part, next_seq, epoch, pushed)
             .await;
         // Offline designation flush-ack (DESIGN.md §5.2, phase 4a): if
         // any shipped record touches a path designated to a different
@@ -1252,10 +1280,9 @@ impl Shipper {
                 continue;
             }
             let new_part = self.meta.next_part_id()?;
-            self.log
-                .ensure_partition_key(&new_part)
-                .await
-                .context("creating partition encryption key")?;
+            // No key coordination on split: an E2E DEK is derived from the
+            // master key (`E2eKeys::dek`), so every node computes the new
+            // partition's key locally with no keyring write.
             let rec = LogRecord::PartSplit {
                 part: parent_part.clone(),
                 at_ino: ino,

@@ -1,38 +1,50 @@
 //! End-to-end key management and authenticated encryption.
 //!
-//! The keyring is the only bucket object protected by the passphrase.  A
-//! memory-hard Argon2id derivation produces a wrapping key; changing the
-//! passphrase therefore rewrites only this small object and never changes
-//! chunk identities or data-encryption keys.  User-content objects use a
-//! separate per-partition DEK.  Registry, lease, designation, heartbeat,
-//! and pointer objects intentionally remain plaintext because they carry
-//! coordination data rather than filenames or file contents.
+//! An E2E filesystem stores exactly one secret on S3: a random 32-byte
+//! **master key (KMK)**, wrapped under a memory-hard Argon2id key derived
+//! from the passphrase and kept inside `meta.json` (there is no separate
+//! keyring object). Every other key is *derived* from the KMK, never
+//! stored:
+//!
+//! * the **addressing key** (keyed chunk-hash identity, DESIGN §8),
+//! * a **per-partition DEK** for log/chunk encryption, and
+//! * the **gossip topic seed** for the P2P fast path.
+//!
+//! Two consequences follow. Changing the passphrase rewraps only the KMK
+//! envelope — chunk identities, DEKs, and the gossip topic are unchanged,
+//! so `fs passwd` never rotates data keys and never forces a remount. And
+//! a partition split needs no key persistence at all: any node holding
+//! the KMK derives the new partition's DEK locally. Registry, lease,
+//! designation, heartbeat, and pointer objects intentionally remain
+//! plaintext because they carry coordination data, not filenames or file
+//! contents.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     aead::{Aead, Payload},
     KeyInit, XChaCha20Poly1305, XNonce,
 };
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, RwLock},
-};
+use std::sync::Arc;
 use zeroize::Zeroize;
 
 use crate::error::StoreError;
 
-const KEYRING_KEY: &str = "keys/keyring.json";
-const KEYRING_VERSION: u8 = 1;
 const ENVELOPE_VERSION: u8 = 1;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const KEY_LEN: usize = 32;
 
+/// Application-scoped prefix on every derivation message, so a KMK reused
+/// (by mistake) in another context cannot produce the same subkeys.
+const KDF_DOMAIN: &[u8] = b"constellation/e2e/v1/";
+const PURPOSE_ADDRESSING: u8 = 0x01;
+const PURPOSE_GOSSIP: u8 = 0x02;
+const PURPOSE_DEK: u8 = 0x03;
+
 /// OWASP's memory-constrained Argon2id profile: 19 MiB, two iterations,
 /// one lane. Parameters are persisted so stronger future defaults do not
-/// make existing keyrings unreadable.
+/// make existing filesystems unreadable.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Argon2Params {
     pub m_cost_kib: u32,
@@ -50,71 +62,85 @@ impl Default for Argon2Params {
     }
 }
 
+/// The E2E secret block embedded in `meta.json` (present iff `e2e`). It
+/// holds only the wrapped master key and the parameters needed to unwrap
+/// it; every usable key is derived from the KMK at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WrappedKeys {
-    pub addressing_key: String,
-    pub deks: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Keyring {
-    pub v: u8,
+pub struct KeyringBlock {
     pub argon2_params: Argon2Params,
     pub salt: String,
-    pub wrapped: WrappedKeys,
+    /// KMK sealed with XChaCha20-Poly1305 under the Argon2id KEK, AAD
+    /// `b"keyring-master"`. Hex.
+    pub wrapped_master: String,
 }
 
-/// Unwrapped filesystem secrets.  The allocation is page-locked on a
+/// A key's purpose, for domain-separated derivation from the KMK.
+#[derive(Debug, Clone, Copy)]
+pub enum KeyPurpose<'a> {
+    Addressing,
+    Gossip,
+    Dek(&'a str),
+}
+
+/// Derive a subkey from the master key. Domain separation is collision-free
+/// by construction: every message is `KDF_DOMAIN` then a one-byte purpose
+/// tag, and only a DEK appends further bytes (the partition name). The
+/// fixed purposes therefore produce length-`|domain|+1` messages with
+/// distinct tags, and a DEK message carries the distinct `PURPOSE_DEK` tag
+/// followed by the name — so no partition name can make a DEK message equal
+/// a fixed-purpose message, and the name→DEK map is injective.
+fn derive_from_master(master: &[u8; KEY_LEN], purpose: KeyPurpose) -> [u8; KEY_LEN] {
+    let mut msg = Vec::with_capacity(KDF_DOMAIN.len() + 1);
+    msg.extend_from_slice(KDF_DOMAIN);
+    match purpose {
+        KeyPurpose::Addressing => msg.push(PURPOSE_ADDRESSING),
+        KeyPurpose::Gossip => msg.push(PURPOSE_GOSSIP),
+        KeyPurpose::Dek(partition) => {
+            msg.push(PURPOSE_DEK);
+            msg.extend_from_slice(partition.as_bytes());
+        }
+    }
+    let out = *blake3::keyed_hash(master, &msg).as_bytes();
+    msg.zeroize();
+    out
+}
+
+/// Unwrapped filesystem secrets. The allocations are page-locked on a
 /// best-effort basis. Containers and unprivileged hosts often have a small
 /// RLIMIT_MEMLOCK; failure is observable but does not make a filesystem
-/// unavailable.
+/// unavailable. The hot, fixed subkeys (addressing key, gossip seed) are
+/// precomputed; per-partition DEKs are derived on demand (a keyed BLAKE3
+/// hash, sub-microsecond).
 pub struct E2eKeys {
+    master_key: Box<[u8; KEY_LEN]>,
     addressing_key: Box<[u8; KEY_LEN]>,
-    deks: RwLock<BTreeMap<String, Box<[u8; KEY_LEN]>>>,
-    wrapping_key: Box<[u8; KEY_LEN]>,
-    salt: [u8; SALT_LEN],
-    params: Argon2Params,
+    gossip_secret: Box<[u8; KEY_LEN]>,
     locked: bool,
 }
 
 impl std::fmt::Debug for E2eKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("E2eKeys")
-            .field(
-                "partitions",
-                &self.deks.read().unwrap().keys().collect::<Vec<_>>(),
-            )
             .field("locked", &self.locked)
             .finish_non_exhaustive()
     }
 }
 
 impl E2eKeys {
+    /// A fresh filesystem's keys, from a random master. Used by `fs
+    /// create` and tests; the master is wrapped separately (see
+    /// [`create_keyring_block`]).
     pub fn generate() -> Self {
-        let mut deks = BTreeMap::new();
-        deks.insert("p0".into(), Box::new(rand::random()));
-        Self::new(
-            Box::new(rand::random()),
-            deks,
-            Box::new([0; KEY_LEN]),
-            [0; SALT_LEN],
-            Argon2Params::default(),
-        )
+        Self::from_master(Box::new(rand::random()))
     }
 
-    fn new(
-        addressing_key: Box<[u8; KEY_LEN]>,
-        deks: BTreeMap<String, Box<[u8; KEY_LEN]>>,
-        wrapping_key: Box<[u8; KEY_LEN]>,
-        salt: [u8; SALT_LEN],
-        params: Argon2Params,
-    ) -> Self {
+    fn from_master(master_key: Box<[u8; KEY_LEN]>) -> Self {
+        let addressing_key = Box::new(derive_from_master(&master_key, KeyPurpose::Addressing));
+        let gossip_secret = Box::new(derive_from_master(&master_key, KeyPurpose::Gossip));
         let mut keys = Self {
+            master_key,
             addressing_key,
-            deks: RwLock::new(deks),
-            wrapping_key,
-            salt,
-            params,
+            gossip_secret,
             locked: false,
         };
         keys.locked = keys.try_lock();
@@ -127,204 +153,108 @@ impl E2eKeys {
     }
 
     fn try_lock(&self) -> bool {
-        let addressing = region::lock(self.addressing_key.as_ptr(), self.addressing_key.len());
-        if addressing.is_err() {
-            return false;
-        }
-        if region::lock(self.wrapping_key.as_ptr(), self.wrapping_key.len()).is_err() {
-            return false;
-        }
-        for dek in self.deks.read().unwrap().values() {
-            if region::lock(dek.as_ptr(), dek.len()).is_err() {
-                return false;
-            }
-        }
-        true
+        region::lock(self.master_key.as_ptr(), self.master_key.len()).is_ok()
+            && region::lock(self.addressing_key.as_ptr(), self.addressing_key.len()).is_ok()
+            && region::lock(self.gossip_secret.as_ptr(), self.gossip_secret.len()).is_ok()
     }
 
     pub fn addressing_key(&self) -> &[u8; KEY_LEN] {
         &self.addressing_key
     }
 
-    pub fn dek(&self, partition: &str) -> Result<[u8; KEY_LEN], StoreError> {
-        self.deks
-            .read()
-            .unwrap()
-            .get(partition)
-            .map(|key| **key)
-            .ok_or_else(|| StoreError::Meta(format!("keyring has no DEK for {partition}")))
+    /// The P2P gossip topic seed for this filesystem. Derived from the
+    /// KMK, so only a passphrase holder can compute it and join the topic.
+    pub fn gossip_secret(&self) -> &[u8; KEY_LEN] {
+        &self.gossip_secret
     }
 
-    fn insert_partition(&self, partition: &str, key: [u8; KEY_LEN]) -> bool {
-        let mut deks = self.deks.write().unwrap();
-        if deks.contains_key(partition) {
-            return false;
-        }
-        let boxed = Box::new(key);
-        if region::lock(boxed.as_ptr(), boxed.len()).is_err() {
-            tracing::warn!(partition, "could not mlock new partition DEK");
-        }
-        deks.insert(partition.to_string(), boxed);
-        true
+    /// The data-encryption key for `partition`. Derived, never stored, so
+    /// it is always available with no keyring read — a partition split
+    /// needs no key coordination.
+    pub fn dek(&self, partition: &str) -> [u8; KEY_LEN] {
+        derive_from_master(&self.master_key, KeyPurpose::Dek(partition))
     }
 
     pub fn hash(&self, plaintext: &[u8]) -> constellation_fs_core::ChunkHash {
         constellation_fs_core::ChunkHash::keyed(self.addressing_key(), plaintext)
-    }
-
-    /// Create and persist a random DEK before a new partition becomes
-    /// writable. Partition creation is lease-serialized; rewriting the small
-    /// keyring first makes a crash leave an unused key, never an unreadable
-    /// log stream.
-    pub async fn ensure_partition(
-        &self,
-        store: &Arc<dyn ObjectStore>,
-        partition: &str,
-    ) -> Result<(), StoreError> {
-        if !self.insert_partition(partition, rand::random()) {
-            return Ok(());
-        }
-        let path = object_store::path::Path::from(KEYRING_KEY);
-        loop {
-            let object = store.get(&path).await?;
-            let version = UpdateVersion {
-                e_tag: object.meta.e_tag.clone(),
-                version: object.meta.version.clone(),
-            };
-            let remote: Keyring = serde_json::from_slice(&object.bytes().await?)?;
-            for (remote_partition, wrapped) in remote.wrapped.deks {
-                if self.deks.read().unwrap().contains_key(&remote_partition) {
-                    continue;
-                }
-                let key = decrypt_envelope(
-                    &self.wrapping_key,
-                    remote_partition.as_bytes(),
-                    &unhex(&wrapped)?,
-                )?;
-                self.insert_partition(&remote_partition, array32(&key)?);
-            }
-            let ring = wrap_with_key(self, &self.wrapping_key, self.salt, self.params)?;
-            let options = PutOptions::from(PutMode::Update(version));
-            match store
-                .put_opts(
-                    &path,
-                    PutPayload::from(serde_json::to_vec_pretty(&ring)?),
-                    options,
-                )
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(object_store::Error::Precondition { .. }) => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-
-    /// Refresh one DEK added by another node's partition split. The retained
-    /// wrapping key decrypts the updated keyring without retaining the user's
-    /// passphrase.
-    pub async fn refresh_partition(
-        &self,
-        store: &Arc<dyn ObjectStore>,
-        partition: &str,
-    ) -> Result<(), StoreError> {
-        if self.deks.read().unwrap().contains_key(partition) {
-            return Ok(());
-        }
-        let object = store
-            .get(&object_store::path::Path::from(KEYRING_KEY))
-            .await?;
-        let ring: Keyring = serde_json::from_slice(&object.bytes().await?)?;
-        let wrapped = ring
-            .wrapped
-            .deks
-            .get(partition)
-            .ok_or_else(|| StoreError::Meta(format!("keyring has no DEK for {partition}")))?;
-        let key = decrypt_envelope(&self.wrapping_key, partition.as_bytes(), &unhex(wrapped)?)?;
-        self.insert_partition(partition, array32(&key)?);
-        Ok(())
     }
 }
 
 impl Drop for E2eKeys {
     fn drop(&mut self) {
         if self.locked {
+            let _ = unsafe { region::unlock(self.master_key.as_ptr(), self.master_key.len()) };
             let _ =
                 unsafe { region::unlock(self.addressing_key.as_ptr(), self.addressing_key.len()) };
-            let _ = unsafe { region::unlock(self.wrapping_key.as_ptr(), self.wrapping_key.len()) };
-            for dek in self.deks.get_mut().unwrap().values() {
-                let _ = unsafe { region::unlock(dek.as_ptr(), dek.len()) };
-            }
+            let _ =
+                unsafe { region::unlock(self.gossip_secret.as_ptr(), self.gossip_secret.len()) };
         }
+        self.master_key.zeroize();
         self.addressing_key.zeroize();
-        self.wrapping_key.zeroize();
-        for dek in self.deks.get_mut().unwrap().values_mut() {
-            dek.zeroize();
-        }
+        self.gossip_secret.zeroize();
     }
 }
 
 pub type SharedE2eKeys = Arc<E2eKeys>;
 
-pub async fn put_keyring(
-    store: &Arc<dyn ObjectStore>,
-    passphrase: &str,
-) -> Result<SharedE2eKeys, StoreError> {
-    let params = Argon2Params::default();
-    let salt: [u8; SALT_LEN] = rand::random();
-    let wrapping_key = derive_key(passphrase, &salt, params)?;
-    let mut deks = BTreeMap::new();
-    deks.insert("p0".into(), Box::new(rand::random()));
-    let keys = E2eKeys::new(
-        Box::new(rand::random()),
-        deks,
-        Box::new(wrapping_key),
-        salt,
-        params,
-    );
-    let ring = wrap_with_key(&keys, &wrapping_key, salt, params)?;
-    store
-        .put(
-            &object_store::path::Path::from(KEYRING_KEY),
-            PutPayload::from(serde_json::to_vec_pretty(&ring)?),
-        )
-        .await?;
+/// Mint a fresh master key and return the block to embed in `meta.json`.
+/// The KMK is wrapped under the passphrase and then dropped — the caller
+/// (mount) re-derives the live keys with [`unlock`].
+pub fn create_keyring_block(passphrase: &str) -> Result<KeyringBlock, StoreError> {
+    let mut master: [u8; KEY_LEN] = rand::random();
+    let block = seal_master(&master, passphrase, Argon2Params::default());
+    master.zeroize();
+    block
+}
+
+/// Unwrap the master key from a `meta.json` keyring block and derive the
+/// live keys. No S3 access — the block is already in the loaded meta.
+pub fn unlock(block: &KeyringBlock, passphrase: &str) -> Result<SharedE2eKeys, StoreError> {
+    let mut master = open_master(block, passphrase)?;
+    let keys = E2eKeys::from_master(Box::new(master));
+    master.zeroize();
     Ok(Arc::new(keys))
 }
 
-pub async fn load_keyring(
-    store: &Arc<dyn ObjectStore>,
-    passphrase: &str,
-) -> Result<SharedE2eKeys, StoreError> {
-    let object = store
-        .get(&object_store::path::Path::from(KEYRING_KEY))
-        .await?;
-    let ring: Keyring = serde_json::from_slice(&object.bytes().await?)?;
-    Ok(Arc::new(unwrap(&ring, passphrase)?))
-}
-
-pub async fn change_passphrase(
-    store: &Arc<dyn ObjectStore>,
+/// Rewrap the master under a new passphrase, preserving its value. Every
+/// derived key (addressing, DEKs, gossip seed) is therefore unchanged;
+/// only the KEK envelope moves. The caller CAS-writes the returned block
+/// into `meta.json`.
+pub fn rewrap_master(
+    block: &KeyringBlock,
     old: &str,
     new: &str,
-) -> Result<(), StoreError> {
-    let path = object_store::path::Path::from(KEYRING_KEY);
-    let object = store.get(&path).await?;
-    let version = UpdateVersion {
-        e_tag: object.meta.e_tag.clone(),
-        version: object.meta.version.clone(),
-    };
-    let old_ring: Keyring = serde_json::from_slice(&object.bytes().await?)?;
-    let keys = unwrap(&old_ring, old)?;
-    let ring = wrap(&keys, new, Argon2Params::default())?;
-    store
-        .put_opts(
-            &path,
-            PutPayload::from(serde_json::to_vec_pretty(&ring)?),
-            PutOptions::from(PutMode::Update(version)),
-        )
-        .await?;
-    Ok(())
+) -> Result<KeyringBlock, StoreError> {
+    let mut master = open_master(block, old)?;
+    let out = seal_master(&master, new, Argon2Params::default());
+    master.zeroize();
+    out
+}
+
+fn seal_master(
+    master: &[u8; KEY_LEN],
+    passphrase: &str,
+    params: Argon2Params,
+) -> Result<KeyringBlock, StoreError> {
+    let salt: [u8; SALT_LEN] = rand::random();
+    let mut kek = derive_key(passphrase, &salt, params)?;
+    let wrapped = encrypt_envelope(&kek, b"keyring-master", master);
+    kek.zeroize();
+    Ok(KeyringBlock {
+        argon2_params: params,
+        salt: hex(&salt),
+        wrapped_master: hex(&wrapped?),
+    })
+}
+
+fn open_master(block: &KeyringBlock, passphrase: &str) -> Result<[u8; KEY_LEN], StoreError> {
+    let salt: [u8; SALT_LEN] = unhex(&block.salt)?
+        .try_into()
+        .map_err(|_| StoreError::CorruptObject("keyring salt has wrong length".into()))?;
+    let mut kek = derive_key(passphrase, &salt, block.argon2_params)?;
+    let opened = decrypt_envelope(&kek, b"keyring-master", &unhex(&block.wrapped_master)?);
+    kek.zeroize();
+    array32(&opened?)
 }
 
 fn derive_key(
@@ -345,72 +275,6 @@ fn derive_key(
         .hash_password_into(passphrase.as_bytes(), salt, &mut key)
         .map_err(|error| StoreError::Meta(format!("Argon2 key derivation failed: {error}")))?;
     Ok(key)
-}
-
-fn wrap(keys: &E2eKeys, passphrase: &str, params: Argon2Params) -> Result<Keyring, StoreError> {
-    let salt: [u8; SALT_LEN] = rand::random();
-    let mut kek = derive_key(passphrase, &salt, params)?;
-    let ring = wrap_with_key(keys, &kek, salt, params)?;
-    kek.zeroize();
-    Ok(ring)
-}
-
-fn wrap_with_key(
-    keys: &E2eKeys,
-    kek: &[u8; KEY_LEN],
-    salt: [u8; SALT_LEN],
-    params: Argon2Params,
-) -> Result<Keyring, StoreError> {
-    let addressing_key = encrypt_envelope(kek, b"addressing-key", keys.addressing_key())?;
-    let mut deks = BTreeMap::new();
-    for (partition, dek) in keys.deks.read().unwrap().iter() {
-        deks.insert(
-            partition.clone(),
-            encrypt_envelope(kek, partition.as_bytes(), dek.as_ref())?,
-        );
-    }
-    Ok(Keyring {
-        v: KEYRING_VERSION,
-        argon2_params: params,
-        salt: hex(&salt),
-        wrapped: WrappedKeys {
-            addressing_key: hex(&addressing_key),
-            deks: deks
-                .into_iter()
-                .map(|(partition, bytes)| (partition, hex(&bytes)))
-                .collect(),
-        },
-    })
-}
-
-fn unwrap(ring: &Keyring, passphrase: &str) -> Result<E2eKeys, StoreError> {
-    if ring.v != KEYRING_VERSION {
-        return Err(StoreError::Meta(format!(
-            "unsupported keyring version {}",
-            ring.v
-        )));
-    }
-    let salt: [u8; SALT_LEN] = unhex(&ring.salt)?
-        .try_into()
-        .map_err(|_| StoreError::CorruptObject("keyring salt has wrong length".into()))?;
-    let kek = derive_key(passphrase, &salt, ring.argon2_params)?;
-    let addressing = decrypt_envelope(
-        &kek,
-        b"addressing-key",
-        &unhex(&ring.wrapped.addressing_key)?,
-    )?;
-    let mut deks = BTreeMap::new();
-    for (partition, wrapped) in &ring.wrapped.deks {
-        let key = decrypt_envelope(&kek, partition.as_bytes(), &unhex(wrapped)?)?;
-        deks.insert(partition.clone(), Box::new(array32(&key)?));
-    }
-    Ok(E2eKeys::new(
-        Box::new(array32(&addressing)?),
-        deks,
-        Box::new(kek),
-        salt,
-        ring.argon2_params,
-    ))
 }
 
 /// Encrypt an already-compressed object. The version and random nonce make
@@ -511,16 +375,104 @@ fn unhex(value: &str) -> Result<Vec<u8>, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::memory::InMemory;
 
     #[test]
-    fn keyring_roundtrip_and_wrong_passphrase() {
-        let keys = E2eKeys::generate();
-        let ring = wrap(&keys, "correct horse", Argon2Params::default()).unwrap();
-        let opened = unwrap(&ring, "correct horse").unwrap();
-        assert_eq!(opened.addressing_key(), keys.addressing_key());
-        assert_eq!(opened.dek("p0").unwrap(), keys.dek("p0").unwrap());
-        assert!(unwrap(&ring, "wrong battery").is_err());
+    fn derivation_is_deterministic_and_key_specific() {
+        let k = E2eKeys::generate();
+        // Deterministic per master.
+        assert_eq!(k.dek("p0"), k.dek("p0"));
+        // Purposes are distinct from one another.
+        assert_ne!(k.addressing_key().as_slice(), k.gossip_secret().as_slice());
+        assert_ne!(k.addressing_key().as_slice(), k.dek("p0").as_slice());
+        assert_ne!(k.gossip_secret().as_slice(), k.dek("p0").as_slice());
+        // A different master changes every derived key.
+        let other = E2eKeys::generate();
+        assert_ne!(k.addressing_key(), other.addressing_key());
+        assert_ne!(k.gossip_secret(), other.gossip_secret());
+        assert_ne!(k.dek("p0"), other.dek("p0"));
+    }
+
+    /// The one new failure mode option A introduces: a partition name that
+    /// collides with a fixed purpose or another partition. Guard it by
+    /// construction and here.
+    #[test]
+    fn key_purposes_never_collide() {
+        let k = E2eKeys::generate();
+        let names: Vec<String> = vec![
+            "".into(),
+            "p0".into(),
+            "p1".into(),
+            "addressing".into(),
+            "gossip".into(),
+            "dek".into(),
+            "dek:p0".into(),
+            "\u{1}".into(), // a raw tag byte as a name
+            "\u{2}".into(),
+            "\u{3}".into(),
+            "a/b".into(),
+            "p".repeat(300),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(*k.addressing_key()));
+        assert!(seen.insert(*k.gossip_secret()));
+        for name in &names {
+            assert!(
+                seen.insert(k.dek(name)),
+                "derived-key collision for partition {name:?}"
+            );
+        }
+        assert_ne!(k.dek("p1"), k.dek("p2"));
+    }
+
+    #[test]
+    fn unlock_roundtrip_and_wrong_passphrase() {
+        let block = create_keyring_block("correct horse").unwrap();
+        let a = unlock(&block, "correct horse").unwrap();
+        let b = unlock(&block, "correct horse").unwrap();
+        assert_eq!(a.addressing_key(), b.addressing_key());
+        assert_eq!(a.dek("p0"), b.dek("p0"));
+        assert_eq!(a.gossip_secret(), b.gossip_secret());
+        assert!(unlock(&block, "wrong battery").is_err());
+    }
+
+    /// The headline property: a passphrase change is a pure envelope
+    /// rewrap. A key handle unwrapped *before* the change keeps deriving
+    /// identical DEKs — including for partitions that do not exist yet —
+    /// so a live node needs no remount.
+    #[test]
+    fn passwd_rewraps_master_keeping_all_derived_keys() {
+        let block = create_keyring_block("old-pass").unwrap();
+        let before = unlock(&block, "old-pass").unwrap();
+
+        let new_block = rewrap_master(&block, "old-pass", "new-pass").unwrap();
+        assert!(unlock(&new_block, "old-pass").is_err());
+        let after = unlock(&new_block, "new-pass").unwrap();
+
+        assert_eq!(after.addressing_key(), before.addressing_key());
+        assert_eq!(after.gossip_secret(), before.gossip_secret());
+        assert_eq!(after.dek("p0"), before.dek("p0"));
+        // A partition that did not exist when the passphrase changed.
+        assert_eq!(
+            after.dek("part-created-later"),
+            before.dek("part-created-later")
+        );
+    }
+
+    #[test]
+    fn keyring_block_hides_secrets() {
+        let block = create_keyring_block("pass").unwrap();
+        let keys = unlock(&block, "pass").unwrap();
+        let json = serde_json::to_vec(&block).unwrap();
+        for secret in [
+            keys.addressing_key().as_slice(),
+            keys.gossip_secret().as_slice(),
+            keys.dek("p0").as_slice(),
+        ] {
+            assert!(
+                !json.windows(secret.len()).any(|w| w == secret),
+                "a raw secret leaked into the keyring block"
+            );
+        }
     }
 
     #[test]
@@ -535,47 +487,5 @@ mod tests {
         assert!(!ciphertext
             .windows(b"compressed bytes".len())
             .any(|window| window == b"compressed bytes"));
-    }
-
-    #[tokio::test]
-    async fn partition_split_persists_a_fresh_dek() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let keys = put_keyring(&store, "passphrase").await.unwrap();
-        keys.ensure_partition(&store, "p7").await.unwrap();
-        let reopened = load_keyring(&store, "passphrase").await.unwrap();
-        assert_eq!(reopened.dek("p7").unwrap(), keys.dek("p7").unwrap());
-        assert_ne!(reopened.dek("p7").unwrap(), reopened.dek("p0").unwrap());
-    }
-
-    #[tokio::test]
-    async fn passphrase_change_rewraps_without_rotating_data_keys() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let before = put_keyring(&store, "old-pass").await.unwrap();
-        let address = *before.addressing_key();
-        let dek = before.dek("p0").unwrap();
-        change_passphrase(&store, "old-pass", "new-pass")
-            .await
-            .unwrap();
-        assert!(load_keyring(&store, "old-pass").await.is_err());
-        let after = load_keyring(&store, "new-pass").await.unwrap();
-        assert_eq!(*after.addressing_key(), address);
-        assert_eq!(after.dek("p0").unwrap(), dek);
-    }
-
-    #[tokio::test]
-    async fn concurrent_partition_additions_merge_through_cas() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        put_keyring(&store, "passphrase").await.unwrap();
-        let a = load_keyring(&store, "passphrase").await.unwrap();
-        let b = load_keyring(&store, "passphrase").await.unwrap();
-        let (ra, rb) = tokio::join!(
-            a.ensure_partition(&store, "p_a"),
-            b.ensure_partition(&store, "p_b")
-        );
-        ra.unwrap();
-        rb.unwrap();
-        let reopened = load_keyring(&store, "passphrase").await.unwrap();
-        reopened.dek("p_a").unwrap();
-        reopened.dek("p_b").unwrap();
     }
 }
