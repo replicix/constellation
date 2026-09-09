@@ -1,4 +1,4 @@
-# Plan 22 — Retention policies as xattr expressions
+# Plan 22 — Prune policies as xattr expressions
 
 Read `docs/plans/v1/CONVENTIONS.md` first. Spec context:
 `docs/explanation/DESIGN.md` §4 (metadata plane, log, partitions, leases),
@@ -14,28 +14,28 @@ a directory are removed when they go cold — and have every node agree on
 exactly which entries those are.
 
 - **The policy is the marker.** A directory carries its complete
-  retention policy in `user.constellation.reap`. There is no policy
+  prune policy in `user.constellation.prune`. There is no policy
   registry, no name to resolve, no second object to keep in sync, and
   therefore no such thing as a dangling reference or an orphaned root.
   Deleting the policy is `setfattr -x`, and it takes effect the same way
   every other metadata change does.
 - **Cluster state by construction.** Xattrs are replicated shared
-  metadata. No node has its own retention rules and no node can be
+  metadata. No node has its own prune rules and no node can be
   configured to disagree.
-- **Convergent.** The reaping *decision* is made once, by one node, from
+- **Convergent.** The pruning *decision* is made once, by one node, from
   replicated state, and published as ordinary `Unlink` mutations. Every
   replica converges on the same namespace. Divergent local deletion is
   the one outcome this plan must make impossible.
 - **Lossy inputs are fine.** A dropped atime bump means an entry is
-  judged on its previous atime — worst case it is reaped one cold
+  judged on its previous atime — worst case it is pruned one cold
   interval early or kept one late. What is *not* acceptable is two nodes
-  reaping different sets.
-- **Namespace-only.** Reaping unlinks names. Reclaiming bytes stays the
+  pruning different sets.
+- **Namespace-only.** Pruning unlinks names. Reclaiming bytes stays the
   existing bucket GC's job (`crates/cli/src/gc.rs`), driven by the
   `deref` index (`crates/meta/src/sqlite.rs:446`).
 
 Non-goals: per-user quotas, a general expression/predicate language,
-reaping as a correctness input to anything, per-node retention
+pruning as a correctness input to anything, per-node prune
 overrides, undo.
 
 ## Settled decisions
@@ -46,12 +46,12 @@ Taken from the design review; do not relitigate them.
   `policy` table, no names.
 - **Action is hard unlink.** No trash tree, no quarantine, no
   tombstones. The name is gone from the live namespace.
-- **Snapshots and clones keep their own references.** A reaped file
+- **Snapshots and clones keep their own references.** A pruned file
   stays fully readable in any snapshot or clone that captured it; its
   chunks are reclaimable only once the last reference — live *or*
   snapshot — is gone. That is already `Unlink` + `deref` semantics; the
   plan's job is to not break it and to prove it.
-- **Execution is a singleton**, one node at a time under a `_reaper`
+- **Execution is a singleton**, one node at a time under a `_prune`
   cluster lease, mirroring `GcLease` (`crates/cli/src/gc.rs:73-136`).
 - **Rules must not all require atime.** An `age` policy on mtime works
   with the plan-20 feature entirely off.
@@ -60,7 +60,7 @@ Taken from the design review; do not relitigate them.
 
 ## Step 1 — The policy language
 
-`crates/meta/src/reap/policy.rs` (new): a hand-written parser over a
+`crates/meta/src/prune/policy.rs` (new): a hand-written parser over a
 tiny, closed grammar. Pure, no I/O, no dependencies beyond `std`.
 
 ```
@@ -130,7 +130,7 @@ it — parse verdicts have to be identical on every node and at every
 moment, which is the Step 5 purity invariant. A percentage-watermark
 policy on a filesystem with no quota is simply **inert**: it never
 triggers, it deletes nothing, and it is counted in `inert_roots` and
-listed as inert by `constellation reap ls`. Set a quota later and it
+listed as inert by `constellation prune ls`. Set a quota later and it
 starts working; clear the quota and it stops. No edit to the policy in
 either direction.
 
@@ -164,7 +164,7 @@ off
 ```
 
 Semantics of multiple rules in one policy: **union** — an entry is
-reaped if any rule selects it. Order is irrelevant, which keeps the
+pruned if any rule selects it. Order is irrelevant, which keeps the
 policy a set of independent statements rather than a program.
 
 `Policy::parse(&str) -> Result<Policy, PolicyError>` where `PolicyError`
@@ -185,12 +185,12 @@ that deletes data.
 ## Step 2 — Binding, inheritance and validation
 
 ```bash
-setfattr -n user.constellation.reap -v 'age(90d)' /mnt/c/scratch/build
-setfattr -n user.constellation.reap -v 'off'      /mnt/c/scratch/build/keep
-setfattr -x user.constellation.reap               /mnt/c/scratch/build
+setfattr -n user.constellation.prune -v 'age(90d)' /mnt/c/scratch/build
+setfattr -n user.constellation.prune -v 'off'      /mnt/c/scratch/build/keep
+setfattr -x user.constellation.prune               /mnt/c/scratch/build
 ```
 
-- Constant `REAP_XATTR = "user.constellation.reap"` next to
+- Constant `PRUNE_XATTR = "user.constellation.prune"` next to
   `SCRATCH_XATTR` (`crates/meta/src/sqlite.rs:23`).
 - **Inheritance**: the nearest ancestor carrying the xattr wins,
   entirely. Policies do not merge, so the effective policy for any path
@@ -217,16 +217,16 @@ same verdict.
    written. Rejecting at the FUSE boundary is what keeps an unparseable
    policy out of the log entirely.
 2. FUSE cannot carry the reason, so the reason goes where it can be
-   read: `constellation reap set <path> '<expr>'` prints the message and
-   a caret under the offending token, and `constellation reap check
+   read: `constellation prune set <path> '<expr>'` prints the message and
+   a caret under the offending token, and `constellation prune check
    '<expr>'` validates without writing.
-3. The last rejection is also cached in `ReapStats::last_parse_error`
+3. The last rejection is also cached in `PruneStats::last_parse_error`
    (expression, offset, message) and shown in `constellation status`,
    so an operator who hit a bare `EINVAL` from `setfattr` can find out
    why without retyping anything.
 4. **Replay never validates.** A record that reached the log is applied
    verbatim, or a node with a different parser version would diverge
-   from its peers. Instead the *reaper* re-parses at run time and, on
+   from its peers. Instead the *pruner* re-parses at run time and, on
    failure, **skips the entire subtree** and counts it in
    `unparseable_roots`. Fail-closed: an unreadable policy deletes
    nothing, ever.
@@ -239,48 +239,48 @@ A policy that parses is not yet a policy that deletes.
   explicit arming token `!` as its final clause — `age(90d); !`.
 - Rationale: `setfattr` is a one-line command that is easy to run
   against the wrong path, and the difference between "I described a
-  retention rule" and "I authorised deletion" should be visible in the
+  prune rule" and "I authorised deletion" should be visible in the
   stored value, not implied by its absence. `getfattr -R` over a tree
   then shows exactly which subtrees are armed.
-- `constellation reap set --arm` appends the token; `constellation reap
+- `constellation prune set --arm` appends the token; `constellation prune
   disarm <path>` removes it. Both are ordinary xattr writes.
 - `dry` may be written explicitly for symmetry; `dry` and `!` together
   is a parse error.
 
-## Step 4 — The reaper
+## Step 4 — The pruner
 
-`crates/cli/src/reap.rs` (new). One run:
+`crates/cli/src/prune.rs` (new). One run:
 
-1. **Acquire** the `_reaper` lease — generalize `GcLease`
+1. **Acquire** the `_prune` lease — generalize `GcLease`
    (`crates/cli/src/gc.rs:73`) into
-   `SingletonLease::acquire(store, "_reaper", mode)` rather than
+   `SingletonLease::acquire(store, "_prune", mode)` rather than
    copy-pasting the CAS dance. Held for the whole run, released on every
    path.
 2. **Refuse to run** if any of: the node is `departed`, `epoch_frozen`,
    offline `ReadOnly`, a read-only member, or its replica trails the log
-   tail by more than `CONSTELLATION_REAP_MAX_LAG_S` (default 300).
-   Reaping from a stale replica is how you delete a file someone
+   tail by more than `CONSTELLATION_PRUNE_MAX_LAG_S` (default 300).
+   Pruning from a stale replica is how you delete a file someone
    recreated. This is the single most important guard in the plan.
 3. **Enumerate roots** via `xattr_by_name`, parse each expression, drop
    `off` and unparseable ones, and skip any root whose directory
-   `ctime_ns` is newer than `now - CONSTELLATION_REAP_GRACE_S`
+   `ctime_ns` is newer than `now - CONSTELLATION_PRUNE_GRACE_S`
    (default 86400). The marked directory's own ctime is the "policy
    installed at" timestamp — `SetXattr` bumps it, so no extra state is
    needed, and any unrelated metadata change on the root only *delays*
-   reaping, which is the safe direction.
+   pruning, which is the safe direction.
 4. **Walk** each root depth-first over `dentry`, skipping scratch roots
    and any nested directory carrying its own policy (that subtree gets
    its own pass). Evaluate filters, then rules, against the **replicated
    inode row**. Resumable via a per-root cursor in `kv`
-   (`reap_cursor/<root_ino>`) under
-   `CONSTELLATION_REAP_SCAN_BUDGET_MS` (default 5000), so a huge tree
+   (`prune_cursor/<root_ino>`) under
+   `CONSTELLATION_PRUNE_SCAN_BUDGET_MS` (default 5000), so a huge tree
    spans runs instead of monopolizing one.
 5. **Select.** `age`/`unused`/`keep` select as they walk.
    `lru` selects against a bounded min-heap ordered by atime, scoped by
    its effective `of=`:
    - **`of=subtree` roots are independent.** Each has its own budget, so
      each gets its own heap and its own stop condition. Subtree size
-     comes from the walk itself — the reaper is already visiting every
+     comes from the walk itself — the pruner is already visiting every
      entry, so the recursive size it needs is a running total, not a
      second pass. (It is *not* read from the maintained whole-FS
      counter, which has no per-directory breakdown; per-directory
@@ -313,7 +313,7 @@ A policy that parses is not yet a policy that deletes.
    between selection and execution must survive. This is what makes a
    lossy atime stream safe: the losing case is one extra cold interval,
    never a delete against fresh state.
-9. **Never reap**: any directory (reaping only ever removes non-
+9. **Never prune**: any directory (pruning only ever removes non-
    directory entries, so a tree's shape survives its contents),
    anything with an open write handle on the executing node, and
    snapshot/clone synthetic inodes. Hardlinks have their own rule, see
@@ -330,10 +330,10 @@ Bytes belong to inodes; names do not. `recursive_size_conn`
 (`crates/meta/src/sqlite.rs:570`) walks with `UNION` over inos, so a
 hardlinked file counts **once** however many names it has, and `unlink`
 only sheds its bytes from the usage counter when `nlink == 1`. The
-reaper must account the same way, and the right behavior then differs by
+pruner must account the same way, and the right behavior then differs by
 rule:
 
-- **`age` / `unused` / `keep` reap `nlink > 1` entries normally.**
+- **`age` / `unused` / `keep` prune `nlink > 1` entries normally.**
   Removing one name of a multiply-linked file is exactly what
   `find … -delete` does, and it is safe by construction: the data
   survives through the remaining link, so the worst case is that a name
@@ -351,10 +351,10 @@ rule:
   the one that frees the bytes.
 - **The audit entry reports `bytes_unlinked` and `bytes_freed`
   separately** — the gap between them is precisely the hardlinked
-  fraction, and it is the number an operator needs when a reap run did
+  fraction, and it is the number an operator needs when a prune run did
   not reclaim what they expected.
 
-A hardlink reaching *out* of the marked tree only ever makes the reaper
+A hardlink reaching *out* of the marked tree only ever makes the pruner
 more conservative: atime and mtime are per-inode, so reads through the
 outside name keep the inside name looking warm. Under-deletion is the
 failing direction, which is the correct one.
@@ -362,12 +362,12 @@ failing direction, which is the correct one.
 ## Step 4c — Partitioned trees
 
 A marked root is a namespace subtree; partitions are an orthogonal
-sharding of that namespace, and a tree large enough to be worth reaping
+sharding of that namespace, and a tree large enough to be worth pruning
 is exactly one that has been split. Three consequences:
 
 **The walk does not care.** Every node holds the full metadata replica,
 so the depth-first walk over `dentry` crosses partition boundaries
-without noticing, and the `reap_cursor/<root_ino>` cursor is a position
+without noticing, and the `prune_cursor/<root_ino>` cursor is a position
 in the *namespace*, not in the partition map. A split or merge mid-walk
 therefore cannot cause the walk to skip or revisit entries — which is
 the reason to walk the namespace rather than iterate partitions.
@@ -385,29 +385,29 @@ in-flight cross-partition rename (`RenameXpartSrc`,
 re-verification in Step 4.8 already fails them, since the `(parent,
 name)` the unlink names no longer resolves to the selected inode.
 
-**Cold partitions must not be permanently unreapable.** This is a
+**Cold partitions must not be permanently unpruneable.** This is a
 correction to the inherited plan-20 posture. Atime could safely say
 "never acquire a lease" because the cost of never publishing was one
-stale timestamp. Retention cannot: a partition with no live holder is a
+stale timestamp. Pruning cannot: a partition with no live holder is a
 partition nobody is writing to, which is precisely the cold data a
-retention policy exists to remove. "Never acquire" would make the
-feature silently inert on the trees it is most for. So the reaper **may
+prune policy exists to remove. "Never acquire" would make the
+feature silently inert on the trees it is most for. So the pruner **may
 acquire a lease for a partition that is currently unheld**, under three
 restrictions:
 
 - **Never preempt.** If a live holder exists, forward to it or skip.
-  The reaper takes leases nobody wants, never one somebody has.
+  The pruner takes leases nobody wants, never one somebody has.
 - **One at a time, released immediately** after that partition's batch
-  drains. A reap run must not accumulate leases across a whole tree.
+  drains. A prune run must not accumulate leases across a whole tree.
 - **Never `touch()`** (`crates/cli/src/lease.rs:78`), so a
-  reaper-acquired lease still looks idle to placement and to
+  pruner-acquired lease still looks idle to placement and to
   `idle_release_due`, and a real writer arriving mid-batch wins the
   partition on the next release rather than queueing behind background
   work.
 
-**Reaping shrinks partitions**, so a large run is likely to make
+**Pruning shrinks partitions**, so a large run is likely to make
 neighbouring partitions merge-eligible. That is desirable, but the
-reaper must not race it: skip any partition with an in-flight split or
+pruner must not race it: skip any partition with an in-flight split or
 merge for the current run and pick it up on the next one.
 
 ## Step 5 — The consistency rules
@@ -415,30 +415,30 @@ merge for the current run and pick it up on the next one.
 These are the invariants that make "one node deletes for everyone"
 sound. Each gets a test.
 
-- **Decide only from replicated state.** The reaper reads `inode`,
+- **Decide only from replicated state.** The pruner reads `inode`,
   `dentry`, `xattr` — never a node-local accumulator, never the
   in-memory pending atime map from plan 20, never local cache residency,
   never local pins (explicitly node-local, `crates/cli/src/pin.rs:3`). A
-  node's own unflushed reads cannot change what it reaps.
+  node's own unflushed reads cannot change what it prunes.
 - **Publish through the normal mutation path.** No direct SQL deletes,
-  no reaper-specific record type. Every other node learns about a reap
+  no pruner-specific record type. Every other node learns about a prune
   exactly as it learns about `rm`.
 - **Lag gate before decisions** (Step 4.2) and re-verification before
   each delete (Step 4.8).
 - **Parsing is pure and total.** Same bytes in, same policy out, on
   every node and every run. No environment, no locale, no clock in the
   parser.
-- **No lease pinning.** A reap run must not make a partition look busy:
+- **No lease pinning.** A prune run must not make a partition look busy:
   never call `LeaseView::touch()` (`crates/cli/src/lease.rs:78`), and
-  exclude reaper-issued unlinks from the idle-release backlog accounting
+  exclude pruner-issued unlinks from the idle-release backlog accounting
   the way plan 20 excludes `Atime`
   (`crates/cli/src/lease.rs:482-487`). Background work must not fight a
-  real writer for a lease — including a lease the reaper itself took
+  real writer for a lease — including a lease the pruner itself took
   under Step 4c.
 
 ## Step 6 — Snapshots and clones
 
-A reap is an unlink, so existing rules already give the required
+A prune is an unlink, so existing rules already give the required
 behavior; the obligation is to prove it:
 
 - The name disappears from the live tree.
@@ -448,43 +448,43 @@ behavior; the obligation is to prove it:
   reference — including every snapshot's — is gone
   (`crates/meta/src/sqlite.rs:446`; see the existing
   `deref_tracks_snapshot_delete` at `:3705`).
-- Reaping never descends into a snapshot or clone view.
+- Pruning never descends into a snapshot or clone view.
 
 ## Step 7 — CLI and configuration
 
 ```
-constellation reap ls                     # every marked root: path, policy, armed?, last run
-constellation reap show <path>            # effective policy for a path + which ancestor set it
-constellation reap set <path> '<expr>' [--arm]
-constellation reap check '<expr>'         # parse only, no write, exit 2 on error
-constellation reap disarm <path> | rm <path>
-constellation reap run [<path>] [--dry-run]
-constellation reap status
+constellation prune ls                     # every marked root: path, policy, armed?, last run
+constellation prune show <path>            # effective policy for a path + which ancestor set it
+constellation prune set <path> '<expr>' [--arm]
+constellation prune check '<expr>'         # parse only, no write, exit 2 on error
+constellation prune disarm <path> | rm <path>
+constellation prune run [<path>] [--dry-run]
+constellation prune status
 ```
 
-`reap set` and `reap check` print parse failures with the expression,
-a caret under the offending token, and a suggested fix. `reap show` on
+`prune set` and `prune check` print parse failures with the expression,
+a caret under the offending token, and a suggested fix. `prune show` on
 an unmarked path prints the inherited policy and the ancestor it came
 from, or "no policy".
 
 | Var | Default | Meaning |
 |---|---|---|
-| `CONSTELLATION_REAP` | 1 | master switch for the background reaper |
-| `CONSTELLATION_REAP_INTERVAL_S` | 3600 | scheduler tick |
-| `CONSTELLATION_REAP_GRACE_S` | 86400 | quiet period after a root's ctime changes |
-| `CONSTELLATION_REAP_MAX_LAG_S` | 300 | replica-staleness refusal threshold |
-| `CONSTELLATION_REAP_SCAN_BUDGET_MS` | 5000 | per-run walk budget before cursor save |
-| `CONSTELLATION_REAP_FORWARD_TIMEOUT_MS` | 2000 | unlink forward timeout |
+| `CONSTELLATION_PRUNE` | 1 | master switch for the background pruner |
+| `CONSTELLATION_PRUNE_INTERVAL_S` | 3600 | scheduler tick |
+| `CONSTELLATION_PRUNE_GRACE_S` | 86400 | quiet period after a root's ctime changes |
+| `CONSTELLATION_PRUNE_MAX_LAG_S` | 300 | replica-staleness refusal threshold |
+| `CONSTELLATION_PRUNE_SCAN_BUDGET_MS` | 5000 | per-run walk budget before cursor save |
+| `CONSTELLATION_PRUNE_FORWARD_TIMEOUT_MS` | 2000 | unlink forward timeout |
 
 Document in `docs/reference/configuration.md` and a new
-`docs/reference/features/retention.md` following the feature template:
+`docs/reference/features/prune.md` following the feature template:
 the full grammar, a table of rules, the arming token, the fail-closed
 rule, "atime is best-effort so an `unused`/`lru` policy can be off by
-one cold interval", and the snapshot-retention semantics.
+one cold interval", and the snapshot keep semantics.
 
 ## Step 8 — Observability
 
-`ReapStats` of `AtomicU64` on `StatusReport` (`crates/api/src/types.rs`),
+`PruneStats` of `AtomicU64` on `StatusReport` (`crates/api/src/types.rs`),
 modelled on the plan-20 `AtimeStats`: `runs`, `roots`, `armed_roots`,
 `unparseable_roots`, `inert_roots`, `entries_examined`, `selected`, `deleted`,
 `bytes_deleted`, `skipped_reverify`, `skipped_forward_err`,
@@ -495,7 +495,7 @@ non-atomic `last_parse_error` from Step 2.3. Surfaced in
 
 `skipped_reverify` climbing is the healthy signal that Step 4.8 is doing
 its job. `unparseable_roots`, `inert_roots` or `refused_lag` above zero means
-retention is silently not happening, which is the failure mode an
+pruning is silently not happening, which is the failure mode an
 operator will otherwise notice only by running out of space.
 
 ## Step 9 — Tests
@@ -519,13 +519,13 @@ Unit (evaluation):
 
 Multi-node in-process (the pattern at the bottom of
 `crates/cli/src/shipper.rs`):
-- A holds `_reaper` and reaps under a marked root; B converges on the
-  same namespace and never reaps anything itself.
-- Two nodes race for `_reaper`; exactly one runs, and the loser's
+- A holds `_prune` and prunes under a marked root; B converges on the
+  same namespace and never prunes anything itself.
+- Two nodes race for `_prune`; exactly one runs, and the loser's
   namespace still converges.
 - B reads a file between A's selection and execution; re-verification
   drops it and the file survives on both replicas.
-- A snapshot taken before the reap still reads the reaped file on both
+- A snapshot taken before the prune still reads the pruned file on both
   nodes; deleting that snapshot then releases the chunks to GC.
 - A `high=` root that runs out of victims leaves the filesystem above
   `low` and reports it, rather than escaping the mark to find more.
@@ -537,22 +537,22 @@ Multi-node in-process (the pattern at the bottom of
 - A file linked from outside the marked tree is unlinked by `age` inside
   it, stays readable through the outside name, and frees no bytes.
 - A percentage-watermark root on a filesystem with no quota is inert;
-  setting a quota makes the same unedited policy start reaping, and
+  setting a quota makes the same unedited policy start pruning, and
   clearing it makes it stop.
 - A root whose xattr is garbage (written directly into the log, past the
   `setxattr` gate) is skipped on every node, and its subtree is intact.
 - A run over a tree spanning several partitions unlinks from all of
   them, and both replicas converge.
-- A partition with no holder is reaped: the reaper acquires the lease,
+- A partition with no holder is pruned: the pruner acquires the lease,
   releases it immediately after the batch, and `idle_release_due` is
   unaffected.
 - A partition with a live holder is never preempted; its victims are
   forwarded instead.
-- A split executed mid-run neither skips nor double-reaps entries, and
+- A split executed mid-run neither skips nor double-prunes entries, and
   stale partition mappings surface as counted `NotHolder` skips.
 - A scratch subtree under a marked root is untouched.
 
-Harness scenario `reap-retention`
+Harness scenario `prune`
 (`crates/harness/src/scenarios.rs`): two nodes, seeded tree, an armed
 `age` policy on mtime with a short TTL; `eventually()` asserts identical
 listings on both mounts and the expected survivor set. Variant 1 cuts S3
@@ -565,7 +565,7 @@ asserts the subtree converges to its own budget while the rest of the
 tree is untouched.
 
 Compliance and perf:
-- pjdfstest FULL pass with the reaper enabled and no marked roots — the
+- pjdfstest FULL pass with the pruner enabled and no marked roots — the
   default posture must be inert.
 - A run over a 1M-entry tree stays within the scan budget and does not
   measurably regress steady-state read throughput; paste the numbers.
@@ -574,8 +574,8 @@ Compliance and perf:
 
 1. Parser + canonical form + the whole unit and fuzz suite. Pure code,
    nothing wired, independently reviewable.
-2. `REAP_XATTR`, the `setxattr` validation gate, `xattr_by_name`,
-   ancestor resolution, and `constellation reap ls|show|check|set`.
+2. `PRUNE_XATTR`, the `setxattr` validation gate, `xattr_by_name`,
+   ancestor resolution, and `constellation prune ls|show|check|set`.
    Policies can be written and inspected; nothing runs.
 3. `SingletonLease` extraction, the walk, and dry runs with the audit
    journal. Reviewable at zero deletion risk.
@@ -594,6 +594,6 @@ Per `docs/plans/v1/CONVENTIONS.md`, plus:
 - The snapshot-survival assertion, with `deref` state before and after
   the snapshot is deleted.
 - The fail-closed assertion for an unparseable policy on both nodes.
-- Confirmation that a reap run acquires no partition lease it did not
+- Confirmation that a prune run acquires no partition lease it did not
   already hold and does not delay idle release (paste the counters).
-- pjdfstest FULL pass with `CONSTELLATION_REAP=1` and no marked roots.
+- pjdfstest FULL pass with `CONSTELLATION_PRUNE=1` and no marked roots.

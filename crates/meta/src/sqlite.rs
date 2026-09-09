@@ -116,6 +116,9 @@ CREATE TABLE IF NOT EXISTS xattr (
     value BLOB NOT NULL,
     PRIMARY KEY (ino, name)
 ) WITHOUT ROWID;
+-- Name-only lookups (prune-policy root discovery, plan 22) would be a
+-- full scan of the WITHOUT ROWID (ino, name) primary key otherwise.
+CREATE INDEX IF NOT EXISTS xattr_by_name ON xattr (name);
 CREATE TABLE IF NOT EXISTS journal (
     seq    INTEGER PRIMARY KEY AUTOINCREMENT,
     record BLOB NOT NULL,
@@ -2444,6 +2447,43 @@ impl SqliteMeta {
 
     pub fn is_scratch_dir(&self, ino: Ino) -> Result<bool, MetaError> {
         Ok(self.get_xattr(ino, SCRATCH_XATTR)?.as_deref() == Some(b"1"))
+    }
+
+    /// Every directory carrying a `user.constellation.prune` marker,
+    /// with the raw (unparsed) policy expression. Uses the
+    /// `xattr_by_name` index (plan 22, Step 2). The value is stored as a
+    /// BLOB; a non-UTF-8 value is returned verbatim (lossily) so the
+    /// pruner's re-parse fails it closed rather than the query eliding
+    /// it silently.
+    pub fn prune_roots(&self) -> Result<Vec<(Ino, String)>, MetaError> {
+        self.with_reader(|conn| {
+            let mut stmt =
+                conn.prepare_cached("SELECT ino, value FROM xattr WHERE name = ?1 ORDER BY ino")?;
+            let rows = stmt.query_map(params![crate::prune::PRUNE_XATTR], |r| {
+                let ino: Ino = r.get(0)?;
+                let value: Vec<u8> = r.get(1)?;
+                Ok((ino, String::from_utf8_lossy(&value).into_owned()))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// The prune policy in effect for `ino`: the nearest ancestor (or
+    /// `ino` itself) carrying the marker, returned as `(root_ino, expr)`.
+    /// Inheritance does not merge — one expression from one directory
+    /// governs any path (plan 22, Step 2).
+    pub fn effective_prune_policy(&self, ino: Ino) -> Result<Option<(Ino, String)>, MetaError> {
+        let mut cur = ino;
+        loop {
+            if let Some(value) = self.get_xattr(cur, crate::prune::PRUNE_XATTR)? {
+                let expr = String::from_utf8_lossy(&value).into_owned();
+                return Ok(Some((cur, expr)));
+            }
+            match self.parent_of(cur)? {
+                Some(parent) if parent != cur => cur = parent,
+                _ => return Ok(None),
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

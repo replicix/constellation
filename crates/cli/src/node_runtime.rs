@@ -146,6 +146,12 @@ pub struct NodeRuntime {
     /// Node-level read-time atime accumulator + counters (plan 20),
     /// shared by every view's FUSE fs and drained by the flush ticker.
     atime: Arc<crate::atime::AtimeAccumulator>,
+    /// Node-level prune counters (plan 22), shared with the pruner task
+    /// and the control plane.
+    prune_stats: Arc<crate::prune::PruneStats>,
+    /// Unix-ms heartbeat of the sync task's last loop pass; the pruner's
+    /// replica-freshness gate (plan 22, Step 4.2) reads it.
+    last_sync_ms: Arc<AtomicU64>,
     read_only_member: bool,
     fsync_s3: bool,
     ship: Arc<tokio::sync::Mutex<shipper::Shipper>>,
@@ -460,6 +466,8 @@ impl NodeRuntime {
         let departed = Arc::new(AtomicBool::new(false));
         let atime_stats = crate::atime::AtimeStats::new();
         let atime = Arc::new(crate::atime::AtimeAccumulator::new(atime_mode, atime_stats));
+        let prune_stats = crate::prune::PruneStats::new();
+        let last_sync_ms = Arc::new(AtomicU64::new(crate::prune::now_unix_ms()));
 
         // Background metadata sync: tail foreign segments + ship the
         // journal, every interval or on demand (close/fsync nudges).
@@ -724,6 +732,59 @@ impl NodeRuntime {
                 }
             });
         }
+        // Retention pruner ticker (plan 22, Step 4). The default has no
+        // marked roots, so a run walks nothing and is cheap; it only does
+        // work once an operator sets a `user.constellation.prune` policy.
+        {
+            let (store_inner, meta, keepers, forward, peers, stop, departed, epoch_frozen) = (
+                store.inner().clone(),
+                meta.clone(),
+                keepers.clone(),
+                forward.clone(),
+                peers.clone(),
+                stop.clone(),
+                departed.clone(),
+                epochs.frozen.clone(),
+            );
+            let sync_tx = sync_tx.clone();
+            let prune_stats = prune_stats.clone();
+            let last_sync_ms = last_sync_ms.clone();
+            rt.spawn(async move {
+                let mut timer = tokio::time::interval(crate::prune::interval());
+                timer.tick().await;
+                loop {
+                    timer.tick().await;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if !crate::prune::enabled() {
+                        continue;
+                    }
+                    let lag = std::time::Duration::from_millis(
+                        crate::prune::now_unix_ms()
+                            .saturating_sub(last_sync_ms.load(Ordering::Relaxed)),
+                    );
+                    let deps = crate::prune::PruneDeps {
+                        store: store_inner.clone(),
+                        meta: meta.clone(),
+                        sync_tx: sync_tx.clone(),
+                        keepers: keepers.clone(),
+                        forward: forward.clone(),
+                        peers: peers.clone(),
+                        node_id,
+                        lease_mode,
+                        read_only_member,
+                        departed: departed.clone(),
+                        epoch_frozen: Some(epoch_frozen.clone()),
+                        stats: prune_stats.clone(),
+                        replica_lag: lag,
+                    };
+                    if let Err(error) = crate::prune::run(&deps, None, false).await {
+                        tracing::warn!(%error, "periodic prune pass failed");
+                    }
+                }
+            });
+        }
         {
             let (
                 ship,
@@ -766,6 +827,7 @@ impl NodeRuntime {
                 forward.clone(),
                 placement.clone(),
             );
+            let last_sync_ms = last_sync_ms.clone();
             rt.spawn(async move {
                 let mut pending: Option<fusefs::SyncRequest> = None;
                 // The periodic poll is a *persistent* deadline, not a fresh
@@ -782,6 +844,10 @@ impl NodeRuntime {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
+                    // Freshness heartbeat for the pruner's lag gate: the
+                    // task tails/answers every pass, so this bounds how
+                    // stale our replica can be while the task is alive.
+                    last_sync_ms.store(crate::prune::now_unix_ms(), Ordering::Relaxed);
                     let request = if let Some(req) = pending.take() {
                         Some(req)
                     } else {
@@ -1337,6 +1403,8 @@ impl NodeRuntime {
             placement,
             departed,
             atime,
+            prune_stats,
+            last_sync_ms,
             read_only_member,
             fsync_s3,
             ship,
@@ -1495,6 +1563,7 @@ impl NodeRuntime {
                 staging_budget: self.staging_budget.clone(),
                 snapshots: self.snapshots.clone(),
                 atime: self.atime.clone(),
+                prune_stats: self.prune_stats.clone(),
             },
             self.fsmeta.chunk_size,
             self.compression,
@@ -1545,6 +1614,11 @@ impl NodeRuntime {
                     forward: self.forward.clone(),
                     placement: self.placement.clone(),
                     atime: self.atime.clone(),
+                    prune_stats: self.prune_stats.clone(),
+                    keepers: self.keepers.clone(),
+                    lease_mode: self.lease_mode,
+                    read_only_member: self.read_only_member,
+                    last_sync_ms: self.last_sync_ms.clone(),
                 });
                 *status_guard = Some(status.clone());
                 drop(status_guard);

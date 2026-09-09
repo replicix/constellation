@@ -19,10 +19,12 @@ mod parallelism;
 mod pin;
 mod placement;
 mod prefetch;
+mod prune;
 mod registry;
 mod reintegrate;
 mod scan;
 mod shipper;
+mod singleton;
 mod snapshot;
 mod sources;
 mod staging;
@@ -242,6 +244,11 @@ enum Command {
         #[command(subcommand)]
         command: QuotaCommand,
     },
+    /// Manage retention prune policies (plan 22).
+    Prune {
+        #[command(subcommand)]
+        command: PruneCommand,
+    },
     /// Inspect one file or directory through the running daemon.
     Inspect {
         target: String,
@@ -358,6 +365,55 @@ enum QuotaCommand {
         target: String,
         /// Byte size (`10G`), or `unlimited`/`0` to clear the cap.
         size: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PruneCommand {
+    /// Validate a policy expression without writing it. Exit 2 on error.
+    Check {
+        /// The policy, e.g. 'age(90d)' or 'lru(high=85%, low=70%)'.
+        expr: String,
+    },
+    /// Write a policy onto a directory (validated first).
+    Set {
+        /// A directory inside a mount.
+        path: PathBuf,
+        /// The policy expression.
+        expr: String,
+        /// Arm the policy for real deletion (otherwise dry-run).
+        #[arg(long)]
+        arm: bool,
+    },
+    /// Remove the arming token, leaving the policy in dry-run.
+    Disarm { path: PathBuf },
+    /// Delete the policy from a directory.
+    Rm { path: PathBuf },
+    /// Show the effective policy for a path and where it is inherited from.
+    Show { path: PathBuf },
+    /// List every marked prune root (via the daemon).
+    Ls {
+        target: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Run one prune pass now (via the daemon).
+    Run {
+        target: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Restrict to the marked root governing this path.
+        #[arg(long)]
+        path: Option<String>,
+        /// Evaluate and report without deleting.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the prune counters (via the daemon).
+    Status {
+        target: String,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
@@ -774,6 +830,7 @@ fn main() -> Result<()> {
                 ))
             }
         },
+        Command::Prune { command } => run_prune_command(&rt, command),
         Command::Inspect { target, state_dir } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
@@ -2155,6 +2212,175 @@ async fn refresh_peers(
 /// A daemon-side refusal (over budget, no such path) comes back as
 /// `Response::Error` and must exit non-zero: `pin` failing silently would
 /// leave the user believing a subtree is resident when it is not.
+/// The `constellation prune ...` subcommands. The tree-editing ones
+/// (`check`/`set`/`disarm`/`rm`/`show`) act directly on the mounted path
+/// via xattr syscalls — `set` still goes through the daemon's validation
+/// gate, this just gives a good client-side error first. The rest are
+/// daemon round-trips.
+fn run_prune_command(rt: &tokio::runtime::Runtime, command: PruneCommand) -> Result<()> {
+    use constellation_meta::prune::Policy;
+    use constellation_meta::prune::PRUNE_XATTR;
+    match command {
+        PruneCommand::Check { expr } => match Policy::parse(&expr) {
+            Ok(policy) => {
+                println!("ok: {policy}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("{}", e.render(&expr));
+                std::process::exit(2);
+            }
+        },
+        PruneCommand::Set { path, expr, arm } => {
+            let mut policy = match Policy::parse(&expr) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{}", e.render(&expr));
+                    std::process::exit(2);
+                }
+            };
+            if arm && !policy.off {
+                policy.armed = true;
+            }
+            let value = policy.to_string();
+            xattr_set(&path, PRUNE_XATTR, value.as_bytes())
+                .with_context(|| format!("setting prune policy on {}", path.display()))?;
+            println!("{}: {value}", path.display());
+            Ok(())
+        }
+        PruneCommand::Disarm { path } => {
+            let raw = xattr_get(&path, PRUNE_XATTR)?
+                .ok_or_else(|| anyhow::anyhow!("no prune policy on {}", path.display()))?;
+            let expr = String::from_utf8_lossy(&raw);
+            let mut policy = Policy::parse(&expr).map_err(|e| anyhow::anyhow!("{}", e))?;
+            policy.armed = false;
+            let value = policy.to_string();
+            xattr_set(&path, PRUNE_XATTR, value.as_bytes())?;
+            println!("{}: {value}", path.display());
+            Ok(())
+        }
+        PruneCommand::Rm { path } => {
+            xattr_remove(&path, PRUNE_XATTR)?;
+            println!("{}: prune policy removed", path.display());
+            Ok(())
+        }
+        PruneCommand::Show { path } => {
+            let mut cur = path.canonicalize().unwrap_or(path.clone());
+            loop {
+                if let Some(raw) = xattr_get(&cur, PRUNE_XATTR)? {
+                    let expr = String::from_utf8_lossy(&raw);
+                    let armed = Policy::parse(&expr).map(|p| p.armed).unwrap_or(false);
+                    println!(
+                        "{}\n  policy: {}\n  from:   {}\n  armed:  {}",
+                        path.display(),
+                        expr,
+                        cur.display(),
+                        armed
+                    );
+                    return Ok(());
+                }
+                match cur.parent() {
+                    Some(parent) if parent != cur => cur = parent.to_path_buf(),
+                    _ => break,
+                }
+            }
+            println!("{}: no prune policy", path.display());
+            Ok(())
+        }
+        PruneCommand::Ls { target, state_dir } => {
+            let (_, dir) = resolve_target(&target, state_dir)?;
+            rt.block_on(control_call(&dir, constellation_api::Request::PruneList))
+        }
+        PruneCommand::Run {
+            target,
+            state_dir,
+            path,
+            dry_run,
+        } => {
+            let (_, dir) = resolve_target(&target, state_dir)?;
+            rt.block_on(control_call(
+                &dir,
+                constellation_api::Request::PruneRun { path, dry_run },
+            ))
+        }
+        PruneCommand::Status { target, state_dir } => {
+            let (_, dir) = resolve_target(&target, state_dir)?;
+            rt.block_on(async {
+                let sock = dir.join(constellation_api::SOCKET_NAME);
+                match constellation_api::call(&sock, &constellation_api::Request::Status).await? {
+                    constellation_api::Response::Status(report) => {
+                        println!("{}", serde_json::to_string_pretty(&report.prune)?);
+                        Ok(())
+                    }
+                    constellation_api::Response::Error { message } => bail!(message),
+                    other => bail!("unexpected response: {other:?}"),
+                }
+            })
+        }
+    }
+}
+
+/// Set an extended attribute on `path` via libc (no `xattr` crate dep).
+fn xattr_set(path: &std::path::Path, name: &str, value: &[u8]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let cname = std::ffi::CString::new(name)?;
+    let rc = unsafe {
+        libc::setxattr(
+            cpath.as_ptr(),
+            cname.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Read an extended attribute; `Ok(None)` when it is absent.
+fn xattr_get(path: &std::path::Path, name: &str) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let cname = std::ffi::CString::new(name)?;
+    let size = unsafe { libc::getxattr(cpath.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ENODATA) => Ok(None),
+            _ => Err(err.into()),
+        };
+    }
+    let mut buf = vec![0u8; size as usize];
+    let got = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            cname.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if got < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    buf.truncate(got as usize);
+    Ok(Some(buf))
+}
+
+/// Remove an extended attribute.
+fn xattr_remove(path: &std::path::Path, name: &str) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let cname = std::ffi::CString::new(name)?;
+    let rc = unsafe { libc::removexattr(cpath.as_ptr(), cname.as_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 async fn control_call(state_dir: &std::path::Path, req: constellation_api::Request) -> Result<()> {
     let sock = state_dir.join(constellation_api::SOCKET_NAME);
     match constellation_api::call(&sock, &req).await? {
@@ -2213,6 +2439,14 @@ async fn control_call(state_dir: &std::path::Path, req: constellation_api::Reque
             match max_bytes {
                 Some(cap) => println!("quota: {used_bytes} / {cap} bytes used"),
                 None => println!("quota: {used_bytes} bytes used (unlimited)"),
+            }
+            Ok(())
+        }
+        constellation_api::Response::PruneRoots { roots } => {
+            if roots.is_empty() {
+                println!("no prune policies");
+            } else {
+                println!("{}", serde_json::to_string_pretty(&roots)?);
             }
             Ok(())
         }
@@ -2813,6 +3047,12 @@ struct DaemonStatus {
     forward: std::sync::Arc<forward::ForwardState>,
     placement: std::sync::Arc<placement::Placement>,
     atime: std::sync::Arc<crate::atime::AtimeAccumulator>,
+    prune_stats: std::sync::Arc<crate::prune::PruneStats>,
+    keepers:
+        std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, lease::LeaseKeeper>>>,
+    lease_mode: constellation_store_s3::LeaseMode,
+    read_only_member: bool,
+    last_sync_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DaemonStatus {
@@ -2858,6 +3098,31 @@ impl DaemonStatus {
             .map_err(|_| "sync task is not running".to_string())?;
         tokio::task::block_in_place(|| self.rt.block_on(receive))
             .map_err(|_| "snapshot barrier stopped".to_string())?
+    }
+
+    /// Assemble the pruner's dependency bundle from the daemon's shared
+    /// handles (plan 22). `replica_lag` is derived from the sync task's
+    /// heartbeat.
+    fn prune_deps(&self) -> crate::prune::PruneDeps {
+        use std::sync::atomic::Ordering;
+        let lag = std::time::Duration::from_millis(
+            crate::prune::now_unix_ms().saturating_sub(self.last_sync_ms.load(Ordering::Relaxed)),
+        );
+        crate::prune::PruneDeps {
+            store: self.store.clone(),
+            meta: self.meta.clone(),
+            sync_tx: self.sync_tx.clone(),
+            keepers: self.keepers.clone(),
+            forward: self.forward.clone(),
+            peers: self.peers.clone(),
+            node_id: self.node_id,
+            lease_mode: self.lease_mode,
+            read_only_member: self.read_only_member,
+            departed: self.departed.clone(),
+            epoch_frozen: Some(self.epochs.frozen.clone()),
+            stats: self.prune_stats.clone(),
+            replica_lag: lag,
+        }
     }
 }
 
@@ -3041,6 +3306,30 @@ impl constellation_api::StatusSource for DaemonStatus {
                 constellation_api::QuotaStatus {
                     max_bytes: self.meta.quota().ok().flatten(),
                     used_bytes: self.meta.usage().0,
+                }
+            },
+            prune: {
+                use std::sync::atomic::Ordering::Relaxed;
+                let s = &self.prune_stats;
+                constellation_api::PruneStatus {
+                    runs: s.runs.load(Relaxed),
+                    roots: s.roots.load(Relaxed),
+                    armed_roots: s.armed_roots.load(Relaxed),
+                    unparseable_roots: s.unparseable_roots.load(Relaxed),
+                    inert_roots: s.inert_roots.load(Relaxed),
+                    entries_examined: s.entries_examined.load(Relaxed),
+                    selected: s.selected.load(Relaxed),
+                    deleted: s.deleted.load(Relaxed),
+                    bytes_deleted: s.bytes_deleted.load(Relaxed),
+                    bytes_freed: s.bytes_freed.load(Relaxed),
+                    skipped_reverify: s.skipped_reverify.load(Relaxed),
+                    skipped_forward_err: s.skipped_forward_err.load(Relaxed),
+                    skipped_hardlink: s.skipped_hardlink.load(Relaxed),
+                    skipped_repartition: s.skipped_repartition.load(Relaxed),
+                    leases_acquired: s.leases_acquired.load(Relaxed),
+                    refused_lag: s.refused_lag.load(Relaxed),
+                    last_run_unix_ms: s.last_run_unix_ms.load(Relaxed),
+                    last_parse_error: s.last_parse_error.lock().ok().and_then(|g| g.clone()),
                 }
             },
         }
@@ -3506,6 +3795,91 @@ impl constellation_api::StatusSource for DaemonStatus {
         let max = self.meta.quota().map_err(|e| format!("{e:#}"))?;
         let (used, _) = self.meta.usage();
         Ok((max, used))
+    }
+
+    fn prune_run(&self, path: Option<&str>, dry_run: bool) -> std::result::Result<String, String> {
+        // Restrict to the marked root governing `path`, if one was given.
+        let only = match path {
+            Some(p) => {
+                let ino = self
+                    .meta
+                    .resolve_path(p)
+                    .map_err(|e| format!("{e:#}"))?
+                    .ok_or_else(|| format!("no such path: {p}"))?;
+                match self
+                    .meta
+                    .effective_prune_policy(ino)
+                    .map_err(|e| format!("{e:#}"))?
+                {
+                    Some((root, _)) => Some(vec![root]),
+                    None => return Err(format!("no prune policy governs {p}")),
+                }
+            }
+            None => None,
+        };
+        let deps = self.prune_deps();
+        let report = tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(async { crate::prune::run(&deps, only, dry_run).await })
+        })
+        .map_err(|e| format!("{e:#}"))?;
+        if let Some(why) = report.refused {
+            return Err(format!("prune refused: {why}"));
+        }
+        let (mut sel, mut del) = (0u64, 0u64);
+        for r in &report.roots {
+            sel += r.selected;
+            del += r.deleted;
+        }
+        Ok(format!(
+            "prune {}: {} roots, {} selected, {} deleted",
+            if report.dry_run { "dry-run" } else { "run" },
+            report.roots.len(),
+            sel,
+            del
+        ))
+    }
+
+    fn prune_ls(&self) -> std::result::Result<Vec<constellation_api::PruneRootStatus>, String> {
+        let roots = self.meta.prune_roots().map_err(|e| format!("{e:#}"))?;
+        let mut out = Vec::new();
+        for (ino, expr) in roots {
+            let path = self.meta.path_of(ino).unwrap_or_else(|_| "?".into());
+            match constellation_meta::prune::Policy::parse(&expr) {
+                Ok(policy) => {
+                    let note = if let Some((
+                        constellation_meta::prune::Watermark::Percent(_),
+                        _,
+                        constellation_meta::prune::Of::Fs,
+                    )) = policy.lru_watermarks()
+                    {
+                        use constellation_meta::MetaStore;
+                        if self.meta.quota().ok().flatten().unwrap_or(0) == 0 {
+                            Some("inert: lru percentage needs a quota".to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    out.push(constellation_api::PruneRootStatus {
+                        path,
+                        policy: policy.to_string(),
+                        armed: policy.armed,
+                        valid: !policy.off,
+                        note,
+                    });
+                }
+                Err(e) => out.push(constellation_api::PruneRootStatus {
+                    path,
+                    policy: expr,
+                    armed: false,
+                    valid: false,
+                    note: Some(format!("unparseable: {}", e.msg)),
+                }),
+            }
+        }
+        Ok(out)
     }
 
     fn mount_add(

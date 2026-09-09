@@ -13,8 +13,8 @@ pub use types::{
     AtimeStatus, CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry,
     DoctorStatus, DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus,
     MountInfo, MountViewOpts, P2pStatus, PartitionStatus, PeerStatus, PinStatus, PrefetchStatus,
-    QuotaStatus, ReintegrationStatus, Request, Response, SnapshotStatus, SourceStatus, SpoolStatus,
-    StatusReport, WritebackStatus,
+    PruneRootStatus, PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response,
+    SnapshotStatus, SourceStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -142,6 +142,20 @@ pub trait StatusSource: Send + Sync + 'static {
         Err("quota is not supported by this daemon".into())
     }
 
+    /// Run one retention-prune pass (plan 22). Default refuses.
+    fn prune_run(
+        &self,
+        _path: Option<&str>,
+        _dry_run: bool,
+    ) -> std::result::Result<String, String> {
+        Err("pruning is not supported by this daemon".into())
+    }
+
+    /// List marked prune roots and their effective policies.
+    fn prune_ls(&self) -> std::result::Result<Vec<PruneRootStatus>, String> {
+        Err("pruning is not supported by this daemon".into())
+    }
+
     /// Attach a new view. Default refuses so a provider (tests, older
     /// daemons) that predates multi-view mounts stays valid.
     fn mount_add(
@@ -189,6 +203,11 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
         Request::Leave { node_id, force } => result(source.leave(node_id, force)),
         Request::SetWriteMode { mode } => result(source.set_write_mode(&mode)),
         Request::SnapshotCreate { selector } => result(source.snapshot_create(&selector)),
+        Request::PruneRun { path, dry_run } => result(source.prune_run(path.as_deref(), dry_run)),
+        Request::PruneList => match source.prune_ls() {
+            Ok(roots) => Response::PruneRoots { roots },
+            Err(message) => Response::Error { message },
+        },
         Request::SnapshotList { path } | Request::ListSnapshots { path } => {
             match source.snapshot_list(path.as_deref()) {
                 Ok(snapshots) => Response::Snapshots { snapshots },
@@ -361,6 +380,7 @@ mod tests {
                 placement_reason: None,
                 quota: QuotaStatus::default(),
                 atime: AtimeStatus::default(),
+                prune: PruneStatus::default(),
             }
         }
 
@@ -547,6 +567,7 @@ mod tests {
                 placement_reason: None,
                 quota: QuotaStatus::default(),
                 atime: AtimeStatus::default(),
+                prune: PruneStatus::default(),
             }
         }
     }

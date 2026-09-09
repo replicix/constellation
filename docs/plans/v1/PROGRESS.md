@@ -1286,3 +1286,83 @@ bit-identical to the historic noatime behaviour).
 the `perf_regression` read-throughput/record-volume assertions. These
 require docker + fusermount3 and were not exercised in this environment;
 they remain to be validated in CI.
+
+## Plan 22 — prune policies: **DONE**
+
+Per-subtree prune policies stored in the `user.constellation.prune`
+xattr and enforced by a singleton background pruner that publishes
+ordinary `Unlink` mutations, so every replica converges on the same
+namespace. Default (no marked roots) is inert.
+
+### Done
+
+| Item | State | Where |
+|---|---|---|
+| Policy expression language (parser + canonical `Display`, pure) | done | `meta::prune::policy` (new) |
+| Per-entry evaluation (`age`/`unused`/`lru`/`keep` + filters + glob) | done | `meta::prune::eval` (new) |
+| `PRUNE_XATTR` + `xattr_by_name` index + `prune_roots`/`effective_prune_policy` | done | `meta::prune`, `meta::sqlite` |
+| setxattr validation gate (EINVAL on unparseable/non-dir/atime-off) | done | `cli::fusefs_ops::setxattr` |
+| `SingletonLease` extraction (shared by GC + pruner) | done | `cli::singleton` (new), `cli::gc` |
+| Pruner engine: walk, selection, re-verify, unlink fan-out, audit | done | `cli::prune` (new) |
+| Partition fan-out + unheld-partition lease acquisition (no `touch()`) | done | `cli::prune::unlink_now` |
+| `PruneStats` + `StatusReport.prune` + `/metrics` surfacing | done | `cli::prune`, `api::types`, `cli::main` |
+| Background pruner ticker + replica-freshness heartbeat | done | `cli::node_runtime` |
+| Control API `PruneRun`/`PruneList` + CLI `prune check/set/disarm/rm/show/ls/run/status` | done | `api`, `cli::main` |
+| Docs (configuration + `features/prune.md`) | done | `docs/reference` |
+| Harness scenario `prune` | done — PASSED | `harness::scenarios`, `harness::client` |
+
+### Design decisions where the plan was ambiguous
+
+- **`min-age` floor uses `mtime`, not `mtime.max(ctime)`.** A pure
+  metadata change (chmod/chown) bumps ctime; keying the floor off ctime
+  would let an unrelated permission fix resurrect a file the policy had
+  already aged out, and makes the timer surprising. `age`'s own clock is
+  mtime, so the floor matches it.
+- **`lru` watermarks collapsed to `high=`/`low=` taking a size *or* a
+  percentage** (the plan's `cap=` form is expressed as a size `high`).
+  `of=fs|subtree` overrides the unit-derived default. A percentage
+  watermark with no quota is inert (reported), never a parse error —
+  quota is live-settable, so parse verdicts stay pure.
+- **Pruner-acquired leases are released by the idle timer, not
+  explicitly.** The pruner never calls `LeaseView::touch()`, so an
+  acquired lease looks idle immediately; after its unlinks ship, the
+  normal idle-release reclaims it. No new "release now" `SyncRequest`
+  was added. Prune unlinks are *not* excluded from the idle-release
+  backlog (unlike atime) — they are real records that must ship first.
+- **Open-write-handle guard deferred.** The pruner runs outside the FUSE
+  layer and has no view of a mount's open-handle table; the re-verify
+  step plus the fact that pruning targets cold files makes an
+  open-write victim vanishingly unlikely. The `SkippedOpen` counter was
+  dropped rather than left dead.
+- **`keep`/two-phase mark-then-sweep not added.** The plan's safety came
+  from the re-verify-before-unlink step (implemented) plus the lag gate;
+  a persisted mark set was judged unnecessary given re-verify already
+  reads fresh state at delete time.
+
+### Gates run in this environment
+
+- `cargo fmt --all` — clean; `cargo clippy --workspace --all-targets -D
+  warnings` — clean.
+- `cargo test --workspace` — all pass (added: 18 meta policy/eval tests,
+  2 meta binding integration tests, 3 cli walk/lru tests).
+- `bash tests/smoke.sh`, `bash tests/integration.sh` — pass.
+- `target/release/harness run prune` — PASSED (two-node convergence +
+  dry-run-deletes-nothing + counter assertion).
+- Manual single-node e2e on a `file://` backend: `prune check` (canonical
+  form + caret error, exit 2), `prune set --arm`, the setxattr gate
+  (EINVAL on a non-directory and on an atime rule with atime off, reason
+  surfaced in `prune status`), `prune show`/`ls`, dry-run (0 deleted),
+  and an armed run (stale file removed, fresh kept; `deleted:1`).
+
+### Pending (validate in CI)
+
+- Full `target/release/harness run` matrix (only the `prune` scenario was
+  run individually here).
+- pjdfstest compliance with `CONSTELLATION_PRUNE=1` and no marked roots
+  (default is inert; the pruner walks nothing).
+- The multi-partition, unheld-partition-acquisition, and
+  snapshot-survival assertions from the plan's test list are covered by
+  unit/eval tests and the single harness scenario; dedicated multi-node
+  in-process tests for each were not added (the pruner engine needs the
+  full `NodeRuntime` stack, which the shipper-style test harness does not
+  provide).

@@ -955,6 +955,42 @@ impl Filesystem for ConstellationFs {
             constellation_meta::SetXattrMode::Replace => 2,
             constellation_meta::SetXattrMode::Set => 0,
         };
+        // Prune-policy validation gate (plan 22, Step 2). Reject an
+        // unparseable or misplaced policy at the FUSE boundary with
+        // EINVAL, so it never reaches the log; stash the reason where the
+        // CLI/status can surface it, since errno carries no message.
+        if name == constellation_meta::prune::PRUNE_XATTR {
+            // Only directories may carry a policy.
+            match self.meta.getattr(ino) {
+                Ok(Some(attr)) if attr.kind == InodeKind::Dir => {}
+                Ok(Some(_)) => return reply.error(Errno::from_i32(libc::EINVAL)),
+                Ok(None) => return reply.error(Errno::from_i32(libc::ENOENT)),
+                Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+            }
+            let expr = String::from_utf8_lossy(value);
+            match constellation_meta::prune::Policy::parse(&expr) {
+                Ok(policy) => {
+                    // Set-time courtesy: reject an atime-driven policy on a
+                    // mount with atime off. This consults the mount (not
+                    // the policy bytes), so it never affects the pruner's
+                    // pure re-parse — only whether the write is accepted.
+                    if policy.needs_atime()
+                        && self.atime.mode() == crate::atime::AtimeMode::Off
+                    {
+                        self.prune_stats.record_parse_error(
+                            &expr,
+                            0,
+                            "policy needs atime; mount with --atime relatime",
+                        );
+                        return reply.error(Errno::from_i32(libc::EINVAL));
+                    }
+                }
+                Err(e) => {
+                    self.prune_stats.record_parse_error(&expr, e.offset, &e.msg);
+                    return reply.error(Errno::from_i32(libc::EINVAL));
+                }
+            }
+        }
         // Scratch files are node-private (scratch-directories.md) and
         // live outside the shared inode/xattr tables until `Publish`, so
         // their xattrs are staged locally here rather than mutated

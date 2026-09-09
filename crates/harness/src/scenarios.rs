@@ -89,6 +89,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: quota_enforcement,
     },
     Scenario {
+        name: "prune",
+        desc: "retention prune (plan 22): an armed age policy removes stale files on one node and both replicas converge; dry-run deletes nothing",
+        requires: &[],
+        run: prune_retention,
+    },
+    Scenario {
         name: "git-workflow",
         desc: "stage/publish/edit ping-pong between two nodes of one filesystem",
         requires: &[],
@@ -1185,6 +1191,103 @@ fn atime_eventual(seed: u64) -> Result<()> {
 
     reader.unmount()?;
     writer.unmount()?;
+    Ok(())
+}
+
+/// Retention pruning (plan 22). Two nodes share a filesystem; an armed
+/// `age` policy on a marked directory removes a stale file, and the
+/// second node's namespace converges. A dry-run pass first proves it
+/// deletes nothing.
+fn prune_retention(_seed: u64) -> Result<()> {
+    let (env, root) = setup("prune")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/prune-{}", ts());
+    // Grace 0 so a just-installed policy acts immediately; a large
+    // interval so only the on-demand run fires; a generous lag ceiling.
+    let prune_env = |c: Client| {
+        c.with_env("CONSTELLATION_PRUNE_GRACE_S", "0")
+            .with_env("CONSTELLATION_PRUNE_INTERVAL_S", "100000")
+            .with_env("CONSTELLATION_PRUNE_MAX_LAG_S", "3600")
+    };
+    let mut a = prune_env(Client::new(root.path(), "pa", &env.endpoint, &backend)?);
+    let mut b = prune_env(Client::new(root.path(), "pb", &env.endpoint, &backend)?);
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+
+    // A marked directory with two files: one stale, one fresh.
+    std::fs::create_dir(a.mnt.join("data"))?;
+    std::fs::write(a.mnt.join("data/old.log"), b"stale")?;
+    std::fs::write(a.mnt.join("data/fresh.log"), b"fresh")?;
+    // Backdate old.log's mtime 60 days so age(30d) selects it.
+    let status = std::process::Command::new("touch")
+        .args(["-d", "60 days ago"])
+        .arg(a.mnt.join("data/old.log"))
+        .status()?;
+    anyhow::ensure!(status.success(), "touch -d failed");
+
+    // Install an armed age policy on the directory.
+    set_xattr(
+        &a.mnt.join("data"),
+        "user.constellation.prune",
+        b"age(30d); !",
+    )?;
+
+    // The reader must first see the directory and both files.
+    eventually("files visible on b", Duration::from_secs(20), || {
+        anyhow::ensure!(b.mnt.join("data/old.log").is_file(), "old.log not yet on b");
+        anyhow::ensure!(
+            b.mnt.join("data/fresh.log").is_file(),
+            "fresh.log not yet on b"
+        );
+        Ok(())
+    })?;
+
+    // A dry-run pass deletes nothing.
+    a.prune_run(true)?;
+    anyhow::ensure!(
+        a.mnt.join("data/old.log").is_file(),
+        "dry-run must not delete old.log"
+    );
+
+    // The armed run removes the stale file, keeps the fresh one. The
+    // unlink lands in the replica immediately; the local kernel dentry
+    // cache clears within the FUSE entry TTL (~1s), so poll briefly.
+    a.prune_run(false)?;
+    eventually("old.log gone on a", Duration::from_secs(10), || {
+        anyhow::ensure!(
+            !a.mnt.join("data/old.log").exists(),
+            "old.log still cached on a"
+        );
+        Ok(())
+    })?;
+    anyhow::ensure!(
+        a.mnt.join("data/fresh.log").is_file(),
+        "fresh.log must survive on a"
+    );
+
+    // The second node converges on the same namespace.
+    eventually("b converges after prune", Duration::from_secs(30), || {
+        anyhow::ensure!(
+            !b.mnt.join("data/old.log").exists(),
+            "old.log still visible on b"
+        );
+        anyhow::ensure!(
+            b.mnt.join("data/fresh.log").is_file(),
+            "fresh.log must remain on b"
+        );
+        Ok(())
+    })?;
+
+    // The prune counters reflect exactly one deletion.
+    let s = a.control_status()?;
+    anyhow::ensure!(
+        s["prune"]["deleted"].as_u64().unwrap_or(0) >= 1,
+        "prune deleted counter should be >= 1: {s}"
+    );
+
+    b.unmount()?;
+    a.unmount()?;
     Ok(())
 }
 

@@ -269,6 +269,36 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         "Partitions visible in the local replica.",
         status.partitions.len()
     );
+    gauge!(
+        "constellation_prune_runs_total",
+        "Retention prune passes completed.",
+        status.prune.runs
+    );
+    gauge!(
+        "constellation_prune_deleted_total",
+        "Entries removed by retention pruning.",
+        status.prune.deleted
+    );
+    gauge!(
+        "constellation_prune_bytes_freed_total",
+        "Bytes freed by retention pruning (last-link unlinks).",
+        status.prune.bytes_freed
+    );
+    gauge!(
+        "constellation_prune_unparseable_roots",
+        "Marked roots whose policy failed to parse (fail-closed).",
+        status.prune.unparseable_roots
+    );
+    gauge!(
+        "constellation_prune_inert_roots",
+        "Marked roots inert for want of a quota (percentage lru).",
+        status.prune.inert_roots
+    );
+    gauge!(
+        "constellation_prune_refused_lag_total",
+        "Prune passes refused because the replica was too stale.",
+        status.prune.refused_lag
+    );
     (
         [(
             header::CONTENT_TYPE,

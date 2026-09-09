@@ -145,6 +145,21 @@ eventual convergence continue through S3.
 | `CONSTELLATION_GC_HORIZON_S` | `604800` | seconds | age before unreferenced chunks are eligible (`0` for tests) |
 | `CONSTELLATION_LOG_RETENTION_SEGMENTS` | `128` | segments | sealed log segments kept before GC |
 
+### Retention pruning
+
+Prune policies are stored per subtree in the `user.constellation.prune`
+xattr and evaluated by a singleton background pruner. See
+[`features/prune.md`](features/prune.md) for the policy grammar.
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_PRUNE` | `1` | boolean | master switch for the background pruner |
+| `CONSTELLATION_PRUNE_INTERVAL_S` | `3600` | seconds | background prune tick interval |
+| `CONSTELLATION_PRUNE_GRACE_S` | `86400` | seconds | quiet period after a marked directory's ctime changes |
+| `CONSTELLATION_PRUNE_MAX_LAG_S` | `300` | seconds | replica-staleness refusal threshold |
+| `CONSTELLATION_PRUNE_SCAN_BUDGET_MS` | `5000` | milliseconds | per-run walk budget before the cursor is saved |
+| `CONSTELLATION_PRUNE_FORWARD_TIMEOUT_MS` | `2000` | milliseconds | unlink forward timeout to the lease holder |
+
 ### FUSE and runtime threads
 
 | Variable | Default | Unit / values | Subsystem |

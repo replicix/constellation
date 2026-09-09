@@ -246,6 +246,10 @@ pub struct FsDependencies {
     /// all views and drained by the sync task's flush ticker. `Off` by
     /// default, in which case the read hook short-circuits.
     pub atime: Arc<crate::atime::AtimeAccumulator>,
+    /// Node-level prune counters (plan 22), shared with the pruner task
+    /// and the control plane; the setxattr gate records the last policy
+    /// parse rejection here.
+    pub prune_stats: Arc<crate::prune::PruneStats>,
 }
 
 const SYNTHETIC_INO_BIT: u64 = 1 << 63;
@@ -319,6 +323,8 @@ pub struct ConstellationFs {
     statfs_ttl: Duration,
     /// Read-time atime accumulator (plan 20), shared node-wide.
     pub(crate) atime: Arc<crate::atime::AtimeAccumulator>,
+    /// Prune counters (plan 22), shared node-wide.
+    pub(crate) prune_stats: Arc<crate::prune::PruneStats>,
 }
 
 fn staging_errno(e: &crate::staging::StagingError) -> i32 {
@@ -451,6 +457,7 @@ impl ConstellationFs {
             usage_cache: Mutex::new(None),
             statfs_ttl: statfs_ttl_from_env(),
             atime: deps.atime,
+            prune_stats: deps.prune_stats,
         }
     }
 
@@ -1912,6 +1919,7 @@ mod quota_tests {
                     crate::atime::AtimeMode::Off,
                     crate::atime::AtimeStats::new(),
                 )),
+                prune_stats: crate::prune::PruneStats::new(),
             },
             DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,
@@ -2191,6 +2199,7 @@ mod quota_tests {
                     crate::atime::AtimeMode::Off,
                     crate::atime::AtimeStats::new(),
                 )),
+                prune_stats: crate::prune::PruneStats::new(),
             },
             DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,

@@ -43,6 +43,16 @@ pub enum Request {
     SetWriteMode {
         mode: String,
     },
+    /// Run one prune pass now. `path` restricts to the marked root at
+    /// that path; `dry_run` forces dry-run regardless of arming.
+    PruneRun {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// List every marked prune root and its effective policy.
+    PruneList,
     SnapshotCreate {
         selector: String,
     },
@@ -197,6 +207,9 @@ pub enum Response {
     },
     Mounts {
         mounts: Vec<MountInfo>,
+    },
+    PruneRoots {
+        roots: Vec<PruneRootStatus>,
     },
     Error {
         message: String,
@@ -373,6 +386,10 @@ pub struct StatusReport {
     /// zero and `mode` "off".
     #[serde(default)]
     pub atime: AtimeStatus,
+    /// Retention pruning (plan 22). Default (no marked roots) leaves
+    /// every counter zero.
+    #[serde(default)]
+    pub prune: PruneStatus,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -396,6 +413,63 @@ pub struct AtimeStatus {
     pub local_only: u64,
     #[serde(default)]
     pub skew_clamped: u64,
+}
+
+/// Retention-pruning counters (plan 22), surfaced in `constellation
+/// status`, on the web UI, and in `/metrics`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PruneStatus {
+    #[serde(default)]
+    pub runs: u64,
+    #[serde(default)]
+    pub roots: u64,
+    #[serde(default)]
+    pub armed_roots: u64,
+    #[serde(default)]
+    pub unparseable_roots: u64,
+    #[serde(default)]
+    pub inert_roots: u64,
+    #[serde(default)]
+    pub entries_examined: u64,
+    #[serde(default)]
+    pub selected: u64,
+    #[serde(default)]
+    pub deleted: u64,
+    #[serde(default)]
+    pub bytes_deleted: u64,
+    #[serde(default)]
+    pub bytes_freed: u64,
+    #[serde(default)]
+    pub skipped_reverify: u64,
+    #[serde(default)]
+    pub skipped_forward_err: u64,
+    #[serde(default)]
+    pub skipped_hardlink: u64,
+    #[serde(default)]
+    pub skipped_repartition: u64,
+    #[serde(default)]
+    pub leases_acquired: u64,
+    #[serde(default)]
+    pub refused_lag: u64,
+    #[serde(default)]
+    pub last_run_unix_ms: u64,
+    /// Last setxattr policy rejection: `(expression, byte_offset, message)`.
+    #[serde(default)]
+    pub last_parse_error: Option<(String, usize, String)>,
+}
+
+/// One marked prune root, for `constellation prune ls`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PruneRootStatus {
+    pub path: String,
+    pub policy: String,
+    #[serde(default)]
+    pub armed: bool,
+    #[serde(default)]
+    pub valid: bool,
+    /// A note when the policy is unparseable or inert.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

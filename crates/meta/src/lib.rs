@@ -3,6 +3,7 @@
 
 pub mod error;
 pub mod mutate;
+pub mod prune;
 pub mod record;
 pub mod reintegrate;
 pub mod replay;
@@ -10,6 +11,7 @@ pub mod sqlite;
 
 pub use error::MetaError;
 pub use mutate::{execute as execute_mutate, MutateOp, MutateOutcome};
+pub use prune::{Policy, PolicyError, PRUNE_XATTR};
 pub use record::{CloneNode, LogRecord};
 pub use reintegrate::{classify, materialize, Disposition, CONFLICT_DIR};
 pub use replay::TouchSet;

@@ -5,13 +5,13 @@
 //! DELETE this module CAS-publishes the complete condemned set and waits a
 //! lease TTL; writers independently treat those hashes as dedup misses.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::{ChunkHash, InodeKind, Tree};
 use constellation_meta::SqliteMeta;
 use constellation_store_s3::{
     append_journal, publish_condemned, read_condemned, DesignationMode, DesignationStore,
-    GcJournalEntry, Lease, LeaseMode, LeaseStore, SnapshotStore,
+    GcJournalEntry, LeaseMode, SnapshotStore,
 };
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -68,50 +68,6 @@ pub struct GcReport {
     pub condemned_epoch: Option<u64>,
 }
 
-struct GcLease {
-    store: LeaseStore,
-    lease: Lease,
-    tag: constellation_store_s3::LeaseTag,
-}
-
-impl GcLease {
-    async fn acquire(store: Arc<dyn ObjectStore>, mode: LeaseMode) -> Result<Self> {
-        let leases = LeaseStore::new(store, "_gc", mode);
-        let now = constellation_store_s3::lease::now_unix_ms();
-        let holder = (std::process::id() as u64) << 32 | now as u64 & 0xffff_ffff;
-        let ttl = constellation_store_s3::lease::lease_ttl_ms();
-        let (lease, tag) = match leases.get().await? {
-            None => {
-                let lease = Lease::granted("_gc", holder, 1, ttl);
-                let tag = leases.try_create(&lease).await?;
-                (lease, tag)
-            }
-            Some((previous, tag)) if previous.is_claimable(now) => {
-                let lease = Lease::granted("_gc", holder, previous.epoch + 1, ttl);
-                let tag = leases.try_swap(&lease, &tag).await?;
-                (lease, tag)
-            }
-            Some((previous, _)) => {
-                bail!(
-                    "GC lease is held by {} for another {} ms",
-                    previous.holder,
-                    previous.expires_in_ms(now)
-                )
-            }
-        };
-        debug_assert_eq!(leases.partition(), "_gc");
-        Ok(Self {
-            store: leases,
-            lease,
-            tag,
-        })
-    }
-
-    async fn release(self) {
-        let _ = self.store.try_swap(&self.lease.released(), &self.tag).await;
-    }
-}
-
 pub async fn run(
     object_store: Arc<dyn ObjectStore>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
@@ -122,7 +78,8 @@ pub async fn run(
     peers: Option<&constellation_net::Peers>,
 ) -> Result<GcReport> {
     let config = GcConfig::from_env();
-    let lease = GcLease::acquire(object_store.clone(), lease_mode).await?;
+    let lease =
+        crate::singleton::SingletonLease::acquire(object_store.clone(), "_gc", lease_mode).await?;
     let result = run_held(
         object_store,
         chunks,
