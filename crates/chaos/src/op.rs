@@ -169,11 +169,7 @@ pub fn execute_op(root: &Path, op: &Op) -> Result<Complete> {
             if let Some(parent) = full.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&full)
-            {
+            match OpenOptions::new().write(true).create_new(true).open(&full) {
                 Ok(mut f) => {
                     f.write_all(content)
                         .with_context(|| format!("write create {path}"))?;
@@ -253,7 +249,12 @@ pub fn execute_op(root: &Path, op: &Op) -> Result<Complete> {
             patch,
         } => {
             let full = resolve(root, path)?;
-            match OpenOptions::new().write(true).create(true).open(&full) {
+            match OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&full)
+            {
                 Ok(mut f) => {
                     if let Err(e) = f.seek(SeekFrom::Start(*offset)) {
                         return Ok(Complete::fail(start, e));
@@ -289,7 +290,12 @@ pub fn execute_op(root: &Path, op: &Op) -> Result<Complete> {
         }
         Op::Truncate { path, size } => {
             let full = resolve(root, path)?;
-            match OpenOptions::new().write(true).create(true).open(&full) {
+            match OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&full)
+            {
                 Ok(f) => {
                     if let Err(e) = f.set_len(*size) {
                         return Ok(Complete::fail(start, e));
@@ -323,11 +329,7 @@ pub fn execute_op(root: &Path, op: &Op) -> Result<Complete> {
                 Err(e) => Ok(Complete::fail(start, e)),
             }
         }
-        Op::ReadAt {
-            path,
-            offset,
-            len,
-        } => {
+        Op::ReadAt { path, offset, len } => {
             let full = resolve(root, path)?;
             match File::open(&full) {
                 Ok(mut f) => {
@@ -377,6 +379,7 @@ pub fn execute_op(root: &Path, op: &Op) -> Result<Complete> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -390,13 +393,7 @@ mod tests {
         };
         let c = execute_op(dir.path(), &op).unwrap();
         assert_eq!(c.outcome, Outcome::Ok);
-        let c2 = execute_op(
-            dir.path(),
-            &Op::Read {
-                path: "a/f".into(),
-            },
-        )
-        .unwrap();
+        let c2 = execute_op(dir.path(), &Op::Read { path: "a/f".into() }).unwrap();
         assert_eq!(c2.bytes.as_deref(), Some(b"hello".as_slice()));
     }
 

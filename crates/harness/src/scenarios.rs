@@ -424,6 +424,12 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         run: disjoint_write_4,
     },
+    Scenario {
+        name: "named-shared-daemon",
+        desc: "plan 21: mount NAME then NAME:/sub from a second CLI call share one daemon/node_id; unmount tears down views one at a time, then the process",
+        requires: &[],
+        run: named_shared_daemon,
+    },
 ];
 
 fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
@@ -1109,7 +1115,10 @@ fn quota_enforcement(_seed: u64) -> Result<()> {
     // Tiny cap so a single write overshoots.
     a.set_quota(Some(64 * 1024))?;
     let (max, _) = a.get_quota()?;
-    anyhow::ensure!(max == Some(64 * 1024), "quota not visible on setter: {max:?}");
+    anyhow::ensure!(
+        max == Some(64 * 1024),
+        "quota not visible on setter: {max:?}"
+    );
 
     eventually("quota replicates to peer", Duration::from_secs(30), || {
         let (max, _) = b.get_quota()?;
@@ -4848,4 +4857,237 @@ fn disjoint_write_4(seed: u64) -> Result<()> {
         let _ = c.unmount();
     }
     Ok(())
+}
+
+/// Plan 21: a named filesystem's views (root + a subtree) share one
+/// daemon process and one `node_id` — mounting a second view from a
+/// *fresh* CLI invocation must attach to the already-running daemon over
+/// its control socket instead of starting a second process. Exercises
+/// the registry, name resolution, daemonization (real backgrounding, not
+/// `--foreground`), multi-view `MountAdd`/`MountRemove`, and the
+/// daemon's own clean exit once its last view is detached.
+fn named_shared_daemon(_seed: u64) -> Result<()> {
+    use std::os::unix::net::UnixStream;
+    use std::process::Command;
+    use std::time::Instant;
+
+    fn constellation_bin() -> PathBuf {
+        std::env::var_os("CONSTELLATION_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let target = std::env::var_os("CARGO_TARGET_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("target"));
+                target.join("release/constellation")
+            })
+    }
+
+    fn is_mountpoint(p: &std::path::Path) -> bool {
+        Command::new("mountpoint")
+            .arg("-q")
+            .arg(p)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn read_status(sock: &std::path::Path) -> Result<serde_json::Value> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = UnixStream::connect(sock)
+            .with_context(|| format!("connecting to {}", sock.display()))?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.write_all(b"{\"cmd\":\"status\"}\n")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        Ok(serde_json::from_str(&line)?)
+    }
+
+    fn pid_alive(pid: &str) -> bool {
+        pid.trim()
+            .parse::<u32>()
+            .ok()
+            .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+    }
+
+    let (env, root) = setup("named-daemon")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/named-{}", ts());
+
+    let registry = root.path().join("registry.toml");
+    let data_home = root.path().join("data");
+    let mnt1 = root.path().join("mnt1");
+    let mnt2 = root.path().join("mnt2");
+    std::fs::create_dir_all(&mnt1)?;
+    std::fs::create_dir_all(&mnt2)?;
+
+    let cmd = |args: &[&str]| -> Command {
+        let mut c = Command::new(constellation_bin());
+        c.args(args)
+            .env("AWS_ACCESS_KEY_ID", "test")
+            .env("AWS_SECRET_ACCESS_KEY", "test")
+            .env("AWS_DEFAULT_REGION", "us-east-1")
+            .env("AWS_ENDPOINT", &env.endpoint)
+            .env("AWS_ALLOW_HTTP", "true")
+            .env("CONSTELLATION_REGISTRY", &registry)
+            .env("XDG_DATA_HOME", &data_home)
+            .env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
+            .env("CONSTELLATION_S3_MAX_RETRIES", "2")
+            .env("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "2000");
+        c
+    };
+
+    let state_dir = data_home.join("constellation").join("myfs");
+    let pid_path = state_dir.join("daemon.pid");
+    let sock_path = state_dir.join("control.sock");
+
+    // Runs the scenario body; teardown below always attempts a clean
+    // `unmount myfs` and, failing that, a direct kill of any leftover
+    // daemon.pid — this is the harness scenario's answer to "clients
+    // unmount in all paths" when there's no `Client`/`Drop` to lean on.
+    let body = || -> Result<()> {
+        let out = cmd(&[
+            "fs",
+            "create",
+            "myfs",
+            "--s3",
+            &backend,
+            "--chunk-size",
+            "1048576",
+        ])
+        .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "fs create failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // First mount: this invocation forks, becomes the daemon, and
+        // the parent (what `.output()` waits on) exits once the child
+        // reports "control socket bound and view attached" — real
+        // daemonization, not `--foreground`.
+        let out = cmd(&["mount", "myfs", mnt1.to_str().unwrap()]).output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "first mount failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !is_mountpoint(&mnt1) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        anyhow::ensure!(is_mountpoint(&mnt1), "mnt1 did not come up");
+
+        let pid1 = std::fs::read_to_string(&pid_path)
+            .context("reading daemon.pid after the first mount")?
+            .trim()
+            .to_string();
+        anyhow::ensure!(pid_alive(&pid1), "daemon.pid {pid1} is not a live process");
+
+        // A subtree the second view will mount must exist first.
+        std::fs::create_dir(mnt1.join("sub")).context("creating /sub before mounting it")?;
+
+        // Second mount, same name, different view, from a *fresh* CLI
+        // invocation: must attach to the daemon above, not start a
+        // second one.
+        let out = cmd(&["mount", "myfs:/sub", mnt2.to_str().unwrap()]).output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "second mount failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !is_mountpoint(&mnt2) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        anyhow::ensure!(is_mountpoint(&mnt2), "mnt2 did not come up");
+
+        let pid2 = std::fs::read_to_string(&pid_path)
+            .context("reading daemon.pid after the second mount")?
+            .trim()
+            .to_string();
+        anyhow::ensure!(
+            pid1 == pid2,
+            "a second daemon.pid appeared ({pid1} vs {pid2}); views did not share one process"
+        );
+
+        let status = read_status(&sock_path)?;
+        anyhow::ensure!(
+            status["mounts"].as_array().map(|m| m.len()) == Some(2),
+            "daemon should report exactly 2 mounted views: {status}"
+        );
+
+        // Both mountpoints usable, through the one shared replica.
+        std::fs::write(mnt1.join("a.txt"), b"root-view")?;
+        std::fs::write(mnt2.join("b.txt"), b"sub-view")?;
+        anyhow::ensure!(
+            std::fs::read(mnt1.join("sub/b.txt"))? == b"sub-view",
+            "subtree view content not visible through the root view"
+        );
+
+        // Detach the subtree view: root keeps working, daemon stays up.
+        let out = cmd(&["unmount", "myfs:/sub"]).output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "unmount myfs:/sub failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && is_mountpoint(&mnt2) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        anyhow::ensure!(!is_mountpoint(&mnt2), "mnt2 still mounted after unmount");
+        anyhow::ensure!(
+            is_mountpoint(&mnt1) && std::fs::read(mnt1.join("a.txt"))? == b"root-view",
+            "root view stopped working after detaching the subtree view"
+        );
+        anyhow::ensure!(
+            pid_alive(&pid1),
+            "daemon exited after detaching a non-last view"
+        );
+
+        // Detach the last view: the daemon must run its clean-shutdown
+        // sequence and exit, removing its own PID file.
+        let out = cmd(&["unmount", "myfs"]).output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "unmount myfs failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && (is_mountpoint(&mnt1) || pid_alive(&pid1)) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        anyhow::ensure!(
+            !is_mountpoint(&mnt1),
+            "mnt1 still mounted after unmount myfs"
+        );
+        anyhow::ensure!(
+            !pid_alive(&pid1),
+            "daemon {pid1} still alive after its last view was detached"
+        );
+        anyhow::ensure!(!pid_path.exists(), "daemon.pid not removed on clean exit");
+        Ok(())
+    };
+
+    let result = body();
+
+    // Best-effort teardown regardless of where `body` failed.
+    let _ = cmd(&["unmount", "myfs"]).output();
+    if let Ok(pid) = std::fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = Command::new("fusermount3")
+        .args(["-u", "-z"])
+        .arg(&mnt1)
+        .status();
+    let _ = Command::new("fusermount3")
+        .args(["-u", "-z"])
+        .arg(&mnt2)
+        .status();
+
+    result
 }

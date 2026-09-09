@@ -11,9 +11,10 @@ pub mod web;
 
 pub use types::{
     CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry, DoctorStatus,
-    DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus, P2pStatus,
-    PartitionStatus, PeerStatus, PinStatus, PrefetchStatus, QuotaStatus, ReintegrationStatus,
-    Request, Response, SnapshotStatus, SourceStatus, SpoolStatus, StatusReport, WritebackStatus,
+    DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus, MountInfo,
+    MountViewOpts, P2pStatus, PartitionStatus, PeerStatus, PinStatus, PrefetchStatus, QuotaStatus,
+    ReintegrationStatus, Request, Response, SnapshotStatus, SourceStatus, SpoolStatus,
+    StatusReport, WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -140,6 +141,27 @@ pub trait StatusSource: Send + Sync + 'static {
     fn get_quota(&self) -> std::result::Result<(Option<u64>, u64), String> {
         Err("quota is not supported by this daemon".into())
     }
+
+    /// Attach a new view. Default refuses so a provider (tests, older
+    /// daemons) that predates multi-view mounts stays valid.
+    fn mount_add(
+        &self,
+        _subtree: &str,
+        _mountpoint: &Path,
+        _opts: &MountViewOpts,
+    ) -> std::result::Result<String, String> {
+        Err("mount-add is not supported by this daemon".into())
+    }
+
+    /// Detach the view mounted at `mountpoint`.
+    fn mount_remove(&self, _mountpoint: &Path) -> std::result::Result<String, String> {
+        Err("mount-remove is not supported by this daemon".into())
+    }
+
+    /// Every view currently mounted by this daemon.
+    fn mount_list(&self) -> Vec<MountInfo> {
+        Vec::new()
+    }
 }
 
 /// The single request dispatcher shared by unix sockets and HTTP. Keeping
@@ -209,6 +231,15 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
                 used_bytes,
             },
             Err(message) => Response::Error { message },
+        },
+        Request::MountAdd {
+            subtree,
+            mountpoint,
+            opts,
+        } => result(source.mount_add(&subtree, &mountpoint, &opts)),
+        Request::MountRemove { mountpoint } => result(source.mount_remove(&mountpoint)),
+        Request::MountList => Response::Mounts {
+            mounts: source.mount_list(),
         },
     }
 }
@@ -283,7 +314,12 @@ mod tests {
             StatusReport {
                 fs_uuid: "test-uuid".into(),
                 backend: "s3://bucket/prefix".into(),
-                mountpoint: "/mnt/x".into(),
+                mounts: vec![MountInfo {
+                    id: 1,
+                    subtree: String::new(),
+                    mountpoint: "/mnt/x".into(),
+                    mounted_ms_ago: 1000,
+                }],
                 node_id: 1,
                 version: "1.0.0-test".into(),
                 enrolled: true,
@@ -469,7 +505,12 @@ mod tests {
             StatusReport {
                 fs_uuid: "multi".into(),
                 backend: "s3://bucket/prefix".into(),
-                mountpoint: "/mnt/x".into(),
+                mounts: vec![MountInfo {
+                    id: 1,
+                    subtree: String::new(),
+                    mountpoint: "/mnt/x".into(),
+                    mounted_ms_ago: 1000,
+                }],
                 node_id: 1,
                 version: "1.0.0-test".into(),
                 enrolled: true,
@@ -654,6 +695,15 @@ mod tests {
             Request::Doctor,
             Request::CacheList,
             Request::CachePrune { target_bytes: 0 },
+            Request::MountAdd {
+                subtree: "/".into(),
+                mountpoint: "/mnt/y".into(),
+                opts: MountViewOpts::default(),
+            },
+            Request::MountRemove {
+                mountpoint: "/mnt/y".into(),
+            },
+            Request::MountList,
         ];
         let dir = tempfile::tempdir().unwrap();
         let source = Arc::new(Fake);

@@ -9,7 +9,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 pub async fn serve(listen: SocketAddr, mount: PathBuf) -> Result<()> {
-    anyhow::ensure!(mount.is_dir(), "mount is not a directory: {}", mount.display());
+    anyhow::ensure!(
+        mount.is_dir(),
+        "mount is not a directory: {}",
+        mount.display()
+    );
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("bind {listen}"))?;

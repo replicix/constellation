@@ -2673,8 +2673,8 @@ impl SqliteMeta {
             if !Self::scratch_exists(conn, ino)? {
                 return Err(MetaError::NoEnt(ino));
             }
-            let mut stmt = conn
-                .prepare_cached("SELECT name FROM scratch_xattr WHERE ino = ?1 ORDER BY name")?;
+            let mut stmt =
+                conn.prepare_cached("SELECT name FROM scratch_xattr WHERE ino = ?1 ORDER BY name")?;
             let rows = stmt.query_map(params![ino], |row| row.get(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
@@ -2688,10 +2688,12 @@ impl SqliteMeta {
         self.with_reader(|conn| Self::scratch_xattrs_by_ino(conn, ino))
     }
 
-    fn scratch_xattrs_by_ino(conn: &Connection, ino: Ino) -> Result<Vec<(String, Vec<u8>)>, MetaError> {
-        let mut stmt = conn.prepare_cached(
-            "SELECT name, value FROM scratch_xattr WHERE ino = ?1 ORDER BY name",
-        )?;
+    fn scratch_xattrs_by_ino(
+        conn: &Connection,
+        ino: Ino,
+    ) -> Result<Vec<(String, Vec<u8>)>, MetaError> {
+        let mut stmt = conn
+            .prepare_cached("SELECT name, value FROM scratch_xattr WHERE ino = ?1 ORDER BY name")?;
         let rows = stmt.query_map(params![ino], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -4098,7 +4100,10 @@ mod tests {
             42,
             &[
                 ("user.passsage.meta".to_string(), b"blob".to_vec()),
-                ("user.passsage.vary".to_string(), b"accept-encoding".to_vec()),
+                (
+                    "user.passsage.vary".to_string(),
+                    b"accept-encoding".to_vec(),
+                ),
             ],
         )
         .unwrap();
@@ -4109,7 +4114,10 @@ mod tests {
         );
         assert_eq!(
             m.list_xattrs(ino).unwrap(),
-            vec!["user.passsage.meta".to_string(), "user.passsage.vary".to_string()]
+            vec![
+                "user.passsage.meta".to_string(),
+                "user.passsage.vary".to_string()
+            ]
         );
         let records = m.take_journal(10).unwrap();
         assert_eq!(records.len(), 4);

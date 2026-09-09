@@ -619,6 +619,23 @@ multi-client and P2P-invalidation scenarios test adjacent fallback and
 convergence behavior only. Add a named harness scenario before relying on
 fault-injection coverage for holder crash-after-ack or Publish crash windows.
 
+## Named filesystems and the shared mount daemon (plan 21)
+
+`named-shared-daemon` drives the real `constellation` binary directly
+(not the `Client` harness abstraction, which always mounts ad hoc via
+explicit `--state-dir`/`--s3` and stays in the foreground for direct
+process-lifetime control) against an isolated `CONSTELLATION_REGISTRY`/
+`XDG_DATA_HOME`. It proves the daemon-sharing model end to end: `mount
+myfs MOUNTPOINT` daemonizes for real (fork + `setsid`, not
+`--foreground`); a second, independent CLI invocation, `mount
+myfs:/sub MOUNTPOINT2`, attaches to that already-running daemon over its
+control socket instead of starting a second process — asserted by both
+mountpoints sharing one `daemon.pid` and the daemon reporting exactly
+one `node_id`. It then exercises `unmount myfs:/sub` (root view keeps
+serving, daemon stays up) followed by `unmount myfs` (last view: the
+daemon runs its clean-shutdown sequence, exits, and removes its own PID
+file).
+
 ## CI notes
 
 - The `integration` job builds the runner image via buildx with

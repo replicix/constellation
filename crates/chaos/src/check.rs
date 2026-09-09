@@ -5,6 +5,14 @@ use crate::op::{Op, Outcome};
 use anyhow::Result;
 use std::collections::HashMap;
 
+/// `(path, offset) -> [(patch start within the write, patch bytes), ...]`
+/// for `check_torn_writes`'s torn-write detection.
+type PatchesByPathOffset = HashMap<(String, u64), Vec<(u64, Vec<u8>)>>;
+
+/// `path -> [(worker, content hash, op_id), ...]` for a convergence-read
+/// quiesce group in `check_convergence_reads`.
+type ConvergenceGroup = HashMap<String, Vec<(usize, Option<String>, u64)>>;
+
 #[derive(Debug, Clone)]
 pub struct CheckFailure {
     pub checker: String,
@@ -91,7 +99,10 @@ fn check_unexpected_errno(history: &History) -> Result<(), CheckFailure> {
     Ok(())
 }
 
-fn storm_groups(history: &History, pred: impl Fn(&Op) -> bool) -> HashMap<String, Vec<(Event, Event)>> {
+fn storm_groups(
+    history: &History,
+    pred: impl Fn(&Op) -> bool,
+) -> HashMap<String, Vec<(Event, Event)>> {
     let mut groups: HashMap<String, Vec<(Event, Event)>> = HashMap::new();
     for (inv, comp) in paired(history) {
         let Some(op) = &inv.op else { continue };
@@ -153,7 +164,10 @@ fn check_exactly_one_winner(history: &History) -> Result<(), CheckFailure> {
         if pairs.len() < 2 {
             continue;
         }
-        let oks = pairs.iter().filter(|(_, c)| c.kind == EventKind::Ok).count();
+        let oks = pairs
+            .iter()
+            .filter(|(_, c)| c.kind == EventKind::Ok)
+            .count();
         if oks > 1 {
             return Err(CheckFailure {
                 checker: "exactly_one_winner".into(),
@@ -167,7 +181,10 @@ fn check_exactly_one_winner(history: &History) -> Result<(), CheckFailure> {
         if pairs.len() < 2 {
             continue;
         }
-        let oks = pairs.iter().filter(|(_, c)| c.kind == EventKind::Ok).count();
+        let oks = pairs
+            .iter()
+            .filter(|(_, c)| c.kind == EventKind::Ok)
+            .count();
         if oks > 1 {
             return Err(CheckFailure {
                 checker: "exactly_one_winner".into(),
@@ -181,7 +198,10 @@ fn check_exactly_one_winner(history: &History) -> Result<(), CheckFailure> {
         if pairs.len() < 2 {
             continue;
         }
-        let oks = pairs.iter().filter(|(_, c)| c.kind == EventKind::Ok).count();
+        let oks = pairs
+            .iter()
+            .filter(|(_, c)| c.kind == EventKind::Ok)
+            .count();
         if oks > 1 {
             return Err(CheckFailure {
                 checker: "exactly_one_winner".into(),
@@ -195,7 +215,10 @@ fn check_exactly_one_winner(history: &History) -> Result<(), CheckFailure> {
         if pairs.len() < 2 {
             continue;
         }
-        let oks = pairs.iter().filter(|(_, c)| c.kind == EventKind::Ok).count();
+        let oks = pairs
+            .iter()
+            .filter(|(_, c)| c.kind == EventKind::Ok)
+            .count();
         if oks > 1 {
             return Err(CheckFailure {
                 checker: "exactly_one_winner".into(),
@@ -262,9 +285,7 @@ fn check_write_full_register(history: &History) -> Result<(), CheckFailure> {
         if !any_write {
             return Err(CheckFailure {
                 checker: "register_linearizability".into(),
-                message: format!(
-                    "read of {path} got hash {hash} not in successful WriteFull set"
-                ),
+                message: format!("read of {path} got hash {hash} not in successful WriteFull set"),
                 op_ids: vec![op_id],
             });
         }
@@ -274,7 +295,7 @@ fn check_write_full_register(history: &History) -> Result<(), CheckFailure> {
 
 fn check_torn_writes(history: &History) -> Result<(), CheckFailure> {
     // For WriteAt at same path+offset, collect patches; ReadAt must match one full patch.
-    let mut patches: HashMap<(String, u64), Vec<(u64, Vec<u8>)>> = HashMap::new();
+    let mut patches: PatchesByPathOffset = HashMap::new();
     let mut readats: Vec<(String, u64, Vec<u8>, u64)> = Vec::new();
 
     for (inv, comp) in paired(history) {
@@ -381,7 +402,9 @@ fn check_disjoint_writes(history: &History) -> Result<(), CheckFailure> {
             if bytes != patch {
                 return Err(CheckFailure {
                     checker: "disjoint_write".into(),
-                    message: format!("disjoint WriteAt {path}@{offset} not visible in later ReadAt"),
+                    message: format!(
+                        "disjoint WriteAt {path}@{offset} not visible in later ReadAt"
+                    ),
                     op_ids: vec![inv.op_id, rinv.op_id],
                 });
             }
@@ -427,7 +450,9 @@ fn check_chmod_atomicity(history: &History) -> Result<(), CheckFailure> {
         if !modes.iter().any(|x| (*x & 0o7777) == m_perm) {
             return Err(CheckFailure {
                 checker: "attr_atomicity".into(),
-                message: format!("stat mode {m:#o} on {path} not in concurrent chmod set {modes:?}"),
+                message: format!(
+                    "stat mode {m:#o} on {path} not in concurrent chmod set {modes:?}"
+                ),
                 op_ids: vec![op_id],
             });
         }
@@ -440,29 +465,26 @@ fn check_convergence_reads(history: &History) -> Result<(), CheckFailure> {
     // Simpler approach: consecutive successful Reads of same path with same
     // op tag window — group by path among reads that share close time after Info.
     let mut pending_tag: Option<String> = None;
-    let mut group: HashMap<String, Vec<(usize, Option<String>, u64)>> = HashMap::new();
+    let mut group: ConvergenceGroup = HashMap::new();
     // path -> (worker, hash, op_id)
 
-    let flush =
-        |tag: &str, group: &mut HashMap<String, Vec<(usize, Option<String>, u64)>>| -> Result<(), CheckFailure> {
-            for (path, entries) in group.drain() {
-                if entries.len() < 2 {
-                    continue;
-                }
-                let hashes: Vec<_> = entries.iter().map(|(_, h, _)| h.clone()).collect();
-                let first = &hashes[0];
-                if hashes.iter().any(|h| h != first) {
-                    return Err(CheckFailure {
-                        checker: "convergence".into(),
-                        message: format!(
-                            "after {tag}, workers disagree on {path}: {hashes:?}"
-                        ),
-                        op_ids: entries.iter().map(|(_, _, id)| *id).collect(),
-                    });
-                }
+    let flush = |tag: &str, group: &mut ConvergenceGroup| -> Result<(), CheckFailure> {
+        for (path, entries) in group.drain() {
+            if entries.len() < 2 {
+                continue;
             }
-            Ok(())
-        };
+            let hashes: Vec<_> = entries.iter().map(|(_, h, _)| h.clone()).collect();
+            let first = &hashes[0];
+            if hashes.iter().any(|h| h != first) {
+                return Err(CheckFailure {
+                    checker: "convergence".into(),
+                    message: format!("after {tag}, workers disagree on {path}: {hashes:?}"),
+                    op_ids: entries.iter().map(|(_, _, id)| *id).collect(),
+                });
+            }
+        }
+        Ok(())
+    };
 
     for ev in history.events() {
         if ev.kind == EventKind::Info {
@@ -518,8 +540,7 @@ fn check_convergence_reads(history: &History) -> Result<(), CheckFailure> {
                 inv_map.insert(ev.op_id, ev.clone());
             }
             EventKind::Ok | EventKind::Fail => {
-                if let (Some((_, ref mut ops)), Some(inv)) = (&mut cur, inv_map.remove(&ev.op_id))
-                {
+                if let (Some((_, ref mut ops)), Some(inv)) = (&mut cur, inv_map.remove(&ev.op_id)) {
                     ops.push((inv, ev.clone()));
                 }
             }
@@ -607,27 +628,35 @@ mod tests {
             content: b"x".to_vec(),
         };
         h.record_invoke(0, 1, op.clone());
-        h.record_complete(0, 1, Complete {
-            outcome: Outcome::Ok,
-            errno: None,
-            errno_name: None,
-            value_hash: None,
-            bytes: None,
-            size: None,
-            mode: None,
-            wall_ns: 1,
-        });
+        h.record_complete(
+            0,
+            1,
+            Complete {
+                outcome: Outcome::Ok,
+                errno: None,
+                errno_name: None,
+                value_hash: None,
+                bytes: None,
+                size: None,
+                mode: None,
+                wall_ns: 1,
+            },
+        );
         h.record_invoke(1, 2, op);
-        h.record_complete(1, 2, Complete {
-            outcome: Outcome::Ok,
-            errno: None,
-            errno_name: None,
-            value_hash: None,
-            bytes: None,
-            size: None,
-            mode: None,
-            wall_ns: 1,
-        });
+        h.record_complete(
+            1,
+            2,
+            Complete {
+                outcome: Outcome::Ok,
+                errno: None,
+                errno_name: None,
+                value_hash: None,
+                bytes: None,
+                size: None,
+                mode: None,
+                wall_ns: 1,
+            },
+        );
         assert!(check_exactly_one_winner(&h).is_err());
     }
 }

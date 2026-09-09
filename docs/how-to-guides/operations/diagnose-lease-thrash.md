@@ -19,7 +19,7 @@ or targeting stale holder information.
 ## 2. Read forwarding status
 
 ```bash
-constellation status
+constellation status --state-dir "$STATE_DIR"   # or a registered name: `constellation status myfs`
 ```
 
 Check:

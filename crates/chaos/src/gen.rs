@@ -145,7 +145,13 @@ impl Generator {
         let n = self.profile.workers;
         let families: &[&str] = match self.profile.scenarios {
             ScenarioSet::Namespace => &["create", "mkdir", "unlink", "rmdir", "rename"],
-            ScenarioSet::Data => &["write_full", "write_overlap", "write_disjoint", "append", "truncate"],
+            ScenarioSet::Data => &[
+                "write_full",
+                "write_overlap",
+                "write_disjoint",
+                "append",
+                "truncate",
+            ],
             ScenarioSet::Cto => &["cto"],
             ScenarioSet::All => &[
                 "create",

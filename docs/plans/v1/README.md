@@ -45,6 +45,8 @@ Execution protocol:
 | 19 | `wip/19-p9-crash-reporting.md` | wip | secure crash reporting pipeline | 13 |
 | 20 | `wip/20-read-atime.md` | wip | optional read-time atime (batched, eventually consistent) | 18 |
 | 21 | `wip/21-fs-registry-and-daemon.md` | wip | named filesystems, shared mount daemon, local registry | 18 |
+| 22 | `wip/22-atime-retention-policies.md` | wip | retention policies as xattr expressions, reaped by a singleton reaper | 20 (`age`/`keep` rules independent) |
+| 23 | `wip/23-remote-support-mode.md` | wip | compile-time-gated remote support mode: mount-armed `ro`/`rw` P2P sessions | 02 (independent of 19–22) |
 
 "Committed in practice": the plan does not technically build on the
 intermediate milestones, but the protocol is strictly sequential, so

@@ -5,9 +5,9 @@ use crate::op::{Complete, Op};
 use crate::proto::{read_msg, write_msg, Request, Response};
 use anyhow::{bail, Context, Result};
 use std::net::SocketAddr;
-use std::sync::Mutex;
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
 
 struct WorkerConn {
     addr: SocketAddr,
@@ -66,7 +66,7 @@ impl TcpCluster {
             op_id,
             op: op.clone(),
         };
-        let mut guard = stream.lock().expect("worker mutex");
+        let mut guard = stream.lock().await;
         write_msg(&mut guard, &req)
             .await
             .with_context(|| format!("invoke {addr}"))?;
@@ -96,7 +96,7 @@ impl Cluster for TcpCluster {
             work_root: work_root.to_string(),
         };
         for w in &self.workers {
-            let mut stream = w.stream.lock().expect("worker mutex");
+            let mut stream = self.rt.block_on(w.stream.lock());
             self.rt
                 .block_on(write_msg(&mut stream, &req))
                 .with_context(|| format!("prepare {}", w.addr))?;
@@ -131,8 +131,12 @@ impl Cluster for TcpCluster {
                             .workers
                             .get(*w)
                             .with_context(|| format!("worker {w}"))?;
-                        let complete = handle
-                            .block_on(Self::invoke_one(&worker.stream, worker.addr, *id, op))?;
+                        let complete = handle.block_on(Self::invoke_one(
+                            &worker.stream,
+                            worker.addr,
+                            *id,
+                            op,
+                        ))?;
                         Ok((*w, *id, complete))
                     })
                 })
@@ -149,13 +153,13 @@ impl Cluster for TcpCluster {
             name: name.to_string(),
         };
         for w in &self.workers {
-            let mut stream = w.stream.lock().expect("worker mutex");
+            let mut stream = self.rt.block_on(w.stream.lock());
             self.rt
                 .block_on(write_msg(&mut stream, &req))
                 .with_context(|| format!("barrier send {}", w.addr))?;
         }
         for w in &self.workers {
-            let mut stream = w.stream.lock().expect("worker mutex");
+            let mut stream = self.rt.block_on(w.stream.lock());
             let resp: Response = self.rt.block_on(read_msg(&mut stream))?;
             match resp {
                 Response::BarrierOk { name: n } => {

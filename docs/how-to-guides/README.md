@@ -9,9 +9,11 @@ Goal-oriented directions for a specific task or problem.
 - [Use a custom S3 endpoint](operations/use-custom-s3-endpoint.md) — floci / Localstack-style daemon on another host, create bucket, mount
 - [Run a shared cache workload](operations/shared-cache-workload.md) — node-local staging and atomic Publish
 - [Diagnose lease thrash](operations/diagnose-lease-thrash.md) — forwarding counters, handoff logs, placement
+- [Enable remote support](operations/enable-remote-support.md) — arm a node for a support session, choose `ro`/`rw`, end it
 
 ## Development
 
 - [Testing](development/TESTING.md) — test lanes, harness, compliance suites
 - [Run a chaos soak](development/run-chaos-soak.md) — multi-node conflict stress over TCP
 - [Releasing](development/RELEASING.md) — tag, build artifacts, publish checklist
+- [Run a support session](development/run-a-support-session.md) — support-engineer side: collect bundles, interactive REPL, repair rules

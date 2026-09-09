@@ -580,6 +580,16 @@ Each mount remains one process. This preserves the existing replica/cache/P2P
 lifecycle and SQLite WAL behavior; sharing one daemon among several FUSE
 sessions is not needed for correctness or the snapshot-mount scenario.
 
+**Superseded by plan 21** (see "Plan 21 — named filesystems, a shared mount
+daemon, and a local registry" below): the deferral above was true for
+*correctness* — nothing about snapshot/clone mounting needed a shared
+daemon — but stopped being sufficient once naming needed one daemon to
+answer for every view (root + subtrees) registered under one name, per
+DESIGN.md §13's "one daemon per (bucket, prefix) per machine". Plan 21
+implements that: `NodeRuntime` now hosts zero or more mounted views on
+one node identity/replica/cache/lease keeper, matching the spec that was
+already written before this deferral, not a correctness fix.
+
 Deferred: courtesy gossip warning before deleting a mounted snapshot. Gossip
 does not currently advertise mount selectors, and deletion is specified as
 non-blocking even for offline mounts.
@@ -949,8 +959,251 @@ release workspace build, all workspace tests, and all 102 CLI unit tests pass.
 Live mounted throughput scaling was not measured on this host because
 `/dev/fuse` is unavailable.
 
-## Later phases
+## Plan 21 step 0 — `NodeRuntime` extraction: **DONE**
 
-Phases 1–8f are closed. Phase 9 automated crash reporting remains future work.
+| Item | State | Where |
+|---|---|---|
+| `NodeRuntime::start`: per-node setup (backend/replica/cache open, node identity, staging GC/budget, lease keeper, P2P endpoint, periodic GC task, shipper attach + root adoption, sync task, gossip/registry/designation/placement background tasks) extracted from the old monolithic `mount()` | done | `cli::node_runtime` |
+| `NodeRuntime::add_mount`: per-view setup (selector/`@snapshot` parsing, `--rw`/`--clone-name`/`--ephemeral` clone creation, `FuseFs` construction, mount options, `fuser::Session`) spawns its session on a dedicated OS thread; `remove_mount` unmounts one view via its `SessionUnmounter` and joins that thread without touching siblings | done | `cli::node_runtime` |
+| Node-level signal handling: SIGINT/SIGTERM unmount every currently-mounted view (via a background thread, so the async handler task never blocks), then run `NodeRuntime::shutdown` once the last view is gone; second signal still aborts immediately | done | `cli::node_runtime` |
+| `Command::Mount`'s CLI handler reduced to a thin wrapper (`cmd_mount`): build `NodeConfig`, `NodeRuntime::start`, one `add_mount`, block on `join_mount` — today's single-view blocking behavior, unchanged | done | `cli::main` |
+| `existence::Existence::spawn_seed` takes `&tokio::runtime::Handle` instead of `&Runtime` (the only other call-site change this step needed) | done | `cli::existence` |
+
+Per the plan's explicit step-0 scope: no control-socket wire changes, no
+registry, no name resolution, no daemonization — those are plan 21 steps
+1–7 and remain future work. `DaemonStatus` still reports a single
+`mountpoint`/`prefetch_stats`, so building it and starting the control
+socket + web UI is deferred to the first `add_mount` call rather than
+living in `start()` — the plan's own architecture diagram (`mount` →
+`NodeRuntime::start` → `add_mount` → "serve control socket") shows this
+same ordering for the fully-built system, and Step 1 is explicitly where
+that struct grows a `mounts: Vec<MountInfo>` shape; step 0 does not change
+it. `existence.spawn_seed`'s bucket-wide LIST scan is likewise spawned
+from `add_mount` (guarded to the first view only), matching the original
+`mount()`'s exact call site immediately before the `fuser::Session` is
+built, not any earlier — the scan's own short grace delay assumes a mount
+is imminent.
+
+### Step 0 exit criteria (plan 21)
+
+- [x] `cargo fmt --all` clean and `cargo clippy -p constellation --all-targets -- -D warnings` clean for every file this step touched.
+- [x] `cargo test --workspace`: 0 failures.
+- [x] `bash tests/smoke.sh` and `bash tests/integration.sh` (floci S3 via docker): both PASSED.
+- [x] `docker compose --profile test run --rm compliance`: pjdfstest **8798 passed, 0 failed**, empty baseline.
+- [ ] `target/release/harness run`: not a clean "every scenario PASSED" on this host — see below.
+
+Steps 1–7 (control-socket mount verbs, local registry, name resolution,
+mount/unmount rework, daemonization, `fs create`/`export`, `fs list`) were
+implemented in a later session and are recorded as their own milestone
+below ("Plan 21 steps 1–7").
+
+**Harness note.** This host is a loaded interactive desktop (browsers,
+Slack, editors, other agent sessions), not a dedicated CI runner — `free`
+showed **21 GiB of swap in use** during this work, and consecutive
+`harness run` invocations back-to-back failed *different* scenario
+subsets each time, including scenarios with no plausible relationship to
+this refactor (`cold-cache`, `two-clients-disjoint`, `s3-outage`) and one
+timeout carrying a raw `HTTP error: error sending request` against the
+local S3 emulator. To separate host noise from an actual regression, the
+suspect scenarios were run repeatedly (5-8x each) against both this
+change and the unmodified base commit (`git stash`, rebuild, rerun):
+`s3-flap`, `kill9-remount`, and `deposed-reintegration` fail at a similar
+rate on the base commit with the same divergence signatures, confirming
+they predate this plan. `writeback-latency` and `partition-split` showed
+a higher failure rate under the refactored binary in some batches; one
+suspected ordering difference (`existence.spawn_seed` timing relative to
+the FUSE mount) was found and fixed to match the original call site
+exactly, but did not change the failure rate, and a full-matrix rerun
+after the fix still showed the same scenario churning between different
+failures run to run — consistent with host load rather than a code path
+that differs between the two binaries. No logic difference was found
+between the original and refactored code for any of these paths after
+line-by-line comparison. Re-running the full matrix on a quiet host is
+the way to close this out with confidence; it is flagged here rather than
+asserted clean.
 Deferred format/data-plane items remain listed in `docs/plans/v1/ROADMAP.md` and the
 phase-specific scope notes above.
+
+## Plan 21 steps 1–7 — named filesystems, local registry, shared mount daemon: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Control socket gains `MountAdd { subtree, mountpoint, opts }` / `MountRemove { mountpoint }` / `MountList`; a second CLI invocation extends an already-running daemon instead of starting a new process | done | `api::{Request,Response}`, `cli::main` (`fn mount_add/mount_remove/mount_list`) |
+| `StatusReport`/`DaemonStatus` converted from a single `mountpoint: String` to `mounts: Vec<MountInfo>` (one entry per live view); `leave` is node-level and detaches every mounted view, not just whichever one answered the control call | done | `api::types::StatusReport`, `cli::main::DaemonStatus` |
+| Local registry: `$XDG_CONFIG_HOME/constellation/registry.toml` (`CONSTELLATION_REGISTRY` override), node-level fields under `[NAME]`, per-view rows under `[[NAME.mounts]]`; `Registry::load/load_locked/entry/merge_and_save/remove`, write-then-rename, whole-file `flock` around the read-modify-write cycle | done | `cli::registry` (13 unit tests: overwrite-only-explicit-fields, node-vs-view placement, upsert-by-subtree, remove, TOML round-trip, 8-way concurrent-writer lock race) |
+| Name resolution: `myfs`, `myfs:/sub`, and a leading-`/` literal path are never reinterpreted even when it contains a colon; `Target::{Named,Raw}`, `state_dir`/`s3_url`/`state_dir_opt`/`effective_path` helpers | done | `cli::target` (7 unit tests) |
+| Every state-dir-taking subcommand (pin, unpin, offline, online, inspect, pins, designations, reintegrate, leave, write-mode, quota get/set, cache ls/stat/prune, log tail, status, snapshot create/delete/ls, clone, debug snap-refs, gc run/verify, fsck, doctor, `fs passwd`) takes a `TARGET` positional resolved through the registry, with `--state-dir`/`--s3` kept as explicit overrides | done | `cli::main` (`Command` variants + `resolve_target`) |
+| `mount`/`unmount` CLI rework: `TARGET [MOUNTPOINT]` positional syntax, explicit flags become registry overrides via `merge_and_save`, `--s3` refused against an already-populated state dir under the same name (identity pinned to the name), a per-name `daemon.lock` (`flock`, non-blocking) decides attach-vs-become-daemon race-free, bare `mount NAME` brings up every registered view all-or-nothing (partial failure rolls back only the views *this invocation* added) | done | `cli::main` (`cmd_mount`, `cmd_mount_body`, `take_state_dir_lock`, `attach_views`) |
+| New `Command::Unmount { target, state_dir }`: detaches one view (`NAME:/sub`) or every currently-mounted view (bare `NAME`); the daemon runs its own shutdown once its last view is gone, the CLI call waits (bounded) for the control socket to close | done | `cli::main::cmd_unmount` |
+| Daemonization (JuiceFS-style): fork before any tokio runtime/`NodeRuntime`/FUSE-thread work exists (the process is still single-threaded, so the child inherits no half-held locks or dead worker threads); parent blocks on a status pipe for "every requested view attached" or a specific error and exits with that verdict; child does `setsid()`, redirects stdout/stderr to `state_dir/daemon.log`, writes `state_dir/daemon.pid`; `-f`/`--foreground` and `CONSTELLATION_NO_DAEMONIZE` opt out | done | `cli::daemonize` |
+| `fs create` gains a mandatory positional `name`; registers the name with no views yet (`zfs create pool/dataset`-style) | done | `cli::main` (`FsCommand::Create`) |
+| New `Command::Export { name, force }`: one-shot teardown — if a `node_id` was ever claimed, sends `Leave` to a reachable daemon (drains the journal, releases leases, tombstones the registry record, then detaches every view from a background thread once the response is on the wire) and waits for the socket to close; if the daemon is unreachable, retires the node directly via the admin-leave path (refusing a live-but-wedged `daemon.lock` unless `--force`); always deletes the state dir (it is name-keyed, so leaving it behind would make a later `mount NAME` reopen a replica that already recorded "left the cluster") and the registry row last | done | `cli::main::cmd_export` |
+| `FsCommand::List` (`constellation fs list`): every registered name, its `S3`/state dir, and per-view subtree/mountpoint/live-mounted-or-not (probed via `MountList` against the control socket) | done | `cli::main::cmd_fs_list` |
+| Harness scenario `named-shared-daemon`: drives the real binary directly (not the `Client` abstraction, which always mounts ad hoc and stays foregrounded) against an isolated `CONSTELLATION_REGISTRY`/`XDG_DATA_HOME`; proves `mount myfs MOUNTPOINT` then `mount myfs:/sub MOUNTPOINT2` from a second, independent invocation share one `daemon.pid`/one `node_id` (real backgrounding, not `--foreground`), both views serve reads/writes through the shared replica, `unmount myfs:/sub` leaves the root view and daemon up, `unmount myfs` runs the daemon's clean-shutdown sequence and removes its own PID file | done | `harness::scenarios::named_shared_daemon` |
+| Call-site sweep: `tests/lib.sh` (`fs create NAME`, `mount / MOUNTPOINT --state-dir DIR --foreground`), `crates/harness/src/client.rs` (same two changes plus every ad-hoc `TARGET` positional `gc run`/`fsck` now needs), `README.md`, `docs/reference/configuration.md` (`CONSTELLATION_REGISTRY`, `CONSTELLATION_NO_DAEMONIZE`), new `docs/reference/features/named-filesystems.md`, `docs/how-to-guides/development/TESTING.md` | done | see files listed |
+
+**Design decisions where the plan was ambiguous or silent.**
+
+- The plan's Step 1 sketch showed `MountRemove { subtree }`; the implementation
+  addresses it by `mountpoint` instead, since the same subtree may legitimately
+  be mounted at two different mountpoints and "detach *this* mount" needs to
+  name which one.
+- The plan's "Deferred, not decided against" note leaves open what a bare
+  `myfs:/path` control command targets when more than one view is mounted;
+  the implementation takes the plan's own fallback literally — commands that
+  need exactly one state dir resolve it from the registry regardless of how
+  many views are live (there is exactly one state dir per name), so this
+  only matters for the daemon-side single-mount commands, which already
+  operate node-wide (`leave`, `write-mode`) rather than needing to pick a
+  view.
+- **`export` vs. `forget`.** The plan's Step 6 sketch (`Command::Forget`)
+  described a "remove the registry row, no data touched, refuse if the
+  daemon is reachable" verb — the `zpool export` name without the
+  "must not currently be busy" ceremony. The implementation instead ships a
+  single `constellation export NAME [--force]` that performs the full
+  teardown: self-leave (if a `node_id` was ever claimed) while the daemon is
+  still up so it can drain its journal and release leases cleanly, detach
+  every view, delete the state dir, then drop the registry row — folding
+  what would otherwise be a "you must `unmount` and manually clean up
+  first" two-step dance into the one verb DESIGN.md's control-plane surface
+  already promises (`fs create|mount|umount`; `export` is this plan's
+  addition to that list). This was carried forward from mid-implementation
+  design discussion in the session that did steps 1–7; it is recorded here
+  because it changes user-visible behavior from the plan's written sketch.
+  The state dir is deleted unconditionally (not left for a future `mount
+  NAME` to reopen) because it is name-keyed: leaving it behind after a
+  successful leave would make a later `mount NAME` reopen a replica that
+  already recorded "left the cluster" and refuse to remount, which is worse
+  than requiring `fs create`/`mount --s3` again.
+- `read_status`/`is_mountpoint`/`constellation_bin` in the new harness
+  scenario duplicate small helpers already private to `harness::client`
+  (`Client` is built around "one client owns one foregrounded process with
+  a known PID," which does not fit a scenario that specifically needs a
+  second, independent CLI invocation to attach to a daemon it does not own)
+  rather than widening `Client`'s public surface for a single caller.
+
+### Steps 1–7 exit criteria (plan 21)
+
+- [x] `cargo fmt --all` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean (including two unrelated pre-existing lint violations in `constellation-chaos` — a `std::sync::Mutex` guard held across an `.await`, a `needless_question_mark`, `manual_is_multiple_of`, `suspicious_open_options` on two `OpenOptions` calls, two `type_complexity` findings, and a test module's `unwrap_used` — fixed in passing since they blocked the workspace-wide gate; none are in a file this plan otherwise touches).
+- [x] `cargo test --workspace`: 0 failures (352 tests across every crate, including the CLI's 141).
+- [x] `bash tests/smoke.sh` and `bash tests/integration.sh` (floci S3 via docker): both PASSED.
+- [x] Two-view single-process/single-`node_id` confirmation: `named-shared-daemon` harness scenario PASSED — see its description above; it asserts one `daemon.pid`, `status.mounts.len() == 2`, and one `node_id` after the second, independent `mount myfs:/sub` invocation.
+- [x] `target/release/harness run`: 63/67 PASSED, 2 `fio-*` SKIPPED (`fio` absent, acceptable per CONVENTIONS), 4 FAILED — all 4 confirmed pre-existing, not plan-21 regressions; see below.
+- [x] `docker compose --profile test run --rm compliance`: pjdfstest **8798 passed, 0 failed**, empty baseline (`--foreground`, the standing gate); additionally re-run against a **daemonized** mount (real fork/`setsid`, not `--foreground`) restricted to the categories most likely to be sensitive to fd inheritance/cwd/signal delivery (`chmod rename open unlink mkdir symlink truncate link chown`): **8114 passed, 0 failed**. See below for how the daemonized run was driven.
+
+**Harness note (steps 1–7).** Before the harness matrix was run, a
+background `harness run` a prior session in this worktree had left running
+was found still active (docker containers, orphaned FUSE mounts under
+`/tmp/harness-*`) and was cleaned up first. An initial isolated check of
+`baseline` alone (before the full matrix) showed it failing intermittently
+(`MODEL DIVERGENCE`: a written file reading back as size 0, or a wrong byte
+count) at roughly a 20-30% rate across repeated single-scenario reruns —
+concerning since it is the simplest possible scenario (one client, no fault
+injection) and was not one of step 0's three confirmed-flaky scenarios
+(`s3-flap`, `kill9-remount`, `deposed-reintegration`). It was checked
+against the **unmodified `main` branch's own release build** in the sibling
+checkout: `baseline` reproduced the identical `MODEL DIVERGENCE` failure
+mode at a similar rate there too (6 runs, 1 failure, `w-f-87` size 0),
+confirming it predates this plan and is not a steps-1–7 regression (which
+do not touch the FUSE read/write path).
+
+The subsequent full 67-scenario matrix run then passed 63, skipped 2
+(`fio-latency`/`fio-blips`, `fio` absent), and failed 4:
+`deposed-reintegration` (already confirmed-flaky per step 0), plus three
+new-looking failures — `partition-split` (`MODEL DIVERGENCE` after a
+merge), `gc-dedup-race` ("GC deleted content committed during condemned
+wait"), `writeback-latency` ("back import content mismatch"); `baseline`
+itself passed this time. Per this plan's guidance not to chase flakiness
+in an open-ended loop, each of the three new-looking failures got a small,
+bounded number of targeted reruns against the **same unmodified `main`
+build** used for the `baseline` check above (not this worktree):
+`partition-split` reproduced the identical divergence on the first main
+run; `gc-dedup-race` reproduced on main at a similar rate (1 failure in 8
+runs across both checks); `writeback-latency` reproduced on main at an
+even higher rate (3/3 failures once retried). All three, like `baseline`
+and `deposed-reintegration`, are therefore pre-existing and
+host-load-correlated, not regressions introduced by steps 1–7 (none of
+which touch partition split/merge, GC condemnation, or the write-back
+path) — consistent with step 0's own prior finding that this specific
+host produces scenario-independent, non-reproducible-on-a-clean-run
+divergences under load. Left for a future investigation on a quiet host,
+per this plan's explicit instruction not to chase pre-existing host-load
+flakiness inside this plan's scope.
+
+**Reconciliation note (steps 1–7): rebased onto four commits that landed
+on `main` after this worktree branched** (`ad314cd` scratch-xattr
+staging, `366356c` logical statfs used-space, `7d556f6` cluster-wide
+logical size quota, `76c865d` mount-view-scoped statfs). The scratch-xattr
+commit is purely `SqliteMeta`-level and inode-addressed, so it needed no
+changes for multi-view: it merged with no conflicts and no design
+questions. The two statfs commits are per-`ConstellationFs`
+(`usage_cache`/`statfs_ttl` fields on the struct itself), and each mounted
+view already gets its own `ConstellationFs` instance from
+`NodeRuntime::add_mount`, so per-view scoping (a subtree/snapshot view
+reporting its own used bytes, a whole-fs view reading the maintained
+counter) held with no functional changes — confirmed by
+`fusefs::quota_tests::view_usage_scopes_to_subtree_mount` and
+`..._scopes_to_snapshot_mount` passing unmodified post-merge.
+
+The quota commit needed real integration, not just conflict resolution,
+because it had modified the old monolithic `mount()` (already deleted by
+step 0's `NodeRuntime` extraction) and a single-view `DaemonStatus`:
+
+- The `Command::Quota`/`QuotaCommand::{Get,Set}` CLI shape changed from
+  a bare `--state-dir` to the same `TARGET [--state-dir DIR]` positional
+  every other node-level command (`write-mode`, `cache`, `log tail`)
+  already uses, resolved through `resolve_target` — matching the plan's
+  Step 3 table entry (`quota get/set myfs [size]`, "always whole-fs,
+  never per-subtree, node-level").
+- The creation-time cap mirroring (`fsmeta.max_logical_bytes` →
+  `QUOTA_CREATION_KV_KEY` in node-local kv) moved from `mount()` into
+  `NodeRuntime::start`, right after `meta.set_node_prefix`, matching the
+  original call site exactly (once per node, not per view).
+- `DaemonStatus::set_quota`/`get_quota` moved from operating on
+  `self.meta`/`self.quota_cache` fields of a single-view daemon struct to
+  going through `self.node` (the shared `NodeRuntime`), consistent with
+  every other control-plane method after step 0's extraction.
+- One real design decision: the old code cached a *single* `QuotaCache`
+  handle (one `ConstellationFs`, one cache) on `DaemonStatus` and
+  invalidated just that on a live `SetQuota`. Under multi-view that is
+  wrong — a second, later-mounted view has its own independent
+  `QuotaCache` (each `ConstellationFs` owns one), and invalidating only
+  the first view's would leave every other mounted view serving a stale
+  cap for up to `QUOTA_CACHE_TTL` (5s) after an operator lowers or clears
+  it. Fixed by giving `node_runtime::MountHandle` its own `quota_cache`
+  field (captured from `fs.quota_cache_handle()` before the view's
+  `ConstellationFs` moves into its `fuser::Session`) and adding
+  `NodeRuntime::invalidate_quota_caches()`, which walks every currently
+  mounted view and invalidates each one; `DaemonStatus::set_quota` calls
+  that instead of touching a single cached handle. No test previously
+  exercised the multi-view case (the existing `quota-enforcement` harness
+  scenario is single-view), so this was verified by inspection against
+  `fusefs.rs`'s own cache-invalidation contract rather than a new
+  regression test; the mechanism (a per-view cache handle, invalidated by
+  iterating `NodeRuntime`'s mount table) mirrors how the pre-existing
+  multi-view code already handles everything else that is node-level but
+  view-local-cached.
+
+`docs/reference/configuration.md`'s merge produced accidental duplicate
+rows (`CONSTELLATION_DIGEST_INTERVAL_S`, `CONSTELLATION_SCAN_AHEAD`
+appearing in both "Metadata sync and partitions" and their correct
+sections) from a bad 3-way match; removed the duplicates and gave
+`CONSTELLATION_REGISTRY`/`CONSTELLATION_NO_DAEMONIZE` their own new
+"Named filesystems and daemonization" subsection (with a Table of
+Contents entry) instead of leaving them stranded mid-table.
+
+**Compliance note (steps 1–7): daemonized-mount pjdfstest.** The standard
+`docker compose --profile test run --rm compliance` gate drives
+`tests/lib.sh`'s `fs_mount`, which always passes `--foreground` (needed for
+the suite's own direct process-lifetime control via `$MOUNT_PID`) — so by
+itself it does not exercise the daemonization path (fork/`setsid`/PID
+file/log redirection) the plan calls out as needing its own check. To
+satisfy that without permanently complicating the shipped test helper, a
+throwaway conditional was added to `fs_mount` (drop `--foreground` when
+`CONSTELLATION_TEST_FOREGROUND=0`), the compliance image was rebuilt, and
+`compliance` was re-run with that variable set and `PJDFSTEST_ONLY` limited
+to the categories most sensitive to fd inheritance/cwd/signal-delivery
+through `setsid` (`chmod rename open unlink mkdir symlink truncate link
+chown`) — **8114 passed, 0 failed**. The `fs_mount` edit was then reverted
+(confirmed via `git diff` matching the pre-edit content exactly) and
+`tests/lib.sh` in the final tree has no trace of it.

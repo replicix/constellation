@@ -152,10 +152,7 @@ fn run_step(
                     .lock()
                     .expect("history")
                     .record_complete(w, id, complete.clone());
-                bail!(
-                    "unexpected errno {name} on worker {w} during {}",
-                    step.tag
-                );
+                bail!("unexpected errno {name} on worker {w} during {}", step.tag);
             }
         }
         history
@@ -176,10 +173,7 @@ fn run_step(
 
 fn observe_key(complete: &crate::op::Complete) -> String {
     if complete.outcome == Outcome::Fail {
-        return format!(
-            "FAIL:{}",
-            complete.errno_name.as_deref().unwrap_or("OTHER")
-        );
+        return format!("FAIL:{}", complete.errno_name.as_deref().unwrap_or("OTHER"));
     }
     if let Some(h) = &complete.value_hash {
         return format!("hash:{h}");
@@ -267,10 +261,7 @@ fn wait_converged_verify(
 
         if disagreement.is_none() {
             for (w, id, op, complete) in collected {
-                history
-                    .lock()
-                    .expect("history")
-                    .record_invoke(w, id, op);
+                history.lock().expect("history").record_invoke(w, id, op);
                 history
                     .lock()
                     .expect("history")
@@ -287,10 +278,7 @@ fn wait_converged_verify(
         let detail = disagreement.expect("disagreement set");
         if start.elapsed() > timeout {
             for (w, id, op, complete) in collected {
-                history
-                    .lock()
-                    .expect("history")
-                    .record_invoke(w, id, op);
+                history.lock().expect("history").record_invoke(w, id, op);
                 history
                     .lock()
                     .expect("history")
@@ -306,7 +294,7 @@ fn wait_converged_verify(
             );
         }
 
-        if attempt == 1 || attempt % 8 == 0 {
+        if attempt == 1 || attempt.is_multiple_of(8) {
             tracing::debug!(
                 tag = %step.tag,
                 attempt,
@@ -417,27 +405,19 @@ fn seed_create(
         .record_invoke(0, id, op.clone());
     let c = cluster.invoke(0, id, &op)?;
     // If already exists from a prior round, treat as ok enough to continue.
-    if c.outcome == Outcome::Fail
-        && c.errno_name.as_deref() == Some("EEXIST")
-    {
+    if c.outcome == Outcome::Fail && c.errno_name.as_deref() == Some("EEXIST") {
         let id2 = next_id(op_ids);
         let op2 = Op::WriteFull {
             path: path.to_string(),
             content: b"seed".to_vec(),
         };
-        history
-            .lock()
-            .expect("history")
-            .record_complete(0, id, c);
+        history.lock().expect("history").record_complete(0, id, c);
         history
             .lock()
             .expect("history")
             .record_invoke(0, id2, op2.clone());
         let c2 = cluster.invoke(0, id2, &op2)?;
-        history
-            .lock()
-            .expect("history")
-            .record_complete(0, id2, c2);
+        history.lock().expect("history").record_complete(0, id2, c2);
         return Ok(());
     }
     history.lock().expect("history").record_complete(0, id, c);

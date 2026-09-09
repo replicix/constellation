@@ -40,7 +40,9 @@ const QUOTA_CACHE_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_STATFS_TTL_S: u64 = 5;
 
 fn parse_statfs_ttl_secs(raw: Option<&str>) -> Duration {
-    let secs = raw.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_STATFS_TTL_S);
+    let secs = raw
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_STATFS_TTL_S);
     Duration::from_secs(secs)
 }
 
@@ -1873,9 +1875,7 @@ mod quota_tests {
 
     fn test_fs(meta: Arc<SqliteMeta>) -> (ConstellationFs, TempDir) {
         let dir = TempDir::new().unwrap();
-        let cache = Arc::new(
-            DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap(),
-        );
+        let cache = Arc::new(DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap());
         let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
         let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
             meta.clone(),
@@ -2142,9 +2142,7 @@ mod quota_tests {
             .unwrap();
 
         let dir = TempDir::new().unwrap();
-        let cache = Arc::new(
-            DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap(),
-        );
+        let cache = Arc::new(DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap());
         let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
         let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
             meta.clone(),
@@ -2160,9 +2158,7 @@ mod quota_tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            setup
-                .block_on(snapshots.create("/source", "snap"))
-                .unwrap();
+            setup.block_on(snapshots.create("/source", "snap")).unwrap();
         }
 
         let fs_rt = tokio::runtime::Builder::new_current_thread()

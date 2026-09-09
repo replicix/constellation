@@ -154,9 +154,16 @@ impl Client {
     }
 
     pub fn fs_create(&self) -> Result<()> {
+        // Plan 21: `fs create` now takes a mandatory name positional. The
+        // harness always drives mounts through explicit `--state-dir`/
+        // `--s3` (never a registered name), so this registry row is
+        // never read back — a fixed throwaway name is fine; it just
+        // avoids letting the shared per-user registry file grow one row
+        // per scenario run.
         let mut args = vec![
             "fs",
             "create",
+            "harness",
             "--s3",
             &self.backend,
             "--chunk-size",
@@ -180,11 +187,13 @@ impl Client {
         let output = self
             .cmd(&[
                 "mount",
+                "/",
+                wrong_mnt.to_str().unwrap(),
                 "--s3",
                 &self.backend,
-                wrong_mnt.to_str().unwrap(),
                 "--state-dir",
                 wrong_state.to_str().unwrap(),
+                "--foreground",
             ])
             .env("CONSTELLATION_PASSPHRASE", "definitely-wrong")
             .output()?;
@@ -207,17 +216,25 @@ impl Client {
             bail!("{} already mounted", self.name);
         }
         let logf = std::fs::File::create(&self.log)?;
+        // Plan 21: `mount` now takes TARGET MOUNTPOINT as two positionals
+        // (TARGET is a registry name, "name:/sub", or — as here, since
+        // the harness always mounts ad-hoc via --state-dir/--s3 — a
+        // literal inner path). The old single-positional "just the
+        // mountpoint, root implied" shorthand is gone: root must be
+        // spelled out as "/" explicitly.
         let mut args = vec![
             "mount".to_string(),
+            inner.unwrap_or("/").to_string(),
+            self.mnt.to_str().unwrap().to_string(),
             "--s3".to_string(),
             self.backend.clone(),
+            "--state-dir".to_string(),
+            self.state.to_str().unwrap().to_string(),
+            // Keep direct process-lifetime control: `Client` owns the
+            // child's pid, waits on it, signals it, etc. Daemonizing by
+            // default (plan 21, step 5) would fork away from that pid.
+            "--foreground".to_string(),
         ];
-        if let Some(inner) = inner {
-            args.push(inner.to_string());
-        }
-        args.push(self.mnt.to_str().unwrap().to_string());
-        args.push("--state-dir".to_string());
-        args.push(self.state.to_str().unwrap().to_string());
         args.extend(extra.iter().map(|arg| (*arg).to_string()));
         if let Some(bytes) = self.cache_size {
             args.push("--cache-size".to_string());
@@ -278,9 +295,12 @@ impl Client {
     }
 
     pub fn gc_process(&self, orphans: bool) -> Result<Child> {
+        // "/" is a placeholder TARGET positional (plan 21): unregistered,
+        // so `--s3`/`--state-dir` below are what actually get used.
         let mut args = vec![
             "gc",
             "run",
+            "/",
             "--s3",
             &self.backend,
             "--state-dir",
@@ -303,6 +323,7 @@ impl Client {
     pub fn fsck(&self, repair: bool) -> Result<std::process::Output> {
         let mut args = vec![
             "fsck",
+            "/",
             "--s3",
             &self.backend,
             "--state-dir",
@@ -521,10 +542,7 @@ impl Client {
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line)?;
         let response: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            response["resp"] == "quota",
-            "get_quota failed: {response}"
-        );
+        anyhow::ensure!(response["resp"] == "quota", "get_quota failed: {response}");
         let max = response["max_bytes"].as_u64();
         let used = response["used_bytes"].as_u64().unwrap_or(0);
         Ok((max, used))
@@ -534,6 +552,7 @@ impl Client {
     pub fn leave(&mut self, node_id: Option<u64>, force: bool) -> Result<()> {
         let mut args = vec![
             "leave".to_string(),
+            "/".to_string(), // placeholder TARGET (plan 21); --state-dir below wins
             "--state-dir".into(),
             self.state.display().to_string(),
         ];

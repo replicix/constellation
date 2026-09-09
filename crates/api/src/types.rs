@@ -98,6 +98,52 @@ pub enum Request {
     },
     /// Read the current quota and used bytes.
     GetQuota,
+    /// Attach a new view (root, subtree, or `@snapshot` selector) to the
+    /// running daemon, on its own `fuser::Session`. Lets a second CLI
+    /// invocation extend an already-running daemon instead of starting a
+    /// new process (plan 21).
+    MountAdd {
+        subtree: String,
+        mountpoint: std::path::PathBuf,
+        opts: MountViewOpts,
+    },
+    /// Detach one view, identified by where it is mounted (not by
+    /// subtree: the same subtree may legitimately be mounted at two
+    /// places).
+    MountRemove {
+        mountpoint: std::path::PathBuf,
+    },
+    /// Every view currently mounted by this daemon.
+    MountList,
+}
+
+/// Per-view mount options, mirroring today's `mount` CLI flags that are
+/// genuinely per-view rather than per-node.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MountViewOpts {
+    #[serde(default)]
+    pub allow_other: bool,
+    #[serde(default)]
+    pub fs_name: Option<String>,
+    #[serde(default)]
+    pub fuse_threads: Option<usize>,
+    #[serde(default)]
+    pub rw: bool,
+    #[serde(default)]
+    pub clone_name: Option<String>,
+    #[serde(default)]
+    pub ephemeral: bool,
+}
+
+/// One mounted view, as exposed by the control API (`MountList`,
+/// `StatusReport::mounts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountInfo {
+    pub id: u64,
+    pub subtree: String,
+    pub mountpoint: String,
+    /// Milliseconds since this view was mounted.
+    pub mounted_ms_ago: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +194,9 @@ pub enum Response {
     Quota {
         max_bytes: Option<u64>,
         used_bytes: u64,
+    },
+    Mounts {
+        mounts: Vec<MountInfo>,
     },
     Error {
         message: String,
@@ -248,7 +297,15 @@ fn default_true() -> bool {
 pub struct StatusReport {
     pub fs_uuid: String,
     pub backend: String,
-    pub mountpoint: String,
+    /// Every view this daemon currently has mounted (plan 21, step 1).
+    /// Was a single `mountpoint: String` field; a daemon serves exactly
+    /// one view in every release before this one, so old single-view
+    /// clients should read `mounts[0].mountpoint` if they need the
+    /// scalar back, but the struct field itself is gone — multi-view is
+    /// the whole point of this change and there is no sane single value
+    /// to keep reporting once more than one view is live.
+    #[serde(default)]
+    pub mounts: Vec<MountInfo>,
     /// This node's cluster-unique id (scopes ino allocation, marks log
     /// segment origin).
     #[serde(default)]

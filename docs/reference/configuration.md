@@ -20,6 +20,7 @@ not listed here.
   - [Garbage collection](#garbage-collection)
   - [FUSE and runtime threads](#fuse-and-runtime-threads)
   - [Filesystem stats](#filesystem-stats)
+  - [Named filesystems and daemonization](#named-filesystems-and-daemonization)
   - [Control UI](#control-ui)
 - [Boolean values](#boolean-values)
 - [Build-time](#build-time)
@@ -168,6 +169,13 @@ while no such record exists. Each node mirrors `meta.json`'s cap into
 node-local state at mount rather than seeding it into the journal, so a
 node that has not yet tailed a live change can never re-publish a cap an
 operator has cleared.
+
+### Named filesystems and daemonization
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_REGISTRY` | `$XDG_CONFIG_HOME/constellation/registry.toml` | path | local named-filesystem registry file (see [named filesystems](features/named-filesystems.md)) |
+| `CONSTELLATION_NO_DAEMONIZE` | unset | boolean-ish (any non-empty value) | force `--foreground` behavior for every `mount` (CI/harness convenience) |
 
 ### Control UI
 

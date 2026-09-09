@@ -187,9 +187,7 @@ pub enum LogRecord {
     },
     /// Cluster-wide logical byte cap. `None` clears the quota (unlimited).
     /// Journaled on `p0`; replay upserts `kv.quota_max_bytes`.
-    SetQuota {
-        max_logical_bytes: Option<u64>,
-    },
+    SetQuota { max_logical_bytes: Option<u64> },
 }
 
 impl LogRecord {

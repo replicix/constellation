@@ -12,8 +12,8 @@ fs_setup "${1:-}"
 
 say "fs create + doctor ($BACKEND)"
 fs_create
-"$BIN" doctor --s3 "$BACKEND"
-"$BIN" fs create --s3 "$BACKEND" 2>/dev/null && { echo "FAIL: double create succeeded"; exit 1; }
+"$BIN" doctor tests --s3 "$BACKEND"
+"$BIN" fs create tests --s3 "$BACKEND" 2>/dev/null && { echo "FAIL: double create succeeded"; exit 1; }
 
 say "mount"
 fs_mount

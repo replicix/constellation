@@ -400,8 +400,7 @@ fn insert_node(
             }
         }
     }
-    let prior_file = kind == InodeKind::File
-        && kind_of(tx, ino)? == Some(InodeKind::File.as_u8());
+    let prior_file = kind == InodeKind::File && kind_of(tx, ino)? == Some(InodeKind::File.as_u8());
     // OR REPLACE: idempotent under checkpoint/segment overlap.
     tx.execute(
         "INSERT OR REPLACE INTO inode (ino, kind, size, mode, uid, gid, nlink, atime_ns,
@@ -440,11 +439,7 @@ fn insert_node(
     Ok(Applied::Done)
 }
 
-fn apply_one(
-    tx: &Connection,
-    rec: &LogRecord,
-    usage: &UsageTracker,
-) -> Result<Applied, MetaError> {
+fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<Applied, MetaError> {
     match rec {
         LogRecord::Mkdir {
             parent,
@@ -656,7 +651,9 @@ fn apply_one(
                 if existing == ino {
                     return Ok(Applied::Done); // hardlink pair: POSIX no-op
                 }
-                if let Applied::Skipped(why) = evict_dentry(tx, usage, *new_parent, new_name, existing)? {
+                if let Applied::Skipped(why) =
+                    evict_dentry(tx, usage, *new_parent, new_name, existing)?
+                {
                     return Ok(Applied::Skipped(why));
                 }
             }

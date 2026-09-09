@@ -39,7 +39,7 @@ operations fail with `EXDEV`.
 Run the workload from two nodes, then inspect each node:
 
 ```bash
-constellation status
+constellation status --state-dir "$STATE_DIR"   # or a registered name: `constellation status myfs`
 journalctl --user -u constellation | grep 'handed the lease to a peer'
 ```
 
@@ -54,7 +54,7 @@ than that, keep the lease sticky across the expected gap:
 
 ```bash
 export CONSTELLATION_LEASE_IDLE_RELEASE_MS=120000
-constellation mount --s3 "$BUCKET" /mnt/cache
+constellation mount / /mnt/cache --s3 "$BUCKET"
 ```
 
 Increase this only when idle release causes reacquisition churn. Placement and

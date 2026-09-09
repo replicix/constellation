@@ -22,12 +22,19 @@ fs_setup() {
 }
 
 fs_create() {
-    "$BIN" fs create --s3 "$BACKEND" --chunk-size 1048576 --compression zstd:3
+    # Plan 21: `fs create` takes a mandatory name positional now. These
+    # suites always drive mounts via explicit --state-dir/--s3 (never a
+    # registered name), so this registry row is never read back.
+    "$BIN" fs create tests --s3 "$BACKEND" --chunk-size 1048576 --compression zstd:3
 }
 
 # fs_mount [extra mount flags...]
 fs_mount() {
-    "$BIN" mount --s3 "$BACKEND" "$MNT" --state-dir "$STATE" "$@" \
+    # Plan 21: TARGET MOUNTPOINT are now two positionals (root must be
+    # spelled "/" explicitly); --foreground keeps the direct
+    # process-lifetime control ($MOUNT_PID, fusermount3) these suites
+    # rely on instead of the new default (background + daemonize).
+    "$BIN" mount / "$MNT" --s3 "$BACKEND" --state-dir "$STATE" --foreground "$@" \
         >>"$MOUNT_LOG" 2>&1 &
     MOUNT_PID=$!
     local i

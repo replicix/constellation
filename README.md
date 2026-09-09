@@ -46,17 +46,31 @@ BIN=./target/release/constellation
 BUCKET=s3://my-bucket/constellation-demo   # empty prefix on first create
 mkdir -p /mnt/constellation
 
-$BIN doctor --s3 "$BUCKET"                 # checks If-None-Match / If-Match
-$BIN fs create --s3 "$BUCKET"              # once per prefix
-$BIN mount --s3 "$BUCKET" /mnt/constellation
-$BIN status                                # from another shell
+$BIN doctor demo --s3 "$BUCKET"            # checks If-None-Match / If-Match
+$BIN fs create demo --s3 "$BUCKET"         # registers "demo", once per prefix
+$BIN mount demo /mnt/constellation         # backgrounds itself by default
+$BIN status demo                           # from another shell
 # … use /mnt/constellation …
-fusermount3 -u /mnt/constellation
+$BIN unmount demo
 ```
 
+`demo` is a name registered on this machine (like `zpool`/`zfs`), resolved
+through `$XDG_CONFIG_HOME/constellation/registry.toml`
+(`CONSTELLATION_REGISTRY` overrides it) — see
+`docs/reference/features/named-filesystems.md`. `mount demo:/sub MOUNTPOINT`
+mounts just a subtree, and a bare `mount demo` (no mountpoint) brings up
+every view already registered for it. `constellation export demo` is the
+only way to un-register a name (leaves the cluster, detaches every view,
+deletes its state dir). For an ad-hoc, unregistered mount — no name, no
+registry writes — pass `--s3`/`--state-dir` with a literal path instead:
+`$BIN mount / /mnt/constellation --s3 "$BUCKET" --state-dir /tmp/scratch`.
+Add `-f`/`--foreground` to any `mount` to skip backgrounding (useful for
+debugging or supervising it with another process manager).
+
 Local state (metadata DB + chunk cache) defaults to
-`~/.local/share/constellation/<fs-uuid>/`; override with `--state-dir`.
-Needs FUSE (`fusermount3`) on the host.
+`$XDG_DATA_HOME/constellation/<name>/` for a registered name, or
+`~/.local/share/constellation/<fs-uuid>/` for an unregistered one; override
+with `--state-dir`. Needs FUSE (`fusermount3`) on the host.
 
 On Linux, request handling and the Tokio runtime size themselves from the
 CPU quota visible to the process. FUSE workers grow as roughly `2×sqrt(CPUs)`
@@ -83,6 +97,7 @@ Docs follow [Diátaxis](https://diataxis.fr/). Start at
 | [docs/how-to-guides/development/TESTING.md](docs/how-to-guides/development/TESTING.md) | correctness strategy: property tests, deterministic simulation, POSIX suites, e2e scenarios |
 | [docs/how-to-guides/development/RELEASING.md](docs/how-to-guides/development/RELEASING.md) | release artifacts and tag checklist |
 | [docs/reference/configuration.md](docs/reference/configuration.md) | runtime environment variables and defaults |
+| [docs/reference/features/named-filesystems.md](docs/reference/features/named-filesystems.md) | the local registry, one daemon per name, daemonization, `export` |
 | [docs/plans/v1/](docs/plans/v1/) | v1 roadmap, progress, and implementation plans (`done/` / `wip/`) |
 
 ## Layout

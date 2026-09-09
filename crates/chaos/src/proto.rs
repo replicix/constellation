@@ -10,17 +10,9 @@ use tokio::net::TcpStream;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Hello,
-    Prepare {
-        run_id: String,
-        work_root: String,
-    },
-    Invoke {
-        op_id: u64,
-        op: Op,
-    },
-    Barrier {
-        name: String,
-    },
+    Prepare { run_id: String, work_root: String },
+    Invoke { op_id: u64, op: Op },
+    Barrier { name: String },
     Abort,
     Shutdown,
 }
@@ -28,21 +20,11 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    HelloOk {
-        worker_id: String,
-        mount: String,
-    },
+    HelloOk { worker_id: String, mount: String },
     PrepareOk,
-    Complete {
-        op_id: u64,
-        complete: Complete,
-    },
-    BarrierOk {
-        name: String,
-    },
-    Error {
-        message: String,
-    },
+    Complete { op_id: u64, complete: Complete },
+    BarrierOk { name: String },
+    Error { message: String },
 }
 
 pub async fn write_msg<T: Serialize>(stream: &mut TcpStream, msg: &T) -> Result<()> {

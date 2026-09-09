@@ -12,7 +12,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "chaos", about = "Constellation multi-node FS consistency stress tool")]
+#[command(
+    name = "chaos",
+    about = "Constellation multi-node FS consistency stress tool"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -128,7 +131,7 @@ fn main() -> Result<()> {
 fn parse_duration(s: &str) -> Result<u64> {
     let s = s.trim();
     if let Some(num) = s.strip_suffix('s') {
-        return Ok(num.parse::<u64>().context("duration seconds")?);
+        return num.parse::<u64>().context("duration seconds");
     }
     if let Some(num) = s.strip_suffix('m') {
         return Ok(num.parse::<u64>().context("duration minutes")? * 60);
