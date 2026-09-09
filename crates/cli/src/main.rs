@@ -1466,29 +1466,58 @@ fn cmd_mount_body(
         .enable_all()
         .build()?;
     let sock = state_dir.join(constellation_api::SOCKET_NAME);
-    match take_state_dir_lock(state_dir) {
-        Ok(LockOutcome::Attach) => {
-            let result = rt.block_on(attach_views(&sock, &views));
-            match result {
-                Ok(()) => {
+    // A daemon that is draining before exit still holds `daemon.lock` and
+    // still serves `control.sock`, so we would otherwise `Attach` and add
+    // a view onto a process about to exit (which orphans the mount). If
+    // the attach is refused for that reason, wait for the old daemon to
+    // release the lock, then loop: the next `take_state_dir_lock` will
+    // return `BecomeDaemon`.
+    let lock_outcome = loop {
+        match take_state_dir_lock(state_dir)? {
+            LockOutcome::Attach => match rt.block_on(attach_views(&sock, &views))? {
+                AttachOutcome::Attached => {
                     for view in &views {
                         println!("mounted {} at {}", view.subtree, view.mountpoint.display());
                     }
                     if let Some(v) = verdict {
                         v.success_attached()?;
                     }
-                    Ok(())
+                    return Ok(());
                 }
-                Err(e) => {
-                    if let Some(v) = verdict {
-                        v.failure(&format!("{e:#}"))?;
-                        std::process::exit(1);
+                AttachOutcome::DaemonShuttingDown => {
+                    eprintln!(
+                        "existing daemon for this mount is shutting down (draining); \
+                         waiting for it to exit before taking over…"
+                    );
+                    // Wait for the old daemon to release the lock / remove
+                    // its socket. Bounded so a genuinely wedged daemon
+                    // surfaces an error rather than spinning forever.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(600);
+                    while sock.exists() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
                     }
-                    Err(e)
+                    if sock.exists() {
+                        let msg = "existing daemon is still shutting down after 600s; \
+                             not taking over (retry once it has exited)"
+                            .to_string();
+                        if let Some(v) = verdict {
+                            v.failure(&msg)?;
+                            std::process::exit(1);
+                        }
+                        bail!(msg);
+                    }
+                    // Old daemon is gone: loop and re-take the lock, which
+                    // now yields `BecomeDaemon`.
+                    continue;
                 }
-            }
+            },
+            LockOutcome::BecomeDaemon => break LockOutcome::BecomeDaemon,
         }
-        Ok(LockOutcome::BecomeDaemon) => {
+    };
+    match lock_outcome {
+        LockOutcome::Attach => unreachable!("attach handled in the loop above"),
+        LockOutcome::BecomeDaemon => {
             let handle = rt.handle().clone();
             let node = match node_runtime::NodeRuntime::start(
                 node_runtime::NodeConfig {
@@ -1558,18 +1587,21 @@ fn cmd_mount_body(
             drop(rt);
             Ok(())
         }
-        Err(e) => {
-            if let Some(v) = verdict {
-                v.failure(&format!("{e:#}"))?;
-                std::process::exit(1);
-            }
-            Err(e)
-        }
     }
 }
 
-/// Send `MountAdd` for every view to an already-running daemon.
-async fn attach_views(sock: &Path, views: &[ViewSpec]) -> Result<()> {
+/// Outcome of trying to attach views to an already-running daemon.
+enum AttachOutcome {
+    /// Every view attached.
+    Attached,
+    /// The daemon is mid-shutdown (draining before exit) and refused the
+    /// attach. The caller should wait for it to exit and retry the whole
+    /// lock/become-daemon flow rather than orphaning a mount on a dying
+    /// process.
+    DaemonShuttingDown,
+}
+
+async fn attach_views(sock: &Path, views: &[ViewSpec]) -> Result<AttachOutcome> {
     for view in views {
         let resp = constellation_api::call(
             sock,
@@ -1583,13 +1615,18 @@ async fn attach_views(sock: &Path, views: &[ViewSpec]) -> Result<()> {
         .with_context(|| format!("attaching {}", view.mountpoint.display()))?;
         match resp {
             constellation_api::Response::Ok { .. } => {}
+            constellation_api::Response::Error { message }
+                if message.contains("shutting down") =>
+            {
+                return Ok(AttachOutcome::DaemonShuttingDown);
+            }
             constellation_api::Response::Error { message } => {
                 bail!("{}: {message}", view.mountpoint.display())
             }
             other => bail!("unexpected response: {other:?}"),
         }
     }
-    Ok(())
+    Ok(AttachOutcome::Attached)
 }
 
 /// `constellation umount`: resolve the target, then send `MountRemove`
@@ -1648,13 +1685,47 @@ async fn cmd_umount(target: String, state_dir: Option<PathBuf>) -> Result<()> {
             other => bail!("unexpected response: {other:?}"),
         }
     }
-    // Best-effort: wait briefly for the socket to disappear if this was
-    // the daemon's last view (it exits once it is).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while sock.exists() && std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Wait for the daemon to actually exit if this removed its last view.
+    // The daemon deletes `control.sock` only at the very end of its clean
+    // shutdown (drain uploads + ship journal), so the socket's presence is
+    // the honest "still shutting down" signal. Rather than a fixed 10s cap
+    // — which silently returned "done" while a large drain was still in
+    // flight, tempting a remount that orphaned a mount — poll the live
+    // status and report drain progress until the socket is gone.
+    if sock.exists() {
+        wait_for_daemon_exit(&sock).await;
     }
     Ok(())
+}
+
+/// Poll the daemon's control socket until it disappears (clean shutdown
+/// complete), printing periodic drain progress so `umount` does not look
+/// finished while uploads/journal are still shipping. Purely informational
+/// — a daemon that never finishes draining will keep this waiting, which
+/// is the honest state; the user can Ctrl-C to stop watching (the drain
+/// continues in the daemon regardless).
+async fn wait_for_daemon_exit(sock: &Path) {
+    let mut last_report = std::time::Instant::now();
+    let started = last_report;
+    while sock.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if last_report.elapsed() >= std::time::Duration::from_secs(2) && sock.exists() {
+            last_report = std::time::Instant::now();
+            if let Ok(constellation_api::Response::Status(report)) =
+                constellation_api::call(sock, &constellation_api::Request::Status).await
+            {
+                let pending = report.writeback.pending_uploads;
+                let backlog = report.spool.journal_backlog;
+                if pending > 0 || backlog > 0 {
+                    eprintln!(
+                        "shutting down: draining {pending} uploads, {backlog} journal entries \
+                         ({}s elapsed)…",
+                        started.elapsed().as_secs()
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// `constellation export NAME` (plan 21, step 6): the only way to

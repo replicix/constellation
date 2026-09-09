@@ -46,6 +46,43 @@ use crate::{
     shipper, snapshot, staging, writeback,
 };
 
+/// Detach a stale FUSE mount left behind by a previous daemon that exited
+/// without unmounting (crash, `kill`, or an orphaned view). Such a
+/// mountpoint answers `stat` with `ENOTCONN`; if we don't clear it first,
+/// building a fresh FUSE session over it fails with the same "Transport
+/// endpoint is not connected". Best-effort and quiet on the common case
+/// (no stale mount): only acts when the path actually reports `ENOTCONN`.
+fn clear_stale_mount(mountpoint: &std::path::Path) {
+    match std::fs::metadata(mountpoint) {
+        // A live FUSE mount or an ordinary directory stats fine — leave it.
+        Ok(_) => return,
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {}
+        // Anything else (NotFound, permission, …) is not ours to fix here.
+        Err(_) => return,
+    }
+    tracing::warn!(
+        ?mountpoint,
+        "detaching stale FUSE mount from a previous daemon before remounting"
+    );
+    // `fusermount3 -uz` (lazy) is the portable way to drop a dead FUSE
+    // mount from userspace; fall back to `fusermount` for older systems.
+    for bin in ["fusermount3", "fusermount"] {
+        let status = std::process::Command::new(bin)
+            .args(["-uz", &mountpoint.to_string_lossy()])
+            .status();
+        if let Ok(s) = status {
+            if s.success() {
+                return;
+            }
+        }
+    }
+    tracing::warn!(
+        ?mountpoint,
+        "could not detach stale mount automatically; \
+         run `fusermount3 -uz <mountpoint>` if the remount fails"
+    );
+}
+
 /// Everything needed to open/create a node's backend + local state,
 /// independent of any particular mounted view.
 #[allow(clippy::too_many_arguments)]
@@ -1497,6 +1534,16 @@ impl NodeRuntime {
     /// the thread runs until the view is unmounted (via `remove_mount`,
     /// an external `fusermount -u`, or process shutdown).
     pub fn add_mount(self: &Arc<Self>, view: ViewConfig) -> Result<MountId> {
+        // Refuse to attach a view onto a daemon whose final shutdown has
+        // already begun. Once the last view is removed the FUSE thread
+        // runs `shutdown()` (drain + ship, then exit); a view added after
+        // that point is never joined, so when the drain completes the
+        // process exits and orphans the new kernel mount, leaving a dead
+        // mountpoint (`Transport endpoint is not connected`). Rejecting
+        // here lets the client fall through to `BecomeDaemon` cleanly.
+        if self.shutdown_started.load(Ordering::SeqCst) {
+            bail!("daemon is shutting down; retry once it has exited");
+        }
         let ViewConfig {
             inner_path,
             mountpoint,
@@ -1685,6 +1732,13 @@ impl NodeRuntime {
         {
             self.existence.spawn_seed(self.store.clone(), &self.rt);
         }
+        // Self-heal a stale mountpoint left by a previous daemon that
+        // exited without unmounting (crash, kill, or an orphaned view
+        // attached during shutdown). Such a mountpoint answers stat with
+        // `ENOTCONN`; a fresh `Session::new` on it fails with the same
+        // "Transport endpoint is not connected". Lazily detach it first so
+        // the remount just works instead of surfacing os error 107.
+        clear_stale_mount(&mountpoint);
         tracing::info!(?mountpoint, state_dir = ?self.state_dir, fs = %self.fsmeta.uuid, "mounting");
         let mut fuse_config = fuser::Config::default();
         fuse_config.mount_options = options;
