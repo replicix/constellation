@@ -152,6 +152,13 @@ impl Filesystem for ConstellationFs {
         let ino = self.real_ino(ino);
         let atime_ns = _atime.map(time_or_now_ns);
         let mtime_ns = mtime.map(time_or_now_ns);
+        // An explicit atime set must drop any queued read-bump for this
+        // inode, so a pending coalesced bump cannot clobber a fresh
+        // `touch -a` locally (the remote case is handled by the ctime
+        // guard in replay).
+        if atime_ns.is_some() {
+            self.atime.purge(ino);
+        }
         if let Some(new_size) = size {
             if let Err(error) = self.truncate(ino, new_size) {
                 reply.error(Errno::from_i32(error));
@@ -1210,15 +1217,21 @@ impl ConstellationFs {
         let mut writes = self.writes.lock(ino);
         let ws = writes.get_mut(&ino);
         let manifest = self.load_manifest(ino)?;
-        let committed_len = self
-            .meta
-            .getattr(ino)
-            .map_err(|e| errno(&e))?
-            .map(|a| a.size)
-            .unwrap_or(manifest.file_len);
+        let attr = self.meta.getattr(ino).map_err(|e| errno(&e))?;
+        let committed_len = attr.as_ref().map(|a| a.size).unwrap_or(manifest.file_len);
         let file_len = ws.as_ref().map(|w| w.file_len).unwrap_or(committed_len);
         if offset >= file_len {
             return Ok(Vec::new());
+        }
+        // Read-time atime (plan 20): best-effort, policy-gated, and a
+        // no-op unless the operator opted in. Records into a separate
+        // accumulator shard (never the write shard held here), so it
+        // adds a lock only in the rare bump case and cannot deadlock the
+        // read. A missing attr row simply skips the bump. Placed after
+        // the EOF early return: a zero-byte read need not move atime.
+        if let Some(attr) = &attr {
+            self.atime
+                .on_read(attr, constellation_fs_core::types::now_ns());
         }
         let len = size.min(file_len - offset);
         let hashes = self.chunk_list(&manifest)?;

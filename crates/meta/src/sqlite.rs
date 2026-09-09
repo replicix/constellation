@@ -121,6 +121,16 @@ CREATE TABLE IF NOT EXISTS journal (
     record BLOB NOT NULL,
     part   TEXT NOT NULL DEFAULT 'p0'
 );
+-- Read-time atime bumps live here, never in `journal`: one
+-- upsert-coalesced row per inode, so existing journal scans keep their
+-- cost and the lease/merge backlog checks exclude atime for free.
+CREATE TABLE IF NOT EXISTS atime_journal (
+    ino      INTEGER PRIMARY KEY,
+    part     TEXT NOT NULL,
+    atime_ns INTEGER NOT NULL,
+    time_ns  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS atime_journal_part ON atime_journal (part);
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -836,7 +846,10 @@ impl SqliteMeta {
             LogRecord::Setattr { ino, .. }
             | LogRecord::WriteManifest { ino, .. }
             | LogRecord::SetXattr { ino, .. }
-            | LogRecord::RemoveXattr { ino, .. } => Self::partition_of_conn(conn, *ino),
+            | LogRecord::RemoveXattr { ino, .. }
+            // Atime never reaches the `journal` table (it lives in
+            // `atime_journal`); this arm only keeps the match total.
+            | LogRecord::Atime { ino, .. } => Self::partition_of_conn(conn, *ino),
         }
     }
 
@@ -3541,6 +3554,94 @@ impl MetaStore for SqliteMeta {
     fn journal_len(&self) -> Result<u64, MetaError> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))?)
+    }
+
+    fn apply_atime(&self, bumps: &[(Ino, i64, i64)]) -> Result<(u64, u64), MetaError> {
+        if bumps.is_empty() {
+            return Ok((0, 0));
+        }
+        let skew = crate::replay::atime_skew_tolerance_ns();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (mut applied, mut clamped) = (0u64, 0u64);
+        for (ino, atime_ns, time_ns) in bumps {
+            // Count rows the UPDATE actually changed so `applied`
+            // reflects real bumps, not guard-dropped or missing inodes.
+            let was_clamped = crate::replay::apply_atime_one(&tx, *ino, *atime_ns, *time_ns, skew)?;
+            applied += tx.changes();
+            if was_clamped {
+                clamped += 1;
+            }
+        }
+        tx.commit()?;
+        Ok((applied, clamped))
+    }
+
+    fn queue_atime(&self, bumps: &[(Ino, i64, i64)]) -> Result<(), MetaError> {
+        if bumps.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (ino, atime_ns, time_ns) in bumps {
+            let part = Self::partition_of_conn(&tx, *ino)?;
+            tx.execute(
+                "INSERT INTO atime_journal (ino, part, atime_ns, time_ns) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(ino) DO UPDATE SET
+                     part     = excluded.part,
+                     atime_ns = MAX(atime_ns, excluded.atime_ns),
+                     time_ns  = MAX(time_ns,  excluded.time_ns)",
+                params![ino, part, atime_ns, time_ns],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn atime_backlog_of(&self, part: &str) -> Result<u64, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM atime_journal WHERE part = ?1",
+            params![part],
+            |r| r.get(0),
+        )?)
+    }
+
+    fn take_atime_of(&self, part: &str, max: usize) -> Result<Vec<(Ino, i64, i64)>, MetaError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ino, atime_ns, time_ns FROM atime_journal WHERE part = ?1 ORDER BY ino LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![part, max.min(i64::MAX as usize) as i64], |r| {
+            Ok((
+                r.get::<_, Ino>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn clear_atime(&self, part: &str, inos: &[Ino]) -> Result<(), MetaError> {
+        if inos.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for ino in inos {
+            tx.execute(
+                "DELETE FROM atime_journal WHERE part = ?1 AND ino = ?2",
+                params![part, ino],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn drop_atime_of(&self, part: &str) -> Result<(), MetaError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM atime_journal WHERE part = ?1", params![part])?;
+        Ok(())
     }
 }
 

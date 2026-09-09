@@ -53,25 +53,19 @@ Three hard blockers, each of which motivates a piece of the design:
 
 So: a dedicated record with `max()` merge semantics.
 
-## Step 0 — Segment version bump
+## Step 0 — No segment version bump
 
 `SegmentEnvelope` pins `v == 2` exactly
-(`crates/cli/src/shipper.rs:161-169`) and `records: Vec<LogRecord>` is a
+(`crates/cli/src/shipper.rs`) and `records: Vec<LogRecord>` is a
 closed postcard enum, so a node running an older binary that tails a
 segment containing a new `LogRecord` variant fails to decode **the whole
 segment**, not just the unknown record.
 
-Mixed-version clusters are out of scope, so this is simply a version
-bump: set `v = 3`, keep the exact-match check, and let a mismatch raise
-the existing loud "unsupported log segment version" error. No
-forward-compatible framing, no capability negotiation, no staged
-rollout.
-
-Note the scope: `decode` hard-requires `env.v == 2`
-(`crates/cli/src/shipper.rs:164`), so this also makes *existing buckets*
-undecodable by the new binary. That is accepted — there is no backwards
-compatibility requirement — but it means v = 3 is a fresh-bucket change,
-not an in-place upgrade of a running cluster.
+Mixed-version clusters and existing-bucket upgrades are out of scope, so
+there is nothing useful for a version bump to gate: keep `v = 2`, add
+`LogRecord::Atime`, and treat any decode failure (postcard or otherwise)
+as unsupported. No forward-compatible framing, no capability negotiation,
+no staged rollout.
 
 ## Step 1 — `LogRecord::Atime`
 
@@ -488,8 +482,8 @@ Perf and compliance:
 ## Step 9 — Suggested implementation order
 
 1. `LogRecord::Atime` + the shared apply helper + replay + `TouchSet`
-   exemption + `atime_journal` table + segment `v = 3` + unit tests.
-   (Inert: nothing emits the record yet.)
+   exemption + `atime_journal` table + unit tests.
+   (Inert: nothing emits the record yet; envelope stays at `v = 2`.)
 2. Policy module + accumulator in the write shard + read hook, flushing
    to **local only**, plus the mode flag. Usable single-node at this
    point, and independently reviewable.
@@ -499,8 +493,8 @@ Perf and compliance:
 
 ## Settled decisions
 
-- **Wire compat**: no backwards compatibility, no mixed clusters —
-  straight `v = 3` bump (Step 0).
+- **Wire compat**: no backwards compatibility, no mixed clusters — keep
+  `v = 2` and add `LogRecord::Atime` without an envelope bump (Step 0).
 - **Read-only members**: local-only by default, opt-in forwarding via
   `CONSTELLATION_ATIME_RO_FORWARD=1`.
 - **Modes**: `off` / `relatime` / `lazy`. No `strict` — we cannot honour

@@ -130,7 +130,11 @@ pub fn classify(view: &SqliteMeta, rec: &LogRecord) -> Result<Disposition, MetaE
         | LogRecord::SnapCreate { .. }
         | LogRecord::SnapDelete { .. }
         | LogRecord::Clone { .. }
-        | LogRecord::SetQuota { .. } => Ok(Disposition::Clean),
+        | LogRecord::SetQuota { .. }
+        // Atime never enters the `journal`, so reintegration of stranded
+        // journal records should not see one; if it somehow does, it is
+        // droppable by definition — never a conflict.
+        | LogRecord::Atime { .. } => Ok(Disposition::Clean),
     }
 }
 

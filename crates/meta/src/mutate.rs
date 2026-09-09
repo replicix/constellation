@@ -98,6 +98,16 @@ pub enum MutateOp {
         ino: Ino,
         name: String,
     },
+    /// Batched read-time atime bumps forwarded to the holder (plan 20).
+    /// Each entry is `(ino, atime_ns, time_ns)`; `time_ns` is the
+    /// emitter's observation time, carried so the holder can apply the
+    /// ctime guard against the emitter's clock rather than its own.
+    /// Best effort: a holder applies and queues it for shipping, and
+    /// appends nothing to the write journal. Appended last so a peer too
+    /// old to decode it falls back to `Busy` (a harmless rotation).
+    AtimeBatch {
+        entries: Vec<(Ino, i64, i64)>,
+    },
     /// Scratch → shared publish: create the inode at `parent/name` with
     /// the given attrs and commit its manifest (and any xattrs staged on
     /// the scratch file) in one transaction.
@@ -278,6 +288,15 @@ pub fn execute(meta: &SqliteMeta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaE
                 *parent, name, *ino, *mode, *uid, *gid, *mtime_ns, manifest, *size, xattrs,
             )?;
         }
+        MutateOp::AtimeBatch { entries } => {
+            // Apply to the holder's own inode table (so its stat reflects
+            // the read) and queue for shipping. Never writes the journal,
+            // so the requester gets back an empty record set — it already
+            // applied the bump locally before forwarding.
+            meta.apply_atime(entries)?;
+            meta.queue_atime(entries)?;
+            return Ok(Vec::new());
+        }
     }
     meta.peek_journal_after(before)
         .map(|rows| rows.into_iter().map(|(_, r)| r).collect())
@@ -287,6 +306,29 @@ pub fn execute(meta: &SqliteMeta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaE
 mod tests {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
+
+    #[test]
+    fn atime_batch_applies_locally_queues_for_ship_and_journals_nothing() {
+        let m = SqliteMeta::open_in_memory().unwrap();
+        let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        let part = m.partition_of(f.ino).unwrap();
+        let before = m.journal_len().unwrap();
+        let t = f.ctime_ns + 10;
+        let records = execute(
+            &m,
+            &MutateOp::AtimeBatch {
+                entries: vec![(f.ino, t, t)],
+            },
+        )
+        .unwrap();
+        // The holder appends nothing to the write journal...
+        assert!(records.is_empty());
+        assert_eq!(m.journal_len().unwrap(), before);
+        // ...applies to its own inode table...
+        assert_eq!(m.getattr(f.ino).unwrap().unwrap().atime_ns, t);
+        // ...and queues exactly one atime row for the shipper to drain.
+        assert_eq!(m.atime_backlog_of(&part).unwrap(), 1);
+    }
 
     #[test]
     fn mutate_op_roundtrip() {

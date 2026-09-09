@@ -1,5 +1,6 @@
 //! Constellation entry point: CLI, daemon, and FUSE mount in one binary.
 
+mod atime;
 mod backend;
 mod coop;
 mod daemonize;
@@ -101,6 +102,11 @@ enum Command {
         /// a continuation epoch's write-eligible roster.
         #[arg(long)]
         read_only_member: bool,
+        /// Read-time access-time updates: off (default), relatime, or
+        /// lazy (plan 20). Best-effort and eventually consistent;
+        /// overridable by CONSTELLATION_ATIME.
+        #[arg(long)]
+        atime: Option<String>,
         /// Mount a snapshot selector through an automatically created clone.
         #[arg(long)]
         rw: bool,
@@ -499,6 +505,7 @@ fn main() -> Result<()> {
         fsync_mode,
         write_mode,
         read_only_member,
+        atime,
         rw,
         clone_name,
         ephemeral,
@@ -519,6 +526,7 @@ fn main() -> Result<()> {
                 fsync_mode,
                 write_mode,
                 read_only_member,
+                atime,
                 rw,
                 clone_name,
                 ephemeral,
@@ -953,6 +961,7 @@ struct MountArgs {
     fsync_mode: Option<String>,
     write_mode: Option<String>,
     read_only_member: bool,
+    atime: Option<String>,
     rw: bool,
     clone_name: Option<String>,
     ephemeral: bool,
@@ -1045,11 +1054,20 @@ fn cmd_mount(
         fsync_mode,
         write_mode,
         read_only_member,
+        atime,
         rw,
         clone_name,
         ephemeral,
         web_ui,
     } = args;
+    // Resolve once: env CONSTELLATION_ATIME overrides the --atime flag.
+    let atime_mode =
+        crate::atime::AtimeMode::resolve(atime.as_deref().and_then(crate::atime::AtimeMode::parse));
+    if let Some(raw) = &atime {
+        if crate::atime::AtimeMode::parse(raw).is_none() {
+            bail!("invalid --atime {raw:?} (expected off, relatime, or lazy)");
+        }
+    }
 
     let mut reg = registry::Registry::load_locked()?;
     let mut resolved = target::resolve(&target, &reg);
@@ -1223,6 +1241,7 @@ fn cmd_mount(
             fsync_s3,
             initial_write_mode,
             read_only_member,
+            atime_mode,
             web_ui.unwrap_or(0),
             log_buffer,
             views,
@@ -1237,6 +1256,7 @@ fn cmd_mount(
                 fsync_s3,
                 initial_write_mode,
                 read_only_member,
+                atime_mode,
                 web_ui.unwrap_or(0),
                 log_buffer,
                 views,
@@ -1309,6 +1329,7 @@ fn cmd_mount_body(
     fsync_s3: bool,
     initial_write_mode: writeback::WriteMode,
     read_only_member: bool,
+    atime_mode: crate::atime::AtimeMode,
     web_ui: u16,
     log_buffer: log_buffer::LogBuffer,
     views: Vec<ViewSpec>,
@@ -1358,6 +1379,7 @@ fn cmd_mount_body(
                     read_only_member,
                     web_ui,
                     log_buffer,
+                    atime_mode,
                 },
                 handle,
             ) {
@@ -2227,6 +2249,11 @@ async fn run_sync_round(
         }
         if k.idle_release_due(ship.journal_backlog_of(part)) {
             tracing::info!(part, "idle-releasing partition lease");
+            // Ship-then-release (plan 20): flush any pending read-time
+            // atime for this partition before the lease is gone, so a
+            // read-heavy holder's bumps reach the cluster rather than
+            // being stranded in a partition we will no longer ship.
+            ship.ship_atime_before_release(part, k).await;
             k.release().await?;
         }
     }
@@ -2785,6 +2812,7 @@ struct DaemonStatus {
     log_buffer: log_buffer::LogBuffer,
     forward: std::sync::Arc<forward::ForwardState>,
     placement: std::sync::Arc<placement::Placement>,
+    atime: std::sync::Arc<crate::atime::AtimeAccumulator>,
 }
 
 impl DaemonStatus {
@@ -2993,6 +3021,21 @@ impl constellation_api::StatusSource for DaemonStatus {
                 .pushed_applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             placement_reason: self.placement.last_reason.lock().unwrap().clone(),
+            atime: {
+                use std::sync::atomic::Ordering::Relaxed;
+                let s = &self.atime.stats;
+                constellation_api::AtimeStatus {
+                    mode: self.atime.mode().as_str().to_string(),
+                    queued: s.queued.load(Relaxed),
+                    coalesced: s.coalesced.load(Relaxed),
+                    applied: s.applied.load(Relaxed),
+                    dropped_cap: s.dropped_cap.load(Relaxed),
+                    forward_ok: s.forward_ok.load(Relaxed),
+                    forward_err: s.forward_err.load(Relaxed),
+                    local_only: s.local_only.load(Relaxed),
+                    skew_clamped: s.skew_clamped.load(Relaxed),
+                }
+            },
             quota: {
                 use constellation_meta::MetaStore;
                 constellation_api::QuotaStatus {

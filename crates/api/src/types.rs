@@ -369,6 +369,33 @@ pub struct StatusReport {
     /// Optional cluster-wide logical byte cap and current used bytes.
     #[serde(default)]
     pub quota: QuotaStatus,
+    /// Read-time atime (plan 20). Default (`off`) leaves every counter
+    /// zero and `mode` "off".
+    #[serde(default)]
+    pub atime: AtimeStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AtimeStatus {
+    /// "off", "relatime", or "lazy".
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub queued: u64,
+    #[serde(default)]
+    pub coalesced: u64,
+    #[serde(default)]
+    pub applied: u64,
+    #[serde(default)]
+    pub dropped_cap: u64,
+    #[serde(default)]
+    pub forward_ok: u64,
+    #[serde(default)]
+    pub forward_err: u64,
+    #[serde(default)]
+    pub local_only: u64,
+    #[serde(default)]
+    pub skew_clamped: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -12,6 +12,7 @@ not listed here.
   - [Identity and secrets](#identity-and-secrets)
   - [Leases and mutations](#leases-and-mutations)
   - [Metadata sync and partitions](#metadata-sync-and-partitions)
+  - [Read-time atime](#read-time-atime)
   - [P2P and cooperative cache](#p2p-and-cooperative-cache)
   - [Prefetch and scan-ahead](#prefetch-and-scan-ahead)
   - [Uploads, staging, and encoding](#uploads-staging-and-encoding)
@@ -63,6 +64,28 @@ machinery remains for opt-in and for filesystems that already split.
 Heat was a proxy for lease contention from before forwarded mutations;
 a single-writer tree walk (rsync, unpack) otherwise splits every hot
 directory and leaves extra streams to LIST and leases to renew.
+
+### Read-time atime
+
+Optional, best-effort, eventually-consistent access-time updates on
+`read()` (plan 20). The default is `off` and behaves exactly as before
+(noatime). The mount flag `--atime <off|relatime|lazy>` selects the
+mode; `CONSTELLATION_ATIME` overrides the flag. See
+[features/atime.md](features/atime.md) for semantics and limits.
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_ATIME` | `off` | `off`, `relatime`, `lazy` | read-time atime mode; overrides `--atime` |
+| `CONSTELLATION_ATIME_GRANULARITY_S` | `86400` (relatime) / `1` (lazy) | seconds | bump threshold; resolved after the mode is known |
+| `CONSTELLATION_ATIME_FLUSH_MS` | `10000` | milliseconds | accumulator flush period |
+| `CONSTELLATION_ATIME_MAX_PENDING` | `65536` | distinct inodes | accumulator cap; overflow drops the new entry |
+| `CONSTELLATION_ATIME_SHIP_MAX_DELAY_S` | `300` | seconds | max delay before an atime-only partition ships on its own |
+| `CONSTELLATION_ATIME_FORWARD_TIMEOUT_MS` | `200` | milliseconds | batched-forward timeout to the lease holder |
+| `CONSTELLATION_ATIME_SKEW_TOLERANCE_S` | `300` | seconds | clamp applied to a claimed atime on apply |
+| `CONSTELLATION_ATIME_RO_FORWARD` | `0` | boolean | let a read-only member forward atime batches |
+
+Atime never blocks a read, never acquires a lease, and never delays an
+unmount or lease handoff. A dropped bump only costs freshness.
 
 ### P2P and cooperative cache
 
@@ -201,3 +224,4 @@ and `CONSTELLATION_P2P_RELAY` default off. `off`, `0`, and `false`
 - [Lease placement](features/lease-placement.md)
 - [P2P relays](features/p2p-relays.md)
 - [Prefetch](features/prefetch.md)
+- [Read-time atime](features/atime.md)

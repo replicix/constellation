@@ -1207,3 +1207,82 @@ through `setsid` (`chmod rename open unlink mkdir symlink truncate link
 chown`) — **8114 passed, 0 failed**. The `fs_mount` edit was then reverted
 (confirmed via `git diff` matching the pre-edit content exactly) and
 `tests/lib.sh` in the final tree has no trace of it.
+
+## Plan 20 — optional read-time atime: **DONE**
+
+Batched, eventually-consistent, best-effort access-time updates on
+`read()`, gated behind `--atime <off|relatime|lazy>` (default `off`,
+bit-identical to the historic noatime behaviour).
+
+| Item | State | Where |
+|---|---|---|
+| `LogRecord::Atime` + `TouchSet` exemption | done | `meta::record`, `meta::replay` |
+| Shared apply helper (clamp + ctime guard + max-merge) | done | `meta::replay::apply_atime_one` |
+| `atime_journal` table + 6 `MetaStore` methods (`apply_atime`, `queue_atime`, `atime_backlog_of`, `take_atime_of`, `clear_atime`, `drop_atime_of`) | done | `meta::sqlite` |
+| `MutateOp::AtimeBatch` holder handler (apply + queue, journals nothing) | done | `meta::mutate` |
+| Policy module + sharded accumulator + config readers + `AtimeStats` | done | `cli::atime` (new) |
+| Read-path hook + explicit-setattr purge | done | `cli::fusefs_ops` |
+| Flush ticker (drain → local apply → holder-queue / non-holder forward) | done | `cli::node_runtime::atime_flush_once` |
+| Ride-along atime drain into write segments | done | `cli::shipper::ship_part` |
+| Ship-then-release on idle lease release | done | `cli::shipper::ship_atime_before_release`, `cli::main` |
+| Batched forward with shorter timeout | done | `cli::forward::request_mutate_with` |
+| Mount flag `--atime` + `CONSTELLATION_ATIME*` env | done | `cli::main`, `cli::node_runtime` |
+| Status/observability (`AtimeStatus` on `StatusReport`) | done | `api::types`, `cli::main` |
+| Docs (configuration + `features/atime.md`) | done | `docs/reference` |
+| Harness scenario `atime-eventual` | added, not run here | `harness::scenarios` |
+
+### Design decisions where the plan was ambiguous
+
+- **No segment version bump.** The plan's Step 0 called for `v = 3` so
+  mixed-version / old-bucket mismatches fail the exact-match check
+  loudly. Mixed-version clusters and existing-bucket upgrades are out of
+  scope anyway, so the bump buys nothing — keep `v = 2` and let an
+  unknown `LogRecord::Atime` fail postcard decode if an older binary
+  ever sees one.
+- **Accumulator location.** The plan suggested piggybacking the pending
+  map on the existing per-inode write shard for "zero extra locks". That
+  shard's `lock()` returns the `HashMap<Ino, WriteState>` guard directly
+  and is held across the read's S3 fetch, so folding atime in would have
+  meant reworking every write-path call site and risking a drain blocked
+  behind network I/O. Chose instead a **separate sharded accumulator**
+  (`cli::atime::AtimeAccumulator`): the read hot path pays one
+  uncontended lock only in the rare bump case (after an `Off`/policy
+  short-circuit against the already-loaded attr), and the flusher
+  `try_lock`s each shard and skips on contention. This trades the
+  "zero locks" ideal (paid only when actually bumping) for not
+  destabilising the write path.
+- **`apply_atime` carries per-entry `time_ns`.** The plan's illustrative
+  signature was `apply_atime(&[(Ino,i64)], time_ns)`; widened to
+  `&[(Ino, atime_ns, time_ns)]` so the ctime guard is exact across a
+  batch whose entries were observed at different times.
+- **`CONSTELLATION_ATIME_SHIP_MAX_DELAY_S` standalone timer deferred.**
+  Eventual cross-node visibility is already guaranteed by ride-along
+  shipping and ship-then-release (a pure-read holder idle-releases and
+  ships its atime). The standalone "ship an atime-only partition on a
+  timer" path is a refinement for the corner case of a holder that
+  neither writes nor idles; the knob is defined and documented but not
+  yet wired (marked `#[allow(dead_code)]` with a rationale comment).
+- **Web UI dashboard card deferred.** The `atime` counters are surfaced
+  in the `StatusReport` JSON (so `constellation status` shows them and
+  the web UI has the data); a dedicated dashboard card is cosmetic and
+  was not added.
+
+### Gates run in this environment
+
+- `cargo fmt --all --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — all pass (added: 7 meta replay atime tests,
+  1 meta mutate `AtimeBatch` test, 1 cross-replica convergence test, 8
+  cli policy/accumulator tests).
+- `bash tests/smoke.sh` — pass.
+- Manual single-node e2e: mounted `--atime lazy`, confirmed a cold read
+  advances `atime` after the flush interval.
+
+### Not run here (need docker / the fault-injection harness)
+
+`tests/integration.sh`, `target/release/harness run` (including the new
+`atime-eventual` scenario), the pjdfstest compliance lane under both
+`--atime off` and `--atime relatime`, the xfstests `relatime` lane, and
+the `perf_regression` read-throughput/record-volume assertions. These
+require docker + fusermount3 and were not exercised in this environment;
+they remain to be validated in CI.

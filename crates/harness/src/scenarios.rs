@@ -77,6 +77,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: two_clients_shared,
     },
     Scenario {
+        name: "atime-eventual",
+        desc: "read-time atime (plan 20): a read on one node eventually bumps atime on the other; under an S3 cut reads keep succeeding and atime is simply lost",
+        requires: &[],
+        run: atime_eventual,
+    },
+    Scenario {
         name: "quota-enforcement",
         desc: "live quota set blocks growth with ENOSPC; clearing resumes; replicates to a second node",
         requires: &[],
@@ -1099,6 +1105,86 @@ fn two_clients_shared(seed: u64) -> Result<()> {
     );
     c0.unmount()?;
     c1.unmount()?;
+    Ok(())
+}
+
+/// Read-time atime (plan 20). Two nodes share a filesystem with
+/// `--atime relatime` and a zero granularity so any cold read bumps.
+/// A read on the reader must eventually become visible on the writer's
+/// node, and — with S3 cut — reads must keep succeeding while the atime
+/// updates are simply lost (never blocking a read).
+fn atime_eventual(seed: u64) -> Result<()> {
+    let _ = seed;
+    let (env, root) = setup("atime-eventual")?;
+    let proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/atime-{}", ts());
+    // relatime + granularity 0 so any cold read bumps; fast flush and a
+    // short ship-max-delay so a bump reaches S3 without waiting.
+    let atime_env = |c: Client| {
+        c.with_env("CONSTELLATION_ATIME", "relatime")
+            .with_env("CONSTELLATION_ATIME_GRANULARITY_S", "0")
+            .with_env("CONSTELLATION_ATIME_FLUSH_MS", "500")
+    };
+    let mut writer = atime_env(Client::new(root.path(), "w", &env.endpoint, &backend)?);
+    let mut reader = atime_env(Client::new(root.path(), "r", &env.endpoint, &backend)?);
+    writer.fs_create()?;
+    writer.mount()?;
+    reader.mount()?;
+
+    // The writer (partition holder) creates a file; the reader must see it.
+    std::fs::write(writer.mnt.join("shared.txt"), b"hello atime")?;
+    eventually(
+        "shared file visible on reader",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(reader.mnt.join("shared.txt").is_file(), "not yet on reader");
+            Ok(())
+        },
+    )?;
+
+    // Cold read on the reader (it has never opened this file, so the read
+    // reaches FUSE rather than the page cache) → a bump forwarded to the
+    // holder. Force the holder to ship by writing a sibling so the bump
+    // rides along a segment.
+    let baseline = std::fs::metadata(reader.mnt.join("shared.txt"))?
+        .accessed()
+        .ok();
+    std::thread::sleep(Duration::from_secs(1));
+    let _ = std::fs::read(reader.mnt.join("shared.txt")).context("cold read on reader")?;
+    std::fs::write(writer.mnt.join("marker.txt"), b"x")?;
+
+    // The writer's replica (authoritative) must observe atime advance.
+    // Compared there rather than via the reader's kernel attr cache.
+    eventually(
+        "atime advanced on the holder",
+        Duration::from_secs(40),
+        || {
+            let now = std::fs::metadata(writer.mnt.join("shared.txt"))?.accessed()?;
+            if let Some(b) = baseline {
+                anyhow::ensure!(now > b, "atime not advanced yet");
+            }
+            Ok(())
+        },
+    )?;
+
+    // The reader's forward path must not have produced namespace conflicts.
+    let s = reader.control_status()?;
+    anyhow::ensure!(
+        s["spool"]["conflicts"].as_u64() == Some(0),
+        "atime must not cause conflicts: {s}"
+    );
+
+    // S3 cut: cached reads keep succeeding at full speed; atime updates
+    // are simply lost, never blocking or failing a read.
+    proxy.cut()?;
+    for _ in 0..25 {
+        let _ = std::fs::read(reader.mnt.join("shared.txt"))
+            .context("read during S3 cut must still succeed")?;
+    }
+    proxy.heal()?;
+
+    reader.unmount()?;
+    writer.unmount()?;
     Ok(())
 }
 

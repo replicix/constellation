@@ -188,6 +188,21 @@ pub enum LogRecord {
     /// Cluster-wide logical byte cap. `None` clears the quota (unlimited).
     /// Journaled on `p0`; replay upserts `kv.quota_max_bytes`.
     SetQuota { max_logical_bytes: Option<u64> },
+    /// A read-time access-time bump. Best-effort and order-free: replay
+    /// merges with max(), so a duplicate, delayed, or out-of-order
+    /// record can never make replicas disagree, and a dropped one only
+    /// costs freshness. Deliberately *not* a `Setattr`: it must not
+    /// touch ctime and must not participate in conflict detection (see
+    /// `TouchSet::add` and `apply_one`).
+    Atime {
+        ino: Ino,
+        /// The access time being claimed.
+        atime_ns: i64,
+        /// When the emitting node observed the read. Used to drop bumps
+        /// that were already in flight when someone set atime
+        /// explicitly (the `ctime_ns < time_ns` guard in replay).
+        time_ns: i64,
+    },
 }
 
 impl LogRecord {

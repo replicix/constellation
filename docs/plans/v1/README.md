@@ -43,7 +43,7 @@ Execution protocol:
 | 17 | `done/17-p8f-xattr.md` | done | POSIX xattr + virtual rsize/rcount | 16 |
 | 18 | `done/18-p10a-adaptive-prefetch.md` | done | adaptive prefetch, streaming fetch, scan-ahead | 17 |
 | 19 | `wip/19-p9-crash-reporting.md` | wip | secure crash reporting pipeline | 13 |
-| 20 | `wip/20-read-atime.md` | wip | optional read-time atime (batched, eventually consistent) | 18 |
+| 20 | `done/20-read-atime.md` | done | optional read-time atime (batched, eventually consistent) | 18 |
 | 21 | `done/21-fs-registry-and-daemon.md` | done | named filesystems, shared mount daemon, local registry | 18 |
 | 22 | `wip/22-atime-retention-policies.md` | wip | retention policies as xattr expressions, reaped by a singleton reaper | 20 (`age`/`keep` rules independent) |
 | 23 | `wip/23-remote-support-mode.md` | wip | compile-time-gated remote support mode: mount-armed `ro`/`rw` P2P sessions | 02 (independent of 19–22) |

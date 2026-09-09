@@ -169,6 +169,31 @@ pub async fn request_mutate(
     holder: u64,
     op: &MutateOp,
 ) -> MutateOutcome {
+    request_mutate_with(
+        peers,
+        forward,
+        part,
+        requester,
+        holder,
+        op,
+        Duration::from_millis(forward_timeout_ms()),
+    )
+    .await
+}
+
+/// As [`request_mutate`], with an explicit timeout. Atime batches use a
+/// shorter deadline (`CONSTELLATION_ATIME_FORWARD_TIMEOUT_MS`) than the
+/// ordinary mutation forward: a missed atime bump is free to lose.
+#[allow(clippy::too_many_arguments)]
+pub async fn request_mutate_with(
+    peers: &Peers,
+    forward: &ForwardState,
+    part: &str,
+    requester: u64,
+    holder: u64,
+    op: &MutateOp,
+    timeout: Duration,
+) -> MutateOutcome {
     let op_bytes = match op.to_postcard() {
         Ok(b) => b,
         Err(_) => return MutateOutcome::Errno(libc::EINVAL),
@@ -182,7 +207,6 @@ pub async fn request_mutate(
         op: op_bytes,
     };
     let started = Instant::now();
-    let timeout = Duration::from_millis(forward_timeout_ms());
     let reply = tokio::time::timeout(timeout, peers.request_to_node(holder, &payload)).await;
     match reply {
         Ok(Ok(body)) => match body {

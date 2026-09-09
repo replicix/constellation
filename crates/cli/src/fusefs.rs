@@ -242,6 +242,10 @@ pub struct FsDependencies {
     /// staged write is not sealed into the cache until flush.
     pub staging_budget: Arc<StagingBudget>,
     pub snapshots: Arc<crate::snapshot::SnapshotManager>,
+    /// Node-level read-time atime accumulator (plan 20). Shared across
+    /// all views and drained by the sync task's flush ticker. `Off` by
+    /// default, in which case the read hook short-circuits.
+    pub atime: Arc<crate::atime::AtimeAccumulator>,
 }
 
 const SYNTHETIC_INO_BIT: u64 = 1 << 63;
@@ -313,6 +317,8 @@ pub struct ConstellationFs {
     usage_cache: Mutex<Option<(Instant, u64, u64)>>,
     /// From `CONSTELLATION_STATFS_TTL_S` (default 5s). Zero disables caching.
     statfs_ttl: Duration,
+    /// Read-time atime accumulator (plan 20), shared node-wide.
+    pub(crate) atime: Arc<crate::atime::AtimeAccumulator>,
 }
 
 fn staging_errno(e: &crate::staging::StagingError) -> i32 {
@@ -444,6 +450,7 @@ impl ConstellationFs {
             quota_cache: Arc::new(Mutex::new(None)),
             usage_cache: Mutex::new(None),
             statfs_ttl: statfs_ttl_from_env(),
+            atime: deps.atime,
         }
     }
 
@@ -1901,6 +1908,10 @@ mod quota_tests {
                 staging_dir: dir.path().join("staging"),
                 staging_budget: StagingBudget::new(1 << 30),
                 snapshots,
+                atime: Arc::new(crate::atime::AtimeAccumulator::new(
+                    crate::atime::AtimeMode::Off,
+                    crate::atime::AtimeStats::new(),
+                )),
             },
             DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,
@@ -2176,6 +2187,10 @@ mod quota_tests {
                 staging_dir: dir.path().join("staging"),
                 staging_budget: StagingBudget::new(1 << 30),
                 snapshots,
+                atime: Arc::new(crate::atime::AtimeAccumulator::new(
+                    crate::atime::AtimeMode::Off,
+                    crate::atime::AtimeStats::new(),
+                )),
             },
             DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,

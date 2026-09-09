@@ -10,10 +10,10 @@ pub mod types;
 pub mod web;
 
 pub use types::{
-    CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry, DoctorStatus,
-    DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus, MountInfo,
-    MountViewOpts, P2pStatus, PartitionStatus, PeerStatus, PinStatus, PrefetchStatus, QuotaStatus,
-    ReintegrationStatus, Request, Response, SnapshotStatus, SourceStatus, SpoolStatus,
+    AtimeStatus, CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry,
+    DoctorStatus, DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus,
+    MountInfo, MountViewOpts, P2pStatus, PartitionStatus, PeerStatus, PinStatus, PrefetchStatus,
+    QuotaStatus, ReintegrationStatus, Request, Response, SnapshotStatus, SourceStatus, SpoolStatus,
     StatusReport, WritebackStatus,
 };
 
@@ -360,6 +360,7 @@ mod tests {
                 pushed_segments_applied: 0,
                 placement_reason: None,
                 quota: QuotaStatus::default(),
+                atime: AtimeStatus::default(),
             }
         }
 
@@ -545,6 +546,7 @@ mod tests {
                 pushed_segments_applied: 0,
                 placement_reason: None,
                 quota: QuotaStatus::default(),
+                atime: AtimeStatus::default(),
             }
         }
     }

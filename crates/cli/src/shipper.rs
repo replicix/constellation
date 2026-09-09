@@ -717,7 +717,23 @@ impl Shipper {
         if batch.is_empty() {
             return Ok(false);
         }
-        let records: Vec<LogRecord> = batch.iter().map(|(_, r)| r.clone()).collect();
+        let mut records: Vec<LogRecord> = batch.iter().map(|(_, r)| r.clone()).collect();
+        // Ride-along atime drain (plan 20): a write segment is going out
+        // for this partition anyway, so fold in the partition's pending
+        // read-time atime bumps rather than pay a separate PUT. Cleared
+        // only after the PUT succeeds below — a failed ship leaves the
+        // rows for next round, and a duplicate re-ship is absorbed by
+        // the max-merge on replay. Atime never triggers a ship on its
+        // own here; an atime-only partition relies on the idle-release
+        // drain (ship-then-release) instead.
+        let atime_rows = self.meta.take_atime_of(part, SEGMENT_BATCH)?;
+        for (ino, atime_ns, time_ns) in &atime_rows {
+            records.push(LogRecord::Atime {
+                ino: *ino,
+                atime_ns: *atime_ns,
+                time_ns: *time_ns,
+            });
+        }
         let payload = encode(self.node_id, epoch, &records)?;
         let next_seq = self.parts[part].next_seq;
         match self.parts[part].log.put_segment(next_seq, &payload).await {
@@ -727,6 +743,10 @@ impl Shipper {
         }
         let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
         self.meta.ack_journal_rows_at(&seqs, part, next_seq)?;
+        if !atime_rows.is_empty() {
+            let inos: Vec<_> = atime_rows.iter().map(|(ino, _, _)| *ino).collect();
+            self.meta.clear_atime(part, &inos)?;
+        }
         tracing::debug!(
             seq = next_seq,
             part,
@@ -771,6 +791,69 @@ impl Shipper {
             self.checkpoint().await?;
         }
         Ok(true)
+    }
+
+    /// Drain a partition's pending read-time atime (plan 20) into one
+    /// final segment under `lease`'s epoch, then clear it — called
+    /// before an idle lease release or partition merge so a read-heavy
+    /// holder's atime reaches the cluster instead of dying with the
+    /// lease. Best effort: if the segment cannot be put, the rows are
+    /// dropped (atime is droppable by definition) and the release
+    /// proceeds regardless — atime must never delay a handoff.
+    pub async fn ship_atime_before_release(&mut self, part: &str, lease: &LeaseKeeper) {
+        self.ensure_part(part);
+        let Some(epoch) = lease.ship_epoch() else {
+            let _ = self.meta.drop_atime_of(part);
+            return;
+        };
+        let rows = match self.meta.take_atime_of(part, SEGMENT_BATCH) {
+            Ok(r) if !r.is_empty() => r,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::debug!(error = %e, part, "atime drain read failed; dropping");
+                let _ = self.meta.drop_atime_of(part);
+                return;
+            }
+        };
+        let records: Vec<LogRecord> = rows
+            .iter()
+            .map(|(ino, atime_ns, time_ns)| LogRecord::Atime {
+                ino: *ino,
+                atime_ns: *atime_ns,
+                time_ns: *time_ns,
+            })
+            .collect();
+        let next_seq = self.parts[part].next_seq;
+        let payload = match encode(self.node_id, epoch, &records) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(error = %e, part, "atime segment encode failed; dropping");
+                let _ = self.meta.drop_atime_of(part);
+                return;
+            }
+        };
+        match self.parts[part].log.put_segment(next_seq, &payload).await {
+            Ok(()) => {
+                let inos: Vec<_> = rows.iter().map(|(ino, _, _)| *ino).collect();
+                let _ = self.meta.clear_atime(part, &inos);
+                let st = self.parts.get_mut(part).unwrap();
+                st.max_epoch = st.max_epoch.max(epoch);
+                st.next_seq = next_seq + 1;
+                tracing::debug!(
+                    seq = next_seq,
+                    part,
+                    epoch,
+                    rows = records.len(),
+                    "shipped final atime segment before release"
+                );
+            }
+            // Someone else advanced the stream, or the PUT failed: the
+            // rows are droppable, and we are releasing anyway.
+            Err(e) => {
+                tracing::debug!(error = %e, part, "final atime ship failed; dropping rows");
+                let _ = self.meta.drop_atime_of(part);
+            }
+        }
     }
 
     fn note_shipped(&mut self, part: &str, records: &[LogRecord]) {

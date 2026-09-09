@@ -58,6 +58,8 @@ pub struct NodeConfig {
     pub read_only_member: bool,
     pub web_ui: u16,
     pub log_buffer: log_buffer::LogBuffer,
+    /// Resolved read-time atime mode (plan 20). `Off` by default.
+    pub atime_mode: crate::atime::AtimeMode,
 }
 
 /// Everything needed to mount one view (root, subtree, or snapshot
@@ -141,6 +143,9 @@ pub struct NodeRuntime {
     forward: Arc<forward::ForwardState>,
     placement: Arc<placement::Placement>,
     departed: Arc<AtomicBool>,
+    /// Node-level read-time atime accumulator + counters (plan 20),
+    /// shared by every view's FUSE fs and drained by the flush ticker.
+    atime: Arc<crate::atime::AtimeAccumulator>,
     read_only_member: bool,
     fsync_s3: bool,
     ship: Arc<tokio::sync::Mutex<shipper::Shipper>>,
@@ -180,6 +185,7 @@ impl NodeRuntime {
             read_only_member,
             web_ui,
             log_buffer,
+            atime_mode,
         } = cfg;
 
         let backend = rt
@@ -452,6 +458,8 @@ impl NodeRuntime {
         let forward = forward::ForwardState::new();
         let placement = Arc::new(placement::Placement::new());
         let departed = Arc::new(AtomicBool::new(false));
+        let atime_stats = crate::atime::AtimeStats::new();
+        let atime = Arc::new(crate::atime::AtimeAccumulator::new(atime_mode, atime_stats));
 
         // Background metadata sync: tail foreign segments + ship the
         // journal, every interval or on demand (close/fsync nudges).
@@ -684,6 +692,38 @@ impl NodeRuntime {
             });
         }
         let stop = Arc::new(AtomicBool::new(false));
+        // Read-time atime flush ticker (plan 20). Off-mode accumulators
+        // never queue anything, so this loop drains empty and is cheap;
+        // it only does work when the operator opted in.
+        if atime.mode() != crate::atime::AtimeMode::Off {
+            let (atime, meta, keepers, forward, peers, stop) = (
+                atime.clone(),
+                meta.clone(),
+                keepers.clone(),
+                forward.clone(),
+                peers.clone(),
+                stop.clone(),
+            );
+            rt.spawn(async move {
+                let period = crate::atime::flush_interval();
+                loop {
+                    tokio::time::sleep(period).await;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    atime_flush_once(
+                        &atime,
+                        &meta,
+                        &keepers,
+                        &forward,
+                        &peers,
+                        node_id,
+                        read_only_member,
+                    )
+                    .await;
+                }
+            });
+        }
         {
             let (
                 ship,
@@ -1296,6 +1336,7 @@ impl NodeRuntime {
             forward,
             placement,
             departed,
+            atime,
             read_only_member,
             fsync_s3,
             ship,
@@ -1453,6 +1494,7 @@ impl NodeRuntime {
                 staging_dir: self.staging_dir.clone(),
                 staging_budget: self.staging_budget.clone(),
                 snapshots: self.snapshots.clone(),
+                atime: self.atime.clone(),
             },
             self.fsmeta.chunk_size,
             self.compression,
@@ -1502,6 +1544,7 @@ impl NodeRuntime {
                     log_buffer: self.log_buffer.clone(),
                     forward: self.forward.clone(),
                     placement: self.placement.clone(),
+                    atime: self.atime.clone(),
                 });
                 *status_guard = Some(status.clone());
                 drop(status_guard);
@@ -1754,6 +1797,102 @@ impl std::fmt::Debug for MountId {
     }
 }
 
+/// One read-time atime flush (plan 20, Step 4). Drains the in-memory
+/// accumulator, applies every bump to the *local* replica first (the
+/// "always at least try" half, so local `stat` reflects local reads
+/// regardless of what happens next), then per partition chooses a
+/// publication path:
+///
+/// - local holder → queue into `atime_journal` for the shipper to drain;
+/// - non-holder (or a RO member with `CONSTELLATION_ATIME_RO_FORWARD`)
+///   → one best-effort batched forward to the cached holder, discarded
+///   on any failure — never retried into a lease acquisition;
+/// - RO member without the opt-in, or no known holder → local only.
+///
+/// Atime never acquires a lease and never wakes the shipper.
+async fn atime_flush_once(
+    atime: &crate::atime::AtimeAccumulator,
+    meta: &Arc<SqliteMeta>,
+    keepers: &Arc<tokio::sync::Mutex<HashMap<String, lease::LeaseKeeper>>>,
+    forward: &Arc<forward::ForwardState>,
+    peers: &constellation_net::Peers,
+    node_id: u64,
+    read_only_member: bool,
+) {
+    use constellation_meta::MetaStore;
+    let stats = &atime.stats;
+    let drained = atime.drain();
+    if drained.is_empty() {
+        return;
+    }
+    // 1. Local apply through the shared helper (guard + clamp + max).
+    match meta.apply_atime(&drained) {
+        Ok((applied, clamped)) => {
+            stats.applied.fetch_add(applied, Ordering::Relaxed);
+            stats.skew_clamped.fetch_add(clamped, Ordering::Relaxed);
+        }
+        Err(e) => tracing::debug!(error = %e, "atime local apply failed"),
+    }
+    // 2. Group by partition (resolve once per inode).
+    let mut by_part: HashMap<String, Vec<(constellation_fs_core::Ino, i64, i64)>> = HashMap::new();
+    for (ino, atime_ns, time_ns) in drained {
+        match meta.partition_of(ino) {
+            Ok(part) => by_part
+                .entry(part)
+                .or_default()
+                .push((ino, atime_ns, time_ns)),
+            Err(_) => continue,
+        }
+    }
+    // 3. Snapshot the partitions this node currently holds a usable,
+    //    non-lost shipping lease for.
+    let held: std::collections::HashSet<String> = {
+        let keepers = keepers.lock().await;
+        keepers
+            .iter()
+            .filter(|(_, k)| !k.is_lost() && k.ship_epoch().is_some() && k.view().usable())
+            .map(|(p, _)| p.clone())
+            .collect()
+    };
+    let ro_forward = crate::atime::ro_forward_enabled();
+    let timeout = crate::atime::forward_timeout();
+    for (part, entries) in by_part {
+        if held.contains(&part) {
+            // Holder: publish into atime_journal for the shipper drain.
+            match meta.queue_atime(&entries) {
+                Ok(()) => stats.local_only.fetch_add(1, Ordering::Relaxed),
+                Err(e) => {
+                    tracing::debug!(error = %e, part, "atime queue failed");
+                    0
+                }
+            };
+        } else if read_only_member && !ro_forward {
+            // RO member without the opt-in: applied locally, not published.
+            stats.local_only.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Non-holder (or RO with forward enabled): one best-effort
+            // forward to the cached holder. No holder known → keep local.
+            let Some(holder) = forward.cached_holder(&part) else {
+                stats.local_only.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let op = constellation_meta::MutateOp::AtimeBatch { entries };
+            match forward::request_mutate_with(peers, forward, &part, node_id, holder, &op, timeout)
+                .await
+            {
+                constellation_meta::MutateOutcome::Accepted { .. } => {
+                    stats.forward_ok.fetch_add(1, Ordering::Relaxed);
+                }
+                // Busy / NotHolder / Errno / timeout: discard, never
+                // retry into a lease acquisition.
+                _ => {
+                    stats.forward_err.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1773,6 +1912,7 @@ mod tests {
                 read_only_member: false,
                 web_ui: 0,
                 log_buffer: log_buffer::LogBuffer::default(),
+                atime_mode: crate::atime::AtimeMode::Off,
             },
             rt.clone(),
         )

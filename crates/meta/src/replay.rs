@@ -105,9 +105,14 @@ impl TouchSet {
             LogRecord::PartSplit { at_ino, .. } => {
                 self.inos.insert(*at_ino);
             }
+            // Atime is deliberately invisible to conflict detection: it
+            // records neither a dentry nor an ino, so a pending local
+            // atime bump never suppresses a foreign namespace/attr
+            // record, and is never suppressed by pending local work.
             LogRecord::PartMerge { .. }
             | LogRecord::RenameXpartAbort { .. }
-            | LogRecord::SetQuota { .. } => {}
+            | LogRecord::SetQuota { .. }
+            | LogRecord::Atime { .. } => {}
             LogRecord::SnapCreate { .. } | LogRecord::SnapDelete { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
@@ -956,7 +961,63 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             )?;
             Ok(Applied::Done)
         }
+        LogRecord::Atime {
+            ino,
+            atime_ns,
+            time_ns,
+        } => {
+            // Best-effort, order-free: one shared helper (clamp + ctime
+            // guard + max-merge) serves replay, the AtimeBatch handler,
+            // and the emitting node's own local flush, so a value
+            // applied locally can never be one a replica would reject.
+            apply_atime_one(tx, *ino, *atime_ns, *time_ns, atime_skew_tolerance_ns())?;
+            Ok(Applied::Done)
+        }
     }
+}
+
+/// Default skew clamp: a bump's claimed atime is never accepted more
+/// than this far past the applying node's clock, so one badly skewed
+/// node cannot park an inode's atime in the far future.
+const ATIME_SKEW_TOLERANCE_S_DEFAULT: i64 = 300;
+
+/// Skew tolerance in nanoseconds, from `CONSTELLATION_ATIME_SKEW_TOLERANCE_S`.
+/// Read here (rather than threaded through every replay call site) so
+/// foreign-segment replay and bootstrap clamp identically to the local
+/// flush path without plumbing cli config into the meta crate.
+pub fn atime_skew_tolerance_ns() -> i64 {
+    std::env::var("CONSTELLATION_ATIME_SKEW_TOLERANCE_S")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(ATIME_SKEW_TOLERANCE_S_DEFAULT)
+        .saturating_mul(1_000_000_000)
+}
+
+/// Apply one atime bump to `inode`, the single definition of atime
+/// merge semantics. Clamps the claimed value to `now + skew_tol_ns`,
+/// then raises `atime_ns` to the max of its current value and the claim
+/// — but only while `ctime_ns < time_ns`, so any explicit attr change
+/// (a `touch -a`, a peer's write/chmod/truncate) that postdates the
+/// read keeps its authority. Never writes ctime. A missing inode is a
+/// no-op. Returns true if the claim was clamped (for `skew_clamped`).
+pub fn apply_atime_one(
+    tx: &Connection,
+    ino: u64,
+    atime_ns: i64,
+    time_ns: i64,
+    skew_tol_ns: i64,
+) -> Result<bool, MetaError> {
+    let ceiling = constellation_fs_core::types::now_ns().saturating_add(skew_tol_ns);
+    let (claim, clamped) = if atime_ns > ceiling {
+        (ceiling, true)
+    } else {
+        (atime_ns, false)
+    };
+    tx.execute(
+        "UPDATE inode SET atime_ns = MAX(atime_ns, ?2) WHERE ino = ?1 AND ctime_ns < ?3",
+        params![ino, claim, time_ns],
+    )?;
+    Ok(clamped)
 }
 
 fn park_or_apply_xpart(
@@ -1035,6 +1096,7 @@ fn apply_xpart_pair(
 
 #[cfg(test)]
 mod tests {
+    use super::{atime_skew_tolerance_ns, TouchSet};
     use crate::{LogRecord, MetaStore, SqliteMeta};
 
     /// A batch that fails part way rolls the rows back; the usage counter
@@ -1183,5 +1245,184 @@ mod tests {
         assert!(dst.lookup(1, "d").unwrap().is_some());
         drop(dst);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // --- read-time atime (plan 20) ---
+
+    fn atime_of(m: &SqliteMeta, ino: u64) -> i64 {
+        m.getattr(ino).unwrap().unwrap().atime_ns
+    }
+
+    fn atime_rec(ino: u64, atime_ns: i64, time_ns: i64) -> LogRecord {
+        LogRecord::Atime {
+            ino,
+            atime_ns,
+            time_ns,
+        }
+    }
+
+    #[test]
+    fn atime_merge_is_max_idempotent_and_order_free() {
+        let m = SqliteMeta::open_in_memory().unwrap();
+        let f = m.create(1, "f", 0o644, 0, 0).unwrap();
+        let base = f.ctime_ns; // reads always postdate creation
+                               // Out-of-order + duplicated records must converge on the max.
+        m.apply_records(&[
+            atime_rec(f.ino, base + 50, base + 50),
+            atime_rec(f.ino, base + 10, base + 10),
+            atime_rec(f.ino, base + 50, base + 50), // duplicate
+            atime_rec(f.ino, base + 30, base + 30),
+        ])
+        .unwrap();
+        assert_eq!(atime_of(&m, f.ino), base + 50);
+        // Replaying an older record again changes nothing (idempotent).
+        m.apply_records(&[atime_rec(f.ino, base + 10, base + 10)])
+            .unwrap();
+        assert_eq!(atime_of(&m, f.ino), base + 50);
+    }
+
+    #[test]
+    fn atime_ctime_guard_drops_pre_touch_record() {
+        let m = SqliteMeta::open_in_memory().unwrap();
+        let f = m.create(1, "f", 0o644, 0, 0).unwrap();
+        // A read observed before an explicit attr change (ctime bump).
+        let read_time = f.ctime_ns - 1;
+        // Simulate the explicit change: setattr bumps ctime to "now",
+        // which is >= f.ctime_ns > read_time.
+        m.setattr(f.ino, None, None, None, None, Some(1234), None)
+            .unwrap();
+        let after = m.getattr(f.ino).unwrap().unwrap();
+        assert!(after.ctime_ns >= f.ctime_ns);
+        m.apply_records(&[atime_rec(f.ino, read_time + 5, read_time)])
+            .unwrap();
+        // The in-flight read-bump is dropped: explicit atime survives.
+        assert_eq!(atime_of(&m, f.ino), 1234);
+    }
+
+    #[test]
+    fn atime_for_missing_inode_is_a_noop() {
+        let m = SqliteMeta::open_in_memory().unwrap();
+        // No error, no row created.
+        m.apply_records(&[atime_rec(999_999, 1, 1)]).unwrap();
+        assert!(m.getattr(999_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn atime_skew_clamp_caps_a_far_future_claim() {
+        let m = SqliteMeta::open_in_memory().unwrap();
+        let f = m.create(1, "f", 0o644, 0, 0).unwrap();
+        let now = constellation_fs_core::types::now_ns();
+        // A claim a year in the future, with time_ns that passes the
+        // ctime guard.
+        let (applied, clamped) = m
+            .apply_atime(&[(f.ino, now + 365 * 86_400_000_000_000, now + 1)])
+            .unwrap();
+        assert_eq!((applied, clamped), (1, 1));
+        let got = atime_of(&m, f.ino);
+        let ceiling = now + atime_skew_tolerance_ns();
+        assert!(got <= ceiling + 1_000_000_000, "clamped near the ceiling");
+        assert!(got > now, "but still moved forward");
+    }
+
+    #[test]
+    fn atime_journal_coalesces_to_one_row_holding_the_max() {
+        let m = SqliteMeta::open_in_memory().unwrap();
+        let f = m.create(1, "f", 0o644, 0, 0).unwrap();
+        let part = m.partition_of(f.ino).unwrap();
+        // Many "flushes" of the same inode.
+        for t in [10i64, 50, 30, 40] {
+            m.queue_atime(&[(f.ino, t, t)]).unwrap();
+        }
+        assert_eq!(m.atime_backlog_of(&part).unwrap(), 1, "one row per inode");
+        let rows = m.take_atime_of(&part, 100).unwrap();
+        assert_eq!(rows, vec![(f.ino, 50, 50)], "holds the max");
+        m.clear_atime(&part, &[f.ino]).unwrap();
+        assert_eq!(m.atime_backlog_of(&part).unwrap(), 0);
+    }
+
+    #[test]
+    fn atime_backlog_does_not_count_toward_journal_len() {
+        let m = SqliteMeta::open_in_memory().unwrap();
+        let f = m.create(1, "f", 0o644, 0, 0).unwrap();
+        let before = m.journal_len().unwrap();
+        m.queue_atime(&[(f.ino, 100, 100)]).unwrap();
+        assert_eq!(
+            m.journal_len().unwrap(),
+            before,
+            "atime is not write backlog"
+        );
+    }
+
+    #[test]
+    fn atime_converges_across_replicas_via_shipped_records() {
+        // Two replicas holding the same file. A's reads are shipped as
+        // Atime records and tailed by B (and re-applied by A); both must
+        // converge on the max regardless of arrival order, and an
+        // explicit backwards `touch -a` on B must survive.
+        let make = || {
+            let m = SqliteMeta::open_in_memory().unwrap();
+            // Use a fixed ino on both replicas.
+            m.apply_records(&[LogRecord::Create {
+                parent: 1,
+                name: "shared".into(),
+                ino: (1 << 40) | 1,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 100,
+            }])
+            .unwrap();
+            m
+        };
+        let a = make();
+        let b = make();
+        let ino = (1 << 40) | 1;
+
+        // A records reads and publishes them as Atime records.
+        let part = a.partition_of(ino).unwrap();
+        a.queue_atime(&[(ino, 500, 500)]).unwrap();
+        a.queue_atime(&[(ino, 300, 300)]).unwrap();
+        let rows = a.take_atime_of(&part, 100).unwrap();
+        let shipped: Vec<LogRecord> = rows
+            .iter()
+            .map(|(i, at, t)| atime_rec(*i, *at, *t))
+            .collect();
+
+        // B tails them out of order; A replays its own (idempotent).
+        let mut reordered = shipped.clone();
+        reordered.reverse();
+        b.apply_records(&reordered).unwrap();
+        a.apply_records(&shipped).unwrap();
+
+        assert_eq!(atime_of(&a, ino), 500);
+        assert_eq!(atime_of(&b, ino), 500, "replicas converge on the max");
+
+        // B sets atime backwards with an explicit touch (bumps ctime);
+        // a late-arriving read record from before it must not resurrect.
+        b.setattr(ino, None, None, None, None, Some(200), None)
+            .unwrap();
+        b.apply_records(&[atime_rec(ino, 450, 450)]).unwrap();
+        assert_eq!(atime_of(&b, ino), 200, "explicit touch -a survives");
+    }
+
+    #[test]
+    fn touchset_atime_neither_conflicts_nor_is_conflicted() {
+        let atime = atime_rec(42, 1, 1);
+        // An Atime record touches nothing.
+        let pending = TouchSet::from_records([atime.clone()].iter());
+        assert!(pending.dentries.is_empty() && pending.inos.is_empty());
+        // And a pending setattr on the same inode does not suppress it.
+        let setattr = LogRecord::Setattr {
+            ino: 42,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+            time_ns: 1,
+        };
+        let pending = TouchSet::from_records([setattr].iter());
+        assert!(!pending.conflicts(&atime));
     }
 }

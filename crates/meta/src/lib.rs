@@ -170,4 +170,30 @@ pub trait MetaStore: Send + Sync {
     fn take_journal(&self, max: usize) -> Result<Vec<(u64, LogRecord)>, MetaError>;
     fn ack_journal(&self, upto_seq: u64) -> Result<(), MetaError>;
     fn journal_len(&self) -> Result<u64, MetaError>;
+
+    // --- read-time atime (plan 20) ---
+    /// The one atime merge path: clamp to `now + skew`, guard on
+    /// `ctime_ns < time_ns`, max-merge into `inode.atime_ns`. Never
+    /// writes ctime, never journals. Each bump carries its own
+    /// observation time so the guard is exact across a batch. Returns
+    /// `(applied, skew_clamped)` counts. Shared by the local flush and
+    /// the `AtimeBatch` handler so a locally applied value can never be
+    /// one a replica rejects.
+    fn apply_atime(&self, bumps: &[(Ino, i64, i64)]) -> Result<(u64, u64), MetaError>;
+    /// Upsert atime bumps into `atime_journal`, coalescing per inode
+    /// with max(). One row per inode regardless of read or flush count.
+    fn queue_atime(&self, bumps: &[(Ino, i64, i64)]) -> Result<(), MetaError>;
+    /// Pending atime rows for a partition (does not count toward
+    /// `journal_len`, which must keep meaning real write backlog).
+    fn atime_backlog_of(&self, part: &str) -> Result<u64, MetaError>;
+    /// Read (without removing) up to `max` pending atime rows for a
+    /// partition, as `(ino, atime_ns, time_ns)`. Delete only after the
+    /// segment PUT succeeds, via `clear_atime`.
+    fn take_atime_of(&self, part: &str, max: usize) -> Result<Vec<(Ino, i64, i64)>, MetaError>;
+    /// Delete the named atime rows of a partition after a successful
+    /// ship. Safe to lose: a re-ship is absorbed by the max-merge.
+    fn clear_atime(&self, part: &str, inos: &[Ino]) -> Result<(), MetaError>;
+    /// Drop all pending atime rows for a partition (epoch lost / drop
+    /// path). Best effort, no ship.
+    fn drop_atime_of(&self, part: &str) -> Result<(), MetaError>;
 }

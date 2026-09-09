@@ -208,6 +208,12 @@ boundaries where all files are closed, matching close-to-open
 durability semantics; cross-node checks poll with a deadline because
 propagation is asynchronous (sync interval + FUSE TTLs).
 
+`atime-eventual` (plan 20) mounts two nodes with `--atime relatime`: a
+cold read on one node must eventually advance `atime` on the holder,
+and — with S3 cut via toxiproxy — reads must keep succeeding at full
+speed while the atime updates are simply lost (atime never blocks a
+read).
+
 ### Chaos CI (`chaos-ci`)
 
 `harness run chaos-ci` mounts **three** clients on one filesystem and
