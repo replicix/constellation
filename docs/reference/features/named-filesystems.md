@@ -8,7 +8,7 @@ instead of by raw `--s3 URL` or `--state-dir DIR` every time.
 
 - [The registry](#the-registry)
 - [Naming syntax](#naming-syntax)
-- [`mount` and `unmount`](#mount-and-unmount)
+- [`mount` and `umount`](#mount-and-umount)
 - [One daemon per name](#one-daemon-per-name)
 - [Daemonization](#daemonization)
 - [`export`](#export)
@@ -51,17 +51,17 @@ way. `quota` is always whole-filesystem, node-level, like `write-mode`
 — there is no per-subtree cap. `--state-dir`/`--s3` remain explicit
 escape hatches for an ad-hoc, unregistered target.
 
-## `mount` and `unmount`
+## `mount` and `umount`
 
 ```
 constellation mount TARGET [MOUNTPOINT] [--s3 URL] [--state-dir DIR] [--foreground]
-constellation unmount TARGET
+constellation umount TARGET
 ```
 
 `TARGET` is a registered name (`myfs`), a name with a subtree/snapshot
 selector (`myfs:/data`), or — only together with `--s3`/`--state-dir` — a
 literal path/selector for an ad-hoc, unregistered mount (see below). It's
-the same argument shape for both commands; `unmount` just never takes a
+the same argument shape for both commands; `umount` just never takes a
 `MOUNTPOINT`, since a view is already uniquely identified by name(:subtree).
 
 - `mount NAME:/sub MOUNTPOINT` mounts (or updates) exactly that one view.
@@ -74,7 +74,7 @@ the same argument shape for both commands; `unmount` just never takes a
   that were already up before this invocation (served by an
   already-running daemon this one merely attached to) are never touched
   by that rollback.
-- `unmount NAME:/sub` detaches one view; bare `unmount NAME` detaches
+- `umount NAME:/sub` detaches one view; bare `umount NAME` detaches
   every view the daemon currently has mounted. The daemon exits once its
   last view is gone.
 

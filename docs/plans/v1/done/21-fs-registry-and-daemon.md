@@ -30,7 +30,7 @@ myfs brings up everything you last had mounted" is that those views share one
 node identity, one cache, one set of leases, not N independent ones.
 
 DESIGN.md §10 also already lists `fs create|mount|umount` as CLI surface;
-`umount` does not exist yet (`crates/cli/src/main.rs` has no `Unmount`
+`umount` does not exist yet (`crates/cli/src/main.rs` has no `Umount`
 variant — shutdown today is SIGTERM/SIGINT or an external `fusermount -u`).
 This plan adds it as part of the same work, since the daemon model needs a
 clean way to detach one mountpoint without killing the others.
@@ -111,8 +111,8 @@ change, but only where multi-view forces it (`StatusReport`, see Step 1).
   the daemon, the daemon runs its clean shutdown and exits with it; if it
   was attaching to a daemon that already had views mounted, those
   pre-existing views are untouched and the daemon stays up.
-- **`unmount` mirrors it**: `unmount NAME:/sub` detaches one view;
-  bare `unmount NAME` detaches every view the daemon currently has mounted.
+- **`umount` mirrors it**: `umount NAME:/sub` detaches one view;
+  bare `umount NAME` detaches every view the daemon currently has mounted.
   The daemon process exits (after its normal clean-shutdown sequence) once
   its last view is removed.
 - **`write-mode` is node-level**, shared by every mounted view of a name —
@@ -131,7 +131,7 @@ change, but only where multi-view forces it (`StatusReport`, see Step 1).
   fork-on-mount to lean on): `mount` backgrounds itself by default
   (fork + `setsid`, PID file under `state_dir`, logs redirected to the file
   `constellation log tail` already reads), with `-f`/`--foreground` to opt
-  out for debugging, and the new `unmount`/`stop` path as the clean way down
+  out for debugging, and the new `umount`/`stop` path as the clean way down
   instead of `kill`.
 
 ## Architecture overview
@@ -364,7 +364,7 @@ daemon: the socket is not there, and the error says so.
 All of these keep `--state-dir`/`--s3` as explicit escape hatches for
 ad-hoc, unregistered mounts.
 
-## Step 4 — `mount`/`unmount` command rework
+## Step 4 — `mount`/`umount` command rework
 
 `Command::Mount` argument shape becomes (`crates/cli/src/main.rs:49-109`
 area):
@@ -423,7 +423,7 @@ zero mounts.
 A targeted `mount NAME:/sub MOUNTPOINT` has exactly one view, so it either
 works or fails — the rollback path is a no-op there.
 
-New `Command::Unmount { target: String, #[arg(long)] state_dir: Option<PathBuf> }`:
+New `Command::Umount { target: String, #[arg(long)] state_dir: Option<PathBuf> }`:
 resolve target, connect to the socket, send `MountRemove` (bare name → one
 `MountRemove` per currently-mounted view, keyed by mountpoint from
 `MountList`). If the daemon's mount count reaches zero it runs its shutdown
@@ -458,7 +458,7 @@ the tokio runtime spawns workers, before any FUSE session thread exists:
   pipe and serve. A failed bare mount therefore reports through the same
   synchronous path as a bad `--s3`: the shell sees the errors and a
   non-zero status, and no daemon is left behind.
-- `constellation unmount` (last view) and existing SIGTERM/SIGINT handling
+- `constellation umount` (last view) and existing SIGTERM/SIGINT handling
   both go through `NodeRuntime::shutdown`; on clean exit remove the PID
   file and the socket, and release `daemon.lock`.
 - `--foreground`/`-f` skips all of this and behaves exactly like `mount`
@@ -530,7 +530,7 @@ every place that drives the binary:
   mount makes that PID exit immediately and the `mountpoint -q` poll
   race-prone). Either pass `--foreground` there or set
   `CONSTELLATION_NO_DAEMONIZE`; `fs_unmount` should move to
-  `constellation unmount`.
+  `constellation umount`.
 - `mount.sh` / `umount.sh` at the repo root.
 - `crates/harness/src/client.rs` (`mount` at :201, `unmount` at :335,
   and the wrong-passphrase check at :182) — stays on `--foreground` per
@@ -573,8 +573,8 @@ Multi-node / in-process (pattern at the bottom of `crates/cli/src/shipper.rs`):
 Harness (`crates/harness/src/scenarios.rs`):
 - New scenario: `mount myfs /mnt --s3 ...`, then `mount myfs:/sub /mnt2`
   from a second CLI call, assert one process (one `node_id`, one PID file),
-  both mountpoints usable; `unmount myfs:/sub`, assert `/mnt` keeps working
-  and the daemon is still alive; `unmount myfs`, assert clean exit and PID
+  both mountpoints usable; `umount myfs:/sub`, assert `/mnt` keeps working
+  and the daemon is still alive; `umount myfs`, assert clean exit and PID
   file removed.
 - Concurrent daemon start: two `mount myfs` invocations racing from a cold
   state dir produce exactly one daemon and one `node_id`, and the loser

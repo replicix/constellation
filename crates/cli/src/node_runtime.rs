@@ -1674,7 +1674,7 @@ impl NodeRuntime {
     }
 
     /// Clean shutdown: drain shipper, release leases, close meta.db, then
-    /// remove `control.sock`/`daemon.pid` so a waiting `unmount`/`export`
+    /// remove `control.sock`/`daemon.pid` so a waiting `umount`/`export`
     /// (or a later `mount` probing for a live daemon) sees this process
     /// is really gone rather than timing out. Idempotent — called once,
     /// when the last mount is removed or on signal; later calls are a

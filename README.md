@@ -51,7 +51,7 @@ $BIN fs create demo --s3 "$BUCKET"         # registers "demo", once per prefix
 $BIN mount demo /mnt/constellation         # backgrounds itself by default
 $BIN status demo                           # from another shell
 # … use /mnt/constellation …
-$BIN unmount demo
+$BIN umount demo
 ```
 
 `demo` is a name registered on this machine (like `zpool`/`zfs`), resolved

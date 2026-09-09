@@ -426,7 +426,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "named-shared-daemon",
-        desc: "plan 21: mount NAME then NAME:/sub from a second CLI call share one daemon/node_id; unmount tears down views one at a time, then the process",
+        desc: "plan 21: mount NAME then NAME:/sub from a second CLI call share one daemon/node_id; umount tears down views one at a time, then the process",
         requires: &[],
         run: named_shared_daemon,
     },
@@ -4941,9 +4941,9 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
     let sock_path = state_dir.join("control.sock");
 
     // Runs the scenario body; teardown below always attempts a clean
-    // `unmount myfs` and, failing that, a direct kill of any leftover
+    // `umount myfs` and, failing that, a direct kill of any leftover
     // daemon.pid — this is the harness scenario's answer to "clients
-    // unmount in all paths" when there's no `Client`/`Drop` to lean on.
+    // umount in all paths" when there's no `Client`/`Drop` to lean on.
     let body = || -> Result<()> {
         let out = cmd(&[
             "fs",
@@ -5025,17 +5025,17 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
         );
 
         // Detach the subtree view: root keeps working, daemon stays up.
-        let out = cmd(&["unmount", "myfs:/sub"]).output()?;
+        let out = cmd(&["umount", "myfs:/sub"]).output()?;
         anyhow::ensure!(
             out.status.success(),
-            "unmount myfs:/sub failed: {}",
+            "umount myfs:/sub failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline && is_mountpoint(&mnt2) {
             std::thread::sleep(Duration::from_millis(100));
         }
-        anyhow::ensure!(!is_mountpoint(&mnt2), "mnt2 still mounted after unmount");
+        anyhow::ensure!(!is_mountpoint(&mnt2), "mnt2 still mounted after umount");
         anyhow::ensure!(
             is_mountpoint(&mnt1) && std::fs::read(mnt1.join("a.txt"))? == b"root-view",
             "root view stopped working after detaching the subtree view"
@@ -5047,10 +5047,10 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
 
         // Detach the last view: the daemon must run its clean-shutdown
         // sequence and exit, removing its own PID file.
-        let out = cmd(&["unmount", "myfs"]).output()?;
+        let out = cmd(&["umount", "myfs"]).output()?;
         anyhow::ensure!(
             out.status.success(),
-            "unmount myfs failed: {}",
+            "umount myfs failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -5059,7 +5059,7 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
         }
         anyhow::ensure!(
             !is_mountpoint(&mnt1),
-            "mnt1 still mounted after unmount myfs"
+            "mnt1 still mounted after umount myfs"
         );
         anyhow::ensure!(
             !pid_alive(&pid1),
@@ -5072,7 +5072,7 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
     let result = body();
 
     // Best-effort teardown regardless of where `body` failed.
-    let _ = cmd(&["unmount", "myfs"]).output();
+    let _ = cmd(&["umount", "myfs"]).output();
     if let Ok(pid) = std::fs::read_to_string(&pid_path) {
         if let Ok(pid) = pid.trim().parse::<i32>() {
             unsafe {

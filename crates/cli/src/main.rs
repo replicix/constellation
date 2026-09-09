@@ -120,10 +120,10 @@ enum Command {
         )]
         web_ui: Option<u16>,
     },
-    /// Detach a view (`unmount myfs:/sub`) or every currently-mounted
-    /// view (`unmount myfs`). The daemon exits once its last view is
+    /// Detach a view (`umount myfs:/sub`) or every currently-mounted
+    /// view (`umount myfs`). The daemon exits once its last view is
     /// gone.
-    Unmount {
+    Umount {
         /// A registered name ("myfs") or a name with a subtree selector
         /// ("myfs:/data") identifying the view(s) to detach.
         target: String,
@@ -930,7 +930,7 @@ fn main() -> Result<()> {
         Command::Mount { .. } => unreachable!(
             "Command::Mount is handled earlier in main(), before the shared runtime is built"
         ),
-        Command::Unmount { target, state_dir } => rt.block_on(cmd_unmount(target, state_dir)),
+        Command::Umount { target, state_dir } => rt.block_on(cmd_umount(target, state_dir)),
         Command::Export { name, force } => rt.block_on(cmd_export(name, force)),
     }
 }
@@ -1448,11 +1448,11 @@ async fn attach_views(sock: &Path, views: &[ViewSpec]) -> Result<()> {
     Ok(())
 }
 
-/// `constellation unmount`: resolve the target, then send `MountRemove`
+/// `constellation umount`: resolve the target, then send `MountRemove`
 /// for one view or (bare name) every currently-mounted view. The daemon
 /// exits on its own once its last view is gone; this just waits for the
 /// socket to close (or a bounded timeout).
-async fn cmd_unmount(target: String, state_dir: Option<PathBuf>) -> Result<()> {
+async fn cmd_umount(target: String, state_dir: Option<PathBuf>) -> Result<()> {
     let reg = registry::Registry::load()?;
     let resolved = target::resolve(&target, &reg);
     let dir = target::state_dir(state_dir, &resolved)?;

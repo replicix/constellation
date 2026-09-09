@@ -631,8 +631,8 @@ myfs MOUNTPOINT` daemonizes for real (fork + `setsid`, not
 myfs:/sub MOUNTPOINT2`, attaches to that already-running daemon over its
 control socket instead of starting a second process — asserted by both
 mountpoints sharing one `daemon.pid` and the daemon reporting exactly
-one `node_id`. It then exercises `unmount myfs:/sub` (root view keeps
-serving, daemon stays up) followed by `unmount myfs` (last view: the
+one `node_id`. It then exercises `umount myfs:/sub` (root view keeps
+serving, daemon stays up) followed by `umount myfs` (last view: the
 daemon runs its clean-shutdown sequence, exits, and removes its own PID
 file).
 
