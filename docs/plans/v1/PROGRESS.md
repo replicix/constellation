@@ -1431,3 +1431,34 @@ namespace. Default (no marked roots) is inert.
 - Full `target/release/harness run` matrix (E2E + `passwd-live-cluster`
   run individually here; full matrix in progress).
 - pjdfstest compliance lane.
+
+## Plan 25 — Strip node-local upload state from cluster checkpoints: **DONE**
+
+Incident: a fresh joiner restored a mid-write-back checkpoint and
+inherited ~21k `pending_upload` rows (all `ino >> 40 ==` writer prefix)
+with an empty cache, then ERROR-looped forever. Gossip/E2E decrypt was
+not the cause — foreign replay never inserts into `pending_upload`.
+
+| Item | State | Where |
+|---|---|---|
+| `SqliteMeta::snapshot()` deletes `pending_upload`, `atime_journal`, `pin`, `epochs`, `reintegration`, and node-local kv (`left`, `read_only_member`, `lease_lost`, creation-quota mirror); keeps `xpart_pending` (convergent replay parking) | done | `meta::replay` |
+| `clear_pending_uploads()` after bootstrap replay (poisoned pre-plan-25 checkpoints) | done | `cli::shipper::bootstrap` |
+| `purge_foreign_pending_uploads(prefix)` after `set_node_prefix` on every mount (existing-db self-heal); uses `INO_PREFIX_SHIFT` | done | `meta::sqlite`, `cli::node_runtime` |
+| Missing-cache upload failures: one ERROR summary per round (`missing_pending_chunks` + sample hash), not one line per hash; refuse-to-ship for same-prefix torn-disk rows unchanged | done | `cli::main::upload_dirty_chunks` |
+| Unit: `snapshot_strips_pending_upload`, `purge_foreign_pending_uploads_keeps_local_prefix`, `clear_pending_uploads_empties_the_table`, `bootstrap_clears_pending_from_poisoned_checkpoint` | done | `meta::{replay,sqlite}`, `cli::shipper` |
+| Harness: `checkpoint-strips-pending-upload`; `fresh-node-bootstrap` asserts `pending_uploads == 0` | done | `harness::scenarios` |
+
+**Spec note (not DESIGN.md):** cluster checkpoints must not carry
+`pending_upload` (or other node-local upload/pin/epoch bookkeeping).
+That table is this node's not-yet-uploaded set; foreign
+`apply_foreign` never enrolls it.
+
+### Gates run in this environment
+
+- `cargo fmt --all` — clean; `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — all pass.
+- `bash tests/smoke.sh` — pass; `bash tests/integration.sh` — pass
+  (with `AWS_PROFILE` unset so floci credentials win).
+- `target/release/harness run fresh-node-bootstrap checkpoint-strips-pending-upload`
+  — both PASSED.
+- Full harness matrix and pjdfstest — see below / CI.

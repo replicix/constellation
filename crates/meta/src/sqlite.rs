@@ -2948,6 +2948,31 @@ impl SqliteMeta {
     pub fn cancel_pending_upload(&self, hash: &ChunkHash, ino: Ino) -> Result<(), MetaError> {
         self.ack_upload(hash, ino)
     }
+
+    /// Drop every pending-upload row. Used after bootstrap restores a
+    /// cluster checkpoint: a brand-new replica has never written local
+    /// content, so any inherited rows are another node's obligation
+    /// (plan 25). Foreign log replay never inserts into this table.
+    pub fn clear_pending_uploads(&self) -> Result<(), MetaError> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM pending_upload", [])?;
+        Ok(())
+    }
+
+    /// Delete pending-upload rows whose inode prefix is not `prefix`.
+    /// Returns the number of rows removed. Same-prefix rows stay for
+    /// plan-07 crash recovery. Uses [`INO_PREFIX_SHIFT`]; safe because
+    /// `set_node_prefix` rejects prefixes that would set the SQLite
+    /// INTEGER sign bit.
+    pub fn purge_foreign_pending_uploads(&self, prefix: u64) -> Result<u64, MetaError> {
+        let n = self.conn.lock().unwrap().execute(
+            &format!("DELETE FROM pending_upload WHERE (ino >> {INO_PREFIX_SHIFT}) != ?1"),
+            params![prefix as i64],
+        )?;
+        Ok(n as u64)
+    }
 }
 
 impl MetaStore for SqliteMeta {
@@ -4676,6 +4701,45 @@ mod tests {
         };
         let m = SqliteMeta::open(&path).unwrap();
         assert_eq!(m.pending_uploads().unwrap(), vec![(h, ino)]);
+    }
+
+    /// Foreign-prefix pending rows (inherited from a poisoned checkpoint
+    /// or copied state dir) must be droppable without touching this
+    /// node's own crash-recovery backlog (plan 25).
+    #[test]
+    fn purge_foreign_pending_uploads_keeps_local_prefix() {
+        let m = store();
+        m.set_node_prefix(2).unwrap();
+        let local = m.create(ROOT_INO, "local", 0o644, 0, 0).unwrap();
+        let h_local = ChunkHash::of(b"local-chunk");
+        m.set_manifest_dirty(local.ino, None, b"L", 1, &[h_local])
+            .unwrap();
+        // Fabricate a node-1 pending row the way a poisoned checkpoint
+        // would have left it (direct insert; no matching inode needed).
+        let h_foreign = ChunkHash::of(b"foreign-chunk");
+        let foreign_ino = 1u64 << INO_PREFIX_SHIFT | 99;
+        m.add_pending_upload(&h_foreign, foreign_ino).unwrap();
+        assert_eq!(m.pending_upload_count().unwrap(), 2);
+
+        let deleted = m.purge_foreign_pending_uploads(2).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            m.pending_uploads().unwrap(),
+            vec![(h_local, local.ino)],
+            "same-prefix crash-recovery backlog must survive"
+        );
+    }
+
+    #[test]
+    fn clear_pending_uploads_empties_the_table() {
+        let m = store();
+        let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        let h = ChunkHash::of(b"x");
+        m.set_manifest_dirty(f.ino, None, b"M", 1, &[h]).unwrap();
+        m.clear_pending_uploads().unwrap();
+        assert!(m.pending_uploads().unwrap().is_empty());
+        // Namespace intact.
+        assert!(m.lookup(ROOT_INO, "f").unwrap().is_some());
     }
 
     /// The creation-time cap is a node-local fallback, not a journal

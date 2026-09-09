@@ -1461,6 +1461,12 @@ pub async fn bootstrap(db_path: &std::path::Path, log: &LogStore) -> Result<()> 
     for ino in meta.orphans()? {
         meta.reap_orphan(ino)?;
     }
+    // Plan 25: a brand-new replica has never written local content. Any
+    // `pending_upload` rows inherited from a (possibly poisoned) cluster
+    // checkpoint are another node's obligation — foreign replay never
+    // inserts into that table, so a single post-replay clear is enough.
+    meta.clear_pending_uploads()
+        .context("clearing inherited pending_upload rows after bootstrap")?;
     tracing::info!(from_seq, replayed, "bootstrapped metadata replica");
     Ok(())
 }
@@ -2609,5 +2615,67 @@ mod tests {
         assert!(parts.contains(&"p2".into()));
         assert!(restored.lookup(d1.ino, "f1").unwrap().is_some());
         assert!(restored.lookup(d2.ino, "f2").unwrap().is_some());
+    }
+
+    /// A pre-plan-25 checkpoint that still embeds `pending_upload` must
+    /// not poison a fresh bootstrap (plan 25 step 2).
+    #[tokio::test]
+    async fn bootstrap_clears_pending_from_poisoned_checkpoint() {
+        use constellation_fs_core::ChunkHash;
+        use rusqlite::Connection;
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer_path = dir.path().join("writer.db");
+        let (ino, manifest) = {
+            let m = SqliteMeta::open(&writer_path).unwrap();
+            m.set_node_prefix(1).unwrap();
+            let f = m.create(1, "f", 0o644, 0, 0).unwrap();
+            let h = ChunkHash::of(b"poison-chunk");
+            m.set_manifest_dirty(f.ino, None, b"M", 1, &[h]).unwrap();
+            assert_eq!(m.pending_upload_count().unwrap(), 1);
+            (f.ino, m.manifest(f.ino).unwrap())
+        };
+        // Produce checkpoint bytes that still contain pending_upload
+        // (bypass `snapshot()`'s strip): VACUUM INTO a sibling file.
+        let poison_path = dir.path().join("poison.db");
+        {
+            let c = Connection::open(&writer_path).unwrap();
+            c.execute(
+                "VACUUM INTO ?1",
+                rusqlite::params![poison_path.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        let poison = SqliteMeta::open(&poison_path).unwrap();
+        assert_eq!(poison.pending_upload_count().unwrap(), 1);
+        drop(poison);
+        // Re-VACUUM so the put_checkpoint payload is a single file with
+        // pending still present (no dangling WAL).
+        let payload_path = dir.path().join("payload.db");
+        {
+            let c = Connection::open(&poison_path).unwrap();
+            c.execute(
+                "VACUUM INTO ?1",
+                rusqlite::params![payload_path.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        let payload = std::fs::read(&payload_path).unwrap();
+
+        let store: StdArc<dyn ObjectStore> = StdArc::new(InMemory::new());
+        let log = LogStore::new(store);
+        log.put_checkpoint(1, &payload).await.unwrap();
+
+        let boot = dir.path().join("boot.db");
+        bootstrap(&boot, &log).await.unwrap();
+        let restored = SqliteMeta::open(&boot).unwrap();
+        assert_eq!(
+            restored.pending_upload_count().unwrap(),
+            0,
+            "bootstrap must clear inherited pending_upload"
+        );
+        let kept = restored.lookup(1, "f").unwrap().unwrap();
+        assert_eq!(kept.ino, ino);
+        assert_eq!(restored.manifest(ino).unwrap(), manifest);
     }
 }

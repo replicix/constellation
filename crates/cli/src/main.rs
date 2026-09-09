@@ -1492,8 +1492,7 @@ fn cmd_mount_body(
                     // Wait for the old daemon to release the lock / remove
                     // its socket. Bounded so a genuinely wedged daemon
                     // surfaces an error rather than spinning forever.
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(600);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
                     while sock.exists() && std::time::Instant::now() < deadline {
                         std::thread::sleep(std::time::Duration::from_millis(200));
                     }
@@ -1615,9 +1614,7 @@ async fn attach_views(sock: &Path, views: &[ViewSpec]) -> Result<AttachOutcome> 
         .with_context(|| format!("attaching {}", view.mountpoint.display()))?;
         match resp {
             constellation_api::Response::Ok { .. } => {}
-            constellation_api::Response::Error { message }
-                if message.contains("shutting down") =>
-            {
+            constellation_api::Response::Error { message } if message.contains("shutting down") => {
                 return Ok(AttachOutcome::DaemonShuttingDown);
             }
             constellation_api::Response::Error { message } => {
@@ -2877,42 +2874,56 @@ async fn upload_dirty_chunks(
     // futures. Each one reads bytes only after winning the adaptive gate,
     // so both future state and chunk buffers stay independent of a backlog
     // that may contain tens of thousands of rows.
-    let in_flight = futures::stream::iter(grouped.into_iter().map(|(hash, inos)| async move {
-        let _permit = upload.permit().await;
-        let Some(data) = cache.get(&hash)? else {
-            tracing::error!(
-                %hash,
-                ?inos,
-                "pending upload chunk missing from local cache (unrecoverable content); \
-                 leaving the pending row and refusing to ship"
-            );
-            bail!("pending upload chunk {hash} missing from local cache");
-        };
-        let bytes = data.len() as u64;
-        let mode = upload.put_mode(&hash);
-        let mut last = None;
-        let started = std::time::Instant::now();
-        for attempt in 0..3 {
-            match store.put_chunk_mode(&hash, &data, compression, mode).await {
-                Ok(result) => {
-                    let now = std::time::Instant::now();
-                    // A Probe hit only performed HEAD; counting the
-                    // chunk's logical bytes as uploaded would report
-                    // impossible goodput and drive concurrency upward
-                    // during deduplicated workloads.
-                    if !result.existed {
-                        upload.record_success(bytes, now.duration_since(started), now);
+    //
+    // Missing-cache rows (torn disk, or a poisoned inherited backlog that
+    // self-heal missed) must still fail the round so the journal does not
+    // ship — but logging ERROR once per hash per round produced multi-GB
+    // logs (plan 25). Count them and emit a single summary below.
+    let missing_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let missing_sample = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<constellation_fs_core::ChunkHash>,
+    ));
+    let in_flight = futures::stream::iter(grouped.into_iter().map(|(hash, inos)| {
+        let missing_count = missing_count.clone();
+        let missing_sample = missing_sample.clone();
+        async move {
+            let _permit = upload.permit().await;
+            let Some(data) = cache.get(&hash)? else {
+                missing_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                {
+                    let mut sample = missing_sample.lock().unwrap();
+                    if sample.is_none() {
+                        *sample = Some(hash);
                     }
-                    return Ok((hash, inos, mode, result.existed));
                 }
-                Err(error) => last = Some(error),
+                bail!("pending upload chunk {hash} missing from local cache");
+            };
+            let bytes = data.len() as u64;
+            let mode = upload.put_mode(&hash);
+            let mut last = None;
+            let started = std::time::Instant::now();
+            for attempt in 0..3 {
+                match store.put_chunk_mode(&hash, &data, compression, mode).await {
+                    Ok(result) => {
+                        let now = std::time::Instant::now();
+                        // A Probe hit only performed HEAD; counting the
+                        // chunk's logical bytes as uploaded would report
+                        // impossible goodput and drive concurrency upward
+                        // during deduplicated workloads.
+                        if !result.existed {
+                            upload.record_success(bytes, now.duration_since(started), now);
+                        }
+                        return Ok((hash, inos, mode, result.existed));
+                    }
+                    Err(error) => last = Some(error),
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
-            if attempt < 2 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
+            upload.record_error(std::time::Instant::now());
+            Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
         }
-        upload.record_error(std::time::Instant::now());
-        Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
     }))
     .buffer_unordered(upload.max_concurrency());
     futures::pin_mut!(in_flight);
@@ -2955,6 +2966,16 @@ async fn upload_dirty_chunks(
             );
             last_progress = std::time::Instant::now();
         }
+    }
+    let missing = missing_count.load(std::sync::atomic::Ordering::Relaxed);
+    if missing > 0 {
+        let sample = *missing_sample.lock().unwrap();
+        tracing::error!(
+            missing_pending_chunks = missing,
+            sample_hash = ?sample,
+            "pending upload chunks missing from local cache (unrecoverable content); \
+             leaving the pending rows and refusing to ship"
+        );
     }
     if let Some(error) = first_error {
         return Err(error);

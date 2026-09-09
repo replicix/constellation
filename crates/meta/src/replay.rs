@@ -41,7 +41,9 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::sqlite::{SqliteMeta, UsageTracker, INO_PREFIX_SHIFT, QUOTA_KV_KEY};
+use crate::sqlite::{
+    SqliteMeta, UsageTracker, INO_PREFIX_SHIFT, QUOTA_CREATION_KV_KEY, QUOTA_KV_KEY,
+};
 use constellation_fs_core::InodeKind;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
@@ -220,10 +222,24 @@ impl SqliteMeta {
         Ok(skipped)
     }
 
-    /// Consistent zstd-free snapshot of the whole DB with the journal
-    /// and node-local identity stripped (checkpoint payload; a restored
-    /// node must not re-ship records or inherit our node id / ino
-    /// counter).
+    /// Consistent snapshot of the whole DB for a cluster checkpoint.
+    /// Strips node-local and ephemeral state so a fresh replica does not
+    /// inherit another node's identity or upload obligations:
+    /// - `journal` / `atime_journal` / `scratch_*` / `shadow`
+    /// - `pending_upload` (this node's not-yet-uploaded set; plan 25)
+    /// - `pin` (explicitly node-local)
+    /// - `epochs` / `reintegration` (local continuation / stranded-branch
+    ///   bookkeeping tied to this node's journal)
+    /// - identity / apply-cursor kv keys (`node_id`, `node_prefix`,
+    ///   `next_ino`, `applied_seq*`, `part_of/%`) and other node-local kv
+    ///   (`left`, `read_only_member`, `lease_lost`, creation-quota mirror)
+    ///
+    /// `xpart_pending` is kept: it is convergent replay parking for
+    /// cross-partition renames that can span a checkpoint boundary, not
+    /// node-local writeback state.
+    ///
+    /// Replicated namespace tables (`inode`, `dentry`, `xattr`, `snapshot`,
+    /// `chunk_ref`, `deref`, `partition`, …) are kept.
     pub fn snapshot(&self) -> Result<Vec<u8>, MetaError> {
         // Unique per call: a daemon checkpoints per partition, so two
         // snapshots can be in flight at once. Sharing one scratch path
@@ -266,17 +282,28 @@ impl SqliteMeta {
             // a `-wal` sidecar that the payload does not carry.
             c.pragma_update(None, "journal_mode", "DELETE")?;
             c.execute("DELETE FROM journal", [])?;
+            c.execute("DELETE FROM atime_journal", [])?;
+            c.execute("DELETE FROM pending_upload", [])?;
+            c.execute("DELETE FROM pin", [])?;
+            c.execute("DELETE FROM epochs", [])?;
+            c.execute("DELETE FROM reintegration", [])?;
             c.execute_batch(
                 "DROP TABLE IF EXISTS scratch_inode;
                  DROP TABLE IF EXISTS scratch_dentry;
+                 DROP TABLE IF EXISTS scratch_xattr;
                  DROP TABLE IF EXISTS shadow;",
             )?;
             // Reset AUTOINCREMENT so the restored node journals from 1.
             let _ = c.execute("DELETE FROM sqlite_sequence WHERE name = 'journal'", []);
             c.execute(
-                "DELETE FROM kv WHERE key IN ('node_id', 'node_prefix', 'next_ino', 'applied_seq')
-                 OR key LIKE 'applied_seq/%' OR key LIKE 'part_of/%'",
-                [],
+                "DELETE FROM kv WHERE key IN (
+                    'node_id', 'node_prefix', 'next_ino', 'applied_seq',
+                    'left', 'read_only_member', 'lease_lost'
+                 )
+                 OR key LIKE 'applied_seq/%'
+                 OR key LIKE 'part_of/%'
+                 OR key = ?1",
+                params![QUOTA_CREATION_KV_KEY],
             )?;
             // No second VACUUM: `VACUUM INTO` already wrote a compact file,
             // and reclaiming the pages those deletes freed would rewrite the
@@ -1243,6 +1270,47 @@ mod tests {
         let dst = SqliteMeta::open(&tmp).unwrap();
         assert_eq!(dst.journal_len().unwrap(), 0);
         assert!(dst.lookup(1, "d").unwrap().is_some());
+        drop(dst);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Cluster checkpoints must not carry the writer's `pending_upload`
+    /// backlog (or pins / epoch bookkeeping) onto a fresh replica
+    /// (plan 25).
+    #[test]
+    fn snapshot_strips_pending_upload() {
+        use constellation_fs_core::ChunkHash;
+
+        let src = SqliteMeta::open_in_memory().unwrap();
+        src.set_node_prefix(1).unwrap();
+        let f = src.create(1, "f", 0o644, 0, 0).unwrap();
+        let h = ChunkHash::of(b"writer-chunk");
+        src.set_manifest_dirty(f.ino, None, b"M", 4, &[h]).unwrap();
+        src.add_pin("/f", f.ino).unwrap();
+        assert_eq!(src.pending_upload_count().unwrap(), 1);
+        assert!(!src.pins().unwrap().is_empty());
+
+        let snap = src.snapshot().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "constellation-test-pending-{}.db",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, &snap).unwrap();
+        let dst = SqliteMeta::open(&tmp).unwrap();
+        assert!(
+            dst.pending_uploads().unwrap().is_empty(),
+            "pending_upload must not leave the writing node via a checkpoint"
+        );
+        assert!(
+            dst.pins().unwrap().is_empty(),
+            "pins are node-local and must be stripped"
+        );
+        assert!(dst.kv_get("node_id").unwrap().is_none());
+        assert!(dst.kv_get("node_prefix").unwrap().is_none());
+        // Namespace / manifest survive.
+        let kept = dst.lookup(1, "f").unwrap().unwrap();
+        assert_eq!(kept.ino, f.ino);
+        assert_eq!(dst.manifest(f.ino).unwrap().as_deref(), Some(b"M".as_ref()));
         drop(dst);
         let _ = std::fs::remove_file(&tmp);
     }

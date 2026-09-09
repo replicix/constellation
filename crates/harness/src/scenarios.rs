@@ -275,6 +275,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: fresh_node_bootstrap,
     },
     Scenario {
+        name: "checkpoint-strips-pending-upload",
+        desc: "a mid-write-back checkpoint must not give a fresh joiner the writer's pending_upload backlog",
+        requires: &[],
+        run: checkpoint_strips_pending_upload,
+    },
+    Scenario {
         name: "readahead",
         desc: "cold sequential read of a multi-chunk file under S3 latency must pipeline (prefetcher)",
         requires: &[],
@@ -2922,6 +2928,10 @@ fn fresh_node_bootstrap(seed: u64) -> Result<()> {
     // A brand-new node with an empty state dir sees the same world.
     let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?;
     c1.mount().context("bootstrap mount on fresh node")?;
+    anyhow::ensure!(
+        c1.control_status()?["writeback"]["pending_uploads"].as_u64() == Some(0),
+        "fresh bootstrap must not inherit pending_upload rows"
+    );
     model
         .verify(&c1.mnt)
         .context("fresh node namespace/data vs model")?;
@@ -2934,6 +2944,108 @@ fn fresh_node_bootstrap(seed: u64) -> Result<()> {
     model.verify(&c1.mnt)?;
     c1.unmount()?;
     Ok(())
+}
+
+/// Mid-write-back checkpoints used to embed the writer's `pending_upload`
+/// table; a joiner then ERROR-looped trying to upload chunks it never had
+/// (plan 25). Crash the writer while pending > 0 and a checkpoint exists,
+/// then assert a fresh node bootstraps with pending == 0 and readable data.
+fn checkpoint_strips_pending_upload(seed: u64) -> Result<()> {
+    let (env, root) = setup("ckpt-pending")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("ckpt-pending-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut a = Client::new(root.path(), "a", &env.endpoint, &backend)?.with_write_mode("back");
+    a.fs_create()?;
+    a.mount()?;
+
+    // > CHECKPOINT_EVERY (32) small files so a mid-flight checkpoint is
+    // due while write-back still has a pending queue.
+    let mut expected = Vec::new();
+    for i in 0..48u64 {
+        let data = pattern(seed.wrapping_add(i), 4096);
+        let name = format!("f{i:03}");
+        std::fs::write(a.mnt.join(&name), &data)?;
+        expected.push((name, data));
+    }
+    eventually(
+        "mid-flight checkpoint while pending_uploads > 0",
+        Duration::from_secs(90),
+        || {
+            let pending = a.control_status()?["writeback"]["pending_uploads"]
+                .as_u64()
+                .unwrap_or(0);
+            anyhow::ensure!(pending > 0, "pending already drained ({pending})");
+            let n = count_checkpoint_objects(&env.direct_endpoint, &prefix)?;
+            anyhow::ensure!(n > 0, "no checkpoint object yet");
+            Ok(())
+        },
+    )?;
+    // Crash before clean drain so S3's LATEST checkpoint is still the
+    // mid-flight one (a clean unmount would drain pending first).
+    a.kill9()?;
+
+    let mut b = Client::new(root.path(), "b", &env.endpoint, &backend)?;
+    b.mount()
+        .context("fresh joiner after mid-flight checkpoint")?;
+    let status = b.control_status()?;
+    anyhow::ensure!(
+        status["writeback"]["pending_uploads"].as_u64() == Some(0),
+        "joiner inherited pending_upload: {status}"
+    );
+    let log = b.tail_log_n(500);
+    let spam = log.matches("pending upload chunk missing").count()
+        + log.matches("pending upload chunks missing").count();
+    anyhow::ensure!(
+        spam == 0,
+        "joiner log has {spam} missing-chunk lines; tail:\n{log}"
+    );
+
+    // Finish uploading any chunks that died with A, then verify B can read.
+    a.mount().context("writer remount to finish uploads")?;
+    a.set_write_mode("through")?;
+    eventually("writer pending drained", Duration::from_secs(120), || {
+        anyhow::ensure!(a.control_status()?["writeback"]["pending_uploads"].as_u64() == Some(0));
+        Ok(())
+    })?;
+    a.unmount()?;
+
+    for (name, data) in &expected {
+        let got =
+            std::fs::read(b.mnt.join(name)).with_context(|| format!("reading {name} on joiner"))?;
+        anyhow::ensure!(got == *data, "content mismatch on {name}");
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let log2 = b.tail_log_n(200);
+    let spam2 = log2.matches("pending upload chunk missing").count()
+        + log2.matches("pending upload chunks missing").count();
+    anyhow::ensure!(spam2 == 0, "spam after idle: {spam2}\n{log2}");
+    b.unmount()?;
+    Ok(())
+}
+
+fn count_checkpoint_objects(endpoint: &str, prefix: &str) -> Result<usize> {
+    let list_prefix = format!("{prefix}/checkpoints/");
+    let response = ureq::get(&format!(
+        "{endpoint}/{BUCKET}?list-type=2&prefix={list_prefix}"
+    ))
+    .call()
+    .context("listing checkpoint objects")?
+    .into_string()?;
+    let mut n = 0usize;
+    let mut rest = response.as_str();
+    while let Some(start) = rest.find("<Key>") {
+        rest = &rest[start + 5..];
+        let Some(end) = rest.find("</Key>") else {
+            break;
+        };
+        let key = &rest[..end];
+        if key.ends_with(".zst") {
+            n += 1;
+        }
+        rest = &rest[end + 6..];
+    }
+    Ok(n)
 }
 
 /// With 60 ms of injected S3 latency and a cold cache, a sequential

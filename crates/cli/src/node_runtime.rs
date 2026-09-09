@@ -328,6 +328,21 @@ impl NodeRuntime {
             bail!("--read-only-member is fixed on first mount for this state directory");
         }
         meta.set_node_prefix(node_id)?;
+        // Plan 25: drop pending_upload rows that belong to another node's
+        // ino prefix (poisoned checkpoint restored into an existing state
+        // dir, or a copied meta.db). Same-prefix rows stay for crash
+        // recovery. On a fresh bootstrap this is a no-op after
+        // `clear_pending_uploads`.
+        let purged = meta
+            .purge_foreign_pending_uploads(node_id)
+            .context("purging foreign pending_upload rows")?;
+        if purged > 0 {
+            tracing::info!(
+                purged,
+                node_id,
+                "dropped foreign pending_upload rows inherited from another node"
+            );
+        }
         tracing::info!(node_id, "node identity");
 
         // Mirror the creation-time cap from meta.json into node-local kv.

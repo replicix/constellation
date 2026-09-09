@@ -181,7 +181,12 @@ Scenarios (see `harness list`): `baseline`, `latency`, `slow-network`,
 criterion), `cold-cache`, `two-clients-disjoint`,
 `fresh-node-bootstrap` (a brand-new node reconstructs the namespace and
 data purely from S3 — checkpoint restore plus log replay — and must
-match the model exactly), `readahead` (cold sequential read of a
+match the model exactly; also asserts `writeback.pending_uploads == 0`
+so a joiner never inherits the writer's upload queue),
+`checkpoint-strips-pending-upload` (writer crashes mid-write-back after
+a checkpoint exists while `pending_uploads > 0`; a fresh joiner must
+bootstrap with pending == 0, no missing-chunk log spam, and readable
+data once the writer finishes draining), `readahead` (cold sequential read of a
 multi-chunk file under injected latency must beat the serial-fetch
 floor, proving the prefetcher pipelines), `readahead-adaptive` (a
 128-chunk read under 200 ms latency must expand the byte window and beat

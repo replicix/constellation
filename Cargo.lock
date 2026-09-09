@@ -999,6 +999,7 @@ dependencies = [
  "object_store",
  "postcard",
  "rpassword",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
