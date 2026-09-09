@@ -151,4 +151,4 @@ constellation mount / /mnt --s3 s3://bucket/prefix --state-dir /tmp/scratch
 ## References
 
 - [`docs/explanation/DESIGN.md`](../../explanation/DESIGN.md) §10 (Control Plane), §13 (Snapshots and Clones)
-- [`docs/plans/v1/wip/21-fs-registry-and-daemon.md`](../../plans/v1/wip/21-fs-registry-and-daemon.md)
+- [`docs/plans/v1/done/21-fs-registry-and-daemon.md`](../../plans/v1/done/21-fs-registry-and-daemon.md)
