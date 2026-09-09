@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
+use aws_types::service_config::ServiceConfigKey;
 use object_store::aws::{AmazonS3Builder, AwsCredential};
 use object_store::CredentialProvider;
 use tokio::sync::RwLock;
@@ -133,8 +134,35 @@ pub async fn amazon_s3_builder(bucket: &str) -> Result<AmazonS3Builder, StoreErr
         .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
         .unwrap_or_else(|| "us-east-1".into());
 
-    Ok(AmazonS3Builder::from_env()
+    let mut builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .with_region(region)
-        .with_credentials(Arc::new(adapter)))
+        .with_credentials(Arc::new(adapter));
+
+    // `AmazonS3Builder::from_env` reads `AWS_ENDPOINT` (object_store's own
+    // env var) but not `AWS_ENDPOINT_URL` / `AWS_ENDPOINT_URL_S3` (standard
+    // AWS CLI variables). The SDK's `SdkConfig::endpoint_url()` covers the
+    // profile-level `endpoint_url` key and `AWS_ENDPOINT_URL`, but NOT the
+    // newer `services` stanza used by non-AWS stores (Backblaze B2, etc.).
+    //
+    // `SdkConfig::service_config()` + `ServiceConfigKey` does handle all of
+    // that — it checks `AWS_ENDPOINT_URL_S3`, the profile-level key, and
+    // the `services = name` / `[services name]` / `s3.endpoint_url` chain.
+    let endpoint = sdk
+        .service_config()
+        .and_then(|sc| {
+            ServiceConfigKey::builder()
+                .service_id("S3")
+                .env("AWS_ENDPOINT_URL_S3")
+                .profile("endpoint_url")
+                .build()
+                .ok()
+                .and_then(|key| sc.load_config(key))
+        })
+        .or_else(|| sdk.endpoint_url().map(str::to_owned));
+    if let Some(ep) = endpoint {
+        builder = builder.with_endpoint(ep);
+    }
+
+    Ok(builder)
 }

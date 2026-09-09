@@ -1116,6 +1116,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
+ "aws-types",
  "blake3",
  "bytes",
  "chacha20poly1305",

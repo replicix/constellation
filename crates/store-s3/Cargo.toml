@@ -16,6 +16,7 @@ object_store.workspace = true
 # enable SSO + credentials-process.
 aws-config.workspace = true
 aws-credential-types.workspace = true
+aws-types.workspace = true
 async-trait = "0.1"
 rand.workspace = true
 serde.workspace = true
