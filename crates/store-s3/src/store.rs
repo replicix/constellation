@@ -546,6 +546,137 @@ impl ChunkStore {
         }
     }
 
+    /// Exercise every object-store operation a constellation filesystem
+    /// relies on against a throwaway key under the configured prefix, so
+    /// `fs create` can refuse a backend up front with one clean message
+    /// instead of failing mid-create with a raw protocol error (e.g.
+    /// Backblaze B2, which 501s the `If-None-Match`/`If-Match` headers
+    /// that create-if-absent and etag CAS depend on).
+    ///
+    /// Every check runs even when an earlier one fails, so the report
+    /// lists all problems at once. Cleanup is best-effort.
+    pub async fn preflight(&self) -> Vec<PreflightCheck> {
+        let key = object_store::path::Path::from(format!(".preflight/{}", Uuid::new_v4()));
+        let mut checks = Vec::new();
+
+        // Unconditional write: connectivity, credentials, bucket/prefix
+        // write permission. Its version feeds the etag-CAS check below.
+        let write = self
+            .store
+            .put_opts(
+                &key,
+                PutPayload::from_static(b"preflight"),
+                PutOptions::from(PutMode::Overwrite),
+            )
+            .await;
+        let written = match &write {
+            Ok(r) => Some(UpdateVersion {
+                e_tag: r.e_tag.clone(),
+                version: r.version.clone(),
+            }),
+            Err(_) => None,
+        };
+        checks.push(PreflightCheck::new(
+            "write object (PUT)",
+            true,
+            write.map(|_| ()).map_err(|e| concise_os_error(&e)),
+        ));
+
+        // Read back.
+        let read = match self.store.get(&key).await {
+            Ok(r) => r.bytes().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        checks.push(PreflightCheck::new(
+            "read object (GET)",
+            true,
+            read.map_err(|e| concise_os_error(&e)),
+        ));
+
+        // List the prefix (GC and node discovery walk object listings).
+        let list = self
+            .store
+            .list(Some(&object_store::path::Path::from(".preflight")))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>();
+        checks.push(PreflightCheck::new(
+            "list objects (LIST)",
+            true,
+            list.map(|_| ()).map_err(|e| concise_os_error(&e)),
+        ));
+
+        // Create-if-absent (`If-None-Match: *`): load-bearing from phase 1.
+        let cia_key = object_store::path::Path::from(format!(".preflight/{}", Uuid::new_v4()));
+        let create_if_absent = match self
+            .store
+            .put_opts(
+                &cia_key,
+                PutPayload::from_static(b"a"),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+        {
+            Ok(_) => match self
+                .store
+                .put_opts(
+                    &cia_key,
+                    PutPayload::from_static(b"b"),
+                    PutOptions::from(PutMode::Create),
+                )
+                .await
+            {
+                Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+                Ok(_) => Err("backend accepted a second create over an existing object; \
+                              create-if-absent is not enforced"
+                    .to_string()),
+                Err(e) => Err(concise_os_error(&e)),
+            },
+            Err(e) => Err(concise_os_error(&e)),
+        };
+        let _ = self.store.delete(&cia_key).await;
+        checks.push(PreflightCheck::new(
+            "create-if-absent (If-None-Match)",
+            true,
+            create_if_absent,
+        ));
+
+        // Etag CAS (`If-Match`): required for lease renew/takeover, and so
+        // for multi-node mounts. Single-node mounts degrade without it, so
+        // it is reported but not treated as fatal for `fs create`.
+        let etag_cas = match &written {
+            Some(v) => match self
+                .store
+                .put_opts(
+                    &key,
+                    PutPayload::from_static(b"cas"),
+                    PutOptions::from(PutMode::Update(v.clone())),
+                )
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(e) => Err(concise_os_error(&e)),
+            },
+            None => Err("skipped (initial write failed)".to_string()),
+        };
+        checks.push(PreflightCheck::new(
+            "etag CAS (If-Match)",
+            false,
+            etag_cas,
+        ));
+
+        // Delete: cleanup uses it everywhere (GC, lease release).
+        let delete = self.store.delete(&key).await;
+        checks.push(PreflightCheck::new(
+            "delete object (DELETE)",
+            true,
+            delete.map_err(|e| concise_os_error(&e)),
+        ));
+
+        checks
+    }
+
     /// `doctor` probe: verify which conditional-write primitives the
     /// backend supports. Create-if-absent is required from phase 1;
     /// etag CAS becomes load-bearing with leases (phase 3).
@@ -617,6 +748,58 @@ impl ChunkStore {
 pub struct Capabilities {
     pub create_if_absent: bool,
     pub etag_cas: bool,
+}
+
+/// One operation exercised by [`ChunkStore::preflight`].
+#[derive(Debug, Clone)]
+pub struct PreflightCheck {
+    /// Human-readable operation name (e.g. `"create-if-absent (If-None-Match)"`).
+    pub name: &'static str,
+    /// Whether a filesystem cannot be created without this operation.
+    pub required: bool,
+    /// `Ok(())` when the operation worked, `Err(reason)` with a concise
+    /// explanation otherwise.
+    pub outcome: Result<(), String>,
+}
+
+impl PreflightCheck {
+    fn new(name: &'static str, required: bool, outcome: Result<(), String>) -> Self {
+        Self {
+            name,
+            required,
+            outcome,
+        }
+    }
+}
+
+/// Collapse a verbose `object_store` error (which embeds the full S3 XML
+/// body) into a one-line reason suitable for a preflight report.
+fn concise_os_error(e: &object_store::Error) -> String {
+    match e {
+        object_store::Error::NotImplemented { .. } => {
+            "not supported by this S3 backend (server returned 501 Not Implemented)".to_string()
+        }
+        object_store::Error::NotFound { .. } => "object not found".to_string(),
+        object_store::Error::Precondition { .. } => "precondition failed".to_string(),
+        object_store::Error::AlreadyExists { .. } => "object already exists".to_string(),
+        object_store::Error::Generic { source, .. } => {
+            // Generic S3 errors wrap the transport error; some backends
+            // report an unimplemented conditional header this way.
+            let msg = source.to_string();
+            if msg.contains("501") || msg.contains("NotImplemented") {
+                "not supported by this S3 backend (server returned 501 Not Implemented)".to_string()
+            } else {
+                // Keep just the first line; the rest is an XML dump.
+                msg.lines().next().unwrap_or("request failed").to_string()
+            }
+        }
+        other => other
+            .to_string()
+            .lines()
+            .next()
+            .unwrap_or("request failed")
+            .to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -830,6 +1013,23 @@ mod tests {
     #[tokio::test]
     async fn conditional_write_probe() {
         store().probe_conditional_writes().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preflight_passes_and_cleans_up_on_capable_backend() {
+        let s = store();
+        let checks = s.preflight().await;
+        assert!(!checks.is_empty());
+        for c in &checks {
+            assert!(c.outcome.is_ok(), "{} should pass: {:?}", c.name, c.outcome);
+        }
+        // Every scratch object must be removed afterward.
+        let leftover = s
+            .inner()
+            .list(Some(&object_store::path::Path::from(".preflight")))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(leftover.is_empty(), "preflight left scratch objects behind");
     }
 
     #[tokio::test]

@@ -520,6 +520,34 @@ fn passphrase(env: &str, prompt: &str) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(value))
 }
 
+/// `allow_other` needs `user_allow_other` in `/etc/fuse.conf` for a
+/// non-root user; without it the FUSE mount fails deep in the daemon with
+/// no useful message. Check it up front so the error is actionable and
+/// reaches the caller's terminal. Root is exempt (the kernel allows it).
+fn ensure_allow_other_supported(enabled: bool) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    // SAFETY: geteuid is always safe and never fails.
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(());
+    }
+    let enabled_in_conf = std::fs::read_to_string("/etc/fuse.conf")
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            let code = line.split('#').next().unwrap_or("").trim();
+            code == "user_allow_other"
+        });
+    if !enabled_in_conf {
+        bail!(
+            "--allow-other requires `user_allow_other` in /etc/fuse.conf. \
+             Add or uncomment that line (as root) in /etc/fuse.conf, or run the mount as root."
+        );
+    }
+    Ok(())
+}
+
 /// Is a daemon already serving this state dir? A successful connect to the
 /// control socket means yes — a new `mount` will attach to it rather than
 /// unlock the keyring itself, so it needs no passphrase.
@@ -534,6 +562,40 @@ fn daemon_socket_is_live(state_dir: &Path) -> bool {
 /// survives the fork) or the filesystem is not E2E. Reads `meta.json`
 /// through a throwaway runtime that is fully dropped before the caller
 /// forks, so no runtime threads leak into the daemon child.
+/// Run the backend preflight for `fs create`, print the per-operation
+/// report, and bail with a concise message if any required operation is
+/// unsupported (e.g. Backblaze B2 rejecting the conditional-write headers).
+async fn preflight_backend(store: &ChunkStore, s3: &str) -> Result<()> {
+    let checks = store.preflight().await;
+    let mut failed = Vec::new();
+    for c in &checks {
+        let status = match &c.outcome {
+            Ok(()) => "ok".to_string(),
+            Err(reason) => {
+                if c.required {
+                    failed.push((c.name, reason.clone()));
+                    format!("FAILED: {reason}")
+                } else {
+                    format!("unavailable: {reason}")
+                }
+            }
+        };
+        eprintln!("  {:.<40} {}", format!("{} ", c.name), status);
+    }
+    if !failed.is_empty() {
+        let details = failed
+            .iter()
+            .map(|(name, reason)| format!("  - {name}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "backend at {s3} is not usable as a constellation filesystem; \
+             the following required operations failed:\n{details}"
+        );
+    }
+    Ok(())
+}
+
 fn prompt_e2e_passphrase_if_needed(s3: &str) -> Result<Option<Zeroizing<String>>> {
     if std::env::var_os("CONSTELLATION_PASSPHRASE").is_some() {
         return Ok(None);
@@ -649,6 +711,11 @@ fn main() -> Result<()> {
                 .block_on(backend::open_backend(&s3))
                 .context("opening backend")?;
             let store = ChunkStore::new(backend.clone());
+            // Verify the backend supports every operation a filesystem
+            // needs before writing (or prompting for) anything, so an
+            // unusable backend fails fast with a clean report instead of
+            // a raw protocol error mid-create.
+            rt.block_on(preflight_backend(&store, &s3))?;
             let mut meta = FsMeta::new(chunk_size, &setting.to_string());
             meta.e2e = e2e;
             // E2E filesystems seed the gossip topic from the passphrase-
@@ -1175,6 +1242,11 @@ fn cmd_mount(
             bail!("invalid --atime {raw:?} (expected off, relatime, or lazy)");
         }
     }
+    // Fail fast and clearly on an unusable `--allow-other`, before we
+    // touch the registry (so a doomed attempt never persists the option)
+    // and before the daemon forks (so the error reaches this terminal
+    // instead of dying as "daemon exited before reporting status").
+    ensure_allow_other_supported(allow_other)?;
 
     let mut reg = registry::Registry::load_locked()?;
     let mut resolved = target::resolve(&target, &reg);
@@ -1236,7 +1308,11 @@ fn cmd_mount(
                     mountpoint: mountpoint.clone().unwrap_or_else(|| {
                         stored.map(|m| m.mountpoint.clone()).unwrap_or_default()
                     }),
-                    allow_other: allow_other || stored.is_some_and(|m| m.allow_other),
+                    // Authoritative from this command line, not sticky:
+                    // an explicit `mount NAME MOUNTPOINT` redefines the
+                    // view, so omitting `--allow-other` turns it back off.
+                    // (A bare `mount NAME` keeps the stored views as-is.)
+                    allow_other,
                     fs_name: fs_name
                         .clone()
                         .or_else(|| stored.map(|m| m.fs_name.clone()))
@@ -1330,6 +1406,12 @@ fn cmd_mount(
         }
     };
     drop(reg); // release the registry's own advisory lock before forking
+
+    // A view may enable allow_other from the registry rather than this
+    // command line; validate the effective value too.
+    for view in &views {
+        ensure_allow_other_supported(view.allow_other)?;
+    }
 
     let fsync_s3 = match node_fsync_mode.as_str() {
         "local" => false,

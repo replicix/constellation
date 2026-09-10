@@ -37,4 +37,4 @@ pub use nodes::{
     write_eligible_roster, NodeInfo,
 };
 pub use snapshot::{snapshot_id, SnapshotRecord, SnapshotStore};
-pub use store::{Capabilities, ChunkPutMode, ChunkPutResult, ChunkStore, FsMeta};
+pub use store::{Capabilities, ChunkPutMode, ChunkPutResult, ChunkStore, FsMeta, PreflightCheck};
