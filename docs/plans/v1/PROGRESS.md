@@ -1584,7 +1584,7 @@ fixed 500 ms, and bounds a segment by bytes as well as by record count.
 | `tail_all_except` keeps its parallel-across-partitions shape — the sweep is now a parallel probe, not a parallel LIST | done | `cli::shipper::tail_all_except` |
 | `TAIL_GET_CONCURRENCY` 8 → 16 | done | `cli::shipper` |
 | `bootstrap()` keeps LIST + sequential GET (it is always in catch-up mode) | unchanged, deliberate | `cli::shipper::bootstrap` |
-| `CONSTELLATION_SYNC_IDLE_MAX_MS` (default `30_000`) with `CONSTELLATION_SYNC_INTERVAL_MS` as the floor; `next_poll_ms(interval, idle_rounds, max)` doubles per idle round and clamps | done | `cli::node_runtime::next_poll_ms` |
+| `CONSTELLATION_SYNC_IDLE_MAX_MS` (default `30_000`, **later lowered to `10_000`** — see steps 9–10) with `CONSTELLATION_SYNC_INTERVAL_MS` as the floor; `next_poll_ms(interval, idle_rounds, max)` doubles per idle round and clamps | done | `cli::node_runtime::next_poll_ms` |
 | Productive round = a segment applied or shipped (`spool.head_seq` before/after) **or** a non-empty journal; any `SyncRequest` (FUSE nudge, barrier, acquire, forward, gossip `Nudge`) resets `idle_rounds` to 0 and the deadline to the interval; `debug!` on ceiling and on reset | done | `cli::node_runtime` `'sync` loop |
 | `SEGMENT_MAX_BYTES = 4 MiB`: the batch is cut to the largest prefix that fits, leftovers stay journaled and ship next round, `ack_journal_rows_at` gets only the shipped seqs, ride-along atime rows count against the cap and are cleared only if they shipped | done | `cli::shipper::{records_within_cap,ship_part}` |
 | Journal read **once** per `ship_all` and passed into `ship_part(part, lease, batch)`; `ship_part_taking` is the thin wrapper for `sync_one` | done | `cli::shipper::{ship_all,ship_part,ship_part_taking}` |
@@ -1642,7 +1642,8 @@ fixed 500 ms, and bounds a segment by bytes as well as by record count.
 
 With P2P **up** the backoff is invisible: a gossip `Nudge` resets it the
 moment a peer publishes. With P2P **down**, a follower's freshness bound
-degrades from 0.5 s to `CONSTELLATION_SYNC_IDLE_MAX_MS` (30 s) after ~6
+degrades from 0.5 s to `CONSTELLATION_SYNC_IDLE_MAX_MS` (30 s at the time
+of this slice; lowered to 10 s in steps 9–10) after ~6
 idle rounds — 0.5 + 1 + 2 + 4 + 8 + 16 s ≈ 31 s of complete quiet — and
 snaps back to 0.5 s on the next segment it applies, because applying one
 is a productive round. DESIGN.md §12's posture ("eventual S3 polling
@@ -1937,3 +1938,194 @@ chunk-prefix LIST runs at mount any more.
 - `bash tests/smoke.sh` — `SMOKE TEST PASSED`.
 - Docker lanes (`tests/integration.sh`, harness matrix, pjdfstest) not run
   in this slice — see CI.
+
+## Plan 26 steps 9–10 — configuration docs, harness scenarios, and the defects the scenarios found: **DONE**
+
+This slice closes plan 26. It is also the first slice in which the docker
+lanes ran at all, so it is where steps 0–8 were actually exercised
+end-to-end — and where two defects in already-"done" steps surfaced.
+
+| Item | State | Where |
+|---|---|---|
+| `docs/reference/configuration.md`: all eight plan-26 knobs documented, each verified against the code that actually reads it | done | `docs/reference/configuration.md` |
+| `ckpt-bulk-ingest-bounded` — newest-2 bound, footprint ≤ 3× the final snapshot, fresh node bootstraps to the oracle | done, PASSES | `harness::scenarios` |
+| `idle-cluster-is-quiet` — 3 nodes, 60 s idle, per-class request budget, zero LISTs of `log/` | done, PASSES | `harness::scenarios` |
+| `wan-writer-ships-put-only` — 200 ms path, 500-file burst, zero LISTs of `log/p0`, follower converges on the poll alone | done, PASSES | `harness::scenarios` |
+| `sticky-lease-handoff-over-s3` — S3-only handoff, no EIO, epoch advances, holder released cooperatively | done, PASSES | `harness::scenarios` |
+| `multi-partition-retention-is-per-partition` — step 0 regression test | done, PASSES | `harness::scenarios` |
+| `reqlog::CountingProxy` — counting HTTP relay chained in front of toxiproxy, with a `desyncs` counter every user asserts is zero | done | `harness::reqlog` |
+| `reqlog::breakdown` — requests grouped by class *and* bucket area, so "30 LISTs" can be shown to be membership polls and not `log/` | done | `harness::reqlog` |
+| `CONSTELLATION_HARNESS_DOCKER_PREFIX` — lets two harness processes share a host, which is what made the HEAD-vs-working-tree A/B possible | done | `harness::s3env` |
+| **Defect found in step 8**: `chunk_ref` existence hint claimed "in the bucket" for this node's own un-uploaded chunks | fixed | `meta::sqlite::chunk_ref_exists` |
+| **Defect found in step 3**: a deposed holder could not see the new holder's writes for up to TTL/2 | fixed | `cli::shipper::{HELD_TAIL_MAX_STALENESS,held_partitions}` |
+| TESTING.md documents the five scenarios and the counting relay | done | `docs/how-to-guides/development/TESTING.md` |
+
+### Defect 1 — step 8's `chunk_ref` hint was wrong for in-flight chunks
+
+`chunk_ref` rows are written when a **manifest commits**. In write-back
+mode that happens *before* the chunk is uploaded, so `Existence::contains`
+answered "probably already in the bucket" about an object that provably
+was not there yet, and `put_mode` returned `Probe` — a HEAD that is
+guaranteed to 404 — before every single write-back PUT.
+
+Found by scenario evidence, not by unit tests: `wan-writer-ships-put-only`
+tallied `HEAD=500` for a 500-file burst of unique content, one wasted
+round trip per file. On the plan's own Appendix numbers that is 177 ms
+HU→AWS and 27 ms same-region *per chunk*, on the path plan 26 exists to
+make cheaper. No unit test could see it — they seed the hint with
+`insert()` and never model a pending upload.
+
+`chunk_ref_exists` now excludes hashes with a live `pending_upload` row,
+in one indexed statement on the reader connection (never the writer, which
+FUSE also needs). `pending_upload` is node-local, so this only ever
+suppresses a hint about *our own* unfinished work — a hash referenced by a
+peer still hits, which is the property step 8 was built for. Pinned by
+`chunk_ref_hint_ignores_this_nodes_pending_uploads`, which fails without
+the exclusion.
+
+### Defect 2 — step 3 left a deposed holder blind for up to TTL/2
+
+Step 3 lets a holder skip reading partitions it holds, gated on
+`ship_epoch()`. That is `None` for a keeper that is expired, released or
+deposed — but a keeper only *learns* it was deposed at its own renewal
+CAS, half a TTL away (30 s at the default 60 s TTL). Until then its view
+still says "usable", the partition stays in the held set, and its stream
+stays unread. Correctness was never at risk — the epoch fences anything
+the deposed node ships — but the **read** staleness is real.
+
+Step 3's own unit test described this accurately ("A has not noticed yet
+… the renewal CAS is where it finds out") and then drove `renew_now()`
+explicitly, making detection instantaneous in-test. The conclusion drawn
+from it — that a deposed keeper "drops out of the set by itself" with no
+extra code — was right about correctness and silent about latency.
+
+Measured cost: against a plan-26-free tree (HEAD 87df4ce), three
+scenarios that pass there fail here, and every one of them fails on the
+*old holder* not seeing the new holder's writes — `two-clients-shared`
+("b not on c0"), `lease-handover` ("via c0: MODEL DIVERGENCE"),
+`rename-across-partitions` ("q not on c0").
+
+The skip is now tied to **freshness** rather than usability: a held
+partition is read again once `HELD_TAIL_MAX_STALENESS` (5 s) has passed
+since it was last read, whatever the lease view claims.
+
+Why this keeps step 3's measured win. That win — 2.6 → 5.1 shipped seg/s
+HU→AWS — came from dropping a LIST that ran **per shipped segment**, a
+cost that scales with throughput. The bound costs at most one probe per
+5 s per partition, a cost that scales with time; across the 500-file
+burst in `wan-writer-ships-put-only` the two differ by orders of
+magnitude. After step 4b the read is a GET-next probe rather than a LIST
+(~1/12.5 of the request price on AWS, and latency-neutral: 177 ms GET-404
+vs 175 ms idle LIST HU→AWS), and a holder probing its own stream 404s at
+`next_seq` and returns without reaching the LIST catch-up path — so the
+scenario's zero-LIST assertion still holds. The bound also only forces a
+read when a sync round happens anyway; it never schedules one, so an idle
+node polling at the 30 s ceiling stays bounded by its poll.
+
+A first round holding a partition is treated as fresh: `acquire_lease_for`
+already tails the stream to head as its takeover witness, so the bound is
+measured from that read rather than immediately repeating it.
+
+`a_deposed_keeper_leaves_the_held_set_and_tails_again` now pins the
+production path first — no renewal, only the bound — and keeps the
+renewal assertions after it. Non-vacuity: disabling the freshness check
+fails it with "the staleness bound must bring a deposed holder's stream
+back without waiting for its renewal".
+
+### Contradictions with DESIGN.md to record (CONVENTIONS rule 5)
+
+- §4 "A holder releases after about 30 seconds without a mutation" is now
+  conditional on a registered requester (recorded under steps 6–7 above).
+- §4's partition-lease model does not say how quickly a **deposed** holder
+  must notice. It now notices its own staleness within
+  `HELD_TAIL_MAX_STALENESS` (5 s) for reads, while write authority is
+  still fenced by the epoch and learned at renewal.
+- §12's polling backstop now has an idle ceiling
+  (`CONSTELLATION_SYNC_IDLE_MAX_MS`, **10 s** — see "Two settled decisions
+  revisited" below) rather than a fixed interval.
+
+DESIGN.md is not edited.
+
+### Pre-existing failures, NOT caused by plan 26
+
+Established by running the identical scenario on HEAD (87df4ce, verified
+plan-26-free: no `SYNC_IDLE_MAX_MS`, no `wanted_by`, no `reqlog.rs`) and
+on this tree, on an otherwise quiet machine. These are reported, not
+fixed — they predate this work.
+
+| Scenario | HEAD | This tree | Note |
+|---|---|---|---|
+| `slow-network` | FAIL | FAIL | identical seed, file `w-f-11`, sizes 20105→0 |
+| `gc-dedup-race` | 7/20 | 10/20 | load-sensitive race; Fisher p≈0.53, indistinguishable; 0/6 when the machine is idle |
+| `writeback-latency` | FAIL | FAIL | `back import content mismatch` |
+| `writeback-backpressure` | FAIL | FAIL | `ENOSPC arrived without observable throttling` |
+| `atime-eventual` | FAIL @40 s | FAIL @40 s | same assertion |
+| `deposed-reintegration` | FAIL @20 s | FAIL @40 s | fails earlier on HEAD |
+
+An earlier, uncontrolled comparison suggested `gc-dedup-race` was a
+plan-26 regression (HEAD 6/6 clean against 4/9 failing here). That was an
+artifact of unequal machine load; interleaving the two binaries run for
+run removed it. Load matters enough on this scenario that any future
+comparison has to be interleaved.
+
+`checkpoint-strips-pending-upload` is the reverse case: byte-identical
+scenario source, **FAILS 3/3 on HEAD** at its 90 s timeout and **passes
+3/3 here** in 3.7 s. Plan 26 fixes it.
+
+### Defect 3 — step 4c's backoff starved lease maintenance
+
+`run_sync_round` is the **only** caller of `renew_if_due()` and
+`idle_release_due()`. The sync task's idle backoff therefore does not
+merely delay a *read*; it delays lease renewal and the discovery of
+another node's `wanted_by` handoff request.
+
+Two consequences, both measured:
+
+- Step 7's stated worst case — "the holder notices at its next renewal
+  (≤ TTL/2 = 30 s)" — silently became "after one backoff interval".
+  Daemon log from `two-clients-shared`: the requester registered at
+  `17:34:12.221` (`registered a handoff request in the partition lease
+  part="p0" holder=1 landed=true`) and the holder did not notice until
+  `17:35:03.306` (`renew CAS lost to a handoff request, not a takeover
+  wanted_by=[2] epoch=1`) — **51.0 s**, which is exactly
+  0.2+0.4+0.8+1.6+3.2+6.4+12.8+25.6 for the `idle_rounds=8` the same log
+  reports.
+- With `idle_max_ms` above TTL/2 a holder can sleep through its own
+  renewal entirely and let the lease lapse while still believing it holds
+  it.
+
+`lease_poll_cap_ms` now clamps the poll deadline to TTL/4 whenever this
+node holds any lease. A quarter rather than a half so one slow round
+cannot push the renewal past its deadline; the added traffic is small
+next to the renewal HEAD+PUT the holder already performs every TTL/2.
+Pinned by `a_lease_holder_never_backs_off_past_its_renewal`.
+
+### Two settled decisions revisited (idle probe width, idle ceiling)
+
+Plan 26 settled on a 16-wide GET-next probe and a 30 s idle ceiling.
+Running the docker lanes showed the pairing to be the expensive half of
+the design, and both were changed with the user's approval.
+
+`LogStore::get_run(from, k)` returns the longest **contiguous** run from
+`from`. When `from` is absent — a caught-up node asking "anything new?",
+the overwhelmingly common case — the other k−1 GETs cannot contribute to
+the answer whatever they find. A 16-wide idle probe buys one bit for 16
+requests. Per node per partition per day, at AWS list price (GET
+$0.0004/1k, LIST $0.005/1k — the 12.5× the Appendix measures):
+
+| poll | requests/day | GET-equivalents | $/yr/node |
+|---|---:|---:|---:|
+| fixed 500 ms LIST (pre-plan-26) | 172,800 | 2,160,000 | 315.36 |
+| 30 s ceiling, k=16 (as first shipped) | 46,080 | 46,080 | 6.73 |
+| 10 s ceiling, k=16 | 138,240 | 138,240 | 20.18 |
+| 5 s ceiling, k=16 | 276,480 | 276,480 | 40.37 |
+| **10 s ceiling, k=1 (shipped)** | **8,640** | **8,640** | **1.26** |
+| 5 s ceiling, k=1 | 17,280 | 17,280 | 2.52 |
+
+So the shipped pairing is **5.3× cheaper than the 30 s/16-wide one and
+three times fresher**: this was never a freshness-versus-cost trade, both
+were being paid for nothing. Catch-up keeps k=16, where the Appendix
+measures it as correct (1693 ms vs 2201 ms at k=8 over 64 segments,
+HU→AWS); the probe widens to 16 the moment the narrow one hits, and only
+escalates to a LIST if the wide probe also saturates. `TAIL_PROBE_IDLE`
+= 1, `CONSTELLATION_SYNC_IDLE_MAX_MS` default 10 s.

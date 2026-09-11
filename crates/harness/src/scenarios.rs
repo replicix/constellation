@@ -1209,18 +1209,7 @@ fn two_clients_shared(seed: u64) -> Result<()> {
 
     std::fs::create_dir(c0.mnt.join("a"))?;
     std::fs::create_dir(c1.mnt.join("b"))?;
-    // These two clients share the host's node key on purpose (see
-    // `Client::with_own_node_key`), so the P2P fast path is dead and every
-    // deadline here is an *S3-only* bound. Plan 26 moved that bound twice:
-    // a quiet follower's poll backs off to `CONSTELLATION_SYNC_IDLE_MAX_MS`
-    // (30 s) instead of the fixed interval, and a non-holder's first write
-    // waits for a sticky-lease handoff (up to TTL/2 + dwell) rather than an
-    // unconditional idle release. A cross-node assertion therefore has to
-    // allow the handoff and the poll in series; the old 20/30 s deadlines
-    // are inside one poll ceiling on their own. `eventually` returns as
-    // soon as the condition holds, so the wider deadline costs nothing when
-    // convergence is quick.
-    eventually("subtrees visible on both", Duration::from_secs(90), || {
+    eventually("subtrees visible on both", Duration::from_secs(20), || {
         anyhow::ensure!(c0.mnt.join("b").is_dir(), "b not on c0");
         anyhow::ensure!(c1.mnt.join("a").is_dir(), "a not on c1");
         Ok(())
@@ -1241,7 +1230,7 @@ fn two_clients_shared(seed: u64) -> Result<()> {
         // Remote view converges (close-to-open through S3 alone).
         eventually(
             &format!("cross-node convergence, block {block}"),
-            Duration::from_secs(90),
+            Duration::from_secs(30),
             || {
                 m0.verify(&c1.mnt.join("a")).context("c0's tree via c1")?;
                 m1.verify(&c0.mnt.join("b")).context("c1's tree via c0")?;
@@ -1290,13 +1279,9 @@ fn atime_eventual(seed: u64) -> Result<()> {
 
     // The writer (partition holder) creates a file; the reader must see it.
     std::fs::write(writer.mnt.join("shared.txt"), b"hello atime")?;
-    // S3-only bound: these clients share the host node key, so a follower
-    // sees a new segment on its next poll and that poll now backs off to
-    // `CONSTELLATION_SYNC_IDLE_MAX_MS` (30 s, plan 26 step 4c) while the
-    // reader has nothing to do.
     eventually(
         "shared file visible on reader",
-        Duration::from_secs(60),
+        Duration::from_secs(20),
         || {
             anyhow::ensure!(reader.mnt.join("shared.txt").is_file(), "not yet on reader");
             Ok(())
@@ -1316,15 +1301,9 @@ fn atime_eventual(seed: u64) -> Result<()> {
 
     // The writer's replica (authoritative) must observe atime advance.
     // Compared there rather than via the reader's kernel attr cache.
-    //
-    // Two S3-only bounds in series here: the reader is not the partition
-    // holder, so shipping its atime record waits on a sticky-lease handoff
-    // (up to TTL/2 + dwell, plan 26 step 7), and only then does the writer
-    // pick the segment up on a poll that has backed off to the 30 s ceiling
-    // (step 4c).
     eventually(
         "atime advanced on the holder",
-        Duration::from_secs(90),
+        Duration::from_secs(40),
         || {
             let now = std::fs::metadata(writer.mnt.join("shared.txt"))?.accessed()?;
             if let Some(b) = baseline {
@@ -2262,11 +2241,7 @@ fn lease_handover(seed: u64) -> Result<()> {
     let mut w1 = Workload::new(seed.wrapping_add(1), "b");
     // The model's root is the shared subtree both nodes write into.
     std::fs::create_dir(c0.mnt.join("shared"))?;
-    // S3-only bound (shared host node key, no fast path): a quiet
-    // follower's poll backs off to `CONSTELLATION_SYNC_IDLE_MAX_MS` (30 s,
-    // plan 26 step 4c), so a convergence deadline has to clear one poll
-    // ceiling plus the ship itself.
-    eventually("shared subtree on B", Duration::from_secs(60), || {
+    eventually("shared subtree on B", Duration::from_secs(20), || {
         anyhow::ensure!(c1.mnt.join("shared").is_dir(), "shared not on c1");
         Ok(())
     })?;
@@ -2300,12 +2275,10 @@ fn lease_handover(seed: u64) -> Result<()> {
         epochs.push(b_lease["epoch"].as_u64().unwrap_or(0));
         w1.run_block(&c1.mnt.join("shared"), &mut m, 25)?;
 
-        // Both nodes converge on the union of both nodes' writes. A is now
-        // the *non*-holder and has been quiet since its block, so its poll
-        // is at the idle ceiling; the deadline has to clear that.
+        // Both nodes converge on the union of both nodes' writes.
         eventually(
             &format!("both views converge, round {round}"),
-            Duration::from_secs(90),
+            Duration::from_secs(30),
             || {
                 m.verify(&c1.mnt.join("shared")).context("via c1")?;
                 m.verify(&c0.mnt.join("shared")).context("via c0")?;
@@ -2712,13 +2685,9 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     )?;
     c0.reintegrate()?;
 
-    // Reintegration lands as ordinary segments, so each node still has to
-    // poll for the other's. This scenario's 3 s interval backs off to the
-    // same `CONSTELLATION_SYNC_IDLE_MAX_MS` ceiling (30 s, plan 26 step 4c)
-    // while A is paused and B is quiet, which does not fit in 40 s.
     eventually(
         "clean branch and conflict materialization converge",
-        Duration::from_secs(90),
+        Duration::from_secs(40),
         || {
             for client in [&c0, &c1] {
                 let current = std::fs::read(client.mnt.join("shared/same"))?;
@@ -5839,7 +5808,12 @@ fn idle_cluster_is_quiet(_seed: u64) -> Result<()> {
         counter.ensure_sane()?;
         let requests = counter.requests();
         let t = crate::reqlog::tally(&requests);
-        eprintln!("    idle-cluster-is-quiet: {:>7} {t}", client.name);
+        eprintln!(
+            "    idle-cluster-is-quiet: {:>7} {t}\n        {:>7} by area: {}",
+            client.name,
+            client.name,
+            crate::reqlog::breakdown(&requests)
+        );
         let log_lists: Vec<&str> = requests
             .iter()
             .filter(|r| r.lists_prefix("/log/") || r.lists_prefix("log/"))
@@ -5974,9 +5948,15 @@ fn wan_writer_ships_put_only(seed: u64) -> Result<()> {
         .map(|r| r.target.as_str())
         .collect();
     let segments = log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?.len();
+    let existence = a.control_status()?["writeback"].clone();
     eprintln!(
         "    wan-writer-ships-put-only: {FILES} files in {burst:?} over a 200ms path, \
-         {segments} segments on p0; writer {t}"
+         {segments} segments on p0; writer {t}\n        by area: {}\n        \
+         existence hints: chunk_ref={} bloom={} misses={}",
+        crate::reqlog::breakdown(&requests),
+        existence["existence_chunk_ref_hits"],
+        existence["existence_bloom_hits"],
+        existence["existence_misses"]
     );
     anyhow::ensure!(
         self_lists.is_empty(),

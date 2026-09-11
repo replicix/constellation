@@ -330,21 +330,35 @@ impl SqliteMeta {
             .is_some())
     }
 
-    /// Is `hash` referenced by any manifest this replica knows about?
+    /// Is `hash` referenced by a manifest this replica knows about *and*
+    /// not still queued for upload by this node?
     ///
-    /// The upload path's existence hint (`cli::existence`). Deliberately a
-    /// single indexed probe with no `inode` join, unlike
-    /// [`Self::hash_is_live`]: the question here is only "has this content
-    /// been put in the bucket already", a hit merely selects a confirming
-    /// HEAD, and a row that outlives its inode — a rebuilt index carries
-    /// orphans too — costs nothing worse than that HEAD. Replay maintains
-    /// `chunk_ref` from foreign records as well as local ones, so a hash
-    /// referenced anywhere in the cluster is a hit here.
+    /// The upload path's existence hint (`cli::existence`). Deliberately no
+    /// `inode` join, unlike [`Self::hash_is_live`]: the question here is
+    /// only "has this content been put in the bucket already", a hit merely
+    /// selects a confirming HEAD, and a row that outlives its inode — a
+    /// rebuilt index carries orphans too — costs nothing worse than that
+    /// HEAD. Replay maintains `chunk_ref` from foreign records as well as
+    /// local ones, so a hash referenced anywhere in the cluster is a hit.
+    ///
+    /// The `pending_upload` exclusion is not an optimization, it is what
+    /// keeps the hint truthful. `chunk_ref` rows are written when a
+    /// manifest commits, and in write-back mode that happens *before* the
+    /// chunk is uploaded — so a node asking about its own in-flight chunk
+    /// would be told "already in the bucket" about an object that provably
+    /// is not there yet, and every write-back upload would pay a
+    /// guaranteed-404 HEAD before its PUT (177 ms HU→AWS, 27 ms
+    /// same-region — plan 26 Appendix). `pending_upload` is node-local, so
+    /// this only ever suppresses a hint about *our* unfinished work; a
+    /// hash referenced by a peer still hits. One statement rather than two
+    /// calls, so the hot upload path takes the reader once and never the
+    /// writer connection.
     pub fn chunk_ref_exists(&self, hash: &ChunkHash) -> Result<bool, MetaError> {
         self.with_reader(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT 1 FROM chunk_ref WHERE chunk_hash = ?1 LIMIT 1",
+                    "SELECT 1 FROM chunk_ref WHERE chunk_hash = ?1 \
+                     AND NOT EXISTS(SELECT 1 FROM pending_upload WHERE hash = ?1) LIMIT 1",
                     params![hash.0.to_vec()],
                     |_| Ok(()),
                 )
@@ -3950,6 +3964,33 @@ mod tests {
         assert!(
             !dst.chunk_ref_exists(&hash).unwrap(),
             "the hint follows the reference, and the last one just went"
+        );
+    }
+
+    /// A node must not take its own un-uploaded chunk as evidence that the
+    /// chunk is already in the bucket. `chunk_ref` is written when the
+    /// manifest commits, which in write-back mode is *before* the upload,
+    /// so without the `pending_upload` exclusion every write-back upload
+    /// would spend a guaranteed-404 HEAD confirming a hint about itself.
+    #[test]
+    fn chunk_ref_hint_ignores_this_nodes_pending_uploads() {
+        let meta = store();
+        let hash = ChunkHash::of(b"still-being-uploaded");
+        let file = meta.create(ROOT_INO, "local", 0o644, 0, 0).unwrap();
+        meta.set_manifest(file.ino, &one_hash_manifest(hash), 1)
+            .unwrap();
+        // The manifest is committed, so the reference exists...
+        meta.add_pending_upload(&hash, file.ino).unwrap();
+        assert!(
+            !meta.chunk_ref_exists(&hash).unwrap(),
+            "a hash this node has not finished uploading is not a bucket hit"
+        );
+
+        // ...and once the upload is acked the very same reference is a hit.
+        meta.ack_upload(&hash, file.ino).unwrap();
+        assert!(
+            meta.chunk_ref_exists(&hash).unwrap(),
+            "after the upload lands the reference is a legitimate hint"
         );
     }
 

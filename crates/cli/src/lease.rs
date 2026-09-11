@@ -471,7 +471,20 @@ impl LeaseKeeper {
                 // concluding anything, and keep the view intact until we
                 // know — clearing it first would stall the FUSE threads on
                 // a lease we still hold.
-                if let Some((cur, fresh_tag)) = self.store.get().await? {
+                // A read failure here is not evidence of anything. The
+                // lease was `take`n at the top of this function, so
+                // propagating with `?` would drop it on the floor and
+                // silently demote a holder that has not been deposed —
+                // and with the store unreachable it cannot re-acquire
+                // either, so the next mutation would fail with EIO.
+                let current = match self.store.get().await {
+                    Ok(current) => current,
+                    Err(e) => {
+                        self.held = Some((lease, tag));
+                        return Err(e.into());
+                    }
+                };
+                if let Some((cur, fresh_tag)) = current {
                     if cur.holder == self.node_id
                         && cur.epoch == lease.epoch
                         && !cur.released

@@ -25,9 +25,11 @@
 //! — expired, released, or deposed — which drops it out of the held set
 //! on its own.
 //!
-//! What a *follower* does instead is probe: [`TAIL_GET_CONCURRENCY`]
-//! speculative GETs at the sequences it expects next, and a LIST only
-//! when every probe hits and it may therefore be arbitrarily far behind.
+//! What a *follower* does instead is probe: a single speculative GET at
+//! the sequence it expects next ([`TAIL_PROBE_IDLE`]), widening to
+//! [`TAIL_GET_CONCURRENCY`] the moment that hits, and a LIST only when
+//! the wide probe also saturates and it may therefore be arbitrarily far
+//! behind.
 //! The idle poll — overwhelmingly the common case, since most nodes are
 //! caught up most of the time — is then a 404 rather than a listing:
 //! measured, no slower (177 vs 175 ms HU→AWS, 34 vs 34 ms against OVH)
@@ -155,11 +157,35 @@ const SEGMENT_BATCH: usize = 10_000;
 /// 16 rather than 8 on measurement: catching up over 64 segments takes
 /// 1693 ms at k=16 against 2201 ms at k=8 from Europe to AWS (279 vs 333
 /// same-region, 476 vs 596 against OVH Milan) — see plan 26's appendix.
-/// The probe pays for that width every idle round in 404s, which is why
-/// it is paired with the sync task's idle backoff (`next_poll_ms` in
-/// `node_runtime.rs`): k misses at a 30 s ceiling are far cheaper than
-/// one LIST every 500 ms.
+/// This is the *catch-up* width; the idle probe is
+/// [`TAIL_PROBE_IDLE`] wide.
 const TAIL_GET_CONCURRENCY: usize = 16;
+
+/// Width of the *idle* GET-next probe: one request.
+///
+/// [`LogStore::get_run`] returns the longest **contiguous** run from
+/// `from`, so when `from` is absent — the overwhelmingly common case, a
+/// caught-up node asking "anything new?" — the other k-1 GETs cannot
+/// contribute to the answer no matter what they find. A 16-wide idle
+/// probe therefore buys one bit of information for 16 requests.
+///
+/// Narrowing it is what makes a tight idle ceiling affordable. Per node
+/// per partition per day, at AWS list price (GET $0.0004/1k, LIST
+/// $0.005/1k — the 12.5× ratio the appendix measures):
+///
+/// | poll | requests/day | GET-equivalents |
+/// |---|---:|---:|
+/// | pre-plan 500 ms LIST | 172,800 | 2,160,000 |
+/// | 30 s ceiling, k=16 | 46,080 | 46,080 |
+/// | 10 s ceiling, k=16 | 138,240 | 138,240 |
+/// | **10 s ceiling, k=1** | **8,640** | **8,640** |
+///
+/// So a 10 s ceiling with a 1-wide probe is 5.3× cheaper than a 30 s
+/// ceiling with a 16-wide one *and* three times fresher — the width, not
+/// the ceiling, was the expensive half. The width still widens to
+/// [`TAIL_GET_CONCURRENCY`] the moment a probe hits, so catch-up keeps
+/// the measured k=16 behaviour.
+const TAIL_PROBE_IDLE: usize = 1;
 
 /// Byte ceiling on one shipped segment. `SEGMENT_BATCH` bounds a segment
 /// by record *count*, which says nothing about its size: a batch of
@@ -329,6 +355,9 @@ pub struct Shipper {
     /// half-TTL, so re-registering faster than that is pure request
     /// traffic — and each attempt is a CAS PUT, the expensive class.
     wanted_registered_at: HashMap<String, Instant>,
+    /// When this node last read a partition it believes it holds
+    /// (plan 26 Step 3, staleness bound). See [`HELD_TAIL_MAX_STALENESS`].
+    held_tail_at: HashMap<String, Instant>,
     /// P2P handle for push invalidation. Disabled by default so the
     /// existing tests and the no-P2P path need no changes.
     peers: constellation_net::Peers,
@@ -445,6 +474,7 @@ impl Shipper {
             autosplit: part_autosplit(),
             last_ship_at: HashMap::new(),
             wanted_registered_at: HashMap::new(),
+            held_tail_at: HashMap::new(),
             peers: constellation_net::Peers::disabled(),
             designations: None,
         })
@@ -566,7 +596,7 @@ impl Shipper {
         reintegrating: bool,
     ) -> Result<()> {
         loop {
-            let held = held_partitions(leases);
+            let held = self.held_partitions(leases);
             self.tail_all_except(&held).await?;
             if !reintegrating && matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
                 tracing::debug!(
@@ -663,11 +693,11 @@ impl Shipper {
             let probes = futures::future::join_all(probed.iter().map(|id| {
                 let log = self.parts[id].log.with_partition(id);
                 let next = self.parts[id].next_seq;
-                async move { log.get_run(next, TAIL_GET_CONCURRENCY).await }
+                async move { log.get_run(next, TAIL_PROBE_IDLE).await }
             }))
             .await;
             for (id, probe) in probed.into_iter().zip(probes) {
-                self.tail_part_probed(&id, probe?).await?;
+                self.tail_part_probed(&id, probe?, TAIL_PROBE_IDLE).await?;
             }
             seen.extend(todo);
         }
@@ -675,16 +705,16 @@ impl Shipper {
 
     async fn tail_part(&mut self, part: &str) -> Result<()> {
         self.ensure_part(part);
-        let probe = self.probe_run(part).await?;
-        self.tail_part_probed(part, probe).await
+        let probe = self.probe_run(part, TAIL_PROBE_IDLE).await?;
+        self.tail_part_probed(part, probe, TAIL_PROBE_IDLE).await
     }
 
-    /// The speculative GET-next probe: [`TAIL_GET_CONCURRENCY`] segment
-    /// GETs from this partition's next expected sequence, in flight
-    /// together. The reply is the longest contiguous run that exists.
-    async fn probe_run(&self, part: &str) -> Result<Vec<(u64, Vec<u8>)>> {
+    /// The speculative GET-next probe: `width` segment GETs from this
+    /// partition's next expected sequence, in flight together. The reply
+    /// is the longest contiguous run that exists.
+    async fn probe_run(&self, part: &str, width: usize) -> Result<Vec<(u64, Vec<u8>)>> {
         let st = &self.parts[part];
-        Ok(st.log.get_run(st.next_seq, TAIL_GET_CONCURRENCY).await?)
+        Ok(st.log.get_run(st.next_seq, width).await?)
     }
 
     /// Tail `part` from an already-fetched probe run.
@@ -700,19 +730,34 @@ impl Shipper {
     ///
     /// Termination: the loop only re-lists after applying a full run of k
     /// segments, so `next_seq` advances by at least k per iteration.
-    async fn tail_part_probed(&mut self, part: &str, mut run: Vec<(u64, Vec<u8>)>) -> Result<()> {
+    async fn tail_part_probed(
+        &mut self,
+        part: &str,
+        mut run: Vec<(u64, Vec<u8>)>,
+        mut width: usize,
+    ) -> Result<()> {
         loop {
-            let saturated = run.len() >= TAIL_GET_CONCURRENCY;
+            let saturated = run.len() >= width;
             for (seq, payload) in std::mem::take(&mut run) {
                 self.apply_segment_payload(part, seq, &payload)?;
             }
             if !saturated {
                 return Ok(());
             }
+            if width < TAIL_GET_CONCURRENCY {
+                // The narrow idle probe hit, so this node is not idle
+                // after all. Widen before reaching for a LIST: one more
+                // pipelined GET sweep usually drains a normal arrival,
+                // and a LIST here would price every single new segment at
+                // a listing.
+                width = TAIL_GET_CONCURRENCY;
+                run = self.probe_run(part, width).await?;
+                continue;
+            }
             let next = self.parts[part].next_seq;
             let seqs = self.parts[part].log.list_segments_from(next).await?;
             self.apply_listed(part, seqs).await?;
-            run = self.probe_run(part).await?;
+            run = self.probe_run(part, width).await?;
         }
     }
 
@@ -1428,7 +1473,7 @@ impl Shipper {
         }
         let mut last_progress = Instant::now();
         loop {
-            let held = held_partitions(leases);
+            let held = self.held_partitions(leases);
             self.tail_all_except(&held).await?;
             if matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
                 tracing::info!(
@@ -1684,20 +1729,93 @@ fn parent_of(meta: &SqliteMeta, ino: u64) -> Option<u64> {
     meta.parent_of(ino).ok().flatten()
 }
 
-/// The partitions whose streams this node is the sole legal appender of
-/// right now, and which therefore need no LIST this round.
+/// How long this node may go without reading a partition it believes it
+/// holds. Caps how stale a *deposed* holder's view can get.
 ///
-/// The gate is [`LeaseKeeper::ship_epoch`] rather than "a keeper exists":
-/// it is `None` for a keeper that is expired, released or deposed, so a
-/// keeper losing authority drops out of the set by itself and its stream
-/// is read again on the very next round — which is exactly what a deposed
-/// holder must do to see the new holder's writes.
-fn held_partitions(leases: &HashMap<String, LeaseKeeper>) -> HashSet<String> {
-    leases
-        .iter()
-        .filter(|(_, keeper)| keeper.ship_epoch().is_some())
-        .map(|(part, _)| part.clone())
-        .collect()
+/// [`LeaseKeeper::ship_epoch`] alone is not enough to skip the read. It is
+/// `None` for a keeper that knows it is expired, released or deposed — but
+/// a keeper only *finds out* at its own renewal CAS, which is half a TTL
+/// away (30 s at the default 60 s TTL). Until then its view still says
+/// "usable", the partition stays in the held set, and its stream stays
+/// unread: a deposed holder cannot see the new holder's writes for up to
+/// TTL/2. Correctness was never at risk (the epoch fences anything the
+/// deposed node ships), but the read staleness is real, and it is what
+/// made `two-clients-shared`, `lease-handover` and `rename-across-partitions`
+/// regress against a plan-26-free tree.
+///
+/// So the skip is tied to *freshness* rather than to usability: a held
+/// partition is read again once this long has passed since we last read
+/// it, whatever the lease view claims.
+///
+/// This keeps Step 3's measured win. That win — 2.6 → 5.1 shipped seg/s
+/// HU→AWS — came from dropping a LIST that ran *per shipped segment*, a
+/// cost that scales with throughput; this costs at most one probe per
+/// bound per partition, a cost that scales with time. Over the 500-file
+/// burst in `wan-writer-ships-put-only` the two are orders of magnitude
+/// apart. And after Step 4b the read is a GET-next probe rather than a
+/// LIST: ~1/12.5 of the request price on AWS and latency-neutral (177 ms
+/// GET-404 vs 175 ms idle LIST HU→AWS). A holder probing its own stream
+/// finds nothing at `next_seq` and returns on the first 404, so it never
+/// reaches the LIST catch-up path — `wan-writer-ships-put-only`'s
+/// zero-LIST assertion still holds.
+///
+/// The bound only forces a read when a sync round happens anyway; it
+/// never schedules one. An idle node polling at the 30 s ceiling is
+/// therefore still bounded by its poll, not by this.
+const HELD_TAIL_MAX_STALENESS: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl Shipper {
+    /// The partitions whose streams this node may skip reading this round:
+    /// it is the sole legal appender *and* it has read them recently
+    /// enough that a silent deposition cannot have gone unnoticed for
+    /// longer than [`HELD_TAIL_MAX_STALENESS`].
+    ///
+    /// Records the read time for the partitions it lets through to the
+    /// tail, so the cost is one probe per bound rather than one per round.
+    fn held_partitions(&mut self, leases: &HashMap<String, LeaseKeeper>) -> HashSet<String> {
+        let now = Instant::now();
+        let mut held = HashSet::new();
+        for (part, keeper) in leases.iter() {
+            if keeper.ship_epoch().is_none() {
+                // Known not to hold it: read it, and do not claim the read
+                // as a held-partition refresh.
+                continue;
+            }
+            match self.held_tail_at.get(part) {
+                // Seen recently enough that a silent deposition cannot
+                // have gone unnoticed for longer than the bound.
+                Some(at) if now.duration_since(*at) < HELD_TAIL_MAX_STALENESS => {
+                    held.insert(part.clone());
+                }
+                // Stale: falls through to the read this round, and that
+                // read is what the next bound is measured from.
+                Some(_) => {
+                    self.held_tail_at.insert(part.clone(), now);
+                }
+                // First round holding it. Acquisition already tailed this
+                // stream to head (`acquire_lease_for`'s takeover witness),
+                // so there is nothing to catch up on; start the bound from
+                // that read rather than immediately repeating it.
+                None => {
+                    self.held_tail_at.insert(part.clone(), now);
+                    held.insert(part.clone());
+                }
+            }
+        }
+        held
+    }
+
+    /// Test hook: age a held partition's read clock past
+    /// [`HELD_TAIL_MAX_STALENESS`] instead of sleeping through it, so a
+    /// test can exercise the bound — the only thing that brings a deposed
+    /// holder's stream back in production — without a wall-clock wait.
+    #[cfg(test)]
+    pub(crate) fn expire_held_tail_for_test(&mut self, part: &str) {
+        let aged = Instant::now()
+            .checked_sub(HELD_TAIL_MAX_STALENESS * 2)
+            .expect("monotonic clock is far enough from its origin");
+        self.held_tail_at.insert(part.to_string(), aged);
+    }
 }
 
 /// Acquire the lease for `part` if it is free, tailing that stream to
@@ -3424,10 +3542,18 @@ mod tests {
     }
 
     /// A keeper that is deposed mid-flight must start reading its stream
-    /// again — its lease is what earned it the right to skip the LIST.
-    /// The plan does not want that assumed: `ship_epoch()` returns `None`
-    /// once the keeper is lost, which is what drops it out of the held
-    /// set, and this pins that behaviour.
+    /// again — its lease is what earned it the right to skip the read.
+    ///
+    /// The load-bearing half is the part with **no renewal in it**.
+    /// `ship_epoch()` does return `None` once the keeper is lost, but the
+    /// keeper only learns it is lost at its renewal CAS, half a TTL away;
+    /// nothing in production calls `renew_now` on demand the way a test
+    /// can. So the staleness bound, not the renewal, is what has to bring
+    /// the stream back, and that is what this asserts first. (An earlier
+    /// version of this test drove `renew_now` immediately, which was true
+    /// about correctness and silent about the 30 s window — the gap that
+    /// regressed `two-clients-shared`, `lease-handover` and
+    /// `rename-across-partitions` against a plan-26-free tree.)
     #[tokio::test]
     async fn a_deposed_keeper_leaves_the_held_set_and_tails_again() {
         let store = StdArc::new(InMemory::new());
@@ -3454,7 +3580,23 @@ mod tests {
             "a holder must not list the partition it believes it holds"
         );
 
-        // The renewal CAS is where it finds out.
+        // Production timing: no renewal, just time passing. Once the
+        // held-read clock is older than the bound the stream is read
+        // again, even though the keeper still believes it holds the lease.
+        assert!(
+            leases[PARTITION].ship_epoch().is_some(),
+            "the keeper must still believe it holds the lease, or this \
+             would be testing the renewal path again"
+        );
+        a.ship.expire_held_tail_for_test(PARTITION);
+        a.ship.sync_all(&mut leases).await.unwrap();
+        assert!(
+            a.meta.lookup(1, "from-b").unwrap().is_some(),
+            "the staleness bound must bring a deposed holder's stream back \
+             without waiting for its renewal"
+        );
+
+        // The renewal CAS is still where it learns it was deposed.
         leases
             .get_mut(PARTITION)
             .unwrap()

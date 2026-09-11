@@ -74,7 +74,7 @@ thrash](../how-to-guides/operations/diagnose-lease-thrash.md).
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_SYNC_INTERVAL_MS` | `500` | milliseconds | background log tail/ship poll; the **floor** of the idle backoff |
-| `CONSTELLATION_SYNC_IDLE_MAX_MS` | `30000` | milliseconds | **ceiling** of the idle poll backoff |
+| `CONSTELLATION_SYNC_IDLE_MAX_MS` | `10000` | milliseconds | **ceiling** of the idle poll backoff |
 | `CONSTELLATION_PART_SPLIT_OPS` | `512` | operations, positive | heat threshold used only when autosplit is on |
 | `CONSTELLATION_PART_AUTOSPLIT` | `off` | boolean | heat-driven automatic partition split |
 | `CONSTELLATION_PART_MERGE_IDLE_S` | `3600` | seconds | automatic idle partition merge |
@@ -93,15 +93,37 @@ request that reaches the sync task: a close/fsync nudge, a barrier, a
 lease acquisition, a forwarded mutation, or a gossip `Nudge` from a peer.
 
 An idle node's poll is what it costs the cluster to sit still, and the
-poll is no longer a `LIST`: the tailer probes with speculative segment
-`GET`s and only falls back to a listing when it may be far behind. With
-P2P up the backoff is invisible, because a peer publishing anything
-resets it. With P2P **down**, a follower's worst-case staleness grows
-from the interval to the ceiling after roughly six idle rounds
-(0.5 + 1 + 2 + 4 + 8 + 16 s ≈ 31 s of complete quiet) and snaps back to
-the interval on the next segment it applies. Lower the ceiling if a
-P2P-less deployment needs a tighter freshness bound; raise the floor if
-request volume matters more than latency.
+poll is no longer a `LIST`: the tailer probes with a **single**
+speculative segment `GET`, widens to 16 concurrent GETs as soon as that
+hits, and only falls back to a listing when the wide probe also saturates
+and it may be far behind. With P2P up the backoff is invisible, because a
+peer publishing anything resets it. With P2P **down**, a follower's
+worst-case staleness grows from the interval to the ceiling after roughly
+five idle rounds (0.5 + 1 + 2 + 4 + 8 s ≈ 15 s of complete quiet) and
+snaps back to the interval on the next segment it applies.
+
+The one-wide idle probe is what makes the 10 s ceiling affordable.
+`get_run` returns the longest *contiguous* run from the sequence asked
+for, so when that sequence is absent — a caught-up node asking "anything
+new?" — the other 15 GETs of a 16-wide probe cannot contribute to the
+answer. Per node per partition per day, at AWS list price:
+
+| poll | requests/day | GET-equivalents |
+|---|---:|---:|
+| fixed 500 ms `LIST` (pre-plan-26) | 172,800 | 2,160,000 |
+| 30 s ceiling, 16-wide probe | 46,080 | 46,080 |
+| 10 s ceiling, 16-wide probe | 138,240 | 138,240 |
+| **10 s ceiling, 1-wide probe (shipped)** | **8,640** | **8,640** |
+
+Lower the ceiling further if a P2P-less deployment needs a tighter
+freshness bound; raise the floor if request volume matters more than
+latency.
+
+A node that currently **holds** a partition lease never backs off past a
+quarter of `CONSTELLATION_LEASE_TTL_MS`, whatever the ceiling says: the
+sync round is also what renews the lease and what notices another node's
+handoff request, so backing off past the renewal cadence would let a
+holder sleep through its own renewal.
 
 #### Checkpoint cadence
 

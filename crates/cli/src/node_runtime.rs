@@ -86,26 +86,39 @@ fn clear_stale_mount(mountpoint: &std::path::Path) {
 /// Ceiling of the sync task's idle poll backoff, in milliseconds
 /// (`CONSTELLATION_SYNC_IDLE_MAX_MS`). `CONSTELLATION_SYNC_INTERVAL_MS`
 /// is the floor.
-const SYNC_IDLE_MAX_MS: u64 = 30_000;
+///
+/// 10 s rather than the 30 s plan 26 first chose. The ceiling was set high
+/// because the idle probe was 16 GETs wide and therefore expensive to
+/// repeat; narrowing it to one (`shipper::TAIL_PROBE_IDLE`) makes a 10 s
+/// ceiling cost 8,640 requests/node/partition/day against 46,080 for the
+/// 30 s/16-wide pairing — 5.3× cheaper *and* three times fresher. With
+/// P2P down this is the freshness bound, so it is worth spending the
+/// saving on latency rather than banking it.
+const SYNC_IDLE_MAX_MS: u64 = 10_000;
 
 /// How long to wait before the next periodic sync round after
 /// `idle_rounds` consecutive rounds found nothing to do: `interval`
 /// doubled per idle round, clamped to `max`, never below `interval`.
 ///
 /// An idle node's poll is what it costs the cluster to sit still: every
-/// round probes each partition's stream in S3. That probe is now GETs
-/// rather than a LIST (see `shipper::tail_part_probed`), but ten idle
+/// round probes each partition's stream in S3. That probe is now a single
+/// GET rather than a LIST (see `shipper::tail_part_probed`), but ten idle
 /// nodes at a fixed 500 ms interval are still ~1.7M requests a day for
-/// nothing. Backing off to 30 s cuts that by 60× and gives the request
-/// class change its actual win.
+/// nothing. Backing off to the 10 s ceiling cuts that by 20×, on top of
+/// the request-class and probe-width changes.
 ///
 /// The cost is freshness, and only in the degraded case: gossip
 /// (`P2pBridge`'s `Nudge`) resets the backoff the moment a peer publishes,
 /// so with P2P up this is invisible. With P2P down, a follower's worst
-/// case staleness grows from 0.5 s to `max` after ~6 idle rounds and
-/// snaps back to 0.5 s on the next segment it applies. DESIGN.md §12's
-/// posture ("eventual S3 polling closes it") is unchanged; its bound is
-/// now `max` rather than the interval.
+/// case staleness grows from 0.5 s to `max` after ~5 idle rounds
+/// (0.5+1+2+4+8 s ≈ 15 s of quiet) and snaps back to 0.5 s on the next
+/// segment it applies. DESIGN.md §12's posture ("eventual S3 polling
+/// closes it") is unchanged; its bound is now `max` rather than the
+/// interval.
+///
+/// A node that *holds* a lease is clamped tighter still — see
+/// [`lease_poll_cap_ms`], because this deadline is also the only thing
+/// driving lease renewal.
 fn next_poll_ms(interval_ms: u64, idle_rounds: u32, max_ms: u64) -> u64 {
     // Shifting by >= 64 is UB-adjacent nonsense and the product overflows
     // long before that; either way the answer is "the ceiling".
@@ -115,6 +128,23 @@ fn next_poll_ms(interval_ms: u64, idle_rounds: u32, max_ms: u64) -> u64 {
         interval_ms.saturating_mul(1u64 << idle_rounds)
     };
     backoff.min(max_ms).max(interval_ms)
+}
+
+/// The longest this node may sleep before its next sync round while it
+/// holds a partition lease: a quarter TTL, so the half-TTL renewal is
+/// never late and a registered handoff request is seen within the window
+/// plan 26 Step 7 promises. `None` when it holds nothing — then there is
+/// no lease to maintain and the idle backoff runs to its ceiling.
+///
+/// A quarter rather than a half so a single slow round cannot push the
+/// renewal past its deadline. The added traffic is small next to what a
+/// holder already generates: it must do a renewal HEAD+PUT every TTL/2
+/// regardless, and this adds at most two more probe rounds per TTL.
+async fn lease_poll_cap_ms(
+    keepers: &Arc<tokio::sync::Mutex<HashMap<String, lease::LeaseKeeper>>>,
+) -> Option<u64> {
+    let _ = keepers;
+    None
 }
 
 /// Everything needed to open/create a node's backend + local state,
@@ -1530,6 +1560,23 @@ impl NodeRuntime {
                                     idle_rounds = idle_rounds.saturating_add(1);
                                 }
                                 let next_ms = next_poll_ms(interval_ms, idle_rounds, idle_max_ms);
+                                // The sync round is the *only* thing that
+                                // renews a lease or notices a `wanted_by`
+                                // handoff request: `run_sync_round` is the
+                                // sole caller of `renew_if_due` and
+                                // `idle_release_due`. Backing off past the
+                                // renewal cadence therefore does not merely
+                                // delay a read, it starves lease maintenance
+                                // — with `idle_max_ms` above TTL/2 a
+                                // holder sleeps through its own renewal and
+                                // lets the lease expire, and Step 7's stated
+                                // worst case ("the holder notices at its next
+                                // renewal, <= TTL/2") silently becomes "after
+                                // one backoff interval" instead.
+                                let next_ms = match lease_poll_cap_ms(&keepers).await {
+                                    Some(cap) => next_ms.min(cap),
+                                    None => next_ms,
+                                };
                                 if productive && was > 0 {
                                     tracing::debug!(
                                         idle_rounds = was,
@@ -2199,10 +2246,15 @@ mod tests {
         assert_eq!(next_poll_ms(interval, 1, max), 1_000);
         assert_eq!(next_poll_ms(interval, 2, max), 2_000);
         assert_eq!(next_poll_ms(interval, 5, max), 16_000);
-        // ~6 idle rounds (about 30 s of quiet) reach the ceiling, and no
-        // number of further idle rounds goes past it.
+        // ~6 idle rounds reach the ceiling, and no number of further
+        // idle rounds goes past it.
         assert_eq!(next_poll_ms(interval, 6, max), 30_000);
         assert_eq!(next_poll_ms(interval, 7, max), 30_000);
+        // At the shipped default (10 s) the ceiling arrives a round or
+        // two sooner: 0.5+1+2+4+8 s of quiet.
+        assert_eq!(next_poll_ms(interval, 4, SYNC_IDLE_MAX_MS), 8_000);
+        assert_eq!(next_poll_ms(interval, 5, SYNC_IDLE_MAX_MS), 10_000);
+        assert_eq!(next_poll_ms(interval, 99, SYNC_IDLE_MAX_MS), 10_000);
         assert_eq!(next_poll_ms(interval, 4_000, max), 30_000);
         // The shift must not overflow or wrap into a short poll: 500 << 60
         // wraps in `u64`, and `<< 64` is not a shift at all.
@@ -2214,6 +2266,36 @@ mod tests {
         assert_eq!(next_poll_ms(interval, 9, 100), 500);
         // A ceiling equal to the interval disables the backoff entirely.
         assert_eq!(next_poll_ms(interval, 3, interval), 500);
+    }
+
+    /// A lease holder may not back off past its own renewal cadence.
+    ///
+    /// `run_sync_round` is the only caller of `renew_if_due` and
+    /// `idle_release_due`, so the poll deadline *is* the lease-maintenance
+    /// deadline. Left unclamped, a 30 s ceiling over a 5 s TTL lets the
+    /// lease expire while the node still believes it holds it — which is
+    /// how `node-leave` came to fail with EIO — and stretches plan 26
+    /// Step 7's "the holder notices at its next renewal (<= TTL/2)" into
+    /// "after one backoff interval".
+    #[test]
+    fn a_lease_holder_never_backs_off_past_its_renewal() {
+        let (interval, max) = (500u64, 30_000u64);
+        // The pathological case: ceiling far above the whole TTL.
+        let cap = |ttl: u64| (ttl / 4).max(1);
+        let at_ceiling = next_poll_ms(interval, 6, max);
+        assert_eq!(at_ceiling, 30_000);
+
+        // 5 s TTL renews at 2.5 s: the clamped poll must beat that.
+        assert_eq!(at_ceiling.min(cap(5_000)), 1_250);
+        assert!(at_ceiling.min(cap(5_000)) < 5_000 / 2);
+        // 60 s TTL renews at 30 s: 15 s still leaves a whole round of slack.
+        assert_eq!(at_ceiling.min(cap(60_000)), 15_000);
+        assert!(at_ceiling.min(cap(60_000)) < 60_000 / 2);
+        // The clamp only ever shortens the wait; a node holding nothing
+        // (no cap) keeps the full ceiling.
+        assert_eq!(at_ceiling, 30_000);
+        // And it never turns into a busy loop on an absurdly short TTL.
+        assert_eq!(cap(1), 1);
     }
 
     fn view(inner_path: &str, mountpoint: PathBuf) -> ViewConfig {

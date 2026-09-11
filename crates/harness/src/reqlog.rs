@@ -65,6 +65,33 @@ impl Request {
     pub fn touches(&self, needle: &str) -> bool {
         percent_decode(self.path()).contains(needle) || self.lists_prefix(needle)
     }
+
+    /// The bucket area this request touches — `log`, `chunks`,
+    /// `checkpoints`, `nodes`, `leases`, `designations`, … Every scenario
+    /// puts its filesystem under a per-run key prefix, so the area is the
+    /// segment after the bucket and that prefix; a LIST names it in
+    /// `prefix=` instead of in the path.
+    ///
+    /// This is what turns a bare class tally into an answerable question:
+    /// "30 LISTs" is only meaningful once you can see they are all
+    /// membership polls and none of them is `log/`.
+    pub fn area(&self) -> String {
+        let is_list = self.is_list();
+        let raw = if is_list {
+            percent_decode(self.query())
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("prefix=").map(str::to_string))
+                .unwrap_or_default()
+        } else {
+            percent_decode(self.path())
+        };
+        let mut segments = raw.split('/').filter(|s| !s.is_empty());
+        if !is_list {
+            segments.next(); // bucket
+        }
+        segments.next(); // per-run filesystem prefix
+        segments.next().unwrap_or("(root)").to_string()
+    }
 }
 
 /// Minimal percent-decoding: enough to turn `prefix=p%2Flog%2Fp0%2F` back
@@ -120,6 +147,26 @@ impl std::fmt::Display for Tally {
             self.total()
         )
     }
+}
+
+/// Requests grouped by class *and* bucket area, busiest first. The class
+/// tally says what a node spent; this says what it spent it on.
+pub fn breakdown(requests: &[Request]) -> String {
+    let mut counts: std::collections::BTreeMap<(String, String), u64> = Default::default();
+    for r in requests {
+        let class = if r.is_list() {
+            "LIST".to_string()
+        } else {
+            r.method.clone()
+        };
+        *counts.entry((class, r.area())).or_default() += 1;
+    }
+    let mut rows: Vec<_> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.iter()
+        .map(|((class, area), n)| format!("{class} {area}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn tally(requests: &[Request]) -> Tally {
