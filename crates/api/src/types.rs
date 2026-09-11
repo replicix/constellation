@@ -524,13 +524,11 @@ pub struct WritebackStatus {
     #[serde(default)]
     pub remote_probe_hit_rate: f64,
     #[serde(default)]
-    pub existence_listed: u64,
-    #[serde(default)]
-    pub existence_complete: bool,
-    #[serde(default)]
     pub existence_bloom_hits: u64,
     #[serde(default)]
-    pub existence_bloom_misses: u64,
+    pub existence_chunk_ref_hits: u64,
+    #[serde(default)]
+    pub existence_misses: u64,
     #[serde(default)]
     pub existence_peer_hints: u64,
 }

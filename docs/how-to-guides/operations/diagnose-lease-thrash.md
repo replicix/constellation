@@ -61,9 +61,13 @@ P2P reachability and forward timeout rather than placement.
 ## 5. Check idle release
 
 Bursts separated by more than the default 30 seconds can legitimately release
-and reacquire the lease. Raise `CONSTELLATION_LEASE_IDLE_RELEASE_MS` above the
-normal inter-burst gap, then remount. Do not use a long idle interval to hide
-forwarding failures during an active workload.
+and reacquire the lease — but only while another node is actually asking for
+the partition. An idle holder with no requester keeps its lease indefinitely,
+so if you see release/reacquire cycles on a quiet cluster, look for the
+second writer that is registering itself rather than at the timer. Where there
+really is a competing writer, raise `CONSTELLATION_LEASE_IDLE_RELEASE_MS` above
+the normal inter-burst gap, then remount. Do not use a long idle interval to
+hide forwarding failures during an active workload.
 
 See [Lease placement](../../reference/features/lease-placement.md),
 [Forwarded mutations](../../reference/features/forwarded-mutations.md), and

@@ -15,7 +15,7 @@ pub use prune::{Policy, PolicyError, PRUNE_XATTR};
 pub use record::{CloneNode, LogRecord};
 pub use reintegrate::{classify, materialize, Disposition, CONFLICT_DIR};
 pub use replay::TouchSet;
-pub use sqlite::{SqliteMeta, SCRATCH_XATTR};
+pub use sqlite::{JournalBatch, SqliteMeta, SCRATCH_XATTR};
 
 use constellation_fs_core::{FileAttr, Ino};
 

@@ -408,13 +408,13 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "existence-bloom-dedup",
-        desc: "fresh node LIST-seeds S3 existence and deduplicates without per-chunk HEAD misses",
+        desc: "fresh node hints from its replica's chunk_ref and deduplicates without a bucket LIST",
         requires: &[],
         run: existence_bloom_dedup,
     },
     Scenario {
         name: "existence-peer-hint",
-        desc: "LIST-disabled uploader uses live peer cache digests only as confirming probe hints",
+        desc: "uploader uses live peer cache digests as confirming probe hints ahead of the replica",
         requires: &[],
         run: existence_peer_hint,
     },
@@ -447,6 +447,36 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "4 local mounts, data-only soak schedule (hits write_disjoint hard)",
         requires: &[],
         run: disjoint_write_4,
+    },
+    Scenario {
+        name: "ckpt-bulk-ingest-bounded",
+        desc: "plan 26: a bulk ingest leaves at most the newest 2 checkpoints, and a fresh node still bootstraps from them",
+        requires: &[],
+        run: ckpt_bulk_ingest_bounded,
+    },
+    Scenario {
+        name: "idle-cluster-is-quiet",
+        desc: "plan 26: 3 idle nodes issue no LIST of log/ and stay within the lease/heartbeat/probe budget",
+        requires: &[],
+        run: idle_cluster_is_quiet,
+    },
+    Scenario {
+        name: "wan-writer-ships-put-only",
+        desc: "plan 26: over a 200ms path the holder never lists its own stream, and a P2P-less follower converges within the idle ceiling",
+        requires: &[],
+        run: wan_writer_ships_put_only,
+    },
+    Scenario {
+        name: "sticky-lease-handoff-over-s3",
+        desc: "plan 26: with P2P off, a blocked writer registers wanted_by and takes the lease cooperatively instead of EIO",
+        requires: &[],
+        run: sticky_lease_handoff_over_s3,
+    },
+    Scenario {
+        name: "multi-partition-retention-is-per-partition",
+        desc: "plan 26: GC floors log retention per partition, so a child's live segments survive a far-ahead p0",
+        requires: &[],
+        run: multi_partition_retention_is_per_partition,
     },
     Scenario {
         name: "named-shared-daemon",
@@ -1179,7 +1209,18 @@ fn two_clients_shared(seed: u64) -> Result<()> {
 
     std::fs::create_dir(c0.mnt.join("a"))?;
     std::fs::create_dir(c1.mnt.join("b"))?;
-    eventually("subtrees visible on both", Duration::from_secs(20), || {
+    // These two clients share the host's node key on purpose (see
+    // `Client::with_own_node_key`), so the P2P fast path is dead and every
+    // deadline here is an *S3-only* bound. Plan 26 moved that bound twice:
+    // a quiet follower's poll backs off to `CONSTELLATION_SYNC_IDLE_MAX_MS`
+    // (30 s) instead of the fixed interval, and a non-holder's first write
+    // waits for a sticky-lease handoff (up to TTL/2 + dwell) rather than an
+    // unconditional idle release. A cross-node assertion therefore has to
+    // allow the handoff and the poll in series; the old 20/30 s deadlines
+    // are inside one poll ceiling on their own. `eventually` returns as
+    // soon as the condition holds, so the wider deadline costs nothing when
+    // convergence is quick.
+    eventually("subtrees visible on both", Duration::from_secs(90), || {
         anyhow::ensure!(c0.mnt.join("b").is_dir(), "b not on c0");
         anyhow::ensure!(c1.mnt.join("a").is_dir(), "a not on c1");
         Ok(())
@@ -1200,7 +1241,7 @@ fn two_clients_shared(seed: u64) -> Result<()> {
         // Remote view converges (close-to-open through S3 alone).
         eventually(
             &format!("cross-node convergence, block {block}"),
-            Duration::from_secs(30),
+            Duration::from_secs(90),
             || {
                 m0.verify(&c1.mnt.join("a")).context("c0's tree via c1")?;
                 m1.verify(&c0.mnt.join("b")).context("c1's tree via c0")?;
@@ -1249,9 +1290,13 @@ fn atime_eventual(seed: u64) -> Result<()> {
 
     // The writer (partition holder) creates a file; the reader must see it.
     std::fs::write(writer.mnt.join("shared.txt"), b"hello atime")?;
+    // S3-only bound: these clients share the host node key, so a follower
+    // sees a new segment on its next poll and that poll now backs off to
+    // `CONSTELLATION_SYNC_IDLE_MAX_MS` (30 s, plan 26 step 4c) while the
+    // reader has nothing to do.
     eventually(
         "shared file visible on reader",
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         || {
             anyhow::ensure!(reader.mnt.join("shared.txt").is_file(), "not yet on reader");
             Ok(())
@@ -1271,9 +1316,15 @@ fn atime_eventual(seed: u64) -> Result<()> {
 
     // The writer's replica (authoritative) must observe atime advance.
     // Compared there rather than via the reader's kernel attr cache.
+    //
+    // Two S3-only bounds in series here: the reader is not the partition
+    // holder, so shipping its atime record waits on a sticky-lease handoff
+    // (up to TTL/2 + dwell, plan 26 step 7), and only then does the writer
+    // pick the segment up on a poll that has backed off to the 30 s ceiling
+    // (step 4c).
     eventually(
         "atime advanced on the holder",
-        Duration::from_secs(40),
+        Duration::from_secs(90),
         || {
             let now = std::fs::metadata(writer.mnt.join("shared.txt"))?.accessed()?;
             if let Some(b) = baseline {
@@ -1704,8 +1755,8 @@ fn existence_fixture_files() -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// A complete LIST seed turns a cold duplicate import into confirming HEADs
-/// on hits, while a disabled second pass proves the optimization is optional.
+/// A replica that replayed the writer's manifests turns a cold duplicate
+/// import into confirming HEADs on hits, with no bucket LIST at mount.
 fn existence_bloom_dedup(_seed: u64) -> Result<()> {
     let (env, root) = setup("existence-bloom-dedup")?;
     let _proxy = env.s3_proxy()?;
@@ -1732,21 +1783,11 @@ fn existence_bloom_dedup(_seed: u64) -> Result<()> {
     let before = raw_chunk_count(&env, &prefix)?;
 
     let mut b = Client::new(root.path(), "b", &env.endpoint, &backend)?;
-    let seed_started = std::time::Instant::now();
     b.mount()?;
-    eventually(
-        "existence LIST seed completes",
-        Duration::from_secs(20),
-        || {
-            let status = b.control_status()?;
-            anyhow::ensure!(
-                status["writeback"]["existence_complete"] == true,
-                "seed not complete: {status}"
-            );
-            Ok(())
-        },
-    )?;
-    let seed_elapsed = seed_started.elapsed();
+    eventually("A's tree reaches B", Duration::from_secs(20), || {
+        anyhow::ensure!(b.mnt.join("source/0299").is_file());
+        Ok(())
+    })?;
     std::fs::create_dir(b.mnt.join("duplicate"))?;
     model.mkdir(std::path::Path::new("duplicate"));
     for (i, data) in files.iter().enumerate() {
@@ -1769,62 +1810,34 @@ fn existence_bloom_dedup(_seed: u64) -> Result<()> {
     model.verify(&b.mnt)?;
     let status = b.control_status()?;
     let wb = &status["writeback"];
-    let listed = wb["existence_listed"].as_u64().unwrap_or(0);
-    let hits = wb["existence_bloom_hits"].as_u64().unwrap_or(0);
-    let misses = wb["existence_bloom_misses"].as_u64().unwrap_or(u64::MAX);
+    let bloom = wb["existence_bloom_hits"].as_u64().unwrap_or(0);
+    let chunk_ref = wb["existence_chunk_ref_hits"].as_u64().unwrap_or(0);
+    let misses = wb["existence_misses"].as_u64().unwrap_or(u64::MAX);
     eprintln!(
-        "    existence-bloom-dedup: listed={listed} complete=true bloom_hits={hits} bloom_misses={misses} list_seed={seed_elapsed:.1?}"
+        "    existence-bloom-dedup: chunk_ref_hits={chunk_ref} bloom_hits={bloom} misses={misses}"
     );
-    anyhow::ensure!(listed >= before as u64, "LIST omitted chunk keys: {wb}");
     anyhow::ensure!(
-        hits >= before as u64,
-        "duplicate did not hit the seed: {wb}"
+        bloom + chunk_ref >= before as u64,
+        "duplicate did not hit the replica hint: {wb}"
     );
-    anyhow::ensure!(misses <= 1, "duplicate unexpectedly missed the seed: {wb}");
+    anyhow::ensure!(misses <= 1, "duplicate unexpectedly went unhinted: {wb}");
     anyhow::ensure!(
         raw_chunk_count(&env, &prefix)? == before,
         "duplicate import created extra chunk objects"
     );
     b.unmount()?;
-
-    let mut c = Client::new(root.path(), "list-off", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_EXISTENCE_LIST", "off");
-    c.mount()?;
-    std::fs::create_dir(c.mnt.join("without-list"))?;
-    model.mkdir(std::path::Path::new("without-list"));
-    for (i, data) in files.iter().enumerate() {
-        std::fs::write(c.mnt.join(format!("without-list/{i:04}")), data)?;
-        model.write_file(
-            std::path::Path::new(&format!("without-list/{i:04}")),
-            data.clone(),
-        );
-    }
-    eventually("LIST-disabled copy drains", Duration::from_secs(20), || {
-        anyhow::ensure!(c.control_status()?["writeback"]["pending_uploads"].as_u64() == Some(0));
-        Ok(())
-    })?;
-    model.verify(&c.mnt)?;
-    let off = c.control_status()?;
-    anyhow::ensure!(
-        off["writeback"]["existence_listed"].as_u64() == Some(0)
-            && off["writeback"]["existence_complete"] == false,
-        "LIST kill switch still seeded: {off}"
-    );
-    c.unmount()?;
     Ok(())
 }
 
-/// With LIST disabled, a clean peer digest gets sole credit for selecting
-/// the probe. Disabling cooperative cache removes that hint without changing
-/// correctness.
+/// A clean peer digest is consulted before the replica and gets the credit
+/// for selecting the probe. Disabling cooperative cache removes that hint
+/// without changing correctness.
 fn existence_peer_hint(_seed: u64) -> Result<()> {
     let (env, root) = setup("existence-peer-hint")?;
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/existence-peer-{}", ts());
-    let mut a = coop_client(root.path(), "hint-a", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_EXISTENCE_LIST", "off");
-    let mut b = coop_client(root.path(), "hint-b", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_EXISTENCE_LIST", "off");
+    let mut a = coop_client(root.path(), "hint-a", &env.endpoint, &backend)?;
+    let mut b = coop_client(root.path(), "hint-b", &env.endpoint, &backend)?;
     a.fs_create()?;
     a.mount()?;
     b.mount()?;
@@ -1855,9 +1868,9 @@ fn existence_peer_hint(_seed: u64) -> Result<()> {
         .as_u64()
         .unwrap_or(0);
     eprintln!(
-        "    existence-peer-hint: peer_hints={hints} list_enabled=false bloom_hits={} bloom_misses={}",
+        "    existence-peer-hint: peer_hints={hints} bloom_hits={} chunk_ref_hits={}",
         status["writeback"]["existence_bloom_hits"],
-        status["writeback"]["existence_bloom_misses"]
+        status["writeback"]["existence_chunk_ref_hits"]
     );
     anyhow::ensure!(hints >= 1, "peer digest never selected a probe: {status}");
     let mut model = Model::default();
@@ -1868,7 +1881,6 @@ fn existence_peer_hint(_seed: u64) -> Result<()> {
     b.unmount()?;
 
     let mut c = Client::new(root.path(), "coop-off", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_EXISTENCE_LIST", "off")
         .with_env("CONSTELLATION_COOP", "off");
     c.mount()?;
     std::fs::write(c.mnt.join("coop-off-copy"), &data)?;
@@ -2250,7 +2262,11 @@ fn lease_handover(seed: u64) -> Result<()> {
     let mut w1 = Workload::new(seed.wrapping_add(1), "b");
     // The model's root is the shared subtree both nodes write into.
     std::fs::create_dir(c0.mnt.join("shared"))?;
-    eventually("shared subtree on B", Duration::from_secs(20), || {
+    // S3-only bound (shared host node key, no fast path): a quiet
+    // follower's poll backs off to `CONSTELLATION_SYNC_IDLE_MAX_MS` (30 s,
+    // plan 26 step 4c), so a convergence deadline has to clear one poll
+    // ceiling plus the ship itself.
+    eventually("shared subtree on B", Duration::from_secs(60), || {
         anyhow::ensure!(c1.mnt.join("shared").is_dir(), "shared not on c1");
         Ok(())
     })?;
@@ -2284,10 +2300,12 @@ fn lease_handover(seed: u64) -> Result<()> {
         epochs.push(b_lease["epoch"].as_u64().unwrap_or(0));
         w1.run_block(&c1.mnt.join("shared"), &mut m, 25)?;
 
-        // Both nodes converge on the union of both nodes' writes.
+        // Both nodes converge on the union of both nodes' writes. A is now
+        // the *non*-holder and has been quiet since its block, so its poll
+        // is at the idle ceiling; the deadline has to clear that.
         eventually(
             &format!("both views converge, round {round}"),
-            Duration::from_secs(30),
+            Duration::from_secs(90),
             || {
                 m.verify(&c1.mnt.join("shared")).context("via c1")?;
                 m.verify(&c0.mnt.join("shared")).context("via c0")?;
@@ -2694,9 +2712,13 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     )?;
     c0.reintegrate()?;
 
+    // Reintegration lands as ordinary segments, so each node still has to
+    // poll for the other's. This scenario's 3 s interval backs off to the
+    // same `CONSTELLATION_SYNC_IDLE_MAX_MS` ceiling (30 s, plan 26 step 4c)
+    // while A is paused and B is quiet, which does not fit in 40 s.
     eventually(
         "clean branch and conflict materialization converge",
-        Duration::from_secs(40),
+        Duration::from_secs(90),
         || {
             for client in [&c0, &c1] {
                 let current = std::fs::read(client.mnt.join("shared/same"))?;
@@ -5495,4 +5517,810 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
         .status();
 
     result
+}
+
+// --- plan 26: metadata-plane S3 efficiency ---
+//
+// These five assert on *S3 request classes and counts*, which no other
+// lane can see: toxiproxy is a TCP fault injector with no notion of HTTP
+// and floci logs bucket lifecycle only. `reqlog::CountingProxy` is
+// chained in front of toxiproxy (client -> counter -> toxiproxy ->
+// floci) so a scenario can say "zero LISTs of `log/p0` during the burst"
+// about the actual wire, with every toxic still applied.
+
+/// Every object under `prefix` with its size, via a direct (unproxied)
+/// ListObjectsV2. One page (1000 keys); every caller here stays well
+/// under that.
+fn raw_objects(endpoint: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
+    let mut body = String::new();
+    ureq::get(&format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}"))
+        .call()
+        .with_context(|| format!("listing {prefix}"))?
+        .into_reader()
+        .read_to_string(&mut body)?;
+    let mut out = Vec::new();
+    let mut rest = body.as_str();
+    while let Some(start) = rest.find("<Contents>") {
+        rest = &rest[start..];
+        let Some(end) = rest.find("</Contents>") else {
+            break;
+        };
+        let entry = &rest[..end];
+        if let (Some(key), Some(size)) = (
+            xml_field(entry, "Key"),
+            xml_field(entry, "Size").and_then(|s| s.parse().ok()),
+        ) {
+            out.push((key.to_string(), size));
+        }
+        rest = &rest[end..];
+    }
+    Ok(out)
+}
+
+fn xml_field<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let start = xml.find(&format!("<{name}>"))? + name.len() + 2;
+    let end = xml[start..].find(&format!("</{name}>"))? + start;
+    Some(&xml[start..end])
+}
+
+fn raw_json(endpoint: &str, key: &str) -> Result<serde_json::Value> {
+    let body = ureq::get(&raw_key(endpoint, key))
+        .call()
+        .with_context(|| format!("fetching {key}"))?
+        .into_string()?;
+    serde_json::from_str(&body).with_context(|| format!("parsing {key}"))
+}
+
+/// The `<seq>.zst` snapshots under `checkpoints/p0/`, oldest first.
+fn checkpoint_snapshots(endpoint: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
+    let mut out: Vec<(String, u64)> = raw_objects(endpoint, &format!("{prefix}/checkpoints/p0/"))?
+        .into_iter()
+        .filter(|(key, _)| key.ends_with(".zst"))
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// Segment sequence numbers present for one partition.
+fn log_segment_seqs(endpoint: &str, prefix: &str, part: &str) -> Result<Vec<u64>> {
+    let mut seqs: Vec<u64> = raw_objects(endpoint, &format!("{prefix}/log/{part}/"))?
+        .into_iter()
+        .filter_map(|(key, _)| {
+            let name = key.rsplit('/').next()?.strip_suffix(".zst")?;
+            u64::from_str_radix(name, 16).ok()
+        })
+        .collect();
+    seqs.sort_unstable();
+    Ok(seqs)
+}
+
+fn journal_drained(c: &Client) -> Result<()> {
+    let status = c.control_status()?;
+    let backlog = status["spool"]["journal_backlog"].as_u64().unwrap_or(1);
+    let pending = status["writeback"]["pending_uploads"].as_u64().unwrap_or(1);
+    anyhow::ensure!(
+        backlog == 0 && pending == 0,
+        "journal_backlog={backlog} pending_uploads={pending}"
+    );
+    Ok(())
+}
+
+/// Checkpoint cadence (plan 26 step 1) and inline compaction (step 2).
+///
+/// A checkpoint is a whole-DB copy, so its cost has to be proportional to
+/// the log it lets us truncate rather than to a segment count. Bulk
+/// ingest is where the old count-only cadence was worst: measured on a
+/// 1.85M-file rsync, 641 checkpoints totalling 54.55 GiB protected a
+/// 0.17 GiB log, and 639 of them were dead on arrival because GC is a
+/// daily backstop rather than a bound.
+///
+/// Ingest a seeded tree from one writer and then rewrite it a few times,
+/// so several checkpoints genuinely fire and the inline prune has
+/// something to prune. Assert the bucket holds at most the newest two
+/// snapshots, that their combined size is a small multiple of one
+/// snapshot, and — the part that makes the bound safe — that a brand-new
+/// node still bootstraps to the oracle's exact tree from what survived.
+///
+/// The rewrite passes are load-bearing, not padding. A pure ingest grows
+/// the replica and the log together, so the byte gate fires roughly
+/// logarithmically and one checkpoint covers the whole run; rewriting a
+/// fixed set of files grows the log at a constant DB size, which is the
+/// shape that actually produces back-to-back checkpoints. A brief pause
+/// between writes keeps the shipper from coalescing the whole workload
+/// into a handful of very large segments, which would never reach the
+/// `CHECKPOINT_EVERY` count floor.
+fn ckpt_bulk_ingest_bounded(seed: u64) -> Result<()> {
+    const FILES: usize = 200;
+    const REWRITES: usize = 40;
+    let (env, root) = setup("ckpt-bulk-ingest")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("ckpt-ingest-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mut a = Client::new(root.path(), "ingest-a", &env.endpoint, &backend)?;
+    a.fs_create()?;
+    a.mount()?;
+
+    let mut model = Model::default();
+    std::fs::create_dir(a.mnt.join("ingest"))?;
+    model.mkdir(std::path::Path::new("ingest"));
+    // Every snapshot object ever observed, so the report can state what
+    // was *written* and not merely what survived the inline prune.
+    let mut ever: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let sample = |ever: &mut std::collections::BTreeMap<String, u64>| -> Result<()> {
+        for (key, size) in checkpoint_snapshots(&env.direct_endpoint, &prefix)? {
+            ever.insert(key, size);
+        }
+        Ok(())
+    };
+    let mut passes = 0usize;
+    for pass in 0..=REWRITES {
+        passes = pass + 1;
+        for i in 0..FILES {
+            let data = pattern(
+                seed.wrapping_add((pass * FILES + i) as u64),
+                512 + (i % 7) * 64,
+            );
+            let rel = format!("ingest/f{i:04}");
+            std::fs::write(a.mnt.join(&rel), &data)?;
+            model.write_file(std::path::Path::new(&rel), data);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        sample(&mut ever)?;
+        // Three checkpoints is what makes the newest-2 assertion mean
+        // something; how much log that takes depends on how large the
+        // replica compacts to, so drive the workload until it happens
+        // rather than guessing a pass count.
+        if ever.len() >= 3 {
+            break;
+        }
+    }
+    eventually("ingest ships", Duration::from_secs(180), || {
+        sample(&mut ever)?;
+        journal_drained(&a)
+    })?;
+    sample(&mut ever)?;
+
+    let remaining = checkpoint_snapshots(&env.direct_endpoint, &prefix)?;
+    let segments = log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?.len();
+    let newest = remaining.last().map(|(_, size)| *size).unwrap_or(0);
+    let remaining_bytes: u64 = remaining.iter().map(|(_, size)| *size).sum();
+    let written_bytes: u64 = ever.values().sum();
+    // What the count-only cadence would have left behind for the same
+    // ingest: one whole-DB copy every CHECKPOINT_EVERY (32) segments,
+    // none of them pruned until the daily GC tick.
+    let count_only = segments / 32;
+    let written_count = ever.len();
+    let count_only_bytes = count_only as u64 * newest;
+    eprintln!(
+        "    ckpt-bulk-ingest-bounded: {FILES} files x {} passes, {segments} segments; \
+         checkpoints written {written_count} ({written_bytes} B), \
+         remaining {} ({remaining_bytes} B), newest snapshot {newest} B; \
+         count-only cadence would have left ~{count_only} (~{count_only_bytes} B) un-pruned",
+        passes,
+        remaining.len()
+    );
+
+    // Without several checkpoints the newest-2 bound would be vacuous.
+    anyhow::ensure!(
+        written_count >= 3,
+        "only {written_count} checkpoint(s) fired over {segments} segments; \
+         the newest-2 assertion below would prove nothing"
+    );
+    anyhow::ensure!(
+        remaining.len() <= 2,
+        "inline compaction must keep at most the newest 2 checkpoints, found {}: {remaining:?}",
+        remaining.len()
+    );
+    anyhow::ensure!(
+        remaining_bytes <= 3 * newest,
+        "checkpoint footprint {remaining_bytes} B exceeds 3x the final snapshot ({newest} B)"
+    );
+    // Pruning is only safe if what is left is still a complete license to
+    // rebuild: a fresh node must reach the oracle from the bucket alone.
+    a.unmount()?;
+    let mut b = Client::new(root.path(), "ingest-b", &env.endpoint, &backend)?;
+    b.mount()
+        .context("fresh bootstrap after inline compaction")?;
+    eventually(
+        "fresh node matches the oracle",
+        Duration::from_secs(120),
+        || model.verify(&b.mnt),
+    )?;
+    b.unmount()?;
+    Ok(())
+}
+
+/// How many poll deadlines elapse in `window_ms` when every round is
+/// idle: the interval doubles per idle round, clamped to the ceiling
+/// (mirrors `cli::node_runtime::next_poll_ms`).
+fn idle_poll_rounds(interval_ms: u64, idle_max_ms: u64, window_ms: u64) -> u64 {
+    let (mut elapsed, mut rounds, mut idle) = (0u64, 0u64, 0u32);
+    loop {
+        let next = interval_ms
+            .saturating_mul(1u64 << idle.min(32))
+            .clamp(interval_ms, idle_max_ms);
+        elapsed += next;
+        if elapsed > window_ms {
+            return rounds;
+        }
+        rounds += 1;
+        idle = idle.saturating_add(1);
+    }
+}
+
+/// In-flight probe GETs per idle poll round, per partition
+/// (`cli::shipper::TAIL_GET_CONCURRENCY`).
+const TAIL_GET_CONCURRENCY: u64 = 16;
+
+/// Steady-state cost of sitting still (plan 26 steps 3, 4b and 4c).
+///
+/// Before this plan an idle node polled every 500 ms and every round was
+/// one `LIST` per partition: ten idle nodes were ~1.7M LISTs a day for
+/// nothing, in the most expensive request class there is (12.5x a GET on
+/// AWS). Three nodes converge, go quiet for a minute, and every request
+/// each one makes is counted by class on its own relay.
+///
+/// The structural assertion is that **nothing lists `log/` at all** — the
+/// holder does not list a stream it is the only legal appender of (step
+/// 3), and a follower probes with speculative GETs instead (step 4b). The
+/// budget then bounds the total against what the remaining periodic work
+/// can explain: lease renewal, the 5 s registry/membership poll, the 10 s
+/// designation poll, and the backed-off metadata probe itself.
+fn idle_cluster_is_quiet(_seed: u64) -> Result<()> {
+    const IDLE_S: u64 = 60;
+    const INTERVAL_MS: u64 = 500;
+    const IDLE_MAX_MS: u64 = 30_000;
+    const TTL_MS: u64 = 60_000;
+    const NODES: u64 = 3;
+
+    let (env, root) = setup("idle-cluster-quiet")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/idle-quiet-{}", ts());
+    let counters = [
+        env.counting_proxy()?,
+        env.counting_proxy()?,
+        env.counting_proxy()?,
+    ];
+    let mk = |name: &str, endpoint: &str| -> Result<Client> {
+        Ok(Client::new(root.path(), name, endpoint, &backend)?
+            // Distinct P2P identities: three "hosts" on one machine.
+            .with_own_node_key()
+            .with_env("CONSTELLATION_SYNC_INTERVAL_MS", &INTERVAL_MS.to_string())
+            .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", &IDLE_MAX_MS.to_string())
+            .with_env("CONSTELLATION_LEASE_TTL_MS", &TTL_MS.to_string()))
+    };
+    let mut a = mk("quiet-a", &counters[0].endpoint())?;
+    let mut b = mk("quiet-b", &counters[1].endpoint())?;
+    let mut c = mk("quiet-c", &counters[2].endpoint())?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    c.mount()?;
+
+    // Converge first: a node that has never seen the tree is catching up,
+    // not idling, and catch-up legitimately lists.
+    std::fs::write(a.mnt.join("marker"), b"quiet")?;
+    for follower in [&b, &c] {
+        eventually(
+            &format!("marker reaches {}", follower.name),
+            Duration::from_secs(60),
+            || {
+                anyhow::ensure!(
+                    std::fs::read(follower.mnt.join("marker"))? == b"quiet",
+                    "marker not visible yet"
+                );
+                Ok(())
+            },
+        )?;
+    }
+    eventually("writer's journal drains", Duration::from_secs(60), || {
+        journal_drained(&a)
+    })?;
+    // Let the backoff start from a clean slate, then measure.
+    for counter in &counters {
+        counter.reset();
+    }
+    std::thread::sleep(Duration::from_secs(IDLE_S));
+
+    // Budget, per node, from the periods that are actually configured.
+    // This is the plan's `lease renewals + heartbeats + 3` with
+    // "heartbeats" expanded into what a heartbeat costs in requests: the
+    // 5 s registry poll reads the roster and the peer directory (a LIST
+    // plus a GET per registered node each) and re-reads this node's own
+    // record, and the 10 s designation poll lists its prefix.
+    let renewals = (IDLE_S / (TTL_MS / 2_000) + 1) * 2;
+    let heartbeats = (IDLE_S / 5) * (2 + 2 * NODES + 1) + (IDLE_S / 10) * 2;
+    let probes = idle_poll_rounds(INTERVAL_MS, IDLE_MAX_MS, IDLE_S * 1_000) * TAIL_GET_CONCURRENCY;
+    let per_node = renewals + heartbeats + probes + 3;
+    let budget = NODES * per_node;
+
+    let mut total = crate::reqlog::Tally::default();
+    for (counter, client) in counters.iter().zip([&a, &b, &c]) {
+        counter.ensure_sane()?;
+        let requests = counter.requests();
+        let t = crate::reqlog::tally(&requests);
+        eprintln!("    idle-cluster-is-quiet: {:>7} {t}", client.name);
+        let log_lists: Vec<&str> = requests
+            .iter()
+            .filter(|r| r.lists_prefix("/log/") || r.lists_prefix("log/"))
+            .map(|r| r.target.as_str())
+            .collect();
+        anyhow::ensure!(
+            log_lists.is_empty(),
+            "{} listed log/ while idle ({} times): {log_lists:?}",
+            client.name,
+            log_lists.len()
+        );
+        // Nothing but membership and designations may list at all.
+        let stray: Vec<&str> = requests
+            .iter()
+            .filter(|r| r.is_list() && !r.lists_prefix("nodes") && !r.lists_prefix("designations"))
+            .map(|r| r.target.as_str())
+            .collect();
+        anyhow::ensure!(
+            stray.is_empty(),
+            "{} issued {} LIST(s) outside the membership/designation polls: {stray:?}",
+            client.name,
+            stray.len()
+        );
+        total.list += t.list;
+        total.get += t.get;
+        total.head += t.head;
+        total.put += t.put;
+        total.post += t.post;
+        total.delete += t.delete;
+        total.other += t.other;
+    }
+    // What the pre-plan fixed 500 ms LIST poll alone would have cost the
+    // same three nodes over the same minute, priced in GET-equivalents
+    // (AWS: a LIST is 12.5x a GET).
+    let before = NODES * (IDLE_S * 1_000 / INTERVAL_MS);
+    eprintln!(
+        "    idle-cluster-is-quiet: {IDLE_S}s idle, {NODES} nodes: {total} (budget {budget}); \
+         priced in GET-equivalents {} vs {} for the pre-plan fixed-interval LIST poll alone",
+        total.total() - total.list + total.list * 12,
+        before * 12
+    );
+    anyhow::ensure!(
+        total.total() <= budget,
+        "an idle cluster issued {} requests over {IDLE_S}s, budget {budget}: {total}",
+        total.total()
+    );
+    a.unmount()?;
+    b.unmount()?;
+    c.unmount()?;
+    Ok(())
+}
+
+/// A far writer's ship loop is PUT-only (plan 26 step 3), and a follower
+/// with no fast path is bounded by the idle poll ceiling (step 4c).
+///
+/// The holder used to run one `LIST` of its own partition before every
+/// `ship_all`, asking a stream it is the sole legal appender of whether
+/// anyone else had appended. Measured HU->AWS, dropping it takes a writer
+/// from 2.6 to 5.1 shipped segments/s. With 200 ms injected on the S3
+/// path, count every request the writer makes during a 500-file burst and
+/// require that none of them lists `log/p0`.
+///
+/// The follower runs with `CONSTELLATION_P2P=off`, so no gossip `Nudge`
+/// can reset its backoff: convergence has to come from the poll alone,
+/// within the documented `idle_max_ms` bound.
+fn wan_writer_ships_put_only(seed: u64) -> Result<()> {
+    const FILES: usize = 500;
+    const IDLE_MAX_MS: u64 = 10_000;
+    let (env, root) = setup("wan-writer-put-only")?;
+    let proxy = env.s3_proxy()?;
+    let prefix = format!("wan-put-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let writer_counter = env.counting_proxy()?;
+    let mk = |name: &str, endpoint: &str| -> Result<Client> {
+        Ok(Client::new(root.path(), name, endpoint, &backend)?
+            .with_env("CONSTELLATION_P2P", "off")
+            .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "500")
+            .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", &IDLE_MAX_MS.to_string())
+            // The holder must keep the lease across the whole burst.
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000"))
+    };
+    let mut a = mk("wan-a", &writer_counter.endpoint())?.with_write_mode("back");
+    let mut b = mk("wan-b", &env.endpoint)?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+
+    let mut model = Model::default();
+    // Take the lease before the measurement starts: acquisition tails to
+    // head, and that tail legitimately lists.
+    std::fs::write(a.mnt.join("warm"), b"warm")?;
+    model.write_file(std::path::Path::new("warm"), b"warm".to_vec());
+    eventually("warm-up ships", Duration::from_secs(60), || {
+        journal_drained(&a)
+    })?;
+    eventually(
+        "warm-up reaches the follower",
+        Duration::from_secs(60),
+        || {
+            anyhow::ensure!(b.mnt.join("warm").is_file(), "warm not on the follower");
+            Ok(())
+        },
+    )?;
+    anyhow::ensure!(
+        lease_of(&a)?["held"] == true,
+        "the writer must hold p0 before the burst: {}",
+        lease_of(&a)?
+    );
+
+    proxy.latency(200, 0)?;
+    writer_counter.reset();
+    let burst_start = std::time::Instant::now();
+    std::fs::create_dir(a.mnt.join("burst"))?;
+    model.mkdir(std::path::Path::new("burst"));
+    for i in 0..FILES {
+        let data = pattern(seed.wrapping_add(i as u64), 256);
+        let rel = format!("burst/f{i:04}");
+        std::fs::write(a.mnt.join(&rel), &data)?;
+        model.write_file(std::path::Path::new(&rel), data);
+    }
+    eventually("the burst ships", Duration::from_secs(300), || {
+        journal_drained(&a)
+    })?;
+    let burst = burst_start.elapsed();
+
+    writer_counter.ensure_sane()?;
+    let requests = writer_counter.requests();
+    let t = crate::reqlog::tally(&requests);
+    let self_lists: Vec<&str> = requests
+        .iter()
+        .filter(|r| r.lists_prefix("/log/p0") || r.lists_prefix("log/p0"))
+        .map(|r| r.target.as_str())
+        .collect();
+    let segments = log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?.len();
+    eprintln!(
+        "    wan-writer-ships-put-only: {FILES} files in {burst:?} over a 200ms path, \
+         {segments} segments on p0; writer {t}"
+    );
+    anyhow::ensure!(
+        self_lists.is_empty(),
+        "the holder listed its own stream {} time(s) during the burst: {self_lists:?}",
+        self_lists.len()
+    );
+
+    // With no fast path the follower's freshness bound is the poll
+    // ceiling and nothing else.
+    let converge_deadline = Duration::from_millis(IDLE_MAX_MS) + Duration::from_secs(5);
+    let converge_start = std::time::Instant::now();
+    eventually(
+        "follower converges over S3 alone",
+        converge_deadline,
+        || model.verify(&b.mnt),
+    )?;
+    eprintln!(
+        "    wan-writer-ships-put-only: follower converged {:?} after the writer drained \
+         (bound {converge_deadline:?}, P2P off)",
+        converge_start.elapsed()
+    );
+    proxy.heal()?;
+    ensure_no_conflicts([&a, &b])?;
+    a.unmount()?;
+    b.unmount()?;
+    Ok(())
+}
+
+/// Sticky leases hand over through S3 alone (plan 26 step 7).
+///
+/// An idle holder no longer gives a lease back to nobody: it releases
+/// only once a requester has recorded itself in the lease object's
+/// `wanted_by` list, and never inside `LEASE_MIN_DWELL_MS` of taking it.
+/// With `CONSTELLATION_P2P=off` there is no `HandOff` message, so the
+/// whole negotiation has to happen over conditional writes: B registers
+/// on its first blocked `Acquire`, A picks that up at its next renewal
+/// (at most TTL/2 away), finishes its batch and releases, and B's write
+/// completes rather than returning EIO.
+///
+/// A must not be *deposed* along the way — that would be the old TTL
+/// expiry path rather than the cooperative one — so the scenario checks
+/// that A never reports `lost`, that the epoch strictly advanced (A's
+/// fencing token is stale, so anything it shipped late would be
+/// rejected), and that both nodes converge on the union.
+fn sticky_lease_handoff_over_s3(_seed: u64) -> Result<()> {
+    const TTL_MS: u64 = 10_000;
+    const DWELL_MS: u64 = 5_000; // cli::lease::LEASE_MIN_DWELL_MS
+    let (env, root) = setup("sticky-lease-handoff")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/sticky-{}", ts());
+    let mk = |name: &str| -> Result<Client> {
+        Ok(Client::new(root.path(), name, &env.endpoint, &backend)?
+            .with_env("CONSTELLATION_P2P", "off")
+            .with_env("CONSTELLATION_LEASE_TTL_MS", &TTL_MS.to_string())
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "1000"))
+    };
+    let mut a = mk("sticky-a")?;
+    let mut b = mk("sticky-b")?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    anyhow::ensure!(
+        p2p_of(&a)?["enabled"] == false && p2p_of(&b)?["enabled"] == false,
+        "this scenario must exercise the S3-only handoff"
+    );
+
+    let mut model = Model::default();
+    std::fs::create_dir(a.mnt.join("shared"))?;
+    model.mkdir(std::path::Path::new("shared"));
+    for i in 0..10 {
+        let rel = format!("shared/from-a-{i}");
+        let data = format!("a{i}").into_bytes();
+        std::fs::write(a.mnt.join(&rel), &data)?;
+        model.write_file(std::path::Path::new(&rel), data);
+    }
+    eventually("A's writes ship", Duration::from_secs(60), || {
+        journal_drained(&a)
+    })?;
+    let a_lease = lease_of(&a)?;
+    anyhow::ensure!(
+        a_lease["held"] == true && a_lease["lost"] == false,
+        "A must hold p0 after writing: {a_lease}"
+    );
+    let a_epoch = a_lease["epoch"].as_u64().unwrap_or(0);
+    // Stickiness: with nobody asking, an idle holder keeps the lease well
+    // past `CONSTELLATION_LEASE_IDLE_RELEASE_MS` (1 s here).
+    std::thread::sleep(Duration::from_secs(6));
+    let idle_lease = lease_of(&a)?;
+    anyhow::ensure!(
+        idle_lease["held"] == true && idle_lease["epoch"].as_u64() == Some(a_epoch),
+        "an idle holder with no requester released the lease anyway: {idle_lease}"
+    );
+
+    // B's first write registers `wanted_by` and then has to wait for A to
+    // notice at its next renewal.
+    let bound = Duration::from_millis(TTL_MS / 2 + DWELL_MS) + Duration::from_secs(10);
+    let handoff_start = std::time::Instant::now();
+    let rel = "shared/from-b";
+    std::fs::write(b.mnt.join(rel), b"b0").with_context(|| {
+        format!(
+            "B's write failed instead of waiting for the handoff; A log:\n{}\nB log:\n{}",
+            a.tail_log_n(40),
+            b.tail_log_n(40)
+        )
+    })?;
+    let handoff = handoff_start.elapsed();
+    model.write_file(std::path::Path::new(rel), b"b0".to_vec());
+    eprintln!(
+        "    sticky-lease-handoff-over-s3: B's first write completed in {handoff:?} \
+         (bound {bound:?} = TTL/2 + dwell + 10s, P2P off)"
+    );
+    anyhow::ensure!(
+        handoff <= bound,
+        "S3-only handoff took {handoff:?}, over the {bound:?} bound"
+    );
+
+    let b_lease = lease_of(&b)?;
+    anyhow::ensure!(
+        b_lease["held"] == true,
+        "B wrote without holding p0: {b_lease}"
+    );
+    let b_epoch = b_lease["epoch"].as_u64().unwrap_or(0);
+    anyhow::ensure!(
+        b_epoch > a_epoch,
+        "the fencing token must advance across a handoff: A {a_epoch} -> B {b_epoch}"
+    );
+    let a_after = lease_of(&a)?;
+    anyhow::ensure!(
+        a_after["lost"] == false,
+        "A was deposed instead of releasing cooperatively: {a_after}; log:\n{}",
+        a.tail_log_n(40)
+    );
+
+    eventually("both nodes converge", Duration::from_secs(60), || {
+        model.verify(&a.mnt).context("via A")?;
+        model.verify(&b.mnt).context("via B")?;
+        Ok(())
+    })?;
+    ensure_no_conflicts([&a, &b])?;
+    a.unmount()?;
+    b.unmount()?;
+    Ok(())
+}
+
+/// Log retention is per partition (plan 26 step 0) — the regression test
+/// for a latent data-loss bug.
+///
+/// GC used to compute one floor, `LATEST.seq - retention`, and apply it
+/// to every object under `log/`. `LATEST.seq` is the maximum sequence
+/// over *all* partitions, so a young child partition sitting at seq 10
+/// while p0 was thousands of segments ahead had its entire stream deleted
+/// — including the segments above `VECTOR.json`'s `applied[child]`, which
+/// is exactly the part no checkpoint can replace. A node bootstrapping
+/// afterwards would simply never see those files.
+///
+/// Force a split, get a checkpoint written while the child is quiet, then
+/// write into the child so its live segments sit *above* its vector
+/// entry, run GC, and require a fresh node to still see them.
+fn multi_partition_retention_is_per_partition(_seed: u64) -> Result<()> {
+    const RETENTION: u64 = 8;
+    let (env, root) = setup("multi-part-retention")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("part-retention-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mk = |name: &str| -> Result<Client> {
+        Ok(part_env(
+            Client::new(root.path(), name, &env.endpoint, &backend)?,
+            4,
+            3_600,
+        )
+        .with_env(
+            "CONSTELLATION_LOG_RETENTION_SEGMENTS",
+            &RETENTION.to_string(),
+        )
+        // GC waits one full authority TTL before deleting; keep that
+        // mandatory wait short.
+        .with_env("CONSTELLATION_LEASE_TTL_MS", "2000"))
+    };
+    // The split heuristic requires at least two registered nodes.
+    let mut a = mk("part-a")?;
+    let mut b = mk("part-b")?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+
+    let mut model = Model::default();
+    std::fs::create_dir(a.mnt.join("hot"))?;
+    model.mkdir(std::path::Path::new("hot"));
+    eventually("hot visible on B", Duration::from_secs(30), || {
+        anyhow::ensure!(b.mnt.join("hot").is_dir(), "hot not on B");
+        Ok(())
+    })?;
+    wait_for_split(&a, &a.mnt.join("hot"), &mut model, "split")?;
+    let child = partition_ids(&a)?
+        .into_iter()
+        .find(|id| id != "p0")
+        .context("no child partition after the split")?;
+
+    // Run p0 far ahead of the child and let a checkpoint land while the
+    // child is quiet, so its vector entry is low.
+    //
+    // A checkpoint needs `CHECKPOINT_EVERY` (32) *shipped segments*, and a
+    // ship round takes the whole journal as one segment: 160 back-to-back
+    // writes coalesce into a handful of segments and never reach the
+    // floor, however long the wait. A brief pause between writes lets each
+    // close() nudge ship its own segment, so write in paced batches and
+    // stop only once p0 is far enough ahead rather than guessing a file
+    // count that happens to be enough.
+    //
+    // "Far enough" is the hazard's own definition: the *old* global floor
+    // was `LATEST.seq - retention` applied to every partition, so it only
+    // reaches the child's live segments when `LATEST.seq` outruns them by
+    // more than the retention window. Keep a margin on top for the child
+    // segments written next — they must land above the vector entry and
+    // still below the old floor.
+    const CHILD_MARGIN: u64 = 30;
+    std::fs::create_dir(a.mnt.join("cold"))?;
+    model.mkdir(std::path::Path::new("cold"));
+    let mut cold = 0usize;
+    let mut staged = false;
+    for _ in 0..30 {
+        for _ in 0..40 {
+            let rel = format!("cold/c{cold:04}");
+            let data = format!("cold-{cold}").into_bytes();
+            std::fs::write(a.mnt.join(&rel), &data)?;
+            model.write_file(std::path::Path::new(&rel), data);
+            cold += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eventually("p0 ships", Duration::from_secs(60), || journal_drained(&a))?;
+        if checkpoint_snapshots(&env.direct_endpoint, &prefix)?.is_empty() {
+            continue;
+        }
+        let covered = raw_json(
+            &env.direct_endpoint,
+            &format!("{prefix}/checkpoints/p0/LATEST"),
+        )?["seq"]
+            .as_u64()
+            .unwrap_or(0);
+        let child_max = log_segment_seqs(&env.direct_endpoint, &prefix, &child)?
+            .last()
+            .copied()
+            .unwrap_or(0);
+        if covered.saturating_sub(RETENTION) > child_max + CHILD_MARGIN {
+            staged = true;
+            break;
+        }
+    }
+    anyhow::ensure!(
+        staged,
+        "p0 never outran the child far enough for the old global floor to reach it \
+         after {cold} paced writes ({} p0 segment(s))",
+        log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?.len()
+    );
+
+    // Now write into the child, above whatever the checkpoint captured.
+    // A byte-proportional cadence will not fire another checkpoint for
+    // ten tiny segments, but assert the hazard exists rather than
+    // assuming it: the child's live segments must sit above its vector
+    // entry, and the *old* global floor must have covered them.
+    let mut hot_files = Vec::new();
+    let mut ready = false;
+    for attempt in 0..5 {
+        for i in 0..10 {
+            let rel = format!("hot/late-{attempt}-{i}");
+            let data = format!("late-{attempt}-{i}").into_bytes();
+            std::fs::write(a.mnt.join(&rel), &data)?;
+            model.write_file(std::path::Path::new(&rel), data.clone());
+            hot_files.push((rel, data));
+        }
+        eventually("child segments ship", Duration::from_secs(60), || {
+            journal_drained(&a)
+        })?;
+        let vector = raw_json(
+            &env.direct_endpoint,
+            &format!("{prefix}/checkpoints/VECTOR.json"),
+        )?;
+        let latest = raw_json(
+            &env.direct_endpoint,
+            &format!("{prefix}/checkpoints/p0/LATEST"),
+        )?;
+        let covered = latest["seq"].as_u64().unwrap_or(0);
+        let applied = vector["applied"][&child].as_u64().unwrap_or(0);
+        let child_seqs = log_segment_seqs(&env.direct_endpoint, &prefix, &child)?;
+        let max_child = child_seqs.last().copied().unwrap_or(0);
+        eprintln!(
+            "    multi-partition-retention: attempt {attempt}: LATEST.seq={covered} \
+             vector[{child}]={applied} child segments {:?}..{max_child} (n={})",
+            child_seqs.first(),
+            child_seqs.len()
+        );
+        if max_child > applied && covered.saturating_sub(RETENTION) > max_child {
+            ready = true;
+            break;
+        }
+    }
+    anyhow::ensure!(
+        ready,
+        "could not stage the hazard: the child's live segments never sat above its \
+         vector entry while under the old global floor"
+    );
+
+    let out = a.gc_run(false)?;
+    anyhow::ensure!(
+        out.status.success(),
+        "gc run failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let surviving = log_segment_seqs(&env.direct_endpoint, &prefix, &child)?;
+    let vector = raw_json(
+        &env.direct_endpoint,
+        &format!("{prefix}/checkpoints/VECTOR.json"),
+    )?;
+    let applied = vector["applied"][&child].as_u64().unwrap_or(0);
+    eprintln!(
+        "    multi-partition-retention: after gc, {} segment(s) left on {child}, \
+         vector applied {applied}",
+        surviving.len()
+    );
+    anyhow::ensure!(
+        surviving
+            .iter()
+            .all(|seq| *seq >= applied.saturating_sub(RETENTION)),
+        "GC pruned {child} below its own vector floor: {surviving:?} vs applied {applied}"
+    );
+
+    // Crash both nodes so no clean-unmount checkpoint can paper over a
+    // truncated child stream, then rebuild from the bucket alone.
+    a.kill9()?;
+    b.kill9()?;
+    let mut c = mk("part-c")?;
+    c.mount()
+        .context("fresh bootstrap after per-partition GC")?;
+    for (rel, data) in &hot_files {
+        let got = std::fs::read(c.mnt.join(rel))
+            .with_context(|| format!("{rel} missing on the fresh node after GC"))?;
+        anyhow::ensure!(got == *data, "{rel} has the wrong content after GC");
+    }
+    eventually(
+        "fresh node matches the oracle",
+        Duration::from_secs(120),
+        || model.verify(&c.mnt),
+    )?;
+    c.unmount()?;
+    Ok(())
 }

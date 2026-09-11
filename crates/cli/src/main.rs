@@ -2872,13 +2872,8 @@ impl UploadRuntime {
             self.existence.note_peer_hint();
             return constellation_store_s3::ChunkPutMode::Probe;
         }
-        match self.existence.contains(hash) {
-            Some(true) => return constellation_store_s3::ChunkPutMode::Probe,
-            Some(false) if self.create_if_absent => {
-                return constellation_store_s3::ChunkPutMode::Create;
-            }
-            Some(false) => return constellation_store_s3::ChunkPutMode::Overwrite,
-            None => {}
+        if self.existence.contains(hash) {
+            return constellation_store_s3::ChunkPutMode::Probe;
         }
         let n = self
             .decisions
@@ -2897,7 +2892,7 @@ impl UploadRuntime {
         Self::new(
             create_if_absent,
             None,
-            crate::existence::Existence::new(1024, false, false),
+            crate::existence::Existence::new(1024, false, None),
         )
     }
 
@@ -2913,7 +2908,7 @@ impl UploadRuntime {
             probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
             decisions: std::sync::atomic::AtomicU64::new(0),
             coop: None,
-            existence: crate::existence::Existence::new(1024, false, false),
+            existence: crate::existence::Existence::new(1024, false, None),
         }
     }
 }
@@ -3515,10 +3510,9 @@ impl constellation_api::StatusSource for DaemonStatus {
                     upload_concurrency: self.upload.gate.target() as u32,
                     remote_probe_enabled: probe.enabled(),
                     remote_probe_hit_rate: probe.hit_rate(),
-                    existence_listed: existence.listed,
-                    existence_complete: existence.complete,
                     existence_bloom_hits: existence.bloom_hits,
-                    existence_bloom_misses: existence.bloom_misses,
+                    existence_chunk_ref_hits: existence.chunk_ref_hits,
+                    existence_misses: existence.misses,
                     existence_peer_hints: existence.peer_hints,
                 }
             },
@@ -4680,8 +4674,12 @@ mod pending_upload_tests {
         hash
     }
 
+    /// A hinted hash confirms with a HEAD and skips the PUT entirely; an
+    /// unhinted one keeps the adaptive fallback, because no hint source can
+    /// prove absence any more (plan 26 step 8 deleted the LIST seed that
+    /// could). Neither decision costs a LIST.
     #[test]
-    fn complete_list_seed_probes_hits_and_creates_misses_without_head() {
+    fn hinted_hash_probes_and_unhinted_hash_keeps_the_adaptive_fallback() {
         let f = fixture();
         let known_data = b"already in S3";
         let known = ChunkHash::of(known_data);
@@ -4697,8 +4695,8 @@ mod pending_upload_tests {
 
         queue(&f, "known", known_data);
         queue(&f, "new", b"not in S3");
-        let existence = crate::existence::Existence::new(1024, true, false);
-        existence.seed_for_test(&[known], true);
+        let existence = crate::existence::Existence::new(1024, true, None);
+        existence.insert(&known);
         let upload = UploadRuntime::new(true, None, existence);
         rt().block_on(upload_dirty_chunks(
             &f.cache,
@@ -4711,8 +4709,17 @@ mod pending_upload_tests {
         ))
         .unwrap();
 
-        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 1);
-        assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.failing.heads.load(Ordering::SeqCst),
+            2,
+            "the hint confirms with a HEAD; the unhinted chunk probes too"
+        );
+        assert_eq!(
+            f.failing.puts.load(Ordering::SeqCst),
+            1,
+            "only the chunk that is genuinely absent is uploaded"
+        );
+        assert_eq!(upload.existence.report().bloom_hits, 1);
         assert!(f.meta.pending_uploads().unwrap().is_empty());
     }
 
@@ -4721,8 +4728,8 @@ mod pending_upload_tests {
         let f = fixture();
         let data = b"forced false positive";
         let hash = queue(&f, "false-positive", data);
-        let existence = crate::existence::Existence::new(1024, true, false);
-        existence.seed_for_test(&[hash], true);
+        let existence = crate::existence::Existence::new(1024, true, None);
+        existence.insert(&hash);
         let upload = UploadRuntime::new(true, None, existence);
 
         rt().block_on(upload_dirty_chunks(
@@ -4756,7 +4763,7 @@ mod pending_upload_tests {
             bucket: 0,
             buckets: 1,
         });
-        let existence = crate::existence::Existence::new(1024, true, true);
+        let existence = crate::existence::Existence::new(1024, true, None);
         let upload = UploadRuntime::new(true, Some(coop), existence);
         assert_eq!(
             upload.put_mode(&hinted),
@@ -4766,7 +4773,7 @@ mod pending_upload_tests {
         assert_eq!(
             upload.put_mode(&ChunkHash::of(b"peer miss")),
             constellation_store_s3::ChunkPutMode::Probe,
-            "an incomplete LIST plus peer miss must keep the adaptive probe"
+            "an unhinted hash must keep the adaptive probe"
         );
     }
 
@@ -4783,8 +4790,8 @@ mod pending_upload_tests {
         .unwrap();
         f.failing.puts.store(0, Ordering::SeqCst);
         f.failing.heads.store(0, Ordering::SeqCst);
-        let existence = crate::existence::Existence::new(1024, true, false);
-        existence.seed_for_test(&[hash], true);
+        let existence = crate::existence::Existence::new(1024, true, None);
+        existence.insert(&hash);
         let upload = UploadRuntime::new(true, None, existence);
 
         rt().block_on(upload_dirty_chunks(

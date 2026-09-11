@@ -49,6 +49,8 @@ Execution protocol:
 | 23 | `wip/23-remote-support-mode.md` | wip | compile-time-gated remote support mode: mount-armed `ro`/`rw` P2P sessions | 02 (independent of 19–22) |
 | 24 | `done/24-e2e-keyring-master-key.md` | done | single-file keyring: one wrapped master key in meta.json, all keys derived; live `fs passwd`, no keyring.json | 10 |
 | 25 | `done/25-checkpoint-strip-pending-upload.md` | done | strip node-local `pending_upload` from cluster checkpoints; heal poisoned joiners | 07 (08 committed in practice) |
+| 26 | `wip/26-metadata-plane-s3-efficiency.md` | wip | proportional checkpoint cadence + inline prune, per-partition log retention (bug fix), holder skips self-tail, GET-next tailer with idle backoff, ranged checkpoint I/O, sticky leases with `wanted_by`, existence from `chunk_ref` | 25 |
+| 27 | `wip/27-merkle-packed-checkpoints.md` | wip | checkpoint = packed Merkle tree + sidecar, vector-monotonic `ROOT`, any-holder publish, O(change) snapshots, bulk-load bootstrap | 26 |
 
 "Committed in practice": the plan does not technically build on the
 intermediate milestones, but the protocol is strictly sequential, so

@@ -330,6 +330,29 @@ impl SqliteMeta {
             .is_some())
     }
 
+    /// Is `hash` referenced by any manifest this replica knows about?
+    ///
+    /// The upload path's existence hint (`cli::existence`). Deliberately a
+    /// single indexed probe with no `inode` join, unlike
+    /// [`Self::hash_is_live`]: the question here is only "has this content
+    /// been put in the bucket already", a hit merely selects a confirming
+    /// HEAD, and a row that outlives its inode — a rebuilt index carries
+    /// orphans too — costs nothing worse than that HEAD. Replay maintains
+    /// `chunk_ref` from foreign records as well as local ones, so a hash
+    /// referenced anywhere in the cluster is a hit here.
+    pub fn chunk_ref_exists(&self, hash: &ChunkHash) -> Result<bool, MetaError> {
+        self.with_reader(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM chunk_ref WHERE chunk_hash = ?1 LIMIT 1",
+                    params![hash.0.to_vec()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
+    }
+
     /// Repopulate `chunk_ref` from the manifests currently in `inode`.
     /// Orphans (nlink = 0) are indexed too so that the reaping transition
     /// finds its rows to remove; `hash_is_live` filters them out via the
@@ -1447,6 +1470,29 @@ impl SqliteMeta {
             .unwrap()
             .execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
         Ok(())
+    }
+
+    /// Whether the journal still holds the `dst` half of cross-partition
+    /// rename `txid` (i.e. it is written but not yet shipped).
+    ///
+    /// The shipper asks this once per `RenameXpartSrc` it sees, and used to
+    /// answer it by grouping and decoding the *entire* journal — up to
+    /// `SEGMENT_BATCH` records per partition materialized to settle a
+    /// yes/no question about one record. Records are opaque postcard blobs
+    /// to SQLite, so the scan cannot move into the query, but it can stop
+    /// at the first match and keep exactly one record alive at a time.
+    pub fn journal_has_xpart_dst(&self, txid: u64) -> Result<bool, MetaError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn.prepare("SELECT record FROM journal")?;
+            let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+            for row in rows {
+                let rec = LogRecord::from_postcard(&row?)?;
+                if matches!(rec, LogRecord::RenameXpartDst { txid: t, .. } if t == txid) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
     }
 
     /// Peek the journal grouped by partition, preserving per-partition
@@ -3869,6 +3915,44 @@ mod tests {
         );
     }
 
+    /// The upload-path existence hint answers from `chunk_ref` alone, so it
+    /// must see references this replica only learned by replaying another
+    /// node's records — that is what removed the mount-time bucket LIST.
+    /// It tracks references, not bucket contents: dropping the last one
+    /// takes the hint away again, which costs at most a redundant
+    /// conditional PUT of content GC has not collected yet.
+    #[test]
+    fn chunk_ref_exists_sees_replayed_foreign_references() {
+        let hash = ChunkHash::of(b"uploaded-by-another-node");
+        let src = store();
+        let file = src.create(ROOT_INO, "remote", 0o644, 0, 0).unwrap();
+        src.set_manifest(file.ino, &one_hash_manifest(hash), 1)
+            .unwrap();
+
+        let dst = store();
+        assert!(
+            !dst.chunk_ref_exists(&hash).unwrap(),
+            "an empty replica must not claim a hash"
+        );
+        let records: Vec<LogRecord> = src
+            .take_journal(16)
+            .unwrap()
+            .into_iter()
+            .map(|(_, rec)| rec)
+            .collect();
+        dst.apply_records(&records).unwrap();
+        assert!(
+            dst.chunk_ref_exists(&hash).unwrap(),
+            "replay of a foreign manifest must seed the hint"
+        );
+
+        dst.unlink(ROOT_INO, "remote").unwrap();
+        assert!(
+            !dst.chunk_ref_exists(&hash).unwrap(),
+            "the hint follows the reference, and the last one just went"
+        );
+    }
+
     #[test]
     fn deref_tracks_snapshot_delete() {
         let meta = store();
@@ -4099,6 +4183,44 @@ mod tests {
         // Ack drains.
         m.ack_journal(recs[3].0).unwrap();
         assert_eq!(m.journal_len().unwrap(), 0);
+    }
+
+    /// The shipper decides whether an orphan `RenameXpartSrc` may be
+    /// aborted by asking whether its partner is still sitting unshipped in
+    /// the journal. The answer must be about that one txid, and must not
+    /// be confused by other cross-partition renames in flight.
+    #[test]
+    fn journal_has_xpart_dst_finds_only_the_named_txid() {
+        let m = store();
+        assert!(!m.journal_has_xpart_dst(7).unwrap());
+        m.journal_on(
+            "p0",
+            &LogRecord::RenameXpartSrc {
+                txid: 7,
+                part: "p0".into(),
+                from_parent: ROOT_INO,
+                name: "x".into(),
+                ino: 42,
+                time_ns: 1,
+            },
+        )
+        .unwrap();
+        // The src half alone is not the partner it is looking for.
+        assert!(!m.journal_has_xpart_dst(7).unwrap());
+        m.journal_on(
+            "p1",
+            &LogRecord::RenameXpartDst {
+                txid: 7,
+                part: "p1".into(),
+                to_parent: ROOT_INO,
+                new_name: "y".into(),
+                ino: 42,
+                time_ns: 2,
+            },
+        )
+        .unwrap();
+        assert!(m.journal_has_xpart_dst(7).unwrap());
+        assert!(!m.journal_has_xpart_dst(8).unwrap());
     }
 
     #[test]

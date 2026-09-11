@@ -454,22 +454,22 @@ Phase 8a adds three destructive-integrity scenarios:
   asserts exit codes 1 (detected), 2 (repaired), then 0 (clean), remounts, and
   verifies the healed file bytes.
 
-Phase 8c adds two upload-existence scenarios:
+Phase 8c adds two upload-existence scenarios (plan 26 step 8 replaced their
+mount-time bucket LIST with the replica's `chunk_ref` index):
 
 - `existence-bloom-dedup` writes a unique multi-chunk tree on A, unmounts it,
-  then mounts B with a fresh state directory and waits for the background
-  256-prefix chunk LIST to report complete. B writes identical bytes without
-  warming its local cache first; bloom hits must advance, misses stay near
-  zero, the model oracle verifies both files, and a direct bucket LIST proves
-  no additional chunk keys appeared. A second fresh node repeats the copy
-  with `CONSTELLATION_EXISTENCE_LIST=off`, proving the optimization is
-  optional and its counters stay disabled. The scenario prints listed-key
-  count and seed wall time so LIST cost remains visible.
-- `existence-peer-hint` disables existence LIST on both nodes, waits for A's
-  clean-cache digest, and writes identical bytes through B. B must report at
-  least one peer upload hint, yet every hint still selects a confirming store
-  operation. A fresh `CONSTELLATION_COOP=off` node repeats the write with zero
-  peer hints and exact model verification.
+  then mounts B with a fresh state directory and waits for A's tree to arrive
+  over the metadata log. B writes identical bytes without warming its local
+  cache first; hint hits must advance (`existence_chunk_ref_hits` plus
+  `existence_bloom_hits`), misses stay near zero, the model oracle verifies
+  both files, and a direct bucket LIST proves no additional chunk keys
+  appeared. The scenario prints the hit counters by source.
+- `existence-peer-hint` waits for A's clean-cache digest and writes identical
+  bytes through B. B must report at least one peer upload hint — the peer
+  digest is consulted ahead of the replica, so it keeps the credit — yet every
+  hint still selects a confirming store operation. A fresh
+  `CONSTELLATION_COOP=off` node repeats the write with zero peer hints and
+  exact model verification.
 
 Phase 8d adds `snapshot-churn`, a seeded out-of-core lifecycle oracle. Its
 SQLite WAL stores live rows per writable root, immutable rows per snapshot, and
@@ -526,6 +526,53 @@ file and a sparse file with a 1 GiB logical length; the virtual
 Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.
+
+Plan 26 adds five metadata-plane scenarios. They assert on **S3 request
+classes and counts**, which no other lane can see: toxiproxy is a TCP fault
+injector with no notion of HTTP, and floci logs bucket lifecycle only.
+`crates/harness/src/reqlog.rs` is a counting HTTP relay chained in front of
+toxiproxy (client -> counter -> toxiproxy -> floci), so a scenario can say
+"zero LISTs of `log/p0` during the burst" about the actual wire while every
+toxic still applies. It parses client-to-upstream HTTP/1.1 request lines only,
+and exposes a `desyncs` counter that every scenario using it asserts is zero,
+so a miscounted stream fails the scenario instead of silently under-reporting.
+
+- `ckpt-bulk-ingest-bounded` ingests a seeded tree from one writer and rewrites
+  it until at least three checkpoints have fired, then asserts the bucket holds
+  at most the newest two snapshots, that their combined size is within 3x the
+  final snapshot, and that a fresh node still bootstraps to the oracle's exact
+  tree from what survived the inline prune. Writes are paced deliberately: a
+  ship round takes the whole journal as one segment, so back-to-back writes
+  coalesce and never reach the 32-segment count floor. The scenario prints
+  checkpoints written against checkpoints remaining, in objects and bytes; seed
+  42 measured 64 written (3,690,594 B) and 2 remaining (119,978 B) over 1000
+  segments.
+- `idle-cluster-is-quiet` converges three nodes, leaves them idle for 60 s, and
+  counts every request each one makes on its own relay. Nothing may list `log/`
+  at all, no LIST may fall outside the membership and designation polls, and
+  the total must stay inside a budget derived from the configured periods
+  (lease renewal, the 5 s registry poll, the 10 s designation poll, and the
+  backed-off metadata probe itself). Seed 42 measured 563 requests
+  (LIST=90 GET=472 PUT=1) against a budget of 675.
+- `wan-writer-ships-put-only` puts 200 ms on the S3 path and counts the
+  holder's requests across a 500-file burst: none may list `log/p0`. The
+  follower runs with `CONSTELLATION_P2P=off`, so no gossip `Nudge` can reset
+  its backoff and convergence has to come from the poll alone, within
+  `CONSTELLATION_SYNC_IDLE_MAX_MS` plus 5 s.
+- `sticky-lease-handoff-over-s3` disables P2P, so the whole lease negotiation
+  happens over conditional writes. An idle holder with nobody waiting must keep
+  the lease well past `CONSTELLATION_LEASE_IDLE_RELEASE_MS`; B's first write
+  must then complete — not EIO — inside `TTL/2 + dwell + 10 s`, the fencing
+  epoch must advance, and A must have released cooperatively rather than been
+  deposed.
+- `multi-partition-retention-is-per-partition` is the regression test for the
+  finding-6 data-loss bug. It forces a split, drives p0 far enough ahead that
+  the *old* global floor (`LATEST.seq - retention`) would reach the child's
+  live segments, writes into the child above its `VECTOR.json` entry, runs `gc
+  run`, kill-9s both nodes so no clean-unmount checkpoint can paper over a
+  truncated stream, and requires a fresh node to still read every child file.
+  It asserts the hazard is staged before it asserts the fix, so it cannot pass
+  vacuously.
 
 `p2p-partition-tolerance` cuts P2P with the kill switch on one node
 (toxiproxy only fronts S3, so this is how plan 02 specifies simulating an

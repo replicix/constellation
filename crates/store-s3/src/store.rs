@@ -660,11 +660,7 @@ impl ChunkStore {
             },
             None => Err("skipped (initial write failed)".to_string()),
         };
-        checks.push(PreflightCheck::new(
-            "etag CAS (If-Match)",
-            false,
-            etag_cas,
-        ));
+        checks.push(PreflightCheck::new("etag CAS (If-Match)", false, etag_cas));
 
         // Delete: cleanup uses it everywhere (GC, lease release).
         let delete = self.store.delete(&key).await;

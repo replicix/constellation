@@ -83,6 +83,40 @@ fn clear_stale_mount(mountpoint: &std::path::Path) {
     );
 }
 
+/// Ceiling of the sync task's idle poll backoff, in milliseconds
+/// (`CONSTELLATION_SYNC_IDLE_MAX_MS`). `CONSTELLATION_SYNC_INTERVAL_MS`
+/// is the floor.
+const SYNC_IDLE_MAX_MS: u64 = 30_000;
+
+/// How long to wait before the next periodic sync round after
+/// `idle_rounds` consecutive rounds found nothing to do: `interval`
+/// doubled per idle round, clamped to `max`, never below `interval`.
+///
+/// An idle node's poll is what it costs the cluster to sit still: every
+/// round probes each partition's stream in S3. That probe is now GETs
+/// rather than a LIST (see `shipper::tail_part_probed`), but ten idle
+/// nodes at a fixed 500 ms interval are still ~1.7M requests a day for
+/// nothing. Backing off to 30 s cuts that by 60× and gives the request
+/// class change its actual win.
+///
+/// The cost is freshness, and only in the degraded case: gossip
+/// (`P2pBridge`'s `Nudge`) resets the backoff the moment a peer publishes,
+/// so with P2P up this is invisible. With P2P down, a follower's worst
+/// case staleness grows from 0.5 s to `max` after ~6 idle rounds and
+/// snaps back to 0.5 s on the next segment it applies. DESIGN.md §12's
+/// posture ("eventual S3 polling closes it") is unchanged; its bound is
+/// now `max` rather than the interval.
+fn next_poll_ms(interval_ms: u64, idle_rounds: u32, max_ms: u64) -> u64 {
+    // Shifting by >= 64 is UB-adjacent nonsense and the product overflows
+    // long before that; either way the answer is "the ceiling".
+    let backoff = if idle_rounds >= u64::BITS {
+        u64::MAX
+    } else {
+        interval_ms.saturating_mul(1u64 << idle_rounds)
+    };
+    backoff.min(max_ms).max(interval_ms)
+}
+
 /// Everything needed to open/create a node's backend + local state,
 /// independent of any particular mounted view.
 #[allow(clippy::too_many_arguments)]
@@ -173,14 +207,6 @@ pub struct NodeRuntime {
     epochs: Arc<epoch::EpochManager>,
     designations: Arc<designation::DesignationManager>,
     coop: Arc<coop::Coop>,
-    existence: Arc<crate::existence::Existence>,
-    /// Set once, by whichever `add_mount` call is first to run (see its
-    /// body): the LIST-seeded existence scan is spawned right before that
-    /// view's `fuser::Session` is created, matching the original
-    /// monolithic `mount()`'s exact call site (a short grace delay lets
-    /// the mount finish attaching before LIST work begins). A second
-    /// view must not spawn a second, redundant bucket-wide scan.
-    existence_seeded: AtomicBool,
     upload: Arc<crate::UploadRuntime>,
     forward: Arc<forward::ForwardState>,
     placement: Arc<placement::Placement>,
@@ -525,11 +551,10 @@ impl NodeRuntime {
             node_id,
             fsmeta.chunk_size,
         );
-        let existence = crate::existence::Existence::from_env();
         let upload = Arc::new(crate::UploadRuntime::new(
             caps.create_if_absent,
             Some(coop.clone()),
-            existence.clone(),
+            crate::existence::Existence::with_meta(meta.clone()),
         ));
         let forward = forward::ForwardState::new();
         let placement = Arc::new(placement::Placement::new());
@@ -545,12 +570,24 @@ impl NodeRuntime {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(500);
+        // The interval is the *floor* of an exponential idle backoff; this
+        // is its ceiling (see `next_poll_ms`).
+        let idle_max_ms: u64 = std::env::var("CONSTELLATION_SYNC_IDLE_MAX_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SYNC_IDLE_MAX_MS);
         let ship = shipper::Shipper::attach_with_mode(meta.clone(), log, node_id, lease_mode)?;
         let spool = ship.spool.clone();
         let mut ship = ship;
         if !read_only_member {
-            rt.block_on(crate::adopt_root(&meta, &mut ship, &mut keeper))
-                .context("adopting the root directory owner")?;
+            rt.block_on(async {
+                // Seed the checkpoint cadence baseline from S3 before the
+                // first ship round, so a restart resumes byte-proportional
+                // checkpointing instead of firing on the segment count.
+                ship.seed_checkpoint_baseline().await;
+                crate::adopt_root(&meta, &mut ship, &mut keeper).await
+            })
+            .context("adopting the root directory owner")?;
         }
         ship.set_peers(peers.clone());
         ship.set_designations(designations.clone());
@@ -910,6 +947,9 @@ impl NodeRuntime {
                 // its holder never publishes.
                 let poll = tokio::time::sleep(std::time::Duration::from_millis(interval_ms));
                 tokio::pin!(poll);
+                // Consecutive poll-triggered rounds that found nothing to
+                // do. Drives the backoff; any request at all resets it.
+                let mut idle_rounds: u32 = 0;
                 'sync: loop {
                     if stop.load(Ordering::Relaxed) {
                         break;
@@ -929,6 +969,34 @@ impl NodeRuntime {
                             _ = poll.as_mut() => None,
                         }
                     };
+                    // Any request — a FUSE nudge, a barrier, an acquire, a
+                    // forward, or a gossip-driven `Nudge` from `P2pBridge`
+                    // — means this node is not idle. Collapse the backoff
+                    // before handling it, so the round it triggers is
+                    // followed by a prompt one.
+                    //
+                    // The `idle_rounds > 0` guard is what keeps this from
+                    // re-introducing the starvation the persistent deadline
+                    // exists to prevent: the deadline is pushed out at most
+                    // once per idle period, not once per request, so a peer
+                    // sending requests faster than the interval still
+                    // cannot hold the periodic round off forever.
+                    if request.is_some() && idle_rounds > 0 {
+                        tracing::debug!(
+                            idle_rounds,
+                            interval_ms,
+                            "sync request ended the idle backoff"
+                        );
+                        idle_rounds = 0;
+                        poll.as_mut().reset(
+                            tokio::time::Instant::now()
+                                + std::time::Duration::from_millis(interval_ms),
+                        );
+                    }
+                    // Only the periodic poll's own rounds count towards the
+                    // backoff; a round somebody asked for is by definition
+                    // not this node sitting still.
+                    let poll_triggered = request.is_none();
                     match request {
                         Some(fusefs::SyncRequest::Acquire { part, reply }) => {
                             let deposed = match meta.kv_get("lease_lost") {
@@ -1376,12 +1444,23 @@ impl NodeRuntime {
                         }
                         Some(fusefs::SyncRequest::Nudge) | None => {
                             // A round is about to run; push the periodic
-                            // poll out by one interval so it only fires when
-                            // rounds have genuinely stopped happening.
+                            // poll out so it only fires when rounds have
+                            // genuinely stopped happening. It is set again
+                            // from the round's outcome below, which is what
+                            // the idle backoff rides on; this one covers the
+                            // path where a request cuts the round short.
                             poll.as_mut().reset(
                                 tokio::time::Instant::now()
                                     + std::time::Duration::from_millis(interval_ms),
                             );
+                            // What "idle" means for the backoff: nothing was
+                            // applied or shipped (both advance `head_seq`)
+                            // and nothing is waiting to ship. A journal that
+                            // stays non-empty means we are blocked on a
+                            // foreign lease, not idle — backing off there
+                            // would delay our own writes reaching S3.
+                            let head_before = spool.lock().unwrap().head_seq;
+                            let mut nudged = false;
                             // Keep polling one round while draining ordinary
                             // nudges. Dropping this future used to cancel the
                             // async upload side while already-started
@@ -1398,10 +1477,12 @@ impl NodeRuntime {
                                 &upload,
                             );
                             tokio::pin!(round);
+                            let mut completed = false;
                             loop {
                                 tokio::select! {
                                     biased;
                                     r = &mut round => {
+                                        completed = true;
                                         if let Err(e) = r {
                                             tracing::warn!(
                                                 error = %e,
@@ -1417,6 +1498,9 @@ impl NodeRuntime {
                                         Some(fusefs::SyncRequest::Nudge) => {
                                             // Coalesced: the current round already
                                             // covers the work visible at its start.
+                                            // Somebody is still asking, so this is
+                                            // not an idle round whatever it finds.
+                                            nudged = true;
                                         }
                                         Some(request) => {
                                             // Explicit operations retain their old
@@ -1427,6 +1511,46 @@ impl NodeRuntime {
                                         None => break 'sync,
                                     },
                                 }
+                            }
+                            // A round interrupted by a request is neither
+                            // idle nor productive: the request it yielded to
+                            // resets the backoff on the next pass anyway.
+                            if completed {
+                                let head_after = spool.lock().unwrap().head_seq;
+                                let backlog =
+                                    constellation_meta::MetaStore::journal_len(&*meta).unwrap_or(0);
+                                let productive = nudged
+                                    || head_after != head_before
+                                    || backlog > 0
+                                    || !poll_triggered;
+                                let was = idle_rounds;
+                                if productive {
+                                    idle_rounds = 0;
+                                } else {
+                                    idle_rounds = idle_rounds.saturating_add(1);
+                                }
+                                let next_ms = next_poll_ms(interval_ms, idle_rounds, idle_max_ms);
+                                if productive && was > 0 {
+                                    tracing::debug!(
+                                        idle_rounds = was,
+                                        next_ms,
+                                        "sync round was productive; idle backoff reset"
+                                    );
+                                } else if !productive
+                                    && next_ms >= idle_max_ms
+                                    && next_poll_ms(interval_ms, was, idle_max_ms) < idle_max_ms
+                                {
+                                    tracing::debug!(
+                                        idle_rounds,
+                                        idle_max_ms,
+                                        "sync idle backoff reached its ceiling; \
+                                         with P2P down this is now the freshness bound"
+                                    );
+                                }
+                                poll.as_mut().reset(
+                                    tokio::time::Instant::now()
+                                        + std::time::Duration::from_millis(next_ms),
+                                );
                             }
                         }
                     }
@@ -1466,8 +1590,6 @@ impl NodeRuntime {
             epochs,
             designations,
             coop,
-            existence,
-            existence_seeded: AtomicBool::new(false),
             upload,
             forward,
             placement,
@@ -1732,20 +1854,6 @@ impl NodeRuntime {
         let mut options = options;
         if selector.is_some() && !rw_snapshot {
             options.push(fuser::MountOption::RO);
-        }
-        // Matches the original monolithic `mount()`'s exact call site:
-        // right before the FUSE session is built, not any earlier. The
-        // scan's own 100ms grace delay assumes the mount is about to
-        // attach; spawning it during node-level startup (well before any
-        // view exists) measurably shifted upload-path timing in testing
-        // and is not an equivalent reordering. Only the first view seeds
-        // it — the scan is bucket-wide and node-level, not per-view.
-        if self
-            .existence_seeded
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            self.existence.spawn_seed(self.store.clone(), &self.rt);
         }
         // Self-heal a stale mountpoint left by a previous daemon that
         // exited without unmounting (crash, kill, or an orphaned view
@@ -2079,6 +2187,33 @@ mod tests {
             rt.clone(),
         )
         .expect("NodeRuntime::start")
+    }
+
+    /// The idle poll doubles from the configured interval and stops at the
+    /// ceiling, which is what turns an idle node's steady-state S3 cost
+    /// from ~2 requests/s into ~2 requests/minute (plan 26 step 4c).
+    #[test]
+    fn idle_poll_doubles_up_to_the_ceiling() {
+        let (interval, max) = (500u64, 30_000u64);
+        assert_eq!(next_poll_ms(interval, 0, max), 500);
+        assert_eq!(next_poll_ms(interval, 1, max), 1_000);
+        assert_eq!(next_poll_ms(interval, 2, max), 2_000);
+        assert_eq!(next_poll_ms(interval, 5, max), 16_000);
+        // ~6 idle rounds (about 30 s of quiet) reach the ceiling, and no
+        // number of further idle rounds goes past it.
+        assert_eq!(next_poll_ms(interval, 6, max), 30_000);
+        assert_eq!(next_poll_ms(interval, 7, max), 30_000);
+        assert_eq!(next_poll_ms(interval, 4_000, max), 30_000);
+        // The shift must not overflow or wrap into a short poll: 500 << 60
+        // wraps in `u64`, and `<< 64` is not a shift at all.
+        assert_eq!(next_poll_ms(interval, 60, max), 30_000);
+        assert_eq!(next_poll_ms(interval, 64, max), 30_000);
+        assert_eq!(next_poll_ms(interval, u32::MAX, max), 30_000);
+        // The interval is the floor even if the ceiling is set below it.
+        assert_eq!(next_poll_ms(interval, 0, 100), 500);
+        assert_eq!(next_poll_ms(interval, 9, 100), 500);
+        // A ceiling equal to the interval disables the backoff entirely.
+        assert_eq!(next_poll_ms(interval, 3, interval), 500);
     }
 
     fn view(inner_path: &str, mountpoint: PathBuf) -> ViewConfig {

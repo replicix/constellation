@@ -79,6 +79,23 @@ pub struct Lease {
     /// no TTL to wait out.
     #[serde(default)]
     pub released: bool,
+    /// Node ids that have asked for this partition and are waiting, sorted
+    /// and deduped. A would-be holder that finds the lease busy writes
+    /// itself in here (the only field it may touch), which is what makes
+    /// the holder's idle release *conditional*: leases are sticky, and a
+    /// node that keeps writing never hands one back to nobody.
+    ///
+    /// The holder learns of a request the same way it learns of anything
+    /// else — its next renew CAS fails against the edited object — so this
+    /// costs no extra request on either side. Cleared by [`Lease::granted`]
+    /// and [`Lease::released`]: the request has been answered. Preserved by
+    /// [`Lease::renewed`], or a holder renewing would erase the very
+    /// request it is supposed to act on.
+    ///
+    /// `serde(default)` for the same reason as every other field here, not
+    /// for compatibility with older objects: see [`LEASE_VERSION`].
+    #[serde(default)]
+    pub wanted_by: Vec<u64>,
 }
 
 fn default_version() -> u32 {
@@ -95,10 +112,13 @@ impl Lease {
             epoch,
             expires_unix_ms: now_unix_ms() + ttl_ms as i64,
             released: false,
+            wanted_by: Vec::new(),
         }
     }
 
-    /// Same holder and epoch, pushed-out expiry.
+    /// Same holder and epoch, pushed-out expiry. Any pending request in
+    /// `wanted_by` survives: it is addressed to this holder and is only
+    /// answered by releasing.
     pub fn renewed(&self, ttl_ms: u64) -> Self {
         Self {
             expires_unix_ms: now_unix_ms() + ttl_ms as i64,
@@ -108,10 +128,28 @@ impl Lease {
     }
 
     /// Voluntary hand-back: holder and epoch are preserved as history,
-    /// `released` makes the partition claimable without waiting.
+    /// `released` makes the partition claimable without waiting. Requests
+    /// are dropped — the partition is free, so there is nothing left to
+    /// ask for, and a request carried into the next holder's tenure would
+    /// make it release for a node that has long since moved on.
     pub fn released(&self) -> Self {
         Self {
             released: true,
+            wanted_by: Vec::new(),
+            ..self.clone()
+        }
+    }
+
+    /// This lease with `node_id` recorded as waiting for it. Everything
+    /// else — holder, epoch, expiry — is copied unchanged: a requester
+    /// swaps the object, but it is not allowed to move the lease.
+    pub fn wanting(&self, node_id: u64) -> Self {
+        let mut wanted_by = self.wanted_by.clone();
+        wanted_by.push(node_id);
+        wanted_by.sort_unstable();
+        wanted_by.dedup();
+        Self {
+            wanted_by,
             ..self.clone()
         }
     }
@@ -389,6 +427,41 @@ mod tests {
             s.try_create(&Lease::granted(P, 2, 1, TTL)).await,
             Err(StoreError::CasConflict)
         ));
+    }
+
+    /// The sticky-lease handshake in one object: a requester may add
+    /// itself, a renewal must carry that request forward (erasing it would
+    /// make the holder deaf to the only signal a peer has when P2P is
+    /// down), and both ways of parting with the lease answer it.
+    #[tokio::test]
+    async fn renew_preserves_wanted_by_while_grant_and_release_clear_it() {
+        let granted = Lease::granted(P, 7, 1, TTL);
+        assert!(granted.wanted_by.is_empty());
+
+        let wanted = granted.wanting(9).wanting(3).wanting(9);
+        assert_eq!(wanted.wanted_by, vec![3, 9], "sorted and deduped");
+        assert_eq!(
+            (wanted.holder, wanted.epoch, wanted.expires_unix_ms),
+            (granted.holder, granted.epoch, granted.expires_unix_ms),
+            "a requester may not move the lease, only sign the waiting list"
+        );
+
+        assert_eq!(wanted.renewed(TTL).wanted_by, vec![3, 9]);
+        assert!(wanted.released().wanted_by.is_empty());
+        assert!(Lease::granted(P, 9, wanted.epoch + 1, TTL)
+            .wanted_by
+            .is_empty());
+
+        // And through the store, since that is where it has to survive.
+        let s = ls(LeaseMode::Cas);
+        s.try_create(&granted).await.unwrap();
+        let (cur, tag) = s.get().await.unwrap().unwrap();
+        s.try_swap(&cur.wanting(9), &tag).await.unwrap();
+        let (edited, tag) = s.get().await.unwrap().unwrap();
+        assert_eq!((edited.holder, edited.epoch), (7, 1));
+        assert_eq!(edited.wanted_by, vec![9]);
+        s.try_swap(&edited.renewed(TTL), &tag).await.unwrap();
+        assert_eq!(s.get().await.unwrap().unwrap().0.wanted_by, vec![9]);
     }
 
     #[tokio::test]

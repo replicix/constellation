@@ -1026,6 +1026,14 @@ impl ConstellationFs {
             }
         }
         let start = std::time::Instant::now();
+        // Each retry is a classify GET (and, the first time round, a CAS
+        // PUT registering this node in the holder's `wanted_by`). A fixed
+        // 100 ms sleep meant ten of those per second per blocked thread for
+        // as long as the wait lasts, which on a sticky lease is up to half
+        // a TTL. Back off instead: the first few retries stay responsive
+        // for the common case where the holder is about to let go, and a
+        // long wait settles at one probe every 2 s.
+        let mut backoff = Duration::from_millis(100);
         loop {
             let (tx, rx) = tokio::sync::oneshot::channel();
             if h.tx
@@ -1059,7 +1067,8 @@ impl ConstellationFs {
                 );
                 return Err(libc::EIO);
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(2000));
         }
     }
 

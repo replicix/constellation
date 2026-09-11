@@ -5,6 +5,7 @@
 //!   client (host) -> 127.0.0.1:<toxi-port> -> toxiproxy -> floci:4566
 
 use crate::docker::{Container, Network};
+use crate::reqlog::CountingProxy;
 use crate::toxiproxy::{Proxy, Toxiproxy};
 use anyhow::{Context, Result};
 
@@ -12,9 +13,28 @@ pub const FLOCI_IMAGE: &str = "floci/floci:1.7.0-compat";
 pub const TOXIPROXY_IMAGE: &str = "ghcr.io/shopify/toxiproxy:2.12.0";
 pub const BUCKET: &str = "constellation-harness";
 
+/// Prefix for the docker container and network names this environment
+/// owns, from `CONSTELLATION_HARNESS_DOCKER_PREFIX` (default
+/// `constellation-harness`).
+///
+/// Startup force-removes leftovers under its own prefix, because a
+/// crashed run holds the network open. That makes two harness processes
+/// on one host mutually destructive: the second one's cleanup deletes the
+/// first one's live S3 out from under it, and the first one then fails
+/// with connection-refused somewhere unrelated. Giving each run a
+/// distinct prefix is the way to run two at once (e.g. a long matrix in
+/// one terminal and a single scenario in another).
+fn docker_prefix() -> String {
+    std::env::var("CONSTELLATION_HARNESS_DOCKER_PREFIX")
+        .unwrap_or_else(|_| "constellation-harness".to_string())
+}
+
 pub struct S3Env {
     // Drop order matters: proxy state -> containers -> network.
     pub toxiproxy: Toxiproxy,
+    /// Container name of the S3 emulator, as toxiproxy resolves it on the
+    /// private network.
+    floci_name: String,
     _toxi: Container,
     _floci: Container,
     _net: Network,
@@ -27,11 +47,14 @@ pub struct S3Env {
 
 impl S3Env {
     pub fn start() -> Result<S3Env> {
+        let prefix = docker_prefix();
+        let floci_name = format!("{prefix}-floci");
+        let toxi_name = format!("{prefix}-toxiproxy");
         // Leftovers from a crashed run would hold the network open.
-        let _ = crate::docker::docker(&["rm", "-f", "harness-floci", "harness-toxiproxy"]);
-        let net = Network::create("constellation-harness")?;
+        let _ = crate::docker::docker(&["rm", "-f", &floci_name, &toxi_name]);
+        let net = Network::create(&prefix)?;
         let floci = Container::run(
-            "harness-floci",
+            &floci_name,
             FLOCI_IMAGE,
             &[
                 "--network",
@@ -43,7 +66,7 @@ impl S3Env {
             ],
         )?;
         let toxi = Container::run(
-            "harness-toxiproxy",
+            &toxi_name,
             TOXIPROXY_IMAGE,
             &[
                 "--network",
@@ -67,6 +90,7 @@ impl S3Env {
 
         Ok(S3Env {
             toxiproxy,
+            floci_name,
             _toxi: toxi,
             _floci: floci,
             _net: net,
@@ -78,7 +102,20 @@ impl S3Env {
     /// The S3 proxy all constellation clients go through.
     pub fn s3_proxy(&self) -> Result<Proxy<'_>> {
         self.toxiproxy
-            .create_proxy("s3", "0.0.0.0:4567", "harness-floci:4566")
+            .create_proxy("s3", "0.0.0.0:4567", &format!("{}:4566", self.floci_name))
+    }
+
+    /// A request-counting relay chained *in front of* toxiproxy, for
+    /// scenarios that assert on S3 request classes (plan 26). Clients
+    /// given `counter.endpoint()` still go through every toxic:
+    ///
+    ///   client -> counter (host) -> toxiproxy -> floci
+    pub fn counting_proxy(&self) -> Result<CountingProxy> {
+        let upstream = self
+            .endpoint
+            .strip_prefix("http://")
+            .context("S3 endpoint is not http://")?;
+        CountingProxy::start(upstream)
     }
 }
 

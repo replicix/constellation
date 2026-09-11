@@ -23,16 +23,53 @@
 //! handful of atomics, on every mutating op (nanoseconds) and only fall
 //! back to the sync task's channel when the view says the lease is not
 //! currently valid.
+//!
+//! ### Leases are sticky (plan 26 Step 7)
+//!
+//! A holder used to hand the lease back after 30 s without a mutation,
+//! whether or not anyone wanted it. For the overwhelmingly common
+//! single-writer-at-a-time mount that bought nothing and cost the next
+//! write three S3 round trips (GET lease → tail → CAS PUT) on the FUSE
+//! path. Idle release is now *conditional*: it fires only once a peer has
+//! recorded itself in [`Lease::wanted_by`], and never before
+//! [`LEASE_MIN_DWELL_MS`] of tenure, so two nodes alternating writes
+//! cannot ping-pong the lease between them.
+//!
+//! Worst-case reasoning, with P2P down: a requester registers `wanted_by`
+//! at its first `Acquire` (one CAS round trip); the holder notices at its
+//! next renewal (at most TTL/2 = 30 s away), finishes any in-flight batch
+//! and releases; the requester claims on its next retry. Today's worst
+//! case was the same 30 s (the unconditional idle release) or an EIO after
+//! 2×TTL if the holder was busy. So sticky leases are never worse than
+//! what they replace, and they remove the 3-round-trip re-acquire from the
+//! common path entirely. With P2P up, forwarding (ADR-14) means the
+//! requester never needs the lease at all, and the existing `HandOff`
+//! request remains the fast path — it does not go through `wanted_by`.
+//!
+//! Note what the requester's edit does *not* rely on: it is a CAS swap
+//! that can lose, and a lost swap is simply dropped (we try again on the
+//! next `Acquire`). Nothing here treats a 412 as a fast failure — measured
+//! against AWS a stale `If-Match` takes 599 ms to come back rejected, four
+//! times a plain GET, server-side and not the client's retries — so the
+//! conflict paths retry on a later round rather than in a tight loop.
 
 use anyhow::{bail, Result};
 use constellation_store_s3::lease::{lease_ttl_ms, now_unix_ms, LeaseMode};
 use constellation_store_s3::{Lease, LeaseStore, LeaseTag, StoreError};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Default write-idle period after which a holder hands the lease back
 /// so a peer can take it without waiting out the TTL.
 pub const DEFAULT_IDLE_RELEASE_MS: u64 = 30_000;
+
+/// Minimum tenure before a holder may idle-release, however long it has
+/// been idle and however loudly a peer is asking. Two nodes writing to the
+/// same partition in turn would otherwise trade the lease on every lull,
+/// and each trade is a CAS pair plus an epoch bump that fences whatever
+/// the previous holder had not yet flushed.
+pub const LEASE_MIN_DWELL_MS: u64 = 5_000;
 
 /// Treat the lease as unusable this close to expiry: renewal happens at
 /// half-TTL, so a mutation landing inside the margin should route
@@ -122,8 +159,15 @@ pub enum Plan {
         tag: LeaseTag,
         needs_tail: bool,
     },
-    /// Another node holds an unexpired lease.
-    Busy { holder: u64, expires_in_ms: i64 },
+    /// Another node holds an unexpired lease. `prev`/`tag` are carried so
+    /// the caller can register itself in [`Lease::wanted_by`] without a
+    /// second read: the classify GET already paid for them.
+    Busy {
+        holder: u64,
+        expires_in_ms: i64,
+        prev: Lease,
+        tag: LeaseTag,
+    },
 }
 
 impl Plan {
@@ -159,6 +203,11 @@ pub struct LeaseKeeper {
     view: Arc<LeaseView>,
     /// The lease we believe we hold, with the tag needed to swap it.
     held: Option<(Lease, LeaseTag)>,
+    /// When the current tenure began; gates [`LEASE_MIN_DWELL_MS`].
+    held_since: Option<Instant>,
+    /// Node ids waiting for this partition, as of the last lease object we
+    /// read. Empty means nobody is asking, and a sticky lease is kept.
+    wanted: Vec<u64>,
     /// Open continuation-epoch promise forbids S3 takeover (DESIGN.md §5.3).
     takeover_gate: Arc<AtomicBool>,
     /// Diagnostic tag naming the mechanism behind the next acquisition
@@ -176,6 +225,8 @@ impl LeaseKeeper {
             idle_release_ms: idle_release_ms(),
             view: Arc::new(LeaseView::default()),
             held: None,
+            held_since: None,
+            wanted: Vec::new(),
             takeover_gate: Arc::new(AtomicBool::new(false)),
             acquire_reason: "unspecified",
         }
@@ -286,6 +337,8 @@ impl LeaseKeeper {
             return Ok(Plan::Busy {
                 holder: prev.holder,
                 expires_in_ms: prev.expires_in_ms(now),
+                prev,
+                tag,
             });
         }
         let needs_tail = prev.holder != 0 && prev.holder != self.node_id;
@@ -297,6 +350,8 @@ impl LeaseKeeper {
             return Ok(Plan::Busy {
                 holder: prev.holder,
                 expires_in_ms: prev.expires_in_ms(now),
+                prev,
+                tag,
             });
         }
         Ok(Plan::Claim {
@@ -364,6 +419,12 @@ impl LeaseKeeper {
                 );
                 self.view.set_held(&lease);
                 self.view.touch();
+                // A fresh grant answers every pending request by definition
+                // (`Lease::granted` clears `wanted_by`), and starts the
+                // dwell clock that keeps the next one from being answered
+                // the instant it arrives.
+                self.wanted.clear();
+                self.held_since = Some(Instant::now());
                 self.held = Some((lease, tag));
                 self.refresh_condemned().await;
                 Ok(true)
@@ -404,6 +465,46 @@ impl LeaseKeeper {
                 Ok(())
             }
             Err(StoreError::CasConflict) => {
+                // Not necessarily a deposition any more: a peer that wants
+                // this partition edits `wanted_by` in place, which changes
+                // the etag and so fails exactly this CAS. Re-read before
+                // concluding anything, and keep the view intact until we
+                // know — clearing it first would stall the FUSE threads on
+                // a lease we still hold.
+                if let Some((cur, fresh_tag)) = self.store.get().await? {
+                    if cur.holder == self.node_id
+                        && cur.epoch == lease.epoch
+                        && !cur.released
+                        && !cur.is_expired(now_unix_ms())
+                    {
+                        self.wanted = cur.wanted_by.clone();
+                        tracing::debug!(
+                            wanted_by = ?self.wanted,
+                            epoch = cur.epoch,
+                            "renew CAS lost to a handoff request, not a takeover"
+                        );
+                        let renewed = cur.renewed(self.ttl_ms);
+                        return match self.store.try_swap(&renewed, &fresh_tag).await {
+                            Ok(tag) => {
+                                self.view.set_held(&renewed);
+                                self.held = Some((renewed, tag));
+                                self.refresh_condemned().await;
+                                Ok(())
+                            }
+                            // Lost again: somebody is moving faster than we
+                            // can read. Fall back to the deposition probe,
+                            // which is authoritative.
+                            Err(StoreError::CasConflict) => {
+                                self.view.clear();
+                                self.diagnose_lost_renew(&lease).await
+                            }
+                            Err(e) => {
+                                self.held = Some((cur, fresh_tag));
+                                Err(e.into())
+                            }
+                        };
+                    }
+                }
                 self.view.clear();
                 self.diagnose_lost_renew(&lease).await
             }
@@ -413,6 +514,22 @@ impl LeaseKeeper {
                 self.held = Some((lease, tag));
                 Err(e.into())
             }
+        }
+    }
+
+    /// Record `self.node_id` in a *foreign* holder's lease object: the
+    /// S3-only way of asking for a partition somebody else is sitting on.
+    /// Only `wanted_by` changes — holder, epoch and expiry are copied
+    /// across — so this can never move write authority, and a losing CAS
+    /// is not an error: somebody else edited or took the lease in the
+    /// meantime and the next `Acquire` re-reads it anyway.
+    ///
+    /// Returns whether the request landed.
+    pub async fn register_wanted(&self, prev: &Lease, tag: &LeaseTag) -> Result<bool> {
+        match self.store.try_swap(&prev.wanting(self.node_id), tag).await {
+            Ok(_) => Ok(true),
+            Err(StoreError::CasConflict) => Ok(false),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -477,13 +594,46 @@ impl LeaseKeeper {
         );
     }
 
-    /// Write-idle with nothing pending: hand the lease back so a peer
-    /// does not have to wait out the TTL. Reacquiring costs one CAS.
+    /// Write-idle, nothing pending, **and somebody is waiting**: hand the
+    /// lease back rather than making them sit out the TTL.
+    ///
+    /// The requester condition is what makes leases sticky (see the module
+    /// doc). Without it an idle holder gave up write authority that nobody
+    /// else wanted, and paid three S3 round trips on the FUSE path to take
+    /// it back the moment it wrote again. The dwell floor bounds the other
+    /// direction: a lease handed over cannot be handed back immediately.
     pub fn idle_release_due(&self, journal_backlog: u64) -> bool {
         !self.view.epoch_held.load(Ordering::Relaxed)
             && self.held.is_some()
             && journal_backlog == 0
+            && !self.wanted.is_empty()
             && self.view.idle_for_ms() >= self.idle_release_ms as i64
+            && self.held_for_ms() >= LEASE_MIN_DWELL_MS as i64
+    }
+
+    /// How long this node has held the current lease, in ms. `0` when it
+    /// holds none, which keeps [`Self::idle_release_due`] false there.
+    fn held_for_ms(&self) -> i64 {
+        self.held_since
+            .map(|at| at.elapsed().as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Test hook: make the two *timers* in [`Self::idle_release_due`] read
+    /// as elapsed without sleeping through them. Only the timers — whether
+    /// a requester is registered, and whether the journal is drained, is
+    /// what the tests using this are about.
+    #[cfg(test)]
+    pub(crate) fn expire_idle_timers_for_test(&mut self) {
+        self.idle_release_ms = 0;
+        self.held_since =
+            Some(Instant::now() - std::time::Duration::from_millis(LEASE_MIN_DWELL_MS));
+    }
+
+    /// Node ids currently recorded as waiting for this partition.
+    #[cfg(test)]
+    pub(crate) fn wanted_by(&self) -> &[u64] {
+        &self.wanted
     }
 
     /// Give the lease up (idle release, or clean unmount after the final
@@ -497,6 +647,10 @@ impl LeaseKeeper {
             return Ok(None);
         };
         self.view.clear();
+        // `Lease::released` drops `wanted_by`: the partition is free, so
+        // every pending request has just been answered.
+        self.wanted.clear();
+        self.held_since = None;
         match self.store.try_swap(&lease.released(), &tag).await {
             Ok(new_tag) => {
                 tracing::info!(epoch = lease.epoch, "released partition lease");

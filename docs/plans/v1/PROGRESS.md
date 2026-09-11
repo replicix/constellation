@@ -1462,3 +1462,478 @@ That table is this node's not-yet-uploaded set; foreign
 - `target/release/harness run fresh-node-bootstrap checkpoint-strips-pending-upload`
   — both PASSED.
 - Full harness matrix and pjdfstest — see below / CI.
+
+## Plan 26 steps 0–2 — checkpoint cadence, inline prune, per-partition log retention: **DONE**
+
+Steps 9–10 of `wip/26-metadata-plane-s3-efficiency.md` (config docs,
+harness scenarios) are **not** in this slice; steps 3, 4–5, 6–7 and 8
+landed separately, below.
+
+| Item | State | Where |
+|---|---|---|
+| Log retention floored per partition against `checkpoints/VECTOR.json`, never against LATEST's cluster-wide `covered` (finding-6 data-loss bug) | done | `cli::gc::metadata_candidates` |
+| A partition absent from the vector is never pruned; `LATEST` without a vector is a hard error (no global-floor fallback) | done | `cli::gc::metadata_candidates` |
+| Evidence JSON gains `partition` + `vector_applied` | done | `cli::gc::metadata_candidates` |
+| Byte-proportional checkpoint cadence: `bytes_since_ckpt >= ratio × last_ckpt_bytes`, with `CHECKPOINT_EVERY` kept as a count floor and the opt-in time floor unchanged | done | `cli::shipper` (`checkpoint_is_due`, `ship_part`, `checkpoint`) |
+| `CONSTELLATION_CHECKPOINT_RATIO` (default `1.0`; `<= 0`/unparseable → warn + default), read once at attach into `ckpt_ratio` | done | `cli::shipper::checkpoint_ratio` |
+| `CheckpointRef { seq, bytes }`; `bytes` = uncompressed snapshot size | done | `store-s3::log` |
+| `LogStore::get_checkpoint_ref()` (pointer-only read); `get_latest_checkpoint` uses it | done | `store-s3::log` |
+| `Shipper::seed_checkpoint_baseline()` seeds `last_ckpt_bytes` across restarts, called inside the attach-time `block_on` | done | `cli::shipper`, `cli::node_runtime` |
+| Inline prune of superseded checkpoints after LATEST + VECTOR both land: newest 2 kept, `keep_seq` never deleted, concurrency 8, `NotFound` ignored, failure logged and left to GC | done | `store-s3::log::prune_superseded_checkpoints` |
+| `get_latest_checkpoint` re-reads `LATEST` once and retries on a `NotFound` snapshot GET | done | `store-s3::log` |
+| Unit: per-partition retention floor (two vector cases), `checkpoint_trigger_is_byte_proportional_once_seeded`, `CheckpointRef` round-trip with `bytes`, inline-prune newest-2, delete-failing store still succeeds, `get_latest_checkpoint` race recovery | done | `cli::gc`, `cli::shipper`, `store-s3::log` |
+
+### Design decisions
+
+- **The retention floor reads `checkpoints/VECTOR.json` directly, not via
+  `LogStore::get_checkpoint_vector`.** That helper maps a missing vector to
+  an empty one, which would silently turn "corrupt bucket" into "prune
+  nothing" and hide exactly the condition the plan wants to fail on. GC
+  therefore does its own GET and `bail!`s when `LATEST` exists without a
+  vector.
+- **Cadence compares uncompressed to uncompressed.** `bytes_since_ckpt`
+  accumulates the postcard envelope handed to `put_segment` (pre-zstd,
+  pre-seal) so it is on the same scale as `snap.len()`, the baseline. Using
+  at-rest bytes on one side and logical bytes on the other would make the
+  ratio depend on two unrelated compression factors.
+- **`last_ckpt_bytes == 0` keeps the old count-only behaviour.** A fresh
+  mount, or a restart whose best-effort seed failed, falls back to the
+  `CHECKPOINT_EVERY` trigger — a seed failure is never worse than
+  pre-plan-26 behaviour, so the seed does not need to be fatal.
+- **Inline prune keeps newest-2, matching GC.** Newest-1 would break a
+  bootstrap that read `LATEST` just before it moved; the defensive
+  re-read-once in `get_latest_checkpoint` covers the remaining window
+  (two rapid checkpoints inside one bootstrap).
+- **Measurement context (plan 26 Appendix, 2026-09-10):** cadence is the
+  write-amplification fix (641 checkpoints / 54.55 GiB protecting a 0.17
+  GiB log on a 1.85M-file rsync); it is independent of the read-side and
+  steady-state findings that steps 3–8 address.
+
+### Gates run in this environment
+
+- `cargo fmt --all` — clean; `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — zero failures (cli 169, store-s3 89, meta 73,
+  fs-core 68, plus the smaller suites).
+- `bash tests/smoke.sh` — `SMOKE TEST PASSED`.
+- Docker lanes (`tests/integration.sh`, harness matrix, pjdfstest) not run
+  in this slice — see CI.
+
+## Plan 26 step 3 — the holder does not tail partitions it holds: **DONE**
+
+Steps 9–10 remain open. This slice is purely about removing the
+per-round LIST of a stream this node is the only legal appender of.
+
+| Item | State | Where |
+|---|---|---|
+| `tail_all_except(&held)` skips the LIST for held partitions; `tail_all` is the `&HashSet::new()` call and stays what `tail_to_head` uses, so the takeover witness still sees every stream | done | `cli::shipper::tail_all_except` |
+| `held` built from the keeper map via `ship_epoch().is_some()` in `sync_all_inner` and `shutdown_all` | done | `cli::shipper::held_partitions` |
+| `sync_one` skips `tail_part` while `lease.ship_epoch().is_some()` | done | `cli::shipper::sync_one` |
+| `ship_part` forces one `tail_part` on `StoreError::AlreadyExists` before retrying, so a restarted holder absorbs its own unacked segment instead of spinning at the same sequence | done | `cli::shipper::ship_part` |
+| A keeper that goes lost/expired/released drops out of `held` on its own and its stream is read again on the next round (verified, not assumed) | done | `cli::lease::LeaseKeeper::ship_epoch` (unchanged), test below |
+| Unit: `holder_ships_without_listing_its_own_stream` (counting `ObjectStore` decorator; 0 listings of `log/p0` across 10 shipped rounds), `restarted_holder_recovers_own_unacked_segment_without_tailing_all`, `a_deposed_keeper_leaves_the_held_set_and_tails_again` | done | `cli::shipper` tests |
+
+### Design decisions
+
+- **The held set is gated on `ship_epoch()`, not on "a keeper exists".**
+  `ship_epoch()` already returns `None` for a keeper that is expired,
+  released or deposed, which is exactly the set of states in which another
+  node may legally be appending to that stream. No forced-tail bookkeeping
+  for the lost transition was needed: a test drives A to deposition through
+  `renew_now` and asserts it tails the new holder's segment on its very
+  next round. Adding an explicit force would have been a second mechanism
+  for a condition the epoch already expresses.
+- **`sync_one` gained an explicit `ensure_part`.** The skipped `tail_part`
+  was also what registered a partition acquired straight from
+  `Plan::Create`, and `ship_part` indexes `self.parts` unconditionally.
+  `tail_all_except` likewise still `ensure_part`s held partitions (a split
+  can reveal a child we must ship to); only the LIST is skipped.
+- **Fencing a late segment is now discovered by the CAS collision, not by
+  a poll.** A deposed predecessor can still write at the head of a stream
+  the new holder owns, and the new holder no longer polls it — so the
+  `AlreadyExists` tail is the only path that surfaces it. It still fences,
+  and the holder still ships *past* the fenced sequence rather than over
+  it. `lower_epoch_segment_is_fenced` was adapted to that path (the holder
+  now has a record to ship when the zombie lands) and gained two
+  assertions; nothing it asserted before was dropped or loosened.
+- **Measurement context (plan 26 Appendix, 2026-09-10):** the self-LIST
+  costs a full round trip per sync round to learn nothing. Dropping it is
+  2.6 → 5.1 shipped segments/s HU→AWS, 24.5 → 33.1 same-region, 5.4 → 6.2
+  HU→OVH. The win is largest exactly where it hurts most (WAN), and it is
+  free everywhere else.
+
+### Gates run in this environment
+
+- `cargo fmt --all` — clean; `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — zero failures (cli 172, store-s3 89, meta 73,
+  fs-core 68, plus the smaller suites).
+- `bash tests/smoke.sh` — `SMOKE TEST PASSED`.
+- Docker lanes (`tests/integration.sh`, harness matrix, pjdfstest) not run
+  in this slice — see CI.
+
+## Plan 26 steps 4–5 — GET-next tailer, idle backoff, ship-loop hygiene: **DONE**
+
+Steps 9–10 remain open (config docs, harness
+scenarios). This slice removes the
+per-round LIST from the *follower* side, stops an idle node polling at a
+fixed 500 ms, and bounds a segment by bytes as well as by record count.
+
+| Item | State | Where |
+|---|---|---|
+| `LogStore::get_run(from, k)`: k concurrent segment GETs, longest contiguous run returned, `NotFound` at `from + i` ends it, everything past the first gap discarded, non-`NotFound` errors propagated, bodies opened through the existing `open_segment` (E2E included) | done | `store-s3::log::get_run` |
+| Tailer probes with GET-next and only falls back to LIST in catch-up (all k probes hit), then loops for another probe | done | `cli::shipper::{probe_run,tail_part_probed,apply_listed}` |
+| `tail_all_except` keeps its parallel-across-partitions shape — the sweep is now a parallel probe, not a parallel LIST | done | `cli::shipper::tail_all_except` |
+| `TAIL_GET_CONCURRENCY` 8 → 16 | done | `cli::shipper` |
+| `bootstrap()` keeps LIST + sequential GET (it is always in catch-up mode) | unchanged, deliberate | `cli::shipper::bootstrap` |
+| `CONSTELLATION_SYNC_IDLE_MAX_MS` (default `30_000`) with `CONSTELLATION_SYNC_INTERVAL_MS` as the floor; `next_poll_ms(interval, idle_rounds, max)` doubles per idle round and clamps | done | `cli::node_runtime::next_poll_ms` |
+| Productive round = a segment applied or shipped (`spool.head_seq` before/after) **or** a non-empty journal; any `SyncRequest` (FUSE nudge, barrier, acquire, forward, gossip `Nudge`) resets `idle_rounds` to 0 and the deadline to the interval; `debug!` on ceiling and on reset | done | `cli::node_runtime` `'sync` loop |
+| `SEGMENT_MAX_BYTES = 4 MiB`: the batch is cut to the largest prefix that fits, leftovers stay journaled and ship next round, `ack_journal_rows_at` gets only the shipped seqs, ride-along atime rows count against the cap and are cleared only if they shipped | done | `cli::shipper::{records_within_cap,ship_part}` |
+| Journal read **once** per `ship_all` and passed into `ship_part(part, lease, batch)`; `ship_part_taking` is the thin wrapper for `sync_one` | done | `cli::shipper::{ship_all,ship_part,ship_part_taking}` |
+| `SqliteMeta::journal_has_xpart_dst(txid)` replaces the two `take_journal_grouped(usize::MAX)` full-journal scans in `note_xpart_shipped` / `consider_xpart_aborts` | done | `meta::sqlite`, `cli::shipper` |
+| No PUT pipelining, with the measured numbers recorded on `ship_part` so the next reader does not re-derive them | done, deliberate | `cli::shipper::ship_part` doc |
+| Unit: `get_run` gap/empty/k-wider-than-run + E2E open; `tailer_uses_get_probes_not_list_in_steady_state`; `oversized_batch_is_split_at_the_byte_cap`; `idle_poll_doubles_up_to_the_ceiling`; `journal_has_xpart_dst_finds_only_the_named_txid` | done | `store-s3::log`, `cli::shipper`, `cli::node_runtime`, `meta::sqlite` |
+
+### Design decisions
+
+- **The probe costs k 404s per idle round on a real backend, and that is
+  only a win together with the backoff.** A GET is ~1/12.5 of a LIST on
+  AWS, so k = 16 misses is ~1.3 LISTs' worth of request price: step 4b on
+  its own would make an idle node marginally *more* expensive, not less.
+  Step 4c is what turns it around — 500 ms → 30 s between polls is 60×
+  fewer rounds, so the pair lands at roughly 1/45 of today's idle cost.
+  They are one change and should not be split. (Latency is neutral either
+  way: 177 ms GET-404 vs 175 ms idle LIST HU→AWS, 34 vs 34 on OVH. The
+  one measured counter-example is same-region, where an idle LIST is
+  *faster* — 14 ms vs 25 ms — and only the request price carries the
+  choice there.)
+- **Catch-up keeps LIST.** A saturated probe means "possibly far behind",
+  and one 1000-key page (171–344 ms everywhere) beats k round trips at
+  that depth. Measured over 64 segments: 1693 ms for probe+LIST catch-up
+  at k = 16 against 3132 ms for the LIST-every-round tailer.
+- **`buffered` makes the idle probe one request against `InMemory` and k
+  against S3.** The futures are polled in order; a store that answers the
+  head synchronously never polls the siblings. The unit test therefore
+  asserts one first-miss GET per idle round (the plan's stated
+  alternative), and the k-wide fan-out is what a real backend sees.
+- **The backoff reset is guarded by `idle_rounds > 0`.** Resetting the
+  poll deadline on *every* request would re-introduce the starvation the
+  persistent deadline exists to prevent (a peer nudging faster than the
+  interval could hold the periodic round off forever). Resetting at most
+  once per idle period satisfies "any request resets it" without that.
+- **A non-empty journal is never idle.** A node that cannot ship (foreign
+  lease held) still has work pending; backing off there would delay its
+  own writes reaching S3 by up to `idle_max_ms`.
+- **Interrupted rounds are neither productive nor idle.** A round cut
+  short by a request leaves `idle_rounds` alone; the request itself resets
+  it on the next pass.
+- **A single record larger than the cap still ships.** `records_within_cap`
+  always keeps the first record: the cap bounds *batching*, and refusing
+  to ship an oversized record would wedge its partition's stream forever.
+- **No PUT pipelining (plan 26 Appendix, 2026-09-10).** Pipelining is a
+  real 5–10× on segments/s (5.1 → 29.4 HU→AWS at depth 8, 33.1 → 231
+  same-region, 6.2 → 41.6 HU→OVH), and is still declined: a holder
+  reaches the same *records*/s by letting the journal accumulate during
+  the in-flight PUT and shipping one larger segment — `SEGMENT_BATCH` =
+  10k records at a 200 ms RTT is ~50k records/s, an order of magnitude
+  above what the FUSE path produces. Depth > 1 buys throughput we do not
+  need in exchange for a gap-on-failure hazard: one failed sequence among
+  several in flight stalls every tailer behind it.
+
+### Freshness consequence (documented, per plan 26 step 4c)
+
+With P2P **up** the backoff is invisible: a gossip `Nudge` resets it the
+moment a peer publishes. With P2P **down**, a follower's freshness bound
+degrades from 0.5 s to `CONSTELLATION_SYNC_IDLE_MAX_MS` (30 s) after ~6
+idle rounds — 0.5 + 1 + 2 + 4 + 8 + 16 s ≈ 31 s of complete quiet — and
+snaps back to 0.5 s on the next segment it applies, because applying one
+is a productive round. DESIGN.md §12's posture ("eventual S3 polling
+closes it") is unchanged; its bound is now `idle_max_ms` rather than the
+poll interval. DESIGN.md is not edited (CONVENTIONS rule 5).
+
+Two knock-on checks: the pruner's staleness gate (`CONSTELLATION_PRUNE_MAX_LAG_S`,
+default 300 s) is an order of magnitude above the new ceiling, so it is
+unaffected; and harness scenarios that assert cross-node convergence with
+P2P disabled inside a 10–20 s `eventually` deadline could now need up to
+30 s if the writer starts after a long idle period. The docker lanes were
+not run in this slice (see below), so that is called out as a watch item
+for CI rather than an observed failure.
+
+### Gates run in this environment
+
+- `cargo fmt --all` — clean; `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — zero failures (cli 175, meta 90 + 5, store-s3
+  75, net 68, fs-core 33, plus the smaller suites).
+- `bash tests/smoke.sh` — `SMOKE TEST PASSED`.
+- Docker lanes (`tests/integration.sh`, harness matrix, pjdfstest) not run
+  in this slice — see CI.
+
+### Behaviour a pinned test had to follow
+
+`restarted_holder_recovers_own_unacked_segment_without_tailing_all`
+asserted that the forced tail after `AlreadyExists` produced a **LIST** of
+`log/p0`. Step 4b moved that tail to a GET-next probe, so the assertion
+now counts GETs instead — and gained a stronger companion: the LIST count
+must stay at zero for a one-segment recovery. No original assertion was
+dropped or loosened (journal acked, `next_seq` advanced, the op not
+applied twice, and the recovery tail not becoming the steady state are
+all still there, the last one now over both request classes).
+
+## Plan 26 steps 6–7 — parallel checkpoint I/O, sticky leases: **DONE**
+
+Steps 9–10 remain open (config docs, harness
+scenarios). This slice makes the one object that is never small move in
+parallel, and stops a holder handing back write authority nobody asked
+for.
+
+| Item | State | Where |
+|---|---|---|
+| `get_object_parallel(store, key, RANGE_BYTES, CONCURRENCY)`: HEAD for size, single GET at or below one range, otherwise contiguous 8 MiB `get_range`s through `buffered(CONCURRENCY)`, assembled in issue order into one `Vec<u8>` | done | `store-s3::log::get_object_parallel` |
+| `get_latest_checkpoint` fetches through it, including the defensive re-read-`LATEST`-once retry (both attempts take the same path) | done | `store-s3::log` |
+| `RANGE_BYTES` = 8 MiB; `CONSTELLATION_CHECKPOINT_IO_CONCURRENCY` (default 8, `0`/unparseable → default) | done | `store-s3::log::checkpoint_io_concurrency` |
+| Checkpoint bodies over 16 MiB go up as `WriteMultipart` (`put_multipart` → 8 MiB `put` chunks → `finish()`), with in-flight parts capped at the same concurrency; smaller bodies keep the single PUT | done | `store-s3::log::put_checkpoint_body` |
+| `shipper::bootstrap` inherits both (it goes through `get_latest_checkpoint`) | done, no change needed | `cli::shipper::bootstrap` |
+| `Lease.wanted_by: Vec<u64>` (sorted, deduped); `granted`/`released` clear it, `renewed` preserves it; `Lease::wanting(node_id)` is the only way to add one and copies holder/epoch/expiry unchanged. `LEASE_VERSION` unchanged | done | `store-s3::lease` |
+| `Plan::Busy` carries `prev` + `tag` so a requester can register itself without a second GET | done | `cli::lease::Plan` |
+| `acquire_lease_for` registers this node in `wanted_by` on `Plan::Busy` in `LeaseMode::Cas`, skipping when already listed; `CasConflict` ignored; still returns `Ok(false)` | done | `cli::shipper::{acquire_lease_for,register_wanted_by}`, `cli::lease::LeaseKeeper::register_wanted` |
+| Rate limit: `wanted_registered_at: HashMap<part, Instant>`, no re-registration within `lease_ttl_ms / 2` | done | `cli::shipper` |
+| `renew_now` on `CasConflict` re-reads and distinguishes a `wanted_by` edit (same holder, same epoch, unreleased, unexpired) from a deposition: adopts the fresh tag, copies `cur.wanted_by` into `LeaseKeeper::wanted`, retries the renew once. Only a different holder / higher epoch / expired-and-taken still means deposed | done | `cli::lease::LeaseKeeper::renew_now` |
+| `idle_release_due(backlog)` is now the six-condition form: not epoch-held, held, backlog 0, **a registered requester**, idle ≥ `idle_release_ms`, tenure ≥ `LEASE_MIN_DWELL_MS` (5 s) | done | `cli::lease::LeaseKeeper::idle_release_due` |
+| `release()` writes `released: true` with `wanted_by` cleared and forgets the local requester list | done | `cli::lease::LeaseKeeper::release` |
+| P2P `HandOff` unchanged and still the fast path | unchanged, deliberate | `cli::main`, `cli::net` wiring |
+| `require_lease_for`'s retry sleep doubles 100 → 200 → … → 2000 ms; `acquire_deadline` unchanged | done | `cli::fusefs::require_lease_for` |
+| Worst-case handoff reasoning written into the module doc | done | `cli::lease` module doc |
+| Unit: 40 MiB round trip through multipart + ranged GET, plain and E2E, byte-equal; 1 KiB takes the single-GET path; `renewed` keeps `wanted_by` while `granted`/`released` clear it; `active_holder_never_releases_idle_without_a_requester`; `requester_registers_wanted_by_and_gets_the_lease`; `wanted_by_edit_is_not_a_deposition` | done | `store-s3::log`, `store-s3::lease`, `cli::shipper` tests |
+
+### Design decisions
+
+- **The ranges are issued here, not through `ObjectStore::get_ranges`.**
+  The plan allowed either, with the fallback conditioned on measured
+  throughput. The choice is structural rather than measured: `get_ranges`
+  routes through `coalesce_ranges`, which merges ranges less than
+  `OBJECT_STORE_COALESCE_DEFAULT` (1 MiB) apart into one request. A
+  contiguous split of a single object is *zero* bytes apart, so all eight
+  ranges would merge straight back into the single GET the step exists to
+  eliminate — the 23.5 s vs 6.3 s (HU→AWS), 6.6 vs 2.7 (OVH), 1.3 vs 0.30
+  (same-region) gap would simply not be collected. It also pins its own
+  parallelism at 10, ignoring `CONSTELLATION_CHECKPOINT_IO_CONCURRENCY`.
+- **One extra HEAD per checkpoint read, accepted and pinned by a test.**
+  The range plan needs the size; a HEAD is 176 ms HU→AWS and 13 ms
+  same-region, on a path that is about to spend seconds. Guessing instead
+  and discovering the size from a first ranged GET would save that round
+  trip and cost a branch on every backend's range semantics.
+- **In-flight multipart parts are capped.** `WriteMultipart` starts a part
+  as soon as its chunk is buffered, so a 400 MiB checkpoint would put ~50
+  parts in flight at once. The Appendix's own numbers argue against
+  assuming more is better: 64 MiB in 1 MiB pieces measured *slower* at
+  concurrency 64 than at 16 (5.1 s vs 3.4 s HU→AWS). Same knob as the
+  read side.
+- **`wanted_by` is `#[serde(default)]`, like every other field of
+  `Lease`.** Not a legacy read path: the struct's documented contract
+  (`LEASE_VERSION`, and `forward_compatible_decode`) is that a lease
+  object missing fields decodes rather than failing a mount. A single
+  required field would make `{}` unparseable and break that pinned
+  behaviour.
+- **A requester's registration is rate-limited per *attempt*, not per
+  success.** A CAS that lost still means the object moved under us, and
+  the blocked FUSE thread is retrying anyway; counting only successes
+  would let a contended lease attract one CAS PUT per retry. Half a TTL is
+  the holder's own renewal period — asking more often than it can look
+  cannot make it release sooner.
+- **Nothing in the handoff treats a 412 as a fast failure.** Measured
+  against AWS, a stale `If-Match` comes back rejected in 599 ms (671 ms
+  with client retries disabled — server-side, not botocore), four times a
+  plain GET; OVH returns it in ~RTT. So every conflicting path here
+  retries on a later round rather than in a loop: the requester drops a
+  lost registration entirely, and `renew_now` re-reads once and then
+  either swaps or defers to the deposition probe.
+- **The requester side is `LeaseMode::Cas` only.** Without `If-Match` a
+  swap is a blind overwrite, and blindly rewriting a live holder's lease
+  object is exactly the race that mode cannot make safe. On the
+  `LocalFileSystem` smoke lane the registration is simply skipped.
+- **Deposition stays terminal.** The new branch narrows *what counts as*
+  deposition (a same-holder, same-epoch, unreleased, unexpired object is a
+  handoff request); it does not add a way back from one.
+
+### Contradiction with DESIGN.md to record (CONVENTIONS rule 5)
+
+DESIGN.md §4 says "A holder releases after about 30 seconds without a
+mutation." That is now **conditional on a registered requester**: an idle
+holder with nobody waiting keeps the lease indefinitely, and even with a
+requester it will not release inside `LEASE_MIN_DWELL_MS` (5 s) of taking
+it. `CONSTELLATION_LEASE_IDLE_RELEASE_MS` (30 s) still sets the idle
+threshold. DESIGN.md is not edited.
+
+Worst case is unchanged by the swap, which is why it is safe: with P2P
+down a requester registers at its first `Acquire` (one CAS round trip),
+the holder notices at its next renewal (≤ TTL/2 = 30 s), finishes its
+in-flight batch and releases, and the requester claims on its next retry
+— the same 30 s the unconditional idle release cost, or the same EIO
+after 2×TTL against a busy holder. What goes away is the 3-round-trip
+re-acquire on the common single-writer path.
+
+### Behaviour a pinned test had to follow
+
+No existing test asserted unconditional idle release — `idle_release_due`
+had no unit coverage and its only caller is `main::run_sync_round` — so
+nothing had to be rewritten for the new semantics. The two existing
+`Plan::Busy` matchers (`cli::lease`'s `open_epoch_promise_refuses_s3_takeover`
+and the `acquire_lease_for` log site) use `..` and were unaffected by the
+added fields. `CountingStore` in `cli::shipper`'s tests gained a PUT
+counter; no existing assertion changed.
+
+### Non-vacuity checks (behaviour disabled, tests must fail)
+
+- Drop `&& !self.wanted.is_empty()` from `idle_release_due` →
+  `active_holder_never_releases_idle_without_a_requester` FAILS (it
+  reports release as due with every timer elapsed and no requester).
+- Make `register_wanted_by` return immediately →
+  `requester_registers_wanted_by_and_gets_the_lease` FAILS with
+  `wanted_by` `left: [] right: [2]`.
+- Disable the `wanted_by`-edit branch in `renew_now` → all three sticky
+  tests FAIL: the holder never learns who is waiting (`left: []`,
+  `right: [2]`) and the retried renew never lands (lease etag stays `"2"`).
+- Force `get_object_parallel` down the single-GET path →
+  `large_checkpoint_roundtrips_through_parallel_io` FAILS with
+  (heads, whole) `left: (1, 1) right: (1, 0)`. With the ranged path live
+  the 40 MiB body is 1 HEAD + 6 ranged GETs + 0 whole GETs + 1 multipart
+  upload; the 1 KiB body is 1 HEAD + 1 whole GET + 0 multipart uploads.
+
+### Gates run in this environment
+
+- `cargo fmt --all` — clean; `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — zero failures (cli 178, meta 90 + 3 + 2,
+  store-s3 78, net 68, fs-core 33, upload-concurrency 10, harness 8,
+  api 6, chaos 3, uploadbench 4).
+- `bash tests/smoke.sh` — `SMOKE TEST PASSED`.
+- Docker lanes (`tests/integration.sh`, harness matrix, pjdfstest) not run
+  in this slice — see CI. The plan's own report items (ingest checkpoint
+  tallies, idle request tally, handoff timing) come from the step 10
+  scenarios, which are not in this slice.
+- Note: `large_checkpoint_roundtrips_through_parallel_io` moves 80 MiB
+  through zstd and (once) ChaCha20-Poly1305 in a debug build and takes
+  ~24 s on its own, which is now most of the `store-s3` suite's wall
+  clock.
+- Pre-existing flake observed while running the gate, **not** from this
+  slice: `constellation-net`'s `stream_framing_and_bare_encoding_are_distinct`
+  fails about 3 runs in 30. It generates a fresh random key each run and
+  asserts a length-prefixed frame never postcard-decodes as a bare
+  payload, which is true only probabilistically. `crates/net` has no
+  changes in this working tree.
+
+## Plan 26 step 8 — existence hint from `chunk_ref`, no mount-time LIST: **DONE**
+
+Steps 9–10 remain open (config docs, harness scenarios). This slice
+deletes the last bucket-wide LIST on the mount path and replaces it with
+a table the replica already maintains.
+
+| Item | State | Where |
+|---|---|---|
+| Mount-time LIST seed deleted: `spawn_seed`, `LIST_CONCURRENCY`, the `list_enabled` flag, the `complete`/`listed` state and `CONSTELLATION_EXISTENCE_LIST` | done | `cli::existence` |
+| The bloom stays, as an in-process cache of hashes this node uploaded itself or was hinted about by a peer (`insert`, `note_peer_hint` unchanged) | done | `cli::existence` |
+| `Existence::with_meta(meta)` is the mount-path constructor; the replica is consulted per upload, so startup cost is no longer proportional to the bucket | done | `cli::existence`, `cli::node_runtime` |
+| `SqliteMeta::chunk_ref_exists(hash)`: `SELECT 1 FROM chunk_ref WHERE chunk_hash = ?1 LIMIT 1` through `with_reader` | done | `meta::sqlite` |
+| `contains(hash)` = bloom hit **or** `chunk_ref_exists`; replay maintains `chunk_ref` from foreign records, so a hash referenced anywhere in the cluster is a hit | done | `cli::existence::contains` |
+| No proven-absent answer any more: return type is `bool` (hinted / not hinted), `Some(false)` and its no-HEAD `Create` branch are gone | done | `cli::existence`, `cli::main::put_mode` |
+| `report()` gains `chunk_ref_hits`; `listed`/`complete` removed, `bloom_misses` becomes `misses` (no source could answer) | done | `cli::existence::ExistenceReport` |
+| Control-plane status: `existence_chunk_ref_hits` + `existence_misses` replace `existence_listed`/`existence_complete`/`existence_bloom_misses`; `/metrics` follows | done | `api::types`, `api::web`, `cli::main` |
+| `store-s3::existence` (`scan_chunk_hashes`, `parse_chunk_key`, `ChunkHashScan`) deleted — it existed only to seed the mount-time bloom and had no other caller | done | `store-s3::lib` |
+| Harness `existence-bloom-dedup` / `existence-peer-hint` retargeted at the new counters and the removed env var | done, unverified | `harness::scenarios` |
+| Unit: `chunk_ref_hit_selects_probe_without_a_list`, `bloom_answers_only_for_inserted_hashes`, `chunk_ref_exists_sees_replayed_foreign_references` | done | `cli::existence`, `meta::sqlite` |
+
+### Design decisions
+
+- **`contains` returns `bool`, not `Option<bool>`.** The plan says
+  `Some(false)` no longer exists and to adjust the return type and every
+  caller; with only `Some(true)` and `None` left, the `Option` layer
+  carries no information. `true` means "probably already in the bucket,
+  take a confirming HEAD", `false` means "no hint" — never "absent".
+- **The replica is queried per upload rather than copied into the bloom
+  at mount.** A copy would be O(referenced hashes) of SQLite work at
+  mount for a filter that is already only advisory, and it would go stale
+  against everything replay learns afterwards. One indexed `chunk_ref`
+  probe on a local DB is far below the S3 round trip the decision is
+  about (177–194 ms HU→AWS, 27–110 ms HU→OVH for any chunk request).
+- **What the removed LIST cost.** 59.5k chunk objects took 23 s at mount
+  and the scan is O(hours) at ten million. LIST is the most expensive
+  request class (12.5× a GET on AWS) and a 1000-key page measures 331 ms
+  HU→AWS, 344 ms HU→OVH and 171 ms same-region — so a 10M-object bucket
+  is ~10k pages, ~55 min of pure LIST from Europe, to build a filter that
+  only ever saves a HEAD. The `chunk_ref` table already holds the
+  referenced-hash set at zero extra S3 cost.
+- **`chunk_ref_exists` does not join `inode`, unlike `hash_is_live`.**
+  The question is "has this content been put in the bucket", not "is it
+  still reachable"; a row that outlives its inode costs one HEAD at
+  worst. GC is unaffected — it still re-derives the live set from the
+  manifests before deleting anything.
+- **Peer digests keep priority over the replica.** `put_mode` consults
+  the cooperative-cache digest first, so `existence_peer_hints` still
+  measures the P2P path rather than being shadowed by a replica hit.
+- **A replica read error degrades to the adaptive probe.** The hint is
+  never a dependency: `chunk_ref_exists` failing logs at `debug!` and the
+  upload takes the ordinary fallback.
+
+### Behaviour a pinned test had to follow
+
+`complete_list_seed_probes_hits_and_creates_misses_without_head` pinned
+the one thing this step deletes: a *proven miss* from a complete LIST
+going straight to `Create` with no HEAD (it asserted exactly 1 HEAD for
+two queued chunks). Nothing can prove absence without that LIST, so the
+unhinted chunk now takes the adaptive probe and the test is
+`hinted_hash_probes_and_unhinted_hash_keeps_the_adaptive_fallback`,
+asserting 2 HEADs. Every other assertion it made is kept — 1 PUT (only
+the genuinely absent chunk is uploaded), the pending-upload table
+drained — and it gained one: `bloom_hits == 1`, so the hit is attributed
+to the hint rather than to luck. `bloom_false_positive_still_calls_store_before_ack`,
+`condemned_hash_overwrites_even_when_existence_bloom_claims_present` and
+`peer_hit_selects_probe_but_peer_miss_retains_adaptive_head` kept every
+assertion; only their `seed_for_test(&[h], true)` setup became
+`insert(&h)`. `incomplete_seed_never_proves_a_miss` and
+`complete_seed_reports_hits_and_misses` were deleted with the seed they
+tested, and `store-s3::existence`'s two tests went with the module.
+
+### Non-vacuity checks (behaviour disabled, tests must fail)
+
+- Make `contains` skip the `self.meta` branch →
+  `chunk_ref_hit_selects_probe_without_a_list` FAILS
+  (`assertion failed: existence.contains(&hash)`); the bloom-only test
+  still passes, so the two sources are covered independently.
+- Make `contains` return `false` unconditionally → 3 of the 178 cli tests
+  FAIL (both `existence` tests and
+  `hinted_hash_probes_and_unhinted_hash_keeps_the_adaptive_fallback`).
+- `chunk_ref_exists_sees_replayed_foreign_references` asserts the empty
+  replica says no *before* the replay, so the post-replay `true` is not a
+  constant.
+
+### Mount-path LIST audit
+
+`grep` for `list(`, `list_with_offset`, `list_with_delimiter` and
+`list_segments*` across `crates/cli/src` and `crates/store-s3/src`: the
+only remaining LIST of `chunks/` is `cli::gc`'s explicit orphan pass
+(`gc run --orphans`, an operator command, already documented as the one
+place that lists that prefix). The mount path's remaining LISTs are all
+metadata-plane and already bounded by earlier steps of this plan — log
+catch-up (`list_segments_from`, step 4b), checkpoint prune
+(`checkpoints/p0/`, step 2), leases, designations and snapshots. No
+chunk-prefix LIST runs at mount any more.
+
+### Deferred
+
+- `docs/reference/configuration.md` still lists `CONSTELLATION_EXISTENCE_LIST`.
+  Step 9 owns that table (it lists the var as "removed") and will rewrite
+  it wholesale; the variable itself is deleted from the code here.
+- The two `existence-*` harness scenarios were rewritten for the new
+  counters but **not run** — the docker lanes are out of scope for this
+  slice. `existence-bloom-dedup` now waits for A's tree to reach B over
+  the metadata log instead of for a LIST seed, and asserts
+  `bloom_hits + chunk_ref_hits >= unique chunks`; its third pass (a
+  `CONSTELLATION_EXISTENCE_LIST=off` control) is gone with the kill
+  switch.
+
+### Gates run in this environment
+
+- `cargo fmt --all` — clean; `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — zero failures (cli 178, meta 91 + 3 + 2,
+  store-s3 76, net 68, fs-core 33, upload-concurrency 10, harness 8,
+  api 6, chaos 3, uploadbench 4).
+- `bash tests/smoke.sh` — `SMOKE TEST PASSED`.
+- Docker lanes (`tests/integration.sh`, harness matrix, pjdfstest) not run
+  in this slice — see CI.

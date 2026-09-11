@@ -1,20 +1,35 @@
-//! Mount-time S3 existence hint for cold, high-dedup uploads (phase 8c).
+//! Existence hints for cold, high-dedup uploads (phase 8c, plan 26 step 8).
 //!
-//! A complete LIST snapshot may prove a miss and avoid a HEAD before a
-//! conditional create. Hits are advisory only: they select `Probe`, whose
-//! HEAD (and PUT on a 404) remains the correctness operation. The filter is
-//! add-only after seeding; bucket GC can therefore leave stale hits, but
-//! those cost only a HEAD and can never acknowledge an upload by themselves.
+//! Two sources, both advisory, both one-sided. The replica's `chunk_ref`
+//! table is the authoritative one: replay maintains it from *foreign*
+//! records as well as local ones, so it names every chunk hash referenced
+//! anywhere in the cluster, and it is already on disk before the first
+//! upload runs. The in-process bloom sits in front of it as a cache for the
+//! hashes this node uploaded itself or was hinted about by a peer digest —
+//! things the replica learns only once the manifest is journaled.
+//!
+//! A hit selects `Probe`, whose HEAD (and PUT on a 404) remains the
+//! correctness operation, so a false positive costs one HEAD and can never
+//! acknowledge an upload by itself. Bucket GC may leave stale hits behind
+//! for the same reason: they are harmless.
+//!
+//! There is deliberately **no negative answer**. Proving a hash absent from
+//! the bucket would take a complete LIST of every chunk object, which is
+//! what this module used to do at mount time: 59.5k objects took 23 s and it
+//! is O(hours) at ten million, against a request class that is the most
+//! expensive there is (12.5x a GET on AWS) and whose 1000-key page costs
+//! ~331 ms from Europe to us-west-2, ~344 ms to OVH Milan and ~171 ms
+//! same-region. Nothing downstream needs the negative: an unhinted upload
+//! falls back to the adaptive probe policy, and `Create` is a conditional
+//! `If-None-Match: *` PUT that fails safely on a hash already present.
 
 use constellation_fs_core::ChunkHash;
+use constellation_meta::SqliteMeta;
 use constellation_net::bloom::{Bloom, BITS_PER_ENTRY};
-use constellation_store_s3::ChunkStore;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 const DEFAULT_BYTES: usize = 4 * 1024 * 1024;
-const LIST_CONCURRENCY: usize = 8;
 
 fn enabled(name: &str) -> bool {
     !std::env::var(name).ok().is_some_and(|value| {
@@ -27,27 +42,29 @@ fn enabled(name: &str) -> bool {
 
 pub struct Existence {
     bloom: Mutex<Bloom>,
-    max_entries: usize,
-    list_enabled: bool,
+    meta: Option<Arc<SqliteMeta>>,
     peer_hint_enabled: bool,
-    complete: AtomicBool,
-    listed: AtomicU64,
     bloom_hits: AtomicU64,
-    bloom_misses: AtomicU64,
+    chunk_ref_hits: AtomicU64,
+    misses: AtomicU64,
     peer_hints: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExistenceReport {
-    pub listed: u64,
-    pub complete: bool,
     pub bloom_hits: u64,
-    pub bloom_misses: u64,
+    pub chunk_ref_hits: u64,
+    /// Upload decisions no hint source could answer; these take the
+    /// adaptive probe fallback.
+    pub misses: u64,
     pub peer_hints: u64,
 }
 
 impl Existence {
-    pub fn from_env() -> Arc<Self> {
+    /// Mount-path constructor: the replica is the hint source, and it is
+    /// consulted lazily per upload rather than copied into the bloom, so
+    /// there is no startup cost proportional to the bucket.
+    pub fn with_meta(meta: Arc<SqliteMeta>) -> Arc<Self> {
         let bytes = std::env::var("CONSTELLATION_EXISTENCE_BLOOM_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -55,62 +72,26 @@ impl Existence {
             .max(8);
         Self::new(
             bytes,
-            enabled("CONSTELLATION_EXISTENCE_LIST"),
             enabled("CONSTELLATION_EXISTENCE_PEER_HINT"),
+            Some(meta),
         )
     }
 
-    pub(crate) fn new(bytes: usize, list_enabled: bool, peer_hint_enabled: bool) -> Arc<Self> {
+    pub(crate) fn new(
+        bytes: usize,
+        peer_hint_enabled: bool,
+        meta: Option<Arc<SqliteMeta>>,
+    ) -> Arc<Self> {
         let max_entries = bytes.saturating_mul(8) / BITS_PER_ENTRY;
         Arc::new(Self {
             bloom: Mutex::new(Bloom::with_capacity_and_max_bytes(max_entries, bytes)),
-            max_entries,
-            list_enabled,
+            meta,
             peer_hint_enabled,
-            complete: AtomicBool::new(false),
-            listed: AtomicU64::new(0),
             bloom_hits: AtomicU64::new(0),
-            bloom_misses: AtomicU64::new(0),
+            chunk_ref_hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
             peer_hints: AtomicU64::new(0),
         })
-    }
-
-    /// Spawn after mount setup. The short delay lets `fuser::mount` finish
-    /// attaching before LIST work begins, while uploads remain free to use
-    /// the ordinary adaptive fallback until `complete` flips.
-    pub fn spawn_seed(self: &Arc<Self>, store: Arc<ChunkStore>, rt: &tokio::runtime::Handle) {
-        if !self.list_enabled {
-            return;
-        }
-        let this = self.clone();
-        rt.spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let started = Instant::now();
-            let sink = this.clone();
-            match constellation_store_s3::scan_chunk_hashes(
-                store.inner().clone(),
-                this.max_entries,
-                LIST_CONCURRENCY,
-                move |hash| sink.insert(&hash),
-            )
-            .await
-            {
-                Ok(scan) => {
-                    let listed = scan.listed as u64;
-                    this.listed.store(listed, Ordering::Release);
-                    this.complete.store(scan.complete, Ordering::Release);
-                    tracing::info!(
-                        listed,
-                        complete = scan.complete,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "S3 existence LIST seed finished"
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "S3 existence LIST seed failed; uploads use adaptive probes");
-                }
-            }
-        });
     }
 
     pub fn peer_hints_enabled(&self) -> bool {
@@ -121,19 +102,32 @@ impl Existence {
         self.peer_hints.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `Some(true)` selects a confirming probe; `Some(false)` is a proven
-    /// miss from a complete seed. `None` retains the adaptive fallback.
-    pub fn contains(&self, hash: &ChunkHash) -> Option<bool> {
-        if !self.complete.load(Ordering::Acquire) {
-            return None;
-        }
-        let hit = self.bloom.lock().unwrap().contains(&hash.0);
-        if hit {
+    /// `true` means "probably in the bucket already" and selects a
+    /// confirming probe. `false` means only "no hint" — never "absent" —
+    /// and leaves the adaptive fallback in charge.
+    pub fn contains(&self, hash: &ChunkHash) -> bool {
+        if self.bloom.lock().unwrap().contains(&hash.0) {
             self.bloom_hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.bloom_misses.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
-        Some(hit)
+        if let Some(meta) = self.meta.as_ref() {
+            match meta.chunk_ref_exists(hash) {
+                Ok(true) => {
+                    self.chunk_ref_hits.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                Ok(false) => {}
+                // The replica is a hint, not a dependency: a reader error
+                // degrades the upload to the adaptive probe, not to a
+                // failure.
+                Err(error) => tracing::debug!(
+                    %error,
+                    "chunk_ref existence probe failed; upload uses the adaptive fallback"
+                ),
+            }
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        false
     }
 
     pub fn insert(&self, hash: &ChunkHash) {
@@ -142,45 +136,83 @@ impl Existence {
 
     pub fn report(&self) -> ExistenceReport {
         ExistenceReport {
-            listed: self.listed.load(Ordering::Acquire),
-            complete: self.complete.load(Ordering::Acquire),
             bloom_hits: self.bloom_hits.load(Ordering::Relaxed),
-            bloom_misses: self.bloom_misses.load(Ordering::Relaxed),
+            chunk_ref_hits: self.chunk_ref_hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
             peer_hints: self.peer_hints.load(Ordering::Relaxed),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn seed_for_test(&self, hashes: &[ChunkHash], complete: bool) {
-        let mut bloom = self.bloom.lock().unwrap();
-        for hash in hashes {
-            bloom.insert(&hash.0);
-        }
-        drop(bloom);
-        self.listed.store(hashes.len() as u64, Ordering::Release);
-        self.complete.store(complete, Ordering::Release);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use constellation_fs_core::manifest::{ChunkInfo, Manifest};
+    use constellation_meta::LogRecord;
 
-    #[test]
-    fn incomplete_seed_never_proves_a_miss() {
-        let existence = Existence::new(64, true, true);
-        assert_eq!(existence.contains(&ChunkHash::of(b"unknown")), None);
+    /// Manifest bytes that actually decode, so that replay's `chunk_ref`
+    /// bookkeeping can extract the hash from them.
+    fn manifest_of(hash: ChunkHash) -> Vec<u8> {
+        Manifest {
+            layout: constellation_fs_core::ChunkLayout::new(4096),
+            file_len: 4096,
+            chunks: ChunkInfo::Inline([(0u64, hash)].into_iter().collect()),
+        }
+        .encode()
     }
 
+    /// A replica that replayed someone else's manifest already knows the
+    /// hash is in the bucket, so the upload path can pick `Probe` with no
+    /// LIST anywhere in the mount.
     #[test]
-    fn complete_seed_reports_hits_and_misses() {
-        let existence = Existence::new(64, true, true);
-        let known = ChunkHash::of(b"known");
-        existence.insert(&known);
-        existence.complete.store(true, Ordering::Release);
-        assert_eq!(existence.contains(&known), Some(true));
-        assert_eq!(existence.contains(&ChunkHash::of(b"unknown")), Some(false));
+    fn chunk_ref_hit_selects_probe_without_a_list() {
+        let hash = ChunkHash::of(b"written by another node");
+        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let existence = Existence::new(64, true, Some(meta.clone()));
+        assert!(
+            !existence.contains(&hash),
+            "nothing references the hash yet"
+        );
+
+        meta.apply_records(&[
+            LogRecord::Create {
+                parent: constellation_fs_core::types::ROOT_INO,
+                name: "remote".into(),
+                ino: 4242,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::WriteManifest {
+                ino: 4242,
+                base_manifest: None,
+                manifest: manifest_of(hash),
+                size: 4096,
+                time_ns: 2,
+            },
+        ])
+        .unwrap();
+
+        assert!(existence.contains(&hash));
         let report = existence.report();
-        assert_eq!((report.bloom_hits, report.bloom_misses), (1, 1));
+        assert_eq!(
+            (report.chunk_ref_hits, report.bloom_hits, report.misses),
+            (1, 0, 1)
+        );
+    }
+
+    /// Without a replica behind it the bloom is the only source, and it
+    /// only ever answers for what this node put in it.
+    #[test]
+    fn bloom_answers_only_for_inserted_hashes() {
+        let existence = Existence::new(64, true, None);
+        let known = ChunkHash::of(b"known");
+        assert!(!existence.contains(&known));
+        existence.insert(&known);
+        assert!(existence.contains(&known));
+        assert!(!existence.contains(&ChunkHash::of(b"unknown")));
+        let report = existence.report();
+        assert_eq!((report.bloom_hits, report.misses), (1, 2));
     }
 }

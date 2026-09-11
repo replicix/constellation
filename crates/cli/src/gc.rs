@@ -344,33 +344,78 @@ fn collect_hash_strings(value: &serde_json::Value, out: &mut HashSet<ChunkHash>)
 async fn metadata_candidates(store: &Arc<dyn ObjectStore>, config: &GcConfig) -> Result<Vec<Mark>> {
     let mut marks = Vec::new();
     let latest = match store.get(&Path::from("checkpoints/p0/LATEST")).await {
-        Ok(result) => serde_json::from_slice::<constellation_store_s3::log::CheckpointRef>(
-            &result.bytes().await?,
-        )
-        .ok()
-        .map(|reference| reference.seq),
+        Ok(result) => Some(
+            serde_json::from_slice::<constellation_store_s3::log::CheckpointRef>(
+                &result.bytes().await?,
+            )?
+            .seq,
+        ),
         Err(object_store::Error::NotFound { .. }) => None,
         Err(error) => return Err(error.into()),
     };
     if let Some(latest) = latest {
-        let floor = latest.saturating_sub(config.retention_segments);
+        // Log retention is per partition, floored against VECTOR.json's
+        // applied_seq for that partition — never against the max seq
+        // across all partitions. A checkpoint's `covered` is the maximum
+        // over every stream, so a child partition that is far behind p0
+        // would otherwise have live segments deleted out from under a
+        // bootstrap that has only replayed it to `applied[child]` (the
+        // finding-6 data-loss bug). A `LATEST` pointer with no vector is
+        // a corrupt bucket: we have no per-partition floor to apply, so
+        // we refuse rather than fall back to the global floor. (Read the
+        // object directly rather than via `get_checkpoint_vector`, which
+        // maps a missing vector to an empty one and would hide exactly
+        // this corruption.)
+        let vector = match store.get(&Path::from("checkpoints/VECTOR.json")).await {
+            Ok(result) => serde_json::from_slice::<constellation_store_s3::log::CheckpointVector>(
+                &result.bytes().await?,
+            )?,
+            Err(object_store::Error::NotFound { .. }) => anyhow::bail!(
+                "checkpoints/p0/LATEST names seq {latest} but checkpoints/VECTOR.json is \
+                 missing; refusing to prune the log against a global floor"
+            ),
+            Err(error) => return Err(error.into()),
+        };
         for object in store
             .list(Some(&Path::from("log")))
             .try_collect::<Vec<_>>()
             .await?
         {
-            let Some(name) = object
+            // Segments are `log/<part>/<seq:016x>.zst`; `parts()[1]` is the
+            // partition and the filename stem is the sequence. The `sealed`
+            // marker has no `.zst` suffix and drops out here.
+            let parts: Vec<_> = object
+                .location
+                .parts()
+                .map(|part| part.as_ref().to_string())
+                .collect();
+            let Some(partition) = parts.get(1) else {
+                continue;
+            };
+            let Some(seq) = object
                 .location
                 .filename()
                 .and_then(|name| name.strip_suffix(".zst"))
+                .and_then(|name| u64::from_str_radix(name, 16).ok())
             else {
                 continue;
             };
-            if u64::from_str_radix(name, 16).is_ok_and(|seq| seq < floor) {
+            // A partition absent from the vector is not covered by the
+            // snapshot yet: pruning any of its segments would truncate a
+            // stream the checkpoint cannot replace.
+            let Some(applied) = vector.applied.get(partition).copied() else {
+                continue;
+            };
+            let floor = applied.saturating_sub(config.retention_segments);
+            if seq < floor {
                 marks.push(Mark {
                     key: object.location.to_string(),
                     rule: "log-retention".into(),
-                    evidence: json!({"latest_checkpoint":latest,"retention_segments":config.retention_segments}),
+                    evidence: json!({
+                        "partition": partition,
+                        "vector_applied": applied,
+                        "retention_segments": config.retention_segments,
+                    }),
                     hash: None,
                 });
             }
@@ -435,5 +480,107 @@ mod tests {
             lease_ttl_ms: 1,
         };
         assert_eq!(250 - config.horizon_ms, 150);
+    }
+
+    /// The log-retention floor is per partition, taken from VECTOR.json's
+    /// applied_seq for that partition — never from the global `covered`
+    /// seq in LATEST. A partition far behind the checkpoint frontier keeps
+    /// all of its segments (finding-6 regression).
+    #[tokio::test]
+    async fn log_retention_floor_is_per_partition_against_the_vector() {
+        use constellation_store_s3::log::{CheckpointRef, CheckpointVector};
+        use object_store::memory::InMemory;
+        use object_store::PutPayload;
+
+        async fn log_retention_marks(applied_p1: u64) -> Vec<String> {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            // LATEST covers the whole cluster at the max seq (p0's).
+            let latest = serde_json::to_vec(&CheckpointRef {
+                seq: 1000,
+                bytes: 0,
+            })
+            .unwrap();
+            store
+                .put(
+                    &Path::from("checkpoints/p0/LATEST"),
+                    PutPayload::from(latest),
+                )
+                .await
+                .unwrap();
+            let mut vector = CheckpointVector::default();
+            vector.applied.insert("p0".into(), 1000);
+            vector.applied.insert("p1".into(), applied_p1);
+            store
+                .put(
+                    &Path::from("checkpoints/VECTOR.json"),
+                    PutPayload::from(serde_json::to_vec(&vector).unwrap()),
+                )
+                .await
+                .unwrap();
+            // p0 segments straddling its floor (1000 - 128 = 872).
+            for seq in [800u64, 871, 872, 900] {
+                store
+                    .put(
+                        &Path::from(format!("log/p0/{seq:016x}.zst")),
+                        PutPayload::from(Vec::new()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // p1 segments 0..=40.
+            for seq in 0u64..=40 {
+                store
+                    .put(
+                        &Path::from(format!("log/p1/{seq:016x}.zst")),
+                        PutPayload::from(Vec::new()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let config = GcConfig {
+                horizon_ms: 0,
+                retention_segments: 128,
+                lease_ttl_ms: 1,
+            };
+            let mut keys: Vec<String> = metadata_candidates(&store, &config)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|mark| mark.rule == "log-retention")
+                .map(|mark| mark.key)
+                .collect();
+            keys.sort();
+            keys
+        }
+
+        // p1 applied 30: 30 - 128 saturates to 0, so no p1 segment is below
+        // its floor. Only p0's segments under 872 are marked.
+        let case_a = log_retention_marks(30).await;
+        assert_eq!(
+            case_a,
+            vec![
+                format!("log/p0/{:016x}.zst", 800u64),
+                format!("log/p0/{:016x}.zst", 871u64),
+            ]
+        );
+        assert!(!case_a.iter().any(|key| key.starts_with("log/p1/")));
+
+        // p1 applied 300: floor 172, so every present p1 segment (0..=40)
+        // is marked, alongside the same two p0 segments.
+        let case_b = log_retention_marks(300).await;
+        assert_eq!(
+            case_b
+                .iter()
+                .filter(|key| key.starts_with("log/p1/"))
+                .count(),
+            41
+        );
+        assert_eq!(
+            case_b
+                .iter()
+                .filter(|key| key.starts_with("log/p0/"))
+                .count(),
+            2
+        );
     }
 }

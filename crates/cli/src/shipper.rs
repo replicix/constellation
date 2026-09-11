@@ -11,6 +11,32 @@
 //! highest epoch applied; a segment arriving with a lower epoch is a
 //! deposed holder's late write and is skipped as a fencing violation.
 //!
+//! A holder therefore does not tail the partitions it holds: while our
+//! lease is live nobody else may append, so that LIST can only ever
+//! return our own segments and costs a full round trip per sync round to
+//! learn nothing. Measured against AWS S3 from Hungary, dropping it takes
+//! a writer from 2.6 to 5.1 segments/s (24.5 → 33.1 same-region, 5.4 →
+//! 6.2 against OVH Milan) — see plan 26's appendix. Three paths still
+//! read a stream we believe we hold, and each is load-bearing:
+//! [`Shipper::tail_to_head`] (the takeover witness must see *every*
+//! stream), the `AlreadyExists` arm of [`Shipper::ship_part`] (our own
+//! unacked segment from before a restart, or a deposed holder's late
+//! write), and any round where the keeper no longer reports a ship epoch
+//! — expired, released, or deposed — which drops it out of the held set
+//! on its own.
+//!
+//! What a *follower* does instead is probe: [`TAIL_GET_CONCURRENCY`]
+//! speculative GETs at the sequences it expects next, and a LIST only
+//! when every probe hits and it may therefore be arbitrarily far behind.
+//! The idle poll — overwhelmingly the common case, since most nodes are
+//! caught up most of the time — is then a 404 rather than a listing:
+//! measured, no slower (177 vs 175 ms HU→AWS, 34 vs 34 ms against OVH)
+//! and a request class ~12.5× cheaper on AWS. The one measured
+//! counter-example is same-region idle LIST at 14 ms against a 25 ms
+//! GET-404; there it is the request price, not the latency, that carries
+//! the choice. Catch-up keeps LIST because one 1000-key page still beats
+//! k round trips when genuinely behind.
+//!
 //! The leaseless convergence path (foreign records that touch pending
 //! local state are skipped via [`TouchSet`], ours being later in the
 //! global log) is retained as a safety net. With leases it is
@@ -23,9 +49,9 @@ use anyhow::{bail, Context, Result};
 use constellation_meta::replay::TouchSet;
 use constellation_meta::{LogRecord, MetaStore, SqliteMeta};
 use constellation_store_s3::log::{CheckpointVector, PARTITION};
-use constellation_store_s3::{LeaseMode, LeaseStore, LogStore};
+use constellation_store_s3::{Lease, LeaseMode, LeaseStore, LeaseTag, LogStore};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -58,14 +84,59 @@ fn checkpoint_min_interval() -> std::time::Duration {
     )
 }
 
-/// The segment count is the trigger; `min_interval` only ever delays it.
-/// A zero interval (the default) leaves the count in sole charge.
+/// Default checkpoint cadence ratio: fire once shipped-log bytes since the
+/// last checkpoint reach `ratio ×` the last snapshot's uncompressed size.
+/// At 1.0 the checkpoint write traffic is bounded at ~1 byte per byte of
+/// shipped log regardless of namespace size, replacing the count-only
+/// cadence that copied the whole DB every 32 segments (54 GiB written to
+/// protect a 0.17 GiB log on a 1.85M-file rsync — see plan 26).
+const CHECKPOINT_RATIO: f64 = 1.0;
+
+/// Env `CONSTELLATION_CHECKPOINT_RATIO`: shipped-log bytes ÷ last snapshot
+/// bytes to fire a checkpoint. Values `<= 0` (or unparseable) fall back to
+/// the default with a warning — a zero/negative ratio would checkpoint on
+/// every segment once a baseline exists, the very amplification this
+/// bounds. Read once at attach (like `autosplit`) so a test can drive it
+/// without racing the process-global environment.
+fn checkpoint_ratio() -> f64 {
+    match std::env::var("CONSTELLATION_CHECKPOINT_RATIO") {
+        Ok(raw) => match raw.parse::<f64>() {
+            Ok(v) if v > 0.0 => v,
+            _ => {
+                tracing::warn!(
+                    value = %raw,
+                    "CONSTELLATION_CHECKPOINT_RATIO must be a positive number; \
+                     falling back to {CHECKPOINT_RATIO}"
+                );
+                CHECKPOINT_RATIO
+            }
+        },
+        Err(_) => CHECKPOINT_RATIO,
+    }
+}
+
+/// The segment count is a *floor*: never checkpoint below `CHECKPOINT_EVERY`
+/// shipped segments. Above it, a byte-proportional gate governs — fire once
+/// `bytes_since_ckpt >= ratio × last_ckpt_bytes` — so the whole-DB copy is
+/// paid for in proportion to the log it lets us truncate rather than on a
+/// fixed segment count. `last_ckpt_bytes == 0` (no baseline yet: a fresh
+/// mount, or a restart whose seed failed) leaves the count in sole charge,
+/// exactly as before this plan. `min_interval` only ever further delays a
+/// due checkpoint (opt-in, default off).
 fn checkpoint_is_due(
     shipped_since_ckpt: u64,
+    bytes_since_ckpt: u64,
+    last_ckpt_bytes: u64,
+    ratio: f64,
     since_last_ckpt: Option<std::time::Duration>,
     min_interval: std::time::Duration,
 ) -> bool {
     if shipped_since_ckpt < CHECKPOINT_EVERY {
+        return false;
+    }
+    let bytes_ok =
+        last_ckpt_bytes == 0 || (bytes_since_ckpt as f64) >= ratio * (last_ckpt_bytes as f64);
+    if !bytes_ok {
         return false;
     }
     match since_last_ckpt {
@@ -76,11 +147,35 @@ fn checkpoint_is_due(
 /// Max journal records per segment.
 const SEGMENT_BATCH: usize = 10_000;
 
-/// Concurrent segment-payload GETs while tailing one partition. Each
-/// GET is a full S3 round trip; a reader far from the bucket that
-/// fetched a burst's segments one at a time could not keep up with a
-/// writer sitting next to it.
-const TAIL_GET_CONCURRENCY: usize = 8;
+/// Concurrent segment-payload GETs while tailing one partition, and the
+/// width of the speculative GET-next probe. Each GET is a full S3 round
+/// trip; a reader far from the bucket that fetched a burst's segments one
+/// at a time could not keep up with a writer sitting next to it.
+///
+/// 16 rather than 8 on measurement: catching up over 64 segments takes
+/// 1693 ms at k=16 against 2201 ms at k=8 from Europe to AWS (279 vs 333
+/// same-region, 476 vs 596 against OVH Milan) — see plan 26's appendix.
+/// The probe pays for that width every idle round in 404s, which is why
+/// it is paired with the sync task's idle backoff (`next_poll_ms` in
+/// `node_runtime.rs`): k misses at a 30 s ceiling are far cheaper than
+/// one LIST every 500 ms.
+const TAIL_GET_CONCURRENCY: usize = 16;
+
+/// Byte ceiling on one shipped segment. `SEGMENT_BATCH` bounds a segment
+/// by record *count*, which says nothing about its size: a batch of
+/// manifests with spilled chunk lists can be orders of magnitude larger
+/// per record than a batch of renames. An oversized segment is a
+/// pathological single PUT (retried whole on failure, buffered whole by
+/// every tailer), so the batch is cut to the largest prefix that fits and
+/// the remainder ships next round.
+const SEGMENT_MAX_BYTES: usize = 4 << 20;
+
+/// Slack for the segment envelope's own fields (`v`, `node`, `epoch` and
+/// the record-vector length, all postcard varints) when measuring a batch
+/// against [`SEGMENT_MAX_BYTES`]. A record's standalone postcard encoding
+/// is byte-identical to its encoding inside the vector, so the sum of
+/// record lengths plus this is the payload size.
+const SEGMENT_ENVELOPE_SLACK: usize = 64;
 
 pub fn part_split_ops() -> u64 {
     std::env::var("CONSTELLATION_PART_SPLIT_OPS")
@@ -158,6 +253,26 @@ fn encode(node: u64, epoch: u64, records: &[LogRecord]) -> Result<Vec<u8>> {
     })?)
 }
 
+/// How many leading records of `records` fit in one segment under
+/// [`SEGMENT_MAX_BYTES`].
+///
+/// A record's postcard encoding is the same standalone as it is inside the
+/// envelope's vector, so the sizes add up without a trial encode per
+/// prefix. The first record always "fits": a single record larger than the
+/// cap must still ship, or it would block its partition's stream forever —
+/// the cap bounds batching, it is not a limit on what may be journaled.
+fn records_within_cap(records: &[LogRecord]) -> Result<usize> {
+    let mut total = SEGMENT_ENVELOPE_SLACK;
+    for (i, rec) in records.iter().enumerate() {
+        let len = rec.to_postcard()?.len();
+        if i > 0 && total + len > SEGMENT_MAX_BYTES {
+            return Ok(i);
+        }
+        total += len;
+    }
+    Ok(records.len())
+}
+
 fn decode(payload: &[u8]) -> Result<Segment> {
     let env: SegmentEnvelope = postcard::from_bytes(payload)
         .map_err(|e| anyhow::anyhow!("log segment postcard decode: {e}"))?;
@@ -181,6 +296,17 @@ pub struct Shipper {
     /// Per-partition stream state (next_seq, max_epoch, log handle).
     parts: HashMap<String, PartState>,
     shipped_since_ckpt: u64,
+    /// Uncompressed bytes of log shipped since the last checkpoint. Drives
+    /// the byte-proportional cadence gate (plan 26 Step 1).
+    bytes_since_ckpt: u64,
+    /// Uncompressed size of the last checkpoint's snapshot; the cadence
+    /// baseline. Seeded from `LATEST` across restarts
+    /// ([`Shipper::seed_checkpoint_baseline`]); `0` means "no baseline
+    /// yet", leaving the segment count in sole charge of the first one.
+    last_ckpt_bytes: u64,
+    /// Checkpoint cadence ratio, resolved once at attach (see
+    /// [`checkpoint_ratio`]).
+    ckpt_ratio: f64,
     /// When the last checkpoint finished; `None` until the first one.
     /// Enforces `checkpoint_min_interval` against the segment counter.
     last_ckpt_at: Option<Instant>,
@@ -197,6 +323,12 @@ pub struct Shipper {
     /// environment variable.
     autosplit: bool,
     last_ship_at: HashMap<String, Instant>,
+    /// When this node last wrote itself into a partition's `wanted_by`
+    /// (plan 26 Step 7b). A blocked FUSE thread retries `Acquire` every
+    /// few hundred ms and the holder only looks at the object once per
+    /// half-TTL, so re-registering faster than that is pure request
+    /// traffic — and each attempt is a CAS PUT, the expensive class.
+    wanted_registered_at: HashMap<String, Instant>,
     /// P2P handle for push invalidation. Disabled by default so the
     /// existing tests and the no-P2P path need no changes.
     peers: constellation_net::Peers,
@@ -300,6 +432,9 @@ impl Shipper {
             lease_mode,
             parts,
             shipped_since_ckpt: 0,
+            bytes_since_ckpt: 0,
+            last_ckpt_bytes: 0,
+            ckpt_ratio: checkpoint_ratio(),
             last_ckpt_at: None,
             skip_ship: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             spool: Arc::new(std::sync::Mutex::new(SpoolInfo {
@@ -309,6 +444,7 @@ impl Shipper {
             dir_ops: HashMap::new(),
             autosplit: part_autosplit(),
             last_ship_at: HashMap::new(),
+            wanted_registered_at: HashMap::new(),
             peers: constellation_net::Peers::disabled(),
             designations: None,
         })
@@ -317,6 +453,32 @@ impl Shipper {
     /// Attach the P2P handle so shipped segments are announced to peers.
     pub fn set_peers(&mut self, peers: constellation_net::Peers) {
         self.peers = peers;
+    }
+
+    /// Seed the byte-proportional cadence baseline from the checkpoint that
+    /// already exists in S3, so the first checkpoint after a restart fires
+    /// on bytes shipped rather than on the segment count alone.
+    ///
+    /// Best effort: `attach_with_mode` is sync and has no runtime, so this
+    /// is a separate async step run right after attach. A missing `LATEST`
+    /// or any read error leaves `last_ckpt_bytes = 0`, which means the
+    /// count trigger governs the first checkpoint — exactly the pre-plan-26
+    /// behaviour, so a failure here is never worse than not seeding.
+    pub async fn seed_checkpoint_baseline(&mut self) {
+        match self.log.get_checkpoint_ref().await {
+            Ok(Some(r)) => {
+                self.last_ckpt_bytes = r.bytes;
+                tracing::debug!(
+                    seq = r.seq,
+                    bytes = r.bytes,
+                    "seeded checkpoint cadence baseline from S3"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "checkpoint baseline seed failed; count trigger governs the first checkpoint");
+            }
+        }
     }
 
     /// Arm or disarm the heat-based split trigger, bypassing
@@ -404,7 +566,8 @@ impl Shipper {
         reintegrating: bool,
     ) -> Result<()> {
         loop {
-            self.tail_all().await?;
+            let held = held_partitions(leases);
+            self.tail_all_except(&held).await?;
             if !reintegrating && matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
                 tracing::debug!(
                     "deposed node remains tail-only until reintegration; \
@@ -427,10 +590,18 @@ impl Shipper {
     }
 
     pub async fn sync_one(&mut self, part: &str, lease: &LeaseKeeper) -> Result<()> {
+        // Holding the lease means no other node may append here, so the
+        // tail is skipped (see the module doc). It has to be replaced by
+        // an explicit `ensure_part`: the tail is what used to register a
+        // partition acquired straight from `Plan::Create`, and `ship_part`
+        // indexes `self.parts` unconditionally.
+        self.ensure_part(part);
         loop {
-            self.tail_part(part).await?;
+            if lease.ship_epoch().is_none() {
+                self.tail_part(part).await?;
+            }
             self.consider_xpart_aborts(part, lease).await?;
-            if !self.ship_part(part, lease).await? {
+            if !self.ship_part_taking(part, lease).await? {
                 return Ok(());
             }
         }
@@ -447,14 +618,24 @@ impl Shipper {
         Ok(TailedToHead::witness())
     }
 
-    /// Tail every known partition. Applying a `part_split` can reveal a
-    /// partition we did not know about, so this repeats until no new
-    /// stream appears — otherwise `tail_to_head` would return while a
-    /// freshly discovered child stream was still unread, which matters
-    /// because lease takeover uses it as the "I have seen everything"
-    /// witness.
+    /// Tail every known partition, unconditionally. This is what the
+    /// takeover witness needs: a claim on a stream is only legal once
+    /// *every* stream is applied, so it must not skip anything.
     async fn tail_all(&mut self) -> Result<()> {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        self.tail_all_except(&HashSet::new()).await
+    }
+
+    /// Tail every known partition except the ones in `held`. Applying a
+    /// `part_split` can reveal a partition we did not know about, so this
+    /// repeats until no new stream appears — otherwise `tail_to_head`
+    /// would return while a freshly discovered child stream was still
+    /// unread, which matters because lease takeover uses it as the "I
+    /// have seen everything" witness.
+    ///
+    /// A held partition is still registered in `self.parts` (a split can
+    /// reveal a child we will have to ship to); only its LIST is skipped.
+    async fn tail_all_except(&mut self, held: &HashSet<String>) -> Result<()> {
+        let mut seen: HashSet<String> = HashSet::new();
         loop {
             let mut ids: Vec<String> = self.parts.keys().cloned().collect();
             for (id, _) in self.meta.partitions()? {
@@ -469,64 +650,99 @@ impl Shipper {
             for id in &todo {
                 self.ensure_part(id);
             }
-            // One *parallel* LIST sweep across the partitions. Each
+            let probed: Vec<String> = todo
+                .iter()
+                .filter(|id| !held.contains(*id))
+                .cloned()
+                .collect();
+            // One *parallel* probe sweep across the partitions. Each
             // partition is its own S3 prefix, so a tree that has split
             // into N partitions costs N round trips here; sequentially
             // that dominates the sync round on a WAN mount (~200 ms ×
-            // N per round, before a single segment is even fetched).
-            let listings = futures::future::join_all(todo.iter().map(|id| {
+            // N per round, before a single segment is even applied).
+            let probes = futures::future::join_all(probed.iter().map(|id| {
                 let log = self.parts[id].log.with_partition(id);
                 let next = self.parts[id].next_seq;
-                async move { log.list_segments_from(next).await }
+                async move { log.get_run(next, TAIL_GET_CONCURRENCY).await }
             }))
             .await;
-            for (id, listing) in todo.into_iter().zip(listings) {
-                self.tail_part_listed(&id, listing?).await?;
-                seen.insert(id);
+            for (id, probe) in probed.into_iter().zip(probes) {
+                self.tail_part_probed(&id, probe?).await?;
             }
+            seen.extend(todo);
         }
     }
 
     async fn tail_part(&mut self, part: &str) -> Result<()> {
         self.ensure_part(part);
-        let next = self.parts[part].next_seq;
-        let seqs = self.parts[part].log.list_segments_from(next).await?;
-        self.tail_part_listed(part, seqs).await
+        let probe = self.probe_run(part).await?;
+        self.tail_part_probed(part, probe).await
     }
 
-    /// Tail `part` starting from an already-fetched listing, re-listing
-    /// until no new contiguous segment appears. Payload GETs for the
-    /// contiguous run are pipelined ([`TAIL_GET_CONCURRENCY`] in
-    /// flight); `buffered` yields them in order, so records still apply
-    /// in strict sequence.
-    async fn tail_part_listed(&mut self, part: &str, mut seqs: Vec<u64>) -> Result<()> {
-        use futures::StreamExt;
+    /// The speculative GET-next probe: [`TAIL_GET_CONCURRENCY`] segment
+    /// GETs from this partition's next expected sequence, in flight
+    /// together. The reply is the longest contiguous run that exists.
+    async fn probe_run(&self, part: &str) -> Result<Vec<(u64, Vec<u8>)>> {
+        let st = &self.parts[part];
+        Ok(st.log.get_run(st.next_seq, TAIL_GET_CONCURRENCY).await?)
+    }
+
+    /// Tail `part` from an already-fetched probe run.
+    ///
+    /// The probe *is* the steady-state poll: a follower with nothing to
+    /// apply pays k GET-404s, no LIST at all. A saturated run (every probe
+    /// hit) is the signal that this node may be arbitrarily far behind,
+    /// and then one LIST page — up to 1000 keys for roughly the price of
+    /// two GETs — is the cheapest way to learn how far, so catch-up drops
+    /// back to LIST + a pipelined fetch and loops for another probe.
+    /// Measured HU→AWS over 64 segments: 1693 ms this way against 3132 ms
+    /// for the LIST-every-round tailer it replaces.
+    ///
+    /// Termination: the loop only re-lists after applying a full run of k
+    /// segments, so `next_seq` advances by at least k per iteration.
+    async fn tail_part_probed(&mut self, part: &str, mut run: Vec<(u64, Vec<u8>)>) -> Result<()> {
         loop {
-            let next = self.parts[part].next_seq;
-            let run: Vec<u64> = seqs
-                .iter()
-                .copied()
-                .enumerate()
-                .take_while(|(i, seq)| *seq == next + *i as u64)
-                .map(|(_, seq)| seq)
-                .collect();
-            if run.is_empty() {
-                return Ok(());
-            }
-            let base = self.parts[part].log.with_partition(part);
-            let mut fetched = futures::stream::iter(run.into_iter().map(|seq| {
-                let log = base.with_partition(base.partition());
-                async move { (seq, log.get_segment(seq).await) }
-            }))
-            .buffered(TAIL_GET_CONCURRENCY);
-            while let Some((seq, payload)) = fetched.next().await {
-                let payload = payload?;
+            let saturated = run.len() >= TAIL_GET_CONCURRENCY;
+            for (seq, payload) in std::mem::take(&mut run) {
                 self.apply_segment_payload(part, seq, &payload)?;
             }
-            drop(fetched);
+            if !saturated {
+                return Ok(());
+            }
             let next = self.parts[part].next_seq;
-            seqs = self.parts[part].log.list_segments_from(next).await?;
+            let seqs = self.parts[part].log.list_segments_from(next).await?;
+            self.apply_listed(part, seqs).await?;
+            run = self.probe_run(part).await?;
         }
+    }
+
+    /// Fetch and apply the contiguous head of an already-fetched listing.
+    /// GETs are pipelined ([`TAIL_GET_CONCURRENCY`] in flight); `buffered`
+    /// yields them in order, so records still apply in strict sequence.
+    async fn apply_listed(&mut self, part: &str, seqs: Vec<u64>) -> Result<()> {
+        use futures::StreamExt;
+        let next = self.parts[part].next_seq;
+        let run: Vec<u64> = seqs
+            .iter()
+            .copied()
+            .enumerate()
+            .take_while(|(i, seq)| *seq == next + *i as u64)
+            .map(|(_, seq)| seq)
+            .collect();
+        if run.is_empty() {
+            return Ok(());
+        }
+        let base = self.parts[part].log.with_partition(part);
+        let mut fetched = futures::stream::iter(run.into_iter().map(|seq| {
+            let log = base.with_partition(base.partition());
+            async move { (seq, log.get_segment(seq).await) }
+        }))
+        .buffered(TAIL_GET_CONCURRENCY);
+        while let Some((seq, payload)) = fetched.next().await {
+            let payload = payload?;
+            self.apply_segment_payload(part, seq, &payload)?;
+        }
+        Ok(())
     }
 
     /// Apply a gossip-pushed segment without an S3 GET. Returns false for
@@ -660,13 +876,18 @@ impl Shipper {
     /// keepers are otherwise only made by the FUSE write gate, so a
     /// daemon that restarted with a stranded child-partition journal
     /// would never ship it.
+    /// The journal is read **once** here and each partition's batch is
+    /// handed to [`Shipper::ship_part`]. Reading it again per partition
+    /// (as this used to) meant decoding every journaled record twice per
+    /// round for a batch that cannot have changed in between — the FUSE
+    /// side only appends, and appends are picked up by the next round.
     async fn ship_all(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<bool> {
         let grouped = self.meta.take_journal_grouped(SEGMENT_BATCH)?;
         if grouped.is_empty() {
             return Ok(false);
         }
         let mut more = false;
-        for (part, _batch) in grouped {
+        for (part, batch) in grouped {
             self.ensure_part(&part);
             if !leases.contains_key(&part) {
                 let mut keeper = LeaseKeeper::new(
@@ -709,24 +930,52 @@ impl Shipper {
             let Some(lease) = leases.get(&part) else {
                 continue;
             };
-            if self.ship_part(&part, lease).await? {
+            if self.ship_part(&part, lease, batch).await? {
                 more = true;
             }
         }
         Ok(more)
     }
 
+    /// [`Shipper::ship_part`] for a caller that has not already read the
+    /// journal (the single-partition `sync_one` path).
+    async fn ship_part_taking(&mut self, part: &str, lease: &LeaseKeeper) -> Result<bool> {
+        let batch = self
+            .meta
+            .take_journal_grouped(SEGMENT_BATCH)?
+            .into_iter()
+            .find(|(p, _)| p == part)
+            .map(|(_, batch)| batch)
+            .unwrap_or_default();
+        self.ship_part(part, lease, batch).await
+    }
+
     /// Ship one journal batch for `part`. Returns true if another
     /// round is needed (more records pending, or a CAS collision).
-    async fn ship_part(&mut self, part: &str, lease: &LeaseKeeper) -> Result<bool> {
+    ///
+    /// One PUT per round, never a pipeline. Pipelining segment PUTs is a
+    /// measured 5–10× on ship rate (plan 26's appendix: 5.1 → 29.4 seg/s
+    /// HU→AWS at depth 8, 33 → 231 same-region, 6.2 → 41.6 against OVH),
+    /// and it is still deliberately not done: a holder reaches the same
+    /// *records* per second by letting the journal accumulate while one
+    /// PUT is in flight and shipping one larger segment. At `SEGMENT_BATCH`
+    /// = 10k records and a 200 ms round trip that is ~50k records/s, an
+    /// order of magnitude above what the FUSE path in front of it
+    /// produces. Depth > 1 would buy throughput we do not need in exchange
+    /// for a real hazard: with several sequences in flight, a failure of
+    /// one leaves a hole that stalls every tailer behind it until it is
+    /// filled or the stream is repaired. The byte cap below is what an
+    /// accumulating journal actually needs.
+    async fn ship_part(
+        &mut self,
+        part: &str,
+        lease: &LeaseKeeper,
+        batch: constellation_meta::JournalBatch,
+    ) -> Result<bool> {
         if self.skip_ship.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(false);
         }
         let Some(epoch) = lease.ship_epoch() else {
-            return Ok(false);
-        };
-        let grouped = self.meta.take_journal_grouped(SEGMENT_BATCH)?;
-        let Some((_, batch)) = grouped.into_iter().find(|(p, _)| p == part) else {
             return Ok(false);
         };
         if batch.is_empty() {
@@ -741,6 +990,7 @@ impl Shipper {
         // the max-merge on replay. Atime never triggers a ship on its
         // own here; an atime-only partition relies on the idle-release
         // drain (ship-then-release) instead.
+        let journaled = records.len();
         let atime_rows = self.meta.take_atime_of(part, SEGMENT_BATCH)?;
         for (ino, atime_ns, time_ns) in &atime_rows {
             records.push(LogRecord::Atime {
@@ -749,11 +999,33 @@ impl Shipper {
                 time_ns: *time_ns,
             });
         }
+        // Cut to what fits in one segment. The ride-along atime rows sit at
+        // the end and so are the first thing dropped, which is right: they
+        // are droppable by definition, and a journaled record cut here is
+        // simply shipped by the next round (this returns `true`, so the
+        // caller comes straight back).
+        let fits = records_within_cap(&records)?;
+        let shipped_journal = fits.min(journaled);
+        let shipped_atime = fits.saturating_sub(journaled);
+        records.truncate(fits);
+        let batch = &batch[..shipped_journal];
+        let atime_rows = &atime_rows[..shipped_atime];
         let payload = encode(self.node_id, epoch, &records)?;
         let next_seq = self.parts[part].next_seq;
         match self.parts[part].log.put_segment(next_seq, &payload).await {
             Ok(()) => {}
-            Err(constellation_store_s3::StoreError::AlreadyExists) => return Ok(true),
+            // The sequence we aimed at is taken. Because a holder no
+            // longer tails its own stream, this CAS collision is the only
+            // thing left that tells it the stream moved without it, so
+            // the segment has to be absorbed here rather than by the next
+            // round's tail: normally our own unacked segment from before
+            // a restart (recovered by `apply_decoded_segment`), otherwise
+            // a deposed holder's late write, which the fence rejects.
+            // Skipping this would spin forever at the same sequence.
+            Err(constellation_store_s3::StoreError::AlreadyExists) => {
+                self.tail_part(part).await?;
+                return Ok(true);
+            }
             Err(e) => return Err(e).context("shipping log segment"),
         }
         let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
@@ -815,6 +1087,10 @@ impl Shipper {
             spool.last_error = None;
         }
         self.shipped_since_ckpt += 1;
+        // `payload` is the uncompressed postcard envelope, consistent with
+        // `snap.len()` (also uncompressed) as the baseline it is compared
+        // against in the cadence gate.
+        self.bytes_since_ckpt += payload.len() as u64;
         if self.checkpoint_is_due() {
             self.checkpoint().await?;
         }
@@ -1002,15 +1278,7 @@ impl Shipper {
                     if self.meta.xpart_dst_seen(*txid)? {
                         self.meta.unpark_xpart(*txid)?;
                     } else {
-                        let dst_journaled = self
-                            .meta
-                            .take_journal_grouped(usize::MAX)?
-                            .iter()
-                            .any(|(_, recs)| {
-                                recs.iter().any(|(_, r)| {
-                                    matches!(r, LogRecord::RenameXpartDst { txid: t, .. } if *t == *txid)
-                                })
-                            });
+                        let dst_journaled = self.meta.journal_has_xpart_dst(*txid)?;
                         if !dst_journaled {
                             self.meta.park_xpart(*txid, "src", rec)?;
                         }
@@ -1071,16 +1339,7 @@ impl Shipper {
             if has_dst_pending {
                 continue;
             }
-            let has_dst_journaled =
-                self.meta
-                    .take_journal_grouped(usize::MAX)?
-                    .iter()
-                    .any(|(_, recs)| {
-                        recs.iter().any(|(_, r)| {
-                        matches!(r, LogRecord::RenameXpartDst { txid: t, .. } if *t == txid)
-                    })
-                    });
-            if has_dst_journaled {
+            if self.meta.journal_has_xpart_dst(txid)? {
                 continue;
             }
             self.meta
@@ -1105,6 +1364,9 @@ impl Shipper {
     fn checkpoint_is_due(&self) -> bool {
         checkpoint_is_due(
             self.shipped_since_ckpt,
+            self.bytes_since_ckpt,
+            self.last_ckpt_bytes,
+            self.ckpt_ratio,
             self.last_ckpt_at.map(|at| at.elapsed()),
             checkpoint_min_interval(),
         )
@@ -1135,6 +1397,9 @@ impl Shipper {
             .put_checkpoint_with_vector(covered, &snap, &vector)
             .await?;
         self.shipped_since_ckpt = 0;
+        // The freshly written snapshot is the new cadence baseline.
+        self.last_ckpt_bytes = snap.len() as u64;
+        self.bytes_since_ckpt = 0;
         self.last_ckpt_at = Some(Instant::now());
         tracing::info!(
             seq = covered,
@@ -1163,7 +1428,8 @@ impl Shipper {
         }
         let mut last_progress = Instant::now();
         loop {
-            self.tail_all().await?;
+            let held = held_partitions(leases);
+            self.tail_all_except(&held).await?;
             if matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
                 tracing::info!(
                     journal_backlog = MetaStore::journal_len(&*self.meta).unwrap_or(0),
@@ -1359,10 +1625,79 @@ impl Shipper {
         }
         Ok(())
     }
+
+    /// Ask a live foreign holder for `part` by writing this node into the
+    /// lease object's `wanted_by` list (plan 26 Step 7b).
+    ///
+    /// This is the only signal a requester has when P2P is down, and it
+    /// costs one CAS PUT: the holder's next renewal fails against the
+    /// edited object, which is how it learns to release. Everything here
+    /// is best effort — a lost CAS means somebody else edited or took the
+    /// lease first, and the next `Acquire` re-reads it — so nothing in the
+    /// acquisition path branches on the outcome.
+    ///
+    /// Only in [`LeaseMode::Cas`]. Without `If-Match` a swap is a blind
+    /// overwrite, and blindly rewriting a live holder's lease object is
+    /// precisely the race that mode cannot afford.
+    async fn register_wanted_by(
+        &mut self,
+        keeper: &LeaseKeeper,
+        part: &str,
+        prev: &Lease,
+        tag: &LeaseTag,
+    ) {
+        if self.lease_mode != LeaseMode::Cas || prev.wanted_by.contains(&self.node_id) {
+            return;
+        }
+        // Half a TTL is the holder's own renewal period: registering more
+        // often than it can look cannot make it release any sooner. The
+        // timestamp is taken per *attempt*, not per success — a CAS that
+        // lost still means the object moved under us, and hammering it
+        // from a blocked FUSE thread would only add request traffic.
+        let cooldown = std::time::Duration::from_millis(
+            constellation_store_s3::lease::lease_ttl_ms().max(2) / 2,
+        );
+        if self
+            .wanted_registered_at
+            .get(part)
+            .is_some_and(|at| at.elapsed() < cooldown)
+        {
+            return;
+        }
+        self.wanted_registered_at
+            .insert(part.to_string(), Instant::now());
+        match keeper.register_wanted(prev, tag).await {
+            Ok(landed) => tracing::debug!(
+                part,
+                holder = prev.holder,
+                landed,
+                "registered a handoff request in the partition lease"
+            ),
+            Err(error) => {
+                tracing::debug!(%error, part, "could not register a handoff request")
+            }
+        }
+    }
 }
 
 fn parent_of(meta: &SqliteMeta, ino: u64) -> Option<u64> {
     meta.parent_of(ino).ok().flatten()
+}
+
+/// The partitions whose streams this node is the sole legal appender of
+/// right now, and which therefore need no LIST this round.
+///
+/// The gate is [`LeaseKeeper::ship_epoch`] rather than "a keeper exists":
+/// it is `None` for a keeper that is expired, released or deposed, so a
+/// keeper losing authority drops out of the set by itself and its stream
+/// is read again on the very next round — which is exactly what a deposed
+/// holder must do to see the new holder's writes.
+fn held_partitions(leases: &HashMap<String, LeaseKeeper>) -> HashSet<String> {
+    leases
+        .iter()
+        .filter(|(_, keeper)| keeper.ship_epoch().is_some())
+        .map(|(part, _)| part.clone())
+        .collect()
 }
 
 /// Acquire the lease for `part` if it is free, tailing that stream to
@@ -1383,6 +1718,8 @@ pub async fn acquire_lease_for(
     if let crate::lease::Plan::Busy {
         holder,
         expires_in_ms,
+        prev,
+        tag,
     } = &plan
     {
         tracing::debug!(
@@ -1391,6 +1728,7 @@ pub async fn acquire_lease_for(
             part,
             "partition lease held by another node"
         );
+        ship.register_wanted_by(keeper, part, prev, tag).await;
     }
     let tailed = if plan.needs_tail() {
         Some(ship.tail_part_to_head(part).await?)
@@ -1477,8 +1815,13 @@ mod tests {
     use crate::lease::LeaseKeeper;
     use constellation_meta::MetaStore;
     use constellation_store_s3::{LeaseMode, LeaseStore, LogStore};
+    use futures::stream::BoxStream;
     use object_store::memory::InMemory;
-    use object_store::ObjectStore;
+    use object_store::path::Path as OPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
     use std::sync::Arc as StdArc;
     use std::time::Duration;
 
@@ -1498,39 +1841,71 @@ mod tests {
         let none = Duration::from_secs(CHECKPOINT_MIN_INTERVAL_S);
         assert_eq!(none, Duration::ZERO, "the floor must default to off");
 
+        // With no byte baseline (`last_ckpt_bytes == 0`) the byte gate is
+        // inert and the segment count is in sole charge, exactly as before
+        // plan 26. `bytes_since` and `ratio` must not matter here.
+        let due = |shipped, since| checkpoint_is_due(shipped, 0, 0, 1.0, since, none);
+
         // Below the segment count, nothing triggers a checkpoint.
-        assert!(!checkpoint_is_due(CHECKPOINT_EVERY - 1, None, none));
-        assert!(!checkpoint_is_due(
-            CHECKPOINT_EVERY - 1,
-            Some(Duration::from_secs(3600)),
-            none
-        ));
+        assert!(!due(CHECKPOINT_EVERY - 1, None));
+        assert!(!due(CHECKPOINT_EVERY - 1, Some(Duration::from_secs(3600))));
 
         // At the count, the default fires regardless of recency.
-        assert!(checkpoint_is_due(CHECKPOINT_EVERY, None, none));
-        assert!(checkpoint_is_due(
-            CHECKPOINT_EVERY,
-            Some(Duration::ZERO),
-            none
-        ));
+        assert!(due(CHECKPOINT_EVERY, None));
+        assert!(due(CHECKPOINT_EVERY, Some(Duration::ZERO)));
 
         // A configured floor delays it, and only until the gap is met.
         let floor = Duration::from_secs(60);
         assert!(!checkpoint_is_due(
             CHECKPOINT_EVERY,
+            0,
+            0,
+            1.0,
             Some(Duration::from_secs(59)),
             floor
         ));
         assert!(checkpoint_is_due(
             CHECKPOINT_EVERY,
+            0,
+            0,
+            1.0,
             Some(Duration::from_secs(60)),
             floor
         ));
         // The first checkpoint of a mount has no gap to wait out.
-        assert!(checkpoint_is_due(CHECKPOINT_EVERY, None, floor));
+        assert!(checkpoint_is_due(CHECKPOINT_EVERY, 0, 0, 1.0, None, floor));
+    }
+
+    /// Once a baseline exists, the segment count is only a floor: the
+    /// checkpoint fires when shipped-log bytes reach `ratio ×` the last
+    /// snapshot size, so the whole-DB copy is paid for in proportion to
+    /// the log it lets us truncate.
+    #[test]
+    fn checkpoint_trigger_is_byte_proportional_once_seeded() {
+        let none = Duration::ZERO;
+        let baseline = 1_000_000u64;
+        let due =
+            |shipped, bytes, ratio| checkpoint_is_due(shipped, bytes, baseline, ratio, None, none);
+
+        // At the count but a byte short of ratio 1.0 → not yet.
+        assert!(!due(CHECKPOINT_EVERY, 999_999, 1.0));
+        // Exactly the baseline → fire.
+        assert!(due(CHECKPOINT_EVERY, 1_000_000, 1.0));
+        // A smaller ratio fires earlier (half the baseline).
+        assert!(due(CHECKPOINT_EVERY, 500_000, 0.5));
+        assert!(!due(CHECKPOINT_EVERY, 499_999, 0.5));
+        // The segment count remains a hard floor regardless of bytes: no
+        // checkpoint below it even with a mountain of bytes shipped.
+        assert!(!due(CHECKPOINT_EVERY - 1, 10_000_000, 1.0));
     }
 
     fn node(store: &StdArc<InMemory>, id: u64) -> Node {
+        node_on(store.clone() as StdArc<dyn ObjectStore>, id)
+    }
+
+    /// `node`, but over any backing store — the request-counting decorator
+    /// below is not an `InMemory`.
+    fn node_on(store: StdArc<dyn ObjectStore>, id: u64) -> Node {
         let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
         meta.set_node_prefix(id).unwrap();
         let log = LogStore::new(store.clone());
@@ -1542,7 +1917,7 @@ mod tests {
         ship.set_autosplit(true);
         let lease = LeaseKeeper::new(
             LeaseStore::new(
-                store.clone(),
+                store,
                 constellation_store_s3::log::PARTITION,
                 LeaseMode::Cas,
             ),
@@ -1905,6 +2280,13 @@ mod tests {
 
     /// A late segment stamped with a superseded epoch is fenced out
     /// rather than applied over the current holder's state.
+    ///
+    /// Since plan 26 Step 3 the holder does not poll the stream it holds,
+    /// so a deposed predecessor's late write is not found by a tail: it
+    /// surfaces when the holder's own next CAS lands on the sequence that
+    /// write took. That is the only path a live cluster has — the fence
+    /// still has to reject it, and the holder still has to ship *past* it
+    /// rather than over it.
     #[tokio::test]
     async fn lower_epoch_segment_is_fenced() {
         let store = StdArc::new(InMemory::new());
@@ -1935,13 +2317,24 @@ mod tests {
             .await
             .unwrap();
 
+        // B keeps writing; its CAS collides with the zombie's sequence.
+        b.meta.mkdir(1, "after", 0o755, 0, 0).unwrap();
         b.sync().await;
+
         assert!(
             b.meta.lookup(1, "zombie").unwrap().is_none(),
             "a superseded epoch must not mutate the namespace"
         );
         assert_eq!(b.ship.spool.lock().unwrap().fenced, 1);
-        assert_eq!(b.meta.applied_seq().unwrap(), seq);
+        assert_eq!(
+            b.meta.applied_seq().unwrap(),
+            seq + 1,
+            "B must ship past the fenced sequence, not over it"
+        );
+        assert!(
+            b.meta.lookup(1, "after").unwrap().is_some(),
+            "the collision must not cost B the write that hit it"
+        );
     }
 
     /// Rewrite the lease object so it is already expired, simulating a
@@ -2677,5 +3070,586 @@ mod tests {
         let kept = restored.lookup(1, "f").unwrap().unwrap();
         assert_eq!(kept.ino, ino);
         assert_eq!(restored.manifest(ino).unwrap(), manifest);
+    }
+
+    /// An `InMemory` that records the prefix of every listing and the key
+    /// of every GET. LIST is the request class plan 26 is trying to keep
+    /// off the steady-state path (12.5x the price of a GET on AWS, and
+    /// ~180 ms from Europe whether it returns anything or not), so the
+    /// assertions below count calls rather than infer them from behaviour.
+    #[derive(Debug, Default)]
+    struct CountingStore {
+        inner: InMemory,
+        listed: std::sync::Mutex<Vec<String>>,
+        got: std::sync::Mutex<Vec<String>>,
+        put: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingStore {
+        /// How many listings were issued under `prefix`.
+        fn lists_of(&self, prefix: &str) -> usize {
+            self.listed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.starts_with(prefix))
+                .count()
+        }
+
+        /// How many object GETs were issued under `prefix`.
+        fn gets_of(&self, prefix: &str) -> usize {
+            self.got
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.starts_with(prefix))
+                .count()
+        }
+
+        /// How many PUTs were issued to `key`.
+        fn puts_of(&self, key: &str) -> usize {
+            self.put
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| *k == key)
+                .count()
+        }
+
+        fn note(&self, prefix: Option<&OPath>) {
+            self.listed
+                .lock()
+                .unwrap()
+                .push(prefix.map(|p| p.to_string()).unwrap_or_default());
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &OPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.put.lock().unwrap().push(location.to_string());
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &OPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &OPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.got.lock().unwrap().push(location.to_string());
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<OPath>>,
+        ) -> BoxStream<'static, object_store::Result<OPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&OPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.note(prefix);
+            self.inner.list(prefix)
+        }
+        /// Overridden rather than inherited: the blanket implementation
+        /// routes through `list`, which would still be counted, but the
+        /// tailer calls this one and the count must name what it called.
+        fn list_with_offset(
+            &self,
+            prefix: Option<&OPath>,
+            offset: &OPath,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.note(prefix);
+            self.inner.list_with_offset(prefix, offset)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&OPath>,
+        ) -> object_store::Result<ListResult> {
+            self.note(prefix);
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &OPath,
+            to: &OPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// While this node holds p0's lease it is the only node allowed to
+    /// append there, so the per-round LIST of `log/p0` can only ever
+    /// return segments it wrote itself. Measured HU->AWS, dropping it
+    /// takes a writer from 2.6 to 5.1 segments/s; the ship loop must be
+    /// PUT-only (plan 26 Step 3).
+    #[tokio::test]
+    async fn holder_ships_without_listing_its_own_stream() {
+        let counting = StdArc::new(CountingStore::default());
+        let mut a = node_on(counting.clone() as StdArc<dyn ObjectStore>, 1);
+
+        assert!(acquire_lease(&mut a.ship, &mut a.lease).await.unwrap());
+        let mut leases = HashMap::new();
+        leases.insert(PARTITION.to_string(), a.lease);
+        // Everything before this point (acquisition, and the tail it does
+        // when the claim is a takeover) is allowed to list.
+        let base = counting.lists_of("log/p0");
+
+        for i in 0..10 {
+            a.meta.create(1, &format!("f{i}"), 0o644, 0, 0).unwrap();
+            a.ship.sync_all(&mut leases).await.unwrap();
+        }
+
+        assert_eq!(
+            counting.lists_of("log/p0") - base,
+            0,
+            "a lease holder listed the stream only it may append to: {:?}",
+            counting.listed.lock().unwrap()
+        );
+        assert_eq!(a.meta.journal_len().unwrap(), 0, "every round must ship");
+        assert_eq!(a.ship.last_shipped_seq(PARTITION), Some(10));
+    }
+
+    /// The one case the skipped self-tail would strand: a holder that
+    /// crashed between the segment PUT and the journal ack comes back,
+    /// reacquires its own lease, and aims at a sequence its own segment
+    /// already occupies. Nothing tails p0 for it any more, so the CAS
+    /// collision itself has to absorb that segment — otherwise the ship
+    /// loop retries the same sequence forever.
+    #[tokio::test]
+    async fn restarted_holder_recovers_own_unacked_segment_without_tailing_all() {
+        let counting = StdArc::new(CountingStore::default());
+        let store = counting.clone() as StdArc<dyn ObjectStore>;
+        let a = node_on(store.clone(), 1);
+        a.meta.mkdir(1, "d", 0o755, 0, 0).unwrap();
+        let records: Vec<LogRecord> = a
+            .meta
+            .take_journal(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        // The PUT lands, the ack never does: the journal still holds the
+        // records and `next_seq` never advanced.
+        a.ship
+            .log
+            .put_segment(1, &encode(1, 1, &records).unwrap())
+            .await
+            .unwrap();
+
+        // Restart: a fresh shipper over the same replica, holding p0.
+        let mut ship = Shipper::attach(a.meta.clone(), LogStore::new(store.clone()), 1).unwrap();
+        let mut keeper = LeaseKeeper::new(LeaseStore::new(store, PARTITION, LeaseMode::Cas), 1);
+        assert!(acquire_lease(&mut ship, &mut keeper).await.unwrap());
+        assert!(keeper.ship_epoch().is_some(), "the restart holds p0");
+        let mut leases = HashMap::new();
+        leases.insert(PARTITION.to_string(), keeper);
+
+        let (lists_before, gets_before) = (counting.lists_of("log/p0"), counting.gets_of("log/p0"));
+        ship.sync_all(&mut leases).await.unwrap();
+        assert_eq!(a.meta.journal_len().unwrap(), 0, "journal acked");
+        assert_eq!(ship.next_seq(), 2, "next_seq must advance past our own");
+        assert_eq!(names(&a.meta, 1).len(), 1, "the op must not apply twice");
+        // Step 4b moved the tail from LIST to a GET-next probe, so the
+        // evidence that the forced tail ran is a GET of the stream, not a
+        // listing of it. The listing must now stay at zero throughout —
+        // this run is short enough that the probe alone reaches the
+        // recovered segment.
+        assert!(
+            counting.gets_of("log/p0") > gets_before,
+            "recovery must come from the forced tail after AlreadyExists"
+        );
+        assert_eq!(
+            counting.lists_of("log/p0"),
+            lists_before,
+            "the probe covers a one-segment recovery; no LIST is needed"
+        );
+
+        // And that tail is one-shot: an ordinary round after it is back to
+        // PUT-only (here, with nothing to ship, to no requests at all).
+        let settled = (counting.lists_of("log/p0"), counting.gets_of("log/p0"));
+        ship.sync_all(&mut leases).await.unwrap();
+        assert_eq!(
+            (counting.lists_of("log/p0"), counting.gets_of("log/p0")),
+            settled,
+            "the recovery tail must not become the steady state"
+        );
+    }
+
+    /// A follower's steady-state poll must not touch LIST at all: it is
+    /// the speculative GET-next probe, whose misses cost a GET each
+    /// (~1/12.5 of a LIST on AWS, and no slower — 177 vs 175 ms from
+    /// Europe). LIST stays for catch-up, where one page beats k GETs, and
+    /// this pins both halves: the 20-segment backlog below is fetched with
+    /// a listing, the ten idle rounds after it with probes only.
+    #[tokio::test]
+    async fn tailer_uses_get_probes_not_list_in_steady_state() {
+        let counting = StdArc::new(CountingStore::default());
+        let store = counting.clone() as StdArc<dyn ObjectStore>;
+        let mut a = node_on(store.clone(), 1);
+        let mut b = node_on(store.clone(), 2);
+
+        assert!(acquire_lease(&mut a.ship, &mut a.lease).await.unwrap());
+        let mut a_leases = HashMap::new();
+        a_leases.insert(PARTITION.to_string(), a.lease);
+        // Deeper than one probe (k = 16) so the follower starts out in
+        // catch-up mode rather than steady state.
+        for i in 0..20 {
+            a.meta.create(1, &format!("f{i}"), 0o644, 0, 0).unwrap();
+            a.ship.sync_all(&mut a_leases).await.unwrap();
+        }
+
+        let mut b_leases: HashMap<String, LeaseKeeper> = HashMap::new();
+        let (lists, gets) = (counting.lists_of("log/p0"), counting.gets_of("log/p0"));
+        b.ship.sync_all(&mut b_leases).await.unwrap();
+        assert_eq!(names(&b.meta, 1).len(), 20, "the follower caught up");
+        assert!(
+            counting.lists_of("log/p0") > lists,
+            "a follower 20 segments behind must still use a LIST page: \
+             1000 keys in one round trip beats k GETs at that depth"
+        );
+        assert!(counting.gets_of("log/p0") > gets);
+
+        // Steady state: nothing is being written anywhere.
+        let (lists, gets) = (counting.lists_of("log/p0"), counting.gets_of("log/p0"));
+        for _ in 0..10 {
+            b.ship.sync_all(&mut b_leases).await.unwrap();
+        }
+        assert_eq!(
+            counting.lists_of("log/p0") - lists,
+            0,
+            "an idle follower must not list the log: {:?}",
+            counting.listed.lock().unwrap()
+        );
+        // One first-miss GET per round. The probe asks for k sequences at
+        // once, but `buffered` polls them in order and this store answers
+        // the head synchronously, so its siblings are never polled and
+        // never reach the backend. Against a real S3 the head returns
+        // pending and all k requests do go out — k 404s of a class costing
+        // ~1/12.5 of the LIST they replace, and that is what the sync
+        // task's idle backoff (30 s ceiling vs a 500 ms poll) pays for.
+        assert_eq!(
+            counting.gets_of("log/p0") - gets,
+            10,
+            "each idle round must cost exactly one probe head (seq {}), \
+             and nothing else",
+            b.ship.last_shipped_seq(PARTITION).unwrap_or(0) + 1
+        );
+    }
+
+    /// `SEGMENT_BATCH` bounds a segment by record count, which says
+    /// nothing about its size. Three multi-MiB records must not become one
+    /// oversized PUT: the batch is cut to the largest prefix under
+    /// `SEGMENT_MAX_BYTES`, the rest stays journaled, and successive
+    /// rounds drain it with no record lost or shipped twice.
+    #[tokio::test]
+    async fn oversized_batch_is_split_at_the_byte_cap() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let mut b = node(&store, 2);
+
+        let f = a.meta.create(1, "big", 0o644, 0, 0).unwrap();
+        a.sync().await; // the create ships as seq 1, journal empty again
+
+        // ~3 MiB each: two fit in no segment, one does.
+        let blob = vec![b'x'; 3 << 20];
+        for i in 0..3 {
+            a.meta
+                .set_xattr(
+                    f.ino,
+                    &format!("user.blob{i}"),
+                    &blob,
+                    constellation_meta::SetXattrMode::Set,
+                )
+                .unwrap();
+        }
+        assert_eq!(a.meta.journal_len().unwrap(), 3);
+
+        let log = LogStore::for_partition(store.clone(), PARTITION);
+        for round in 0..3u64 {
+            assert!(
+                a.ship.ship_part_taking(PARTITION, &a.lease).await.unwrap(),
+                "round {round} must ship"
+            );
+            assert_eq!(
+                a.meta.journal_len().unwrap(),
+                2 - round,
+                "round {round} ships exactly one record and leaves the rest"
+            );
+            let payload = log.get_segment(2 + round).await.unwrap();
+            assert!(
+                payload.len() <= SEGMENT_MAX_BYTES,
+                "segment {} is {} bytes, over the {SEGMENT_MAX_BYTES} cap",
+                2 + round,
+                payload.len()
+            );
+            assert_eq!(decode(&payload).unwrap().records.len(), 1);
+        }
+        assert!(
+            !a.ship.ship_part_taking(PARTITION, &a.lease).await.unwrap(),
+            "the journal is drained"
+        );
+
+        a.release().await;
+        b.sync().await;
+        for i in 0..3 {
+            assert_eq!(
+                b.meta
+                    .get_xattr(f.ino, &format!("user.blob{i}"))
+                    .unwrap()
+                    .as_deref(),
+                Some(&blob[..]),
+                "the peer converges across the split batch"
+            );
+        }
+    }
+
+    /// A keeper that is deposed mid-flight must start reading its stream
+    /// again — its lease is what earned it the right to skip the LIST.
+    /// The plan does not want that assumed: `ship_epoch()` returns `None`
+    /// once the keeper is lost, which is what drops it out of the held
+    /// set, and this pins that behaviour.
+    #[tokio::test]
+    async fn a_deposed_keeper_leaves_the_held_set_and_tails_again() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let mut b = node(&store, 2);
+
+        a.meta.mkdir(1, "from-a", 0o755, 0, 0).unwrap();
+        a.sync().await;
+
+        // A stalls; its lease expires and B takes over and writes.
+        expire_lease(&store).await;
+        b.sync().await;
+        b.meta.mkdir(1, "from-b", 0o755, 0, 0).unwrap();
+        b.sync().await;
+
+        // A has not noticed yet: its own view still says the lease is
+        // usable, so p0 stays in the held set and stays unread.
+        let mut leases = HashMap::new();
+        leases.insert(PARTITION.to_string(), a.lease);
+        assert!(leases[PARTITION].ship_epoch().is_some());
+        a.ship.sync_all(&mut leases).await.unwrap();
+        assert!(
+            a.meta.lookup(1, "from-b").unwrap().is_none(),
+            "a holder must not list the partition it believes it holds"
+        );
+
+        // The renewal CAS is where it finds out.
+        leases
+            .get_mut(PARTITION)
+            .unwrap()
+            .renew_now()
+            .await
+            .unwrap();
+        assert!(leases[PARTITION].is_lost());
+        assert_eq!(
+            leases[PARTITION].ship_epoch(),
+            None,
+            "a lost keeper must not report a ship epoch, or it would keep \
+             suppressing the tail of a stream it no longer owns"
+        );
+
+        a.ship.sync_all(&mut leases).await.unwrap();
+        assert!(
+            a.meta.lookup(1, "from-b").unwrap().is_some(),
+            "the deposed node must tail the new holder's writes on its next round"
+        );
+    }
+
+    /// The lease object as it currently stands in the bucket.
+    async fn lease_object(store: &StdArc<InMemory>) -> Lease {
+        lease_object_of(&LeaseStore::new(store.clone(), PARTITION, LeaseMode::Cas)).await
+    }
+
+    async fn lease_object_of(leases: &LeaseStore) -> Lease {
+        leases.get().await.unwrap().unwrap().0
+    }
+
+    /// Leases are sticky: an idle holder keeps write authority until some
+    /// peer actually asks for it. Releasing it to nobody costs the next
+    /// local write three S3 round trips to take it back, and buys nothing
+    /// — which is the whole of plan 26 Step 7.
+    #[tokio::test]
+    async fn active_holder_never_releases_idle_without_a_requester() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+
+        a.meta.mkdir(1, "from-a", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        assert_eq!(a.meta.journal_len().unwrap(), 0, "nothing left to ship");
+
+        // Both idle timers are elapsed and the journal is drained: every
+        // condition the old unconditional release had is met.
+        a.lease.expire_idle_timers_for_test();
+        assert!(
+            !a.lease.idle_release_due(0),
+            "an idle holder must keep a lease nobody is waiting for"
+        );
+
+        // Renewing is where a request would be noticed; there is none.
+        a.lease.renew_now().await.unwrap();
+        assert!(!a.lease.is_lost());
+        assert!(a.lease.wanted_by().is_empty());
+        assert!(!a.lease.idle_release_due(0));
+        let cur = lease_object(&store).await;
+        assert_eq!((cur.holder, cur.epoch, cur.released), (1, 1, false));
+
+        // Non-vacuity: the requester list is the *only* difference. One
+        // peer signs it, A's next renew picks it up, and the same call
+        // with the same timers now says release.
+        let leases = LeaseStore::new(store.clone(), PARTITION, LeaseMode::Cas);
+        let (live, tag) = leases.get().await.unwrap().unwrap();
+        leases.try_swap(&live.wanting(2), &tag).await.unwrap();
+        a.lease.renew_now().await.unwrap();
+        a.lease.expire_idle_timers_for_test();
+        assert_eq!(a.lease.wanted_by(), &[2]);
+        assert!(a.lease.idle_release_due(0));
+    }
+
+    /// The S3-only handoff, end to end and with P2P out of the picture: B
+    /// cannot take a live lease, so it signs the waiting list; A learns of
+    /// it through its own renewal CAS failing, releases once idle, and B
+    /// claims at a bumped epoch that fences A's late writes.
+    #[tokio::test]
+    async fn requester_registers_wanted_by_and_gets_the_lease() {
+        let counting = StdArc::new(CountingStore::default());
+        let store = counting.clone() as StdArc<dyn ObjectStore>;
+        let mut a = node_on(store.clone(), 1);
+        let mut b = node_on(store.clone(), 2);
+        let leases = LeaseStore::new(store.clone(), PARTITION, LeaseMode::Cas);
+
+        a.meta.mkdir(1, "from-a", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        let held = leases.get().await.unwrap().unwrap().0;
+        assert_eq!((held.holder, held.epoch), (1, 1));
+
+        // B wants the partition. It does not get it, and it does not move
+        // it either: holder, epoch and expiry come back untouched.
+        assert!(!acquire_lease(&mut b.ship, &mut b.lease).await.unwrap());
+        let busy = leases.get().await.unwrap().unwrap().0;
+        assert_eq!(busy.wanted_by, vec![2], "B signed the waiting list");
+        assert_eq!(
+            (busy.holder, busy.epoch, busy.expires_unix_ms, busy.released),
+            (held.holder, held.epoch, held.expires_unix_ms, held.released),
+            "a requester may not move the lease"
+        );
+
+        // Retrying does not re-register: the holder only looks once per
+        // half-TTL, so a blocked writer asking again is pure request cost.
+        let puts = counting.puts_of("leases/p0.json");
+        for _ in 0..5 {
+            assert!(!acquire_lease(&mut b.ship, &mut b.lease).await.unwrap());
+        }
+        assert_eq!(
+            counting.puts_of("leases/p0.json"),
+            puts,
+            "five more Acquire retries must not cost five more CAS PUTs"
+        );
+
+        // A's renewal CAS fails against B's edit — and that is a handoff
+        // request, not a deposition.
+        a.lease.renew_now().await.unwrap();
+        assert!(!a.lease.is_lost());
+        assert_eq!(a.lease.wanted_by(), &[2]);
+        assert_eq!(a.lease.ship_epoch(), Some(1), "A still holds p0");
+
+        // With a requester registered, the idle release fires.
+        a.lease.expire_idle_timers_for_test();
+        assert!(a.lease.idle_release_due(0));
+        a.release().await;
+        let released = lease_object_of(&leases).await;
+        assert!(released.released, "A handed it back");
+        assert!(
+            released.wanted_by.is_empty(),
+            "the request has been answered; it must not bind the next holder"
+        );
+
+        // B takes over, applying A's flushed log first.
+        b.meta.mkdir(1, "from-b", 0o755, 0, 0).unwrap();
+        b.sync().await;
+        assert_eq!(b.lease.ship_epoch(), Some(2), "a handover bumps the epoch");
+        assert!(b.meta.lookup(1, "from-a").unwrap().is_some());
+
+        // A's late flush, stamped with the epoch it no longer holds, is
+        // fenced rather than applied.
+        let stranded = vec![LogRecord::Mkdir {
+            parent: 1,
+            name: "zombie".into(),
+            ino: 1 << 40 | 99,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 0,
+        }];
+        let seq = b.ship.next_seq();
+        b.ship
+            .log
+            .put_segment(seq, &encode(1, 1, &stranded).unwrap())
+            .await
+            .unwrap();
+        b.meta.mkdir(1, "after", 0o755, 0, 0).unwrap();
+        b.sync().await;
+        assert!(b.meta.lookup(1, "zombie").unwrap().is_none());
+        assert_eq!(b.ship.spool.lock().unwrap().fenced, 1);
+    }
+
+    /// A renew CAS that fails is not by itself evidence of anything: since
+    /// Step 7b a requester edits the lease object in place, which fails the
+    /// holder's CAS exactly as a takeover would. Mistaking the two would
+    /// make any node that is asked for a partition stop shipping forever
+    /// (deposition is terminal), so the holder has to re-read and tell them
+    /// apart.
+    #[tokio::test]
+    async fn wanted_by_edit_is_not_a_deposition() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let mut b = node(&store, 2);
+
+        a.meta.mkdir(1, "from-a", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        assert!(!acquire_lease(&mut b.ship, &mut b.lease).await.unwrap());
+        let leases = LeaseStore::new(store.clone(), PARTITION, LeaseMode::Cas);
+        let edited_tag = leases.get().await.unwrap().unwrap().1;
+
+        a.lease.renew_now().await.unwrap();
+        assert!(!a.lease.is_lost(), "a handoff request must not depose");
+        assert_eq!(a.lease.ship_epoch(), Some(1), "same epoch, same holder");
+        let (cur, tag) = leases.get().await.unwrap().unwrap();
+        assert_eq!((cur.holder, cur.epoch, cur.released), (1, 1, false));
+        assert_eq!(cur.wanted_by, vec![2], "the request survives the renewal");
+        // Surviving the CAS failure is not enough: the renewal itself has
+        // to land against the fresh tag, or the lease drifts toward expiry
+        // and the handoff turns back into a takeover.
+        assert_ne!(tag, edited_tag, "the retried renew must have swapped");
+        // And A has to come away knowing who is waiting — that is the only
+        // thing that will ever make it release.
+        assert_eq!(a.lease.wanted_by(), &[2]);
+
+        // And authority is intact: A keeps shipping until it chooses to
+        // release, which is what "finishes any in-flight batch" means.
+        a.meta.mkdir(1, "also-from-a", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        assert_eq!(a.meta.journal_len().unwrap(), 0);
+        assert_eq!(a.ship.last_shipped_seq(PARTITION), Some(2));
     }
 }

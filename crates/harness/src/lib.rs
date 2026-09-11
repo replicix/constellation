@@ -6,6 +6,7 @@ pub mod client;
 pub mod corpus;
 pub mod docker;
 pub mod model;
+pub mod reqlog;
 pub mod s3env;
 pub mod scenarios;
 pub mod snapchurn;

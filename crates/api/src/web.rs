@@ -230,24 +230,19 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.prefetch.scan_ahead_bytes
     );
     gauge!(
-        "constellation_existence_listed",
-        "Chunk keys admitted by the mount-time S3 LIST seed.",
-        status.writeback.existence_listed
-    );
-    gauge!(
-        "constellation_existence_complete",
-        "Whether the S3 existence LIST seed completed within its memory cap.",
-        u8::from(status.writeback.existence_complete)
-    );
-    gauge!(
         "constellation_existence_bloom_hits_total",
-        "Upload decisions whose complete existence filter reported present.",
+        "Upload decisions hinted present by the local existence bloom.",
         status.writeback.existence_bloom_hits
     );
     gauge!(
-        "constellation_existence_bloom_misses_total",
-        "Upload decisions whose complete existence filter proved absent.",
-        status.writeback.existence_bloom_misses
+        "constellation_existence_chunk_ref_hits_total",
+        "Upload decisions hinted present by the replica's chunk_ref index.",
+        status.writeback.existence_chunk_ref_hits
+    );
+    gauge!(
+        "constellation_existence_misses_total",
+        "Upload decisions no existence hint could answer.",
+        status.writeback.existence_misses
     );
     gauge!(
         "constellation_existence_peer_hints_total",

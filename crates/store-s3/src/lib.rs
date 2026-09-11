@@ -9,7 +9,6 @@ pub mod decode_gate;
 pub mod designation;
 pub mod e2e;
 pub mod error;
-pub mod existence;
 pub mod format;
 pub mod gc;
 pub mod layout;
@@ -26,7 +25,6 @@ pub use decode_gate::{DecodeGate, DecodeGatePermit, Priority as DecodePriority};
 pub use designation::{Designation, DesignationMode, DesignationStore, DesignationTag};
 pub use e2e::{create_keyring_block, unlock, Argon2Params, E2eKeys, KeyringBlock, SharedE2eKeys};
 pub use error::StoreError;
-pub use existence::{parse_chunk_key, scan_chunk_hashes, ChunkHashScan};
 pub use gc::{
     append_journal, is_condemned, publish_condemned, read_condemned, CondemnedList, GcJournalEntry,
 };
