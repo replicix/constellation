@@ -254,8 +254,19 @@ impl Signed {
         Ok(out)
     }
 
+    /// Decode exactly one bare message. Trailing bytes are refused:
+    /// `postcard::from_bytes` ignores them, which let a length-prefixed
+    /// frame decode as a bare message whenever the prefix happened to
+    /// parse (about 1 in 20 random keys) — the silent framing mismatch
+    /// `stream_framing_and_bare_encoding_are_distinct` exists to catch.
     pub fn decode(frame: &[u8]) -> Result<Self> {
-        Ok(postcard::from_bytes(frame)?)
+        let (signed, rest) = postcard::take_from_bytes(frame)?;
+        anyhow::ensure!(
+            rest.is_empty(),
+            "{} trailing bytes after a message",
+            rest.len()
+        );
+        Ok(signed)
     }
 }
 
