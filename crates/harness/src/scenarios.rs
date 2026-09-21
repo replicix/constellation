@@ -270,13 +270,13 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "fresh-node-bootstrap",
-        desc: "node B rebuilds the namespace purely from S3 (checkpoint + log replay) and must match the model",
+        desc: "node B rebuilds the namespace purely from S3 (plan 28 commit + log replay) and must match the model",
         requires: &[],
         run: fresh_node_bootstrap,
     },
     Scenario {
         name: "checkpoint-strips-pending-upload",
-        desc: "a mid-write-back checkpoint must not give a fresh joiner the writer's pending_upload backlog",
+        desc: "a mid-write-back commit (plan 28; formerly a checkpoint) must not give a fresh joiner the writer's pending_upload backlog",
         requires: &[],
         run: checkpoint_strips_pending_upload,
     },
@@ -450,7 +450,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "ckpt-bulk-ingest-bounded",
-        desc: "plan 26: a bulk ingest leaves at most the newest 2 checkpoints, and a fresh node still bootstraps from them",
+        desc: "plan 26: with legacy snapshots forced on, a bulk ingest leaves at most the newest 2 checkpoints, and a fresh node still bootstraps",
         requires: &[],
         run: ckpt_bulk_ingest_bounded,
     },
@@ -2967,8 +2967,11 @@ fn checkpoint_strips_pending_upload(seed: u64) -> Result<()> {
                 .as_u64()
                 .unwrap_or(0);
             anyhow::ensure!(pending > 0, "pending already drained ({pending})");
-            let n = count_checkpoint_objects(&env.direct_endpoint, &prefix)?;
-            anyhow::ensure!(n > 0, "no checkpoint object yet");
+            // Plan 28: the mid-flight bootstrap base is a commit now; a
+            // legacy checkpoint counts too, should snapshots be forced.
+            let n = count_checkpoint_objects(&env.direct_endpoint, &prefix)?
+                + count_commit_objects(&env.direct_endpoint, &prefix)?;
+            anyhow::ensure!(n > 0, "no commit or checkpoint object yet");
             Ok(())
         },
     )?;
@@ -3013,6 +3016,10 @@ fn checkpoint_strips_pending_upload(seed: u64) -> Result<()> {
     anyhow::ensure!(spam2 == 0, "spam after idle: {spam2}\n{log2}");
     b.unmount()?;
     Ok(())
+}
+
+fn count_commit_objects(endpoint: &str, prefix: &str) -> Result<usize> {
+    Ok(raw_objects(endpoint, &format!("{prefix}/commits/"))?.len())
 }
 
 fn count_checkpoint_objects(endpoint: &str, prefix: &str) -> Result<usize> {
@@ -5605,7 +5612,10 @@ fn ckpt_bulk_ingest_bounded(seed: u64) -> Result<()> {
     let _proxy = env.s3_proxy()?;
     let prefix = format!("ckpt-ingest-{}", ts());
     let backend = format!("s3://{BUCKET}/{prefix}");
-    let mut a = Client::new(root.path(), "ingest-a", &env.endpoint, &backend)?;
+    // The legacy snapshot is off by default once plan 28 commits exist;
+    // this scenario is about bounding it, so force it on.
+    let mut a = Client::new(root.path(), "ingest-a", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_CHECKPOINT_SNAPSHOT", "on");
     a.fs_create()?;
     a.mount()?;
 

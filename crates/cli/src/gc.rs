@@ -341,41 +341,73 @@ fn collect_hash_strings(value: &serde_json::Value, out: &mut HashSet<ChunkHash>)
     }
 }
 
-async fn metadata_candidates(store: &Arc<dyn ObjectStore>, config: &GcConfig) -> Result<Vec<Mark>> {
-    let mut marks = Vec::new();
+/// The pre-plan-28 floor: `checkpoints/VECTOR.json`, when a checkpoint
+/// exists at all.
+async fn legacy_checkpoint_vector(
+    store: &Arc<dyn ObjectStore>,
+) -> Result<
+    Option<(
+        constellation_store_s3::log::CheckpointVector,
+        serde_json::Value,
+    )>,
+> {
     let latest = match store.get(&Path::from("checkpoints/p0/LATEST")).await {
-        Ok(result) => Some(
+        Ok(result) => {
             serde_json::from_slice::<constellation_store_s3::log::CheckpointRef>(
                 &result.bytes().await?,
             )?
-            .seq,
-        ),
-        Err(object_store::Error::NotFound { .. }) => None,
+            .seq
+        }
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    if let Some(latest) = latest {
-        // Log retention is per partition, floored against VECTOR.json's
-        // applied_seq for that partition — never against the max seq
-        // across all partitions. A checkpoint's `covered` is the maximum
-        // over every stream, so a child partition that is far behind p0
-        // would otherwise have live segments deleted out from under a
-        // bootstrap that has only replayed it to `applied[child]` (the
-        // finding-6 data-loss bug). A `LATEST` pointer with no vector is
-        // a corrupt bucket: we have no per-partition floor to apply, so
-        // we refuse rather than fall back to the global floor. (Read the
-        // object directly rather than via `get_checkpoint_vector`, which
-        // maps a missing vector to an empty one and would hide exactly
-        // this corruption.)
-        let vector = match store.get(&Path::from("checkpoints/VECTOR.json")).await {
-            Ok(result) => serde_json::from_slice::<constellation_store_s3::log::CheckpointVector>(
-                &result.bytes().await?,
-            )?,
-            Err(object_store::Error::NotFound { .. }) => anyhow::bail!(
-                "checkpoints/p0/LATEST names seq {latest} but checkpoints/VECTOR.json is \
-                 missing; refusing to prune the log against a global floor"
-            ),
-            Err(error) => return Err(error.into()),
-        };
+    // Log retention is per partition, floored against VECTOR.json's
+    // applied_seq for that partition — never against the max seq across
+    // all partitions. A checkpoint's `covered` is the maximum over every
+    // stream, so a child partition that is far behind p0 would otherwise
+    // have live segments deleted out from under a bootstrap that has only
+    // replayed it to `applied[child]` (the finding-6 data-loss bug). A
+    // `LATEST` pointer with no vector is a corrupt bucket: we have no
+    // per-partition floor to apply, so we refuse rather than fall back to
+    // the global floor. (Read the object directly rather than via
+    // `get_checkpoint_vector`, which maps a missing vector to an empty one
+    // and would hide exactly this corruption.)
+    let vector = match store.get(&Path::from("checkpoints/VECTOR.json")).await {
+        Ok(result) => serde_json::from_slice::<constellation_store_s3::log::CheckpointVector>(
+            &result.bytes().await?,
+        )?,
+        Err(object_store::Error::NotFound { .. }) => anyhow::bail!(
+            "checkpoints/p0/LATEST names seq {latest} but checkpoints/VECTOR.json is \
+             missing; refusing to prune the log against a global floor"
+        ),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some((vector, json!({"checkpoint": latest}))))
+}
+
+async fn metadata_candidates(store: &Arc<dyn ObjectStore>, config: &GcConfig) -> Result<Vec<Mark>> {
+    let mut marks = Vec::new();
+    // The floor is the position a fresh replica resumes tailing from.
+    // Once the commit chain exists that is the head commit's `applied`
+    // vector (plan 28 S6 bootstraps from the head), and the legacy
+    // checkpoint — no longer written by default — stops mattering; a
+    // forced checkpoint bootstrap over a pruned log refuses rather than
+    // silently stopping at the gap (`shipper::replay_from`).
+    let chain = constellation_store_s3::CommitChain::new(store.clone());
+    let head = match chain.discover_head(0).await? {
+        Some(seq) => chain.get(seq).await?,
+        None => None,
+    };
+    let floor_source = match head {
+        Some(commit) => Some((
+            constellation_store_s3::log::CheckpointVector {
+                applied: commit.applied,
+            },
+            json!({"commit": commit.seq}),
+        )),
+        None => legacy_checkpoint_vector(store).await?,
+    };
+    if let Some((vector, source)) = floor_source {
         for object in store
             .list(Some(&Path::from("log")))
             .try_collect::<Vec<_>>()
@@ -415,6 +447,7 @@ async fn metadata_candidates(store: &Arc<dyn ObjectStore>, config: &GcConfig) ->
                         "partition": partition,
                         "vector_applied": applied,
                         "retention_segments": config.retention_segments,
+                        "floor_source": source,
                     }),
                     hash: None,
                 });
@@ -582,5 +615,86 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// Plan 28: once a commit exists, retention floors on the head
+    /// commit's `applied` vector — where a fresh replica now resumes —
+    /// and a stale legacy checkpoint no longer holds the log back (or
+    /// lets it be cut, if the checkpoint were ahead). A partition the
+    /// commit does not name is not pruned at all.
+    #[tokio::test]
+    async fn log_retention_floors_on_the_head_commit_once_one_exists() {
+        use constellation_store_s3::log::{CheckpointRef, CheckpointVector};
+        use constellation_store_s3::{Commit, CommitAgg, Intent};
+        use object_store::memory::InMemory;
+        use object_store::PutPayload;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let put = |path: String, body: Vec<u8>| {
+            let store = store.clone();
+            async move {
+                store
+                    .put(&Path::from(path), PutPayload::from(body))
+                    .await
+                    .unwrap();
+            }
+        };
+        // A stale legacy checkpoint at p0:50.
+        put(
+            "checkpoints/p0/LATEST".into(),
+            serde_json::to_vec(&CheckpointRef { seq: 50, bytes: 0 }).unwrap(),
+        )
+        .await;
+        let mut vector = CheckpointVector::default();
+        vector.applied.insert("p0".into(), 50);
+        put(
+            "checkpoints/VECTOR.json".into(),
+            serde_json::to_vec(&vector).unwrap(),
+        )
+        .await;
+        for seq in 1u64..=300 {
+            put(format!("log/p0/{seq:016x}.zst"), Vec::new()).await;
+        }
+        for seq in 1u64..=10 {
+            put(format!("log/p9/{seq:016x}.zst"), Vec::new()).await;
+        }
+        let commit = Commit {
+            v: constellation_store_s3::commits::COMMIT_VERSION,
+            seq: 1,
+            parent: 0,
+            roots: BTreeMap::new(),
+            packs: Vec::new(),
+            author: 1,
+            epoch: 1,
+            agg: CommitAgg::default(),
+            intent: Intent::batch(0),
+            unix_ms: 0,
+            applied: BTreeMap::from([("p0".to_string(), 250u64)]),
+        };
+        constellation_store_s3::CommitChain::new(store.clone())
+            .create(&commit)
+            .await
+            .unwrap();
+
+        let config = GcConfig {
+            horizon_ms: 0,
+            retention_segments: 128,
+            lease_ttl_ms: 1,
+        };
+        let marked: Vec<u64> = metadata_candidates(&store, &config)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|mark| mark.rule == "log-retention")
+            .map(|mark| {
+                assert!(mark.key.starts_with("log/p0/"), "{}", mark.key);
+                assert_eq!(mark.evidence["floor_source"]["commit"], 1);
+                let name = mark.key.rsplit('/').next().unwrap();
+                u64::from_str_radix(name.trim_end_matches(".zst"), 16).unwrap()
+            })
+            .collect();
+        // Floor 250 - 128 = 122: segments 1..=121, and nothing for p9.
+        assert_eq!(marked.len(), 121);
+        assert_eq!(marked.iter().max(), Some(&121));
     }
 }

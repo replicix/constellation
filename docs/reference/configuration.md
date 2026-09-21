@@ -82,13 +82,17 @@ thrash](../how-to-guides/operations/diagnose-lease-thrash.md).
 | `CONSTELLATION_CHECKPOINT_RATIO` | `1.0` | ratio, positive | shipped-log bytes ÷ last snapshot bytes needed to fire a checkpoint |
 | `CONSTELLATION_CHECKPOINT_MIN_INTERVAL_S` | `0` | seconds | minimum checkpoint spacing; `0` disables the time floor |
 | `CONSTELLATION_CHECKPOINT_IO_CONCURRENCY` | `8` | requests, positive | parallel 8 MiB ranges (GET) / parts (PUT) for a checkpoint transfer |
+| `CONSTELLATION_CHECKPOINT_SNAPSHOT` | `off` | boolean | keep writing the legacy `VACUUM INTO` checkpoint on a mount that publishes plan 28 commits; off because the commit replaces it (bootstrap and log retention both use the commit chain). Mounts without a publisher (read-only members) always write it |
 
 ### Merkle metadata tree (plan 28)
 
-Writers publish a content-addressed Merkle map of metadata alongside the
-existing SQLite checkpoint (plan 28 option (B)). These knobs size the
-pack store, the in-memory node cache, and the commit-chain poll. They
-are reachable on every non-read-only mount.
+Writers publish a content-addressed Merkle map of metadata as a chain of
+commits (plan 28 option (B)), on the cadence the SQLite checkpoint used
+to fire at; the commit replaces the checkpoint as the bootstrap base
+(`CONSTELLATION_CHECKPOINT_SNAPSHOT` re-enables the legacy snapshot).
+These knobs size the pack store, the in-memory node cache, the
+commit-chain poll, and where a fresh replica comes from. They are
+reachable on every non-read-only mount.
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
@@ -278,9 +282,11 @@ hinted), never "proven absent".
 | `CONSTELLATION_GC_HORIZON_S` | `604800` | seconds | age before unreferenced chunks are eligible (`0` for tests) |
 | `CONSTELLATION_LOG_RETENTION_SEGMENTS` | `128` | segments | sealed log segments kept before GC, **per partition** |
 
-Log retention is evaluated per partition against
-`checkpoints/VECTOR.json`, which records how far the newest checkpoint
-has replayed each partition. A segment is prunable only when its own
+Log retention is evaluated per partition against the position a fresh
+replica resumes from: the head plan 28 commit's `applied` vector once a
+commit exists, otherwise `checkpoints/VECTOR.json`, which records how far
+the newest checkpoint has replayed each partition. (A bootstrap from a
+base the log was pruned past refuses instead of replaying from the gap.) A segment is prunable only when its own
 partition's entry in that vector is more than
 `CONSTELLATION_LOG_RETENTION_SEGMENTS` ahead of it, and a partition the
 vector does not mention yet is never pruned at all. (Flooring every

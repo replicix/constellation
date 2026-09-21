@@ -252,6 +252,27 @@ pub fn part_autosplit() -> bool {
     )
 }
 
+/// Env `CONSTELLATION_CHECKPOINT_SNAPSHOT=on` keeps writing the legacy
+/// `VACUUM INTO` checkpoint on a mount that publishes plan 28 commits.
+///
+/// Off by default: a commit is a complete state that a fresh replica
+/// bootstraps from (S6), log retention floors on the head commit's
+/// vector rather than the checkpoint's, and the O(DB) snapshot was the
+/// only reason the checkpoint cadence was expensive. The knob exists for
+/// a fleet that still has pre-plan-28 binaries bootstrapping from the
+/// same bucket. A mount without a publisher (read-only members, tests)
+/// always writes the snapshot, since it has no commit to offer instead.
+fn checkpoint_snapshot_forced() -> bool {
+    matches!(
+        std::env::var("CONSTELLATION_CHECKPOINT_SNAPSHOT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "1" | "true"
+    )
+}
+
 /// Postcard envelope for a zstd-compressed S3 log segment. `v` is
 /// reserved so a future format bump can reject old readers without a
 /// dual decoder.
@@ -1492,6 +1513,16 @@ impl Shipper {
     /// Snapshot the local DB as a checkpoint covering every partition
     /// this replica has seen, plus a VECTOR.json sidecar.
     pub async fn checkpoint(&mut self) -> Result<()> {
+        if self.publisher.is_some() && !checkpoint_snapshot_forced() {
+            // Plan 28: the commit *is* the checkpoint. Same cadence and
+            // the same counters, so the publish rate is what the
+            // snapshot rate used to be; there is simply no O(DB) copy.
+            self.shipped_since_ckpt = 0;
+            self.bytes_since_ckpt = 0;
+            self.last_ckpt_at = Some(Instant::now());
+            self.publish_tree().await;
+            return Ok(());
+        }
         let mut vector = CheckpointVector::default();
         let mut covered = 0u64;
         for (id, st) in &self.parts {
@@ -1525,11 +1556,8 @@ impl Shipper {
             snapshot_ms,
             "wrote metadata checkpoint"
         );
-        // Plan 28 §11: the commit chain is published on the checkpoint
-        // cadence, which is the cadence this replaces. It runs after
-        // the checkpoint rather than instead of it because nothing
-        // reads a commit until S6 — until then removing the checkpoint
-        // would leave a fresh node with nothing to bootstrap from.
+        // Forced snapshots (`CONSTELLATION_CHECKPOINT_SNAPSHOT`) still
+        // publish the commit alongside, so the chain never falls behind.
         self.publish_tree().await;
         Ok(())
     }
@@ -2048,7 +2076,20 @@ async fn replay_from(meta: &SqliteMeta, log: &LogStore, part: &str, start: u64) 
     let part_log = log.with_partition(part);
     let mut applied = start;
     let mut replayed = 0usize;
-    for seq in part_log.list_segments_from(start + 1).await? {
+    let seqs = part_log.list_segments_from(start + 1).await?;
+    // A first segment past `start + 1` means retention already pruned
+    // the records this base needs — e.g. a stale legacy checkpoint once
+    // retention floors on the commit chain instead. Stopping at the gap
+    // would hand back a replica silently missing that history.
+    if let Some(&first) = seqs.first() {
+        if first > start + 1 {
+            bail!(
+                "{part}: the log starts at segment {first}, but this bootstrap base \
+                 covers only up to {start}; segments in between were pruned"
+            );
+        }
+    }
+    for seq in seqs {
         if seq != applied + 1 {
             break;
         }
@@ -4036,10 +4077,8 @@ mod tests {
     /// records reach the publisher, and a checkpoint publishes the
     /// commit that will eventually replace it.
     ///
-    /// The checkpoint is asserted to still exist. Nothing reads the
-    /// commit chain until S6, so a replica that bootstraps from a
-    /// checkpoint must keep finding one — this step adds a publish, it
-    /// does not remove a checkpoint.
+    /// No `VACUUM INTO` checkpoint is written once a publisher exists:
+    /// the commit replaces it (S6 bootstraps from it).
     /// Give `n` a plan 28 tree publisher over `store`. The returned
     /// directory holds its node cache and must outlive it.
     fn enable_publisher(n: &mut Node, store: &StdArc<InMemory>, id: u64) -> tempfile::TempDir {
@@ -4090,8 +4129,8 @@ mod tests {
         assert!(commit.agg.keys >= 6, "{:?}", commit.agg);
         assert_eq!(commit.agg.files, 1, "only regular files count (§P7)");
         assert!(
-            a.ship.log().get_checkpoint_ref().await.unwrap().is_some(),
-            "the checkpoint must survive until S6 can read a commit"
+            a.ship.log().get_checkpoint_ref().await.unwrap().is_none(),
+            "a mount that publishes commits writes no snapshot checkpoint"
         );
         assert!(a.ship.tree_publisher().unwrap().published().is_some());
 
@@ -4202,6 +4241,31 @@ mod tests {
         assert!(fresh
             .chunk_ref_exists(&constellation_fs_core::ChunkHash([0; 32]))
             .is_ok());
+    }
+
+    /// A bootstrap base older than the log's retention floor must fail
+    /// loudly: replaying from the first segment present would hand back
+    /// a replica silently missing everything that was pruned.
+    #[tokio::test]
+    async fn replay_refuses_a_base_the_log_was_pruned_past() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        for i in 0..4 {
+            a.meta.mkdir(1, &format!("d{i}"), 0o755, 0, 0).unwrap();
+            a.sync().await;
+        }
+        let log = LogStore::new(store.clone());
+        use object_store::ObjectStoreExt;
+        store
+            .delete(&constellation_store_s3::layout::log_segment(PARTITION, 1))
+            .await
+            .unwrap();
+        let fresh = SqliteMeta::open_in_memory().unwrap();
+        let err = replay_from(&fresh, &log, PARTITION, 0).await.unwrap_err();
+        assert!(err.to_string().contains("pruned"), "{err:#}");
+        // From a base the log still covers, the same replay succeeds.
+        let covered = SqliteMeta::open_in_memory().unwrap();
+        assert!(replay_from(&covered, &log, PARTITION, 1).await.unwrap() > 0);
     }
 
     /// Table-by-table equality of two replicas' shared state, reporting
