@@ -82,7 +82,21 @@ impl Filesystem for ConstellationFs {
             }
         }
         match self.meta.lookup(parent, &name) {
-            Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+            Ok(Some(mut attr)) => {
+                // Same overlay and the same ordering argument as
+                // `getattr`: a name looked up while its inode has pending
+                // writes must report the pending size, or the entry reply
+                // caches a stale one. The ino is only known after the
+                // lookup, so re-read the row under the shard lock.
+                let writes = self.writes.lock(attr.ino);
+                if let Some(ws) = writes.get(&attr.ino) {
+                    attr.size = ws.file_len;
+                } else if let Ok(Some(fresh)) = self.meta.getattr(attr.ino) {
+                    attr = fresh;
+                }
+                drop(writes);
+                reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0))
+            }
             Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
             Err(e) => reply.error(Errno::from_i32(errno(&e))),
         }
@@ -101,6 +115,16 @@ impl Filesystem for ConstellationFs {
             }
             return;
         }
+        // The write shard is taken *before* the committed row is read and
+        // held until the overlay below is applied. `flush_inode` commits
+        // the manifest and retires the write state under this same lock,
+        // so reading the row first and checking the shard afterwards
+        // could see the pre-flush size *and* no write state -- a reply
+        // the kernel then caches for TTL. With host-sized concurrent
+        // FUSE dispatch that interleaving is routine: the harness's
+        // single-client `baseline` read sizes of 0 back for just-closed
+        // files about half the time.
+        let writes = self.writes.lock(ino);
         let attr = self
             .meta
             .getattr(ino)
@@ -114,9 +138,10 @@ impl Filesystem for ConstellationFs {
         match attr {
             Ok(Some(mut attr)) => {
                 // Pending writes shadow the committed size.
-                if let Some(ws) = self.writes.lock(ino).get(&ino) {
+                if let Some(ws) = writes.get(&ino) {
                     attr.size = ws.file_len;
                 }
+                drop(writes);
                 let attr = if requested_ino == constellation_fs_core::types::ROOT_INO {
                     self.visible_attr(attr)
                 } else {
