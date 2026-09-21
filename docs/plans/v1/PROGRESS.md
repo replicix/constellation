@@ -3486,3 +3486,36 @@ spills are rare and an unreferenced blob only costs space.
 | Lease expiry margin (1 s) exceeded short TTLs, so a 200 ms-TTL node never shipped | margin clamped to TTL/4 | `cli::lease::expiry_margin_ms` |
 | **E2E: the metadata tree was published in plaintext** — pack frames are zstd'd nodes whose keys are file names; `.idx` objects carry first keys; blobs hold xattr values and symlink targets; commits hold aggregates. `e2e-basic` scanned only `chunks/` and `log/` | §P13 sealing: `TreeSealing` derives per-kind keys; frames sealed with the node hash as AAD (`FLAG_SEALED_NODES`), `.idx`, blobs and commits sealed whole with their path as AAD; `e2e-basic` now scans `packs/`, `blobs/`, `commits/` for a known file name | `store-s3::{e2e::TreeSealing, packs, blobs, commits}`, test `sealed_packs_hide_names_and_need_the_key` |
 
+
+## Plan 28 (B) — final gates (2026-09-21)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `cargo test --workspace` | pass (one run hit the known load-sensitive `checkpoint_concurrency::snapshot_does_not_stall_concurrent_readers` ratio bound; 5/5 in isolation) |
+| `tests/smoke.sh`, `tests/integration.sh` | PASSED |
+| pjdfstest (`docker compose --profile test run --rm compliance`) | **8798 passed, 0 failed** (empty baseline) |
+| `target/release/harness run` (full matrix, 78 scenarios) | 68 passed, 2 skipped (fio absent), 8 failed — see below |
+
+Failures in the full matrix, triaged against the pre-plan-28 binary
+(`95985b2`) under the same harness:
+
+| Scenario | Verdict |
+|---|---|
+| `ckpt-bulk-ingest-bounded` | **fixed** (cancelled checkpoints left orphan bodies; pre-existing in milder form, worsened here) — passes 3/3 and in the confirmation run |
+| `multi-partition-retention-is-per-partition` | ported to the commit floor; still fails because autosplit also splits the scenario's `cold/` directory, so p0 never outruns the child — **pre-existing** (same double split on `95985b2`), left as is |
+| `checkpoint-strips-pending-upload`, `writeback-backpressure` | pass on rerun and in the confirmation run (timing) |
+| `atime-eventual`, `deposed-reintegration`, `chaos-ci` | fail identically on `95985b2` — **pre-existing**, left as is |
+| `named-shared-daemon` | the known plan 21 `umount myfs:/sub` hang (recorded under plan 26); killed after 18 min |
+
+Confirmation run on the final binary of every scenario the late fixes
+touch — `baseline`, `kill9-remount`, `cold-cache`, `fresh-node-bootstrap`,
+`checkpoint-strips-pending-upload`, `ckpt-bulk-ingest-bounded`,
+`snapshot-churn`, `snapshot-lifecycle`, `snapshot-mount`,
+`clone-workflow`, `gc-lifecycle`, `mtree-gc-plateau`, `e2e-basic`,
+`e2e-two-nodes`, `writeback-backpressure`, `two-clients-shared`,
+`idle-cluster-is-quiet`, `lease-handover`: **18/18 PASSED**.
+
+Partitions and splits remain in (B) because the per-partition op log is
+still the transport; §P4 deletes them with the §11b engine swap, which
+would also retire the split-timing scenario above.
