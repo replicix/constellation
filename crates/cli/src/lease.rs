@@ -94,6 +94,19 @@ pub const LEASE_WANTED_GRACE_MS: u64 = 5_000;
 /// through the sync task instead of racing the clock.
 const EXPIRY_MARGIN_MS: i64 = 1_000;
 
+/// [`EXPIRY_MARGIN_MS`], clamped to a quarter of the configured TTL.
+///
+/// A fixed 1 s margin is wider than a short TTL: at
+/// `CONSTELLATION_LEASE_TTL_MS=200` (snapshot-churn uses it to keep GC's
+/// condemned-list wait short) the lease was *never* usable, so the node
+/// never shipped a segment and its journal grew without bound. Renewal at
+/// half-TTL still leaves a quarter of it as headroom. Read once: this is
+/// on every gated FUSE mutation.
+fn expiry_margin_ms() -> i64 {
+    static MARGIN: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *MARGIN.get_or_init(|| EXPIRY_MARGIN_MS.min(lease_ttl_ms() as i64 / 4))
+}
+
 pub fn idle_release_ms() -> u64 {
     std::env::var("CONSTELLATION_LEASE_IDLE_RELEASE_MS")
         .ok()
@@ -121,7 +134,7 @@ impl LeaseView {
     pub fn usable(&self) -> bool {
         !self.lost.load(Ordering::Relaxed)
             && (self.epoch_held.load(Ordering::Relaxed)
-                || self.valid_until_ms.load(Ordering::Relaxed) - now_unix_ms() > EXPIRY_MARGIN_MS)
+                || self.valid_until_ms.load(Ordering::Relaxed) - now_unix_ms() > expiry_margin_ms())
     }
 
     pub fn is_lost(&self) -> bool {
