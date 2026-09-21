@@ -6285,8 +6285,10 @@ fn multi_partition_retention_is_per_partition(_seed: u64) -> Result<()> {
         .find(|id| id != "p0")
         .context("no child partition after the split")?;
 
-    // Run p0 far ahead of the child and let a checkpoint land while the
-    // child is quiet, so its vector entry is low.
+    // Run p0 far ahead of the child and let a metadata commit land while
+    // the child is quiet, so its `applied` entry is low. (Plan 28: the
+    // commit's vector is the retention floor now; before it, the
+    // checkpoint's VECTOR.json was, with the same per-partition rule.)
     //
     // A checkpoint needs `CHECKPOINT_EVERY` (32) *shipped segments*, and a
     // ship round takes the whole journal as one segment: 160 back-to-back
@@ -6317,15 +6319,10 @@ fn multi_partition_retention_is_per_partition(_seed: u64) -> Result<()> {
             std::thread::sleep(Duration::from_millis(5));
         }
         eventually("p0 ships", Duration::from_secs(60), || journal_drained(&a))?;
-        if checkpoint_snapshots(&env.direct_endpoint, &prefix)?.is_empty() {
+        let Some(head) = head_commit(&env.direct_endpoint, &prefix)? else {
             continue;
-        }
-        let covered = raw_json(
-            &env.direct_endpoint,
-            &format!("{prefix}/checkpoints/p0/LATEST"),
-        )?["seq"]
-            .as_u64()
-            .unwrap_or(0);
+        };
+        let covered = commit_covered(&head);
         let child_max = log_segment_seqs(&env.direct_endpoint, &prefix, &child)?
             .last()
             .copied()
@@ -6360,21 +6357,15 @@ fn multi_partition_retention_is_per_partition(_seed: u64) -> Result<()> {
         eventually("child segments ship", Duration::from_secs(60), || {
             journal_drained(&a)
         })?;
-        let vector = raw_json(
-            &env.direct_endpoint,
-            &format!("{prefix}/checkpoints/VECTOR.json"),
-        )?;
-        let latest = raw_json(
-            &env.direct_endpoint,
-            &format!("{prefix}/checkpoints/p0/LATEST"),
-        )?;
-        let covered = latest["seq"].as_u64().unwrap_or(0);
-        let applied = vector["applied"][&child].as_u64().unwrap_or(0);
+        let head =
+            head_commit(&env.direct_endpoint, &prefix)?.context("the head commit vanished")?;
+        let covered = commit_covered(&head);
+        let applied = head["applied"][&child].as_u64().unwrap_or(0);
         let child_seqs = log_segment_seqs(&env.direct_endpoint, &prefix, &child)?;
         let max_child = child_seqs.last().copied().unwrap_or(0);
         eprintln!(
-            "    multi-partition-retention: attempt {attempt}: LATEST.seq={covered} \
-             vector[{child}]={applied} child segments {:?}..{max_child} (n={})",
+            "    multi-partition-retention: attempt {attempt}: covered={covered} \
+             applied[{child}]={applied} child segments {:?}..{max_child} (n={})",
             child_seqs.first(),
             child_seqs.len()
         );
@@ -6397,11 +6388,8 @@ fn multi_partition_retention_is_per_partition(_seed: u64) -> Result<()> {
         String::from_utf8_lossy(&out.stderr)
     );
     let surviving = log_segment_seqs(&env.direct_endpoint, &prefix, &child)?;
-    let vector = raw_json(
-        &env.direct_endpoint,
-        &format!("{prefix}/checkpoints/VECTOR.json"),
-    )?;
-    let applied = vector["applied"][&child].as_u64().unwrap_or(0);
+    let head = head_commit(&env.direct_endpoint, &prefix)?.context("no head commit after gc")?;
+    let applied = head["applied"][&child].as_u64().unwrap_or(0);
     eprintln!(
         "    multi-partition-retention: after gc, {} segment(s) left on {child}, \
          vector applied {applied}",
@@ -6433,4 +6421,33 @@ fn multi_partition_retention_is_per_partition(_seed: u64) -> Result<()> {
     )?;
     c.unmount()?;
     Ok(())
+}
+
+/// The newest plan 28 commit object under `prefix`, as JSON (plain
+/// filesystems only).
+fn head_commit(endpoint: &str, prefix: &str) -> Result<Option<serde_json::Value>> {
+    let mut keys: Vec<String> = raw_objects(endpoint, &format!("{prefix}/commits/"))?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    keys.sort();
+    match keys.last() {
+        Some(key) => Ok(Some(raw_json(endpoint, key)?)),
+        None => Ok(None),
+    }
+}
+
+/// What the old *global* floor was computed from: the highest sequence
+/// the head commit covers in any partition.
+fn commit_covered(commit: &serde_json::Value) -> u64 {
+    commit["applied"]
+        .as_object()
+        .map(|applied| {
+            applied
+                .values()
+                .filter_map(|v| v.as_u64())
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
 }

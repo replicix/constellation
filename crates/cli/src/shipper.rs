@@ -389,13 +389,22 @@ pub struct Shipper {
     designations: Option<std::sync::Arc<crate::designation::DesignationManager>>,
     /// Plan 28 §11: the `mtree` publisher, when one is wired up.
     ///
-    /// `None` for every existing test and for a read-only member, so
-    /// the checkpoint path behaves exactly as it did; the daemon turns
-    /// it on in `node_runtime` once the node cache exists. The publish
-    /// runs *alongside* the checkpoint rather than in place of it —
-    /// nothing reads the commit chain until S6, so a replica that
-    /// bootstraps from a checkpoint must keep finding one.
-    publisher: Option<crate::mtree_publish::TreePublisher>,
+    /// `None` for most tests and for a read-only member, which keep the
+    /// legacy checkpoint; the daemon turns it on in `node_runtime` once
+    /// the node cache exists.
+    ///
+    /// Behind an async mutex because a publish runs as its own spawned
+    /// task: the daemon's sync loop drops a running round whenever an
+    /// explicit request arrives (every write-through close sends one),
+    /// and a publish that ran inline was dropped with it — under steady
+    /// write traffic, every time, so commits starved
+    /// (`multi-partition-retention-is-per-partition` saw one commit in
+    /// ~1000 segments). A spawned publish finishes regardless, holding
+    /// the lock while it runs.
+    publisher: Option<Arc<tokio::sync::Mutex<crate::mtree_publish::TreePublisher>>>,
+    /// Records noted while a publish held the publisher; handed over at
+    /// the next note or publish that finds it free.
+    tree_backlog: Vec<LogRecord>,
     /// Lease epoch of the last segment we shipped, recorded so a commit
     /// can carry its author's epoch (§P3: a deposed holder's late
     /// commit must be recognizable exactly as a late log segment is).
@@ -512,6 +521,7 @@ impl Shipper {
             peers: constellation_net::Peers::disabled(),
             designations: None,
             publisher: None,
+            tree_backlog: Vec::new(),
             last_ship_epoch: 0,
         })
     }
@@ -536,7 +546,7 @@ impl Shipper {
         mut publisher: crate::mtree_publish::TreePublisher,
     ) -> Result<()> {
         publisher.restore()?;
-        self.publisher = Some(publisher);
+        self.publisher = Some(Arc::new(tokio::sync::Mutex::new(publisher)));
         Ok(())
     }
 
@@ -548,9 +558,39 @@ impl Shipper {
     /// incremental: the set is the changed key set, already computed by
     /// the transport that had to look at each record anyway.
     fn note_tree_records(&mut self, records: &[LogRecord]) {
-        if let Some(publisher) = self.publisher.as_mut() {
-            publisher.note(records);
+        let Some(publisher) = self.publisher.as_ref() else {
+            return;
+        };
+        match publisher.try_lock() {
+            Ok(mut publisher) => {
+                if !self.tree_backlog.is_empty() {
+                    publisher.note(&std::mem::take(&mut self.tree_backlog));
+                }
+                publisher.note(records);
+            }
+            // A publish is in flight; it must not see a half-noted batch
+            // anyway, so park the records for the next free moment.
+            Err(_) => self.tree_backlog.extend_from_slice(records),
         }
+    }
+
+    /// Lock the publisher (waiting for an in-flight publish when `wait`)
+    /// and hand it the backlog. `None` when there is no publisher, or it
+    /// is busy and the caller would rather not wait.
+    async fn take_publisher(
+        &mut self,
+        wait: bool,
+    ) -> Option<tokio::sync::OwnedMutexGuard<crate::mtree_publish::TreePublisher>> {
+        let publisher = self.publisher.clone()?;
+        let mut guard = if wait {
+            publisher.lock_owned().await
+        } else {
+            publisher.try_lock_owned().ok()?
+        };
+        if !self.tree_backlog.is_empty() {
+            guard.note(&std::mem::take(&mut self.tree_backlog));
+        }
+        Some(guard)
     }
 
     /// Publish the pending tree edits as a commit. Best effort: nothing
@@ -559,11 +599,18 @@ impl Shipper {
     /// failure, so the next round carries the same keys.
     async fn publish_tree(&mut self) {
         let epoch = self.last_ship_epoch;
-        let Some(publisher) = self.publisher.as_mut() else {
+        // Busy means the previous publish is still running; it will be
+        // followed by the next cadence's.
+        let Some(mut publisher) = self.take_publisher(false).await else {
             return;
         };
-        if let Err(e) = publisher.publish(epoch).await {
-            tracing::warn!(error = %e, "metadata tree publish failed; retrying next round");
+        let task = tokio::spawn(async move { publisher.publish(epoch).await.map(|_| ()) });
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "metadata tree publish failed; retrying next round")
+            }
+            Err(e) => tracing::warn!(error = %e, "metadata tree publish task failed"),
         }
     }
 
@@ -572,16 +619,19 @@ impl Shipper {
     /// publisher only sees shipped and tailed records).
     pub async fn publish_now(&mut self) -> Result<(u64, constellation_mtree::NodeHash)> {
         let epoch = self.last_ship_epoch;
-        let publisher = self
-            .publisher
-            .as_mut()
+        let mut publisher = self
+            .take_publisher(true)
+            .await
             .context("this mount has no metadata tree publisher")?;
-        publisher.publish_now(epoch).await
+        tokio::spawn(async move { publisher.publish_now(epoch).await })
+            .await
+            .context("metadata publish task")?
     }
 
+    /// The published root, for tests.
     #[cfg(test)]
-    pub fn tree_publisher(&self) -> Option<&crate::mtree_publish::TreePublisher> {
-        self.publisher.as_ref()
+    pub fn tree_published(&self) -> Option<(constellation_mtree::NodeHash, u64)> {
+        self.publisher.as_ref()?.try_lock().ok()?.published()
     }
 
     /// Seed the byte-proportional cadence baseline from the checkpoint that
@@ -1525,13 +1575,22 @@ impl Shipper {
     /// Snapshot the local DB as a checkpoint covering every partition
     /// this replica has seen, plus a VECTOR.json sidecar.
     pub async fn checkpoint(&mut self) -> Result<()> {
+        // The cadence counters are reset *before* the work, not after it.
+        // The daemon's sync loop drops a running round whenever an
+        // explicit request arrives (a write-through close sends one), so
+        // this future can be cancelled at any await below. Resetting
+        // only on success meant a cancelled checkpoint stayed due and
+        // was retried on every following segment, each attempt leaving
+        // an orphaned snapshot body before the inline prune could run:
+        // `ckpt-bulk-ingest-bounded` found 30 surviving checkpoints. A
+        // cancelled checkpoint now simply waits for the next cadence.
+        self.shipped_since_ckpt = 0;
+        self.bytes_since_ckpt = 0;
+        self.last_ckpt_at = Some(Instant::now());
         if self.publisher.is_some() && !checkpoint_snapshot_forced() {
             // Plan 28: the commit *is* the checkpoint. Same cadence and
             // the same counters, so the publish rate is what the
             // snapshot rate used to be; there is simply no O(DB) copy.
-            self.shipped_since_ckpt = 0;
-            self.bytes_since_ckpt = 0;
-            self.last_ckpt_at = Some(Instant::now());
             self.publish_tree().await;
             return Ok(());
         }
@@ -1546,28 +1605,33 @@ impl Shipper {
             return Ok(());
         }
         // Copying the DB takes tens of milliseconds on a large namespace, so
-        // it does not belong on a runtime worker.
+        // it does not belong on a runtime worker. The copy, the upload, the
+        // pointer writes and the inline prune run as one *spawned* task:
+        // if the sync round awaiting it is dropped (see above), the task
+        // still finishes, so a checkpoint is never left half-written — a
+        // body with no pointer and no prune behind it.
         let meta = Arc::clone(&self.meta);
-        let started = Instant::now();
-        let snap = tokio::task::spawn_blocking(move || meta.snapshot())
-            .await
-            .context("checkpoint snapshot task")??;
-        let snapshot_ms = started.elapsed().as_millis();
-        self.log
-            .put_checkpoint_with_vector(covered, &snap, &vector)
-            .await?;
-        self.shipped_since_ckpt = 0;
+        let log = self.log.with_partition(PARTITION);
+        let parts = vector.applied.len();
+        let task = tokio::spawn(async move {
+            let started = Instant::now();
+            let snap = tokio::task::spawn_blocking(move || meta.snapshot())
+                .await
+                .context("checkpoint snapshot task")??;
+            let snapshot_ms = started.elapsed().as_millis();
+            log.put_checkpoint_with_vector(covered, &snap, &vector)
+                .await?;
+            tracing::info!(
+                seq = covered,
+                bytes = snap.len(),
+                parts,
+                snapshot_ms,
+                "wrote metadata checkpoint"
+            );
+            anyhow::Ok(snap.len() as u64)
+        });
         // The freshly written snapshot is the new cadence baseline.
-        self.last_ckpt_bytes = snap.len() as u64;
-        self.bytes_since_ckpt = 0;
-        self.last_ckpt_at = Some(Instant::now());
-        tracing::info!(
-            seq = covered,
-            bytes = snap.len(),
-            parts = vector.applied.len(),
-            snapshot_ms,
-            "wrote metadata checkpoint"
-        );
+        self.last_ckpt_bytes = task.await.context("checkpoint task")??;
         // Forced snapshots (`CONSTELLATION_CHECKPOINT_SNAPSHOT`) still
         // publish the commit alongside, so the chain never falls behind.
         self.publish_tree().await;
@@ -4144,7 +4208,7 @@ mod tests {
             a.ship.log().get_checkpoint_ref().await.unwrap().is_none(),
             "a mount that publishes commits writes no snapshot checkpoint"
         );
-        assert!(a.ship.tree_publisher().unwrap().published().is_some());
+        assert!(a.ship.tree_published().is_some());
 
         // A second round with nothing new publishes nothing: an empty
         // changed set is not a commit.

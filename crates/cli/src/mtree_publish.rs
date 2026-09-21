@@ -334,10 +334,6 @@ impl Plan {
             .collect()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.edits.is_empty()
-    }
-
     pub fn len(&self) -> usize {
         self.edits.len()
     }
@@ -676,9 +672,11 @@ impl TreePublisher {
             }
         };
 
-        if plan.is_empty() && Some(root) == base {
+        if Some(root) == base {
             // The published root already reflects the replica at
-            // `vector`; say so locally, so a restart need not rebuild.
+            // `vector` — an empty plan, or a restart's rebuild that
+            // reproduced the head exactly. Nothing to commit; say so
+            // locally, so a restart need not rebuild again.
             if let Some(state) = self.state.as_mut() {
                 state.applied = vector;
             }
@@ -1605,13 +1603,14 @@ mod tests {
             "a stale tree must not be trusted"
         );
 
-        let rebuilt = cold.publish(7).await.unwrap().unwrap();
-        assert_eq!(rebuilt.seq, 2);
-        assert_eq!(
-            rebuilt.root(SHARD0),
-            first.root(SHARD0),
-            "an unchanged replica must rebuild to the same root"
+        // The rebuild must reproduce the published root exactly — which
+        // also means it has nothing to commit.
+        assert!(
+            cold.publish(7).await.unwrap().is_none(),
+            "an unchanged replica must rebuild to the same root and commit nothing"
         );
+        assert_eq!(cold.published(), Some((first.root(SHARD0).unwrap(), 1)));
+        assert!(cold.pending().is_empty());
     }
 
     /// An object store that lets a test put a competing commit into
@@ -1844,8 +1843,14 @@ mod tests {
         let chain = CommitChain::new(Arc::clone(&fx.store));
         assert_eq!(chain.discover_head(0).await.unwrap(), Some(head.seq));
 
-        // Once the tailer has caught up, the same publisher lands.
+        // Once the tailer has caught up, the same publisher lands (with a
+        // change of its own: a replica level with the head and holding
+        // nothing new has nothing to commit).
         fx.meta.set_applied_seq_of("p0", 10).unwrap();
+        fx.meta
+            .create(ROOT_INO, "after-catch-up", 0o644, 0, 0)
+            .unwrap();
+        behind.note(&fx.records());
         let landed = behind.publish(7).await.unwrap().expect("caught up");
         assert_eq!((landed.seq, landed.applied.get("p0")), (2, Some(&10)));
     }
