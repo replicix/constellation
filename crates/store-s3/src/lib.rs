@@ -29,7 +29,7 @@ pub use aws_auth::amazon_s3_builder;
 
 pub use blobs::BlobStore;
 pub use codec::{Codec, CompressionSetting};
-pub use commits::{Commit, CommitAgg, CommitChain, CommitPayload, Intent, SHARD0};
+pub use commits::{vector_covers, Commit, CommitAgg, CommitChain, CommitPayload, Intent, SHARD0};
 pub use compact::{CompactionPacer, Compactor, PackFate, PackVerdict, Reclaim, Sweep, Unpaced};
 pub use decode_gate::{DecodeGate, DecodeGatePermit, Priority as DecodePriority};
 pub use designation::{Designation, DesignationMode, DesignationStore, DesignationTag};

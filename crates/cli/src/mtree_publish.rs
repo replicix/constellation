@@ -38,6 +38,24 @@
 //! tree is canonical, "incremental and bulk agree" is an equality of
 //! root hashes rather than a structural comparison.
 //!
+//! ## Never building on a head this replica is behind
+//!
+//! A publish adopts the chain head and then writes *this replica's*
+//! values for the keys it touched. That is only correct if the replica
+//! has applied at least as much of every partition's log as the head
+//! reflects; a replica that is behind would overwrite newer values with
+//! the older ones it still holds, and no diff can show it, because the
+//! stale value is ours. So every commit records the applied vector it
+//! was planned at ([`Commit::applied`], read in the same SQLite snapshot
+//! as the plan), and a publish — or a splice onto a lost race's winner —
+//! proceeds only when this replica's vector covers the other one.
+//! Otherwise it defers and the tailer closes the gap.
+//!
+//! With that, vectors only grow along the chain, and each commit's tree
+//! is its author's replica at its vector: a key the author did not touch
+//! since its last publish already holds, in the head, a value at least
+//! as new as the author's.
+//!
 //! ## What is in the tree
 //!
 //! `0x01`–`0x04`: inodes, dentries with S1's attr copy, spilled xattrs,
@@ -70,7 +88,8 @@ use constellation_mtree::{
     keys, record, Attrs, DentryRecord, Edit, Kind, NodeHash, Tree, VALUE_SPILL,
 };
 use constellation_store_s3::{
-    BlobStore, Commit, CommitChain, CommitPayload, Intent, NodeCache, StoreError, SHARD0,
+    vector_covers, BlobStore, Commit, CommitChain, CommitPayload, Intent, NodeCache, StoreError,
+    SHARD0,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -326,10 +345,26 @@ pub struct TreePublisher {
     handle: tokio::runtime::Handle,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Published {
     root: NodeHash,
     seq: u64,
+    /// The commit's [`Commit::applied`] vector: what this tree reflects.
+    applied: Vector,
+}
+
+/// Partition id → highest applied log segment.
+type Vector = BTreeMap<String, u64>;
+
+/// What the blocking half of a publish decided.
+enum Planned {
+    /// A plan, the root it produces, and the vector it was read at.
+    Ready(Plan, NodeHash, Vector),
+    /// This replica has applied less of some partition's log than the
+    /// head it would build on, so every value it holds for a key it
+    /// touched might be older than the head's. Publishing would regress
+    /// the tree; the tailer closes the gap and a later round publishes.
+    Behind { mine: Vector, head: Vector },
 }
 
 impl TreePublisher {
@@ -370,7 +405,7 @@ impl TreePublisher {
 
     #[cfg(test)]
     pub fn published(&self) -> Option<(NodeHash, u64)> {
-        self.state.map(|s| (s.root, s.seq))
+        self.state.as_ref().map(|s| (s.root, s.seq))
     }
 
     /// Pick the published root back up after a restart.
@@ -396,13 +431,14 @@ impl TreePublisher {
             return Ok(());
         };
         let recorded = self.meta.kv_get(KV_VECTOR)?.unwrap_or_default();
-        if recorded != encode_vector(&self.meta.applied_vector()?) {
+        let applied = self.meta.applied_vector()?;
+        if recorded != encode_vector(&applied) {
             tracing::info!(
                 "metadata tree is behind the replica; the next publish rebuilds it in full"
             );
             return Ok(());
         }
-        self.state = Some(Published { root, seq });
+        self.state = Some(Published { root, seq, applied });
         self.pending = Touched::default();
         self.hydrated = false;
         Ok(())
@@ -425,7 +461,7 @@ impl TreePublisher {
             return Ok(());
         }
         self.hydrated = true;
-        let Some(state) = self.state else {
+        let Some(state) = self.state.clone() else {
             return Ok(());
         };
         for seq in self.chain.list_from(0).await? {
@@ -489,7 +525,8 @@ impl TreePublisher {
         // the genuinely concurrent case.
         self.hydrate().await?;
         let parent = self.adopt_head().await?;
-        let base = self.state.map(|s| s.root);
+        let base = self.state.as_ref().map(|s| s.root);
+        let head_applied = self.state.as_ref().map(|s| s.applied.clone());
 
         let meta = Arc::clone(&self.meta);
         let cache = Arc::clone(&self.cache);
@@ -499,26 +536,47 @@ impl TreePublisher {
         // The tree build reads SQLite and decompresses nodes. Tens of
         // milliseconds on a large batch, so it does not belong on a
         // runtime worker any more than `VACUUM INTO` did.
-        let planned = tokio::task::spawn_blocking(move || -> Result<(Plan, NodeHash)> {
+        //
+        // The vector and every read the plan makes share one SQLite
+        // snapshot (`read_consistent`), so the commit's `applied` claim
+        // is exactly what the tree was built from.
+        let planned = tokio::task::spawn_blocking(move || -> Result<Planned> {
             let tree = Tree::with_config(cache, config).map_err(StoreError::from)?;
             let builder = Builder {
                 meta: &meta,
                 tree: &tree,
                 blobs: &blobs,
             };
-            match base {
-                Some(base) if !batch.needs_rebuild() => {
-                    let plan = builder.plan(Some(&base), &batch)?;
-                    let edits = plan.edits();
-                    let root = tree.apply(&base, &edits).map_err(StoreError::from)?;
-                    Ok((plan, root))
+            meta.read_consistent(|| -> Result<Planned> {
+                let vector = meta.applied_vector_reader()?;
+                if let Some(head) = head_applied.filter(|head| !vector_covers(&vector, head)) {
+                    return Ok(Planned::Behind { mine: vector, head });
                 }
-                _ => builder.rebuild(),
-            }
+                let (plan, root) = match base {
+                    Some(base) if !batch.needs_rebuild() => {
+                        let plan = builder.plan(Some(&base), &batch)?;
+                        let edits = plan.edits();
+                        let root = tree.apply(&base, &edits).map_err(StoreError::from)?;
+                        (plan, root)
+                    }
+                    _ => builder.rebuild()?,
+                };
+                Ok(Planned::Ready(plan, root, vector))
+            })
         })
         .await
         .context("metadata tree build task")??;
-        let (plan, root) = planned;
+        let (plan, root, vector) = match planned {
+            Planned::Ready(plan, root, vector) => (plan, root, vector),
+            Planned::Behind { mine, head } => {
+                tracing::debug!(
+                    mine = encode_vector(&mine),
+                    head = encode_vector(&head),
+                    "metadata publish deferred: this replica is behind the chain head"
+                );
+                return Ok(None);
+            }
+        };
 
         if plan.is_empty() && Some(root) == base {
             return Ok(None);
@@ -536,7 +594,8 @@ impl TreePublisher {
         let payload = CommitPayload::single_root(root, packs)
             .with_author(self.node_id, epoch)
             .with_intent(Intent::batch(plan.len() as u64))
-            .with_agg(agg.into());
+            .with_agg(agg.into())
+            .with_applied(vector.clone());
 
         // §P3's rebase. `spliced` carries the root the *current*
         // payload was computed against, because a second lost race must
@@ -549,6 +608,7 @@ impl TreePublisher {
         let noted = Arc::clone(&declined);
         let cache = Arc::clone(&self.cache);
         let handle = self.handle.clone();
+        let mine = vector.clone();
         let commit = self
             .chain
             .publish(
@@ -557,7 +617,8 @@ impl TreePublisher {
                 payload,
                 move |payload: CommitPayload, winner: &Commit| {
                     let from = spliced.get();
-                    match Self::splice(&tree, &cache, &handle, &plan, from, winner, payload) {
+                    match Self::splice(&tree, &cache, &handle, &plan, &mine, from, winner, payload)
+                    {
                         Ok((next, root)) => {
                             spliced.set(Some(root));
                             Ok(next)
@@ -580,6 +641,7 @@ impl TreePublisher {
                     // root actually landed.
                     root: commit.root(SHARD0).unwrap_or(root),
                     seq: commit.seq,
+                    applied: vector,
                 });
                 self.remember()?;
                 Ok(Some(commit))
@@ -619,10 +681,25 @@ impl TreePublisher {
         cache: &Arc<NodeCache>,
         handle: &tokio::runtime::Handle,
         plan: &Plan,
+        mine: &Vector,
         from: Option<NodeHash>,
         winner: &Commit,
         payload: CommitPayload,
     ) -> Result<(CommitPayload, NodeHash), StoreError> {
+        // The same guard `publish_batch` applies to the head it adopts,
+        // applied to the head it lost to: a winner that has seen log
+        // this replica has not may hold newer values for keys in this
+        // batch, and a splice would overwrite them. `conflicts_with`
+        // cannot see that case, because the stale value is ours and
+        // never appears in the winner's diff.
+        if !vector_covers(mine, &winner.applied) {
+            return Err(StoreError::Conflict(format!(
+                "commit {} reflects log this replica has not applied ({} against {})",
+                winner.seq,
+                encode_vector(&winner.applied),
+                encode_vector(mine)
+            )));
+        }
         let winner_root = winner.root(SHARD0).ok_or_else(|| {
             StoreError::CorruptObject(format!("commit {} names no shard 0 root", winner.seq))
         })?;
@@ -665,7 +742,7 @@ impl TreePublisher {
     /// Move our idea of the chain head forward, so the CAS aims at the
     /// slot after the newest commit rather than at one that is taken.
     async fn adopt_head(&mut self) -> Result<u64> {
-        let known = self.state.map(|s| s.seq).unwrap_or(0);
+        let known = self.state.as_ref().map(|s| s.seq).unwrap_or(0);
         let Some(head) = self.chain.discover_head(known).await? else {
             return Ok(0);
         };
@@ -685,18 +762,26 @@ impl TreePublisher {
             author = commit.author,
             "adopting a newer metadata commit as this publish's parent"
         );
-        self.state = Some(Published { root, seq: head });
+        self.state = Some(Published {
+            root,
+            seq: head,
+            applied: commit.applied,
+        });
         Ok(head)
     }
 
+    /// Persist the published root with the vector it was *planned* at,
+    /// not the replica's vector now: a segment applied since the plan
+    /// makes the two differ, and `restore` must then rebuild rather
+    /// than trust a tree that never saw that segment.
     fn remember(&self) -> Result<()> {
-        let Some(state) = self.state else {
+        let Some(state) = self.state.as_ref() else {
             return Ok(());
         };
         self.meta.kv_set(KV_ROOT, &state.root.to_hex())?;
         self.meta.kv_set(KV_SEQ, &state.seq.to_string())?;
         self.meta
-            .kv_set(KV_VECTOR, &encode_vector(&self.meta.applied_vector()?))?;
+            .kv_set(KV_VECTOR, &encode_vector(&state.applied))?;
         Ok(())
     }
 }
@@ -1568,6 +1653,66 @@ mod tests {
         );
         let chain = CommitChain::new(Arc::clone(&fx.store));
         assert_eq!(chain.list_from(0).await.unwrap().last(), Some(&won.seq));
+    }
+
+    /// The S5 regression the `applied` vector exists to stop: a replica
+    /// that is behind the chain head must not publish on top of it.
+    ///
+    /// Adopting the head and then writing this replica's values for its
+    /// touched keys would overwrite anything newer the head holds with
+    /// the older value still in this replica, and `conflicts_with`
+    /// never sees it — the head was adopted *before* planning, so the
+    /// stale value is ours and appears in no diff. The replica has to
+    /// wait for its tailer instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_replica_behind_the_head_defers_instead_of_regressing() {
+        let mut fx = Fixture::new();
+        seed(&fx.meta, 5);
+        fx.meta.set_applied_seq_of("p0", 10).unwrap();
+        let mut ahead = fx.publisher(1);
+        let head = publish(&mut ahead, &fx.records()).await.unwrap();
+        assert_eq!(head.applied.get("p0"), Some(&10));
+
+        // Same bucket, a replica that has applied less of p0.
+        fx.meta.set_applied_seq_of("p0", 3).unwrap();
+        let mut behind = fx.publisher(2);
+        assert!(
+            behind.publish(7).await.unwrap().is_none(),
+            "a replica behind the head must defer"
+        );
+        assert!(!behind.pending().is_empty(), "and keep its work");
+        let chain = CommitChain::new(Arc::clone(&fx.store));
+        assert_eq!(chain.discover_head(0).await.unwrap(), Some(head.seq));
+
+        // Once the tailer has caught up, the same publisher lands.
+        fx.meta.set_applied_seq_of("p0", 10).unwrap();
+        let landed = behind.publish(7).await.unwrap().expect("caught up");
+        assert_eq!((landed.seq, landed.applied.get("p0")), (2, Some(&10)));
+    }
+
+    /// The same guard on the lost-CAS path: a winner whose vector this
+    /// replica does not cover is declined rather than spliced onto,
+    /// even when its key set is disjoint from the batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_winner_ahead_of_the_loser_is_not_spliced_onto() {
+        let mut fx = Fixture::new();
+        let da = fx.meta.mkdir(ROOT_INO, "da", 0o755, 0, 0).unwrap().ino;
+        let db = fx.meta.mkdir(ROOT_INO, "db", 0o755, 0, 0).unwrap().ino;
+        let (landed, won, loser) = race(
+            &mut fx,
+            |meta| {
+                meta.create(da, "a", 0o644, 0, 0).unwrap();
+                meta.set_applied_seq_of("p0", 10).unwrap();
+            },
+            |meta| {
+                meta.create(db, "b", 0o644, 0, 0).unwrap();
+                meta.set_applied_seq_of("p0", 5).unwrap();
+            },
+        )
+        .await;
+        assert_eq!(won.applied.get("p0"), Some(&10));
+        assert!(landed.is_none(), "an ahead winner must not be spliced onto");
+        assert!(!loser.pending().is_empty());
     }
 
     /// A value over `VALUE_SPILL` leaves the node and becomes a blob

@@ -1882,6 +1882,85 @@ impl SqliteMeta {
         self.with_reader(|conn| Self::dentry_ino(conn, parent, name))
     }
 
+    /// Run `f` with every read it makes through this replica's reader
+    /// surface on the calling thread seeing **one** snapshot.
+    ///
+    /// Plan 28's publisher reads the applied-sequence vector and then
+    /// plans a batch over a few hundred point reads; the commit claims
+    /// the tree reflects the log up to that vector, so a segment applied
+    /// half-way through the plan would make the claim false in the
+    /// direction nothing can repair (the vector would say "covered"
+    /// about a record the tree never saw). A deferred WAL read
+    /// transaction on the per-thread reader connection pins the
+    /// snapshot at its first read and costs writers nothing.
+    ///
+    /// In-memory replicas (tests) have a single connection shared with
+    /// writers, and opening a transaction on it would block them; there
+    /// `f` simply runs, which is exact for the single-threaded tests
+    /// that use them.
+    pub fn read_consistent<T, E>(&self, f: impl FnOnce() -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<MetaError>,
+    {
+        if self.path.is_none() {
+            return f();
+        }
+        struct Snapshot<'a>(&'a SqliteMeta);
+        impl Drop for Snapshot<'_> {
+            fn drop(&mut self) {
+                // ROLLBACK rather than COMMIT: the connection is
+                // query-only, and a rollback is also what a panic
+                // unwinding through `f` needs.
+                let _ = self.0.with_reader(|conn| {
+                    if !conn.is_autocommit() {
+                        conn.execute_batch("ROLLBACK")?;
+                    }
+                    Ok(())
+                });
+            }
+        }
+        self.with_reader(|conn| {
+            conn.execute_batch("BEGIN DEFERRED")?;
+            // The snapshot is taken at the first read, not at BEGIN.
+            conn.query_row("SELECT count(*) FROM kv", [], |_| Ok(()))?;
+            Ok(())
+        })?;
+        let _snapshot = Snapshot(self);
+        f()
+    }
+
+    /// [`Self::applied_vector`] through the reader connection, so that it
+    /// participates in [`Self::read_consistent`].
+    pub fn applied_vector_reader(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, u64>, MetaError> {
+        self.with_reader(|conn| {
+            let kv = |key: &str| -> Result<Option<String>, MetaError> {
+                Ok(conn
+                    .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| {
+                        r.get(0)
+                    })
+                    .optional()?)
+            };
+            let mut stmt = conn.prepare_cached("SELECT id FROM partition ORDER BY id")?;
+            let parts: Vec<String> = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            let mut out = std::collections::BTreeMap::new();
+            for part in parts {
+                let seq = match kv(&format!("applied_seq/{part}"))? {
+                    Some(v) => v.parse().unwrap_or(0),
+                    None if part == "p0" => {
+                        kv("applied_seq")?.and_then(|v| v.parse().ok()).unwrap_or(0)
+                    }
+                    None => 0,
+                };
+                out.insert(part, seq);
+            }
+            Ok(out)
+        })
+    }
+
     /// One page of inode numbers above `after`, for the full rebuild.
     ///
     /// SQLite's signed integer order, not the tree's unsigned key
@@ -4102,6 +4181,39 @@ mod tests {
     /// hash alone would therefore switch the hint off for every upload and
     /// silently undo plan 26 step 8; the exclusion has to be per
     /// referencing inode.
+    /// Plan 28's publisher reads the applied vector and then plans a
+    /// batch; a segment applied in between must not be visible to the
+    /// plan, or the commit would claim a position its tree never saw.
+    #[test]
+    fn read_consistent_pins_one_snapshot_across_reads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let meta = std::sync::Arc::new(SqliteMeta::open(dir.path().join("m.db")).unwrap());
+        meta.set_applied_seq_of("p0", 4).unwrap();
+        let writer = std::sync::Arc::clone(&meta);
+        let (before, after, row) = meta
+            .read_consistent(|| -> Result<_, MetaError> {
+                let before = meta.applied_vector_reader()?;
+                std::thread::spawn(move || {
+                    writer.set_applied_seq_of("p0", 9).unwrap();
+                    writer.create(ROOT_INO, "late", 0o644, 0, 0).unwrap();
+                })
+                .join()
+                .unwrap();
+                Ok((
+                    before,
+                    meta.applied_vector_reader()?,
+                    meta.child_ino_reader(ROOT_INO, "late")?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(before.get("p0"), Some(&4));
+        assert_eq!(after, before, "a write committed mid-snapshot leaked in");
+        assert_eq!(row, None);
+        // And the snapshot ends with the call.
+        assert_eq!(meta.applied_vector_reader().unwrap().get("p0"), Some(&9));
+        assert!(meta.child_ino_reader(ROOT_INO, "late").unwrap().is_some());
+    }
+
     #[test]
     fn chunk_ref_hint_still_hits_when_a_peer_already_uploaded_the_content() {
         let hash = ChunkHash::of(b"content a peer already put in the bucket");
