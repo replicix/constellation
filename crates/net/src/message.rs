@@ -254,18 +254,20 @@ impl Signed {
         Ok(out)
     }
 
-    /// Decode exactly one bare message. Trailing bytes are refused:
-    /// `postcard::from_bytes` ignores them, which let a length-prefixed
-    /// frame decode as a bare message whenever the prefix happened to
-    /// parse (about 1 in 20 random keys) — the silent framing mismatch
+    /// Decode exactly one bare message. Trailing bytes and a signature
+    /// that is not Ed25519-sized are refused: `postcard::from_bytes`
+    /// ignores trailing input, which let a length-prefixed frame decode
+    /// as a bare message whenever the prefix happened to parse (about 1
+    /// in 20 random keys) — the silent framing mismatch
     /// `stream_framing_and_bare_encoding_are_distinct` exists to catch.
     pub fn decode(frame: &[u8]) -> Result<Self> {
-        let (signed, rest) = postcard::take_from_bytes(frame)?;
+        let (signed, rest): (Signed, _) = postcard::take_from_bytes(frame)?;
         anyhow::ensure!(
             rest.is_empty(),
             "{} trailing bytes after a message",
             rest.len()
         );
+        anyhow::ensure!(signed.sig.len() == 64, "signature must be 64 bytes");
         Ok(signed)
     }
 }
@@ -385,10 +387,15 @@ mod tests {
         assert_eq!(framed.len(), bare.len() + 4, "frame adds a length prefix");
         // The bare form is what gossip receivers decode.
         assert_eq!(Signed::decode(&bare).unwrap().verify().unwrap().1, payload);
-        // The framed form must not be mistaken for it.
+        // The framed form must not be mistaken for it. What a receiver
+        // does is decode *then verify*; decode alone refuses almost every
+        // frame structurally, and the signature check closes the rest
+        // (a shifted `from`/`sig` pair cannot verify).
         assert!(
-            Signed::decode(&framed).is_err(),
-            "a length-prefixed frame must not decode as a bare payload"
+            Signed::decode(&framed)
+                .and_then(|signed| signed.verify())
+                .is_err(),
+            "a length-prefixed frame must not be accepted as a bare payload"
         );
     }
 
