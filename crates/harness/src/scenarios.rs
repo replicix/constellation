@@ -557,8 +557,15 @@ fn bucket_objects(endpoint: &str, prefix: &str) -> Result<Vec<(String, Vec<u8>)>
         keys.push(rest[..end].to_string());
         rest = &rest[end + 6..];
     }
+    // Plan 28 added the metadata tree: packs (nodes whose keys are file
+    // names), spilled blobs and commits are all sealed on E2E, so they
+    // are scanned with the rest.
     keys.into_iter()
-        .filter(|key| key.contains("/chunks/") || key.contains("/log/"))
+        .filter(|key| {
+            ["/chunks/", "/log/", "/packs/", "/blobs/", "/commits/"]
+                .iter()
+                .any(|kind| key.contains(kind))
+        })
         .map(|key| {
             let mut bytes = Vec::new();
             ureq::get(&format!("{endpoint}/{BUCKET}/{key}"))
@@ -594,7 +601,17 @@ fn e2e_basic(seed: u64) -> Result<()> {
         !objects.is_empty(),
         "E2E filesystem produced no chunks/logs"
     );
+    anyhow::ensure!(
+        objects.iter().any(|(key, _)| key.contains("/packs/"))
+            && objects.iter().any(|(key, _)| key.contains("/commits/")),
+        "E2E filesystem published no metadata tree, so the scan below proves nothing about it"
+    );
+    let name = b"known-marker";
     for (key, bytes) in &objects {
+        anyhow::ensure!(
+            !bytes.windows(name.len()).any(|window| window == name),
+            "a file name leaked into {key}"
+        );
         anyhow::ensure!(
             !bytes
                 .windows(64)

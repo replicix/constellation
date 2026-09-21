@@ -58,11 +58,25 @@ use std::sync::Arc;
 pub struct BlobStore {
     store: Arc<dyn ObjectStore>,
     hasher: Hasher,
+    /// The tree's blob key on an E2E filesystem (§P13): a spilled value
+    /// is an xattr or a symlink target, i.e. content.
+    seal: Option<Arc<crate::e2e::TreeSealing>>,
 }
 
 impl BlobStore {
     pub fn new(store: Arc<dyn ObjectStore>, hasher: Hasher) -> BlobStore {
-        BlobStore { store, hasher }
+        BlobStore {
+            store,
+            hasher,
+            seal: None,
+        }
+    }
+
+    /// Seal bodies under `sealing` (an E2E filesystem), with the object
+    /// path as associated data; `None` leaves them plain.
+    pub fn with_sealing(mut self, sealing: Option<crate::e2e::TreeSealing>) -> BlobStore {
+        self.seal = sealing.map(Arc::new);
+        self
     }
 
     /// The address these bytes have under this filesystem's hasher.
@@ -86,11 +100,18 @@ impl BlobStore {
                 key: Self::path(hash).to_string(),
             });
         }
+        let path = Self::path(hash);
+        let body = match self.seal.as_deref() {
+            Some(seal) => {
+                crate::e2e::encrypt_object(&seal.blobs, path.as_ref().as_bytes(), &bytes)?
+            }
+            None => bytes,
+        };
         match self
             .store
             .put_opts(
-                &Self::path(hash),
-                PutPayload::from(bytes),
+                &path,
+                PutPayload::from(body),
                 PutOptions::from(PutMode::Create),
             )
             .await
@@ -108,7 +129,13 @@ impl BlobStore {
     /// the same rule `node_cache` applies to a node.
     pub async fn get(&self, hash: &BlobHash) -> Result<Vec<u8>, StoreError> {
         let path = Self::path(hash);
-        let body = self.store.get(&path).await?.bytes().await?.to_vec();
+        let stored = self.store.get(&path).await?.bytes().await?;
+        let body = match self.seal.as_deref() {
+            Some(seal) => {
+                crate::e2e::decrypt_object(&seal.blobs, path.as_ref().as_bytes(), &stored)?
+            }
+            None => stored.to_vec(),
+        };
         if self.hash(&body) != *hash {
             return Err(StoreError::HashMismatch {
                 key: path.to_string(),

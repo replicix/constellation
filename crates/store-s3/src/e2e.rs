@@ -197,6 +197,53 @@ impl Drop for E2eKeys {
 
 pub type SharedE2eKeys = Arc<E2eKeys>;
 
+/// Plan 28 §P13: the keys that seal the metadata tree on an E2E
+/// filesystem — pack frames and indices, spilled-value blobs, and commit
+/// objects — one derived key per object kind.
+///
+/// Keyed *addressing* alone (node hashes and the boundary function under
+/// the addressing key) hides nothing about content: a pack frame is a
+/// zstd'd node whose keys are file names and whose values are attributes.
+/// So every such object is AEAD-sealed under a key only a passphrase
+/// holder can derive, with the object's identity as associated data. The
+/// purpose strings contain a `/`, which no partition id does, so they
+/// cannot collide with a log partition's DEK.
+#[derive(Clone)]
+pub struct TreeSealing {
+    pub(crate) nodes: [u8; KEY_LEN],
+    pub(crate) blobs: [u8; KEY_LEN],
+    pub(crate) commits: [u8; KEY_LEN],
+}
+
+impl TreeSealing {
+    pub fn from_keys(keys: &E2eKeys) -> TreeSealing {
+        TreeSealing {
+            nodes: keys.dek("mtree/nodes"),
+            blobs: keys.dek("mtree/blobs"),
+            commits: keys.dek("mtree/commits"),
+        }
+    }
+
+    /// For an optional keyring, as every constructor that takes one has.
+    pub fn for_keys(keys: Option<&SharedE2eKeys>) -> Option<TreeSealing> {
+        keys.map(|keys| TreeSealing::from_keys(keys))
+    }
+}
+
+impl std::fmt::Debug for TreeSealing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TreeSealing(..)")
+    }
+}
+
+impl Drop for TreeSealing {
+    fn drop(&mut self) {
+        self.nodes.zeroize();
+        self.blobs.zeroize();
+        self.commits.zeroize();
+    }
+}
+
 /// Mint a fresh master key and return the block to embed in `meta.json`.
 /// The KMK is wrapped under the passphrase and then dropped — the caller
 /// (mount) re-derives the live keys with [`unlock`].

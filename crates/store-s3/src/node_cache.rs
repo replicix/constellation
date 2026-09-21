@@ -67,7 +67,7 @@
 //! crash-safety argument: see `commits.rs`.
 
 use crate::error::StoreError;
-use crate::packs::{build_packs, PackHash, PackIndex, PackNode, PackStore};
+use crate::packs::{PackHash, PackIndex, PackNode, PackStore};
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::ChunkHash;
 use constellation_mtree::{Hasher, MtreeError, NodeHash, NodeRef, NodeStore};
@@ -447,7 +447,7 @@ impl NodeCache {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
-        let built = build_packs(batch.clone(), self.packs.target_bytes())?;
+        let built = self.packs.build(batch.clone())?;
         for pack in &built {
             self.packs.put_pack(pack).await?;
         }
@@ -573,6 +573,7 @@ impl NodeCache {
         let bytes = self
             .block_on(self.packs.get_node_bytes(
                 &location.pack,
+                hash,
                 location.offset,
                 location.compressed_len,
             ))

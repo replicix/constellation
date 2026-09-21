@@ -174,7 +174,8 @@ async fn run_inner(
     config: &MtreeGcConfig,
     verify_only: bool,
 ) -> Result<MtreeGcReport> {
-    let chain = CommitChain::new(store.clone());
+    let sealing = constellation_store_s3::TreeSealing::for_keys(keys);
+    let chain = CommitChain::new(store.clone()).with_sealing(sealing.clone());
     let mut report = MtreeGcReport::default();
     let seqs = chain.list_from(0).await?;
     if seqs.is_empty() {
@@ -186,6 +187,7 @@ async fn run_inner(
     // 1. Retention.
     let expired = expired_commits(
         store.clone(),
+        sealing.clone(),
         seqs.clone(),
         config.retention,
         config.retention_ms,
@@ -209,6 +211,7 @@ async fn run_inner(
     let retained = retained_commits(store.clone(), expired.clone()).await?;
     let live = mark_roots(
         store.clone(),
+        sealing.clone(),
         reader.cache.clone(),
         retained,
         config.threads,
@@ -239,6 +242,7 @@ async fn run_inner(
     reader.cache.refresh_catalog().await?;
     let live = mark_roots(
         store.clone(),
+        sealing.clone(),
         reader.cache.clone(),
         retained,
         config.threads,
@@ -321,12 +325,13 @@ async fn run_inner(
 /// `retention_ms`. Only those candidates are fetched (for their age).
 async fn expired_commits(
     store: Arc<dyn ObjectStore>,
+    sealing: Option<constellation_store_s3::TreeSealing>,
     seqs: Vec<u64>,
     retention: usize,
     retention_ms: i64,
     now: i64,
 ) -> Result<Vec<u64>> {
-    let chain = CommitChain::new(store);
+    let chain = CommitChain::new(store).with_sealing(sealing);
     let keep_from = seqs.len().saturating_sub(retention);
     let mut expired = Vec::new();
     for seq in seqs.into_iter().take(keep_from) {
@@ -355,12 +360,13 @@ async fn retained_commits(store: Arc<dyn ObjectStore>, expired: Vec<u64>) -> Res
 /// and any known node a live hold names.
 async fn mark_roots(
     store: Arc<dyn ObjectStore>,
+    sealing: Option<constellation_store_s3::TreeSealing>,
     cache: Arc<constellation_store_s3::NodeCache>,
     commits: Vec<u64>,
     threads: usize,
     now: i64,
 ) -> Result<HashSet<NodeHash>> {
-    let chain = CommitChain::new(store.clone());
+    let chain = CommitChain::new(store.clone()).with_sealing(sealing);
     let mut roots: Vec<NodeHash> = Vec::new();
     for seq in commits {
         if let Some(commit) = chain.get(seq).await? {

@@ -33,7 +33,9 @@ pub use commits::{vector_covers, Commit, CommitAgg, CommitChain, CommitPayload, 
 pub use compact::{CompactionPacer, Compactor, PackFate, PackVerdict, Reclaim, Sweep, Unpaced};
 pub use decode_gate::{DecodeGate, DecodeGatePermit, Priority as DecodePriority};
 pub use designation::{Designation, DesignationMode, DesignationStore, DesignationTag};
-pub use e2e::{create_keyring_block, unlock, Argon2Params, E2eKeys, KeyringBlock, SharedE2eKeys};
+pub use e2e::{
+    create_keyring_block, unlock, Argon2Params, E2eKeys, KeyringBlock, SharedE2eKeys, TreeSealing,
+};
 pub use error::StoreError;
 pub use gc::{
     append_journal, is_condemned, publish_condemned, publish_condemned_packs, read_condemned,

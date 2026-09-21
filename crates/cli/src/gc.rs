@@ -191,7 +191,7 @@ async fn run_chunks(
             }
         }
     }
-    candidates.extend(metadata_candidates(&store, config).await?);
+    candidates.extend(metadata_candidates(&store, chunks.e2e_keys(), config).await?);
     candidates.sort_by(|a, b| a.key.cmp(&b.key));
 
     if verify_only || candidates.is_empty() {
@@ -416,7 +416,11 @@ async fn legacy_checkpoint_vector(
     Ok(Some((vector, json!({"checkpoint": latest}))))
 }
 
-async fn metadata_candidates(store: &Arc<dyn ObjectStore>, config: &GcConfig) -> Result<Vec<Mark>> {
+async fn metadata_candidates(
+    store: &Arc<dyn ObjectStore>,
+    keys: Option<&constellation_store_s3::SharedE2eKeys>,
+    config: &GcConfig,
+) -> Result<Vec<Mark>> {
     let mut marks = Vec::new();
     // The floor is the position a fresh replica resumes tailing from.
     // Once the commit chain exists that is the head commit's `applied`
@@ -424,7 +428,8 @@ async fn metadata_candidates(store: &Arc<dyn ObjectStore>, config: &GcConfig) ->
     // checkpoint — no longer written by default — stops mattering; a
     // forced checkpoint bootstrap over a pruned log refuses rather than
     // silently stopping at the gap (`shipper::replay_from`).
-    let chain = constellation_store_s3::CommitChain::new(store.clone());
+    let chain = constellation_store_s3::CommitChain::new(store.clone())
+        .with_sealing(constellation_store_s3::TreeSealing::for_keys(keys));
     let head = match chain.discover_head(0).await? {
         Some(seq) => chain.get(seq).await?,
         None => None,
@@ -606,7 +611,7 @@ mod tests {
                 retention_segments: 128,
                 lease_ttl_ms: 1,
             };
-            let mut keys: Vec<String> = metadata_candidates(&store, &config)
+            let mut keys: Vec<String> = metadata_candidates(&store, None, &config)
                 .await
                 .unwrap()
                 .into_iter()
@@ -712,7 +717,7 @@ mod tests {
             retention_segments: 128,
             lease_ttl_ms: 1,
         };
-        let marked: Vec<u64> = metadata_candidates(&store, &config)
+        let marked: Vec<u64> = metadata_candidates(&store, None, &config)
             .await
             .unwrap()
             .into_iter()

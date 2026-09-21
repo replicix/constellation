@@ -598,16 +598,17 @@ impl ChainReader {
                 DiskCache::open(cache_dir, NODE_SCRATCH_BYTES)?,
             ),
         };
+        let sealing = constellation_store_s3::TreeSealing::for_keys(keys);
         let cache = Arc::new(NodeCache::new(
-            constellation_store_s3::PackStore::new(backend.clone()),
+            constellation_store_s3::PackStore::new(backend.clone()).with_sealing(sealing.clone()),
             Arc::new(disk),
             hasher,
             tokio::runtime::Handle::current(),
         ));
         Ok(ChainReader {
-            chain: CommitChain::new(backend.clone()),
+            chain: CommitChain::new(backend.clone()).with_sealing(sealing.clone()),
             cache,
-            blobs: BlobStore::new(backend, hasher),
+            blobs: BlobStore::new(backend, hasher).with_sealing(sealing),
             config: record::config().with_hasher(hasher),
         })
     }

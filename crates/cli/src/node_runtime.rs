@@ -460,15 +460,20 @@ impl NodeRuntime {
             Some(keys) => constellation_mtree::Hasher::Keyed(*keys.addressing_key()),
             None => constellation_mtree::Hasher::Plain,
         };
+        // …and on an E2E filesystem every tree object is also sealed
+        // (§P13): pack frames and indices, spilled blobs, commits.
+        let tree_sealing = constellation_store_s3::TreeSealing::for_keys(e2e_keys.as_ref());
         let tree_access = snapshot::TreeAccess {
             nodes: Arc::new(constellation_store_s3::NodeCache::new(
-                constellation_store_s3::PackStore::new(store.inner().clone()),
+                constellation_store_s3::PackStore::new(store.inner().clone())
+                    .with_sealing(tree_sealing.clone()),
                 cache.clone(),
                 tree_hasher,
                 rt.clone(),
             )),
             config: constellation_mtree::record::config().with_hasher(tree_hasher),
-            blobs: constellation_store_s3::BlobStore::new(store.inner().clone(), tree_hasher),
+            blobs: constellation_store_s3::BlobStore::new(store.inner().clone(), tree_hasher)
+                .with_sealing(tree_sealing.clone()),
         };
         let snapshots_base =
             snapshot::SnapshotManager::new(meta.clone(), store.clone(), fsmeta.chunk_size, node_id)
@@ -673,7 +678,8 @@ impl NodeRuntime {
                 meta.clone(),
                 tree_access.nodes.clone(),
                 tree_access.blobs.clone(),
-                constellation_store_s3::CommitChain::new(store.inner().clone()),
+                constellation_store_s3::CommitChain::new(store.inner().clone())
+                    .with_sealing(tree_sealing.clone()),
                 tree_access.config,
                 node_id,
                 rt.clone(),

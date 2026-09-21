@@ -81,7 +81,7 @@
 use crate::error::StoreError;
 use crate::layout;
 use crate::mark::PackCatalog;
-use crate::packs::{build_packs_in, PackEntry, PackHash, PackNode, PackStore};
+use crate::packs::{PackEntry, PackHash, PackNode, PackStore};
 use constellation_mtree::{Hasher, NodeHash, NodeRef};
 use object_store::ObjectStoreExt;
 use std::collections::{HashMap, HashSet};
@@ -428,7 +428,7 @@ impl Compactor {
             .collect();
         let nodes = self.extract(&bodies, &survivors, live)?;
         outcome.nodes_moved = nodes.len() as u64;
-        let built = build_packs_in(&self.pool, nodes, self.packs.target_bytes())?;
+        let built = self.packs.build_in(&self.pool, nodes)?;
 
         // Durability first, and *all* of it: one failed PUT aborts the
         // batch with nothing deleted, because a partial replacement set
@@ -508,8 +508,7 @@ impl Compactor {
                             entry.hash
                         ))
                     })?;
-                    let bytes = zstd::decode_all(frame)
-                        .map_err(|e| StoreError::Compression(e.to_string()))?;
+                    let bytes = self.packs.open_frame(&entry.hash, frame)?;
                     if self.hasher.hash(&bytes) != entry.hash {
                         return Err(StoreError::HashMismatch {
                             key: layout::pack(&pack.to_hex()).to_string(),

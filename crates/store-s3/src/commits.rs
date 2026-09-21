@@ -55,13 +55,13 @@
 //! real rebase; until then the identity rebase is correct for a single
 //! writer and honest about what it is not.
 //!
-//! ## §P13 hooks
+//! ## §P13
 //!
-//! A commit object is JSON today. Sealing it is a body transform under
-//! the same `encrypt_object`/`decrypt_object` pair `log.rs` already
-//! applies to segments, with the object key as AAD, and needs no format
-//! change here — [`Commit::v`] exists to version the payload, not the
-//! sealing. Keyed node addressing needs nothing at all: `roots` and
+//! A commit object is JSON; on an E2E filesystem ([`CommitChain::with_sealing`])
+//! it is AEAD-sealed under the tree's commit key with the object path as
+//! associated data — the same `encrypt_object`/`decrypt_object` pair
+//! `log.rs` applies to segments. [`Commit::v`] versions the payload, not
+//! the sealing. Keyed node addressing needs nothing here: `roots` and
 //! `packs` are hex hashes whose derivation this module never inspects.
 
 use crate::error::StoreError;
@@ -306,6 +306,7 @@ pub struct CommitChain {
     store: Arc<dyn ObjectStore>,
     packs: PackStore,
     probe_window: usize,
+    seal: Option<Arc<crate::e2e::TreeSealing>>,
 }
 
 impl CommitChain {
@@ -314,7 +315,14 @@ impl CommitChain {
             packs: PackStore::new(store.clone()),
             store,
             probe_window: probe_window(),
+            seal: None,
         }
+    }
+
+    /// Seal commit objects under `sealing` (an E2E filesystem).
+    pub fn with_sealing(mut self, sealing: Option<crate::e2e::TreeSealing>) -> CommitChain {
+        self.seal = sealing.map(Arc::new);
+        self
     }
 
     pub fn with_probe_window(mut self, window: usize) -> CommitChain {
@@ -334,11 +342,18 @@ impl CommitChain {
     /// without [`CommitChain::publish`]'s checks. Ordinary writers
     /// should not: the checks are the invariant.
     pub async fn create(&self, commit: &Commit) -> Result<(), StoreError> {
-        let body = serde_json::to_vec(commit)?;
+        let key = layout::commit(commit.seq);
+        let json = serde_json::to_vec(commit)?;
+        let body = match self.seal.as_deref() {
+            Some(seal) => {
+                crate::e2e::encrypt_object(&seal.commits, key.as_ref().as_bytes(), &json)?
+            }
+            None => json,
+        };
         match self
             .store
             .put_opts(
-                &layout::commit(commit.seq),
+                &key,
                 PutPayload::from(body),
                 PutOptions::from(PutMode::Create),
             )
@@ -351,9 +366,16 @@ impl CommitChain {
     }
 
     pub async fn get(&self, seq: u64) -> Result<Option<Commit>, StoreError> {
-        match self.store.get(&layout::commit(seq)).await {
+        let key = layout::commit(seq);
+        match self.store.get(&key).await {
             Ok(res) => {
-                let body = res.bytes().await?;
+                let stored = res.bytes().await?;
+                let body = match self.seal.as_deref() {
+                    Some(seal) => {
+                        crate::e2e::decrypt_object(&seal.commits, key.as_ref().as_bytes(), &stored)?
+                    }
+                    None => stored.to_vec(),
+                };
                 let commit: Commit = serde_json::from_slice(&body)?;
                 if commit.v != COMMIT_VERSION {
                     return Err(StoreError::CorruptObject(format!(

@@ -63,15 +63,18 @@
 //! [`constellation_mtree::NodeRef::parse`] — see `node_cache.rs`. A
 //! corrupt or lying index produces a failed read, never a wrong answer.
 //!
-//! ## §P13 hooks
+//! ## §P13: sealing on an E2E filesystem
 //!
-//! Both objects carry a `flags` byte and two reserved bytes in their
-//! header. `FLAG_SEALED_NODES` is defined and *refused* on read, so
-//! turning on AEAD sealing later is a flag flip plus a seal/open pair
-//! around the per-node frames, not a format version bump. Keyed
-//! addressing (the other half of §P13) needs nothing here at all: node
-//! identity is whatever `mtree::Hasher` computes, and this module only
-//! ever compares it.
+//! A [`PackStore`] built [`PackStore::with_sealing`] AEAD-seals every
+//! node frame (zstd, then XChaCha20-Poly1305 under the tree's node key,
+//! with the node's hash as associated data, so a frame cannot be moved
+//! to stand for another node) and sets `FLAG_SEALED_NODES` in the body
+//! header. The `.idx` object is sealed whole, with its object path as
+//! associated data: its entries carry each node's first *key*, which is
+//! a file name. A pack body's hash is blake3 of the sealed bytes, so it
+//! names ciphertext and reveals nothing. Keyed addressing (the other
+//! half of §P13) needs nothing here: node identity is whatever
+//! `mtree::Hasher` computes, and this module only ever compares it.
 
 use crate::error::StoreError;
 use crate::layout;
@@ -85,9 +88,7 @@ pub const PACK_MAGIC: [u8; 4] = *b"CPK1";
 pub const PACK_INDEX_MAGIC: [u8; 4] = *b"CPI1";
 pub const PACK_FORMAT_VERSION: u8 = 1;
 
-/// Per-node AEAD sealing (§P13). Reserved, never set by this code, and
-/// refused on read so that a future writer cannot be silently
-/// misread by a reader that predates it.
+/// Per-node AEAD sealing (§P13): set in a sealed pack's body header.
 pub const FLAG_SEALED_NODES: u8 = 0x01;
 
 /// magic(4) + version(1) + flags(1) + reserved(2) + node count(4).
@@ -328,8 +329,37 @@ impl BuiltPack {
 /// node at ~120 KiB (§14.1), so this is a theoretical branch that must
 /// nevertheless not be a panic.
 pub fn build_packs(
+    nodes: Vec<PackNode>,
+    target_bytes: usize,
+) -> Result<Vec<BuiltPack>, StoreError> {
+    build_packs_sealed(nodes, target_bytes, None)
+}
+
+/// One node's frame: zstd, then (sealed) AEAD under `key` with the node
+/// hash as associated data.
+fn frame(node: &PackNode, key: Option<&[u8; 32]>) -> Result<Vec<u8>, StoreError> {
+    let compressed = zstd::encode_all(&node.bytes[..], ZSTD_LEVEL)
+        .map_err(|e| StoreError::Compression(e.to_string()))?;
+    match key {
+        Some(key) => crate::e2e::encrypt_object(key, &node.hash.0, &compressed),
+        None => Ok(compressed),
+    }
+}
+
+fn body_header(sealed: bool) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&PACK_MAGIC);
+    body.push(PACK_FORMAT_VERSION);
+    body.push(if sealed { FLAG_SEALED_NODES } else { 0 });
+    body.extend_from_slice(&[0u8; 2]); // reserved
+    body.extend_from_slice(&[0u8; 4]); // node count, patched at seal
+    body
+}
+
+fn build_packs_sealed(
     mut nodes: Vec<PackNode>,
     target_bytes: usize,
+    key: Option<&[u8; 32]>,
 ) -> Result<Vec<BuiltPack>, StoreError> {
     nodes.sort_by(|a, b| {
         a.level
@@ -346,14 +376,9 @@ pub fn build_packs(
 
     for node in nodes {
         if body.is_empty() {
-            body.extend_from_slice(&PACK_MAGIC);
-            body.push(PACK_FORMAT_VERSION);
-            body.push(0); // flags: §P13 sealing off
-            body.extend_from_slice(&[0u8; 2]); // reserved
-            body.extend_from_slice(&[0u8; 4]); // node count, patched at seal
+            body = body_header(key.is_some());
         }
-        let frame = zstd::encode_all(&node.bytes[..], ZSTD_LEVEL)
-            .map_err(|e| StoreError::Compression(e.to_string()))?;
+        let frame = frame(&node, key)?;
         let offset = u32::try_from(body.len())
             .map_err(|_| StoreError::CorruptObject("pack grew past 4 GiB".into()))?;
         let compressed_len = u32::try_from(frame.len())
@@ -419,8 +444,17 @@ pub fn build_packs_concurrent(
 
 pub(crate) fn build_packs_in(
     pool: &rayon::ThreadPool,
+    nodes: Vec<PackNode>,
+    target_bytes: usize,
+) -> Result<Vec<BuiltPack>, StoreError> {
+    build_packs_in_sealed(pool, nodes, target_bytes, None)
+}
+
+fn build_packs_in_sealed(
+    pool: &rayon::ThreadPool,
     mut nodes: Vec<PackNode>,
     target_bytes: usize,
+    key: Option<&[u8; 32]>,
 ) -> Result<Vec<BuiltPack>, StoreError> {
     use rayon::prelude::*;
 
@@ -433,7 +467,7 @@ pub(crate) fn build_packs_in(
     // thread. The cost buys parallelism, so pay it only when there is
     // parallelism to buy.
     if pool.current_num_threads() < 2 {
-        return build_packs(nodes, target_bytes);
+        return build_packs_sealed(nodes, target_bytes, key);
     }
 
     nodes.sort_by(|a, b| {
@@ -451,10 +485,7 @@ pub(crate) fn build_packs_in(
     let frames: Vec<Vec<u8>> = pool.install(|| {
         nodes
             .par_iter()
-            .map(|node| {
-                zstd::encode_all(&node.bytes[..], ZSTD_LEVEL)
-                    .map_err(|e| StoreError::Compression(e.to_string()))
-            })
+            .map(|node| frame(node, key))
             .collect::<Result<Vec<_>, StoreError>>()
     })?;
 
@@ -475,21 +506,16 @@ pub(crate) fn build_packs_in(
 
     pool.install(|| {
         cuts.par_iter()
-            .map(|range| assemble(&nodes[range.clone()], &frames[range.clone()]))
+            .map(|range| assemble(&nodes[range.clone()], &frames[range.clone()], key.is_some()))
             .collect::<Result<Vec<_>, StoreError>>()
     })
 }
 
 /// One output pack from an already-compressed run of nodes. Byte-for-byte
 /// what [`build_packs`]' inner loop would have produced for the same run.
-fn assemble(nodes: &[PackNode], frames: &[Vec<u8>]) -> Result<BuiltPack, StoreError> {
-    let mut body: Vec<u8> =
-        Vec::with_capacity(HEADER_LEN + frames.iter().map(|frame| frame.len()).sum::<usize>());
-    body.extend_from_slice(&PACK_MAGIC);
-    body.push(PACK_FORMAT_VERSION);
-    body.push(0); // flags: §P13 sealing off
-    body.extend_from_slice(&[0u8; 2]); // reserved
-    body.extend_from_slice(&[0u8; 4]); // node count, patched at seal
+fn assemble(nodes: &[PackNode], frames: &[Vec<u8>], sealed: bool) -> Result<BuiltPack, StoreError> {
+    let mut body = body_header(sealed);
+    body.reserve(frames.iter().map(|frame| frame.len()).sum::<usize>());
     let mut index = PackIndex::default();
     for (node, frame) in nodes.iter().zip(frames) {
         let offset = u32::try_from(body.len())
@@ -525,6 +551,8 @@ fn seal(mut body: Vec<u8>, index: PackIndex) -> BuiltPack {
 pub struct PackStore {
     store: Arc<dyn ObjectStore>,
     target_bytes: usize,
+    /// The tree's node key on an E2E filesystem (§P13).
+    seal: Option<Arc<crate::e2e::TreeSealing>>,
 }
 
 impl PackStore {
@@ -532,7 +560,46 @@ impl PackStore {
         PackStore {
             store,
             target_bytes: pack_target_bytes(),
+            seal: None,
         }
+    }
+
+    /// Seal frames and indices under `sealing` (an E2E filesystem); a
+    /// `None` leaves the store plain. Readers and writers of one bucket
+    /// must agree, exactly as they must on the hasher.
+    pub fn with_sealing(mut self, sealing: Option<crate::e2e::TreeSealing>) -> PackStore {
+        self.seal = sealing.map(Arc::new);
+        self
+    }
+
+    fn node_key(&self) -> Option<&[u8; 32]> {
+        self.seal.as_deref().map(|seal| &seal.nodes)
+    }
+
+    /// Assemble packs the way this store writes them (sealed or plain).
+    pub fn build(&self, nodes: Vec<PackNode>) -> Result<Vec<BuiltPack>, StoreError> {
+        build_packs_sealed(nodes, self.target_bytes, self.node_key())
+    }
+
+    pub(crate) fn build_in(
+        &self,
+        pool: &rayon::ThreadPool,
+        nodes: Vec<PackNode>,
+    ) -> Result<Vec<BuiltPack>, StoreError> {
+        build_packs_in_sealed(pool, nodes, self.target_bytes, self.node_key())
+    }
+
+    /// Frame bytes back to the node they encode (open, then decompress).
+    pub(crate) fn open_frame(&self, node: &NodeHash, frame: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let compressed;
+        let frame = match self.node_key() {
+            Some(key) => {
+                compressed = crate::e2e::decrypt_object(key, &node.0, frame)?;
+                &compressed[..]
+            }
+            None => frame,
+        };
+        zstd::decode_all(frame).map_err(|e| StoreError::Compression(e.to_string()))
     }
 
     /// Override the fill target. For tests that need several packs out
@@ -568,8 +635,14 @@ impl PackStore {
         let hex = pack.hash.to_hex();
         self.put_created(&layout::pack(&hex), pack.body.clone())
             .await?;
-        self.put_created(&layout::pack_index(&hex), pack.index.encode())
-            .await
+        let key = layout::pack_index(&hex);
+        let index = match self.node_key() {
+            Some(seal) => {
+                crate::e2e::encrypt_object(seal, key.as_ref().as_bytes(), &pack.index.encode())?
+            }
+            None => pack.index.encode(),
+        };
+        self.put_created(&key, index).await
     }
 
     async fn put_created(
@@ -594,7 +667,14 @@ impl PackStore {
     pub async fn get_index(&self, hash: &PackHash) -> Result<PackIndex, StoreError> {
         let key = layout::pack_index(&hash.to_hex());
         let body = self.store.get(&key).await?.bytes().await?;
-        PackIndex::decode(&body)
+        match self.node_key() {
+            Some(seal) => PackIndex::decode(&crate::e2e::decrypt_object(
+                seal,
+                key.as_ref().as_bytes(),
+                &body,
+            )?),
+            None => PackIndex::decode(&body),
+        }
     }
 
     /// One node, by ranged GET.
@@ -606,13 +686,14 @@ impl PackStore {
     pub async fn get_node_bytes(
         &self,
         pack: &PackHash,
+        node: &NodeHash,
         offset: u32,
         compressed_len: u32,
     ) -> Result<Vec<u8>, StoreError> {
         let key = layout::pack(&pack.to_hex());
         let range = offset as u64..(offset as u64 + compressed_len as u64);
         let frame = self.store.get_range(&key, range).await?;
-        zstd::decode_all(&frame[..]).map_err(|e| StoreError::Compression(e.to_string()))
+        self.open_frame(node, &frame)
     }
 
     /// Whole pack body, for compaction and `fsck` (S7, S6).
@@ -805,7 +886,12 @@ mod tests {
         assert_eq!(index, built[0].index);
         let entry = &index.entries[0];
         let bytes = packs
-            .get_node_bytes(&built[0].hash, entry.offset, entry.compressed_len)
+            .get_node_bytes(
+                &built[0].hash,
+                &entry.hash,
+                entry.offset,
+                entry.compressed_len,
+            )
             .await
             .unwrap();
         assert_eq!(bytes, node.bytes);
@@ -868,5 +954,67 @@ mod tests {
         let hash = PackHash::of(b"body");
         assert_eq!(PackHash::from_hex(&hash.to_hex()), Some(hash));
         assert_eq!(PackHash::from_hex("nope"), None);
+    }
+
+    /// §P13 on an E2E filesystem: a sealed pack round-trips through its
+    /// own store, no plaintext node key (a file name) appears in the body
+    /// or the index object, and a store without the key cannot read it.
+    #[tokio::test]
+    async fn sealed_packs_hide_names_and_need_the_key() {
+        use object_store::memory::InMemory;
+        let backend: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let keys = crate::e2e::E2eKeys::generate();
+        let sealed = PackStore::new(backend.clone())
+            .with_sealing(Some(crate::e2e::TreeSealing::from_keys(&keys)));
+        let name: &[u8] = b"secret-file-name-in-a-dentry-key";
+        let node = pack_node(0, &[name]);
+        let built = sealed.build(vec![node.clone()]).unwrap();
+        assert_eq!(built[0].body[5] & FLAG_SEALED_NODES, FLAG_SEALED_NODES);
+        sealed.put_pack(&built[0]).await.unwrap();
+
+        let hex = built[0].hash.to_hex();
+        for key in [layout::pack(&hex), layout::pack_index(&hex)] {
+            let raw = backend.get(&key).await.unwrap().bytes().await.unwrap();
+            assert!(
+                !raw.windows(name.len()).any(|w| w == name),
+                "{key} leaks a node key in plaintext"
+            );
+        }
+        let index = sealed.get_index(&built[0].hash).await.unwrap();
+        let entry = &index.entries[0];
+        assert_eq!(entry.first_key, name);
+        let bytes = sealed
+            .get_node_bytes(
+                &built[0].hash,
+                &entry.hash,
+                entry.offset,
+                entry.compressed_len,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, node.bytes);
+
+        // Without the key: the index does not decode and a frame does
+        // not open. A frame moved to stand for another node fails too.
+        let plain = PackStore::new(backend.clone());
+        assert!(plain.get_index(&built[0].hash).await.is_err());
+        assert!(plain
+            .get_node_bytes(
+                &built[0].hash,
+                &entry.hash,
+                entry.offset,
+                entry.compressed_len
+            )
+            .await
+            .is_err());
+        assert!(sealed
+            .get_node_bytes(
+                &built[0].hash,
+                &NodeHash([9; 32]),
+                entry.offset,
+                entry.compressed_len
+            )
+            .await
+            .is_err());
     }
 }
