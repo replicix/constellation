@@ -7,7 +7,9 @@
 use crate::error::MetaError;
 use crate::record::LogRecord;
 use crate::replay::TouchSet;
-use crate::{CloneNode, CloneSpec, DirEntry, MetaStore, SetXattrMode, SnapshotNode, SnapshotRow};
+use crate::{
+    CloneNode, CloneSpec, DirEntry, MetaStore, SetXattrMode, SnapshotNode, SnapshotRow, TreeInode,
+};
 use constellation_fs_core::types::{now_ns, ROOT_INO};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -348,17 +350,29 @@ impl SqliteMeta {
     /// would be told "already in the bucket" about an object that provably
     /// is not there yet, and every write-back upload would pay a
     /// guaranteed-404 HEAD before its PUT (177 ms HU→AWS, 27 ms
-    /// same-region — plan 26 Appendix). `pending_upload` is node-local, so
-    /// this only ever suppresses a hint about *our* unfinished work; a
-    /// hash referenced by a peer still hits. One statement rather than two
-    /// calls, so the hot upload path takes the reader once and never the
-    /// writer connection.
+    /// same-region — plan 26 Appendix).
+    ///
+    /// The exclusion is *per referencing inode*, not per hash, and that
+    /// distinction is the whole point. `put_mode` runs while draining
+    /// `pending_upload`, so the hash being asked about always has a local
+    /// pending row; excluding on the hash alone would switch the hint off
+    /// entirely and throw away the dedup case it exists for. What makes
+    /// content "already in the bucket" is a reference from an inode this
+    /// node is *not* currently uploading for — a peer's manifest replayed
+    /// into `chunk_ref`, or one of our own already-acked files. So:
+    /// deduplicating a peer's content hits (their `ino` has no pending row
+    /// of ours), while our own brand-new content misses (its only
+    /// reference is the inode we are uploading right now).
+    ///
+    /// One statement rather than two calls, so the hot upload path takes
+    /// the reader once and never the writer connection.
     pub fn chunk_ref_exists(&self, hash: &ChunkHash) -> Result<bool, MetaError> {
         self.with_reader(|conn| {
             Ok(conn
                 .query_row(
                     "SELECT 1 FROM chunk_ref WHERE chunk_hash = ?1 \
-                     AND NOT EXISTS(SELECT 1 FROM pending_upload WHERE hash = ?1) LIMIT 1",
+                     AND NOT EXISTS(SELECT 1 FROM pending_upload \
+                         WHERE hash = ?1 AND ino = chunk_ref.ino) LIMIT 1",
                     params![hash.0.to_vec()],
                     |_| Ok(()),
                 )
@@ -1796,6 +1810,92 @@ impl SqliteMeta {
 
     pub fn child_ino(&self, parent: Ino, name: &str) -> Result<Option<Ino>, MetaError> {
         Self::dentry_ino(&self.conn.lock().unwrap(), parent, name)
+    }
+
+    // ------------------------------------------------- tree builder reads
+    //
+    // Plan 28 §11's builder turns this replica into an `mtree` and
+    // publishes it as a commit. Everything it needs is already here in
+    // some shape, but not in a shape it can use without either taking
+    // the write mutex (which would put a publish on FUSE's critical
+    // path — the exact stall the plan exists to remove) or issuing one
+    // query per field. So the builder gets its own small read surface,
+    // and every method below goes through [`Self::with_reader`]: a
+    // per-thread read-only WAL connection, concurrent with writers by
+    // construction.
+    //
+    // They are deliberately *reads of current state* rather than of the
+    // journal. The journal says which entities changed; what they
+    // changed *to* is whatever the replica now holds, and asking the
+    // replica is both cheaper and immune to a record the builder does
+    // not know how to interpret.
+
+    /// Everything the `0x01` record needs for one inode, in one place.
+    ///
+    /// `None` means the inode is gone, which the builder reads as
+    /// "delete its keys".
+    pub fn tree_inode(&self, ino: Ino) -> Result<Option<TreeInode>, MetaError> {
+        self.with_reader(|conn| Self::tree_inode_conn(conn, ino))
+    }
+
+    fn tree_inode_conn(conn: &Connection, ino: Ino) -> Result<Option<TreeInode>, MetaError> {
+        let row = conn
+            .query_row(
+                "SELECT ino, kind, size, mode, uid, gid, nlink, atime_ns, mtime_ns, ctime_ns,
+                        rdev, symlink_target, manifest
+                 FROM inode WHERE ino = ?1",
+                params![ino],
+                |row| {
+                    Ok((
+                        Self::row_to_attr(row)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<Vec<u8>>>(12)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((attr, target, manifest)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(TreeInode {
+            attr,
+            target,
+            manifest,
+            xattrs: Self::xattrs_by_ino(conn, ino)?,
+        }))
+    }
+
+    /// Every name that points at `ino`, as `(parent, name)`. The
+    /// `0x04` reverse index in its current form, and the set of `0x02`
+    /// dentries whose attr copy has to be refreshed when `ino`'s attrs
+    /// move.
+    pub fn links_of(&self, ino: Ino) -> Result<Vec<(Ino, String)>, MetaError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn.prepare_cached("SELECT parent, name FROM dentry WHERE ino = ?1")?;
+            let rows = stmt.query_map(params![ino], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// [`Self::child_ino`] without the write mutex.
+    pub fn child_ino_reader(&self, parent: Ino, name: &str) -> Result<Option<Ino>, MetaError> {
+        self.with_reader(|conn| Self::dentry_ino(conn, parent, name))
+    }
+
+    /// One page of inode numbers above `after`, for the full rebuild.
+    ///
+    /// SQLite's signed integer order, not the tree's unsigned key
+    /// order, and that is fine: the rebuild feeds these to
+    /// `mtree::apply`, whose result is a function of the key *set* and
+    /// not of the order the keys arrived in. All this has to do is
+    /// enumerate every inode exactly once.
+    pub fn scan_inos(&self, after: Ino, limit: usize) -> Result<Vec<Ino>, MetaError> {
+        self.with_reader(|conn| {
+            let mut stmt =
+                conn.prepare_cached("SELECT ino FROM inode WHERE ino > ?1 ORDER BY ino LIMIT ?2")?;
+            let rows = stmt.query_map(params![after, limit as i64], |row| row.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     pub fn applied_vector(&self) -> Result<std::collections::BTreeMap<String, u64>, MetaError> {
@@ -3991,6 +4091,45 @@ mod tests {
         assert!(
             meta.chunk_ref_exists(&hash).unwrap(),
             "after the upload lands the reference is a legitimate hint"
+        );
+    }
+
+    /// Deduplicating somebody else's content must still hit while our own
+    /// copy is in flight — the case the upload path exists to optimise.
+    ///
+    /// `put_mode` is called *while* draining `pending_upload`, so the hash
+    /// always has a local pending row at that moment. Excluding on the
+    /// hash alone would therefore switch the hint off for every upload and
+    /// silently undo plan 26 step 8; the exclusion has to be per
+    /// referencing inode.
+    #[test]
+    fn chunk_ref_hint_still_hits_when_a_peer_already_uploaded_the_content() {
+        let hash = ChunkHash::of(b"content a peer already put in the bucket");
+
+        // A peer's manifest, learned by replay — no pending upload of ours.
+        let src = store();
+        let theirs = src.create(ROOT_INO, "theirs", 0o644, 0, 0).unwrap();
+        src.set_manifest(theirs.ino, &one_hash_manifest(hash), 1)
+            .unwrap();
+        let meta = store();
+        let records: Vec<LogRecord> = src
+            .take_journal(16)
+            .unwrap()
+            .into_iter()
+            .map(|(_, rec)| rec)
+            .collect();
+        meta.apply_records(&records).unwrap();
+
+        // Now we write the same bytes: our own copy is queued for upload.
+        let ours = meta.create(ROOT_INO, "ours", 0o644, 0, 0).unwrap();
+        meta.set_manifest(ours.ino, &one_hash_manifest(hash), 2)
+            .unwrap();
+        meta.add_pending_upload(&hash, ours.ino).unwrap();
+
+        assert!(
+            meta.chunk_ref_exists(&hash).unwrap(),
+            "the peer's reference proves the object is in the bucket, so this \
+             upload must take the confirming HEAD rather than blind-PUT"
         );
     }
 

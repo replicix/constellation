@@ -71,6 +71,24 @@ pub const DEFAULT_IDLE_RELEASE_MS: u64 = 30_000;
 /// the previous holder had not yet flushed.
 pub const LEASE_MIN_DWELL_MS: u64 = 5_000;
 
+/// How long a registered requester may go unanswered before the holder
+/// stops waiting for its own write-idle window and hands the lease over at
+/// the next drained batch.
+///
+/// Without this, `idle_release_due` only fired on the idle timer, so under
+/// sustained contention each holder kept the lease for
+/// `CONSTELLATION_LEASE_IDLE_RELEASE_MS` (30 s by default) and a third
+/// node could sit behind two full tenures — past the FUSE acquire deadline
+/// of 2xTTL, which surfaces to userspace as EIO on a write. `chaos-ci`
+/// reproduces exactly that: two waiters gave up 121.27 s in, 74 us apart.
+///
+/// Plan 26 Step 7's prose already said the holder "finishes any in-flight
+/// batch, releases"; its code block said to wait out the idle window too.
+/// This is the prose, bounded: the idle threshold still governs while
+/// nobody has been waiting long, and `LEASE_MIN_DWELL_MS` still bounds the
+/// handoff rate, so a lease cannot be traded more than once per dwell.
+pub const LEASE_WANTED_GRACE_MS: u64 = 5_000;
+
 /// Treat the lease as unusable this close to expiry: renewal happens at
 /// half-TTL, so a mutation landing inside the margin should route
 /// through the sync task instead of racing the clock.
@@ -208,6 +226,9 @@ pub struct LeaseKeeper {
     /// Node ids waiting for this partition, as of the last lease object we
     /// read. Empty means nobody is asking, and a sticky lease is kept.
     wanted: Vec<u64>,
+    /// When `wanted` last went from empty to non-empty; gates
+    /// [`LEASE_WANTED_GRACE_MS`]. `None` whenever nobody is waiting.
+    wanted_since: Option<Instant>,
     /// Open continuation-epoch promise forbids S3 takeover (DESIGN.md §5.3).
     takeover_gate: Arc<AtomicBool>,
     /// Diagnostic tag naming the mechanism behind the next acquisition
@@ -227,6 +248,7 @@ impl LeaseKeeper {
             held: None,
             held_since: None,
             wanted: Vec::new(),
+            wanted_since: None,
             takeover_gate: Arc::new(AtomicBool::new(false)),
             acquire_reason: "unspecified",
         }
@@ -424,6 +446,7 @@ impl LeaseKeeper {
                 // dwell clock that keeps the next one from being answered
                 // the instant it arrives.
                 self.wanted.clear();
+                self.wanted_since = None;
                 self.held_since = Some(Instant::now());
                 self.held = Some((lease, tag));
                 self.refresh_condemned().await;
@@ -491,6 +514,11 @@ impl LeaseKeeper {
                         && !cur.is_expired(now_unix_ms())
                     {
                         self.wanted = cur.wanted_by.clone();
+                        if self.wanted.is_empty() {
+                            self.wanted_since = None;
+                        } else if self.wanted_since.is_none() {
+                            self.wanted_since = Some(Instant::now());
+                        }
                         tracing::debug!(
                             wanted_by = ?self.wanted,
                             epoch = cur.epoch,
@@ -620,8 +648,18 @@ impl LeaseKeeper {
             && self.held.is_some()
             && journal_backlog == 0
             && !self.wanted.is_empty()
-            && self.view.idle_for_ms() >= self.idle_release_ms as i64
             && self.held_for_ms() >= LEASE_MIN_DWELL_MS as i64
+            && (self.view.idle_for_ms() >= self.idle_release_ms as i64
+                || self.wanted_for_ms() >= LEASE_WANTED_GRACE_MS as i64)
+    }
+
+    /// How long somebody has been waiting for this partition, in ms. `0`
+    /// when nobody is, which keeps the grace arm of
+    /// [`Self::idle_release_due`] false there.
+    fn wanted_for_ms(&self) -> i64 {
+        self.wanted_since
+            .map(|at| at.elapsed().as_millis() as i64)
+            .unwrap_or(0)
     }
 
     /// How long this node has held the current lease, in ms. `0` when it
@@ -641,6 +679,19 @@ impl LeaseKeeper {
         self.idle_release_ms = 0;
         self.held_since =
             Some(Instant::now() - std::time::Duration::from_millis(LEASE_MIN_DWELL_MS));
+    }
+
+    /// Test hook: satisfy the dwell floor and age the requester's wait past
+    /// [`LEASE_WANTED_GRACE_MS`], while leaving `idle_release_ms` alone so
+    /// the write-idle arm of [`Self::idle_release_due`] stays false. Lets a
+    /// test exercise the starvation bound on its own — the arm that a busy
+    /// holder under contention actually takes.
+    #[cfg(test)]
+    pub(crate) fn expire_wanted_grace_for_test(&mut self) {
+        self.held_since =
+            Some(Instant::now() - std::time::Duration::from_millis(LEASE_MIN_DWELL_MS));
+        self.wanted_since =
+            Some(Instant::now() - std::time::Duration::from_millis(LEASE_WANTED_GRACE_MS));
     }
 
     /// Node ids currently recorded as waiting for this partition.
@@ -663,6 +714,7 @@ impl LeaseKeeper {
         // `Lease::released` drops `wanted_by`: the partition is free, so
         // every pending request has just been answered.
         self.wanted.clear();
+        self.wanted_since = None;
         self.held_since = None;
         match self.store.try_swap(&lease.released(), &tag).await {
             Ok(new_tag) => {

@@ -1958,6 +1958,10 @@ end-to-end — and where two defects in already-"done" steps surfaced.
 | `CONSTELLATION_HARNESS_DOCKER_PREFIX` — lets two harness processes share a host, which is what made the HEAD-vs-working-tree A/B possible | done | `harness::s3env` |
 | **Defect found in step 8**: `chunk_ref` existence hint claimed "in the bucket" for this node's own un-uploaded chunks | fixed | `meta::sqlite::chunk_ref_exists` |
 | **Defect found in step 3**: a deposed holder could not see the new holder's writes for up to TTL/2 | fixed | `cli::shipper::{HELD_TAIL_MAX_STALENESS,held_partitions}` |
+| **Defect found in step 4c**: the idle backoff starved lease renewal and handoff discovery (`run_sync_round` is their only caller) | fixed | `cli::node_runtime::lease_poll_cap_ms` |
+| **Defect found in step 7c**: a transient read during a renewal CAS conflict dropped `self.held`, demoting a healthy holder | fixed | `cli::lease::LeaseKeeper::renew_now` |
+| Idle probe narrowed to 1 GET, widening to 16 on a hit (settled decision revisited, user-approved) | done | `cli::shipper::TAIL_PROBE_IDLE` |
+| `CONSTELLATION_SYNC_IDLE_MAX_MS` default 30 s → 10 s (settled decision revisited, user-approved) | done | `cli::node_runtime::SYNC_IDLE_MAX_MS` |
 | TESTING.md documents the five scenarios and the counting relay | done | `docs/how-to-guides/development/TESTING.md` |
 
 ### Defect 1 — step 8's `chunk_ref` hint was wrong for in-flight chunks
@@ -1975,13 +1979,27 @@ HU→AWS and 27 ms same-region *per chunk*, on the path plan 26 exists to
 make cheaper. No unit test could see it — they seed the hint with
 `insert()` and never model a pending upload.
 
-`chunk_ref_exists` now excludes hashes with a live `pending_upload` row,
-in one indexed statement on the reader connection (never the writer, which
-FUSE also needs). `pending_upload` is node-local, so this only ever
-suppresses a hint about *our own* unfinished work — a hash referenced by a
-peer still hits, which is the property step 8 was built for. Pinned by
-`chunk_ref_hint_ignores_this_nodes_pending_uploads`, which fails without
-the exclusion.
+`chunk_ref_exists` now excludes a reference **from an inode this node is
+currently uploading for**, in one indexed statement on the reader
+connection (never the writer, which FUSE also needs).
+
+The per-inode correlation is the whole fix, and getting it wrong first is
+worth recording. An initial version excluded on the *hash* alone, which
+looked right and passed every unit test — but `put_mode` runs while
+draining `pending_upload`, so the hash being asked about always has a
+local pending row. That version silently switched the hint off
+altogether, and the harness caught what the unit tests could not:
+`existence-bloom-dedup` inverted from `chunk_ref_hits=300 misses=0` to
+`chunk_ref_hits=0 misses=300`. What actually makes content "already in
+the bucket" is a reference from an inode we are *not* uploading right
+now — a peer's replayed manifest, or one of our own already-acked files.
+
+Pinned by two tests that fail without the respective halves:
+`chunk_ref_hint_ignores_this_nodes_pending_uploads` (our brand-new
+content must miss) and
+`chunk_ref_hint_still_hits_when_a_peer_already_uploaded_the_content` (a
+peer's content must hit while our duplicate is in flight — this one fails
+against the hash-only predicate).
 
 ### Defect 2 — step 3 left a deposed holder blind for up to TTL/2
 
@@ -2129,3 +2147,1247 @@ measures it as correct (1693 ms vs 2201 ms at k=8 over 64 segments,
 HU→AWS); the probe widens to 16 the moment the narrow one hits, and only
 escalates to a LIST if the wide probe also saturates. `TAIL_PROBE_IDLE`
 = 1, `CONSTELLATION_SYNC_IDLE_MAX_MS` default 10 s.
+
+### Defect 4 — a transient read during a renewal CAS conflict demoted a healthy holder
+
+`renew_now` `take`s `self.held` at the top. Plan 26's new `CasConflict`
+branch then re-reads the lease object to tell a `wanted_by` edit from a
+real deposition — with `self.store.get().await?`. On a transient read
+failure that `?` returns **without putting the lease back**, so a holder
+that was never deposed silently loses its lease handle; with the store
+unreachable it cannot re-acquire either, and the next mutation fails with
+EIO. The pre-plan-26 code had no intermediate read here (it went straight
+to `diagnose_lost_renew`), so the path is new.
+
+Found by reading while root-causing `node-leave`, **not** by that
+scenario: the ablation below shows `node-leave` passes with or without
+this fix. It is recorded on its own merits — a correctness bug on the
+degraded path, fixed by restoring `self.held` before propagating.
+
+### Why `node-leave` regressed, established by ablation
+
+`node-leave` passes on a plan-26-free tree and failed reproducibly here
+(38.0 / 38.1 / 38.7 / 38.8 / 39.0 s) with EIO. The errno origin, from the
+daemon log with `RUST_LOG=constellation=debug`:
+
+```
+ERROR constellation::fusefs: another node holds the partition lease;
+      failing the write with EIO waited=11.106991567s part="p0"
+```
+
+That is an `acquire_deadline` expiry (`2 × ttl_ms` = 10 s at this
+scenario's 5 s TTL; the 11.1 s is the retry ladder's last attempt landing
+just past it). The peer holding p0 could not run the sync round that
+hands the lease over inside the deadline, because that round is also the
+only thing that renews a lease and notices a handoff request.
+
+Each candidate fix was reverted individually against the scenario:
+
+| idle ceiling | TTL/4 lease clamp | `held` restoration | `node-leave` |
+|---|---|---|---|
+| 10 s | yes | yes | PASS (33.8 s) |
+| **30 s** | yes | yes | **FAIL 2/2** |
+| 10 s | **no** | yes | **FAIL 2/2** |
+| 10 s | yes | **no** | PASS (33.4 s, 30.8 s) |
+
+So it needed **both** the lower ceiling and the TTL/4 clamp, and neither
+alone; the `held` restoration is unrelated to it. Both halves are
+necessary because the clamp only binds a node while it *holds* something
+(`ship_epoch().is_some()`), and the ceiling governs every round where it
+does not.
+
+### No harness deadline was raised
+
+Every convergence scenario in this plan passes at its **original**
+deadline. Provisional raises were made while the cause was still open and
+have all been reverted; `two-clients-shared` (20 s / 30 s),
+`lease-handover` (20 s / 30 s), `rename-across-partitions` (20 s),
+`atime-eventual` (20 s / 40 s) and `deposed-reintegration` (40 s) are
+byte-identical to their pre-plan-26 values. The reverted numbers are not
+a weakened suite — they are the original one.
+
+```
+=== two-clients-shared PASSED in 236.3s
+=== rename-across-partitions PASSED in 194.0s
+=== lease-handover PASSED in 178.3s
+=== node-leave PASSED in 33.8s
+```
+
+### `named-shared-daemon` hangs — pre-existing, and it blocks the matrix
+
+The full harness matrix has never completed on this host, on either tree.
+It is not dying: `named-shared-daemon` (the 77th and last scenario)
+**hangs indefinitely**, so the run never reports a verdict for it and the
+harness never exits.
+
+Diagnosed live while it was stuck: the harness process was blocked in
+`Command::output()` on a child `constellation umount myfs:/sub` that had
+been running for 4m40s and never returned. The daemon it was unmounting
+was healthy and still serving the other mount — its own log shows
+`Unmounting .../mnt2`, `FUSE detached`, and then the daemon carrying on
+(`joining the gossip topic`). So the sub-mount detaches and the `umount`
+command fails to notice and exit. The leaked daemon then outlives the run
+holding a live FUSE mount, which is why stray
+`constellation mount myfs /tmp/harness-named-daemon-*/mnt1` processes and
+their mounts accumulate across sessions.
+
+**Pre-existing, not plan 26**: the same scenario run from the HEAD
+worktree (87df4ce, plan-26-free) also hangs — killed by a 420 s timeout
+with no verdict, leaving the same stray daemon and mount behind.
+
+Consequence for the gate: `target/release/harness run` cannot be reported
+green as a whole while one scenario never reports. Every other scenario
+is run and accounted for by excluding this one explicitly. Fixing the
+shared-daemon umount drain is out of scope for plan 26 and wants its own
+change — it is a `umount` liveness bug in the plan 21 shared-daemon path,
+not a metadata-plane one.
+
+## Plan 28 step S2 — `crates/mtree`, the pure data structure: **DONE**
+
+Step S2 of `wip/28-s3-native-metadata-store.md` §11. A new workspace
+crate holding the prolly tree (probabilistic B-tree / Merkle search
+tree) as a pure synchronous library — no S3, no tokio, no filesystem,
+no async, no global state. It is a **productionization of
+`bench/prollybench`'s `node.rs` + `tree.rs`**, the code §14 measured,
+not a new design: the algorithm is unchanged and every property those
+files assert is preserved. No existing crate was touched beyond the
+workspace member entries, so the e2e lanes cannot be affected and were
+not run (see "Gates" below).
+
+| Item | State | Where |
+|---|---|---|
+| Node format: magic `MTRE`, explicit `FORMAT_VERSION`, level, entry count, offset table, then leaf `(key, value)` or interior `(first_key, child_hash, agg)` | done | `mtree::node::{encode, NodeRef}` |
+| Keys and values opaque at this layer — the §P6 codec stays S3's job, and no structural decision may depend on key meaning | done | `mtree::node` (module docs state the boundary) |
+| Boundary function over keys only: `u32::from_le_bytes(blake3(k)[0..4]) < u32::MAX / TARGET` at level 0, a different 4-byte window per level above it | done | `mtree::node::is_boundary` |
+| `MIN_ENTRIES`/`MAX_ENTRIES` entry clamps, configurable, canonicality-safe per §14.1; defaults 1 / 256 | done | `mtree::config::Config`, `mtree::node` |
+| Bulk build from a sorted iterator, streaming (O(depth × MAX_ENTRIES) memory) | done | `mtree::Tree::build` |
+| Point read; ordered cursor with `next` and `seek`; prefix/resumable range scan | done | `mtree::Tree::{get, cursor, cursor_at, range}`, `mtree::Cursor` |
+| Incremental `apply` of a sorted key delta (insert/update/delete) returning a new root, cost O(keys changed) | done | `mtree::Tree::apply` |
+| Structural `diff` descending only where hashes differ, plus `delta` as applicable edits | done | `mtree::Tree::{diff, delta}` |
+| Three-way `merge` returning `Merged::Root` or `Merged::Conflicts` (the exact overlapping key set) | done | `mtree::Tree::merge` |
+| §P7 augmented aggregates — bytes, files, keys, max mtime — as a monoid, carried on every interior entry, combined bottom-up | done | `mtree::node::Agg`, `mtree::Tree::aggregate` |
+| Leaf→aggregate projection supplied by the caller, because it needs the §P6 encoding | done | `mtree::config::{LeafAgg, no_leaf_agg}` |
+| blake3 hashing with a **keyed** mode selectable at construction (§P13), covering node identity *and* the boundary function | done | `mtree::hash::{Hasher, NodeHash}`, `Config::keyed` |
+| `thiserror` error enum; node decode rejects malformed input rather than panicking, with a separate O(n) `validate` for trust boundaries | done | `mtree::error::MtreeError`, `NodeRef::{new, parse, validate}` |
+| `NodeStore` trait (sync, content-addressed) plus `MemoryNodeStore` with read/write counters | done | `mtree::store` |
+| Reachability walk and level census, for S7's mark and for §14.1's table | done | `mtree::Tree::{reachable, census}` |
+| Property suite: order independence (50 orders), incremental = bulk byte-identical, delete-then-reinsert, diff O(difference), disjoint merge agreement, exact conflict set, clamp canonicality under deletes, format pinning, seeded fuzz vs `BTreeMap`, corrupted-node no-panic fuzz | done | `mtree/tests/properties.rs` (14 tests) |
+| Unit tests co-located per CONVENTIONS (encoding round-trips, version refusal, boundary rate, monoid laws, store semantics) | done | `mtree::{node,hash,store,config,tree}` (25 tests) |
+| Added to `members` and `default-members`; `constellation-mtree` workspace dependency declared for S3/S4 | done | root `Cargo.toml` |
+
+### Design decisions where the plan left a choice
+
+- **The entry clamps moved from process globals into a `Config`.**
+  prollybench keeps `MAX_ENTRIES` in a `static AtomicUsize`, which
+  forced its tests to serialize on a mutex and would have made the
+  shape of an on-bucket format depend on process state. `Config`
+  carries the clamps, the hasher, and the leaf-aggregate projection, is
+  validated at `Tree` construction, and is documented as a *format*
+  parameter set rather than a tuning surface: two trees over the same
+  key set with different clamps are different trees.
+- **`MIN_ENTRIES` defaults to 1, i.e. off.** The plan asks for both
+  clamps and both are implemented and tested (including at `(8, 64)`
+  and `(16, 16)`), but §14 measured the tree with no lower clamp, and
+  every number this crate is sized against comes from there. Raising it
+  is now a configuration change, not a format change.
+- **The keyed hasher also governs the boundary function.** §P13 only
+  says node hashes are keyed, but the boundary function hashes keys too
+  and it decides the tree's *shape*. Leaving it unkeyed would publish
+  an oracle for split points and node sizes computable from a guessed
+  key set — the same side channel ADR-8 is about. Keyed and unkeyed
+  trees are both canonical; they differ in every hash and in nothing
+  else, asserted by `a_keyed_tree_is_canonical_and_differs_in_every_hash`.
+- **Aggregates are a fixed triple plus the key count, with a
+  caller-supplied projection.** A generic monoid would have to be part
+  of the on-bucket format contract, which nothing could then verify.
+  What *is* caller-supplied is the leaf→`Agg` projection, because only
+  the §P6 codec knows which key range holds the authoritative inode
+  record and therefore which entries may count a file's bytes without
+  double-counting the dentry attr copy. The key count is filled in by
+  the tree rather than the projection, so it stays a structural fact.
+  Per-directory recursive size is deliberately absent and the module
+  docs say why (descendants are not contiguous in the key order).
+- **`Agg::EMPTY` uses `max_mtime: 0`, not `i64::MIN`.** `i64::MIN` is
+  the exact identity for a max over `i64`, but it varint-encodes to ten
+  bytes in every interior entry of an otherwise-empty subtree, and an
+  mtime of 0 already means "nothing to report" elsewhere in this repo.
+  The cost is that a genuinely pre-1970 mtime is masked by a sibling
+  with no mtime, which no filesystem this stores will produce.
+- **Decode is split into an O(1) `new` and an O(entries) `validate`.**
+  Every accessor is individually bounds-checked and returns
+  `Malformed` instead of panicking, so the read path pays only the
+  bounds checks Rust slicing does anyway and §14.2's lookup numbers are
+  not quietly taxed by a validation pass per node view. Key *ordering*
+  cannot be checked lazily — a node whose keys are out of order decodes
+  fine and merely makes binary search lie — so `parse` (= `new` +
+  `validate`) is the documented entry point for bytes arriving off a
+  network, which is where S4's pack reader must call it.
+- **The cursor is safe rather than clever.** prollybench's `entry()`
+  launders a borrow through `std::slice::from_raw_parts` to keep the
+  `entry`/`next` loop ergonomic. Here `entry()` takes `&mut self` and
+  returns a borrow tied to it, and `diff` uses a private
+  `materialize` + `peek` pair so it can hold two entries at once; there
+  is no `unsafe` in the crate. `diff` still allocates only for keys it
+  actually reports.
+- **The store computes no hashes and the tree does no I/O.** `NodeStore`
+  is `get`/`put` over `(NodeHash, level, bytes)`; the hash is computed
+  by the tree because only the tree knows whether this filesystem
+  addresses nodes with plain or keyed blake3. `level` is passed to
+  `put` because it is free here and S4 wants it (interior nodes stay
+  resident, §14.1's 19.75 MiB) without decoding a header.
+- **Node-read counts are asserted through the store's counters.**
+  "Diff cost tracks the difference and not the state" is a claim about
+  node reads, so `MemoryNodeStore` counts them and the property test
+  asserts against the counter, rather than `diff` returning its own
+  cost in its signature.
+
+### Relationship to `bench/prollybench`'s encoding
+
+**Changed, deliberately, and the node hashes differ.** prollybench
+writes `magic(4) + level(1) + count(4)`, a 9-byte header whose version
+lives inside the magic (`MTN1`). The plan requires an explicit format
+version, so this crate writes `magic(4) + version(1) + level(1) +
+count(4)` — `b"MTRE"`, version 1 — a 10-byte header. Everything after
+the header is byte-identical: the same little-endian offset table, the
+same `klen/vlen` `u16` prefixes, the same leaf and interior entry
+bodies, the same varint aggregates. The entry *partition* is identical
+too, because the boundary function is unchanged. Nothing exists on any
+bucket in either format, so there is no migration; from here on
+`FORMAT_VERSION` is the migration story and
+`the_node_encoding_and_root_hashes_are_pinned` is what makes an
+accidental change fail loudly.
+
+`bench/prollybench/**` was read and not modified (a parallel S1
+measurement is live in there).
+
+### Deliberately deferred
+
+- **The §P6 key codec** — that is S3, and keeping it out is what lets
+  the structure and the encoding be versioned independently.
+- **zstd, AEAD sealing, packs, the node cache, the commit chain** — S4.
+  Node bytes leave this crate encoded and uncompressed.
+- **Parallel mark and compaction** (prollybench's `reachable_par`,
+  rayon) — S7, and it needs a real store; the sequential `reachable`
+  here is the algorithm, and it terminates on shared subtrees.
+- **A `Tree::verify` / fsck entry point** — S6, which is where
+  "recompute the root hash and compare" is actually wired. The
+  primitives it needs (`NodeRef::parse`, `reachable`, `census`) are in.
+- **Range aggregates** (`agg` over an arbitrary key range rather than a
+  whole subtree) — §P7's per-directory `du` answer needs them, but it
+  needs the key encoding first, so it lands with S3/S5.
+
+### Plan 28 S2 exit criteria
+
+- [x] `crates/mtree` exists, is pure and synchronous, and is in both
+      `members` and `default-members`
+- [x] Node format is explicitly versioned and pinned by a test with
+      hard-coded hex and root hashes (plain and keyed)
+- [x] Boundary function reads keys only, level-decorrelated, with both
+      entry clamps specified and implemented
+- [x] Bulk build, point read, ordered cursor (`next`/`seek`),
+      incremental `apply`, `diff`, three-way `merge`, and §P7 monoid
+      aggregates all present
+- [x] Keyed hashing selectable at construction, covering node identity
+      and the boundary function
+- [x] Malformed node bytes produce errors, never panics — asserted over
+      8,000 seeded corruptions
+- [x] All seven required property tests green, plus a seeded
+      `BTreeMap`-oracle fuzz
+- [x] No existing crate's source modified
+
+### Gates run in this environment
+
+- `cargo fmt --all` — no diff (`--check` clean).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — **531 passed, 0 failed**, of which
+  `constellation-mtree` contributes 40: 25 co-located unit tests, 14
+  property/fuzz tests, 1 doctest. The `mtree` property suite runs in
+  ~10 s in a debug build.
+- One transient, unrelated failure worth recording:
+  `constellation-meta --test checkpoint_concurrency ::
+  snapshot_does_not_stall_concurrent_readers` failed once while a
+  `cargo clippy --workspace` run was still saturating the host, and
+  passed 4/4 afterwards (3× in isolation, 1× in a clean workspace run).
+  It is a wall-clock latency threshold in a crate this step does not
+  touch and does not link against, so it is load sensitivity in that
+  test rather than a regression here.
+- `bash tests/smoke.sh`, `bash tests/integration.sh`, the harness
+  matrix and pjdfstest — **not run, and cannot be affected.** They
+  exercise product wiring; this step adds a crate that no existing
+  crate depends on and modifies no existing crate's source, so its
+  contribution to every one of those lanes is dead code. Per §11's
+  "steps that touch no product code cannot regress the e2e lanes and do
+  not run them", and per this plan's gate for S2 ("fmt, clippy, and
+  `cargo test --workspace` green. No other crate changes"). The full
+  CONVENTIONS list applies from S5 onward, where `cli/shipper` is
+  actually touched.
+
+### Spec note
+
+No contradiction with `docs/explanation/DESIGN.md` was found in this
+step. The plan's §P1 writes the boundary predicate as
+`blake3(k)[0..4]`, which is exactly what level 0 computes; the
+per-level window above level 0 is an addition the predicate needs (with
+one window for every level, every boundary key of level 0 would also be
+one at level 1 and the tree would degenerate into a chain of one-entry
+interior nodes). `boundary_rate_tracks_target` and
+`level_zero_is_exactly_the_documented_predicate` pin both halves.
+
+## Plan 28 step S4 — pack store, node cache, commit chain: **DONE**
+
+Step S4 of `wip/28-s3-native-metadata-store.md` §11: the storage layer
+beneath the metadata tree, in `crates/store-s3`. Three new modules plus
+layout helpers, all **additive** — nothing calls them yet. The shipper,
+`checkpoints/*`, `LATEST` and `VECTOR.json` are untouched; publishing
+from the live replica is S5's job.
+
+| Item | State | Where |
+|---|---|---|
+| `packs/<hex>` writer: ~1–16 MiB sealed concatenation of per-node zstd frames, self-describing header with a version and a flags byte | done | `store_s3::packs::{build_packs, BuiltPack, PackStore::put_pack}` |
+| Packed **in key order** (`(level, first_key)`), which is what turns §P6's key locality into pack locality | done | `store_s3::packs::build_packs` |
+| `packs/<hex>.idx` sibling index of `(node hash, level, first key, offset, clen, len)` | done | `store_s3::packs::PackIndex` |
+| Single-node reads are ranged GETs into the pack | done | `store_s3::packs::PackStore::get_node_bytes` |
+| `mtree::NodeStore` over `fs-core::cache` **verbatim** — same LRU, same reserve-before-accept, same blake3 verify-and-drop | done | `store_s3::node_cache::NodeCache` |
+| Resolution ladder memory → disk cache → peer → S3, with the peer tier as a hook (`PeerNodeSource`) so `cli`'s cooperative cache plugs in without a dependency inversion | done | `store_s3::node_cache::{NodeCache, PeerNodeSource}` |
+| Concurrent misses: no lock held across I/O, asserted by a store that deadlocks the test if the miss path serializes | done | `node_cache::tests::misses_are_concurrent` |
+| Every node out of a pack, a peer or the disk cache goes through `NodeRef::parse`, never the O(1) constructor | done | `node_cache::NodeCache::accept` |
+| Resident interior tier under a byte budget (§14.1's ~20 MiB), leaves left to the disk LRU | done | `node_cache::{MemoryTier, node_memory_bytes}` |
+| `commits/<seq:016x>`, CAS-created with `If-None-Match: *`, immutable, carrying every §P2 field (`seq`, `parent`, `roots`, `packs`, `author`, `epoch`, `agg`, `intent`, `unix_ms`) | done | `store_s3::commits::{Commit, CommitChain::create}` |
+| Head discovery by GET-next probe over `seq+1..seq+k`, LIST only as the catch-up fallback — the same shape as plan 26's segment tailer | done | `commits::CommitChain::{get_run, discover_head}` |
+| Optimistic publish: CAS at `parent + 1`, 412 hands the winner to a caller-supplied rebase and retries without dropping the payload | done | `commits::CommitChain::publish` |
+| The ordering invariant enforced by construction: unpacked nodes and non-durable packs both refuse the commit | done | `commits::CommitChain::{publish, assert_packs_durable}` |
+| `layout.rs` helpers for both prefixes, in the `log_segment`/`checkpoint` style | done | `store_s3::layout::{pack, pack_index, packs_prefix, commit, commits_prefix}` |
+
+### The index lives in a sibling object, not in the commit
+
+§P8 offers both and the sibling wins on one structural argument: **a
+pack outlives the commit that wrote it.** A commit names only the packs
+*it* created, but most nodes a reader resolves live in packs written by
+ancestors — many of them outside the retained commit window, since
+§P10b deletes old commits freely and by design. An inline index would
+therefore make "read a node" mean "first find the commit that
+introduced its pack", an unbounded walk back through history that
+becomes *impossible* once retention has deleted that commit, even
+though the pack is still live and still reachable. Three secondary
+consequences agree: the commit object stays O(new packs) rather than
+O(nodes written) (a 10k-op commit rewrites ~1,100 nodes per §14.5,
+so ~44 KiB of index in an object that is otherwise a few hundred
+bytes); the index's lifetime is exactly the pack's, so S7 deletes a
+pair with no cross-object bookkeeping; and a partial replica can fetch
+a few KiB of index without touching a 1–16 MiB body. The cost is two
+PUTs to write a pack and two GETs to read one whole, both amortized
+over ~128 nodes.
+
+The index is **untrusted**: it says where bytes are, never what they
+are. Every node is hashed against the hash the caller asked for and
+then structurally parsed, so a lying index is a failed read.
+
+### §14.2's one-pack-per-directory property, and the test that holds it
+
+`build_packs` sorts by `(level, first_key)` before filling. §P6 makes a
+directory's dentries one contiguous key range; the sort turns that into
+pack locality, which is what §14.2 measured as "distinct packs per
+`ls -la` = 1". `NodeCache` counts distinct packs touched *at level 0*
+— exactly §14.2's column — and
+`node_cache::tests::one_directory_is_one_pack` builds 64 directories ×
+500 dentries into 256 KiB packs, scans each directory from a cold cache
+and asserts **60 of 64 directories are exactly one pack, none worse
+than two**. The four stragglers straddle a pack seal, which is a
+function of where the seal falls and not of the ordering. A control in
+the same test reads 8 dentries from each of the 64 directories against
+an equally cold reader and touches many packs, so the assertion is not
+vacuous. Level participates in the sort ahead of the key so interior
+nodes cluster together, which is what makes S6's interior-only partial
+replica a few whole-pack GETs.
+
+### The crash-ordering invariant
+
+Every node and pack a commit names is durable **before** the commit
+object is CAS-created. `publish` refuses to run while the node cache
+holds unpacked nodes, and re-verifies on every attempt that each pack
+the payload names is present (body *and* index) before the CAS. So:
+
+- crash **before** the CAS → orphan packs, which are garbage that S7's
+  reachability sweep reclaims and which no reader can see;
+- crash **after** it → a commit all of whose nodes provably exist.
+
+There is no third state. Two tests inject a failure into each half of
+the window:
+
+- `commits::tests::no_commit_ever_names_a_missing_node` fails every
+  `commits/*` PUT, asserts the orphan packs are on the bucket and *no*
+  commit exists, walks every commit that does exist and resolves its
+  roots from a cold cache, then unfreezes the store and asserts the
+  retry lands one commit naming the same content-addressed packs.
+- `commits::tests::a_crash_during_the_pack_puts_leaves_only_orphans`
+  fails the index PUT of the first pack, asserts the failed seal put
+  the batch back on the pending list, asserts nothing committed, then
+  re-seals and asserts the half-written pack is *completed* rather than
+  duplicated (one body and one index per pack, and the count matches
+  the commit's).
+
+CAS contention is
+`commits::tests::the_loser_of_a_cas_race_retries_without_losing_its_payload`:
+two writers build disjoint trees against the same empty parent, A takes
+`seq 1`, B gets 412, sees the winner, and lands at `seq 2` with its own
+roots and its own pack list intact.
+
+Head discovery is `head_discovery_probes_then_falls_back_to_list`
+(probe finds the head inside the window; a saturated window hands over
+to LIST) and `a_gap_falls_back_to_list` (retention deletes 3..8, the
+probe sees nothing at all, and only the LIST can find that 10 is the
+head).
+
+### Design decisions where the plan left a choice
+
+- **`publish` CASes at `parent + 1`, not at "wherever the head is
+  now."** §P3's rule is that a writer holds the parent it read, and
+  taking the head at publish time would silently overwrite whatever
+  landed in between instead of surfacing it. The caller passes the
+  parent; a 412 is then informative rather than an accident.
+- **Rebase is a callback, not a policy in this module.** §P3's
+  structural rebase (diff the winner against the parent, splice a
+  disjoint write-set, re-execute an overlapping one) needs the key
+  codec and the operation semantics, neither of which live in
+  `store-s3`. `publish` retries the CAS around a caller-supplied
+  rebase and guarantees only that the loser's payload is carried into
+  the next attempt rather than dropped. S5 supplies the real one.
+- **`put` does not touch S3; `seal_packs` does.** `mtree::apply` writes
+  one node at a time and a per-node PUT is exactly the shape §P8
+  exists to avoid. Pending nodes sit in the disk cache as `Dirty`,
+  which is already `fs-core::cache`'s word for "present locally, not
+  yet durable upstream, never evicted"; `seal_packs` packs them and
+  demotes them to `Clean`. This is also what makes the ordering
+  invariant checkable rather than merely documented.
+- **The memory tier stops admitting at its budget instead of evicting.**
+  A second LRU beside `fs-core::cache`'s would be two eviction policies
+  to reason about; overflowing into the disk cache is correct and only
+  slower, and §14.1/§14.5 say the interior is ~20 MiB against a 64 MiB
+  default.
+- **`build_packs` takes its target verbatim; only the env knob is
+  range-checked.** §P8's 1–16 MiB exists to stop an operator turning
+  packing off, not to stop a caller that computes a size from its own
+  shape.
+- **A pack hash is its own type.** `PackHash` is neither a `NodeHash`
+  nor a `ChunkHash`: the three namespaces are swept by different rules
+  (§P10) and confusing them should not typecheck.
+- **Duplicate concurrent misses on the same node are accepted.**
+  Single-flight would need a per-hash wait map — a lock on the hot path
+  — to save a duplicate ranged GET of an 8 KiB immutable node.
+
+### New config knobs
+
+- `CONSTELLATION_PACK_TARGET_BYTES` (default 4 MiB, accepted range
+  1–16 MiB) — sealed pack size. Read in `packs::pack_target_bytes`.
+- `CONSTELLATION_NODE_MEMORY_BYTES` (default 64 MiB, `0` disables) —
+  byte budget for the resident interior tier. Read in
+  `node_cache::node_memory_bytes`.
+- `CONSTELLATION_COMMIT_PROBE_WINDOW` (default 8) — GET-next probe
+  width before the tailer falls back to LIST. Read in
+  `commits::probe_window`.
+
+### Left as hooks
+
+- **§P13 AEAD sealing.** Both pack objects carry a `flags` byte and two
+  reserved bytes; `FLAG_SEALED_NODES` is defined and *refused* on read,
+  so switching sealing on is a flag flip plus a seal/open pair around
+  the per-node frames — no format version bump. Commit objects seal the
+  same way `log.rs` already seals segments (`encrypt_object` with the
+  object key as AAD), and `Commit::v` versions the payload rather than
+  the sealing. **Keyed hashing needs nothing further**: `NodeCache`
+  takes an `mtree::Hasher`, so a keyed filesystem already addresses and
+  verifies nodes under its addressing key; the documented precondition
+  is that the `DiskCache` be opened with `open_keyed` under the same
+  key, which the caller (S5) wires.
+- **S7.** `PackStore::{get_body, contains}` and
+  `CommitChain::list_from` are the primitives the sweep and the
+  compactor need; `PackIndex` carries each node's level and first key so
+  a compactor can rewrite a partially dead pack while preserving key
+  order.
+- **S6.** `NodeCache::load_pack_indices` is how a reader that did not
+  write the tree learns where anything is; a partial replica loads the
+  interior packs' indices and nothing else.
+
+### Deliberately deferred
+
+- **Wiring into `cli/src/shipper.rs`** — S5, and the step scope is
+  explicitly additive-only.
+- **§P3's structural rebase** — needs the §P6 codec and operation
+  semantics; the seam is `publish`'s rebase callback.
+- **E2E sealing of packs and commits** — hooks only, per the step's
+  instruction.
+- **A single-flight miss path and pack read coalescing** — measure
+  first; §14.9 says the miss path scales, and coalescing adds a lock to
+  the path that has to.
+- **`HEAD` as a hint object** — §P2 says it is never authoritative and
+  the probe already finds the head in one round; adding a second,
+  lying source of truth before anything needs it is not free.
+
+### Plan 28 S4 exit criteria
+
+- [x] `packs/<hash>` writer and reader with an index and ranged
+      single-node reads
+- [x] Packed in key order, with §14.2's one-distinct-pack-per-directory
+      property asserted in a test
+- [x] `mtree::NodeStore` implemented over `fs-core::cache` verbatim,
+      with the memory → disk → peer → S3 ladder
+- [x] Concurrent misses, asserted by a test that deadlocks if the path
+      serializes
+- [x] Every node read from a pack goes through `NodeRef::parse`
+- [x] `commits/<seq:016x>` CAS-created with every §P2 field
+- [x] Head discovery by probe with LIST as the catch-up fallback
+- [x] `InMemory` tests for CAS contention (412, correct retry, payload
+      preserved) and for head discovery including a gap
+- [x] Crash-ordering invariant tested on both sides of the pack-PUT /
+      commit-CAS window
+- [x] `layout.rs` helpers for both prefixes
+- [x] Additive only: no existing behaviour changed, no `crates/cli`,
+      `crates/mtree` or `bench/prollybench` file touched
+
+### Gates run in this environment
+
+- `cargo fmt --all` — no diff (`--check` clean).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — **565 passed, 0 failed**, of which
+  `constellation-store-s3` contributes 110 (up from 76): 34 new
+  co-located tests across `packs`, `node_cache`, `commits` and
+  `layout`.
+- `bash tests/smoke.sh` — **SMOKE TEST PASSED.**
+- `bash tests/integration.sh`, the harness matrix and pjdfstest —
+  **not run.** They need docker and they exercise product wiring this
+  step deliberately does not touch: nothing in the product depends on
+  the three new modules yet, so their contribution to those lanes is
+  dead code. Per §11, the full CONVENTIONS gate list starts at S5,
+  where `cli/shipper` is actually wired.
+- Environment note: `/dev/fuse` is not exposed inside the sandbox this
+  work was done in, so
+  `node_runtime::tests::two_views_of_one_node_converge_with_a_peer_and_pin_is_view_agnostic`
+  and `tests/smoke.sh` fail there with "No such file or directory".
+  Both were re-run with `/dev/fuse` available and pass; the figures
+  above are from that run.
+
+### Spec note
+
+No contradiction with `docs/explanation/DESIGN.md` was found in this
+step. One wording note for the coordinator, not a contradiction: §P8
+writes the index as "`packs/<hash>.idx` — or inline the index in the
+commit" as if the two were interchangeable. They are not — an inline
+index cannot survive commit retention, as argued above — so the choice
+is forced rather than free, and the plan reads as though it is open.
+
+## Plan 28 step S7a — reachability mark and pack compactor: **DONE**
+
+Step S7a of `wip/28-s3-native-metadata-store.md` §11 — the library half
+of metadata GC, in `crates/store-s3`. Three new modules (`mark.rs`,
+`compact.rs`, `parallel.rs`, 2,195 lines) plus one additive `pub fn` in
+`packs.rs`, all **additive**: nothing calls them, no `crates/cli` file
+is touched, and today's chunk GC — the `deref` table, the deref-txid
+bookkeeping, the `superseded-checkpoint` rule, the `gc.horizon`, the
+condemned-list handshake, holds, reintegration verification — is
+unchanged. §P10 retires the first three only once the tree is
+authoritative for metadata, which is well past this step. S7b owns the
+`cli/gc` wiring, the retention policy and the rate budgets.
+
+| Item | State | Where |
+|---|---|---|
+| Reachability mark from a root set of commit sequence numbers → live node hashes + live packs | done | `store_s3::mark::{mark, live_set, LiveSet}` |
+| Walk terminates on shared subtrees, so marking N commits costs O(their differences) — asserted, not assumed | done | `mark::tests::marking_a_chain_costs_the_differences` |
+| Parallel work-stealing frontier over not-yet-visited child hashes, deduplicated by hash, on a private rayon pool | done | `mark::mark`, `parallel::thread_pool` |
+| `packs/*` catalogued by one LIST plus a concurrent index fetch, because a pack outlives the commit that wrote it (§P8) | done | `store_s3::mark::PackCatalog` |
+| Pack classification into fully live / fully dead / partially dead, from the `.idx` entries alone with no node body decoded | done | `store_s3::compact::{Sweep::classify, PackFate, PackVerdict}` |
+| Fully dead packs deleted with their `.idx` sibling at zero rewrite cost | done | `compact::Compactor::delete_dead` |
+| Partially dead packs rewritten: survivors read out, re-emitted **in key order**, originals retired afterwards | done | `compact::Compactor::compact` |
+| The ordering invariant — a replacement is durable before the original is deleted — with a failure injected on each side | done | `compact::tests::a_failed_{replacement_put,delete}_leaves_every_live_node_readable` |
+| Concurrent rewrite path: independent output packs compressed and sealed in parallel, byte-identical to the serial writer | done | `packs::{build_packs_concurrent, build_packs_in}` |
+| Restartable cursor and batch size on both sweep paths | done | `compact::{Reclaim::next, batch_of, cursor_after}` |
+| Rate-budget mechanism for S7b to drive, with no policy in this crate | done | `compact::{CompactionPacer, Unpaced}` |
+
+### The mark, and what the test actually proves
+
+§P10's affordability claim is that marking a retained window of N
+commits costs O(their differences) rather than O(N × state), because
+content addressing makes an unchanged subtree the *same* subtree in
+every commit that contains it. `marking_a_chain_costs_the_differences`
+turns that into an exact identity rather than a plausible inequality.
+`MemoryNodeStore` counts distinct writes, so the reachable set of a
+17-root chain is knowable independently of the walk: it must be the
+base tree's node count plus exactly the nodes the 16 later commits
+introduced. Measured on a 60,000-key tree with four keys changed per
+commit:
+
+| root set | reachable nodes | node visits |
+|---|---:|---:|
+| 1 (the base tree) | 574 | 574 |
+| 17 (base + a 16-commit chain) | 690 | 690 |
+
+- **`visits == nodes` in both rows**, which is the property: a shared
+  subtree is entered once across the whole root set. Any re-entry makes
+  `node_visits` exceed `nodes.len()` and the test fails.
+- **690 visits for 17 roots against 574 for one.** A walk that restarted
+  per root would cost 17 × 574 = 9,758. The marginal cost of a retained
+  commit is 7.25 nodes.
+- The non-vacuity guard is in the test: the chain introduces 116 nodes
+  against a 574-node tree, so the inequality is not passing because the
+  deltas happen to be large.
+
+This is the same structural fact §14.6 measured for `diff` (a one-key
+diff of a 35.8M-key tree costs 20 node reads), applied to the walk.
+
+The walk reads nodes through `NodeRef::new`, not `parse`, and the
+consequence is stated in the module doc rather than left implicit: a
+mark is only as sound as its store's verification, and a corrupt
+interior node that hid a live subtree would be the one corruption that
+loses data instead of leaking space. `NodeCache` is why that is safe —
+it hash-checks and `parse`s every byte that arrives from a pack, a peer
+or the disk cache — and re-validating in the walk would double its cost
+to re-check bytes this process just verified.
+
+### The crash-ordering invariant for a rewrite
+
+S4's invariant was "every pack a commit names is durable before the
+commit exists". The rewrite's mirror image is **a replacement pack must
+be durable before the original it replaces is deleted**, and the two
+crash outcomes are asymmetric on purpose:
+
+- **PUTs done, DELETEs not** — a live node has two copies. Harmless:
+  both hash to the same node, no reader can tell, and the next round's
+  mark classifies the loser and the next sweep reclaims it.
+- **DELETEs done, PUTs not** — a live node has no copy. Data loss, and
+  unrecoverable.
+
+So `compact` awaits *every* replacement PUT before deleting anything,
+and one failed PUT aborts the batch with nothing deleted, because a
+partial replacement set cannot safely retire any original. Both sides
+have a test that injects the failure and then asserts, from a cold
+cache that knows only what the bucket says, that the whole live set
+still resolves:
+
+- `a_failed_delete_leaves_every_live_node_readable` — deletes refuse;
+  asserts the replacements landed, the originals are *still present*
+  (the permitted duplicate), every delete is reported in
+  `Reclaim::delete_failures` rather than swallowed, the live set
+  resolves, and a retry with deletes working completes the batch.
+- `a_failed_replacement_put_leaves_every_live_node_readable` — the
+  second replacement PUT fails; asserts the batch errors, *no* original
+  was retired, the live set resolves, the half-written replacement is
+  catalogued as incomplete rather than as dead, and the retry converges.
+
+Two smaller guards fall out of the same argument and have their own
+tests: a rewrite may never delete a pack it just reproduced
+(`replacements` is subtracted from the delete list), and pairing a
+`Sweep` with a live set other than the mark it was classified against
+is refused rather than applied (`a_sweep_from_a_different_mark_is_refused_not_applied`)
+— otherwise a stale mark would silently drop survivors.
+
+### §14.9's compaction ceiling: measured, mostly lifted, and the residual named
+
+§14.9 found compaction topping out at ~1.7× with threads "because the
+pack writer is serial", against mark's ~4×. That is the difference
+between GC costing ~2 cores and GC costing most of the machine, since
+§14.5 measured the compactor rewriting 117% of the bytes the commit
+path itself writes.
+
+`build_packs_concurrent` restructures the writer in three phases:
+compress every node in parallel; decide pack boundaries **serially**, by
+exactly `build_packs`' rule; assemble, count-patch and hash the
+independent output packs in parallel. Keeping the boundary pass serial
+is deliberate — it is what makes the output byte-identical to
+`build_packs`, which `concurrent_and_serial_builds_agree_byte_for_byte`
+asserts across four node counts, four targets and two widths. A scheme
+that partitioned the node list up front to avoid the pass would cut
+packs at different places, and pack composition is exactly what §14.2's
+one-directory-one-pack property is a statement about.
+
+Measured on this host — **4 physical cores / 8 hardware threads, an
+i7-8650U, a 15 W mobile part that throttles hard** — over 259.3 MiB of
+incompressible synthetic nodes in 64 packs at a 4 MiB target, half the
+nodes dead so every pack is partially dead. Medians of three runs;
+run-to-run spread was ±15% and the serial baseline itself varied
+104–139 MiB/s, so read the *scaling* column and not the absolutes.
+MiB/s is live node bytes carried over per second, the same quantity
+§14.5 reports as 14.79 GiB per run.
+
+**End to end (`Compactor::compact`: GET bodies, decompress, verify,
+parse, re-emit in key order, PUT, DELETE; `InMemory` bucket):**
+
+| threads | MiB/s | scaling | §14.9 scaling |
+|---:|---:|---:|---:|
+| 1 | 97 | 1.00× | 1.00× (167 MiB/s) |
+| 4 | 260 | **2.78×** | 1.68× (281 MiB/s) |
+| 8 | 259 | **2.66×** | 1.67× (279 MiB/s) |
+| 16 | 231 | 2.34× | 1.53× (256 MiB/s) |
+
+**Pack writer alone (`build_packs_concurrent`):**
+
+| threads | MiB/s | scaling |
+|---:|---:|---:|
+| serial `build_packs` | 129 | 1.00× |
+| 1 | 132 | 1.00× |
+| 4 | 257 | 2.16× |
+| 8 | 350 | **3.17×** |
+| 16 | 348 | 2.88× |
+
+**Where the remaining time goes**, per `where_the_rewrite_time_goes` and
+a phase-instrumented run of `compact` (259 MiB read, 130 MiB rewritten):
+
+| phase | 1 thread | wide | scaling |
+|---|---:|---:|---:|
+| `(level, first key)` sort + dedup | 0.08 ms | 0.11 ms | serial, **0.006% of the run** |
+| compress (parallel) | 1.82 s | 0.55 s | 3.3× |
+| decide pack boundaries | 0.009 ms | 0.011 ms | serial, **0.0005% of the run** |
+| assemble + blake3 (parallel) | 0.17 s | 0.043 s | 3.4× |
+| read pack bodies | 0.6 ms | 0.6 ms | — |
+| PUT replacements | 127 ms | 34 ms | 3.7× |
+
+The honest reading, in three parts:
+
+1. **§14.9's diagnosis is fixed.** The writer's serial fraction is now
+   0.007% of the rewrite. Nothing in the path is serial in any amount
+   that Amdahl notices.
+2. **It still does not scale linearly, and the reason is this host, not
+   the code.** Every *parallel* phase independently saturates at
+   3.3–3.7× on 4 physical cores — compression, sealing and PUTs all land
+   in the same place, which is what a memory-bandwidth ceiling looks
+   like rather than a lock. §14.9's own memory-resident lookup column
+   saturated at 3.31× at 16 threads and 3.38× at 32 for the same
+   reason. 16 threads is 4× oversubscribed here and regresses, exactly
+   as §14.9's 16-thread row does.
+3. **One flat phase was found and removed.** Before this step's last
+   change, reading pack bodies cost 219 ms and did **not** shrink with
+   threads at all — 44% of the 8-thread wall clock — because
+   `PackStore::get_body` ends in `.to_vec()`, and a `memcpy` is a
+   `memcpy` on any number of cores. Reading bodies as `bytes::Bytes` and
+   slicing frames out of them took that phase from 219 ms to 0.6 ms and
+   is most of the 1.67× → 2.7× improvement. The writer change alone got
+   the writer to 3.17× but left end-to-end near 1.95×, which is a
+   useful warning: the ceiling had moved, and measuring only the
+   component §14.9 blamed would have missed it.
+
+Sizing consequence for S7b: at ~260 MiB/s on four cores, §14.5's
+14.79 GiB per GC round is ~58 s of wall clock at full width, or the
+same work spread thinner under `CONSTELLATION_COMPACT_BYTES_PER_S`.
+"GC is most of the machine" becomes "compaction is ~3 cores while it
+runs", and it is the rate budget rather than the thread width that
+decides how much of the machine that is.
+
+### Design decisions where the plan left a choice
+
+- **The level-synchronous frontier, rather than a shared concurrent
+  visited-set consulted per edge.** Every node in a frontier sits at the
+  same level of the tree, so there is no straggler to wait on, and the
+  only serial step is inserting the next level's child hashes into
+  `seen` — hashing, no I/O. Deduplication has to be serial somewhere,
+  because "have I visited this hash" *is* the termination condition, and
+  doing it once per level over an already-gathered vector beats a lock
+  on the hot edge.
+- **A pack body with no `.idx` sibling is reported, never swept.** It is
+  the state a crash between `put_pack`'s two PUTs leaves *and* the state
+  a healthy writer is in for a few milliseconds during every seal. It
+  holds no resolvable node, so it costs only space, and deleting it
+  safely needs the same age horizon and condemned-list handshake today's
+  chunk orphan pass uses — which is policy, and therefore S7b's.
+  `PackCatalog::incomplete` gives that policy something to work from.
+- **A failed DELETE is reported, not raised.** The pack is unreachable
+  garbage either way and the next round re-classifies it, whereas
+  aborting a batch on one 503 would discard the record of every pack
+  that *was* reclaimed. A failed PUT is the opposite and aborts at once.
+- **Packs are processed in ascending hash order.** Stable across runs
+  and independent of LIST ordering, so a restart cursor is one 32-byte
+  value and a resumed run repeats no work. Re-running a completed batch
+  is harmless: the DELETEs are idempotent and the PUTs are
+  content-addressed.
+- **The concurrent writer falls back to `build_packs` at width 1.**
+  Holding every frame in its own allocation costs one extra `Vec` per
+  node and one extra copy of every byte, which the serial writer avoids
+  by compressing straight into the body it is filling. Measured: 1.75 s
+  serial against 2.66 s for the concurrent path pinned to one thread.
+  The cost buys parallelism, so it is paid only when there is
+  parallelism to buy.
+- **`build_packs_concurrent` is a new `pub fn` in `packs.rs` rather than
+  a refactor of `build_packs`.** It reuses `seal` and the header
+  constants and duplicates the framing loop; not one existing line of
+  S4's output changed, and the duplication is pinned by the
+  byte-identity test. A shared-helper refactor would have been tidier
+  and was declined because the step's scope is additive.
+- **The compactor takes an `mtree::Hasher`.** A rewrite re-verifies
+  every node it moves, so a keyed (E2E, §P13) filesystem compacts with
+  no change; a mismatched hasher turns the whole compaction into a hash
+  error rather than corrupting anything.
+- **`Compactor` owns its rayon pool for its lifetime.** A sweep is many
+  batches and a pool per batch would be a thread-spawn storm; `mark`
+  builds one per call because it runs once per round.
+
+### New config knobs
+
+- `CONSTELLATION_GC_THREADS` (default: one per core; `0` means the
+  same) — width of the mark and rewrite pools. Read in
+  `parallel::gc_threads`. A private pool rather than rayon's global one
+  because GC is the one subsystem whose parallelism an operator must be
+  able to cap (§14.5: GC and compaction consumed 939 s of 1,205 s), and
+  because the measurement tests have to set the width per run.
+- `CONSTELLATION_COMPACT_BYTES_PER_S` is **not** implemented here. §S7
+  assigns the rate budget to S7b; `CompactionPacer` is the mechanism it
+  drives, and `Unpaced` is the default because a library that slept by
+  default would be making S7b's decision for it.
+
+### What S7b drives
+
+- `mark::live_set(chain, cache, &[seq], threads)` — resolve §P10's root
+  set (newest commit, retained window, `snaps/*`, clones, unexpired
+  `holds/*`) to commit sequence numbers and hand them over; it returns
+  the live node set, the live packs, the catalog the sweep is classified
+  against, and `missing_roots` for sequence numbers retention already
+  removed (reported, not fatal: "the newest commit vanished" and "a
+  retained commit aged out mid-run" are the same observation with very
+  different meanings, and only the caller can tell them apart).
+- `Sweep::classify(&catalog, &live)` plus `Sweep::{fully_dead,
+  partially_dead, fully_live, rewrite_bytes, reclaimable_bytes,
+  whole_pack_death_fraction}` — the last is §14.5's 0.7% headline as a
+  live metric, so the plan's assumption can be re-checked against real
+  traffic rather than taken on faith.
+- `Compactor::{delete_dead, compact}` with `max_packs` and
+  `resume_after`, returning `Reclaim { deleted, written, nodes_moved,
+  bytes_read, bytes_written, delete_failures, next }` — enough to drive
+  a rate budget from observed throughput.
+- `PackCatalog::incomplete()` — orphan bodies for the horizon pass.
+- `parallel::{gc_threads, effective_threads}` for pool sizing.
+- Two new `StoreError` variants: `Node` (from `MtreeError`) and
+  `Parallel` (pool construction, `spawn_blocking` join).
+
+### Deliberately deferred
+
+- **All of `cli/gc` wiring, retention policy, scheduling and the rate
+  budget** — S7b's, and it needs S5's real commit stream.
+- **Retiring the `deref` table and the `superseded-checkpoint` rule** —
+  §P10 retires them only once the tree is authoritative for metadata.
+  Nothing here touches them.
+- **Sweeping incomplete pack bodies** — needs the age horizon and the
+  condemned handshake, which are policy. Reported instead.
+- **Chunk-plane packing** — §P8 allows it; no part of this step needs it.
+- **Avoiding the `put_pack` body clone** — 34 ms of a 500 ms batch after
+  the read-side fix, and removing it means duplicating the one primitive
+  that carries the pack-durability ordering. Measure again if the PUT
+  phase ever stops scaling.
+- **A `rayon::par_sort` for the pre-pack sort** — it is 0.006% of the
+  rewrite; parallelizing it would be noise.
+- **§0.2b's steady-state re-run against the real store** — §S7's gate
+  asks for it, and it needs S5's publisher plus S7b's scheduler to
+  produce a steady state at all. The per-round quantities it would
+  measure (`whole_pack_death_fraction`, `rewrite_bytes`) are exposed so
+  that run is a matter of reading counters.
+
+### Plan 28 S7a exit criteria
+
+- [x] Mark from a root set of commit sequence numbers → live node set +
+      live pack set
+- [x] The walk terminates on shared subtrees, proved by a test that
+      compares a 1-root mark against a 17-root chain and asserts the
+      visit count tracks the differences (690 vs 574, against 9,758 for
+      a naive re-walk)
+- [x] Mark parallelized as a work-stealing frontier deduplicated by
+      hash, on a width-capped pool
+- [x] Packs classified fully live / fully dead / partially dead from the
+      `.idx` entries alone
+- [x] Fully dead packs deleted with their `.idx` sibling at zero rewrite
+      cost
+- [x] Partially dead packs rewritten in key order, originals retired
+      only after the replacements are durable
+- [x] The ordering invariant tested on both sides — failed DELETE and
+      failed replacement PUT — each asserting every live node still
+      resolves from a cold cache
+- [x] The rewrite path made concurrent, byte-identical to the serial
+      writer, with the scaling measured at 1/4/8/16 threads and the
+      residual ceiling attributed by phase
+- [x] Restartable cursor and batch size on both sweep paths
+- [x] A mechanism for S7b's rate budget, with no policy in this crate
+- [x] Additive only: no `crates/cli` file touched, no `crates/mtree`
+      file touched, no `bench/prollybench` file touched, no behavioural
+      change to S4's three modules, nothing calling the new code
+
+### Gates run in this environment
+
+- `cargo fmt --all` — no diff (`--check` clean). It left the in-flight
+  `crates/cli/src/{lease,shipper,node_runtime}.rs` and
+  `crates/meta/src/sqlite.rs` untouched.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — **614 passed, 0 failed**, plus the 2
+  `#[ignore]`d measurement tests. `constellation-store-s3` contributes
+  131 (up from 110): 21 new co-located tests across `mark`, `compact`,
+  `packs` and `parallel`.
+- `bash tests/smoke.sh` — **SMOKE TEST PASSED.**
+- Measurements: `cargo test --release -p constellation-store-s3 --lib
+  -- --ignored --nocapture --test-threads=1` reproduces both tables
+  above. `--test-threads=1` matters: run in parallel the two
+  measurements contend for the same four cores and the 1-thread rows
+  read 30% low.
+- `bash tests/integration.sh`, the harness matrix and pjdfstest — **not
+  run.** They need docker and they exercise product wiring this step
+  deliberately does not touch: nothing in the product calls `mark.rs` or
+  `compact.rs`, so their contribution to those lanes is dead code. Per
+  §11 the full CONVENTIONS gate list starts at S5, and the §S7 gate that
+  re-runs §0.2b's steady-state shape needs S5's publisher and S7b's
+  scheduler to have a steady state to measure.
+- Environment note: the sandbox this work was done in does not expose
+  `/dev/fuse`, so
+  `node_runtime::tests::two_views_of_one_node_converge_with_a_peer_and_pin_is_view_agnostic`
+  and `tests/smoke.sh` fail there with "No such file or directory".
+  Both were re-run with `/dev/fuse` available and pass; the figures
+  above are from that run.
+
+### Spec note
+
+No contradiction with `docs/explanation/DESIGN.md` was found in this
+step, and no behavioural change was needed in `crates/mtree` or in S4's
+three modules.
+
+Two notes for the coordinator, neither a contradiction:
+
+1. **§P10b's "packs die whole" hope should be read as retired, not
+   merely unsupported.** §14.5 measured 0.7% and this step's
+   classification reproduces the shape in miniature: an aged test tree
+   leaves overwhelmingly *partially* dead packs, and the fixture has to
+   tolerate zero whole-pack deaths rather than assert any. The cheap
+   path is implemented and tested, but the plan should size the
+   compactor as the normal path everywhere it currently hedges.
+2. **§14.9's "compaction is ~2 cores" conclusion was measured against
+   one component.** The serial pack writer was real and is fixed
+   (3.17×), but on this host end-to-end compaction only reached ~1.95×
+   until a *second* non-scaling phase was removed — the `Vec` copy at
+   the end of `PackStore::get_body`, which was 44% of the 8-thread wall
+   clock. Worth recording because the same shape is likely elsewhere:
+   `object_store` handing back owned `Vec`s where `Bytes` would do.
+
+## Plan 28 step S1 — settling the dentry attr copy: **DONE**
+
+Step S1 of `wip/28-s3-native-metadata-store.md` §11, a measurement only:
+`bench/prollybench` gained a variant switch and a new benchmark, and the
+results are §14.10 of the plan. No `crates/**` file was touched, so the
+e2e lanes cannot be affected and were not run. `cargo test --release` in
+`bench/prollybench`: 19 passed, 0 failed.
+
+**Verdict: keep the denormalized attr copy. §P6 stands as written.**
+Three `0x02` value shapes were measured through the same code paths at
+census scale, fresh and aged.
+
+| Item | State | Where |
+|---|---|---|
+| Three `0x02` shapes behind one flag: `copy` (§P6), `nocopy` (ino + kind), `dentry-auth` (the dentry *is* the record for `nlink == 1`) | done | `bench/prollybench/src/keys.rs` (`Enc`) |
+| Footprint, `setattr` B/op, cold `ls -la` and `getattr(ino)` per variant, at 1 and 8 threads | done | `bench/prollybench/src/b06.rs` |
+| Aged corpus strengthened: hot-directory retention, churn over the eight widest directories, shuffled ino allocation | done | `bench/prollybench/src/corpus.rs` |
+| Results written up as §14.10 | done | plan §14.10 |
+
+### What decided it
+
+`nocopy` saves 10.9% of stored leaf bytes and 1.3–1.5× on `setattr`, and
+charges **12,039 pack reads for a cold `ls -la` against `copy`'s 30.4** —
+396×, or 321 ms per directory against 2.2 ms. That gives up §14.2's
+one-pack-per-directory property, which is the whole point of the
+encoding. It is also the only cost measured anywhere in this plan that
+**does not thread away**: every other read row scales 3.6–6.4×, and
+`nocopy`'s cold `ls -la` is still 144× `copy` at 8 threads. Its tier-(b)
+scaling of 1.88× is the worst measured in the plan, because a scan plus
+~3,000 scattered point reads thrashes the 64 MiB cache the scan is
+supposed to fit inside.
+
+The decision rests on the two amplifications not being commensurable,
+and §14.10 quantifies that rather than asserting it: a written byte
+costs ~2.17 bytes of transfer that does not divide by cores, because it
+is stored on every replica and rewritten by a compactor running at 117%
+of the commit write rate; a pack read is a cached read that does divide.
+(S7a has since taken compaction from 1.7× to 2.78×. That does not
+disturb the verdict — threading changes the rewrite's wall clock, not
+the byte volume, and the margin is three orders of magnitude clear of
+it.)
+
+### Two corrections to earlier sections
+
+1. **Write amplification comes from the scattered `0x01` inode write,
+   not from the attr copy.** On an aged tree, directory-local `setattr`
+   costs 41 B/op with the copy and 40 B/op without — 3%. §14.4's reading
+   that "the attr copy means each `chmod` writes two keys" is right
+   about the mechanism and wrong about which key is expensive once a
+   tree has aged. §P6 and §14.7 item 6 have been corrected.
+2. **§14.8's aged corpus understated ino scatter by roughly 7×.** Its
+   densest tracked directory shrank to 1.7k children after aging; with
+   retention and churn it holds 4,241 children spread over 134 distinct
+   1024-ino buckets against 4,994 over 12 when fresh. Aged
+   directory-local `setattr` is **15.9× today's log bytes, not §14.8's
+   2.1×** — the same gate failed by a wider margin. Read §14.10's rows
+   in preference to §14.8's.
+
+### What it opened
+
+- **§S1b, ino allocation locality**, added to the plan's work order. The
+  *identical* encoding costs 2.3× today's log bytes fresh and 15.9×
+  aged, and that ~7× gap is entirely ino locality, because `alloc_ino`
+  is a global `counter++` so a directory's children drift apart in the
+  `0x01` range as the filesystem ages. Most of `dentry-auth`'s measured
+  advantage is just that it never writes that key. Allocation is policy
+  rather than format — an ino is already opaque, existing filesystems
+  keep theirs, no migration is implied — so this can change after (B)
+  ships, but the number should be known before the encoding is touched.
+- **`dentry-auth` stays on the table** rather than being discarded with
+  `nocopy`, with an explicit trigger: it is the only measured shape that
+  writes less on *every* axis while keeping `ls -la` at one pack (24.2M
+  keys against 35.8M, 13.6% fewer compressed leaf bytes, 25% less
+  interior, aged directory-local `setattr` at **1.01×**), and it charges
+  for that on `getattr(ino)` — 7.92 cold pack reads against 4.00, about
+  half the throughput — which is a bad trade for the operation FUSE uses
+  most. It would also make `link()` migrate a record into `0x01` when
+  `nlink` rises, a product consequence this plan has not costed. Take it
+  only if `setattr` cost becomes binding on the compactor budget.
+- Nothing measured here helps the **scattered** case, where
+  `dentry-auth` lands between the other two (632× against `copy`'s 756×
+  and `nocopy`'s 506×).
+
+### Process note worth keeping
+
+`cargo test --release` does **not** rebuild `target/release/prollybench`
+when the crate has no integration tests, so an early census run silently
+executed a stale binary. Every published number comes from a run after
+an explicit `cargo build --release`.
+
+## Plan 28 step S3 — `mtree::keys`, the §P6 codec: **DONE**
+
+Step S3 of `wip/28-s3-native-metadata-store.md` §11. The §P6 key
+encoding and the value records it points at, added to `crates/mtree` as
+two modules that depend on the S2 core and that **the core does not
+depend on**. S1's verdict is implemented as written: the `0x02` dentry
+carries the denormalized attr copy. No existing crate's source was
+touched beyond `mtree/src/lib.rs`'s own module list, and nothing outside
+`mtree` calls this yet, so the e2e lanes cannot be affected and were not
+run (see "Gates" below).
+
+| Item | State | Where |
+|---|---|---|
+| `0x01 \| ino` → the authoritative inode record: attrs, `nlink`, `rdev`, inline manifest or its hash, symlink target, inline xattrs | done | `mtree::keys::inode`, `mtree::record::InodeRecord` |
+| `0x02 \| parent_ino \| name` → `(ino, kind)` **plus the denormalized attr copy** (S1's verdict, §14.10) | done | `mtree::keys::dentry`, `mtree::record::DentryRecord` |
+| `0x03 \| ino \| xattr_name` → value, spilled to a blob hash above `VALUE_SPILL` | done | `mtree::keys::xattr`, `mtree::record::{Payload, place_value}` |
+| `0x04 \| ino \| parent_ino \| name` → `()`, the reverse dentry index | done | `mtree::keys::rdentry`, `mtree::record::RDENTRY_VALUE` |
+| `0x30 \| subsystem \| id` → record body (snapshots, clones, quota, designations, holds) | done | `mtree::keys::{subsystem, Subsystem}` |
+| `0x10`–`0x2f` reserved and unused; refused by name on decode | done | `mtree::keys::RESERVED_RANGES`, `KeyError::ReservedRange` |
+| Big-endian fixed-width ids, names last, so byte order is numeric and lexical order | done | `mtree::keys` (module docs state why) |
+| Half-open scan ranges with an exclusive bound derived by prefix successor | done | `mtree::keys::{KeyRange, dentries_of, xattrs_of, names_of, names_of_in, records_of, whole_range}` |
+| Total, non-panicking key decode with a distinct `thiserror` error | done | `mtree::keys::{Key::parse, KeyError}` |
+| `XATTR_INLINE` (256 B) whole-set inlining; above it every name moves to `0x03` | done | `mtree::record::{place_xattrs, XattrPlacement, xattr_section_len}` |
+| `VALUE_SPILL` (1 KiB) blob spill, with the caller's hash function (E2E keyed addressing) | done | `mtree::record::{Payload::place, place_value}` |
+| Deterministic inode-value planner: xattr set, then manifest, then symlink target, until the record fits | done | `mtree::record::{plan_inode, InodePlan}` |
+| §P7 leaf→`Agg` projection — closes S2's caller-supplied gap; only `0x01` is authoritative | done | `mtree::record::{leaf_agg, config}` |
+| Local attr/record types declared from `meta`'s schema, so `mtree` gains no `meta` (or `fs-core`) dependency | done | `mtree::record::{Attrs, Kind, InodeRecord, DentryRecord, BlobHash}` |
+| Round-trip tests for every range including the empty (`0x30` with no id) and maximal (`NAME_MAX`, spilled manifest, xattr set at the budget) cases | done | `mtree::{keys,record}` tests |
+| Ordering tests: every field, `ino` across the bit-40 allocation shift and the `u64` extremes, names containing `0x00`/`0x2f`/`0xff` | done | `mtree::keys` tests, `mtree/tests/keys.rs` |
+| §12's mechanical **"no mutable field is in the tree"** test, declarative and byte-level, plus the atime exclusion | done | `mtree/tests/keys.rs::no_mutable_field_is_in_the_tree`, `mtree::keys::Field` |
+| Range-scan tests: one directory's dentries and one inode's xattrs are contiguous, and a bounded scan cannot run into the next | done | `mtree/tests/keys.rs` |
+| Aggregate test against an independently computed model total, with hard-linked files so a double-count would show | done | `mtree/tests/keys.rs::the_aggregate_counts_each_file_once_and_ignores_the_dentry_copy` |
+| Inline/spill boundary tests in both directions, at `XATTR_INLINE` and `VALUE_SPILL`, through a real tree | done | `mtree::record` tests, `mtree/tests/keys.rs` |
+
+### The aggregate gap S2 left open, and why its test is not vacuous
+
+S2 made the leaf→`Agg` projection a caller-supplied function pointer
+because only the key codec knows which range holds the authoritative
+record. `record::leaf_agg` contributes only for `Key::Inode`; `0x02`,
+`0x03`, `0x04` and `0x30` contribute nothing, so the dentry's attr copy
+cannot inflate a total. This is the one place in the plan where an error
+would have been *consistently* wrong rather than detectably wrong — the
+root hash attests to the aggregate, so every replica would have agreed
+on an inflated `du`.
+
+`the_aggregate_counts_each_file_once_and_ignores_the_dentry_copy`
+computes its model total by iterating its own inode map, never the tree,
+over a corpus whose inos deliberately straddle several
+`(node_prefix << 40)` buckets and in which every fourth file is hard
+linked from the root, so some inodes carry two dentry copies. Two guards
+stop it passing vacuously: a tree built from the `0x01` records alone
+must report the same bytes, files and max mtime, and the test asserts the
+dentry copies really do carry non-zero sizes — so if the copy ever
+stopped carrying attrs, the test would fail rather than quietly become
+trivial. A follow-up incremental commit grows one file by 4 KiB,
+rewriting its inode record and all its dentry copies, and the total must
+move by exactly 4 KiB.
+
+Verified against `meta::sqlite::recursive_size_conn`: both count size
+and files for `kind == File` only, so `du`, `statfs` and quota do not
+change meaning when the tree becomes their source.
+
+### Design decisions where the plan left a choice
+
+- **No `meta` and no `fs-core` dependency.** `meta` depends on
+  `fs-core`, and S5/S6 need `meta` or code above it to depend on
+  `mtree`, so an `mtree → meta` edge would close a cycle someone would
+  have to unpick. `meta`'s schema was read and the field list
+  redeclared as plain data; `Kind`'s discriminants match
+  `fs_core::InodeKind::as_u8` (0–6, verified pairwise) so S5's mapping
+  is a cast. The `fs-core` edge was avoidable too: a file's chunk list
+  is carried as opaque encoded-manifest bytes, so this crate needs no
+  manifest decoder and no `ChunkHash`.
+- **`Attrs` has no `atime_ns` at all.** §P6 excludes atime from the
+  tree, so it is absent from the record rather than merely absent from
+  the keys — there is no field to set, and `ATTRS_LEN` is pinned at 49
+  with its nine fields enumerated, so adding one fails a test on
+  purpose. atime stays node-local and best-effort (today's
+  `atime_journal` with max-merge on apply).
+- **Value layout is versioned by `node::FORMAT_VERSION`, not by a
+  per-record version byte.** A byte per record is ~36 MB at census
+  scale and would have changed every §14 byte count for no benefit the
+  node header does not already provide; the record encodings are pinned
+  by hex tests instead.
+- **Keys are big-endian, values little-endian.** Only keys are ever
+  compared, so key endianness is load-bearing and value endianness is
+  free — little-endian matches every other encoder in the repo.
+- **`plan_inode`'s spill order is format, not heuristic.** The xattr
+  set by the whole-set rule, then the manifest, then the symlink
+  target, until the record fits `VALUE_SPILL`. Manifest first because
+  it is the field that actually grows while a target is bounded by
+  `PATH_MAX`, and because `fs-core` already spills chunk lists. Two
+  writers that spilled different fields would produce different bytes
+  for the same filesystem and therefore different root hashes.
+- **Inline xattrs are sorted by `plan_inode`.** Canonicality reaches
+  into the values: the same set in a different iteration order has to
+  produce the same bytes, asserted by
+  `inline_xattrs_are_sorted_so_the_record_is_canonical`.
+- **A nameless key is a decode error, not a key.** A range's own prefix
+  is a scan bound; storing it would make a directory's lower bound
+  ambiguous. An over-long `0x01` key is refused too
+  (`KeyError::Oversized`), because trailing bytes would let two
+  distinct keys resolve to one inode.
+- **`KeyError`/`RecordError` are separate from `MtreeError`.** Node
+  structure arriving off a network and a byte string that is not a §P6
+  key are different diagnoses; merging them would report bucket
+  corruption for a codec-version mismatch, or the reverse.
+- **The core stays ignorant of the codec.** `keys` and `record` depend
+  on the core and nothing in `node.rs`, `tree.rs`, `config.rs`,
+  `hash.rs`, `store.rs` or `error.rs` references them. S2's seam is
+  what let the codec be tested against `MemoryNodeStore` in
+  milliseconds, and no prefix is special-cased in the structure.
+
+### Ordering traps found
+
+The bit-40 straddle is a non-event under big-endian fixed-width inos,
+which is the point; the trap it warns about is any variable-width
+encoding, since a varint `ino` would order `(1 << 40)` before
+`(1 << 40) - 1`. Three things did surprise:
+
+- **The exclusive bound of the last directory.** `dentries_of(u64::MAX)
+  .end()` is `[0x03]`, the start of the xattr range. Correct, but it
+  means the bound cannot be computed as `parent + 1` (which overflows);
+  it needs a general prefix successor that drops trailing `0xff`s, with
+  the all-`0xff` case returning the empty string meaning "no upper
+  bound".
+- **A name may be a byte prefix of another name.** `dentry(7, b"a")`
+  prefixes `dentry(7, b"a\x00")`, which is harmless *only* because the
+  name is the last field. So "names go last, ids are fixed width" is
+  load-bearing rather than tidy.
+- **An over-long `0x01` key** decoded fine and ignored its tenth byte,
+  which would have let two distinct keys resolve to the same inode.
+
+### Deliberately deferred
+
+- **The `0x30` record bodies themselves** — the codec carries the key
+  and a spillable body; what a snapshot, clone, quota, designation or
+  hold record *contains* is S5/S6's, and inventing it here would
+  freeze a format nothing yet writes.
+- **Range aggregates** (`agg` over an arbitrary key range, §P7's
+  per-directory `du`) — the key encoding they need now exists, but the
+  API belongs with the caller that answers `du`, which is S5/S6.
+- **The `dentry-auth` escape hatch** (§S1, §14.10 reading 5) — not
+  built, per S1's trigger.
+- **Ino allocation locality** (§S1b) — a `bench/` measurement, and
+  allocation is policy rather than format, so it can change after (B)
+  ships.
+
+### Plan 28 S3 exit criteria
+
+- [x] All five §P6 ranges encode, decode and round-trip, including the
+  empty and maximal cases
+- [x] `0x10`–`0x2f` reserved: nothing encodes into the span, and a key
+  that claims one is a named decode error
+- [x] Big-endian throughout; encoded byte order equals numeric and
+  lexical order for every field, asserted over the `ino` bit-40
+  allocation shift, the `u64` extremes, and names containing
+  `0x00`, `0x2f` and `0xff`
+- [x] S1's decision implemented: the `0x02` value carries the
+  denormalized attr copy
+- [x] `XATTR_INLINE` (256 B) and `VALUE_SPILL` (1 KiB) implemented and
+  tested across both boundaries in both directions
+- [x] §12's mechanical "no mutable field is in the tree" test present,
+  covering §P5's retracted indexes and atime
+- [x] S2's aggregate gap closed: a §P6 projection that counts the
+  `0x01` record and never the dentry copy, checked against an
+  independently computed model total
+- [x] `crates/mtree` gained no dependency — in particular not
+  `constellation-meta` — and the tree core does not depend on the
+  codec
+- [x] No existing crate's source modified
+
+### Gates run in this environment
+
+- `cargo fmt --all` — no diff (`--check` clean).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace --no-fail-fast` — **613 passed, 1 failed, 2
+  ignored**, of which `constellation-mtree` contributes 68: 47
+  co-located unit tests (25 before this step), 6 new integration tests
+  in `tests/keys.rs`, S2's 14 properties, and 1 doctest.
+- The one failure is
+  `node_runtime::tests::two_views_of_one_node_converge_with_a_peer_and_pin_is_view_agnostic`,
+  which needs `/dev/fuse`; this sandbox does not expose it and the test
+  fails in the mount call. Environmental, in a crate this step neither
+  touches nor links against, and it passes on the host.
+- One flake, recorded for the same reason S2 recorded it: a wall-clock
+  latency test in `constellation-meta --test checkpoint_concurrency`
+  failed once while a concurrent benchmark held the host at load
+  average ~11, and passed 3/3 in isolation and 3/3 on the final full
+  run.
+- `bash tests/smoke.sh`, `bash tests/integration.sh`, the harness
+  matrix and pjdfstest — **not run, and cannot be affected.** This step
+  adds two modules to a crate no product crate depends on yet, so its
+  contribution to those lanes is dead code. Per §11's rule that steps
+  touching no product code do not run the e2e lanes. The full
+  CONVENTIONS list applies from S5, where `cli/shipper` is wired.
+
+## Plan 28 step S5 — builder from the live replica: **DONE (gates open)**
+
+Step S5 of `wip/28-s3-native-metadata-store.md` §11. Option (B) is
+wired: `SqliteMeta` → §P6 `mtree` → pack + commit, driven from the
+shipper beside today's checkpoint. The S5 subagent stalled mid-flight
+after landing the code; the coordinator verified and ran gates.
+
+| Item | State | Where |
+|---|---|---|
+| Incremental publish from journal / touched entities → `mtree::apply` | done | `cli/src/mtree_publish.rs` |
+| Full rebuild on first publish / level mismatch | done | `TreePublisher::{publish, restore, hydrate}` |
+| Rebase splice on lost CAS (key-granularity read-set) | done | `TreePublisher::splice`; test `two_publishers_with_disjoint_keys_both_survive` |
+| Pack-before-commit for spilled values | done | `store-s3/src/blobs.rs` + spill test |
+| Shipper / mount wiring; publisher on by default for writers | done | `shipper.rs`, `node_runtime.rs` |
+| atime stays out of the tree | done | test `atime_never_reaches_the_tree` |
+| §11a `configuration.md` for S4 knobs | **open** | not written |
+| `getattr`/`lookup` p99 during publish | **open** | not measured |
+| Harness matrix | **open** | not run |
+| pjdfstest | **open** | docker image build failed (see below) |
+
+### Gates (2026-09-14)
+
+- `cargo fmt --all --check` — pass
+- `cargo clippy --workspace --all-targets -- -D warnings` — pass
+- `cargo test --workspace` — 625 passed, 1 failed in sandbox
+  (`node_runtime::…two_views…`: no `/dev/fuse`); **passes with FUSE**
+- `mtree_publish` — 7/7 pass
+- `tests/smoke.sh` — **PASSED**
+- `tests/integration.sh` — **PASSED**
+- `docker compose --profile test run --rm compliance` — **interrupted**.
+  `.dockerignore` fixed so `bench/uploadbench` is copied (it is a
+  workspace member). Rebuild was compiling when stopped; pjdfstest never
+  ran.
+- `target/release/harness run` — **interrupted mid-matrix**. Partial:
+  FAILED `baseline`, `slow-network`, `s3-outage`, `s3-flap`,
+  `kill9-remount` (MODEL DIVERGENCE / truncated file sizes); PASSED
+  `latency`, `cold-cache`, `two-clients-disjoint`. Not diagnosed.
+- FUSE publish p99 — not measured
+- §11a store knobs — **documented** in
+  `docs/reference/configuration.md` (Merkle metadata tree)
+
+### Deliberately left open
+
+- Finish compliance after image build completes
+- Finish / diagnose harness matrix (divergences may be S5-related)
+- Publish stall `getattr`/`lookup` p99 measurement
+- S7b: document `CONSTELLATION_GC_THREADS` / compact rate knobs

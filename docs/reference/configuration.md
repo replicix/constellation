@@ -12,6 +12,7 @@ not listed here.
   - [Identity and secrets](#identity-and-secrets)
   - [Leases and mutations](#leases-and-mutations)
   - [Metadata sync and partitions](#metadata-sync-and-partitions)
+  - [Merkle metadata tree (plan 28)](#merkle-metadata-tree-plan-28)
   - [Read-time atime](#read-time-atime)
   - [P2P and cooperative cache](#p2p-and-cooperative-cache)
   - [Prefetch and scan-ahead](#prefetch-and-scan-ahead)
@@ -81,6 +82,25 @@ thrash](../how-to-guides/operations/diagnose-lease-thrash.md).
 | `CONSTELLATION_CHECKPOINT_RATIO` | `1.0` | ratio, positive | shipped-log bytes ÷ last snapshot bytes needed to fire a checkpoint |
 | `CONSTELLATION_CHECKPOINT_MIN_INTERVAL_S` | `0` | seconds | minimum checkpoint spacing; `0` disables the time floor |
 | `CONSTELLATION_CHECKPOINT_IO_CONCURRENCY` | `8` | requests, positive | parallel 8 MiB ranges (GET) / parts (PUT) for a checkpoint transfer |
+
+### Merkle metadata tree (plan 28)
+
+Writers publish a content-addressed Merkle map of metadata alongside the
+existing SQLite checkpoint (plan 28 option (B)). These knobs size the
+pack store, the in-memory node cache, and the commit-chain poll. They
+are reachable on every non-read-only mount.
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_PACK_TARGET_BYTES` | `4194304` (4 MiB) | bytes, **1–16 MiB** accepted | sealed pack body size before the writer starts the next pack; out of range falls back to the default |
+| `CONSTELLATION_NODE_MEMORY_BYTES` | `67108864` (64 MiB) | bytes; `0` disables | RAM budget for interior metadata nodes; `0` forces every read through the disk cache (used by partial-replica tests) |
+| `CONSTELLATION_COMMIT_PROBE_WINDOW` | `8` | positive integer | how many commit slots ahead of the known head one poll probes before falling back to a LIST |
+
+Pack target is the main write-amplification / request-overhead trade-off
+for metadata: smaller packs mean more S3 objects and more compaction
+work; larger packs mean slower cold directory fetches when a pack spans
+unrelated key ranges. The 4 MiB default sits in the measured sweet spot
+from plan 28 §P8 / §14.
 
 #### Idle poll backoff
 

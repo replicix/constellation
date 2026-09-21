@@ -1,6 +1,8 @@
 /target
 /bench/dbbench/data
 /bench/dbbench/target
+/bench/prollybench/data
+/bench/prollybench/target
 /bench/.cargo-home
 /.scratch
 mount.sh

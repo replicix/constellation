@@ -43,4 +43,13 @@ pub enum StoreError {
 
     #[error("AWS credentials: {0}")]
     AwsCredentials(String),
+
+    #[error("metadata node: {0}")]
+    Node(#[from] constellation_mtree::MtreeError),
+
+    /// A worker pool could not be built, or a blocking task panicked.
+    /// Distinct from [`StoreError::Io`] because nothing about the
+    /// bucket is implicated and a retry is pointless.
+    #[error("parallel execution: {0}")]
+    Parallel(String),
 }

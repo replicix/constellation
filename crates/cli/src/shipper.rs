@@ -366,6 +366,19 @@ pub struct Shipper {
     /// ack is awaited (bounded) before the batch is treated as fully
     /// published. `None` when no designations exist for this mount.
     designations: Option<std::sync::Arc<crate::designation::DesignationManager>>,
+    /// Plan 28 §11: the `mtree` publisher, when one is wired up.
+    ///
+    /// `None` for every existing test and for a read-only member, so
+    /// the checkpoint path behaves exactly as it did; the daemon turns
+    /// it on in `node_runtime` once the node cache exists. The publish
+    /// runs *alongside* the checkpoint rather than in place of it —
+    /// nothing reads the commit chain until S6, so a replica that
+    /// bootstraps from a checkpoint must keep finding one.
+    publisher: Option<crate::mtree_publish::TreePublisher>,
+    /// Lease epoch of the last segment we shipped, recorded so a commit
+    /// can carry its author's epoch (§P3: a deposed holder's late
+    /// commit must be recognizable exactly as a late log segment is).
+    last_ship_epoch: u64,
 }
 
 struct PartState {
@@ -477,12 +490,65 @@ impl Shipper {
             held_tail_at: HashMap::new(),
             peers: constellation_net::Peers::disabled(),
             designations: None,
+            publisher: None,
+            last_ship_epoch: 0,
         })
     }
 
     /// Attach the P2P handle so shipped segments are announced to peers.
     pub fn set_peers(&mut self, peers: constellation_net::Peers) {
         self.peers = peers;
+    }
+
+    /// Turn on plan 28's `mtree` publish (§11).
+    ///
+    /// Separate from `attach_with_mode` for the reason `set_peers` is:
+    /// the publisher needs a node cache, a blob store and a commit
+    /// chain, none of which exist at attach time, and every caller that
+    /// does not have them must keep working unchanged.
+    ///
+    /// [`crate::mtree_publish::TreePublisher::restore`] runs here so a
+    /// restart picks up the published root when — and only when — it
+    /// can prove the tree is level with the replica.
+    pub fn enable_tree_publish(
+        &mut self,
+        mut publisher: crate::mtree_publish::TreePublisher,
+    ) -> Result<()> {
+        publisher.restore()?;
+        self.publisher = Some(publisher);
+        Ok(())
+    }
+
+    /// Fold a batch of records into the publisher's changed-entity set.
+    ///
+    /// Every record that reaches this replica passes through here
+    /// exactly once — `ship_part` for our own, `apply_decoded_segment`
+    /// for everything tailed — which is what makes the publish
+    /// incremental: the set is the changed key set, already computed by
+    /// the transport that had to look at each record anyway.
+    fn note_tree_records(&mut self, records: &[LogRecord]) {
+        if let Some(publisher) = self.publisher.as_mut() {
+            publisher.note(records);
+        }
+    }
+
+    /// Publish the pending tree edits as a commit. Best effort: nothing
+    /// reads the commit chain until S6, so a publish that cannot land
+    /// must not stop the log from shipping. The pending set survives a
+    /// failure, so the next round carries the same keys.
+    async fn publish_tree(&mut self) {
+        let epoch = self.last_ship_epoch;
+        let Some(publisher) = self.publisher.as_mut() else {
+            return;
+        };
+        if let Err(e) = publisher.publish(epoch).await {
+            tracing::warn!(error = %e, "metadata tree publish failed; retrying next round");
+        }
+    }
+
+    #[cfg(test)]
+    pub fn tree_publisher(&self) -> Option<&crate::mtree_publish::TreePublisher> {
+        self.publisher.as_ref()
     }
 
     /// Seed the byte-proportional cadence baseline from the checkpoint that
@@ -913,6 +979,10 @@ impl Shipper {
         for (id, _) in self.meta.partitions()? {
             self.ensure_part(&id);
         }
+        // Applied (or, for our own recovered segment, confirmed
+        // applied): the replica now holds these entities' new values,
+        // so the tree owes them an edit.
+        self.note_tree_records(&seg.records);
         Ok(())
     }
 
@@ -1088,6 +1158,8 @@ impl Shipper {
         );
         self.note_xpart_shipped(&records)?;
         self.note_shipped(part, &records);
+        self.note_tree_records(&records);
+        self.last_ship_epoch = self.last_ship_epoch.max(epoch);
         // Push invalidation: tell peers the segment is durable so they
         // tail now rather than at their next poll. Best effort by
         // design — the poll is what guarantees they converge.
@@ -1453,6 +1525,12 @@ impl Shipper {
             snapshot_ms,
             "wrote metadata checkpoint"
         );
+        // Plan 28 §11: the commit chain is published on the checkpoint
+        // cadence, which is the cadence this replaces. It runs after
+        // the checkpoint rather than instead of it because nothing
+        // reads a commit until S6 — until then removing the checkpoint
+        // would leave a fresh node with nothing to bootstrap from.
+        self.publish_tree().await;
         Ok(())
     }
 
@@ -3668,6 +3746,57 @@ mod tests {
         assert!(a.lease.idle_release_due(0));
     }
 
+    /// A holder that never goes write-idle must still answer a waiting
+    /// requester. `chaos-ci` is the case: three mounts creating files at
+    /// once, so `idle_for_ms` never reaches `idle_release_ms`, handoffs
+    /// happened only on the 30 s idle timer, and the third node sat behind
+    /// two full tenures until the FUSE acquire deadline (2xTTL) expired and
+    /// the write returned EIO — measured at 121.27 s.
+    ///
+    /// The grace arm is what breaks that: once somebody has been waiting
+    /// longer than `LEASE_WANTED_GRACE_MS`, the next drained batch hands the
+    /// lease over regardless of how busy this node still is.
+    #[tokio::test]
+    async fn busy_holder_releases_to_a_requester_that_has_waited() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+
+        a.meta.mkdir(1, "from-a", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        assert_eq!(a.meta.journal_len().unwrap(), 0, "nothing left to ship");
+
+        // A peer signs the waiting list and A picks it up at its renewal.
+        let leases = LeaseStore::new(store.clone(), PARTITION, LeaseMode::Cas);
+        let (live, tag) = leases.get().await.unwrap().unwrap();
+        leases.try_swap(&live.wanting(2), &tag).await.unwrap();
+        a.lease.renew_now().await.unwrap();
+        assert_eq!(a.lease.wanted_by(), &[2]);
+
+        // A is *not* write-idle: it has just shipped, so `idle_for_ms` is
+        // far below the 30 s threshold. Under the old condition this was
+        // the deadlock -- a requester registered, a holder that never idles.
+        assert!(
+            !a.lease.idle_release_due(0),
+            "dwell has not elapsed yet, so nothing is due"
+        );
+
+        // Age only the dwell and the requester's wait; the idle threshold
+        // is untouched, so the write-idle arm stays false and the release
+        // below can only come from the grace arm.
+        a.lease.expire_wanted_grace_for_test();
+        assert!(
+            a.lease.idle_release_due(0),
+            "a requester that has waited past the grace must be answered \
+             even though this node is still writing"
+        );
+
+        // Still gated on the journal: an in-flight batch finishes first.
+        assert!(
+            !a.lease.idle_release_due(1),
+            "a drained journal is still the precondition"
+        );
+    }
+
     /// The S3-only handoff, end to end and with P2P out of the picture: B
     /// cannot take a live lease, so it signs the waiting list; A learns of
     /// it through its own renewal CAS failing, releases once idle, and B
@@ -3793,5 +3922,65 @@ mod tests {
         a.sync().await;
         assert_eq!(a.meta.journal_len().unwrap(), 0);
         assert_eq!(a.ship.last_shipped_seq(PARTITION), Some(2));
+    }
+
+    /// Plan 28 §11's wiring, end to end through the shipper: shipped
+    /// records reach the publisher, and a checkpoint publishes the
+    /// commit that will eventually replace it.
+    ///
+    /// The checkpoint is asserted to still exist. Nothing reads the
+    /// commit chain until S6, so a replica that bootstraps from a
+    /// checkpoint must keep finding one — this step adds a publish, it
+    /// does not remove a checkpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_also_publishes_a_metadata_commit() {
+        use constellation_fs_core::cache::DiskCache;
+        use constellation_mtree::{record, Hasher};
+        use constellation_store_s3::{BlobStore, CommitChain, NodeCache, PackStore, SHARD0};
+
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let backend = store.clone() as StdArc<dyn ObjectStore>;
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = Arc::new(NodeCache::new(
+            PackStore::new(backend.clone()),
+            Arc::new(DiskCache::open(dir.path(), 1 << 30).unwrap()),
+            Hasher::Plain,
+            tokio::runtime::Handle::current(),
+        ));
+        a.ship
+            .enable_tree_publish(crate::mtree_publish::TreePublisher::new(
+                a.meta.clone(),
+                cache,
+                BlobStore::new(backend.clone(), Hasher::Plain),
+                CommitChain::new(backend.clone()),
+                record::config(),
+                1,
+                tokio::runtime::Handle::current(),
+            ))
+            .unwrap();
+
+        let d = a.meta.mkdir(1, "d", 0o755, 0, 0).unwrap();
+        a.meta.create(d.ino, "f", 0o644, 0, 0).unwrap();
+        a.sync().await;
+        a.ship.checkpoint().await.unwrap();
+
+        let chain = CommitChain::new(backend);
+        let head = chain.discover_head(0).await.unwrap().expect("a commit");
+        let commit = chain.get(head).await.unwrap().unwrap();
+        assert_eq!((commit.seq, commit.author), (1, 1));
+        assert!(commit.root(SHARD0).is_some());
+        assert!(commit.agg.keys >= 6, "{:?}", commit.agg);
+        assert_eq!(commit.agg.files, 1, "only regular files count (§P7)");
+        assert!(
+            a.ship.log().get_checkpoint_ref().await.unwrap().is_some(),
+            "the checkpoint must survive until S6 can read a commit"
+        );
+        assert!(a.ship.tree_publisher().unwrap().published().is_some());
+
+        // A second round with nothing new publishes nothing: an empty
+        // changed set is not a commit.
+        a.ship.checkpoint().await.unwrap();
+        assert_eq!(chain.discover_head(0).await.unwrap(), Some(1));
     }
 }

@@ -1,5 +1,10 @@
 .git
 target
-bench
+# `bench/uploadbench` is a workspace member and must be present for
+# `cargo build` in the image. Exclude only the non-member benches.
+bench/dbbench
+bench/prollybench
+bench/*.py
+bench/*.txt
 docs
 *.md

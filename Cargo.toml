@@ -4,6 +4,7 @@ members = [
     "crates/cli",
     "crates/fs-core",
     "crates/meta",
+    "crates/mtree",
     "crates/store-s3",
     "crates/net",
     "crates/api",
@@ -21,6 +22,7 @@ default-members = [
     "crates/cli",
     "crates/fs-core",
     "crates/meta",
+    "crates/mtree",
     "crates/store-s3",
     "crates/net",
     "crates/api",
@@ -28,7 +30,7 @@ default-members = [
     "crates/chaos",
     "crates/upload-concurrency",
 ]
-exclude = ["bench/dbbench"]
+exclude = ["bench/dbbench", "bench/prollybench"]
 
 [workspace.package]
 version = "1.0.0"
@@ -39,6 +41,7 @@ repository = "https://github.com/bra-fsn/constellation"
 [workspace.dependencies]
 constellation-fs-core = { path = "crates/fs-core" }
 constellation-meta = { path = "crates/meta" }
+constellation-mtree = { path = "crates/mtree" }
 constellation-store-s3 = { path = "crates/store-s3" }
 constellation-net = { path = "crates/net" }
 constellation-api = { path = "crates/api" }
@@ -69,6 +72,7 @@ fuser = { version = "0.18", default-features = false }
 libc = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 futures = "0.3"
+rayon = "1"
 tempfile = "3"
 rand = "0.9"
 memmap2 = "0.9"

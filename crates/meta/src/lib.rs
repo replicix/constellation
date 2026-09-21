@@ -38,6 +38,23 @@ pub struct SnapshotNode {
     pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
+/// One inode as plan 28's `mtree` builder needs it: the attrs, the two
+/// spillable bodies, and the whole xattr set, fetched together because
+/// §P6's `plan_inode` decides the record's shape from all of them at
+/// once.
+///
+/// Shaped like [`SnapshotNode`] minus the name, and not merged with it,
+/// because the two answer different questions: a snapshot node is one
+/// child of one directory, and this is one inode however many names
+/// point at it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeInode {
+    pub attr: FileAttr,
+    pub target: Option<String>,
+    pub manifest: Option<Vec<u8>>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotRow {
     pub id: String,

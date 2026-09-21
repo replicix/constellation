@@ -143,8 +143,13 @@ fn next_poll_ms(interval_ms: u64, idle_rounds: u32, max_ms: u64) -> u64 {
 async fn lease_poll_cap_ms(
     keepers: &Arc<tokio::sync::Mutex<HashMap<String, lease::LeaseKeeper>>>,
 ) -> Option<u64> {
-    let _ = keepers;
-    None
+    keepers
+        .lock()
+        .await
+        .values()
+        .filter(|k| !k.is_lost() && k.ship_epoch().is_some())
+        .map(|k| (k.ttl_ms() / 4).max(1))
+        .min()
 }
 
 /// Everything needed to open/create a node's backend + local state,
@@ -621,6 +626,39 @@ impl NodeRuntime {
         }
         ship.set_peers(peers.clone());
         ship.set_designations(designations.clone());
+        // Plan 28 §11: publish the §P6 tree alongside the checkpoint.
+        //
+        // The hasher has to match the one the disk cache was opened
+        // with. On an E2E filesystem node identity, the boundary
+        // function and blob addressing are all keyed under the
+        // addressing key (§P13), so a plain-hashing publisher would
+        // write nodes nothing can name and a tree of a different shape.
+        // A read-only member publishes nothing: it ships no segments,
+        // so it has no authority to commit one.
+        if !read_only_member {
+            let hasher = match &e2e_keys {
+                Some(keys) => constellation_mtree::Hasher::Keyed(*keys.addressing_key()),
+                None => constellation_mtree::Hasher::Plain,
+            };
+            let backend = store.inner().clone();
+            let nodes = Arc::new(constellation_store_s3::NodeCache::new(
+                constellation_store_s3::PackStore::new(backend.clone()),
+                cache.clone(),
+                hasher,
+                rt.clone(),
+            ));
+            let publisher = crate::mtree_publish::TreePublisher::new(
+                meta.clone(),
+                nodes,
+                constellation_store_s3::BlobStore::new(backend.clone(), hasher),
+                constellation_store_s3::CommitChain::new(backend),
+                constellation_mtree::record::config().with_hasher(hasher),
+                node_id,
+                rt.clone(),
+            );
+            ship.enable_tree_publish(publisher)
+                .context("restoring the published metadata tree")?;
+        }
         let ship = Arc::new(tokio::sync::Mutex::new(ship));
         let pins = Arc::new(pin::PinManager::new(
             meta.clone(),

@@ -1,0 +1,13 @@
+[package]
+name = "constellation-mtree"
+description = "Canonical Merkle search tree (prolly tree) over opaque byte keys (plan 28 §P1, §P7, §P13)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

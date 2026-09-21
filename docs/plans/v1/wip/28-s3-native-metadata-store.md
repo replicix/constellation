@@ -2,13 +2,14 @@
 
 Read `docs/plans/v1/CONVENTIONS.md` first, then plans 26 and 27.
 
-**This plan is a design study, not a work order.** It answers the
-question "if we designed a consistent distributed filesystem on S3 from
-the ground up, which primitives would we pick?" and it ends with a
-recommendation that is deliberately *not* "rewrite everything". Steps 1+
-are sketched at plan granularity so the size of the bet is visible; Step 0
-is three benchmarks that decide whether the bet is worth taking at all.
-Nothing here may be implemented before Step 0 reports.
+**This plan began as a design study and is now a work order.** It asks
+"if we designed a consistent distributed filesystem on S3 from the ground
+up, which primitives would we pick?", measures the answer, and then
+narrows to the part worth building now. §5–§9 are the design and the
+recommendation; §10 is the Step 0 measurements that decided whether the
+bet was worth taking; **§14 is what they reported**; **§11 is the
+resulting work order** for §9's option (B). The steps beyond (B) stay
+sketched, in §11b.
 
 Spec context: `docs/explanation/DESIGN.md` §4 (metadata plane), §6
 (consistency), §12 (DB/FUSE fast paths), §13 (snapshots), §14 (GC);
@@ -112,14 +113,24 @@ content-addressed nodes (the structure behind Dolt/Noms; the same idea as
 `fs-core::Tree` generalized from "one blob per directory" to "one blob
 per key range").
 
-- **Boundaries from keys only.** A node ends after key `k` when
-  `u32::from_le_bytes(blake3(k)[0..4]) < u32::MAX / TARGET_ENTRIES`, with
-  hard min/max entry clamps. Because the predicate reads the *key* and
+- **Boundaries from keys only.** A node ends after key `k` when a 4-byte
+  window of `blake3(k)` compares below `u32::MAX / TARGET_ENTRIES`, with
+  min/max entry clamps. Because the predicate reads the *key* and
   not the value, a `chmod` rewrites leaves along one path but never
   reshapes the tree; because it reads no history, insertion order cannot
   matter. Wide directories need no HAMT special case (plan 27 §Design):
   a 10M-entry directory is simply a long contiguous key range that the
   boundary function splits into ~85k leaves.
+
+  As built in S2 the predicate is **per level**: the window is
+  `level % 8` and the target differs for leaves and interior nodes. The
+  window has to rotate, or a key that is a boundary at level 0 is a
+  boundary at every level and the tree degenerates into single-entry
+  chains above the leaves. It remains a pure function of `(key, level)`,
+  which is all canonicality requires. The clamps are
+  `MAX_ENTRIES = 256` (§14.1) and `MIN_ENTRIES = 1`, i.e. the lower
+  clamp is implemented but **off by default**, because every number in
+  §14 was measured without one.
 - **Node = the existing `Tree` blob, generalized**: magic, level, entry
   count, then either `(key, value)` pairs (leaf) or
   `(first_key, child_hash, subtree_aggregates)` triples (interior).
@@ -348,10 +359,16 @@ rules rather than cells:
   rounding error of files, and both writes land in one atomic commit
   attested by one root hash — so unlike plan 27's SQLite-vs-tree pair
   there is no reconciliation path that could drift, and `fsck` is still
-  just a hash recomputation. §14.4 also shows this is where scattered write
-  amplification comes from — a `chmod` writes two keys in two distant
-  ranges — so the copy is only the right trade if recursive attribute
-  changes go through §P9 macros rather than key deltas.
+  just a hash recomputation. **S1 measured the alternative and this rule
+  stands** (§14.10): dropping the copy saves 10.9% of stored bytes and
+  1.3–1.5× on `setattr`, and charges 12,039 pack reads for a cold
+  `ls -la` against 30.4. An earlier draft of this bullet blamed the copy
+  for scattered write amplification; §14.10 reading 3 corrects that. The
+  second key is nearly free on an aged tree (41 B/op with the copy
+  against 40 without) — what costs is the **scattered `0x01` write**, so
+  the lever is ino allocation locality (§S1b), not the copy. Recursive
+  attribute changes should still go through §P9 macros rather than key
+  deltas.
 - **Indexes stay out of the tree.** Only keys that are *immutable for the
   lifetime of the entity they describe* may live in the hashed tree. That
   admits the four primary ranges above (`ino` and `(parent_ino, name)`
@@ -426,8 +443,32 @@ both planes.
 
 ```
 packs/<hash>          # ~1–16 MiB, concatenated zstd'd (sealed) blobs
-packs/<hash>.idx      # (hash, offset, len) — or inline the index in the commit
+packs/<hash>.idx      # (node hash, offset, len, level, first key)
 ```
+
+**Corrected in S4: the index must be a sibling object, not inlined in the
+commit.** This plan originally offered the two as interchangeable. They
+are not, and the argument is short: **a pack outlives the commit that
+wrote it.** A commit names only the packs it created, while most nodes a
+reader resolves live in packs written by ancestors — many of them already
+outside the retained window, because §P10b deletes old commits freely on
+the grounds that they are cheap and never load-bearing. With an inline
+index, "read a node" would mean "first find the commit that introduced
+its pack", which is an unbounded walk back through history and flatly
+impossible once retention has removed that commit, even though the pack
+itself is still live and reachable. Three lesser points agree: the commit
+object stays O(new packs) rather than O(nodes written) (§14.5's 10k-op
+commit rewrites ~1,100 nodes, so ~44 KiB of index inside an otherwise
+few-hundred-byte object); the index's lifetime is exactly the pack's, so
+§P10's sweep deletes a pair with no cross-object bookkeeping; and a
+partial replica can fetch a few KiB of index without touching a 1–16 MiB
+body. The price is one extra PUT per pack and one extra GET to read a
+pack whole, amortized over ~128 nodes.
+
+The index is **untrusted**: it says where bytes are, never what they are.
+Every node is verified against the hash the caller asked for and then
+parsed, so a corrupt or lying index is a read error, never a wrong
+answer.
 
 The plan 26 Appendix settles the granularity: 64×1 MiB packed blobs beat
 both 4096 loose blobs (4.7×) and one ranged image (1.9×) on the far AWS
@@ -516,10 +557,19 @@ handles them very differently:
    wrote. The footprint plateaus *because* of the compactor, not in spite
    of needing one. So the budget to plan for is a compactor sized at
    roughly the commit write rate (`CONSTELLATION_COMPACT_BYTES_PER_S`),
-   parallelized per §0.5. The one untested hope: §14.5 picks a fresh
-   random directory per commit, whereas a real writer returns to the same
-   directories repeatedly, so that run measures the pessimistic end of
-   pack death and the optimistic end is still unmeasured.
+   parallelized per §0.5. The one untested hope was that §14.5 picks a
+   fresh random directory per commit, whereas a real writer returns to
+   the same directories repeatedly, so that run measures the pessimistic
+   end of pack death. **S7a weakly corroborates against even that hope**:
+   its classifier, run over an aged tree that *does* revisit directories,
+   still leaves overwhelmingly partially-dead packs — enough that the
+   fixture has to tolerate zero whole-pack deaths rather than assert any.
+   That is a small synthetic tree rather than §14.5's 20 minutes of steady
+   state, so it corroborates rather than settles; the decisive measurement
+   would be §14.5 re-run with directory revisiting. **Treat whole-pack
+   death as the rare case and the rewrite as the normal path everywhere
+   this plan still hedges.** The cheap path is implemented and tested
+   (S7a's `delete_dead`), it is simply not the one that will run.
 3. **Unreachable keys from bulk unlink.** P9's unlink-then-reap makes
    `rm -rf` O(1) in the commit, which means a 10M-file subtree removal
    leaves ~20M keys that are unreachable from the dentry graph but still
@@ -585,6 +635,17 @@ their hash as AAD before packing, and commit objects are sealed with
 their key as AAD — the same rules plan 27 §Design already sets for packs,
 applied to the whole metadata plane. Dedup and structural sharing are
 unaffected (one key per filesystem).
+
+**Amended in S2: the key governs the boundary function too, not only node
+identity.** The boundary predicate hashes *keys* and thereby decides the
+tree's shape, so with a plaintext predicate a provider who guesses a
+plausible key set can compute where the splits fall and compare that
+against the node sizes it stores — the same class of oracle ADR-8 exists
+to close, just reached through the shape instead of the hash. Keying both
+costs nothing (the hasher is already threaded through) and both modes
+stay canonical; the consequence to state plainly is that a keyed tree and
+a plaintext tree over identical content have **different shapes**, so the
+mode is a property of the filesystem fixed at creation, not a setting.
 
 ## 6. What this buys, against the spec
 
@@ -822,36 +883,566 @@ compaction throughput at 32 threads against §14.5's 939 s of 1,205 s
 wall — if that divides by cores, the "GC is most of the machine" finding
 becomes "GC is one core".
 
-## 11. Steps 1+ (sketch only; sequencing depends on §9's choice)
+## 11. The work order
 
-Each step must leave the tree building and `cargo test --workspace`
-green, per CONVENTIONS.
+Step 0 has reported (§14) and §9's option **(B)** is the evidence-backed
+choice (§14.7.7), so this section is no longer a sketch. The scope of (B):
 
-1. **New crate `crates/mtree`**: node format, boundary function, cursor,
-   bulk build, splice, diff, three-way merge, augmented aggregates.
-   Pure, no I/O, exhaustively property-tested. This is the crate that
-   either works or does not; it lands alone.
-2. **Key encoding + codec** (`mtree::keys`): the P6 table, with
-   round-trip and ordering tests (byte order equals numeric order for
-   every field).
-3. **Store integration**: pack writer/reader, node cache over
-   `fs-core::cache`, commit object + CAS create + GET-next head discovery
-   reusing `store-s3::log`. The commit chain replaces `checkpoints/*`,
-   `LATEST`, and `VECTOR.json`.
-4. **Builder from the live replica**: build a tree from `SqliteMeta` and
-   publish it. At this point option (B) is complete and the bucket format
-   is final; plans 26+27's goals are met and `SnapshotManager::build_tree`
-   is deleted in favor of retaining a root hash.
-5. **Reader**: bootstrap and partial replica from a commit; peer-served
-   nodes; `fsck` = recompute the root hash.
-6. **Engine swap** (only if 0.1 passed): `MetaStore` backed by
-   `mtree` + WAL + memtable; SQLite becomes a derived view.
-7. **Optimistic commit + rebase**; read-set capture in the tree cursor;
-   leases demoted per P3.
-8. **Delete partitions**: shards under one commit; `xpart_*`,
-   `PartSplit`/`PartMerge`, and `CheckpointVector` removed.
-9. **Macros** (P9) for bulk namespace ops, with hash verification.
-10. **GC by reachability** (P10) and pack compaction.
+> The **on-bucket format** becomes a canonical Merkle map and the commit
+> chain replaces the checkpoint, while **SQLite stays the live query
+> engine** and the op log stays the incremental transport.
+
+That buys the thing that is expensive to change later — the format, the
+key encoding, ADR-5's no-migration promise — and defers the thing that is
+cheap to change later, namely which engine answers `lookup`. Everything
+that requires the engine swap is out of scope here and restated in §11b.
+
+Per CONVENTIONS, every step ends with `cargo fmt --all` producing no
+diff, `cargo clippy --workspace --all-targets -- -D warnings` clean, and
+`cargo test --workspace` at zero failures; every step adds its rows to
+`PROGRESS.md`; **no step commits anything.** Steps that touch no product
+code cannot regress the e2e lanes and do not run them. From S5 onward the
+full CONVENTIONS gate list applies, pjdfstest included.
+
+| Step | Deliverable | Depends on | Product code touched |
+|---|---|---|---|
+| **S1** | Settle the dentry attr copy (measurement) — **DONE: copy stays** | — | none — `bench/` only |
+| **S1b** | Ino allocation locality (measurement) | — | none — `bench/` only |
+| **S2** | `crates/mtree` — the pure data structure — **DONE** | — | new crate only |
+| **S3** | `mtree::keys` — the §P6 codec — **DONE** | S1, S2 | new crate only |
+| **S4** | Pack store, node cache, commit chain — **DONE** | S2 | `store-s3` |
+| **S5** | Builder from the live replica — **(B) complete** — **DONE (gates open)** | S3, S4 | `cli/shipper` |
+| **S6** | Reader: bootstrap, partial replica, `fsck` | S5 | `cli`, `meta` |
+| **S7a** | Reachability mark + compactor, as library code — **DONE** | S4 | `store-s3` |
+| **S7b** | GC wiring, retention, rate budgets | S5, S7a | `cli/gc` |
+
+S1 and S2 are independent and start together. S1 is a short measurement
+and S2 is the long pole, so gating S3 on S1 costs nothing.
+
+### S1 — Settle the dentry attr copy — **DONE (2026-09-12): the copy stays**
+
+Full numbers in §14.10. Three `0x02` value shapes (`copy` as §P6 writes
+it, `nocopy` = ino + kind, and `dentry-auth` = the dentry is the record
+for `nlink == 1`) measured through the same code paths at census scale,
+fresh and aged. **§P6 stands as written.** `nocopy` saves 10.9% of stored
+leaf bytes and 1.3–1.5× on `setattr`, and charges **12,039 pack reads for
+a cold `ls -la` against 30.4** — giving up §14.2's one-pack-per-directory
+property, which is the reason the encoding is shaped this way. It is also
+the one cost in the plan that does not thread away: every other read row
+scales 3.6–6.4×, while `nocopy` at 8 threads is still 144× `copy`.
+
+The decision rests on the two amplifications not being commensurable, and
+§14.10 quantifies that rather than asserting it: a written byte costs
+~2.17 bytes of transfer that does **not** divide by cores (it is stored on
+every replica and rewritten by a compactor that §14.5 measured at 117% of
+the commit write rate and §14.9 measured parallelizing only ~1.7×),
+whereas a pack read is a cached read that does divide.
+
+S7a has since lifted that 1.7× to 2.78×, which **does not disturb the
+verdict** and is worth saying why rather than leaving the stale citation
+to be noticed later. Compactor threading changes the wall clock of the
+rewrite, not the byte volume: a written byte is still stored on every
+replica and still crosses the network once per replica, and neither of
+those divides by cores at any thread count. Only the 2.17 multiplier's
+second term gets cheaper in time, and the margin S1 measured — 396× the
+pack reads, 144× still at 8 threads — is three orders of magnitude clear
+of anything that correction moves.
+
+Two results S1 was not asked for but which its numbers settle:
+
+- **`dentry-auth` stays on the table** rather than being discarded with
+  `nocopy`. It is the only measured shape that writes less on *every*
+  axis while keeping `ls -la` at one pack: 24.2M keys instead of 35.8M,
+  13.6% fewer compressed leaf bytes, 25% less interior, and aged
+  directory-local `setattr` at **1.01×** today's log bytes where `copy`
+  pays 15.9×. It charges on `getattr(ino)` — 7.92 cold pack reads against
+  4.00, roughly half the throughput — which is a bad trade for the op
+  FUSE uses most, and `link()` would have to migrate a record into `0x01`
+  when `nlink` rises, a product complexity this plan has not costed. The
+  trigger for revisiting it is `setattr` cost becoming binding on the
+  compactor budget.
+- **§14.8's aged row is superseded.** Its aged corpus let the densest
+  tracked directory shrink to 1.7k children, understating ino scatter by
+  roughly 7×; with hot-directory retention and churn it holds 4,241
+  children over 134 distinct ino buckets, and aged directory-local
+  `setattr` is **15.9× today's log bytes, not §14.8's 2.1×**. Same gate,
+  failed by a wider margin. Read §14.10's rows in preference to §14.8's.
+
+### S1b — Ino allocation locality
+
+**Why this exists.** §14.10 reading 3 relocates the write-amplification
+problem: the expensive key is the scattered `0x01` inode write, not §P6's
+second key. And §14.10 bounds the prize precisely, because the *same*
+encoding costs **2.3× today's log bytes on a fresh tree and 15.9× on an
+aged one** — a ~7× gap that is entirely ino locality, since `alloc_ino`
+is a global `counter++` and a directory's children therefore drift apart
+in the `0x01` range as the filesystem ages. Most of `dentry-auth`'s
+measured advantage is just that it never writes that key.
+
+**Deliverable.** In `bench/prollybench`, an ino allocation policy that
+places a new inode's number near its parent directory's — a per-directory
+cursor into a reserved range, with a documented overflow rule when a
+range fills — measured against today's global counter on §14.10's aged
+corpus: directory-local and scattered `setattr` bytes per op, `ls -la`
+pack reads, `getattr` cost, and the ino-bucket spread statistic §14.10
+introduced (children per directory over distinct 1024-ino buckets).
+
+**Why it is cheap to get wrong, which is why it comes before S3.** An ino
+is already opaque and allocation is *policy*, not format: existing
+filesystems keep their inos, only new allocations cluster, and no bucket
+migration is implied. So unlike the attr copy this can change after (B)
+ships — but knowing the number now tells us whether the aged-tree
+amplification is a format problem at all, and it is cheap to measure.
+**Gate:** none. It informs §P6 and §S1's `dentry-auth` trigger; it does
+not block S3.
+
+Original work order, for the record:
+
+**Why this is first.** §14.8 leaves exactly one format question open, and
+option (B) makes the format final, so it must be answered before §P6 is
+frozen. §P6 keeps a denormalized attr copy in the `0x02` dentry so that
+READDIRPLUS is a pure sequential scan. §14.2 confirms the payoff — a cold
+`ls -la` touches one distinct pack — and §14.4/§14.8 confirm the price:
+every `setattr` writes two keys in two distant ranges, which is 83–93×
+today's bytes for directory-local setattr and roughly doubles the
+scattered case. Neither number settles the trade, because **the
+alternative was never measured.**
+
+**Deliverable.** A no-attr-copy variant in `bench/prollybench` (dentry
+value becomes `(ino, kind)` only, so `ls -la` is one `0x02` range scan
+plus point reads into `0x01`), measured against the current encoding on:
+
+- `setattr` bytes per op — the §14.4 and §14.8 rows recomputed, clustered
+  and scattered, fresh and aged, at 1k/10k/100k.
+- cold and tier-(b) `ls -la`: distinct packs touched and wall time, at 1
+  and 8 threads. §14.9 showed the read path is thread-scalable, and that
+  asymmetry may be what decides this.
+- total leaf bytes, since the copy inflates every replica, not just
+  writes.
+- the same against an aged tree, where ino/directory decorrelation is
+  supposed to make the no-copy variant worse.
+
+**The asymmetry to weigh explicitly.** Read amplification is absorbed by
+cache and by cores (§14.9) and is paid once per cold directory; write
+amplification is permanent, is paid in S3 bytes by every replica, and is
+paid *again* by the compactor (§14.5, which rewrote 117% of what the
+commits wrote). State it, then recommend.
+
+**Gate.** No product code changes. `cargo test --release` in
+`bench/prollybench` stays green. Results land as §14.10 with an explicit
+recommendation, and in `bench/prollybench/RESULTS.md`.
+
+### S2 — `crates/mtree`: the pure data structure — **DONE (2026-09-12)**
+
+Landed as `crates/mtree`, 3,321 lines, no existing crate's source touched:
+`node.rs` (format, encode/parse, boundary function, aggregates),
+`tree.rs` (build, cursor, apply, diff, merge), `config.rs`, `hash.rs`,
+`store.rs` (a `NodeStore` trait plus a counting in-memory impl), and 40
+tests — the eight required properties, a `BTreeMap`-oracle fuzz, and an
+8,000-case corruption fuzz asserting no panic. `cargo fmt` clean, clippy
+`-D warnings` clean, `cargo test --workspace` 531 passed / 0 failed
+(independently re-verified; the single `node_runtime` FUSE-mount test
+needs `/dev/fuse` and passes where it is exposed).
+
+Four decisions worth carrying forward, all recorded in `PROGRESS.md`:
+
+- The clamps, the hasher, and the aggregate projection live in a
+  `Config` validated at construction and documented as a **format**
+  parameter set rather than a tuning surface — two trees over one key set
+  with different clamps are different trees. §P1 and §P13 above are
+  amended to match what was built.
+- The aggregate is the fixed §P7 triple plus a key count, fed by a
+  caller-supplied leaf→`Agg` projection. It has to be caller-supplied:
+  only the §P6 codec knows which key range holds the authoritative inode
+  record, and therefore which entries may count a file's bytes without
+  double-counting a denormalized dentry copy — **which is exactly what S1
+  is deciding.** `mtree` must not be able to guess.
+- Decode is split into an O(1) constructor and an O(entries) `validate`,
+  because key *ordering* cannot be checked lazily. `parse` is the
+  documented entry point for bytes arriving off a network.
+- No `unsafe`. prollybench's cursor launders a borrow through
+  `from_raw_parts`; the productionized cursor does not.
+
+The node header changed deliberately — `b"MTRE"` + an explicit
+`FORMAT_VERSION` byte, 10 bytes against prollybench's 9 — so node hashes
+differ from §14's. Everything after the header is byte-identical and the
+entry partition is unchanged, so §14's *measurements* carry over even
+though its hashes do not. Nothing exists in either format on any bucket,
+so there is no migration; `FORMAT_VERSION` is the story from here, and a
+test pins the encoding hex, the plain and keyed root hashes of a fixed
+1,000-key set, and the level census.
+
+Original work order, for the record:
+
+`bench/prollybench/src/node.rs` (333 lines) and `tree.rs` (1,041) already
+implement this, and they are what §14 measured, so this is a
+productionization rather than a green field. Read them first and preserve
+every property they assert.
+
+**Deliverable.** A new workspace crate `crates/mtree`, pure and
+synchronous — no S3, no tokio, no filesystem — providing:
+
+- **Node format**: magic, level, entry count, offset table, then leaf
+  `(key, value)` pairs or interior `(first_key, child_hash, aggregate)`
+  triples. Explicitly versioned, because this is an on-bucket format.
+- **A boundary function over keys only**:
+  `u32::from_le_bytes(blake3(key)[0..4]) < u32::MAX / TARGET_ENTRIES`,
+  with `MIN_ENTRIES`/`MAX_ENTRIES` clamps. §14.1 settled that the clamp
+  is canonicality-safe — a node's *start* is itself context-free, so
+  "seal after MAX entries counted from the start" remains a pure function
+  of the key set — and measured `MAX_ENTRIES = 256`, which clips a
+  p99-of-536, max-of-1545 entry tail (a ~120 KiB worst-case leaf) at no
+  measurable read cost. Specify the clamp; do not omit it.
+- Bulk build, point read, an ordered cursor (next and seek), incremental
+  apply of a sorted key delta, structural `diff`, three-way `merge`
+  returning either a merged root or an exact conflict key set, and
+  augmented subtree aggregates (bytes, count, max mtime) as a monoid.
+- blake3 node hashing with a **keyed** mode for §P13, so E2E addressing is
+  not retrofitted later.
+
+**Property tests** — the reason the crate exists, and non-negotiable:
+order independence over 50 random insertion orders; an incrementally
+applied tree byte-identical to a bulk-built one; delete-then-reinsert
+returning the original root; diff cost tracking the difference rather
+than the state; disjoint branches merging to one hash from both
+directions; overlapping branches yielding exactly the overlapping key
+set; and the clamp preserving canonicality **under deletes**, which is
+the case that forces a clamped run to absorb its right neighbour.
+
+**Gate.** Added to `members` and `default-members`. fmt, clippy
+`-D warnings`, and `cargo test --workspace` green. No other crate
+changes.
+
+### S3 — `mtree::keys`: the §P6 codec — **DONE (2026-09-12)**
+
+`crates/mtree/src/keys.rs` (the five ranges, `Key::parse`, `KeyRange`)
+and `crates/mtree/src/record.rs` (the values, the inline/spill planners,
+the aggregate projection), plus `crates/mtree/tests/keys.rs`. 68 tests in
+`mtree`, up from 14. S1's verdict is implemented as written: the `0x02`
+dentry carries the attr copy. Verified independently: the tree core
+references neither module, `mtree`'s dependency list is still exactly
+`blake3` + `thiserror`, and `0x10`–`0x2f` is refused by name on decode.
+
+**S2's aggregate gap is closed.** `record::leaf_agg` contributes only for
+`Key::Inode`; `0x02`, `0x03`, `0x04` and `0x30` contribute nothing, so
+the dentry copy cannot inflate a total. This was the one place in the
+plan where an error would have been *consistently* wrong — the root hash
+attests to the aggregate, so every replica would agree on an inflated
+`du`. Its test computes the model total from its own inode map rather
+than from the tree, over a corpus with hard links so a double count
+shows, and two guards stop it passing vacuously. Confirmed against
+`meta::sqlite::recursive_size_conn`: both count size and files for
+`kind == File` only, so `du`, `statfs` and quota do not change meaning
+when the tree becomes their source.
+
+Six decisions carried forward, the first three of which **S5 depends
+on**:
+
+1. **`mtree` gained no dependency at all** — not `constellation-meta`,
+   and not `constellation-fs-core` either. The record types are declared
+   locally from `meta`'s schema, and a file's chunk list is carried as
+   opaque encoded-manifest bytes so the crate needs no manifest decoder.
+   The `meta → mtree` edge S5 wants is therefore still open.
+2. **`Kind`'s discriminants match `fs_core::InodeKind::as_u8`** (0–6,
+   verified pairwise), so S5's mapping is a cast rather than a match.
+3. **`plan_inode`'s spill order is format, not heuristic**: xattr set,
+   then manifest, then symlink target, until the record fits
+   `VALUE_SPILL`. Two writers that spilled different fields would
+   produce different bytes for the same filesystem and so different root
+   hashes. Inline xattrs are sorted for the same reason — canonicality
+   reaches into the values, not just the key order.
+4. **Keys are big-endian, values little-endian.** Only keys are compared,
+   so key endianness is load-bearing and value endianness is free; LE
+   matches every other encoder in the repo.
+5. **atime is absent rather than excluded.** `Attrs` has no atime field,
+   so there is no way to reach a key *or a value* with it, and
+   `ATTRS_LEN` is pinned at 49 bytes with its nine fields enumerated —
+   adding a tenth fails a test on purpose. atime stays node-local in
+   today's `atime_journal` with max-merge on apply.
+6. **Names go last and ids are fixed width, which is load-bearing rather
+   than tidy.** A name may be a byte prefix of another name, so any field
+   appended after a name would make the field boundary undecidable. Three
+   ordering traps were found and closed: a directory's exclusive upper
+   bound needs a general prefix successor (it cannot be `parent + 1`,
+   which overflows at `u64::MAX`), a nameless key is a decode error
+   because it is a scan bound and storing it would make a directory's
+   lower bound ambiguous, and an over-long `0x01` key is refused because
+   trailing bytes would let two distinct keys resolve to one inode.
+
+Deferred with reasons: the `0x30` record *bodies* (S5/S6 — inventing
+them here would freeze a format nothing writes), range aggregates for
+per-directory `du` (the keys exist; the API belongs with the caller that
+answers it), and `dentry-auth` (§14.10 reading 5 keeps it on the table
+with a trigger; building both shapes now would double the codec).
+
+Original work order, for the record:
+
+**Deliverable.** The §P6 table as a codec: `0x01` inode, `0x02` dentry
+(shape per S1's decision), `0x03` spilled xattr, `0x04` reverse dentry,
+and `0x30` subsystem records, with `0x10`–`0x2f` reserved and unused.
+Big-endian throughout so byte order is numeric order. `XATTR_INLINE`
+(256 B) inlining and `VALUE_SPILL` (1 KiB) blob spill.
+
+**Tests.** Round-trip for every range; an ordering test asserting that
+encoded byte order equals numeric and lexical order for every field,
+including `ino` boundary cases; and §12's mechanical **"no mutable field
+is in the tree"** test — every in-tree key built only from fields
+immutable for the entity's lifetime. That test is what keeps the
+retracted secondary indexes (§P5) and atime (§P6) from creeping back.
+
+**Gate.** As S2.
+
+### S4 — Pack store, node cache, commit chain — **DONE (2026-09-12)**
+
+Landed as `crates/store-s3/src/{packs,node_cache,commits}.rs` (2,668
+lines) plus five `layout.rs` helpers — purely additive, with nothing
+calling it yet and `checkpoints/*`, `LATEST` and `VECTOR.json` untouched.
+110 store-s3 tests (up from 93), `cargo test --workspace` 565/0,
+`tests/smoke.sh` passed; independently re-verified.
+
+- **The index placement is forced, not chosen** — see the correction in
+  §P8 above, which is the substantive design change this step produced.
+- **§14.2's one-pack-per-directory property is confirmed against a real
+  store**: 64 directories × 500 dentries into 256 KiB packs, scanned from
+  a cold cache, gave **60 of 64 directories in exactly one pack and none
+  worse than two** (the stragglers straddle a pack seal), with a control
+  in the same test reading scattered dentries and touching many packs so
+  the assertion cannot pass vacuously. Packs are filled in
+  `(level, first_key)` order, which is what turns §P6's key locality into
+  pack locality — and sorting level first is also what will make S6's
+  interior-only bootstrap a few whole-pack GETs.
+- **The crash-ordering invariant has a real test**, not a comment:
+  commit PUTs are failed, orphan packs are asserted present with no
+  commit, every existing commit is walked and its roots resolved from a
+  cold cache, and the retry is asserted to converge on the same
+  content-addressed packs. A second test fails a pack's index PUT and
+  asserts the re-seal *completes* the half-written pack instead of
+  duplicating it.
+- **An obligation handed to S5**: `publish` CASes at `parent + 1` where
+  `parent` is the root the writer actually read — never at the current
+  head, which would silently overwrite whatever landed in between.
+  §P3's structural rebase is therefore a **caller-supplied callback**,
+  because it needs the key codec and operation semantics that live above
+  this crate. S4 guarantees only that a loser's payload is carried
+  forward; **S5 must supply the real rebase**, and until it does, a lost
+  CAS is an error rather than a merge.
+- Hooks left: a `flags` byte on both pack objects with
+  `FLAG_SEALED_NODES` defined and refused on read, so §P13's AEAD sealing
+  is a flag flip plus a seal/open pair with no format bump; `NodeCache`
+  already takes an `mtree::Hasher` for keyed mode. For §S7:
+  `PackStore::{get_body, contains}`, `CommitChain::list_from`, and a
+  `PackIndex` carrying each node's level and first key so a compactor can
+  rewrite a partially dead pack in key order.
+- Knobs: `CONSTELLATION_PACK_TARGET_BYTES` (4 MiB, 1–16 accepted),
+  `CONSTELLATION_NODE_MEMORY_BYTES` (64 MiB),
+  `CONSTELLATION_COMMIT_PROBE_WINDOW` (8).
+- Known gap, deliberately left: no single-flight on duplicate concurrent
+  misses. A lock there would sit on the exact path §14.9 says must scale,
+  to save a duplicate ranged GET of an immutable 8 KiB node. Revisit only
+  if measured.
+
+Original work order, for the record:
+
+**Deliverable**, in `crates/store-s3`:
+
+- A `packs/<hash>` writer and reader — ~1–16 MiB sealed concatenations
+  with an index (inline in the commit, or `packs/<hash>.idx`) and ranged
+  reads for single nodes. Pack **in key order**: §14.2's "one distinct
+  pack per directory" is the property to preserve.
+- A node cache over `fs-core::cache` verbatim — the same eviction, the
+  same blake3 verification, and the same peer-then-S3 resolution ladder
+  the data plane already uses for chunks. Implement `mtree::NodeStore`
+  against it; S2 defined that trait as the seam for exactly this.
+  **Every node read from a pack must go through `NodeRef::parse`, not the
+  O(1) constructor**: these are bytes off a network, and the ordering
+  check is the part that cannot be done lazily.
+- `commits/<seq:016x>`, CAS-created with `If-None-Match: *`, carrying the
+  §P2 fields (`seq`, `parent`, `roots`, `packs`, `author`, `epoch`,
+  `agg`, `intent`). Head discovery by GET-next probe over `seq+1..seq+k`
+  with LIST only as the catch-up fallback, reusing plan 26's tailer shape
+  and `store-s3::log`'s CAS.
+- `layout.rs` helpers for both prefixes.
+
+**The ordering invariant, which is the whole crash-safety argument**:
+every node and pack a commit names must be durable *before* the commit
+object is CAS-created. A crash before it leaves orphan packs, which are
+garbage that S7 reclaims; a crash after it leaves a commit all of whose
+nodes exist. There is no third state. Test it with `InMemory` plus an
+injected failure between the pack PUT and the commit CAS.
+
+**Gate.** CONVENTIONS gates 1–2, plus `InMemory` unit tests for CAS
+contention (two writers, one 412, correct retry) and for head discovery.
+
+### S5 — Builder from the live replica — **(B) complete** — **DONE (2026-09-14), gates partially open**
+
+Landed by the S5 subagent before it stalled, verified and gated by the
+coordinator. Code: `crates/cli/src/mtree_publish.rs` (~1.6k lines),
+`crates/store-s3/src/blobs.rs`, shipper/`node_runtime` wiring (publisher
+**on by default** for non-read-only mounts), additive `meta` helpers.
+Seven `mtree_publish` unit tests green, including the disjoint-publisher
+splice that fails a blind retry, incremental ≡ full rebuild, atime
+exclusion, and pack-before-commit spill.
+
+**Gates run (coordinator, 2026-09-14):**
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `cargo test --workspace` | **625 passed**, 1 failed in sandbox only (`two_views…` needs `/dev/fuse`); **passes unsandboxed** |
+| `mtree_publish` (7 tests) | pass |
+| `tests/smoke.sh` | **PASSED** |
+| `tests/integration.sh` | **PASSED** |
+| `docker compose … compliance` (pjdfstest) | **interrupted** — `.dockerignore` fixed to keep `bench/uploadbench` (workspace member). Second attempt was compiling inside the image when stopped; **pjdfstest still not executed**. |
+| `target/release/harness run` | **interrupted mid-matrix** — early results: `baseline`/`slow-network`/`s3-outage`/`s3-flap`/`kill9-remount` **FAILED** (MODEL DIVERGENCE, truncated sizes); `latency`/`cold-cache`/`two-clients-disjoint` **PASSED**. Not diagnosed; continue later. |
+| `getattr`/`lookup` p99 during publish | **not measured** |
+
+§11a's store knobs are now in `docs/reference/configuration.md`
+(Merkle metadata tree section). GC knobs remain S7b.
+
+Original work order, for the record:
+
+**Deliverable.** Build an `mtree` from `SqliteMeta` over the §P6 encoding
+and publish it as a commit, wired into `cli/src/shipper.rs` where
+`checkpoint` lives. After this step the bucket format is final (ADR-5's
+no-migration promise), plans 26 and 27's checkpoint goals are met, and
+`SnapshotManager::build_tree` is replaced by retaining a root hash (§13).
+
+The incremental path is the point: a publish must cost O(keys changed
+since the last commit), not O(DB). Drive it from the existing journal and
+`applied_seq` watermark to find the changed key set, then `mtree::apply`.
+A full rebuild happens only on first publish and in `fsck`.
+
+**S5 also owes S4 the rebase callback.** `CommitChain::publish` CASes at
+the parent the writer read and hands a lost race back to a
+caller-supplied closure, because resolving it needs the §P6 codec and
+operation semantics that `store-s3` cannot see. Until S5 supplies it a
+lost CAS is simply an error. The §P3 shape to implement: diff the
+winner's roots against the parent, and if the difference does not
+intersect this batch's read-set, splice the write-set onto the winner and
+retry; otherwise re-execute. In (B)'s scope the writer still holds the
+partition lease, so a lost CAS should be rare and the disjoint splice is
+enough — but it must be a real splice, not a blind retry, or two
+publishers can silently drop one another's keys.
+
+**Gate.** The full CONVENTIONS gate list from here on, pjdfstest
+included. Plus: publishing must not stall FUSE. Report `getattr`/`lookup`
+p99 during an active publish per §13 — eliminating the `VACUUM INTO`
+stall is one of this plan's claims, and replacing it with a tree-build
+stall would be a regression, not a win.
+
+### S6 — Reader: bootstrap, partial replica, `fsck`
+
+**Deliverable.** Rebuild a replica from a commit — plan 27's goal, now
+against a canonical format. A full bootstrap, and a **partial** one that
+fetches only the interior plus the leaves the mounted path touches, which
+is ADR-5's 100M+ path and which §14.1's 19.75 MiB interior makes cheap.
+`fsck` becomes "recompute the root hash and compare", verifying every
+byte of metadata rather than walking and comparing.
+
+**Tests.** Plan 27's table-by-table equality between the source replica
+and one rebuilt from the tree — kept, because it remains the honest check
+that builder and reader agree. Plus §12's partial-replica test: a node
+budget that fits the interior only, `ls -la` of a cold directory costing
+one pack GET, and a `readdir` walk that never faults in leaves outside
+the directories it visits.
+
+**Gate.** Full list, plus bootstrap wall time for full and partial
+replicas on the plan 26 Appendix paths (§13).
+
+### S7 — GC by reachability + pack compaction
+
+**Split into S7a and S7b after S4 landed.** S4 deliberately left the
+primitives this needs (`PackStore::{get_body, contains}`,
+`CommitChain::list_from`, and a `PackIndex` carrying level and first key
+so a partially dead pack can be rewritten in key order), so the mark and
+the compactor are implementable and testable as library code against
+synthetic commits, with no dependency on S5's publisher. **S7a** is that
+library work in `store-s3`; **S7b** is the `cli/gc` wiring, the retention
+policy, and the rate budgets, which do need a real commit stream and so
+follow S5. The deliverable below is split accordingly — everything about
+marking, sweeping and compacting bytes is S7a; everything about *when*
+and *how fast* is S7b.
+
+**S7a is DONE (2026-09-12)**, in `store-s3`'s `mark.rs`, `compact.rs` and
+`parallel.rs` (2,195 lines) plus one additive `pub fn` in `packs.rs`.
+Additive: nothing calls it, no `cli` file is touched, and today's chunk
+GC is unchanged. 131 tests pass in `store-s3`, clippy clean. What S7b
+inherits, and the three things worth knowing before wiring it:
+
+- **§P10's affordability claim is now an identity, not an inequality.**
+  Marking a 17-root chain over a 60,000-key tree visits 690 nodes where
+  one root visits 574 — a marginal cost of 7.25 nodes per retained
+  commit, against 9,758 for a walk that restarted per root. The test
+  asserts `visits == nodes.len()`, so any re-entry into a shared subtree
+  fails it, and it carries a non-vacuity guard so it cannot pass by the
+  deltas happening to be large.
+- **The crash-ordering rule is S4's, mirrored**: a replacement pack must
+  be durable before the original it replaces is deleted. The two crash
+  outcomes are deliberately asymmetric — PUTs-without-DELETEs leaves a
+  live node with two identical copies, which no reader can distinguish
+  and the next round reclaims, while DELETEs-without-PUTs loses data
+  irrecoverably. So one failed PUT aborts the batch with nothing
+  deleted, and both sides have a test that injects the failure and then
+  resolves the whole live set from a cold cache.
+- **A pack body with no `.idx` sibling is reported, never swept** — it is
+  both the state a crash between `put_pack`'s two PUTs leaves *and* the
+  state a healthy writer is in for a few milliseconds during every seal.
+  Deleting it safely needs the age horizon and condemned-list handshake
+  today's chunk orphan pass uses, which is policy, and therefore S7b's.
+  `PackCatalog::incomplete` is what that policy reads.
+
+**Deliverable.** Mark from the bucket root set — the newest commit, the
+retained window, every `snaps/*`, every clone, every unexpired
+`holds/*` — as a Merkle walk that terminates on shared subtrees, so
+marking N commits costs O(their differences). Sweep unreferenced packs
+and compact partially dead ones, under a rate budget
+(`CONSTELLATION_COMPACT_BYTES_PER_S`) and with a restartable cursor,
+because nothing depends on either completing promptly.
+
+**Size this from §14.5, not from §P10b's original optimism**: 0.7% of
+packs died whole, the compactor rewrote 117% of the bytes the commits
+themselves wrote, and §14.9 found that mark parallelizes ~4× while
+compaction reached only ~1.7×. **S7a has since done this work**: mark is
+parallel, the writer is concurrent, and the flat phase §14.9 missed (a
+`.to_vec()` in `get_body`) is gone, so end-to-end compaction is 2.78× at
+4 threads and ~260 MiB/s. Size S7b's budget from that: §14.5's 14.79 GiB
+per round is ~58 s at full width, about 3 cores while it runs. The
+`deref` table, its txid bookkeeping,
+and the `superseded-checkpoint` rule go away; the `gc.horizon`, the
+condemned-list handshake, the offline exemption, holds, and reintegration
+verification all stay (§P10).
+
+**Gate.** Full list, plus a re-run of §0.2b's steady-state shape against
+the real store: the footprint must plateau.
+
+### 11a. Carried debt: the config knobs are undocumented
+
+`docs/reference/configuration.md` is this repo's canonical env-knob
+reference. Plan 28 knobs:
+
+| Knob | Added by | Documented by |
+|---|---|---|
+| `CONSTELLATION_PACK_TARGET_BYTES` (4 MiB) | S4 | **S5 — done** (`configuration.md`, Merkle metadata tree) |
+| `CONSTELLATION_NODE_MEMORY_BYTES` (64 MiB) | S4 | **S5 — done** |
+| `CONSTELLATION_COMMIT_PROBE_WINDOW` (8) | S4 | **S5 — done** |
+| `CONSTELLATION_GC_THREADS` (one per core) | S7a | **S7b** |
+| `CONSTELLATION_COMPACT_BYTES_PER_S` | not yet | **S7b** |
+| `CONSTELLATION_COMMIT_RETENTION`, `..._RETENTION_S` | not yet | **S7b** |
+
+GC and retention knobs stay with S7b — they are not operator-reachable
+until that wiring lands.
+
+### 11b. Out of scope here — the engine swap
+
+Deliberately deferred, in dependency order, each needing its own plan:
+`MetaStore` backed by `mtree` + WAL + memtable with SQLite demoted to a
+derived view (§P5); optimistic commit with structural rebase and read-set
+capture in the cursor (§P3); deleting partitions in favour of keyspace
+shards under one commit (§P4); and §P9 macros. §14.7.7 notes that gate
+0.1(b) no longer *refuses* the engine swap once concurrency is counted
+(§14.9) — it is still the larger bet, and (B) sequences it after the
+format lands.
 
 ## 12. Tests
 
@@ -884,7 +1475,7 @@ Beyond the per-step unit and property tests:
 
 ## 13. Gates + report
 
-Per CONVENTIONS, plus paste into the report: the three Step 0 tables;
+Per CONVENTIONS, plus paste into the report: the Step 0 tables (§14);
 lookup/readdir throughput against the ADR-9 baseline on the same machine;
 commit bytes per op for all three write shapes against today's shipped
 log bytes; bootstrap wall time for full and partial replicas on the plan
@@ -1147,21 +1738,286 @@ set grows. A one-key diff of a 35.8M-key filesystem costs 20 node reads.
 
 **Gate 0.3: PASS.**
 
+### 14.8 §0.2 aged tree (added after §14)
+
+The fresh-tree clustered numbers lean on an unstated property: a one-pass
+import keeps `0x01` order correlated with directory order because
+`alloc_ino` is `counter++`. Age the census tree with 10 generations of
+create / rename / unlink (20k ops each, 41.5 s), then re-measure both
+create-shaped clustered commits and directory-local setattr — the shape
+whose inode leaves are supposed to scatter.
+
+| Tree | Shape | ops | B/op (zstd) | today's B/op | ratio |
+|---|---|---:|---:|---:|---:|
+| fresh | clustered create | 1k / 10k / 100k | 137 / 76 / 68 | 45 | 3.02× / 1.68× / 1.51× |
+| fresh | clustered touch (one dir setattr) | 1k / 10k / 100k | 485 / 64 / 6 | 6 / 4 / 3 | **83× / 15× / 2.3×** |
+| aged | clustered create | 1k / 10k / 100k | 151 / 75 / 68 | 45 | 3.34× / 1.66× / 1.50× |
+| aged | clustered touch (one dir setattr) | 1k / 10k / 100k | 454 / 46 / 5 | 5 / 3 / 2 | **93× / 17× / 2.1×** |
+
+**Gate 0.2 aged "clustered ≤ 4× today's log bytes": PASS for create
+(worst 3.34×), FAIL for directory-local setattr (worst 93×).**
+
+Two readings, and the second is the one that matters:
+
+1. **Creates do not care about age.** New inos are still sequential
+   (`alloc_ino` is still `counter++`), so a clustered create against an
+   aged tree costs what it costs against a fresh one. The encoding does
+   not need the "dentry authoritative for `nlink == 1`" escape hatch for
+   create-shaped work.
+2. **Directory-local setattr was never cheap, even on a fresh tree
+   (83× at 1k ops).** Aging makes it only marginally worse (93×). The
+   cost is §P6's dual-key write — every setattr rewrites a `0x01` and a
+   `0x02` — not the decorrelation the gate was written to catch. Fresh
+   burst-filled directories already have mostly-contiguous inos, and after
+   aging the densest tracked directory is smaller (1.7k unique keys at
+   100k ops vs 10k fresh), so the measurement understates the aged
+   ino-scatter case rather than overstates it. The format decision the
+   gate was meant to force is still open, but the evidence points at the
+   attr copy itself (§14.7.6), not at aging.
+
+### 14.9 §0.5 Thread scaling (added after §14)
+
+Single-threaded tier (b) was 42–50 k/s at a 64 MiB leaf cache. Immutable
+nodes make a lookup a pure function of `(root, key)`, so the miss path
+(ranged read + zstd) should parallelize. Measured at census scale, 400k
+lookups, 64 MiB leaf cache (packs under `/tmp` so a concurrent syncthing
+daemon was not hashing the pack rewrite storm):
+
+| Threads | (a) lookup/s | (a) scaling | (b) 64 MiB lookup/s | (b) scaling | pack reads/lookup |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 694 k/s | 1.00× | 51 k/s | 1.00× | 0.94 |
+| 2 | 1.23 M/s | 1.77× | 97 k/s | 1.90× | 0.94 |
+| 4 | 2.01 M/s | 2.90× | **188 k/s** | 3.69× | 0.94 |
+| 8 | 2.32 M/s | 3.34× | **326 k/s** | 6.41× | 0.94 |
+| 16 | 2.29 M/s | 3.31× | 389 k/s | 7.65× | 0.94 |
+| 32 | 2.34 M/s | 3.38× | 382 k/s | 7.51× | 0.94 |
+
+**Gate 0.5: tier (b) ≥ 150 k/s aggregate at ≤ 8 threads with a 64 MiB
+leaf cache → PASS (326 k/s at 8 threads, already clear at 4 with
+188 k/s).** Near-linear to 8 threads on the miss path; (a) saturates
+around 3.3× on this host's memory bandwidth. §14.7.1's "needs ~1 GiB of
+leaf cache" therefore weakens exactly as the gate hoped: **~1 GiB *or*
+4 cores with a 64 MiB cache clears 150 k/s on a uniformly random working
+set.**
+
+Commit build across §P4-shaped key-range shards (32k clustered ops,
+apply each shard from the common root in parallel, merge left-to-right):
+
+| Shards | wall | vs 1-thread |
+|---:|---:|---:|
+| 1 (whole) | 58 ms | 1.00× |
+| 2 | 79 ms | 0.73× |
+| 4+ | slower | merge dominates |
+
+Shard-parallel apply does not beat a single-threaded apply of the same
+batch once the merge is counted; the win, if any, is latency hiding
+across independent writers, not wall-clock of one commit.
+
+Mark + compaction against a dirty tip (1.04 GiB live / 1.25 GiB dead,
+1,995 partially-dead packs):
+
+| Threads | mark | mark scaling | compact MiB/s | compact scaling |
+|---:|---:|---:|---:|---:|
+| 1 | 8.8 s | 1.00× | 167 | 1.00× |
+| 4 | 2.7 s | 3.20× | 281 | 1.68× |
+| 8 | 2.1 s | 4.16× | 279 | 1.67× |
+| 16 | 2.3 s | 3.88× | 256 | 1.53× |
+
+Mark scales to ~4×; compaction tops out around 1.7× because the pack
+writer is serial. §14.5's "GC is most of the machine" becomes "mark is a
+few cores, compaction is ~2" — better, not free. The 939 s of 1,205 s
+finding does not divide by 32.
+
+> **The compaction half of this row is superseded by S7a.** The
+> diagnosis was only partly right: making the pack writer concurrent
+> took the *writer* to 3.17×, but left end-to-end near 1.95×. The larger
+> flat phase was `PackStore::get_body` ending in `.to_vec()` — reading
+> pack bodies cost 219 ms and did not shrink with threads at all, 44% of
+> the 8-thread wall clock, because a `memcpy` is a `memcpy` on any
+> number of cores. Reading bodies as `bytes::Bytes` and slicing frames
+> out of them took that phase to 0.6 ms. End-to-end compaction is now
+> **2.78× at 4 threads** against this row's 1.68×, and the writer's
+> serial fraction is 0.007% of the rewrite. The residual is this host's
+> memory bandwidth, not code: every parallel phase independently
+> saturates at 3.3–3.7× on 4 physical cores, which is where this row's
+> own memory-resident lookup column saturates too. Sizing for S7b
+> becomes **~260 MiB/s on four cores**, so §14.5's 14.79 GiB per round
+> is ~58 s at full width and "compaction is ~2 cores" becomes "~3 cores
+> while it runs" — with the rate budget, not the thread width, deciding
+> how much of the machine that is. The lesson worth keeping: measuring
+> only the component this row blamed would have missed the real ceiling.
+
+### 14.10 S1 — settling the dentry attr copy (added after §14)
+
+§14.4 and §14.8 both ended by pointing at §P6's denormalized attr copy
+without measuring the alternative, so measure it. Three `0x02` value
+shapes run through the same code paths against the same census corpus,
+selected by a flag: `copy` is §P6 as written (ino + a full attr copy),
+`nocopy` is ino + kind, so `ls -la` becomes one `0x02` range scan plus a
+point read per child into `0x01`, and `dentry-auth` is §11's escape hatch
+— for `nlink == 1` the dentry *is* the record and there is no `0x01` key,
+so `getattr(ino)` probes `0x04 | ino` for the name and then reads the
+dentry. Directories keep their `0x01` record in all three. The aged tree
+is §14.8's aging plus a per-generation churn of a quarter of the children
+of the eight widest directories, with new inos allocated from a shuffled
+pool so churn interleaves with ordinary creates; that fixes the defect
+§14.8 admitted to, and the fix is what moves its numbers (below).
+
+| Variant | keys | leaves | leaf bytes | zstd leaf bytes | interior | vs `copy` |
+|---|---:|---:|---:|---:|---:|---:|
+| copy | 35,819,001 | 306,096 | 2.73 GiB | 1.00 GiB | 19.75 MiB | — |
+| nocopy | 35,819,001 | 306,096 | 2.20 GiB | 914.22 MiB | 19.75 MiB | **−10.9%** |
+| dentry-auth | 24,218,019 | 207,159 | 2.02 GiB | 886.77 MiB | 14.87 MiB | **−13.6%** |
+
+Four levels in every variant. The zstd column is every leaf compressed at
+the pack writer's level rather than a sample, because the variants change
+which key range dominates the first leaves and a sampled ratio would not
+be comparable across them.
+
+`setattr` bytes per op, the §14.4 and §14.8 rows recomputed per variant,
+at 1k / 10k / 100k ops per commit:
+
+| Tree | Shape | Variant | B/op (zstd) | today's B/op | ratio |
+|---|---|---|---:|---:|---:|
+| fresh | clustered (one dir) | copy | 485 / 64 / 6 | 6 / 4 / 3 | 83× / 15× / 2.3× |
+| fresh | clustered | nocopy | 340 / 49 / 5 | 6 / 4 / 3 | 59× / 11× / 1.8× |
+| fresh | clustered | dentry-auth | 348 / 34 / 3 | 6 / 4 / 3 | 60× / 7.9× / **1.2×** |
+| fresh | scattered (random ino) | copy | 24,811 / 16,018 / 6,721 | 10 / 9 / 9 | 2,460× / 1,773× / 758× |
+| fresh | scattered | nocopy | 15,109 / 10,577 / 4,509 | 10 / 9 / 9 | 1,498× / 1,170× / **508×** |
+| fresh | scattered | dentry-auth | 19,374 / 13,313 / 5,605 | 10 / 9 / 9 | 1,921× / 1,473× / 632× |
+| aged | clustered (one dir) | copy | 3,128 / 412 / 41 | 6 / 4 / 3 | 528× / 103× / 15.9× |
+| aged | clustered | nocopy | 3,028 / 398 / 40 | 6 / 4 / 3 | 512× / 100× / 15.3× |
+| aged | clustered | dentry-auth | 266 / 26 / 3 | 6 / 4 / 3 | 45× / 6.6× / **1.01×** |
+| aged | scattered (random ino) | copy | 24,847 / 15,995 / 6,700 | 10 / 9 / 9 | 2,463× / 1,770× / 756× |
+| aged | scattered | nocopy | 15,071 / 10,547 / 4,483 | 10 / 9 / 9 | 1,494× / 1,167× / **506×** |
+| aged | scattered | dentry-auth | 19,414 / 13,293 / 5,601 | 10 / 9 / 9 | 1,925× / 1,471× / 632× |
+
+`ls -la` of a wide directory, 32 directories of ≥ 1,000 entries scanned
+whole. Distinct packs and pack reads are properties of the operation and
+are traced on the single-threaded pass; the tier is re-prepared before
+each pass, so the 8-thread column is a second cold run and not a replay
+against the cache the serial pass just filled.
+
+| Tree | Tier | Variant | packs/dir | pack reads/dir | ms/dir (1t) | ms/dir (8t) | scaling |
+|---|---|---|---:|---:|---:|---:|---:|
+| fresh | (b) 64 MiB | copy | 1.06 | 27.1 | 2.329 | 0.648 | 3.60× |
+| fresh | (b) 64 MiB | nocopy | 2.41 | 57.5 | 9.586 | 3.985 | 2.41× |
+| fresh | (b) 64 MiB | dentry-auth | 1.25 | 27.1 | 2.604 | 0.660 | 3.94× |
+| fresh | (c) cold | copy | 4.06 | 30.4 | 2.248 | 0.459 | 4.90× |
+| fresh | (c) cold | nocopy | 5.44 | **12,038.8** | **321.091** | **66.396** | 4.84× |
+| fresh | (c) cold | dentry-auth | 2.41 | 30.4 | 3.612 | 0.773 | 4.67× |
+| aged | (b) 64 MiB | copy | 1.03 | 26.0 | 4.514 | 0.842 | 5.36× |
+| aged | (b) 64 MiB | nocopy | 3.44 | 72.0 | 7.863 | 4.185 | 1.88× |
+| aged | (b) 64 MiB | dentry-auth | 1.12 | 26.1 | 2.986 | 0.561 | 5.32× |
+| aged | (c) cold | copy | 4.03 | 29.3 | 4.437 | 0.691 | 6.42× |
+| aged | (c) cold | nocopy | 6.94 | **11,804.3** | **287.898** | **68.928** | 4.18× |
+| aged | (c) cold | dentry-auth | 2.12 | 29.3 | 2.979 | 0.518 | 5.75× |
+
+`getattr(ino)`, which is what the escape hatch charges for: `copy` and
+`nocopy` read one `0x01` leaf, `dentry-auth` reads two leaves in two
+distant ranges.
+
+| Tier | Variant | getattr/s (1t) | getattr/s (8t) | scaling | pack reads/getattr |
+|---|---|---:|---:|---:|---:|
+| (b) 64 MiB | copy | 16 k/s | 45 k/s | 2.91× | 0.95 |
+| (b) 64 MiB | nocopy | 16 k/s | 55 k/s | 3.43× | 0.95 |
+| (b) 64 MiB | dentry-auth | 8 k/s | 28 k/s | 3.55× | 1.93 |
+| (c) cold | copy | 8 k/s | 33 k/s | 3.96× | 4.00 |
+| (c) cold | nocopy | 7 k/s | 40 k/s | 5.37× | 4.00 |
+| (c) cold | dentry-auth | 3 k/s | 13 k/s | 3.83× | 7.92 |
+
+The two amplifications are not commensurable and the decision turns on
+that. A read amplification is absorbed by cache and by cores, and it is
+paid once per cold directory; the tables above show it thread away at
+4–6×. A write amplification is permanent: it is S3 bytes stored on every
+replica, it is paid again by the compactor, which §14.5 measured
+rewriting 117% of what the commits themselves wrote, and §14.9 measured
+that rewrite parallelizing only ~1.7× because the pack writer is serial.
+A byte written therefore costs about 2.17 bytes of transfer that does not
+divide by cores; a pack read costs a cached read that does.
+
+Five readings:
+
+1. **Dropping the copy is not a trade, it is a loss.** `nocopy` saves
+   10.9% of stored leaf bytes and 1.3–1.5× on `setattr`, and it charges
+   **12,039 pack reads for a cold `ls -la` against `copy`'s 30.4** — 396×
+   — for 321 ms per directory against 2.2 ms. §14.2's "one pack per
+   directory" is the whole point of the encoding and `nocopy` gives it up.
+2. **That read cost is the one cost in this plan that does not thread
+   away.** Every other read row scales 3.6–6.4×; `nocopy`'s cold `ls -la`
+   scales 4.8× and is still 66 ms per directory at 8 threads, 144× `copy`
+   at the same width. Its tier-(b) scaling is the worst measured anywhere
+   (1.88×) because a scan plus 3,000 scattered point reads thrashes the
+   64 MiB cache the scan is supposed to fit in.
+3. **On the aged tree the write saving nearly vanishes.** Aged
+   directory-local `setattr` at 100k ops costs 41 B/op with the copy and
+   40 B/op without it — 3%. After aging, that directory's children have
+   scattered `0x01` records, and it is the scattered inode write that
+   costs, not the second key. §14.4's reading that "§P6's attr copy means
+   each `chmod` writes two keys" is right about the mechanism and wrong
+   about which key is expensive on an aged tree.
+4. **§14.8's aged corpus understated ino scatter by roughly 7×, and the
+   corrected corpus is what makes reading 3 visible.** Its densest tracked
+   directory shrank to 1.7k children after aging; with hot-directory
+   retention and churn it holds **4,241 children spread over 134 distinct
+   1024-ino buckets, against 4,994 over 12 when fresh**. Aged
+   directory-local `setattr` at 100k ops is **15.9× today's log bytes, not
+   §14.8's 2.1×**. Substitute this row for §14.8's; the gate it fails is
+   the same one, by a wider margin.
+5. **The escape hatch is the only shape that writes less without reading
+   worse.** `dentry-auth` holds 24.2M keys instead of 35.8M, 13.6% fewer
+   compressed leaf bytes and 25% less interior, reads a directory in the
+   same 30.4 pack reads as `copy`, and brings aged directory-local
+   `setattr` to **1.01× today's log bytes** where `copy` pays 15.9×. It
+   charges for it on `getattr(ino)`: 1.93 pack reads against 0.95 warm,
+   7.92 against 4.00 cold, and half the throughput. It does not help the
+   scattered case, where it lands between the other two (632× against
+   `copy`'s 756× and `nocopy`'s 506×); nothing measured here fixes
+   scattered.
+
+**Recommendation: keep the attr copy. §P6 stands as written.** The
+no-attr-copy variant buys a 10.9% footprint saving and a write saving
+that is 1.4× on a fresh tree and 3% on an aged one, and pays for it with
+the single read regression in this plan that neither cache nor cores
+absorb.
+
+Two things follow that are not the question S1 asked but are settled by
+its numbers. First, `dentry-auth` should stay on the table rather than
+being written off with `nocopy`: it is the only measured shape that
+reduces writes on every axis while keeping `ls -la` at one pack, and the
+trigger for taking it is `setattr` write cost becoming binding on the
+compactor budget §14.5 sized. It is not free — `link()` would have to
+migrate a record into `0x01` when `nlink` rises above 1, which is product
+complexity this plan has not costed, and `getattr(ino)` doubles. Second,
+and cheaper: most of `dentry-auth`'s advantage here is that it never
+writes the scattered `0x01`, and the same effect is available to `copy`
+by allocating inos near the parent directory. The fresh/aged pair bounds
+the prize — the identical shape costs 2.3× fresh and 15.9× aged, the
+difference being entirely ino locality — so §14.7.6 should name ino
+allocation policy alongside the attr copy, and that experiment should run
+before the encoding is changed.
+
+Caveat on the wall-clock columns: this host was compiling throughout, so
+differences under ~1.3× in the millisecond columns are noise. The byte
+counts and the pack-read counts are deterministic and are not.
+
 ### 14.7 What Step 0 changes
 
-1. **The read gate does not kill the plan, but it does kill the "no
-   database, tiny replica" framing.** §P5 sells the local engine as
-   "interior resident (10 MiB) plus a node cache"; measured, a uniformly
-   random lookup workload needs ~1 GiB of leaf cache to stay above
-   150 k/s. The tree is competitive with SQLite when both are resident
-   (0.72× warm) and the partial-replica property is real, but the plan
-   should stop implying that ~20 MiB of residency buys ADR-9 latency.
+1. **The single-threaded read gate does not kill the plan, and thread
+   scaling rehabilitates the small-cache story.** §P5's "interior + tiny
+   leaf cache" framing was wrong for one core (needs ~1 GiB to clear
+   150 k/s alone) and right for a host-sized mount: **4 threads × 64 MiB
+   clears the bar at 188 k/s, 8 threads at 326 k/s** (§14.9). The tree
+   matches SQLite when both are resident (0.72× warm single-threaded;
+   well above with a handful of cores) and the partial-replica property
+   is real. Stop implying one core + 20 MiB buys ADR-9 latency; do claim
+   that a normal concurrent mount does.
 2. **§7's "existential risk" is not the one that materialized.** Point
    reads are fine (1.3 µs p50 resident). The costs that measured worse
    than the plan predicted are all on the *write and reclamation* side:
    commit bytes per op (1.5–1.7× today's rather than parity), superseded
    bytes per day (21× the estimate), and compaction (rewriting more bytes
-   than the commits write, consuming most of a core).
+   than the commits write; only ~1.8× faster with threads).
 3. **Appendix A's per-commit arithmetic should be restated** with 68–75
    B/op clustered, 9.12 MiB per mixed 10k-op commit, and the node-size
    distribution rather than its mean.
@@ -1172,17 +2028,28 @@ set grows. A one-key diff of a 35.8M-key filesystem costs 20 node reads.
    cost" is not supported** by this workload (0.7%). Either the plan
    drops the claim and budgets a compactor at roughly the commit write
    rate, or it demonstrates the claim under a locality-preserving
-   workload, which this run did not test.
-6. **§P6's dentry attr copy is where scattered write amplification comes
-   from**, and it should be named as such next to the `ls -la` benefit it
-   buys (which the same run confirms: one pack per directory).
+   workload, which this run did not test. Parallel mark helps (~4×);
+   parallel compaction barely does (~1.8×).
+6. **Write amplification comes from the scattered `0x01` write, not from
+   §P6's attr copy** — superseded by §14.10, which measured the
+   alternative that §14.4 and §14.8 only pointed at. The copy costs a
+   second key that is nearly free once a tree has aged (41 B/op with it,
+   40 without), while dropping it costs 396× the pack reads on a cold
+   `ls -la`. So the copy stays, and the lever worth pulling is **ino
+   allocation locality**: the identical shape costs 2.3× today's log
+   bytes fresh and 15.9× aged, and that entire ~7× gap is ino scatter.
+   §S1b is that experiment. Age does not move *create* cost (§14.8), and
+   the `ls -la` benefit is confirmed at one pack per directory (§14.2,
+   §14.10).
 7. **§9's recommendation (B) survives Step 0 intact and is now the
    evidence-backed choice.** The bucket-format half of the bet — canonical
    Merkle map, §P6 key encoding, packs, commit chain — measured well:
    determinism, O(difference) diff, hash-agreeing merges, scale-invariant
-   rename, one-GET directory reads, and a footprint that plateaus. The
-   engine-swap half (option C, Step 6) is exactly what gate 0.1(b)
-   declines to license today.
+   rename, one-GET directory reads, a footprint that plateaus, and
+   thread-scaled reads that clear the bar the single-threaded run missed.
+   The engine-swap half (option C, Step 6) is no longer refused by gate
+   0.1(b) once concurrency is counted; it is still the larger bet, and
+   (B) still sequences it after the format lands.
 
 ## Appendix A — worked numbers at census scale
 

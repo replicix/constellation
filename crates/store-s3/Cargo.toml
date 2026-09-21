@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 constellation-fs-core.workspace = true
+constellation-mtree.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 futures.workspace = true
@@ -19,6 +20,7 @@ aws-credential-types.workspace = true
 aws-types.workspace = true
 async-trait = "0.1"
 rand.workspace = true
+rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

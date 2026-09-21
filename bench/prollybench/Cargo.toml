@@ -1,0 +1,26 @@
+[package]
+name = "prollybench"
+version = "0.1.0"
+edition = "2021"
+description = "Plan 28 Step 0: prolly-tree metadata plane measurements (lookup/scan, commit cost, diff/merge)"
+publish = false
+
+[dependencies]
+# The real log-record type, so 0.2's "bytes per op today" column is the
+# shipped encoding rather than a re-implementation of it.
+constellation-meta = { path = "../../crates/meta" }
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+postcard = { version = "1", features = ["alloc"] }
+rand = { version = "0.9", features = ["small_rng"] }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zstd = "0.13"
+
+[profile.release]
+debug = false
+lto = "thin"
+codegen-units = 1
