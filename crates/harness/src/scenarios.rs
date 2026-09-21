@@ -449,6 +449,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: disjoint_write_4,
     },
     Scenario {
+        name: "mtree-gc-plateau",
+        desc: "plan 28 S7b: rewrite rounds with a metadata commit and a GC round each; the metadata pack footprint must plateau, and a fresh node still bootstraps",
+        requires: &[],
+        run: mtree_gc_plateau,
+    },
+    Scenario {
         name: "ckpt-bulk-ingest-bounded",
         desc: "plan 26: with legacy snapshots forced on, a bulk ingest leaves at most the newest 2 checkpoints, and a fresh node still bootstraps",
         requires: &[],
@@ -5578,6 +5584,103 @@ fn journal_drained(c: &Client) -> Result<()> {
         backlog == 0 && pending == 0,
         "journal_backlog={backlog} pending_uploads={pending}"
     );
+    Ok(())
+}
+
+/// Plan 28 S7b's gate: the steady-state metadata footprint plateaus.
+///
+/// Every round rewrites a third of a fixed file set — the shape that
+/// supersedes leaves without growing the namespace — forces a metadata
+/// commit (a snapshot is a retained root, so taking one publishes; it is
+/// deleted again straight away so it roots nothing), and runs a GC round
+/// with a two-commit retention window. Without GC the `packs/` footprint
+/// grows every round; with it, what the retired commits alone kept alive
+/// is deleted or compacted away, so the late rounds must sit near the
+/// early ones rather than keep climbing. A fresh node then bootstraps
+/// from the surviving commit and must match the oracle, which is the
+/// part that proves GC removed only garbage.
+fn mtree_gc_plateau(seed: u64) -> Result<()> {
+    const FILES: usize = 300;
+    const ROUNDS: usize = 12;
+    let (env, root) = setup("mtree-gc-plateau")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("mtree-gc-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let gc_env = [
+        ("CONSTELLATION_LEASE_TTL_MS", "200"),
+        ("CONSTELLATION_GC_HORIZON_S", "0"),
+        ("CONSTELLATION_COMMIT_RETENTION", "2"),
+        ("CONSTELLATION_COMMIT_RETENTION_S", "0"),
+        ("CONSTELLATION_COMPACT_BYTES_PER_S", "0"),
+    ];
+    let mut a = Client::new(root.path(), "gc-a", &env.endpoint, &backend)?;
+    for (key, value) in gc_env {
+        a = a.with_env(key, value);
+    }
+    a.fs_create()?;
+    a.mount()?;
+
+    let mut model = Model::default();
+    std::fs::create_dir(a.mnt.join("set"))?;
+    model.mkdir(std::path::Path::new("set"));
+    let write = |a: &Client, model: &mut Model, i: usize, salt: u64| -> Result<()> {
+        let rel = format!("set/f{i:04}");
+        let data = pattern(seed.wrapping_add(salt), 256 + (i % 5) * 32);
+        std::fs::write(a.mnt.join(&rel), &data)?;
+        model.write_file(std::path::Path::new(&rel), data);
+        Ok(())
+    };
+    for i in 0..FILES {
+        write(&a, &mut model, i, i as u64)?;
+    }
+
+    let packs_bytes = || -> Result<u64> {
+        Ok(
+            raw_objects(&env.direct_endpoint, &format!("{prefix}/packs/"))?
+                .iter()
+                .map(|(_, size)| *size)
+                .sum(),
+        )
+    };
+    let mut series = Vec::new();
+    for round in 0..ROUNDS {
+        for i in (round % 3..FILES).step_by(3) {
+            write(&a, &mut model, i, (round * FILES + i) as u64 + 1_000_000)?;
+        }
+        eventually("round ships", Duration::from_secs(60), || {
+            journal_drained(&a)
+        })?;
+        let name = format!("/set@round{round}");
+        a.snapshot_create(&name)?;
+        a.snapshot_delete(&name)?;
+        let output = a.gc_run(false)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "gc round {round} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        series.push(packs_bytes()?);
+    }
+    eprintln!("    mtree-gc-plateau: packs/ bytes per round {series:?}");
+    let early = *series[2..6].iter().max().unwrap_or(&0);
+    let late = *series[ROUNDS - 4..].iter().max().unwrap_or(&0);
+    anyhow::ensure!(early > 0, "no metadata packs were written: {series:?}");
+    anyhow::ensure!(
+        late <= early + early / 2,
+        "the metadata footprint kept growing across GC rounds: {series:?}"
+    );
+    model.verify(&a.mnt)?;
+    a.unmount()?;
+
+    let mut b = Client::new(root.path(), "gc-b", &env.endpoint, &backend)?;
+    b.mount().context("fresh bootstrap after metadata GC")?;
+    eventually(
+        "fresh node matches the oracle",
+        Duration::from_secs(60),
+        || model.verify(&b.mnt),
+    )?;
+    b.unmount()?;
     Ok(())
 }
 

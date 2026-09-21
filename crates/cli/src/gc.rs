@@ -66,6 +66,10 @@ pub struct GcReport {
     pub candidates: Vec<Mark>,
     pub deleted: Vec<String>,
     pub condemned_epoch: Option<u64>,
+    /// Plan 28 S7b: the metadata tree's round (commit retention, pack
+    /// sweep and compaction). `None` when the phase did not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<crate::mtree_gc::MtreeGcReport>,
 }
 
 pub async fn run(
@@ -95,6 +99,35 @@ pub async fn run(
 }
 
 async fn run_held(
+    store: Arc<dyn ObjectStore>,
+    chunks: Arc<constellation_store_s3::ChunkStore>,
+    meta: Arc<SqliteMeta>,
+    config: &GcConfig,
+    orphans: bool,
+    verify_only: bool,
+    peers: Option<&constellation_net::Peers>,
+) -> Result<GcReport> {
+    // Chunks first: their snapshot roots are read from the metadata tree,
+    // which the second phase compacts.
+    let mut report = run_chunks(
+        store.clone(),
+        chunks.clone(),
+        meta.clone(),
+        config,
+        orphans,
+        verify_only,
+        peers,
+    )
+    .await?;
+    let tree_config =
+        crate::mtree_gc::MtreeGcConfig::from_env(config.horizon_ms, config.lease_ttl_ms);
+    report.metadata = Some(
+        crate::mtree_gc::run(store, chunks.e2e_keys(), &meta, &tree_config, verify_only).await?,
+    );
+    Ok(report)
+}
+
+async fn run_chunks(
     store: Arc<dyn ObjectStore>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
     meta: Arc<SqliteMeta>,
@@ -167,6 +200,7 @@ async fn run_held(
             candidates,
             deleted: Vec::new(),
             condemned_epoch: None,
+            metadata: None,
         });
     }
 
@@ -224,6 +258,7 @@ async fn run_held(
         candidates,
         deleted,
         condemned_epoch: Some(condemned.epoch),
+        metadata: None,
     })
 }
 

@@ -36,7 +36,8 @@ pub use designation::{Designation, DesignationMode, DesignationStore, Designatio
 pub use e2e::{create_keyring_block, unlock, Argon2Params, E2eKeys, KeyringBlock, SharedE2eKeys};
 pub use error::StoreError;
 pub use gc::{
-    append_journal, is_condemned, publish_condemned, read_condemned, CondemnedList, GcJournalEntry,
+    append_journal, is_condemned, publish_condemned, publish_condemned_packs, read_condemned,
+    read_condemned_packs, CondemnedList, GcJournalEntry,
 };
 pub use lease::{live_leases_held_by, Lease, LeaseMode, LeaseStore, LeaseTag};
 pub use log::{CheckpointVector, LogStore};

@@ -87,6 +87,51 @@ pub async fn publish_condemned(
     }
 }
 
+/// Plan 28 S7b: the metadata packs a GC round intends to delete or
+/// rewrite, as hex pack hashes (`hashes`). Same handshake as chunks: the
+/// list is published before the grace wait, and a tree publisher never
+/// deduplicates a node against a pack on it (and re-checks right before
+/// its commit CAS). Written only by the `_gc` singleton-lease holder.
+pub async fn read_condemned_packs(
+    store: &Arc<dyn ObjectStore>,
+) -> Result<std::collections::HashSet<crate::packs::PackHash>, StoreError> {
+    match store.get(&layout::gc_condemned_packs()).await {
+        Ok(result) => {
+            let list: CondemnedList = serde_json::from_slice(&result.bytes().await?)?;
+            Ok(list
+                .hashes
+                .iter()
+                .filter_map(|hex| crate::packs::PackHash::from_hex(hex))
+                .collect())
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(Default::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Replace the condemned-pack list (an empty set clears it).
+pub async fn publish_condemned_packs(
+    store: &Arc<dyn ObjectStore>,
+    packs: &std::collections::HashSet<crate::packs::PackHash>,
+    epoch: u64,
+    published_ms: i64,
+) -> Result<(), StoreError> {
+    let mut hashes: Vec<String> = packs.iter().map(|pack| pack.to_hex()).collect();
+    hashes.sort();
+    let list = CondemnedList {
+        epoch,
+        hashes,
+        published_ms,
+    };
+    store
+        .put(
+            &layout::gc_condemned_packs(),
+            PutPayload::from(serde_json::to_vec(&list)?),
+        )
+        .await?;
+    Ok(())
+}
+
 pub async fn append_journal(
     store: &Arc<dyn ObjectStore>,
     entry: &GcJournalEntry,

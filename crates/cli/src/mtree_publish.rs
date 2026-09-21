@@ -106,6 +106,10 @@ const REBUILD_PAGE: usize = 4096;
 /// of retries will not fix.
 const PUBLISH_ATTEMPTS: usize = 4;
 
+/// Publish attempts [`TreePublisher::publish_now`] makes before it
+/// reports a deferral.
+const PUBLISH_NOW_ATTEMPTS: usize = 3;
+
 /// Where the published tree's identity is remembered across restarts.
 const KV_ROOT: &str = "mtree/root";
 const KV_SEQ: &str = "mtree/commit_seq";
@@ -564,11 +568,20 @@ impl TreePublisher {
     /// error, because a caller asking for "now" (a snapshot) must not be
     /// handed an older state.
     pub async fn publish_now(&mut self, epoch: u64) -> Result<(u64, NodeHash)> {
-        if let Some(commit) = self.publish(epoch).await? {
-            let root = commit
-                .root(SHARD0)
-                .with_context(|| format!("commit {} names no shard 0 root", commit.seq))?;
-            return Ok((commit.seq, root));
+        // A deferral that the next attempt resolves by itself — most
+        // often a pack GC condemned after this batch deduplicated against
+        // it, which the retry re-uploads — is retried here rather than
+        // surfaced, because the caller is waiting.
+        for _ in 0..PUBLISH_NOW_ATTEMPTS {
+            if let Some(commit) = self.publish(epoch).await? {
+                let root = commit
+                    .root(SHARD0)
+                    .with_context(|| format!("commit {} names no shard 0 root", commit.seq))?;
+                return Ok((commit.seq, root));
+            }
+            if self.pending.is_empty() {
+                break;
+            }
         }
         if !self.pending.is_empty() {
             anyhow::bail!(
@@ -592,6 +605,13 @@ impl TreePublisher {
         // the genuinely concurrent case.
         self.hydrate().await?;
         let parent = self.adopt_head().await?;
+        // GC handshake (S7b): never deduplicate a node against a pack a
+        // GC round has condemned, and remember which packs this batch
+        // did deduplicate against, to re-check just before the CAS.
+        let backend = self.cache.packs().inner();
+        self.cache
+            .set_condemned(constellation_store_s3::read_condemned_packs(&backend).await?);
+        self.cache.start_dedup_log();
         let base = self.state.as_ref().map(|s| s.root);
         let head_applied = self.state.as_ref().map(|s| s.applied.clone());
 
@@ -672,6 +692,21 @@ impl TreePublisher {
         // blob, and packs are sealed below.
         self.blobs.put_all(plan.blobs.clone()).await?;
         let packs = self.cache.seal_packs().await?;
+
+        // The other half of the GC handshake: a pack this batch trusted
+        // as holding an unchanged node must still exist and must not
+        // have been condemned since planning. Otherwise its locations
+        // are forgotten and the batch is re-planned next round, which
+        // uploads those nodes afresh. GC waits a lease TTL between
+        // condemning and deleting, which covers the gap from here to
+        // the CAS.
+        let condemned = constellation_store_s3::read_condemned_packs(&backend).await?;
+        if !self.cache.dedup_is_sound(&condemned).await? {
+            tracing::info!(
+                "metadata publish deferred: a pack it deduplicated against is condemned by GC"
+            );
+            return Ok(Outcome::Deferred);
+        }
 
         let tree = self.tree()?;
         let agg = tree.aggregate(&root).map_err(StoreError::from)?;

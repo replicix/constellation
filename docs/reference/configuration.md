@@ -281,12 +281,17 @@ hinted), never "proven absent".
 | `CONSTELLATION_GC_INTERVAL_S` | `86400` | seconds | background GC tick interval |
 | `CONSTELLATION_GC_HORIZON_S` | `604800` | seconds | age before unreferenced chunks are eligible (`0` for tests) |
 | `CONSTELLATION_LOG_RETENTION_SEGMENTS` | `128` | segments | sealed log segments kept before GC, **per partition** |
+| `CONSTELLATION_COMMIT_RETENTION` | `64` | commits, at least 1 | newest plan 28 metadata commits always kept by GC |
+| `CONSTELLATION_COMMIT_RETENTION_S` | `86400` | seconds | commits younger than this are kept however many there are; a commit is deleted only when it is outside the newest `CONSTELLATION_COMMIT_RETENTION` *and* older than this |
+| `CONSTELLATION_COMPACT_BYTES_PER_S` | `33554432` (32 MiB/s) | bytes per second; `0` unpaced | read budget for metadata pack deletion and compaction in a GC round |
+| `CONSTELLATION_GC_THREADS` | one per core | threads, positive | width of the metadata mark and pack rewrite pools |
 
 Log retention is evaluated per partition against the position a fresh
 replica resumes from: the head plan 28 commit's `applied` vector once a
 commit exists, otherwise `checkpoints/VECTOR.json`, which records how far
 the newest checkpoint has replayed each partition. (A bootstrap from a
-base the log was pruned past refuses instead of replaying from the gap.) A segment is prunable only when its own
+base the log was pruned past refuses instead of replaying from the gap.)
+A segment is prunable only when its own
 partition's entry in that vector is more than
 `CONSTELLATION_LOG_RETENTION_SEGMENTS` ahead of it, and a partition the
 vector does not mention yet is never pruned at all. (Flooring every
@@ -294,6 +299,15 @@ partition against one cluster-wide sequence would delete a young child
 partition's whole log the moment a busy `p0` ran far ahead of it.) A
 `LATEST` checkpoint with no vector beside it is a corrupt bucket and
 fails the run rather than falling back to a global floor.
+
+Metadata GC (plan 28 S7b) runs as a second phase of every GC round:
+commit retention by the two knobs above, a reachability mark from the
+retained commits, every snapshot root and live holds, then deletion of
+dead packs and compaction of partially dead ones under
+`CONSTELLATION_COMPACT_BYTES_PER_S`. Packs to be removed are published in
+`gc/condemned-packs.json` and the round waits one lease TTL and re-marks
+before touching them; writers never deduplicate against a condemned pack.
+Spilled values under `blobs/` are not swept yet.
 
 ### Retention pruning
 

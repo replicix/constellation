@@ -120,6 +120,11 @@ pub fn gc_condemned() -> Path {
     Path::from("gc/condemned.json")
 }
 
+/// Plan 28 S7b: metadata packs a GC round is about to delete or rewrite.
+pub fn gc_condemned_packs() -> Path {
+    Path::from("gc/condemned-packs.json")
+}
+
 pub fn gc_journal(ts: i64, nonce: &str) -> Path {
     Path::from(format!("gc/journal/{ts:016x}-{nonce}.json"))
 }

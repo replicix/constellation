@@ -359,8 +359,10 @@ impl Compactor {
         }
         let bytes: u64 = batch.iter().map(|v| v.body_bytes).sum();
         self.pace(bytes).await;
-        self.delete_packs(batch.iter().map(|v| v.pack), &mut outcome)
-            .await;
+        // Collected first, for the same `Send`-generality reason as the
+        // reads in `compact`: the iterator lives across the deletes.
+        let dead: Vec<PackHash> = batch.iter().map(|v| v.pack).collect();
+        self.delete_packs(dead.into_iter(), &mut outcome).await;
         Ok(outcome)
     }
 
@@ -400,9 +402,13 @@ impl Compactor {
         // that helper.
         let mut bodies: HashMap<PackHash, bytes::Bytes> = HashMap::with_capacity(batch.len());
         let store = self.packs.inner();
-        let mut reads = futures::stream::iter(batch.iter().map(|verdict| {
+        // Pack hashes are copied out before the async blocks are built:
+        // an async block that borrows the iterator item makes this future
+        // non-general over the item's lifetime, which costs it `Send` at
+        // any caller that spawns it (the daemon's GC tick does).
+        let hashes: Vec<PackHash> = batch.iter().map(|verdict| verdict.pack).collect();
+        let mut reads = futures::stream::iter(hashes.into_iter().map(|hash| {
             let store = store.clone();
-            let hash = verdict.pack;
             async move {
                 let key = layout::pack(&hash.to_hex());
                 let body = async { store.get(&key).await?.bytes().await };
@@ -427,9 +433,10 @@ impl Compactor {
         // Durability first, and *all* of it: one failed PUT aborts the
         // batch with nothing deleted, because a partial replacement set
         // cannot safely retire any original.
-        let mut writes = futures::stream::iter(built.iter().map(|pack| {
+        let mut writes = futures::stream::iter((0..built.len()).map(|i| {
             let packs = self.packs.clone();
-            async move { packs.put_pack(pack).await }
+            let built = &built;
+            async move { packs.put_pack(&built[i]).await }
         }))
         .buffer_unordered(self.request_concurrency);
         while let Some(written) = writes.next().await {

@@ -173,6 +173,13 @@ pub struct NodeCache {
     refresh_generation: AtomicU64,
     refresh: Mutex<()>,
     pending: Mutex<Vec<PackNode>>,
+    /// Packs a GC round has condemned (plan 28 S7b). `put` never treats a
+    /// node located in one as already durable: the pack may be deleted
+    /// before the commit that would name the node lands.
+    condemned: RwLock<HashSet<PackHash>>,
+    /// Packs `put` deduplicated against since [`NodeCache::start_dedup_log`]
+    /// — what a publisher re-checks just before its commit CAS.
+    deduped: Mutex<HashSet<PackHash>>,
     counters: Counters,
 }
 
@@ -212,6 +219,8 @@ impl NodeCache {
             refresh_generation: AtomicU64::new(0),
             refresh: Mutex::new(()),
             pending: Mutex::new(Vec::new()),
+            condemned: RwLock::new(HashSet::new()),
+            deduped: Mutex::new(HashSet::new()),
             counters: Counters::default(),
         }
     }
@@ -354,6 +363,59 @@ impl NodeCache {
         let refreshed = self.block_on(self.refresh_catalog()).is_ok();
         self.refresh_generation.fetch_add(1, Ordering::Release);
         refreshed
+    }
+
+    // ------------------------------------------------ GC handshake (S7b)
+
+    /// Install the current condemned-pack list.
+    pub fn set_condemned(&self, packs: HashSet<PackHash>) {
+        *self.condemned.write().expect("condemned packs") = packs;
+    }
+
+    /// Begin recording which packs `put` deduplicates against.
+    pub fn start_dedup_log(&self) {
+        self.deduped.lock().expect("dedup log").clear();
+    }
+
+    /// Packs `put` has deduplicated against since the log started.
+    pub fn deduped_packs(&self) -> Vec<PackHash> {
+        self.deduped
+            .lock()
+            .expect("dedup log")
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Drop every location in `packs`: they are condemned or gone, so a
+    /// later `put` of one of their nodes must upload it again rather
+    /// than trust a copy that will not (or does not) exist.
+    pub fn forget_packs(&self, packs: &HashSet<PackHash>) {
+        self.locations
+            .write()
+            .expect("locations")
+            .retain(|_, location| !packs.contains(&location.pack));
+        self.attached
+            .write()
+            .expect("attached packs")
+            .retain(|pack| !packs.contains(pack));
+    }
+
+    /// Whether every pack deduplicated against since the log started is
+    /// still safe to name: present on the bucket and not condemned. Any
+    /// that is not is forgotten, so the caller's retry re-uploads.
+    pub async fn dedup_is_sound(&self, condemned: &HashSet<PackHash>) -> Result<bool, StoreError> {
+        let mut bad = HashSet::new();
+        for pack in self.deduped_packs() {
+            if condemned.contains(&pack) || !self.packs.contains(&pack).await? {
+                bad.insert(pack);
+            }
+        }
+        if bad.is_empty() {
+            return Ok(true);
+        }
+        self.forget_packs(&bad);
+        Ok(false)
     }
 
     pub fn location_of(&self, hash: &NodeHash) -> Option<NodeLocation> {
@@ -519,8 +581,21 @@ impl NodeCache {
     }
 
     fn put_node(&self, hash: NodeHash, level: u8, bytes: Vec<u8>) -> Result<(), MtreeError> {
-        if self.location_of(&hash).is_some() {
-            return Ok(()); // already durable; nodes are immutable
+        if let Some(location) = self.location_of(&hash) {
+            // Already durable; nodes are immutable — unless a GC round
+            // is about to delete the pack that holds it.
+            if !self
+                .condemned
+                .read()
+                .expect("condemned packs")
+                .contains(&location.pack)
+            {
+                self.deduped
+                    .lock()
+                    .expect("dedup log")
+                    .insert(location.pack);
+                return Ok(());
+            }
         }
         let node = PackNode::from_bytes(hash, bytes)?;
         debug_assert_eq!(
