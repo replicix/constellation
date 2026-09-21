@@ -1991,6 +1991,107 @@ mod tests {
         assert!(publisher.pending().is_empty());
     }
 
+    /// Plan 28 §13's measurement: `getattr` latency on a file-backed
+    /// replica while a full-rebuild publish runs, against the same loop
+    /// with nothing publishing. The publish reads through the per-thread
+    /// WAL reader connections and builds on a blocking thread, so FUSE's
+    /// point reads should not queue behind it the way they did behind
+    /// `VACUUM INTO`. Ignored: it is a measurement, run by hand with
+    /// `cargo test --release -p constellation getattr_latency -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn getattr_latency_during_a_publish() {
+        let dir = TempDir::new().unwrap();
+        let mut fx = Fixture::new();
+        fx.meta = Arc::new(SqliteMeta::open(dir.path().join("m.db")).unwrap());
+        let files: u64 = std::env::var("GETATTR_BENCH_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let d = fx.meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
+        let mut inos = Vec::new();
+        for i in 0..files {
+            let ino = fx
+                .meta
+                .create(d, &format!("f{i}"), 0o644, 0, 0)
+                .unwrap()
+                .ino;
+            fx.meta.set_manifest(ino, &[7u8; 64], 4096).unwrap();
+            inos.push(ino);
+        }
+        fx.records();
+
+        let sample =
+            |meta: Arc<SqliteMeta>, inos: Vec<u64>, stop: Arc<std::sync::atomic::AtomicBool>| {
+                std::thread::spawn(move || {
+                    let mut samples = Vec::new();
+                    let mut i = 0usize;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let t = std::time::Instant::now();
+                        meta.getattr(inos[(i * 7919) % inos.len()]).unwrap();
+                        samples.push(t.elapsed());
+                        i += 1;
+                    }
+                    samples.sort();
+                    samples
+                })
+            };
+        let pct = |s: &[std::time::Duration], p: f64| s[((s.len() as f64 - 1.0) * p) as usize];
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let idle = sample(Arc::clone(&fx.meta), inos.clone(), Arc::clone(&stop));
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let idle = idle.join().unwrap();
+
+        let mut publisher = fx.publisher(1);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy = sample(Arc::clone(&fx.meta), inos.clone(), Arc::clone(&stop));
+        let started = std::time::Instant::now();
+        let commit = publisher.publish(1).await.unwrap().unwrap();
+        let publish_ms = started.elapsed().as_millis();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let busy = busy.join().unwrap();
+
+        eprintln!(
+            "getattr over {files} files: idle p50 {:?} p99 {:?} max {:?} ({} samples); \
+             during a {publish_ms} ms full publish ({} keys) p50 {:?} p99 {:?} max {:?} ({} samples)",
+            pct(&idle, 0.5),
+            pct(&idle, 0.99),
+            idle.last().unwrap(),
+            idle.len(),
+            commit.intent.ops,
+            pct(&busy, 0.5),
+            pct(&busy, 0.99),
+            busy.last().unwrap(),
+            busy.len(),
+        );
+
+        // And the other direction: a fresh replica loaded from that
+        // commit (S6's bootstrap, minus log tailing), from a cold cache.
+        let scratch = TempDir::new().unwrap();
+        let reader =
+            crate::mtree_read::ChainReader::for_store(Arc::clone(&fx.store), None, scratch.path())
+                .unwrap();
+        let fresh = Arc::new(SqliteMeta::open(dir.path().join("fresh.db")).unwrap());
+        let started = std::time::Instant::now();
+        let loaded = crate::mtree_read::bootstrap_from_commit(&reader, Arc::clone(&fresh))
+            .await
+            .unwrap()
+            .unwrap();
+        eprintln!(
+            "bootstrap from commit {}: {} inodes, {} dentries in {} ms (in-memory store, cold node cache)",
+            loaded.commit.seq,
+            loaded.inodes,
+            loaded.dentries,
+            started.elapsed().as_millis()
+        );
+        assert_eq!(
+            fresh.dump_replicated().unwrap().len(),
+            fx.meta.dump_replicated().unwrap().len()
+        );
+    }
+
     /// A value over `VALUE_SPILL` leaves the node and becomes a blob
     /// reference, and the blob is on the bucket before the commit that
     /// names it.
