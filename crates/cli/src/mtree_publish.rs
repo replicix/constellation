@@ -382,6 +382,16 @@ struct Published {
 /// Partition id → highest applied log segment.
 type Vector = BTreeMap<String, u64>;
 
+/// How one publish attempt ended.
+enum Outcome {
+    Committed(Box<Commit>),
+    /// The tree already reflects the batch; nothing to commit.
+    Unchanged,
+    /// Not now: behind the head, a parked rename, or a declined splice.
+    /// The pending set is kept for the next round.
+    Deferred,
+}
+
 /// What the blocking half of a publish decided.
 enum Planned {
     /// A plan, the root it produces, and the vector it was read at.
@@ -507,14 +517,33 @@ impl TreePublisher {
     /// to do or when the publish deferred to let the tailer catch up.
     /// The pending set is cleared only on success, so a failure costs a
     /// round rather than a key.
+    ///
+    /// **Cancellation-safe**, and it has to be: the daemon's sync loop
+    /// drops a running round (and with it this future) whenever an
+    /// explicit request arrives. The pending set is therefore only
+    /// *read* while the publish is in flight and cleared once it has
+    /// landed; `&mut self` guarantees nothing is noted in between. An
+    /// earlier version took the set up front, and a cancelled round
+    /// silently dropped its keys from the tree for good (found by
+    /// `snapshot-churn`: a clone never reached any commit).
     pub async fn publish(&mut self, epoch: u64) -> Result<Option<Commit>> {
         if self.pending.is_empty() {
             return Ok(None);
         }
         let started = std::time::Instant::now();
-        let batch = std::mem::take(&mut self.pending);
+        let batch = self.pending.clone();
         match self.publish_batch(&batch, epoch).await {
-            Ok(Some(commit)) => {
+            Ok(Outcome::Unchanged) => {
+                // The tree already says what the replica says (e.g. a
+                // cancelled round's commit landed and was adopted).
+                self.pending = Touched::default();
+                Ok(None)
+            }
+            Ok(Outcome::Deferred) => Ok(None),
+            Err(e) => Err(e),
+            Ok(Outcome::Committed(commit)) => {
+                let commit = *commit;
+                self.pending = Touched::default();
                 tracing::info!(
                     seq = commit.seq,
                     root = %commit.roots.get(SHARD0).map(String::as_str).unwrap_or(""),
@@ -526,19 +555,35 @@ impl TreePublisher {
                 );
                 Ok(Some(commit))
             }
-            Ok(None) => {
-                // Deferred, not done: put the work back.
-                self.pending.merge(batch);
-                Ok(None)
-            }
-            Err(e) => {
-                self.pending.merge(batch);
-                Err(e)
-            }
         }
     }
 
-    async fn publish_batch(&mut self, batch: &Touched, epoch: u64) -> Result<Option<Commit>> {
+    /// Publish whatever is pending and return the commit that now
+    /// reflects this replica: the new one, or — when nothing was pending
+    /// — the last one, which already does. A deferred publish is an
+    /// error, because a caller asking for "now" (a snapshot) must not be
+    /// handed an older state.
+    pub async fn publish_now(&mut self, epoch: u64) -> Result<(u64, NodeHash)> {
+        if let Some(commit) = self.publish(epoch).await? {
+            let root = commit
+                .root(SHARD0)
+                .with_context(|| format!("commit {} names no shard 0 root", commit.seq))?;
+            return Ok((commit.seq, root));
+        }
+        if !self.pending.is_empty() {
+            anyhow::bail!(
+                "the metadata publish was deferred (this replica is behind the chain head, \
+                 or a cross-partition rename is half applied); retry shortly"
+            );
+        }
+        let state = self
+            .state
+            .as_ref()
+            .context("nothing has been published on this mount yet")?;
+        Ok((state.seq, state.root))
+    }
+
+    async fn publish_batch(&mut self, batch: &Touched, epoch: u64) -> Result<Outcome> {
         // Adopt whatever the chain's head is before planning. A commit
         // from another writer is the normal reason our parent moved,
         // and its records have already reached this replica through the
@@ -600,19 +645,25 @@ impl TreePublisher {
                     head = encode_vector(&head),
                     "metadata publish deferred: this replica is behind the chain head"
                 );
-                return Ok(None);
+                return Ok(Outcome::Deferred);
             }
             Planned::Parked(halves) => {
                 tracing::debug!(
                     halves,
                     "metadata publish deferred: a cross-partition rename is half applied"
                 );
-                return Ok(None);
+                return Ok(Outcome::Deferred);
             }
         };
 
         if plan.is_empty() && Some(root) == base {
-            return Ok(None);
+            // The published root already reflects the replica at
+            // `vector`; say so locally, so a restart need not rebuild.
+            if let Some(state) = self.state.as_mut() {
+                state.applied = vector;
+            }
+            self.remember()?;
+            return Ok(Outcome::Unchanged);
         }
 
         // Ordering invariant (§P2/S4), extended to blobs: every byte
@@ -677,7 +728,7 @@ impl TreePublisher {
                     applied: vector,
                 });
                 self.remember()?;
-                Ok(Some(commit))
+                Ok(Outcome::Committed(Box::new(commit)))
             }
             // A refused splice is not a failure of this publish so much
             // as a statement that the batch has to be re-executed
@@ -692,7 +743,7 @@ impl TreePublisher {
                     reason = declined.unwrap_or_default(),
                     "metadata publish deferred: the winning commit overlaps this batch"
                 );
-                Ok(None)
+                Ok(Outcome::Deferred)
             }
             Err(e) => Err(e.into()),
         }
@@ -820,14 +871,6 @@ impl TreePublisher {
 }
 
 impl Touched {
-    /// Fold a batch that did not land back into the pending set.
-    fn merge(&mut self, other: Touched) {
-        self.full |= other.full;
-        self.subsystems |= other.subsystems;
-        self.inodes.extend(other.inodes);
-        self.dentries.extend(other.dentries);
-    }
-
     fn from_inodes(inodes: impl IntoIterator<Item = Ino>) -> Touched {
         Touched {
             inodes: inodes.into_iter().collect(),
@@ -1795,6 +1838,122 @@ mod tests {
         assert_eq!(won.applied.get("p0"), Some(&10));
         assert!(landed.is_none(), "an ahead winner must not be spliced onto");
         assert!(!loser.pending().is_empty());
+    }
+
+    /// An object store whose writes stall, so a publish can be caught
+    /// in flight.
+    #[derive(Debug)]
+    struct SlowStore {
+        inner: Arc<dyn ObjectStore>,
+        stall: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for SlowStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SlowStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for SlowStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.stall.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The daemon's sync loop drops a running round whenever an explicit
+    /// request arrives, so a publish must survive being cancelled at any
+    /// await point: its batch stays pending and the next publish carries
+    /// it. (Found by `snapshot-churn`, where a clone never reached any
+    /// commit because a cancelled round had already taken its keys.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_publish_keeps_its_batch() {
+        let mut fx = Fixture::new();
+        let dir = seed(&fx.meta, 3);
+        let slow = Arc::new(SlowStore {
+            inner: Arc::clone(&fx.store),
+            stall: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut publisher = fx.publisher_on(Arc::clone(&slow) as Arc<dyn ObjectStore>, 1);
+        publish(&mut publisher, &fx.records()).await.unwrap();
+
+        let late = fx.meta.create(dir, "late", 0o644, 0, 0).unwrap().ino;
+        publisher.note(&fx.records());
+        slow.stall.store(true, std::sync::atomic::Ordering::Relaxed);
+        let cancelled =
+            tokio::time::timeout(std::time::Duration::from_millis(200), publisher.publish(7)).await;
+        assert!(cancelled.is_err(), "the stalled publish must be cut off");
+        assert!(
+            !publisher.pending().is_empty(),
+            "the cancelled batch was dropped"
+        );
+
+        slow.stall
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let landed = publisher
+            .publish(7)
+            .await
+            .unwrap()
+            .expect("the batch lands");
+        let (tree, _) = fx.reader().await;
+        assert!(tree
+            .get(&landed.root(SHARD0).unwrap(), &keys::inode(late))
+            .unwrap()
+            .is_some());
+        assert!(publisher.pending().is_empty());
     }
 
     /// A value over `VALUE_SPILL` leaves the node and becomes a blob

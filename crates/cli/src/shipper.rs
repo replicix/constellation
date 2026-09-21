@@ -567,6 +567,18 @@ impl Shipper {
         }
     }
 
+    /// Publish now and return the commit that reflects this replica —
+    /// what a snapshot retains. Callers ship the journal first (the
+    /// publisher only sees shipped and tailed records).
+    pub async fn publish_now(&mut self) -> Result<(u64, constellation_mtree::NodeHash)> {
+        let epoch = self.last_ship_epoch;
+        let publisher = self
+            .publisher
+            .as_mut()
+            .context("this mount has no metadata tree publisher")?;
+        publisher.publish_now(epoch).await
+    }
+
     #[cfg(test)]
     pub fn tree_publisher(&self) -> Option<&crate::mtree_publish::TreePublisher> {
         self.publisher.as_ref()

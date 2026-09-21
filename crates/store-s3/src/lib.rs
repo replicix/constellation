@@ -51,5 +51,5 @@ pub use packs::{
     PackStore,
 };
 pub use parallel::{effective_threads, gc_threads};
-pub use snapshot::{snapshot_id, SnapshotRecord, SnapshotStore};
+pub use snapshot::{snapshot_id, SnapshotRecord, SnapshotStore, SnapshotTreeRoot};
 pub use store::{Capabilities, ChunkPutMode, ChunkPutResult, ChunkStore, FsMeta, PreflightCheck};

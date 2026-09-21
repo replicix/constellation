@@ -412,6 +412,24 @@ impl<S: NodeStore> TreeReader<S> {
         Ok(out)
     }
 
+    /// One inode as its replica row, spilled values resolved. `None`
+    /// when the tree has no record for it.
+    pub fn inode_row(&self, ino: Ino, resolver: &Resolver<'_>) -> Result<Option<TreeInode>> {
+        let Some(value) = self.tree.get(&self.root, &keys::inode(ino))? else {
+            return Ok(None);
+        };
+        // An inline set means nothing spilled; otherwise read the range
+        // (empty when the inode simply has no xattrs).
+        let spilled = if InodeRecord::decode(&value)?.xattrs.is_empty() {
+            let range = keys::xattrs_of(ino);
+            self.tree
+                .range(&self.root, range.start(), range.prefix(), usize::MAX)?
+        } else {
+            Vec::new()
+        };
+        Ok(Some(resolver.inode(ino, &value, &spilled)?))
+    }
+
     /// Load every interior node and no leaf: the partial replica's
     /// resident set. Returns (interior nodes, the level-1 nodes' leaf
     /// children), the second being what a full replica would add.
@@ -560,9 +578,17 @@ impl ChainReader {
     /// writers do (keyed under the addressing key on an E2E
     /// filesystem, §P13), with its node cache in `cache_dir`.
     pub fn for_log(log: &LogStore, cache_dir: &std::path::Path) -> Result<ChainReader> {
+        Self::for_store(log.inner(), log.e2e_keys(), cache_dir)
+    }
+
+    /// [`Self::for_log`] from a bare backend and the filesystem's keyring.
+    pub fn for_store(
+        backend: Arc<dyn object_store::ObjectStore>,
+        keys: Option<&constellation_store_s3::SharedE2eKeys>,
+        cache_dir: &std::path::Path,
+    ) -> Result<ChainReader> {
         use constellation_fs_core::cache::DiskCache;
-        let backend = log.inner();
-        let (hasher, disk) = match log.e2e_keys() {
+        let (hasher, disk) = match keys {
             Some(keys) => (
                 constellation_mtree::Hasher::Keyed(*keys.addressing_key()),
                 DiskCache::open_keyed(cache_dir, NODE_SCRATCH_BYTES, *keys.addressing_key())?,

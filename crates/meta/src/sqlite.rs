@@ -560,11 +560,6 @@ impl SqliteMeta {
         Ok(())
     }
 
-    fn parse_hash_hex(value: &str) -> Result<ChunkHash, MetaError> {
-        ChunkHash::from_hex(value)
-            .ok_or_else(|| MetaError::Invalid(format!("invalid chunk hash {value:?}")))
-    }
-
     /// Open (or create) a metadata DB. Creates the root inode on first use.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MetaError> {
         let path = path.as_ref().to_path_buf();
@@ -1116,10 +1111,9 @@ impl SqliteMeta {
                 row.created_unix_ms
             ],
         )?;
-        tx.execute(
-            "DELETE FROM deref WHERE chunk_hash = ?1",
-            params![Self::parse_hash_hex(&row.root_hash)?.0.to_vec()],
-        )?;
+        // A snapshot root lives in the metadata tree (plan 28), which
+        // chunk GC reaches by walking it; it is not a chunk and never
+        // enters the `deref` candidate set.
         Self::journal(
             &tx,
             &LogRecord::SnapCreate {
@@ -1137,14 +1131,14 @@ impl SqliteMeta {
     pub fn delete_snapshot(&self, path: &str, name: &str) -> Result<bool, MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let row: Option<(String, String)> = tx
+        let id: Option<String> = tx
             .query_row(
-                "SELECT id, root_hash FROM snapshot WHERE path = ?1 AND name = ?2",
+                "SELECT id FROM snapshot WHERE path = ?1 AND name = ?2",
                 params![path, name],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .optional()?;
-        let Some((id, root_hash)) = row else {
+        let Some(id) = id else {
             return Ok(false);
         };
         tx.execute("DELETE FROM snapshot WHERE id = ?1", params![id])?;
@@ -1155,15 +1149,6 @@ impl SqliteMeta {
                 path: path.to_string(),
                 name: name.to_string(),
             },
-        )?;
-        tx.execute(
-            "INSERT OR REPLACE INTO deref (chunk_hash, deref_seq, deref_unix_ms)
-             VALUES (?1, ?2, ?3)",
-            params![
-                Self::parse_hash_hex(&root_hash)?.0.to_vec(),
-                Self::next_deref_seq(&tx)?,
-                now_unix_ms()
-            ],
         )?;
         tx.commit()?;
         Ok(true)
@@ -4465,24 +4450,25 @@ mod tests {
         );
     }
 
+    /// Plan 28: a snapshot root is a directory in the metadata tree, not
+    /// a chunk, so creating and deleting one never touches the chunk
+    /// GC's `deref` candidate set (GC protects a snapshot's chunks by
+    /// walking its tree instead).
     #[test]
-    fn deref_tracks_snapshot_delete() {
+    fn snapshot_roots_never_enter_deref() {
         let meta = store();
-        let hash = ChunkHash::of(b"snapshot-root");
         let row = SnapshotRow {
             id: "snap".into(),
             path: "/".into(),
             name: "before".into(),
-            root_hash: hash.to_hex(),
+            root_hash: format!("mtree:3:{}:1", "ab".repeat(32)),
             created_unix_ms: 1,
         };
         meta.record_snapshot(&row).unwrap();
-        meta.delete_snapshot("/", "before").unwrap();
-        assert!(meta
-            .deref_candidates(i64::MAX)
-            .unwrap()
-            .iter()
-            .any(|(candidate, _, _)| *candidate == hash));
+        assert_eq!(meta.snapshots(None).unwrap(), vec![row]);
+        assert!(meta.delete_snapshot("/", "before").unwrap());
+        assert!(meta.snapshots(None).unwrap().is_empty());
+        assert!(meta.deref_candidates(i64::MAX).unwrap().is_empty());
     }
 
     #[test]

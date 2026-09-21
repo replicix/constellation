@@ -138,6 +138,12 @@ pub struct HandoffResult {
 pub enum SyncRequest {
     /// Run a sync round soon; the sender does not wait.
     Nudge,
+    /// Ship everything this node can, then publish a plan 28 metadata
+    /// commit and reply with `(seq, root)` — the tree a snapshot taken
+    /// now retains.
+    Publish {
+        reply: tokio::sync::oneshot::Sender<Result<(u64, constellation_mtree::NodeHash), String>>,
+    },
     /// Run a sync round and report its outcome (fsync barrier).
     Barrier {
         ino: Ino,
@@ -271,7 +277,7 @@ pub(crate) enum SyntheticNode {
         size: u64,
         mtime_ns: i64,
         target: Option<String>,
-        object: Option<ChunkHash>,
+        object: Option<crate::snapshot::FrozenObject>,
         xattrs: Vec<(String, Vec<u8>)>,
     },
 }
@@ -306,8 +312,8 @@ pub struct ConstellationFs {
     snapshots: Arc<crate::snapshot::SnapshotManager>,
     synthetic: Mutex<SyntheticRegistry>,
     tree_cache: Mutex<(
-        HashMap<ChunkHash, constellation_fs_core::Tree>,
-        VecDeque<ChunkHash>,
+        HashMap<crate::snapshot::FrozenObject, crate::snapshot::FrozenDir>,
+        VecDeque<crate::snapshot::FrozenObject>,
     )>,
     view_root: Ino,
     /// Cached effective quota (`None` = unlimited), refreshed at most
@@ -573,7 +579,7 @@ impl ConstellationFs {
             size: 0,
             mtime_ns: row.created_unix_ms * 1_000_000,
             target: None,
-            object: Some(crate::snapshot::parse_hash(&row.root_hash)?),
+            object: Some(crate::snapshot::SnapshotRoot::parse(&row.root_hash)?.object()),
             xattrs: Vec::new(),
         };
         self.view_root = self.intern_synthetic(format!("mount:{path}@{name}"), node);
@@ -710,7 +716,7 @@ impl ConstellationFs {
                                 size: entry.size,
                                 mtime_ns: entry.mtime_ns,
                                 target: entry.target,
-                                object: entry.manifest_or_tree_hash,
+                                object: entry.object,
                                 xattrs: entry.xattrs,
                             };
                             let subtotal = self.synthetic_node_recursive_size(&child)?;
@@ -728,8 +734,8 @@ impl ConstellationFs {
 
     pub(crate) fn snapshot_tree(
         &self,
-        hash: ChunkHash,
-    ) -> Result<constellation_fs_core::Tree, i32> {
+        hash: crate::snapshot::FrozenObject,
+    ) -> Result<crate::snapshot::FrozenDir, i32> {
         {
             let cache = self.tree_cache.lock().unwrap();
             if let Some(tree) = cache.0.get(&hash) {
@@ -738,7 +744,7 @@ impl ConstellationFs {
         }
         let tree = self
             .rt
-            .block_on(self.snapshots.load_tree(hash))
+            .block_on(self.snapshots.list_frozen(&hash))
             .map_err(|_| libc::EIO)?;
         let mut cache = self.tree_cache.lock().unwrap();
         if cache.0.len() >= 128 {
@@ -820,7 +826,7 @@ impl ConstellationFs {
                         size: entry.size,
                         mtime_ns: entry.mtime_ns,
                         target: entry.target,
-                        object: entry.manifest_or_tree_hash,
+                        object: entry.object,
                         xattrs: entry.xattrs,
                     }
                 }
@@ -885,7 +891,7 @@ impl ConstellationFs {
                             size: entry.size,
                             mtime_ns: entry.mtime_ns,
                             target: entry.target,
-                            object: entry.manifest_or_tree_hash,
+                            object: entry.object,
                             xattrs: entry.xattrs,
                         },
                     )
@@ -918,7 +924,7 @@ impl ConstellationFs {
         };
         let manifest = self
             .rt
-            .block_on(self.snapshots.load_manifest(manifest_hash))
+            .block_on(self.snapshots.load_manifest(&manifest_hash))
             .map_err(|_| libc::EIO)?;
         let hashes = self.chunk_list(&manifest)?;
         if offset >= manifest.file_len {
@@ -1903,7 +1909,6 @@ mod quota_tests {
         let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
             meta.clone(),
             store.clone(),
-            CompressionSetting::RAW,
             DEFAULT_CHUNK_SIZE,
             1,
         ));
@@ -2172,13 +2177,9 @@ mod quota_tests {
         let dir = TempDir::new().unwrap();
         let cache = Arc::new(DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap());
         let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
-        let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
-            meta.clone(),
-            store.clone(),
-            CompressionSetting::RAW,
-            DEFAULT_CHUNK_SIZE,
-            1,
-        ));
+        let (manager, _nodes) =
+            crate::snapshot::test_manager(meta.clone(), store.clone(), DEFAULT_CHUNK_SIZE);
+        let snapshots = Arc::new(manager);
         // Create the snapshot on a throwaway runtime so the FUSE handle's
         // runtime is idle when view_usage later block_on's tree loads.
         {

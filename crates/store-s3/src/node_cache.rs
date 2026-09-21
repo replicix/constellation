@@ -369,47 +369,43 @@ impl NodeCache {
     /// durable on the bucket, which is the precondition
     /// [`crate::commits::CommitChain::publish`] refuses to run without.
     ///
-    /// On failure the batch goes back on the pending list, so a retry
+    /// On failure or cancellation the batch stays on the pending list, so a retry
     /// re-packs and re-PUTs. Packs that did land are content-addressed
     /// duplicates of what the retry produces, so the retry converges;
     /// any that the retry does not reproduce are orphans, which is
     /// exactly the state the crash-ordering argument permits and which
     /// S7's reachability sweep reclaims.
     pub async fn seal_packs(&self) -> Result<Vec<PackHash>, StoreError> {
-        let batch = std::mem::take(&mut *self.pending.lock().expect("pending nodes"));
+        // Copied, not taken: a caller's future may be dropped at any
+        // await below (the daemon cancels sync rounds), and a batch
+        // taken up front would then vanish from the pending list while
+        // never having been made durable. Nodes leave the list only once
+        // their pack is on the bucket.
+        let batch = self.pending.lock().expect("pending nodes").clone();
         if batch.is_empty() {
             return Ok(Vec::new());
         }
-        let built = match build_packs(batch.clone(), self.packs.target_bytes()) {
-            Ok(built) => built,
-            Err(e) => {
-                self.restore_pending(batch);
-                return Err(e);
-            }
-        };
+        let built = build_packs(batch.clone(), self.packs.target_bytes())?;
         for pack in &built {
-            if let Err(e) = self.packs.put_pack(pack).await {
-                self.restore_pending(batch);
-                return Err(e);
-            }
+            self.packs.put_pack(pack).await?;
         }
         // Durable: publish the locations and let the LRU have the bytes
         // back. Neither step can fail, so there is no window where a
         // node is packed but unreachable.
+        let mut sealed = HashSet::new();
         for pack in &built {
             self.attach_index(pack.hash, &pack.index);
             for entry in pack.nodes() {
                 self.cache
                     .set_state(&chunk_hash(&entry.hash), ChunkState::Clean);
+                sealed.insert(entry.hash);
             }
         }
+        self.pending
+            .lock()
+            .expect("pending nodes")
+            .retain(|node| !sealed.contains(&node.hash));
         Ok(built.iter().map(|pack| pack.hash).collect())
-    }
-
-    fn restore_pending(&self, mut batch: Vec<PackNode>) {
-        let mut pending = self.pending.lock().expect("pending nodes");
-        batch.append(&mut pending);
-        *pending = batch;
     }
 
     // ------------------------------------------------------------ read

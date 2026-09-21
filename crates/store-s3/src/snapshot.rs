@@ -1,12 +1,15 @@
 //! Named snapshot records in `snaps/` (DESIGN.md §13).
 //!
-//! Tree and manifest objects use the ordinary chunk path.  This module only
-//! owns the small mutable namespace of names pointing at immutable roots.
+//! A snapshot is a name pointing at an immutable root. Since plan 28 the
+//! root is a directory inside a published metadata tree — `(commit seq,
+//! mtree root, dir ino)` — so taking one costs a forced publish and
+//! nothing else: the tree is already on the bucket and a snapshot merely
+//! keeps its root alive. This module only owns the small mutable
+//! namespace of names.
 //! Creation is conditional, so two creators of the same `path@name` cannot
 //! silently replace one another.
 
 use crate::{layout, StoreError};
-use constellation_fs_core::ChunkHash;
 use futures::StreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
@@ -19,32 +22,53 @@ pub struct SnapshotRecord {
     pub path: String,
     pub created_unix_ms: i64,
     pub creator: u64,
-    pub root: ChunkHash,
+    /// The directory inside a published metadata tree.
+    pub tree: SnapshotTreeRoot,
 }
 
+/// Where a snapshot lives: directory `ino` under the metadata
+/// tree `root`, published as commit `seq`. The commit may be retired by
+/// retention; `root` is what keeps the nodes alive (it is a GC root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotTreeRoot {
+    pub seq: u64,
+    /// Hex node hash.
+    pub root: String,
+    pub ino: u64,
+}
+
+/// The record version this build writes and reads. Version 1 (an
+/// `fs-core` directory `Tree` blob) predates plan 28 and is refused.
+pub const SNAPSHOT_RECORD_VERSION: u32 = 2;
+
 impl SnapshotRecord {
+    /// A record for directory `tree.ino` of a published tree.
     pub fn new(
         path: impl Into<String>,
         name: impl Into<String>,
         creator: u64,
-        root: ChunkHash,
+        tree: SnapshotTreeRoot,
     ) -> Self {
         Self {
-            v: 1,
+            v: SNAPSHOT_RECORD_VERSION,
             path: path.into(),
             name: name.into(),
-            created_unix_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0),
+            created_unix_ms: now_unix_ms(),
             creator,
-            root,
+            tree,
         }
     }
 
     pub fn id(&self) -> String {
         snapshot_id(&self.path, &self.name)
     }
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 pub fn snapshot_id(path: &str, name: &str) -> String {
@@ -96,7 +120,7 @@ impl SnapshotStore {
             let meta = item?;
             let bytes = self.store.get(&meta.location).await?.bytes().await?;
             let record: SnapshotRecord = serde_json::from_slice(&bytes)?;
-            if record.v != 1 {
+            if record.v != SNAPSHOT_RECORD_VERSION {
                 return Err(StoreError::Meta(format!(
                     "snapshot {} has unsupported version {}",
                     meta.location, record.v
@@ -127,7 +151,16 @@ mod tests {
     async fn create_is_cas_and_delete_leaves_tree_blobs_alone() {
         let backend = Arc::new(InMemory::new());
         let snapshots = SnapshotStore::new(backend);
-        let record = SnapshotRecord::new("/data", "daily", 7, ChunkHash::of(b"root"));
+        let record = SnapshotRecord::new(
+            "/data",
+            "daily",
+            7,
+            SnapshotTreeRoot {
+                seq: 3,
+                root: "ab".repeat(32),
+                ino: 9,
+            },
+        );
         snapshots.create(&record).await.unwrap();
         assert!(matches!(
             snapshots.create(&record).await,

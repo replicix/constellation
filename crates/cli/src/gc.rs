@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
-use constellation_fs_core::{ChunkHash, InodeKind, Tree};
+use constellation_fs_core::ChunkHash;
 use constellation_meta::SqliteMeta;
 use constellation_store_s3::{
     append_journal, publish_condemned, read_condemned, DesignationMode, DesignationStore,
@@ -249,54 +249,50 @@ async fn snapshot_roots(
     chunks: &constellation_store_s3::ChunkStore,
     store: Arc<dyn ObjectStore>,
 ) -> Result<HashSet<ChunkHash>> {
-    let records = SnapshotStore::new(store).list().await?;
+    use crate::snapshot::{snapshot_chunk_refs, SnapshotRoot, TreeAccess};
+    let records = SnapshotStore::new(store.clone()).list().await?;
     let mut roots = HashSet::new();
-    let mut cache: BTreeMap<ChunkHash, HashSet<ChunkHash>> = BTreeMap::new();
+    if records.is_empty() {
+        return Ok(roots);
+    }
+    // Snapshots live in the metadata tree (plan 28): build one reader
+    // (and its scratch node cache) for the pass.
+    let scratch = ScratchDir::new("gc-snapshot-nodes")?;
+    let reader =
+        crate::mtree_read::ChainReader::for_store(store.clone(), chunks.e2e_keys(), &scratch.0)?;
+    reader.cache.refresh_catalog().await?;
+    let tree = TreeAccess::from_reader(reader);
+    let mut walked = HashSet::new();
     for record in records {
-        if let Some(cached) = cache.get(&record.root) {
-            roots.extend(cached);
-            continue;
+        let root = SnapshotRoot::of_record(&record)?;
+        if walked.insert(root.encode()) {
+            roots.extend(snapshot_chunk_refs(chunks, &tree, &root).await?);
         }
-        let mut reachable = HashSet::new();
-        walk_snapshot(chunks, record.root, &mut reachable).await?;
-        roots.extend(&reachable);
-        cache.insert(record.root, reachable);
     }
     Ok(roots)
 }
 
-fn walk_snapshot<'a>(
-    chunks: &'a constellation_store_s3::ChunkStore,
-    tree_hash: ChunkHash,
-    out: &'a mut HashSet<ChunkHash>,
-) -> futures::future::BoxFuture<'a, Result<()>> {
-    Box::pin(async move {
-        if !out.insert(tree_hash) {
-            return Ok(());
-        }
-        let tree = Tree::decode(&chunks.get_chunk(&tree_hash).await?)?;
-        for entry in tree.entries {
-            let Some(hash) = entry.manifest_or_tree_hash else {
-                continue;
-            };
-            if entry.kind == InodeKind::Dir {
-                walk_snapshot(chunks, hash, out).await?;
-            } else if entry.kind == InodeKind::File {
-                out.insert(hash);
-                let manifest = Manifest::decode(&chunks.get_chunk(&hash).await?)?;
-                match manifest.chunks {
-                    ChunkInfo::Inline(hashes) => out.extend(hashes.into_values()),
-                    ChunkInfo::Spilled(spill) => {
-                        out.insert(spill);
-                        out.extend(
-                            decode_chunk_list(&chunks.get_chunk(&spill).await?)?.into_values(),
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    })
+/// A process-private scratch directory, removed on drop.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new(tag: &str) -> Result<ScratchDir> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "constellation-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path)?;
+        Ok(ScratchDir(path))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 async fn hold_roots(store: Arc<dyn ObjectStore>, now: i64) -> Result<HashSet<ChunkHash>> {

@@ -506,9 +506,17 @@ fn live(seed: u64) -> Result<()> {
     );
     let env = S3Env::start().context("starting snapshot-churn S3 environment")?;
     let _proxy = env.s3_proxy()?;
-    let temp = tempfile::Builder::new()
+    let mut temp = tempfile::Builder::new()
         .prefix("harness-snapshot-churn-")
         .tempdir()?;
+    // Same convention as `scenarios::setup`: keep mount logs and state.
+    if std::env::var_os("CHAOS_KEEP_TMP").is_some_and(|v| v != "0") {
+        temp.disable_cleanup(true);
+        eprintln!(
+            "CHAOS_KEEP_TMP: artifacts kept at {}",
+            temp.path().display()
+        );
+    }
     let prefix = format!("snapshot-churn-{}", unix_ms());
     let backend = format!("s3://{BUCKET}/{prefix}");
     let mut client = Client::new(temp.path(), "churn", &env.endpoint, &backend)?

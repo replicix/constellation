@@ -1,36 +1,187 @@
-//! Snapshot construction, eager clones, and GC-root enumeration.
+//! Snapshots, eager clones, and GC-root enumeration (DESIGN.md §13).
 //!
-//! The immutable object model belongs in `fs-core`; this daemon-side module
-//! joins the live SQLite replica to the chunk store.  Building performs one
-//! indexed query per directory and conditional PUTs every manifest/tree blob.
-//! Clones deliberately use the plan's correctness-first eager fallback:
-//! metadata is inserted in one transaction and one `clone` record while data
-//! chunks remain shared.
+//! Since plan 28 a snapshot is **a retained root hash**: `(commit seq,
+//! mtree root, dir ino)`. Taking one forces a metadata publish (so the
+//! tree reflects everything this node has written under the path) and
+//! records where the directory sits in that tree. Nothing else is
+//! written — the nodes are already on the bucket, shared structurally
+//! with every commit around them — which is what replaced the old
+//! `build_tree`, a walk that re-uploaded one `fs-core` `Tree` blob per
+//! directory and one manifest blob per file.
+//!
+//! Reading goes through [`FrozenObject`] — an inode of a retained root —
+//! and [`crate::mtree_read::TreeReader`], for the FUSE `.constellation/
+//! snapshot` view, `clone_to` and GC alike. Clones deliberately keep the
+//! correctness-first eager copy: metadata is inserted in one transaction
+//! and one `clone` record while data chunks remain shared.
 
+use crate::mtree_read::{Resolver, TreeReader};
 use anyhow::{bail, Context, Result};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
-use constellation_fs_core::{ChunkHash, InodeKind, Tree, TreeEntry};
+use constellation_fs_core::{ChunkHash, Ino, InodeKind};
 use constellation_meta::{CloneSpec, MetaStore, SnapshotRow, SqliteMeta};
-use constellation_store_s3::{CompressionSetting, SnapshotRecord, SnapshotStore, StoreError};
+use constellation_mtree::NodeHash;
+use constellation_store_s3::{
+    BlobStore, NodeCache, SnapshotRecord, SnapshotStore, SnapshotTreeRoot, StoreError,
+};
 use futures::future::BoxFuture;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
+
+/// Force a metadata publish and return the commit that now reflects this
+/// node's state: `(seq, root)`. In the daemon it runs a sync round and a
+/// publish on the sync task; tests hand in a publisher directly.
+pub type PublishHook = Arc<dyn Fn() -> BoxFuture<'static, Result<(u64, NodeHash)>> + Send + Sync>;
+
+/// How to read the metadata tree: the node cache, the tree config (the
+/// hasher is part of it), and the blob store for spilled values.
+#[derive(Clone)]
+pub struct TreeAccess {
+    pub nodes: Arc<NodeCache>,
+    pub config: constellation_mtree::Config,
+    pub blobs: BlobStore,
+}
+
+impl TreeAccess {
+    pub fn from_reader(reader: crate::mtree_read::ChainReader) -> TreeAccess {
+        TreeAccess {
+            nodes: reader.cache,
+            config: reader.config,
+            blobs: reader.blobs,
+        }
+    }
+
+    fn reader(&self, root: NodeHash) -> Result<TreeReader<Arc<NodeCache>>> {
+        Ok(TreeReader::new(
+            constellation_mtree::Tree::with_config(self.nodes.clone(), self.config)?,
+            root,
+        ))
+    }
+
+    /// Run a synchronous tree read off the runtime. The node cache
+    /// bridges to async I/O with `block_in_place`, which a blocking
+    /// thread may do on any runtime flavour.
+    async fn read<T, F>(&self, root: NodeHash, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&TreeReader<Arc<NodeCache>>, &Resolver<'_>) -> Result<T> + Send + 'static,
+    {
+        let reader = self.reader(root)?;
+        let blobs = self.blobs.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let resolver = Resolver {
+                blobs: &blobs,
+                handle: &handle,
+            };
+            f(&reader, &resolver)
+        })
+        .await
+        .context("metadata tree read task")?
+    }
+}
+
+/// What a snapshot row's `root_hash` column names: directory `ino` of
+/// metadata tree `root`, published as commit `seq`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotRoot {
+    pub seq: u64,
+    pub root: NodeHash,
+    pub ino: Ino,
+}
+
+/// `root_hash` spelling of a [`SnapshotRoot`]: `mtree:<seq>:<root>:<ino>`.
+const TREE_ROOT_PREFIX: &str = "mtree:";
+
+impl SnapshotRoot {
+    pub fn parse(value: &str) -> Result<SnapshotRoot> {
+        let rest = value
+            .strip_prefix(TREE_ROOT_PREFIX)
+            .with_context(|| format!("snapshot root {value:?} is not a metadata tree root"))?;
+        let mut fields = rest.split(':');
+        let (Some(seq), Some(root), Some(ino), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            bail!("malformed snapshot root {value:?}");
+        };
+        Ok(SnapshotRoot {
+            seq: seq.parse().context("snapshot commit seq")?,
+            root: NodeHash::from_hex(root).context("snapshot tree root")?,
+            ino: ino.parse().context("snapshot directory ino")?,
+        })
+    }
+
+    pub fn encode(&self) -> String {
+        format!(
+            "{TREE_ROOT_PREFIX}{}:{}:{}",
+            self.seq,
+            self.root.to_hex(),
+            self.ino
+        )
+    }
+
+    /// The frozen directory this root names.
+    pub fn object(&self) -> FrozenObject {
+        FrozenObject {
+            root: self.root,
+            ino: self.ino,
+        }
+    }
+
+    pub fn of_record(record: &SnapshotRecord) -> Result<SnapshotRoot> {
+        Ok(SnapshotRoot {
+            seq: record.tree.seq,
+            root: NodeHash::from_hex(&record.tree.root).context("snapshot tree root")?,
+            ino: record.tree.ino,
+        })
+    }
+}
+
+/// A directory or file inside a snapshot: an inode of a retained tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FrozenObject {
+    pub root: NodeHash,
+    pub ino: Ino,
+}
+
+/// One child of a frozen directory.
+#[derive(Clone, Debug)]
+pub struct FrozenEntry {
+    pub name: String,
+    pub kind: InodeKind,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub target: Option<String>,
+    /// Set for directories and regular files.
+    pub object: Option<FrozenObject>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
+}
+
+/// A frozen directory's children and its own xattrs.
+#[derive(Clone, Debug, Default)]
+pub struct FrozenDir {
+    pub entries: Vec<FrozenEntry>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
+}
 
 #[derive(Clone)]
 pub struct SnapshotManager {
     meta: Arc<SqliteMeta>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
     records: SnapshotStore,
-    compression: CompressionSetting,
     chunk_size: u32,
     creator: u64,
+    tree: Option<TreeAccess>,
+    publish: Option<PublishHook>,
 }
 
 impl SnapshotManager {
     pub fn new(
         meta: Arc<SqliteMeta>,
         chunks: Arc<constellation_store_s3::ChunkStore>,
-        compression: CompressionSetting,
         chunk_size: u32,
         creator: u64,
     ) -> Self {
@@ -38,10 +189,30 @@ impl SnapshotManager {
             records: SnapshotStore::new(chunks.inner().clone()),
             meta,
             chunks,
-            compression,
             chunk_size,
             creator,
+            tree: None,
+            publish: None,
         }
+    }
+
+    /// Read version-2 snapshots through `access`.
+    pub fn with_tree(mut self, access: TreeAccess) -> Self {
+        self.tree = Some(access);
+        self
+    }
+
+    /// Take snapshots by forcing a publish through `hook`. Without one
+    /// this manager can read snapshots but not create them.
+    pub fn with_publisher(mut self, hook: PublishHook) -> Self {
+        self.publish = Some(hook);
+        self
+    }
+
+    fn tree(&self) -> Result<&TreeAccess> {
+        self.tree
+            .as_ref()
+            .context("this mount has no metadata tree reader")
     }
 
     pub async fn create(&self, path: &str, name: &str) -> Result<String> {
@@ -58,8 +229,37 @@ impl SnapshotManager {
         if attr.kind != InodeKind::Dir {
             bail!("snapshot path must be a directory");
         }
-        let (root, _) = self.build_tree(ino).await?;
-        let record = SnapshotRecord::new(&path, name, self.creator, root);
+        let publish = self
+            .publish
+            .as_ref()
+            .context("this mount cannot publish a metadata commit, so it cannot take snapshots")?;
+        let (seq, root) = publish().await?;
+        // The commit must actually hold the directory: a path created
+        // after the last shipped segment would otherwise freeze nothing.
+        let kind = self
+            .tree()?
+            .read(root, move |reader, _| {
+                Ok(reader.getattr(ino)?.map(|rec| rec.attrs.kind.as_u8()))
+            })
+            .await?;
+        if kind != Some(InodeKind::Dir.as_u8()) {
+            bail!(
+                "snapshot path {path} (ino {ino}) is not in metadata commit {seq} yet \
+                 (found kind {kind:?}, {} journal rows unshipped); retry",
+                self.meta.journal_len().unwrap_or(0)
+            );
+        }
+        let snapshot = SnapshotRoot { seq, root, ino };
+        let record = SnapshotRecord::new(
+            &path,
+            name,
+            self.creator,
+            SnapshotTreeRoot {
+                seq,
+                root: root.to_hex(),
+                ino,
+            },
+        );
         match self.records.create(&record).await {
             Ok(()) => {}
             Err(StoreError::AlreadyExists) => bail!("snapshot {path}@{name} already exists"),
@@ -69,93 +269,15 @@ impl SnapshotManager {
             id: record.id(),
             path,
             name: name.to_string(),
-            root_hash: root.to_hex(),
+            root_hash: snapshot.encode(),
             created_unix_ms: record.created_unix_ms,
         })?;
         Ok(format!(
-            "created snapshot {}@{} ({})",
+            "created snapshot {}@{} ({}, metadata commit {seq})",
             record.path,
             record.name,
             record.id()
         ))
-    }
-
-    fn build_tree(&self, ino: u64) -> BoxFuture<'_, Result<(ChunkHash, usize)>> {
-        Box::pin(async move {
-            let children = self.meta.snapshot_children(ino)?;
-            let mut entries = Vec::with_capacity(children.len());
-            let mut uploaded = 0usize;
-            for child in children {
-                let reference = match child.attr.kind {
-                    InodeKind::Dir => {
-                        let (hash, count) = self.build_tree(child.attr.ino).await?;
-                        uploaded += count;
-                        Some(hash)
-                    }
-                    InodeKind::File => {
-                        let manifest = child
-                            .manifest
-                            .unwrap_or_else(|| Manifest::empty(self.chunk_size).encode());
-                        let hash = self.chunks.hash(&manifest);
-                        if !self
-                            .chunks
-                            .put_chunk_mode(
-                                &hash,
-                                &manifest,
-                                self.compression,
-                                constellation_store_s3::ChunkPutMode::Create,
-                            )
-                            .await?
-                            .existed
-                        {
-                            uploaded += 1;
-                        }
-                        Some(hash)
-                    }
-                    _ => None,
-                };
-                entries.push(TreeEntry {
-                    name: child.name,
-                    kind: child.attr.kind,
-                    mode: child.attr.mode,
-                    uid: child.attr.uid,
-                    gid: child.attr.gid,
-                    size: child.attr.size,
-                    mtime_ns: child.attr.mtime_ns,
-                    target: child.target,
-                    manifest_or_tree_hash: reference,
-                    xattrs: child.xattrs,
-                });
-            }
-            let root_xattrs = self
-                .meta
-                .list_xattrs(ino)?
-                .into_iter()
-                .map(|name| {
-                    let value = self
-                        .meta
-                        .get_xattr(ino, &name)?
-                        .context("listed xattr disappeared")?;
-                    Ok((name, value))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let blob = Tree::new(entries)?.with_xattrs(root_xattrs)?.encode();
-            let hash = self.chunks.hash(&blob);
-            if !self
-                .chunks
-                .put_chunk_mode(
-                    &hash,
-                    &blob,
-                    self.compression,
-                    constellation_store_s3::ChunkPutMode::Create,
-                )
-                .await?
-                .existed
-            {
-                uploaded += 1;
-            }
-            Ok((hash, uploaded))
-        })
     }
 
     pub fn list(&self, path: Option<&str>) -> Result<Vec<SnapshotRow>> {
@@ -164,9 +286,10 @@ impl SnapshotManager {
     }
 
     /// Snapshots whose frozen subtree contains `directory`, paired with the
-    /// tree object corresponding to that directory.  Component-aware prefix
-    /// matching avoids treating `/project-old` as a child of `/project`.
-    pub async fn covering(&self, directory: &str) -> Result<Vec<(SnapshotRow, ChunkHash)>> {
+    /// frozen object corresponding to that directory.  Component-aware
+    /// prefix matching avoids treating `/project-old` as a child of
+    /// `/project`.
+    pub async fn covering(&self, directory: &str) -> Result<Vec<(SnapshotRow, FrozenObject)>> {
         let directory = normalize_path(directory);
         let mut covered = Vec::new();
         for row in self.meta.snapshots(None)? {
@@ -178,25 +301,29 @@ impl SnapshotManager {
                     .and_then(|rest| rest.strip_prefix('/'))
             };
             let Some(relative) = relative else { continue };
-            let mut hash = parse_hash(&row.root_hash)?;
-            let mut exists = true;
-            for component in relative.split('/').filter(|part| !part.is_empty()) {
-                let tree = self.load_tree(hash).await?;
-                match tree
-                    .entries
-                    .into_iter()
-                    .find(|entry| entry.name == component && entry.kind == InodeKind::Dir)
-                    .and_then(|entry| entry.manifest_or_tree_hash)
-                {
-                    Some(next) => hash = next,
-                    None => {
-                        exists = false;
-                        break;
+            let components: Vec<String> = relative
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+            let SnapshotRoot { root, ino, .. } = SnapshotRoot::parse(&row.root_hash)?;
+            let found = self
+                .tree()?
+                .read(root, move |reader, _| {
+                    let mut ino = ino;
+                    for component in &components {
+                        match reader.lookup(ino, component.as_bytes())? {
+                            Some(entry) if entry.attrs.kind.as_u8() == InodeKind::Dir.as_u8() => {
+                                ino = entry.ino
+                            }
+                            _ => return Ok(None),
+                        }
                     }
-                }
-            }
-            if exists {
-                covered.push((row, hash));
+                    Ok(Some(FrozenObject { root, ino }))
+                })
+                .await?;
+            if let Some(object) = found {
+                covered.push((row, object));
             }
         }
         // An exact-path name wins over the same name inherited from an
@@ -206,6 +333,66 @@ impl SnapshotManager {
         covered.retain(|(row, _)| names.insert(row.name.clone()));
         covered.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
         Ok(covered)
+    }
+
+    /// A frozen directory's children, in name order.
+    pub async fn list_frozen(&self, dir: &FrozenObject) -> Result<FrozenDir> {
+        let FrozenObject { root, ino } = *dir;
+        self.tree()?
+            .read(root, move |reader, resolver| {
+                let xattrs = reader
+                    .inode_row(ino, resolver)?
+                    .map(|row| row.xattrs)
+                    .unwrap_or_default();
+                let mut entries = Vec::new();
+                for child in reader.readdir(ino, None, usize::MAX)? {
+                    let row = reader
+                        .inode_row(child.ino, resolver)?
+                        .with_context(|| format!("dentry to missing inode {}", child.ino))?;
+                    let kind = row.attr.kind;
+                    entries.push(FrozenEntry {
+                        name: String::from_utf8(child.name)
+                            .context("snapshot entry name is not UTF-8")?,
+                        kind,
+                        mode: row.attr.mode,
+                        uid: row.attr.uid,
+                        gid: row.attr.gid,
+                        size: row.attr.size,
+                        mtime_ns: row.attr.mtime_ns,
+                        target: row.target,
+                        object: matches!(kind, InodeKind::Dir | InodeKind::File).then_some(
+                            FrozenObject {
+                                root,
+                                ino: child.ino,
+                            },
+                        ),
+                        xattrs: row.xattrs,
+                    });
+                }
+                Ok(FrozenDir { entries, xattrs })
+            })
+            .await
+    }
+
+    /// A frozen file's encoded manifest, `None` for a file that never had
+    /// content written.
+    async fn frozen_manifest_bytes(&self, file: &FrozenObject) -> Result<Option<Vec<u8>>> {
+        let FrozenObject { root, ino } = *file;
+        self.tree()?
+            .read(root, move |reader, resolver| {
+                Ok(reader
+                    .inode_row(ino, resolver)?
+                    .with_context(|| format!("snapshot file {ino} has no inode record"))?
+                    .manifest)
+            })
+            .await
+    }
+
+    pub async fn load_manifest(&self, file: &FrozenObject) -> Result<Manifest> {
+        match self.frozen_manifest_bytes(file).await? {
+            Some(bytes) => Ok(Manifest::decode(&bytes)?),
+            None => Ok(Manifest::empty(self.chunk_size)),
+        }
     }
 
     pub async fn delete(&self, path: &str, name: &str) -> Result<String> {
@@ -225,7 +412,7 @@ impl SnapshotManager {
             .into_iter()
             .find(|row| row.name == name)
             .with_context(|| format!("snapshot {path}@{name} does not exist"))?;
-        let root = parse_hash(&row.root_hash)?;
+        let root = SnapshotRoot::parse(&row.root_hash)?;
         let mut specs = vec![CloneSpec {
             parent_index: None,
             name: String::new(),
@@ -243,7 +430,7 @@ impl SnapshotManager {
             manifest: None,
             xattrs: Vec::new(),
         }];
-        self.flatten_tree(root, 0, &mut specs).await?;
+        self.flatten(root.object(), 0, &mut specs).await?;
         self.meta.eager_clone(
             &path,
             name,
@@ -257,26 +444,23 @@ impl SnapshotManager {
         ))
     }
 
-    fn flatten_tree<'a>(
+    fn flatten<'a>(
         &'a self,
-        hash: ChunkHash,
+        dir: FrozenObject,
         parent_index: usize,
         specs: &'a mut Vec<CloneSpec>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let tree = Tree::decode(&self.chunks.get_chunk(&hash).await?)?;
-            specs[parent_index].xattrs = tree.xattrs.clone();
-            for entry in tree.entries {
-                let manifest = if entry.kind == InodeKind::File {
-                    let hash = entry
-                        .manifest_or_tree_hash
-                        .context("snapshot file has no manifest reference")?;
-                    Some(self.chunks.get_chunk(&hash).await?)
-                } else {
-                    None
+            let listing = self.list_frozen(&dir).await?;
+            specs[parent_index].xattrs = listing.xattrs;
+            for entry in listing.entries {
+                let manifest = match (entry.kind, entry.object) {
+                    (InodeKind::File, Some(object)) => self.frozen_manifest_bytes(&object).await?,
+                    (InodeKind::File, None) => bail!("snapshot file has no manifest reference"),
+                    _ => None,
                 };
-                let child_tree = (entry.kind == InodeKind::Dir)
-                    .then_some(entry.manifest_or_tree_hash)
+                let child_dir = (entry.kind == InodeKind::Dir)
+                    .then_some(entry.object)
                     .flatten();
                 let index = specs.len();
                 specs.push(CloneSpec {
@@ -292,63 +476,85 @@ impl SnapshotManager {
                     manifest,
                     xattrs: entry.xattrs,
                 });
-                if let Some(child_tree) = child_tree {
-                    self.flatten_tree(child_tree, index, specs).await?;
+                if let Some(child_dir) = child_dir {
+                    self.flatten(child_dir, index, specs).await?;
                 }
             }
             Ok(())
         })
     }
 
+    /// Every chunk a snapshot keeps alive, as hex keys.
     pub async fn refs(&self, id: &str) -> Result<Vec<String>> {
         let record = self
             .records
             .get(id)
             .await?
             .with_context(|| format!("snapshot {id} does not exist"))?;
-        let mut refs = BTreeSet::new();
-        self.walk_refs(record.root, &mut refs).await?;
-        Ok(refs.into_iter().collect())
+        let refs = snapshot_chunk_refs(
+            &self.chunks,
+            self.tree()?,
+            &SnapshotRoot::of_record(&record)?,
+        )
+        .await?;
+        let mut hex: Vec<String> = refs.into_iter().map(|hash| hash.to_hex()).collect();
+        hex.sort();
+        Ok(hex)
     }
+}
 
-    fn walk_refs<'a>(
-        &'a self,
-        tree_hash: ChunkHash,
-        refs: &'a mut BTreeSet<String>,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            refs.insert(tree_hash.to_hex());
-            let tree = Tree::decode(&self.chunks.get_chunk(&tree_hash).await?)?;
-            for entry in tree.entries {
-                let Some(hash) = entry.manifest_or_tree_hash else {
-                    continue;
-                };
-                if entry.kind == InodeKind::Dir {
-                    self.walk_refs(hash, refs).await?;
-                } else if entry.kind == InodeKind::File {
-                    refs.insert(hash.to_hex());
-                    let manifest = Manifest::decode(&self.chunks.get_chunk(&hash).await?)?;
-                    let chunks = match manifest.chunks {
-                        ChunkInfo::Inline(chunks) => chunks,
-                        ChunkInfo::Spilled(spill) => {
-                            refs.insert(spill.to_hex());
-                            decode_chunk_list(&self.chunks.get_chunk(&spill).await?)?
+/// Every chunk object a snapshot references: the data chunks (and
+/// spilled chunk lists) of every file under its directory. Chunk GC's
+/// snapshot roots, and `snap refs`.
+pub async fn snapshot_chunk_refs(
+    chunks: &constellation_store_s3::ChunkStore,
+    tree: &TreeAccess,
+    snapshot: &SnapshotRoot,
+) -> Result<HashSet<ChunkHash>> {
+    let SnapshotRoot { root, ino, .. } = *snapshot;
+    let manifests = tree
+        .read(root, move |reader, resolver| {
+            let mut manifests = Vec::new();
+            let mut stack = vec![ino];
+            while let Some(dir) = stack.pop() {
+                for child in reader.readdir(dir, None, usize::MAX)? {
+                    match child.attrs.kind.as_u8() {
+                        k if k == InodeKind::Dir.as_u8() => stack.push(child.ino),
+                        k if k == InodeKind::File.as_u8() => {
+                            if let Some(bytes) = reader
+                                .inode_row(child.ino, resolver)?
+                                .and_then(|row| row.manifest)
+                            {
+                                manifests.push(bytes);
+                            }
                         }
-                    };
-                    refs.extend(chunks.into_values().map(|hash| hash.to_hex()));
+                        _ => {}
+                    }
                 }
             }
-            Ok(())
+            Ok(manifests)
         })
+        .await?;
+    let mut refs = HashSet::new();
+    for bytes in manifests {
+        add_manifest_refs(chunks, &Manifest::decode(&bytes)?, &mut refs).await?;
     }
+    Ok(refs)
+}
 
-    pub async fn load_tree(&self, hash: ChunkHash) -> Result<Tree> {
-        Ok(Tree::decode(&self.chunks.get_chunk(&hash).await?)?)
+async fn add_manifest_refs(
+    chunks: &constellation_store_s3::ChunkStore,
+    manifest: &Manifest,
+    refs: &mut HashSet<ChunkHash>,
+) -> Result<()> {
+    match &manifest.chunks {
+        ChunkInfo::Inline(hashes) => refs.extend(hashes.values().copied()),
+        ChunkInfo::Spilled(spill) => {
+            refs.insert(*spill);
+            refs.extend(decode_chunk_list(&chunks.get_chunk(spill).await?)?.into_values());
+        }
     }
-
-    pub async fn load_manifest(&self, hash: ChunkHash) -> Result<Manifest> {
-        Ok(Manifest::decode(&self.chunks.get_chunk(&hash).await?)?)
-    }
+    Ok(())
 }
 
 pub fn split_selector(selector: &str) -> Result<(String, String)> {
@@ -371,15 +577,75 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn parse_hash(hex: &str) -> Result<ChunkHash> {
-    if hex.len() != 64 {
-        bail!("invalid 32-byte hash {hex:?}");
-    }
-    let mut bytes = [0u8; 32];
-    for (index, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        bytes[index] = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
-    }
-    Ok(ChunkHash(bytes))
+/// A manager that can take and read tree snapshots over `chunks`'
+/// bucket, for tests: its publisher drains the journal itself, and its
+/// node cache runs on a leaked runtime of its own so it works under any
+/// caller's runtime flavour and outlives the caller's.
+#[cfg(test)]
+pub(crate) fn test_manager(
+    meta: Arc<SqliteMeta>,
+    chunks: Arc<constellation_store_s3::ChunkStore>,
+    chunk_size: u32,
+) -> (SnapshotManager, tempfile::TempDir) {
+    use constellation_fs_core::cache::DiskCache;
+    use constellation_mtree::{record, Hasher};
+    use constellation_store_s3::{CommitChain, PackStore};
+    let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap(),
+    ));
+    let handle = runtime.handle().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = chunks.inner().clone();
+    let nodes = Arc::new(NodeCache::new(
+        PackStore::new(backend.clone()),
+        Arc::new(DiskCache::open(dir.path(), 1 << 30).unwrap()),
+        Hasher::Plain,
+        handle.clone(),
+    ));
+    let access = TreeAccess {
+        nodes: nodes.clone(),
+        config: record::config(),
+        blobs: BlobStore::new(backend.clone(), Hasher::Plain),
+    };
+    let publisher = Arc::new(tokio::sync::Mutex::new(
+        crate::mtree_publish::TreePublisher::new(
+            meta.clone(),
+            nodes,
+            access.blobs.clone(),
+            CommitChain::new(backend),
+            record::config(),
+            1,
+            handle.clone(),
+        ),
+    ));
+    let writer = meta.clone();
+    let hook: PublishHook = Arc::new(move || {
+        let publisher = publisher.clone();
+        let meta = writer.clone();
+        let handle = handle.clone();
+        Box::pin(async move {
+            handle
+                .spawn(async move {
+                    let batch = meta.take_journal(usize::MAX)?;
+                    if let Some((seq, _)) = batch.last() {
+                        meta.ack_journal(*seq)?;
+                    }
+                    let records: Vec<_> = batch.into_iter().map(|(_, r)| r).collect();
+                    let mut publisher = publisher.lock().await;
+                    publisher.note(&records);
+                    publisher.publish_now(1).await
+                })
+                .await?
+        })
+    });
+    let manager = SnapshotManager::new(meta, chunks, chunk_size, 1)
+        .with_tree(access)
+        .with_publisher(hook);
+    (manager, dir)
 }
 
 #[cfg(test)]
@@ -397,8 +663,24 @@ mod tests {
         assert!(split_selector("/projects").is_err());
     }
 
-    #[tokio::test]
-    async fn eager_clone_write_cannot_mutate_snapshot_tree() {
+    #[test]
+    fn snapshot_roots_round_trip_and_refuse_anything_else() {
+        let tree = SnapshotRoot {
+            seq: 42,
+            root: NodeHash([7; 32]),
+            ino: 1 << 40 | 9,
+        };
+        assert_eq!(SnapshotRoot::parse(&tree.encode()).unwrap(), tree);
+        assert!(SnapshotRoot::parse(&ChunkHash::of(b"tree blob").to_hex()).is_err());
+        assert!(SnapshotRoot::parse("mtree:1:zz:3").is_err());
+        assert!(SnapshotRoot::parse("mtree:1:2").is_err());
+    }
+
+    /// A snapshot is a retained tree root: later writes to the source and
+    /// to a clone of it leave what the snapshot reads unchanged, down to
+    /// xattrs and manifests, and GC's view of its chunks is the frozen one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tree_snapshot_is_frozen_against_source_and_clone_writes() {
         let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
         let source = meta.mkdir(1, "source", 0o755, 1, 1).unwrap();
         meta.set_xattr(
@@ -416,31 +698,36 @@ mod tests {
             constellation_meta::SetXattrMode::Set,
         )
         .unwrap();
-        let original = Manifest::from_chunks(
-            DEFAULT_CHUNK_SIZE,
-            3,
-            vec![ChunkHash::of(b"old")],
-            constellation_fs_core::INLINE_CHUNKS_MAX,
-            ChunkHash::of,
-        )
-        .0
-        .encode();
+        let sub = meta.mkdir(source.ino, "sub", 0o700, 1, 1).unwrap();
+        meta.symlink(sub.ino, "link", "../file", 1, 1).unwrap();
+        let manifest_of = |tag: &[u8]| {
+            Manifest::from_chunks(
+                DEFAULT_CHUNK_SIZE,
+                3,
+                vec![ChunkHash::of(tag)],
+                constellation_fs_core::INLINE_CHUNKS_MAX,
+                ChunkHash::of,
+            )
+            .0
+            .encode()
+        };
+        let original = manifest_of(b"old");
         meta.set_manifest(file.ino, &original, 3).unwrap();
         let chunks = Arc::new(constellation_store_s3::ChunkStore::new(Arc::new(
             InMemory::new(),
         )));
-        let manager = SnapshotManager::new(
-            meta.clone(),
-            chunks.clone(),
-            CompressionSetting::RAW,
-            DEFAULT_CHUNK_SIZE,
-            1,
-        );
-        manager.create("/source", "before").await.unwrap();
-        let row = manager.list(Some("/source")).unwrap().remove(0);
-        let root = parse_hash(&row.root_hash).unwrap();
-        let frozen_before = chunks.get_chunk(&root).await.unwrap();
+        let (manager, _nodes) = test_manager(meta.clone(), chunks.clone(), DEFAULT_CHUNK_SIZE);
 
+        let created = manager.create("/source", "before").await.unwrap();
+        assert!(created.contains("metadata commit"), "{created}");
+        let row = manager.list(Some("/source")).unwrap().remove(0);
+        let root = SnapshotRoot::parse(&row.root_hash).unwrap();
+        assert_eq!(root.ino, source.ino);
+
+        // Writes after the snapshot, then a clone that is itself written.
+        meta.set_manifest(file.ino, &manifest_of(b"newer"), 3)
+            .unwrap();
+        meta.create(source.ino, "late", 0o644, 1, 1).unwrap();
         manager
             .clone_to("/source", "before", "/copy")
             .await
@@ -448,39 +735,51 @@ mod tests {
         let clone_root = meta.resolve_path("/copy").unwrap().unwrap();
         let clone_attr = meta.getattr(clone_root).unwrap().unwrap();
         assert_eq!(clone_attr.uid, unsafe { libc::geteuid() });
-        assert_eq!(clone_attr.gid, unsafe { libc::getegid() });
         assert_eq!(
             meta.get_xattr(clone_root, "user.directory").unwrap(),
             Some(b"root".to_vec())
         );
-        let clone_file = meta.resolve_path("/copy/file").unwrap().unwrap();
-        let changed = Manifest::from_chunks(
-            DEFAULT_CHUNK_SIZE,
-            3,
-            vec![ChunkHash::of(b"new")],
-            constellation_fs_core::INLINE_CHUNKS_MAX,
-            ChunkHash::of,
-        )
-        .0
-        .encode();
-        meta.set_manifest(clone_file, &changed, 3).unwrap();
-
-        assert_eq!(chunks.get_chunk(&root).await.unwrap(), frozen_before);
-        let tree = manager.load_tree(root).await.unwrap();
+        assert!(meta.resolve_path("/copy/late").unwrap().is_none());
         assert_eq!(
-            tree.entries[0].xattrs,
+            meta.readlink(meta.resolve_path("/copy/sub/link").unwrap().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("../file")
+        );
+        let clone_file = meta.resolve_path("/copy/file").unwrap().unwrap();
+        assert_eq!(meta.manifest(clone_file).unwrap().unwrap(), original);
+        meta.set_manifest(clone_file, &manifest_of(b"clone"), 3)
+            .unwrap();
+
+        let frozen = manager.list_frozen(&root.object()).await.unwrap();
+        assert_eq!(
+            frozen.xattrs,
+            vec![("user.directory".into(), b"root".to_vec())]
+        );
+        let names: Vec<&str> = frozen.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["file", "sub"]);
+        assert_eq!(
+            frozen.entries[0].xattrs,
             vec![("user.snapshot".into(), b"preserved".to_vec())]
         );
-        let manifest_hash = tree.entries[0].manifest_or_tree_hash.unwrap();
+        let object = frozen.entries[0].object.unwrap();
         assert_eq!(
-            manager.load_manifest(manifest_hash).await.unwrap(),
+            manager.load_manifest(&object).await.unwrap(),
             Manifest::decode(&original).unwrap()
         );
-        assert_eq!(meta.manifest(file.ino).unwrap().unwrap(), original);
-        assert_eq!(meta.manifest(clone_file).unwrap().unwrap(), changed);
-        assert_eq!(
-            meta.get_xattr(clone_file, "user.snapshot").unwrap(),
-            Some(b"preserved".to_vec())
-        );
+
+        // What the FUSE view resolves for a subdirectory of the source.
+        let covering = manager.covering("/source/sub").await.unwrap();
+        assert_eq!(covering.len(), 1);
+        let sub_frozen = manager.list_frozen(&covering[0].1).await.unwrap();
+        assert_eq!(sub_frozen.entries[0].target.as_deref(), Some("../file"));
+
+        // GC protects the frozen chunk, not the current ones.
+        let refs = snapshot_chunk_refs(&chunks, manager.tree().unwrap(), &root)
+            .await
+            .unwrap();
+        assert!(refs.contains(&ChunkHash::of(b"old")));
+        assert!(!refs.contains(&ChunkHash::of(b"newer")));
+        assert_eq!(manager.refs(&row.id).await.unwrap().len(), refs.len());
     }
 }

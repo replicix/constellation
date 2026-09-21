@@ -209,6 +209,12 @@ impl ChunkStore {
         self.e2e.is_some()
     }
 
+    /// The filesystem's E2E keyring, when it has one (plan 28's metadata
+    /// tree readers hash and shape nodes under its addressing key).
+    pub fn e2e_keys(&self) -> Option<&SharedE2eKeys> {
+        self.e2e.as_ref()
+    }
+
     /// Compute the filesystem's chunk identity. All callers which mint a
     /// manifest use this helper so an E2E mount cannot accidentally expose a
     /// plain confirmation-of-file hash.

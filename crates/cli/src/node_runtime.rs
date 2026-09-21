@@ -448,13 +448,31 @@ impl NodeRuntime {
             .compression
             .parse()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let snapshots = Arc::new(snapshot::SnapshotManager::new(
-            meta.clone(),
-            store.clone(),
-            compression,
-            fsmeta.chunk_size,
-            node_id,
-        ));
+        // Plan 28's metadata tree: one node cache per node, shared by the
+        // publisher and by snapshot reads.
+        //
+        // The hasher has to match the one the disk cache was opened
+        // with. On an E2E filesystem node identity, the boundary function
+        // and blob addressing are all keyed under the addressing key
+        // (§P13), so a plain-hashing reader or writer would look for
+        // nodes nothing names and build a tree of a different shape.
+        let tree_hasher = match &e2e_keys {
+            Some(keys) => constellation_mtree::Hasher::Keyed(*keys.addressing_key()),
+            None => constellation_mtree::Hasher::Plain,
+        };
+        let tree_access = snapshot::TreeAccess {
+            nodes: Arc::new(constellation_store_s3::NodeCache::new(
+                constellation_store_s3::PackStore::new(store.inner().clone()),
+                cache.clone(),
+                tree_hasher,
+                rt.clone(),
+            )),
+            config: constellation_mtree::record::config().with_hasher(tree_hasher),
+            blobs: constellation_store_s3::BlobStore::new(store.inner().clone(), tree_hasher),
+        };
+        let snapshots_base =
+            snapshot::SnapshotManager::new(meta.clone(), store.clone(), fsmeta.chunk_size, node_id)
+                .with_tree(tree_access.clone());
 
         // Write authority (DESIGN.md §4/§5). Renew and takeover need
         // If-Match; a backend without it can only be driven safely by one
@@ -504,6 +522,27 @@ impl NodeRuntime {
         // blocks on it for fsync in --fsync-mode s3, and asks it to take
         // the lease on the first mutation.
         let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel::<fusefs::SyncRequest>();
+
+        // A snapshot is a retained metadata root (plan 28), so taking one
+        // forces a publish on the sync task, which owns the shipper. A
+        // read-only member publishes nothing and so cannot take one.
+        let snapshots = Arc::new(if read_only_member {
+            snapshots_base
+        } else {
+            let tx = sync_tx.clone();
+            snapshots_base.with_publisher(Arc::new(move || {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    let (reply, receive) = tokio::sync::oneshot::channel();
+                    tx.send(fusefs::SyncRequest::Publish { reply })
+                        .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
+                    receive
+                        .await
+                        .map_err(|_| anyhow::anyhow!("metadata publish stopped"))?
+                        .map_err(|e| anyhow::anyhow!(e))
+                })
+            }))
+        });
 
         // P2P fast path (DESIGN.md §8, M3.3). Every failure here is
         // non-fatal: without peers the daemon behaves exactly as phases 1-2,
@@ -626,33 +665,16 @@ impl NodeRuntime {
         }
         ship.set_peers(peers.clone());
         ship.set_designations(designations.clone());
-        // Plan 28 §11: publish the §P6 tree alongside the checkpoint.
-        //
-        // The hasher has to match the one the disk cache was opened
-        // with. On an E2E filesystem node identity, the boundary
-        // function and blob addressing are all keyed under the
-        // addressing key (§P13), so a plain-hashing publisher would
-        // write nodes nothing can name and a tree of a different shape.
-        // A read-only member publishes nothing: it ships no segments,
-        // so it has no authority to commit one.
+        // Plan 28 §11: publish the §P6 tree on the checkpoint cadence.
+        // A read-only member publishes nothing: it ships no segments, so
+        // it has no authority to commit one.
         if !read_only_member {
-            let hasher = match &e2e_keys {
-                Some(keys) => constellation_mtree::Hasher::Keyed(*keys.addressing_key()),
-                None => constellation_mtree::Hasher::Plain,
-            };
-            let backend = store.inner().clone();
-            let nodes = Arc::new(constellation_store_s3::NodeCache::new(
-                constellation_store_s3::PackStore::new(backend.clone()),
-                cache.clone(),
-                hasher,
-                rt.clone(),
-            ));
             let publisher = crate::mtree_publish::TreePublisher::new(
                 meta.clone(),
-                nodes,
-                constellation_store_s3::BlobStore::new(backend.clone(), hasher),
-                constellation_store_s3::CommitChain::new(backend),
-                constellation_mtree::record::config().with_hasher(hasher),
+                tree_access.nodes.clone(),
+                tree_access.blobs.clone(),
+                constellation_store_s3::CommitChain::new(store.inner().clone()),
+                tree_access.config,
                 node_id,
                 rt.clone(),
             );
@@ -1417,6 +1439,16 @@ impl NodeRuntime {
                             )
                             .await;
                             let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                        }
+                        Some(fusefs::SyncRequest::Publish { reply }) => {
+                            let mut ship = ship.lock().await;
+                            let mut keepers = keepers.lock().await;
+                            let r = async {
+                                ship.sync_all(&mut keepers).await?;
+                                ship.publish_now().await
+                            }
+                            .await;
+                            let _ = reply.send(r.map_err(|e| format!("{e:#}")));
                         }
                         Some(fusefs::SyncRequest::Barrier { ino, reply }) => {
                             // `--fsync-mode s3` is an inode/partition

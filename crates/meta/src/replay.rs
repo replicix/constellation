@@ -872,35 +872,10 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![id, path, name, root_hash, created_unix_ms],
             )?;
-            if let Some(hash) = constellation_fs_core::ChunkHash::from_hex(root_hash) {
-                tx.execute(
-                    "DELETE FROM deref WHERE chunk_hash = ?1",
-                    params![hash.0.to_vec()],
-                )?;
-            }
             Ok(Applied::Done)
         }
         LogRecord::SnapDelete { id, .. } => {
-            let root_hash: Option<String> = tx
-                .query_row(
-                    "SELECT root_hash FROM snapshot WHERE id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .optional()?;
             tx.execute("DELETE FROM snapshot WHERE id = ?1", params![id])?;
-            if let Some(hash) =
-                root_hash.and_then(|value| constellation_fs_core::ChunkHash::from_hex(&value))
-            {
-                tx.execute(
-                    "INSERT OR REPLACE INTO deref (chunk_hash, deref_seq, deref_unix_ms)
-                     VALUES (?1, 0, ?2)",
-                    params![
-                        hash.0.to_vec(),
-                        constellation_fs_core::types::now_ns() / 1_000_000
-                    ],
-                )?;
-            }
             Ok(Applied::Done)
         }
         LogRecord::Clone { nodes, .. } => {
