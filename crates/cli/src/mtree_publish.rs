@@ -86,7 +86,7 @@ use anyhow::{Context, Result};
 use constellation_fs_core::{FileAttr, Ino};
 use constellation_meta::{LogRecord, SqliteMeta, TreeInode};
 use constellation_mtree::{
-    keys, record, Attrs, DentryRecord, Edit, Kind, NodeHash, Tree, VALUE_SPILL,
+    keys, record, Attrs, DentryRecord, Edit, Kind, NodeHash, NodeStore, Tree, VALUE_SPILL,
 };
 use constellation_store_s3::{
     vector_covers, BlobStore, Commit, CommitChain, CommitPayload, Intent, NodeCache, StoreError,
@@ -110,6 +110,11 @@ const PUBLISH_ATTEMPTS: usize = 4;
 const KV_ROOT: &str = "mtree/root";
 const KV_SEQ: &str = "mtree/commit_seq";
 const KV_VECTOR: &str = "mtree/applied_vector";
+
+/// The commit this replica last published or was loaded from, if any.
+pub fn remembered_seq(meta: &SqliteMeta) -> Result<Option<u64>> {
+    Ok(meta.kv_get(KV_SEQ)?.and_then(|seq| seq.parse().ok()))
+}
 
 /// Record a commit this replica's state was loaded from (S6's
 /// bootstrap), so the node's publisher can pick it up as its parent
@@ -857,6 +862,20 @@ fn encode_vector(vector: &std::collections::BTreeMap<String, u64>) -> String {
         .join(",")
 }
 
+/// Build the tree the replica's current state calls for, from nothing,
+/// into `tree`'s store — `fsck`'s half of "recompute the root hash and
+/// compare". The same code path as a publisher's rebuild, so an
+/// agreement bug between them cannot hide here. Nothing is uploaded:
+/// spilled values are hashed, never stored.
+pub fn rebuild_root<S: NodeStore>(
+    meta: &SqliteMeta,
+    tree: &Tree<S>,
+    blobs: &BlobStore,
+) -> Result<NodeHash> {
+    let builder = Builder { meta, tree, blobs };
+    meta.read_consistent(|| Ok(builder.rebuild()?.1))
+}
+
 // ----------------------------------------------------------- the builder
 
 /// One key/value pair as the tree hands it back.
@@ -867,13 +886,13 @@ type Entry = (Vec<u8>, Vec<u8>);
 /// Borrowed rather than owned so the same code serves the incremental
 /// path and the rebuild; the only difference between them is whether
 /// there is an old tree to diff against.
-struct Builder<'a> {
+struct Builder<'a, S> {
     meta: &'a SqliteMeta,
-    tree: &'a Tree<Arc<NodeCache>>,
+    tree: &'a Tree<S>,
     blobs: &'a BlobStore,
 }
 
-impl Builder<'_> {
+impl<S: NodeStore> Builder<'_, S> {
     /// Every inode, a page at a time, onto an empty tree.
     ///
     /// The first publish and `fsck`'s path. It is the incremental
