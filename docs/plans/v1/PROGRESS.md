@@ -3344,7 +3344,7 @@ encoding, since a varint `ino` would order `(1 << 40)` before
   touching no product code do not run the e2e lanes. The full
   CONVENTIONS list applies from S5, where `cli/shipper` is wired.
 
-## Plan 28 step S5 — builder from the live replica: **DONE (gates open)**
+## Plan 28 step S5 — builder from the live replica: **DONE**
 
 Step S5 of `wip/28-s3-native-metadata-store.md` §11. Option (B) is
 wired: `SqliteMeta` → §P6 `mtree` → pack + commit, driven from the
@@ -3359,10 +3359,11 @@ after landing the code; the coordinator verified and ran gates.
 | Pack-before-commit for spilled values | done | `store-s3/src/blobs.rs` + spill test |
 | Shipper / mount wiring; publisher on by default for writers | done | `shipper.rs`, `node_runtime.rs` |
 | atime stays out of the tree | done | test `atime_never_reaches_the_tree` |
-| §11a `configuration.md` for S4 knobs | **open** | not written |
-| `getattr`/`lookup` p99 during publish | **open** | not measured |
-| Harness matrix | **open** | not run |
-| pjdfstest | **open** | docker image build failed (see below) |
+| §11a `configuration.md` for S4 knobs | done | `docs/reference/configuration.md` |
+| `getattr` p99 during publish | done (2026-09-21) | 5.1 µs idle, 5–8 µs during a 1.3 s full publish of 300k keys; `mtree_publish::tests::getattr_latency_during_a_publish` (ignored, run by hand) |
+| **Defect**: a replica *behind* the chain head could overwrite newer tree values with older ones | fixed | commits carry an `applied` vector, read in the plan's SQLite snapshot (`SqliteMeta::read_consistent`); publish and splice require `vector_covers` |
+| **Defect**: a cancelled sync round dropped the publisher's taken batch for good | fixed | `TreePublisher::publish` and `NodeCache::seal_packs` are cancellation-safe; test `a_cancelled_publish_keeps_its_batch` |
+| Harness matrix, pjdfstest | done | the final plan 28 gate run, below |
 
 ### Gates (2026-09-14)
 
@@ -3385,9 +3386,102 @@ after landing the code; the coordinator verified and ran gates.
 - §11a store knobs — **documented** in
   `docs/reference/configuration.md` (Merkle metadata tree)
 
-### Deliberately left open
+### Resolved 2026-09-21
 
-- Finish compliance after image build completes
-- Finish / diagnose harness matrix (divergences may be S5-related)
-- Publish stall `getattr`/`lookup` p99 measurement
-- S7b: document `CONSTELLATION_GC_THREADS` / compact rate knobs
+- The harness divergences (`baseline`, `kill9-remount`: files reading back
+  as size 0 or another file's size) were **not S5**: they reproduce on
+  `95985b2`, before plan 28, about half the time on a 32-core host.
+  `getattr` read the committed row *then* checked the write shard, so it
+  could interleave with `flush_inode` and cache the pre-flush size for
+  TTL. Fixed by reading under the shard lock (and giving `lookup` the
+  same overlay); 0/24 failures after, from ~50%.
+- The two defects in the table above; the second was found by
+  `snapshot-churn` once snapshots were commit-backed.
+- `CONSTELLATION_GC_THREADS` and the compaction knobs are documented with
+  S7b.
+
+## Plan 28 step S6 — reader: bootstrap, partial replica, `fsck`: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Bootstrap a fresh replica from the chain head: one cursor walk loads `0x01`/`0x02`/`0x03` into `inode`/`dentry`/`xattr` (spilled values resolved from `blobs/`), `0x30` into partitions, snapshot rows and the replicated quota; then tail each partition from the commit's `applied` vector | done | `cli::mtree_read::{bootstrap_from_commit, load_tree}`, `cli::shipper::bootstrap_from_tree` |
+| Checkpoint fallback when the chain is empty; `CONSTELLATION_BOOTSTRAP_SOURCE=checkpoint` forces it | done | `cli::shipper::bootstrap` |
+| `0x30` records written by the publisher (new `Subsystem::Partition`; bodies are versioned self-delimiting field lists) | done | `mtree::record::{encode_fields, decode_fields}`, `mtree_read::subsystem_state` |
+| Publisher defers while a cross-partition rename half is parked, so no commit splits a pair (`xpart_pending` is not carried) | done | `mtree_publish::Planned::Parked` |
+| Readers find nodes through the pack catalog, not a commit's own `packs`; `NodeCache` refreshes the catalog once per burst of misses (compaction moves nodes into packs no commit names) | done | `NodeCache::refresh_catalog`, miss path in `NodeStore::get` |
+| Table-by-table equality of a bootstrapped replica with the publisher, with the checkpoint and every covered segment deleted so only the commit can supply the state | done | `shipper::tests::a_fresh_replica_bootstraps_from_the_commit_chain`, `SqliteMeta::dump_replicated` |
+| Partial replica at reader level: `TreeReader` (lookup/getattr/readdir(plus)/listxattr from a root); interior-only warm-up reads no leaf, a cold `ls -la` touches one pack (≤ 2 across a seal, ≥ 75% of directories in one), a walk reads no leaf outside the visited directories bar one boundary leaf per side | done | `mtree_read::tests::{the_reader_answers_what_the_replica_answers, a_partial_replica_reads_only_the_directories_it_visits}` |
+| `fsck`: verify every node of the head (hash, structure, each interior aggregate against its child, root against the commit) and, when a commit claims exactly the replica's state, rebuild through the publisher's code path into memory and compare roots, reporting differing keys | done | `cli::fsck::check_metadata_tree`, `TreeReader::verify`, `mtree_publish::rebuild_root` |
+| Bootstrap wall time | measured locally | 100k inodes in 358 ms from a cold cache over an in-memory store (`getattr_latency_during_a_publish`); **not** measured on the plan 26 Appendix remote paths (no remote bucket on this host) |
+
+Not carried by a commit, deliberately: atime (§P6), the `deref` table (a
+replica that never saw a dereference misses some chunk-GC candidates; the
+orphan pass collects them), parked `xpart_pending` halves (see above).
+
+**Deferred to §11b:** serving FUSE from a partial SQLite replica needs
+the engine swap (SQLite answers every FUSE call in (B)), so the partial
+replica exists as the reader API and its tests, not as a mount mode.
+
+### Plan 28 S6 exit criteria
+
+- [x] Full bootstrap from a commit, checkpoint fallback, table-by-table
+      equality with the source replica
+- [x] Partial-replica tests at reader level (§12's shape)
+- [x] `fsck` recomputes the root and verifies every node
+- [ ] Bootstrap wall time on the plan 26 Appendix paths (no remote
+      bucket available; local number recorded instead)
+
+## Plan 28 — retiring the checkpoint: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| A mount with a publisher writes no `VACUUM INTO` snapshot; the checkpoint cadence publishes a commit instead | done | `Shipper::checkpoint` |
+| `CONSTELLATION_CHECKPOINT_SNAPSHOT=on` re-enables the snapshot (mounts without a publisher always write it) | done | `shipper::checkpoint_snapshot_forced` |
+| Log retention floors on the head commit's `applied` vector once a commit exists, else on `checkpoints/VECTOR.json` | done | `gc::metadata_candidates`, test `log_retention_floors_on_the_head_commit_once_one_exists` |
+| A bootstrap whose base the log was pruned past fails loudly instead of replaying from the gap | done | `shipper::replay_from`, test `replay_refuses_a_base_the_log_was_pruned_past` |
+
+## Plan 28 — snapshots as retained tree roots: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| A snapshot is `(commit seq, mtree root, dir ino)`, taken after a forced publish on the sync task | done | `SyncRequest::Publish`, `Shipper::publish_now`, `SnapshotManager::create` |
+| `build_tree` deleted; `covering`, `clone_to`, the FUSE view and chunk-GC's snapshot roots read the tree through `FrozenObject`/`TreeReader` | done | `cli::snapshot`, `cli::fusefs`, `gc::snapshot_roots` |
+| Legacy (v1, `fs-core` tree blob) snapshots removed outright — no established users | done | `SnapshotRecord` v2 only; snapshot roots never enter `deref` |
+| Frozen against source and clone writes, down to xattrs and manifests; GC protects the frozen chunks | done | `snapshot::tests::a_tree_snapshot_is_frozen_against_source_and_clone_writes` |
+
+## Plan 28 step S7b — metadata GC wiring, retention, rate budgets: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| Commit retention: `CONSTELLATION_COMMIT_RETENTION` (64) and `..._RETENTION_S` (86400); a commit goes only when outside the newest N *and* older than S; head always kept | done | `cli::mtree_gc::expired_commits` |
+| Mark from retained commits, every snapshot root, and nodes named by live holds | done | `mtree_gc::mark_roots` |
+| Sweep with `Sweep::classify`; delete dead packs, compact partially dead ones under `CONSTELLATION_COMPACT_BYTES_PER_S` (32 MiB/s) with a restartable cursor in kv | done | `mtree_gc::run_inner` |
+| Condemned-pack handshake: publish list, wait a lease TTL, re-mark, act only on still-dead condemned packs; index-less bodies deleted only past the horizon and after the wait | done | `gc/condemned-packs.json`, `store-s3::gc::{read,publish}_condemned_packs` |
+| Publisher never deduplicates against a condemned pack and re-checks every pack it trusted immediately before the CAS (condemned or gone → forget, defer, re-upload) | done | `NodeCache::{set_condemned, start_dedup_log, dedup_is_sound}`, test `a_publisher_never_names_a_condemned_pack` |
+| Round test: retired commits' packs reclaimed, retained commits and a snapshot of a retired commit fully readable from a cold cache, cursors cleared, the publisher keeps working across compaction | done | `mtree_gc::tests::a_round_reclaims_what_retired_commits_kept_and_nothing_else` |
+| S7a's `Compactor` futures made `Send`-general (the daemon spawns GC) | done | `store-s3::compact` |
+| Knobs documented | done | `configuration.md` (Garbage collection) |
+| Steady-state plateau against the real store | done | harness `mtree-gc-plateau` (flat ~43.8 KB from round 2) |
+
+**Deferred:** `blobs/` (values > 1 KiB spilled from nodes) is not swept.
+A blob is content-addressed under one key forever, so it cannot use the
+re-upload escape packs use and needs a two-mark horizon of its own;
+spills are rare and an unreferenced blob only costs space.
+
+### Plan 28 S7b exit criteria
+
+- [x] Retention, mark, sweep, compaction and the rate budget wired into
+      `gc::run`
+- [x] Restartable cursor; condemned-list handshake for packs and
+      incomplete packs
+- [x] Knobs documented
+- [x] Footprint plateau measured against the real store
+
+## Plan 28 — other defects found while finishing (B)
+
+| Defect | Fix | Where |
+|---|---|---|
+| `getattr`/`lookup` could cache a pre-flush size (pre-existing; the S5 harness failures) | read the committed row under the write-shard lock | `cli::fusefs_ops` |
+| A framed gossip message sometimes decoded as a bare one (`postcard` ignores trailing bytes; ~1 in 20 keys) | exact decode, 64-byte signature, test asserts decode-then-verify | `net::message::Signed::decode` |
+| Lease expiry margin (1 s) exceeded short TTLs, so a 200 ms-TTL node never shipped | margin clamped to TTL/4 | `cli::lease::expiry_margin_ms` |
+

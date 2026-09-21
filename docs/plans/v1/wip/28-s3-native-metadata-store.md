@@ -911,10 +911,10 @@ full CONVENTIONS gate list applies, pjdfstest included.
 | **S2** | `crates/mtree` — the pure data structure — **DONE** | — | new crate only |
 | **S3** | `mtree::keys` — the §P6 codec — **DONE** | S1, S2 | new crate only |
 | **S4** | Pack store, node cache, commit chain — **DONE** | S2 | `store-s3` |
-| **S5** | Builder from the live replica — **(B) complete** — **DONE (gates open)** | S3, S4 | `cli/shipper` |
-| **S6** | Reader: bootstrap, partial replica, `fsck` | S5 | `cli`, `meta` |
+| **S5** | Builder from the live replica — **(B) complete** — **DONE** | S3, S4 | `cli/shipper` |
+| **S6** | Reader: bootstrap, partial replica, `fsck` — **DONE** | S5 | `cli`, `meta` |
 | **S7a** | Reachability mark + compactor, as library code — **DONE** | S4 | `store-s3` |
-| **S7b** | GC wiring, retention, rate budgets | S5, S7a | `cli/gc` |
+| **S7b** | GC wiring, retention, rate budgets — **DONE** | S5, S7a | `cli/gc` |
 
 S1 and S2 are independent and start together. S1 is a short measurement
 and S2 is the long pole, so gating S3 on S1 costs nothing.
@@ -1331,7 +1331,35 @@ p99 during an active publish per §13 — eliminating the `VACUUM INTO`
 stall is one of this plan's claims, and replacing it with a tree-build
 stall would be a regression, not a win.
 
-### S6 — Reader: bootstrap, partial replica, `fsck`
+### S6 — Reader: bootstrap, partial replica, `fsck` — **DONE (2026-09-21)**
+
+Landed in `cli/src/mtree_read.rs` (bootstrap loader, `TreeReader`,
+`0x30` codec), `shipper::bootstrap_from_tree`, and
+`fsck::check_metadata_tree`; details and exit criteria in `PROGRESS.md`.
+Carried forward:
+
+- **Commits carry an `applied` vector** (partition → highest applied
+  segment), read in the same SQLite snapshot as the publisher's plan. It
+  is both the bootstrap's resume point and the guard that closed the S5
+  regression bug: a replica may only build on, or splice onto, a commit
+  whose vector its own covers.
+- **`0x30` is written**: snapshot rows, the replicated quota, and a new
+  `Subsystem::Partition` for the partition map. `xpart_pending` is not
+  carried; the publisher defers while a rename half is parked instead.
+- **Readers use the pack catalog, never a commit's `packs`**, and the node
+  cache refreshes it on a miss — a tree lives mostly in ancestors' packs
+  and, after S7b's compaction, in packs no commit names.
+- **The checkpoint is retired**: a publishing mount writes no `VACUUM
+  INTO` snapshot (`CONSTELLATION_CHECKPOINT_SNAPSHOT=on` restores it), and
+  log retention floors on the head commit's vector.
+- **Snapshots are retained roots** `(seq, root, dir ino)` after a forced
+  publish; `build_tree` and the legacy tree-blob snapshots are gone.
+- **The partial replica is a reader API**, tested at reader level (§12's
+  shape). Mounting from it is §11b's engine swap.
+- Not measured: bootstrap wall time on the plan 26 Appendix paths (no
+  remote bucket); locally 100k inodes load in 358 ms from a cold cache.
+
+Original work order, for the record:
 
 **Deliverable.** Rebuild a replica from a commit — plan 27's goal, now
 against a canonical format. A full bootstrap, and a **partial** one that
@@ -1416,6 +1444,20 @@ verification all stay (§P10).
 **Gate.** Full list, plus a re-run of §0.2b's steady-state shape against
 the real store: the footprint must plateau.
 
+**S7b is DONE (2026-09-21)**, in `cli/src/mtree_gc.rs` as a second phase
+of `gc::run`: commit retention, a mark from retained commits, snapshot
+roots and holds, the sweep and paced compaction with a restartable kv
+cursor, and index-less packs past the horizon. The delete-vs-dedup race
+turned out to have a metadata twin that S7a's library could not see: a
+publisher's `NodeCache::put` skips uploading any node whose location it
+already knows, which can *resurrect* a node the mark found dead and name
+a pack GC is about to delete. It is closed by the same shape as the chunk
+handshake — `gc/condemned-packs.json`, a lease-TTL wait and a re-mark on
+the GC side; no dedup against a condemned pack plus a pre-CAS check of
+every pack the batch trusted on the publisher side. The plateau gate is
+the harness scenario `mtree-gc-plateau`. `blobs/` is not swept yet (see
+`PROGRESS.md`).
+
 ### 11a. Carried debt: the config knobs are undocumented
 
 `docs/reference/configuration.md` is this repo's canonical env-knob
@@ -1426,12 +1468,11 @@ reference. Plan 28 knobs:
 | `CONSTELLATION_PACK_TARGET_BYTES` (4 MiB) | S4 | **S5 — done** (`configuration.md`, Merkle metadata tree) |
 | `CONSTELLATION_NODE_MEMORY_BYTES` (64 MiB) | S4 | **S5 — done** |
 | `CONSTELLATION_COMMIT_PROBE_WINDOW` (8) | S4 | **S5 — done** |
-| `CONSTELLATION_GC_THREADS` (one per core) | S7a | **S7b** |
-| `CONSTELLATION_COMPACT_BYTES_PER_S` | not yet | **S7b** |
-| `CONSTELLATION_COMMIT_RETENTION`, `..._RETENTION_S` | not yet | **S7b** |
-
-GC and retention knobs stay with S7b — they are not operator-reachable
-until that wiring lands.
+| `CONSTELLATION_GC_THREADS` (one per core) | S7a | **S7b — done** |
+| `CONSTELLATION_COMPACT_BYTES_PER_S` (32 MiB/s) | S7b | **S7b — done** |
+| `CONSTELLATION_COMMIT_RETENTION` (64), `..._RETENTION_S` (86400) | S7b | **S7b — done** |
+| `CONSTELLATION_BOOTSTRAP_SOURCE` (`auto`) | S6 | **S6 — done** |
+| `CONSTELLATION_CHECKPOINT_SNAPSHOT` (`off`) | S6 | **S6 — done** |
 
 ### 11b. Out of scope here — the engine swap
 

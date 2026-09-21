@@ -527,6 +527,24 @@ Because every one of these changes lands in the write path, pjdfstest
 (truncate, extend, and hole semantics) and the `fio-*` scenarios are the
 real regression tripwires for both phases, not just the new scenarios.
 
+Plan 28 adds `mtree-gc-plateau` and reshapes two older scenarios around the
+metadata commit chain:
+
+- `mtree-gc-plateau` rewrites a third of a fixed 300-file set in each of twelve
+  rounds, forces a metadata commit per round (taking and immediately deleting
+  a snapshot publishes one), and runs `constellation gc` with a two-commit
+  retention window (`CONSTELLATION_COMMIT_RETENTION=2`,
+  `..._RETENTION_S=0`, unpaced compaction). The `packs/` byte footprint of
+  the late rounds must stay within 1.5x the early rounds', and a fresh node
+  must then bootstrap from the surviving commit to the oracle. Seed 42
+  measured a flat ~43.8 KB from round 2 on; without GC it grows ~20 KB a
+  round.
+- `checkpoint-strips-pending-upload` accepts a plan 28 commit as the
+  mid-flight bootstrap base (a legacy checkpoint still counts if forced on).
+- `fresh-node-bootstrap` now rebuilds from the newest commit plus the log
+  tail after its applied vector.
+- `snapshot-churn` honours `CHAOS_KEEP_TMP` like the other scenarios.
+
 Plan 26 adds five metadata-plane scenarios. They assert on **S3 request
 classes and counts**, which no other lane can see: toxiproxy is a TCP fault
 injector with no notion of HTTP, and floci logs bucket lifecycle only.
@@ -537,7 +555,9 @@ toxic still applies. It parses client-to-upstream HTTP/1.1 request lines only,
 and exposes a `desyncs` counter that every scenario using it asserts is zero,
 so a miscounted stream fails the scenario instead of silently under-reporting.
 
-- `ckpt-bulk-ingest-bounded` ingests a seeded tree from one writer and rewrites
+- `ckpt-bulk-ingest-bounded` forces the legacy `VACUUM INTO` snapshot back on
+  (`CONSTELLATION_CHECKPOINT_SNAPSHOT=on`; plan 28 turned it off by default)
+  and ingests a seeded tree from one writer, rewriting
   it until at least three checkpoints have fired, then asserts the bucket holds
   at most the newest two snapshots, that their combined size is within 3x the
   final snapshot, and that a fresh node still bootstraps to the oracle's exact
