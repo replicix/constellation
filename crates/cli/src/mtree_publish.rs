@@ -63,8 +63,9 @@
 //! unlinked file some process still holds open — is **not** in the
 //! tree: it is node-local transient state that no other replica can
 //! reach, and including it would make the §P7 aggregate disagree with
-//! the reachable filesystem it is supposed to describe. `0x30` is not
-//! written yet; see the S5 section of `PROGRESS.md`.
+//! the reachable filesystem it is supposed to describe. `0x30` holds the
+//! snapshot rows, the replicated quota and the partition map — what a
+//! bootstrap needs beyond the namespace (codec in `mtree_read`).
 //!
 //! atime appears nowhere. `LogRecord::Atime` is noted as touching
 //! nothing at all, which `atime_never_reaches_the_tree` pins — not as a
@@ -110,6 +111,21 @@ const KV_ROOT: &str = "mtree/root";
 const KV_SEQ: &str = "mtree/commit_seq";
 const KV_VECTOR: &str = "mtree/applied_vector";
 
+/// Record a commit this replica's state was loaded from (S6's
+/// bootstrap), so the node's publisher can pick it up as its parent
+/// instead of rebuilding. `restore` still trusts it only if the replica
+/// has applied exactly `commit.applied` — a bootstrap that tailed past
+/// the commit leaves the vectors unequal and the first publish rebuilds.
+pub fn remember_loaded_commit(meta: &SqliteMeta, commit: &Commit) -> Result<()> {
+    let Some(root) = commit.root(SHARD0) else {
+        return Ok(());
+    };
+    meta.kv_set(KV_ROOT, &root.to_hex())?;
+    meta.kv_set(KV_SEQ, &commit.seq.to_string())?;
+    meta.kv_set(KV_VECTOR, &encode_vector(&commit.applied))?;
+    Ok(())
+}
+
 /// The entities a batch of log records touched.
 ///
 /// References, not values, and a set rather than a list: publishing is
@@ -120,6 +136,11 @@ const KV_VECTOR: &str = "mtree/applied_vector";
 pub struct Touched {
     inodes: BTreeSet<Ino>,
     dentries: BTreeSet<(Ino, String)>,
+    /// A snapshot, quota or partition record moved, so the `0x30`
+    /// subsystem range is re-planned. It holds a handful of records per
+    /// filesystem, so re-deriving all of it is cheaper than tracking
+    /// which one.
+    subsystems: bool,
     /// Set when the changed set is unknown and only a rebuild can
     /// restore agreement with the replica.
     full: bool,
@@ -127,7 +148,7 @@ pub struct Touched {
 
 impl Touched {
     pub fn is_empty(&self) -> bool {
-        !self.full && self.inodes.is_empty() && self.dentries.is_empty()
+        !self.full && !self.subsystems && self.inodes.is_empty() && self.dentries.is_empty()
     }
 
     pub fn needs_rebuild(&self) -> bool {
@@ -216,14 +237,15 @@ impl Touched {
             // restores it, and the next record it journals is what this
             // sees. Nothing to do here.
             LogRecord::RenameXpartAbort { .. } => {}
-            // §P6's `0x30` range is not written yet (see the module
-            // docs), so subsystem records touch no tree key.
+            // The `0x30` records a bootstrap needs: snapshot rows, the
+            // replicated quota, and the partition map (which moves no
+            // inode, name or attribute, but tells a bootstrapped
+            // replica which logs to tail).
             LogRecord::SnapCreate { .. }
             | LogRecord::SnapDelete { .. }
-            | LogRecord::SetQuota { .. } => {}
-            // Partition topology is replica-local bookkeeping: it moves
-            // no inode, no name and no attribute.
-            LogRecord::PartSplit { .. } | LogRecord::PartMerge { .. } => {}
+            | LogRecord::SetQuota { .. }
+            | LogRecord::PartSplit { .. }
+            | LogRecord::PartMerge { .. } => self.subsystems = true,
             // The one record that must never move the tree. §P6
             // excludes atime from the encoding entirely; a tree that
             // changed on read would make `find` a publish storm.
@@ -239,7 +261,7 @@ impl Touched {
 
     /// Entities, for logging and for the batch size a commit records.
     pub fn len(&self) -> usize {
-        self.inodes.len() + self.dentries.len()
+        self.inodes.len() + self.dentries.len() + usize::from(self.subsystems)
     }
 }
 
@@ -338,9 +360,8 @@ pub struct TreePublisher {
     /// it. `None` until the first publish.
     state: Option<Published>,
     pending: Touched,
-    /// Whether the node cache has been taught where the nodes under
-    /// [`Self::state`] live. False after a restart, when the root came
-    /// out of the replica's kv store but the cache is cold.
+    /// Whether the node cache has loaded the pack catalog. False until
+    /// the first publish of every process (see `new`).
     hydrated: bool,
     handle: tokio::runtime::Handle,
 }
@@ -365,6 +386,11 @@ enum Planned {
     /// touched might be older than the head's. Publishing would regress
     /// the tree; the tailer closes the gap and a later round publishes.
     Behind { mine: Vector, head: Vector },
+    /// A cross-partition rename half is parked waiting for its partner.
+    /// That state lives only in `xpart_pending`, which no commit
+    /// carries, so a commit now could fall between the two halves and
+    /// strand the second one on every replica bootstrapped from it.
+    Parked(u64),
 }
 
 impl TreePublisher {
@@ -389,7 +415,11 @@ impl TreePublisher {
                 full: true,
                 ..Touched::default()
             },
-            hydrated: true,
+            // Always hydrate before the first publish, restored root or
+            // not: a rebuild re-`put`s every node of the namespace, and
+            // only a cache that knows which ones are already on the
+            // bucket skips the upload for the unchanged ones.
+            hydrated: false,
             handle,
         }
     }
@@ -447,31 +477,18 @@ impl TreePublisher {
     /// Teach a cold node cache where the published root's nodes live.
     ///
     /// A restart restores the root hash from the replica's kv store,
-    /// but the cache that has to resolve it has never seen a pack. A
-    /// commit names only the packs *it* created, so the locations are
-    /// spread over the chain and the whole of it up to our own commit
-    /// has to be read. Once per process, and only when a root was
-    /// restored rather than written.
-    ///
-    /// This is the crude version. A reader that walked the root and
-    /// fetched indices on demand would touch far fewer packs, but it
-    /// needs S6's reader; §P10b keeps the chain short in the meantime.
+    /// but the cache that has to resolve it has never seen a pack. The
+    /// nodes are spread over packs written by every ancestor commit —
+    /// some of them retired by retention, and after compaction some in
+    /// packs no commit names — so the pack catalog is the only complete
+    /// map. Once per process, and only when a root was restored rather
+    /// than written.
     async fn hydrate(&mut self) -> Result<()> {
         if self.hydrated {
             return Ok(());
         }
+        crate::mtree_read::attach_catalog(&self.cache).await?;
         self.hydrated = true;
-        let Some(state) = self.state.clone() else {
-            return Ok(());
-        };
-        for seq in self.chain.list_from(0).await? {
-            if seq > state.seq {
-                break;
-            }
-            if let Some(commit) = self.chain.get(seq).await? {
-                self.cache.load_pack_indices(&commit.pack_hashes()?).await?;
-            }
-        }
         Ok(())
     }
 
@@ -552,6 +569,10 @@ impl TreePublisher {
                 if let Some(head) = head_applied.filter(|head| !vector_covers(&vector, head)) {
                     return Ok(Planned::Behind { mine: vector, head });
                 }
+                let parked = meta.xpart_pending_count_reader()?;
+                if parked > 0 {
+                    return Ok(Planned::Parked(parked));
+                }
                 let (plan, root) = match base {
                     Some(base) if !batch.needs_rebuild() => {
                         let plan = builder.plan(Some(&base), &batch)?;
@@ -573,6 +594,13 @@ impl TreePublisher {
                     mine = encode_vector(&mine),
                     head = encode_vector(&head),
                     "metadata publish deferred: this replica is behind the chain head"
+                );
+                return Ok(None);
+            }
+            Planned::Parked(halves) => {
+                tracing::debug!(
+                    halves,
+                    "metadata publish deferred: a cross-partition rename is half applied"
                 );
                 return Ok(None);
             }
@@ -790,6 +818,7 @@ impl Touched {
     /// Fold a batch that did not land back into the pending set.
     fn merge(&mut self, other: Touched) {
         self.full |= other.full;
+        self.subsystems |= other.subsystems;
         self.inodes.extend(other.inodes);
         self.dentries.extend(other.dentries);
     }
@@ -866,20 +895,32 @@ impl Builder<'_> {
             };
             after = last;
             let plan = self.plan(None, &Touched::from_inodes(page))?;
-            root = self
-                .tree
-                .apply(&root, &plan.edits())
-                .map_err(StoreError::from)?;
-            total.blobs.extend(plan.blobs);
-            total.entities += plan.entities;
-            // The rebuild depends on nothing in any previous tree, so
-            // its read set is empty: a concurrent winner can change any
-            // key at all without invalidating "this is the replica".
-            // The edit count is kept for the commit's intent.
-            total.edits.extend(plan.edits);
+            self.absorb_page(&mut root, &mut total, plan)?;
         }
+        let subsystems = Touched {
+            subsystems: true,
+            ..Touched::default()
+        };
+        let plan = self.plan(None, &subsystems)?;
+        self.absorb_page(&mut root, &mut total, plan)?;
+        // The rebuild depends on nothing in any previous tree, so its
+        // read set is empty: a concurrent winner can change any key at
+        // all without invalidating "this is the replica".
         total.reads = ReadSet::default();
         Ok((total, root))
+    }
+
+    /// Fold one page of a rebuild into the running root. The edit count
+    /// is kept for the commit's intent.
+    fn absorb_page(&self, root: &mut NodeHash, total: &mut Plan, plan: Plan) -> Result<()> {
+        *root = self
+            .tree
+            .apply(root, &plan.edits())
+            .map_err(StoreError::from)?;
+        total.blobs.extend(plan.blobs);
+        total.entities += plan.entities;
+        total.edits.extend(plan.edits);
+        Ok(())
     }
 
     /// The incremental plan: what has to change in the tree so that it
@@ -946,8 +987,30 @@ impl Builder<'_> {
             }
         }
 
-        plan.entities = inodes.len() + names.len();
+        if batch.subsystems {
+            self.plan_subsystems(base, &mut plan)?;
+        }
+        plan.entities = inodes.len() + names.len() + usize::from(batch.subsystems);
         Ok(plan)
+    }
+
+    /// The `0x30` records (B) publishes, re-derived whole: they are a
+    /// handful per filesystem.
+    fn plan_subsystems(&self, base: Option<&NodeHash>, plan: &mut Plan) -> Result<()> {
+        let wanted = crate::mtree_read::subsystem_state(self.meta)?;
+        for subsystem in crate::mtree_read::PUBLISHED_SUBSYSTEMS {
+            let range = keys::records_of(subsystem);
+            plan.reads.prefix(range.prefix().to_vec());
+            for (key, _) in self.scan(base, &range)? {
+                if !wanted.contains_key(&key) {
+                    plan.remove(key);
+                }
+            }
+        }
+        for (key, value) in wanted {
+            plan.upsert(key, value);
+        }
+        Ok(())
     }
 
     /// One inode's `0x01`, `0x03` and `0x04` keys.

@@ -15,6 +15,7 @@ mod lease;
 mod leave;
 mod log_buffer;
 mod mtree_publish;
+mod mtree_read;
 mod node_runtime;
 mod parallelism;
 mod pin;

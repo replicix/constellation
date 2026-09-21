@@ -1947,11 +1947,131 @@ pub fn new_keeper(
 /// Build a fresh local replica from S3: latest checkpoint (if any) plus
 /// replay of newer segments. Used when the state dir has no metadata DB.
 ///
+/// Where a fresh replica comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootstrapSource {
+    /// The commit chain's head when there is one, else the checkpoint.
+    Auto,
+    /// The legacy `VACUUM INTO` checkpoint only.
+    Checkpoint,
+}
+
+/// Env `CONSTELLATION_BOOTSTRAP_SOURCE`: `auto` (default) restores the
+/// newest plan 28 commit and falls back to the checkpoint when the chain
+/// is empty; `checkpoint` forces the legacy path, which exists for
+/// buckets written before plan 28 and as an escape hatch while commits
+/// are new.
+fn bootstrap_source() -> BootstrapSource {
+    match std::env::var("CONSTELLATION_BOOTSTRAP_SOURCE").as_deref() {
+        Ok("checkpoint") => BootstrapSource::Checkpoint,
+        Ok("auto") | Ok("") | Err(_) => BootstrapSource::Auto,
+        Ok(other) => {
+            tracing::warn!(
+                value = other,
+                "CONSTELLATION_BOOTSTRAP_SOURCE must be auto or checkpoint; using auto"
+            );
+            BootstrapSource::Auto
+        }
+    }
+}
+
+/// Plan 28 S6: rebuild the replica from the commit chain's head, then
+/// tail every partition from the commit's `applied` vector. `false` when
+/// the chain is empty, so the caller falls back to the checkpoint.
+///
+/// A half-written replica is removed on failure, so the fallback (or a
+/// retry) starts from nothing rather than from a partial load.
+async fn bootstrap_from_tree(db_path: &std::path::Path, log: &LogStore) -> Result<bool> {
+    let scratch = db_path.with_extension("bootstrap-nodes");
+    let _ = std::fs::remove_dir_all(&scratch);
+    let result = async {
+        let reader = crate::mtree_read::ChainReader::for_log(log, &scratch)?;
+        if reader.head().await?.is_none() {
+            return Ok(None);
+        }
+        let meta = Arc::new(SqliteMeta::open(db_path)?);
+        let Some(loaded) =
+            crate::mtree_read::bootstrap_from_commit(&reader, Arc::clone(&meta)).await?
+        else {
+            return Ok(None);
+        };
+        let mut parts: Vec<String> = loaded.commit.applied.keys().cloned().collect();
+        for (id, _) in meta.partitions()? {
+            if !parts.contains(&id) {
+                parts.push(id);
+            }
+        }
+        let mut replayed = 0usize;
+        for part in parts {
+            let start = loaded.commit.applied.get(&part).copied().unwrap_or(0);
+            replayed += replay_from(&meta, log, &part, start).await?;
+        }
+        crate::mtree_publish::remember_loaded_commit(&meta, &loaded.commit)?;
+        for ino in meta.orphans()? {
+            meta.reap_orphan(ino)?;
+        }
+        tracing::info!(
+            seq = loaded.commit.seq,
+            inodes = loaded.inodes,
+            dentries = loaded.dentries,
+            replayed,
+            "bootstrapped metadata replica from commit"
+        );
+        anyhow::Ok(Some(()))
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    match result {
+        Ok(Some(())) => Ok(true),
+        Ok(None) => {
+            remove_db(db_path);
+            Ok(false)
+        }
+        Err(e) => {
+            remove_db(db_path);
+            Err(e.context("bootstrapping the metadata replica from the commit chain"))
+        }
+    }
+}
+
+fn remove_db(db_path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = db_path.as_os_str().to_owned();
+        path.push(suffix);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(path));
+    }
+}
+
+/// Apply `part`'s contiguous log run after `start` and record where it
+/// stopped. Shared by both bootstrap sources.
+async fn replay_from(meta: &SqliteMeta, log: &LogStore, part: &str, start: u64) -> Result<usize> {
+    let part_log = log.with_partition(part);
+    let mut applied = start;
+    let mut replayed = 0usize;
+    for seq in part_log.list_segments_from(start + 1).await? {
+        if seq != applied + 1 {
+            break;
+        }
+        let seg = decode(&part_log.get_segment(seq).await?)?;
+        replayed += seg.records.len();
+        meta.apply_records(&seg.records)
+            .with_context(|| format!("replaying {part} log segment {seq}"))?;
+        applied = seq;
+    }
+    meta.set_applied_seq_of(part, applied)?;
+    Ok(replayed)
+}
+
 /// The checkpoint is a whole-DB snapshot; `checkpoints/VECTOR.json`
 /// records every partition's applied_seq at snapshot time. Bootstrap
 /// restores the snapshot and then tails each partition from its vector
 /// entry (falling back to p0-only for pre-partition checkpoints).
 pub async fn bootstrap(db_path: &std::path::Path, log: &LogStore) -> Result<()> {
+    if bootstrap_source() != BootstrapSource::Checkpoint
+        && bootstrap_from_tree(db_path, log).await?
+    {
+        return Ok(());
+    }
     let from_seq = match log.get_latest_checkpoint().await? {
         Some((seq, snapshot)) => {
             std::fs::write(db_path, &snapshot).context("writing checkpoint snapshot")?;
@@ -1978,19 +2098,7 @@ pub async fn bootstrap(db_path: &std::path::Path, log: &LogStore) -> Result<()> 
             .get(&part)
             .copied()
             .unwrap_or(if part == PARTITION { from_seq } else { 0 });
-        let part_log = log.with_partition(&part);
-        let mut applied = start;
-        for seq in part_log.list_segments_from(start + 1).await? {
-            if seq != applied + 1 {
-                break;
-            }
-            let seg = decode(&part_log.get_segment(seq).await?)?;
-            replayed += seg.records.len();
-            meta.apply_records(&seg.records)
-                .with_context(|| format!("replaying {part} log segment {seq}"))?;
-            applied = seq;
-        }
-        meta.set_applied_seq_of(&part, applied)?;
+        replayed += replay_from(&meta, log, &part, start).await?;
     }
     for ino in meta.orphans()? {
         meta.reap_orphan(ino)?;
@@ -3932,14 +4040,12 @@ mod tests {
     /// commit chain until S6, so a replica that bootstraps from a
     /// checkpoint must keep finding one — this step adds a publish, it
     /// does not remove a checkpoint.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_checkpoint_also_publishes_a_metadata_commit() {
+    /// Give `n` a plan 28 tree publisher over `store`. The returned
+    /// directory holds its node cache and must outlive it.
+    fn enable_publisher(n: &mut Node, store: &StdArc<InMemory>, id: u64) -> tempfile::TempDir {
         use constellation_fs_core::cache::DiskCache;
         use constellation_mtree::{record, Hasher};
-        use constellation_store_s3::{BlobStore, CommitChain, NodeCache, PackStore, SHARD0};
-
-        let store = StdArc::new(InMemory::new());
-        let mut a = node(&store, 1);
+        use constellation_store_s3::{BlobStore, CommitChain, NodeCache, PackStore};
         let backend = store.clone() as StdArc<dyn ObjectStore>;
         let dir = tempfile::TempDir::new().unwrap();
         let cache = Arc::new(NodeCache::new(
@@ -3948,17 +4054,28 @@ mod tests {
             Hasher::Plain,
             tokio::runtime::Handle::current(),
         ));
-        a.ship
+        n.ship
             .enable_tree_publish(crate::mtree_publish::TreePublisher::new(
-                a.meta.clone(),
+                n.meta.clone(),
                 cache,
                 BlobStore::new(backend.clone(), Hasher::Plain),
-                CommitChain::new(backend.clone()),
+                CommitChain::new(backend),
                 record::config(),
-                1,
+                id,
                 tokio::runtime::Handle::current(),
             ))
             .unwrap();
+        dir
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_also_publishes_a_metadata_commit() {
+        use constellation_store_s3::{CommitChain, SHARD0};
+
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let backend = store.clone() as StdArc<dyn ObjectStore>;
+        let _nodes = enable_publisher(&mut a, &store, 1);
 
         let d = a.meta.mkdir(1, "d", 0o755, 0, 0).unwrap();
         a.meta.create(d.ino, "f", 0o644, 0, 0).unwrap();
@@ -3982,5 +4099,130 @@ mod tests {
         // changed set is not a commit.
         a.ship.checkpoint().await.unwrap();
         assert_eq!(chain.discover_head(0).await.unwrap(), Some(1));
+    }
+
+    /// Plan 28 S6: a fresh replica restores the chain head and tails the
+    /// log from the commit's vector, and ends up equal — table by table
+    /// — to the replica that published it (plan 27's honest check that
+    /// builder and reader agree, kept). The checkpoint is deleted first,
+    /// so nothing but the commit chain can have produced the result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fresh_replica_bootstraps_from_the_commit_chain() {
+        use constellation_meta::{SetXattrMode, SnapshotRow};
+        use futures::TryStreamExt;
+        use object_store::ObjectStoreExt;
+
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let _nodes = enable_publisher(&mut a, &store, 1);
+
+        let d = a.meta.mkdir(1, "d", 0o755, 0, 0).unwrap();
+        let f = a.meta.create(d.ino, "f", 0o644, 7, 8).unwrap();
+        a.meta
+            .set_manifest(f.ino, &vec![0xab; 4096], 1 << 20)
+            .unwrap();
+        a.meta
+            .set_xattr(f.ino, "user.small", b"v", SetXattrMode::Set)
+            .unwrap();
+        // A set big enough to spill into 0x03 keys, and one value big
+        // enough to spill into a blob.
+        let big = a.meta.create(d.ino, "big", 0o600, 0, 0).unwrap();
+        for i in 0..40 {
+            a.meta
+                .set_xattr(big.ino, &format!("user.k{i}"), b"vvvv", SetXattrMode::Set)
+                .unwrap();
+        }
+        a.meta
+            .set_xattr(big.ino, "user.huge", &vec![7u8; 40_000], SetXattrMode::Set)
+            .unwrap();
+        a.meta.symlink(d.ino, "s", &"t".repeat(3000), 0, 0).unwrap();
+        a.meta.link(f.ino, 1, "hard").unwrap();
+        a.meta.write_quota(Some(1 << 40)).unwrap();
+        a.meta
+            .record_snapshot(&SnapshotRow {
+                id: "snap-1".into(),
+                path: "/d".into(),
+                name: "one".into(),
+                root_hash: "ab".repeat(32),
+                created_unix_ms: 42,
+            })
+            .unwrap();
+        a.sync().await;
+        a.ship.checkpoint().await.unwrap();
+
+        // Shipped after the commit: only the log tail carries these.
+        a.meta.create(d.ino, "late", 0o644, 0, 0).unwrap();
+        a.meta.unlink(d.ino, "s").unwrap();
+        a.sync().await;
+
+        for path in store
+            .list(Some(&OPath::from("checkpoints")))
+            .map_ok(|meta| meta.location)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+        {
+            store.delete(&path).await.unwrap();
+        }
+        assert!(a
+            .ship
+            .log()
+            .get_latest_checkpoint()
+            .await
+            .unwrap()
+            .is_none());
+        // And every segment the commit covers, as retention would: with
+        // them gone, only the commit can supply the state before its
+        // vector (the log alone would otherwise rebuild it from seq 1).
+        let chain = constellation_store_s3::CommitChain::new(store.clone());
+        let head = chain
+            .get(chain.discover_head(0).await.unwrap().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let covered = head.applied[PARTITION];
+        assert!(covered >= 1);
+        for seq in 1..=covered {
+            store
+                .delete(&constellation_store_s3::layout::log_segment(PARTITION, seq))
+                .await
+                .unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("fresh.db");
+        bootstrap(&db, &LogStore::new(store.clone())).await.unwrap();
+        let fresh = SqliteMeta::open(&db).unwrap();
+        assert_replicas_equal(&fresh, &a.meta);
+        assert_eq!(
+            fresh.applied_vector().unwrap(),
+            a.meta.applied_vector().unwrap()
+        );
+        assert!(fresh.child_ino(d.ino, "late").unwrap().is_some());
+        assert!(fresh
+            .chunk_ref_exists(&constellation_fs_core::ChunkHash([0; 32]))
+            .is_ok());
+    }
+
+    /// Table-by-table equality of two replicas' shared state, reporting
+    /// only the rows that differ (a full dump buries them in manifests).
+    fn assert_replicas_equal(got: &SqliteMeta, want: &SqliteMeta) {
+        let got = got.dump_replicated().unwrap();
+        let want = want.dump_replicated().unwrap();
+        let short = |row: &String| row.chars().take(240).collect::<String>();
+        let missing: Vec<String> = want
+            .iter()
+            .filter(|r| !got.contains(r))
+            .map(short)
+            .collect();
+        let extra: Vec<String> = got
+            .iter()
+            .filter(|r| !want.contains(r))
+            .map(short)
+            .collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "replicas differ\nmissing: {missing:#?}\nextra: {extra:#?}"
+        );
     }
 }

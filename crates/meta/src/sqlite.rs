@@ -1961,6 +1961,226 @@ impl SqliteMeta {
         })
     }
 
+    /// A replicated kv value through the reader connection (participates
+    /// in [`Self::read_consistent`]).
+    pub fn kv_get_reader(&self, key: &str) -> Result<Option<String>, MetaError> {
+        self.with_reader(|conn| {
+            Ok(conn
+                .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| {
+                    r.get(0)
+                })
+                .optional()?)
+        })
+    }
+
+    /// [`Self::snapshots`] through the reader connection.
+    pub fn snapshots_reader(&self) -> Result<Vec<SnapshotRow>, MetaError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, path, name, root_hash, created_unix_ms FROM snapshot ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SnapshotRow {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    name: row.get(2)?,
+                    root_hash: row.get(3)?,
+                    created_unix_ms: row.get(4)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Cross-partition rename halves parked waiting for their partner.
+    ///
+    /// Plan 28's publisher will not commit while any exist: a parked half
+    /// is replay state that lives only in this table, so a commit whose
+    /// vector fell between the two halves would hand a bootstrapping
+    /// replica the second half with nothing to pair it with.
+    pub fn xpart_pending_count_reader(&self) -> Result<u64, MetaError> {
+        self.with_reader(|conn| {
+            Ok(conn.query_row("SELECT count(*) FROM xpart_pending", [], |r| r.get(0))?)
+        })
+    }
+
+    // ------------------------------------------------- tree bootstrap load
+    //
+    // Plan 28 S6 rebuilds a replica from a published commit instead of a
+    // `VACUUM INTO` image. The rows arrive a page at a time from a tree
+    // walk; these write them verbatim. They journal nothing — the rows
+    // *are* the shared state at the commit's vector — and touch no
+    // derived table except through `finish_tree_load`.
+
+    /// Insert one page of inodes (with their xattr sets) and dentries.
+    pub fn load_tree_rows(
+        &self,
+        inodes: &[TreeInode],
+        dentries: &[(Ino, String, Ino)],
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut inode = tx.prepare_cached(
+                "INSERT OR REPLACE INTO inode
+                 (ino, kind, size, mode, uid, gid, nlink, atime_ns, mtime_ns, ctime_ns,
+                  rdev, manifest, symlink_target)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            )?;
+            let mut clear = tx.prepare_cached("DELETE FROM xattr WHERE ino = ?1")?;
+            let mut xattr =
+                tx.prepare_cached("INSERT INTO xattr (ino, name, value) VALUES (?1, ?2, ?3)")?;
+            for row in inodes {
+                let a = &row.attr;
+                inode.execute(params![
+                    a.ino,
+                    a.kind.as_u8(),
+                    a.size as i64,
+                    a.mode,
+                    a.uid,
+                    a.gid,
+                    a.nlink,
+                    a.atime_ns,
+                    a.mtime_ns,
+                    a.ctime_ns,
+                    a.rdev as i64,
+                    row.manifest,
+                    row.target,
+                ])?;
+                clear.execute(params![a.ino])?;
+                for (name, value) in &row.xattrs {
+                    xattr.execute(params![a.ino, name, value])?;
+                }
+            }
+            let mut dentry = tx.prepare_cached(
+                "INSERT OR REPLACE INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
+            )?;
+            for (parent, name, ino) in dentries {
+                dentry.execute(params![parent, name, ino])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The `0x30` subsystem state: partition map, snapshot rows, and the
+    /// replicated quota (`None` = the tree holds no quota record, so the
+    /// creation-time cap applies as it does on any fresh replica).
+    pub fn load_tree_subsystems(
+        &self,
+        partitions: &[(String, Ino)],
+        snapshots: &[SnapshotRow],
+        quota: Option<Option<u64>>,
+    ) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // Every filesystem has at least p0, so an empty map means a tree
+        // written before partitions were published, not "no partitions":
+        // keep the default rather than leave the replica with none.
+        if !partitions.is_empty() {
+            tx.execute("DELETE FROM partition", [])?;
+        }
+        for (id, root) in partitions {
+            tx.execute(
+                "INSERT INTO partition (id, root_ino) VALUES (?1, ?2)",
+                params![id, root],
+            )?;
+        }
+        tx.execute("DELETE FROM snapshot", [])?;
+        for row in snapshots {
+            tx.execute(
+                "INSERT INTO snapshot (id, path, name, root_hash, created_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    row.id,
+                    row.path,
+                    row.name,
+                    row.root_hash,
+                    row.created_unix_ms
+                ],
+            )?;
+        }
+        if let Some(quota) = quota {
+            let value = quota.map(|n| n.to_string()).unwrap_or_default();
+            tx.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+                params![QUOTA_KV_KEY, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rebuild the derived `chunk_ref` index over everything loaded.
+    pub fn finish_tree_load(&self) -> Result<(), MetaError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM chunk_ref", [])?;
+        Self::rebuild_chunk_ref(&tx)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES ('chunk_ref_index_v1', '1')",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every replicated row of shared state, rendered as sorted text.
+    ///
+    /// Plan 28's table-by-table check that a replica rebuilt from a
+    /// published tree equals the replica that published it — the honest
+    /// test that builder and reader agree, kept from plan 27. Covers the
+    /// namespace (`inode` minus atime, which §P6 keeps out of the tree,
+    /// `dentry`, `xattr`) and the `0x30` subsystem state (`partition`,
+    /// `snapshot`, the replicated quota). Node-local and derived tables
+    /// are not shared state and are left out, and so are `nlink == 0`
+    /// inodes: unlinked-but-open files (and not yet reaped rows) that no
+    /// other replica can reach.
+    pub fn dump_replicated(&self) -> Result<Vec<String>, MetaError> {
+        self.with_reader(|conn| {
+            let mut out = Vec::new();
+            let mut collect = |sql: &str, cols: usize, tag: &str| -> Result<(), MetaError> {
+                let mut stmt = conn.prepare(sql)?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let mut line = String::from(tag);
+                    for i in 0..cols {
+                        let value: rusqlite::types::Value = row.get(i)?;
+                        line.push_str(&format!(" {value:?}"));
+                    }
+                    out.push(line);
+                }
+                Ok(())
+            };
+            collect(
+                "SELECT ino, kind, size, mode, uid, gid, nlink, mtime_ns, ctime_ns, rdev,
+                        manifest, symlink_target FROM inode WHERE nlink > 0",
+                12,
+                "inode",
+            )?;
+            collect("SELECT parent, name, ino FROM dentry", 3, "dentry")?;
+            collect(
+                "SELECT x.ino, x.name, x.value FROM xattr x
+                 JOIN inode i ON i.ino = x.ino WHERE i.nlink > 0",
+                3,
+                "xattr",
+            )?;
+            collect("SELECT id, root_ino FROM partition", 2, "partition")?;
+            collect(
+                "SELECT id, path, name, root_hash, created_unix_ms FROM snapshot",
+                5,
+                "snapshot",
+            )?;
+            collect(
+                &format!("SELECT key, value FROM kv WHERE key = '{QUOTA_KV_KEY}'"),
+                2,
+                "kv",
+            )?;
+            out.sort();
+            Ok(out)
+        })
+    }
+
     /// One page of inode numbers above `after`, for the full rebuild.
     ///
     /// SQLite's signed integer order, not the tree's unsigned key

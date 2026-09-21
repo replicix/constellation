@@ -174,6 +174,9 @@ pub enum RecordError {
     /// values must be empty.
     #[error("a reverse-dentry value must be empty, got {0} bytes")]
     NonEmptyRDentryValue(usize),
+
+    #[error("unknown subsystem record version {0}")]
+    UnknownRecordVersion(u8),
 }
 
 // --------------------------------------------------------------- attrs
@@ -423,6 +426,52 @@ pub fn place_xattrs(xattrs: &[(Vec<u8>, Vec<u8>)]) -> XattrPlacement {
     } else {
         XattrPlacement::Spilled
     }
+}
+
+// ----------------------------------------------------------- 0x30 records
+
+/// Version byte leading every `0x30` value.
+pub const SUBSYSTEM_RECORD_VERSION: u8 = 1;
+
+/// A `0x30` value: [`SUBSYSTEM_RECORD_VERSION`], then each field as a
+/// u32-LE length and its bytes.
+///
+/// Deliberately untyped. Each subsystem's field list is owned by the
+/// code that reads and writes that subsystem, which is above this crate
+/// (snapshots and quota are daemon concepts), and the records are tiny
+/// and rare — a few per filesystem, not per inode — so a self-delimiting
+/// field list costs nothing and keeps adding a field to one subsystem a
+/// local change. Canonicality still holds: the bytes are a function of
+/// the field values alone.
+pub fn encode_fields(fields: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + fields.iter().map(|field| 4 + field.len()).sum::<usize>());
+    out.push(SUBSYSTEM_RECORD_VERSION);
+    for field in fields {
+        out.extend_from_slice(&(field.len() as u32).to_le_bytes());
+        out.extend_from_slice(field);
+    }
+    out
+}
+
+/// Inverse of [`encode_fields`].
+pub fn decode_fields(buf: &[u8]) -> Result<Vec<&[u8]>, RecordError> {
+    let (&version, mut rest) = buf.split_first().ok_or(RecordError::Truncated("version"))?;
+    if version != SUBSYSTEM_RECORD_VERSION {
+        return Err(RecordError::UnknownRecordVersion(version));
+    }
+    let mut fields = Vec::new();
+    while !rest.is_empty() {
+        if rest.len() < 4 {
+            return Err(RecordError::Truncated("field length"));
+        }
+        let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        let body = rest
+            .get(4..4 + len)
+            .ok_or(RecordError::Truncated("field"))?;
+        fields.push(body);
+        rest = &rest[4 + len..];
+    }
+    Ok(fields)
 }
 
 // ----------------------------------------------------------- 0x01 record
@@ -1077,5 +1126,16 @@ mod tests {
             (config.leaf_agg)(&keys::inode(1), &InodeRecord::new(attrs()).encode()).files,
             1
         );
+    }
+
+    #[test]
+    fn subsystem_fields_round_trip_and_refuse_garbage() {
+        let encoded = encode_fields(&[b"/a", b"", &7u64.to_le_bytes()]);
+        let fields = decode_fields(&encoded).unwrap();
+        assert_eq!(fields, vec![&b"/a"[..], &b""[..], &7u64.to_le_bytes()[..]]);
+        assert_eq!(decode_fields(&encode_fields(&[])).unwrap().len(), 0);
+        assert!(decode_fields(&[]).is_err());
+        assert!(decode_fields(&[2]).is_err());
+        assert!(decode_fields(&encoded[..encoded.len() - 1]).is_err());
     }
 }

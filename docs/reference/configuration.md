@@ -95,6 +95,7 @@ are reachable on every non-read-only mount.
 | `CONSTELLATION_PACK_TARGET_BYTES` | `4194304` (4 MiB) | bytes, **1–16 MiB** accepted | sealed pack body size before the writer starts the next pack; out of range falls back to the default |
 | `CONSTELLATION_NODE_MEMORY_BYTES` | `67108864` (64 MiB) | bytes; `0` disables | RAM budget for interior metadata nodes; `0` forces every read through the disk cache (used by partial-replica tests) |
 | `CONSTELLATION_COMMIT_PROBE_WINDOW` | `8` | positive integer | how many commit slots ahead of the known head one poll probes before falling back to a LIST |
+| `CONSTELLATION_BOOTSTRAP_SOURCE` | `auto` | `auto` \| `checkpoint` | where a fresh replica comes from: `auto` restores the newest commit and tails the log from its applied vector, falling back to the legacy checkpoint when the bucket has no commits; `checkpoint` forces the legacy path |
 
 Pack target is the main write-amplification / request-overhead trade-off
 for metadata: smaller packs mean more S3 objects and more compaction

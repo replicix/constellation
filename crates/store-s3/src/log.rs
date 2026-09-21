@@ -190,6 +190,13 @@ impl LogStore {
         self.e2e.is_some()
     }
 
+    /// The filesystem's E2E keyring, when it has one. Plan 28's commit
+    /// readers need the addressing key to hash and shape the tree the
+    /// way its writers did (§P13).
+    pub fn e2e_keys(&self) -> Option<&SharedE2eKeys> {
+        self.e2e.as_ref()
+    }
+
     /// Encode a plaintext segment body to its at-rest / on-wire form:
     /// zstd, then (E2E) AEAD-seal under the partition DEK with the S3
     /// object path as AAD. [`put_segment`] and the gossip fast path share

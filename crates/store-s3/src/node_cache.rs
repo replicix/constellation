@@ -163,6 +163,15 @@ pub struct NodeCache {
     peer: Option<Arc<dyn PeerNodeSource>>,
     memory: RwLock<MemoryTier>,
     locations: RwLock<HashMap<NodeHash, NodeLocation>>,
+    /// Packs whose index has been attached, so a catalog refresh only
+    /// fetches the indices it has not seen.
+    attached: RwLock<HashSet<PackHash>>,
+    /// Bumped by every catalog refresh; `refresh` is held across one. A miss
+    /// notes the generation before it looks, and refreshes only if
+    /// nobody else has since — so a burst of concurrent misses costs
+    /// one LIST, not one each.
+    refresh_generation: AtomicU64,
+    refresh: Mutex<()>,
     pending: Mutex<Vec<PackNode>>,
     counters: Counters,
 }
@@ -199,6 +208,9 @@ impl NodeCache {
                 budget: node_memory_bytes(),
             }),
             locations: RwLock::new(HashMap::new()),
+            attached: RwLock::new(HashSet::new()),
+            refresh_generation: AtomicU64::new(0),
+            refresh: Mutex::new(()),
             pending: Mutex::new(Vec::new()),
             counters: Counters::default(),
         }
@@ -257,6 +269,7 @@ impl NodeCache {
 
     /// Teach the cache where a pack's nodes live.
     pub fn attach_index(&self, pack: PackHash, index: &PackIndex) {
+        self.attached.write().expect("attached packs").insert(pack);
         let mut locations = self.locations.write().expect("locations");
         for entry in &index.entries {
             locations.insert(
@@ -293,6 +306,54 @@ impl NodeCache {
             self.attach_index(hash, &index?);
         }
         Ok(())
+    }
+
+    /// LIST `packs/` and attach every index this cache has not seen.
+    ///
+    /// The complete answer to "where does this node live": a commit
+    /// names only the packs it wrote, a tree mostly lives in its
+    /// ancestors' packs, and after compaction some nodes live in packs
+    /// no commit names at all. Readers call this once up front (S6's
+    /// bootstrap, a restarted publisher), and [`NodeStore::get`] calls
+    /// it on a miss — which is how a replica learns about packs another
+    /// writer, or the compactor, produced after its last look. A pack
+    /// that compaction replaced keeps its stale entries until the
+    /// replacement's index overwrites them, which this does.
+    ///
+    /// Returns how many new indices were attached.
+    pub async fn refresh_catalog(&self) -> Result<usize, StoreError> {
+        use futures::TryStreamExt;
+        let listed = self
+            .packs
+            .inner()
+            .list(Some(&crate::layout::packs_prefix()))
+            .try_collect::<Vec<_>>()
+            .await?;
+        let fresh: Vec<PackHash> = {
+            let attached = self.attached.read().expect("attached packs");
+            listed
+                .iter()
+                .filter_map(|meta| meta.location.filename()?.strip_suffix(".idx"))
+                .filter_map(PackHash::from_hex)
+                .filter(|hash| !attached.contains(hash))
+                .collect()
+        };
+        self.load_pack_indices(&fresh).await?;
+        Ok(fresh.len())
+    }
+
+    /// The miss path's refresh: at most one catalog load per burst of
+    /// concurrent misses: whoever takes the lock first refreshes, and
+    /// everyone who noted the same generation before missing just
+    /// retries.
+    fn refresh_after_miss(&self, seen: u64) -> bool {
+        let _single_flight = self.refresh.lock().expect("catalog refresh");
+        if self.refresh_generation.load(Ordering::Acquire) != seen {
+            return true;
+        }
+        let refreshed = self.block_on(self.refresh_catalog()).is_ok();
+        self.refresh_generation.fetch_add(1, Ordering::Release);
+        refreshed
     }
 
     pub fn location_of(&self, hash: &NodeHash) -> Option<NodeLocation> {
@@ -419,6 +480,27 @@ impl NodeStore for NodeCache {
         }
         // S3. The location lookup releases its lock before the GET, so
         // concurrent misses stay concurrent (§14.9).
+        let seen = self.refresh_generation.load(Ordering::Acquire);
+        if let Ok(bytes) = self.fetch_located(hash) {
+            return Ok(bytes);
+        }
+        // Either no index this cache holds names the node, or the pack
+        // it named is gone (compacted). Both are what a catalog refresh
+        // repairs; one attempt, then the miss is real.
+        if self.refresh_after_miss(seen) {
+            return self.fetch_located(hash);
+        }
+        Err(MtreeError::MissingNode(*hash))
+    }
+
+    fn put(&self, hash: NodeHash, level: u8, bytes: Vec<u8>) -> Result<(), MtreeError> {
+        self.put_node(hash, level, bytes)
+    }
+}
+
+impl NodeCache {
+    /// The S3 rung of the ladder, from whatever location is known now.
+    fn fetch_located(&self, hash: &NodeHash) -> Result<Arc<[u8]>, MtreeError> {
         let Some(location) = self.location_of(hash) else {
             return Err(MtreeError::MissingNode(*hash));
         };
@@ -440,7 +522,7 @@ impl NodeStore for NodeCache {
         self.accept(hash, bytes)
     }
 
-    fn put(&self, hash: NodeHash, level: u8, bytes: Vec<u8>) -> Result<(), MtreeError> {
+    fn put_node(&self, hash: NodeHash, level: u8, bytes: Vec<u8>) -> Result<(), MtreeError> {
         if self.location_of(&hash).is_some() {
             return Ok(()); // already durable; nodes are immutable
         }
