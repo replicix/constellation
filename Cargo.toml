@@ -30,7 +30,7 @@ default-members = [
     "crates/chaos",
     "crates/upload-concurrency",
 ]
-exclude = ["bench/dbbench", "bench/prollybench"]
+exclude = ["bench/dbbench", "bench/prollybench", "bench/enginebench"]
 
 [workspace.package]
 version = "1.0.0"
