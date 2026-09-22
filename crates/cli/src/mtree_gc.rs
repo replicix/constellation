@@ -492,11 +492,16 @@ async fn expired_commits(
     let chain = CommitChain::new(store).with_sealing(sealing);
     let keep_from = seqs.len().saturating_sub(retention);
     let mut expired = Vec::new();
+    // A contiguous prefix only, deleted in ascending order by the caller:
+    // `CommitChain::discover_head` relies on a live commit never being
+    // followed by a deleted one. Stopping at the first young commit also
+    // keeps clock skew between authors from punching a hole in the chain,
+    // which a publisher could otherwise re-fill with a forked commit.
     for seq in seqs.into_iter().take(keep_from) {
-        if let Some(commit) = chain.get(seq).await? {
-            if now - commit.unix_ms > retention_ms {
-                expired.push(seq);
-            }
+        match chain.get(seq).await? {
+            Some(commit) if now - commit.unix_ms > retention_ms => expired.push(seq),
+            Some(_) => break,
+            None => {}
         }
     }
     Ok(expired)
@@ -667,6 +672,29 @@ mod tests {
     use constellation_store_s3::{BlobStore, NodeCache, PackStore, SHARD0};
     use object_store::memory::InMemory;
     use tempfile::TempDir;
+
+    /// Retention must delete a contiguous prefix: a young commit (e.g. an
+    /// author with a skewed clock) stops the scan, so no live commit is
+    /// ever followed by a deleted one (`CommitChain::discover_head`
+    /// depends on it).
+    #[tokio::test]
+    async fn expired_commits_is_a_contiguous_prefix() {
+        use constellation_store_s3::{CommitChain, CommitPayload};
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let chain = CommitChain::new(store.clone());
+        let now = 1_000_000;
+        let old = now - 10_000;
+        for (seq, unix_ms) in [(1u64, old), (2, old), (3, now), (4, old), (5, old)] {
+            chain
+                .create(&CommitPayload::default().at(seq, unix_ms))
+                .await
+                .unwrap();
+        }
+        let expired = expired_commits(store, None, vec![1, 2, 3, 4, 5], 1, 5_000, now)
+            .await
+            .unwrap();
+        assert_eq!(expired, vec![1, 2]);
+    }
 
     fn config(retention: usize) -> MtreeGcConfig {
         MtreeGcConfig {

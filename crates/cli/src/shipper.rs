@@ -354,6 +354,13 @@ impl Shipper {
         Ok(())
     }
 
+    /// The publisher handle, for warming it up off the sync loop.
+    pub fn publisher_handle(
+        &self,
+    ) -> Option<Arc<tokio::sync::Mutex<crate::mtree_publish::TreePublisher>>> {
+        self.publisher.clone()
+    }
+
     /// Lock the publisher (waiting for an in-flight publish when `wait`).
     /// `None` when there is no publisher, or it is busy and the caller
     /// would rather not wait.

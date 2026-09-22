@@ -275,7 +275,8 @@ impl CommitPayload {
         self
     }
 
-    fn at(&self, seq: u64, unix_ms: i64) -> Commit {
+    /// The commit this payload becomes at `seq`, stamped `unix_ms`.
+    pub fn at(&self, seq: u64, unix_ms: i64) -> Commit {
         Commit {
             v: COMMIT_VERSION,
             seq,
@@ -444,6 +445,14 @@ impl CommitChain {
         let run = self.get_run(known.saturating_add(1), k).await?;
         if !run.is_empty() && run.len() < k {
             return Ok(run.last().map(|commit| commit.seq));
+        }
+        // Nothing after `known`: if `known` itself still exists it is the
+        // head, because retention deletes a contiguous prefix in ascending
+        // order (`mtree_gc::expired_commits`), so a live commit is never
+        // followed by a deleted one. The steady-state publish then costs
+        // GETs, not a LIST.
+        if run.is_empty() && known > 0 && self.get(known).await?.is_some() {
+            return Ok(Some(known));
         }
         let listed = self.list_from(known.max(1)).await?;
         match listed.last().copied() {
@@ -733,22 +742,25 @@ mod tests {
         assert_eq!(chain.discover_head(20).await.unwrap(), Some(20));
     }
 
-    /// A hole punched by retention (§P10b deletes old commits freely)
-    /// is invisible to a probe, which stops at the first 404. The LIST
-    /// fallback is the only thing that can see past it, and it must.
+    /// Retention deletes a contiguous prefix, so a publisher whose `known`
+    /// commit was pruned sees nothing at `known + 1` either. Only a LIST
+    /// can say where the head is, and discovery must fall back to it; when
+    /// `known` is still live, the head is `known` and no LIST is needed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_gap_falls_back_to_list() {
+    async fn a_pruned_known_falls_back_to_list() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let chain = CommitChain::new(store.clone()).with_probe_window(4);
-        for seq in [1u64, 2, 9, 10] {
+        for seq in [9u64, 10] {
             chain
                 .create(&CommitPayload::default().at(seq, 1))
                 .await
                 .unwrap();
         }
-        // 3..8 are absent, so probing from 2 sees nothing at all.
+        // 1..8 were pruned, so probing from 2 sees nothing at all.
         assert!(chain.get_run(3, 4).await.unwrap().is_empty());
         assert_eq!(chain.discover_head(2).await.unwrap(), Some(10));
+        // `known` live and nothing after it: it is the head.
+        assert_eq!(chain.discover_head(10).await.unwrap(), Some(10));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

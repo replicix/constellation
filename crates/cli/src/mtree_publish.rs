@@ -181,6 +181,11 @@ pub struct TreePublisher {
     /// Whether the node cache has loaded the pack catalog. False until
     /// the first publish of every process (see `new`).
     hydrated: bool,
+    /// When a head discovery last proved the chain empty (a LIST found no
+    /// commit). Until the commit retention age has passed since then, no
+    /// commit can have been created *and* pruned, so an empty probe at
+    /// seq 1 is proof enough that the chain is still empty.
+    empty_chain_seen: Option<std::time::Instant>,
     handle: tokio::runtime::Handle,
 }
 
@@ -246,6 +251,7 @@ impl TreePublisher {
             // `restore` found, and only a cache that knows which packs
             // hold its nodes can resolve them.
             hydrated: false,
+            empty_chain_seen: None,
             handle,
         }
     }
@@ -297,6 +303,16 @@ impl TreePublisher {
         }
         crate::mtree_read::attach_catalog(&self.cache).await?;
         self.hydrated = true;
+        Ok(())
+    }
+
+    /// Do a first publish's one-time discovery (pack catalog LIST, chain
+    /// head) now rather than on the first publish, which the idle-publish
+    /// cadence otherwise defers into a quiet period. Best effort: a
+    /// failure here just leaves the work to the first publish.
+    pub async fn warm_up(&mut self) -> Result<()> {
+        self.hydrate().await?;
+        self.adopt_head().await?;
         Ok(())
     }
 
@@ -660,7 +676,24 @@ impl TreePublisher {
     /// slot after the newest commit rather than at one that is taken.
     async fn adopt_head(&mut self) -> Result<u64> {
         let known = self.state.as_ref().map(|s| s.seq).unwrap_or(0);
+        let retention = std::time::Duration::from_secs(
+            std::env::var("CONSTELLATION_COMMIT_RETENTION_S")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(crate::mtree_gc::DEFAULT_COMMIT_RETENTION_S),
+        );
+        if known == 0
+            && self
+                .empty_chain_seen
+                .is_some_and(|seen| seen.elapsed() < retention / 2)
+            && self.chain.get(1).await?.is_none()
+        {
+            return Ok(0);
+        }
         let Some(head) = self.chain.discover_head(known).await? else {
+            if known == 0 {
+                self.empty_chain_seen = Some(std::time::Instant::now());
+            }
             return Ok(0);
         };
         if head <= known {

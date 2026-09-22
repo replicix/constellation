@@ -682,6 +682,13 @@ impl NodeRuntime {
             ship.enable_tree_publish(publisher)
                 .context("restoring the published metadata tree")?;
         }
+        if let Some(publisher) = ship.publisher_handle() {
+            rt.spawn(async move {
+                if let Err(e) = publisher.lock().await.warm_up().await {
+                    tracing::debug!(error = %e, "publisher warm-up failed; the first publish will retry it");
+                }
+            });
+        }
         let ship = Arc::new(tokio::sync::Mutex::new(ship));
         let pins = Arc::new(pin::PinManager::new(
             meta.clone(),
