@@ -1,7 +1,8 @@
-//! Path resolution, the plan 28 §11 tree-builder read surface
-//! (`tree_inode`, `links_of`, `scan_inos`, `dump_replicated`), and
-//! `recursive_size` (a DFS over `0x02` since there is no maintained
-//! per-directory counter yet — that is plan 29 M3).
+//! Path resolution, the plan 29 M2 publisher's read surface
+//! (`tree_inode_at`, `ns_get_at`, `resolve_local_payload_at`,
+//! `dump_replicated`), and `recursive_size` (a DFS over `0x02` since
+//! there is no maintained per-directory counter yet — that is plan 29
+//! M3).
 
 use crate::error::MetaError;
 use crate::store::{ns, Meta};
@@ -9,6 +10,7 @@ use crate::TreeInode;
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::Ino;
 use constellation_mtree::keys;
+use constellation_mtree::record::Payload;
 use fjall::Readable;
 
 impl Meta {
@@ -74,10 +76,6 @@ impl Meta {
         ns::child_ino(&r, &self.ns, parent, name)
     }
 
-    pub fn child_ino_reader(&self, parent: Ino, name: &str) -> Result<Option<Ino>, MetaError> {
-        self.child_ino(parent, name)
-    }
-
     pub fn child_ino_at(
         &self,
         r: &impl Readable,
@@ -87,13 +85,14 @@ impl Meta {
         ns::child_ino(r, &self.ns, parent, name)
     }
 
-    // ------------------------------------------------------- tree builder
+    // ------------------------------------------------------- publisher
 
-    pub fn tree_inode(&self, ino: Ino) -> Result<Option<TreeInode>, MetaError> {
-        let r = self.db.read_tx();
-        self.tree_inode_at(&r, ino)
-    }
-
+    /// One inode's local content, fully resolved (attrs, manifest,
+    /// symlink target, whole xattr set), under the caller's snapshot —
+    /// the publisher's "expand" half of local-to-published payload
+    /// conversion (plan 29 M2): re-placing this against a spill
+    /// threshold needs the plaintext, not whatever local `Payload` it
+    /// currently sits behind.
     pub fn tree_inode_at(
         &self,
         r: &impl Readable,
@@ -126,43 +125,23 @@ impl Meta {
         }))
     }
 
-    pub fn links_of(&self, ino: Ino) -> Result<Vec<(Ino, String)>, MetaError> {
-        let r = self.db.read_tx();
-        ns::links_of(&r, &self.ns, ino)
+    /// A raw point read of `ns` by literal key, under the caller's
+    /// snapshot — what the publisher uses for a dirty `0x02`/`0x04`/
+    /// `0x30` key, which (unlike `0x01`/`0x03`) needs no local-vs-
+    /// published payload conversion and so copies verbatim.
+    pub fn ns_get_at(&self, r: &impl Readable, key: &[u8]) -> Result<Option<Vec<u8>>, MetaError> {
+        Ok(r.get(&self.ns, key)?.map(|v| v.to_vec()))
     }
 
-    pub fn links_of_at(
+    /// Resolve a `Payload` decoded from a *local* `ns`/`0x03` value
+    /// (spilled to this replica's own `blobs` keyspace, if at all) to
+    /// its plaintext bytes.
+    pub fn resolve_local_payload_at(
         &self,
         r: &impl Readable,
-        ino: Ino,
-    ) -> Result<Vec<(Ino, String)>, MetaError> {
-        ns::links_of(r, &self.ns, ino)
-    }
-
-    pub fn scan_inos(&self, after: Ino, limit: usize) -> Result<Vec<Ino>, MetaError> {
-        let r = self.db.read_tx();
-        self.scan_inos_at(&r, after, limit)
-    }
-
-    pub fn scan_inos_at(
-        &self,
-        r: &impl Readable,
-        after: Ino,
-        limit: usize,
-    ) -> Result<Vec<Ino>, MetaError> {
-        let start = keys::inode(after.saturating_add(1));
-        let end = keys::whole_range(keys::RANGE_INODE).end().to_vec();
-        let mut out = Vec::new();
-        for guard in r.range(&self.ns, start..end) {
-            if out.len() >= limit {
-                break;
-            }
-            let (k, _) = guard.into_inner()?;
-            if let keys::Key::Inode { ino } = keys::Key::parse(&k)? {
-                out.push(ino);
-            }
-        }
-        Ok(out)
+        payload: &Payload,
+    ) -> Result<Vec<u8>, MetaError> {
+        ns::resolve_payload(r, &self.blobs, payload)
     }
 
     /// DFS over `0x02` in one snapshot: no maintained per-directory
@@ -252,6 +231,28 @@ impl Meta {
         for guard in r.iter(&self.ns) {
             let (k, _) = guard.into_inner()?;
             out.push(k.to_vec());
+        }
+        Ok(out)
+    }
+
+    /// [`Self::ns_keys`] plus the bytes: a full raw dump of `ns`, in key
+    /// order. Exposed for the plan 29 M2 dirty-tracking test, which
+    /// diffs two dumps to get the exact key set a mutation touched and
+    /// checks it against `dirty_snapshot`.
+    #[allow(clippy::type_complexity)]
+    pub fn ns_dump(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, MetaError> {
+        let r = self.db.read_tx();
+        self.ns_dump_at(&r)
+    }
+
+    /// [`Self::ns_dump`], under the caller's snapshot — what `fsck`'s
+    /// full rebuild (`cli::mtree_publish::rebuild_root`) walks.
+    #[allow(clippy::type_complexity)]
+    pub fn ns_dump_at(&self, r: &impl Readable) -> Result<Vec<(Vec<u8>, Vec<u8>)>, MetaError> {
+        let mut out = Vec::new();
+        for guard in r.iter(&self.ns) {
+            let (k, v) = guard.into_inner()?;
+            out.push((k.to_vec(), v.to_vec()));
         }
         Ok(out)
     }

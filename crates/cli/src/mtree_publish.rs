@@ -1,106 +1,90 @@
-//! Plan 28 §11 (S5): turn the live SQLite replica into an `mtree` over
-//! the §P6 encoding and publish it as a commit.
+//! Plan 28 §11 / plan 29 M2: turn the live fjall replica's dirty key set
+//! into an `mtree` delta and publish it as a commit.
 //!
-//! This is the step that makes option (B) real. SQLite remains the
-//! query engine and the op log remains the transport (§11b) — nothing
-//! here reads the tree back, and no FUSE path consults it. What changes
-//! is what *durability* means: instead of `VACUUM INTO`-ing the whole
-//! database every N segments and PUTting the result, a publish writes
-//! only the tree nodes the batch actually touched and CAS-creates one
-//! commit naming the new root.
+//! ## The incremental path is native, not derived
 //!
-//! ## The incremental path is the whole point
+//! Plan 29 M1 made `ns`'s key/value encoding *exactly* plan 28 §P6's —
+//! the same encoding the published tree uses, modulo one difference:
+//! `0x01`/`0x03` values may spill to a *local* blob (`Meta`'s own
+//! `blobs` keyspace, plain-hashed) instead of the *published* blob store
+//! (bucket-addressed, keyed on E2E). Plan 29 M2 finishes the thought:
+//! since M0a/M0b/M0c and M1 already collapsed "which keys changed" into
+//! a property the engine itself can track, the publisher no longer
+//! re-derives it from the op log (`Touched`, deleted here) or by diffing
+//! against a rebuilt tree. Instead:
 //!
-//! A checkpoint costs O(database). A publish must cost O(keys changed),
-//! or the plan's central claim is false. The changed key set comes from
-//! the place that already knows it — the op log — and nowhere else:
+//! 1. every write to `ns` marks its key in a sibling `dirty` keyspace,
+//!    in the *same* transaction (`constellation_meta::store::ns::Dirty`,
+//!    centralised in the `ns` write helpers — see plan
+//!    `docs/plans/v1/wip/29-fjall-metadata-engine.md`'s M2 section);
+//! 2. a publish reads one fjall snapshot, takes `Meta::dirty_snapshot`
+//!    as its whole read set, and for each dirty key reads `ns`'s current
+//!    value at that key (absent → a delete edit);
+//! 3. `0x01`/`0x03` values are "expanded" (resolved against `Meta`'s
+//!    local blobs) and re-placed with `constellation_mtree::record::{plan_inode,
+//!    place_value}` against the *published* hasher (`BlobStore::hash`,
+//!    keyed on E2E), collecting bodies to upload before the commit that
+//!    names them (§S4's ordering invariant). Every other key — `0x02`
+//!    dentries, `0x04` reverse dentries, `0x30` subsystem records —
+//!    copies verbatim: none of them wrap a `Payload`, so there is
+//!    nothing to convert;
+//! 4. on a successful commit (direct or spliced), `Meta::clear_dirty_upto`
+//!    retires exactly the `(key, counter)` pairs this publish observed —
+//!    a key re-dirtied by a write this publish never saw keeps a higher
+//!    counter and survives the clear, staying dirty for the next round.
 //!
-//! 1. every record that reaches this replica passes through
-//!    `shipper::Shipper::apply_decoded_segment` (foreign segments) or
-//!    `ship_part` (our own), and both hand it to [`Touched::note`];
-//! 2. [`Touched`] keeps *entity references* (inode numbers, and
-//!    `(parent, name)` dentry coordinates), not values. A record says
-//!    which entities moved; what they moved *to* is whatever the
-//!    replica now holds, which is both cheaper to read and immune to a
-//!    record this code does not know how to interpret;
-//! 3. at publish time [`TreePublisher::plan`] turns that reference set
-//!    into `mtree` edits with a bounded number of indexed SQLite reads
-//!    and a bounded number of tree point/range reads per entity, and
-//!    hands them to `Tree::apply`, whose cost is O(edits + the nodes
-//!    they touch).
-//!
-//! A full rebuild happens on the first publish and after a restart that
-//! cannot prove the tree is level with the replica (see
-//! [`TreePublisher::restore`]); it is the same per-inode code path fed
-//! every inode a page at a time, so the two cannot drift apart. That
-//! sharing is deliberate and is what
-//! `an_incremental_history_matches_a_full_rebuild` checks: because the
-//! tree is canonical, "incremental and bulk agree" is an equality of
-//! root hashes rather than a structural comparison.
+//! One consequence worth stating: a restart never needs a rebuild. The
+//! dirty set is durable fjall state, not an in-memory `Touched` that a
+//! crash erases, so [`TreePublisher::restore`] is just "read back the
+//! root/seq/vector this replica last published or bootstrapped onto";
+//! whatever is still dirty (survived a crash, or accumulated while no
+//! publisher was attached) is picked up by the very next `publish` call
+//! exactly as it would be mid-session. `Builder::rebuild` and the old
+//! restart-vector-equality check are gone; the equivalent full walk
+//! that remains, [`rebuild_root`], exists only for `fsck` and the
+//! genesis/bootstrap cases that have no prior tree to diff against.
 //!
 //! ## Never building on a head this replica is behind
 //!
-//! A publish adopts the chain head and then writes *this replica's*
-//! values for the keys it touched. That is only correct if the replica
-//! has applied at least as much of every partition's log as the head
-//! reflects; a replica that is behind would overwrite newer values with
-//! the older ones it still holds, and no diff can show it, because the
-//! stale value is ours. So every commit records the applied vector it
-//! was planned at ([`Commit::applied`], read in the same SQLite snapshot
-//! as the plan), and a publish — or a splice onto a lost race's winner —
+//! Unchanged from S5: a publish adopts the chain head and then writes
+//! *this replica's* values for the keys it touched, which is only
+//! correct if the replica has applied at least as much of the log as
+//! the head reflects. Every commit records the applied vector it was
+//! planned at ([`Commit::applied`], read in the same fjall snapshot as
+//! the plan), and a publish — or a splice onto a lost race's winner —
 //! proceeds only when this replica's vector covers the other one.
-//! Otherwise it defers and the tailer closes the gap.
 //!
-//! With that, vectors only grow along the chain, and each commit's tree
-//! is its author's replica at its vector: a key the author did not touch
-//! since its last publish already holds, in the head, a value at least
-//! as new as the author's.
+//! ## The §P3 splice, restated for key deltas
 //!
-//! ## What is in the tree
-//!
-//! `0x01`–`0x04`: inodes, dentries with S1's attr copy, spilled xattrs,
-//! and the reverse dentry index. An inode with `nlink == 0` — an
-//! unlinked file some process still holds open — is **not** in the
-//! tree: it is node-local transient state that no other replica can
-//! reach, and including it would make the §P7 aggregate disagree with
-//! the reachable filesystem it is supposed to describe. `0x30` holds the
-//! snapshot rows, the replicated quota and the partition map — what a
-//! bootstrap needs beyond the namespace (codec in `mtree_read`).
-//!
-//! atime appears nowhere. `LogRecord::Atime` is noted as touching
-//! nothing at all, which `atime_never_reaches_the_tree` pins — not as a
-//! micro-optimization but because a tree that moved on read would turn
-//! every `find` into a publish.
+//! A lost CAS diffs the winner's root against the parent this batch was
+//! planned against. The old read set (dirty keys plus every prefix the
+//! builder scanned to find them) is gone because there is nothing left
+//! to scan: the dirty key set *is* the batch's read set now, since every
+//! key this batch could possibly depend on is a key it also (re)writes
+//! — reading a dentry's old value, a directory's link count, a scanned
+//! `0x03`/`0x04` range for "is anything else there" are all now folded
+//! into the write path that already dirties the keys those decisions
+//! touch (§P6's "every write locates its own dependents"). So a disjoint
+//! splice is safe iff the winner's diff touches none of this batch's
+//! edited keys *and* the vector guard holds — [`Plan::conflicts_with`]
+//! and [`TreePublisher::splice`] implement exactly that.
 //!
 //! ## Not stalling FUSE
 //!
-//! Every read this module makes goes through a lock-free `fjall`
-//! snapshot (`Meta::read_consistent`), so a publish never takes the
-//! single-writer transaction FUSE writers contend on, and the tree
-//! build itself runs on a
-//! blocking thread rather than a runtime worker. Replacing a
-//! `VACUUM INTO` stall with a tree-build stall would be a regression
-//! dressed as a win, so this is measured rather than asserted; the
-//! numbers are in `PROGRESS.md`.
+//! Unchanged from S5: every read goes through a lock-free `fjall`
+//! snapshot (`Meta::read_consistent`), and the tree build runs on a
+//! blocking thread rather than a runtime worker.
 
 use anyhow::{Context, Result};
-use constellation_fs_core::{FileAttr, Ino};
-use constellation_meta::{LogRecord, Meta, TreeInode};
-use constellation_mtree::{
-    keys, record, Attrs, DentryRecord, Edit, Kind, NodeHash, NodeStore, Tree, VALUE_SPILL,
-};
+use constellation_meta::Meta;
+use constellation_mtree::{keys, record, ChangeKind, NodeHash, NodeStore, Tree, VALUE_SPILL};
 use constellation_store_s3::log::PARTITION;
 use constellation_store_s3::{
     vector_covers, BlobStore, Commit, CommitChain, CommitPayload, Intent, NodeCache, StoreError,
     SHARD0,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
-
-/// Inodes per page of a full rebuild. Bounds the rebuild's memory at
-/// one page of records rather than the whole namespace; the tree is
-/// canonical, so the page size cannot affect the root hash it produces.
-const REBUILD_PAGE: usize = 4096;
 
 /// CAS attempts before a publish gives up and leaves its work pending.
 /// Small on purpose: in (B) the writer still holds the partition lease,
@@ -122,11 +106,13 @@ pub fn remembered_seq(meta: &Meta) -> Result<Option<u64>> {
     Ok(meta.kv_get(KV_SEQ)?.and_then(|seq| seq.parse().ok()))
 }
 
-/// Record a commit this replica's state was loaded from (S6's
-/// bootstrap), so the node's publisher can pick it up as its parent
-/// instead of rebuilding. `restore` still trusts it only if the replica
-/// has applied exactly `commit.applied` — a bootstrap that tailed past
-/// the commit leaves the vectors unequal and the first publish rebuilds.
+/// Record a commit this replica's state was loaded from (S6's/M2's
+/// bootstrap), so the node's publisher picks it up as its parent instead
+/// of ever needing a rebuild. Unlike S5, there is no vector-equality
+/// re-check on restore: a bootstrap that ingested this commit left
+/// `dirty` empty for everything it loaded (`Meta::clear_all_dirty`), so
+/// whatever is dirty by the time a publisher attaches is genuinely new
+/// local or tailed work, not a sign the tree fell behind.
 pub fn remember_loaded_commit(meta: &Meta, commit: &Commit) -> Result<()> {
     let Some(root) = commit.root(SHARD0) else {
         return Ok(());
@@ -137,164 +123,16 @@ pub fn remember_loaded_commit(meta: &Meta, commit: &Commit) -> Result<()> {
     Ok(())
 }
 
-/// The entities a batch of log records touched.
-///
-/// References, not values, and a set rather than a list: publishing is
-/// idempotent per key, so a thousand `setattr`s on one inode cost one
-/// entry here and one edit later. This is the whole of the incremental
-/// path's input.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Touched {
-    inodes: BTreeSet<Ino>,
-    dentries: BTreeSet<(Ino, String)>,
-    /// A snapshot or quota record moved, so the `0x30` subsystem range
-    /// is re-planned. It holds a handful of records per filesystem, so
-    /// re-deriving all of it is cheaper than tracking which one.
-    subsystems: bool,
-    /// Set when the changed set is unknown and only a rebuild can
-    /// restore agreement with the replica.
-    full: bool,
-}
-
-impl Touched {
-    pub fn is_empty(&self) -> bool {
-        !self.full && !self.subsystems && self.inodes.is_empty() && self.dentries.is_empty()
-    }
-
-    pub fn needs_rebuild(&self) -> bool {
-        self.full
-    }
-
-    fn inode(&mut self, ino: Ino) {
-        self.inodes.insert(ino);
-    }
-
-    fn dentry(&mut self, parent: Ino, name: &str) {
-        self.dentries.insert((parent, name.to_string()));
-    }
-
-    fn link(&mut self, parent: Ino, name: &str, ino: Ino) {
-        self.inode(ino);
-        self.inode(parent);
-        self.dentry(parent, name);
-    }
-
-    /// Fold one record's entity references in.
-    ///
-    /// Deliberately over-approximate where a record does not name
-    /// everything it moves: `Unlink` does not carry the target's ino,
-    /// and `Rename` does not carry the moved or clobbered one. Those
-    /// are recovered at plan time from the dentry's *old* value in the
-    /// tree and its new value in the replica, which is the only place
-    /// both are known. Over-approximating costs a few wasted point
-    /// reads; under-approximating would silently strand a key.
-    pub fn note(&mut self, record: &LogRecord) {
-        match record {
-            LogRecord::Mkdir {
-                parent, name, ino, ..
-            }
-            | LogRecord::Create {
-                parent, name, ino, ..
-            }
-            | LogRecord::Symlink {
-                parent, name, ino, ..
-            }
-            | LogRecord::Mknod {
-                parent, name, ino, ..
-            }
-            | LogRecord::Link {
-                parent, name, ino, ..
-            } => self.link(*parent, name, *ino),
-            LogRecord::Unlink { parent, name, .. } | LogRecord::Rmdir { parent, name, .. } => {
-                self.inode(*parent);
-                self.dentry(*parent, name);
-            }
-            LogRecord::Rename {
-                parent,
-                name,
-                new_parent,
-                new_name,
-                ..
-            } => {
-                self.inode(*parent);
-                self.inode(*new_parent);
-                self.dentry(*parent, name);
-                self.dentry(*new_parent, new_name);
-            }
-            LogRecord::Setattr { ino, .. }
-            | LogRecord::WriteManifest { ino, .. }
-            | LogRecord::SetXattr { ino, .. }
-            | LogRecord::RemoveXattr { ino, .. } => self.inode(*ino),
-            LogRecord::Clone { nodes, .. } => {
-                for node in nodes {
-                    self.link(node.parent, &node.name, node.ino);
-                }
-            }
-            // The `0x30` records a bootstrap needs: snapshot rows and
-            // the replicated quota.
-            LogRecord::SnapCreate { .. }
-            | LogRecord::SnapDelete { .. }
-            | LogRecord::SetQuota { .. } => self.subsystems = true,
-            // The one record that must never move the tree. §P6
-            // excludes atime from the encoding entirely; a tree that
-            // changed on read would make `find` a publish storm.
-            LogRecord::Atime { .. } => {}
-        }
-    }
-
-    pub fn note_all<'a>(&mut self, records: impl IntoIterator<Item = &'a LogRecord>) {
-        for record in records {
-            self.note(record);
-        }
-    }
-
-    /// Entities, for logging and for the batch size a commit records.
-    pub fn len(&self) -> usize {
-        self.inodes.len() + self.dentries.len() + usize::from(self.subsystems)
-    }
-}
-
-/// What a batch depended on, at key granularity (§P3).
-///
-/// The keys whose presence, absence or content the plan read, plus the
-/// prefixes it scanned. A scanned prefix is a *negative* observation —
-/// "these are all the names pointing at this inode" — so a winner that
-/// added a key inside one invalidates the plan just as surely as one
-/// that changed a key it read by name. Node granularity would be wrong
-/// in both directions: it would report conflicts for unrelated keys
-/// that happen to share a leaf, and it would have no way to express the
-/// absence the scan relied on.
-#[derive(Clone, Debug, Default)]
-pub struct ReadSet {
-    keys: BTreeSet<Vec<u8>>,
-    prefixes: BTreeSet<Vec<u8>>,
-}
-
-impl ReadSet {
-    fn key(&mut self, key: Vec<u8>) {
-        self.keys.insert(key);
-    }
-
-    fn prefix(&mut self, prefix: Vec<u8>) {
-        self.prefixes.insert(prefix);
-    }
-
-    pub fn contains(&self, key: &[u8]) -> bool {
-        self.keys.contains(key) || self.prefixes.iter().any(|p| key.starts_with(p))
-    }
-}
-
-/// A batch turned into tree edits.
+/// A batch turned into tree edits: dirty keys, converted to their
+/// published form, keyed so the batch is deduplicated and sorted by
+/// construction (`Tree::apply` demands strictly ascending keys).
 #[derive(Debug, Default)]
 pub struct Plan {
-    /// Keyed so the batch is deduplicated and sorted by construction;
-    /// `Tree::apply` demands strictly ascending keys.
     edits: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    /// Bodies that exceeded `VALUE_SPILL` and must be durable before
-    /// the commit that names them.
+    /// Bodies that exceeded `VALUE_SPILL` and must be durable before the
+    /// commit that names them.
     blobs: Vec<Vec<u8>>,
-    reads: ReadSet,
-    /// Entities the plan covered, for the commit's intent.
+    /// Dirty keys this plan covers, for the commit's intent.
     entities: usize,
 }
 
@@ -307,7 +145,7 @@ impl Plan {
         self.edits.insert(key, None);
     }
 
-    fn edits(&self) -> Vec<Edit> {
+    fn edits(&self) -> Vec<constellation_mtree::Edit> {
         self.edits
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
@@ -318,21 +156,18 @@ impl Plan {
         self.edits.len()
     }
 
-    /// True when a winner's change set touches anything this batch read
-    /// or wrote. The write-set counts as read: two publishers that both
-    /// set the same key have no disjoint splice, whether or not either
-    /// looked at the old value.
-    fn conflicts_with(&self, changed: &[(Vec<u8>, constellation_mtree::ChangeKind)]) -> bool {
-        changed
-            .iter()
-            .any(|(key, _)| self.reads.contains(key) || self.edits.contains_key(key))
+    /// True when a winner's change set touches any key this batch edits.
+    /// The dirty set *is* the read set now (see the module docs), so
+    /// this is the whole of §P3's disjointness check.
+    fn conflicts_with(&self, changed: &[(Vec<u8>, ChangeKind)]) -> bool {
+        changed.iter().any(|(key, _)| self.edits.contains_key(key))
     }
 }
 
 /// Builds and publishes the §P6 tree for one replica.
 ///
-/// Owned by `shipper::Shipper` and driven by its publish cadence (plan 29
-/// M0b), which replaced the whole-DB checkpoint cadence this used to piggy-back on.
+/// Owned by `shipper::Shipper` and driven by its publish cadence (every
+/// `PUBLISH_EVERY` shipped segments, on idle, and at shutdown).
 pub struct TreePublisher {
     meta: Arc<Meta>,
     cache: Arc<NodeCache>,
@@ -343,7 +178,6 @@ pub struct TreePublisher {
     /// The root this replica last published, and the commit that names
     /// it. `None` until the first publish.
     state: Option<Published>,
-    pending: Touched,
     /// Whether the node cache has loaded the pack catalog. False until
     /// the first publish of every process (see `new`).
     hydrated: bool,
@@ -365,17 +199,23 @@ type Vector = u64;
 /// How one publish attempt ended.
 enum Outcome {
     Committed(Box<Commit>),
-    /// The tree already reflects the batch; nothing to commit.
+    /// The tree already reflects the batch (an empty dirty set, or a
+    /// plan whose net effect reproduces the published root exactly);
+    /// nothing to commit.
     Unchanged,
-    /// Not now: behind the head, or a declined splice. The pending set
-    /// is kept for the next round.
+    /// Not now: behind the head, or a declined splice. `dirty` is left
+    /// untouched, so the next round picks the same keys back up.
     Deferred,
 }
 
 /// What the blocking half of a publish decided.
 enum Planned {
-    /// A plan, the root it produces, and the vector it was read at.
-    Ready(Plan, NodeHash, Vector),
+    /// A plan, the root it produces, the vector it was read at, and the
+    /// `dirty_snapshot` this plan's read set came from — handed back to
+    /// `clear_dirty_upto` on success.
+    Ready(Plan, NodeHash, Vector, Vec<(Vec<u8>, u64)>),
+    /// Nothing was dirty.
+    Empty,
     /// This replica has applied less of the log than the head it would
     /// build on, so every value it holds for a key it touched might be
     /// older than the head's. Publishing would regress the tree; the
@@ -401,26 +241,13 @@ impl TreePublisher {
             config,
             node_id,
             state: None,
-            pending: Touched {
-                full: true,
-                ..Touched::default()
-            },
             // Always hydrate before the first publish, restored root or
-            // not: a rebuild re-`put`s every node of the namespace, and
-            // only a cache that knows which ones are already on the
-            // bucket skips the upload for the unchanged ones.
+            // not: the first publish applies edits onto whatever root
+            // `restore` found, and only a cache that knows which packs
+            // hold its nodes can resolve them.
             hydrated: false,
             handle,
         }
-    }
-
-    pub fn note(&mut self, records: &[LogRecord]) {
-        self.pending.note_all(records);
-    }
-
-    #[cfg(test)]
-    pub fn pending(&self) -> &Touched {
-        &self.pending
     }
 
     #[cfg(test)]
@@ -430,18 +257,13 @@ impl TreePublisher {
 
     /// Pick the published root back up after a restart.
     ///
-    /// The tree is only reusable if it is level with the replica, and
-    /// the cheapest honest proof of that is the applied-sequence vector
-    /// recorded alongside it: the replica has applied exactly the log
-    /// the tree was built from. Anything else — a crash between an
-    /// `apply` and a publish, a tail that ran without a publisher — and
-    /// the in-memory touched set is gone with no way to reconstruct it,
-    /// so the next publish rebuilds.
-    ///
-    /// Re-deriving the delta by re-reading the log segments between the
-    /// two vectors would avoid the rebuild at the cost of S3 GETs for
-    /// data the replica already has; that is left for a later step and
-    /// noted in `PROGRESS.md`.
+    /// No longer validates the tree against the replica's applied-seq
+    /// vector: a node's dirty set persists in `fjall` across restarts,
+    /// so there is nothing a restart could have silently lost that
+    /// would make a rebuild necessary (see the module docs). A missing
+    /// or corrupt kv entry just means no publish or bootstrap has ever
+    /// landed on this replica, which `publish_batch` already handles
+    /// (`state: None`, first publish builds on the empty tree).
     pub fn restore(&mut self) -> Result<()> {
         let (Some(root_hex), Some(seq)) = (self.meta.kv_get(KV_ROOT)?, self.meta.kv_get(KV_SEQ)?)
         else {
@@ -450,16 +272,12 @@ impl TreePublisher {
         let (Some(root), Ok(seq)) = (NodeHash::from_hex(&root_hex), seq.parse::<u64>()) else {
             return Ok(());
         };
-        let recorded = self.meta.kv_get(KV_VECTOR)?.unwrap_or_default();
-        let applied = self.meta.applied_seq()?;
-        if recorded != encode_vector(applied) {
-            tracing::info!(
-                "metadata tree is behind the replica; the next publish rebuilds it in full"
-            );
-            return Ok(());
-        }
+        let applied = self
+            .meta
+            .kv_get(KV_VECTOR)?
+            .and_then(|s| parse_vector(&s))
+            .unwrap_or(0);
         self.state = Some(Published { root, seq, applied });
-        self.pending = Touched::default();
         self.hydrated = false;
         Ok(())
     }
@@ -486,43 +304,33 @@ impl TreePublisher {
         Ok(Tree::with_config(self.cache.clone(), self.config)?)
     }
 
-    /// Publish the pending set, if there is one.
+    /// Publish the current dirty set, if there is one.
     ///
     /// Returns the commit that landed, or `None` when there was nothing
     /// to do or when the publish deferred to let the tailer catch up.
-    /// The pending set is cleared only on success, so a failure costs a
-    /// round rather than a key.
     ///
-    /// **Cancellation-safe**, and it has to be: the daemon's sync loop
-    /// drops a running round (and with it this future) whenever an
-    /// explicit request arrives. The pending set is therefore only
-    /// *read* while the publish is in flight and cleared once it has
-    /// landed; `&mut self` guarantees nothing is noted in between. An
-    /// earlier version took the set up front, and a cancelled round
-    /// silently dropped its keys from the tree for good (found by
-    /// `snapshot-churn`: a clone never reached any commit).
+    /// **Cancellation- and crash-safe**: nothing about the batch lives
+    /// only in this process's memory. `dirty` is only ever *read* while
+    /// a publish is in flight, and cleared — durably, in `fjall` — only
+    /// once a commit has actually landed. Dropping this future at any
+    /// await point (the daemon's sync loop does exactly that whenever an
+    /// explicit request arrives) leaves `dirty` exactly as it was, so
+    /// the next publish (in this process or, after a crash, the next
+    /// one) picks the same keys back up.
     pub async fn publish(&mut self, epoch: u64) -> Result<Option<Commit>> {
-        if self.pending.is_empty() {
+        if !self.meta.has_dirty() {
             return Ok(None);
         }
         let started = std::time::Instant::now();
-        let batch = self.pending.clone();
-        match self.publish_batch(&batch, epoch).await {
-            Ok(Outcome::Unchanged) => {
-                // The tree already says what the replica says (e.g. a
-                // cancelled round's commit landed and was adopted).
-                self.pending = Touched::default();
-                Ok(None)
-            }
+        match self.publish_batch(epoch).await {
+            Ok(Outcome::Unchanged) => Ok(None),
             Ok(Outcome::Deferred) => Ok(None),
             Err(e) => Err(e),
             Ok(Outcome::Committed(commit)) => {
                 let commit = *commit;
-                self.pending = Touched::default();
                 tracing::info!(
                     seq = commit.seq,
                     root = %commit.roots.get(SHARD0).map(String::as_str).unwrap_or(""),
-                    entities = batch.len(),
                     keys = commit.intent.ops,
                     packs = commit.packs.len(),
                     ms = started.elapsed().as_millis(),
@@ -533,8 +341,8 @@ impl TreePublisher {
         }
     }
 
-    /// Publish whatever is pending and return the commit that now
-    /// reflects this replica: the new one, or — when nothing was pending
+    /// Publish whatever is dirty and return the commit that now
+    /// reflects this replica: the new one, or — when nothing was dirty
     /// — the last one, which already does. A deferred publish is an
     /// error, because a caller asking for "now" (a snapshot) must not be
     /// handed an older state.
@@ -550,14 +358,14 @@ impl TreePublisher {
                     .with_context(|| format!("commit {} names no shard 0 root", commit.seq))?;
                 return Ok((commit.seq, root));
             }
-            if self.pending.is_empty() {
+            if !self.meta.has_dirty() {
                 break;
             }
         }
-        if !self.pending.is_empty() {
+        if self.meta.has_dirty() {
             anyhow::bail!(
                 "the metadata publish was deferred (this replica is behind the chain head, \
-                 or a cross-partition rename is half applied); retry shortly"
+                 or a concurrent commit overlaps its batch); retry shortly"
             );
         }
         let state = self
@@ -567,7 +375,7 @@ impl TreePublisher {
         Ok((state.seq, state.root))
     }
 
-    async fn publish_batch(&mut self, batch: &Touched, epoch: u64) -> Result<Outcome> {
+    async fn publish_batch(&mut self, epoch: u64) -> Result<Outcome> {
         // Adopt whatever the chain's head is before planning. A commit
         // from another writer is the normal reason our parent moved,
         // and its records have already reached this replica through the
@@ -590,42 +398,41 @@ impl TreePublisher {
         let cache = Arc::clone(&self.cache);
         let config = self.config;
         let blobs = self.blobs.clone();
-        let batch = batch.clone();
         // The tree build reads fjall and decompresses nodes. Tens of
         // milliseconds on a large batch, so it does not belong on a
         // runtime worker any more than `VACUUM INTO` did.
         //
-        // The vector and every read the plan makes share one fjall
-        // snapshot (`read_consistent`), so the commit's `applied` claim
-        // is exactly what the tree was built from.
+        // The vector, the dirty snapshot and every read the plan makes
+        // share one fjall snapshot (`read_consistent`), so the commit's
+        // `applied` claim, the read set and the values planned are
+        // provably the same point-in-time view.
         let planned = tokio::task::spawn_blocking(move || -> Result<Planned> {
             let tree = Tree::with_config(cache, config).map_err(StoreError::from)?;
-            let builder = Builder {
-                meta: &meta,
-                tree: &tree,
-                blobs: &blobs,
-            };
             meta.read_consistent(|snap| -> Result<Planned> {
                 let vector = meta.applied_seq_at(snap)?;
                 if let Some(head) = head_applied.filter(|head| !vector_covers(vector, *head)) {
                     return Ok(Planned::Behind { mine: vector, head });
                 }
-                let (plan, root) = match base {
-                    Some(base) if !batch.needs_rebuild() => {
-                        let plan = builder.plan(snap, Some(&base), &batch)?;
-                        let edits = plan.edits();
-                        let root = tree.apply(&base, &edits).map_err(StoreError::from)?;
-                        (plan, root)
-                    }
-                    _ => builder.rebuild(snap)?,
+                let dirty = meta.dirty_snapshot(snap)?;
+                if dirty.is_empty() {
+                    return Ok(Planned::Empty);
+                }
+                let plan = plan_from_dirty(&meta, snap, &blobs, &dirty)?;
+                let base_for_apply = match base {
+                    Some(root) => root,
+                    None => tree.empty().map_err(StoreError::from)?,
                 };
-                Ok(Planned::Ready(plan, root, vector))
+                let root = tree
+                    .apply(&base_for_apply, &plan.edits())
+                    .map_err(StoreError::from)?;
+                Ok(Planned::Ready(plan, root, vector, dirty))
             })
         })
         .await
         .context("metadata tree build task")??;
-        let (plan, root, vector) = match planned {
-            Planned::Ready(plan, root, vector) => (plan, root, vector),
+        let (plan, root, vector, observed_dirty) = match planned {
+            Planned::Ready(plan, root, vector, dirty) => (plan, root, vector, dirty),
+            Planned::Empty => return Ok(Outcome::Unchanged),
             Planned::Behind { mine, head } => {
                 tracing::debug!(
                     mine = encode_vector(mine),
@@ -638,13 +445,15 @@ impl TreePublisher {
 
         if Some(root) == base {
             // The published root already reflects the replica at
-            // `vector` — an empty plan, or a restart's rebuild that
-            // reproduced the head exactly. Nothing to commit; say so
-            // locally, so a restart need not rebuild again.
+            // `vector` — an empty net effect (every dirty value already
+            // matches what is published). Nothing to commit, but the
+            // dirty set this plan covered is genuinely reconciled, so
+            // it still clears.
             if let Some(state) = self.state.as_mut() {
                 state.applied = vector;
             }
             self.remember()?;
+            self.meta.clear_dirty_upto(&observed_dirty)?;
             return Ok(Outcome::Unchanged);
         }
 
@@ -724,16 +533,16 @@ impl TreePublisher {
                     applied: vector,
                 });
                 self.remember()?;
+                self.meta.clear_dirty_upto(&observed_dirty)?;
                 Ok(Outcome::Committed(Box::new(commit)))
             }
             // A refused splice is not a failure of this publish so much
             // as a statement that the batch has to be re-executed
-            // against state this replica has not applied yet. The
-            // tailer is what supplies it, so the work goes back on the
-            // pending set and the next round re-plans from the winner's
-            // root — which is re-execution in §P3's sense, deferred by
-            // one round so that it re-executes against a replica that
-            // has actually seen the winner's records.
+            // against state this replica has not applied yet. `dirty`
+            // is left untouched — the tailer supplies what re-execution
+            // needs, and the next round re-plans the same keys from the
+            // winner's root, which is re-execution in §P3's sense,
+            // deferred by one round.
             Err(StoreError::Conflict(_)) if declined.is_some() => {
                 tracing::info!(
                     reason = declined.unwrap_or_default(),
@@ -802,7 +611,7 @@ impl TreePublisher {
         };
         if plan.conflicts_with(&changed) {
             return Err(StoreError::Conflict(format!(
-                "commit {} changed {} keys, overlapping this batch's read set",
+                "commit {} changed {} keys, overlapping this batch's edits",
                 winner.seq,
                 changed.len()
             )));
@@ -852,8 +661,9 @@ impl TreePublisher {
 
     /// Persist the published root with the vector it was *planned* at,
     /// not the replica's vector now: a segment applied since the plan
-    /// makes the two differ, and `restore` must then rebuild rather
-    /// than trust a tree that never saw that segment.
+    /// makes the two differ, and a later restart's guard (§P3's
+    /// disjointness check, not a rebuild — see the module docs) must
+    /// see the vector the tree actually reflects.
     fn remember(&self) -> Result<()> {
         let Some(state) = self.state.as_ref() else {
             return Ok(());
@@ -862,15 +672,6 @@ impl TreePublisher {
         self.meta.kv_set(KV_SEQ, &state.seq.to_string())?;
         self.meta.kv_set(KV_VECTOR, &encode_vector(state.applied))?;
         Ok(())
-    }
-}
-
-impl Touched {
-    fn from_inodes(inodes: impl IntoIterator<Item = Ino>) -> Touched {
-        Touched {
-            inodes: inodes.into_iter().collect(),
-            ..Touched::default()
-        }
     }
 }
 
@@ -896,299 +697,110 @@ fn encode_vector(applied: Vector) -> String {
     format!("{PARTITION}:{applied}")
 }
 
+fn parse_vector(s: &str) -> Option<Vector> {
+    s.rsplit(':').next()?.parse().ok()
+}
+
+// ------------------------------------------------------- key conversion
+
+/// The three cases a `ns` key's current value falls into when it moves
+/// from local to published form: `0x01` and `0x03` wrap a `Payload` that
+/// may point at a *local* blob and must be re-placed against the
+/// *published* hasher; everything else copies verbatim (`value` is
+/// already known present).
+fn republish_present(
+    meta: &Meta,
+    snap: &fjall::Snapshot,
+    blobs: &BlobStore,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
+    match keys::Key::parse(key)? {
+        keys::Key::Inode { ino } => {
+            let row = meta.tree_inode_at(snap, ino)?.with_context(|| {
+                format!("inode {ino}: present in ns but tree_inode_at found nothing")
+            })?;
+            let xattrs: Vec<(Vec<u8>, Vec<u8>)> = row
+                .xattrs
+                .iter()
+                .map(|(name, value)| (name.as_bytes().to_vec(), value.clone()))
+                .collect();
+            let planned = record::plan_inode(
+                attrs_of(&row.attr),
+                row.manifest.clone(),
+                row.target.as_ref().map(|t| t.as_bytes().to_vec()),
+                &xattrs,
+                |bytes| blobs.hash(bytes),
+            );
+            Ok((planned.record.encode(), planned.blobs))
+        }
+        keys::Key::Xattr { .. } => {
+            let payload = record::Payload::decode(value)?;
+            let bytes = meta.resolve_local_payload_at(snap, &payload)?;
+            let (payload, blob) = record::place_value(bytes, |b| blobs.hash(b));
+            debug_assert!(
+                payload.encoded_len() <= VALUE_SPILL + 1,
+                "a spilled payload must be a hash"
+            );
+            Ok((payload.encode(), blob.into_iter().collect()))
+        }
+        keys::Key::Dentry { .. } | keys::Key::RDentry { .. } | keys::Key::Subsystem { .. } => {
+            Ok((value.to_vec(), Vec::new()))
+        }
+    }
+}
+
+/// Turn a `dirty_snapshot` into a [`Plan`]: for each key, read `ns`'s
+/// current raw value under the same snapshot (absent → delete edit),
+/// converting `0x01`/`0x03` payloads to their published form.
+fn plan_from_dirty(
+    meta: &Meta,
+    snap: &fjall::Snapshot,
+    blobs: &BlobStore,
+    dirty: &[(Vec<u8>, u64)],
+) -> Result<Plan> {
+    let mut plan = Plan::default();
+    for (key, _counter) in dirty {
+        match meta.ns_get_at(snap, key)? {
+            None => plan.remove(key.clone()),
+            Some(value) => {
+                let (published, new_blobs) = republish_present(meta, snap, blobs, key, &value)?;
+                plan.blobs.extend(new_blobs);
+                plan.upsert(key.clone(), published);
+            }
+        }
+    }
+    plan.entities = dirty.len();
+    Ok(plan)
+}
+
 /// Build the tree the replica's current state calls for, from nothing,
 /// into `tree`'s store — `fsck`'s half of "recompute the root hash and
-/// compare". The same code path as a publisher's rebuild, so an
-/// agreement bug between them cannot hide here. Nothing is uploaded:
+/// compare", and the genesis/bootstrap escape hatch for a replica with
+/// no prior published root to diff against. Nothing is uploaded:
 /// spilled values are hashed, never stored.
+///
+/// A full walk rather than the incremental path: unlike a publish, this
+/// has no dirty set to work from (independent verification is the
+/// point), so it visits every key in `ns` once. `Tree::build`'s own
+/// memory cost is bounded (one pending run per level); the input vector
+/// this assembles is not, which is an acceptable trade for a maintenance
+/// operation that already reads and hashes the whole tree elsewhere
+/// (`TreeReader::verify`).
 pub fn rebuild_root<S: NodeStore>(
     meta: &Meta,
     tree: &Tree<S>,
     blobs: &BlobStore,
 ) -> Result<NodeHash> {
-    let builder = Builder { meta, tree, blobs };
-    meta.read_consistent(|snap| Ok(builder.rebuild(snap)?.1))
-}
-
-// ----------------------------------------------------------- the builder
-
-/// One key/value pair as the tree hands it back.
-type Entry = (Vec<u8>, Vec<u8>);
-
-/// Turns replica state into §P6 edits.
-///
-/// Borrowed rather than owned so the same code serves the incremental
-/// path and the rebuild; the only difference between them is whether
-/// there is an old tree to diff against.
-struct Builder<'a, S> {
-    meta: &'a Meta,
-    tree: &'a Tree<S>,
-    blobs: &'a BlobStore,
-}
-
-impl<S: NodeStore> Builder<'_, S> {
-    /// Every inode, a page at a time, onto an empty tree.
-    ///
-    /// The first publish and `fsck`'s path. It is the incremental
-    /// planner fed the whole namespace rather than a second
-    /// implementation, which is what makes "incremental equals bulk" a
-    /// property of one code path instead of a coincidence between two.
-    /// The cost is that a rebuild pays `apply`'s rewrite per page
-    /// rather than a single streaming build; rebuilds are rare by
-    /// construction, and an agreement bug here would be silent and
-    /// permanent.
-    fn rebuild(&self, snap: &fjall::Snapshot) -> Result<(Plan, NodeHash)> {
-        let mut root = self.tree.empty().map_err(StoreError::from)?;
-        let mut total = Plan::default();
-        let mut after: Ino = 0;
-        loop {
-            let page = self.meta.scan_inos_at(snap, after, REBUILD_PAGE)?;
-            let Some(last) = page.last().copied() else {
-                break;
-            };
-            after = last;
-            let plan = self.plan(snap, None, &Touched::from_inodes(page))?;
-            self.absorb_page(&mut root, &mut total, plan)?;
+    meta.read_consistent(|snap| -> Result<NodeHash> {
+        let dump = meta.ns_dump_at(snap)?;
+        let mut pairs = Vec::with_capacity(dump.len());
+        for (key, value) in &dump {
+            let (published, _blobs) = republish_present(meta, snap, blobs, key, value)?;
+            pairs.push((key.clone(), published));
         }
-        let subsystems = Touched {
-            subsystems: true,
-            ..Touched::default()
-        };
-        let plan = self.plan(snap, None, &subsystems)?;
-        self.absorb_page(&mut root, &mut total, plan)?;
-        // The rebuild depends on nothing in any previous tree, so its
-        // read set is empty: a concurrent winner can change any key at
-        // all without invalidating "this is the replica".
-        total.reads = ReadSet::default();
-        Ok((total, root))
-    }
-
-    /// Fold one page of a rebuild into the running root. The edit count
-    /// is kept for the commit's intent.
-    fn absorb_page(&self, root: &mut NodeHash, total: &mut Plan, plan: Plan) -> Result<()> {
-        *root = self
-            .tree
-            .apply(root, &plan.edits())
-            .map_err(StoreError::from)?;
-        total.blobs.extend(plan.blobs);
-        total.entities += plan.entities;
-        total.edits.extend(plan.edits);
-        Ok(())
-    }
-
-    /// The incremental plan: what has to change in the tree so that it
-    /// agrees with the replica about `batch`'s entities.
-    fn plan(
-        &self,
-        snap: &fjall::Snapshot,
-        base: Option<&NodeHash>,
-        batch: &Touched,
-    ) -> Result<Plan> {
-        let mut plan = Plan::default();
-        let mut inodes: BTreeSet<Ino> = batch.inodes.clone();
-        // Dentries whose `0x02` value has to be rewritten, either
-        // because the name moved or because the attrs it copies did.
-        let mut names: BTreeSet<(Ino, String)> = batch.dentries.clone();
-
-        // A record that removes or moves a name does not carry the ino
-        // it pointed at. The tree's old value is where that is written
-        // down, so read it before anything else and close the inode set
-        // over what turns up.
-        for (parent, name) in &batch.dentries {
-            let key = keys::dentry(*parent, name.as_bytes());
-            if let Some(old) = self.get(base, &key)? {
-                inodes.insert(DentryRecord::decode(&old)?.ino);
-            }
-            plan.reads.key(key);
-            if let Some(ino) = self.meta.child_ino_at(snap, *parent, name)? {
-                inodes.insert(ino);
-            }
-        }
-
-        let mut rows: BTreeMap<Ino, Option<TreeInode>> = BTreeMap::new();
-        for ino in &inodes {
-            let row = self.meta.tree_inode_at(snap, *ino)?;
-            let links = self.meta.links_of_at(snap, *ino)?;
-            // Every name pointing at this inode carries a copy of its
-            // attrs (§P6's `0x02` value, S1's verdict), so an attribute
-            // change fans out to each of them. Hard links are rare, so
-            // this is one extra key in the common case.
-            names.extend(links.iter().cloned());
-            let present = row.as_ref().is_some_and(|row| row.attr.nlink > 0);
-            self.plan_inode(snap, base, &mut plan, *ino, row.as_ref(), &links, present)?;
-            rows.insert(*ino, row);
-        }
-
-        for (parent, name) in &names {
-            let key = keys::dentry(*parent, name.as_bytes());
-            plan.reads.key(key.clone());
-            let ino = self.meta.child_ino_at(snap, *parent, name)?;
-            let attrs = match ino {
-                Some(ino) => match rows.entry(ino) {
-                    std::collections::btree_map::Entry::Occupied(row) => {
-                        row.get().as_ref().map(|row| attrs_of(&row.attr))
-                    }
-                    std::collections::btree_map::Entry::Vacant(slot) => {
-                        let row = self.meta.tree_inode_at(snap, ino)?;
-                        let attrs = row.as_ref().map(|row| attrs_of(&row.attr));
-                        slot.insert(row);
-                        attrs
-                    }
-                },
-                None => None,
-            };
-            match (ino, attrs) {
-                (Some(ino), Some(attrs)) if attrs.nlink > 0 => {
-                    plan.upsert(key, DentryRecord::new(ino, attrs).encode())
-                }
-                _ => plan.remove(key),
-            }
-        }
-
-        if batch.subsystems {
-            self.plan_subsystems(snap, base, &mut plan)?;
-        }
-        plan.entities = inodes.len() + names.len() + usize::from(batch.subsystems);
-        Ok(plan)
-    }
-
-    /// The `0x30` records (B) publishes, re-derived whole: they are a
-    /// handful per filesystem.
-    fn plan_subsystems(
-        &self,
-        snap: &fjall::Snapshot,
-        base: Option<&NodeHash>,
-        plan: &mut Plan,
-    ) -> Result<()> {
-        let wanted = crate::mtree_read::subsystem_state(self.meta, snap)?;
-        for subsystem in crate::mtree_read::PUBLISHED_SUBSYSTEMS {
-            let range = keys::records_of(subsystem);
-            plan.reads.prefix(range.prefix().to_vec());
-            for (key, _) in self.scan(base, &range)? {
-                if !wanted.contains_key(&key) {
-                    plan.remove(key);
-                }
-            }
-        }
-        for (key, value) in wanted {
-            plan.upsert(key, value);
-        }
-        Ok(())
-    }
-
-    /// One inode's `0x01`, `0x03` and `0x04` keys.
-    #[allow(clippy::too_many_arguments)]
-    fn plan_inode(
-        &self,
-        _snap: &fjall::Snapshot,
-        base: Option<&NodeHash>,
-        plan: &mut Plan,
-        ino: Ino,
-        row: Option<&TreeInode>,
-        links: &[(Ino, String)],
-        present: bool,
-    ) -> Result<()> {
-        let inode_key = keys::inode(ino);
-        plan.reads.key(inode_key.clone());
-
-        // The reverse index (`0x04`) is a set of names, so the edit is
-        // the symmetric difference between what the tree holds and what
-        // the replica holds. The scan is a negative observation and
-        // goes in the read set as a prefix: a winner that added a name
-        // here invalidates the deletes computed from it.
-        let name_range = keys::names_of(ino);
-        plan.reads.prefix(name_range.prefix().to_vec());
-        let stale: BTreeSet<Vec<u8>> = self
-            .scan(base, &name_range)?
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
-        let wanted: BTreeSet<Vec<u8>> = if present {
-            links
-                .iter()
-                .map(|(parent, name)| keys::rdentry(ino, *parent, name.as_bytes()))
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
-        for key in stale.difference(&wanted) {
-            plan.remove(key.clone());
-        }
-        for key in wanted {
-            plan.upsert(key, record::RDENTRY_VALUE.to_vec());
-        }
-
-        let xattr_range = keys::xattrs_of(ino);
-        plan.reads.prefix(xattr_range.prefix().to_vec());
-        let spilled: BTreeSet<Vec<u8>> = self
-            .scan(base, &xattr_range)?
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
-
-        let Some(row) = row.filter(|_| present) else {
-            plan.remove(inode_key);
-            for key in spilled {
-                plan.remove(key);
-            }
-            return Ok(());
-        };
-
-        let xattrs: Vec<(Vec<u8>, Vec<u8>)> = row
-            .xattrs
-            .iter()
-            .map(|(name, value)| (name.as_bytes().to_vec(), value.clone()))
-            .collect();
-        let planned = record::plan_inode(
-            attrs_of(&row.attr),
-            row.manifest.clone(),
-            row.target.as_ref().map(|t| t.as_bytes().to_vec()),
-            &xattrs,
-            |bytes| self.blobs.hash(bytes),
-        );
-        plan.blobs.extend(planned.blobs);
-        plan.upsert(inode_key, planned.record.encode());
-
-        let mut wanted: BTreeSet<Vec<u8>> = BTreeSet::new();
-        if planned.xattrs == record::XattrPlacement::Spilled {
-            for (name, value) in &xattrs {
-                let key = keys::xattr(ino, name);
-                let (payload, blob) =
-                    record::place_value(value.clone(), |bytes| self.blobs.hash(bytes));
-                debug_assert!(
-                    payload.encoded_len() <= VALUE_SPILL + 1,
-                    "a spilled payload must be a hash"
-                );
-                plan.blobs.extend(blob);
-                plan.upsert(key.clone(), payload.encode());
-                wanted.insert(key);
-            }
-        }
-        for key in spilled.difference(&wanted) {
-            plan.remove(key.clone());
-        }
-        Ok(())
-    }
-
-    fn get(&self, base: Option<&NodeHash>, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        match base {
-            Some(root) => Ok(self.tree.get(root, key)?),
-            None => Ok(None),
-        }
-    }
-
-    fn scan(
-        &self,
-        base: Option<&NodeHash>,
-        range: &keys::KeyRange,
-    ) -> Result<Vec<Entry>, StoreError> {
-        match base {
-            Some(root) => Ok(self
-                .tree
-                .range(root, range.start(), range.prefix(), usize::MAX)?),
-            None => Ok(Vec::new()),
-        }
-    }
+        Ok(tree.build(pairs).map_err(StoreError::from)?)
+    })
 }
 
 /// `fs-core`'s attrs as §P6 stores them: the same fields minus atime,
@@ -1198,9 +810,9 @@ impl<S: NodeStore> Builder<'_, S> {
 /// discriminants match `InodeKind::as_u8` on purpose; `from_u8` is
 /// still called rather than transmuted so a future divergence is an
 /// error instead of a reinterpretation.
-fn attrs_of(attr: &FileAttr) -> Attrs {
-    Attrs {
-        kind: Kind::from_u8(attr.kind.as_u8()).unwrap_or(Kind::File),
+fn attrs_of(attr: &constellation_fs_core::FileAttr) -> record::Attrs {
+    record::Attrs {
+        kind: record::Kind::from_u8(attr.kind.as_u8()).unwrap_or(record::Kind::File),
         mode: attr.mode,
         uid: attr.uid,
         gid: attr.gid,
@@ -1228,17 +840,16 @@ mod tests {
     use super::*;
     use constellation_fs_core::cache::DiskCache;
     use constellation_fs_core::types::ROOT_INO;
-    use constellation_meta::{MetaStore, SetXattrMode};
+    use constellation_meta::{LogRecord, MetaStore, SetXattrMode};
     use constellation_mtree::{Hasher, Payload};
     use constellation_store_s3::PackStore;
     use object_store::memory::InMemory;
     use object_store::{ObjectStore, ObjectStoreExt};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
 
     /// A replica, a bucket, and however many publishers a test needs.
-    /// Several publishers over *one* replica is the shape the rebase
-    /// tests want: two writers whose batches are disjoint, which is
-    /// what §P3 splices, rather than two unrelated filesystems.
     struct Fixture {
         store: Arc<dyn ObjectStore>,
         meta: Arc<Meta>,
@@ -1266,10 +877,15 @@ mod tests {
             ))
         }
 
-        fn publisher_on(&mut self, store: Arc<dyn ObjectStore>, node_id: u64) -> TreePublisher {
+        fn publisher_over(
+            &mut self,
+            meta: Arc<Meta>,
+            store: Arc<dyn ObjectStore>,
+            node_id: u64,
+        ) -> TreePublisher {
             let cache = self.cache(store.clone());
             TreePublisher::new(
-                Arc::clone(&self.meta),
+                meta,
                 cache,
                 BlobStore::new(store.clone(), Hasher::Plain),
                 CommitChain::new(store),
@@ -1279,22 +895,62 @@ mod tests {
             )
         }
 
+        fn publisher_on(&mut self, store: Arc<dyn ObjectStore>, node_id: u64) -> TreePublisher {
+            let meta = Arc::clone(&self.meta);
+            self.publisher_over(meta, store, node_id)
+        }
+
         fn publisher(&mut self, node_id: u64) -> TreePublisher {
             let store = Arc::clone(&self.store);
             self.publisher_on(store, node_id)
         }
 
-        /// Drain the journal exactly as shipping does — read the batch,
-        /// then acknowledge it — so a test's second publish sees only
-        /// the second batch's records. Handing the whole journal over
-        /// every time would make every publish look incremental while
-        /// actually re-deriving the namespace.
-        fn records(&self) -> Vec<LogRecord> {
-            let batch = self.meta.take_journal(usize::MAX).unwrap();
-            if let Some((seq, _)) = batch.last() {
-                self.meta.ack_journal(*seq).unwrap();
+        /// Fork a second, independently-replicated node for the §P3
+        /// race tests: a fresh `Meta` under its own ino prefix, replayed
+        /// to `self.meta`'s current state (so both agree on ino
+        /// numbering), with its own publisher already `restore`d onto
+        /// whatever `from` has last committed — exactly what a real
+        /// second machine's bootstrap would leave it with. From here on
+        /// the two replicas are genuinely separate: each has its own
+        /// `dirty` keyspace, so mutating one never touches the other's.
+        fn peer(
+            &mut self,
+            node_id: u64,
+            store: Arc<dyn ObjectStore>,
+            from: &TreePublisher,
+        ) -> Peer {
+            let meta = Arc::new(Meta::open_in_memory().unwrap());
+            meta.set_node_prefix(node_id).unwrap();
+            let records: Vec<LogRecord> = self
+                .meta
+                .peek_journal_after(0)
+                .unwrap()
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect();
+            meta.apply_records(&records).unwrap();
+            meta.set_applied_seq(self.meta.applied_seq().unwrap())
+                .unwrap();
+            if let Some((root, seq)) = from.published() {
+                meta.kv_set(KV_ROOT, &root.to_hex()).unwrap();
+                meta.kv_set(KV_SEQ, &seq.to_string()).unwrap();
+                meta.kv_set(KV_VECTOR, &encode_vector(meta.applied_seq().unwrap()))
+                    .unwrap();
+                // This replica's content is exactly what `from`'s commit
+                // already published (the records just replayed are the
+                // same ones that produced it), so — like a real
+                // bootstrap — it starts with nothing to publish. Without
+                // this, the replay above would leave every replayed key
+                // dirty, and this batch's plan would spuriously include
+                // them (as no-op edits) alongside whatever this peer
+                // genuinely changes, tripping `conflicts_with` on a key
+                // the winner touched that this peer only "touches" by
+                // republishing an unchanged value.
+                meta.clear_all_dirty().unwrap();
             }
-            batch.into_iter().map(|(_, record)| record).collect()
+            let mut publisher = self.publisher_over(Arc::clone(&meta), store, node_id);
+            publisher.restore().unwrap();
+            Peer { meta, publisher }
         }
 
         /// A tree over a cold cache holding every pack every commit has
@@ -1317,13 +973,25 @@ mod tests {
         }
     }
 
-    /// Note everything journaled so far and publish it.
-    async fn publish(publisher: &mut TreePublisher, records: &[LogRecord]) -> Option<Commit> {
-        publisher.note(records);
+    /// A second node in a §P3 race test (see `Fixture::peer`).
+    struct Peer {
+        meta: Arc<Meta>,
+        publisher: TreePublisher,
+    }
+
+    fn dirty_keys(meta: &Meta) -> BTreeSet<Vec<u8>> {
+        meta.read_consistent(|snap| meta.dirty_snapshot(snap))
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    async fn publish(publisher: &mut TreePublisher) -> Option<Commit> {
         publisher.publish(7).await.unwrap()
     }
 
-    fn seed(meta: &Meta, files: u64) -> Ino {
+    fn seed(meta: &Meta, files: u64) -> constellation_fs_core::Ino {
         let dir = meta.mkdir(ROOT_INO, "d", 0o755, 1000, 1000).unwrap().ino;
         for i in 0..files {
             meta.create(dir, &format!("f{i}"), 0o644, 1000, 1000)
@@ -1332,26 +1000,20 @@ mod tests {
         dir
     }
 
-    /// The claim the whole step rests on: a tree grown one batch at a
-    /// time is byte-identical to one built from the replica in bulk.
-    ///
-    /// It is an equality of root hashes rather than a structural
-    /// comparison because the tree is canonical — which is also why
-    /// this single assertion covers dentry attr copies, the reverse
-    /// index, xattr placement and delete handling at once. Anything the
-    /// incremental path forgets to write, or writes differently,
-    /// changes the hash.
+    /// The claim the whole step rests on: a tree grown one publish at a
+    /// time is byte-identical to [`rebuild_root`]'s independent full
+    /// walk of the same replica, at every step — an equality of root
+    /// hashes rather than a structural comparison, because the tree is
+    /// canonical. This single assertion covers dentry attr copies, the
+    /// reverse index, xattr placement and delete handling at once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_incremental_history_matches_a_full_rebuild() {
         let mut fx = Fixture::new();
         let dir = seed(&fx.meta, 40);
         let mut publisher = fx.publisher(1);
-        let first = publish(&mut publisher, &fx.records()).await.unwrap();
+        let first = publish(&mut publisher).await.unwrap();
         assert_eq!(first.seq, 1);
 
-        // A mixed workload, published incrementally after each step, so
-        // every intermediate root is checked too rather than only the
-        // final one.
         let meta = Arc::clone(&fx.meta);
         let other = meta.mkdir(ROOT_INO, "other", 0o755, 0, 0).unwrap().ino;
         let steps: Vec<Box<dyn Fn()>> = vec![
@@ -1442,22 +1104,23 @@ mod tests {
         let mut last = first;
         for (i, step) in steps.iter().enumerate() {
             step();
-            let records = fx.records();
-            last = publish(&mut publisher, &records)
+            last = publish(&mut publisher)
                 .await
                 .unwrap_or_else(|| panic!("step {i} published nothing"));
-            // A fresh publisher over a fresh bucket rebuilds from the
-            // replica alone; the roots must agree at every step.
-            let mut bulk = Fixture {
-                store: Arc::new(InMemory::new()),
-                meta: Arc::clone(&fx.meta),
-                dirs: Vec::new(),
-            };
-            let mut rebuilder = bulk.publisher(2);
-            let rebuilt = rebuilder.publish(7).await.unwrap().unwrap();
+
+            let blobs = BlobStore::new(Arc::new(InMemory::new()), Hasher::Plain);
+            let tmp = TempDir::new().unwrap();
+            let cache = Arc::new(NodeCache::new(
+                PackStore::new(Arc::new(InMemory::new())),
+                Arc::new(DiskCache::open(tmp.path(), 1 << 20).unwrap()),
+                Hasher::Plain,
+                tokio::runtime::Handle::current(),
+            ));
+            let tree = Tree::with_config(cache, record::config()).unwrap();
+            let rebuilt = rebuild_root(&fx.meta, &tree, &blobs).unwrap();
             assert_eq!(
                 last.root(SHARD0),
-                rebuilt.root(SHARD0),
+                Some(rebuilt),
                 "step {i}: incremental and rebuilt roots disagree"
             );
         }
@@ -1473,14 +1136,13 @@ mod tests {
         let mut fx = Fixture::new();
         let dir = seed(&fx.meta, 3_000);
         let mut publisher = fx.publisher(1);
-        let full = publish(&mut publisher, &fx.records()).await.unwrap();
+        let full = publish(&mut publisher).await.unwrap();
         // 3,000 files + the directory + root: an 0x01, an 0x02 and an
         // 0x04 for each named inode.
         assert!(full.intent.ops > 9_000, "{}", full.intent.ops);
 
         fx.meta.create(dir, "just-one", 0o644, 1, 1).unwrap();
-        let records = fx.records();
-        let one = publish(&mut publisher, &records).await.unwrap();
+        let one = publish(&mut publisher).await.unwrap();
         // The new file's 0x01/0x02/0x04, and its parent's 0x01 plus the
         // 0x02/0x04 that copy the parent's now-bumped mtime.
         assert!(
@@ -1516,8 +1178,9 @@ mod tests {
         );
     }
 
-    /// §P6 excludes atime from the tree, so the record that carries it
-    /// must move nothing at all. Without this, a read-only `find` over
+    /// §P6 excludes atime from the tree, so the read-time atime merge
+    /// must move nothing at all: it never touches `ns`, so it never
+    /// touches `dirty` either. Without this, a read-only `find` over
     /// the namespace would publish a commit per batch — the write shape
     /// §14.4 measured, arriving through the read path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1525,18 +1188,13 @@ mod tests {
         let mut fx = Fixture::new();
         let dir = seed(&fx.meta, 4);
         let mut publisher = fx.publisher(1);
-        let first = publish(&mut publisher, &fx.records()).await.unwrap();
+        let first = publish(&mut publisher).await.unwrap();
 
         let ino = fx.meta.child_ino(dir, "f0").unwrap().unwrap();
-        let bumps: Vec<LogRecord> = (0..100)
-            .map(|i| LogRecord::Atime {
-                ino,
-                atime_ns: 1_000 + i,
-                time_ns: 1_000 + i,
-            })
-            .collect();
-        publisher.note(&bumps);
-        assert!(publisher.pending().is_empty());
+        for i in 0..100 {
+            fx.meta.apply_atime(&[(ino, 1_000 + i, 1_000 + i)]).unwrap();
+        }
+        assert!(!fx.meta.has_dirty());
         assert!(publisher.publish(7).await.unwrap().is_none());
         assert_eq!(
             publisher.published(),
@@ -1544,55 +1202,48 @@ mod tests {
         );
     }
 
-    /// A restart reuses the published root only when it can prove the
-    /// tree is level with the replica, and rebuilds when it cannot.
-    ///
-    /// The rebuild has to be *equal*, not merely valid: if a crash
-    /// could change the root hash for a replica that did not change,
-    /// every node's idea of the filesystem would depend on its restart
-    /// history and structural sharing between them would collapse.
+    /// A restart never needs a rebuild (plan 29 M2): the dirty set is
+    /// durable `fjall` state, so a fresh `TreePublisher` over the same
+    /// replica just picks its parent back up and, when a key changes
+    /// after that, edits exactly that key — not the whole namespace.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_restart_rebuilds_unless_the_tree_is_level_with_the_replica() {
+    async fn a_restart_never_needs_a_rebuild() {
         let mut fx = Fixture::new();
         seed(&fx.meta, 20);
         let mut publisher = fx.publisher(1);
-        let first = publish(&mut publisher, &fx.records()).await.unwrap();
+        let first = publish(&mut publisher).await.unwrap();
 
+        // The "restart": a brand-new `TreePublisher` over the same
+        // meta/bucket, as a fresh process would construct.
         let mut warm = fx.publisher(1);
         warm.restore().unwrap();
         assert_eq!(warm.published(), Some((first.root(SHARD0).unwrap(), 1)));
-        assert!(warm.pending().is_empty(), "a level tree owes no edits");
-
-        // The crash: the replica applied log the publisher never saw,
-        // so the in-memory changed set is gone and unreconstructable.
-        fx.meta.kv_set(KV_VECTOR, "p0:9999").unwrap();
-        let mut cold = fx.publisher(1);
-        cold.restore().unwrap();
+        assert!(!fx.meta.has_dirty(), "the first publish cleared its keys");
         assert!(
-            cold.published().is_none(),
-            "a stale tree must not be trusted"
+            warm.publish(7).await.unwrap().is_none(),
+            "nothing dirty means nothing to publish"
         );
 
-        // The rebuild must reproduce the published root exactly — which
-        // also means it has nothing to commit.
+        let ino = fx
+            .meta
+            .child_ino(fx.meta.resolve_path("d").unwrap().unwrap(), "f0")
+            .unwrap()
+            .unwrap();
+        fx.meta
+            .setattr(ino, Some(0o600), None, None, None, None, None)
+            .unwrap();
+        let second = warm.publish(7).await.unwrap().unwrap();
+        assert_eq!(second.seq, 2);
+        // Just this file's 0x01 plus its one dentry copy.
         assert!(
-            cold.publish(7).await.unwrap().is_none(),
-            "an unchanged replica must rebuild to the same root and commit nothing"
+            second.intent.ops <= 2,
+            "a restart's next publish edited {} keys, not just the changed one",
+            second.intent.ops
         );
-        assert_eq!(cold.published(), Some((first.root(SHARD0).unwrap(), 1)));
-        assert!(cold.pending().is_empty());
     }
 
     /// An object store that lets a test put a competing commit into
     /// the slot *between* a publisher's head discovery and its CAS.
-    ///
-    /// The race the rebase hook exists for is a window a few
-    /// microseconds wide, and a test that tried to hit it by running
-    /// two publishers concurrently would be a flake generator. So the
-    /// window is opened deliberately: the winner's commit is published
-    /// normally, lifted off the bucket, and re-installed by this
-    /// wrapper on the loser's first write to `commits/`. What the loser
-    /// sees is exactly what it would see in a real race.
     #[derive(Debug)]
     struct RaceStore {
         inner: Arc<dyn ObjectStore>,
@@ -1670,68 +1321,50 @@ mod tests {
         }
     }
 
-    /// Set a race up: a common base commit, then two publishers whose
-    /// batches are whatever the caller does in `a` and `b`. Returns the
-    /// loser's publish result.
-    async fn race(
-        fx: &mut Fixture,
-        a: impl FnOnce(&Meta),
-        b: impl FnOnce(&Meta),
-    ) -> (Option<Commit>, Commit, TreePublisher) {
-        let mut winner = fx.publisher(1);
-        publish(&mut winner, &fx.records()).await.unwrap();
-
-        // The loser picks the base commit up from the replica exactly
-        // as a restarted daemon would, before the winner moves on.
-        let racer = Arc::new(RaceStore {
-            inner: Arc::clone(&fx.store),
-            staged: std::sync::Mutex::new(None),
-        });
-        let mut loser = fx.publisher_on(Arc::clone(&racer) as Arc<dyn ObjectStore>, 2);
-        loser.restore().unwrap();
-        assert!(loser.published().is_some(), "the loser must share a parent");
-
-        a(&fx.meta);
-        let won = publish(&mut winner, &fx.records()).await.unwrap();
-
-        // Lift the winner's commit off the bucket and hand it to the
-        // wrapper, which puts it back the instant the loser CASes.
-        let path = constellation_store_s3::layout::commit(won.seq);
-        let body = fx.store.get(&path).await.unwrap().bytes().await.unwrap();
-        fx.store.delete(&path).await.unwrap();
+    /// Lift `commit`'s object off the bucket and stage it so the next
+    /// write to `commits/` through `racer` puts it right back — opening
+    /// the race window a real concurrent publish would create.
+    async fn stage_for_race(store: &Arc<dyn ObjectStore>, racer: &RaceStore, commit: &Commit) {
+        let path = constellation_store_s3::layout::commit(commit.seq);
+        let body = store.get(&path).await.unwrap().bytes().await.unwrap();
+        store.delete(&path).await.unwrap();
         *racer.staged.lock().expect("staged commit") = Some((path, body.to_vec()));
-
-        b(&fx.meta);
-        let records = fx.records();
-        loser.note(&records);
-        (loser.publish(7).await.unwrap(), won, loser)
     }
 
     /// §P3's splice, and the test a blind retry fails.
     ///
-    /// Two publishers build on the same parent and touch disjoint keys.
-    /// One wins the slot; the loser must re-apply its write-set **onto
-    /// the winner's root** and land at the next sequence with both
-    /// batches present. Simply retrying its own payload would also
-    /// produce a commit, and would also look green — while silently
-    /// deleting every key the winner added, because its root was
-    /// computed from a parent that no longer exists. That is the
-    /// failure this asserts against: `a` must still be there.
+    /// Two independently-replicated nodes build on the same parent and
+    /// touch disjoint keys. One wins the slot; the loser must re-apply
+    /// its own edits **onto the winner's root** and land at the next
+    /// sequence with both batches present. Simply retrying its own
+    /// payload would also produce a commit, and would also look green —
+    /// while silently deleting every key the winner added, because its
+    /// root was computed from a parent that no longer exists. That is
+    /// the failure this asserts against: `a` must still be there.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_publishers_with_disjoint_keys_both_survive() {
         let mut fx = Fixture::new();
         let da = fx.meta.mkdir(ROOT_INO, "da", 0o755, 0, 0).unwrap().ino;
         let db = fx.meta.mkdir(ROOT_INO, "db", 0o755, 0, 0).unwrap().ino;
-        let (landed, won, _) = race(
-            &mut fx,
-            |meta| {
-                meta.create(da, "a", 0o644, 0, 0).unwrap();
-            },
-            |meta| {
-                meta.create(db, "b", 0o644, 0, 0).unwrap();
-            },
-        )
-        .await;
+        let mut winner = fx.publisher(1);
+        publish(&mut winner).await.unwrap();
+
+        let racer = Arc::new(RaceStore {
+            inner: Arc::clone(&fx.store),
+            staged: std::sync::Mutex::new(None),
+        });
+        let mut loser = fx.peer(2, Arc::clone(&racer) as Arc<dyn ObjectStore>, &winner);
+        assert!(
+            loser.publisher.published().is_some(),
+            "the loser must share a parent"
+        );
+
+        fx.meta.create(da, "a", 0o644, 0, 0).unwrap();
+        let won = publish(&mut winner).await.unwrap();
+        stage_for_race(&fx.store, &racer, &won).await;
+
+        loser.meta.create(db, "b", 0o644, 0, 0).unwrap();
+        let landed = loser.publisher.publish(7).await.unwrap();
 
         let landed = landed.expect("a disjoint batch must splice, not defer");
         assert_eq!((landed.seq, landed.parent), (won.seq + 1, won.seq));
@@ -1765,63 +1398,73 @@ mod tests {
     async fn an_overlapping_batch_declines_instead_of_clobbering() {
         let mut fx = Fixture::new();
         let shared = fx.meta.mkdir(ROOT_INO, "shared", 0o755, 0, 0).unwrap().ino;
-        let (landed, won, loser) = race(
-            &mut fx,
-            |meta| {
-                meta.create(shared, "a", 0o644, 0, 0).unwrap();
-            },
-            |meta| {
-                meta.create(shared, "b", 0o644, 0, 0).unwrap();
-            },
-        )
-        .await;
+        let mut winner = fx.publisher(1);
+        publish(&mut winner).await.unwrap();
+
+        let racer = Arc::new(RaceStore {
+            inner: Arc::clone(&fx.store),
+            staged: std::sync::Mutex::new(None),
+        });
+        let mut loser = fx.peer(2, Arc::clone(&racer) as Arc<dyn ObjectStore>, &winner);
+
+        fx.meta.create(shared, "a", 0o644, 0, 0).unwrap();
+        let won = publish(&mut winner).await.unwrap();
+        stage_for_race(&fx.store, &racer, &won).await;
+
+        loser.meta.create(shared, "b", 0o644, 0, 0).unwrap();
+        let landed = loser.publisher.publish(7).await.unwrap();
+
         assert!(landed.is_none(), "an overlapping batch must not commit");
         assert!(
-            !loser.pending().is_empty(),
+            loser.meta.has_dirty(),
             "a declined batch must survive to be re-executed"
         );
         let chain = CommitChain::new(Arc::clone(&fx.store));
         assert_eq!(chain.list_from(0).await.unwrap().last(), Some(&won.seq));
     }
 
-    /// The S5 regression the `applied` vector exists to stop: a replica
-    /// that is behind the chain head must not publish on top of it.
-    ///
-    /// Adopting the head and then writing this replica's values for its
-    /// touched keys would overwrite anything newer the head holds with
-    /// the older value still in this replica, and `conflicts_with`
-    /// never sees it — the head was adopted *before* planning, so the
-    /// stale value is ours and appears in no diff. The replica has to
-    /// wait for its tailer instead.
+    /// The S5/M2 regression the `applied` vector exists to stop: a
+    /// replica that is behind the chain head must not publish on top of
+    /// it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_replica_behind_the_head_defers_instead_of_regressing() {
         let mut fx = Fixture::new();
         seed(&fx.meta, 5);
         fx.meta.set_applied_seq(10).unwrap();
         let mut ahead = fx.publisher(1);
-        let head = publish(&mut ahead, &fx.records()).await.unwrap();
+        let head = publish(&mut ahead).await.unwrap();
         assert_eq!(head.applied, 10);
 
-        // Same bucket, a replica that has applied less of p0.
-        fx.meta.set_applied_seq(3).unwrap();
-        let mut behind = fx.publisher(2);
+        // A second node replicated to the same structure, but which has
+        // tailed less of the shared log than the head it would build on
+        // and has some local work of its own to publish.
+        let mut behind = fx.peer(2, Arc::clone(&fx.store), &ahead);
+        behind.meta.set_applied_seq(3).unwrap();
+        behind
+            .meta
+            .create(ROOT_INO, "local-work", 0o644, 0, 0)
+            .unwrap();
         assert!(
-            behind.publish(7).await.unwrap().is_none(),
+            behind.publisher.publish(7).await.unwrap().is_none(),
             "a replica behind the head must defer"
         );
-        assert!(!behind.pending().is_empty(), "and keep its work");
+        assert!(behind.meta.has_dirty(), "and keep its work");
         let chain = CommitChain::new(Arc::clone(&fx.store));
         assert_eq!(chain.discover_head(0).await.unwrap(), Some(head.seq));
 
-        // Once the tailer has caught up, the same publisher lands (with a
-        // change of its own: a replica level with the head and holding
-        // nothing new has nothing to commit).
-        fx.meta.set_applied_seq(10).unwrap();
-        fx.meta
+        // Once the tailer has caught up, the same publisher lands (with
+        // a change of its own).
+        behind.meta.set_applied_seq(10).unwrap();
+        behind
+            .meta
             .create(ROOT_INO, "after-catch-up", 0o644, 0, 0)
             .unwrap();
-        behind.note(&fx.records());
-        let landed = behind.publish(7).await.unwrap().expect("caught up");
+        let landed = behind
+            .publisher
+            .publish(7)
+            .await
+            .unwrap()
+            .expect("caught up");
         assert_eq!((landed.seq, landed.applied), (2, 10));
     }
 
@@ -1833,29 +1476,39 @@ mod tests {
         let mut fx = Fixture::new();
         let da = fx.meta.mkdir(ROOT_INO, "da", 0o755, 0, 0).unwrap().ino;
         let db = fx.meta.mkdir(ROOT_INO, "db", 0o755, 0, 0).unwrap().ino;
-        let (landed, won, loser) = race(
-            &mut fx,
-            |meta| {
-                meta.create(da, "a", 0o644, 0, 0).unwrap();
-                meta.set_applied_seq(10).unwrap();
-            },
-            |meta| {
-                meta.create(db, "b", 0o644, 0, 0).unwrap();
-                meta.set_applied_seq(5).unwrap();
-            },
-        )
-        .await;
+        let mut winner = fx.publisher(1);
+        publish(&mut winner).await.unwrap();
+
+        let racer = Arc::new(RaceStore {
+            inner: Arc::clone(&fx.store),
+            staged: std::sync::Mutex::new(None),
+        });
+        let mut loser = fx.peer(2, Arc::clone(&racer) as Arc<dyn ObjectStore>, &winner);
+
+        fx.meta.create(da, "a", 0o644, 0, 0).unwrap();
+        fx.meta.set_applied_seq(10).unwrap();
+        let won = publish(&mut winner).await.unwrap();
         assert_eq!(won.applied, 10);
+        stage_for_race(&fx.store, &racer, &won).await;
+
+        loser.meta.create(db, "b", 0o644, 0, 0).unwrap();
+        loser.meta.set_applied_seq(5).unwrap();
+        let landed = loser.publisher.publish(7).await.unwrap();
         assert!(landed.is_none(), "an ahead winner must not be spliced onto");
-        assert!(!loser.pending().is_empty());
+        assert!(loser.meta.has_dirty());
     }
 
     /// An object store whose writes stall, so a publish can be caught
-    /// in flight.
+    /// in flight. `resume` lets a test release a stalled call instead of
+    /// only ever cancelling it: `notify_one` stores its permit even if
+    /// called before anything is waiting, so there is no race between
+    /// "the stalled call started waiting" and "the test decided to let
+    /// it through".
     #[derive(Debug)]
     struct SlowStore {
         inner: Arc<dyn ObjectStore>,
-        stall: std::sync::atomic::AtomicBool,
+        stall: AtomicBool,
+        resume: tokio::sync::Notify,
     }
 
     impl std::fmt::Display for SlowStore {
@@ -1872,8 +1525,8 @@ mod tests {
             payload: object_store::PutPayload,
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            if self.stall.load(std::sync::atomic::Ordering::Relaxed) {
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            if self.stall.load(Ordering::Relaxed) {
+                self.resume.notified().await;
             }
             self.inner.put_opts(location, payload, opts).await
         }
@@ -1926,33 +1579,31 @@ mod tests {
 
     /// The daemon's sync loop drops a running round whenever an explicit
     /// request arrives, so a publish must survive being cancelled at any
-    /// await point: its batch stays pending and the next publish carries
-    /// it. (Found by `snapshot-churn`, where a clone never reached any
-    /// commit because a cancelled round had already taken its keys.)
+    /// await point: its dirty keys stay dirty, untouched by a publish
+    /// that never reached `clear_dirty_upto`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cancelled_publish_keeps_its_batch() {
         let mut fx = Fixture::new();
         let dir = seed(&fx.meta, 3);
         let slow = Arc::new(SlowStore {
             inner: Arc::clone(&fx.store),
-            stall: std::sync::atomic::AtomicBool::new(false),
+            stall: AtomicBool::new(false),
+            resume: tokio::sync::Notify::new(),
         });
         let mut publisher = fx.publisher_on(Arc::clone(&slow) as Arc<dyn ObjectStore>, 1);
-        publish(&mut publisher, &fx.records()).await.unwrap();
+        publish(&mut publisher).await.unwrap();
 
         let late = fx.meta.create(dir, "late", 0o644, 0, 0).unwrap().ino;
-        publisher.note(&fx.records());
-        slow.stall.store(true, std::sync::atomic::Ordering::Relaxed);
+        slow.stall.store(true, Ordering::Relaxed);
         let cancelled =
             tokio::time::timeout(std::time::Duration::from_millis(200), publisher.publish(7)).await;
         assert!(cancelled.is_err(), "the stalled publish must be cut off");
         assert!(
-            !publisher.pending().is_empty(),
-            "the cancelled batch was dropped"
+            fx.meta.has_dirty(),
+            "the cancelled batch's dirty keys were dropped"
         );
 
-        slow.stall
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        slow.stall.store(false, Ordering::Relaxed);
         let landed = publisher
             .publish(7)
             .await
@@ -1963,16 +1614,110 @@ mod tests {
             .get(&landed.root(SHARD0).unwrap(), &keys::inode(late))
             .unwrap()
             .is_some());
-        assert!(publisher.pending().is_empty());
+        assert!(!fx.meta.has_dirty());
+    }
+
+    /// The `clear_dirty_upto` counter check, exercised through a real
+    /// publish: a key re-dirtied while a publish is stalled in flight
+    /// must survive that publish's clear, because the publish's plan
+    /// (and the value it published) never saw the re-dirtying write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_key_re_dirtied_mid_publish_survives_the_clear() {
+        let mut fx = Fixture::new();
+        let f = fx.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        let slow = Arc::new(SlowStore {
+            inner: Arc::clone(&fx.store),
+            stall: AtomicBool::new(false),
+            resume: tokio::sync::Notify::new(),
+        });
+        let mut publisher = fx.publisher_on(Arc::clone(&slow) as Arc<dyn ObjectStore>, 1);
+        publish(&mut publisher).await.unwrap();
+
+        fx.meta
+            .setattr(f.ino, Some(0o600), None, None, None, None, None)
+            .unwrap();
+        slow.stall.store(true, Ordering::Relaxed);
+
+        let publisher = Arc::new(tokio::sync::Mutex::new(publisher));
+        let task = {
+            let publisher = Arc::clone(&publisher);
+            tokio::spawn(async move { publisher.lock().await.publish(7).await })
+        };
+        // Give the task time to pass the (fast, local) snapshot/plan
+        // step and reach the stalled S3 call.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let key = keys::inode(f.ino);
+        fx.meta
+            .setattr(f.ino, Some(0o644), None, None, None, None, None)
+            .unwrap();
+
+        // Release the stalled call rather than only cancelling it, so
+        // this publish actually lands: `stall` first, so no *later*
+        // put (the commit CAS after the pack upload this unblocks)
+        // stalls again, then the notify.
+        slow.stall.store(false, Ordering::Relaxed);
+        slow.resume.notify_one();
+        let landed = task.await.unwrap().unwrap();
+        assert!(landed.is_some(), "the stalled publish must eventually land");
+
+        assert!(
+            dirty_keys(&fx.meta).contains(&key),
+            "a key re-dirtied mid-publish must survive clear_dirty_upto"
+        );
+    }
+
+    /// A value over `VALUE_SPILL` leaves the node and becomes a blob
+    /// reference, and the blob is on the bucket before the commit that
+    /// names it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_oversized_value_spills_to_a_blob_that_is_durable_first() {
+        let mut fx = Fixture::new();
+        let dir = seed(&fx.meta, 2);
+        let ino = fx.meta.child_ino(dir, "f0").unwrap().unwrap();
+        let value = vec![0x5a; 40_000];
+        fx.meta
+            .set_xattr(ino, "user.big", &value, SetXattrMode::Set)
+            .unwrap();
+        // A PATH_MAX symlink target spills too, through a different
+        // field of the same record.
+        let target = "x".repeat(3_000);
+        fx.meta.symlink(dir, "long", &target, 0, 0).unwrap();
+
+        let mut publisher = fx.publisher(1);
+        let commit = publish(&mut publisher).await.unwrap();
+
+        let blobs = BlobStore::new(Arc::clone(&fx.store), Hasher::Plain);
+        let (tree, _) = fx.reader().await;
+        let root = commit.root(SHARD0).unwrap();
+
+        let spilled = tree
+            .get(&root, &keys::xattr(ino, b"user.big"))
+            .unwrap()
+            .expect("an oversized xattr must have its own 0x03 key");
+        match Payload::decode(&spilled).unwrap() {
+            Payload::Spilled(hash) => assert_eq!(blobs.get(&hash).await.unwrap(), value),
+            other => panic!("expected a blob reference, got {other:?}"),
+        }
+
+        let link = fx.meta.child_ino(dir, "long").unwrap().unwrap();
+        let encoded = tree.get(&root, &keys::inode(link)).unwrap().unwrap();
+        match record::InodeRecord::decode(&encoded)
+            .unwrap()
+            .symlink_target
+        {
+            Some(Payload::Spilled(hash)) => {
+                assert_eq!(blobs.get(&hash).await.unwrap(), target.as_bytes())
+            }
+            other => panic!("expected a spilled target, got {other:?}"),
+        }
     }
 
     /// Plan 28 §13's measurement: `getattr` latency on a file-backed
     /// replica while a full-rebuild publish runs, against the same loop
-    /// with nothing publishing. The publish reads through the per-thread
-    /// WAL reader connections and builds on a blocking thread, so FUSE's
-    /// point reads should not queue behind it the way they did behind
-    /// `VACUUM INTO`. Ignored: it is a measurement, run by hand with
-    /// `cargo test --release -p constellation getattr_latency -- --ignored --nocapture`.
+    /// with nothing publishing. Ignored: it is a measurement, run by
+    /// hand with `cargo test --release -p constellation getattr_latency
+    /// -- --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
     async fn getattr_latency_during_a_publish() {
@@ -1994,7 +1739,6 @@ mod tests {
             fx.meta.set_manifest(ino, &[7u8; 64], 4096).unwrap();
             inos.push(ino);
         }
-        fx.records();
 
         let sample = |meta: Arc<Meta>, inos: Vec<u64>, stop: Arc<std::sync::atomic::AtomicBool>| {
             std::thread::spawn(move || {
@@ -2042,7 +1786,7 @@ mod tests {
         );
 
         // And the other direction: a fresh replica loaded from that
-        // commit (S6's bootstrap, minus log tailing), from a cold cache.
+        // commit (bootstrap, minus log tailing), from a cold cache.
         let scratch = TempDir::new().unwrap();
         let reader =
             crate::mtree_read::ChainReader::for_store(Arc::clone(&fx.store), None, scratch.path())
@@ -2064,51 +1808,5 @@ mod tests {
             fresh.dump_replicated().unwrap().len(),
             fx.meta.dump_replicated().unwrap().len()
         );
-    }
-
-    /// A value over `VALUE_SPILL` leaves the node and becomes a blob
-    /// reference, and the blob is on the bucket before the commit that
-    /// names it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_oversized_value_spills_to_a_blob_that_is_durable_first() {
-        let mut fx = Fixture::new();
-        let dir = seed(&fx.meta, 2);
-        let ino = fx.meta.child_ino(dir, "f0").unwrap().unwrap();
-        let value = vec![0x5a; 40_000];
-        fx.meta
-            .set_xattr(ino, "user.big", &value, SetXattrMode::Set)
-            .unwrap();
-        // A PATH_MAX symlink target spills too, through a different
-        // field of the same record.
-        let target = "x".repeat(3_000);
-        fx.meta.symlink(dir, "long", &target, 0, 0).unwrap();
-
-        let mut publisher = fx.publisher(1);
-        let commit = publish(&mut publisher, &fx.records()).await.unwrap();
-
-        let blobs = BlobStore::new(Arc::clone(&fx.store), Hasher::Plain);
-        let (tree, _) = fx.reader().await;
-        let root = commit.root(SHARD0).unwrap();
-
-        let spilled = tree
-            .get(&root, &keys::xattr(ino, b"user.big"))
-            .unwrap()
-            .expect("an oversized xattr must have its own 0x03 key");
-        match Payload::decode(&spilled).unwrap() {
-            Payload::Spilled(hash) => assert_eq!(blobs.get(&hash).await.unwrap(), value),
-            other => panic!("expected a blob reference, got {other:?}"),
-        }
-
-        let link = fx.meta.child_ino(dir, "long").unwrap().unwrap();
-        let encoded = tree.get(&root, &keys::inode(link)).unwrap().unwrap();
-        match record::InodeRecord::decode(&encoded)
-            .unwrap()
-            .symlink_target
-        {
-            Some(Payload::Spilled(hash)) => {
-                assert_eq!(blobs.get(&hash).await.unwrap(), target.as_bytes())
-            }
-            other => panic!("expected a spilled target, got {other:?}"),
-        }
     }
 }

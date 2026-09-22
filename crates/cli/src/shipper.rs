@@ -64,6 +64,24 @@ use std::time::Instant;
 /// namespace, so a plain segment-count cadence is enough.
 const PUBLISH_EVERY: u64 = 32;
 
+/// Default for `CONSTELLATION_PUBLISH_IDLE_S`: publish whenever `ns` has
+/// dirty keys and this many seconds have passed since the last publish
+/// attempt, even with no segment shipped since (plan 29 M2, moved up
+/// from plan 29 M3). Without this, a node that is idle — or only ever
+/// tailing foreign segments, which dirty `ns` just as surely as a local
+/// write but never advance `shipped_since_publish` — could leave its
+/// head commit, and the log-retention floor riding on it, stale
+/// indefinitely.
+const PUBLISH_IDLE_S_DEFAULT: u64 = 30;
+
+fn publish_idle_interval() -> std::time::Duration {
+    let secs: u64 = std::env::var("CONSTELLATION_PUBLISH_IDLE_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PUBLISH_IDLE_S_DEFAULT);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Max journal records per segment.
 const SEGMENT_BATCH: usize = 10_000;
 
@@ -229,13 +247,17 @@ pub struct Shipper {
     /// ~1000 segments). A spawned publish finishes regardless, holding
     /// the lock while it runs.
     publisher: Option<Arc<tokio::sync::Mutex<crate::mtree_publish::TreePublisher>>>,
-    /// Records noted while a publish held the publisher; handed over at
-    /// the next note or publish that finds it free.
-    tree_backlog: Vec<LogRecord>,
     /// Lease epoch of the last segment we shipped, recorded so a commit
     /// can carry its author's epoch (§P3: a deposed holder's late
     /// commit must be recognizable exactly as a late log segment is).
     last_ship_epoch: u64,
+    /// When a publish last ran (landed, deferred, or found nothing to
+    /// do) or this `Shipper` was constructed, for
+    /// [`Shipper::publish_idle_due`]. Seeded at construction rather than
+    /// left `None` so a freshly mounted, otherwise-idle node does not
+    /// publish immediately — the idle window is measured from "since
+    /// this node last did anything", and mounting counts.
+    last_publish_attempt: Instant,
 }
 
 struct PartState {
@@ -299,8 +321,8 @@ impl Shipper {
             peers: constellation_net::Peers::disabled(),
             designations: None,
             publisher: None,
-            tree_backlog: Vec::new(),
             last_ship_epoch: 0,
+            last_publish_attempt: Instant::now(),
         })
     }
 
@@ -328,54 +350,34 @@ impl Shipper {
         Ok(())
     }
 
-    /// Fold a batch of records into the publisher's changed-entity set.
+    /// Lock the publisher (waiting for an in-flight publish when `wait`).
+    /// `None` when there is no publisher, or it is busy and the caller
+    /// would rather not wait.
     ///
-    /// Every record that reaches this replica passes through here
-    /// exactly once — `ship_part` for our own, `apply_decoded_segment`
-    /// for everything tailed — which is what makes the publish
-    /// incremental: the set is the changed key set, already computed by
-    /// the transport that had to look at each record anyway.
-    fn note_tree_records(&mut self, records: &[LogRecord]) {
-        let Some(publisher) = self.publisher.as_ref() else {
-            return;
-        };
-        match publisher.try_lock() {
-            Ok(mut publisher) => {
-                if !self.tree_backlog.is_empty() {
-                    publisher.note(&std::mem::take(&mut self.tree_backlog));
-                }
-                publisher.note(records);
-            }
-            // A publish is in flight; it must not see a half-noted batch
-            // anyway, so park the records for the next free moment.
-            Err(_) => self.tree_backlog.extend_from_slice(records),
-        }
-    }
-
-    /// Lock the publisher (waiting for an in-flight publish when `wait`)
-    /// and hand it the backlog. `None` when there is no publisher, or it
-    /// is busy and the caller would rather not wait.
+    /// Plan 29 M2: there is no batch to hand over here any more. Every
+    /// write to `ns` — ours via `ship_part`'s journal drain, a foreign
+    /// one via `apply_decoded_segment`'s replay — dirties its own keys
+    /// in the same transaction, durably, in `constellation_meta::Meta`
+    /// itself. A publish reads that dirty set directly
+    /// (`TreePublisher::publish`), so there is nothing left for the
+    /// transport layer to accumulate or hand off.
     async fn take_publisher(
         &mut self,
         wait: bool,
     ) -> Option<tokio::sync::OwnedMutexGuard<crate::mtree_publish::TreePublisher>> {
         let publisher = self.publisher.clone()?;
-        let mut guard = if wait {
-            publisher.lock_owned().await
+        if wait {
+            Some(publisher.lock_owned().await)
         } else {
-            publisher.try_lock_owned().ok()?
-        };
-        if !self.tree_backlog.is_empty() {
-            guard.note(&std::mem::take(&mut self.tree_backlog));
+            publisher.try_lock_owned().ok()
         }
-        Some(guard)
     }
 
-    /// Publish the pending tree edits as a commit. Best effort: nothing
-    /// reads the commit chain until S6, so a publish that cannot land
-    /// must not stop the log from shipping. The pending set survives a
-    /// failure, so the next round carries the same keys.
+    /// Publish the current dirty set as a commit. Best effort: a publish
+    /// that cannot land must not stop the log from shipping. `dirty`
+    /// survives a failure, so the next round carries the same keys.
     async fn publish_tree(&mut self) {
+        self.last_publish_attempt = Instant::now();
         let epoch = self.last_ship_epoch;
         // Busy means the previous publish is still running; it will be
         // followed by the next cadence's.
@@ -396,6 +398,7 @@ impl Shipper {
     /// what a snapshot retains. Callers ship the journal first (the
     /// publisher only sees shipped and tailed records).
     pub async fn publish_now(&mut self) -> Result<(u64, constellation_mtree::NodeHash)> {
+        self.last_publish_attempt = Instant::now();
         let epoch = self.last_ship_epoch;
         let mut publisher = self
             .take_publisher(true)
@@ -404,6 +407,20 @@ impl Shipper {
         tokio::spawn(async move { publisher.publish_now(epoch).await })
             .await
             .context("metadata publish task")?
+    }
+
+    /// A publisher is wired up, its dirty set is non-empty, and no
+    /// publish has run for `CONSTELLATION_PUBLISH_IDLE_S` (default 30s).
+    /// The every-`PUBLISH_EVERY`-segments cadence only fires for a node
+    /// that is actively shipping its own writes; a node that is mostly
+    /// idle, or mostly tailing foreign segments (which dirty `ns` just
+    /// as surely, but never increment `shipped_since_publish`), would
+    /// otherwise leave its head commit — and the log-retention floor
+    /// that rides on it — stale indefinitely.
+    fn publish_idle_due(&self) -> bool {
+        self.publisher.is_some()
+            && self.meta.has_dirty()
+            && self.last_publish_attempt.elapsed() >= publish_idle_interval()
     }
 
     /// The published root, for tests.
@@ -498,6 +515,14 @@ impl Shipper {
                 return Ok(());
             }
             if !self.ship_all(leases).await? {
+                // Nothing left to ship this round. `ship_part`'s own
+                // cadence only fires on the back of a shipped segment,
+                // so a node that is idle, or only ever tailing foreign
+                // segments, would otherwise never publish on its own —
+                // check the idle timer here instead.
+                if self.publish_idle_due() {
+                    self.publish().await?;
+                }
                 return Ok(());
             }
         }
@@ -786,9 +811,9 @@ impl Shipper {
             spool.last_error = None;
         }
         // Applied (or, for our own recovered segment, confirmed
-        // applied): the replica now holds these entities' new values,
-        // so the tree owes them an edit.
-        self.note_tree_records(&seg.records);
+        // applied): `apply_foreign`/journal replay above already dirtied
+        // whatever keys these records touched, in the same transaction —
+        // there is nothing left to note here (plan 29 M2).
         Ok(())
     }
 
@@ -962,7 +987,6 @@ impl Shipper {
             records = records.len(),
             "shipped log segment"
         );
-        self.note_tree_records(&records);
         self.last_ship_epoch = self.last_ship_epoch.max(epoch);
         // Push invalidation: tell peers the segment is durable so they
         // tail now rather than at their next poll. Best effort by
@@ -1162,7 +1186,7 @@ impl Shipper {
     #[allow(dead_code)]
     pub async fn shutdown(&mut self, lease: &LeaseKeeper) -> Result<()> {
         self.sync(lease).await?;
-        if self.shipped_since_publish > 0 {
+        if self.meta.has_dirty() {
             self.publish().await?;
         }
         Ok(())
@@ -1201,7 +1225,7 @@ impl Shipper {
                 break;
             }
         }
-        if self.shipped_since_publish > 0 {
+        if self.meta.has_dirty() {
             self.publish().await?;
         }
         if initial > 0 {

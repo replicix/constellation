@@ -622,23 +622,12 @@ pub(crate) fn test_manager(
             handle.clone(),
         ),
     ));
-    let writer = meta.clone();
     let hook: PublishHook = Arc::new(move || {
         let publisher = publisher.clone();
-        let meta = writer.clone();
         let handle = handle.clone();
         Box::pin(async move {
             handle
-                .spawn(async move {
-                    let batch = meta.take_journal(usize::MAX)?;
-                    if let Some((seq, _)) = batch.last() {
-                        meta.ack_journal(*seq)?;
-                    }
-                    let records: Vec<_> = batch.into_iter().map(|(_, r)| r).collect();
-                    let mut publisher = publisher.lock().await;
-                    publisher.note(&records);
-                    publisher.publish_now(1).await
-                })
+                .spawn(async move { publisher.lock().await.publish_now(1).await })
                 .await?
         })
     });

@@ -84,6 +84,7 @@ impl Meta {
         ns::put_inode(
             &mut tx,
             &self.scratch,
+            ns::Dirty::Untracked,
             &self.blobs,
             ino,
             attrs,
@@ -91,7 +92,15 @@ impl Meta {
             None,
             &[],
         )?;
-        ns::put_dentry(&mut tx, &self.scratch, parent, name, ino, attrs);
+        ns::put_dentry(
+            &mut tx,
+            &self.scratch,
+            ns::Dirty::Untracked,
+            parent,
+            name,
+            ino,
+            attrs,
+        )?;
         tx.commit()?;
         Ok(ns::attrs_to_fileattr(ino, &attrs, t))
     }
@@ -113,9 +122,16 @@ impl Meta {
         let Some(d) = ns::get_dentry_record(&tx, &self.scratch, parent, name)? else {
             return Err(MetaError::NoEntry);
         };
-        ns::remove_dentry(&mut tx, &self.scratch, parent, name, d.ino);
+        ns::remove_dentry(
+            &mut tx,
+            &self.scratch,
+            ns::Dirty::Untracked,
+            parent,
+            name,
+            d.ino,
+        )?;
         tx.remove(&self.scratch, keys::inode(d.ino));
-        ns::clear_spilled_xattrs(&mut tx, &self.scratch, d.ino)?;
+        ns::clear_spilled_xattrs(&mut tx, &self.scratch, ns::Dirty::Untracked, d.ino)?;
         tx.commit()?;
         Ok(())
     }
@@ -134,8 +150,23 @@ impl Meta {
         if ns::child_ino(&tx, &self.scratch, new_parent, new_name)?.is_some() {
             return Err(MetaError::Exists);
         }
-        ns::remove_dentry(&mut tx, &self.scratch, parent, name, d.ino);
-        ns::put_dentry(&mut tx, &self.scratch, new_parent, new_name, d.ino, d.attrs);
+        ns::remove_dentry(
+            &mut tx,
+            &self.scratch,
+            ns::Dirty::Untracked,
+            parent,
+            name,
+            d.ino,
+        )?;
+        ns::put_dentry(
+            &mut tx,
+            &self.scratch,
+            ns::Dirty::Untracked,
+            new_parent,
+            new_name,
+            d.ino,
+            d.attrs,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -181,6 +212,7 @@ impl Meta {
         ns::put_inode(
             &mut tx,
             &self.scratch,
+            ns::Dirty::Untracked,
             &self.blobs,
             ino,
             attrs,
@@ -288,6 +320,7 @@ impl Meta {
         ns::put_inode(
             &mut tx,
             &self.scratch,
+            ns::Dirty::Untracked,
             &self.blobs,
             ino,
             attrs,
@@ -332,6 +365,7 @@ impl Meta {
         ns::put_inode(
             &mut tx,
             &self.scratch,
+            ns::Dirty::Untracked,
             &self.blobs,
             ino,
             attrs,

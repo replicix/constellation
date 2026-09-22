@@ -1,16 +1,44 @@
-//! The plan 28 S6 bootstrap-from-commit loader (`load_tree_rows`,
-//! `load_tree_subsystems`, `finish_tree_load`) and reintegration's
-//! atomic namespace swap (`commit_reintegration_batch`).
+//! Plan 29 M2's ingestion-based bootstrap-from-commit loader
+//! (`ns_ingest_page`, `put_local_blob`, `rebuild_derived_from_ns`,
+//! `clear_all_dirty`) and reintegration's atomic namespace swap
+//! (`commit_reintegration_batch`).
+//!
+//! Bootstrap no longer reconstructs `TreeInode` rows and re-derives
+//! `0x01`/`0x02` records through the ordinary write path: since M1,
+//! `ns`'s key/value encoding *is* the published tree's (modulo the
+//! local-vs-published spill of `0x01`/`0x03` payloads), so loading a
+//! commit is a bulk copy of its keys, not a translation. The caller
+//! (`cli::mtree_read::bootstrap_from_commit`) walks the tree with one
+//! ordered cursor, converts each spilled payload's blob reference from
+//! the bucket's addressing to this replica's local `blobs` keyspace, and
+//! hands pages of `(key, value)` pairs to [`Meta::ns_ingest_page`], which
+//! loads them with `fjall::Keyspace::start_ingestion` — bypassing the
+//! write-transaction/dirty-tracking path entirely, which is exactly
+//! right here: the loaded rows already equal the published tree, so
+//! nothing about them is unpublished. [`Meta::clear_all_dirty`] wipes
+//! whatever `Meta::open`'s genesis root insert speculatively dirtied, so
+//! a bootstrapped replica's very first publish is the log tail's delta
+//! alone, not a rebuild.
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::store::snapshot::{quota_record, snapshot_record};
-use crate::store::{journal, misc, ns, Meta, KV_APPLIED_SEQ};
-use crate::{SnapshotRow, TreeInode};
+use crate::store::{journal, misc, ns, Meta, KV_APPLIED_SEQ, KV_USAGE_BYTES, KV_USAGE_FILES};
 use constellation_fs_core::Ino;
-use constellation_mtree::keys::{self, Subsystem};
-use constellation_mtree::record::InodeRecord;
+use constellation_mtree::keys;
+use constellation_mtree::record::{self, Attrs, BlobHash, InodeRecord, Kind, XattrPlacement};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
+
+/// One inode's `0x01` record, re-encoded in this replica's *local*
+/// spill scheme, plus any `0x03` entries the xattr set spilled to — the
+/// bootstrap ingestion counterpart of `ns::put_inode`, which cannot be
+/// used directly because ingestion never opens a write transaction.
+pub struct LocalInodeEncoding {
+    /// The `0x01` value.
+    pub record: Vec<u8>,
+    /// `(name, encoded Payload)` for each spilled xattr, empty when the
+    /// set is inline (already folded into `record`).
+    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+}
 
 /// Wholesale clear of a keyspace, inside the caller's write transaction.
 fn clear_tx(tx: &mut SingleWriterWriteTx, ks: &SingleWriterTxKeyspace) -> Result<(), MetaError> {
@@ -73,80 +101,102 @@ fn rebuild_indexes_tx(
     Ok(())
 }
 
-impl Meta {
-    /// Bulk upsert of one page of a tree walk's inode+xattr+dentry rows.
-    /// Never journals: the rows *are* the shared state at the commit's
-    /// vector. `0x01` records are visited before any `0x02` in key
-    /// order, so a dentry's owning inode is always already committed by
-    /// the time this is called for it (paged across multiple calls or
-    /// not).
-    pub fn load_tree_rows(
-        &self,
-        inodes: &[TreeInode],
-        dentries: &[(Ino, String, Ino)],
-    ) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        for ti in inodes {
-            let attrs = ns::fileattr_to_attrs(&ti.attr);
-            let xattrs: Vec<(Vec<u8>, Vec<u8>)> = ti
-                .xattrs
-                .iter()
-                .map(|(n, v)| (n.as_bytes().to_vec(), v.clone()))
-                .collect();
-            ns::put_inode(
-                &mut tx,
-                &self.ns,
-                &self.blobs,
-                ti.attr.ino,
-                attrs,
-                ti.manifest.clone(),
-                ti.target.clone().map(String::into_bytes),
-                &xattrs,
-            )?;
-            crate::store::atime::set_atime_tx(&mut tx, &self.atime, ti.attr.ino, ti.attr.atime_ns);
+/// Sum of reachable file sizes/count over whatever `ns` currently holds
+/// — the ingestion-bootstrap equivalent of the incremental
+/// `adjust_usage_tx` every ordinary write path maintains, needed because
+/// a bulk `start_ingestion` load bypasses that path entirely.
+fn usage_from_ns_tx(
+    r: &impl Readable,
+    ns_ks: &SingleWriterTxKeyspace,
+) -> Result<(u64, u64), MetaError> {
+    let range = keys::whole_range(keys::RANGE_INODE);
+    let (mut bytes, mut files) = (0u64, 0u64);
+    for guard in r.range(ns_ks, ns::key_range_bounds(&range)) {
+        let (_, v) = guard.into_inner()?;
+        let rec = InodeRecord::decode(&v)?;
+        if rec.attrs.kind == Kind::File {
+            bytes += rec.attrs.size;
+            files += 1;
         }
-        for (parent, name, ino) in dentries {
-            if let Some(rec) = ns::get_inode_record(&tx, &self.ns, *ino)? {
-                ns::put_dentry(&mut tx, &self.ns, *parent, name, *ino, rec.attrs);
+    }
+    Ok((bytes, files))
+}
+
+impl Meta {
+    /// Bulk-load one page of already-ordered `ns` key/value pairs
+    /// (plan 29 M2 bootstrap) via `fjall::Keyspace::start_ingestion`,
+    /// bypassing the write-transaction/dirty-tracking path: these rows
+    /// are exactly the published tree's bytes (the caller has already
+    /// converted any spilled payload's blob reference to this replica's
+    /// local `blobs` keyspace), so nothing about them is unpublished.
+    ///
+    /// `page` must be strictly ascending by key (ingestion's own
+    /// requirement) and, across calls, each page's keys must sort after
+    /// the previous page's — exactly what a single ordered tree cursor,
+    /// paged, already produces. Never journals: there is nothing to
+    /// journal, the rows *are* the shared state at the commit's vector.
+    pub fn ns_ingest_page(&self, page: &[(Vec<u8>, Vec<u8>)]) -> Result<(), MetaError> {
+        if page.is_empty() {
+            return Ok(());
+        }
+        let mut ingestion = self.ns.inner().start_ingestion()?;
+        for (k, v) in page {
+            ingestion.write(k.clone(), v.clone())?;
+        }
+        ingestion.finish()?;
+        Ok(())
+    }
+
+    /// Store `body` under its local (plain blake3) hash, for a bootstrap
+    /// converting a published `Payload::Spilled` reference (fetched from
+    /// the bucket's `blobs/`, under whatever hash the filesystem's E2E
+    /// mode used) back to this replica's node-local spill scheme.
+    pub fn put_local_blob(&self, body: Vec<u8>) -> Result<BlobHash, MetaError> {
+        let hash = Self::hash_blob(&body);
+        self.blobs.insert(hash.0, body)?;
+        Ok(hash)
+    }
+
+    /// Re-encode one inode's plaintext content (already resolved by the
+    /// caller from whatever the *published* side spilled it to) into
+    /// this replica's local `0x01`/`0x03` encoding: the same
+    /// `record::plan_inode`/local-hash spill decision `ns::put_inode`
+    /// makes for an ordinary write, but returning the bytes rather than
+    /// writing them — a bootstrap loads them via `ns_ingest_page`
+    /// instead, which cannot share a write transaction with anything.
+    pub fn encode_local_inode(
+        &self,
+        attrs: Attrs,
+        manifest: Option<Vec<u8>>,
+        symlink_target: Option<Vec<u8>>,
+        xattrs: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<LocalInodeEncoding, MetaError> {
+        let planned = record::plan_inode(attrs, manifest, symlink_target, xattrs, Self::hash_blob);
+        for blob in planned.blobs {
+            self.put_local_blob(blob)?;
+        }
+        let mut spilled = Vec::new();
+        if planned.xattrs == XattrPlacement::Spilled {
+            for (name, value) in xattrs {
+                let (payload, blob) = record::place_value(value.clone(), Self::hash_blob);
+                if let Some(blob) = blob {
+                    self.put_local_blob(blob)?;
+                }
+                spilled.push((name.clone(), payload.encode()));
             }
         }
-        tx.commit()?;
-        Ok(())
+        Ok(LocalInodeEncoding {
+            record: planned.record.encode(),
+            xattrs: spilled,
+        })
     }
 
-    pub fn load_tree_subsystems(
-        &self,
-        snapshots: &[SnapshotRow],
-        quota: Option<Option<u64>>,
-    ) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        let range = keys::records_of(Subsystem::Snapshot);
-        let existing: Vec<Vec<u8>> = tx
-            .range(&self.ns, ns::key_range_bounds(&range))
-            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
-            .collect::<Result<_, _>>()?;
-        for k in existing {
-            tx.remove(&self.ns, k);
-        }
-        for row in snapshots {
-            tx.insert(
-                &self.ns,
-                keys::subsystem(Subsystem::Snapshot, row.id.as_bytes()),
-                snapshot_record(row),
-            );
-        }
-        if let Some(q) = quota {
-            tx.insert(
-                &self.ns,
-                keys::subsystem(Subsystem::Quota, b""),
-                quota_record(q),
-            );
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn finish_tree_load(&self) -> Result<(), MetaError> {
+    /// After a bootstrap's `ns_ingest_page` calls are all in: rebuild
+    /// `chunk_ref`/`chunk_ref_by_ino`/`xattr_by_name` and the persisted
+    /// usage counters from whatever `ns` now holds — the derived state
+    /// an ordinary write path maintains incrementally, which bulk
+    /// ingestion bypassed.
+    pub fn rebuild_derived_from_ns(&self) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         rebuild_indexes_tx(
             &mut tx,
@@ -156,6 +206,24 @@ impl Meta {
             &self.chunk_ref_by_ino,
             &self.xattr_by_name,
         )?;
+        let (bytes, files) = usage_from_ns_tx(&tx, &self.ns)?;
+        crate::store::kv_set_tx(&mut tx, &self.local, KV_USAGE_BYTES, &bytes.to_string());
+        crate::store::kv_set_tx(&mut tx, &self.local, KV_USAGE_FILES, &files.to_string());
+        tx.commit()?;
+        self.usage_tracker().reseat(bytes, files);
+        Ok(())
+    }
+
+    /// Wipe `dirty` outright. `Meta::open`'s genesis root insert always
+    /// dirties `ROOT_INO`'s key speculatively (a truly fresh filesystem
+    /// has no commit to bootstrap from, so that insert has to be able to
+    /// stand on its own); a bootstrap that then ingests a real commit
+    /// over it must retract that guess; the ingested tree already equals
+    /// the published one by construction, so the honest post-bootstrap
+    /// dirty set is empty, not "whatever genesis guessed".
+    pub fn clear_all_dirty(&self) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        clear_tx(&mut tx, &self.dirty)?;
         tx.commit()?;
         Ok(())
     }
@@ -185,12 +253,30 @@ impl Meta {
     ) -> Result<(), MetaError> {
         let side_snap = side.db.read_tx();
         let mut tx = self.db.write_tx();
-        clear_tx(&mut tx, &self.ns)?;
+        // Reintegration replaces the whole namespace, so every key that
+        // was live before or is live after has to be treated as changed
+        // for the next publish's sake: dirty each existing key while
+        // clearing it, then dirty each key the copy-in inserts. A key
+        // the reconciliation left unchanged is simply dirtied twice,
+        // which costs an extra harmless entry, not correctness.
+        let old_ns_keys: Vec<Vec<u8>> = tx
+            .iter(&self.ns)
+            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+        for k in old_ns_keys {
+            ns::ns_remove(&mut tx, &self.ns, self.dirty_for_ns(), k)?;
+        }
         clear_tx(&mut tx, &self.orphans)?;
         clear_tx(&mut tx, &self.atime)?;
         for guard in side_snap.iter(&side.ns) {
             let (k, v) = guard.into_inner()?;
-            tx.insert(&self.ns, k.to_vec(), v.to_vec());
+            ns::ns_insert(
+                &mut tx,
+                &self.ns,
+                self.dirty_for_ns(),
+                k.to_vec(),
+                v.to_vec(),
+            )?;
         }
         for guard in side_snap.iter(&side.orphans) {
             let (k, v) = guard.into_inner()?;

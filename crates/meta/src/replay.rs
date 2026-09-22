@@ -333,8 +333,10 @@ fn apply_one(
             root_hash,
             created_unix_ms,
         } => {
-            tx.insert(
+            ns::ns_insert(
+                tx,
                 &meta.ns,
+                meta.dirty_for_ns(),
                 keys::subsystem(keys::Subsystem::Snapshot, id.as_bytes()),
                 crate::store::snapshot_record(&crate::SnapshotRow {
                     id: id.clone(),
@@ -343,23 +345,27 @@ fn apply_one(
                     root_hash: root_hash.clone(),
                     created_unix_ms: *created_unix_ms,
                 }),
-            );
+            )?;
             Ok(Applied::Done)
         }
         LogRecord::SnapDelete { id, .. } => {
-            tx.remove(
+            ns::ns_remove(
+                tx,
                 &meta.ns,
+                meta.dirty_for_ns(),
                 keys::subsystem(keys::Subsystem::Snapshot, id.as_bytes()),
-            );
+            )?;
             Ok(Applied::Done)
         }
         LogRecord::Clone { nodes, .. } => apply_clone(tx, meta, nodes, staged),
         LogRecord::SetQuota { max_logical_bytes } => {
-            tx.insert(
+            ns::ns_insert(
+                tx,
                 &meta.ns,
+                meta.dirty_for_ns(),
                 keys::subsystem(keys::Subsystem::Quota, b""),
                 crate::store::quota_record(*max_logical_bytes),
-            );
+            )?;
             Ok(Applied::Done)
         }
         LogRecord::Atime {
@@ -429,6 +435,7 @@ fn insert_node(
     ns::put_inode(
         tx,
         &meta.ns,
+        meta.dirty_for_ns(),
         &meta.blobs,
         ino,
         attrs,
@@ -437,12 +444,12 @@ fn insert_node(
         &[],
     )?;
     let is_new_dentry = ns::get_dentry_record(tx, &meta.ns, parent, name)?.is_none();
-    ns::put_dentry(tx, &meta.ns, parent, name, ino, attrs);
+    ns::put_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, ino, attrs)?;
     atime::set_atime_tx(tx, &meta.atime, ino, t);
     if is_new_dentry && kind == Kind::Dir {
-        misc::bump_nlink_tx(tx, &meta.ns, parent, 1, t)?;
+        misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, 1, t)?;
     }
-    misc::touch_times_tx(tx, &meta.ns, parent, t)?;
+    misc::touch_times_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, t)?;
     if kind == Kind::File && !prior_file {
         // A fresh file always starts at 0 bytes (Create/Mkdir/Symlink/
         // Mknod never carry file content), but the file *count* still
@@ -466,16 +473,16 @@ fn evict_dentry(
     t: i64,
 ) -> Result<Applied, MetaError> {
     let Some(rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
-        ns::remove_dentry(tx, &meta.ns, parent, name, ino);
+        ns::remove_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, ino)?;
         return Ok(Applied::Done);
     };
     if rec.attrs.kind == Kind::Dir {
         if ns::has_children(tx, &meta.ns, ino)? {
             return Ok(Applied::Skipped("name held by non-empty directory"));
         }
-        ns::remove_dentry(tx, &meta.ns, parent, name, ino);
-        tx.remove(&meta.ns, keys::inode(ino));
-        ns::clear_spilled_xattrs(tx, &meta.ns, ino)?;
+        ns::remove_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, ino)?;
+        ns::ns_remove(tx, &meta.ns, meta.dirty_for_ns(), keys::inode(ino))?;
+        ns::clear_spilled_xattrs(tx, &meta.ns, meta.dirty_for_ns(), ino)?;
         let names: Vec<Vec<u8>> = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?
             .into_iter()
             .map(|(n, _)| n.into_bytes())
@@ -483,14 +490,14 @@ fn evict_dentry(
         misc::xattr_by_name_del_all_tx(tx, &meta.xattr_by_name, ino, names);
         atime::remove_atime_tx(tx, &meta.atime, ino);
     } else {
-        ns::remove_dentry(tx, &meta.ns, parent, name, ino);
+        ns::remove_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, ino)?;
         if rec.attrs.nlink <= 1 {
             let manifest_bytes = rec
                 .manifest
                 .as_ref()
                 .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
                 .transpose()?;
-            ns::clear_spilled_xattrs(tx, &meta.ns, ino)?;
+            ns::clear_spilled_xattrs(tx, &meta.ns, meta.dirty_for_ns(), ino)?;
             let names: Vec<Vec<u8>> = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?
                 .into_iter()
                 .map(|(n, _)| n.into_bytes())
@@ -513,9 +520,9 @@ fn evict_dentry(
                 ino.to_be_bytes().to_vec(),
                 orphan_rec.encode(),
             );
-            tx.remove(&meta.ns, keys::inode(ino));
+            ns::ns_remove(tx, &meta.ns, meta.dirty_for_ns(), keys::inode(ino))?;
         } else {
-            misc::bump_nlink_tx(tx, &meta.ns, ino, -1, t)?;
+            misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), ino, -1, t)?;
         }
     }
     Ok(Applied::Done)
@@ -543,9 +550,18 @@ fn apply_link(
             skip => return Ok(skip),
         }
     }
-    let rec = misc::bump_nlink_tx(tx, &meta.ns, ino, 1, t)?.expect("checked above");
-    ns::put_dentry(tx, &meta.ns, parent, name, ino, rec.attrs);
-    misc::touch_times_tx(tx, &meta.ns, parent, t)?;
+    let rec =
+        misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), ino, 1, t)?.expect("checked above");
+    ns::put_dentry(
+        tx,
+        &meta.ns,
+        meta.dirty_for_ns(),
+        parent,
+        name,
+        ino,
+        rec.attrs,
+    )?;
+    misc::touch_times_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, t)?;
     Ok(Applied::Done)
 }
 
@@ -560,7 +576,7 @@ fn apply_unlink(
         return Ok(Applied::Done);
     };
     let result = evict_dentry(tx, meta, parent, name, d.ino, t)?;
-    misc::touch_times_tx(tx, &meta.ns, parent, t)?;
+    misc::touch_times_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, t)?;
     Ok(result)
 }
 
@@ -575,7 +591,7 @@ fn apply_rmdir(
         return Ok(Applied::Done);
     };
     let Some(rec) = ns::get_inode_record(tx, &meta.ns, d.ino)? else {
-        ns::remove_dentry(tx, &meta.ns, parent, name, d.ino);
+        ns::remove_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, d.ino)?;
         return Ok(Applied::Done);
     };
     if rec.attrs.kind != Kind::Dir {
@@ -584,11 +600,11 @@ fn apply_rmdir(
     if ns::has_children(tx, &meta.ns, d.ino)? {
         return Ok(Applied::Skipped("directory not empty locally"));
     }
-    ns::remove_dentry(tx, &meta.ns, parent, name, d.ino);
-    tx.remove(&meta.ns, keys::inode(d.ino));
-    ns::clear_spilled_xattrs(tx, &meta.ns, d.ino)?;
+    ns::remove_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, d.ino)?;
+    ns::ns_remove(tx, &meta.ns, meta.dirty_for_ns(), keys::inode(d.ino))?;
+    ns::clear_spilled_xattrs(tx, &meta.ns, meta.dirty_for_ns(), d.ino)?;
     atime::remove_atime_tx(tx, &meta.atime, d.ino);
-    misc::bump_nlink_tx(tx, &meta.ns, parent, -1, t)?;
+    misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, -1, t)?;
     Ok(Applied::Done)
 }
 
@@ -620,24 +636,38 @@ fn apply_rename(
             skip => return Ok(skip),
         }
     }
-    tx.remove(&meta.ns, keys::dentry(parent, name.as_bytes()));
-    tx.remove(&meta.ns, keys::rdentry(ino, parent, name.as_bytes()));
-    tx.insert(
+    ns::ns_remove(
+        tx,
         &meta.ns,
+        meta.dirty_for_ns(),
+        keys::dentry(parent, name.as_bytes()),
+    )?;
+    ns::ns_remove(
+        tx,
+        &meta.ns,
+        meta.dirty_for_ns(),
+        keys::rdentry(ino, parent, name.as_bytes()),
+    )?;
+    ns::ns_insert(
+        tx,
+        &meta.ns,
+        meta.dirty_for_ns(),
         keys::dentry(new_parent, new_name.as_bytes()),
         DentryRecord::new(ino, src.attrs).encode(),
-    );
-    tx.insert(
+    )?;
+    ns::ns_insert(
+        tx,
         &meta.ns,
+        meta.dirty_for_ns(),
         keys::rdentry(ino, new_parent, new_name.as_bytes()),
         record::RDENTRY_VALUE.to_vec(),
-    );
+    )?;
     if src_rec.attrs.kind == Kind::Dir && parent != new_parent {
-        misc::bump_nlink_tx(tx, &meta.ns, parent, -1, t)?;
-        misc::bump_nlink_tx(tx, &meta.ns, new_parent, 1, t)?;
+        misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, -1, t)?;
+        misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), new_parent, 1, t)?;
     }
-    misc::touch_times_tx(tx, &meta.ns, parent, t)?;
-    misc::touch_times_tx(tx, &meta.ns, new_parent, t)?;
+    misc::touch_times_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, t)?;
+    misc::touch_times_tx(tx, &meta.ns, meta.dirty_for_ns(), new_parent, t)?;
     Ok(Applied::Done)
 }
 
@@ -677,13 +707,21 @@ fn apply_setattr(
     }
     rec.attrs.ctime_ns = t;
     let attrs = rec.attrs;
-    tx.insert(&meta.ns, keys::inode(ino), rec.encode());
+    ns::ns_insert(
+        tx,
+        &meta.ns,
+        meta.dirty_for_ns(),
+        keys::inode(ino),
+        rec.encode(),
+    )?;
     for (parent, name) in ns::links_of(tx, &meta.ns, ino)? {
-        tx.insert(
+        ns::ns_insert(
+            tx,
             &meta.ns,
+            meta.dirty_for_ns(),
             keys::dentry(parent, name.as_bytes()),
             DentryRecord::new(ino, attrs).encode(),
-        );
+        )?;
     }
     if let Some(a) = atime_ns {
         atime::set_atime_tx(tx, &meta.atime, ino, a);
@@ -720,6 +758,7 @@ fn apply_write_manifest(
     ns::put_inode(
         tx,
         &meta.ns,
+        meta.dirty_for_ns(),
         &meta.blobs,
         ino,
         attrs,
@@ -731,11 +770,13 @@ fn apply_write_manifest(
         &xattrs,
     )?;
     for (parent, name) in ns::links_of(tx, &meta.ns, ino)? {
-        tx.insert(
+        ns::ns_insert(
+            tx,
             &meta.ns,
+            meta.dirty_for_ns(),
             keys::dentry(parent, name.as_bytes()),
             DentryRecord::new(ino, attrs).encode(),
-        );
+        )?;
     }
     misc::track_manifest_transition_tx(
         tx,
@@ -785,6 +826,7 @@ fn apply_set_xattr(
     ns::put_inode(
         tx,
         &meta.ns,
+        meta.dirty_for_ns(),
         &meta.blobs,
         ino,
         attrs,
@@ -827,6 +869,7 @@ fn apply_remove_xattr(
     ns::put_inode(
         tx,
         &meta.ns,
+        meta.dirty_for_ns(),
         &meta.blobs,
         ino,
         attrs,
@@ -877,6 +920,7 @@ fn apply_clone(
         ns::put_inode(
             tx,
             &meta.ns,
+            meta.dirty_for_ns(),
             &meta.blobs,
             node.ino,
             attrs,
@@ -884,7 +928,15 @@ fn apply_clone(
             node.target.clone().map(String::into_bytes),
             &xattrs,
         )?;
-        ns::put_dentry(tx, &meta.ns, node.parent, &node.name, node.ino, attrs);
+        ns::put_dentry(
+            tx,
+            &meta.ns,
+            meta.dirty_for_ns(),
+            node.parent,
+            &node.name,
+            node.ino,
+            attrs,
+        )?;
         atime::set_atime_tx(tx, &meta.atime, node.ino, node.mtime_ns);
         misc::track_manifest_transition_tx(
             tx,
@@ -898,7 +950,14 @@ fn apply_clone(
             misc::xattr_by_name_put_tx(tx, &meta.xattr_by_name, n, node.ino, v);
         }
         if kind == InodeKind::Dir {
-            misc::bump_nlink_tx(tx, &meta.ns, node.parent, 1, node.mtime_ns)?;
+            misc::bump_nlink_tx(
+                tx,
+                &meta.ns,
+                meta.dirty_for_ns(),
+                node.parent,
+                1,
+                node.mtime_ns,
+            )?;
         }
         let is_file = kind == InodeKind::File;
         match (prior_file, is_file) {

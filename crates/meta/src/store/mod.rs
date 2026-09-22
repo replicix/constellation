@@ -117,6 +117,11 @@ pub(crate) const KV_NEXT_JOURNAL_SEQ: &str = "next_journal_seq";
 pub(crate) const KV_NEXT_SHADOW_ID: &str = "next_shadow_id";
 pub(crate) const KV_USAGE_BYTES: &str = "usage_bytes";
 pub(crate) const KV_USAGE_FILES: &str = "usage_files";
+/// Monotonic counter behind the `dirty` keyspace (plan 29 M2): every key
+/// written to `ns` records the counter value it was touched at, so
+/// `clear_dirty_upto` can tell "still dirty at the counter a publish
+/// observed" from "re-dirtied since".
+pub(crate) const KV_NEXT_DIRTY_SEQ: &str = "next_dirty_seq";
 
 pub type JournalBatch = Vec<(u64, crate::record::LogRecord)>;
 pub type EpochRow = (
@@ -269,6 +274,13 @@ pub struct Meta {
     pub(crate) chunk_ref_by_ino: SingleWriterTxKeyspace,
     pub(crate) xattr_by_name: SingleWriterTxKeyspace,
     pub(crate) scratch: SingleWriterTxKeyspace,
+    /// Plan 29 M2: `key -> counter: u64 BE`, the set of `ns` keys changed
+    /// since the last publish observed them. Every write to `ns` records
+    /// its key here in the same transaction (centralised in the `ns`
+    /// write helpers — see `store::ns::Dirty`), so a publish's read set
+    /// is exactly this keyspace rather than something re-derived from
+    /// the journal.
+    pub(crate) dirty: SingleWriterTxKeyspace,
     pub(crate) pins: SingleWriterTxKeyspace,
     pub(crate) epochs: SingleWriterTxKeyspace,
     pub(crate) reintegration: SingleWriterTxKeyspace,
@@ -328,6 +340,7 @@ impl Meta {
         let chunk_ref_by_ino = db.keyspace("chunk_ref_by_ino", KeyspaceCreateOptions::default)?;
         let xattr_by_name = db.keyspace("xattr_by_name", KeyspaceCreateOptions::default)?;
         let scratch = db.keyspace("scratch", ns_options)?;
+        let dirty = db.keyspace("dirty", KeyspaceCreateOptions::default)?;
         let pins = db.keyspace("pins", KeyspaceCreateOptions::default)?;
         let epochs = db.keyspace("epochs", KeyspaceCreateOptions::default)?;
         let reintegration = db.keyspace("reintegration", KeyspaceCreateOptions::default)?;
@@ -347,6 +360,7 @@ impl Meta {
             chunk_ref_by_ino,
             xattr_by_name,
             scratch,
+            dirty,
             pins,
             epochs,
             reintegration,
@@ -374,11 +388,18 @@ impl Meta {
                 ctime_ns: t,
                 rdev: 0,
             };
-            tx.insert(
+            // Genesis (plan 29 M2): a brand-new filesystem has no commit
+            // to bootstrap from, so the root inode's own creation has to
+            // dirty itself — the mechanism a bootstrap-from-commit relies
+            // on (the loaded root is already published, so ingestion
+            // leaves `dirty` empty) does not apply here.
+            ns::ns_insert(
+                &mut tx,
                 &self.ns,
+                ns::Dirty::tracked(&self.dirty, &self.local),
                 keys::inode(ROOT_INO),
                 InodeRecord::new(attrs).encode(),
-            );
+            )?;
             tx.insert(&self.atime, ROOT_INO.to_be_bytes(), t.to_le_bytes());
         }
         if kv_get_tx(&tx, &self.local, KV_NEXT_INO)?.is_none() {
@@ -424,10 +445,6 @@ impl Meta {
     pub fn kv_get(&self, key: &str) -> Result<Option<String>, MetaError> {
         let r = self.db.read_tx();
         kv_get_tx(&r, &self.local, key)
-    }
-
-    pub fn kv_get_reader(&self, key: &str) -> Result<Option<String>, MetaError> {
-        self.kv_get(key)
     }
 
     pub fn kv_set(&self, key: &str, value: &str) -> Result<(), MetaError> {
@@ -477,10 +494,6 @@ impl Meta {
         applied_seq_at(&r, &self.local)
     }
 
-    pub fn applied_seq_reader(&self) -> Result<u64, MetaError> {
-        self.applied_seq()
-    }
-
     pub fn applied_seq_at(&self, r: &impl Readable) -> Result<u64, MetaError> {
         applied_seq_at(r, &self.local)
     }
@@ -514,6 +527,77 @@ impl Meta {
     ) -> Result<Option<Vec<u8>>, MetaError> {
         Ok(r.get(blobs, hash.0)?.map(|v| v.to_vec()))
     }
+
+    // ---------------------------------------------- dirty tracking (M2)
+
+    /// A `ns::Dirty` handle marking writes against this store's `ns`
+    /// keyspace. The one thing every `ns`-mutating call site constructs
+    /// to route its writes through the tracked path.
+    pub(crate) fn dirty_for_ns(&self) -> ns::Dirty<'_> {
+        ns::Dirty::tracked(&self.dirty, &self.local)
+    }
+
+    /// Every `(key, counter)` currently in `dirty`, under the caller's
+    /// snapshot — the publisher's whole read set (plan 29 M2). `counter`
+    /// is the value [`Self::clear_dirty_upto`] must be given back to
+    /// retire the entry, so a key re-dirtied after the snapshot was taken
+    /// (and therefore holding a higher counter by the time the clear
+    /// runs) survives the clear.
+    pub fn dirty_snapshot(&self, snap: &Snapshot) -> Result<Vec<(Vec<u8>, u64)>, MetaError> {
+        let mut out = Vec::new();
+        for guard in snap.iter(&self.dirty) {
+            let (k, v) = guard.into_inner()?;
+            let counter = u64::from_be_bytes(
+                v.as_ref()
+                    .try_into()
+                    .map_err(|_| MetaError::Invalid("dirty counter".into()))?,
+            );
+            out.push((k.to_vec(), counter));
+        }
+        Ok(out)
+    }
+
+    /// Remove each `(key, counter)` from `dirty`, but only if `dirty`
+    /// still holds exactly the counter observed — a key whose stored
+    /// counter has since moved on was re-dirtied after the snapshot this
+    /// publish read, by a write this publish never saw, and must stay
+    /// dirty for the next one.
+    pub fn clear_dirty_upto(&self, keys: &[(Vec<u8>, u64)]) -> Result<(), MetaError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.write_tx();
+        for (key, counter) in keys {
+            if let Some(current) = tx.get(&self.dirty, key.clone())? {
+                let current = u64::from_be_bytes(
+                    current
+                        .as_ref()
+                        .try_into()
+                        .map_err(|_| MetaError::Invalid("dirty counter".into()))?,
+                );
+                if current <= *counter {
+                    tx.remove(&self.dirty, key.clone());
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Cheap non-emptiness probe: whether a publish has anything to do at
+    /// all, without paying for a full [`Self::dirty_snapshot`].
+    pub fn has_dirty(&self) -> bool {
+        self.dirty.first_key_value().is_some()
+    }
+}
+
+pub(crate) fn next_dirty_seq_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+) -> Result<u64, MetaError> {
+    let next = kv_get_u64(tx, local, KV_NEXT_DIRTY_SEQ)?.unwrap_or(0) + 1;
+    kv_set_tx(tx, local, KV_NEXT_DIRTY_SEQ, &next.to_string());
+    Ok(next)
 }
 
 // ---------------------------------------------------------- free helpers

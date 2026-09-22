@@ -171,19 +171,35 @@ holder sleep through its own renewal.
 
 #### Publish cadence
 
-A publish writes a metadata commit — a delta of the tree keys a batch of
-records actually changed, CAS-created as one immutable object — and it
-is what licenses log truncation (log retention floors on the head
-commit's `applied` position; see below). Plan 29 M0b retired the
-whole-DB `VACUUM INTO` checkpoint this superseded, along with its
-byte-proportional cadence: a publish costs O(keys changed), not
-O(database), so there is nothing to sub-linearly amortize against
-namespace size the way the old ratio gate did.
+A publish writes a metadata commit — a delta of the `ns` keys a fjall
+write transaction actually touched (plan 29 M2: every write dirties its
+own key, in the same transaction, in a `dirty` keyspace the publisher
+reads directly), CAS-created as one immutable object — and it is what
+licenses log truncation (log retention floors on the head commit's
+`applied` position; see below). Plan 29 M0b retired the whole-DB `VACUUM
+INTO` checkpoint this superseded, along with its byte-proportional
+cadence: a publish costs O(keys changed), not O(database), so there is
+nothing to sub-linearly amortize against namespace size the way the old
+ratio gate did.
 
-The cadence is a plain count floor — at least 32 shipped segments since
-the last publish (`PUBLISH_EVERY`, not currently a knob) — plus an
-unconditional publish on clean unmount (or when the mount otherwise
-drains its journal for shutdown).
+The cadence is:
+
+- a plain count floor — at least 32 shipped segments since the last
+  publish (`PUBLISH_EVERY`, not currently a knob);
+- an idle timer — `dirty` is non-empty and no publish has run for
+  `CONSTELLATION_PUBLISH_IDLE_S` (default 30), checked once per sync
+  round after there is nothing left to ship. Without this, a node that
+  is mostly idle, or mostly tailing *foreign* segments (which dirty `ns`
+  just as surely as a local write, but never advance the shipped-segment
+  counter), could leave its head commit — and the log-retention floor
+  riding on it — stale indefinitely;
+- an unconditional publish on clean unmount (or whenever the mount
+  otherwise drains its journal for shutdown), gated only on `dirty`
+  being non-empty.
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_PUBLISH_IDLE_S` | `30` | seconds | idle-publish interval |
 
 ### Read-time atime
 

@@ -77,11 +77,13 @@ impl Meta {
 
     pub fn record_snapshot(&self, row: &SnapshotRow) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
-        tx.insert(
+        ns::ns_insert(
+            &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             keys::subsystem(Subsystem::Snapshot, row.id.as_bytes()),
             snapshot_record(row),
-        );
+        )?;
         journal::append_tx(
             &mut tx,
             &self.journal_ks,
@@ -117,10 +119,12 @@ impl Meta {
             }
         }
         let Some(id) = found else { return Ok(false) };
-        tx.remove(
+        ns::ns_remove(
+            &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             keys::subsystem(Subsystem::Snapshot, id.as_bytes()),
-        );
+        )?;
         journal::append_tx(
             &mut tx,
             &self.journal_ks,
@@ -138,10 +142,6 @@ impl Meta {
     pub fn snapshots(&self, path: Option<&str>) -> Result<Vec<SnapshotRow>, MetaError> {
         let r = self.db.read_tx();
         self.snapshots_at(&r, path)
-    }
-
-    pub fn snapshots_reader(&self) -> Result<Vec<SnapshotRow>, MetaError> {
-        self.snapshots(None)
     }
 
     pub fn snapshots_at(
@@ -201,11 +201,13 @@ impl Meta {
 
     pub fn write_quota(&self, max_logical_bytes: Option<u64>) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
-        tx.insert(
+        ns::ns_insert(
+            &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             keys::subsystem(Subsystem::Quota, b""),
             quota_record(max_logical_bytes),
-        );
+        )?;
         journal::append_tx(
             &mut tx,
             &self.journal_ks,
@@ -282,6 +284,7 @@ impl Meta {
             ns::put_inode(
                 &mut tx,
                 &self.ns,
+                self.dirty_for_ns(),
                 &self.blobs,
                 ino,
                 attrs,
@@ -289,7 +292,15 @@ impl Meta {
                 spec.target.clone().map(String::into_bytes),
                 &xattrs,
             )?;
-            ns::put_dentry(&mut tx, &self.ns, node_parent, name, ino, attrs);
+            ns::put_dentry(
+                &mut tx,
+                &self.ns,
+                self.dirty_for_ns(),
+                node_parent,
+                name,
+                ino,
+                attrs,
+            )?;
             crate::store::atime::set_atime_tx(&mut tx, &self.atime, ino, spec.mtime_ns);
             misc::track_manifest_transition_tx(
                 &mut tx,
@@ -303,7 +314,14 @@ impl Meta {
                 misc::xattr_by_name_put_tx(&mut tx, &self.xattr_by_name, n, ino, v);
             }
             if spec.kind == InodeKind::Dir {
-                misc::bump_nlink_tx(&mut tx, &self.ns, node_parent, 1, spec.mtime_ns)?;
+                misc::bump_nlink_tx(
+                    &mut tx,
+                    &self.ns,
+                    self.dirty_for_ns(),
+                    node_parent,
+                    1,
+                    spec.mtime_ns,
+                )?;
             }
             if spec.kind == InodeKind::File {
                 delta_bytes += spec.size as i64;

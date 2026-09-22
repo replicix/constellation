@@ -24,6 +24,7 @@ fn mask_mode(mode: u32) -> u32 {
 fn insert_new_node(
     tx: &mut SingleWriterWriteTx,
     ns_ks: &SingleWriterTxKeyspace,
+    dirty: ns::Dirty,
     atime_ks: &SingleWriterTxKeyspace,
     blobs: &SingleWriterTxKeyspace,
     parent: Ino,
@@ -40,13 +41,23 @@ fn insert_new_node(
     if ns::get_inode_record(tx, ns_ks, ino)?.is_some() {
         return Err(MetaError::Exists);
     }
-    ns::put_inode(tx, ns_ks, blobs, ino, attrs, manifest, symlink_target, &[])?;
-    ns::put_dentry(tx, ns_ks, parent, name, ino, attrs);
+    ns::put_inode(
+        tx,
+        ns_ks,
+        dirty,
+        blobs,
+        ino,
+        attrs,
+        manifest,
+        symlink_target,
+        &[],
+    )?;
+    ns::put_dentry(tx, ns_ks, dirty, parent, name, ino, attrs)?;
     atime::set_atime_tx(tx, atime_ks, ino, attrs.mtime_ns);
     if attrs.kind == Kind::Dir {
-        misc::bump_nlink_tx(tx, ns_ks, parent, 1, attrs.mtime_ns)?;
+        misc::bump_nlink_tx(tx, ns_ks, dirty, parent, 1, attrs.mtime_ns)?;
     } else {
-        misc::touch_times_tx(tx, ns_ks, parent, attrs.mtime_ns)?;
+        misc::touch_times_tx(tx, ns_ks, dirty, parent, attrs.mtime_ns)?;
     }
     Ok(())
 }
@@ -122,6 +133,7 @@ impl Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.atime,
             &self.blobs,
             parent,
@@ -174,6 +186,7 @@ impl Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.atime,
             &self.blobs,
             parent,
@@ -228,6 +241,7 @@ impl Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.atime,
             &self.blobs,
             parent,
@@ -286,6 +300,7 @@ impl Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.atime,
             &self.blobs,
             parent,
@@ -321,6 +336,7 @@ impl Meta {
     fn set_manifest_tx(
         tx: &mut SingleWriterWriteTx,
         ns_ks: &SingleWriterTxKeyspace,
+        dirty: ns::Dirty,
         blobs: &SingleWriterTxKeyspace,
         chunk_ref: &SingleWriterTxKeyspace,
         chunk_ref_by_ino: &SingleWriterTxKeyspace,
@@ -357,6 +373,7 @@ impl Meta {
         ns::put_inode(
             tx,
             ns_ks,
+            dirty,
             blobs,
             ino,
             attrs,
@@ -369,11 +386,13 @@ impl Meta {
         )?;
         // Update dentry copies (attrs changed: size/mtime/ctime).
         for (parent, name) in ns::links_of(tx, ns_ks, ino)? {
-            tx.insert(
+            ns::ns_insert(
+                tx,
                 ns_ks,
+                dirty,
                 keys::dentry(parent, name.as_bytes()),
                 DentryRecord::new(ino, attrs).encode(),
-            );
+            )?;
         }
         misc::track_manifest_transition_tx(
             tx,
@@ -410,6 +429,7 @@ impl Meta {
         let delta = Self::set_manifest_tx(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.blobs,
             &self.chunk_ref,
             &self.chunk_ref_by_ino,
@@ -442,6 +462,7 @@ impl Meta {
         let delta = Self::set_manifest_tx(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.blobs,
             &self.chunk_ref,
             &self.chunk_ref_by_ino,
@@ -494,9 +515,16 @@ impl Meta {
                 return Ok(());
             }
             let t = now_ns();
-            ns::remove_dentry(&mut tx, &self.ns, parent, name, old.ino);
+            ns::remove_dentry(
+                &mut tx,
+                &self.ns,
+                self.dirty_for_ns(),
+                parent,
+                name,
+                old.ino,
+            )?;
             if old_rec.attrs.nlink <= 1 {
-                ns::clear_spilled_xattrs(&mut tx, &self.ns, old.ino)?;
+                ns::clear_spilled_xattrs(&mut tx, &self.ns, self.dirty_for_ns(), old.ino)?;
                 let names: Vec<Vec<u8>> =
                     ns::all_xattrs(&tx, &self.ns, &self.blobs, &old_rec, old.ino)?
                         .into_iter()
@@ -520,13 +548,13 @@ impl Meta {
                     old.ino.to_be_bytes().to_vec(),
                     orphan_rec.encode(),
                 );
-                tx.remove(&self.ns, keys::inode(old.ino));
+                ns::ns_remove(&mut tx, &self.ns, self.dirty_for_ns(), keys::inode(old.ino))?;
                 if old_rec.attrs.kind == Kind::File {
                     delta_bytes -= old_rec.attrs.size as i64;
                     delta_files -= 1;
                 }
             } else {
-                misc::bump_nlink_tx(&mut tx, &self.ns, old.ino, -1, t)?;
+                misc::bump_nlink_tx(&mut tx, &self.ns, self.dirty_for_ns(), old.ino, -1, t)?;
             }
             journal::append_tx(
                 &mut tx,
@@ -554,8 +582,16 @@ impl Meta {
             ctime_ns,
             rdev: 0,
         };
-        ns::put_dentry(&mut tx, &self.ns, parent, name, ino, attrs);
-        misc::touch_times_tx(&mut tx, &self.ns, parent, ctime_ns)?;
+        ns::put_dentry(
+            &mut tx,
+            &self.ns,
+            self.dirty_for_ns(),
+            parent,
+            name,
+            ino,
+            attrs,
+        )?;
+        misc::touch_times_tx(&mut tx, &self.ns, self.dirty_for_ns(), parent, ctime_ns)?;
         atime::set_atime_tx(&mut tx, &self.atime, ino, mtime_ns);
         let xattr_pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
             .iter()
@@ -564,6 +600,7 @@ impl Meta {
         ns::put_inode(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.blobs,
             ino,
             attrs,
@@ -634,6 +671,7 @@ impl Meta {
 fn rename_in_tx(
     tx: &mut SingleWriterWriteTx,
     ns_ks: &SingleWriterTxKeyspace,
+    dirty: ns::Dirty,
     atime_ks: &SingleWriterTxKeyspace,
     orphans_ks: &SingleWriterTxKeyspace,
     xattr_by_name_ks: &SingleWriterTxKeyspace,
@@ -689,8 +727,8 @@ fn rename_in_tx(
             if ns::has_children(tx, ns_ks, existing.ino)? {
                 return Err(MetaError::NotEmpty);
             }
-            tx.remove(ns_ks, keys::inode(existing.ino));
-            ns::clear_spilled_xattrs(tx, ns_ks, existing.ino)?;
+            ns::ns_remove(tx, ns_ks, dirty, keys::inode(existing.ino))?;
+            ns::clear_spilled_xattrs(tx, ns_ks, dirty, existing.ino)?;
             let names: Vec<Vec<u8>> =
                 ns::all_xattrs(tx, ns_ks, blobs, &existing_rec, existing.ino)?
                     .into_iter()
@@ -698,9 +736,9 @@ fn rename_in_tx(
                     .collect();
             misc::xattr_by_name_del_all_tx(tx, xattr_by_name_ks, existing.ino, names);
             atime::remove_atime_tx(tx, atime_ks, existing.ino);
-            misc::bump_nlink_tx(tx, ns_ks, new_parent, -1, t)?;
+            misc::bump_nlink_tx(tx, ns_ks, dirty, new_parent, -1, t)?;
         } else if existing_rec.attrs.nlink <= 1 {
-            ns::clear_spilled_xattrs(tx, ns_ks, existing.ino)?;
+            ns::clear_spilled_xattrs(tx, ns_ks, dirty, existing.ino)?;
             let names: Vec<Vec<u8>> =
                 ns::all_xattrs(tx, ns_ks, blobs, &existing_rec, existing.ino)?
                     .into_iter()
@@ -729,36 +767,45 @@ fn rename_in_tx(
                 existing.ino.to_be_bytes().to_vec(),
                 orphan_rec.encode(),
             );
-            tx.remove(ns_ks, keys::inode(existing.ino));
+            ns::ns_remove(tx, ns_ks, dirty, keys::inode(existing.ino))?;
             if existing_rec.attrs.kind == Kind::File {
                 delta.0 -= existing_rec.attrs.size as i64;
                 delta.1 -= 1;
             }
         } else {
-            misc::bump_nlink_tx(tx, ns_ks, existing.ino, -1, t)?;
+            misc::bump_nlink_tx(tx, ns_ks, dirty, existing.ino, -1, t)?;
         }
-        ns::remove_dentry(tx, ns_ks, new_parent, new_name, existing.ino);
+        ns::remove_dentry(tx, ns_ks, dirty, new_parent, new_name, existing.ino)?;
     }
 
-    tx.remove(ns_ks, keys::dentry(parent, name.as_bytes()));
-    tx.remove(ns_ks, keys::rdentry(ino, parent, name.as_bytes()));
-    tx.insert(
+    ns::ns_remove(tx, ns_ks, dirty, keys::dentry(parent, name.as_bytes()))?;
+    ns::ns_remove(
+        tx,
         ns_ks,
+        dirty,
+        keys::rdentry(ino, parent, name.as_bytes()),
+    )?;
+    ns::ns_insert(
+        tx,
+        ns_ks,
+        dirty,
         keys::dentry(new_parent, new_name.as_bytes()),
         DentryRecord::new(ino, src.attrs).encode(),
-    );
-    tx.insert(
+    )?;
+    ns::ns_insert(
+        tx,
         ns_ks,
+        dirty,
         keys::rdentry(ino, new_parent, new_name.as_bytes()),
         record::RDENTRY_VALUE.to_vec(),
-    );
+    )?;
 
     if src_rec.attrs.kind == Kind::Dir && parent != new_parent {
-        misc::bump_nlink_tx(tx, ns_ks, parent, -1, t)?;
-        misc::bump_nlink_tx(tx, ns_ks, new_parent, 1, t)?;
+        misc::bump_nlink_tx(tx, ns_ks, dirty, parent, -1, t)?;
+        misc::bump_nlink_tx(tx, ns_ks, dirty, new_parent, 1, t)?;
     }
-    misc::touch_times_tx(tx, ns_ks, parent, t)?;
-    misc::touch_times_tx(tx, ns_ks, new_parent, t)?;
+    misc::touch_times_tx(tx, ns_ks, dirty, parent, t)?;
+    misc::touch_times_tx(tx, ns_ks, dirty, new_parent, t)?;
     Ok(Some((ino, t, delta.0, delta.1)))
 }
 
@@ -887,6 +934,7 @@ impl MetaStore for Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.atime,
             &self.blobs,
             parent,
@@ -939,6 +987,7 @@ impl MetaStore for Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.atime,
             &self.blobs,
             parent,
@@ -993,6 +1042,7 @@ impl MetaStore for Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.atime,
             &self.blobs,
             parent,
@@ -1050,6 +1100,7 @@ impl MetaStore for Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.atime,
             &self.blobs,
             parent,
@@ -1090,9 +1141,18 @@ impl MetaStore for Meta {
         }
         let t = now_ns();
         let at = atime::get_atime(&tx, &self.atime, ino)?;
-        let rec2 = misc::bump_nlink_tx(&mut tx, &self.ns, ino, 1, t)?.expect("checked above");
-        ns::put_dentry(&mut tx, &self.ns, parent, name, ino, rec2.attrs);
-        misc::touch_times_tx(&mut tx, &self.ns, parent, t)?;
+        let rec2 = misc::bump_nlink_tx(&mut tx, &self.ns, self.dirty_for_ns(), ino, 1, t)?
+            .expect("checked above");
+        ns::put_dentry(
+            &mut tx,
+            &self.ns,
+            self.dirty_for_ns(),
+            parent,
+            name,
+            ino,
+            rec2.attrs,
+        )?;
+        misc::touch_times_tx(&mut tx, &self.ns, self.dirty_for_ns(), parent, t)?;
         journal::append_tx(
             &mut tx,
             &self.journal_ks,
@@ -1115,7 +1175,7 @@ impl MetaStore for Meta {
         };
         let ino = d.ino;
         let Some(rec) = ns::get_inode_record(&tx, &self.ns, ino)? else {
-            ns::remove_dentry(&mut tx, &self.ns, parent, name, ino);
+            ns::remove_dentry(&mut tx, &self.ns, self.dirty_for_ns(), parent, name, ino)?;
             tx.commit()?;
             return Ok(());
         };
@@ -1123,7 +1183,7 @@ impl MetaStore for Meta {
             return Err(MetaError::IsDir);
         }
         let t = now_ns();
-        ns::remove_dentry(&mut tx, &self.ns, parent, name, ino);
+        ns::remove_dentry(&mut tx, &self.ns, self.dirty_for_ns(), parent, name, ino)?;
         let mut usage_delta = (0i64, 0i64);
         if rec.attrs.nlink <= 1 {
             let manifest_bytes = rec
@@ -1135,7 +1195,7 @@ impl MetaStore for Meta {
                 .into_iter()
                 .map(|(n, _)| n.into_bytes())
                 .collect();
-            ns::clear_spilled_xattrs(&mut tx, &self.ns, ino)?;
+            ns::clear_spilled_xattrs(&mut tx, &self.ns, self.dirty_for_ns(), ino)?;
             misc::xattr_by_name_del_all_tx(&mut tx, &self.xattr_by_name, ino, names);
             misc::track_manifest_transition_tx(
                 &mut tx,
@@ -1154,14 +1214,14 @@ impl MetaStore for Meta {
                 ino.to_be_bytes().to_vec(),
                 orphan_rec.encode(),
             );
-            tx.remove(&self.ns, keys::inode(ino));
+            ns::ns_remove(&mut tx, &self.ns, self.dirty_for_ns(), keys::inode(ino))?;
             if rec.attrs.kind == Kind::File {
                 usage_delta = (-(rec.attrs.size as i64), -1);
             }
         } else {
-            misc::bump_nlink_tx(&mut tx, &self.ns, ino, -1, t)?;
+            misc::bump_nlink_tx(&mut tx, &self.ns, self.dirty_for_ns(), ino, -1, t)?;
         }
-        misc::touch_times_tx(&mut tx, &self.ns, parent, t)?;
+        misc::touch_times_tx(&mut tx, &self.ns, self.dirty_for_ns(), parent, t)?;
         journal::append_tx(
             &mut tx,
             &self.journal_ks,
@@ -1194,16 +1254,16 @@ impl MetaStore for Meta {
             return Err(MetaError::NotEmpty);
         }
         let t = now_ns();
-        ns::remove_dentry(&mut tx, &self.ns, parent, name, ino);
-        tx.remove(&self.ns, keys::inode(ino));
+        ns::remove_dentry(&mut tx, &self.ns, self.dirty_for_ns(), parent, name, ino)?;
+        ns::ns_remove(&mut tx, &self.ns, self.dirty_for_ns(), keys::inode(ino))?;
         let names: Vec<Vec<u8>> = ns::all_xattrs(&tx, &self.ns, &self.blobs, &rec, ino)?
             .into_iter()
             .map(|(n, _)| n.into_bytes())
             .collect();
-        ns::clear_spilled_xattrs(&mut tx, &self.ns, ino)?;
+        ns::clear_spilled_xattrs(&mut tx, &self.ns, self.dirty_for_ns(), ino)?;
         misc::xattr_by_name_del_all_tx(&mut tx, &self.xattr_by_name, ino, names);
         atime::remove_atime_tx(&mut tx, &self.atime, ino);
-        misc::bump_nlink_tx(&mut tx, &self.ns, parent, -1, t)?;
+        misc::bump_nlink_tx(&mut tx, &self.ns, self.dirty_for_ns(), parent, -1, t)?;
         journal::append_tx(
             &mut tx,
             &self.journal_ks,
@@ -1229,6 +1289,7 @@ impl MetaStore for Meta {
         let result = rename_in_tx(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.atime,
             &self.orphans,
             &self.xattr_by_name,
@@ -1296,13 +1357,21 @@ impl MetaStore for Meta {
         }
         rec.attrs.ctime_ns = t;
         let attrs = rec.attrs;
-        tx.insert(&self.ns, keys::inode(ino), rec.encode());
+        ns::ns_insert(
+            &mut tx,
+            &self.ns,
+            self.dirty_for_ns(),
+            keys::inode(ino),
+            rec.encode(),
+        )?;
         for (parent, name) in ns::links_of(&tx, &self.ns, ino)? {
-            tx.insert(
+            ns::ns_insert(
+                &mut tx,
                 &self.ns,
+                self.dirty_for_ns(),
                 keys::dentry(parent, name.as_bytes()),
                 DentryRecord::new(ino, attrs).encode(),
-            );
+            )?;
         }
         if let Some(a) = atime_ns {
             atime::set_atime_tx(&mut tx, &self.atime, ino, a);
@@ -1336,6 +1405,7 @@ impl MetaStore for Meta {
         let delta = Self::set_manifest_tx(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.blobs,
             &self.chunk_ref,
             &self.chunk_ref_by_ino,
@@ -1395,6 +1465,7 @@ impl MetaStore for Meta {
         ns::put_inode(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.blobs,
             ino,
             attrs,
@@ -1449,6 +1520,7 @@ impl MetaStore for Meta {
         ns::put_inode(
             &mut tx,
             &self.ns,
+            self.dirty_for_ns(),
             &self.blobs,
             ino,
             attrs,

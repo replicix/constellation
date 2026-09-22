@@ -5,16 +5,23 @@
 //! the other direction: given a commit, reconstruct what the replica
 //! that published it held.
 //!
-//! ## Bootstrap
+//! ## Bootstrap (plan 29 M2)
 //!
 //! [`bootstrap_from_commit`] replaces the checkpoint restore. It finds
-//! the chain head, walks the tree with one ordered cursor, and writes
-//! the rows straight into a fresh SQLite replica: `0x01` → `inode` (and
-//! inline `xattr`), `0x02` → `dentry`, `0x03` → spilled `xattr`, `0x30`
-//! → snapshot rows and the replicated quota. `0x04` is not loaded; it is
-//! the `dentry_by_ino` index, which SQLite derives. The caller then
-//! resumes tailing the log from the commit's [`Commit::applied`]
-//! position, exactly where a checkpoint's `VECTOR.json` used to put it.
+//! the chain head and [`load_tree`]s it: one ordered cursor over the
+//! whole tree, bulk-loaded into a fresh replica's `ns` keyspace via
+//! `fjall::Keyspace::start_ingestion` (`Meta::ns_ingest_page`) rather
+//! than through the ordinary write path — since M1 made `ns`'s encoding
+//! *equal* the published tree's, this is a copy of every key
+//! (`0x01`/`0x02`/`0x03`/`0x04`/`0x30` alike, `0x04` included — there is
+//! no separate derivation to skip any more), not a translation, apart
+//! from `0x01`/`0x03` payloads moving from the bucket's blob addressing
+//! to this replica's local one (`Meta::encode_local_inode`). The caller
+//! then resumes tailing the log from the commit's [`Commit::applied`]
+//! position, exactly where a checkpoint's `VECTOR.json` used to put it —
+//! and the dirty set an ordinary write path would have accumulated along
+//! the way starts empty (`Meta::clear_all_dirty`), so this replica's
+//! first publish is that tail's delta alone, not a rebuild.
 //!
 //! One thing a checkpoint carried and a commit deliberately does not:
 //!
@@ -46,97 +53,18 @@
 
 use anyhow::{bail, Context, Result};
 use constellation_fs_core::{FileAttr, Ino, InodeKind};
-use constellation_meta::{Meta, SnapshotRow, TreeInode};
-use constellation_mtree::keys::{self, Key, Subsystem};
+use constellation_meta::{Meta, TreeInode};
+use constellation_mtree::keys::{self, Key};
 use constellation_mtree::record::{self, DentryRecord, InodeRecord, Payload};
 use constellation_mtree::{NodeHash, NodeRef, NodeStore, Tree};
 use constellation_store_s3::{BlobStore, Commit, CommitChain, LogStore, NodeCache, SHARD0};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// A tree key and its value.
 type Pair = (Vec<u8>, Vec<u8>);
 
-// ------------------------------------------------------ 0x30 record codec
-
-// `snapshot_record`/`quota_record` (and their parsers) now live in
-// `constellation_meta::store` so both the replica and the publisher
-// share one codec; see `constellation_meta::store::{snapshot_record,
-// quota_record, parse_snapshot_record, parse_quota_record}`.
-use constellation_meta::store::snapshot_record;
-
-fn fixed<const N: usize>(field: &[u8], what: &str) -> Result<[u8; N]> {
-    field
-        .try_into()
-        .with_context(|| format!("{what}: expected {N} bytes, got {}", field.len()))
-}
-
 fn text(field: &[u8], what: &str) -> Result<String> {
     String::from_utf8(field.to_vec()).with_context(|| format!("{what} is not UTF-8"))
-}
-
-/// The `0x30` keys and values the replica's current state calls for,
-/// read through the caller's fjall snapshot so the publisher's
-/// point-in-time view covers them.
-pub(crate) fn subsystem_state(
-    meta: &Meta,
-    snap: &fjall::Snapshot,
-) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-    let mut out = BTreeMap::new();
-    for row in meta.snapshots_at(snap, None)? {
-        out.insert(
-            keys::subsystem(Subsystem::Snapshot, row.id.as_bytes()),
-            snapshot_record(&row),
-        );
-    }
-    // `ns` already holds the quota subsystem record in exactly the
-    // tree's shape, under the same snapshot as the rest of this plan.
-    if let Some(bytes) = meta.replicated_quota_record_at(snap)? {
-        out.insert(keys::subsystem(Subsystem::Quota, b""), bytes);
-    }
-    Ok(out)
-}
-
-/// The subsystem ranges the publisher owns. Clones, designations and
-/// holds have no replicated SQLite state in (B) and are left alone.
-pub(crate) const PUBLISHED_SUBSYSTEMS: [Subsystem; 2] = [Subsystem::Snapshot, Subsystem::Quota];
-
-/// What the `0x30` range of a tree says.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Subsystems {
-    pub snapshots: Vec<SnapshotRow>,
-    pub quota: Option<Option<u64>>,
-}
-
-impl Subsystems {
-    fn absorb(&mut self, subsystem: Subsystem, id: &[u8], value: &[u8]) -> Result<()> {
-        let fields = record::decode_fields(value)?;
-        match subsystem {
-            Subsystem::Snapshot => {
-                let [path, name, root, created] = fields[..] else {
-                    bail!("snapshot record has {} fields", fields.len());
-                };
-                self.snapshots.push(SnapshotRow {
-                    id: text(id, "snapshot id")?,
-                    path: text(path, "snapshot path")?,
-                    name: text(name, "snapshot name")?,
-                    root_hash: text(root, "snapshot root")?,
-                    created_unix_ms: i64::from_le_bytes(fixed(created, "snapshot time")?),
-                });
-            }
-            Subsystem::Quota => {
-                self.quota = Some(match fields[..] {
-                    [] => None,
-                    [max] => Some(u64::from_le_bytes(fixed(max, "quota")?)),
-                    _ => bail!("quota record has {} fields", fields.len()),
-                });
-            }
-            // Not written by (B); ignore rather than refuse, so a later
-            // writer adding them does not break an older reader.
-            Subsystem::Clone | Subsystem::Designation | Subsystem::Hold => {}
-        }
-        Ok(())
-    }
 }
 
 // ------------------------------------------------------- record decoding
@@ -436,8 +364,10 @@ pub(crate) async fn attach_catalog(cache: &NodeCache) -> Result<usize> {
 /// in flight; eviction is fine.
 const NODE_SCRATCH_BYTES: u64 = 1 << 30;
 
-/// Keys per SQLite transaction during a bootstrap load. Bounds memory at
-/// one page of rows; the tree is walked once regardless.
+/// Entries per `fjall::Keyspace::start_ingestion` session during a
+/// bootstrap load. Bounds memory at one page; the tree is walked once
+/// regardless. Two independent page buffers are flushed as they fill
+/// (see [`load_tree`]'s doc), so this bounds each of them separately.
 const LOAD_PAGE: usize = 8192;
 
 /// What a tree load produced.
@@ -448,7 +378,32 @@ pub(crate) struct Loaded {
     pub dentries: u64,
 }
 
-/// Walk `root` in key order and load it into `meta`.
+/// Walk `root` in key order and bulk-load it into `meta` (plan 29 M2).
+///
+/// Since M1, `ns`'s key/value encoding *is* the published tree's, so
+/// this is a bulk copy rather than a translation: `0x02` (dentry), `0x04`
+/// (reverse dentry) and `0x30` (subsystem) values carry no `Payload` and
+/// copy verbatim. `0x01` (inode) and `0x03` (spilled xattr) values need
+/// local re-encoding — `Meta::encode_local_inode` resolves the published
+/// payload (fetching from the bucket's `blobs/` if spilled) and re-places
+/// it against this replica's local hash and spill threshold, exactly the
+/// reverse of what a publish does.
+///
+/// **Two independent ingestion streams, not one.** `fjall::Keyspace::
+/// start_ingestion` requires each session's own keys strictly ascending,
+/// but does *not* require successive sessions to sort after one another
+/// (each is registered as its own sorted run and merged normally) — so
+/// this walks the tree once in true key order, but a re-encoded inode's
+/// local `0x03` entries cannot go in the *same* page as the `0x01`/`0x02`/
+/// `0x04`/`0x30` keys around them (a `0x03` key sorts after every `0x01`
+/// key, so interleaving it into a page that keeps growing past it would
+/// break that page's own ascending order). `main` collects the four
+/// verbatim-order kinds (they stay ascending relative to each other once
+/// `0x03` is filtered out of the walk); `local_xattrs` collects the
+/// re-encoded `0x03` entries, itself kept ascending because inodes are
+/// visited in ascending order and each one's own spilled names are
+/// visited in ascending order. Each is ingested through its own,
+/// independently-paged sessions.
 ///
 /// Synchronous: the cursor resolves nodes through the cache's blocking
 /// bridge, so callers run it on a blocking thread.
@@ -458,66 +413,82 @@ pub(crate) fn load_tree(
     meta: &Meta,
     resolver: &Resolver<'_>,
 ) -> Result<(u64, u64)> {
-    // A `0x01` record whose xattr set spilled cannot be finished without
-    // its `0x03` keys, and the `0x03` range sorts after all of `0x01`.
-    // Spilled sets are rare (a set over 256 B), so read that range
-    // first with its own cursor and keep it; everything else streams.
-    let mut spilled: BTreeMap<Ino, Vec<Pair>> = BTreeMap::new();
-    let xattrs = keys::whole_range(keys::RANGE_XATTR);
-    let mut cursor = tree.cursor_at(root, xattrs.start())?;
-    while let Some((key, value)) = cursor.entry()? {
-        if !xattrs.contains(key) {
-            break;
-        }
-        let Key::Xattr { ino, .. } = Key::parse(key)? else {
-            bail!("a non-xattr key inside the xattr range");
-        };
-        spilled
-            .entry(ino)
-            .or_default()
-            .push((key.to_vec(), value.to_vec()));
-        cursor.next()?;
-    }
-
-    let mut inodes: Vec<TreeInode> = Vec::new();
-    let mut dentries: Vec<(Ino, String, Ino)> = Vec::new();
-    let mut subsystems = Subsystems::default();
+    let mut main: Vec<Pair> = Vec::with_capacity(LOAD_PAGE);
+    let mut local_xattrs: Vec<Pair> = Vec::with_capacity(LOAD_PAGE);
     let (mut n_inodes, mut n_dentries) = (0u64, 0u64);
-    let flush = |inodes: &mut Vec<TreeInode>, dentries: &mut Vec<(Ino, String, Ino)>| {
-        meta.load_tree_rows(inodes, dentries)?;
-        inodes.clear();
-        dentries.clear();
-        anyhow::Ok(())
+
+    let flush = |page: &mut Vec<Pair>, force: bool| -> Result<()> {
+        if page.len() >= LOAD_PAGE || (force && !page.is_empty()) {
+            meta.ns_ingest_page(page)?;
+            page.clear();
+        }
+        Ok(())
     };
 
     let mut cursor = tree.cursor(root)?;
     while let Some((key, value)) = cursor.entry()? {
         match Key::parse(key)? {
             Key::Inode { ino } => {
-                let own = spilled.remove(&ino).unwrap_or_default();
-                inodes.push(resolver.inode(ino, value, &own)?);
+                let rec = InodeRecord::decode(value).with_context(|| format!("inode {ino}"))?;
+                let manifest = rec
+                    .manifest
+                    .as_ref()
+                    .map(|p| resolver.payload(p))
+                    .transpose()?;
+                let target = rec
+                    .symlink_target
+                    .as_ref()
+                    .map(|p| resolver.payload(p))
+                    .transpose()?;
+                let mut xattrs: Vec<(Vec<u8>, Vec<u8>)> = rec
+                    .xattrs
+                    .iter()
+                    .map(|(n, v)| (n.clone(), v.clone()))
+                    .collect();
+                if xattrs.is_empty() {
+                    // The set spilled: read this inode's `0x03` range
+                    // with its own cursor. Rare (a set over
+                    // `XATTR_INLINE`), so paying a fresh cursor per
+                    // spilled inode is fine.
+                    let range = keys::xattrs_of(ino);
+                    for (k, v) in tree.range(root, range.start(), range.prefix(), usize::MAX)? {
+                        let Key::Xattr { name, .. } = Key::parse(&k)? else {
+                            bail!("a non-xattr key inside inode {ino}'s xattr range");
+                        };
+                        let payload = Payload::decode(&v)?;
+                        xattrs.push((name.to_vec(), resolver.payload(&payload)?));
+                    }
+                }
+                let local = meta.encode_local_inode(rec.attrs, manifest, target, &xattrs)?;
+                main.push((key.to_vec(), local.record));
+                for (name, value) in local.xattrs {
+                    local_xattrs.push((keys::xattr(ino, &name), value));
+                }
                 n_inodes += 1;
             }
-            Key::Dentry { parent_ino, name } => {
-                let target = DentryRecord::decode(value)?;
-                dentries.push((parent_ino, text(name, "dentry name")?, target.ino));
+            Key::Dentry { .. } => {
+                main.push((key.to_vec(), value.to_vec()));
                 n_dentries += 1;
             }
-            // Already read above, and derived by SQLite respectively.
-            Key::Xattr { .. } | Key::RDentry { .. } => {}
-            Key::Subsystem { subsystem, id } => subsystems.absorb(subsystem, id, value)?,
+            Key::RDentry { .. } | Key::Subsystem { .. } => {
+                main.push((key.to_vec(), value.to_vec()));
+            }
+            // Handled per-inode above.
+            Key::Xattr { .. } => {}
         }
-        if inodes.len() + dentries.len() >= LOAD_PAGE {
-            flush(&mut inodes, &mut dentries)?;
-        }
+        flush(&mut main, false)?;
+        flush(&mut local_xattrs, false)?;
         cursor.next()?;
     }
-    if let Some((&ino, _)) = spilled.iter().next() {
-        bail!("xattr keys for inode {ino}, which has no inode record");
-    }
-    flush(&mut inodes, &mut dentries)?;
-    meta.load_tree_subsystems(&subsystems.snapshots, subsystems.quota)?;
-    meta.finish_tree_load()?;
+    flush(&mut main, true)?;
+    flush(&mut local_xattrs, true)?;
+
+    meta.rebuild_derived_from_ns()?;
+    // Everything just loaded already equals the published tree; retract
+    // whatever `Meta::open`'s genesis root insert speculatively dirtied
+    // (see `constellation_meta::store::Meta::clear_all_dirty`) so this
+    // replica's first publish is the log tail's delta alone.
+    meta.clear_all_dirty()?;
     Ok((n_inodes, n_dentries))
 }
 
@@ -633,7 +604,7 @@ mod tests {
     use crate::mtree_publish::TreePublisher;
     use constellation_fs_core::cache::DiskCache;
     use constellation_fs_core::types::ROOT_INO;
-    use constellation_meta::{LogRecord, MetaStore, SetXattrMode};
+    use constellation_meta::{MetaStore, SetXattrMode};
     use constellation_mtree::{Hasher, MtreeError};
     use constellation_store_s3::PackStore;
     use object_store::memory::InMemory;
@@ -698,13 +669,6 @@ mod tests {
             1,
             tokio::runtime::Handle::current(),
         );
-        let records: Vec<LogRecord> = meta
-            .take_journal(usize::MAX)
-            .unwrap()
-            .into_iter()
-            .map(|(_, r)| r)
-            .collect();
-        publisher.note(&records);
         let commit = publisher.publish(1).await.unwrap().unwrap();
         (store, meta, commit, inos)
     }
@@ -890,5 +854,118 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// A spilled xattr, a spilled manifest and a spilled symlink target
+    /// all round-trip through publish and bootstrap unchanged, whether
+    /// the filesystem hashes plainly or under an E2E key (§P13): the
+    /// bootstrap converts a published `Payload::Spilled` reference —
+    /// whatever hash scheme named it — back to this replica's own,
+    /// always-plain-hashed local spill (`Meta::encode_local_inode`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spilled_value_round_trips_through_publish_and_bootstrap() {
+        for keys in [
+            None,
+            Some(Arc::new(constellation_store_s3::E2eKeys::generate())),
+        ] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let meta = Arc::new(Meta::open_in_memory().unwrap());
+            let manifest = vec![0xab; 40_000];
+            let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+            meta.set_manifest(f.ino, &manifest, 1 << 20).unwrap();
+            let xattr = vec![0x5a; 30_000];
+            meta.set_xattr(f.ino, "user.big", &xattr, SetXattrMode::Set)
+                .unwrap();
+            let target = "y".repeat(3_000);
+            meta.symlink(ROOT_INO, "s", &target, 0, 0).unwrap();
+
+            let pub_dir = TempDir::new().unwrap();
+            let publish_reader =
+                ChainReader::for_store(Arc::clone(&store), keys.as_ref(), pub_dir.path()).unwrap();
+            let mut publisher = TreePublisher::new(
+                Arc::clone(&meta),
+                Arc::clone(&publish_reader.cache),
+                publish_reader.blobs.clone(),
+                publish_reader.chain,
+                publish_reader.config,
+                1,
+                tokio::runtime::Handle::current(),
+            );
+            publisher.publish(1).await.unwrap().unwrap();
+
+            let boot_dir = TempDir::new().unwrap();
+            let boot_reader =
+                ChainReader::for_store(Arc::clone(&store), keys.as_ref(), boot_dir.path()).unwrap();
+            let fresh = Arc::new(Meta::open_in_memory().unwrap());
+            bootstrap_from_commit(&boot_reader, Arc::clone(&fresh))
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                fresh.manifest(f.ino).unwrap(),
+                Some(manifest.clone()),
+                "e2e = {}",
+                keys.is_some()
+            );
+            assert_eq!(
+                fresh.get_xattr(f.ino, "user.big").unwrap(),
+                Some(xattr.clone())
+            );
+            let s_ino = fresh.child_ino(ROOT_INO, "s").unwrap().unwrap();
+            assert_eq!(fresh.readlink(s_ino).unwrap(), Some(target.clone()));
+        }
+    }
+
+    /// The first publish after a bootstrap is a small delta, not a
+    /// rebuild: the ingestion-loaded content is not dirty
+    /// (`Meta::clear_all_dirty`), so only the one key a post-bootstrap
+    /// change touches has to move.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bootstrap_then_publish_is_a_small_delta() {
+        let (store, _meta, commit, dirs) = published(20, 50).await;
+
+        let scratch = TempDir::new().unwrap();
+        let reader = ChainReader::for_store(Arc::clone(&store), None, scratch.path()).unwrap();
+        let fresh = Arc::new(Meta::open_in_memory().unwrap());
+        let loaded = bootstrap_from_commit(&reader, Arc::clone(&fresh))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.commit.seq, commit.seq);
+        crate::mtree_publish::remember_loaded_commit(&fresh, &loaded.commit).unwrap();
+        assert!(
+            !fresh.has_dirty(),
+            "a bootstrapped replica must start with nothing dirty"
+        );
+
+        // A real second node has its own cluster-assigned prefix,
+        // disjoint from whichever prefix(es) the bootstrapped content's
+        // inos were allocated under; `published()`'s source replica
+        // never set one (defaulting to 0), so this one must claim a
+        // different one to avoid colliding with an existing ino.
+        fresh.set_node_prefix(9).unwrap();
+        fresh.create(dirs[0], "just-one-more", 0o644, 0, 0).unwrap();
+
+        let dir2 = TempDir::new().unwrap();
+        let mut publisher = TreePublisher::new(
+            fresh,
+            cold_cache(Arc::clone(&store), &dir2),
+            BlobStore::new(Arc::clone(&store), Hasher::Plain),
+            CommitChain::new(Arc::clone(&store)),
+            record::config(),
+            2,
+            tokio::runtime::Handle::current(),
+        );
+        publisher.restore().unwrap();
+        let delta = publisher.publish(1).await.unwrap().unwrap();
+        assert_eq!(delta.seq, commit.seq + 1);
+        // The new file's 0x01/0x02/0x04, and its parent's 0x01 plus the
+        // 0x02/0x04 that copy the parent's now-bumped mtime.
+        assert!(
+            delta.intent.ops <= 8,
+            "the first post-bootstrap publish edited {} keys",
+            delta.intent.ops
+        );
     }
 }

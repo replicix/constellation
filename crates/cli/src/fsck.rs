@@ -537,7 +537,7 @@ async fn check_gc_journal(
 mod tests {
     use super::*;
     use constellation_fs_core::{DEFAULT_CHUNK_SIZE, INLINE_CHUNKS_MAX};
-    use constellation_meta::{LogRecord, MetaStore};
+    use constellation_meta::MetaStore;
     use object_store::memory::InMemory;
 
     #[tokio::test]
@@ -588,13 +588,6 @@ mod tests {
         for i in 0..300 {
             meta.create(dir, &format!("f{i}"), 0o644, 0, 0).unwrap();
         }
-        let drain = |meta: &Meta| -> Vec<LogRecord> {
-            let batch = meta.take_journal(usize::MAX).unwrap();
-            if let Some((seq, _)) = batch.last() {
-                meta.ack_journal(*seq).unwrap();
-            }
-            batch.into_iter().map(|(_, record)| record).collect()
-        };
         let nodes = tempfile::TempDir::new().unwrap();
         let mut publisher = TreePublisher::new(
             Arc::clone(&meta),
@@ -610,7 +603,6 @@ mod tests {
             1,
             tokio::runtime::Handle::current(),
         );
-        publisher.note(&drain(&meta));
         publisher.publish(1).await.unwrap().unwrap();
 
         let logs = LogStore::new(store.clone());
@@ -621,11 +613,20 @@ mod tests {
             .unwrap();
         assert!(issues.is_empty(), "{issues:#?}");
 
-        // Drift: the replica changes and nothing is published.
+        // Drift: the replica changes, and the change is drained from
+        // the local journal (as shipping would do) without ever being
+        // published — the `journal_len() == 0` half of the rebuild
+        // comparison's "this commit claims the replica's exact state"
+        // check needs this, or it correctly (if less interestingly)
+        // skips the comparison as "more local work than the commit
+        // could possibly reflect".
         let f7 = meta.child_ino(dir, "f7").unwrap().unwrap();
         meta.setattr(f7, Some(0o600), None, None, None, None, None)
             .unwrap();
-        drain(&meta);
+        let batch = meta.take_journal(usize::MAX).unwrap();
+        if let Some((seq, _)) = batch.last() {
+            meta.ack_journal(*seq).unwrap();
+        }
         check_metadata_tree(&logs, &meta, Some(state.path()), &mut issues)
             .await
             .unwrap();

@@ -40,20 +40,6 @@ pub(crate) fn attrs_to_fileattr(ino: Ino, a: &Attrs, atime_ns: i64) -> FileAttr 
     }
 }
 
-pub(crate) fn fileattr_to_attrs(a: &FileAttr) -> Attrs {
-    Attrs {
-        kind: kind_to_mtree(a.kind),
-        mode: a.mode,
-        uid: a.uid,
-        gid: a.gid,
-        nlink: a.nlink,
-        size: a.size,
-        mtime_ns: a.mtime_ns,
-        ctime_ns: a.ctime_ns,
-        rdev: a.rdev,
-    }
-}
-
 /// Resolve a `Payload` to its bytes, fetching a spilled body from
 /// `blobs` if needed.
 pub(crate) fn resolve_payload(
@@ -221,6 +207,7 @@ pub(crate) fn all_xattrs(
 pub(crate) fn clear_spilled_xattrs(
     tx: &mut SingleWriterWriteTx,
     ns: &SingleWriterTxKeyspace,
+    dirty: Dirty,
     ino: Ino,
 ) -> Result<(), MetaError> {
     let range = keys::xattrs_of(ino);
@@ -229,7 +216,7 @@ pub(crate) fn clear_spilled_xattrs(
         .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
         .collect::<Result<_, _>>()?;
     for k in keys_to_remove {
-        tx.remove(ns, k);
+        ns_remove(tx, ns, dirty, k)?;
     }
     Ok(())
 }
@@ -242,6 +229,7 @@ pub(crate) fn clear_spilled_xattrs(
 pub(crate) fn put_inode(
     tx: &mut SingleWriterWriteTx,
     ns: &SingleWriterTxKeyspace,
+    dirty: Dirty,
     blobs: &SingleWriterTxKeyspace,
     ino: Ino,
     attrs: Attrs,
@@ -253,18 +241,18 @@ pub(crate) fn put_inode(
     for blob in planned.blobs {
         Meta::put_blob(tx, blobs, blob);
     }
-    tx.insert(ns, keys::inode(ino), planned.record.encode());
+    ns_insert(tx, ns, dirty, keys::inode(ino), planned.record.encode())?;
     if planned.xattrs == XattrPlacement::Spilled {
-        clear_spilled_xattrs(tx, ns, ino)?;
+        clear_spilled_xattrs(tx, ns, dirty, ino)?;
         for (name, value) in xattrs {
             let (payload, blob) = record::place_value(value.clone(), Meta::hash_blob);
             if let Some(blob) = blob {
                 Meta::put_blob(tx, blobs, blob);
             }
-            tx.insert(ns, keys::xattr(ino, name), payload.encode());
+            ns_insert(tx, ns, dirty, keys::xattr(ino, name), payload.encode())?;
         }
     } else {
-        clear_spilled_xattrs(tx, ns, ino)?;
+        clear_spilled_xattrs(tx, ns, dirty, ino)?;
     }
     Ok(planned.xattrs)
 }
@@ -272,32 +260,38 @@ pub(crate) fn put_inode(
 pub(crate) fn put_dentry(
     tx: &mut SingleWriterWriteTx,
     ns: &SingleWriterTxKeyspace,
+    dirty: Dirty,
     parent: Ino,
     name: &str,
     ino: Ino,
     attrs: Attrs,
-) {
-    tx.insert(
+) -> Result<(), MetaError> {
+    ns_insert(
+        tx,
         ns,
+        dirty,
         keys::dentry(parent, name.as_bytes()),
         DentryRecord::new(ino, attrs).encode(),
-    );
-    tx.insert(
+    )?;
+    ns_insert(
+        tx,
         ns,
+        dirty,
         keys::rdentry(ino, parent, name.as_bytes()),
         record::RDENTRY_VALUE.to_vec(),
-    );
+    )
 }
 
 pub(crate) fn remove_dentry(
     tx: &mut SingleWriterWriteTx,
     ns: &SingleWriterTxKeyspace,
+    dirty: Dirty,
     parent: Ino,
     name: &str,
     ino: Ino,
-) {
-    tx.remove(ns, keys::dentry(parent, name.as_bytes()));
-    tx.remove(ns, keys::rdentry(ino, parent, name.as_bytes()));
+) -> Result<(), MetaError> {
+    ns_remove(tx, ns, dirty, keys::dentry(parent, name.as_bytes()))?;
+    ns_remove(tx, ns, dirty, keys::rdentry(ino, parent, name.as_bytes()))
 }
 
 /// Whether `parent` has any dentries at all (the `rmdir` emptiness
@@ -347,4 +341,68 @@ pub(crate) fn readdir_entries(
 
 pub(crate) fn key_range_bounds(r: &KeyRange) -> std::ops::Range<Vec<u8>> {
     r.start().to_vec()..r.end().to_vec()
+}
+
+// ------------------------------------------------------- dirty tracking
+
+/// Whether a write to a §P6 keyspace also has to record the touched key
+/// in `dirty` (plan 29 M2). `ns` is tracked, because it is exactly the
+/// published tree's key set; `scratch` (private, never published) is
+/// not, and never journaled/replicated content should not be able to
+/// forget which side of that line it is on.
+#[derive(Clone, Copy)]
+pub(crate) enum Dirty<'a> {
+    Untracked,
+    Tracked {
+        dirty: &'a SingleWriterTxKeyspace,
+        local: &'a SingleWriterTxKeyspace,
+    },
+}
+
+impl<'a> Dirty<'a> {
+    pub(crate) fn tracked(
+        dirty: &'a SingleWriterTxKeyspace,
+        local: &'a SingleWriterTxKeyspace,
+    ) -> Self {
+        Dirty::Tracked { dirty, local }
+    }
+
+    fn mark(self, tx: &mut SingleWriterWriteTx, key: &[u8]) -> Result<(), MetaError> {
+        if let Dirty::Tracked { dirty, local } = self {
+            let seq = crate::store::next_dirty_seq_tx(tx, local)?;
+            tx.insert(dirty, key.to_vec(), seq.to_be_bytes().to_vec());
+        }
+        Ok(())
+    }
+}
+
+/// Insert into a §P6 keyspace (`ns` or `scratch`), marking `key` dirty
+/// first when `dirty` says to track it. The one place every write to
+/// `ns` funnels through — directly, or via [`put_inode`]/[`put_dentry`]/
+/// [`remove_dentry`]/[`clear_spilled_xattrs`] below, which all call this
+/// — so dirty-tracking cannot be forgotten on a new write path (plan 29
+/// M2's `dirty_snapshot`/`clear_dirty_upto` test exercises every
+/// mutating API to check exactly that).
+pub(crate) fn ns_insert(
+    tx: &mut SingleWriterWriteTx,
+    ks: &SingleWriterTxKeyspace,
+    dirty: Dirty,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> Result<(), MetaError> {
+    dirty.mark(tx, &key)?;
+    tx.insert(ks, key, value);
+    Ok(())
+}
+
+/// The removing twin of [`ns_insert`].
+pub(crate) fn ns_remove(
+    tx: &mut SingleWriterWriteTx,
+    ks: &SingleWriterTxKeyspace,
+    dirty: Dirty,
+    key: Vec<u8>,
+) -> Result<(), MetaError> {
+    dirty.mark(tx, &key)?;
+    tx.remove(ks, key);
+    Ok(())
 }

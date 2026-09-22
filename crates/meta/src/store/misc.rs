@@ -16,13 +16,20 @@ use std::collections::HashSet;
 pub(crate) fn touch_times_tx(
     tx: &mut SingleWriterWriteTx,
     ns_ks: &SingleWriterTxKeyspace,
+    dirty: ns::Dirty,
     ino: Ino,
     t: i64,
 ) -> Result<(), MetaError> {
     if let Some(mut rec) = ns::get_inode_record(tx, ns_ks, ino)? {
         rec.attrs.mtime_ns = t;
         rec.attrs.ctime_ns = t;
-        tx.insert(ns_ks, constellation_mtree::keys::inode(ino), rec.encode());
+        ns::ns_insert(
+            tx,
+            ns_ks,
+            dirty,
+            constellation_mtree::keys::inode(ino),
+            rec.encode(),
+        )?;
     }
     Ok(())
 }
@@ -32,6 +39,7 @@ pub(crate) fn touch_times_tx(
 pub(crate) fn bump_nlink_tx(
     tx: &mut SingleWriterWriteTx,
     ns_ks: &SingleWriterTxKeyspace,
+    dirty: ns::Dirty,
     ino: Ino,
     delta: i64,
     t: i64,
@@ -42,7 +50,13 @@ pub(crate) fn bump_nlink_tx(
     rec.attrs.nlink = (rec.attrs.nlink as i64 + delta).max(0) as u32;
     rec.attrs.mtime_ns = t;
     rec.attrs.ctime_ns = t;
-    tx.insert(ns_ks, constellation_mtree::keys::inode(ino), rec.encode());
+    ns::ns_insert(
+        tx,
+        ns_ks,
+        dirty,
+        constellation_mtree::keys::inode(ino),
+        rec.encode(),
+    )?;
     Ok(Some(rec))
 }
 

@@ -540,14 +540,6 @@ mod tests {
         )
     }
 
-    fn drain(meta: &Meta) -> Vec<constellation_meta::LogRecord> {
-        let batch = meta.take_journal(usize::MAX).unwrap();
-        if let Some((seq, _)) = batch.last() {
-            meta.ack_journal(*seq).unwrap();
-        }
-        batch.into_iter().map(|(_, r)| r).collect()
-    }
-
     fn packs(store: &Arc<dyn ObjectStore>) -> Vec<object_store::path::Path> {
         futures::executor::block_on(
             store
@@ -588,7 +580,6 @@ mod tests {
             meta.create(d, &format!("file-{i:04}"), 0o644, 0, 0)
                 .unwrap();
         }
-        writer.note(&drain(&meta));
         let first = writer.publish(1).await.unwrap().unwrap();
         // A snapshot of the first commit: retention will retire the
         // commit object, and the snapshot alone must keep its tree.
@@ -613,7 +604,6 @@ mod tests {
                 meta.setattr(ino, Some(0o600 + round), None, None, None, None, None)
                     .unwrap();
             }
-            writer.note(&drain(&meta));
             writer.publish(1).await.unwrap().unwrap();
         }
         let before = packs(&store).len();
@@ -654,7 +644,6 @@ mod tests {
         // locations for moved nodes are stale, and the miss path finds
         // the replacement packs.
         meta.create(d, "after-gc", 0o644, 0, 0).unwrap();
-        writer.note(&drain(&meta));
         let next = writer.publish(1).await.unwrap().unwrap();
         assert!(readable(&store, next.root(SHARD0).unwrap()).await > 0);
 
@@ -679,7 +668,6 @@ mod tests {
             meta.create(d, &format!("f{i}"), 0o644, 0, 0).unwrap();
         }
         let mut first = publisher(&meta, &store, &dir);
-        first.note(&drain(&meta));
         let base = first.publish(1).await.unwrap().unwrap();
 
         // A second publisher over the same bucket rebuilds (a restart
