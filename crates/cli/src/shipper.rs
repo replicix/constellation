@@ -50,102 +50,20 @@ use crate::lease::{LeaseKeeper, TailedToHead};
 use anyhow::{bail, Context, Result};
 use constellation_meta::replay::TouchSet;
 use constellation_meta::{LogRecord, MetaStore, SqliteMeta};
-use constellation_store_s3::log::{CheckpointVector, PARTITION};
+use constellation_store_s3::log::PARTITION;
 use constellation_store_s3::{Lease, LeaseMode, LeaseStore, LeaseTag, LogStore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Checkpoint after this many shipped segments (across all partitions).
-const CHECKPOINT_EVERY: u64 = 32;
-/// Floor on the gap between checkpoints; disabled by default.
-///
-/// A checkpoint copies the whole metadata DB, so it costs roughly 2ms per
-/// MiB and grows with the namespace: the segment counter alone fires it
-/// every ~100ms under a small-file rsync, and at 50k files that is ~180
-/// checkpoints and 120MB written where 1 checkpoint and 38MB would do.
-///
-/// Spacing them out is nonetheless **not** a free win, which is why the
-/// default is 0. Measured on a 50k-file mount, a 60s floor cut write
-/// amplification 3x and lifted 8-writer throughput ~8%, but made
-/// single-threaded small-file work 1.5x slower (465-501us per file to
-/// 764-786us). Frequent checkpointing was accidentally throttling the
-/// shipper; without it the shipper's other background work contends for
-/// the metadata connection that FUSE handlers also need. Until that
-/// contention is addressed, a floor trades latency for I/O rather than
-/// buying both, so it is opt-in.
-const CHECKPOINT_MIN_INTERVAL_S: u64 = 0;
+/// Publish a metadata commit after this many shipped segments (across all
+/// partitions), and unconditionally on shutdown. Plan 29 M0b retired the
+/// byte-proportional cadence and the whole-DB `VACUUM INTO` checkpoint it
+/// existed to size: a commit is a delta of changed keys, not a copy of the
+/// namespace, so a plain segment-count cadence is enough.
+const PUBLISH_EVERY: u64 = 32;
 
-fn checkpoint_min_interval() -> std::time::Duration {
-    std::time::Duration::from_secs(
-        std::env::var("CONSTELLATION_CHECKPOINT_MIN_INTERVAL_S")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(CHECKPOINT_MIN_INTERVAL_S),
-    )
-}
-
-/// Default checkpoint cadence ratio: fire once shipped-log bytes since the
-/// last checkpoint reach `ratio ×` the last snapshot's uncompressed size.
-/// At 1.0 the checkpoint write traffic is bounded at ~1 byte per byte of
-/// shipped log regardless of namespace size, replacing the count-only
-/// cadence that copied the whole DB every 32 segments (54 GiB written to
-/// protect a 0.17 GiB log on a 1.85M-file rsync — see plan 26).
-const CHECKPOINT_RATIO: f64 = 1.0;
-
-/// Env `CONSTELLATION_CHECKPOINT_RATIO`: shipped-log bytes ÷ last snapshot
-/// bytes to fire a checkpoint. Values `<= 0` (or unparseable) fall back to
-/// the default with a warning — a zero/negative ratio would checkpoint on
-/// every segment once a baseline exists, the very amplification this
-/// bounds. Read once at attach so a test can drive it without racing the
-/// process-global environment.
-fn checkpoint_ratio() -> f64 {
-    match std::env::var("CONSTELLATION_CHECKPOINT_RATIO") {
-        Ok(raw) => match raw.parse::<f64>() {
-            Ok(v) if v > 0.0 => v,
-            _ => {
-                tracing::warn!(
-                    value = %raw,
-                    "CONSTELLATION_CHECKPOINT_RATIO must be a positive number; \
-                     falling back to {CHECKPOINT_RATIO}"
-                );
-                CHECKPOINT_RATIO
-            }
-        },
-        Err(_) => CHECKPOINT_RATIO,
-    }
-}
-
-/// The segment count is a *floor*: never checkpoint below `CHECKPOINT_EVERY`
-/// shipped segments. Above it, a byte-proportional gate governs — fire once
-/// `bytes_since_ckpt >= ratio × last_ckpt_bytes` — so the whole-DB copy is
-/// paid for in proportion to the log it lets us truncate rather than on a
-/// fixed segment count. `last_ckpt_bytes == 0` (no baseline yet: a fresh
-/// mount, or a restart whose seed failed) leaves the count in sole charge,
-/// exactly as before this plan. `min_interval` only ever further delays a
-/// due checkpoint (opt-in, default off).
-fn checkpoint_is_due(
-    shipped_since_ckpt: u64,
-    bytes_since_ckpt: u64,
-    last_ckpt_bytes: u64,
-    ratio: f64,
-    since_last_ckpt: Option<std::time::Duration>,
-    min_interval: std::time::Duration,
-) -> bool {
-    if shipped_since_ckpt < CHECKPOINT_EVERY {
-        return false;
-    }
-    let bytes_ok =
-        last_ckpt_bytes == 0 || (bytes_since_ckpt as f64) >= ratio * (last_ckpt_bytes as f64);
-    if !bytes_ok {
-        return false;
-    }
-    match since_last_ckpt {
-        None => true,
-        Some(elapsed) => elapsed >= min_interval,
-    }
-}
 /// Max journal records per segment.
 const SEGMENT_BATCH: usize = 10_000;
 
@@ -202,27 +120,6 @@ const SEGMENT_MAX_BYTES: usize = 4 << 20;
 /// is byte-identical to its encoding inside the vector, so the sum of
 /// record lengths plus this is the payload size.
 const SEGMENT_ENVELOPE_SLACK: usize = 64;
-
-/// Env `CONSTELLATION_CHECKPOINT_SNAPSHOT=on` keeps writing the legacy
-/// `VACUUM INTO` checkpoint on a mount that publishes plan 28 commits.
-///
-/// Off by default: a commit is a complete state that a fresh replica
-/// bootstraps from (S6), log retention floors on the head commit's
-/// vector rather than the checkpoint's, and the O(DB) snapshot was the
-/// only reason the checkpoint cadence was expensive. The knob exists for
-/// a fleet that still has pre-plan-28 binaries bootstrapping from the
-/// same bucket. A mount without a publisher (read-only members, tests)
-/// always writes the snapshot, since it has no commit to offer instead.
-fn checkpoint_snapshot_forced() -> bool {
-    matches!(
-        std::env::var("CONSTELLATION_CHECKPOINT_SNAPSHOT")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "on" | "1" | "true"
-    )
-}
 
 /// Postcard envelope for a zstd-compressed S3 log segment. `v` is
 /// reserved so a future format bump can reject old readers without a
@@ -293,21 +190,8 @@ pub struct Shipper {
     lease_mode: LeaseMode,
     /// Per-partition stream state (next_seq, max_epoch, log handle).
     parts: HashMap<String, PartState>,
-    shipped_since_ckpt: u64,
-    /// Uncompressed bytes of log shipped since the last checkpoint. Drives
-    /// the byte-proportional cadence gate (plan 26 Step 1).
-    bytes_since_ckpt: u64,
-    /// Uncompressed size of the last checkpoint's snapshot; the cadence
-    /// baseline. Seeded from `LATEST` across restarts
-    /// ([`Shipper::seed_checkpoint_baseline`]); `0` means "no baseline
-    /// yet", leaving the segment count in sole charge of the first one.
-    last_ckpt_bytes: u64,
-    /// Checkpoint cadence ratio, resolved once at attach (see
-    /// [`checkpoint_ratio`]).
-    ckpt_ratio: f64,
-    /// When the last checkpoint finished; `None` until the first one.
-    /// Enforces `checkpoint_min_interval` against the segment counter.
-    last_ckpt_at: Option<Instant>,
+    /// Segments shipped since the last publish; drives [`PUBLISH_EVERY`].
+    shipped_since_publish: u64,
     /// Continuation epoch: journal locally, do not CAS-create segments.
     skip_ship: Arc<std::sync::atomic::AtomicBool>,
     /// Live spool observability shared with the control API.
@@ -331,9 +215,10 @@ pub struct Shipper {
     designations: Option<std::sync::Arc<crate::designation::DesignationManager>>,
     /// Plan 28 §11: the `mtree` publisher, when one is wired up.
     ///
-    /// `None` for most tests and for a read-only member, which keep the
-    /// legacy checkpoint; the daemon turns it on in `node_runtime` once
-    /// the node cache exists.
+    /// `None` for most tests and for a read-only member, which publishes
+    /// nothing (it ships no segments, so it has no authority to commit
+    /// one) and instead bootstraps from commits published by writers; the
+    /// daemon turns this on in `node_runtime` once the node cache exists.
     ///
     /// Behind an async mutex because a publish runs as its own spawned
     /// task: the daemon's sync loop drops a running round whenever an
@@ -403,11 +288,7 @@ impl Shipper {
             node_id,
             lease_mode,
             parts,
-            shipped_since_ckpt: 0,
-            bytes_since_ckpt: 0,
-            last_ckpt_bytes: 0,
-            ckpt_ratio: checkpoint_ratio(),
-            last_ckpt_at: None,
+            shipped_since_publish: 0,
             skip_ship: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             spool: Arc::new(std::sync::Mutex::new(SpoolInfo {
                 head_seq: head,
@@ -529,32 +410,6 @@ impl Shipper {
     #[cfg(test)]
     pub fn tree_published(&self) -> Option<(constellation_mtree::NodeHash, u64)> {
         self.publisher.as_ref()?.try_lock().ok()?.published()
-    }
-
-    /// Seed the byte-proportional cadence baseline from the checkpoint that
-    /// already exists in S3, so the first checkpoint after a restart fires
-    /// on bytes shipped rather than on the segment count alone.
-    ///
-    /// Best effort: `attach_with_mode` is sync and has no runtime, so this
-    /// is a separate async step run right after attach. A missing `LATEST`
-    /// or any read error leaves `last_ckpt_bytes = 0`, which means the
-    /// count trigger governs the first checkpoint — exactly the pre-plan-26
-    /// behaviour, so a failure here is never worse than not seeding.
-    pub async fn seed_checkpoint_baseline(&mut self) {
-        match self.log.get_checkpoint_ref().await {
-            Ok(Some(r)) => {
-                self.last_ckpt_bytes = r.bytes;
-                tracing::debug!(
-                    seq = r.seq,
-                    bytes = r.bytes,
-                    "seeded checkpoint cadence baseline from S3"
-                );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::debug!(error = %e, "checkpoint baseline seed failed; count trigger governs the first checkpoint");
-            }
-        }
     }
 
     pub fn log(&self) -> &LogStore {
@@ -1152,13 +1007,9 @@ impl Shipper {
             spool.head_seq = spool.head_seq.max(next_seq);
             spool.last_error = None;
         }
-        self.shipped_since_ckpt += 1;
-        // `payload` is the uncompressed postcard envelope, consistent with
-        // `snap.len()` (also uncompressed) as the baseline it is compared
-        // against in the cadence gate.
-        self.bytes_since_ckpt += payload.len() as u64;
-        if self.checkpoint_is_due() {
-            self.checkpoint().await?;
+        self.shipped_since_publish += 1;
+        if self.publish_is_due() {
+            self.publish().await?;
         }
         Ok(true)
     }
@@ -1284,91 +1135,35 @@ impl Shipper {
         }
     }
 
-    /// Enough segments shipped *and* enough time elapsed. Shutdown and
-    /// explicit sync paths bypass this and checkpoint unconditionally.
-    fn checkpoint_is_due(&self) -> bool {
-        checkpoint_is_due(
-            self.shipped_since_ckpt,
-            self.bytes_since_ckpt,
-            self.last_ckpt_bytes,
-            self.ckpt_ratio,
-            self.last_ckpt_at.map(|at| at.elapsed()),
-            checkpoint_min_interval(),
-        )
+    /// Enough segments shipped since the last publish. Shutdown and
+    /// explicit sync paths bypass this and publish unconditionally.
+    fn publish_is_due(&self) -> bool {
+        self.shipped_since_publish >= PUBLISH_EVERY
     }
 
-    /// Snapshot the local DB as a checkpoint covering every partition
-    /// this replica has seen, plus a VECTOR.json sidecar.
-    pub async fn checkpoint(&mut self) -> Result<()> {
-        // The cadence counters are reset *before* the work, not after it.
+    /// Publish the pending metadata tree edits as a commit (see
+    /// [`Shipper::publish_tree`]). A mount with no publisher (a read-only
+    /// member, or most tests) has nothing to publish and this is a no-op.
+    pub async fn publish(&mut self) -> Result<()> {
+        // The cadence counter is reset *before* the work, not after it.
         // The daemon's sync loop drops a running round whenever an
         // explicit request arrives (a write-through close sends one), so
-        // this future can be cancelled at any await below. Resetting
-        // only on success meant a cancelled checkpoint stayed due and
-        // was retried on every following segment, each attempt leaving
-        // an orphaned snapshot body before the inline prune could run:
-        // `ckpt-bulk-ingest-bounded` found 30 surviving checkpoints. A
-        // cancelled checkpoint now simply waits for the next cadence.
-        self.shipped_since_ckpt = 0;
-        self.bytes_since_ckpt = 0;
-        self.last_ckpt_at = Some(Instant::now());
-        if self.publisher.is_some() && !checkpoint_snapshot_forced() {
-            // Plan 28: the commit *is* the checkpoint. Same cadence and
-            // the same counters, so the publish rate is what the
-            // snapshot rate used to be; there is simply no O(DB) copy.
-            self.publish_tree().await;
-            return Ok(());
-        }
-        let mut vector = CheckpointVector::default();
-        let mut covered = 0u64;
-        for (id, st) in &self.parts {
-            let seq = st.next_seq.saturating_sub(1);
-            vector.applied.insert(id.clone(), seq);
-            covered = covered.max(seq);
-        }
-        if covered == 0 {
-            return Ok(());
-        }
-        // Copying the DB takes tens of milliseconds on a large namespace, so
-        // it does not belong on a runtime worker. The copy, the upload, the
-        // pointer writes and the inline prune run as one *spawned* task:
-        // if the sync round awaiting it is dropped (see above), the task
-        // still finishes, so a checkpoint is never left half-written — a
-        // body with no pointer and no prune behind it.
-        let meta = Arc::clone(&self.meta);
-        let log = self.log.with_partition(PARTITION);
-        let parts = vector.applied.len();
-        let task = tokio::spawn(async move {
-            let started = Instant::now();
-            let snap = tokio::task::spawn_blocking(move || meta.snapshot())
-                .await
-                .context("checkpoint snapshot task")??;
-            let snapshot_ms = started.elapsed().as_millis();
-            log.put_checkpoint_with_vector(covered, &snap, &vector)
-                .await?;
-            tracing::info!(
-                seq = covered,
-                bytes = snap.len(),
-                parts,
-                snapshot_ms,
-                "wrote metadata checkpoint"
-            );
-            anyhow::Ok(snap.len() as u64)
-        });
-        // The freshly written snapshot is the new cadence baseline.
-        self.last_ckpt_bytes = task.await.context("checkpoint task")??;
-        // Forced snapshots (`CONSTELLATION_CHECKPOINT_SNAPSHOT`) still
-        // publish the commit alongside, so the chain never falls behind.
+        // this future can be cancelled at any await below; resetting only
+        // on success would leave a cancelled publish due on every
+        // following segment. A cancelled publish now simply waits for the
+        // next cadence — the publish itself runs in a spawned task
+        // ([`Shipper::publish_tree`]) and is cancellation-safe regardless.
+        self.shipped_since_publish = 0;
         self.publish_tree().await;
         Ok(())
     }
 
-    /// Final sync + checkpoint on clean unmount.
+    /// Final sync + publish on clean unmount.
     #[allow(dead_code)]
     pub async fn shutdown(&mut self, lease: &LeaseKeeper) -> Result<()> {
         self.sync(lease).await?;
-        if self.shipped_since_ckpt > 0 {
-            self.checkpoint().await?;
+        if self.shipped_since_publish > 0 {
+            self.publish().await?;
         }
         Ok(())
     }
@@ -1406,8 +1201,8 @@ impl Shipper {
                 break;
             }
         }
-        if self.shipped_since_ckpt > 0 {
-            self.checkpoint().await?;
+        if self.shipped_since_publish > 0 {
+            self.publish().await?;
         }
         if initial > 0 {
             tracing::info!(shipped = initial, "journal ship complete");
@@ -1620,40 +1415,10 @@ pub fn new_keeper(
     LeaseKeeper::new(LeaseStore::new(store, part, mode), node_id)
 }
 
-/// Build a fresh local replica from S3: latest checkpoint (if any) plus
-/// replay of newer segments. Used when the state dir has no metadata DB.
-///
-/// Where a fresh replica comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BootstrapSource {
-    /// The commit chain's head when there is one, else the checkpoint.
-    Auto,
-    /// The legacy `VACUUM INTO` checkpoint only.
-    Checkpoint,
-}
-
-/// Env `CONSTELLATION_BOOTSTRAP_SOURCE`: `auto` (default) restores the
-/// newest plan 28 commit and falls back to the checkpoint when the chain
-/// is empty; `checkpoint` forces the legacy path, which exists for
-/// buckets written before plan 28 and as an escape hatch while commits
-/// are new.
-fn bootstrap_source() -> BootstrapSource {
-    match std::env::var("CONSTELLATION_BOOTSTRAP_SOURCE").as_deref() {
-        Ok("checkpoint") => BootstrapSource::Checkpoint,
-        Ok("auto") | Ok("") | Err(_) => BootstrapSource::Auto,
-        Ok(other) => {
-            tracing::warn!(
-                value = other,
-                "CONSTELLATION_BOOTSTRAP_SOURCE must be auto or checkpoint; using auto"
-            );
-            BootstrapSource::Auto
-        }
-    }
-}
-
 /// Plan 28 S6: rebuild the replica from the commit chain's head, then
 /// tail the log from the commit's `applied` position. `false` when the
-/// chain is empty, so the caller falls back to the checkpoint.
+/// chain is empty (a fresh filesystem with no commit yet), so the caller
+/// falls back to a genesis replay of the whole log.
 ///
 /// A half-written replica is removed on failure, so the fallback (or a
 /// retry) starts from nothing rather than from a partial load.
@@ -1709,16 +1474,15 @@ fn remove_db(db_path: &std::path::Path) {
 }
 
 /// Apply `part`'s contiguous log run after `start` and record where it
-/// stopped. Shared by both bootstrap sources.
+/// stopped. Shared by both bootstrap paths (from a commit, and genesis).
 async fn replay_from(meta: &SqliteMeta, log: &LogStore, part: &str, start: u64) -> Result<usize> {
     let part_log = log.with_partition(part);
     let mut applied = start;
     let mut replayed = 0usize;
     let seqs = part_log.list_segments_from(start + 1).await?;
-    // A first segment past `start + 1` means retention already pruned
-    // the records this base needs — e.g. a stale legacy checkpoint once
-    // retention floors on the commit chain instead. Stopping at the gap
-    // would hand back a replica silently missing that history.
+    // A first segment past `start + 1` means retention already pruned the
+    // records this base needs. Stopping at the gap would hand back a
+    // replica silently missing that history, so this must fail loudly.
     if let Some(&first) = seqs.first() {
         if first > start + 1 {
             bail!(
@@ -1741,37 +1505,30 @@ async fn replay_from(meta: &SqliteMeta, log: &LogStore, part: &str, start: u64) 
     Ok(replayed)
 }
 
-/// The checkpoint is a whole-DB snapshot; `checkpoints/VECTOR.json`
-/// records the applied_seq at snapshot time. Bootstrap restores the
-/// snapshot and then tails the log from that position.
+/// Build a fresh local replica from S3. Used when the state dir has no
+/// metadata DB: a fresh mount, or a read-only member, which bootstraps
+/// from commits published by writers exactly like everyone else.
+///
+/// Plan 29 M0b retired the whole-DB `VACUUM INTO` checkpoint: the source
+/// is the commit chain's head when one exists (restore the tree, then
+/// replay the log from its `applied` position), or — a genuinely fresh
+/// filesystem with no commit yet — a replay of the whole log from seq 1.
 pub async fn bootstrap(db_path: &std::path::Path, log: &LogStore) -> Result<()> {
-    if bootstrap_source() != BootstrapSource::Checkpoint
-        && bootstrap_from_tree(db_path, log).await?
-    {
+    if bootstrap_from_tree(db_path, log).await? {
         return Ok(());
     }
-    let from_seq = match log.get_latest_checkpoint().await? {
-        Some((seq, snapshot)) => {
-            std::fs::write(db_path, &snapshot).context("writing checkpoint snapshot")?;
-            tracing::info!(seq, "restored metadata checkpoint");
-            seq
-        }
-        None => 0,
-    };
-    let vector = log.get_checkpoint_vector().await?;
     let meta = SqliteMeta::open(db_path)?;
-    let start = vector.applied.get(PARTITION).copied().unwrap_or(from_seq);
-    let replayed = replay_from(&meta, log, PARTITION, start).await?;
+    let replayed = replay_from(&meta, log, PARTITION, 0).await?;
     for ino in meta.orphans()? {
         meta.reap_orphan(ino)?;
     }
-    // Plan 25: a brand-new replica has never written local content. Any
-    // `pending_upload` rows inherited from a (possibly poisoned) cluster
-    // checkpoint are another node's obligation — foreign replay never
-    // inserts into that table, so a single post-replay clear is enough.
+    // Plan 25: a brand-new replica has never written local content, so any
+    // `pending_upload` row would be another node's obligation — foreign
+    // replay never inserts into that table, so this is normally a no-op;
+    // it stays as a defensive clear after bootstrap.
     meta.clear_pending_uploads()
         .context("clearing inherited pending_upload rows after bootstrap")?;
-    tracing::info!(from_seq, replayed, "bootstrapped metadata replica");
+    tracing::info!(replayed, "bootstrapped metadata replica from genesis");
     Ok(())
 }
 
@@ -1789,7 +1546,6 @@ mod tests {
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
     use std::sync::Arc as StdArc;
-    use std::time::Duration;
 
     struct Node {
         meta: Arc<SqliteMeta>,
@@ -1797,72 +1553,18 @@ mod tests {
         lease: LeaseKeeper,
     }
 
-    /// Checkpointing every 32 shipped segments fires roughly every 100ms
-    /// under small-file writes, and each one copies the whole metadata DB.
-    /// The interval floor exists to space that out, but it costs
-    /// single-threaded latency (see `CHECKPOINT_MIN_INTERVAL_S`), so the
-    /// default must leave the segment count in sole charge.
+    /// The publish cadence is a plain segment count: below `PUBLISH_EVERY`
+    /// nothing is due, and at or above it a publish fires.
     #[test]
-    fn checkpoint_trigger_is_segment_count_until_a_floor_is_set() {
-        let none = Duration::from_secs(CHECKPOINT_MIN_INTERVAL_S);
-        assert_eq!(none, Duration::ZERO, "the floor must default to off");
-
-        // With no byte baseline (`last_ckpt_bytes == 0`) the byte gate is
-        // inert and the segment count is in sole charge, exactly as before
-        // plan 26. `bytes_since` and `ratio` must not matter here.
-        let due = |shipped, since| checkpoint_is_due(shipped, 0, 0, 1.0, since, none);
-
-        // Below the segment count, nothing triggers a checkpoint.
-        assert!(!due(CHECKPOINT_EVERY - 1, None));
-        assert!(!due(CHECKPOINT_EVERY - 1, Some(Duration::from_secs(3600))));
-
-        // At the count, the default fires regardless of recency.
-        assert!(due(CHECKPOINT_EVERY, None));
-        assert!(due(CHECKPOINT_EVERY, Some(Duration::ZERO)));
-
-        // A configured floor delays it, and only until the gap is met.
-        let floor = Duration::from_secs(60);
-        assert!(!checkpoint_is_due(
-            CHECKPOINT_EVERY,
-            0,
-            0,
-            1.0,
-            Some(Duration::from_secs(59)),
-            floor
-        ));
-        assert!(checkpoint_is_due(
-            CHECKPOINT_EVERY,
-            0,
-            0,
-            1.0,
-            Some(Duration::from_secs(60)),
-            floor
-        ));
-        // The first checkpoint of a mount has no gap to wait out.
-        assert!(checkpoint_is_due(CHECKPOINT_EVERY, 0, 0, 1.0, None, floor));
-    }
-
-    /// Once a baseline exists, the segment count is only a floor: the
-    /// checkpoint fires when shipped-log bytes reach `ratio ×` the last
-    /// snapshot size, so the whole-DB copy is paid for in proportion to
-    /// the log it lets us truncate.
-    #[test]
-    fn checkpoint_trigger_is_byte_proportional_once_seeded() {
-        let none = Duration::ZERO;
-        let baseline = 1_000_000u64;
-        let due =
-            |shipped, bytes, ratio| checkpoint_is_due(shipped, bytes, baseline, ratio, None, none);
-
-        // At the count but a byte short of ratio 1.0 → not yet.
-        assert!(!due(CHECKPOINT_EVERY, 999_999, 1.0));
-        // Exactly the baseline → fire.
-        assert!(due(CHECKPOINT_EVERY, 1_000_000, 1.0));
-        // A smaller ratio fires earlier (half the baseline).
-        assert!(due(CHECKPOINT_EVERY, 500_000, 0.5));
-        assert!(!due(CHECKPOINT_EVERY, 499_999, 0.5));
-        // The segment count remains a hard floor regardless of bytes: no
-        // checkpoint below it even with a mountain of bytes shipped.
-        assert!(!due(CHECKPOINT_EVERY - 1, 10_000_000, 1.0));
+    fn publish_is_due_at_the_segment_count() {
+        let store: StdArc<dyn ObjectStore> = StdArc::new(InMemory::new());
+        let mut ship = node_on(store, 1).ship;
+        ship.shipped_since_publish = PUBLISH_EVERY - 1;
+        assert!(!ship.publish_is_due());
+        ship.shipped_since_publish = PUBLISH_EVERY;
+        assert!(ship.publish_is_due());
+        ship.shipped_since_publish = PUBLISH_EVERY + 1;
+        assert!(ship.publish_is_due());
     }
 
     fn node(store: &StdArc<InMemory>, id: u64) -> Node {
@@ -2301,66 +2003,19 @@ mod tests {
         ls.try_swap(&expired, &tag).await.unwrap();
     }
 
-    /// A pre-plan-25 checkpoint that still embeds `pending_upload` must
-    /// not poison a fresh bootstrap (plan 25 step 2).
+    /// A genesis bootstrap (no commit, no prior state) never inherits a
+    /// `pending_upload` obligation: nothing but a local write populates
+    /// that table, and replay never does (plan 25 step 2).
     #[tokio::test]
-    async fn bootstrap_clears_pending_from_poisoned_checkpoint() {
-        use constellation_fs_core::ChunkHash;
-        use rusqlite::Connection;
-
+    async fn bootstrap_from_genesis_has_no_pending_upload() {
         let dir = tempfile::tempdir().unwrap();
-        let writer_path = dir.path().join("writer.db");
-        let (ino, manifest) = {
-            let m = SqliteMeta::open(&writer_path).unwrap();
-            m.set_node_prefix(1).unwrap();
-            let f = m.create(1, "f", 0o644, 0, 0).unwrap();
-            let h = ChunkHash::of(b"poison-chunk");
-            m.set_manifest_dirty(f.ino, None, b"M", 1, &[h]).unwrap();
-            assert_eq!(m.pending_upload_count().unwrap(), 1);
-            (f.ino, m.manifest(f.ino).unwrap())
-        };
-        // Produce checkpoint bytes that still contain pending_upload
-        // (bypass `snapshot()`'s strip): VACUUM INTO a sibling file.
-        let poison_path = dir.path().join("poison.db");
-        {
-            let c = Connection::open(&writer_path).unwrap();
-            c.execute(
-                "VACUUM INTO ?1",
-                rusqlite::params![poison_path.to_string_lossy()],
-            )
-            .unwrap();
-        }
-        let poison = SqliteMeta::open(&poison_path).unwrap();
-        assert_eq!(poison.pending_upload_count().unwrap(), 1);
-        drop(poison);
-        // Re-VACUUM so the put_checkpoint payload is a single file with
-        // pending still present (no dangling WAL).
-        let payload_path = dir.path().join("payload.db");
-        {
-            let c = Connection::open(&poison_path).unwrap();
-            c.execute(
-                "VACUUM INTO ?1",
-                rusqlite::params![payload_path.to_string_lossy()],
-            )
-            .unwrap();
-        }
-        let payload = std::fs::read(&payload_path).unwrap();
-
         let store: StdArc<dyn ObjectStore> = StdArc::new(InMemory::new());
         let log = LogStore::new(store);
-        log.put_checkpoint(1, &payload).await.unwrap();
 
         let boot = dir.path().join("boot.db");
         bootstrap(&boot, &log).await.unwrap();
         let restored = SqliteMeta::open(&boot).unwrap();
-        assert_eq!(
-            restored.pending_upload_count().unwrap(),
-            0,
-            "bootstrap must clear inherited pending_upload"
-        );
-        let kept = restored.lookup(1, "f").unwrap().unwrap();
-        assert_eq!(kept.ino, ino);
-        assert_eq!(restored.manifest(ino).unwrap(), manifest);
+        assert_eq!(restored.pending_upload_count().unwrap(), 0);
     }
 
     /// An `InMemory` that records the prefix of every listing and the key
@@ -3020,11 +2675,7 @@ mod tests {
     }
 
     /// Plan 28 §11's wiring, end to end through the shipper: shipped
-    /// records reach the publisher, and a checkpoint publishes the
-    /// commit that will eventually replace it.
-    ///
-    /// No `VACUUM INTO` checkpoint is written once a publisher exists:
-    /// the commit replaces it (S6 bootstraps from it).
+    /// records reach the publisher, and `publish` commits the tree.
     /// Give `n` a plan 28 tree publisher over `store`. The returned
     /// directory holds its node cache and must outlive it.
     fn enable_publisher(n: &mut Node, store: &StdArc<InMemory>, id: u64) -> tempfile::TempDir {
@@ -3054,7 +2705,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_checkpoint_also_publishes_a_metadata_commit() {
+    async fn a_publish_commits_the_metadata_tree() {
         use constellation_store_s3::{CommitChain, SHARD0};
 
         let store = StdArc::new(InMemory::new());
@@ -3065,7 +2716,7 @@ mod tests {
         let d = a.meta.mkdir(1, "d", 0o755, 0, 0).unwrap();
         a.meta.create(d.ino, "f", 0o644, 0, 0).unwrap();
         a.sync().await;
-        a.ship.checkpoint().await.unwrap();
+        a.ship.publish().await.unwrap();
 
         let chain = CommitChain::new(backend);
         let head = chain.discover_head(0).await.unwrap().expect("a commit");
@@ -3074,27 +2725,23 @@ mod tests {
         assert!(commit.root(SHARD0).is_some());
         assert!(commit.agg.keys >= 6, "{:?}", commit.agg);
         assert_eq!(commit.agg.files, 1, "only regular files count (§P7)");
-        assert!(
-            a.ship.log().get_checkpoint_ref().await.unwrap().is_none(),
-            "a mount that publishes commits writes no snapshot checkpoint"
-        );
         assert!(a.ship.tree_published().is_some());
 
         // A second round with nothing new publishes nothing: an empty
         // changed set is not a commit.
-        a.ship.checkpoint().await.unwrap();
+        a.ship.publish().await.unwrap();
         assert_eq!(chain.discover_head(0).await.unwrap(), Some(1));
     }
 
     /// Plan 28 S6: a fresh replica restores the chain head and tails the
     /// log from the commit's vector, and ends up equal — table by table
     /// — to the replica that published it (plan 27's honest check that
-    /// builder and reader agree, kept). The checkpoint is deleted first,
-    /// so nothing but the commit chain can have produced the result.
+    /// builder and reader agree, kept). Every segment the commit covers
+    /// is deleted first, so nothing but the commit chain can have
+    /// produced the result.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fresh_replica_bootstraps_from_the_commit_chain() {
         use constellation_meta::{SetXattrMode, SnapshotRow};
-        use futures::TryStreamExt;
         use object_store::ObjectStoreExt;
 
         let store = StdArc::new(InMemory::new());
@@ -3133,30 +2780,14 @@ mod tests {
             })
             .unwrap();
         a.sync().await;
-        a.ship.checkpoint().await.unwrap();
+        a.ship.publish().await.unwrap();
 
         // Shipped after the commit: only the log tail carries these.
         a.meta.create(d.ino, "late", 0o644, 0, 0).unwrap();
         a.meta.unlink(d.ino, "s").unwrap();
         a.sync().await;
 
-        for path in store
-            .list(Some(&OPath::from("checkpoints")))
-            .map_ok(|meta| meta.location)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap()
-        {
-            store.delete(&path).await.unwrap();
-        }
-        assert!(a
-            .ship
-            .log()
-            .get_latest_checkpoint()
-            .await
-            .unwrap()
-            .is_none());
-        // And every segment the commit covers, as retention would: with
+        // Every segment the commit covers, as retention would: with
         // them gone, only the commit can supply the state before its
         // vector (the log alone would otherwise rebuild it from seq 1).
         let chain = constellation_store_s3::CommitChain::new(store.clone());

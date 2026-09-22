@@ -71,13 +71,13 @@ pub async fn run(
         &mut issues,
     )
     .await?;
-    check_metadata_objects(&store, logs, &meta, repair, &mut issues).await?;
+    check_metadata_objects(&store, logs, repair, &mut issues).await?;
     check_metadata_tree(logs, &meta, state_dir, &mut issues).await?;
     check_leases(&store, lease_mode, repair, force_release, &mut issues).await?;
     check_cache_cruft(state_dir, repair, &mut issues)?;
     check_gc_journal(&store, &meta, &mut issues).await?;
 
-    let orphan_report = gc::run(store, chunks, meta, lease_mode, true, !repair, None).await?;
+    let orphan_report = gc::run(store, chunks, meta, lease_mode, !repair, None).await?;
     for mark in orphan_report
         .candidates
         .iter()
@@ -182,7 +182,6 @@ async fn record_missing(
 async fn check_metadata_objects(
     store: &Arc<dyn ObjectStore>,
     logs: &LogStore,
-    meta: &SqliteMeta,
     repair: bool,
     issues: &mut Vec<FsckIssue>,
 ) -> Result<()> {
@@ -222,28 +221,6 @@ async fn check_metadata_objects(
                 unrepairable: false,
             });
         }
-    }
-    if logs.get_latest_checkpoint().await.is_err() {
-        let key = Path::from("checkpoints/p0/LATEST");
-        issues.push(FsckIssue {
-            class: "invalid_checkpoint".into(),
-            key: Some(key.to_string()),
-            detail: "latest checkpoint pointer or payload is invalid".into(),
-            repaired: if repair {
-                let vector = constellation_store_s3::CheckpointVector {
-                    applied: std::collections::BTreeMap::from([(
-                        constellation_store_s3::log::PARTITION.to_string(),
-                        meta.applied_seq()?,
-                    )]),
-                };
-                logs.put_checkpoint_with_vector(meta.applied_seq()?, &meta.snapshot()?, &vector)
-                    .await?;
-                true
-            } else {
-                false
-            },
-            unrepairable: false,
-        });
     }
     Ok(())
 }

@@ -263,10 +263,10 @@ pub const SCENARIOS: &[Scenario] = &[
         run: fresh_node_bootstrap,
     },
     Scenario {
-        name: "checkpoint-strips-pending-upload",
-        desc: "a mid-write-back commit (plan 28; formerly a checkpoint) must not give a fresh joiner the writer's pending_upload backlog",
+        name: "commit-strips-pending-upload",
+        desc: "a mid-write-back metadata commit must not give a fresh joiner the writer's pending_upload backlog",
         requires: &[],
-        run: checkpoint_strips_pending_upload,
+        run: commit_strips_pending_upload,
     },
     Scenario {
         name: "readahead",
@@ -441,12 +441,6 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 28 S7b: rewrite rounds with a metadata commit and a GC round each; the metadata pack footprint must plateau, and a fresh node still bootstraps",
         requires: &[],
         run: mtree_gc_plateau,
-    },
-    Scenario {
-        name: "ckpt-bulk-ingest-bounded",
-        desc: "plan 26: with legacy snapshots forced on, a bulk ingest leaves at most the newest 2 checkpoints, and a fresh node still bootstraps",
-        requires: &[],
-        run: ckpt_bulk_ingest_bounded,
     },
     Scenario {
         name: "idle-cluster-is-quiet",
@@ -946,7 +940,7 @@ fn gc_lifecycle(_seed: u64) -> Result<()> {
     std::fs::remove_file(client.mnt.join("tree/doomed"))?;
     std::fs::write(client.mnt.join("tree/live"), live)?;
 
-    let output = client.gc_run(false)?;
+    let output = client.gc_run()?;
     let gc_stdout = String::from_utf8_lossy(&output.stdout);
     anyhow::ensure!(
         output.status.success(),
@@ -993,7 +987,7 @@ fn gc_dedup_race(_seed: u64) -> Result<()> {
     let bytes = b"dedup-race-content";
     std::fs::write(client.mnt.join("old"), bytes)?;
     std::fs::remove_file(client.mnt.join("old"))?;
-    let child = client.gc_process(false)?;
+    let child = client.gc_process()?;
     eventually(
         "condemned pointer publication",
         Duration::from_secs(10),
@@ -2900,12 +2894,12 @@ fn fresh_node_bootstrap(seed: u64) -> Result<()> {
     c0.fs_create()?;
     c0.mount()?;
     wl.run_block(&c0.mnt, &mut model, 50)?;
-    // Clean unmount ships the journal tail and writes a checkpoint.
+    // Clean unmount ships the journal tail and publishes a commit.
     c0.unmount()?;
 
-    // Second epoch exercises the replay path past the checkpoint: ops
+    // Second epoch exercises the replay path past the commit: ops
     // ship on the 2 s ticker, then the daemon is SIGKILLed so no final
-    // checkpoint covers them.
+    // commit covers them.
     c0.mount()?;
     wl.run_block(&c0.mnt, &mut model, 40)?;
     std::thread::sleep(Duration::from_secs(5)); // >= 2 shipper ticks, journal drained
@@ -2932,51 +2926,63 @@ fn fresh_node_bootstrap(seed: u64) -> Result<()> {
     Ok(())
 }
 
-/// Mid-write-back checkpoints used to embed the writer's `pending_upload`
-/// table; a joiner then ERROR-looped trying to upload chunks it never had
-/// (plan 25). Crash the writer while pending > 0 and a checkpoint exists,
-/// then assert a fresh node bootstraps with pending == 0 and readable data.
-fn checkpoint_strips_pending_upload(seed: u64) -> Result<()> {
+/// Mid-write-back checkpoints (now commits) used to embed the writer's
+/// `pending_upload` table; a joiner then ERROR-looped trying to upload
+/// chunks it never had (plan 25). Crash the writer while pending > 0 and
+/// a commit exists, then assert a fresh node bootstraps with pending == 0
+/// and readable data.
+///
+/// `sync_one`'s ship loop drains the *entire* current journal backlog into
+/// one segment every time it runs (bounded only by `SEGMENT_BATCH`/
+/// `SEGMENT_MAX_BYTES`, both far above this scenario's 48 tiny records) —
+/// so a tight write loop that outruns the shipper's round trip produces
+/// one or two large segments, never 48 small ones, and the
+/// `PUBLISH_EVERY` (32) segment floor is never reached. A little added S3
+/// latency plus pacing the writes wider than one shipper round trip is
+/// what makes each close's `nudge_sync` land its own segment instead —
+/// the same latency also keeps the later files' chunk uploads (which
+/// cannot start before their file is written) pending past the point the
+/// mid-flight commit fires, which is the window the scenario needs.
+fn commit_strips_pending_upload(seed: u64) -> Result<()> {
     let (env, root) = setup("ckpt-pending")?;
-    let _proxy = env.s3_proxy()?;
+    let proxy = env.s3_proxy()?;
+    proxy.latency(80, 10)?;
     let prefix = format!("ckpt-pending-{}", ts());
     let backend = format!("s3://{BUCKET}/{prefix}");
     let mut a = Client::new(root.path(), "a", &env.endpoint, &backend)?.with_write_mode("back");
     a.fs_create()?;
     a.mount()?;
 
-    // > CHECKPOINT_EVERY (32) small files so a mid-flight checkpoint is
-    // due while write-back still has a pending queue.
+    // > PUBLISH_EVERY (32) small files, paced wider than one segment's
+    // round trip, so a mid-flight publish is due while write-back still
+    // has a pending queue (the not-yet-written later files' chunks).
     let mut expected = Vec::new();
     for i in 0..48u64 {
         let data = pattern(seed.wrapping_add(i), 4096);
         let name = format!("f{i:03}");
         std::fs::write(a.mnt.join(&name), &data)?;
         expected.push((name, data));
+        std::thread::sleep(Duration::from_millis(120));
     }
     eventually(
-        "mid-flight checkpoint while pending_uploads > 0",
+        "mid-flight commit while pending_uploads > 0",
         Duration::from_secs(90),
         || {
             let pending = a.control_status()?["writeback"]["pending_uploads"]
                 .as_u64()
                 .unwrap_or(0);
             anyhow::ensure!(pending > 0, "pending already drained ({pending})");
-            // Plan 28: the mid-flight bootstrap base is a commit now; a
-            // legacy checkpoint counts too, should snapshots be forced.
-            let n = count_checkpoint_objects(&env.direct_endpoint, &prefix)?
-                + count_commit_objects(&env.direct_endpoint, &prefix)?;
-            anyhow::ensure!(n > 0, "no commit or checkpoint object yet");
+            let n = count_commit_objects(&env.direct_endpoint, &prefix)?;
+            anyhow::ensure!(n > 0, "no commit object yet");
             Ok(())
         },
     )?;
-    // Crash before clean drain so S3's LATEST checkpoint is still the
+    // Crash before clean drain so S3's head commit is still the
     // mid-flight one (a clean unmount would drain pending first).
     a.kill9()?;
 
     let mut b = Client::new(root.path(), "b", &env.endpoint, &backend)?;
-    b.mount()
-        .context("fresh joiner after mid-flight checkpoint")?;
+    b.mount().context("fresh joiner after mid-flight commit")?;
     let status = b.control_status()?;
     anyhow::ensure!(
         status["writeback"]["pending_uploads"].as_u64() == Some(0),
@@ -3015,30 +3021,6 @@ fn checkpoint_strips_pending_upload(seed: u64) -> Result<()> {
 
 fn count_commit_objects(endpoint: &str, prefix: &str) -> Result<usize> {
     Ok(raw_objects(endpoint, &format!("{prefix}/commits/"))?.len())
-}
-
-fn count_checkpoint_objects(endpoint: &str, prefix: &str) -> Result<usize> {
-    let list_prefix = format!("{prefix}/checkpoints/");
-    let response = ureq::get(&format!(
-        "{endpoint}/{BUCKET}?list-type=2&prefix={list_prefix}"
-    ))
-    .call()
-    .context("listing checkpoint objects")?
-    .into_string()?;
-    let mut n = 0usize;
-    let mut rest = response.as_str();
-    while let Some(start) = rest.find("<Key>") {
-        rest = &rest[start + 5..];
-        let Some(end) = rest.find("</Key>") else {
-            break;
-        };
-        let key = &rest[..end];
-        if key.ends_with(".zst") {
-            n += 1;
-        }
-        rest = &rest[end + 6..];
-    }
-    Ok(n)
 }
 
 /// With 60 ms of injected S3 latency and a cold cache, a sequential
@@ -5316,16 +5298,6 @@ fn xml_field<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
     Some(&xml[start..end])
 }
 
-/// The `<seq>.zst` snapshots under `checkpoints/p0/`, oldest first.
-fn checkpoint_snapshots(endpoint: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
-    let mut out: Vec<(String, u64)> = raw_objects(endpoint, &format!("{prefix}/checkpoints/p0/"))?
-        .into_iter()
-        .filter(|(key, _)| key.ends_with(".zst"))
-        .collect();
-    out.sort();
-    Ok(out)
-}
-
 /// Segment sequence numbers present for one partition.
 fn log_segment_seqs(endpoint: &str, prefix: &str, part: &str) -> Result<Vec<u64>> {
     let mut seqs: Vec<u64> = raw_objects(endpoint, &format!("{prefix}/log/{part}/"))?
@@ -5416,7 +5388,7 @@ fn mtree_gc_plateau(seed: u64) -> Result<()> {
         let name = format!("/set@round{round}");
         a.snapshot_create(&name)?;
         a.snapshot_delete(&name)?;
-        let output = a.gc_run(false)?;
+        let output = a.gc_run()?;
         anyhow::ensure!(
             output.status.success(),
             "gc round {round} failed: {}{}",
@@ -5441,134 +5413,6 @@ fn mtree_gc_plateau(seed: u64) -> Result<()> {
     eventually(
         "fresh node matches the oracle",
         Duration::from_secs(60),
-        || model.verify(&b.mnt),
-    )?;
-    b.unmount()?;
-    Ok(())
-}
-
-/// Checkpoint cadence (plan 26 step 1) and inline compaction (step 2).
-///
-/// A checkpoint is a whole-DB copy, so its cost has to be proportional to
-/// the log it lets us truncate rather than to a segment count. Bulk
-/// ingest is where the old count-only cadence was worst: measured on a
-/// 1.85M-file rsync, 641 checkpoints totalling 54.55 GiB protected a
-/// 0.17 GiB log, and 639 of them were dead on arrival because GC is a
-/// daily backstop rather than a bound.
-///
-/// Ingest a seeded tree from one writer and then rewrite it a few times,
-/// so several checkpoints genuinely fire and the inline prune has
-/// something to prune. Assert the bucket holds at most the newest two
-/// snapshots, that their combined size is a small multiple of one
-/// snapshot, and — the part that makes the bound safe — that a brand-new
-/// node still bootstraps to the oracle's exact tree from what survived.
-///
-/// The rewrite passes are load-bearing, not padding. A pure ingest grows
-/// the replica and the log together, so the byte gate fires roughly
-/// logarithmically and one checkpoint covers the whole run; rewriting a
-/// fixed set of files grows the log at a constant DB size, which is the
-/// shape that actually produces back-to-back checkpoints. A brief pause
-/// between writes keeps the shipper from coalescing the whole workload
-/// into a handful of very large segments, which would never reach the
-/// `CHECKPOINT_EVERY` count floor.
-fn ckpt_bulk_ingest_bounded(seed: u64) -> Result<()> {
-    const FILES: usize = 200;
-    const REWRITES: usize = 40;
-    let (env, root) = setup("ckpt-bulk-ingest")?;
-    let _proxy = env.s3_proxy()?;
-    let prefix = format!("ckpt-ingest-{}", ts());
-    let backend = format!("s3://{BUCKET}/{prefix}");
-    // The legacy snapshot is off by default once plan 28 commits exist;
-    // this scenario is about bounding it, so force it on.
-    let mut a = Client::new(root.path(), "ingest-a", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_CHECKPOINT_SNAPSHOT", "on");
-    a.fs_create()?;
-    a.mount()?;
-
-    let mut model = Model::default();
-    std::fs::create_dir(a.mnt.join("ingest"))?;
-    model.mkdir(std::path::Path::new("ingest"));
-    // Every snapshot object ever observed, so the report can state what
-    // was *written* and not merely what survived the inline prune.
-    let mut ever: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let sample = |ever: &mut std::collections::BTreeMap<String, u64>| -> Result<()> {
-        for (key, size) in checkpoint_snapshots(&env.direct_endpoint, &prefix)? {
-            ever.insert(key, size);
-        }
-        Ok(())
-    };
-    let mut passes = 0usize;
-    for pass in 0..=REWRITES {
-        passes = pass + 1;
-        for i in 0..FILES {
-            let data = pattern(
-                seed.wrapping_add((pass * FILES + i) as u64),
-                512 + (i % 7) * 64,
-            );
-            let rel = format!("ingest/f{i:04}");
-            std::fs::write(a.mnt.join(&rel), &data)?;
-            model.write_file(std::path::Path::new(&rel), data);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        sample(&mut ever)?;
-        // Three checkpoints is what makes the newest-2 assertion mean
-        // something; how much log that takes depends on how large the
-        // replica compacts to, so drive the workload until it happens
-        // rather than guessing a pass count.
-        if ever.len() >= 3 {
-            break;
-        }
-    }
-    eventually("ingest ships", Duration::from_secs(180), || {
-        sample(&mut ever)?;
-        journal_drained(&a)
-    })?;
-    sample(&mut ever)?;
-
-    let remaining = checkpoint_snapshots(&env.direct_endpoint, &prefix)?;
-    let segments = log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?.len();
-    let newest = remaining.last().map(|(_, size)| *size).unwrap_or(0);
-    let remaining_bytes: u64 = remaining.iter().map(|(_, size)| *size).sum();
-    let written_bytes: u64 = ever.values().sum();
-    // What the count-only cadence would have left behind for the same
-    // ingest: one whole-DB copy every CHECKPOINT_EVERY (32) segments,
-    // none of them pruned until the daily GC tick.
-    let count_only = segments / 32;
-    let written_count = ever.len();
-    let count_only_bytes = count_only as u64 * newest;
-    eprintln!(
-        "    ckpt-bulk-ingest-bounded: {FILES} files x {} passes, {segments} segments; \
-         checkpoints written {written_count} ({written_bytes} B), \
-         remaining {} ({remaining_bytes} B), newest snapshot {newest} B; \
-         count-only cadence would have left ~{count_only} (~{count_only_bytes} B) un-pruned",
-        passes,
-        remaining.len()
-    );
-
-    // Without several checkpoints the newest-2 bound would be vacuous.
-    anyhow::ensure!(
-        written_count >= 3,
-        "only {written_count} checkpoint(s) fired over {segments} segments; \
-         the newest-2 assertion below would prove nothing"
-    );
-    anyhow::ensure!(
-        remaining.len() <= 2,
-        "inline compaction must keep at most the newest 2 checkpoints, found {}: {remaining:?}",
-        remaining.len()
-    );
-    anyhow::ensure!(
-        remaining_bytes <= 3 * newest,
-        "checkpoint footprint {remaining_bytes} B exceeds 3x the final snapshot ({newest} B)"
-    );
-    // Pruning is only safe if what is left is still a complete license to
-    // rebuild: a fresh node must reach the oracle from the bucket alone.
-    a.unmount()?;
-    let mut b = Client::new(root.path(), "ingest-b", &env.endpoint, &backend)?;
-    b.mount()
-        .context("fresh bootstrap after inline compaction")?;
-    eventually(
-        "fresh node matches the oracle",
-        Duration::from_secs(120),
         || model.verify(&b.mnt),
     )?;
     b.unmount()?;

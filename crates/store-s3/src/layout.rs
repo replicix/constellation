@@ -23,10 +23,6 @@ pub fn log_prefix(partition: &str) -> Path {
     Path::from(format!("log/{partition}"))
 }
 
-pub fn checkpoint(partition: &str, txid: u64) -> Path {
-    Path::from(format!("checkpoints/{partition}/{txid:016x}.zst"))
-}
-
 /// `packs/<hex>`: a sealed concatenation of zstd'd metadata nodes
 /// (plan 28 §P8). Flat, not sharded like `chunks/`: a pack is 1–16 MiB
 /// where a chunk is ~1 MiB of *one* object, so a census-scale bucket

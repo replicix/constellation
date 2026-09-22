@@ -16,15 +16,15 @@
 //! resumes tailing the log from the commit's [`Commit::applied`]
 //! position, exactly where a checkpoint's `VECTOR.json` used to put it.
 //!
-//! Three things a checkpoint carried and a commit deliberately does not:
+//! One thing a checkpoint carried and a commit deliberately does not:
 //!
 //! - **atime.** §P6 keeps it out of the tree, so a bootstrapped inode's
 //!   atime starts at its mtime. atime is node-local and best-effort
 //!   everywhere else too.
-//! - **`deref`.** The deferred-dereference table only makes chunk GC
-//!   *faster*: a replica that never saw a dereference misses some
-//!   candidates, and the orphan LIST pass collects those later. Nothing
-//!   becomes unsafe.
+//!
+//! (Plan 29 M0c removed the `deref` table entirely: chunk GC candidates
+//! come from the orphan LIST pass alone, so a bootstrapped replica never
+//! needing dereference history is no longer a special case.)
 //! ## The partial replica
 //!
 //! [`TreeReader`] answers FUSE's metadata questions — `lookup`,
@@ -597,7 +597,8 @@ impl ChainReader {
 }
 
 /// Load the chain head into a fresh replica at `meta`. `None` when the
-/// chain is empty and the caller should fall back to a checkpoint.
+/// chain is empty (a fresh filesystem) and the caller should fall back to
+/// a genesis replay of the whole log.
 ///
 /// The caller owns tailing: it resumes the log from the returned
 /// commit's `applied` position.

@@ -1,24 +1,25 @@
 //! Coordinated bucket garbage collection (DESIGN.md §14).
 //!
-//! Ordinary candidates come from SQLite's continuously maintained `deref`
-//! index. Only the explicit orphan pass lists `chunks/`. Before any chunk
-//! DELETE this module CAS-publishes the complete condemned set and waits a
-//! lease TTL; writers independently treat those hashes as dedup misses.
+//! Chunk candidates come from a single LIST-based orphan pass over
+//! `chunks/` (plan 29 M0c retired the `deref` index this used to share the
+//! job with — see `store-s3::mark`'s module doc for why the reachability
+//! walk from commit roots makes it unnecessary). Before any chunk DELETE
+//! this module CAS-publishes the complete condemned set and waits a lease
+//! TTL; writers independently treat those hashes as dedup misses.
 
 use anyhow::Result;
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::ChunkHash;
 use constellation_meta::SqliteMeta;
 use constellation_store_s3::{
-    append_journal, publish_condemned, read_condemned, DesignationMode, DesignationStore,
-    GcJournalEntry, LeaseMode, SnapshotStore,
+    append_journal, publish_condemned, read_condemned, GcJournalEntry, LeaseMode, SnapshotStore,
 };
 use futures::TryStreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use serde::Serialize;
 use serde_json::json;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub const DEFAULT_GC_INTERVAL_S: u64 = 86_400;
@@ -77,23 +78,13 @@ pub async fn run(
     chunks: Arc<constellation_store_s3::ChunkStore>,
     meta: Arc<SqliteMeta>,
     lease_mode: LeaseMode,
-    orphans: bool,
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
 ) -> Result<GcReport> {
     let config = GcConfig::from_env();
     let lease =
         crate::singleton::SingletonLease::acquire(object_store.clone(), "_gc", lease_mode).await?;
-    let result = run_held(
-        object_store,
-        chunks,
-        meta,
-        &config,
-        orphans,
-        verify_only,
-        peers,
-    )
-    .await;
+    let result = run_held(object_store, chunks, meta, &config, verify_only, peers).await;
     lease.release().await;
     result
 }
@@ -103,7 +94,6 @@ async fn run_held(
     chunks: Arc<constellation_store_s3::ChunkStore>,
     meta: Arc<SqliteMeta>,
     config: &GcConfig,
-    orphans: bool,
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
 ) -> Result<GcReport> {
@@ -114,7 +104,6 @@ async fn run_held(
         chunks.clone(),
         meta.clone(),
         config,
-        orphans,
         verify_only,
         peers,
     )
@@ -127,12 +116,17 @@ async fn run_held(
     Ok(report)
 }
 
+/// Chunk candidates come from a single pass: LIST `chunks/` and mark
+/// anything older than the horizon that is not in the protected set (live
+/// manifests of the replica, snapshot roots, holds, or already condemned).
+/// Plan 28 §P10 retired the `deref` index and its per-replica bookkeeping —
+/// any node, or an external job with bucket credentials, can GC by reading
+/// roots, so this LIST-based orphan pass is the only candidate source now.
 async fn run_chunks(
     store: Arc<dyn ObjectStore>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
     meta: Arc<SqliteMeta>,
     config: &GcConfig,
-    orphans: bool,
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
 ) -> Result<GcReport> {
@@ -140,11 +134,6 @@ async fn run_chunks(
     let live = live_roots(&chunks, &meta).await?;
     let snapshots = snapshot_roots(&chunks, store.clone()).await?;
     let holds = hold_roots(store.clone(), now).await?;
-    let active_designation = DesignationStore::new(store.clone(), DesignationMode::Cas)
-        .list_all()
-        .await?
-        .into_iter()
-        .any(|designation| !designation.released);
     let protected: HashSet<_> = live
         .iter()
         .chain(snapshots.iter())
@@ -152,43 +141,28 @@ async fn run_chunks(
         .copied()
         .collect();
 
+    let condemned: HashSet<_> = read_condemned(&store)
+        .await?
+        .into_iter()
+        .flat_map(|list| list.hashes)
+        .filter_map(|value| ChunkHash::from_hex(&value))
+        .collect();
+    let known: HashSet<_> = protected.iter().chain(condemned.iter()).copied().collect();
     let mut candidates = Vec::new();
-    if !active_designation {
-        for (hash, seq, at) in meta.deref_candidates(now - config.horizon_ms)? {
-            if !protected.contains(&hash) {
-                candidates.push(Mark {
-                    key: constellation_store_s3::layout::chunk_key(&hash).to_string(),
-                    rule: "deref-horizon".into(),
-                    evidence: json!({"deref_seq":seq,"deref_unix_ms":at,"horizon_ms":config.horizon_ms}),
-                    hash: Some(hash),
-                });
-            }
-        }
-    }
-
-    if orphans {
-        let condemned: HashSet<_> = read_condemned(&store)
-            .await?
-            .into_iter()
-            .flat_map(|list| list.hashes)
-            .filter_map(|value| ChunkHash::from_hex(&value))
-            .collect();
-        let known: HashSet<_> = protected.iter().chain(condemned.iter()).copied().collect();
-        let prefix = Path::from("chunks");
-        for object in store.list(Some(&prefix)).try_collect::<Vec<_>>().await? {
-            let Some(hash) = object.location.filename().and_then(ChunkHash::from_hex) else {
-                continue;
-            };
-            if !known.contains(&hash)
-                && object.last_modified.timestamp_millis() <= now - config.horizon_ms
-            {
-                candidates.push(Mark {
-                    key: object.location.to_string(),
-                    rule: "orphan-horizon".into(),
-                    evidence: json!({"last_modified_ms":object.last_modified.timestamp_millis(),"horizon_ms":config.horizon_ms}),
-                    hash: Some(hash),
-                });
-            }
+    let prefix = Path::from("chunks");
+    for object in store.list(Some(&prefix)).try_collect::<Vec<_>>().await? {
+        let Some(hash) = object.location.filename().and_then(ChunkHash::from_hex) else {
+            continue;
+        };
+        if !known.contains(&hash)
+            && object.last_modified.timestamp_millis() <= now - config.horizon_ms
+        {
+            candidates.push(Mark {
+                key: object.location.to_string(),
+                rule: "orphan-horizon".into(),
+                evidence: json!({"last_modified_ms":object.last_modified.timestamp_millis(),"horizon_ms":config.horizon_ms}),
+                hash: Some(hash),
+            });
         }
     }
     candidates.extend(metadata_candidates(&store, chunks.e2e_keys(), config).await?);
@@ -224,17 +198,8 @@ async fn run_chunks(
             if refreshed_live.contains(&hash) || refreshed_snaps.contains(&hash) {
                 continue;
             }
-            if mark.rule == "deref-horizon"
-                && !meta
-                    .deref_candidates(now - config.horizon_ms)?
-                    .iter()
-                    .any(|(candidate, _, _)| *candidate == hash)
-            {
-                continue;
-            }
             if store.head(&Path::from(mark.key.clone())).await.is_err() {
-                meta.clear_deref(&hash)?;
-                continue;
+                continue; // a concurrent pass already removed it
             }
         }
         store.delete(&Path::from(mark.key.clone())).await?;
@@ -248,9 +213,6 @@ async fn run_chunks(
             },
         )
         .await?;
-        if let Some(hash) = mark.hash {
-            meta.clear_deref(&hash)?;
-        }
         deleted.push(mark.key.clone());
     }
     Ok(GcReport {
@@ -372,162 +334,53 @@ fn collect_hash_strings(value: &serde_json::Value, out: &mut HashSet<ChunkHash>)
     }
 }
 
-/// The pre-plan-28 floor: `checkpoints/VECTOR.json`, when a checkpoint
-/// exists at all.
-async fn legacy_checkpoint_vector(
-    store: &Arc<dyn ObjectStore>,
-) -> Result<
-    Option<(
-        constellation_store_s3::log::CheckpointVector,
-        serde_json::Value,
-    )>,
-> {
-    let latest = match store.get(&Path::from("checkpoints/p0/LATEST")).await {
-        Ok(result) => {
-            serde_json::from_slice::<constellation_store_s3::log::CheckpointRef>(
-                &result.bytes().await?,
-            )?
-            .seq
-        }
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    // Log retention is per partition, floored against VECTOR.json's
-    // applied_seq for that partition — never against the max seq across
-    // all partitions. A checkpoint's `covered` is the maximum over every
-    // stream, so a child partition that is far behind p0 would otherwise
-    // have live segments deleted out from under a bootstrap that has only
-    // replayed it to `applied[child]` (the finding-6 data-loss bug). A
-    // `LATEST` pointer with no vector is a corrupt bucket: we have no
-    // per-partition floor to apply, so we refuse rather than fall back to
-    // the global floor. (Read the object directly rather than via
-    // `get_checkpoint_vector`, which maps a missing vector to an empty one
-    // and would hide exactly this corruption.)
-    let vector = match store.get(&Path::from("checkpoints/VECTOR.json")).await {
-        Ok(result) => serde_json::from_slice::<constellation_store_s3::log::CheckpointVector>(
-            &result.bytes().await?,
-        )?,
-        Err(object_store::Error::NotFound { .. }) => anyhow::bail!(
-            "checkpoints/p0/LATEST names seq {latest} but checkpoints/VECTOR.json is \
-             missing; refusing to prune the log against a global floor"
-        ),
-        Err(error) => return Err(error.into()),
-    };
-    Ok(Some((vector, json!({"checkpoint": latest}))))
-}
-
+/// Log segment retention. The floor is the position a fresh replica resumes
+/// tailing from: the commit chain's head `applied` position (plan 28 S6
+/// bootstraps from the head, replaying the log from there). With no commit
+/// yet, there is nothing to floor retention against — a fresh filesystem's
+/// log is the only copy of its history — so nothing is pruned. A bootstrap
+/// whose base the log was pruned past refuses rather than silently
+/// stopping at the gap (`shipper::replay_from`).
 async fn metadata_candidates(
     store: &Arc<dyn ObjectStore>,
     keys: Option<&constellation_store_s3::SharedE2eKeys>,
     config: &GcConfig,
 ) -> Result<Vec<Mark>> {
-    let mut marks = Vec::new();
-    // The floor is the position a fresh replica resumes tailing from.
-    // Once the commit chain exists that is the head commit's `applied`
-    // vector (plan 28 S6 bootstraps from the head), and the legacy
-    // checkpoint — no longer written by default — stops mattering; a
-    // forced checkpoint bootstrap over a pruned log refuses rather than
-    // silently stopping at the gap (`shipper::replay_from`).
     let chain = constellation_store_s3::CommitChain::new(store.clone())
         .with_sealing(constellation_store_s3::TreeSealing::for_keys(keys));
     let head = match chain.discover_head(0).await? {
         Some(seq) => chain.get(seq).await?,
         None => None,
     };
-    let floor_source = match head {
-        Some(commit) => Some((
-            constellation_store_s3::log::CheckpointVector {
-                applied: BTreeMap::from([(
-                    constellation_store_s3::log::PARTITION.to_string(),
-                    commit.applied,
-                )]),
-            },
-            json!({"commit": commit.seq}),
-        )),
-        None => legacy_checkpoint_vector(store).await?,
+    let Some(commit) = head else {
+        return Ok(Vec::new());
     };
-    if let Some((vector, source)) = floor_source {
-        for object in store
-            .list(Some(&Path::from("log")))
-            .try_collect::<Vec<_>>()
-            .await?
-        {
-            // Segments are `log/<part>/<seq:016x>.zst`; `parts()[1]` is the
-            // partition and the filename stem is the sequence. The `sealed`
-            // marker has no `.zst` suffix and drops out here.
-            let parts: Vec<_> = object
-                .location
-                .parts()
-                .map(|part| part.as_ref().to_string())
-                .collect();
-            let Some(partition) = parts.get(1) else {
-                continue;
-            };
-            let Some(seq) = object
-                .location
-                .filename()
-                .and_then(|name| name.strip_suffix(".zst"))
-                .and_then(|name| u64::from_str_radix(name, 16).ok())
-            else {
-                continue;
-            };
-            // A partition absent from the vector is not covered by the
-            // snapshot yet: pruning any of its segments would truncate a
-            // stream the checkpoint cannot replace.
-            let Some(applied) = vector.applied.get(partition).copied() else {
-                continue;
-            };
-            let floor = applied.saturating_sub(config.retention_segments);
-            if seq < floor {
-                marks.push(Mark {
-                    key: object.location.to_string(),
-                    rule: "log-retention".into(),
-                    evidence: json!({
-                        "partition": partition,
-                        "vector_applied": applied,
-                        "retention_segments": config.retention_segments,
-                        "floor_source": source,
-                    }),
-                    hash: None,
-                });
-            }
-        }
-    }
-    let mut by_partition: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
+    let floor = commit.applied.saturating_sub(config.retention_segments);
+    let mut marks = Vec::new();
     for object in store
-        .list(Some(&Path::from("checkpoints")))
+        .list(Some(&Path::from("log")))
         .try_collect::<Vec<_>>()
         .await?
     {
-        let parts: Vec<_> = object
-            .location
-            .parts()
-            .map(|part| part.as_ref().to_string())
-            .collect();
-        let Some(name) = object
+        // Segments are `log/p0/<seq:016x>.zst`; the `sealed` marker has no
+        // `.zst` suffix and drops out here.
+        let Some(seq) = object
             .location
             .filename()
             .and_then(|name| name.strip_suffix(".zst"))
+            .and_then(|name| u64::from_str_radix(name, 16).ok())
         else {
             continue;
         };
-        if parts.len() >= 3 {
-            if let Ok(seq) = u64::from_str_radix(name, 16) {
-                by_partition
-                    .entry(parts[1].clone())
-                    .or_default()
-                    .push((seq, object.location.to_string()));
-            }
-        }
-    }
-    for checkpoints in by_partition.values_mut() {
-        checkpoints.sort_by_key(|(seq, _)| *seq);
-        let remove = checkpoints.len().saturating_sub(2);
-        for (seq, key) in checkpoints.iter().take(remove) {
+        if seq < floor {
             marks.push(Mark {
-                key: key.clone(),
-                rule: "superseded-checkpoint".into(),
-                evidence: json!({"checkpoint_seq":seq,"kept_newest":2}),
+                key: object.location.to_string(),
+                rule: "log-retention".into(),
+                evidence: json!({
+                    "applied": commit.applied,
+                    "retention_segments": config.retention_segments,
+                    "commit": commit.seq,
+                }),
                 hash: None,
             });
         }
@@ -554,148 +407,53 @@ mod tests {
         assert_eq!(250 - config.horizon_ms, 150);
     }
 
-    /// The log-retention floor is per partition, taken from VECTOR.json's
-    /// applied_seq for that partition — never from the global `covered`
-    /// seq in LATEST. A partition far behind the checkpoint frontier keeps
-    /// all of its segments (finding-6 regression).
+    /// With no commit at all, there is nothing to floor retention against:
+    /// a fresh filesystem's log is the only copy of its history, so the log
+    /// retention pass must mark nothing, however many segments exist.
     #[tokio::test]
-    async fn log_retention_floor_is_per_partition_against_the_vector() {
-        use constellation_store_s3::log::{CheckpointRef, CheckpointVector};
-        use object_store::memory::InMemory;
-        use object_store::PutPayload;
-
-        async fn log_retention_marks(applied_p1: u64) -> Vec<String> {
-            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            // LATEST covers the whole cluster at the max seq (p0's).
-            let latest = serde_json::to_vec(&CheckpointRef {
-                seq: 1000,
-                bytes: 0,
-            })
-            .unwrap();
-            store
-                .put(
-                    &Path::from("checkpoints/p0/LATEST"),
-                    PutPayload::from(latest),
-                )
-                .await
-                .unwrap();
-            let mut vector = CheckpointVector::default();
-            vector.applied.insert("p0".into(), 1000);
-            vector.applied.insert("p1".into(), applied_p1);
-            store
-                .put(
-                    &Path::from("checkpoints/VECTOR.json"),
-                    PutPayload::from(serde_json::to_vec(&vector).unwrap()),
-                )
-                .await
-                .unwrap();
-            // p0 segments straddling its floor (1000 - 128 = 872).
-            for seq in [800u64, 871, 872, 900] {
-                store
-                    .put(
-                        &Path::from(format!("log/p0/{seq:016x}.zst")),
-                        PutPayload::from(Vec::new()),
-                    )
-                    .await
-                    .unwrap();
-            }
-            // p1 segments 0..=40.
-            for seq in 0u64..=40 {
-                store
-                    .put(
-                        &Path::from(format!("log/p1/{seq:016x}.zst")),
-                        PutPayload::from(Vec::new()),
-                    )
-                    .await
-                    .unwrap();
-            }
-            let config = GcConfig {
-                horizon_ms: 0,
-                retention_segments: 128,
-                lease_ttl_ms: 1,
-            };
-            let mut keys: Vec<String> = metadata_candidates(&store, None, &config)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|mark| mark.rule == "log-retention")
-                .map(|mark| mark.key)
-                .collect();
-            keys.sort();
-            keys
-        }
-
-        // p1 applied 30: 30 - 128 saturates to 0, so no p1 segment is below
-        // its floor. Only p0's segments under 872 are marked.
-        let case_a = log_retention_marks(30).await;
-        assert_eq!(
-            case_a,
-            vec![
-                format!("log/p0/{:016x}.zst", 800u64),
-                format!("log/p0/{:016x}.zst", 871u64),
-            ]
-        );
-        assert!(!case_a.iter().any(|key| key.starts_with("log/p1/")));
-
-        // p1 applied 300: floor 172, so every present p1 segment (0..=40)
-        // is marked, alongside the same two p0 segments.
-        let case_b = log_retention_marks(300).await;
-        assert_eq!(
-            case_b
-                .iter()
-                .filter(|key| key.starts_with("log/p1/"))
-                .count(),
-            41
-        );
-        assert_eq!(
-            case_b
-                .iter()
-                .filter(|key| key.starts_with("log/p0/"))
-                .count(),
-            2
-        );
-    }
-
-    /// Plan 28: once a commit exists, retention floors on the head
-    /// commit's `applied` vector — where a fresh replica now resumes —
-    /// and a stale legacy checkpoint no longer holds the log back (or
-    /// lets it be cut, if the checkpoint were ahead). A partition the
-    /// commit does not name is not pruned at all.
-    #[tokio::test]
-    async fn log_retention_floors_on_the_head_commit_once_one_exists() {
-        use constellation_store_s3::log::{CheckpointRef, CheckpointVector};
-        use constellation_store_s3::{Commit, CommitAgg, Intent};
+    async fn log_retention_prunes_nothing_without_a_commit() {
         use object_store::memory::InMemory;
         use object_store::PutPayload;
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let put = |path: String, body: Vec<u8>| {
-            let store = store.clone();
-            async move {
-                store
-                    .put(&Path::from(path), PutPayload::from(body))
-                    .await
-                    .unwrap();
-            }
-        };
-        // A stale legacy checkpoint at p0:50.
-        put(
-            "checkpoints/p0/LATEST".into(),
-            serde_json::to_vec(&CheckpointRef { seq: 50, bytes: 0 }).unwrap(),
-        )
-        .await;
-        let mut vector = CheckpointVector::default();
-        vector.applied.insert("p0".into(), 50);
-        put(
-            "checkpoints/VECTOR.json".into(),
-            serde_json::to_vec(&vector).unwrap(),
-        )
-        .await;
         for seq in 1u64..=300 {
-            put(format!("log/p0/{seq:016x}.zst"), Vec::new()).await;
+            store
+                .put(
+                    &Path::from(format!("log/p0/{seq:016x}.zst")),
+                    PutPayload::from(Vec::new()),
+                )
+                .await
+                .unwrap();
         }
-        for seq in 1u64..=10 {
-            put(format!("log/p9/{seq:016x}.zst"), Vec::new()).await;
+        let config = GcConfig {
+            horizon_ms: 0,
+            retention_segments: 128,
+            lease_ttl_ms: 1,
+        };
+        assert!(metadata_candidates(&store, None, &config)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Plan 28: once a commit exists, retention floors on the head
+    /// commit's `applied` position — where a fresh replica now resumes.
+    #[tokio::test]
+    async fn log_retention_floors_on_the_head_commits_applied() {
+        use constellation_store_s3::{Commit, CommitAgg, Intent};
+        use object_store::memory::InMemory;
+        use object_store::PutPayload;
+        use std::collections::BTreeMap;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for seq in 1u64..=300 {
+            store
+                .put(
+                    &Path::from(format!("log/p0/{seq:016x}.zst")),
+                    PutPayload::from(Vec::new()),
+                )
+                .await
+                .unwrap();
         }
         let commit = Commit {
             v: constellation_store_s3::commits::COMMIT_VERSION,
@@ -727,12 +485,12 @@ mod tests {
             .filter(|mark| mark.rule == "log-retention")
             .map(|mark| {
                 assert!(mark.key.starts_with("log/p0/"), "{}", mark.key);
-                assert_eq!(mark.evidence["floor_source"]["commit"], 1);
+                assert_eq!(mark.evidence["commit"], 1);
                 let name = mark.key.rsplit('/').next().unwrap();
                 u64::from_str_radix(name.trim_end_matches(".zst"), 16).unwrap()
             })
             .collect();
-        // Floor 250 - 128 = 122: segments 1..=121, and nothing for p9.
+        // Floor 250 - 128 = 122: segments 1..=121.
         assert_eq!(marked.len(), 121);
         assert_eq!(marked.iter().max(), Some(&121));
     }

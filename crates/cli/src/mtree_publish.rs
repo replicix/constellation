@@ -330,9 +330,8 @@ impl Plan {
 
 /// Builds and publishes the §P6 tree for one replica.
 ///
-/// Owned by `shipper::Shipper` and driven from the same place the
-/// checkpoint cadence is, so a publish happens exactly where a
-/// checkpoint used to.
+/// Owned by `shipper::Shipper` and driven by its publish cadence (plan 29
+/// M0b), which replaced the whole-DB checkpoint cadence this used to piggy-back on.
 pub struct TreePublisher {
     meta: Arc<SqliteMeta>,
     cache: Arc<NodeCache>,

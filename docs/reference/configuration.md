@@ -76,27 +76,30 @@ thrash](../how-to-guides/operations/diagnose-lease-thrash.md).
 |---|---:|---|---|
 | `CONSTELLATION_SYNC_INTERVAL_MS` | `500` | milliseconds | background log tail/ship poll; the **floor** of the idle backoff |
 | `CONSTELLATION_SYNC_IDLE_MAX_MS` | `10000` | milliseconds | **ceiling** of the idle poll backoff |
-| `CONSTELLATION_CHECKPOINT_RATIO` | `1.0` | ratio, positive | shipped-log bytes ÷ last snapshot bytes needed to fire a checkpoint |
-| `CONSTELLATION_CHECKPOINT_MIN_INTERVAL_S` | `0` | seconds | minimum checkpoint spacing; `0` disables the time floor |
-| `CONSTELLATION_CHECKPOINT_IO_CONCURRENCY` | `8` | requests, positive | parallel 8 MiB ranges (GET) / parts (PUT) for a checkpoint transfer |
-| `CONSTELLATION_CHECKPOINT_SNAPSHOT` | `off` | boolean | keep writing the legacy `VACUUM INTO` checkpoint on a mount that publishes plan 28 commits; off because the commit replaces it (bootstrap and log retention both use the commit chain). Mounts without a publisher (read-only members) always write it |
+
+Plan 29 M0b retired the whole-DB `VACUUM INTO` checkpoint and its
+byte-proportional cadence, I/O concurrency knob, and
+`CONSTELLATION_CHECKPOINT_SNAPSHOT` escape hatch: a metadata commit (see
+below) is a delta of changed keys rather than a copy of the namespace, so
+none of that machinery has an equivalent here. The publish cadence is a
+plain segment count (`PUBLISH_EVERY = 32`, not currently a knob), plus an
+unconditional publish on clean unmount.
 
 ### Merkle metadata tree (plan 28)
 
 Writers publish a content-addressed Merkle map of metadata as a chain of
-commits (plan 28 option (B)), on the cadence the SQLite checkpoint used
-to fire at; the commit replaces the checkpoint as the bootstrap base
-(`CONSTELLATION_CHECKPOINT_SNAPSHOT` re-enables the legacy snapshot).
-These knobs size the pack store, the in-memory node cache, the
-commit-chain poll, and where a fresh replica comes from. They are
-reachable on every non-read-only mount.
+commits (plan 28 option (B)) on the publish cadence above; a fresh
+replica bootstraps from the chain's head commit plus a log replay from
+its `applied` position, or — a genuinely fresh filesystem with no commit
+yet — a replay of the whole log from the beginning (plan 29 M0b).
+These knobs size the pack store, the in-memory node cache, and the
+commit-chain poll. They are reachable on every non-read-only mount.
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_PACK_TARGET_BYTES` | `4194304` (4 MiB) | bytes, **1–16 MiB** accepted | sealed pack body size before the writer starts the next pack; out of range falls back to the default |
 | `CONSTELLATION_NODE_MEMORY_BYTES` | `67108864` (64 MiB) | bytes; `0` disables | RAM budget for interior metadata nodes; `0` forces every read through the disk cache (used by partial-replica tests) |
 | `CONSTELLATION_COMMIT_PROBE_WINDOW` | `8` | positive integer | how many commit slots ahead of the known head one poll probes before falling back to a LIST |
-| `CONSTELLATION_BOOTSTRAP_SOURCE` | `auto` | `auto` \| `checkpoint` | where a fresh replica comes from: `auto` restores the newest commit and tails the log from its applied vector, falling back to the legacy checkpoint when the bucket has no commits; `checkpoint` forces the legacy path |
 
 Pack target is the main write-amplification / request-overhead trade-off
 for metadata: smaller packs mean more S3 objects and more compaction
@@ -147,36 +150,21 @@ sync round is also what renews the lease and what notices another node's
 handoff request, so backing off past the renewal cadence would let a
 holder sleep through its own renewal.
 
-#### Checkpoint cadence
+#### Publish cadence
 
-A checkpoint is a whole-DB copy of the metadata replica, and it is what
-licenses log truncation. Two gates must both pass before one is written:
+A publish writes a metadata commit — a delta of the tree keys a batch of
+records actually changed, CAS-created as one immutable object — and it
+is what licenses log truncation (log retention floors on the head
+commit's `applied` position; see below). Plan 29 M0b retired the
+whole-DB `VACUUM INTO` checkpoint this superseded, along with its
+byte-proportional cadence: a publish costs O(keys changed), not
+O(database), so there is nothing to sub-linearly amortize against
+namespace size the way the old ratio gate did.
 
-1. a **count floor** — at least 32 shipped segments since the last one
-   (not tunable), and
-2. a **byte-proportional gate** — at least `CONSTELLATION_CHECKPOINT_RATIO ×`
-   the last snapshot's uncompressed size in shipped log bytes since the
-   last one.
-
-The ratio is what bounds write amplification: at `1.0` the cluster writes
-about one byte of checkpoint per byte of shipped log, regardless of how
-large the namespace has grown. (The count-only cadence it replaced wrote
-54 GiB of checkpoints to protect a 0.17 GiB log on a 1.85M-file rsync.)
-A larger ratio writes fewer, older checkpoints — cheaper, but a longer
-log replay for a bootstrapping node; below `1.0` the copies dominate
-again. Values `<= 0` or unparseable fall back to the default with a
-warning. There is no baseline to be proportional to until the first
-checkpoint exists, so the very first one fires on the count floor alone.
-
-`CONSTELLATION_CHECKPOINT_MIN_INTERVAL_S` is an opt-in *further* delay on
-top of both gates and is off by default: measured on a 50k-file mount, a
-60 s floor cut write amplification 3× and lifted 8-writer throughput ~8%,
-but made single-threaded small-file work 1.5× slower (465–501 µs per file
-to 764–786 µs), so it trades latency for I/O rather than buying both.
-
-Superseded checkpoints are deleted inline once the new `LATEST` and
-`VECTOR.json` have both landed, keeping the newest two; GC is only the
-backstop for a failed prune.
+The cadence is a plain count floor — at least 32 shipped segments since
+the last publish (`PUBLISH_EVERY`, not currently a knob) — plus an
+unconditional publish on clean unmount (or when the mount otherwise
+drains its journal for shutdown).
 
 ### Read-time atime
 
@@ -276,13 +264,12 @@ hinted), never "proven absent".
 | `CONSTELLATION_GC_THREADS` | one per core | threads, positive | width of the metadata mark and pack rewrite pools |
 
 Log retention is evaluated against the position a fresh replica resumes
-from: the head plan 28 commit's `applied` position once a commit exists,
-otherwise `checkpoints/VECTOR.json`, which records how far the newest
-checkpoint has replayed. (A bootstrap from a base the log was pruned
-past refuses instead of replaying from the gap.) A segment is prunable
-only when that position is more than `CONSTELLATION_LOG_RETENTION_SEGMENTS`
-ahead of it. A `LATEST` checkpoint with no vector beside it is a corrupt
-bucket and fails the run rather than falling back to a global floor.
+from: the head plan 28 commit's `applied` position. With no commit yet
+(a genuinely fresh filesystem), nothing is pruned — the log is the only
+copy of history there is. A segment is prunable only once the head
+commit's `applied` position is more than
+`CONSTELLATION_LOG_RETENTION_SEGMENTS` ahead of it. (A bootstrap from a
+base the log was pruned past refuses instead of replaying from the gap.)
 
 Metadata GC (plan 28 S7b) runs as a second phase of every GC round:
 commit retention by the two knobs above, a reachability mark from the
@@ -371,7 +358,7 @@ operator has cleared.
 
 ## Boolean values
 
-Most boolean switches are enabled when unset. `CONSTELLATION_CHECKPOINT_SNAPSHOT`
+Most boolean switches are enabled when unset. `CONSTELLATION_ATIME_RO_FORWARD`
 and `CONSTELLATION_P2P_RELAY` default off. `off`, `0`, and `false`
 (case-insensitive) disable a switch that defaults on.
 

@@ -6,7 +6,6 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::replay::TouchSet;
 use crate::{
     CloneNode, CloneSpec, DirEntry, MetaStore, SetXattrMode, SnapshotNode, SnapshotRow, TreeInode,
 };
@@ -170,14 +169,9 @@ CREATE TABLE IF NOT EXISTS snapshot (
     created_unix_ms INTEGER NOT NULL,
     UNIQUE(path, name)
 );
-CREATE TABLE IF NOT EXISTS deref (
-    chunk_hash    BLOB PRIMARY KEY,
-    deref_seq     INTEGER NOT NULL,
-    deref_unix_ms INTEGER NOT NULL
-);
 -- Reverse index chunk_hash -> referencing inode. Without it, deciding
 -- whether a hash is still referenced means decoding every manifest in the
--- namespace, which makes a bulk delete quadratic (see `hash_is_live`).
+-- namespace, which makes a bulk delete quadratic (see `chunk_ref_exists`).
 CREATE TABLE IF NOT EXISTS chunk_ref (
     chunk_hash BLOB NOT NULL,
     ino        INTEGER NOT NULL,
@@ -233,10 +227,11 @@ pub type EpochRow = (
 /// SQLite-backed [`MetaStore`].
 pub struct SqliteMeta {
     conn: Mutex<Connection>,
-    /// Set for file-backed stores. A checkpoint snapshot reads through its
-    /// own connection to this path so it does not hold `conn` — under WAL
-    /// that reader is consistent and concurrent with writers. An in-memory
-    /// store has no second handle, so it snapshots under the lock.
+    /// Set for file-backed stores. [`Self::with_reader`] opens its own
+    /// read-only connection to this path so it does not hold `conn` —
+    /// under WAL that reader is consistent and concurrent with writers.
+    /// An in-memory store has no second handle, so it reads under the
+    /// lock instead.
     path: Option<std::path::PathBuf>,
     /// Whole-FS `(bytes, files)` maintained counter; see [`UsageTracker`].
     usage: UsageTracker,
@@ -286,8 +281,9 @@ impl SqliteMeta {
         let Some(bytes) = bytes else {
             return Ok(std::collections::HashSet::new());
         };
-        // Corrupt historical rows are reported by fsck. Deref bookkeeping
-        // must not make replay of the surrounding metadata transaction fail.
+        // Corrupt historical rows are reported by fsck. `chunk_ref`
+        // bookkeeping must not make replay of the surrounding metadata
+        // transaction fail.
         let Ok(manifest) = Manifest::decode(bytes) else {
             return Ok(std::collections::HashSet::new());
         };
@@ -301,32 +297,11 @@ impl SqliteMeta {
         })
     }
 
-    /// Is `hash` still reachable from a linked inode? Answered from the
-    /// `chunk_ref` index: two indexed probes rather than a decode of every
-    /// manifest in the namespace.
-    ///
-    /// The index is a *hint* in the safe direction. A stale row can only
-    /// make a hash look live (delaying collection); GC never trusts this
-    /// answer on its own — it re-derives the full live set from the
-    /// manifests themselves before deleting anything.
-    fn hash_is_live(conn: &Connection, hash: &ChunkHash) -> Result<bool, MetaError> {
-        Ok(conn
-            .query_row(
-                "SELECT 1 FROM chunk_ref JOIN inode USING (ino)
-                 WHERE chunk_ref.chunk_hash = ?1 AND inode.nlink > 0
-                 LIMIT 1",
-                params![hash.0.to_vec()],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-    }
-
     /// Is `hash` referenced by a manifest this replica knows about *and*
     /// not still queued for upload by this node?
     ///
     /// The upload path's existence hint (`cli::existence`). Deliberately no
-    /// `inode` join, unlike [`Self::hash_is_live`]: the question here is
+    /// `inode` join: the question here is
     /// only "has this content been put in the bucket already", a hit merely
     /// selects a confirming HEAD, and a row that outlives its inode — a
     /// rebuilt index carries orphans too — costs nothing worse than that
@@ -373,8 +348,7 @@ impl SqliteMeta {
 
     /// Repopulate `chunk_ref` from the manifests currently in `inode`.
     /// Orphans (nlink = 0) are indexed too so that the reaping transition
-    /// finds its rows to remove; `hash_is_live` filters them out via the
-    /// join.
+    /// finds its rows to remove.
     fn rebuild_chunk_ref(conn: &Connection) -> Result<(), MetaError> {
         let mut stmt =
             conn.prepare("SELECT ino, manifest FROM inode WHERE manifest IS NOT NULL")?;
@@ -393,8 +367,8 @@ impl SqliteMeta {
     }
 
     /// One-time index build for DBs written before `chunk_ref` existed.
-    /// Runs inside `init` so no code path can reach `hash_is_live` with an
-    /// unpopulated index.
+    /// Runs inside `init` so no code path can reach `chunk_ref_exists` with
+    /// an unpopulated index.
     fn backfill_chunk_ref_once(conn: &mut Connection) -> Result<(), MetaError> {
         let done: Option<String> = conn
             .query_row(
@@ -425,8 +399,6 @@ impl SqliteMeta {
         ino: Ino,
         old: Option<&[u8]>,
         new: Option<&[u8]>,
-        seq: u64,
-        unix_ms: i64,
     ) -> Result<(), MetaError> {
         let old = Self::manifest_hashes(old)?;
         let new = Self::manifest_hashes(new)?;
@@ -435,91 +407,14 @@ impl SqliteMeta {
                 "INSERT OR IGNORE INTO chunk_ref (chunk_hash, ino) VALUES (?1, ?2)",
                 params![hash.0.to_vec(), ino],
             )?;
-            conn.execute(
-                "DELETE FROM deref WHERE chunk_hash = ?1",
-                params![hash.0.to_vec()],
-            )?;
         }
         for hash in old.difference(&new) {
             conn.execute(
                 "DELETE FROM chunk_ref WHERE chunk_hash = ?1 AND ino = ?2",
                 params![hash.0.to_vec(), ino],
             )?;
-            if !Self::hash_is_live(conn, hash)? {
-                conn.execute(
-                    "INSERT OR REPLACE INTO deref (chunk_hash, deref_seq, deref_unix_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params![hash.0.to_vec(), seq, unix_ms],
-                )?;
-            }
         }
         Ok(())
-    }
-
-    fn next_deref_seq(conn: &Connection) -> Result<u64, MetaError> {
-        Ok(
-            conn.query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM journal", [], |row| {
-                row.get(0)
-            })?,
-        )
-    }
-
-    /// One-time upgrade backfill. Existing live references cancel stale
-    /// candidate rows; pre-upgrade abandoned uploads remain the orphan
-    /// sweep's responsibility because no historical disappearance time can
-    /// be reconstructed safely.
-    pub fn backfill_deref_once(&self) -> Result<(), MetaError> {
-        if self.kv_get("deref_backfill_v1")?.as_deref() == Some("1") {
-            return Ok(());
-        }
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut live = std::collections::HashSet::new();
-        {
-            let mut stmt =
-                tx.prepare("SELECT manifest FROM inode WHERE nlink > 0 AND manifest IS NOT NULL")?;
-            let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            for row in rows {
-                live.extend(Self::manifest_hashes(Some(&row?))?);
-            }
-        }
-        for hash in live {
-            tx.execute(
-                "DELETE FROM deref WHERE chunk_hash = ?1",
-                params![hash.0.to_vec()],
-            )?;
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO kv (key, value) VALUES ('deref_backfill_v1', '1')",
-            [],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn deref_candidates(
-        &self,
-        older_than_unix_ms: i64,
-    ) -> Result<Vec<(ChunkHash, u64, i64)>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT chunk_hash, deref_seq, deref_unix_ms FROM deref
-             WHERE deref_unix_ms <= ?1 ORDER BY deref_unix_ms, chunk_hash",
-        )?;
-        let rows = stmt.query_map(params![older_than_unix_ms], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get(1)?, row.get(2)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (bytes, seq, at) = row?;
-            let hash = ChunkHash(
-                bytes
-                    .try_into()
-                    .map_err(|_| MetaError::Invalid("deref hash length".into()))?,
-            );
-            out.push((hash, seq, at));
-        }
-        Ok(out)
     }
 
     pub fn live_manifest_hashes(&self) -> Result<std::collections::HashSet<ChunkHash>, MetaError> {
@@ -542,14 +437,6 @@ impl SqliteMeta {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn clear_deref(&self, hash: &ChunkHash) -> Result<(), MetaError> {
-        self.conn.lock().unwrap().execute(
-            "DELETE FROM deref WHERE chunk_hash = ?1",
-            params![hash.0.to_vec()],
-        )?;
-        Ok(())
-    }
-
     /// Open (or create) a metadata DB. Creates the root inode on first use.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MetaError> {
         let path = path.as_ref().to_path_buf();
@@ -560,11 +447,6 @@ impl SqliteMeta {
     /// In-memory store (tests).
     pub fn open_in_memory() -> Result<Self, MetaError> {
         Self::init(Connection::open_in_memory()?, None)
-    }
-
-    /// The backing file, if this store is not in-memory.
-    pub(crate) fn db_path(&self) -> Option<&Path> {
-        self.path.as_deref()
     }
 
     fn init(mut conn: Connection, path: Option<std::path::PathBuf>) -> Result<Self, MetaError> {
@@ -593,8 +475,9 @@ impl SqliteMeta {
                 params![ROOT_INO, InodeKind::Dir.as_u8(), 0o755, t],
             )?;
         }
-        // Present even on DBs restored from a checkpoint (which strips
-        // node-local kv keys); `set_node_prefix` re-scopes it anyway.
+        // Present even on a replica bootstrapped from a commit (which
+        // carries no node-local kv keys); `set_node_prefix` re-scopes it
+        // anyway.
         conn.execute(
             "INSERT OR IGNORE INTO kv (key, value) VALUES ('next_ino', ?1)",
             params![(ROOT_INO + 1).to_string()],
@@ -631,16 +514,6 @@ impl SqliteMeta {
     /// O(1) whole-FS logical usage from the maintained counter.
     pub fn usage_bytes_files(&self) -> (u64, u64) {
         self.usage.load()
-    }
-
-    /// Re-seed the usage counter from a full `recursive_size(ROOT_INO)`.
-    /// Used by tests and after restoring a checkpoint into a live store.
-    pub fn reseat_usage(&self) -> Result<(u64, u64), MetaError> {
-        let conn = self.conn.lock().unwrap();
-        let (bytes, files) = Self::recursive_size_conn(&conn, ROOT_INO)?;
-        drop(conn);
-        self.usage.reseat(bytes, files);
-        Ok((bytes, files))
     }
 
     /// Cluster-wide logical byte cap. `None` = unlimited.
@@ -748,24 +621,6 @@ impl SqliteMeta {
 
     pub fn set_applied_seq(&self, seq: u64) -> Result<(), MetaError> {
         self.kv_set("applied_seq", &seq.to_string())
-    }
-
-    /// Atomically ack journal records and record the log position that
-    /// covers them: a crash can never separate the two (which would
-    /// either wedge recovery or re-ship acked records).
-    pub fn ack_journal_at(&self, upto_journal_seq: u64, applied_seq: u64) -> Result<(), MetaError> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM journal WHERE seq <= ?1",
-            params![upto_journal_seq],
-        )?;
-        tx.execute(
-            "INSERT OR REPLACE INTO kv (key, value) VALUES ('applied_seq', ?1)",
-            params![applied_seq.to_string()],
-        )?;
-        tx.commit()?;
-        Ok(())
     }
 
     /// Atomically ack specific journal rows and record the log position
@@ -925,7 +780,7 @@ impl SqliteMeta {
         )?;
         // A snapshot root lives in the metadata tree (plan 28), which
         // chunk GC reaches by walking it; it is not a chunk and never
-        // enters the `deref` candidate set.
+        // enters chunk GC's candidate set.
         Self::journal(
             &tx,
             &LogRecord::SnapCreate {
@@ -1059,14 +914,7 @@ impl SqliteMeta {
                     params![ino, xattr_name, value],
                 )?;
             }
-            Self::track_manifest_transition(
-                &tx,
-                ino,
-                None,
-                spec.manifest.as_deref(),
-                Self::next_deref_seq(&tx)?,
-                spec.mtime_ns / 1_000_000,
-            )?;
+            Self::track_manifest_transition(&tx, ino, None, spec.manifest.as_deref())?;
             if spec.kind == InodeKind::Dir {
                 tx.execute(
                     "UPDATE inode SET nlink = nlink + 1 WHERE ino = ?1",
@@ -1172,36 +1020,6 @@ impl SqliteMeta {
         let mut stmt = conn.prepare("SELECT path, ino FROM pin ORDER BY path")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    /// Is `ino` inside any pinned subtree? Walks up to the root, so a
-    /// file created under a pin is covered without re-pinning.
-    pub fn pinned_ancestor(&self, ino: Ino) -> Result<Option<String>, MetaError> {
-        let pins = self.pins()?;
-        if pins.is_empty() {
-            return Ok(None);
-        }
-        let conn = self.conn.lock().unwrap();
-        let mut cur = ino;
-        loop {
-            if let Some((path, _)) = pins.iter().find(|(_, pino)| *pino == cur) {
-                return Ok(Some(path.clone()));
-            }
-            if cur == ROOT_INO {
-                return Ok(None);
-            }
-            match conn
-                .query_row(
-                    "SELECT parent FROM dentry WHERE ino = ?1 LIMIT 1",
-                    params![cur],
-                    |r| r.get::<_, Ino>(0),
-                )
-                .optional()?
-            {
-                Some(p) => cur = p,
-                None => return Ok(None),
-            }
-        }
     }
 
     /// Parent of `ino` in the dentry tree, if any.
@@ -1876,35 +1694,6 @@ impl SqliteMeta {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Same-tx: mark a stranded journal row's disposition, drop it, and
-    /// optionally re-journal a replacement (clean replay). Crash-safe
-    /// resume starts at the first unmarked remaining row.
-    pub fn reintegrate_commit(
-        &self,
-        orig_seq: u64,
-        disposition: &str,
-        detail: &str,
-        rejournal: Option<&LogRecord>,
-    ) -> Result<(), MetaError> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO reintegration (journal_seq, disposition, detail)
-             VALUES (?1, ?2, ?3)",
-            params![orig_seq, disposition, detail],
-        )?;
-        if inserted == 0 {
-            tx.commit()?;
-            return Ok(());
-        }
-        tx.execute("DELETE FROM journal WHERE seq = ?1", params![orig_seq])?;
-        if let Some(rec) = rejournal {
-            Self::journal(&tx, rec)?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn reintegration_conflict_count(&self) -> Result<u64, MetaError> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.query_row(
@@ -2019,14 +1808,7 @@ impl SqliteMeta {
             return Err(MetaError::NoEnt(ino));
         }
         usage.adjust(size as i64 - old_size, 0);
-        Self::track_manifest_transition(
-            tx,
-            ino,
-            current.as_deref(),
-            Some(manifest),
-            Self::next_deref_seq(tx)?,
-            t / 1_000_000,
-        )?;
+        Self::track_manifest_transition(tx, ino, current.as_deref(), Some(manifest))?;
         Self::journal(
             tx,
             &LogRecord::WriteManifest {
@@ -2359,14 +2141,7 @@ impl SqliteMeta {
                     params![old_ino],
                     |row| row.get(0),
                 )?;
-                Self::track_manifest_transition(
-                    &tx,
-                    old_ino,
-                    old_manifest.as_deref(),
-                    None,
-                    Self::next_deref_seq(&tx)?,
-                    t / 1_000_000,
-                )?;
+                Self::track_manifest_transition(&tx, old_ino, old_manifest.as_deref(), None)?;
                 if old_attr.kind == InodeKind::File {
                     delta_bytes -= old_attr.size as i64;
                     delta_files -= 1;
@@ -2419,14 +2194,7 @@ impl SqliteMeta {
                 time_ns: mtime_ns,
             },
         )?;
-        Self::track_manifest_transition(
-            &tx,
-            ino,
-            None,
-            Some(manifest),
-            Self::next_deref_seq(&tx)?,
-            mtime_ns / 1_000_000,
-        )?;
+        Self::track_manifest_transition(&tx, ino, None, Some(manifest))?;
         Self::journal(
             &tx,
             &LogRecord::WriteManifest {
@@ -2845,17 +2613,6 @@ impl SqliteMeta {
         Ok(())
     }
 
-    pub fn shadow_touch_set(&self) -> Result<TouchSet, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT records FROM shadow ORDER BY id")?;
-        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut records = Vec::new();
-        for row in rows {
-            records.extend(postcard::from_bytes::<Vec<LogRecord>>(&row?)?);
-        }
-        Ok(TouchSet::from_records(records.iter()))
-    }
-
     pub fn shadow_retire_matching(
         &self,
         epoch: u64,
@@ -2877,14 +2634,6 @@ impl SqliteMeta {
             }
         }
         tx.commit()?;
-        Ok(())
-    }
-
-    pub fn shadow_expire(&self, older_than_ms: i64) -> Result<(), MetaError> {
-        self.conn.lock().unwrap().execute(
-            "DELETE FROM shadow WHERE created_ms < ?1",
-            params![older_than_ms],
-        )?;
         Ok(())
     }
 
@@ -2936,14 +2685,6 @@ impl SqliteMeta {
         )?)
     }
 
-    pub fn pending_uploads_for_inode(&self, ino: Ino) -> Result<Vec<(ChunkHash, Ino)>, MetaError> {
-        Ok(self
-            .pending_uploads()?
-            .into_iter()
-            .filter(|(_, row_ino)| *row_ino == ino)
-            .collect())
-    }
-
     /// Ack one pending upload. Deleting the row for `(hash, ino)` never
     /// disturbs a different inode still pending on the same hash (dedup
     /// across inodes is the upload side's job, not this table's).
@@ -2963,10 +2704,10 @@ impl SqliteMeta {
         self.ack_upload(hash, ino)
     }
 
-    /// Drop every pending-upload row. Used after bootstrap restores a
-    /// cluster checkpoint: a brand-new replica has never written local
-    /// content, so any inherited rows are another node's obligation
-    /// (plan 25). Foreign log replay never inserts into this table.
+    /// Drop every pending-upload row. Used after bootstrap: a brand-new
+    /// replica has never written local content, so any inherited rows
+    /// are another node's obligation (plan 25). Foreign log replay never
+    /// inserts into this table.
     pub fn clear_pending_uploads(&self) -> Result<(), MetaError> {
         self.conn
             .lock()
@@ -3325,14 +3066,7 @@ impl MetaStore for SqliteMeta {
                 params![ino],
                 |row| row.get(0),
             )?;
-            Self::track_manifest_transition(
-                &tx,
-                ino,
-                manifest.as_deref(),
-                None,
-                Self::next_deref_seq(&tx)?,
-                t / 1_000_000,
-            )?;
+            Self::track_manifest_transition(&tx, ino, manifest.as_deref(), None)?;
         }
         tx.execute(
             "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
@@ -3590,14 +3324,7 @@ impl MetaStore for SqliteMeta {
              (SELECT 1 FROM inode WHERE inode.ino = xattr.ino)",
             params![ino],
         )?;
-        Self::track_manifest_transition(
-            &tx,
-            ino,
-            manifest.as_deref(),
-            None,
-            Self::next_deref_seq(&tx)?,
-            now_unix_ms(),
-        )?;
+        Self::track_manifest_transition(&tx, ino, manifest.as_deref(), None)?;
         tx.commit()?;
         Ok(())
     }
@@ -3752,100 +3479,6 @@ mod tests {
         .encode()
     }
 
-    #[test]
-    fn deref_tracks_manifest_replace_and_rereference() {
-        let meta = store();
-        let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap();
-        let old = ChunkHash::of(b"old");
-        let new = ChunkHash::of(b"new");
-        meta.set_manifest(file.ino, &one_hash_manifest(old), 1)
-            .unwrap();
-        meta.set_manifest(file.ino, &one_hash_manifest(new), 1)
-            .unwrap();
-        let rows = meta.deref_candidates(i64::MAX).unwrap();
-        assert!(rows.iter().any(|(hash, _, _)| *hash == old));
-        assert!(!rows.iter().any(|(hash, _, _)| *hash == new));
-
-        meta.set_manifest(file.ino, &one_hash_manifest(old), 1)
-            .unwrap();
-        assert!(!meta
-            .deref_candidates(i64::MAX)
-            .unwrap()
-            .iter()
-            .any(|(hash, _, _)| *hash == old));
-    }
-
-    #[test]
-    fn deref_tracks_last_unlink() {
-        let meta = store();
-        let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap();
-        let hash = ChunkHash::of(b"unlinked");
-        meta.set_manifest(file.ino, &one_hash_manifest(hash), 1)
-            .unwrap();
-        meta.unlink(ROOT_INO, "file").unwrap();
-        assert!(meta
-            .deref_candidates(i64::MAX)
-            .unwrap()
-            .iter()
-            .any(|(candidate, _, _)| *candidate == hash));
-    }
-
-    /// Dedup safety: a hash referenced by a second file must not become a
-    /// collection candidate until the last reference goes away.
-    #[test]
-    fn deref_waits_for_the_last_reference_to_a_shared_hash() {
-        let meta = store();
-        let a = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
-        let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
-        let hash = ChunkHash::of(b"shared-by-two-files");
-        meta.set_manifest(a.ino, &one_hash_manifest(hash), 1)
-            .unwrap();
-        meta.set_manifest(b.ino, &one_hash_manifest(hash), 1)
-            .unwrap();
-
-        let is_candidate = |meta: &SqliteMeta| {
-            meta.deref_candidates(i64::MAX)
-                .unwrap()
-                .iter()
-                .any(|(candidate, _, _)| *candidate == hash)
-        };
-
-        meta.unlink(ROOT_INO, "a").unwrap();
-        meta.reap_orphan(a.ino).unwrap();
-        assert!(!is_candidate(&meta), "b still references the chunk");
-
-        meta.unlink(ROOT_INO, "b").unwrap();
-        meta.reap_orphan(b.ino).unwrap();
-        assert!(is_candidate(&meta), "last reference is gone");
-    }
-
-    /// Tripwire for the regression that made `rm -rf` quadratic: liveness
-    /// used to be answered by decoding every manifest in the namespace, so
-    /// each unlink cost a full pass over `inode`. The probe must stay
-    /// index-driven.
-    #[test]
-    fn hash_liveness_probe_does_not_scan_the_inode_table() {
-        let meta = store();
-        let conn = meta.conn.lock().unwrap();
-        let plan: Vec<String> = conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT 1 FROM chunk_ref JOIN inode USING (ino)
-                 WHERE chunk_ref.chunk_hash = ?1 AND inode.nlink > 0
-                 LIMIT 1",
-            )
-            .unwrap()
-            .query_map(params![vec![0u8; 32]], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let plan = plan.join("; ");
-        assert!(
-            !plan.to_uppercase().contains("SCAN"),
-            "liveness probe must stay indexed, got: {plan}"
-        );
-    }
-
     /// DBs written before `chunk_ref` existed carry no reverse index. The
     /// index must be rebuilt on open, or their live chunks would look
     /// unreferenced.
@@ -3876,10 +3509,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1, "reopening must rebuild the reverse index");
-        assert!(
-            SqliteMeta::hash_is_live(&conn, &hash).unwrap(),
-            "a backfilled reference must read as live"
-        );
     }
 
     /// The upload-path existence hint answers from `chunk_ref` alone, so it
@@ -4019,12 +3648,12 @@ mod tests {
         );
     }
 
-    /// Plan 28: a snapshot root is a directory in the metadata tree, not
-    /// a chunk, so creating and deleting one never touches the chunk
-    /// GC's `deref` candidate set (GC protects a snapshot's chunks by
-    /// walking its tree instead).
+    /// Plan 28: a snapshot root is a directory in the metadata tree, not a
+    /// chunk, so a snapshot's lifecycle is a plain round trip through the
+    /// `snapshot` table (GC protects a snapshot's chunks by walking its
+    /// tree instead).
     #[test]
-    fn snapshot_roots_never_enter_deref() {
+    fn snapshot_create_and_delete_round_trips() {
         let meta = store();
         let row = SnapshotRow {
             id: "snap".into(),
@@ -4037,7 +3666,6 @@ mod tests {
         assert_eq!(meta.snapshots(None).unwrap(), vec![row]);
         assert!(meta.delete_snapshot("/", "before").unwrap());
         assert!(meta.snapshots(None).unwrap().is_empty());
-        assert!(meta.deref_candidates(i64::MAX).unwrap().is_empty());
     }
 
     #[test]
@@ -4524,16 +4152,18 @@ mod tests {
         m.shadow_insert("p0", 7, std::slice::from_ref(&record))
             .unwrap();
 
-        let touches = m.shadow_touch_set().unwrap();
-        assert!(touches
-            .dentries
-            .contains(&(ROOT_INO, "shadowed".to_string())));
+        let count = || -> i64 {
+            m.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM shadow", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(), 1);
 
         m.shadow_retire_matching(7, std::slice::from_ref(&record))
             .unwrap();
-        let touches = m.shadow_touch_set().unwrap();
-        assert!(touches.dentries.is_empty());
-        assert!(touches.inos.is_empty());
+        assert_eq!(count(), 0, "a fully-matched shadow batch is retired");
     }
 
     #[test]
@@ -4684,38 +4314,27 @@ mod tests {
         assert_eq!(m.lookup(cold.ino, "same").unwrap().unwrap().ino, f.ino);
     }
 
-    /// Pins are node-local state keyed by path, and `pinned_ancestor`
-    /// must cover anything created underneath a pin later, so a new file
-    /// in a pinned directory is kept resident without re-pinning.
+    /// Pins are node-local state keyed by path: add/list/remove round trip,
+    /// and path resolution covers descendants of a pinned directory.
     #[test]
-    fn pins_cover_descendants() {
+    fn pins_round_trip_and_path_resolution_covers_descendants() {
         let m = store();
         let data = m.mkdir(ROOT_INO, "data", 0o755, 0, 0).unwrap();
         let sub = m.mkdir(data.ino, "sub", 0o755, 0, 0).unwrap();
-        let f = m.create(sub.ino, "deep", 0o644, 0, 0).unwrap();
-        let outside = m.create(ROOT_INO, "outside", 0o644, 0, 0).unwrap();
+        m.create(sub.ino, "deep", 0o644, 0, 0).unwrap();
+        m.create(ROOT_INO, "outside", 0o644, 0, 0).unwrap();
 
         assert_eq!(m.resolve_path("/data/sub").unwrap(), Some(sub.ino));
         assert_eq!(m.resolve_path("/").unwrap(), Some(ROOT_INO));
         assert!(m.resolve_path("/data/nope").unwrap().is_none());
 
-        assert!(m.pinned_ancestor(f.ino).unwrap().is_none());
+        assert!(m.pins().unwrap().is_empty());
         m.add_pin("/data", data.ino).unwrap();
         assert_eq!(m.pins().unwrap(), vec![("/data".to_string(), data.ino)]);
-        assert_eq!(m.pinned_ancestor(f.ino).unwrap().as_deref(), Some("/data"));
-        assert_eq!(
-            m.pinned_ancestor(data.ino).unwrap().as_deref(),
-            Some("/data"),
-            "the pin root itself is covered"
-        );
-        assert!(
-            m.pinned_ancestor(outside.ino).unwrap().is_none(),
-            "a sibling of the pin must not be covered"
-        );
 
         assert!(m.remove_pin("/data").unwrap());
         assert!(!m.remove_pin("/data").unwrap(), "second unpin is a no-op");
-        assert!(m.pinned_ancestor(f.ino).unwrap().is_none());
+        assert!(m.pins().unwrap().is_empty());
     }
 
     /// A pin's footprint is the manifests under it, so admission control
@@ -4821,9 +4440,9 @@ mod tests {
         assert_eq!(m.pending_uploads().unwrap(), vec![(h, ino)]);
     }
 
-    /// Foreign-prefix pending rows (inherited from a poisoned checkpoint
-    /// or copied state dir) must be droppable without touching this
-    /// node's own crash-recovery backlog (plan 25).
+    /// Foreign-prefix pending rows (inherited from a copied state dir)
+    /// must be droppable without touching this node's own crash-recovery
+    /// backlog (plan 25).
     #[test]
     fn purge_foreign_pending_uploads_keeps_local_prefix() {
         let m = store();
@@ -4832,7 +4451,7 @@ mod tests {
         let h_local = ChunkHash::of(b"local-chunk");
         m.set_manifest_dirty(local.ino, None, b"L", 1, &[h_local])
             .unwrap();
-        // Fabricate a node-1 pending row the way a poisoned checkpoint
+        // Fabricate a node-1 pending row the way a copied state dir
         // would have left it (direct insert; no matching inode needed).
         let h_foreign = ChunkHash::of(b"foreign-chunk");
         let foreign_ino = 1u64 << INO_PREFIX_SHIFT | 99;

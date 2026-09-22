@@ -354,18 +354,4 @@ mod tests {
             Some(&b"stranded"[..])
         );
     }
-
-    #[test]
-    fn reintegrate_commit_is_idempotent() {
-        let m = SqliteMeta::open_in_memory().unwrap();
-        m.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
-        let (seq, rec) = m.take_journal(1).unwrap().into_iter().next().unwrap();
-        m.reintegrate_commit(seq, "clean", "", Some(&rec)).unwrap();
-        m.reintegrate_commit(seq, "clean", "", Some(&rec)).unwrap();
-        // Original row is gone and exactly one replacement remains;
-        // retrying a marked seq is a no-op.
-        assert_eq!(m.reintegration_conflict_count().unwrap(), 0);
-        assert_eq!(m.unmarked_journal().unwrap().len(), 1);
-        assert_eq!(m.unmarked_journal_len().unwrap(), 1);
-    }
 }

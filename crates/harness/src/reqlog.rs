@@ -67,7 +67,7 @@ impl Request {
     }
 
     /// The bucket area this request touches — `log`, `chunks`,
-    /// `checkpoints`, `nodes`, `leases`, `designations`, … Every scenario
+    /// `commits`, `packs`, `nodes`, `leases`, `designations`, … Every scenario
     /// puts its filesystem under a per-run key prefix, so the area is the
     /// segment after the bucket and that prefix; a LIST names it in
     /// `prefix=` instead of in the path.

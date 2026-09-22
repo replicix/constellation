@@ -1,30 +1,31 @@
 //! Replay: apply shipped log records to rebuild or advance a metadata
-//! replica (fresh-node bootstrap, checkpoint catch-up, live tailing of
+//! replica (fresh-node bootstrap, commit-tree catch-up, live tailing of
 //! foreign segments). Replay writes use the recorded inos and
 //! timestamps and are NOT journaled — they already live in the log.
 //!
 //! Replay is **convergent**, not strict: records apply with last-wins
-//! upsert semantics so that (a) segments replayed over a checkpoint
-//! that already contains their effects are idempotent, and (b) two
-//! replicas that saw the same records in different interleavings agree
-//! (the record later in the global log wins). Conflicts with *pending*
-//! (unshipped) local records are skipped by the caller via
-//! [`TouchSet`] — our own records sit later in the global log than
-//! anything we are tailing, so ours win everywhere. That reasoning is
-//! what limits the set to *unshipped* records: a record already
-//! sequenced in the log (notably one a lease holder accepted for us as
-//! a forwarded mutation) has no such claim, and must never suppress a
-//! foreign record, or the two replicas diverge for good.
+//! upsert semantics so that (a) segments replayed over a bootstrap base
+//! (a restored commit, or genesis) that already contains their effects
+//! are idempotent, and (b) two replicas that saw the same records in
+//! different interleavings agree (the record later in the global log
+//! wins). Conflicts with *pending* (unshipped) local records are skipped
+//! by the caller via [`TouchSet`] — our own records sit later in the
+//! global log than anything we are tailing, so ours win everywhere. That
+//! reasoning is what limits the set to *unshipped* records: a record
+//! already sequenced in the log (notably one a lease holder accepted for
+//! us as a forwarded mutation) has no such claim, and must never
+//! suppress a foreign record, or the two replicas diverge for good.
 //!
 //! Plan 29 M0a removed namespace partitions: there is one metadata log
 //! stream (`p0`) and an ordinary cross-directory `rename` is a single
 //! `LogRecord::Rename`, applied in one transaction like any other op.
+//! Plan 29 M0b retired the whole-DB `VACUUM INTO` checkpoint this module
+//! used to write (`SqliteMeta::snapshot`); a fresh replica now bootstraps
+//! from the plan 28 commit chain, or replays from genesis.
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::sqlite::{
-    SqliteMeta, UsageTracker, INO_PREFIX_SHIFT, QUOTA_CREATION_KV_KEY, QUOTA_KV_KEY,
-};
+use crate::sqlite::{SqliteMeta, UsageTracker, INO_PREFIX_SHIFT, QUOTA_KV_KEY};
 use constellation_fs_core::InodeKind;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
@@ -109,8 +110,8 @@ impl TouchSet {
 }
 
 impl SqliteMeta {
-    /// Apply a batch of records in one transaction (bootstrap /
-    /// checkpoint catch-up), then advance this node's ino counter past
+    /// Apply a batch of records in one transaction (bootstrap, or
+    /// commit-tree catch-up), then advance this node's ino counter past
     /// every inode seen under its own prefix.
     pub fn apply_records(&self, records: &[LogRecord]) -> Result<(), MetaError> {
         self.apply_foreign(records, &TouchSet::default())?;
@@ -177,93 +178,6 @@ impl SqliteMeta {
         tx.commit()?;
         staged.drain_into(self.usage_tracker());
         Ok(skipped)
-    }
-
-    /// Consistent snapshot of the whole DB for a cluster checkpoint.
-    /// Strips node-local and ephemeral state so a fresh replica does not
-    /// inherit another node's identity or upload obligations:
-    /// - `journal` / `atime_journal` / `scratch_*` / `shadow`
-    /// - `pending_upload` (this node's not-yet-uploaded set; plan 25)
-    /// - `pin` (explicitly node-local)
-    /// - `epochs` / `reintegration` (local continuation / stranded-branch
-    ///   bookkeeping tied to this node's journal)
-    /// - identity / apply-cursor kv keys (`node_id`, `node_prefix`,
-    ///   `next_ino`, `applied_seq*`) and other node-local kv (`left`,
-    ///   `read_only_member`, `lease_lost`, creation-quota mirror)
-    ///
-    /// Replicated namespace tables (`inode`, `dentry`, `xattr`, `snapshot`,
-    /// `chunk_ref`, `deref`, …) are kept.
-    pub fn snapshot(&self) -> Result<Vec<u8>, MetaError> {
-        // Unique per call: a daemon checkpoints per partition, so two
-        // snapshots can be in flight at once. Sharing one scratch path
-        // let them delete each other's file mid-VACUUM.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tmp = std::env::temp_dir().join(format!(
-            "constellation-ckpt-{}-{}.db",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_file(&tmp);
-
-        // `VACUUM INTO` copies the whole database, which costs milliseconds
-        // per MiB and so grows with the namespace. Holding the store's
-        // connection across it stalls every metadata op — measured at 23ms
-        // for a single getattr on a 30k-file DB. A file-backed store copies
-        // through its own connection instead: WAL gives that reader a
-        // consistent view while writers keep going.
-        match self.db_path() {
-            Some(path) => {
-                let reader = Connection::open_with_flags(
-                    path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_URI
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )?;
-                reader.busy_timeout(std::time::Duration::from_secs(30))?;
-                reader.execute("VACUUM INTO ?1", params![tmp.to_string_lossy()])?;
-            }
-            None => {
-                let conn = self.raw();
-                conn.execute("VACUUM INTO ?1", params![tmp.to_string_lossy()])?;
-            }
-        }
-
-        {
-            let c = Connection::open(&tmp)?;
-            // Rollback journaling keeps these deletes in the main file, so
-            // the bytes read below are complete. Under WAL they would sit in
-            // a `-wal` sidecar that the payload does not carry.
-            c.pragma_update(None, "journal_mode", "DELETE")?;
-            c.execute("DELETE FROM journal", [])?;
-            c.execute("DELETE FROM atime_journal", [])?;
-            c.execute("DELETE FROM pending_upload", [])?;
-            c.execute("DELETE FROM pin", [])?;
-            c.execute("DELETE FROM epochs", [])?;
-            c.execute("DELETE FROM reintegration", [])?;
-            c.execute_batch(
-                "DROP TABLE IF EXISTS scratch_inode;
-                 DROP TABLE IF EXISTS scratch_dentry;
-                 DROP TABLE IF EXISTS scratch_xattr;
-                 DROP TABLE IF EXISTS shadow;",
-            )?;
-            // Reset AUTOINCREMENT so the restored node journals from 1.
-            let _ = c.execute("DELETE FROM sqlite_sequence WHERE name = 'journal'", []);
-            c.execute(
-                "DELETE FROM kv WHERE key IN (
-                    'node_id', 'node_prefix', 'next_ino', 'applied_seq',
-                    'left', 'read_only_member', 'lease_lost'
-                 )
-                 OR key = ?1",
-                params![QUOTA_CREATION_KV_KEY],
-            )?;
-            // No second VACUUM: `VACUUM INTO` already wrote a compact file,
-            // and reclaiming the pages those deletes freed would rewrite the
-            // whole database again for a payload the log store compresses
-            // anyway. The free pages are reused when the copy is restored.
-        }
-        let bytes = std::fs::read(&tmp).map_err(|e| MetaError::Invalid(e.to_string()))?;
-        let _ = std::fs::remove_file(&tmp);
-        Ok(bytes)
     }
 }
 
@@ -332,14 +246,7 @@ fn evict_dentry(
         )?;
         if nlink == 1 {
             tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
-            SqliteMeta::track_manifest_transition(
-                tx,
-                ino,
-                manifest.as_deref(),
-                None,
-                0,
-                constellation_fs_core::types::now_ns() / 1_000_000,
-            )?;
+            SqliteMeta::track_manifest_transition(tx, ino, manifest.as_deref(), None)?;
             if kind == InodeKind::File.as_u8() {
                 usage.adjust(-size, -1);
             }
@@ -569,14 +476,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             )?;
             if nlink == 1 {
                 tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
-                SqliteMeta::track_manifest_transition(
-                    tx,
-                    ino,
-                    manifest.as_deref(),
-                    None,
-                    0,
-                    time_ns / 1_000_000,
-                )?;
+                SqliteMeta::track_manifest_transition(tx, ino, manifest.as_deref(), None)?;
                 if kind == InodeKind::File.as_u8() {
                     usage.adjust(-size, -1);
                 }
@@ -770,14 +670,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
                 params![ino, manifest, *size as i64, time_ns],
             )?;
             usage.adjust(*size as i64 - old_size, 0);
-            SqliteMeta::track_manifest_transition(
-                tx,
-                *ino,
-                old.as_deref(),
-                Some(manifest),
-                0,
-                time_ns / 1_000_000,
-            )?;
+            SqliteMeta::track_manifest_transition(tx, *ino, old.as_deref(), Some(manifest))?;
             Ok(Applied::Done)
         }
         LogRecord::SnapCreate {
@@ -852,8 +745,6 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
                     node.ino,
                     None,
                     node.manifest.as_deref(),
-                    0,
-                    node.mtime_ns / 1_000_000,
                 )?;
                 let prior_file_bytes = prior
                     .filter(|(_, k)| *k == InodeKind::File.as_u8())
@@ -1050,91 +941,6 @@ mod tests {
         // Ino allocation continues past everything replayed.
         let n = dst.create(1, "new", 0o644, 0, 0).unwrap();
         assert!(n.ino > f.ino.max(g.ino));
-    }
-
-    /// Concurrent snapshots in one process must not clobber each other.
-    ///
-    /// Regression: the scratch file was named by PID alone, so two
-    /// threads checkpointing at once removed and re-created the same
-    /// path; the loser's connection then failed with "database file has
-    /// moved" / "attempt to write a readonly database". A daemon
-    /// checkpoints per partition, so this is reachable in production and
-    /// not merely a test artifact.
-    #[test]
-    fn concurrent_snapshots_do_not_collide() {
-        let stores: Vec<std::sync::Arc<SqliteMeta>> = (0..8)
-            .map(|i| {
-                let m = SqliteMeta::open_in_memory().unwrap();
-                m.mkdir(1, &format!("d{i}"), 0o755, 0, 0).unwrap();
-                std::sync::Arc::new(m)
-            })
-            .collect();
-        let handles: Vec<_> = stores
-            .into_iter()
-            .map(|m| std::thread::spawn(move || m.snapshot().map(|b| b.len())))
-            .collect();
-        for h in handles {
-            let bytes = h.join().unwrap().expect("snapshot failed under contention");
-            assert!(bytes > 0, "empty snapshot");
-        }
-    }
-
-    #[test]
-    fn snapshot_strips_journal() {
-        let src = SqliteMeta::open_in_memory().unwrap();
-        src.mkdir(1, "d", 0o755, 0, 0).unwrap();
-        assert_eq!(src.journal_len().unwrap(), 1);
-        let snap = src.snapshot().unwrap();
-
-        let tmp =
-            std::env::temp_dir().join(format!("constellation-test-{}.db", std::process::id()));
-        std::fs::write(&tmp, &snap).unwrap();
-        let dst = SqliteMeta::open(&tmp).unwrap();
-        assert_eq!(dst.journal_len().unwrap(), 0);
-        assert!(dst.lookup(1, "d").unwrap().is_some());
-        drop(dst);
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    /// Cluster checkpoints must not carry the writer's `pending_upload`
-    /// backlog (or pins / epoch bookkeeping) onto a fresh replica
-    /// (plan 25).
-    #[test]
-    fn snapshot_strips_pending_upload() {
-        use constellation_fs_core::ChunkHash;
-
-        let src = SqliteMeta::open_in_memory().unwrap();
-        src.set_node_prefix(1).unwrap();
-        let f = src.create(1, "f", 0o644, 0, 0).unwrap();
-        let h = ChunkHash::of(b"writer-chunk");
-        src.set_manifest_dirty(f.ino, None, b"M", 4, &[h]).unwrap();
-        src.add_pin("/f", f.ino).unwrap();
-        assert_eq!(src.pending_upload_count().unwrap(), 1);
-        assert!(!src.pins().unwrap().is_empty());
-
-        let snap = src.snapshot().unwrap();
-        let tmp = std::env::temp_dir().join(format!(
-            "constellation-test-pending-{}.db",
-            std::process::id()
-        ));
-        std::fs::write(&tmp, &snap).unwrap();
-        let dst = SqliteMeta::open(&tmp).unwrap();
-        assert!(
-            dst.pending_uploads().unwrap().is_empty(),
-            "pending_upload must not leave the writing node via a checkpoint"
-        );
-        assert!(
-            dst.pins().unwrap().is_empty(),
-            "pins are node-local and must be stripped"
-        );
-        assert!(dst.kv_get("node_id").unwrap().is_none());
-        assert!(dst.kv_get("node_prefix").unwrap().is_none());
-        // Namespace / manifest survive.
-        let kept = dst.lookup(1, "f").unwrap().unwrap();
-        assert_eq!(kept.ino, f.ino);
-        assert_eq!(dst.manifest(f.ino).unwrap().as_deref(), Some(b"M".as_ref()));
-        drop(dst);
-        let _ = std::fs::remove_file(&tmp);
     }
 
     // --- read-time atime (plan 20) ---

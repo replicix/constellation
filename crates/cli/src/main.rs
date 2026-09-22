@@ -314,9 +314,6 @@ enum GcCommand {
         s3: Option<String>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Include the expensive LIST-based orphan pass.
-        #[arg(long)]
-        orphans: bool,
     },
     /// Run the mark phase only and print deletion evidence.
     Verify {
@@ -325,8 +322,6 @@ enum GcCommand {
         s3: Option<String>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        #[arg(long)]
-        orphans: bool,
     },
 }
 
@@ -1071,25 +1066,23 @@ fn main() -> Result<()> {
             ))
         }
         Command::Gc { command } => {
-            let (target, s3, state_dir, orphans, verify_only) = match command {
+            let (target, s3, state_dir, verify_only) = match command {
                 GcCommand::Run {
                     target,
                     s3,
                     state_dir,
-                    orphans,
-                } => (target, s3, state_dir, orphans, false),
+                } => (target, s3, state_dir, false),
                 GcCommand::Verify {
                     target,
                     s3,
                     state_dir,
-                    orphans,
-                } => (target, s3, state_dir, orphans, true),
+                } => (target, s3, state_dir, true),
             };
             let reg = registry::Registry::load()?;
             let t = target::resolve(&target, &reg);
             let s3 = target::s3_url(s3, &t)?;
             let dir = target::state_dir_opt(state_dir, &t);
-            let report = rt.block_on(run_gc_cli(&s3, dir, orphans, verify_only))?;
+            let report = rt.block_on(run_gc_cli(&s3, dir, verify_only))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
@@ -1978,7 +1971,6 @@ fn cmd_fs_list(rt: &tokio::runtime::Runtime) -> Result<()> {
 async fn run_gc_cli(
     s3: &str,
     state_dir: Option<PathBuf>,
-    orphans: bool,
     verify_only: bool,
 ) -> Result<gc::GcReport> {
     let backend = backend::open_backend(s3).await?;
@@ -2005,14 +1997,13 @@ async fn run_gc_cli(
         shipper::bootstrap(&db, &logs).await?;
     }
     let meta = std::sync::Arc::new(SqliteMeta::open(db)?);
-    meta.backfill_deref_once()?;
     let caps = chunks.probe_conditional_writes().await?;
     let mode = if caps.etag_cas {
         constellation_store_s3::LeaseMode::Cas
     } else {
         constellation_store_s3::LeaseMode::SingleWriter
     };
-    gc::run(backend, chunks, meta, mode, orphans, verify_only, None).await
+    gc::run(backend, chunks, meta, mode, verify_only, None).await
 }
 
 async fn run_fsck_cli(
@@ -2045,7 +2036,6 @@ async fn run_fsck_cli(
         shipper::bootstrap(&db, &logs).await?;
     }
     let meta = std::sync::Arc::new(SqliteMeta::open(db)?);
-    meta.backfill_deref_once()?;
     let caps = chunks.probe_conditional_writes().await?;
     let mode = if caps.etag_cas {
         constellation_store_s3::LeaseMode::Cas

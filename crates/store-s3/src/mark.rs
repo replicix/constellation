@@ -9,9 +9,9 @@
 //!
 //! ## Why this replaces a refcount table
 //!
-//! Today's chunk GC (`crate::gc`, `cli::gc`) works from SQLite's
-//! continuously maintained `deref` index: every dereference is written
-//! down as it happens, and GC reads the table. That is a second source
+//! Chunk GC (`crate::gc`, `cli::gc`) used to work from SQLite's
+//! continuously maintained `deref` index: every dereference was written
+//! down as it happened, and GC read the table. That was a second source
 //! of truth about liveness, maintained by a different code path than
 //! the one that creates the references, and keeping the two agreeing is
 //! where plan 26's finding 6 lived. The tree needs none of it. A commit
@@ -20,10 +20,10 @@
 //! clone, every unexpired `holds/*` (§P10). The bucket is authoritative
 //! and no bookkeeping can drift from it.
 //!
-//! **Today's `deref` table and the `superseded-checkpoint` rule stay
-//! exactly as they are.** §P10 retires them only once the tree is the
-//! authority for metadata, which is well past this step; this module is
-//! additive and nothing calls it yet.
+//! **Plan 29 M0c retired the `deref` table and the `superseded-checkpoint`
+//! rule**, now that this module and S7b's `cli::gc` wiring are the sole
+//! source of chunk-GC candidates (the orphan LIST pass) and metadata GC
+//! (this mark + `compact.rs`).
 //!
 //! ## The one property that makes GC affordable
 //!

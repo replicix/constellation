@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 /// raises the bound for genuinely slow or hung cases. Full-corpus
 /// perf-regression runs (120k+ files, GB-scale write-back drains) routinely
 /// need well over the 10s this used to allow: draining that many pending
-/// uploads, shipping the journal tail, and writing a checkpoint on a large
-/// SQLite replica are all legitimately slow, not hung, and the old bound
+/// uploads, shipping the journal tail, and publishing a metadata commit
+/// are all legitimately slow, not hung, and the old bound
 /// turned "still finishing" into a flaky "daemon did not exit after
 /// unmount"/"mount did not appear" failure. Override with
 /// `CONSTELLATION_HARNESS_MOUNT_TIMEOUT_S` for scenario-specific tuning.
@@ -316,10 +316,10 @@ impl Client {
         self.state.join("meta.db")
     }
 
-    pub fn gc_process(&self, orphans: bool) -> Result<Child> {
+    pub fn gc_process(&self) -> Result<Child> {
         // "/" is a placeholder TARGET positional (plan 21): unregistered,
         // so `--s3`/`--state-dir` below are what actually get used.
-        let mut args = vec![
+        let args = vec![
             "gc",
             "run",
             "/",
@@ -328,9 +328,6 @@ impl Client {
             "--state-dir",
             self.state.to_str().unwrap(),
         ];
-        if orphans {
-            args.push("--orphans");
-        }
         Ok(self
             .cmd(&args)
             .stdout(Stdio::piped())
@@ -338,8 +335,8 @@ impl Client {
             .spawn()?)
     }
 
-    pub fn gc_run(&self, orphans: bool) -> Result<std::process::Output> {
-        Ok(self.gc_process(orphans)?.wait_with_output()?)
+    pub fn gc_run(&self) -> Result<std::process::Output> {
+        Ok(self.gc_process()?.wait_with_output()?)
     }
 
     pub fn fsck(&self, repair: bool) -> Result<std::process::Output> {

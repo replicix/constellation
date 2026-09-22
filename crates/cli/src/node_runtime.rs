@@ -331,13 +331,13 @@ impl NodeRuntime {
             None => constellation_store_s3::LogStore::new(backend),
         };
         let db_path = state_dir.join("meta.db");
-        // Fresh node: rebuild the replica from checkpoint + log replay.
+        // Fresh node: rebuild the replica from the commit chain plus log
+        // replay (or, with no commit yet, a genesis replay of the whole log).
         if !db_path.exists() {
             rt.block_on(shipper::bootstrap(&db_path, &log))
                 .context("bootstrapping metadata replica")?;
         }
         let meta = Arc::new(SqliteMeta::open(&db_path)?);
-        meta.backfill_deref_once()?;
         meta.scratch_purge_all()?;
         if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
             bail!(
@@ -390,10 +390,9 @@ impl NodeRuntime {
         }
         meta.set_node_prefix(node_id)?;
         // Plan 25: drop pending_upload rows that belong to another node's
-        // ino prefix (poisoned checkpoint restored into an existing state
-        // dir, or a copied meta.db). Same-prefix rows stay for crash
-        // recovery. On a fresh bootstrap this is a no-op after
-        // `clear_pending_uploads`.
+        // ino prefix (a copied meta.db dropped into an existing state
+        // dir). Same-prefix rows stay for crash recovery. On a fresh
+        // bootstrap this is a no-op after `clear_pending_uploads`.
         let purged = meta
             .purge_foreign_pending_uploads(node_id)
             .context("purging foreign pending_upload rows")?;
@@ -581,7 +580,6 @@ impl NodeRuntime {
                         meta.clone(),
                         lease_mode,
                         false,
-                        false,
                         Some(&gc_peers),
                     )
                     .await
@@ -659,18 +657,12 @@ impl NodeRuntime {
         let spool = ship.spool.clone();
         let mut ship = ship;
         if !read_only_member {
-            rt.block_on(async {
-                // Seed the checkpoint cadence baseline from S3 before the
-                // first ship round, so a restart resumes byte-proportional
-                // checkpointing instead of firing on the segment count.
-                ship.seed_checkpoint_baseline().await;
-                crate::adopt_root(&meta, &mut ship, &mut keeper).await
-            })
-            .context("adopting the root directory owner")?;
+            rt.block_on(async { crate::adopt_root(&meta, &mut ship, &mut keeper).await })
+                .context("adopting the root directory owner")?;
         }
         ship.set_peers(peers.clone());
         ship.set_designations(designations.clone());
-        // Plan 28 §11: publish the §P6 tree on the checkpoint cadence.
+        // Plan 28 §11: publish the §P6 tree on the publish cadence.
         // A read-only member publishes nothing: it ships no segments, so
         // it has no authority to commit one.
         if !read_only_member {
@@ -2128,10 +2120,10 @@ impl NodeRuntime {
     }
 
     fn drain_for_shutdown(&self) -> Result<()> {
-        // Clean unmount: ship the journal tail, checkpoint, then release the
-        // lease so a peer does not have to wait out the TTL. Skip when we
-        // already flushed and retired via `leave` — the registry record is
-        // a tombstone and a second ship is unnecessary.
+        // Clean unmount: ship the journal tail, publish a metadata commit,
+        // then release the lease so a peer does not have to wait out the
+        // TTL. Skip when we already flushed and retired via `leave` — the
+        // registry record is a tombstone and a second ship is unnecessary.
         tracing::info!("draining uploads and shipping journal before exit");
         self.stop.store(true, Ordering::Relaxed);
         if matches!(self.meta.kv_get("left")?.as_deref(), Some("1")) {

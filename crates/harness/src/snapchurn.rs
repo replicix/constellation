@@ -725,7 +725,7 @@ fn live(seed: u64) -> Result<()> {
     assert_replica_clean(&client.replica_db())?;
     assert_prefix_empty(&env.direct_endpoint, &format!("{prefix}/snaps/"), "snaps/")?;
     audit.event(None, "gc", None, None, json!({}))?;
-    let output = client.gc_run(true)?;
+    let output = client.gc_run()?;
     anyhow::ensure!(
         output.status.success(),
         "snapshot-churn GC failed: {}{}",
@@ -1215,7 +1215,7 @@ fn apply_event(
                 &format!("{bucket_prefix}/snaps/"),
                 "replay snaps/",
             )?;
-            let output = client.gc_run(true)?;
+            let output = client.gc_run()?;
             anyhow::ensure!(output.status.success(), "replay GC failed");
             assert_prefix_empty(
                 &env.direct_endpoint,

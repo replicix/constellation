@@ -112,7 +112,12 @@ Directory-local ino allocation (plan 28 §S1b); per-directory recursive
 size without a recursive CTE (§P7); `blobs/` GC with a two-mark horizon;
 wire `CONSTELLATION_ATIME_SHIP_MAX_DELAY_S`; root-cause and fix
 `atime-eventual`, `deposed-reintegration`, `chaos-ci` (create-storm
-EIO), `named-shared-daemon` (umount hang).
+EIO), `named-shared-daemon` (umount hang). Chunk GC computes liveness
+from the local replica: tail the log to its head before marking and
+again after the condemned-list wait, so a replica lagging behind a
+writer that deduplicated against an old chunk cannot delete it. Publish
+a commit on idle too (today only every 32 segments and at shutdown, so
+a quiet node's head commit, and with it the log-retention floor, lags).
 
 ### M4 — decide on leaseless optimistic commits (§P3)
 Design note with measurements; implement only if M3 leaves lease

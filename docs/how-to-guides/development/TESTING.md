@@ -180,11 +180,12 @@ Scenarios (see `harness list`): `baseline`, `latency`, `slow-network`,
 `s3-outage`, `s3-flap`, `kill9-remount` (the phase-1 crash-recovery exit
 criterion), `cold-cache`, `two-clients-disjoint`,
 `fresh-node-bootstrap` (a brand-new node reconstructs the namespace and
-data purely from S3 — checkpoint restore plus log replay — and must
+data purely from S3 — the plan 28 commit chain plus log replay, or a
+genesis replay of the whole log when no commit exists yet — and must
 match the model exactly; also asserts `writeback.pending_uploads == 0`
 so a joiner never inherits the writer's upload queue),
-`checkpoint-strips-pending-upload` (writer crashes mid-write-back after
-a checkpoint exists while `pending_uploads > 0`; a fresh joiner must
+`commit-strips-pending-upload` (writer crashes mid-write-back after a
+metadata commit exists while `pending_uploads > 0`; a fresh joiner must
 bootstrap with pending == 0, no missing-chunk log spam, and readable
 data once the writer finishes draining), `readahead` (cold sequential read of a
 multi-chunk file under injected latency must beat the serial-fetch
@@ -525,8 +526,9 @@ metadata commit chain:
   must then bootstrap from the surviving commit to the oracle. Seed 42
   measured a flat ~43.8 KB from round 2 on; without GC it grows ~20 KB a
   round.
-- `checkpoint-strips-pending-upload` accepts a plan 28 commit as the
-  mid-flight bootstrap base (a legacy checkpoint still counts if forced on).
+- `commit-strips-pending-upload` accepts a plan 28 commit as the mid-flight
+  bootstrap base (plan 29 M0b retired the legacy `VACUUM INTO` checkpoint
+  entirely, so a commit is now the only mid-flight base there is).
 - `fresh-node-bootstrap` now rebuilds from the newest commit plus the log
   tail after its applied vector.
 - `snapshot-churn` honours `CHAOS_KEEP_TMP` like the other scenarios.
@@ -541,18 +543,12 @@ toxic still applies. It parses client-to-upstream HTTP/1.1 request lines only,
 and exposes a `desyncs` counter that every scenario using it asserts is zero,
 so a miscounted stream fails the scenario instead of silently under-reporting.
 
-- `ckpt-bulk-ingest-bounded` forces the legacy `VACUUM INTO` snapshot back on
-  (`CONSTELLATION_CHECKPOINT_SNAPSHOT=on`; plan 28 turned it off by default)
-  and ingests a seeded tree from one writer, rewriting
-  it until at least three checkpoints have fired, then asserts the bucket holds
-  at most the newest two snapshots, that their combined size is within 3x the
-  final snapshot, and that a fresh node still bootstraps to the oracle's exact
-  tree from what survived the inline prune. Writes are paced deliberately: a
-  ship round takes the whole journal as one segment, so back-to-back writes
-  coalesce and never reach the 32-segment count floor. The scenario prints
-  checkpoints written against checkpoints remaining, in objects and bytes; seed
-  42 measured 64 written (3,690,594 B) and 2 remaining (119,978 B) over 1000
-  segments.
+- Plan 29 M0b removed `ckpt-bulk-ingest-bounded`: it existed only to bound the
+  legacy `VACUUM INTO` checkpoint's inline prune (newest-2 snapshots), which
+  no longer exists — a metadata commit is a delta of changed keys, not a
+  whole-DB copy, so there is nothing analogous left to bound this way.
+  `mtree-gc-plateau` is the scenario that now covers the metadata-plane
+  footprint over repeated rewrites.
 - `idle-cluster-is-quiet` converges three nodes, leaves them idle for 60 s, and
   counts every request each one makes on its own relay. Nothing may list `log/`
   at all, no LIST may fall outside the membership and designation polls, and
