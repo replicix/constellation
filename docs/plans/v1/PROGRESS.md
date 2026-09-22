@@ -3875,3 +3875,27 @@ No gap found; not a large change. Constellation already has adaptive sequential 
 - The early install is guarded against resurrection (`forward::safe_to_install_early`): only while the requester's replay is below the holder's next ship sequence, because any delete of that entry must ship at or above it. Otherwise the requester falls back to a bounded, observe-only wait. `ENOENT` from a forwarded `unlink`/`rmdir` gets the same wait in the other direction. New scenario `mkdir-p-race` (4 nodes, concurrent `mkdir -p` of one fresh tree): fails deterministically without the fix, passes with it.
 - A forwarded op's own `Accepted` records keep being installed unconditionally. Skipping them above the ship floor left the caller's own op invisible until its segment landed, so its next write ran against a stale base (`disjoint-write-4` failed with EIO). **Open (precise fix):** a later record for the same entry could reach the requester before the reply is applied. That needs the record executed, made durable in S3 and pushed back within the reply's 1–3 ms round trip, so it is theoretical, but closing it needs the holder's journal position in both replies and segments, so a requester knows exactly when its own records have landed.
 - Harness: `S3Env` takes a host-wide `flock` on its docker prefix. A second concurrent `harness run` now fails immediately with an explanation, instead of force-removing the first run's containers and network (container-name conflicts and missing networks, which surfaced as spurious EIO/convergence failures).
+
+## Plan 30 M1 — Stateright model of the authority protocol: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| New workspace crate `constellation-model` (`stateright` 0.31 only; no product dependency either way), in `members` and `default-members` | done | `crates/model` |
+| `AuthorityModel` (`stateright::Model`): nodes, S3 as CAS-able state (lease register, create-if-absent log slots, commit pointer), lossy/reordering P2P multiset, ticks, crash/restart/pause | done | `crates/model/src/protocol.rs` |
+| Namespace sequential spec (`create_excl`/`unlink`, EEXIST/ENOENT) checked with `LinearizabilityTester` | done | `crates/model/src/namespace.rs` |
+| Properties `linearizable`, `converged_at_quiescence`, `commits_are_log_prefixes` (always), `progress` (sometimes) | done | `protocol.rs` `properties()` |
+| Action → code mapping table and simplifications | done | `crates/model/src/lib.rs` |
+| `today_finds_bug_a`: forward timeout → handoff flush → local re-execution → EEXIST (10 actions, 477 unique states) | done | `crates/model/tests/today_bugs.rs` |
+| `today_finds_bug_b`: holder accepts a forward, crashes before shipping, the requester's shadow never retires and is published (7 actions); the crash + takeover shape verified with `assert_discovery` | done | same |
+| `single_writer_is_clean`: exhaustive, all properties hold (504 unique states) | done | same |
+
+**Carried forward to M3:** simplification 9 gates `Publish` on an empty
+local journal, which hides the holder-side variant of bug B (a holder
+publishing unshipped journal effects). M3's `Recovery` variant must drop
+that gate and show `commits_are_log_prefixes` holds with holder publishing
+from log-prefix state.
+
+### Plan 30 M1 exit criteria
+- [x] Both counterexamples found by the checker (release test suite 0.04–0.06 s)
+- [x] `cargo fmt`, `clippy -D warnings`, `cargo test --workspace` clean
+- [x] Model-to-code mapping reviewed by the coordinator

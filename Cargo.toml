@@ -11,6 +11,7 @@ members = [
     "crates/harness",
     "crates/chaos",
     "crates/upload-concurrency",
+    "crates/model",
     "bench/uploadbench",
 ]
 # Bare `cargo build`/`cargo test` at the root only touch the product
@@ -29,6 +30,7 @@ default-members = [
     "crates/harness",
     "crates/chaos",
     "crates/upload-concurrency",
+    "crates/model",
 ]
 exclude = ["bench/dbbench", "bench/prollybench", "bench/enginebench"]
 

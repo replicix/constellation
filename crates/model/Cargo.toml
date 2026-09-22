@@ -1,0 +1,9 @@
+[package]
+name = "constellation-model"
+description = "Stateright model of the metadata authority protocol (plan 30 M1) — no product crate depends on this, and it depends on none of them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+stateright = "0.31"
