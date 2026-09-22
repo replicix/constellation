@@ -1,0 +1,85 @@
+=== 2026-09-21T21:49:45+02:00 engine=sqlite cache_mb=256 ===
+[sqlite] generating corpus: 1000000 entries
+[sqlite] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[sqlite] load done in 28.0s, proc_io write delta 22110 MiB, disk_bytes 120 MiB
+[sqlite] fresh phase done
+[sqlite] aging done: 15000000 mutations in 490.9s
+[sqlite] aged phase done
+[sqlite] mixed workload done
+[sqlite] final disk_bytes 627 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-21T21:59:45+02:00 done sqlite cache_mb=256 ===
+=== 2026-09-21T21:59:45+02:00 engine=sqlite cache_mb=4096 ===
+[sqlite] generating corpus: 1000000 entries
+[sqlite] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[sqlite] load done in 26.9s, proc_io write delta 22110 MiB, disk_bytes 120 MiB
+[sqlite] fresh phase done
+[sqlite] aging done: 15000000 mutations in 476.3s
+[sqlite] aged phase done
+[sqlite] mixed workload done
+[sqlite] final disk_bytes 615 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-21T22:09:29+02:00 done sqlite cache_mb=4096 ===
+=== 2026-09-21T22:09:29+02:00 engine=sqlite-tuned cache_mb=4096 ===
+[sqlite-tuned] generating corpus: 1000000 entries
+[sqlite-tuned] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[sqlite-tuned] load done in 26.7s, proc_io write delta 22110 MiB, disk_bytes 120 MiB
+[sqlite-tuned] fresh phase done
+[sqlite-tuned] aging done: 15000000 mutations in 480.9s
+[sqlite-tuned] aged phase done
+[sqlite-tuned] mixed workload done
+[sqlite-tuned] final disk_bytes 653 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-21T22:19:17+02:00 done sqlite-tuned cache_mb=4096 ===
+=== 2026-09-21T22:19:17+02:00 engine=mtree cache_mb=256 ===
+[mtree] generating corpus: 1000000 entries
+[mtree] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[mtree] load done in 11.8s, proc_io write delta 1684 MiB, disk_bytes 1417 MiB
+[mtree] fresh phase done
+[mtree] aging done: 15000000 mutations in 702.7s
+[mtree] compaction: 109109 MiB -> 773 MiB
+[mtree] locality: bulk-built dir cold reads=5, incrementally-aged dir cold reads=4
+[mtree] aged phase done
+[mtree] mixed workload done
+[mtree] final disk_bytes 1384 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-21T22:32:48+02:00 done mtree cache_mb=256 ===
+=== 2026-09-21T22:32:48+02:00 engine=mtree cache_mb=4096 ===
+[mtree] generating corpus: 1000000 entries
+[mtree] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[mtree] load done in 12.0s, proc_io write delta 1684 MiB, disk_bytes 1417 MiB
+[mtree] fresh phase done
+[mtree] aging done: 15000000 mutations in 599.7s
+[mtree] compaction: 109008 MiB -> 800 MiB
+[mtree] locality: bulk-built dir cold reads=5, incrementally-aged dir cold reads=4
+[mtree] aged phase done
+[mtree] mixed workload done
+[mtree] final disk_bytes 1480 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-21T22:44:37+02:00 done mtree cache_mb=4096 ===
+=== 2026-09-21T22:44:37+02:00 engine=redb cache_mb=256 ===
+[redb] generating corpus: 1000000 entries
+[redb] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[redb] load done in 62.5s, proc_io write delta 56635 MiB, disk_bytes 411 MiB
+[redb] fresh phase done
+[redb] aging done: 15000000 mutations in 1481.7s
+[redb] aged phase done
+[redb] mixed workload done
+[redb] final disk_bytes 2079 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-21T23:11:44+02:00 done redb cache_mb=256 ===
+=== 2026-09-21T23:11:44+02:00 engine=fjall cache_mb=256 ===
+[fjall] generating corpus: 1000000 entries
+[fjall] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[fjall] load done in 5.9s, proc_io write delta 904 MiB, disk_bytes 143 MiB
+[fjall] fresh phase done
+[fjall] aging done: 15000000 mutations in 324.5s
+[fjall] aged phase done
+[fjall] mixed workload done
+[fjall] final disk_bytes 841 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-21T23:18:37+02:00 done fjall cache_mb=256 ===
+=== 2026-09-21T23:18:37+02:00 engine=fjall cache_mb=4096 ===
+[fjall] generating corpus: 1000000 entries
+[fjall] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[fjall] load done in 5.7s, proc_io write delta 903 MiB, disk_bytes 143 MiB
+[fjall] fresh phase done
+[fjall] aging done: 15000000 mutations in 211.5s
+[fjall] aged phase done
+[fjall] mixed workload done
+[fjall] final disk_bytes 816 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-21T23:23:46+02:00 done fjall cache_mb=4096 ===
+ALL DONE 2026-09-21T23:23:46+02:00

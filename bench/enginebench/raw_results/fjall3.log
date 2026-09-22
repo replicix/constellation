@@ -1,0 +1,41 @@
+=== 2026-09-22T01:10:06+02:00 engine=fjall3 entries=1000000 cache_mb=256 ===
+[fjall3] generating corpus: 1000000 entries
+[fjall3] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[fjall3] load done in 5.5s, proc_io write delta 1489 MiB, disk_bytes 245 MiB
+[fjall3] fresh phase done
+[fjall3] aging done: 15000000 mutations in 2301.9s
+[fjall3] aged phase done
+[fjall3] mixed workload done
+[fjall3] final disk_bytes 727 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-22T01:50:07+02:00 done fjall3 (1M) ===
+=== 2026-09-22T01:50:07+02:00 engine=fjall3-tuned entries=1000000 cache_mb=256 ===
+[fjall3-tuned] generating corpus: 1000000 entries
+[fjall3-tuned] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[fjall3-tuned] load done in 5.3s, proc_io write delta 1481 MiB, disk_bytes 246 MiB
+[fjall3-tuned] fresh phase done
+[fjall3-tuned] aging done: 15000000 mutations in 1351.3s
+[fjall3-tuned] aged phase done
+[fjall3-tuned] mixed workload done
+[fjall3-tuned] final disk_bytes 815 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-22T02:14:05+02:00 done fjall3-tuned (1M) ===
+=== 2026-09-22T02:14:05+02:00 engine=fjall3 entries=5000000 cache_mb=256 ===
+[fjall3] generating corpus: 5000000 entries
+[fjall3] corpus: 5000000 recs, 113873 dirs, 881 big dirs, 2418 extra links
+[fjall3] load done in 30.9s, proc_io write delta 9914 MiB, disk_bytes 969 MiB
+[fjall3] fresh phase done
+[fjall3] aging done: 15000000 mutations in 2350.3s
+[fjall3] aged phase done
+[fjall3] mixed workload done
+[fjall3] final disk_bytes 1133 MiB, corpus logical bytes 692975 MiB
+=== 2026-09-22T02:55:00+02:00 done fjall3 (5M) ===
+=== 2026-09-22T02:55:00+02:00 engine=fjall entries=5000000 cache_mb=256 ===
+[fjall] generating corpus: 5000000 entries
+[fjall] corpus: 5000000 recs, 113873 dirs, 881 big dirs, 2418 extra links
+[fjall] load done in 31.1s, proc_io write delta 5945 MiB, disk_bytes 611 MiB
+[fjall] fresh phase done
+[fjall] aging done: 15000000 mutations in 342.5s
+[fjall] aged phase done
+[fjall] mixed workload done
+[fjall] final disk_bytes 1162 MiB, corpus logical bytes 692975 MiB
+=== 2026-09-22T03:02:13+02:00 done fjall (5M) ===
+FJALL3 RUN DONE 2026-09-22T03:02:13+02:00

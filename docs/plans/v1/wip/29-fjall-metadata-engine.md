@@ -48,6 +48,21 @@ publish is a delta of changed keys rather than a translation.
 - Key-value separation only if large values (spilled xattrs/manifests)
   measurably hurt; off by default.
 
+**Configuration** (from `RESULTS.md` "fjall 3 tuning", validated at
+5M entries / 256 MiB: aging 259 s vs fjall 2's 342 s, aged getattr
+5.0 µs vs 5.2 µs fresh, no latency cliff, peak RSS 3.3 GiB). The v3
+defaults are **not** usable here: `worker_threads` defaults to
+`min(cores, 4)`, compaction falls behind under churn, L0 crosses the
+20/30-run write stall/halt thresholds and aged point reads fall off a
+37× cliff. Use:
+
+- `Database::builder(..).cache_size(CONSTELLATION_META_CACHE_BYTES,
+  default 256 MiB).worker_threads(16-ish, scaled to cores)`;
+- namespace keyspace: `expect_point_read_hits(true)`,
+  `data_block_hash_ratio_policy(HashRatioPolicy::all(0.5))`,
+  `filter_block_pinning_policy` and `index_block_pinning_policy`
+  `PinningPolicy::new([true, true, true, false])` (L0–L2 pinned).
+
 Not used: optimistic transactions (writers stay serialized; commit order
 must equal journal order). fjall's internal Version/SuperVersion is not a
 user API; it makes flush/compaction non-blocking for readers for free.

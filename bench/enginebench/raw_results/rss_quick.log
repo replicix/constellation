@@ -1,0 +1,49 @@
+=== 2026-09-21T23:27:46+02:00 engine=sqlite cache_mb=256 (quick) ===
+[sqlite] generating corpus: 1000000 entries
+[sqlite] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[sqlite] load done in 27.5s, proc_io write delta 22110 MiB, disk_bytes 120 MiB
+[sqlite] fresh phase done
+=== 2026-09-21T23:28:23+02:00 done sqlite cache_mb=256 ===
+=== 2026-09-21T23:28:23+02:00 engine=sqlite cache_mb=4096 (quick) ===
+[sqlite] generating corpus: 1000000 entries
+[sqlite] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[sqlite] load done in 27.7s, proc_io write delta 22110 MiB, disk_bytes 120 MiB
+[sqlite] fresh phase done
+=== 2026-09-21T23:29:00+02:00 done sqlite cache_mb=4096 ===
+=== 2026-09-21T23:29:00+02:00 engine=sqlite-tuned cache_mb=4096 (quick) ===
+[sqlite-tuned] generating corpus: 1000000 entries
+[sqlite-tuned] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[sqlite-tuned] load done in 27.8s, proc_io write delta 22110 MiB, disk_bytes 120 MiB
+[sqlite-tuned] fresh phase done
+=== 2026-09-21T23:29:38+02:00 done sqlite-tuned cache_mb=4096 ===
+=== 2026-09-21T23:29:38+02:00 engine=mtree cache_mb=256 (quick) ===
+[mtree] generating corpus: 1000000 entries
+[mtree] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[mtree] load done in 12.3s, proc_io write delta 1684 MiB, disk_bytes 1417 MiB
+[mtree] fresh phase done
+=== 2026-09-21T23:30:00+02:00 done mtree cache_mb=256 ===
+=== 2026-09-21T23:30:00+02:00 engine=mtree cache_mb=4096 (quick) ===
+[mtree] generating corpus: 1000000 entries
+[mtree] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[mtree] load done in 12.5s, proc_io write delta 1684 MiB, disk_bytes 1417 MiB
+[mtree] fresh phase done
+=== 2026-09-21T23:30:23+02:00 done mtree cache_mb=4096 ===
+=== 2026-09-21T23:30:23+02:00 engine=redb cache_mb=256 (quick) ===
+[redb] generating corpus: 1000000 entries
+[redb] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[redb] load done in 64.2s, proc_io write delta 56635 MiB, disk_bytes 411 MiB
+[redb] fresh phase done
+=== 2026-09-21T23:31:37+02:00 done redb cache_mb=256 ===
+=== 2026-09-21T23:31:37+02:00 engine=fjall cache_mb=256 (quick) ===
+[fjall] generating corpus: 1000000 entries
+[fjall] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[fjall] load done in 5.8s, proc_io write delta 901 MiB, disk_bytes 144 MiB
+[fjall] fresh phase done
+=== 2026-09-21T23:31:53+02:00 done fjall cache_mb=256 ===
+=== 2026-09-21T23:31:53+02:00 engine=fjall cache_mb=4096 (quick) ===
+[fjall] generating corpus: 1000000 entries
+[fjall] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[fjall] load done in 5.8s, proc_io write delta 946 MiB, disk_bytes 143 MiB
+[fjall] fresh phase done
+=== 2026-09-21T23:32:09+02:00 done fjall cache_mb=4096 ===
+RSS QUICK ALL DONE 2026-09-21T23:32:09+02:00

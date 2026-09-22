@@ -1,0 +1,21 @@
+=== 2026-09-21T23:32:09+02:00 engine=fjall-tuned cache_mb=4096 ===
+[fjall-tuned] generating corpus: 1000000 entries
+[fjall-tuned] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[fjall-tuned] load done in 5.7s, proc_io write delta 904 MiB, disk_bytes 143 MiB
+[fjall-tuned] fresh phase done
+[fjall-tuned] aging done: 15000000 mutations in 209.8s
+[fjall-tuned] aged phase done
+[fjall-tuned] mixed workload done
+[fjall-tuned] final disk_bytes 902 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-21T23:36:53+02:00 done fjall-tuned cache_mb=4096 ===
+=== 2026-09-21T23:36:53+02:00 engine=fjall-tuned cache_mb=256 ===
+[fjall-tuned] generating corpus: 1000000 entries
+[fjall-tuned] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[fjall-tuned] load done in 5.5s, proc_io write delta 904 MiB, disk_bytes 144 MiB
+[fjall-tuned] fresh phase done
+[fjall-tuned] aging done: 15000000 mutations in 313.7s
+[fjall-tuned] aged phase done
+[fjall-tuned] mixed workload done
+[fjall-tuned] final disk_bytes 748 MiB, corpus logical bytes 138297 MiB
+=== 2026-09-21T23:43:11+02:00 done fjall-tuned cache_mb=256 ===
+FJALL MITIGATION DONE 2026-09-21T23:43:11+02:00

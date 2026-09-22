@@ -1,0 +1,33 @@
+=== 2026-09-21T23:43:11+02:00 engine=sqlite cache_mb=256 entries=5000000 ===
+[sqlite] generating corpus: 5000000 entries
+[sqlite] corpus: 5000000 recs, 113873 dirs, 881 big dirs, 2418 extra links
+[sqlite] load done in 147.7s, proc_io write delta 113226 MiB, disk_bytes 597 MiB
+[sqlite] fresh phase done
+[sqlite] aging done: 15000000 mutations in 1095.7s
+[sqlite] aged phase done
+[sqlite] mixed workload done
+[sqlite] final disk_bytes 1078 MiB, corpus logical bytes 692975 MiB
+=== 2026-09-22T00:04:56+02:00 done sqlite ===
+=== 2026-09-22T00:04:56+02:00 engine=mtree cache_mb=256 entries=5000000 ===
+[mtree] generating corpus: 5000000 entries
+[mtree] corpus: 5000000 recs, 113873 dirs, 881 big dirs, 2418 extra links
+[mtree] load done in 101.2s, proc_io write delta 21122 MiB, disk_bytes 19776 MiB
+[mtree] fresh phase done
+[mtree] aging done: 15000000 mutations in 1008.1s
+[mtree] compaction: 133305 MiB -> 1603 MiB
+[mtree] locality: bulk-built dir cold reads=6, incrementally-aged dir cold reads=6
+[mtree] aged phase done
+[mtree] mixed workload done
+[mtree] final disk_bytes 2651 MiB, corpus logical bytes 692975 MiB
+=== 2026-09-22T00:25:42+02:00 done mtree ===
+=== 2026-09-22T00:25:42+02:00 engine=fjall cache_mb=256 entries=5000000 ===
+[fjall] generating corpus: 5000000 entries
+[fjall] corpus: 5000000 recs, 113873 dirs, 881 big dirs, 2418 extra links
+[fjall] load done in 31.6s, proc_io write delta 5932 MiB, disk_bytes 580 MiB
+[fjall] fresh phase done
+[fjall] aging done: 15000000 mutations in 351.5s
+[fjall] aged phase done
+[fjall] mixed workload done
+[fjall] final disk_bytes 1163 MiB, corpus logical bytes 692975 MiB
+=== 2026-09-22T00:33:05+02:00 done fjall ===
+LARGE SCALE DONE 2026-09-22T00:33:05+02:00

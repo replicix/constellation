@@ -1,0 +1,27 @@
+[package]
+name = "enginebench"
+version = "0.1.0"
+edition = "2021"
+description = "Plan 28 §11b engine bake-off: SQLite (today) vs mtree+WAL+memtable vs redb/fjall, on the real §P6 key encoding, under a realistic aged FUSE workload"
+publish = false
+
+[dependencies]
+constellation-mtree = { path = "../../crates/mtree" }
+constellation-meta = { path = "../../crates/meta" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rand = { version = "0.9", features = ["small_rng"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+redb = "2"
+fjall = "2"
+fjall3 = { package = "fjall", version = "3" }
+lru = "0.12"
+rayon = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+debug = false
+lto = "thin"
+codegen-units = 1

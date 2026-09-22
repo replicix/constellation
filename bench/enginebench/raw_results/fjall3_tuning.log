@@ -1,0 +1,24 @@
+[fjall3-custom] generating corpus: 1000000 entries
+[fjall3-custom] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[fjall3-custom] load done in 5.3s, proc_io write delta 1494 MiB, disk_bytes 243 MiB
+[fjall3-custom] fresh phase done
+[fjall3-custom] aging done: 6000000 mutations in 616.1s
+[fjall3-custom] aged phase done
+[fjall3-custom] mixed workload done
+[fjall3-custom] final disk_bytes 731 MiB, corpus logical bytes 138297 MiB
+[fjall3-custom] generating corpus: 1000000 entries
+[fjall3-custom] corpus: 1000000 recs, 23238 dirs, 170 big dirs, 483 extra links
+[fjall3-custom] load done in 5.2s, proc_io write delta 1484 MiB, disk_bytes 245 MiB
+[fjall3-custom] fresh phase done
+[fjall3-custom] aging done: 6000000 mutations in 78.0s
+[fjall3-custom] aged phase done
+[fjall3-custom] mixed workload done
+[fjall3-custom] final disk_bytes 674 MiB, corpus logical bytes 138297 MiB
+[fjall3-custom] generating corpus: 5000000 entries
+[fjall3-custom] corpus: 5000000 recs, 113873 dirs, 881 big dirs, 2418 extra links
+[fjall3-custom] load done in 30.8s, proc_io write delta 9737 MiB, disk_bytes 974 MiB
+[fjall3-custom] fresh phase done
+[fjall3-custom] aging done: 15000000 mutations in 259.1s
+[fjall3-custom] aged phase done
+[fjall3-custom] mixed workload done
+[fjall3-custom] final disk_bytes 1213 MiB, corpus logical bytes 692975 MiB
