@@ -1465,7 +1465,7 @@ That table is this node's not-yet-uploaded set; foreign
 
 ## Plan 26 steps 0–2 — checkpoint cadence, inline prune, per-partition log retention: **DONE**
 
-Steps 9–10 of `wip/26-metadata-plane-s3-efficiency.md` (config docs,
+Steps 9–10 of `done/26-metadata-plane-s3-efficiency.md` (config docs,
 harness scenarios) are **not** in this slice; steps 3, 4–5, 6–7 and 8
 landed separately, below.
 
@@ -2244,7 +2244,7 @@ not a metadata-plane one.
 
 ## Plan 28 step S2 — `crates/mtree`, the pure data structure: **DONE**
 
-Step S2 of `wip/28-s3-native-metadata-store.md` §11. A new workspace
+Step S2 of `done/28-s3-native-metadata-store.md` §11. A new workspace
 crate holding the prolly tree (probabilistic B-tree / Merkle search
 tree) as a pure synchronous library — no S3, no tokio, no filesystem,
 no async, no global state. It is a **productionization of
@@ -2435,7 +2435,7 @@ interior nodes). `boundary_rate_tracks_target` and
 
 ## Plan 28 step S4 — pack store, node cache, commit chain: **DONE**
 
-Step S4 of `wip/28-s3-native-metadata-store.md` §11: the storage layer
+Step S4 of `done/28-s3-native-metadata-store.md` §11: the storage layer
 beneath the metadata tree, in `crates/store-s3`. Three new modules plus
 layout helpers, all **additive** — nothing calls them yet. The shipper,
 `checkpoints/*`, `LATEST` and `VECTOR.json` are untouched; publishing
@@ -2677,7 +2677,7 @@ is forced rather than free, and the plan reads as though it is open.
 
 ## Plan 28 step S7a — reachability mark and pack compactor: **DONE**
 
-Step S7a of `wip/28-s3-native-metadata-store.md` §11 — the library half
+Step S7a of `done/28-s3-native-metadata-store.md` §11 — the library half
 of metadata GC, in `crates/store-s3`. Three new modules (`mark.rs`,
 `compact.rs`, `parallel.rs`, 2,195 lines) plus one additive `pub fn` in
 `packs.rs`, all **additive**: nothing calls them, no `crates/cli` file
@@ -3059,7 +3059,7 @@ Two notes for the coordinator, neither a contradiction:
 
 ## Plan 28 step S1 — settling the dentry attr copy: **DONE**
 
-Step S1 of `wip/28-s3-native-metadata-store.md` §11, a measurement only:
+Step S1 of `done/28-s3-native-metadata-store.md` §11, a measurement only:
 `bench/prollybench` gained a variant switch and a new benchmark, and the
 results are §14.10 of the plan. No `crates/**` file was touched, so the
 e2e lanes cannot be affected and were not run. `cargo test --release` in
@@ -3149,7 +3149,7 @@ an explicit `cargo build --release`.
 
 ## Plan 28 step S3 — `mtree::keys`, the §P6 codec: **DONE**
 
-Step S3 of `wip/28-s3-native-metadata-store.md` §11. The §P6 key
+Step S3 of `done/28-s3-native-metadata-store.md` §11. The §P6 key
 encoding and the value records it points at, added to `crates/mtree` as
 two modules that depend on the S2 core and that **the core does not
 depend on**. S1's verdict is implemented as written: the `0x02` dentry
@@ -3346,7 +3346,7 @@ encoding, since a varint `ino` would order `(1 << 40)` before
 
 ## Plan 28 step S5 — builder from the live replica: **DONE**
 
-Step S5 of `wip/28-s3-native-metadata-store.md` §11. Option (B) is
+Step S5 of `done/28-s3-native-metadata-store.md` §11. Option (B) is
 wired: `SqliteMeta` → §P6 `mtree` → pack + commit, driven from the
 shipper beside today's checkpoint. The S5 subagent stalled mid-flight
 after landing the code; the coordinator verified and ran gates.
@@ -3685,7 +3685,7 @@ DESIGN.md.
 **Design decisions:**
 
 - **The local↔published spill conversion** is symmetric and lives at two call sites only. Publish direction (`republish_present` in `mtree_publish.rs`): "expand" a local `0x01`/`0x03` value to plaintext (`Meta::tree_inode_at`/`resolve_local_payload_at`, resolving any local `Payload::Spilled` against `Meta`'s own `blobs` keyspace), then "place" it against the *published* hash function (`BlobStore::hash`, keyed on E2E) with `record::plan_inode`/`place_value`, collecting new blob bodies to upload before the commit. Bootstrap direction (`Meta::encode_local_inode` in `crates/meta/src/store/bootstrap.rs`): the caller resolves a *published* `Payload::Spilled` reference via `BlobStore`/`Resolver` (whatever hash scheme the filesystem uses), then this re-places the plaintext against the *local* hash function (`Meta::hash_blob`, always plain blake3) with the same `plan_inode`/`place_value` primitives. Neither direction re-decides the inline-vs-spill threshold from scratch on an assumption; both call the real §P6 spill logic on the resolved plaintext, so a manifest that spilled only because of an unrelated large field on the *other* side re-decides correctly rather than assuming "spilled implies still spilled".
-- **The splice's read-set collapse** is the milestone's central simplification, not just smaller code: under M1's key encoding, every read the old `Builder::plan` needed to make to *resolve* a batch (a dentry's stale target, a directory's current link set, "did this xattr set used to spill") is now a read some *write* already made and dirtied. `Plan::conflicts_with` therefore only has to ask "does the winner's diff intersect the keys I am about to write", because there is no separate class of "keys I only read". The plan's own worked argument (§P3, `docs/plans/v1/wip/29-fjall-metadata-engine.md`) held up under the four adapted race tests without needing a fallback broader check.
+- **The splice's read-set collapse** is the milestone's central simplification, not just smaller code: under M1's key encoding, every read the old `Builder::plan` needed to make to *resolve* a batch (a dentry's stale target, a directory's current link set, "did this xattr set used to spill") is now a read some *write* already made and dirtied. `Plan::conflicts_with` therefore only has to ask "does the winner's diff intersect the keys I am about to write", because there is no separate class of "keys I only read". The plan's own worked argument (§P3, `docs/plans/v1/done/29-fjall-metadata-engine.md`) held up under the four adapted race tests without needing a fallback broader check.
 - **`fjall::Keyspace::start_ingestion` ordering** was verified against source (`~/.cargo/registry/.../lsm-tree-3.1.10/src/tree/ingest.rs`) rather than assumed: `Ingestion::last_key` is per-session state, reset by every `Ingestion::new`, so cross-session ordering is not required — only within one session's `write` calls. This is what licenses `load_tree`'s two-page design (`main` and `local_xattrs`, flushed independently) instead of a five-way split by key prefix, which would have needed buffering the whole tree per prefix bucket rather than paging a single ordered cursor pass.
 - **Two-`Meta` race tests, not two-publisher-one-`Meta`.** M1's `Fixture` gave every `TreePublisher` in a test the *same* `Arc<Meta>`, which worked when the changed-key set was `Touched`, computed from records handed in by the test by hand. Under M2 the changed-key set is a property of the replica (the `dirty` keyspace), so two publishers sharing one `Meta` share one dirty set — the second one to run would find nothing left to publish that the first had not already cleared. `Fixture::peer` fixes this the way two real nodes actually differ: separate `Meta`s, separate ino prefixes, replayed to the same starting content, with `clear_all_dirty` marking that starting content as already-published (exactly what a real bootstrap's `Meta::clear_all_dirty` does) before the two diverge with independent local writes.
 - **Usage counters after ingestion** were a latent gap in M1's `load_tree_rows` bootstrap path (it never called `adjust_usage_tx`, so a bootstrapped replica's `usage_bytes`/`usage_files` silently stayed at 0 until enough local/replayed writes happened to drift them back toward correct). `Meta::rebuild_derived_from_ns` closes this by summing reachable file sizes over `ns` once, after ingestion — the same asymptotic cost as the `chunk_ref`/`xattr_by_name` rebuild it now sits next to.
@@ -3805,7 +3805,7 @@ Decision: DFS is fine (≈16ms/100k warm at 1M scale, well under the 100ms/100k 
 | Holder side: `SyncRequest::Mutate` (incoming forwarded mutations) also moved off the dispatch loop onto its own spawned task — no ordering gate needed there (fjall's single-writer tx already serializes `holder_execute` correctly regardless of arrival order) — found necessary while measuring: it became the new bottleneck once the requester-side fix stopped hiding it | done | `crates/cli/src/node_runtime.rs` |
 | `crates/harness/src/metabench.rs` driver extended with `threads_per_node` (default 1, every pre-existing config byte-for-byte unchanged) and three new `*-concurrent4-lat0` configs, since M4's original one-thread-per-node driver structurally cannot exceed one forward in flight per node and so cannot exercise this fix | done | `crates/harness/src/metabench.rs` |
 
-**Measured (release build, floci+toxiproxy, 0ms injected S3 latency; full tables in `docs/plans/v1/wip/29-fjall-metadata-engine.md`'s "M5" section):** with 4 concurrent FUSE worker threads per node writing into disjoint per-thread directories (the condition M4 identified but could not itself reproduce), 3-node P2P-on `create` throughput went from 1140 to 3086 ops/s (2.7×, repeated during development in the 2.7–3.2× range) and p50 latency from 8.12 ms to 2.05 ms (4×), now within reach of single-node throughput. The matched-shape rows (`threads_per_node=1`, identical to M4's own matrix) are unchanged within run-to-run noise, as expected — that shape never puts more than one forward in flight per node. The fully-contended "shared directory" concurrent config correctly shows no throughput gain (`KeyGate` serializes it by design, since every op's conflict key is the same parent inode).
+**Measured (release build, floci+toxiproxy, 0ms injected S3 latency; full tables in `docs/plans/v1/done/29-fjall-metadata-engine.md`'s "M5" section):** with 4 concurrent FUSE worker threads per node writing into disjoint per-thread directories (the condition M4 identified but could not itself reproduce), 3-node P2P-on `create` throughput went from 1140 to 3086 ops/s (2.7×, repeated during development in the 2.7–3.2× range) and p50 latency from 8.12 ms to 2.05 ms (4×), now within reach of single-node throughput. The matched-shape rows (`threads_per_node=1`, identical to M4's own matrix) are unchanged within run-to-run noise, as expected — that shape never puts more than one forward in flight per node. The fully-contended "shared directory" concurrent config correctly shows no throughput gain (`KeyGate` serializes it by design, since every op's conflict key is the same parent inode).
 
 **Design decisions:**
 

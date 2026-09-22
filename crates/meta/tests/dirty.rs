@@ -10,7 +10,7 @@
 //! that did not actually change — plan 29 M2's doc for
 //! `clear_dirty_upto`) is fine and expected; under-approximation is the
 //! bug this test exists to catch, because it is exactly the kind of
-//! omission `docs/plans/v1/wip/29-fjall-metadata-engine.md`'s M2 section
+//! omission `docs/plans/v1/done/29-fjall-metadata-engine.md`'s M2 section
 //! warns a hand-picked key list would eventually miss.
 
 use constellation_fs_core::types::ROOT_INO;

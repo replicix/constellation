@@ -79,4 +79,4 @@ between GC rounds is bounded, so keep `--gc-every` around 10 at
 a 64 GiB host.
 
 Results, and the reading of them, are in
-`docs/plans/v1/wip/28-s3-native-metadata-store.md` §14.
+`docs/plans/v1/done/28-s3-native-metadata-store.md` §14.

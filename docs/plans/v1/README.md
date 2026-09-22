@@ -49,10 +49,10 @@ Execution protocol:
 | 23 | `wip/23-remote-support-mode.md` | wip | compile-time-gated remote support mode: mount-armed `ro`/`rw` P2P sessions | 02 (independent of 19–22) |
 | 24 | `done/24-e2e-keyring-master-key.md` | done | single-file keyring: one wrapped master key in meta.json, all keys derived; live `fs passwd`, no keyring.json | 10 |
 | 25 | `done/25-checkpoint-strip-pending-upload.md` | done | strip node-local `pending_upload` from cluster checkpoints; heal poisoned joiners | 07 (08 committed in practice) |
-| 26 | `wip/26-metadata-plane-s3-efficiency.md` | wip | proportional checkpoint cadence + inline prune, per-partition log retention (bug fix), holder skips self-tail, GET-next tailer with idle backoff, ranged checkpoint I/O, sticky leases with `wanted_by`, existence from `chunk_ref` | 25 |
-| 27 | `wip/27-merkle-packed-checkpoints.md` | wip | checkpoint = packed Merkle tree + sidecar, vector-monotonic `ROOT`, any-holder publish, O(change) snapshots, bulk-load bootstrap | 26 |
-| 28 | `wip/28-s3-native-metadata-store.md` | wip | S3-native metadata: prolly tree + packs + CAS commit chain replace the checkpoint; reachability GC + compaction | 27 |
-| 29 | `wip/29-fjall-metadata-engine.md` | wip | fjall 3 local engine, partitions removed, key-delta publishing, concurrent ordered forwarding | 28 |
+| 26 | `done/26-metadata-plane-s3-efficiency.md` | done | proportional checkpoint cadence + inline prune, per-partition log retention (bug fix), holder skips self-tail, GET-next tailer with idle backoff, ranged checkpoint I/O, sticky leases with `wanted_by`, existence from `chunk_ref` | 25 |
+| 27 | `done/27-merkle-packed-checkpoints.md` | done (superseded by 28) | checkpoint = packed Merkle tree + sidecar — goals delivered via plan 28's prolly-tree format (option B); plan as written not shipped | 26 |
+| 28 | `done/28-s3-native-metadata-store.md` | done | S3-native metadata: prolly tree + packs + CAS commit chain replace the checkpoint; reachability GC + compaction | 27 |
+| 29 | `done/29-fjall-metadata-engine.md` | done | fjall 3 local engine, partitions removed, key-delta publishing, concurrent ordered forwarding | 28 |
 | 30 | `wip/30-write-path-resilience-and-scale-out.md` | wip | exactly-once forwarding, speculation log, session consistency + `cto=strict`, layered durability, flexible epochs, delegated sub-sequencers, strict locks | 29 |
 
 "Committed in practice": the plan does not technically build on the

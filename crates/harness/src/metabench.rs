@@ -12,7 +12,7 @@
 //! and 3-node with P2P on in a shared and in disjoint directories, and
 //! 3-node with P2P off) and prints one JSON report per run plus a plain
 //! text table. Results feed directly into
-//! `docs/plans/v1/wip/29-fjall-metadata-engine.md`'s "M4 — leaseless
+//! `docs/plans/v1/done/29-fjall-metadata-engine.md`'s "M4 — leaseless
 //! optimistic commits: decision" section; rerun this to reproduce them.
 
 use crate::client::Client;

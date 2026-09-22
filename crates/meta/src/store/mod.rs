@@ -7,7 +7,7 @@
 //! guarantee the SQLite writer mutex gave; readers take a lock-free
 //! `db.read_tx()` snapshot (`fjall::Snapshot`, MVCC).
 //!
-//! Keyspaces (see `docs/plans/v1/wip/29-fjall-metadata-engine.md` and
+//! Keyspaces (see `docs/plans/v1/done/29-fjall-metadata-engine.md` and
 //! plan 28 §P5/§P6):
 //!
 //! - `ns` — the replicated namespace, in *exactly* plan 28 §P6's key

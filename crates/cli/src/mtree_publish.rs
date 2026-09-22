@@ -16,7 +16,7 @@
 //! 1. every write to `ns` marks its key in a sibling `dirty` keyspace,
 //!    in the *same* transaction (`constellation_meta::store::ns::Dirty`,
 //!    centralised in the `ns` write helpers — see plan
-//!    `docs/plans/v1/wip/29-fjall-metadata-engine.md`'s M2 section);
+//!    `docs/plans/v1/done/29-fjall-metadata-engine.md`'s M2 section);
 //! 2. a publish reads one fjall snapshot, takes `Meta::dirty_snapshot`
 //!    as its whole read set, and for each dirty key reads `ns`'s current
 //!    value at that key (absent → a delete edit);
