@@ -51,6 +51,9 @@ Execution protocol:
 | 25 | `done/25-checkpoint-strip-pending-upload.md` | done | strip node-local `pending_upload` from cluster checkpoints; heal poisoned joiners | 07 (08 committed in practice) |
 | 26 | `wip/26-metadata-plane-s3-efficiency.md` | wip | proportional checkpoint cadence + inline prune, per-partition log retention (bug fix), holder skips self-tail, GET-next tailer with idle backoff, ranged checkpoint I/O, sticky leases with `wanted_by`, existence from `chunk_ref` | 25 |
 | 27 | `wip/27-merkle-packed-checkpoints.md` | wip | checkpoint = packed Merkle tree + sidecar, vector-monotonic `ROOT`, any-holder publish, O(change) snapshots, bulk-load bootstrap | 26 |
+| 28 | `wip/28-s3-native-metadata-store.md` | wip | S3-native metadata: prolly tree + packs + CAS commit chain replace the checkpoint; reachability GC + compaction | 27 |
+| 29 | `wip/29-fjall-metadata-engine.md` | wip | fjall 3 local engine, partitions removed, key-delta publishing, concurrent ordered forwarding | 28 |
+| 30 | `wip/30-write-path-resilience-and-scale-out.md` | wip | exactly-once forwarding, speculation log, session consistency + `cto=strict`, layered durability, flexible epochs, delegated sub-sequencers, strict locks | 29 |
 
 "Committed in practice": the plan does not technically build on the
 intermediate milestones, but the protocol is strictly sequential, so
