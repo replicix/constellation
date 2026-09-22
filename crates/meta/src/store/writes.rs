@@ -918,7 +918,7 @@ impl MetaStore for Meta {
         gid: u32,
     ) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
-        let ino = alloc_ino_tx(&mut tx, &self.local)?;
+        let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, parent)?;
         let t = now_ns();
         let attrs = Attrs {
             kind: Kind::Dir,
@@ -971,7 +971,7 @@ impl MetaStore for Meta {
         gid: u32,
     ) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
-        let ino = alloc_ino_tx(&mut tx, &self.local)?;
+        let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, parent)?;
         let t = now_ns();
         let attrs = Attrs {
             kind: Kind::File,
@@ -1026,7 +1026,7 @@ impl MetaStore for Meta {
         gid: u32,
     ) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
-        let ino = alloc_ino_tx(&mut tx, &self.local)?;
+        let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, parent)?;
         let t = now_ns();
         let attrs = Attrs {
             kind: Kind::Symlink,
@@ -1084,7 +1084,7 @@ impl MetaStore for Meta {
             return Err(MetaError::Invalid("mknod kind".into()));
         }
         let mut tx = self.db.write_tx();
-        let ino = alloc_ino_tx(&mut tx, &self.local)?;
+        let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, parent)?;
         let t = now_ns();
         let attrs = Attrs {
             kind: ns::kind_to_mtree(kind),

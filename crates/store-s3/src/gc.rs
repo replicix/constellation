@@ -132,6 +132,58 @@ pub async fn publish_condemned_packs(
     Ok(())
 }
 
+/// Plan 29 M3a: the `blobs/*` hashes a GC round intends to delete, as
+/// hex blob hashes. Same handshake shape as
+/// [`read_condemned_packs`]/[`publish_condemned_packs`]: published
+/// before the grace wait, and a tree publisher never references a blob
+/// on this list without re-checking right before its commit CAS.
+/// Written only by the `_gc` singleton-lease holder.
+pub async fn read_condemned_blobs(
+    store: &Arc<dyn ObjectStore>,
+) -> Result<std::collections::HashSet<constellation_mtree::BlobHash>, StoreError> {
+    match store.get(&layout::gc_condemned_blobs()).await {
+        Ok(result) => {
+            let list: CondemnedList = serde_json::from_slice(&result.bytes().await?)?;
+            Ok(list
+                .hashes
+                .iter()
+                .filter_map(|hex| {
+                    constellation_mtree::NodeHash::from_hex(hex)
+                        .map(|h| constellation_mtree::BlobHash(h.0))
+                })
+                .collect())
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(Default::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Replace the condemned-blob list (an empty set clears it).
+pub async fn publish_condemned_blobs(
+    store: &Arc<dyn ObjectStore>,
+    blobs: &std::collections::HashSet<constellation_mtree::BlobHash>,
+    epoch: u64,
+    published_ms: i64,
+) -> Result<(), StoreError> {
+    let mut hashes: Vec<String> = blobs
+        .iter()
+        .map(|hash| constellation_mtree::NodeHash(hash.0).to_hex())
+        .collect();
+    hashes.sort();
+    let list = CondemnedList {
+        epoch,
+        hashes,
+        published_ms,
+    };
+    store
+        .put(
+            &layout::gc_condemned_blobs(),
+            PutPayload::from(serde_json::to_vec(&list)?),
+        )
+        .await?;
+    Ok(())
+}
+
 pub async fn append_journal(
     store: &Arc<dyn ObjectStore>,
     entry: &GcJournalEntry,

@@ -193,7 +193,7 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
     });
 
     step!(meta, "publish_file", {
-        let ino = meta.allocate_ino().unwrap();
+        let ino = meta.allocate_ino(ROOT_INO).unwrap();
         meta.publish_file(
             ROOT_INO,
             "published",

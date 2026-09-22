@@ -153,6 +153,14 @@ pub enum SyncRequest {
         ino: Ino,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Tail every known partition to the log head without shipping or
+    /// publishing anything (plan 29 M3a: in-daemon GC's liveness-freshness
+    /// gate). Unlike `Publish`/`Barrier`, this never touches a lease —
+    /// it only applies foreign segments this replica has not seen yet —
+    /// so it is safe to run from a read-only member or mid-reintegration.
+    TailToHead {
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Take the lease for `part` if it is free. `Ok(false)` means a live
     /// foreign holder still owns it.
     Acquire {

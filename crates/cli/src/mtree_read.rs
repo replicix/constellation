@@ -32,6 +32,24 @@
 //! (Plan 29 M0c removed the `deref` table entirely: chunk GC candidates
 //! come from the orphan LIST pass alone, so a bootstrapped replica never
 //! needing dereference history is no longer a special case.)
+//!
+//! **Plan 29 M3a, two fixes to [`load_tree`]'s dominant costs** (measured
+//! on a 100k-inode commit: 1.34–1.56 s before, ~0.3–0.4 s after):
+//!
+//! 1. `InodeRecord::xattrs_spilled` replaces `xattrs.is_empty()` as the
+//!    signal for "this inode's xattr set lives in `0x03`". Both cases
+//!    leave the record's inline `xattrs` field empty, so probing on
+//!    emptiness alone paid a full tree range query per inode even for
+//!    the overwhelmingly common "no xattrs at all" case (§P6's census) —
+//!    measured at ~900 ms of the total. The flag makes the check O(1)
+//!    and exact.
+//! 2. `Meta::apply_bootstrap_indexes` replaces a post-ingest
+//!    `rebuild_derived_from_ns` that re-read and re-decoded every `0x01`
+//!    value from `ns` twice more (once for `chunk_ref`/`xattr_by_name`,
+//!    once for usage). [`load_tree`] already decodes each `InodeRecord`
+//!    once to build its local encoding; a [`constellation_meta::BootstrapIndexBuilder`]
+//!    collects the same derived state from that single pass instead —
+//!    ~215 ms recovered.
 //! ## The partial replica
 //!
 //! [`TreeReader`] answers FUSE's metadata questions — `lookup`,
@@ -416,6 +434,11 @@ pub(crate) fn load_tree(
     let mut main: Vec<Pair> = Vec::with_capacity(LOAD_PAGE);
     let mut local_xattrs: Vec<Pair> = Vec::with_capacity(LOAD_PAGE);
     let (mut n_inodes, mut n_dentries) = (0u64, 0u64);
+    // Plan 29 M3a: collected here, from the same decode this loop
+    // already pays for, so the post-ingest derived-state pass
+    // (`Meta::apply_bootstrap_indexes`) never re-reads or re-decodes a
+    // single `0x01` value.
+    let mut derived = constellation_meta::BootstrapIndexBuilder::new();
 
     let flush = |page: &mut Vec<Pair>, force: bool| -> Result<()> {
         if page.len() >= LOAD_PAGE || (force && !page.is_empty()) {
@@ -445,11 +468,17 @@ pub(crate) fn load_tree(
                     .iter()
                     .map(|(n, v)| (n.clone(), v.clone()))
                     .collect();
-                if xattrs.is_empty() {
-                    // The set spilled: read this inode's `0x03` range
-                    // with its own cursor. Rare (a set over
-                    // `XATTR_INLINE`), so paying a fresh cursor per
-                    // spilled inode is fine.
+                // `rec.xattrs_spilled` (plan 29 M3a), not `xattrs.is_empty()`:
+                // an empty inline list is the overwhelmingly common "no
+                // xattrs at all" case (§P6's census), and probing `0x03`
+                // for it anyway was a full tree range query per inode —
+                // measured at ~900 ms of a 1.4 s, 100k-inode bootstrap.
+                // The flag distinguishes that case from an actually
+                // spilled set exactly, with no probe needed either way.
+                if rec.xattrs_spilled {
+                    // Read this inode's `0x03` range with its own
+                    // cursor. Rare (a set over `XATTR_INLINE`), so
+                    // paying a fresh cursor per spilled inode is fine.
                     let range = keys::xattrs_of(ino);
                     for (k, v) in tree.range(root, range.start(), range.prefix(), usize::MAX)? {
                         let Key::Xattr { name, .. } = Key::parse(&k)? else {
@@ -459,6 +488,7 @@ pub(crate) fn load_tree(
                         xattrs.push((name.to_vec(), resolver.payload(&payload)?));
                     }
                 }
+                derived.observe(ino, &rec.attrs, manifest.as_deref(), &xattrs);
                 let local = meta.encode_local_inode(rec.attrs, manifest, target, &xattrs)?;
                 main.push((key.to_vec(), local.record));
                 for (name, value) in local.xattrs {
@@ -483,7 +513,7 @@ pub(crate) fn load_tree(
     flush(&mut main, true)?;
     flush(&mut local_xattrs, true)?;
 
-    meta.rebuild_derived_from_ns()?;
+    meta.apply_bootstrap_indexes(derived)?;
     // Everything just loaded already equals the published tree; retract
     // whatever `Meta::open`'s genesis root insert speculatively dirtied
     // (see `constellation_meta::store::Meta::clear_all_dirty`) so this

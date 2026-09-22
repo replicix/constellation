@@ -733,7 +733,7 @@ mod tests {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         range
             .map(|i| {
-                let mut key = vec![0x01u8];
+                let mut key = vec![0x02u8];
                 key.extend_from_slice(&i.to_be_bytes());
                 let mut value = Vec::with_capacity(48);
                 while value.len() < 48 {
@@ -764,7 +764,7 @@ mod tests {
         for generation in 0..generations {
             let edits: Vec<_> = (0..keys / 8)
                 .map(|i| {
-                    let mut key = vec![0x01u8];
+                    let mut key = vec![0x02u8];
                     key.extend_from_slice(&((i * 7 + generation) % keys).to_be_bytes());
                     (key, Some(vec![generation as u8; 48]))
                 })

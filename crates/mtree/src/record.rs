@@ -494,11 +494,23 @@ pub struct InodeRecord {
     /// and not of the caller's iteration order — two replicas that
     /// disagreed here would disagree on the root hash.
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Whether this inode's xattr set lives in `0x03` instead
+    /// (`XattrPlacement::Spilled`). Plan 29 M3a: an *empty* `xattrs`
+    /// above is ambiguous on its own — it is the overwhelmingly common
+    /// "no xattrs at all" case (§P6's census) but is also what a
+    /// spilled set looks like at this level, since the entries then
+    /// live under `0x03` and not here. Without this bit a reader has no
+    /// way to tell the two apart except by probing `0x03` — cheap
+    /// against a local KV store but a full tree descent per inode
+    /// during bootstrap, which measured as ~900 ms of a 1.4 s, 100k-inode
+    /// bootstrap (`mtree_read::load_tree`) before this field existed.
+    pub xattrs_spilled: bool,
 }
 
 const FLAG_MANIFEST: u8 = 1 << 0;
 const FLAG_SYMLINK: u8 = 1 << 1;
 const FLAG_XATTRS: u8 = 1 << 2;
+const FLAG_XATTRS_SPILLED: u8 = 1 << 3;
 
 impl InodeRecord {
     pub fn new(attrs: Attrs) -> InodeRecord {
@@ -532,6 +544,9 @@ impl InodeRecord {
         }
         if !self.xattrs.is_empty() {
             flags |= FLAG_XATTRS;
+        }
+        if self.xattrs_spilled {
+            flags |= FLAG_XATTRS_SPILLED;
         }
         out.push(flags);
         if let Some(manifest) = &self.manifest {
@@ -595,6 +610,7 @@ impl InodeRecord {
             manifest,
             symlink_target,
             xattrs,
+            xattrs_spilled: flags & FLAG_XATTRS_SPILLED != 0,
         })
     }
 }
@@ -653,6 +669,7 @@ pub fn plan_inode(
         manifest: manifest.map(Payload::Inline),
         symlink_target: symlink_target.map(Payload::Inline),
         xattrs: sorted,
+        xattrs_spilled: placement == XattrPlacement::Spilled,
     };
     let mut blobs = Vec::new();
     for field in [FLAG_MANIFEST, FLAG_SYMLINK] {
@@ -872,6 +889,7 @@ mod tests {
                 (b"security.selinux".to_vec(), b"unconfined_u".to_vec()),
                 (b"user.constellation.scratch".to_vec(), Vec::new()),
             ],
+            xattrs_spilled: false,
         };
         assert_eq!(InodeRecord::decode(&full.encode()).unwrap(), full);
         assert_eq!(full.encode().len(), full.encoded_len());
@@ -883,6 +901,7 @@ mod tests {
             manifest: Some(Payload::Spilled(blob_hash(b"m"))),
             symlink_target: Some(Payload::Spilled(blob_hash(&[b'x'; 4096]))),
             xattrs: vec![(b"user.x".to_vec(), vec![0xff; XATTR_INLINE - 2 - 4 - 6])],
+            xattrs_spilled: false,
         };
         assert_eq!(xattr_section_len(&big.xattrs), XATTR_INLINE);
         assert_eq!(InodeRecord::decode(&big.encode()).unwrap(), big);
@@ -896,6 +915,7 @@ mod tests {
             manifest: Some(Payload::Inline(vec![1, 2, 3])),
             symlink_target: Some(Payload::Inline(b"t".to_vec())),
             xattrs: vec![(b"user.a".to_vec(), b"v".to_vec())],
+            xattrs_spilled: false,
         };
         let encoded = full.encode();
         for cut in 0..encoded.len() {
@@ -1035,6 +1055,40 @@ mod tests {
         let plan = plan_inode(attrs(), None, None, &many, blob_hash);
         assert_eq!(plan.xattrs, XattrPlacement::Spilled);
         assert!(plan.record.xattrs.is_empty());
+    }
+
+    /// Plan 29 M3a: `xattrs_spilled` is what lets a reader (bootstrap's
+    /// `load_tree`) tell "no xattrs at all" from "xattrs live in 0x03"
+    /// without probing `0x03` — both cases leave `record.xattrs` empty,
+    /// so the flag has to be the source of truth, and it must round-trip
+    /// through encode/decode exactly.
+    #[test]
+    fn xattrs_spilled_distinguishes_no_xattrs_from_spilled_and_round_trips() {
+        // No xattrs at all: never spilled, `xattrs` empty.
+        let plan = plan_inode(attrs(), None, None, &[], blob_hash);
+        assert!(!plan.record.xattrs_spilled);
+        assert!(plan.record.xattrs.is_empty());
+        let decoded = InodeRecord::decode(&plan.record.encode()).unwrap();
+        assert!(!decoded.xattrs_spilled);
+
+        // A small inline set: not spilled, `xattrs` non-empty.
+        let small = vec![(b"user.a".to_vec(), b"1".to_vec())];
+        let plan = plan_inode(attrs(), None, None, &small, blob_hash);
+        assert!(!plan.record.xattrs_spilled);
+        assert!(!plan.record.xattrs.is_empty());
+        let decoded = InodeRecord::decode(&plan.record.encode()).unwrap();
+        assert!(!decoded.xattrs_spilled);
+
+        // A large set: spilled, `xattrs` empty — the ambiguous case the
+        // flag exists to resolve.
+        let many: Vec<(Vec<u8>, Vec<u8>)> = (0..40)
+            .map(|i| (format!("user.k{i}").into_bytes(), vec![b'v'; 4]))
+            .collect();
+        let plan = plan_inode(attrs(), None, None, &many, blob_hash);
+        assert!(plan.record.xattrs_spilled);
+        assert!(plan.record.xattrs.is_empty());
+        let decoded = InodeRecord::decode(&plan.record.encode()).unwrap();
+        assert!(decoded.xattrs_spilled);
     }
 
     /// Canonicality reaches into the values: the same set of xattrs in a

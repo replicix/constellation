@@ -88,7 +88,7 @@ pub(crate) fn get_one_xattr(
 
 // ------------------------------------------------------------- chunk_ref
 
-fn manifest_hashes(bytes: Option<&[u8]>) -> HashSet<ChunkHash> {
+pub(crate) fn manifest_hashes(bytes: Option<&[u8]>) -> HashSet<ChunkHash> {
     use constellation_fs_core::manifest::ChunkInfo;
     let Some(bytes) = bytes else {
         return HashSet::new();
@@ -102,13 +102,13 @@ fn manifest_hashes(bytes: Option<&[u8]>) -> HashSet<ChunkHash> {
     }
 }
 
-fn cr_key(hash: &ChunkHash, ino: Ino) -> Vec<u8> {
+pub(crate) fn cr_key(hash: &ChunkHash, ino: Ino) -> Vec<u8> {
     let mut k = hash.0.to_vec();
     k.extend_from_slice(&ino.to_be_bytes());
     k
 }
 
-fn cri_key(ino: Ino, hash: &ChunkHash) -> Vec<u8> {
+pub(crate) fn cri_key(ino: Ino, hash: &ChunkHash) -> Vec<u8> {
     let mut k = ino.to_be_bytes().to_vec();
     k.extend_from_slice(&hash.0);
     k

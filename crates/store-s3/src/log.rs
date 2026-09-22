@@ -31,6 +31,7 @@ fn sealed_key(partition: &str) -> object_store::path::Path {
 }
 
 /// Metadata log I/O for one partition.
+#[derive(Clone)]
 pub struct LogStore {
     store: Arc<dyn ObjectStore>,
     partition: String,

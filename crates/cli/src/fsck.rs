@@ -13,12 +13,12 @@ use constellation_store_s3::{CompressionSetting, GcJournalEntry, LeaseMode, Leas
 use futures::TryStreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsckIssue {
     pub class: String,
     pub key: Option<String>,
@@ -27,7 +27,10 @@ pub struct FsckIssue {
     pub unrepairable: bool,
 }
 
-#[derive(Debug, Serialize)]
+/// Deserializable so `run_fsck_cli` can decode the daemon's `FsckReport`
+/// back from the control socket's JSON, the same round-trip `GcReport`
+/// makes (plan 29 M3a).
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FsckReport {
     pub clean: bool,
     pub repair_requested: bool,
@@ -77,7 +80,8 @@ pub async fn run(
     check_cache_cruft(state_dir, repair, &mut issues)?;
     check_gc_journal(&store, &meta, &mut issues).await?;
 
-    let orphan_report = gc::run(store, chunks, meta, lease_mode, !repair, None).await?;
+    let tail = gc::GcTail::standalone(logs.clone(), &meta)?;
+    let orphan_report = gc::run(store, chunks, meta, lease_mode, !repair, None, &tail).await?;
     for mark in orphan_report
         .candidates
         .iter()

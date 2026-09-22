@@ -568,12 +568,14 @@ impl NodeRuntime {
             let chunks = store.clone();
             let meta = meta.clone();
             let gc_peers = peers.clone();
+            let gc_sync_tx = sync_tx.clone();
             rt.spawn(async move {
                 let mut timer =
                     tokio::time::interval(std::time::Duration::from_secs(interval.max(1)));
                 timer.tick().await;
                 loop {
                     timer.tick().await;
+                    let tail = crate::gc::GcTail::Daemon(gc_sync_tx.clone());
                     if let Err(error) = crate::gc::run(
                         object_store.clone(),
                         chunks.clone(),
@@ -581,6 +583,7 @@ impl NodeRuntime {
                         lease_mode,
                         false,
                         Some(&gc_peers),
+                        &tail,
                     )
                     .await
                     {
@@ -1448,6 +1451,11 @@ impl NodeRuntime {
                             .await;
                             let _ = reply.send(r.map_err(|e| format!("{e:#}")));
                         }
+                        Some(fusefs::SyncRequest::TailToHead { reply }) => {
+                            let mut ship = ship.lock().await;
+                            let r = ship.tail_to_head().await;
+                            let _ = reply.send(r.map(|_| ()).map_err(|e| format!("{e:#}")));
+                        }
                         Some(fusefs::SyncRequest::Barrier { ino, reply }) => {
                             // `--fsync-mode s3` is an inode/partition
                             // barrier, not a whole-mount backlog drain.
@@ -1936,6 +1944,8 @@ impl NodeRuntime {
                     lease_mode: self.lease_mode,
                     read_only_member: self.read_only_member,
                     last_sync_ms: self.last_sync_ms.clone(),
+                    state_dir: self.state_dir.clone(),
+                    compression: self.compression,
                 });
                 *status_guard = Some(status.clone());
                 drop(status_guard);

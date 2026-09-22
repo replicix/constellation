@@ -38,8 +38,9 @@ pub use e2e::{
 };
 pub use error::StoreError;
 pub use gc::{
-    append_journal, is_condemned, publish_condemned, publish_condemned_packs, read_condemned,
-    read_condemned_packs, CondemnedList, GcJournalEntry,
+    append_journal, is_condemned, publish_condemned, publish_condemned_blobs,
+    publish_condemned_packs, read_condemned, read_condemned_blobs, read_condemned_packs,
+    CondemnedList, GcJournalEntry,
 };
 pub use lease::{live_leases_held_by, Lease, LeaseMode, LeaseStore, LeaseTag};
 pub use log::LogStore;

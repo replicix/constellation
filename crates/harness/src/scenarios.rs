@@ -215,6 +215,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: fsck_repair,
     },
     Scenario {
+        name: "fsck-while-mounted",
+        desc: "fsck routes through the running daemon's control socket instead of racing the fjall lock",
+        requires: &[],
+        run: fsck_while_mounted,
+    },
+    Scenario {
         name: "snapshot-lifecycle",
         desc: "snapshot remains frozen behind hidden .constellation view, then becomes stale",
         requires: &[],
@@ -1070,6 +1076,42 @@ fn fsck_repair(_seed: u64) -> Result<()> {
         std::fs::read(client.mnt.join("recoverable"))? == bytes,
         "repaired file did not model-verify"
     );
+    client.unmount()
+}
+
+/// Plan 29 M3a: `fjall` refuses a second process's open of the metadata
+/// store while a mount daemon holds it, so `constellation fsck` must
+/// route through the running daemon's control socket rather than fail
+/// with a raw lock error — the same routing `constellation gc` already
+/// has (M1). Runs `fsck` *while still mounted*, unlike `fsck-repair`
+/// (which always unmounts first and so never exercises this path).
+fn fsck_while_mounted(_seed: u64) -> Result<()> {
+    let (env, root) = setup("fsck-while-mounted")?;
+    let _proxy = env.s3_proxy()?;
+    let mut client = one_client(&env, root.path(), &format!("fsck-live-{}", ts()))?;
+    std::fs::write(
+        client.mnt.join("still-mounted"),
+        b"routed-through-the-daemon",
+    )?;
+
+    let report = client.fsck(false)?;
+    anyhow::ensure!(
+        report.status.code() == Some(0),
+        "fsck while mounted did not come back clean (a lock error would exit non-zero \
+         with no daemon-routed report): {:?}\n{}{}",
+        report.status.code(),
+        String::from_utf8_lossy(&report.stdout),
+        String::from_utf8_lossy(&report.stderr)
+    );
+    // The report is real JSON from the daemon (not a locked-store
+    // failure the CLI swallowed), and it reflects the daemon's own live
+    // replica: the file just written is visible with no issues.
+    let parsed: serde_json::Value = serde_json::from_slice(&report.stdout)?;
+    anyhow::ensure!(
+        parsed["clean"] == serde_json::Value::Bool(true),
+        "expected a clean fsck report from the daemon: {parsed}"
+    );
+
     client.unmount()
 }
 

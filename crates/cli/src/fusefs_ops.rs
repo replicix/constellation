@@ -252,7 +252,7 @@ impl Filesystem for ConstellationFs {
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
-        let ino = match self.meta.allocate_ino() {
+        let ino = match self.meta.allocate_ino(parent) {
             Ok(ino) => ino,
             Err(e) => return reply.error(Errno::from_i32(errno(&e))),
         };
@@ -309,7 +309,7 @@ impl Filesystem for ConstellationFs {
                 return;
             }
         };
-        let ino = match self.meta.allocate_ino() {
+        let ino = match self.meta.allocate_ino(parent) {
             Ok(ino) => ino,
             Err(e) => return reply.error(Errno::from_i32(errno(&e))),
         };
@@ -385,7 +385,7 @@ impl Filesystem for ConstellationFs {
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
-        let ino = match self.meta.allocate_ino() {
+        let ino = match self.meta.allocate_ino(parent) {
             Ok(ino) => ino,
             Err(e) => return reply.error(Errno::from_i32(errno(&e))),
         };
@@ -441,7 +441,7 @@ impl Filesystem for ConstellationFs {
         let parent = self.real_ino(parent);
         let name = checked_name!(link_name, reply);
         let target = target.to_string_lossy();
-        let ino = match self.meta.allocate_ino() {
+        let ino = match self.meta.allocate_ino(parent) {
             Ok(ino) => ino,
             Err(e) => return reply.error(Errno::from_i32(errno(&e))),
         };

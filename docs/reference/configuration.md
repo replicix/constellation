@@ -313,7 +313,23 @@ dead packs and compaction of partially dead ones under
 `CONSTELLATION_COMPACT_BYTES_PER_S`. Packs to be removed are published in
 `gc/condemned-packs.json` and the round waits one lease TTL and re-marks
 before touching them; writers never deduplicate against a condemned pack.
-Spilled values under `blobs/` are not swept yet.
+
+Spilled values under `blobs/` (plan 29 M3a) ride the same mark — it
+already decodes every `0x01`/`0x03` leaf value it visits and now also
+returns the `Payload::Spilled` blob hashes it found — but get a second,
+independent two-mark horizon rather than the pack sweep's condemn/wait/
+re-mark in one round: a blob unreferenced at a mark is recorded in
+`gc/blob-candidates.json` (a bucket object, not node-local kv, so any
+node's round can continue another's bookkeeping) with the time it was
+first seen unreferenced, and is only condemned once a *previous* round's
+sighting is at least `CONSTELLATION_GC_HORIZON_S` old and it is still
+unreferenced. Condemned blobs are published in `gc/condemned-blobs.json`
+and share the pack sweep's one lease-TTL wait and re-mark; a blob
+re-referenced before its horizon elapses drops out of the candidate list
+instead of being condemned. `mtree_publish` re-checks this list right
+before its commit CAS, mirroring the pack check, because `BlobStore::put`
+treats an already-present object as a dedup hit without checking
+liveness.
 
 ### Retention pruning
 

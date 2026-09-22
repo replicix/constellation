@@ -2033,7 +2033,8 @@ async fn run_gc_cli(
     } else {
         constellation_store_s3::LeaseMode::SingleWriter
     };
-    gc::run(backend, chunks, meta, mode, verify_only, None).await
+    let tail = gc::GcTail::standalone(logs, &meta)?;
+    gc::run(backend, chunks, meta, mode, verify_only, None, &tail).await
 }
 
 async fn run_fsck_cli(
@@ -2061,6 +2062,33 @@ async fn run_fsck_cli(
     };
     let dir = state_dir.unwrap_or_else(|| default_state_dir(&fsmeta));
     std::fs::create_dir_all(&dir)?;
+
+    // Same lock-avoidance routing as `constellation gc` (plan 29 M3a):
+    // `fjall` refuses a second process's open of the metadata store
+    // while a mount daemon holds it, so run `fsck` inside the daemon
+    // over the control socket when one is up for this state dir; a
+    // failed/absent connection means nothing is mounted here, so fall
+    // through to opening the store directly exactly as before.
+    let sock = dir.join(constellation_api::SOCKET_NAME);
+    match constellation_api::call(
+        &sock,
+        &constellation_api::Request::FsckRun {
+            repair,
+            force_release: force_release.map(str::to_string),
+        },
+    )
+    .await
+    {
+        Ok(constellation_api::Response::FsckReport { report }) => {
+            return Ok(serde_json::from_value(report)?);
+        }
+        Ok(constellation_api::Response::Error { message }) => {
+            bail!("fsck failed in the running daemon: {message}");
+        }
+        Ok(other) => bail!("unexpected response from running daemon: {other:?}"),
+        Err(_) => {}
+    }
+
     let db = dir.join("meta.db");
     if !db.exists() {
         shipper::bootstrap(&db, &logs).await?;
@@ -3324,6 +3352,11 @@ struct DaemonStatus {
     lease_mode: constellation_store_s3::LeaseMode,
     read_only_member: bool,
     last_sync_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Plan 29 M3a: lets `fsck` (and any future offline-tool verb) run
+    /// in-process over the control socket instead of racing the mount
+    /// for `fjall`'s single-process lock.
+    state_dir: PathBuf,
+    compression: CompressionSetting,
 }
 
 impl DaemonStatus {
@@ -4138,6 +4171,7 @@ impl constellation_api::StatusSource for DaemonStatus {
         let meta = self.meta.clone();
         let lease_mode = self.lease_mode;
         let peers = self.peers.clone();
+        let tail = gc::GcTail::Daemon(self.sync_tx.clone());
         let report = tokio::task::block_in_place(|| {
             self.rt.block_on(gc::run(
                 store,
@@ -4146,7 +4180,46 @@ impl constellation_api::StatusSource for DaemonStatus {
                 lease_mode,
                 verify_only,
                 Some(&peers),
+                &tail,
             ))
+        })
+        .map_err(|e| format!("{e:#}"))?;
+        serde_json::to_value(&report).map_err(|e| format!("{e:#}"))
+    }
+
+    fn fsck_run(
+        &self,
+        repair: bool,
+        force_release: Option<&str>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let store = self.store.clone();
+        let chunks = self.pins.chunks();
+        let meta = self.meta.clone();
+        let lease_mode = self.lease_mode;
+        let state_dir = self.state_dir.clone();
+        let compression = self.compression;
+        let force_release = force_release.map(str::to_string);
+        let report = tokio::task::block_in_place(|| {
+            self.rt.block_on(async move {
+                let logs = match chunks.e2e_keys() {
+                    Some(keys) => {
+                        constellation_store_s3::LogStore::new_e2e(store.clone(), keys.clone())
+                    }
+                    None => constellation_store_s3::LogStore::new(store.clone()),
+                };
+                fsck::run(
+                    store,
+                    chunks,
+                    &logs,
+                    meta,
+                    Some(&state_dir),
+                    compression,
+                    lease_mode,
+                    repair,
+                    force_release.as_deref(),
+                )
+                .await
+            })
         })
         .map_err(|e| format!("{e:#}"))?;
         serde_json::to_value(&report).map_err(|e| format!("{e:#}"))

@@ -1,5 +1,5 @@
 //! Plan 29 M2's ingestion-based bootstrap-from-commit loader
-//! (`ns_ingest_page`, `put_local_blob`, `rebuild_derived_from_ns`,
+//! (`ns_ingest_page`, `put_local_blob`, `apply_bootstrap_indexes`,
 //! `clear_all_dirty`) and reintegration's atomic namespace swap
 //! (`commit_reintegration_batch`).
 //!
@@ -23,7 +23,7 @@
 use crate::error::MetaError;
 use crate::record::LogRecord;
 use crate::store::{journal, misc, ns, Meta, KV_APPLIED_SEQ, KV_USAGE_BYTES, KV_USAGE_FILES};
-use constellation_fs_core::Ino;
+use constellation_fs_core::{ChunkHash, Ino};
 use constellation_mtree::keys;
 use constellation_mtree::record::{self, Attrs, BlobHash, InodeRecord, Kind, XattrPlacement};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
@@ -38,6 +38,60 @@ pub struct LocalInodeEncoding {
     /// `(name, encoded Payload)` for each spilled xattr, empty when the
     /// set is inline (already folded into `record`).
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Accumulates `chunk_ref`/`chunk_ref_by_ino`/`xattr_by_name`/usage from
+/// one pass over a bootstrap's inodes, fed by the *same* decode
+/// `cli::mtree_read::load_tree` already pays for while converting each
+/// inode to its local encoding (plan 29 M3a).
+///
+/// Before this existed, a bootstrap called a `rebuild_derived_from_ns`
+/// method after ingestion, which re-read and re-decoded every `0x01`
+/// value from `ns` twice more (once for the indexes, once for usage) —
+/// measured at ~215 ms of a 100k-inode bootstrap that, after the M3a
+/// xattr-probe fix elsewhere in this milestone, otherwise ran in
+/// ~330 ms. [`Meta::apply_bootstrap_indexes`] takes this instead: the
+/// same information, collected for free during the one pass that
+/// already happens, applied with zero re-decoding.
+#[derive(Default)]
+pub struct BootstrapIndexBuilder {
+    chunk_hashes: Vec<(ChunkHash, Ino)>,
+    xattr_by_name: Vec<(String, Ino, Vec<u8>)>,
+    usage_bytes: u64,
+    usage_files: u64,
+}
+
+impl BootstrapIndexBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one inode's derived state. `manifest` and `xattrs` are the
+    /// already-resolved plaintext the caller used (or is about to use)
+    /// to build this inode's local encoding — never re-fetched or
+    /// re-decoded here.
+    pub fn observe(
+        &mut self,
+        ino: Ino,
+        attrs: &Attrs,
+        manifest: Option<&[u8]>,
+        xattrs: &[(Vec<u8>, Vec<u8>)],
+    ) {
+        for hash in misc::manifest_hashes(manifest) {
+            self.chunk_hashes.push((hash, ino));
+        }
+        for (name, value) in xattrs {
+            self.xattr_by_name.push((
+                String::from_utf8_lossy(name).into_owned(),
+                ino,
+                value.clone(),
+            ));
+        }
+        if attrs.kind == Kind::File {
+            self.usage_bytes += attrs.size;
+            self.usage_files += 1;
+        }
+    }
 }
 
 /// Wholesale clear of a keyspace, inside the caller's write transaction.
@@ -99,27 +153,6 @@ fn rebuild_indexes_tx(
         }
     }
     Ok(())
-}
-
-/// Sum of reachable file sizes/count over whatever `ns` currently holds
-/// — the ingestion-bootstrap equivalent of the incremental
-/// `adjust_usage_tx` every ordinary write path maintains, needed because
-/// a bulk `start_ingestion` load bypasses that path entirely.
-fn usage_from_ns_tx(
-    r: &impl Readable,
-    ns_ks: &SingleWriterTxKeyspace,
-) -> Result<(u64, u64), MetaError> {
-    let range = keys::whole_range(keys::RANGE_INODE);
-    let (mut bytes, mut files) = (0u64, 0u64);
-    for guard in r.range(ns_ks, ns::key_range_bounds(&range)) {
-        let (_, v) = guard.into_inner()?;
-        let rec = InodeRecord::decode(&v)?;
-        if rec.attrs.kind == Kind::File {
-            bytes += rec.attrs.size;
-            files += 1;
-        }
-    }
-    Ok((bytes, files))
 }
 
 impl Meta {
@@ -191,26 +224,47 @@ impl Meta {
         })
     }
 
-    /// After a bootstrap's `ns_ingest_page` calls are all in: rebuild
-    /// `chunk_ref`/`chunk_ref_by_ino`/`xattr_by_name` and the persisted
-    /// usage counters from whatever `ns` now holds — the derived state
-    /// an ordinary write path maintains incrementally, which bulk
-    /// ingestion bypassed.
-    pub fn rebuild_derived_from_ns(&self) -> Result<(), MetaError> {
+    /// After a bootstrap's `ns_ingest_page` calls are all in: apply the
+    /// `chunk_ref`/`chunk_ref_by_ino`/`xattr_by_name`/usage state a
+    /// [`BootstrapIndexBuilder`] accumulated while the caller walked the
+    /// tree — the derived state an ordinary write path maintains
+    /// incrementally, which bulk ingestion bypassed, applied here with
+    /// no re-decoding of what was already decoded once.
+    ///
+    /// Clears the three index keyspaces first (idempotent: a bootstrap
+    /// that retries lands on the same state either way), then inserts
+    /// `builder`'s rows directly.
+    pub fn apply_bootstrap_indexes(&self, builder: BootstrapIndexBuilder) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
-        rebuild_indexes_tx(
+        clear_tx(&mut tx, &self.chunk_ref)?;
+        clear_tx(&mut tx, &self.chunk_ref_by_ino)?;
+        clear_tx(&mut tx, &self.xattr_by_name)?;
+        for (hash, ino) in &builder.chunk_hashes {
+            tx.insert(&self.chunk_ref, misc::cr_key(hash, *ino), Vec::new());
+            tx.insert(
+                &self.chunk_ref_by_ino,
+                misc::cri_key(*ino, hash),
+                Vec::new(),
+            );
+        }
+        for (name, ino, value) in &builder.xattr_by_name {
+            misc::xattr_by_name_put_tx(&mut tx, &self.xattr_by_name, name, *ino, value);
+        }
+        crate::store::kv_set_tx(
             &mut tx,
-            &self.ns,
-            &self.blobs,
-            &self.chunk_ref,
-            &self.chunk_ref_by_ino,
-            &self.xattr_by_name,
-        )?;
-        let (bytes, files) = usage_from_ns_tx(&tx, &self.ns)?;
-        crate::store::kv_set_tx(&mut tx, &self.local, KV_USAGE_BYTES, &bytes.to_string());
-        crate::store::kv_set_tx(&mut tx, &self.local, KV_USAGE_FILES, &files.to_string());
+            &self.local,
+            KV_USAGE_BYTES,
+            &builder.usage_bytes.to_string(),
+        );
+        crate::store::kv_set_tx(
+            &mut tx,
+            &self.local,
+            KV_USAGE_FILES,
+            &builder.usage_files.to_string(),
+        );
         tx.commit()?;
-        self.usage_tracker().reseat(bytes, files);
+        self.usage_tracker()
+            .reseat(builder.usage_bytes, builder.usage_files);
         Ok(())
     }
 

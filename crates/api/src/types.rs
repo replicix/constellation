@@ -63,6 +63,16 @@ pub enum Request {
         #[serde(default)]
         verify_only: bool,
     },
+    /// Run `fsck` now, in the already-running daemon's process — the
+    /// same lock-avoidance reason as `GcRun` (plan 29 M3a): `fsck`
+    /// otherwise opens the metadata store directly, which a live mount
+    /// already holds under `fjall`'s single-process lock.
+    FsckRun {
+        #[serde(default)]
+        repair: bool,
+        #[serde(default)]
+        force_release: Option<String>,
+    },
     SnapshotCreate {
         selector: String,
     },
@@ -225,6 +235,11 @@ pub enum Response {
     /// sits below `cli` in the dependency graph and must not depend on
     /// its report types.
     GcReport {
+        report: serde_json::Value,
+    },
+    /// `cli::fsck::FsckReport`, carried as opaque JSON for the same
+    /// reason as [`Response::GcReport`].
+    FsckReport {
         report: serde_json::Value,
     },
     Error {

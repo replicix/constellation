@@ -7,12 +7,13 @@
 //! this module CAS-publishes the complete condemned set and waits a lease
 //! TTL; writers independently treat those hashes as dedup misses.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::ChunkHash;
 use constellation_meta::Meta;
 use constellation_store_s3::{
-    append_journal, publish_condemned, read_condemned, GcJournalEntry, LeaseMode, SnapshotStore,
+    append_journal, publish_condemned, read_condemned, GcJournalEntry, LeaseMode, LogStore,
+    SnapshotStore,
 };
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -21,6 +22,76 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
+
+/// How this GC round catches its replica up to the log head before
+/// marking, and again after the condemned-list TTL wait, before the
+/// final re-check (plan 29 M3a).
+///
+/// `run_chunks`'s liveness view (`live_roots`) reads `meta.live_manifests`
+/// — the *local* replica's view of which chunks are referenced. A
+/// replica that has not yet tailed a writer's dedup-hit commit believes
+/// an old chunk is unreferenced when it is not; without a tail before
+/// marking, that chunk becomes a candidate, and without a second tail
+/// after the TTL wait, a dedup that landed *during* the wait is still
+/// invisible at delete time. Both tails are mandatory: a round that
+/// cannot refresh its replica aborts rather than mark or delete against
+/// a view it cannot vouch for.
+pub enum GcTail {
+    /// GC is running inside the mount daemon (the control-socket path):
+    /// ask the live sync task — which owns the real `Shipper`, with its
+    /// lease and partition state — to tail every partition, through the
+    /// same channel pattern every other cross-thread daemon call uses.
+    Daemon(tokio::sync::mpsc::UnboundedSender<crate::fusefs::SyncRequest>),
+    /// GC is running standalone (`constellation gc` with no daemon
+    /// holding this state dir, or the periodic in-daemon task before a
+    /// sync channel exists): attach a throwaway tail-only `Shipper`
+    /// straight to the `LogStore` and `Meta` this round already has, and
+    /// tail it. It ships nothing and holds no lease — a GC round never
+    /// authors segments — so this is safe even for a read-only member or
+    /// mid-reintegration.
+    Standalone { logs: LogStore, node_id: u64 },
+}
+
+impl GcTail {
+    /// A standalone tailer for `meta`'s own state dir: reads the node id
+    /// this replica already claimed (`kv_get("node_id")`), or `0` for a
+    /// bootstrap-only replica that has never been mounted (nothing in
+    /// its journal can collide with a real node's segments in that
+    /// case).
+    pub fn standalone(logs: LogStore, meta: &Meta) -> Result<Self> {
+        let node_id = meta
+            .kv_get("node_id")?
+            .map(|v| v.parse::<u64>())
+            .transpose()
+            .context("corrupt node_id in state dir")?
+            .unwrap_or(0);
+        Ok(GcTail::Standalone { logs, node_id })
+    }
+
+    async fn tail_to_head(&self, meta: &Arc<Meta>, lease_mode: LeaseMode) -> Result<()> {
+        match self {
+            GcTail::Daemon(tx) => {
+                let (reply, receive) = tokio::sync::oneshot::channel();
+                tx.send(crate::fusefs::SyncRequest::TailToHead { reply })
+                    .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
+                receive
+                    .await
+                    .context("sync task stopped before replying")?
+                    .map_err(|message| anyhow::anyhow!(message))
+            }
+            GcTail::Standalone { logs, node_id } => {
+                let mut shipper = crate::shipper::Shipper::attach_with_mode(
+                    meta.clone(),
+                    logs.clone(),
+                    *node_id,
+                    lease_mode,
+                )?;
+                shipper.tail_to_head().await?;
+                Ok(())
+            }
+        }
+    }
+}
 
 pub const DEFAULT_GC_INTERVAL_S: u64 = 86_400;
 pub const DEFAULT_GC_HORIZON_S: u64 = 7 * 86_400;
@@ -73,6 +144,7 @@ pub struct GcReport {
     pub metadata: Option<crate::mtree_gc::MtreeGcReport>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     object_store: Arc<dyn ObjectStore>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
@@ -80,22 +152,36 @@ pub async fn run(
     lease_mode: LeaseMode,
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
+    tail: &GcTail,
 ) -> Result<GcReport> {
     let config = GcConfig::from_env();
     let lease =
         crate::singleton::SingletonLease::acquire(object_store.clone(), "_gc", lease_mode).await?;
-    let result = run_held(object_store, chunks, meta, &config, verify_only, peers).await;
+    let result = run_held(
+        object_store,
+        chunks,
+        meta,
+        lease_mode,
+        &config,
+        verify_only,
+        peers,
+        tail,
+    )
+    .await;
     lease.release().await;
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_held(
     store: Arc<dyn ObjectStore>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
     meta: Arc<Meta>,
+    lease_mode: LeaseMode,
     config: &GcConfig,
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
+    tail: &GcTail,
 ) -> Result<GcReport> {
     // Chunks first: their snapshot roots are read from the metadata tree,
     // which the second phase compacts.
@@ -103,9 +189,11 @@ async fn run_held(
         store.clone(),
         chunks.clone(),
         meta.clone(),
+        lease_mode,
         config,
         verify_only,
         peers,
+        tail,
     )
     .await?;
     let tree_config =
@@ -122,14 +210,32 @@ async fn run_held(
 /// Plan 28 §P10 retired the `deref` index and its per-replica bookkeeping —
 /// any node, or an external job with bucket credentials, can GC by reading
 /// roots, so this LIST-based orphan pass is the only candidate source now.
+///
+/// `live_roots` reads the *local* replica (`meta.live_manifests`), which
+/// is only a safe liveness view if the replica is caught up to the log
+/// head: a replica lagging behind a writer that just deduplicated a new
+/// manifest against an old chunk would otherwise mark — and delete —
+/// still-referenced bytes it has not yet learned about (plan 29 M3a).
+/// `tail` therefore runs twice: once here, before the first mark, and
+/// once more after the condemned-list TTL wait, before the final
+/// re-check — a dedup landing during the wait must be visible before
+/// deletion, not just before marking. Either tail failing aborts the
+/// round with nothing marked or deleted rather than proceed against a
+/// replica view this pass could not vouch for.
+#[allow(clippy::too_many_arguments)]
 async fn run_chunks(
     store: Arc<dyn ObjectStore>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
     meta: Arc<Meta>,
+    lease_mode: LeaseMode,
     config: &GcConfig,
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
+    tail: &GcTail,
 ) -> Result<GcReport> {
+    tail.tail_to_head(&meta, lease_mode)
+        .await
+        .context("tailing the metadata log to head before marking chunk GC candidates")?;
     let now = constellation_store_s3::lease::now_unix_ms();
     let live = live_roots(&chunks, &meta).await?;
     let snapshots = snapshot_roots(&chunks, store.clone()).await?;
@@ -190,6 +296,9 @@ async fn run_chunks(
     // refreshed by then can no longer commit under a valid partition lease.
     tokio::time::sleep(std::time::Duration::from_millis(config.lease_ttl_ms)).await;
 
+    tail.tail_to_head(&meta, lease_mode).await.context(
+        "tailing the metadata log to head after the condemned-list wait, before deletion",
+    )?;
     let refreshed_live = live_roots(&chunks, &meta).await?;
     let refreshed_snaps = snapshot_roots(&chunks, store.clone()).await?;
     let mut deleted = Vec::new();
@@ -493,5 +602,130 @@ mod tests {
         // Floor 250 - 128 = 122: segments 1..=121.
         assert_eq!(marked.len(), 121);
         assert_eq!(marked.iter().max(), Some(&121));
+    }
+
+    /// Plan 29 M3a: chunk GC's liveness view is the *local* replica
+    /// (`live_roots` reads `meta.live_manifests`), so a replica that has
+    /// not tailed a writer's dedup-hit commit must not mark that chunk —
+    /// `run_chunks`'s own `tail_to_head` call is what keeps it from
+    /// doing so. Two in-process replicas share one `LogStore`: node A
+    /// writes, node B is GC's (deliberately lagging) target.
+    #[tokio::test]
+    async fn gc_tails_a_lagging_replica_before_marking_a_deduplicated_chunk() {
+        use crate::lease::LeaseKeeper;
+        use constellation_fs_core::manifest::{ChunkInfo, Manifest};
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_fs_core::{ChunkHash, ChunkLayout};
+        use constellation_meta::MetaStore;
+        use constellation_store_s3::{ChunkStore, CompressionSetting, LeaseStore, LogStore};
+        use object_store::memory::InMemory;
+
+        fn manifest_of(hash: ChunkHash, file_len: u64) -> Vec<u8> {
+            Manifest {
+                layout: ChunkLayout::new(4096),
+                file_len,
+                chunks: ChunkInfo::Inline([(0u64, hash)].into_iter().collect()),
+            }
+            .encode()
+        }
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let chunks = Arc::new(ChunkStore::new(store.clone()));
+
+        let meta_a = Arc::new(Meta::open_in_memory().unwrap());
+        meta_a.set_node_prefix(1).unwrap();
+        let mut ship_a =
+            crate::shipper::Shipper::attach(meta_a.clone(), LogStore::new(store.clone()), 1)
+                .unwrap();
+        let mut lease_a = LeaseKeeper::new(
+            LeaseStore::new(
+                store.clone(),
+                constellation_store_s3::log::PARTITION,
+                LeaseMode::Cas,
+            ),
+            1,
+        );
+
+        let meta_b = Arc::new(Meta::open_in_memory().unwrap());
+        meta_b.set_node_prefix(2).unwrap();
+        let mut ship_b =
+            crate::shipper::Shipper::attach(meta_b.clone(), LogStore::new(store.clone()), 2)
+                .unwrap();
+
+        let content = b"dedup-race-content";
+        let hash = ChunkHash::of(content);
+        chunks
+            .put_chunk(&hash, content, CompressionSetting::RAW)
+            .await
+            .unwrap();
+
+        // 1. A creates `old` referencing the chunk and ships it; B tails.
+        let old = meta_a.create(ROOT_INO, "old", 0o644, 0, 0).unwrap();
+        meta_a
+            .set_manifest(
+                old.ino,
+                &manifest_of(hash, content.len() as u64),
+                content.len() as u64,
+            )
+            .unwrap();
+        crate::shipper::acquire_lease(&mut ship_a, &mut lease_a)
+            .await
+            .unwrap();
+        ship_a.sync(&lease_a).await.unwrap();
+        ship_b.tail_to_head().await.unwrap();
+        assert!(live_roots(&chunks, &meta_b).await.unwrap().contains(&hash));
+
+        // 2. A unlinks `old` and ships; B tails again, so B now correctly
+        //    (at this point) believes the chunk unreferenced.
+        meta_a.unlink(ROOT_INO, "old").unwrap();
+        ship_a.sync(&lease_a).await.unwrap();
+        ship_b.tail_to_head().await.unwrap();
+        assert!(!live_roots(&chunks, &meta_b).await.unwrap().contains(&hash));
+
+        // 3. A creates `new` with the *same* content — a dedup hit
+        //    against the very chunk B just decided is dead — and ships
+        //    it. B is deliberately left behind: it is the "lagging" GC
+        //    replica the bug is about.
+        let new = meta_a.create(ROOT_INO, "new", 0o644, 0, 0).unwrap();
+        meta_a
+            .set_manifest(
+                new.ino,
+                &manifest_of(hash, content.len() as u64),
+                content.len() as u64,
+            )
+            .unwrap();
+        ship_a.sync(&lease_a).await.unwrap();
+        // (`ship_b.tail_to_head()` deliberately not called here.)
+
+        let config = GcConfig {
+            horizon_ms: 0,
+            retention_segments: 128,
+            lease_ttl_ms: 1,
+        };
+        let tail = GcTail::standalone(LogStore::new(store.clone()), &meta_b).unwrap();
+        let report = run_chunks(
+            store.clone(),
+            chunks.clone(),
+            meta_b.clone(),
+            LeaseMode::Cas,
+            &config,
+            false,
+            None,
+            &tail,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            report.candidates.iter().all(|m| m.hash != Some(hash)),
+            "the dedup-referenced chunk must never be marked: {:?}",
+            report.candidates
+        );
+        assert!(
+            chunks.has_chunk(&hash).await.unwrap(),
+            "chunk must survive a GC round run against a lagging replica"
+        );
+        // The mandatory tail is why: B must now know about `new` too.
+        assert!(meta_b.getattr(new.ino).unwrap().is_some());
     }
 }

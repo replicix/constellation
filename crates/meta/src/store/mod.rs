@@ -84,6 +84,7 @@ mod scratch;
 pub(crate) mod snapshot;
 mod writes;
 
+pub use bootstrap::BootstrapIndexBuilder;
 pub use snapshot::{quota_record, snapshot_record};
 
 use crate::error::MetaError;
@@ -102,6 +103,29 @@ use std::sync::atomic::{AtomicI64, Ordering};
 /// (~1.1e12) of per-node allocations. Prefix 0 belongs to `fs create`
 /// genesis (the root inode is 1).
 pub const INO_PREFIX_SHIFT: u32 = 40;
+
+/// Size of the ino block a directory's children are drawn from (plan 28
+/// §S1b). `alloc_ino_tx` gives every directory a lazily-allocated,
+/// contiguous span of `INO_BLOCK_SIZE` counter values: the first child
+/// created under a directory reserves a fresh block from the node's
+/// global counter (`KV_NEXT_INO`), and subsequent children in that same
+/// directory draw the next unused number in that block instead of
+/// advancing the global counter — so a directory's children cluster in
+/// one `0x01`-range span instead of scattering across the whole
+/// per-node ino range as the filesystem ages (measured at ~7× write
+/// amplification in §14.10 under the old global `counter++` policy).
+///
+/// 1024 matches §14.10's own "distinct 1024-ino buckets" statistic, so
+/// a directory that stays under one block also stays in one bucket by
+/// that measure. **Overflow rule:** once a directory's active block is
+/// full (all `INO_BLOCK_SIZE` numbers handed out), the next child for
+/// that directory reserves a brand-new block from the global counter —
+/// there is no cross-directory reuse and no bound on how many blocks one
+/// directory can accumulate, so a directory with 100k children simply
+/// owns ~100 blocks, each internally clustered. This is pure allocation
+/// *policy*: an ino never moves once assigned, nothing migrates when a
+/// block fills, and existing (pre-locality) inos are unaffected.
+pub const INO_BLOCK_SIZE: u64 = 1024;
 pub const SCRATCH_XATTR: &str = "user.constellation.scratch";
 pub const QUOTA_KV_KEY: &str = "quota_max_bytes";
 /// Node-local mirror of `meta.json`'s creation-time cap. Never journaled:
@@ -286,6 +310,12 @@ pub struct Meta {
     pub(crate) reintegration: SingleWriterTxKeyspace,
     pub(crate) shadow: SingleWriterTxKeyspace,
     pub(crate) blobs: SingleWriterTxKeyspace,
+    /// Plan 28 §S1b: `dir_ino(8 BE) -> block_start(8 BE) ++ used(4 BE)`,
+    /// the per-directory ino allocation cursor `alloc_ino_tx` reads and
+    /// advances. Node-local only — never journaled or replicated, since
+    /// it is pure allocation policy and every node has its own disjoint
+    /// ino-prefix range to draw blocks from.
+    pub(crate) ino_alloc: SingleWriterTxKeyspace,
     usage: UsageTracker,
     #[allow(dead_code)]
     path: Option<PathBuf>,
@@ -346,6 +376,7 @@ impl Meta {
         let reintegration = db.keyspace("reintegration", KeyspaceCreateOptions::default)?;
         let shadow = db.keyspace("shadow", KeyspaceCreateOptions::default)?;
         let blobs = db.keyspace("blobs", KeyspaceCreateOptions::default)?;
+        let ino_alloc = db.keyspace("ino_alloc", KeyspaceCreateOptions::default)?;
 
         let meta = Meta {
             db,
@@ -366,6 +397,7 @@ impl Meta {
             reintegration,
             shadow,
             blobs,
+            ino_alloc,
             usage: UsageTracker::new(0, 0),
             path,
         };
@@ -480,9 +512,20 @@ impl Meta {
         Ok(())
     }
 
-    pub fn allocate_ino(&self) -> Result<constellation_fs_core::Ino, MetaError> {
+    /// Allocate a new ino for a child of `dir` (plan 28 §S1b): draws the
+    /// next number from `dir`'s active block, reserving a fresh block
+    /// from the node's global counter if `dir` has none yet or its
+    /// current block is full. `dir` is a locality *hint*, not a
+    /// correctness requirement — passing the same value for every call
+    /// degrades to one directory's worth of clustering, never a
+    /// collision, since the block reservation itself is what guarantees
+    /// disjoint ranges.
+    pub fn allocate_ino(
+        &self,
+        dir: constellation_fs_core::Ino,
+    ) -> Result<constellation_fs_core::Ino, MetaError> {
         let mut tx = self.db.write_tx();
-        let ino = alloc_ino_tx(&mut tx, &self.local)?;
+        let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, dir)?;
         tx.commit()?;
         Ok(ino)
     }
@@ -642,20 +685,82 @@ fn applied_seq_at(r: &impl Readable, local: &SingleWriterTxKeyspace) -> Result<u
     Ok(kv_get_u64(r, local, KV_APPLIED_SEQ)?.unwrap_or(0))
 }
 
+/// Decode an `ino_alloc` cursor value: `block_start(8 BE) ++ used(4 BE)`.
+fn decode_cursor(bytes: &[u8]) -> Result<(u64, u32), MetaError> {
+    if bytes.len() != 12 {
+        return Err(MetaError::Invalid("ino_alloc cursor".into()));
+    }
+    let block_start = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+    let used = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+    Ok((block_start, used))
+}
+
+fn encode_cursor(block_start: u64, used: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&block_start.to_be_bytes());
+    out.extend_from_slice(&used.to_be_bytes());
+    out
+}
+
+/// Allocate the next counter value for `dir`'s active ino block,
+/// reserving a fresh `INO_BLOCK_SIZE` block from the node's global
+/// counter if needed (see [`INO_BLOCK_SIZE`]). Crash-safe by
+/// construction: the cursor update and the global counter bump (when a
+/// new block is drawn) happen in the same write transaction the caller
+/// commits along with the create itself, exactly as the old single
+/// `next_ino++` did.
 pub(crate) fn alloc_ino_tx(
     tx: &mut SingleWriterWriteTx,
     local: &SingleWriterTxKeyspace,
+    ino_alloc: &SingleWriterTxKeyspace,
+    dir: constellation_fs_core::Ino,
 ) -> Result<constellation_fs_core::Ino, MetaError> {
-    let next = kv_get_u64(tx, local, KV_NEXT_INO)?
-        .ok_or_else(|| MetaError::Invalid("next_ino missing".into()))?;
-    kv_set_tx(tx, local, KV_NEXT_INO, &(next + 1).to_string());
+    let dir_key = dir.to_be_bytes();
+    let cursor = tx
+        .get(ino_alloc, dir_key)?
+        .map(|v| decode_cursor(&v))
+        .transpose()?;
+    let (block_start, used) = match cursor {
+        Some((block_start, used)) if used < INO_BLOCK_SIZE as u32 => (block_start, used),
+        _ => {
+            // No block yet, or `dir`'s block is full: reserve the next
+            // free block from the global counter. Rounding the counter
+            // up to a block boundary keeps every block aligned, which is
+            // what makes `reclaim_ino_counter` below a cheap block-level
+            // (not per-ino) operation.
+            let next = kv_get_u64(tx, local, KV_NEXT_INO)?
+                .ok_or_else(|| MetaError::Invalid("next_ino missing".into()))?;
+            let block_start = next.div_ceil(INO_BLOCK_SIZE) * INO_BLOCK_SIZE;
+            kv_set_tx(
+                tx,
+                local,
+                KV_NEXT_INO,
+                &(block_start + INO_BLOCK_SIZE).to_string(),
+            );
+            (block_start, 0)
+        }
+    };
+    let counter = block_start + used as u64;
+    if counter >= 1u64 << INO_PREFIX_SHIFT {
+        return Err(MetaError::Invalid(
+            "node ino space exhausted (40-bit counter overflow)".into(),
+        ));
+    }
+    tx.insert(
+        ino_alloc,
+        dir_key.to_vec(),
+        encode_cursor(block_start, used + 1),
+    );
     let prefix = kv_get_u64(tx, local, KV_NODE_PREFIX)?.unwrap_or(0);
-    Ok((prefix << INO_PREFIX_SHIFT) | next)
+    Ok((prefix << INO_PREFIX_SHIFT) | counter)
 }
 
-/// Bump `next_ino` past every ino this node has ever allocated under its
-/// own prefix, so replaying local history can never collide with future
-/// allocations. Mirrors `apply_foreign`'s recompute in the old engine.
+/// Bump `next_ino` past the whole block containing `ino`, so replaying
+/// local history can never let a future block allocation overlap a
+/// number this node has already handed out under its own prefix. Blocks
+/// are always aligned to `INO_BLOCK_SIZE` (see `alloc_ino_tx`), so
+/// "protect this ino" and "protect its block" are the same operation.
+/// Mirrors `apply_foreign`'s recompute in the old engine.
 pub(crate) fn reclaim_ino_counter(
     tx: &mut SingleWriterWriteTx,
     local: &SingleWriterTxKeyspace,
@@ -668,9 +773,10 @@ pub(crate) fn reclaim_ino_counter(
         return Ok(());
     }
     let counter = ino & ((1u64 << INO_PREFIX_SHIFT) - 1);
+    let block_end = (counter / INO_BLOCK_SIZE + 1) * INO_BLOCK_SIZE;
     let next = kv_get_u64(tx, local, KV_NEXT_INO)?.unwrap_or(0);
-    if counter + 1 > next {
-        kv_set_tx(tx, local, KV_NEXT_INO, &(counter + 1).to_string());
+    if block_end > next {
+        kv_set_tx(tx, local, KV_NEXT_INO, &block_end.to_string());
     }
     Ok(())
 }

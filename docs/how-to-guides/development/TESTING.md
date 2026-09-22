@@ -440,6 +440,11 @@ Phase 8a adds three destructive-integrity scenarios:
   cache copy, uploads an old-enough orphan, and plants a torn log segment. It
   asserts exit codes 1 (detected), 2 (repaired), then 0 (clean), remounts, and
   verifies the healed file bytes.
+- `fsck-while-mounted` (plan 29 M3a) runs `constellation fsck` against a state
+  dir a daemon still holds — `fjall`'s single-process lock refuses a second
+  process's direct open, so `fsck` must route through the running daemon's
+  control socket instead. Asserts a clean (`exit 0`) JSON report rather than a
+  lock error, proving the routing worked and not just that fsck ran offline.
 
 Phase 8c adds two upload-existence scenarios (plan 26 step 8 replaced their
 mount-time bucket LIST with the replica's `chunk_ref` index):

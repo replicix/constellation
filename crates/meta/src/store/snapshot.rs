@@ -259,12 +259,12 @@ impl Meta {
         let mut delta_bytes: i64 = 0;
         let mut delta_files: i64 = 0;
         for spec in specs.iter() {
-            let ino = alloc_ino_tx(&mut tx, &self.local)?;
-            inos.push(ino);
             let (node_parent, name): (Ino, &str) = match spec.parent_index {
                 None => (parent, final_name),
                 Some(pi) => (inos[pi], spec.name.as_str()),
             };
+            let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, node_parent)?;
+            inos.push(ino);
             let attrs = record::Attrs {
                 kind: ns::kind_to_mtree(spec.kind),
                 mode: spec.mode,

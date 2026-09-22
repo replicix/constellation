@@ -461,6 +461,11 @@ impl TreePublisher {
         // the tree names is durable before the commit exists. Blobs
         // first because a pack may name a node whose value names a
         // blob, and packs are sealed below.
+        let blob_hashes: Vec<_> = plan
+            .blobs
+            .iter()
+            .map(|body| self.blobs.hash(body))
+            .collect();
         self.blobs.put_all(plan.blobs.clone()).await?;
         let packs = self.cache.seal_packs().await?;
 
@@ -476,6 +481,29 @@ impl TreePublisher {
             tracing::info!(
                 "metadata publish deferred: a pack it deduplicated against is condemned by GC"
             );
+            return Ok(Outcome::Deferred);
+        }
+
+        // Plan 29 M3a's blob twin: `BlobStore::put` above treats an
+        // already-present object as a dedup hit and returns success
+        // without re-checking liveness, so a blob this batch is about
+        // to name in the commit could be deleted by GC's two-mark
+        // horizon in the gap between that PUT and this commit's CAS.
+        // Re-reading the condemned-blob list right here, rather than
+        // trusting the one read (if any) at planning time, is what
+        // closes it — mirroring the pack check immediately above: a
+        // commit that still names a condemned blob is deferred rather
+        // than let through, and the retry either lands after GC's
+        // grace wait cleared the condemnation or re-uploads into a
+        // fresh, uncondemned object (content-addressed, so "fresh" is
+        // simply the same PUT succeeding for real instead of hitting
+        // `AlreadyExists`).
+        let condemned_blobs = constellation_store_s3::read_condemned_blobs(&backend).await?;
+        if blob_hashes
+            .iter()
+            .any(|hash| condemned_blobs.contains(hash))
+        {
+            tracing::info!("metadata publish deferred: a blob it references is condemned by GC");
             return Ok(Outcome::Deferred);
         }
 

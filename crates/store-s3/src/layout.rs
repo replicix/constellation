@@ -121,6 +121,20 @@ pub fn gc_condemned_packs() -> Path {
     Path::from("gc/condemned-packs.json")
 }
 
+/// Plan 29 M3a: `blobs/*` a GC round is about to delete, same handshake
+/// shape as [`gc_condemned_packs`].
+pub fn gc_condemned_blobs() -> Path {
+    Path::from("gc/condemned-blobs.json")
+}
+
+/// Plan 29 M3a: the two-mark horizon's candidate bookkeeping — every
+/// currently-unreferenced blob hash and the round it was first seen
+/// unreferenced. A bucket object (not node-local kv) because any node
+/// may run a GC round, mirroring §P10's "no full local replica needed".
+pub fn gc_blob_candidates() -> Path {
+    Path::from("gc/blob-candidates.json")
+}
+
 pub fn gc_journal(ts: i64, nonce: &str) -> Path {
     Path::from(format!("gc/journal/{ts:016x}-{nonce}.json"))
 }

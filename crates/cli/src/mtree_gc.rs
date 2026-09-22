@@ -36,13 +36,28 @@
 //!    resumes where it stopped instead of restarting.
 //! 6. **Clear** the condemned list.
 //!
-//! ## What is not swept
+//! ## `blobs/`: a second two-mark horizon, riding the same mark (M3a)
 //!
-//! `blobs/` — values over 1 KiB spilled out of tree nodes — is not
-//! collected yet. Spills are rare (a big xattr, a PATH_MAX symlink), an
-//! unreferenced blob only costs space, and a blob is content-addressed
-//! under the same key every time it is written, so it cannot use the
-//! re-upload trick packs use; it needs its own two-mark horizon.
+//! Values over 1 KiB spilled out of tree nodes (`blobs/<hex>`) are
+//! reachable only through a `0x01`/`0x03` leaf value's `Payload`, so
+//! `constellation_store_s3::mark` decodes those values as it visits
+//! each leaf (it was already fetching the bytes) and returns every
+//! blob hash it found alongside the node set — no second walk.
+//!
+//! Unlike packs, a blob is content-addressed under the same key every
+//! time it is written, so it cannot use packs' re-upload-into-a-fresh-
+//! object trick, and a blob's "liveness" has no useful pack-like
+//! notion of partial death — it is either referenced or it is garbage.
+//! That makes the horizon itself the interesting part: a blob is
+//! condemned in the *same* round as a pack only if it was **already**
+//! known unreferenced from an *earlier* round (`gc/blob-candidates.json`
+//! records first-seen-unreferenced times, a bucket object rather than
+//! node-local kv so any node's round can pick up another's bookkeeping)
+//! and `CONSTELLATION_GC_HORIZON_S` has since elapsed — then it goes
+//! through the identical condemn/wait/re-mark/re-check handshake as
+//! packs (`gc/condemned-blobs.json`, checked by `mtree_publish` right
+//! before its commit CAS, mirroring the pack check), sharing this
+//! round's one grace wait rather than paying for a second one.
 
 use crate::mtree_read::ChainReader;
 use anyhow::{Context, Result};
@@ -136,6 +151,15 @@ pub struct MtreeGcReport {
     pub bytes_read: u64,
     pub bytes_written: u64,
     pub delete_failures: usize,
+    /// Plan 29 M3a: every object currently under `blobs/`.
+    pub blobs: usize,
+    /// Blobs currently tracked as unreferenced (waiting on the horizon
+    /// or already eligible), after this round's bookkeeping update.
+    pub blob_candidates: usize,
+    /// Of `blob_candidates`, how many passed the horizon this round and
+    /// were therefore condemned and re-checked.
+    pub blobs_eligible: usize,
+    pub blobs_deleted: usize,
 }
 
 /// Sleeps `bytes / rate` before each batch.
@@ -218,8 +242,8 @@ async fn run_inner(
         now,
     )
     .await?;
-    report.live_nodes = live.len();
-    let sweep = Sweep::classify(&catalog, &live);
+    report.live_nodes = live.nodes.len();
+    let sweep = Sweep::classify(&catalog, &live.nodes);
     let incomplete = old_incomplete(&store, &catalog, now - config.horizon_ms).await?;
     report.packs_dead = sweep.fully_dead().len();
     report.packs_partially_dead = sweep.partially_dead().len();
@@ -230,12 +254,37 @@ async fn run_inner(
         .chain(sweep.partially_dead())
         .chain(incomplete.iter().copied())
         .collect();
-    if verify_only || condemned.is_empty() {
+
+    // `blobs/` two-mark horizon (plan 29 M3a): reuses this same mark's
+    // `blob_hashes` rather than a second walk. Bookkeeping is updated
+    // (new candidates recorded, re-referenced ones dropped) from every
+    // round's first mark, independent of whether anything ends up
+    // eligible for deletion this time.
+    let all_blobs = list_blobs(&store).await?;
+    report.blobs = all_blobs.len();
+    let mut blob_candidates = load_blob_candidates(&store).await?;
+    let eligible_blobs = update_blob_candidates(
+        &mut blob_candidates,
+        &all_blobs,
+        &live.blob_hashes,
+        now,
+        config.horizon_ms,
+    );
+    report.blob_candidates = blob_candidates.first_seen_ms.len();
+    report.blobs_eligible = eligible_blobs.len();
+
+    if verify_only {
+        return Ok(report);
+    }
+    if condemned.is_empty() && eligible_blobs.is_empty() {
+        save_blob_candidates(&store, &blob_candidates).await?;
         return Ok(report);
     }
 
     // 4. Handshake: condemn, wait, re-mark.
     constellation_store_s3::publish_condemned_packs(&store, &condemned, now as u64, now).await?;
+    constellation_store_s3::publish_condemned_blobs(&store, &eligible_blobs, now as u64, now)
+        .await?;
     tokio::time::sleep(config.grace).await;
     let now = constellation_store_s3::lease::now_unix_ms();
     let retained = retained_commits(store.clone(), expired.clone()).await?;
@@ -255,7 +304,26 @@ async fn run_inner(
             condemned_catalog.insert(*pack, entry.index.clone(), entry.body_bytes);
         }
     }
-    let sweep = Sweep::classify(&condemned_catalog, &live);
+    let sweep = Sweep::classify(&condemned_catalog, &live.nodes);
+
+    // Blob deletion: act only on hashes that are both on the condemned
+    // list (unreferenced and past the horizon at the first mark) and
+    // *still* unreferenced at the re-mark — the same "re-check right
+    // before the destructive step" rule the pack sweep applies below.
+    for hash in &eligible_blobs {
+        if live.blob_hashes.contains(hash) {
+            continue; // referenced again since the first mark: survives
+        }
+        let hex = constellation_mtree::NodeHash(hash.0).to_hex();
+        match store.delete(&layout::blob(&hex)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                report.blobs_deleted += 1;
+                blob_candidates.first_seen_ms.remove(&hex);
+            }
+            Err(_) => report.delete_failures += 1,
+        }
+    }
+    save_blob_candidates(&store, &blob_candidates).await?;
 
     // 5. Delete, then compact, from the saved cursors.
     let compactor = Compactor::new(
@@ -278,7 +346,7 @@ async fn run_inner(
     let mut cursor = load_cursor(meta, KV_CURSOR_COMPACT)?;
     loop {
         let batch = compactor
-            .compact(&sweep, &live, BATCH_PACKS, cursor)
+            .compact(&sweep, &live.nodes, BATCH_PACKS, cursor)
             .await?;
         report.packs_rewritten += batch.deleted.len();
         report.packs_written += batch.written.len();
@@ -307,14 +375,104 @@ async fn run_inner(
     // 6. Nothing condemned remains to protect.
     constellation_store_s3::publish_condemned_packs(&store, &HashSet::new(), now as u64, now)
         .await?;
+    constellation_store_s3::publish_condemned_blobs(&store, &HashSet::new(), now as u64, now)
+        .await?;
     tracing::info!(
         commits_deleted = report.commits_deleted.len(),
         packs_deleted = report.packs_deleted,
         packs_rewritten = report.packs_rewritten,
         bytes_written = report.bytes_written,
+        blobs_deleted = report.blobs_deleted,
         "metadata tree GC round complete"
     );
     Ok(report)
+}
+
+// --------------------------------------------------------- blobs/ (M3a)
+
+/// `blobs/*`'s two-mark-horizon candidate bookkeeping
+/// (`layout::gc_blob_candidates`): every currently-unreferenced blob's
+/// hex hash mapped to the unix-ms this round first observed it
+/// unreferenced. A bucket object, not node-local kv, so any node can
+/// run a round (§P10) and pick up where a previous round — possibly on
+/// a different node — left off.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct BlobCandidates {
+    first_seen_ms: std::collections::BTreeMap<String, i64>,
+}
+
+async fn load_blob_candidates(store: &Arc<dyn ObjectStore>) -> Result<BlobCandidates> {
+    match store.get(&layout::gc_blob_candidates()).await {
+        Ok(result) => Ok(serde_json::from_slice(&result.bytes().await?)?),
+        Err(object_store::Error::NotFound { .. }) => Ok(BlobCandidates::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn save_blob_candidates(
+    store: &Arc<dyn ObjectStore>,
+    candidates: &BlobCandidates,
+) -> Result<()> {
+    store
+        .put(
+            &layout::gc_blob_candidates(),
+            object_store::PutPayload::from(serde_json::to_vec(candidates)?),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Every object under `blobs/`, by address.
+async fn list_blobs(
+    store: &Arc<dyn ObjectStore>,
+) -> Result<HashSet<constellation_mtree::BlobHash>> {
+    let mut out = HashSet::new();
+    for object in store
+        .list(Some(&layout::blobs_prefix()))
+        .try_collect::<Vec<_>>()
+        .await?
+    {
+        if let Some(hash) = object
+            .location
+            .filename()
+            .and_then(constellation_mtree::NodeHash::from_hex)
+        {
+            out.insert(constellation_mtree::BlobHash(hash.0));
+        }
+    }
+    Ok(out)
+}
+
+/// Fold this round's first mark into `candidates`, in place, and return
+/// the subset eligible for condemnation: unreferenced now *and* first
+/// seen unreferenced at least `horizon_ms` ago (by a *previous* round —
+/// a blob first seen unreferenced this instant is never eligible in the
+/// same call, which is what makes this a two-mark horizon rather than a
+/// same-round delete). A blob that is referenced again before its
+/// horizon elapses is simply absent from the next call's `unreferenced`
+/// set and therefore silently drops out of the bookkeeping here.
+fn update_blob_candidates(
+    candidates: &mut BlobCandidates,
+    all_blobs: &HashSet<constellation_mtree::BlobHash>,
+    live: &HashSet<constellation_mtree::BlobHash>,
+    now: i64,
+    horizon_ms: i64,
+) -> HashSet<constellation_mtree::BlobHash> {
+    let mut eligible = HashSet::new();
+    let mut next = std::collections::BTreeMap::new();
+    for hash in all_blobs {
+        if live.contains(hash) {
+            continue;
+        }
+        let hex = constellation_mtree::NodeHash(hash.0).to_hex();
+        let first_seen_ms = *candidates.first_seen_ms.get(&hex).unwrap_or(&now);
+        if now - first_seen_ms >= horizon_ms {
+            eligible.insert(*hash);
+        }
+        next.insert(hex, first_seen_ms);
+    }
+    candidates.first_seen_ms = next;
+    eligible
 }
 
 // The helpers below take owned arguments on purpose: the daemon spawns
@@ -357,7 +515,10 @@ async fn retained_commits(store: Arc<dyn ObjectStore>, expired: Vec<u64>) -> Res
 }
 
 /// Every node reachable from the retained commits, the snapshot roots,
-/// and any known node a live hold names.
+/// and any known node a live hold names — plus, since plan 29 M3a,
+/// every blob hash the walk found spilled out of a `0x01`/`0x03` leaf
+/// value along the way (`constellation_store_s3::mark`'s own doc: this
+/// is the same walk, not a second one).
 async fn mark_roots(
     store: Arc<dyn ObjectStore>,
     sealing: Option<constellation_store_s3::TreeSealing>,
@@ -365,7 +526,7 @@ async fn mark_roots(
     commits: Vec<u64>,
     threads: usize,
     now: i64,
-) -> Result<HashSet<NodeHash>> {
+) -> Result<constellation_store_s3::Mark> {
     let chain = CommitChain::new(store.clone()).with_sealing(sealing);
     let mut roots: Vec<NodeHash> = Vec::new();
     for seq in commits {
@@ -394,11 +555,10 @@ async fn mark_roots(
             roots.push(node);
         }
     }
-    let marked =
-        tokio::task::spawn_blocking(move || constellation_store_s3::mark(&cache, &roots, threads))
-            .await
-            .context("metadata mark task")??;
-    Ok(marked.nodes)
+    tokio::task::spawn_blocking(move || constellation_store_s3::mark(&cache, &roots, threads))
+        .await
+        .context("metadata mark task")?
+        .map_err(Into::into)
 }
 
 /// Every 32-byte hex hash in a live `holds/*` object.
@@ -714,5 +874,186 @@ mod tests {
             .deduped_packs()
             .iter()
             .all(|pack| !condemned.contains(pack)));
+    }
+
+    // ------------------------------------------------- blobs/ (M3a)
+
+    /// A symlink target long enough to spill past `VALUE_SPILL` (1 KiB),
+    /// so its value is a `Payload::Spilled` blob hash rather than
+    /// inline bytes.
+    fn long_target(tag: u8) -> String {
+        String::from_utf8(vec![tag; 1500]).unwrap()
+    }
+
+    /// Backdate every candidate in `gc/blob-candidates.json` by
+    /// `age_ms`, simulating "a previous round already saw this
+    /// unreferenced" without an actual wait.
+    async fn backdate_blob_candidates(store: &Arc<dyn ObjectStore>, age_ms: i64) {
+        let mut candidates = load_blob_candidates(store).await.unwrap();
+        for value in candidates.first_seen_ms.values_mut() {
+            *value -= age_ms;
+        }
+        save_blob_candidates(store, &candidates).await.unwrap();
+    }
+
+    fn blob_exists(store: &Arc<dyn ObjectStore>, hash: constellation_mtree::BlobHash) -> bool {
+        let hex = constellation_mtree::NodeHash(hash.0).to_hex();
+        futures::executor::block_on(store.head(&layout::blob(&hex))).is_ok()
+    }
+
+    /// A blob a live symlink still names is never touched, however many
+    /// rounds run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_live_blob_survives() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut writer = publisher(&meta, &store, &dir);
+
+        let target = long_target(1);
+        meta.symlink(ROOT_INO, "link", &target, 0, 0).unwrap();
+        writer.publish(1).await.unwrap().unwrap();
+        let hash = constellation_store_s3::BlobStore::new(store.clone(), Hasher::Plain)
+            .hash(target.as_bytes());
+        assert!(blob_exists(&store, hash), "blob must be durable first");
+
+        let report = run(store.clone(), None, &meta, &config(64), false)
+            .await
+            .unwrap();
+        assert_eq!(report.blobs_deleted, 0, "{report:?}");
+        assert!(blob_exists(&store, hash));
+    }
+
+    /// An unreferenced blob is recorded as a candidate but not touched
+    /// in the round that first observes it — only once a *previous*
+    /// round's sighting is at least the horizon old does it die, after
+    /// the condemn/wait/re-mark handshake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dead_blob_survives_its_first_round_and_dies_after_the_horizon() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut writer = publisher(&meta, &store, &dir);
+
+        let target = long_target(2);
+        let hash = constellation_store_s3::BlobStore::new(store.clone(), Hasher::Plain)
+            .hash(target.as_bytes());
+        meta.symlink(ROOT_INO, "gone", &target, 0, 0).unwrap();
+        writer.publish(1).await.unwrap().unwrap();
+        // A real gap between the two commits' timestamps: retention's
+        // age check (`retention_ms: 0`) is a strict `>`, so a same-
+        // millisecond pair of commits would flakily fail to expire.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        meta.unlink(ROOT_INO, "gone").unwrap();
+        writer.publish(1).await.unwrap().unwrap();
+        assert!(blob_exists(&store, hash), "unlink must not touch blobs/");
+
+        let mut cfg = config(1);
+        cfg.horizon_ms = 1_000_000_000; // effectively "never on the first sighting"
+
+        // Round 1: first sighting. Recorded, not eligible, survives.
+        let report = run(store.clone(), None, &meta, &cfg, false).await.unwrap();
+        assert_eq!(report.blob_candidates, 1, "{report:?}");
+        assert_eq!(report.blobs_eligible, 0, "{report:?}");
+        assert_eq!(report.blobs_deleted, 0, "{report:?}");
+        assert!(blob_exists(&store, hash));
+
+        // Simulate the horizon having elapsed since that sighting.
+        backdate_blob_candidates(&store, cfg.horizon_ms + 1).await;
+
+        // Round 2: the candidate is now past the horizon and still
+        // unreferenced, so it is condemned, survives the re-mark check
+        // (nothing re-referenced it), and is deleted.
+        let report = run(store.clone(), None, &meta, &cfg, false).await.unwrap();
+        assert_eq!(report.blobs_eligible, 1, "{report:?}");
+        assert_eq!(report.blobs_deleted, 1, "{report:?}");
+        assert!(!blob_exists(&store, hash), "blob must be gone");
+        assert!(constellation_store_s3::read_condemned_blobs(&store)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A blob re-referenced between the round that first saw it
+    /// unreferenced and the round that would otherwise condemn it
+    /// survives — the re-mark sees the new reference and the candidate
+    /// bookkeeping drops it rather than condemning it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_blob_re_referenced_between_rounds_survives() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut writer = publisher(&meta, &store, &dir);
+
+        let target = long_target(3);
+        let hash = constellation_store_s3::BlobStore::new(store.clone(), Hasher::Plain)
+            .hash(target.as_bytes());
+        meta.symlink(ROOT_INO, "first", &target, 0, 0).unwrap();
+        writer.publish(1).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        meta.unlink(ROOT_INO, "first").unwrap();
+        writer.publish(1).await.unwrap().unwrap();
+
+        let mut cfg = config(1);
+        cfg.horizon_ms = 1_000_000_000;
+        let report = run(store.clone(), None, &meta, &cfg, false).await.unwrap();
+        assert_eq!(report.blob_candidates, 1, "{report:?}");
+        backdate_blob_candidates(&store, cfg.horizon_ms + 1).await;
+
+        // A second file dedups against the same content before the
+        // round that would otherwise condemn it.
+        meta.symlink(ROOT_INO, "second", &target, 0, 0).unwrap();
+        writer.publish(1).await.unwrap().unwrap();
+
+        let report = run(store.clone(), None, &meta, &cfg, false).await.unwrap();
+        assert_eq!(report.blobs_eligible, 0, "{report:?}");
+        assert_eq!(report.blobs_deleted, 0, "{report:?}");
+        assert_eq!(
+            report.blob_candidates, 0,
+            "re-referenced blob must drop out of the bookkeeping too"
+        );
+        assert!(blob_exists(&store, hash));
+    }
+
+    /// The publisher-side half of the blob handshake, mirroring
+    /// `a_publisher_never_names_a_condemned_pack`: a blob GC condemns
+    /// after a batch already believed (via `BlobStore::put`'s
+    /// `AlreadyExists`-is-success rule) that it was durably present
+    /// makes the publish defer rather than reference it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_publisher_defers_rather_than_name_a_condemned_blob() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut writer = publisher(&meta, &store, &dir);
+
+        let target = long_target(4);
+        let hash = constellation_store_s3::BlobStore::new(store.clone(), Hasher::Plain)
+            .hash(target.as_bytes());
+        // Pre-seed the object directly (as if an earlier, now-dead file
+        // had spilled the identical content) without ever publishing a
+        // reference to it.
+        constellation_store_s3::BlobStore::new(store.clone(), Hasher::Plain)
+            .put(&hash, target.as_bytes().to_vec())
+            .await
+            .unwrap();
+        let condemned: HashSet<_> = [hash].into_iter().collect();
+        constellation_store_s3::publish_condemned_blobs(&store, &condemned, 1, 0)
+            .await
+            .unwrap();
+
+        meta.symlink(ROOT_INO, "dedup", &target, 0, 0).unwrap();
+        let deferred = writer.publish(1).await.unwrap();
+        assert!(
+            deferred.is_none(),
+            "a publish naming a condemned blob must defer, not commit"
+        );
+
+        // Once GC clears the condemnation, the retry succeeds.
+        constellation_store_s3::publish_condemned_blobs(&store, &HashSet::new(), 2, 0)
+            .await
+            .unwrap();
+        let landed = writer.publish(1).await.unwrap();
+        assert!(landed.is_some(), "the retry must land once uncondemned");
     }
 }

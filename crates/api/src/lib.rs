@@ -162,6 +162,16 @@ pub trait StatusSource: Send + Sync + 'static {
         Err("gc is not supported by this daemon".into())
     }
 
+    /// Run `fsck` in this process (see [`crate::Request::FsckRun`]).
+    /// Default refuses.
+    fn fsck_run(
+        &self,
+        _repair: bool,
+        _force_release: Option<&str>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        Err("fsck is not supported by this daemon".into())
+    }
+
     /// Attach a new view. Default refuses so a provider (tests, older
     /// daemons) that predates multi-view mounts stays valid.
     fn mount_add(
@@ -216,6 +226,13 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
         },
         Request::GcRun { verify_only } => match source.gc_run(verify_only) {
             Ok(report) => Response::GcReport { report },
+            Err(message) => Response::Error { message },
+        },
+        Request::FsckRun {
+            repair,
+            force_release,
+        } => match source.fsck_run(repair, force_release.as_deref()) {
+            Ok(report) => Response::FsckReport { report },
             Err(message) => Response::Error { message },
         },
         Request::SnapshotList { path } | Request::ListSnapshots { path } => {

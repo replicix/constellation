@@ -82,7 +82,9 @@ use crate::error::StoreError;
 use crate::layout;
 use crate::node_cache::NodeCache;
 use crate::packs::{PackHash, PackIndex, PackStore};
-use constellation_mtree::{NodeHash, NodeRef, NodeStore};
+use constellation_mtree::keys::{RANGE_INODE, RANGE_XATTR};
+use constellation_mtree::record::{InodeRecord, Payload};
+use constellation_mtree::{BlobHash, NodeHash, NodeRef, NodeStore};
 use futures::TryStreamExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -252,6 +254,49 @@ pub struct Mark {
     pub node_visits: u64,
     /// Tree depth reached, for a report. `0` for an empty root set.
     pub levels: usize,
+    /// Every blob hash reachable through a `0x01`/`0x03` leaf value's
+    /// `Payload::Spilled` (plan 29 M3a `blobs/` GC). The module doc
+    /// above named this gap when S7a landed structural marking only;
+    /// this is that walk extended to also decode the leaf values it was
+    /// already fetching, rather than a second pass over the tree.
+    pub blob_hashes: HashSet<BlobHash>,
+}
+
+/// Pull any `Payload::Spilled` hash out of a `0x01`/`0x03` leaf entry.
+/// Every other range's leaf value never holds a blob reference (§P6: a
+/// `0x02` dentry's attrs are copied inline, never spilled; `0x04` and
+/// `0x30` carry no `Payload` at all), so this is a no-op for them.
+///
+/// A decode failure here is bucket corruption, not a caller error — the
+/// node itself was already hash-verified by the `NodeStore`, so a value
+/// that does not parse as its range's format is exactly the "wrong
+/// answer" a verified store must never hand back silently.
+fn collect_spilled_blobs(
+    key: &[u8],
+    value: &[u8],
+    out: &mut Vec<BlobHash>,
+) -> Result<(), StoreError> {
+    match key.first().copied() {
+        Some(RANGE_INODE) => {
+            let record = InodeRecord::decode(value)
+                .map_err(|e| StoreError::CorruptObject(format!("0x01 leaf value: {e}")))?;
+            if let Some(Payload::Spilled(hash)) = record.manifest {
+                out.push(hash);
+            }
+            if let Some(Payload::Spilled(hash)) = record.symlink_target {
+                out.push(hash);
+            }
+        }
+        Some(RANGE_XATTR) => {
+            let payload = Payload::decode(value)
+                .map_err(|e| StoreError::CorruptObject(format!("0x03 leaf value: {e}")))?;
+            if let Payload::Spilled(hash) = payload {
+                out.push(hash);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Every node reachable from `roots`, walked over `threads` workers
@@ -277,34 +322,46 @@ where
     }
     let visits = AtomicU64::new(0);
     let mut levels = 0usize;
+    let mut blob_hashes: HashSet<BlobHash> = HashSet::new();
 
     while !frontier.is_empty() {
         levels += 1;
-        let children: Vec<Vec<NodeHash>> = pool.install(|| {
+        let results: Vec<(Vec<NodeHash>, Vec<BlobHash>)> = pool.install(|| {
             frontier
                 .par_iter()
-                .map(|hash| -> Result<Vec<NodeHash>, StoreError> {
-                    let buf = store.get(hash)?;
-                    visits.fetch_add(1, Ordering::Relaxed);
-                    let node = NodeRef::new(&buf)?;
-                    if node.is_leaf() {
-                        return Ok(Vec::new());
-                    }
-                    let mut children = Vec::with_capacity(node.count());
-                    for i in 0..node.count() {
-                        children.push(node.child(i)?.0);
-                    }
-                    Ok(children)
-                })
+                .map(
+                    |hash| -> Result<(Vec<NodeHash>, Vec<BlobHash>), StoreError> {
+                        let buf = store.get(hash)?;
+                        visits.fetch_add(1, Ordering::Relaxed);
+                        let node = NodeRef::new(&buf)?;
+                        if node.is_leaf() {
+                            let mut blobs = Vec::new();
+                            for i in 0..node.count() {
+                                collect_spilled_blobs(
+                                    node.key(i)?,
+                                    node.leaf_value(i)?,
+                                    &mut blobs,
+                                )?;
+                            }
+                            return Ok((Vec::new(), blobs));
+                        }
+                        let mut children = Vec::with_capacity(node.count());
+                        for i in 0..node.count() {
+                            children.push(node.child(i)?.0);
+                        }
+                        Ok((children, Vec::new()))
+                    },
+                )
                 .collect::<Result<Vec<_>, StoreError>>()
         })?;
         frontier = Vec::new();
-        for group in children {
-            for child in group {
+        for (children, blobs) in results {
+            for child in children {
                 if seen.insert(child) {
                     frontier.push(child);
                 }
             }
+            blob_hashes.extend(blobs);
         }
     }
 
@@ -312,6 +369,7 @@ where
         node_visits: visits.load(Ordering::Relaxed),
         nodes: seen,
         levels,
+        blob_hashes,
     })
 }
 
@@ -399,7 +457,7 @@ mod tests {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         range
             .map(|i| {
-                let mut key = vec![0x01u8];
+                let mut key = vec![0x02u8];
                 key.extend_from_slice(&i.to_be_bytes());
                 let mut value = Vec::with_capacity(48);
                 while value.len() < 48 {
@@ -449,7 +507,7 @@ mod tests {
             store.reset_counters();
             let mut edits: Vec<_> = (0..4u64)
                 .map(|i| {
-                    let mut key = vec![0x01u8];
+                    let mut key = vec![0x02u8];
                     key.extend_from_slice(&((commit * 3_571 + i * 7_919) % 60_000).to_be_bytes());
                     (key, Some(vec![0xee, commit as u8, i as u8]))
                 })
@@ -619,7 +677,7 @@ mod tests {
             .unwrap();
 
         head = tree
-            .apply(&head, &[(vec![0x01u8, 9, 9], Some(b"new".to_vec()))])
+            .apply(&head, &[(vec![0x02u8, 9, 9], Some(b"new".to_vec()))])
             .unwrap();
         packs = f.cache.seal_packs().await.unwrap();
         let second = f
