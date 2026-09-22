@@ -52,7 +52,7 @@ impl Toxiproxy {
 
 impl Proxy<'_> {
     fn set_enabled(&self, enabled: bool) -> Result<()> {
-        ureq::post(&format!("{}/proxies/{}", self.tp.api, self.name))
+        ureq::patch(&format!("{}/proxies/{}", self.tp.api, self.name))
             .send_json(json!({ "enabled": enabled }))
             .context("toggling proxy")?;
         Ok(())

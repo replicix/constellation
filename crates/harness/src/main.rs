@@ -12,6 +12,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use constellation_harness::bench;
 use constellation_harness::corpus;
+use constellation_harness::metabench;
 use constellation_harness::scenarios::{self, SCENARIOS};
 use constellation_harness::snapchurn;
 use constellation_harness::suites;
@@ -86,6 +87,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Plan 29 M4: single- and multi-node metadata-op throughput/latency
+    /// matrix (creates lease-serialization vs forwarding vs S3 CAS
+    /// measurements). Prints one JSON report per configuration.
+    MetaBench {
+        /// Emit each report as a JSON object on stdout (one per line),
+        /// in addition to the human-readable summary on stderr.
+        #[arg(long)]
+        json: bool,
+    },
     /// Snapshot a local directory into an anonymized corpus manifest.
     CorpusSnapshot {
         /// Directory to walk (`.git` / `.hg` / `.svn` skipped).
@@ -155,6 +165,41 @@ fn main() -> Result<()> {
             let report = bench::run(&cfg)?;
             if cfg.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            Ok(())
+        }
+        Command::MetaBench { json } => {
+            let (reports, raw) = metabench::run_matrix()?;
+            if json {
+                for r in &reports {
+                    println!("{}", serde_json::to_string(r)?);
+                }
+                for r in &raw {
+                    println!("{}", serde_json::to_string(r)?);
+                }
+            }
+            eprintln!("\n=== metabench summary ===");
+            for r in &reports {
+                eprintln!(
+                    "{:28} nodes={} p2p={:<5} layout={:<14} agg={:>8.0} ops/s p50={:>7.2}ms p99={:>7.2}ms fwd_ok={:>5} fwd_p50={:>5?} handoffs={:>3} errors={}",
+                    r.label,
+                    r.nodes,
+                    r.p2p,
+                    r.layout,
+                    r.aggregate_ops_per_sec,
+                    r.p50_ms,
+                    r.p99_ms,
+                    r.forwarded_ok_total,
+                    r.forward_p50_ms,
+                    r.handoffs,
+                    r.errors,
+                );
+            }
+            for r in &raw {
+                eprintln!(
+                    "raw S3 @ {}ms latency: PUT p50={:.2}ms CAS-create p50={:.2}ms GET p50={:.2}ms",
+                    r.latency_ms, r.put_p50_ms, r.cas_create_p50_ms, r.get_p50_ms
+                );
             }
             Ok(())
         }

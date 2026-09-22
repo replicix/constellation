@@ -5,6 +5,7 @@ pub mod bench;
 pub mod client;
 pub mod corpus;
 pub mod docker;
+pub mod metabench;
 pub mod model;
 pub mod reqlog;
 pub mod s3env;
