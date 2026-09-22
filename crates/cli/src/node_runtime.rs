@@ -1004,6 +1004,7 @@ impl NodeRuntime {
                 upload,
                 forward,
                 placement,
+                sync_tx,
             ) = (
                 ship.clone(),
                 stop.clone(),
@@ -1024,6 +1025,7 @@ impl NodeRuntime {
                 upload.clone(),
                 forward.clone(),
                 placement.clone(),
+                sync_tx.clone(),
             );
             let last_sync_ms = last_sync_ms.clone();
             rt.spawn(async move {
@@ -1248,59 +1250,97 @@ impl NodeRuntime {
                             op,
                             reply,
                         }) => {
-                            // Only inspect lease state under the keeper lock. The
-                            // metadata transaction must not serialize unrelated
-                            // lease maintenance or network requests.
-                            let (ship_epoch, is_lost) = {
-                                let keepers = keepers.lock().await;
-                                keepers
-                                    .get(&part)
-                                    .map(|keeper| (keeper.ship_epoch(), keeper.is_lost()))
-                                    .unwrap_or((None, false))
-                            };
-                            let known_holder = if ship_epoch.is_some() {
-                                node_id
-                            } else if let Some(holder) = forward.cached_holder(&part) {
-                                holder
-                            } else {
-                                constellation_store_s3::LeaseStore::new(
-                                    store_inner.clone(),
-                                    &part,
-                                    lease_mode,
-                                )
-                                .get()
-                                .await
-                                .ok()
-                                .flatten()
-                                .map(|(lease, _)| lease.holder)
-                                .unwrap_or(0)
-                            };
-                            let outcome = forward::holder_execute(
-                                &meta,
-                                ship_epoch,
-                                is_lost,
-                                known_holder,
-                                &op,
+                            // Symmetric with the `Forward` arm above (plan
+                            // 29 M5): a peer's incoming forwarded mutation
+                            // needs no ordering gate here (each remote
+                            // requester already serializes its own
+                            // overlapping ops before sending; fjall's
+                            // single-writer tx serializes concurrent
+                            // `holder_execute` calls regardless of arrival
+                            // order, which is all correctness requires on
+                            // this side), but it still deserves to run off
+                            // this loop: under real concurrent load from
+                            // several peers, funnelling every request
+                            // through one synchronous arm serializes their
+                            // per-message scheduling/wake overhead even
+                            // though each `holder_execute` itself is fast,
+                            // and — on a cold cache — this arm's holder
+                            // lookup can hit an S3 `GET`.
+                            let (keepers, forward, store_inner, meta, lease_views, placement, sync_tx) = (
+                                keepers.clone(),
+                                forward.clone(),
+                                store_inner.clone(),
+                                meta.clone(),
+                                lease_views.clone(),
+                                placement.clone(),
+                                sync_tx.clone(),
                             );
-                            if matches!(
-                                outcome,
-                                constellation_meta::MutateOutcome::Accepted { .. }
-                            ) {
-                                if let Some(view) = lease_views.lock().unwrap().get(&part) {
-                                    view.touch();
+                            tokio::spawn(async move {
+                                // Check the lease and execute under one keeper-lock
+                                // hold: handoff/release take the same lock around
+                                // their final flush + release CAS, so an accepted
+                                // op can never land after that flush under an
+                                // epoch the requester is about to supersede.
+                                // `holder_execute` is a local fjall write, so the
+                                // hold is short; the not-holder lookup below (may
+                                // GET the lease from S3) runs after it is dropped.
+                                let executed = {
+                                    let keepers = keepers.lock().await;
+                                    let (ship_epoch, is_lost) = keepers
+                                        .get(&part)
+                                        .map(|keeper| (keeper.ship_epoch(), keeper.is_lost()))
+                                        .unwrap_or((None, false));
+                                    (ship_epoch.is_some() || is_lost).then(|| {
+                                        forward::holder_execute(
+                                            &meta, ship_epoch, is_lost, node_id, &op,
+                                        )
+                                    })
+                                };
+                                let outcome = if let Some(outcome) = executed {
+                                    outcome
+                                } else {
+                                let known_holder = if let Some(holder) = forward.cached_holder(&part) {
+                                    holder
+                                } else {
+                                    constellation_store_s3::LeaseStore::new(
+                                        store_inner.clone(),
+                                        &part,
+                                        lease_mode,
+                                    )
+                                    .get()
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|(lease, _)| lease.holder)
+                                    .unwrap_or(0)
+                                };
+                                forward::holder_execute(&meta, None, false, known_holder, &op)
+                                };
+                                if matches!(
+                                    outcome,
+                                    constellation_meta::MutateOutcome::Accepted { .. }
+                                ) {
+                                    if let Some(view) = lease_views.lock().unwrap().get(&part) {
+                                        view.touch();
+                                    }
+                                    placement.note_forwarded(requester);
+                                    let _ = sync_tx.send(fusefs::SyncRequest::Nudge);
                                 }
-                                placement.note_forwarded(requester);
-                                pending = Some(fusefs::SyncRequest::Nudge);
-                            }
-                            let _ = reply.send(outcome);
+                                let _ = reply.send(outcome);
+                            });
                         }
                         Some(fusefs::SyncRequest::Forward { part, op, reply }) => {
                             let local_epoch = {
                                 let keepers = keepers.lock().await;
                                 keepers.get(&part).and_then(|keeper| keeper.ship_epoch())
                             };
-                            let outcome = if let Some(epoch) = local_epoch {
-                                match constellation_meta::execute_mutate(&meta, &op) {
+                            if let Some(epoch) = local_epoch {
+                                // We hold the lease: this is a local fjall
+                                // write, not a network round trip, so it
+                                // stays inline (plan 29 M5 only targets the
+                                // network-bound non-holder path below).
+                                let outcome = match constellation_meta::execute_mutate(&meta, &op)
+                                {
                                     Ok(records) => {
                                         if let Some(view) = lease_views.lock().unwrap().get(&part) {
                                             view.touch();
@@ -1320,8 +1360,45 @@ impl NodeRuntime {
                                             forward::meta_errno(&error),
                                         )
                                     }
+                                };
+                                if matches!(
+                                    outcome,
+                                    constellation_meta::MutateOutcome::Accepted { .. }
+                                ) {
+                                    pending = Some(fusefs::SyncRequest::Nudge);
                                 }
-                            } else {
+                                let _ = reply.send(Ok(outcome));
+                                continue;
+                            }
+                            // Not the holder: forwarding this op means a
+                            // network round trip (plus, on success, the
+                            // local shadow+apply). Plan 29 M4 found that
+                            // awaiting this inline serializes every FUSE
+                            // thread's forward behind whichever one is
+                            // currently in flight, well past the point
+                            // where the round trip itself completes.
+                            // Spawn it instead so this loop returns to
+                            // `sync_rx.recv()` immediately; the requester-
+                            // side ordering gate (plan 29 M5,
+                            // `crate::keygate`) keeps ops that touch a
+                            // common inode from landing (and being
+                            // applied here) out of the order this node
+                            // issued them in, and the semaphore bounds how
+                            // many such round trips run at once.
+                            let (peers, forward, meta, store_inner, sync_tx) = (
+                                peers.clone(),
+                                forward.clone(),
+                                meta.clone(),
+                                store_inner.clone(),
+                                sync_tx.clone(),
+                            );
+                            tokio::spawn(async move {
+                                // Gate first: a forward queued behind an
+                                // overlapping one must not sit on an in-flight
+                                // permit that a disjoint forward could use.
+                                let keys = forward::conflict_keys(&op, &meta);
+                                let _gate = forward.gate.acquire(keys).await;
+                                let _permit = forward.inflight.clone().acquire_owned().await;
                                 let mut holder = forward.cached_holder(&part);
                                 if holder.is_none() {
                                     let store = constellation_store_s3::LeaseStore::new(
@@ -1340,7 +1417,7 @@ impl NodeRuntime {
                                         forward.note_holder(&part, holder);
                                     }
                                 }
-                                if let Some(mut holder) = holder {
+                                let outcome = if let Some(mut holder) = holder {
                                     let mut outcome = forward::request_mutate(
                                         &peers,
                                         &forward,
@@ -1381,22 +1458,32 @@ impl NodeRuntime {
                                                 "failed to apply accepted forwarded mutation"
                                             );
                                             let _ = reply.send(Err(error.to_string()));
-                                            continue;
+                                            return;
                                         }
                                     }
                                     outcome
                                 } else {
                                     forward.clear_holder(&part);
                                     constellation_meta::MutateOutcome::Busy
+                                };
+                                // The gate/permit guards are still held here
+                                // (dropped at the end of this scope, after
+                                // the apply above completed), so the next
+                                // overlapping forward cannot even start its
+                                // own request until this one's apply has
+                                // landed.
+                                if matches!(
+                                    outcome,
+                                    constellation_meta::MutateOutcome::Accepted { .. }
+                                ) {
+                                    // The sync loop's own state (`pending`)
+                                    // is not reachable from this spawned
+                                    // task; ask it for a prompt round the
+                                    // same way any other caller does.
+                                    let _ = sync_tx.send(fusefs::SyncRequest::Nudge);
                                 }
-                            };
-                            if matches!(
-                                outcome,
-                                constellation_meta::MutateOutcome::Accepted { .. }
-                            ) {
-                                pending = Some(fusefs::SyncRequest::Nudge);
-                            }
-                            let _ = reply.send(Ok(outcome));
+                                let _ = reply.send(Ok(outcome));
+                            });
                         }
                         Some(fusefs::SyncRequest::ApplyPushed {
                             part,

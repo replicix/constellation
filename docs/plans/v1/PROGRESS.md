@@ -3793,3 +3793,33 @@ Decision: DFS is fine (≈16ms/100k warm at 1M scale, well under the 100ms/100k 
 - [x] `tests/smoke.sh` PASSED
 
 **Coordinator follow-up (M3c):** a new invariant test (`store::dentry_copy_tests`) showed the §P6 `0x02` attr copy went stale whenever a directory's nlink/mtime/ctime changed (`touch_times_tx`/`bump_nlink_tx` wrote only `0x01`), so readdirplus and the published tree carried stale subdirectory attrs. That became load-bearing once `recursive_size` started reading sizes from the copy. Every `0x01` write now goes through `ns::put_inode_record`, which refreshes each stale dentry copy in the same transaction; the test covers local mutations and journal replay on a second replica.
+
+## Plan 29 M5 — concurrent, correctly-ordered forwarding: **DONE**
+
+| Item | Status | Where |
+|---|---|---|
+| Requester side: `SyncRequest::Forward`'s non-holder branch (network round trip + `apply_accepted`) moved off the sync dispatch loop onto a `tokio::spawn`ed task, bounded by a semaphore (`ForwardState::inflight`, env `CONSTELLATION_FORWARD_MAX_INFLIGHT`, default 64); the local-holder branch stays inline (no network hop) | done | `crates/cli/src/node_runtime.rs` |
+| `forward::conflict_keys(op, meta)`: the conflict-key set (inode ids) a `MutateOp` reads/writes, every variant covered, conservative fallback (parent only) when a name can't be resolved locally | done | `crates/cli/src/forward.rs` |
+| `KeyGate` (new module): an all-or-nothing, cancellation-safe (RAII `KeyGuard`), FIFO-per-key ordering gate — disjoint key sets never block each other, overlapping sets resolve in `acquire` call order | done | `crates/cli/src/keygate.rs` |
+| Every spawned forward acquires the gate before sending and holds it through `apply_accepted`, so overlapping ops from this node land on the holder — and get applied back — in the order this node issued them | done | `crates/cli/src/node_runtime.rs` |
+| Holder side: `SyncRequest::Mutate` (incoming forwarded mutations) also moved off the dispatch loop onto its own spawned task — no ordering gate needed there (fjall's single-writer tx already serializes `holder_execute` correctly regardless of arrival order) — found necessary while measuring: it became the new bottleneck once the requester-side fix stopped hiding it | done | `crates/cli/src/node_runtime.rs` |
+| `crates/harness/src/metabench.rs` driver extended with `threads_per_node` (default 1, every pre-existing config byte-for-byte unchanged) and three new `*-concurrent4-lat0` configs, since M4's original one-thread-per-node driver structurally cannot exceed one forward in flight per node and so cannot exercise this fix | done | `crates/harness/src/metabench.rs` |
+
+**Measured (release build, floci+toxiproxy, 0ms injected S3 latency; full tables in `docs/plans/v1/wip/29-fjall-metadata-engine.md`'s "M5" section):** with 4 concurrent FUSE worker threads per node writing into disjoint per-thread directories (the condition M4 identified but could not itself reproduce), 3-node P2P-on `create` throughput went from 1140 to 3086 ops/s (2.7×, repeated during development in the 2.7–3.2× range) and p50 latency from 8.12 ms to 2.05 ms (4×), now within reach of single-node throughput. The matched-shape rows (`threads_per_node=1`, identical to M4's own matrix) are unchanged within run-to-run noise, as expected — that shape never puts more than one forward in flight per node. The fully-contended "shared directory" concurrent config correctly shows no throughput gain (`KeyGate` serializes it by design, since every op's conflict key is the same parent inode).
+
+**Design decisions:**
+
+- The ordering gate is deliberately a single global mutex over an all-or-nothing key set, not per-key nested locks — this is what makes it trivially deadlock-free (no lock-ordering protocol needed) at the cost of one shared critical section per acquire/release, which is cheap (a `HashSet`/`VecDeque` scan) relative to the network round trip it guards.
+- `KeyGuard`'s cancellation safety relies on it being a live local constructed *before* the only await point in `acquire`, so a dropped/cancelled caller always runs its `Drop` and cleans up the gate's queue — verified by a dedicated test (`dropped_waiter_releases_and_does_not_strand_others`).
+- The holder-side fix was not in the original design; it was found by instrumenting the requester-side pipeline (`tracing::info!` timestamps at four points) after the first measurement pass showed no improvement for the disjoint-concurrent config despite the gate/semaphore adding negligible overhead — the trace isolated the holder's own single dispatch loop as the remaining serialization point under genuine concurrent load, which only exists once the requester-side fix stops hiding it.
+- `AtimeBatch` was deliberately left out of the gate: it was already off the sync loop before M5 (its own ticker calls `request_mutate_with` directly) and never calls `apply_accepted`, so it has no ordering hazard to protect against.
+
+**Left over (explicitly deferred):** no dedicated unit test for the holder-side spawn beyond the harness measurement (correctness rests on fjall's pre-existing single-writer serialization, unaffected by which task calls it); no fairness/anti-starvation guarantee beyond `KeyGate`'s FIFO-per-key property (not needed for correctness, out of scope here — plan 29 M3c already left the analogous lease-acquisition fairness gap as known, unimplemented follow-up).
+
+### Plan 29 M5 exit criteria
+- [x] fmt clean, clippy `-D warnings` clean, `cargo test --workspace` 0 failures, `cargo build --release --workspace`
+- [x] `target/release/harness run two-clients-shared lease-handover chaos-ci chaos-soak-4 disjoint-write-4 create-storm-s3-only deposed-reintegration node-leave baseline e2e-two-nodes` all PASSED
+- [x] `bash tests/smoke.sh` PASSED
+- [x] Before/after `harness meta-bench` measurements above
+
+**Coordinator follow-up (M5):** the holder-side spawn read `ship_epoch` under the keeper lock, dropped it, then executed. That let a forwarded op commit after a handoff's final flush (the `HandOff` arm holds the keeper lock across `sync_one` + `release`), acknowledged under an epoch the requester was about to supersede. The lease check and `holder_execute` now run under one keeper-lock hold; only the not-holder lease lookup (possibly an S3 GET) runs outside it. On the requester, the ordering gate is acquired before the in-flight permit, so forwards queued behind an overlapping one don't hold permits that disjoint forwards could use. Re-measured at 0 ms latency, 4 threads per node: 1 node 7311 creates/s; 3 nodes disjoint 4944/s (M4: ~1140), shared 1867/s. All ten forwarding/lease scenarios PASSED after the change.

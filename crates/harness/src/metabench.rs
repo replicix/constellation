@@ -94,6 +94,14 @@ pub struct MetaBenchConfig {
     /// `create-storm-s3-only` scenario keeps that path's wall-clock
     /// bounded too.
     pub lease_ttl_ms: Option<u64>,
+    /// FUSE worker threads issuing ops concurrently *per node* (each
+    /// doing `ops_per_node / threads_per_node` ops, one op in flight at a
+    /// time on that thread). `1` (every pre-existing config) reproduces
+    /// plan 29 M4's matrix exactly: at most one forward in flight per
+    /// node, which cannot exercise the single-dispatch-task
+    /// serialization M4 found — see plan 29 M5. A value `>1` is what
+    /// actually stresses that path.
+    pub threads_per_node: usize,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -105,6 +113,7 @@ pub struct MetaBenchReport {
     pub p2p: bool,
     pub s3_latency_ms: u64,
     pub lease_ttl_ms: Option<u64>,
+    pub threads_per_node: usize,
     pub ops_per_node: u64,
     pub completed_ops: u64,
     pub errors: u64,
@@ -158,9 +167,10 @@ fn eventually(deadline: Duration, mut f: impl FnMut() -> bool) -> Result<()> {
 
 /// Run one configuration: mount `cfg.nodes` clients on one shared
 /// backend, fire `cfg.ops_per_node` create/write ops per node
-/// concurrently (one worker thread per node), and report throughput,
-/// latency percentiles, and the forwarding/handoff counters the daemon
-/// already exposes over the control socket.
+/// concurrently (`cfg.threads_per_node` worker threads per node, each
+/// with one op in flight at a time), and report throughput, latency
+/// percentiles, and the forwarding/handoff counters the daemon already
+/// exposes over the control socket.
 pub fn run_one(
     env: &S3Env,
     proxy: &crate::toxiproxy::Proxy<'_>,
@@ -241,52 +251,93 @@ pub fn run_one(
     let error_samples: Arc<std::sync::Mutex<Vec<String>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let t0 = Instant::now();
-    let mut handles = Vec::with_capacity(cfg.nodes);
+    // `threads_per_node` FUSE worker threads per node, each with exactly
+    // one op in flight on its own thread at a time (mirroring real
+    // concurrent FUSE dispatch) — `>1` is what actually puts more than
+    // one forward from this node in flight at once (plan 29 M5); `1`
+    // reproduces plan 29 M4's original one-in-flight-per-node shape.
+    let threads_per_node = cfg.threads_per_node.max(1);
+    let mut handles: Vec<Vec<std::thread::JoinHandle<Vec<u128>>>> = Vec::with_capacity(cfg.nodes);
     for (i, c) in clients.iter().enumerate() {
-        let mnt = c.mnt.clone();
         let shared_dir = match cfg.layout {
             Layout::Shared => Some(dirs[0].clone()),
             Layout::Disjoint => Some(dirs[i].clone()),
             Layout::ManyDirs(_) => None,
         };
-        let many_dirs = dirs.clone();
-        let ops = cfg.ops_per_node;
-        let workload = cfg.workload;
-        let errors = Arc::clone(&errors);
-        let error_samples = Arc::clone(&error_samples);
-        handles.push(std::thread::spawn(move || -> Vec<u128> {
-            let mut lat = Vec::with_capacity(ops as usize);
-            for n in 0..ops {
-                let d = match &shared_dir {
-                    Some(d) => d,
-                    None => &many_dirs[(n as usize) % many_dirs.len()],
+        let mut node_handles = Vec::with_capacity(threads_per_node);
+        for tid in 0..threads_per_node {
+            // Give any remainder from an uneven split to thread 0, so
+            // `sum(ops per thread) == ops_per_node` exactly.
+            let ops = cfg.ops_per_node / threads_per_node as u64
+                + if tid == 0 {
+                    cfg.ops_per_node % threads_per_node as u64
+                } else {
+                    0
                 };
-                let path = mnt.join(d).join(format!("n{i}-{n}"));
-                let t = Instant::now();
-                match workload.run_one(&path) {
-                    Ok(()) => lat.push(t.elapsed().as_micros()),
-                    Err(e) => {
-                        errors.fetch_add(1, Ordering::Relaxed);
-                        let mut samples = error_samples.lock().unwrap();
-                        if samples.len() < 8 {
-                            samples.push(format!(
-                                "node n{i} op {n}: {e} (kind={:?}, raw_os_error={:?})",
-                                e.kind(),
-                                e.raw_os_error()
-                            ));
+            let mnt = c.mnt.clone();
+            let shared_dir = shared_dir.clone();
+            let many_dirs = dirs.clone();
+            let workload = cfg.workload;
+            let errors = Arc::clone(&errors);
+            let error_samples = Arc::clone(&error_samples);
+            // `Disjoint` with more than one thread per node: without a
+            // per-thread subdirectory, every thread on a given node would
+            // still write into that node's *one* directory, so their
+            // conflict-key sets (the shared parent) would still overlap
+            // and the ordering gate would (correctly) serialize them —
+            // silently defeating the point of a "disjoint" concurrency
+            // config. `Shared` deliberately keeps every thread on every
+            // node in the *same* one directory (maximal, intentional
+            // contention: the gate must still serialize that case).
+            let per_thread_subdir = threads_per_node > 1 && matches!(cfg.layout, Layout::Disjoint);
+            if per_thread_subdir {
+                if let Some(d) = &shared_dir {
+                    let _ = std::fs::create_dir_all(mnt.join(d).join(format!("t{tid}")));
+                }
+            }
+            node_handles.push(std::thread::spawn(move || -> Vec<u128> {
+                let mut lat = Vec::with_capacity(ops as usize);
+                for n in 0..ops {
+                    let d = match &shared_dir {
+                        Some(d) => d,
+                        None => &many_dirs[(n as usize) % many_dirs.len()],
+                    };
+                    let path = if per_thread_subdir {
+                        mnt.join(d).join(format!("t{tid}")).join(format!("n{i}-{n}"))
+                    } else {
+                        mnt.join(d).join(format!("n{i}-t{tid}-{n}"))
+                    };
+                    let t = Instant::now();
+                    match workload.run_one(&path) {
+                        Ok(()) => lat.push(t.elapsed().as_micros()),
+                        Err(e) => {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            let mut samples = error_samples.lock().unwrap();
+                            if samples.len() < 8 {
+                                samples.push(format!(
+                                    "node n{i} thread {tid} op {n}: {e} (kind={:?}, raw_os_error={:?})",
+                                    e.kind(),
+                                    e.raw_os_error()
+                                ));
+                            }
                         }
                     }
                 }
-            }
-            lat
-        }));
+                lat
+            }));
+        }
+        handles.push(node_handles);
     }
     let mut per_node_lat = Vec::with_capacity(cfg.nodes);
-    for h in handles {
-        per_node_lat.push(
-            h.join()
-                .map_err(|_| anyhow::anyhow!("metabench worker thread panicked"))?,
-        );
+    for node_handles in handles {
+        let mut lat = Vec::new();
+        for h in node_handles {
+            lat.extend(
+                h.join()
+                    .map_err(|_| anyhow::anyhow!("metabench worker thread panicked"))?,
+            );
+        }
+        per_node_lat.push(lat);
     }
     let wall_s = t0.elapsed().as_secs_f64();
     for sample in error_samples.lock().unwrap().iter() {
@@ -356,6 +407,7 @@ pub fn run_one(
         p2p: cfg.p2p,
         s3_latency_ms: cfg.s3_latency_ms,
         lease_ttl_ms: cfg.lease_ttl_ms,
+        threads_per_node: cfg.threads_per_node,
         ops_per_node: cfg.ops_per_node,
         completed_ops,
         errors: errors.load(Ordering::Relaxed),
@@ -470,6 +522,7 @@ pub fn run_matrix() -> Result<(Vec<MetaBenchReport>, Vec<RawS3Timing>)> {
                 label: format!("1node-{wl}-lat{latency}"),
                 nodes: 1,
                 ops_per_node: ops(4000),
+                threads_per_node: 1,
                 workload,
                 layout: Layout::Shared,
                 p2p: true,
@@ -482,6 +535,7 @@ pub fn run_matrix() -> Result<(Vec<MetaBenchReport>, Vec<RawS3Timing>)> {
                     label: format!("3node-p2pon-{ly}-{wl}-lat{latency}"),
                     nodes: 3,
                     ops_per_node: ops(1200),
+                    threads_per_node: 1,
                     workload,
                     layout,
                     p2p: true,
@@ -497,6 +551,7 @@ pub fn run_matrix() -> Result<(Vec<MetaBenchReport>, Vec<RawS3Timing>)> {
                     label: format!("3node-p2poff-{ly}-{wl}-lat{latency}"),
                     nodes: 3,
                     ops_per_node: ops(300),
+                    threads_per_node: 1,
                     workload,
                     layout,
                     p2p: false,
@@ -505,6 +560,41 @@ pub fn run_matrix() -> Result<(Vec<MetaBenchReport>, Vec<RawS3Timing>)> {
                 });
             }
         }
+    }
+
+    // Plan 29 M5: every row above uses exactly one FUSE worker thread per
+    // node, so it has at most one forward in flight per node at a time —
+    // the shape plan 29 M4's own matrix used, which cannot exercise the
+    // single-dispatch-task serialization M4 found (that bottleneck only
+    // bites when *this node's own* concurrent FUSE threads each have a
+    // forward outstanding). These rows add several concurrent threads
+    // per node on the `create` workload at 0ms latency, 3-node/P2P-on,
+    // shared and disjoint — the exact condition the M5 fix targets — plus
+    // a matching 1-node concurrent baseline for comparison.
+    configs.push(MetaBenchConfig {
+        label: "1node-create-concurrent4-lat0".to_string(),
+        nodes: 1,
+        ops_per_node: ops(4000),
+        threads_per_node: 4,
+        workload: Workload::Create,
+        layout: Layout::Shared,
+        p2p: true,
+        s3_latency_ms: 0,
+        lease_ttl_ms: None,
+    });
+    for layout in [Layout::Shared, Layout::Disjoint] {
+        let ly = layout.label();
+        configs.push(MetaBenchConfig {
+            label: format!("3node-p2pon-{ly}-create-concurrent4-lat0"),
+            nodes: 3,
+            ops_per_node: ops(1200),
+            threads_per_node: 4,
+            workload: Workload::Create,
+            layout,
+            p2p: true,
+            s3_latency_ms: 0,
+            lease_ttl_ms: None,
+        });
     }
 
     // Diagnostic-only filter (not a documented knob): run a subset of

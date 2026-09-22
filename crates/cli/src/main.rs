@@ -11,6 +11,7 @@ mod forward;
 mod fsck;
 mod fusefs;
 mod gc;
+mod keygate;
 mod lease;
 mod leave;
 mod log_buffer;

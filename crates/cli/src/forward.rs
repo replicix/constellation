@@ -4,6 +4,8 @@
 //! Safety still comes from the S3 lease (ADR-2): the holder is the only
 //! appender. This module is the requester/holder glue around that rule.
 
+use crate::keygate::KeyGate;
+use constellation_fs_core::Ino;
 use constellation_meta::{execute_mutate, Meta, MetaStore, MutateOp, MutateOutcome, TouchSet};
 use constellation_net::{Payload, Peers};
 use std::collections::HashMap;
@@ -17,6 +19,75 @@ pub fn forward_timeout_ms() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(500)
+}
+
+/// Env: bound on forwards actually in flight (network round trip +
+/// requester-side apply) at once, per node. Distinct from however many
+/// are merely queued behind the ordering gate (`ForwardState::gate`):
+/// this only limits concurrency, it never affects correctness. Default
+/// 64 (plan 29 M5).
+pub fn forward_max_inflight() -> usize {
+    std::env::var("CONSTELLATION_FORWARD_MAX_INFLIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64)
+}
+
+/// The set of inodes `op` reads or writes, for the requester-side
+/// ordering gate (plan 29 M5, `crate::keygate::KeyGate`). Deliberately
+/// conservative: a name that cannot be resolved against the local
+/// replica (not observed yet, or genuinely absent) is simply left out,
+/// which is still safe because every case below already includes the
+/// parent -- and any other op racing to touch the same not-yet-resolved
+/// child necessarily touches that parent too, so serializing on the
+/// parent alone is a safe (if slightly less concurrent) fallback.
+pub fn conflict_keys(op: &MutateOp, meta: &Meta) -> Vec<Ino> {
+    let lookup = |parent: Ino, name: &str| -> Option<Ino> {
+        meta.lookup(parent, name).ok().flatten().map(|a| a.ino)
+    };
+    let mut keys = match op {
+        MutateOp::Mkdir { parent, .. }
+        | MutateOp::Create { parent, .. }
+        | MutateOp::Symlink { parent, .. }
+        | MutateOp::Mknod { parent, .. } => vec![*parent],
+        // A hardlink bumps the target's nlink, so it conflicts with
+        // anything else touching that inode, not just the new dentry's
+        // parent.
+        MutateOp::Link { ino, parent, .. } => vec![*parent, *ino],
+        MutateOp::Unlink { parent, name } | MutateOp::Rmdir { parent, name } => {
+            let mut k = vec![*parent];
+            k.extend(lookup(*parent, name));
+            k
+        }
+        // Rename can touch up to four inodes: the two directories (entry
+        // add/remove, mtime/ctime), the moved inode itself (its `..`
+        // link, or just its ctime), and whatever it replaces at the
+        // destination (unlinked as part of the same op).
+        MutateOp::Rename {
+            parent,
+            name,
+            new_parent,
+            new_name,
+        } => {
+            let mut k = vec![*parent, *new_parent];
+            k.extend(lookup(*parent, name));
+            k.extend(lookup(*new_parent, new_name));
+            k
+        }
+        MutateOp::Setattr { ino, .. }
+        | MutateOp::SetManifest { ino, .. }
+        | MutateOp::SetXattr { ino, .. }
+        | MutateOp::RemoveXattr { ino, .. } => vec![*ino],
+        // Scratch -> shared publish: creates `ino` under `parent`.
+        MutateOp::Publish { parent, ino, .. } => vec![*parent, *ino],
+        // Best-effort batch; included for completeness (see the module
+        // doc on why `AtimeBatch` never actually goes through the gate).
+        MutateOp::AtimeBatch { entries } => entries.iter().map(|(ino, ..)| *ino).collect(),
+    };
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 /// Env: `CONSTELLATION_FORWARD=off|0|false` disables requester-side
@@ -37,7 +108,6 @@ pub fn forwarding_enabled() -> bool {
 }
 
 /// Cached holder id per partition, plus forward counters for status.
-#[derive(Default)]
 pub struct ForwardState {
     holders: Mutex<HashMap<String, u64>>,
     pub ok: AtomicU64,
@@ -45,6 +115,30 @@ pub struct ForwardState {
     pub latencies_us: Mutex<Vec<u64>>,
     pub pushed_applied: AtomicU64,
     next_req_id: AtomicU64,
+    /// Requester-side ordering gate (plan 29 M5): see `crate::keygate`.
+    /// Serializes forwards whose conflict-key sets overlap so a spawned
+    /// forward task (`node_runtime.rs`'s `SyncRequest::Forward` arm)
+    /// cannot land on the holder, or get applied back here, out of the
+    /// order this node's own FUSE threads issued them in.
+    pub gate: Arc<KeyGate>,
+    /// Bounds forwards actually in flight (network round trip + apply)
+    /// at once; see [`forward_max_inflight`].
+    pub inflight: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for ForwardState {
+    fn default() -> Self {
+        Self {
+            holders: Mutex::new(HashMap::new()),
+            ok: AtomicU64::new(0),
+            err: AtomicU64::new(0),
+            latencies_us: Mutex::new(Vec::new()),
+            pushed_applied: AtomicU64::new(0),
+            next_req_id: AtomicU64::new(0),
+            gate: KeyGate::new(),
+            inflight: Arc::new(tokio::sync::Semaphore::new(forward_max_inflight())),
+        }
+    }
 }
 
 impl ForwardState {
@@ -291,5 +385,449 @@ mod tests {
             Some(&b"current"[..]),
             "the refused commit must not have landed"
         );
+    }
+
+    mod conflict_keys_tests {
+        use super::*;
+        use constellation_fs_core::types::ROOT_INO;
+
+        fn sorted(mut v: Vec<Ino>) -> Vec<Ino> {
+            v.sort_unstable();
+            v
+        }
+
+        #[test]
+        fn create_family_keys_on_parent_only() {
+            let meta = Meta::open_in_memory().unwrap();
+            for op in [
+                MutateOp::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: 999,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                },
+                MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "f".into(),
+                    ino: 999,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                MutateOp::Symlink {
+                    parent: ROOT_INO,
+                    name: "s".into(),
+                    ino: 999,
+                    target: "x".into(),
+                    uid: 0,
+                    gid: 0,
+                },
+                MutateOp::Mknod {
+                    parent: ROOT_INO,
+                    name: "n".into(),
+                    ino: 999,
+                    kind: 3,
+                    mode: 0o600,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                },
+            ] {
+                assert_eq!(conflict_keys(&op, &meta), vec![ROOT_INO], "{op:?}");
+            }
+        }
+
+        #[test]
+        fn link_keys_on_parent_and_target_ino() {
+            let meta = Meta::open_in_memory().unwrap();
+            let op = MutateOp::Link {
+                ino: 42,
+                parent: ROOT_INO,
+                name: "l".into(),
+            };
+            assert_eq!(
+                sorted(conflict_keys(&op, &meta)),
+                sorted(vec![ROOT_INO, 42])
+            );
+        }
+
+        #[test]
+        fn unlink_resolves_child_when_present() {
+            let meta = Meta::open_in_memory().unwrap();
+            let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+            let op = MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "f".into(),
+            };
+            assert_eq!(
+                sorted(conflict_keys(&op, &meta)),
+                sorted(vec![ROOT_INO, f.ino])
+            );
+        }
+
+        #[test]
+        fn rmdir_resolves_child_when_present() {
+            let meta = Meta::open_in_memory().unwrap();
+            let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+            let op = MutateOp::Rmdir {
+                parent: ROOT_INO,
+                name: "d".into(),
+            };
+            assert_eq!(
+                sorted(conflict_keys(&op, &meta)),
+                sorted(vec![ROOT_INO, d.ino])
+            );
+        }
+
+        #[test]
+        fn unlink_falls_back_to_parent_only_when_unresolvable() {
+            // Conservative fallback: a name this replica has never seen
+            // still yields a safe (if less concurrent) key set.
+            let meta = Meta::open_in_memory().unwrap();
+            let op = MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "ghost".into(),
+            };
+            assert_eq!(conflict_keys(&op, &meta), vec![ROOT_INO]);
+        }
+
+        #[test]
+        fn rename_resolves_both_parents_and_moved_and_replaced_ino() {
+            let meta = Meta::open_in_memory().unwrap();
+            let src_dir = meta.mkdir(ROOT_INO, "src", 0o755, 0, 0).unwrap();
+            let dst_dir = meta.mkdir(ROOT_INO, "dst", 0o755, 0, 0).unwrap();
+            let moved = meta.create(src_dir.ino, "a", 0o644, 0, 0).unwrap();
+            let replaced = meta.create(dst_dir.ino, "b", 0o644, 0, 0).unwrap();
+            let op = MutateOp::Rename {
+                parent: src_dir.ino,
+                name: "a".into(),
+                new_parent: dst_dir.ino,
+                new_name: "b".into(),
+            };
+            assert_eq!(
+                sorted(conflict_keys(&op, &meta)),
+                sorted(vec![src_dir.ino, dst_dir.ino, moved.ino, replaced.ino])
+            );
+        }
+
+        #[test]
+        fn rename_without_a_replacement_target_omits_it() {
+            let meta = Meta::open_in_memory().unwrap();
+            let src_dir = meta.mkdir(ROOT_INO, "src", 0o755, 0, 0).unwrap();
+            let dst_dir = meta.mkdir(ROOT_INO, "dst", 0o755, 0, 0).unwrap();
+            let moved = meta.create(src_dir.ino, "a", 0o644, 0, 0).unwrap();
+            let op = MutateOp::Rename {
+                parent: src_dir.ino,
+                name: "a".into(),
+                new_parent: dst_dir.ino,
+                new_name: "new".into(),
+            };
+            assert_eq!(
+                sorted(conflict_keys(&op, &meta)),
+                sorted(vec![src_dir.ino, dst_dir.ino, moved.ino])
+            );
+        }
+
+        #[test]
+        fn attr_like_ops_key_on_their_own_ino_only() {
+            let meta = Meta::open_in_memory().unwrap();
+            for op in [
+                MutateOp::Setattr {
+                    ino: 5,
+                    mode: Some(0o600),
+                    uid: None,
+                    gid: None,
+                    size: None,
+                    atime_ns: None,
+                    mtime_ns: None,
+                },
+                MutateOp::SetManifest {
+                    ino: 5,
+                    base_manifest: None,
+                    manifest: b"m".to_vec(),
+                    size: 0,
+                },
+                MutateOp::SetXattr {
+                    ino: 5,
+                    name: "user.x".into(),
+                    value: b"v".to_vec(),
+                    mode: 0,
+                },
+                MutateOp::RemoveXattr {
+                    ino: 5,
+                    name: "user.x".into(),
+                },
+            ] {
+                assert_eq!(conflict_keys(&op, &meta), vec![5], "{op:?}");
+            }
+        }
+
+        #[test]
+        fn publish_keys_on_parent_and_ino() {
+            let meta = Meta::open_in_memory().unwrap();
+            let op = MutateOp::Publish {
+                ino: 77,
+                parent: ROOT_INO,
+                name: "p".into(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime_ns: 0,
+                manifest: b"m".to_vec(),
+                size: 0,
+                xattrs: vec![],
+            };
+            assert_eq!(
+                sorted(conflict_keys(&op, &meta)),
+                sorted(vec![ROOT_INO, 77])
+            );
+        }
+
+        #[test]
+        fn atime_batch_keys_on_every_ino_in_the_batch() {
+            let meta = Meta::open_in_memory().unwrap();
+            let op = MutateOp::AtimeBatch {
+                entries: vec![(3, 1, 1), (1, 2, 2), (3, 3, 3)],
+            };
+            assert_eq!(conflict_keys(&op, &meta), vec![1, 3]);
+        }
+    }
+
+    /// In-process, no-harness correctness check for the requester-side
+    /// ordering gate (plan 29 M5): a two-replica setup exercising the
+    /// same `conflict_keys` -> `KeyGate::acquire` -> `holder_execute` ->
+    /// `apply_accepted` pipeline `node_runtime.rs`'s spawned `Forward`
+    /// task runs, under a fake network with two independently-adversarial
+    /// legs (see `forward_via_gate`), asserting the requester's replica
+    /// converges with the holder's despite that.
+    ///
+    /// `without_the_gate_a_reorder_is_observable` (below) demonstrates,
+    /// with the exact same helper minus the `gate.acquire` call, that
+    /// this is not a vacuous check: the same workload measurably
+    /// diverges when nothing serializes overlapping forwards.
+    mod ordering_gate_pipeline_tests {
+        use super::*;
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::MetaStore;
+
+        /// Exactly what the spawned `SyncRequest::Forward` task in
+        /// `node_runtime.rs` does per op, minus the real network hop.
+        /// The fake hop has two independently-tunable legs -- `pre`
+        /// before the holder executes (models request transit) and
+        /// `post` after, before this task applies locally (models reply
+        /// transit) -- because a single delay before everything (as a
+        /// first draft of this test used) cannot desynchronize "the
+        /// order the holder executed ops in" from "the order this task
+        /// applies them in": with no `.await` between `holder_execute`
+        /// and `apply_accepted`, a single-delay model has every task
+        /// execute-then-apply as one atomic step relative to the others,
+        /// which is ordering-safe by construction even with no gate at
+        /// all, and would make this test pass for the wrong reason. A
+        /// `post` delay that inverts relative to `pre` (later-executing
+        /// ops reply back fastest) is what actually reproduces plan 29
+        /// M5's hazard: two requester tasks racing their *own*
+        /// holder-execute-vs-local-apply pair against each other, one
+        /// egregiously reordered.
+        async fn forward_via_gate(
+            gate: Option<&Arc<KeyGate>>,
+            holder: &Meta,
+            requester: &Meta,
+            op: MutateOp,
+            pre: Duration,
+            post: Duration,
+        ) {
+            let keys = conflict_keys(&op, requester);
+            let _guard = match gate {
+                Some(gate) => Some(gate.acquire(keys).await),
+                None => None,
+            };
+            tokio::time::sleep(pre).await;
+            let op_bytes = op.to_postcard().unwrap();
+            let outcome = holder_execute(holder, Some(1), false, 1, &op_bytes);
+            tokio::time::sleep(post).await;
+            match outcome {
+                MutateOutcome::Accepted { epoch, records } => {
+                    apply_accepted(requester, "p0", epoch, &records).unwrap();
+                }
+                other => panic!("expected Accepted, got {other:?}"),
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_creates_same_and_disjoint_dirs_converge() {
+            let holder = Arc::new(Meta::open_in_memory().unwrap());
+            let requester = Arc::new(Meta::open_in_memory().unwrap());
+            let gate = KeyGate::new();
+
+            // Three shared directories, created through the same
+            // pipeline (sequentially) so both replicas start identical.
+            let mut dirs = Vec::new();
+            for i in 0..3u64 {
+                let ino = 1000 + i;
+                let op = MutateOp::Mkdir {
+                    parent: ROOT_INO,
+                    name: format!("dir{i}"),
+                    ino,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                };
+                forward_via_gate(
+                    Some(&gate),
+                    &holder,
+                    &requester,
+                    op,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .await;
+                dirs.push(ino);
+            }
+
+            let total = 60u64;
+            let mut tasks = Vec::new();
+            for i in 0..total {
+                let dir = dirs[(i % dirs.len() as u64) as usize];
+                let ino = 2000 + i;
+                let op = MutateOp::Create {
+                    parent: dir,
+                    name: format!("f{i}"),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                };
+                let (gate, holder, requester) = (gate.clone(), holder.clone(), requester.clone());
+                // Adversarial: request transit grows with `i`, reply
+                // transit shrinks with `i`, so send order, holder
+                // execution order, and reply-arrival order are all
+                // different permutations of 0..total.
+                let pre = Duration::from_micros(i * 100);
+                let post = Duration::from_micros((total - i) * 100);
+                tasks.push(tokio::spawn(async move {
+                    forward_via_gate(Some(&gate), &holder, &requester, op, pre, post).await;
+                }));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+
+            assert_eq!(
+                holder.dump_replicated().unwrap(),
+                requester.dump_replicated().unwrap()
+            );
+        }
+
+        /// Ordering-sensitive case: many concurrent `Setattr`s on *one*
+        /// inode from this requester. Whichever order the holder
+        /// actually executes them in decides the final mtime; the
+        /// requester must apply the same records in the same relative
+        /// order to end up with the same value, even though each op's
+        /// fake request/reply transit times are independently reversed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_overlapping_setattrs_preserve_holder_order() {
+            let holder = Arc::new(Meta::open_in_memory().unwrap());
+            let requester = Arc::new(Meta::open_in_memory().unwrap());
+            let gate = KeyGate::new();
+
+            let f = holder.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+            // Mirror the create onto the requester (equivalent to it
+            // having been forwarded and applied first).
+            requester
+                .create_at(ROOT_INO, "f", f.ino, 0o644, 0, 0)
+                .unwrap();
+
+            let total = 40i64;
+            let mut tasks = Vec::new();
+            for i in 0..total {
+                let op = MutateOp::Setattr {
+                    ino: f.ino,
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: None,
+                    atime_ns: None,
+                    mtime_ns: Some(i),
+                };
+                let (gate, holder, requester) = (gate.clone(), holder.clone(), requester.clone());
+                let pre = Duration::from_micros(i as u64 * 150);
+                let post = Duration::from_micros((total - i) as u64 * 150);
+                tasks.push(tokio::spawn(async move {
+                    forward_via_gate(Some(&gate), &holder, &requester, op, pre, post).await;
+                }));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+
+            let holder_attr = holder.getattr(f.ino).unwrap().unwrap();
+            let requester_attr = requester.getattr(f.ino).unwrap().unwrap();
+            assert_eq!(
+                holder_attr.mtime_ns, requester_attr.mtime_ns,
+                "requester must see the same final mtime the holder computed"
+            );
+            assert_eq!(
+                holder.dump_replicated().unwrap(),
+                requester.dump_replicated().unwrap()
+            );
+        }
+
+        /// Negative control for the two tests above: same workload, same
+        /// adversarial transit times, but `gate: None`. This must
+        /// observe the requester's final mtime disagree with the
+        /// holder's at least sometimes, proving the positive tests are
+        /// not passing merely because nothing in this workload can ever
+        /// reorder -- i.e. that `KeyGate` is load-bearing for them.
+        /// Retries a few seeds because the exact reorder this reproduces
+        /// depends on real scheduler timing, not just the programmed
+        /// delays (same reason plan 29 M4's own probe needed a live
+        /// trace rather than a static argument).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn without_the_gate_a_reorder_is_observable() {
+            let total = 40i64;
+            for attempt in 0..20 {
+                let holder = Arc::new(Meta::open_in_memory().unwrap());
+                let requester = Arc::new(Meta::open_in_memory().unwrap());
+                let f = holder.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+                requester
+                    .create_at(ROOT_INO, "f", f.ino, 0o644, 0, 0)
+                    .unwrap();
+
+                let mut tasks = Vec::new();
+                for i in 0..total {
+                    let op = MutateOp::Setattr {
+                        ino: f.ino,
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                        size: None,
+                        atime_ns: None,
+                        mtime_ns: Some(i + attempt * 1000),
+                    };
+                    let (holder, requester) = (holder.clone(), requester.clone());
+                    let pre = Duration::from_micros(i as u64 * 150);
+                    let post = Duration::from_micros((total - i) as u64 * 150);
+                    tasks.push(tokio::spawn(async move {
+                        forward_via_gate(None, &holder, &requester, op, pre, post).await;
+                    }));
+                }
+                for t in tasks {
+                    t.await.unwrap();
+                }
+
+                let holder_attr = holder.getattr(f.ino).unwrap().unwrap();
+                let requester_attr = requester.getattr(f.ino).unwrap().unwrap();
+                if holder_attr.mtime_ns != requester_attr.mtime_ns {
+                    return; // reproduced the hazard; the control holds.
+                }
+            }
+            panic!(
+                "expected at least one of 20 ungated attempts to reorder; \
+                 the workload may no longer be adversarial enough to prove \
+                 the gate is load-bearing"
+            );
+        }
     }
 }

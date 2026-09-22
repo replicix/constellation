@@ -109,6 +109,30 @@ Rebasing adopts the longer of the two file lengths, so a peer's concurrent
 extension survives. A flush that *shortened* the file relative to its own
 base is a truncate and keeps its own length instead.
 
+### Concurrent forwarding, correctly ordered
+
+A requester's forwards run concurrently, not one at a time: the daemon's
+sync task hands each `Forward` request off to its own task (bounded by
+`CONSTELLATION_FORWARD_MAX_INFLIGHT`, default 64) and immediately goes
+back to draining its queue, instead of awaiting the round trip inline
+(plan 29 M4 measured the inline version as the reason 3-node forwarded
+throughput came in *below* single-node).
+
+Concurrency is safe only because a requester-side ordering gate
+(`crate::keygate::KeyGate` in `crates/cli`) serializes any two forwards
+whose *conflict-key sets* overlap — every inode an op reads or writes,
+including parents (two creates in one directory both bump its
+mtime/ctime; two `SetManifest`s on one file race each other's base; a
+rename touches two parents and possibly the moved/replaced inodes).
+Ops with disjoint key sets run fully in parallel; overlapping ops
+resolve in the order this node issued them, so they land on the holder,
+and get applied back into the requester's shadow table, in that same
+order. Without this, two forwards that race the network could complete
+out of order and leave the requester's replica permanently diverged
+from the holder's — the shadow table's suppression of the holder's own
+tail (above) depends on replaying records in the holder's actual
+execution order.
+
 ## Status and logs
 
 `constellation status` and the web UI expose:

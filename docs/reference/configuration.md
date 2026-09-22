@@ -46,6 +46,7 @@ not listed here.
 | `CONSTELLATION_LEASE_IDLE_RELEASE_MS` | `30000` | milliseconds | idle threshold for releasing a held lease — **only** once a requester is registered |
 | `CONSTELLATION_FORWARD_TIMEOUT_MS` | `500` | milliseconds | forwarded mutation request |
 | `CONSTELLATION_FORWARD` | `on` | boolean | requester-side mutation forwarding; `off` makes non-holder writes acquire the lease instead |
+| `CONSTELLATION_FORWARD_MAX_INFLIGHT` | `64` | count, positive | forwards actually in flight (network round trip + apply) at once per node (plan 29 M5); does not affect correctness, only concurrency — ops queued behind the requester-side ordering gate are unaffected by this bound |
 | `CONSTELLATION_LEASE_PLACEMENT` | `on` | boolean | holder-driven placement |
 
 #### Sticky leases

@@ -123,6 +123,14 @@ a quiet node's head commit, and with it the log-retention floor, lags).
 Design note with measurements; implement only if M3 leaves lease
 serialization as the measured bottleneck.
 
+### M5 — concurrent, correctly-ordered forwarding
+Implement M4's named fix: stop awaiting each forwarded mutation inline
+in the sync dispatch loop. Spawn the round trip + apply per forward,
+bounded by a semaphore, guarded by a requester-side ordering gate
+(conflict-key sets, computed per `MutateOp`) so forwards that touch a
+common inode still land on the holder — and get applied back on the
+requester — in the order this node issued them.
+
 ## M4 — leaseless optimistic commits: decision
 
 **Verdict: defer.** The measured bottleneck for the realistic
@@ -490,3 +498,163 @@ single-node throughput. Until then, §P3's cost (a rewrite comparable to
 plan 29 M1, with pjdfstest as the real acceptance test for its
 read-sets) is not justified by what M3 plus a five-line dispatch-loop
 fix can plausibly already deliver.
+
+## M5 — concurrent, correctly-ordered forwarding: implemented
+
+Implements the fix M4 named but did not build. Two changes, both in
+`crates/cli/src/node_runtime.rs`'s sync dispatch loop:
+
+**Requester side (`SyncRequest::Forward` arm).** When this node is not
+the holder, the round trip (`forward::request_mutate`, with its
+`NotHolder` retry) plus the local apply (`forward::apply_accepted`) now
+run on a `tokio::spawn`ed task instead of being awaited inline, bounded
+by a semaphore (`ForwardState::inflight`, env
+`CONSTELLATION_FORWARD_MAX_INFLIGHT`, default 64). The dispatch loop
+returns to `sync_rx.recv()` immediately. The local-holder branch (no
+network hop) stays inline, since M4 already showed it costs only the
+fjall write itself.
+
+**Ordering gate (`crates/cli/src/keygate.rs`, new module).** Concurrent
+forwards are only safe when their conflict-key sets are disjoint — two
+creates in one directory both bump its parent's mtime/ctime; two
+`SetManifest`s on one file race each other's base; a rename touches two
+parents and possibly the moved/replaced inodes. `forward::conflict_keys`
+computes this set per `MutateOp` (conservative: an unresolvable name
+lookup falls back to the parent alone, still safe). `KeyGate` is an
+all-or-nothing mutex over that set: `acquire` waits until every key is
+free, then holds all of them until the returned `KeyGuard` drops (RAII,
+cancellation-safe — a cancelled waiter or a dropped guard always
+releases and re-runs the grant scan). Disjoint sets never wait on each
+other; two waiters that share a key resolve in the order they called
+`acquire` (`GateInner::progress` scans its FIFO queue oldest-first,
+extending the busy set as it grants, so a later, disjoint waiter behind
+a blocked one is never held up). Every spawned forward acquires its
+gate before sending and holds it through `apply_accepted`, so an
+overlapping op cannot even start its own request until the previous
+one's apply has landed — the holder therefore always sees this node's
+overlapping ops in the order it issued them, and the requester applies
+them back in that same order.
+
+**Holder side (`SyncRequest::Mutate` arm)**, found necessary while
+measuring, not anticipated in the design: `holder_execute` itself is a
+fast local fjall write as M4 said, but under genuine concurrent load
+(only possible once the requester-side fix above stopped hiding it)
+funnelling every incoming forwarded mutation through this same single
+synchronous arm — plus, on a cold holder-cache, an S3 `GET` — became the
+new bottleneck. No ordering gate is needed here (fjall's own
+single-writer tx already serializes concurrent `holder_execute` calls
+correctly regardless of arrival order — the holder has no ordering
+obligation to any particular requester), so this arm is spawned the
+same way, with no additional primitive.
+
+### Why plan 29 M4's own matrix couldn't have shown this
+
+`crates/harness/src/metabench.rs`'s driver spawns exactly one OS thread
+per node, so it never has more than one forward in flight per node —
+the fix's precondition, "a single requester with two forwards
+outstanding," cannot occur. Reproducing M4's own bottleneck therefore
+needed a driver change, not just a rebuild: `MetaBenchConfig` gained
+`threads_per_node` (default 1, so every pre-existing config is
+byte-for-byte unchanged), and three new `*-concurrent4-lat0` configs run
+4 threads per node. A `Disjoint`-layout config with `threads_per_node >
+1` additionally gives each (node, thread) pair its own subdirectory —
+without that, all threads on one node would still share that node's one
+directory and their conflict keys would (correctly) serialize them,
+silently defeating the point of the config.
+
+### Measured (release build, floci+toxiproxy, 0ms injected S3 latency)
+
+Matched-shape rows (`threads_per_node=1`, identical to M4's own matrix —
+never exercises the fix, included to confirm no regression):
+
+| Config | before agg ops/s | after agg ops/s | before p50 | after p50 |
+|---|---:|---:|---:|---:|
+| 1node-create | 3344 | 3240 | 0.24 ms | 0.26 ms |
+| 3node-p2pon-shared-create | 1237 | 1093 | 1.82 ms | 1.15 ms |
+| 3node-p2pon-disjoint-create | 1244 | 1041 | 1.90 ms | 1.01 ms |
+| 3node-p2pon-shared-write4k | 295 | 205 | 6.47 ms | 8.73 ms |
+| 3node-p2pon-disjoint-write4k | 363 | 234 | 5.13 ms | 8.50 ms |
+
+All five are within the run-to-run noise plan 29 M4 already documented
+for this harness (single-node `create` swung ~40% between its own three
+runs) — expected, since none of these workloads ever put more than one
+forward in flight per node.
+
+Concurrent rows (`threads_per_node=4`, the condition the fix targets):
+
+| Config | before agg ops/s | after agg ops/s | before p50 | after p50 |
+|---|---:|---:|---:|---:|
+| 1node-create-concurrent4 | 3781 | 4324 | 0.79 ms | 0.67 ms |
+| 3node-p2pon-shared-create-concurrent4 | 1126 | 910 | 7.42 ms | 4.76 ms |
+| 3node-p2pon-disjoint-create-concurrent4 | 1140 | 3086 | 8.12 ms | 2.05 ms |
+
+**Disjoint concurrent throughput: 1140 → 3086 ops/s (2.7×), p50 latency
+8.12 → 2.05 ms (4×)**, now within reach of single-node throughput —
+matching M4's own prediction ("should let aggregate multi-node
+throughput approach however many forwards can be kept in flight at
+once ... for disjoint workloads"). Repeated during development (not
+the paired run above, each a fresh before/after pair): 1236→3648 and
+1140→3820 ops/s — consistently 2.7–3.2×, never a regression.
+
+**Shared concurrent throughput does not improve (1126 → 910 ops/s) —
+correctly.** Every thread across every node targets the same one
+directory, so every op's conflict-key set is the same singleton
+(the shared parent) and `KeyGate` — by design — fully serializes them
+regardless of how many are in flight. This is the intentional
+correctness trade-off the milestone's design section describes, not a
+missed optimization: genuinely overlapping ops cannot run concurrently
+without risking exactly the divergence `KeyGate` exists to prevent. The
+small aggregate dip (within noise given the p99 spread) reflects one
+extra scheduling hop (channel send + spawn) per op with no offsetting
+concurrency gain in this fully-contended case.
+
+**Diagnosis method**: temporary `tracing::info!` timestamps at four
+points (FUSE-thread send, sync-loop dequeue, gate-acquired, reply-sent)
+showed the gate/semaphore themselves added no measurable delay
+(sub-0.2 ms) for disjoint keys, isolating the holder-side dispatch loop
+as the actual remaining bottleneck under real concurrent load — the
+instrumentation was removed before landing; the holder-side fix above
+is what the trace led to.
+
+### Tests
+
+- `crates/cli/src/keygate.rs`: `disjoint_keys_run_concurrently`,
+  `overlapping_keys_serialize`, `overlapping_waiters_are_fifo`,
+  `dropped_waiter_releases_and_does_not_strand_others`,
+  `dropped_holder_releases_correctly`,
+  `no_deadlock_with_opposite_key_orders` (50×2 tasks, opposite
+  two-key acquire order, multi-thread runtime), `empty_key_set_never_blocks`.
+- `crates/cli/src/forward.rs`'s `conflict_keys_tests`: every `MutateOp`
+  variant, including name-lookup resolution (unlink/rmdir child,
+  rename moved/replaced) and the conservative parent-only fallback when
+  a name cannot be resolved locally.
+- `crates/cli/src/forward.rs`'s `ordering_gate_pipeline_tests`: an
+  in-process, no-harness two-replica correctness check exercising the
+  exact `conflict_keys` → `KeyGate::acquire` → `holder_execute` →
+  `apply_accepted` pipeline the spawned task runs, under adversarial
+  fake network transit times (independently reversed request/reply
+  legs per op — a single delay before everything cannot desynchronize
+  execution order from apply order, since there is no `.await` between
+  them within one task). `concurrent_creates_same_and_disjoint_dirs_converge`
+  and `concurrent_overlapping_setattrs_preserve_holder_order` assert
+  the requester's `dump_replicated()` matches the holder's after many
+  concurrent ops; `without_the_gate_a_reorder_is_observable` is a
+  negative control (`gate: None`) proving the positive tests are not
+  vacuous — it reliably reproduces a requester/holder mtime mismatch
+  within 20 attempts.
+
+### Left over
+
+- The holder-side fix was not part of the original design and has no
+  dedicated unit test beyond the harness measurement above (its
+  correctness rests on fjall's pre-existing single-writer serialization,
+  unchanged by moving the call off the dispatch loop).
+- `AtimeBatch` forwards (`atime_flush_once`) do not go through
+  `KeyGate` — they were already off the sync loop before M5 (their own
+  ticker task calls `request_mutate_with` directly) and never call
+  `apply_accepted` (best-effort, no local apply), so there is no
+  ordering hazard for them to begin with; `conflict_keys` still handles
+  the variant for completeness/testability.
+- No attempt was made at fairness/anti-starvation beyond `KeyGate`'s
+  FIFO-per-key property; a global fairness scheme across unrelated keys
+  was not in scope and is not needed for correctness.
