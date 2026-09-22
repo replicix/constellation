@@ -1,0 +1,24 @@
+{
+  "total_ops_ok": 1600,
+  "total_ops_err": 0,
+  "aggregate_ops_per_s": 270.2192510041557,
+  "max_p99_ms": 65.20285800070269,
+  "errors_sample": [],
+  "per_node": {
+    "a": {
+      "ops_ok": 1600,
+      "ops_err": 0,
+      "duration_s": 5.921117737001623,
+      "ops_per_s": 270.2192510041557,
+      "errors": [],
+      "p50_ms": 22.30092999889166,
+      "p90_ms": 47.9584380009328,
+      "p99_ms": 65.20285800070269,
+      "max_ms": 177.59232200114639,
+      "mean_ms": 28.486290669309255,
+      "mode": "small_write",
+      "node": "a",
+      "threads": 8
+    }
+  }
+}

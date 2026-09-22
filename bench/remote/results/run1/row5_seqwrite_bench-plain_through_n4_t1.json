@@ -1,0 +1,345 @@
+{
+  "total_ops_ok": 600,
+  "total_ops_err": 200,
+  "aggregate_ops_per_s": 1546.1622829618973,
+  "max_p99_ms": 3.074762997130165,
+  "errors_sample": [
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    }
+  ],
+  "per_node": {
+    "a": {
+      "ops_ok": 0,
+      "ops_err": 200,
+      "duration_s": 0.36466036699857796,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        }
+      ],
+      "throughput_MBps": 0.0,
+      "mode": "seq_write",
+      "node": "a",
+      "threads": 1
+    },
+    "b": {
+      "ops_ok": 200,
+      "ops_err": 0,
+      "duration_s": 0.3670177589992818,
+      "ops_per_s": 544.9327589632833,
+      "errors": [],
+      "p50_ms": 0.8439090015599504,
+      "p90_ms": 2.2677449996990617,
+      "p99_ms": 2.6924090016109403,
+      "max_ms": 11.456747000920586,
+      "mean_ms": 1.2396024248664617,
+      "throughput_MBps": 544.9327589632833,
+      "mode": "seq_write",
+      "node": "b",
+      "threads": 1
+    },
+    "c": {
+      "ops_ok": 200,
+      "ops_err": 0,
+      "duration_s": 0.3677595699991798,
+      "ops_per_s": 543.8335703961314,
+      "errors": [],
+      "p50_ms": 0.8777570001257118,
+      "p90_ms": 2.3271200007002335,
+      "p99_ms": 3.074762997130165,
+      "max_ms": 17.768157998943934,
+      "mean_ms": 1.3143291150117875,
+      "throughput_MBps": 543.8335703961314,
+      "mode": "seq_write",
+      "node": "c",
+      "threads": 1
+    },
+    "d": {
+      "ops_ok": 200,
+      "ops_err": 0,
+      "duration_s": 0.38805758400121704,
+      "ops_per_s": 515.3874276539658,
+      "errors": [],
+      "p50_ms": 0.8960810009739362,
+      "p90_ms": 2.3799629998393357,
+      "p99_ms": 2.755068999249488,
+      "max_ms": 14.4634380012576,
+      "mean_ms": 1.3166320900018036,
+      "throughput_MBps": 515.3874276539658,
+      "mode": "seq_write",
+      "node": "d",
+      "threads": 1
+    }
+  }
+}

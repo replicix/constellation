@@ -1,0 +1,83 @@
+[2m2026-09-22T15:47:08.841578Z[0m [32m INFO[0m [2mconstellation[0m[2m:[0m selected host-aware thread plan [3mcpus[0m[2m=[0m8 [3mfuse_threads[0m[2m=[0m6 [3mtokio_threads[0m[2m=[0m8 [3mblocking_threads[0m[2m=[0m32
+[2m2026-09-22T15:42:13.113406Z[0m [32m INFO[0m [2mconstellation[0m[2m:[0m selected host-aware thread plan [3mcpus[0m[2m=[0m8 [3mfuse_threads[0m[2m=[0m6 [3mtokio_threads[0m[2m=[0m8 [3mblocking_threads[0m[2m=[0m32
+[2m2026-09-22T15:42:13.365221Z[0m [32m INFO[0m [2mfjall::db[0m[2m:[0m Creating database at /home/ubuntu/.local/share/constellation/bench-plain/meta.db
+[2m2026-09-22T15:42:13.394026Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.422717Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.443813Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.475899Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.497000Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.529055Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.549930Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.582517Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.603787Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.635884Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.656695Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.689030Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.711256Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.742726Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.763751Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.795700Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.816879Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.848985Z[0m [32m INFO[0m [2mlsm_tree::tree::ingest[0m[2m:[0m Finished ingestion writer
+[2m2026-09-22T15:42:13.886859Z[0m [32m INFO[0m [2mconstellation::shipper[0m[2m:[0m bootstrapped metadata replica from genesis [3mreplayed[0m[2m=[0m0
+[2m2026-09-22T15:42:13.891022Z[0m [32m INFO[0m [2mfjall::db[0m[2m:[0m Recovering database at /home/ubuntu/.local/share/constellation/bench-plain/meta.db
+[2m2026-09-22T15:42:13.891077Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/0
+[2m2026-09-22T15:42:13.891087Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/0/v27
+[2m2026-09-22T15:42:13.891616Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/7
+[2m2026-09-22T15:42:13.891628Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/7/v0
+[2m2026-09-22T15:42:13.891735Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/2
+[2m2026-09-22T15:42:13.891744Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/2/v0
+[2m2026-09-22T15:42:13.891841Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/8
+[2m2026-09-22T15:42:13.891850Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/8/v0
+[2m2026-09-22T15:42:13.891957Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/5
+[2m2026-09-22T15:42:13.891966Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/5/v0
+[2m2026-09-22T15:42:13.892063Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/14
+[2m2026-09-22T15:42:13.892072Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/14/v0
+[2m2026-09-22T15:42:13.892166Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/13
+[2m2026-09-22T15:42:13.892174Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/13/v0
+[2m2026-09-22T15:42:13.892266Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/1
+[2m2026-09-22T15:42:13.892274Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/1/v0
+[2m2026-09-22T15:42:13.892367Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/11
+[2m2026-09-22T15:42:13.892375Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/11/v0
+[2m2026-09-22T15:42:13.892467Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/16
+[2m2026-09-22T15:42:13.892475Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/16/v0
+[2m2026-09-22T15:42:13.892583Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/10
+[2m2026-09-22T15:42:13.892593Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/10/v0
+[2m2026-09-22T15:42:13.892685Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/9
+[2m2026-09-22T15:42:13.892693Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/9/v0
+[2m2026-09-22T15:42:13.892787Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/3
+[2m2026-09-22T15:42:13.892796Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/3/v0
+[2m2026-09-22T15:42:13.892885Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/18
+[2m2026-09-22T15:42:13.892893Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/18/v0
+[2m2026-09-22T15:42:13.892984Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/6
+[2m2026-09-22T15:42:13.892993Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/6/v0
+[2m2026-09-22T15:42:13.893090Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/17
+[2m2026-09-22T15:42:13.893099Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/17/v0
+[2m2026-09-22T15:42:13.893191Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/12
+[2m2026-09-22T15:42:13.893199Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/12/v0
+[2m2026-09-22T15:42:13.893290Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/4
+[2m2026-09-22T15:42:13.893298Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/4/v0
+[2m2026-09-22T15:42:13.893389Z[0m [32m INFO[0m [2mlsm_tree::tree[0m[2m:[0m Recovering LSM-tree at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/15
+[2m2026-09-22T15:42:13.893398Z[0m [32m INFO[0m [2mlsm_tree::version::recovery[0m[2m:[0m Recovering current manifest at /home/ubuntu/.local/share/constellation/bench-plain/meta.db/keyspaces/15/v0
+[2m2026-09-22T15:42:14.074234Z[0m [32m INFO[0m [2mconstellation::node_runtime[0m[2m:[0m node identity [3mnode_id[0m[2m=[0m4
+[2m2026-09-22T15:42:14.489288Z[0m [32m INFO[0m [2mconstellation[0m[2m:[0m P2P fast path ready [3mnode_id[0m[2m=[0m4 [3mpeers[0m[2m=[0m3 [3mrelay[0m[2m=[0mdisabled
+[2m2026-09-22T15:42:14.644001Z[0m [32m INFO[0m [2mconstellation::node_runtime[0m[2m:[0m joining the gossip topic [3mbootstrap[0m[2m=[0m3
+[2m2026-09-22T15:42:14.644042Z[0m [32m INFO[0m [2mconstellation_net::peers[0m[2m:[0m gossip receive loop started
+[2m2026-09-22T15:42:14.644092Z[0m [32m INFO[0m [2mconstellation::node_runtime[0m[2m:[0m mounting [3mmountpoint[0m[2m=[0m"/home/ubuntu/cbench/mnt/bench-plain" [3mstate_dir[0m[2m=[0m"/home/ubuntu/.local/share/constellation/bench-plain" [3mfs[0m[2m=[0m3d5c5ecf-1565-4189-856f-d039894fdc0a
+[2m2026-09-22T15:42:14.644113Z[0m [32m INFO[0m [2mfuser::session[0m[2m:[0m Mounting /home/ubuntu/cbench/mnt/bench-plain
+[2m2026-09-22T15:42:14.649872Z[0m [32m INFO[0m [2mconstellation_net::peers[0m[2m:[0m gossip neighbor joined [3mendpoint[0m[2m=[0ma46c35e9c9fcd2c1b65be122bf62f5d66f1f2e836157e85ab0a9a670fbc83383 [3mnode_id[0m[2m=[0mSome(3) [3mpeer[0m[2m=[0ma46c35e9c9fc
+[2m2026-09-22T15:42:14.649907Z[0m [32m INFO[0m [2mconstellation_net::peers[0m[2m:[0m gossip neighbor joined [3mendpoint[0m[2m=[0ma5053772e0d7e59202de3c02cd25379e5d20ffcbabe40ddd3bccffa7c72deab3 [3mnode_id[0m[2m=[0mSome(2) [3mpeer[0m[2m=[0ma5053772e0d7
+[2m2026-09-22T15:42:14.720842Z[0m [32m INFO[0m [2mconstellation_net::peers[0m[2m:[0m gossip neighbor joined [3mendpoint[0m[2m=[0mc3e819af54b00a97482f9618917da22cc40f3d4ea011f28b575bbcd991f7fcad [3mnode_id[0m[2m=[0mSome(1) [3mpeer[0m[2m=[0mc3e819af54b0
+[2m2026-09-22T15:42:46.729364Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m metadata publish deferred: the winning commit overlaps this batch [3mreason[0m[2m=[0m"conflict: no parent root to diff the winner against"
+[2m2026-09-22T15:43:19.915271Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m adopting a newer metadata commit as this publish's parent [3mfrom[0m[2m=[0m0 [3mto[0m[2m=[0m1 [3mauthor[0m[2m=[0m1
+[2m2026-09-22T15:43:21.147798Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m metadata publish deferred: the winning commit overlaps this batch [3mreason[0m[2m=[0m"conflict: commit 2 changed 21618 keys, overlapping this batch's edits"
+[2m2026-09-22T15:43:51.282327Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m adopting a newer metadata commit as this publish's parent [3mfrom[0m[2m=[0m1 [3mto[0m[2m=[0m2 [3mauthor[0m[2m=[0m1
+[2m2026-09-22T15:43:51.601621Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m published metadata commit [3mseq[0m[2m=[0m3 [3mroot[0m[2m=[0m78b77958c7a8e8f49ee130384abe0132361a36ae62fdafcad6704df1150f9e55 [3mkeys[0m[2m=[0m36031 [3mpacks[0m[2m=[0m0 [3mms[0m[2m=[0m393
+[2m2026-09-22T15:44:25.468194Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m adopting a newer metadata commit as this publish's parent [3mfrom[0m[2m=[0m3 [3mto[0m[2m=[0m4 [3mauthor[0m[2m=[0m1
+[2m2026-09-22T15:44:28.141335Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m metadata publish deferred: the winning commit overlaps this batch [3mreason[0m[2m=[0m"conflict: commit 5 changed 7228 keys, overlapping this batch's edits"
+[2m2026-09-22T15:44:55.494082Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m adopting a newer metadata commit as this publish's parent [3mfrom[0m[2m=[0m4 [3mto[0m[2m=[0m6 [3mauthor[0m[2m=[0m1
+[2m2026-09-22T15:44:58.505601Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m published metadata commit [3mseq[0m[2m=[0m7 [3mroot[0m[2m=[0mca899fa799728be816b54c882b4dc28b3a28da9b93b8ab4f55928150af29760d [3mkeys[0m[2m=[0m25261 [3mpacks[0m[2m=[0m1 [3mms[0m[2m=[0m3102
+[2m2026-09-22T15:46:04.570193Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m adopting a newer metadata commit as this publish's parent [3mfrom[0m[2m=[0m7 [3mto[0m[2m=[0m8 [3mauthor[0m[2m=[0m3
+[2m2026-09-22T15:46:06.617181Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m metadata publish deferred: the winning commit overlaps this batch [3mreason[0m[2m=[0m"conflict: commit 9 changed 3616 keys, overlapping this batch's edits"
+[2m2026-09-22T15:46:43.109888Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m adopting a newer metadata commit as this publish's parent [3mfrom[0m[2m=[0m8 [3mto[0m[2m=[0m10 [3mauthor[0m[2m=[0m2
+[2m2026-09-22T15:46:45.913646Z[0m [32m INFO[0m [2mconstellation::mtree_publish[0m[2m:[0m metadata publish deferred: the winning commit overlaps this batch [3mreason[0m[2m=[0m"conflict: commit 11 changed 7228 keys, overlapping this batch's edits"

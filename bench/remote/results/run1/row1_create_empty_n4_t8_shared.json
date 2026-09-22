@@ -1,0 +1,59 @@
+{
+  "total_ops_ok": 2400,
+  "total_ops_err": 0,
+  "aggregate_ops_per_s": 216.28434307584533,
+  "max_p99_ms": 89.67321399904904,
+  "errors_sample": [],
+  "per_node": {
+    "a": {
+      "ops_ok": 1200,
+      "ops_err": 0,
+      "duration_s": 11.09650363900073,
+      "ops_per_s": 108.14217153792266,
+      "errors": [],
+      "p50_ms": 73.68092500109924,
+      "p90_ms": 82.99863700085552,
+      "p99_ms": 89.67321399904904,
+      "max_ms": 323.4217270000954,
+      "mean_ms": 73.51160037834536,
+      "mode": "create_empty",
+      "node": "a",
+      "threads": 8
+    },
+    "b": {
+      "ops_ok": 0,
+      "ops_err": 0,
+      "duration_s": 0.19826524399832124,
+      "ops_per_s": 0.0,
+      "errors": [],
+      "mode": "create_empty",
+      "node": "b",
+      "threads": 8
+    },
+    "c": {
+      "ops_ok": 0,
+      "ops_err": 0,
+      "duration_s": 0.2107592559987097,
+      "ops_per_s": 0.0,
+      "errors": [],
+      "mode": "create_empty",
+      "node": "c",
+      "threads": 8
+    },
+    "d": {
+      "ops_ok": 1200,
+      "ops_err": 0,
+      "duration_s": 0.2070253629972285,
+      "ops_per_s": 5796.391237415991,
+      "errors": [],
+      "p50_ms": 1.1826400004792958,
+      "p90_ms": 1.3486240022757556,
+      "p99_ms": 1.523823997558793,
+      "max_ms": 1.5918649987725075,
+      "mean_ms": 1.195440532531696,
+      "mode": "create_empty",
+      "node": "d",
+      "threads": 8
+    }
+  }
+}

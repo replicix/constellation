@@ -1,0 +1,292 @@
+{
+  "total_ops_ok": 800,
+  "total_ops_err": 24,
+  "aggregate_ops_per_s": 5203.630281462783,
+  "max_p99_ms": 2.8138029992987867,
+  "errors_sample": [
+    {
+      "thread": 1,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 6,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 2,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 7,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 4,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 1,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 5,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 3,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 4,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 0,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 0,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 1,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 7,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 5,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    },
+    {
+      "thread": 6,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+    }
+  ],
+  "per_node": {
+    "a": {
+      "ops_ok": 800,
+      "ops_err": 0,
+      "duration_s": 0.15373882399944705,
+      "ops_per_s": 5203.630281462783,
+      "errors": [],
+      "p50_ms": 1.314527999056736,
+      "p90_ms": 1.4681190004921518,
+      "p99_ms": 2.8138029992987867,
+      "max_ms": 3.9733069970679935,
+      "mean_ms": 1.344147901299948,
+      "mode": "small_write",
+      "node": "a",
+      "threads": 8
+    },
+    "b": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 0.03199979000055464,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        }
+      ],
+      "mode": "small_write",
+      "node": "b",
+      "threads": 8
+    },
+    "c": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 0.035391132998483954,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        }
+      ],
+      "mode": "small_write",
+      "node": "c",
+      "threads": 8
+    },
+    "d": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 0.01882988400029717,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-back'"
+        }
+      ],
+      "mode": "small_write",
+      "node": "d",
+      "threads": 8
+    }
+  }
+}

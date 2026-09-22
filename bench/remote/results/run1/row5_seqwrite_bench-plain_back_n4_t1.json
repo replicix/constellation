@@ -1,0 +1,1158 @@
+{
+  "total_ops_ok": 0,
+  "total_ops_err": 800,
+  "aggregate_ops_per_s": 0.0,
+  "max_p99_ms": 0,
+  "errors_sample": [
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "write",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    }
+  ],
+  "per_node": {
+    "a": {
+      "ops_ok": 0,
+      "ops_err": 200,
+      "duration_s": 0.37115306299892836,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        }
+      ],
+      "throughput_MBps": 0.0,
+      "mode": "seq_write",
+      "node": "a",
+      "threads": 1
+    },
+    "b": {
+      "ops_ok": 0,
+      "ops_err": 200,
+      "duration_s": 0.37561735099734506,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        }
+      ],
+      "throughput_MBps": 0.0,
+      "mode": "seq_write",
+      "node": "b",
+      "threads": 1
+    },
+    "c": {
+      "ops_ok": 0,
+      "ops_err": 200,
+      "duration_s": 0.3782250589974865,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        }
+      ],
+      "throughput_MBps": 0.0,
+      "mode": "seq_write",
+      "node": "c",
+      "threads": 1
+    },
+    "d": {
+      "ops_ok": 0,
+      "ops_err": 200,
+      "duration_s": 0.3901465310009371,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "write",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        }
+      ],
+      "throughput_MBps": 0.0,
+      "mode": "seq_write",
+      "node": "d",
+      "threads": 1
+    }
+  }
+}

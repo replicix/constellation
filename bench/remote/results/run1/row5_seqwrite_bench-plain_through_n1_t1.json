@@ -1,0 +1,25 @@
+{
+  "total_ops_ok": 200,
+  "total_ops_err": 0,
+  "aggregate_ops_per_s": 551.0352481052865,
+  "max_p99_ms": 2.6074029992742,
+  "errors_sample": [],
+  "per_node": {
+    "a": {
+      "ops_ok": 200,
+      "ops_err": 0,
+      "duration_s": 0.3629531879996648,
+      "ops_per_s": 551.0352481052865,
+      "errors": [],
+      "p50_ms": 0.847205999889411,
+      "p90_ms": 2.286300998093793,
+      "p99_ms": 2.6074029992742,
+      "max_ms": 12.673535999056185,
+      "mean_ms": 1.2507658748654649,
+      "throughput_MBps": 551.0352481052865,
+      "mode": "seq_write",
+      "node": "a",
+      "threads": 1
+    }
+  }
+}

@@ -1,0 +1,292 @@
+{
+  "total_ops_ok": 1200,
+  "total_ops_err": 24,
+  "aggregate_ops_per_s": 7493.727843395475,
+  "max_p99_ms": 0.8329619995492976,
+  "errors_sample": [
+    {
+      "thread": 4,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t4'"
+    },
+    {
+      "thread": 5,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t5'"
+    },
+    {
+      "thread": 0,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t0'"
+    },
+    {
+      "thread": 6,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t6'"
+    },
+    {
+      "thread": 7,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t7'"
+    },
+    {
+      "thread": 4,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t4'"
+    },
+    {
+      "thread": 6,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t6'"
+    },
+    {
+      "thread": 1,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t1'"
+    },
+    {
+      "thread": 0,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t0'"
+    },
+    {
+      "thread": 3,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t3'"
+    },
+    {
+      "thread": 0,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t0'"
+    },
+    {
+      "thread": 5,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t5'"
+    },
+    {
+      "thread": 4,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t4'"
+    },
+    {
+      "thread": 7,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t7'"
+    },
+    {
+      "thread": 1,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t1'"
+    }
+  ],
+  "per_node": {
+    "a": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 0.04926111900203978,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t4'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t5'"
+        },
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t0'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t6'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t7'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t2'"
+        },
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t1'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t3'"
+        }
+      ],
+      "mode": "create_empty",
+      "node": "a",
+      "threads": 8
+    },
+    "b": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 0.051485887001035735,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t4'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t6'"
+        },
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t1'"
+        },
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t0'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t3'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t2'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t5'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t7'"
+        }
+      ],
+      "mode": "create_empty",
+      "node": "b",
+      "threads": 8
+    },
+    "c": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 0.05603261299984297,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t0'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t5'"
+        },
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t4'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t7'"
+        },
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t1'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t3'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t2'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-race-repro-1790091994/t6'"
+        }
+      ],
+      "mode": "create_empty",
+      "node": "c",
+      "threads": 8
+    },
+    "d": {
+      "ops_ok": 1200,
+      "ops_err": 0,
+      "duration_s": 0.16013391800152021,
+      "ops_per_s": 7493.727843395475,
+      "errors": [],
+      "p50_ms": 0.6761430013284553,
+      "p90_ms": 0.7610189968545455,
+      "p99_ms": 0.8329619995492976,
+      "max_ms": 1.2902970011055004,
+      "mean_ms": 0.675977744182698,
+      "mode": "create_empty",
+      "node": "d",
+      "threads": 8
+    }
+  }
+}

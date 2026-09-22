@@ -1,0 +1,256 @@
+{
+  "total_ops_ok": 1597,
+  "total_ops_err": 19,
+  "aggregate_ops_per_s": 45.224078724978206,
+  "max_p99_ms": 2584.2679160014086,
+  "errors_sample": [
+    {
+      "op": "small_write",
+      "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through/sw-na-1-12",
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through/sw-na-1-12'"
+    },
+    {
+      "thread": 0,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+    },
+    {
+      "thread": 7,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+    },
+    {
+      "thread": 4,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+    },
+    {
+      "thread": 6,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+    },
+    {
+      "thread": 2,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+    },
+    {
+      "thread": 1,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+    },
+    {
+      "thread": 3,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+    },
+    {
+      "thread": 7,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+    },
+    {
+      "thread": 5,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+    },
+    {
+      "thread": 4,
+      "fatal": true,
+      "errno": 17,
+      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+    },
+    {
+      "op": "small_write",
+      "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through/sw-nd-2-0",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "small_write",
+      "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through/sw-nd-4-0",
+      "errno": 28,
+      "msg": "[Errno 28] No space left on device"
+    }
+  ],
+  "per_node": {
+    "a": {
+      "ops_ok": 799,
+      "ops_err": 1,
+      "duration_s": 35.313046612001926,
+      "ops_per_s": 22.626198435352276,
+      "errors": [
+        {
+          "op": "small_write",
+          "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through/sw-na-1-12",
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through/sw-na-1-12'"
+        }
+      ],
+      "p50_ms": 18.684511000174098,
+      "p90_ms": 2097.205993002717,
+      "p99_ms": 2584.2679160014086,
+      "max_ms": 8539.186224999867,
+      "mean_ms": 341.67785044306544,
+      "mode": "small_write",
+      "node": "a",
+      "threads": 8
+    },
+    "b": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 1.6509999619993323,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        }
+      ],
+      "mode": "small_write",
+      "node": "b",
+      "threads": 8
+    },
+    "c": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 1.6777760590011894,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        },
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 17,
+          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through'"
+        }
+      ],
+      "mode": "small_write",
+      "node": "c",
+      "threads": 8
+    },
+    "d": {
+      "ops_ok": 798,
+      "ops_err": 2,
+      "duration_s": 31.286525524999888,
+      "ops_per_s": 25.50618793903299,
+      "errors": [
+        {
+          "op": "small_write",
+          "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through/sw-nd-2-0",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "small_write",
+          "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n4-through/sw-nd-4-0",
+          "errno": 28,
+          "msg": "[Errno 28] No space left on device"
+        }
+      ],
+      "p50_ms": 355.62197499893955,
+      "p90_ms": 428.5685819995706,
+      "p99_ms": 552.6296460011508,
+      "max_ms": 677.5844229996437,
+      "mean_ms": 312.7719438195292,
+      "mode": "small_write",
+      "node": "d",
+      "threads": 8
+    }
+  }
+}

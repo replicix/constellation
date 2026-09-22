@@ -1,0 +1,74 @@
+{
+  "total_ops_ok": 1596,
+  "total_ops_err": 4,
+  "aggregate_ops_per_s": 20.364341585397614,
+  "max_p99_ms": 595.5062370012456,
+  "errors_sample": [
+    {
+      "op": "small_write",
+      "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-through/sw-na-1-0",
+      "errno": 5,
+      "msg": "[Errno 5] Input/output error"
+    },
+    {
+      "op": "small_write",
+      "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-through/sw-na-2-0",
+      "errno": 28,
+      "msg": "[Errno 28] No space left on device"
+    },
+    {
+      "op": "small_write",
+      "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-through/sw-na-3-0",
+      "errno": 28,
+      "msg": "[Errno 28] No space left on device"
+    },
+    {
+      "op": "small_write",
+      "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-through/sw-na-4-0",
+      "errno": 28,
+      "msg": "[Errno 28] No space left on device"
+    }
+  ],
+  "per_node": {
+    "a": {
+      "ops_ok": 1596,
+      "ops_err": 4,
+      "duration_s": 78.37228585599951,
+      "ops_per_s": 20.364341585397614,
+      "errors": [
+        {
+          "op": "small_write",
+          "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-through/sw-na-1-0",
+          "errno": 5,
+          "msg": "[Errno 5] Input/output error"
+        },
+        {
+          "op": "small_write",
+          "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-through/sw-na-2-0",
+          "errno": 28,
+          "msg": "[Errno 28] No space left on device"
+        },
+        {
+          "op": "small_write",
+          "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-through/sw-na-3-0",
+          "errno": 28,
+          "msg": "[Errno 28] No space left on device"
+        },
+        {
+          "op": "small_write",
+          "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-through/sw-na-4-0",
+          "errno": 28,
+          "msg": "[Errno 28] No space left on device"
+        }
+      ],
+      "p50_ms": 389.3786070002534,
+      "p90_ms": 453.79187499929685,
+      "p99_ms": 595.5062370012456,
+      "max_ms": 707.049590000679,
+      "mean_ms": 391.5588857731281,
+      "mode": "small_write",
+      "node": "a",
+      "threads": 8
+    }
+  }
+}

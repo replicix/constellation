@@ -1,0 +1,1 @@
+[2m2026-09-22T15:42:14.651543Z[0m [33m WARN[0m [1mrouter.accept[0m[1m{[0m[3mme[0m[2m=[0ma5053772e0 [3malpn[0m[2m=[0m"constellation/1" [3mremote[0m[2m=[0m885310f541[1m}[0m[2m:[0m [2mconstellation_net::peers[0m[2m:[0m rejecting peer: not in the registry allowlist [3mpeer[0m[2m=[0m885310f541edf3e625dceadf73bc59d6bee251aefdf0e2d571327af73c231ce9

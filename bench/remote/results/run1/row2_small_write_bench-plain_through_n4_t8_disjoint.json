@@ -1,0 +1,292 @@
+{
+  "total_ops_ok": 800,
+  "total_ops_err": 24,
+  "aggregate_ops_per_s": 477.9639480484506,
+  "max_p99_ms": 61.22053299986874,
+  "errors_sample": [
+    {
+      "thread": 1,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t1'"
+    },
+    {
+      "thread": 0,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t0'"
+    },
+    {
+      "thread": 5,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t5'"
+    },
+    {
+      "thread": 3,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t3'"
+    },
+    {
+      "thread": 2,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t2'"
+    },
+    {
+      "thread": 1,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t1'"
+    },
+    {
+      "thread": 0,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t0'"
+    },
+    {
+      "thread": 6,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t6'"
+    },
+    {
+      "thread": 5,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t5'"
+    },
+    {
+      "thread": 2,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t2'"
+    },
+    {
+      "thread": 0,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t0'"
+    },
+    {
+      "thread": 5,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t5'"
+    },
+    {
+      "thread": 6,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t6'"
+    },
+    {
+      "thread": 3,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t3'"
+    },
+    {
+      "thread": 4,
+      "fatal": true,
+      "errno": 2,
+      "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t4'"
+    }
+  ],
+  "per_node": {
+    "a": {
+      "ops_ok": 800,
+      "ops_err": 0,
+      "duration_s": 1.6737664069987659,
+      "ops_per_s": 477.9639480484506,
+      "errors": [],
+      "p50_ms": 16.205005002120743,
+      "p90_ms": 20.73219500016421,
+      "p99_ms": 61.22053299986874,
+      "max_ms": 72.71876300001168,
+      "mean_ms": 16.318391246227293,
+      "mode": "small_write",
+      "node": "a",
+      "threads": 8
+    },
+    "b": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 0.06968186000085552,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t1'"
+        },
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t0'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t5'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t3'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t2'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t7'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t6'"
+        },
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t4'"
+        }
+      ],
+      "mode": "small_write",
+      "node": "b",
+      "threads": 8
+    },
+    "c": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 0.07445847000053618,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t1'"
+        },
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t0'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t6'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t5'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t2'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t7'"
+        },
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t4'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t3'"
+        }
+      ],
+      "mode": "small_write",
+      "node": "c",
+      "threads": 8
+    },
+    "d": {
+      "ops_ok": 0,
+      "ops_err": 8,
+      "duration_s": 0.007994216997758485,
+      "ops_per_s": 0.0,
+      "errors": [
+        {
+          "thread": 0,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t0'"
+        },
+        {
+          "thread": 5,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t5'"
+        },
+        {
+          "thread": 6,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t6'"
+        },
+        {
+          "thread": 3,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t3'"
+        },
+        {
+          "thread": 4,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t4'"
+        },
+        {
+          "thread": 1,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t1'"
+        },
+        {
+          "thread": 2,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t2'"
+        },
+        {
+          "thread": 7,
+          "fatal": true,
+          "errno": 2,
+          "msg": "[Errno 2] No such file or directory: '/home/ubuntu/cbench/mnt/bench-plain/sw-disjoint-n4-through/t7'"
+        }
+      ],
+      "mode": "small_write",
+      "node": "d",
+      "threads": 8
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "total_ops_ok": 1599,
+  "total_ops_err": 1,
+  "aggregate_ops_per_s": 5713.502617827111,
+  "max_p99_ms": 2.4084159995254595,
+  "errors_sample": [
+    {
+      "op": "small_write",
+      "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-back/sw-na-7-0",
+      "errno": 28,
+      "msg": "[Errno 28] No space left on device"
+    }
+  ],
+  "per_node": {
+    "a": {
+      "ops_ok": 1599,
+      "ops_err": 1,
+      "duration_s": 0.2798633530001098,
+      "ops_per_s": 5713.502617827111,
+      "errors": [
+        {
+          "op": "small_write",
+          "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-back/sw-na-7-0",
+          "errno": 28,
+          "msg": "[Errno 28] No space left on device"
+        }
+      ],
+      "p50_ms": 1.3167819997761399,
+      "p90_ms": 1.4417829988815356,
+      "p99_ms": 2.4084159995254595,
+      "max_ms": 4.428151998581598,
+      "mean_ms": 1.356132432694353,
+      "mode": "small_write",
+      "node": "a",
+      "threads": 8
+    }
+  }
+}

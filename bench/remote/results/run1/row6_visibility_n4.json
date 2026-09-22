@@ -1,0 +1,3624 @@
+{
+  "writer_events": {
+    "events_written": 210,
+    "events": [
+      {
+        "i": 0,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-0",
+        "written_at": 1790092661.508375
+      },
+      {
+        "i": 1,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-1",
+        "written_at": 1790092661.588453
+      },
+      {
+        "i": 2,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-2",
+        "written_at": 1790092661.66467
+      },
+      {
+        "i": 3,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-3",
+        "written_at": 1790092661.74463
+      },
+      {
+        "i": 4,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-4",
+        "written_at": 1790092661.8204806
+      },
+      {
+        "i": 5,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-5",
+        "written_at": 1790092661.896306
+      },
+      {
+        "i": 6,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-6",
+        "written_at": 1790092661.9719079
+      },
+      {
+        "i": 7,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-7",
+        "written_at": 1790092662.0474677
+      },
+      {
+        "i": 8,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-8",
+        "written_at": 1790092662.1243002
+      },
+      {
+        "i": 9,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-9",
+        "written_at": 1790092662.2003853
+      },
+      {
+        "i": 10,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-10",
+        "written_at": 1790092662.278335
+      },
+      {
+        "i": 11,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-11",
+        "written_at": 1790092662.3545802
+      },
+      {
+        "i": 12,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-12",
+        "written_at": 1790092662.4304996
+      },
+      {
+        "i": 13,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-13",
+        "written_at": 1790092662.5067577
+      },
+      {
+        "i": 14,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-14",
+        "written_at": 1790092662.5827436
+      },
+      {
+        "i": 15,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-15",
+        "written_at": 1790092662.6591642
+      },
+      {
+        "i": 16,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-16",
+        "written_at": 1790092662.7351637
+      },
+      {
+        "i": 17,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-17",
+        "written_at": 1790092662.8106186
+      },
+      {
+        "i": 18,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-18",
+        "written_at": 1790092662.8857896
+      },
+      {
+        "i": 19,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-19",
+        "written_at": 1790092662.9611938
+      },
+      {
+        "i": 20,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-20",
+        "written_at": 1790092663.037076
+      },
+      {
+        "i": 21,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-21",
+        "written_at": 1790092663.1183345
+      },
+      {
+        "i": 22,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-22",
+        "written_at": 1790092663.1995504
+      },
+      {
+        "i": 23,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-23",
+        "written_at": 1790092663.2765558
+      },
+      {
+        "i": 24,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-24",
+        "written_at": 1790092663.351959
+      },
+      {
+        "i": 25,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-25",
+        "written_at": 1790092663.4274187
+      },
+      {
+        "i": 26,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-26",
+        "written_at": 1790092663.5038111
+      },
+      {
+        "i": 27,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-27",
+        "written_at": 1790092663.5800242
+      },
+      {
+        "i": 28,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-28",
+        "written_at": 1790092663.656231
+      },
+      {
+        "i": 29,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-29",
+        "written_at": 1790092663.7327836
+      },
+      {
+        "i": 30,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-30",
+        "written_at": 1790092663.8093941
+      },
+      {
+        "i": 31,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-31",
+        "written_at": 1790092663.8855038
+      },
+      {
+        "i": 32,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-32",
+        "written_at": 1790092663.9664001
+      },
+      {
+        "i": 33,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-33",
+        "written_at": 1790092664.044378
+      },
+      {
+        "i": 34,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-34",
+        "written_at": 1790092664.102885
+      },
+      {
+        "i": 35,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-35",
+        "written_at": 1790092664.1596665
+      },
+      {
+        "i": 36,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-36",
+        "written_at": 1790092664.224492
+      },
+      {
+        "i": 37,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-37",
+        "written_at": 1790092664.309729
+      },
+      {
+        "i": 38,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-38",
+        "written_at": 1790092664.38532
+      },
+      {
+        "i": 39,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-39",
+        "written_at": 1790092664.4612308
+      },
+      {
+        "i": 40,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-40",
+        "written_at": 1790092664.5382984
+      },
+      {
+        "i": 41,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-41",
+        "written_at": 1790092664.614351
+      },
+      {
+        "i": 42,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-42",
+        "written_at": 1790092664.6899989
+      },
+      {
+        "i": 43,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-43",
+        "written_at": 1790092664.765536
+      },
+      {
+        "i": 44,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-44",
+        "written_at": 1790092664.8410928
+      },
+      {
+        "i": 45,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-45",
+        "written_at": 1790092664.9163551
+      },
+      {
+        "i": 46,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-46",
+        "written_at": 1790092664.991886
+      },
+      {
+        "i": 47,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-47",
+        "written_at": 1790092665.0749278
+      },
+      {
+        "i": 48,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-48",
+        "written_at": 1790092665.1505606
+      },
+      {
+        "i": 49,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-49",
+        "written_at": 1790092665.226431
+      },
+      {
+        "i": 50,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-50",
+        "written_at": 1790092665.3029354
+      },
+      {
+        "i": 51,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-51",
+        "written_at": 1790092665.3784492
+      },
+      {
+        "i": 52,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-52",
+        "written_at": 1790092665.4543295
+      },
+      {
+        "i": 53,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-53",
+        "written_at": 1790092665.53119
+      },
+      {
+        "i": 54,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-54",
+        "written_at": 1790092665.607113
+      },
+      {
+        "i": 55,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-55",
+        "written_at": 1790092665.6826332
+      },
+      {
+        "i": 56,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-56",
+        "written_at": 1790092665.758656
+      },
+      {
+        "i": 57,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-57",
+        "written_at": 1790092665.834274
+      },
+      {
+        "i": 58,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-58",
+        "written_at": 1790092665.915551
+      },
+      {
+        "i": 59,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-59",
+        "written_at": 1790092665.9909854
+      },
+      {
+        "i": 60,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-60",
+        "written_at": 1790092666.0662043
+      },
+      {
+        "i": 61,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-61",
+        "written_at": 1790092666.1413143
+      },
+      {
+        "i": 62,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-62",
+        "written_at": 1790092666.216787
+      },
+      {
+        "i": 63,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-63",
+        "written_at": 1790092666.3165355
+      },
+      {
+        "i": 64,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-64",
+        "written_at": 1790092666.3924468
+      },
+      {
+        "i": 65,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-65",
+        "written_at": 1790092666.468443
+      },
+      {
+        "i": 66,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-66",
+        "written_at": 1790092666.5446146
+      },
+      {
+        "i": 67,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-67",
+        "written_at": 1790092666.6215322
+      },
+      {
+        "i": 68,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-68",
+        "written_at": 1790092666.6796668
+      },
+      {
+        "i": 69,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-69",
+        "written_at": 1790092666.7391834
+      },
+      {
+        "i": 70,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-70",
+        "written_at": 1790092666.7969725
+      },
+      {
+        "i": 71,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-71",
+        "written_at": 1790092666.8552322
+      },
+      {
+        "i": 72,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-72",
+        "written_at": 1790092666.9128592
+      },
+      {
+        "i": 73,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-73",
+        "written_at": 1790092666.970617
+      },
+      {
+        "i": 74,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-74",
+        "written_at": 1790092667.0281878
+      },
+      {
+        "i": 75,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-75",
+        "written_at": 1790092667.0856054
+      },
+      {
+        "i": 76,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-76",
+        "written_at": 1790092667.1430192
+      },
+      {
+        "i": 77,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-77",
+        "written_at": 1790092667.200841
+      },
+      {
+        "i": 78,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-78",
+        "written_at": 1790092667.259552
+      },
+      {
+        "i": 79,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-79",
+        "written_at": 1790092667.3178158
+      },
+      {
+        "i": 80,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-80",
+        "written_at": 1790092667.375749
+      },
+      {
+        "i": 81,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-81",
+        "written_at": 1790092667.4335713
+      },
+      {
+        "i": 82,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-82",
+        "written_at": 1790092667.4920566
+      },
+      {
+        "i": 83,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-83",
+        "written_at": 1790092667.550249
+      },
+      {
+        "i": 84,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-84",
+        "written_at": 1790092667.6082366
+      },
+      {
+        "i": 85,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-85",
+        "written_at": 1790092667.6659114
+      },
+      {
+        "i": 86,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-86",
+        "written_at": 1790092667.7236702
+      },
+      {
+        "i": 87,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-87",
+        "written_at": 1790092667.7812102
+      },
+      {
+        "i": 88,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-88",
+        "written_at": 1790092667.838938
+      },
+      {
+        "i": 89,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-89",
+        "written_at": 1790092667.8964763
+      },
+      {
+        "i": 90,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-90",
+        "written_at": 1790092667.954388
+      },
+      {
+        "i": 91,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-91",
+        "written_at": 1790092668.0121064
+      },
+      {
+        "i": 92,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-92",
+        "written_at": 1790092668.069708
+      },
+      {
+        "i": 93,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-93",
+        "written_at": 1790092668.127105
+      },
+      {
+        "i": 94,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-94",
+        "written_at": 1790092668.1847413
+      },
+      {
+        "i": 95,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-95",
+        "written_at": 1790092668.243442
+      },
+      {
+        "i": 96,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-96",
+        "written_at": 1790092668.30157
+      },
+      {
+        "i": 97,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-97",
+        "written_at": 1790092668.359869
+      },
+      {
+        "i": 98,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-98",
+        "written_at": 1790092668.4178185
+      },
+      {
+        "i": 99,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-99",
+        "written_at": 1790092668.4758344
+      },
+      {
+        "i": 100,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-100",
+        "written_at": 1790092668.534091
+      },
+      {
+        "i": 101,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-101",
+        "written_at": 1790092668.5922463
+      },
+      {
+        "i": 102,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-102",
+        "written_at": 1790092668.6501296
+      },
+      {
+        "i": 103,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-103",
+        "written_at": 1790092668.7077107
+      },
+      {
+        "i": 104,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-104",
+        "written_at": 1790092668.7652705
+      },
+      {
+        "i": 105,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-105",
+        "written_at": 1790092668.82323
+      },
+      {
+        "i": 106,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-106",
+        "written_at": 1790092668.8808649
+      },
+      {
+        "i": 107,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-107",
+        "written_at": 1790092668.938452
+      },
+      {
+        "i": 108,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-108",
+        "written_at": 1790092668.9959857
+      },
+      {
+        "i": 109,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-109",
+        "written_at": 1790092669.0539763
+      },
+      {
+        "i": 110,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-110",
+        "written_at": 1790092669.1125412
+      },
+      {
+        "i": 111,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-111",
+        "written_at": 1790092669.1703575
+      },
+      {
+        "i": 112,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-112",
+        "written_at": 1790092669.2286165
+      },
+      {
+        "i": 113,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-113",
+        "written_at": 1790092669.2869568
+      },
+      {
+        "i": 114,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-114",
+        "written_at": 1790092669.3449457
+      },
+      {
+        "i": 115,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-115",
+        "written_at": 1790092669.4026735
+      },
+      {
+        "i": 116,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-116",
+        "written_at": 1790092669.460652
+      },
+      {
+        "i": 117,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-117",
+        "written_at": 1790092669.5188017
+      },
+      {
+        "i": 118,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-118",
+        "written_at": 1790092669.5767834
+      },
+      {
+        "i": 119,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-119",
+        "written_at": 1790092669.6346488
+      },
+      {
+        "i": 120,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-120",
+        "written_at": 1790092669.692207
+      },
+      {
+        "i": 121,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-121",
+        "written_at": 1790092669.7498362
+      },
+      {
+        "i": 122,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-122",
+        "written_at": 1790092669.808262
+      },
+      {
+        "i": 123,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-123",
+        "written_at": 1790092669.8664093
+      },
+      {
+        "i": 124,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-124",
+        "written_at": 1790092669.9241993
+      },
+      {
+        "i": 125,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-125",
+        "written_at": 1790092669.982005
+      },
+      {
+        "i": 126,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-126",
+        "written_at": 1790092670.0396132
+      },
+      {
+        "i": 127,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-127",
+        "written_at": 1790092670.0975673
+      },
+      {
+        "i": 128,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-128",
+        "written_at": 1790092670.1551201
+      },
+      {
+        "i": 129,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-129",
+        "written_at": 1790092670.2128565
+      },
+      {
+        "i": 130,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-130",
+        "written_at": 1790092670.2713933
+      },
+      {
+        "i": 131,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-131",
+        "written_at": 1790092670.3290982
+      },
+      {
+        "i": 132,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-132",
+        "written_at": 1790092670.386789
+      },
+      {
+        "i": 133,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-133",
+        "written_at": 1790092670.4444563
+      },
+      {
+        "i": 134,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-134",
+        "written_at": 1790092670.5028005
+      },
+      {
+        "i": 135,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-135",
+        "written_at": 1790092670.5605521
+      },
+      {
+        "i": 136,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-136",
+        "written_at": 1790092670.6180832
+      },
+      {
+        "i": 137,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-137",
+        "written_at": 1790092670.6757476
+      },
+      {
+        "i": 138,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-138",
+        "written_at": 1790092670.7333293
+      },
+      {
+        "i": 139,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-139",
+        "written_at": 1790092670.7909794
+      },
+      {
+        "i": 140,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-140",
+        "written_at": 1790092670.8490107
+      },
+      {
+        "i": 141,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-141",
+        "written_at": 1790092670.9069202
+      },
+      {
+        "i": 142,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-142",
+        "written_at": 1790092670.9647415
+      },
+      {
+        "i": 143,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-143",
+        "written_at": 1790092671.02248
+      },
+      {
+        "i": 144,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-144",
+        "written_at": 1790092671.0800676
+      },
+      {
+        "i": 145,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-145",
+        "written_at": 1790092671.1376545
+      },
+      {
+        "i": 146,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-146",
+        "written_at": 1790092671.195104
+      },
+      {
+        "i": 147,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-147",
+        "written_at": 1790092671.253561
+      },
+      {
+        "i": 148,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-148",
+        "written_at": 1790092671.3129537
+      },
+      {
+        "i": 149,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-149",
+        "written_at": 1790092671.3711903
+      },
+      {
+        "i": 150,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-150",
+        "written_at": 1790092671.4292173
+      },
+      {
+        "i": 151,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-151",
+        "written_at": 1790092671.495719
+      },
+      {
+        "i": 152,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-152",
+        "written_at": 1790092671.5812066
+      },
+      {
+        "i": 153,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-153",
+        "written_at": 1790092671.6573174
+      },
+      {
+        "i": 154,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-154",
+        "written_at": 1790092671.7333155
+      },
+      {
+        "i": 155,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-155",
+        "written_at": 1790092671.8091335
+      },
+      {
+        "i": 156,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-156",
+        "written_at": 1790092671.8855288
+      },
+      {
+        "i": 157,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-157",
+        "written_at": 1790092671.9609025
+      },
+      {
+        "i": 158,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-158",
+        "written_at": 1790092672.036023
+      },
+      {
+        "i": 159,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-159",
+        "written_at": 1790092672.1119173
+      },
+      {
+        "i": 160,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-160",
+        "written_at": 1790092672.170044
+      },
+      {
+        "i": 161,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-161",
+        "written_at": 1790092672.228496
+      },
+      {
+        "i": 162,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-162",
+        "written_at": 1790092672.2867866
+      },
+      {
+        "i": 163,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-163",
+        "written_at": 1790092672.344898
+      },
+      {
+        "i": 164,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-164",
+        "written_at": 1790092672.4030073
+      },
+      {
+        "i": 165,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-165",
+        "written_at": 1790092672.4608912
+      },
+      {
+        "i": 166,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-166",
+        "written_at": 1790092672.5191915
+      },
+      {
+        "i": 167,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-167",
+        "written_at": 1790092672.5771072
+      },
+      {
+        "i": 168,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-168",
+        "written_at": 1790092672.6349018
+      },
+      {
+        "i": 169,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-169",
+        "written_at": 1790092672.6988997
+      },
+      {
+        "i": 170,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-170",
+        "written_at": 1790092672.7567842
+      },
+      {
+        "i": 171,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-171",
+        "written_at": 1790092672.8150601
+      },
+      {
+        "i": 172,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-172",
+        "written_at": 1790092672.8732183
+      },
+      {
+        "i": 173,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-173",
+        "written_at": 1790092672.931322
+      },
+      {
+        "i": 174,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-174",
+        "written_at": 1790092672.989244
+      },
+      {
+        "i": 175,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-175",
+        "written_at": 1790092673.0471034
+      },
+      {
+        "i": 176,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-176",
+        "written_at": 1790092673.1046114
+      },
+      {
+        "i": 177,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-177",
+        "written_at": 1790092673.1623728
+      },
+      {
+        "i": 178,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-178",
+        "written_at": 1790092673.2201195
+      },
+      {
+        "i": 179,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-179",
+        "written_at": 1790092673.278503
+      },
+      {
+        "i": 180,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-180",
+        "written_at": 1790092673.3362935
+      },
+      {
+        "i": 181,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-181",
+        "written_at": 1790092673.3939724
+      },
+      {
+        "i": 182,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-182",
+        "written_at": 1790092673.4516003
+      },
+      {
+        "i": 183,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-183",
+        "written_at": 1790092673.5100882
+      },
+      {
+        "i": 184,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-184",
+        "written_at": 1790092673.5682533
+      },
+      {
+        "i": 185,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-185",
+        "written_at": 1790092673.6262598
+      },
+      {
+        "i": 186,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-186",
+        "written_at": 1790092673.6845477
+      },
+      {
+        "i": 187,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-187",
+        "written_at": 1790092673.7427428
+      },
+      {
+        "i": 188,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-188",
+        "written_at": 1790092673.8006434
+      },
+      {
+        "i": 189,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-189",
+        "written_at": 1790092673.85864
+      },
+      {
+        "i": 190,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-190",
+        "written_at": 1790092673.9162836
+      },
+      {
+        "i": 191,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-191",
+        "written_at": 1790092673.9738595
+      },
+      {
+        "i": 192,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-192",
+        "written_at": 1790092674.031303
+      },
+      {
+        "i": 193,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-193",
+        "written_at": 1790092674.088872
+      },
+      {
+        "i": 194,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-194",
+        "written_at": 1790092674.1465027
+      },
+      {
+        "i": 195,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-195",
+        "written_at": 1790092674.2041564
+      },
+      {
+        "i": 196,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-196",
+        "written_at": 1790092674.2628474
+      },
+      {
+        "i": 197,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-197",
+        "written_at": 1790092674.3210702
+      },
+      {
+        "i": 198,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-198",
+        "written_at": 1790092674.3790135
+      },
+      {
+        "i": 199,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-199",
+        "written_at": 1790092674.4368057
+      },
+      {
+        "i": 200,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-200",
+        "written_at": 1790092674.4952886
+      },
+      {
+        "i": 201,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-201",
+        "written_at": 1790092674.5538044
+      },
+      {
+        "i": 202,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-202",
+        "written_at": 1790092674.611921
+      },
+      {
+        "i": 203,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-203",
+        "written_at": 1790092674.6700048
+      },
+      {
+        "i": 204,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-204",
+        "written_at": 1790092674.7282736
+      },
+      {
+        "i": 205,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-205",
+        "written_at": 1790092674.7867663
+      },
+      {
+        "i": 206,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-206",
+        "written_at": 1790092674.844796
+      },
+      {
+        "i": 207,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-207",
+        "written_at": 1790092674.902941
+      },
+      {
+        "i": 208,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-208",
+        "written_at": 1790092674.961243
+      },
+      {
+        "i": 209,
+        "path": "/home/ubuntu/cbench/mnt/bench-plain/vis/vis-209",
+        "written_at": 1790092675.0191228
+      }
+    ],
+    "mode": "visibility_write",
+    "node": "a",
+    "threads": 1
+  },
+  "poller_results": {
+    "b": {
+      "p50_ms": 16240.605354309082,
+      "p90_ms": 20335.17622947693,
+      "p99_ms": 21245.43571472168,
+      "max_ms": 21340.6183719635,
+      "mean_ms": 16592.71577312833,
+      "samples": 210,
+      "timeouts": 0,
+      "raw": [
+        {
+          "i": 0,
+          "latency_s": 21.3406183719635
+        },
+        {
+          "i": 1,
+          "latency_s": 21.293693780899048
+        },
+        {
+          "i": 2,
+          "latency_s": 21.24543571472168
+        },
+        {
+          "i": 3,
+          "latency_s": 21.169952392578125
+        },
+        {
+          "i": 4,
+          "latency_s": 21.09830117225647
+        },
+        {
+          "i": 5,
+          "latency_s": 21.05176854133606
+        },
+        {
+          "i": 6,
+          "latency_s": 21.007365942001343
+        },
+        {
+          "i": 7,
+          "latency_s": 20.956359386444092
+        },
+        {
+          "i": 8,
+          "latency_s": 20.911049604415894
+        },
+        {
+          "i": 9,
+          "latency_s": 20.869529247283936
+        },
+        {
+          "i": 10,
+          "latency_s": 20.81501841545105
+        },
+        {
+          "i": 11,
+          "latency_s": 20.76764464378357
+        },
+        {
+          "i": 12,
+          "latency_s": 20.721118927001953
+        },
+        {
+          "i": 13,
+          "latency_s": 20.672415494918823
+        },
+        {
+          "i": 14,
+          "latency_s": 20.629493474960327
+        },
+        {
+          "i": 15,
+          "latency_s": 20.577965259552002
+        },
+        {
+          "i": 16,
+          "latency_s": 20.541120767593384
+        },
+        {
+          "i": 17,
+          "latency_s": 20.495446920394897
+        },
+        {
+          "i": 18,
+          "latency_s": 20.451907634735107
+        },
+        {
+          "i": 19,
+          "latency_s": 20.40681791305542
+        },
+        {
+          "i": 20,
+          "latency_s": 20.33517622947693
+        },
+        {
+          "i": 21,
+          "latency_s": 20.257997751235962
+        },
+        {
+          "i": 22,
+          "latency_s": 20.18083620071411
+        },
+        {
+          "i": 23,
+          "latency_s": 20.146721601486206
+        },
+        {
+          "i": 24,
+          "latency_s": 20.098210334777832
+        },
+        {
+          "i": 25,
+          "latency_s": 20.05043911933899
+        },
+        {
+          "i": 26,
+          "latency_s": 20.003052234649658
+        },
+        {
+          "i": 27,
+          "latency_s": 19.956939458847046
+        },
+        {
+          "i": 28,
+          "latency_s": 19.91892099380493
+        },
+        {
+          "i": 29,
+          "latency_s": 19.865631341934204
+        },
+        {
+          "i": 30,
+          "latency_s": 19.8224937915802
+        },
+        {
+          "i": 31,
+          "latency_s": 19.750879287719727
+        },
+        {
+          "i": 32,
+          "latency_s": 19.674156188964844
+        },
+        {
+          "i": 33,
+          "latency_s": 19.60025382041931
+        },
+        {
+          "i": 34,
+          "latency_s": 19.545854806900024
+        },
+        {
+          "i": 35,
+          "latency_s": 19.49311065673828
+        },
+        {
+          "i": 36,
+          "latency_s": 19.43259859085083
+        },
+        {
+          "i": 37,
+          "latency_s": 19.351634979248047
+        },
+        {
+          "i": 38,
+          "latency_s": 19.28026247024536
+        },
+        {
+          "i": 39,
+          "latency_s": 19.208486557006836
+        },
+        {
+          "i": 40,
+          "latency_s": 19.135669231414795
+        },
+        {
+          "i": 41,
+          "latency_s": 19.063672304153442
+        },
+        {
+          "i": 42,
+          "latency_s": 19.016257286071777
+        },
+        {
+          "i": 43,
+          "latency_s": 18.972614765167236
+        },
+        {
+          "i": 44,
+          "latency_s": 18.929558753967285
+        },
+        {
+          "i": 45,
+          "latency_s": 18.88427233695984
+        },
+        {
+          "i": 46,
+          "latency_s": 18.826144695281982
+        },
+        {
+          "i": 47,
+          "latency_s": 18.781325101852417
+        },
+        {
+          "i": 48,
+          "latency_s": 18.73432683944702
+        },
+        {
+          "i": 49,
+          "latency_s": 18.662731647491455
+        },
+        {
+          "i": 50,
+          "latency_s": 18.590296030044556
+        },
+        {
+          "i": 51,
+          "latency_s": 18.51884937286377
+        },
+        {
+          "i": 52,
+          "latency_s": 18.44703984260559
+        },
+        {
+          "i": 53,
+          "latency_s": 18.374398469924927
+        },
+        {
+          "i": 54,
+          "latency_s": 18.32712721824646
+        },
+        {
+          "i": 55,
+          "latency_s": 18.279441118240356
+        },
+        {
+          "i": 56,
+          "latency_s": 18.231379508972168
+        },
+        {
+          "i": 57,
+          "latency_s": 18.18362808227539
+        },
+        {
+          "i": 58,
+          "latency_s": 18.13056778907776
+        },
+        {
+          "i": 59,
+          "latency_s": 18.087002515792847
+        },
+        {
+          "i": 60,
+          "latency_s": 18.04239058494568
+        },
+        {
+          "i": 61,
+          "latency_s": 17.988763332366943
+        },
+        {
+          "i": 62,
+          "latency_s": 17.917731285095215
+        },
+        {
+          "i": 63,
+          "latency_s": 17.847824811935425
+        },
+        {
+          "i": 64,
+          "latency_s": 17.80147957801819
+        },
+        {
+          "i": 65,
+          "latency_s": 17.754338026046753
+        },
+        {
+          "i": 66,
+          "latency_s": 17.705425024032593
+        },
+        {
+          "i": 67,
+          "latency_s": 17.65043354034424
+        },
+        {
+          "i": 68,
+          "latency_s": 17.623410940170288
+        },
+        {
+          "i": 69,
+          "latency_s": 17.592874765396118
+        },
+        {
+          "i": 70,
+          "latency_s": 17.56454634666443
+        },
+        {
+          "i": 71,
+          "latency_s": 17.53374481201172
+        },
+        {
+          "i": 72,
+          "latency_s": 17.497300386428833
+        },
+        {
+          "i": 73,
+          "latency_s": 17.465189218521118
+        },
+        {
+          "i": 74,
+          "latency_s": 17.436668395996094
+        },
+        {
+          "i": 75,
+          "latency_s": 17.404282569885254
+        },
+        {
+          "i": 76,
+          "latency_s": 17.370997667312622
+        },
+        {
+          "i": 77,
+          "latency_s": 17.34613609313965
+        },
+        {
+          "i": 78,
+          "latency_s": 17.315902948379517
+        },
+        {
+          "i": 79,
+          "latency_s": 17.29218816757202
+        },
+        {
+          "i": 80,
+          "latency_s": 17.26457667350769
+        },
+        {
+          "i": 81,
+          "latency_s": 17.23644995689392
+        },
+        {
+          "i": 82,
+          "latency_s": 17.208468198776245
+        },
+        {
+          "i": 83,
+          "latency_s": 17.182076930999756
+        },
+        {
+          "i": 84,
+          "latency_s": 17.151708602905273
+        },
+        {
+          "i": 85,
+          "latency_s": 17.12811303138733
+        },
+        {
+          "i": 86,
+          "latency_s": 17.098363637924194
+        },
+        {
+          "i": 87,
+          "latency_s": 17.071487426757812
+        },
+        {
+          "i": 88,
+          "latency_s": 17.04433798789978
+        },
+        {
+          "i": 89,
+          "latency_s": 16.991519927978516
+        },
+        {
+          "i": 90,
+          "latency_s": 16.933837890625
+        },
+        {
+          "i": 91,
+          "latency_s": 16.876283884048462
+        },
+        {
+          "i": 92,
+          "latency_s": 16.818851947784424
+        },
+        {
+          "i": 93,
+          "latency_s": 16.761619567871094
+        },
+        {
+          "i": 94,
+          "latency_s": 16.704130172729492
+        },
+        {
+          "i": 95,
+          "latency_s": 16.645569562911987
+        },
+        {
+          "i": 96,
+          "latency_s": 16.58758544921875
+        },
+        {
+          "i": 97,
+          "latency_s": 16.529430866241455
+        },
+        {
+          "i": 98,
+          "latency_s": 16.471619844436646
+        },
+        {
+          "i": 99,
+          "latency_s": 16.41377067565918
+        },
+        {
+          "i": 100,
+          "latency_s": 16.35986638069153
+        },
+        {
+          "i": 101,
+          "latency_s": 16.340575456619263
+        },
+        {
+          "i": 102,
+          "latency_s": 16.309580326080322
+        },
+        {
+          "i": 103,
+          "latency_s": 16.27221155166626
+        },
+        {
+          "i": 104,
+          "latency_s": 16.240605354309082
+        },
+        {
+          "i": 105,
+          "latency_s": 16.212629318237305
+        },
+        {
+          "i": 106,
+          "latency_s": 16.184257745742798
+        },
+        {
+          "i": 107,
+          "latency_s": 16.15300226211548
+        },
+        {
+          "i": 108,
+          "latency_s": 16.12401795387268
+        },
+        {
+          "i": 109,
+          "latency_s": 16.09087061882019
+        },
+        {
+          "i": 110,
+          "latency_s": 16.06048083305359
+        },
+        {
+          "i": 111,
+          "latency_s": 16.034995317459106
+        },
+        {
+          "i": 112,
+          "latency_s": 15.999239683151245
+        },
+        {
+          "i": 113,
+          "latency_s": 15.973175764083862
+        },
+        {
+          "i": 114,
+          "latency_s": 15.938913106918335
+        },
+        {
+          "i": 115,
+          "latency_s": 15.913162469863892
+        },
+        {
+          "i": 116,
+          "latency_s": 15.885515689849854
+        },
+        {
+          "i": 117,
+          "latency_s": 15.85643458366394
+        },
+        {
+          "i": 118,
+          "latency_s": 15.828754663467407
+        },
+        {
+          "i": 119,
+          "latency_s": 15.790292978286743
+        },
+        {
+          "i": 120,
+          "latency_s": 15.75761342048645
+        },
+        {
+          "i": 121,
+          "latency_s": 15.731048822402954
+        },
+        {
+          "i": 122,
+          "latency_s": 15.69559621810913
+        },
+        {
+          "i": 123,
+          "latency_s": 15.663544178009033
+        },
+        {
+          "i": 124,
+          "latency_s": 15.635809659957886
+        },
+        {
+          "i": 125,
+          "latency_s": 15.602052688598633
+        },
+        {
+          "i": 126,
+          "latency_s": 15.575564622879028
+        },
+        {
+          "i": 127,
+          "latency_s": 15.5441153049469
+        },
+        {
+          "i": 128,
+          "latency_s": 15.518316507339478
+        },
+        {
+          "i": 129,
+          "latency_s": 15.487044334411621
+        },
+        {
+          "i": 130,
+          "latency_s": 15.459367036819458
+        },
+        {
+          "i": 131,
+          "latency_s": 15.418920755386353
+        },
+        {
+          "i": 132,
+          "latency_s": 15.396113395690918
+        },
+        {
+          "i": 133,
+          "latency_s": 15.36904239654541
+        },
+        {
+          "i": 134,
+          "latency_s": 15.336300373077393
+        },
+        {
+          "i": 135,
+          "latency_s": 15.310096979141235
+        },
+        {
+          "i": 136,
+          "latency_s": 15.27687406539917
+        },
+        {
+          "i": 137,
+          "latency_s": 15.240246772766113
+        },
+        {
+          "i": 138,
+          "latency_s": 15.208574533462524
+        },
+        {
+          "i": 139,
+          "latency_s": 15.177412748336792
+        },
+        {
+          "i": 140,
+          "latency_s": 15.142857313156128
+        },
+        {
+          "i": 141,
+          "latency_s": 15.113380908966064
+        },
+        {
+          "i": 142,
+          "latency_s": 15.082024812698364
+        },
+        {
+          "i": 143,
+          "latency_s": 15.053206205368042
+        },
+        {
+          "i": 144,
+          "latency_s": 15.019927501678467
+        },
+        {
+          "i": 145,
+          "latency_s": 14.990585803985596
+        },
+        {
+          "i": 146,
+          "latency_s": 14.95777702331543
+        },
+        {
+          "i": 147,
+          "latency_s": 14.928673028945923
+        },
+        {
+          "i": 148,
+          "latency_s": 14.895262002944946
+        },
+        {
+          "i": 149,
+          "latency_s": 14.864810943603516
+        },
+        {
+          "i": 150,
+          "latency_s": 14.833211183547974
+        },
+        {
+          "i": 151,
+          "latency_s": 14.793379068374634
+        },
+        {
+          "i": 152,
+          "latency_s": 14.734501838684082
+        },
+        {
+          "i": 153,
+          "latency_s": 14.687682867050171
+        },
+        {
+          "i": 154,
+          "latency_s": 14.63828706741333
+        },
+        {
+          "i": 155,
+          "latency_s": 14.592615365982056
+        },
+        {
+          "i": 156,
+          "latency_s": 14.545654058456421
+        },
+        {
+          "i": 157,
+          "latency_s": 14.499025821685791
+        },
+        {
+          "i": 158,
+          "latency_s": 14.450735807418823
+        },
+        {
+          "i": 159,
+          "latency_s": 14.403310298919678
+        },
+        {
+          "i": 160,
+          "latency_s": 14.37030291557312
+        },
+        {
+          "i": 161,
+          "latency_s": 14.3414466381073
+        },
+        {
+          "i": 162,
+          "latency_s": 14.312350749969482
+        },
+        {
+          "i": 163,
+          "latency_s": 14.280695676803589
+        },
+        {
+          "i": 164,
+          "latency_s": 14.25161600112915
+        },
+        {
+          "i": 165,
+          "latency_s": 14.22248101234436
+        },
+        {
+          "i": 166,
+          "latency_s": 14.192132234573364
+        },
+        {
+          "i": 167,
+          "latency_s": 14.159317255020142
+        },
+        {
+          "i": 168,
+          "latency_s": 14.129231452941895
+        },
+        {
+          "i": 169,
+          "latency_s": 14.093338251113892
+        },
+        {
+          "i": 170,
+          "latency_s": 14.062370777130127
+        },
+        {
+          "i": 171,
+          "latency_s": 14.03406047821045
+        },
+        {
+          "i": 172,
+          "latency_s": 14.007167339324951
+        },
+        {
+          "i": 173,
+          "latency_s": 13.975900888442993
+        },
+        {
+          "i": 174,
+          "latency_s": 13.944159746170044
+        },
+        {
+          "i": 175,
+          "latency_s": 13.915595293045044
+        },
+        {
+          "i": 176,
+          "latency_s": 13.884926557540894
+        },
+        {
+          "i": 177,
+          "latency_s": 13.854093790054321
+        },
+        {
+          "i": 178,
+          "latency_s": 13.825154542922974
+        },
+        {
+          "i": 179,
+          "latency_s": 13.792934656143188
+        },
+        {
+          "i": 180,
+          "latency_s": 13.76309847831726
+        },
+        {
+          "i": 181,
+          "latency_s": 13.735477924346924
+        },
+        {
+          "i": 182,
+          "latency_s": 13.706543445587158
+        },
+        {
+          "i": 183,
+          "latency_s": 13.678241729736328
+        },
+        {
+          "i": 184,
+          "latency_s": 13.649124145507812
+        },
+        {
+          "i": 185,
+          "latency_s": 13.622539758682251
+        },
+        {
+          "i": 186,
+          "latency_s": 13.59637975692749
+        },
+        {
+          "i": 187,
+          "latency_s": 13.565398216247559
+        },
+        {
+          "i": 188,
+          "latency_s": 13.538139581680298
+        },
+        {
+          "i": 189,
+          "latency_s": 13.507678031921387
+        },
+        {
+          "i": 190,
+          "latency_s": 13.478971481323242
+        },
+        {
+          "i": 191,
+          "latency_s": 13.44961404800415
+        },
+        {
+          "i": 192,
+          "latency_s": 13.419919490814209
+        },
+        {
+          "i": 193,
+          "latency_s": 13.391122817993164
+        },
+        {
+          "i": 194,
+          "latency_s": 13.360337018966675
+        },
+        {
+          "i": 195,
+          "latency_s": 13.329723358154297
+        },
+        {
+          "i": 196,
+          "latency_s": 13.299180269241333
+        },
+        {
+          "i": 197,
+          "latency_s": 13.267844200134277
+        },
+        {
+          "i": 198,
+          "latency_s": 13.23816466331482
+        },
+        {
+          "i": 199,
+          "latency_s": 13.206051588058472
+        },
+        {
+          "i": 200,
+          "latency_s": 13.174453973770142
+        },
+        {
+          "i": 201,
+          "latency_s": 13.144334554672241
+        },
+        {
+          "i": 202,
+          "latency_s": 13.111665725708008
+        },
+        {
+          "i": 203,
+          "latency_s": 13.083323955535889
+        },
+        {
+          "i": 204,
+          "latency_s": 13.051722764968872
+        },
+        {
+          "i": 205,
+          "latency_s": 13.020920276641846
+        },
+        {
+          "i": 206,
+          "latency_s": 12.99242639541626
+        },
+        {
+          "i": 207,
+          "latency_s": 12.962507247924805
+        },
+        {
+          "i": 208,
+          "latency_s": 12.930164098739624
+        },
+        {
+          "i": 209,
+          "latency_s": 12.9024076461792
+        }
+      ],
+      "mode": "visibility_poll",
+      "node": "b",
+      "threads": 1
+    },
+    "c": {
+      "p50_ms": 16190.702676773071,
+      "p90_ms": 20301.323413848877,
+      "p99_ms": 21276.830196380615,
+      "max_ms": 21356.412410736084,
+      "mean_ms": 16535.817517553056,
+      "samples": 210,
+      "timeouts": 0,
+      "raw": [
+        {
+          "i": 0,
+          "latency_s": 21.356412410736084
+        },
+        {
+          "i": 1,
+          "latency_s": 21.32547664642334
+        },
+        {
+          "i": 2,
+          "latency_s": 21.276830196380615
+        },
+        {
+          "i": 3,
+          "latency_s": 21.20135521888733
+        },
+        {
+          "i": 4,
+          "latency_s": 21.200189352035522
+        },
+        {
+          "i": 5,
+          "latency_s": 21.149202585220337
+        },
+        {
+          "i": 6,
+          "latency_s": 21.077977180480957
+        },
+        {
+          "i": 7,
+          "latency_s": 21.034021139144897
+        },
+        {
+          "i": 8,
+          "latency_s": 20.978909254074097
+        },
+        {
+          "i": 9,
+          "latency_s": 20.929698944091797
+        },
+        {
+          "i": 10,
+          "latency_s": 20.87304949760437
+        },
+        {
+          "i": 11,
+          "latency_s": 20.82715940475464
+        },
+        {
+          "i": 12,
+          "latency_s": 20.778371572494507
+        },
+        {
+          "i": 13,
+          "latency_s": 20.707165002822876
+        },
+        {
+          "i": 14,
+          "latency_s": 20.63581609725952
+        },
+        {
+          "i": 15,
+          "latency_s": 20.589237689971924
+        },
+        {
+          "i": 16,
+          "latency_s": 20.543729066848755
+        },
+        {
+          "i": 17,
+          "latency_s": 20.47327709197998
+        },
+        {
+          "i": 18,
+          "latency_s": 20.402714014053345
+        },
+        {
+          "i": 19,
+          "latency_s": 20.351160287857056
+        },
+        {
+          "i": 20,
+          "latency_s": 20.301323413848877
+        },
+        {
+          "i": 21,
+          "latency_s": 20.224937438964844
+        },
+        {
+          "i": 22,
+          "latency_s": 20.14827799797058
+        },
+        {
+          "i": 23,
+          "latency_s": 20.09390902519226
+        },
+        {
+          "i": 24,
+          "latency_s": 20.057616233825684
+        },
+        {
+          "i": 25,
+          "latency_s": 19.987037658691406
+        },
+        {
+          "i": 26,
+          "latency_s": 19.915103673934937
+        },
+        {
+          "i": 27,
+          "latency_s": 19.843523740768433
+        },
+        {
+          "i": 28,
+          "latency_s": 19.77186679840088
+        },
+        {
+          "i": 29,
+          "latency_s": 19.700053930282593
+        },
+        {
+          "i": 30,
+          "latency_s": 19.628024101257324
+        },
+        {
+          "i": 31,
+          "latency_s": 19.55645251274109
+        },
+        {
+          "i": 32,
+          "latency_s": 19.481316566467285
+        },
+        {
+          "i": 33,
+          "latency_s": 19.408138036727905
+        },
+        {
+          "i": 34,
+          "latency_s": 19.354259729385376
+        },
+        {
+          "i": 35,
+          "latency_s": 19.30216646194458
+        },
+        {
+          "i": 36,
+          "latency_s": 19.2727530002594
+        },
+        {
+          "i": 37,
+          "latency_s": 19.217198371887207
+        },
+        {
+          "i": 38,
+          "latency_s": 19.165391445159912
+        },
+        {
+          "i": 39,
+          "latency_s": 19.094127893447876
+        },
+        {
+          "i": 40,
+          "latency_s": 19.0215482711792
+        },
+        {
+          "i": 41,
+          "latency_s": 18.977954149246216
+        },
+        {
+          "i": 42,
+          "latency_s": 18.92967414855957
+        },
+        {
+          "i": 43,
+          "latency_s": 18.88317632675171
+        },
+        {
+          "i": 44,
+          "latency_s": 18.812462329864502
+        },
+        {
+          "i": 45,
+          "latency_s": 18.763065576553345
+        },
+        {
+          "i": 46,
+          "latency_s": 18.711814880371094
+        },
+        {
+          "i": 47,
+          "latency_s": 18.63355803489685
+        },
+        {
+          "i": 48,
+          "latency_s": 18.56273651123047
+        },
+        {
+          "i": 49,
+          "latency_s": 18.491615533828735
+        },
+        {
+          "i": 50,
+          "latency_s": 18.44960308074951
+        },
+        {
+          "i": 51,
+          "latency_s": 18.39836835861206
+        },
+        {
+          "i": 52,
+          "latency_s": 18.349711179733276
+        },
+        {
+          "i": 53,
+          "latency_s": 18.310852527618408
+        },
+        {
+          "i": 54,
+          "latency_s": 18.2616446018219
+        },
+        {
+          "i": 55,
+          "latency_s": 18.21844172477722
+        },
+        {
+          "i": 56,
+          "latency_s": 18.170320510864258
+        },
+        {
+          "i": 57,
+          "latency_s": 18.11808156967163
+        },
+        {
+          "i": 58,
+          "latency_s": 18.066417455673218
+        },
+        {
+          "i": 59,
+          "latency_s": 18.025699853897095
+        },
+        {
+          "i": 60,
+          "latency_s": 17.976219654083252
+        },
+        {
+          "i": 61,
+          "latency_s": 17.925431489944458
+        },
+        {
+          "i": 62,
+          "latency_s": 17.878310918807983
+        },
+        {
+          "i": 63,
+          "latency_s": 17.809287548065186
+        },
+        {
+          "i": 64,
+          "latency_s": 17.76074528694153
+        },
+        {
+          "i": 65,
+          "latency_s": 17.706915378570557
+        },
+        {
+          "i": 66,
+          "latency_s": 17.661537408828735
+        },
+        {
+          "i": 67,
+          "latency_s": 17.609326362609863
+        },
+        {
+          "i": 68,
+          "latency_s": 17.580299854278564
+        },
+        {
+          "i": 69,
+          "latency_s": 17.553464651107788
+        },
+        {
+          "i": 70,
+          "latency_s": 17.523693323135376
+        },
+        {
+          "i": 71,
+          "latency_s": 17.487592935562134
+        },
+        {
+          "i": 72,
+          "latency_s": 17.45756435394287
+        },
+        {
+          "i": 73,
+          "latency_s": 17.42649817466736
+        },
+        {
+          "i": 74,
+          "latency_s": 17.40010690689087
+        },
+        {
+          "i": 75,
+          "latency_s": 17.36716103553772
+        },
+        {
+          "i": 76,
+          "latency_s": 17.339653491973877
+        },
+        {
+          "i": 77,
+          "latency_s": 17.311153173446655
+        },
+        {
+          "i": 78,
+          "latency_s": 17.281132459640503
+        },
+        {
+          "i": 79,
+          "latency_s": 17.24477219581604
+        },
+        {
+          "i": 80,
+          "latency_s": 17.215418100357056
+        },
+        {
+          "i": 81,
+          "latency_s": 17.182353973388672
+        },
+        {
+          "i": 82,
+          "latency_s": 17.15071392059326
+        },
+        {
+          "i": 83,
+          "latency_s": 17.109392166137695
+        },
+        {
+          "i": 84,
+          "latency_s": 17.071589708328247
+        },
+        {
+          "i": 85,
+          "latency_s": 17.0347638130188
+        },
+        {
+          "i": 86,
+          "latency_s": 17.00097393989563
+        },
+        {
+          "i": 87,
+          "latency_s": 16.96835684776306
+        },
+        {
+          "i": 88,
+          "latency_s": 16.940704584121704
+        },
+        {
+          "i": 89,
+          "latency_s": 16.91145396232605
+        },
+        {
+          "i": 90,
+          "latency_s": 16.85375213623047
+        },
+        {
+          "i": 91,
+          "latency_s": 16.796188831329346
+        },
+        {
+          "i": 92,
+          "latency_s": 16.73872971534729
+        },
+        {
+          "i": 93,
+          "latency_s": 16.681464910507202
+        },
+        {
+          "i": 94,
+          "latency_s": 16.623957872390747
+        },
+        {
+          "i": 95,
+          "latency_s": 16.56539797782898
+        },
+        {
+          "i": 96,
+          "latency_s": 16.507404088974
+        },
+        {
+          "i": 97,
+          "latency_s": 16.4492609500885
+        },
+        {
+          "i": 98,
+          "latency_s": 16.391451835632324
+        },
+        {
+          "i": 99,
+          "latency_s": 16.33357071876526
+        },
+        {
+          "i": 100,
+          "latency_s": 16.30815815925598
+        },
+        {
+          "i": 101,
+          "latency_s": 16.279233932495117
+        },
+        {
+          "i": 102,
+          "latency_s": 16.25146985054016
+        },
+        {
+          "i": 103,
+          "latency_s": 16.21987795829773
+        },
+        {
+          "i": 104,
+          "latency_s": 16.19070267677307
+        },
+        {
+          "i": 105,
+          "latency_s": 16.16178250312805
+        },
+        {
+          "i": 106,
+          "latency_s": 16.136125087738037
+        },
+        {
+          "i": 107,
+          "latency_s": 16.100388050079346
+        },
+        {
+          "i": 108,
+          "latency_s": 16.06875514984131
+        },
+        {
+          "i": 109,
+          "latency_s": 16.04024887084961
+        },
+        {
+          "i": 110,
+          "latency_s": 15.999496936798096
+        },
+        {
+          "i": 111,
+          "latency_s": 15.971436500549316
+        },
+        {
+          "i": 112,
+          "latency_s": 15.939043998718262
+        },
+        {
+          "i": 113,
+          "latency_s": 15.913600206375122
+        },
+        {
+          "i": 114,
+          "latency_s": 15.886787414550781
+        },
+        {
+          "i": 115,
+          "latency_s": 15.857171297073364
+        },
+        {
+          "i": 116,
+          "latency_s": 15.827622175216675
+        },
+        {
+          "i": 117,
+          "latency_s": 15.792218685150146
+        },
+        {
+          "i": 118,
+          "latency_s": 15.76270604133606
+        },
+        {
+          "i": 119,
+          "latency_s": 15.73279619216919
+        },
+        {
+          "i": 120,
+          "latency_s": 15.705307722091675
+        },
+        {
+          "i": 121,
+          "latency_s": 15.671851873397827
+        },
+        {
+          "i": 122,
+          "latency_s": 15.643483638763428
+        },
+        {
+          "i": 123,
+          "latency_s": 15.612069368362427
+        },
+        {
+          "i": 124,
+          "latency_s": 15.582415103912354
+        },
+        {
+          "i": 125,
+          "latency_s": 15.548570156097412
+        },
+        {
+          "i": 126,
+          "latency_s": 15.519606351852417
+        },
+        {
+          "i": 127,
+          "latency_s": 15.491096496582031
+        },
+        {
+          "i": 128,
+          "latency_s": 15.466609716415405
+        },
+        {
+          "i": 129,
+          "latency_s": 15.438552379608154
+        },
+        {
+          "i": 130,
+          "latency_s": 15.411292314529419
+        },
+        {
+          "i": 131,
+          "latency_s": 15.380131959915161
+        },
+        {
+          "i": 132,
+          "latency_s": 15.347625494003296
+        },
+        {
+          "i": 133,
+          "latency_s": 15.319817543029785
+        },
+        {
+          "i": 134,
+          "latency_s": 15.286572694778442
+        },
+        {
+          "i": 135,
+          "latency_s": 15.254832029342651
+        },
+        {
+          "i": 136,
+          "latency_s": 15.218395709991455
+        },
+        {
+          "i": 137,
+          "latency_s": 15.188082933425903
+        },
+        {
+          "i": 138,
+          "latency_s": 15.159842252731323
+        },
+        {
+          "i": 139,
+          "latency_s": 15.130274057388306
+        },
+        {
+          "i": 140,
+          "latency_s": 15.10396933555603
+        },
+        {
+          "i": 141,
+          "latency_s": 15.074333906173706
+        },
+        {
+          "i": 142,
+          "latency_s": 15.042298555374146
+        },
+        {
+          "i": 143,
+          "latency_s": 15.013280153274536
+        },
+        {
+          "i": 144,
+          "latency_s": 14.985358953475952
+        },
+        {
+          "i": 145,
+          "latency_s": 14.951705932617188
+        },
+        {
+          "i": 146,
+          "latency_s": 14.919504642486572
+        },
+        {
+          "i": 147,
+          "latency_s": 14.891016244888306
+        },
+        {
+          "i": 148,
+          "latency_s": 14.86123776435852
+        },
+        {
+          "i": 149,
+          "latency_s": 14.832533121109009
+        },
+        {
+          "i": 150,
+          "latency_s": 14.799913883209229
+        },
+        {
+          "i": 151,
+          "latency_s": 14.763469219207764
+        },
+        {
+          "i": 152,
+          "latency_s": 14.703713655471802
+        },
+        {
+          "i": 153,
+          "latency_s": 14.652893781661987
+        },
+        {
+          "i": 154,
+          "latency_s": 14.604646682739258
+        },
+        {
+          "i": 155,
+          "latency_s": 14.55673098564148
+        },
+        {
+          "i": 156,
+          "latency_s": 14.509536266326904
+        },
+        {
+          "i": 157,
+          "latency_s": 14.46068024635315
+        },
+        {
+          "i": 158,
+          "latency_s": 14.412039041519165
+        },
+        {
+          "i": 159,
+          "latency_s": 14.3661048412323
+        },
+        {
+          "i": 160,
+          "latency_s": 14.336698055267334
+        },
+        {
+          "i": 161,
+          "latency_s": 14.305622816085815
+        },
+        {
+          "i": 162,
+          "latency_s": 14.274820804595947
+        },
+        {
+          "i": 163,
+          "latency_s": 14.242689371109009
+        },
+        {
+          "i": 164,
+          "latency_s": 14.213701486587524
+        },
+        {
+          "i": 165,
+          "latency_s": 14.185880422592163
+        },
+        {
+          "i": 166,
+          "latency_s": 14.15312147140503
+        },
+        {
+          "i": 167,
+          "latency_s": 14.123487710952759
+        },
+        {
+          "i": 168,
+          "latency_s": 14.093820333480835
+        },
+        {
+          "i": 169,
+          "latency_s": 14.05597972869873
+        },
+        {
+          "i": 170,
+          "latency_s": 14.023898839950562
+        },
+        {
+          "i": 171,
+          "latency_s": 13.995554208755493
+        },
+        {
+          "i": 172,
+          "latency_s": 13.965984106063843
+        },
+        {
+          "i": 173,
+          "latency_s": 13.93677020072937
+        },
+        {
+          "i": 174,
+          "latency_s": 13.904197692871094
+        },
+        {
+          "i": 175,
+          "latency_s": 13.872148513793945
+        },
+        {
+          "i": 176,
+          "latency_s": 13.842878818511963
+        },
+        {
+          "i": 177,
+          "latency_s": 13.810636281967163
+        },
+        {
+          "i": 178,
+          "latency_s": 13.7767493724823
+        },
+        {
+          "i": 179,
+          "latency_s": 13.744790077209473
+        },
+        {
+          "i": 180,
+          "latency_s": 13.712323904037476
+        },
+        {
+          "i": 181,
+          "latency_s": 13.682436466217041
+        },
+        {
+          "i": 182,
+          "latency_s": 13.647887945175171
+        },
+        {
+          "i": 183,
+          "latency_s": 13.617449760437012
+        },
+        {
+          "i": 184,
+          "latency_s": 13.587533473968506
+        },
+        {
+          "i": 185,
+          "latency_s": 13.555104970932007
+        },
+        {
+          "i": 186,
+          "latency_s": 13.528854608535767
+        },
+        {
+          "i": 187,
+          "latency_s": 13.500380754470825
+        },
+        {
+          "i": 188,
+          "latency_s": 13.476865768432617
+        },
+        {
+          "i": 189,
+          "latency_s": 13.447788715362549
+        },
+        {
+          "i": 190,
+          "latency_s": 13.414235353469849
+        },
+        {
+          "i": 191,
+          "latency_s": 13.385112047195435
+        },
+        {
+          "i": 192,
+          "latency_s": 13.350155591964722
+        },
+        {
+          "i": 193,
+          "latency_s": 13.320799350738525
+        },
+        {
+          "i": 194,
+          "latency_s": 13.284954309463501
+        },
+        {
+          "i": 195,
+          "latency_s": 13.256018161773682
+        },
+        {
+          "i": 196,
+          "latency_s": 13.22557258605957
+        },
+        {
+          "i": 197,
+          "latency_s": 13.19406509399414
+        },
+        {
+          "i": 198,
+          "latency_s": 13.165436029434204
+        },
+        {
+          "i": 199,
+          "latency_s": 13.136049032211304
+        },
+        {
+          "i": 200,
+          "latency_s": 13.106802463531494
+        },
+        {
+          "i": 201,
+          "latency_s": 13.07856822013855
+        },
+        {
+          "i": 202,
+          "latency_s": 13.049296379089355
+        },
+        {
+          "i": 203,
+          "latency_s": 13.014244318008423
+        },
+        {
+          "i": 204,
+          "latency_s": 12.975988626480103
+        },
+        {
+          "i": 205,
+          "latency_s": 12.942803144454956
+        },
+        {
+          "i": 206,
+          "latency_s": 12.915428876876831
+        },
+        {
+          "i": 207,
+          "latency_s": 12.883727073669434
+        },
+        {
+          "i": 208,
+          "latency_s": 12.849079370498657
+        },
+        {
+          "i": 209,
+          "latency_s": 12.816523313522339
+        }
+      ],
+      "mode": "visibility_poll",
+      "node": "c",
+      "threads": 1
+    },
+    "d": {
+      "p50_ms": 15664.414882659912,
+      "p90_ms": 20006.516933441162,
+      "p99_ms": 21197.439908981323,
+      "max_ms": 21345.253705978394,
+      "mean_ms": 15526.43508229937,
+      "samples": 210,
+      "timeouts": 0,
+      "raw": [
+        {
+          "i": 0,
+          "latency_s": 21.345253705978394
+        },
+        {
+          "i": 1,
+          "latency_s": 21.26969265937805
+        },
+        {
+          "i": 2,
+          "latency_s": 21.197439908981323
+        },
+        {
+          "i": 3,
+          "latency_s": 21.125271558761597
+        },
+        {
+          "i": 4,
+          "latency_s": 21.053237915039062
+        },
+        {
+          "i": 5,
+          "latency_s": 20.98134422302246
+        },
+        {
+          "i": 6,
+          "latency_s": 20.90957498550415
+        },
+        {
+          "i": 7,
+          "latency_s": 20.837788820266724
+        },
+        {
+          "i": 8,
+          "latency_s": 20.764740705490112
+        },
+        {
+          "i": 9,
+          "latency_s": 20.745993614196777
+        },
+        {
+          "i": 10,
+          "latency_s": 20.672220468521118
+        },
+        {
+          "i": 11,
+          "latency_s": 20.59989309310913
+        },
+        {
+          "i": 12,
+          "latency_s": 20.52788758277893
+        },
+        {
+          "i": 13,
+          "latency_s": 20.455517053604126
+        },
+        {
+          "i": 14,
+          "latency_s": 20.383647441864014
+        },
+        {
+          "i": 15,
+          "latency_s": 20.311159372329712
+        },
+        {
+          "i": 16,
+          "latency_s": 20.239160299301147
+        },
+        {
+          "i": 17,
+          "latency_s": 20.167577743530273
+        },
+        {
+          "i": 18,
+          "latency_s": 20.096286296844482
+        },
+        {
+          "i": 19,
+          "latency_s": 20.078086376190186
+        },
+        {
+          "i": 20,
+          "latency_s": 20.006516933441162
+        },
+        {
+          "i": 21,
+          "latency_s": 19.92939567565918
+        },
+        {
+          "i": 22,
+          "latency_s": 19.852416038513184
+        },
+        {
+          "i": 23,
+          "latency_s": 19.78048014640808
+        },
+        {
+          "i": 24,
+          "latency_s": 19.716044187545776
+        },
+        {
+          "i": 25,
+          "latency_s": 19.644532203674316
+        },
+        {
+          "i": 26,
+          "latency_s": 19.57182025909424
+        },
+        {
+          "i": 27,
+          "latency_s": 19.56685209274292
+        },
+        {
+          "i": 28,
+          "latency_s": 19.49490761756897
+        },
+        {
+          "i": 29,
+          "latency_s": 19.422340869903564
+        },
+        {
+          "i": 30,
+          "latency_s": 19.349634408950806
+        },
+        {
+          "i": 31,
+          "latency_s": 19.2773756980896
+        },
+        {
+          "i": 32,
+          "latency_s": 19.20039939880371
+        },
+        {
+          "i": 33,
+          "latency_s": 19.126235485076904
+        },
+        {
+          "i": 34,
+          "latency_s": 19.07164192199707
+        },
+        {
+          "i": 35,
+          "latency_s": 19.018704175949097
+        },
+        {
+          "i": 36,
+          "latency_s": 18.957669258117676
+        },
+        {
+          "i": 37,
+          "latency_s": 18.876386404037476
+        },
+        {
+          "i": 38,
+          "latency_s": 18.80473279953003
+        },
+        {
+          "i": 39,
+          "latency_s": 18.775062799453735
+        },
+        {
+          "i": 40,
+          "latency_s": 18.72904634475708
+        },
+        {
+          "i": 41,
+          "latency_s": 18.684432983398438
+        },
+        {
+          "i": 42,
+          "latency_s": 18.63584542274475
+        },
+        {
+          "i": 43,
+          "latency_s": 18.587710857391357
+        },
+        {
+          "i": 44,
+          "latency_s": 18.539637565612793
+        },
+        {
+          "i": 45,
+          "latency_s": 18.49171280860901
+        },
+        {
+          "i": 46,
+          "latency_s": 18.445345878601074
+        },
+        {
+          "i": 47,
+          "latency_s": 18.39391279220581
+        },
+        {
+          "i": 48,
+          "latency_s": 18.353212594985962
+        },
+        {
+          "i": 49,
+          "latency_s": 18.308263063430786
+        },
+        {
+          "i": 50,
+          "latency_s": 18.265894174575806
+        },
+        {
+          "i": 51,
+          "latency_s": 18.21879506111145
+        },
+        {
+          "i": 52,
+          "latency_s": 18.174946069717407
+        },
+        {
+          "i": 53,
+          "latency_s": 18.131474256515503
+        },
+        {
+          "i": 54,
+          "latency_s": 18.087402820587158
+        },
+        {
+          "i": 55,
+          "latency_s": 18.045064687728882
+        },
+        {
+          "i": 56,
+          "latency_s": 18.000099897384644
+        },
+        {
+          "i": 57,
+          "latency_s": 17.95664954185486
+        },
+        {
+          "i": 58,
+          "latency_s": 17.90340304374695
+        },
+        {
+          "i": 59,
+          "latency_s": 17.858229160308838
+        },
+        {
+          "i": 60,
+          "latency_s": 17.815428495407104
+        },
+        {
+          "i": 61,
+          "latency_s": 17.769952058792114
+        },
+        {
+          "i": 62,
+          "latency_s": 17.88518714904785
+        },
+        {
+          "i": 63,
+          "latency_s": 17.861465215682983
+        },
+        {
+          "i": 64,
+          "latency_s": 17.82273840904236
+        },
+        {
+          "i": 65,
+          "latency_s": 17.785751819610596
+        },
+        {
+          "i": 66,
+          "latency_s": 17.756658792495728
+        },
+        {
+          "i": 67,
+          "latency_s": 17.68450355529785
+        },
+        {
+          "i": 68,
+          "latency_s": 17.630512714385986
+        },
+        {
+          "i": 69,
+          "latency_s": 17.57503056526184
+        },
+        {
+          "i": 70,
+          "latency_s": 17.521228075027466
+        },
+        {
+          "i": 71,
+          "latency_s": 17.466896772384644
+        },
+        {
+          "i": 72,
+          "latency_s": 17.413291931152344
+        },
+        {
+          "i": 73,
+          "latency_s": 17.359729766845703
+        },
+        {
+          "i": 74,
+          "latency_s": 17.306103944778442
+        },
+        {
+          "i": 75,
+          "latency_s": 17.25257921218872
+        },
+        {
+          "i": 76,
+          "latency_s": 17.1990168094635
+        },
+        {
+          "i": 77,
+          "latency_s": 17.145142316818237
+        },
+        {
+          "i": 78,
+          "latency_s": 17.090394020080566
+        },
+        {
+          "i": 79,
+          "latency_s": 17.03604245185852
+        },
+        {
+          "i": 80,
+          "latency_s": 16.982027769088745
+        },
+        {
+          "i": 81,
+          "latency_s": 16.92817211151123
+        },
+        {
+          "i": 82,
+          "latency_s": 16.8736572265625
+        },
+        {
+          "i": 83,
+          "latency_s": 16.819375038146973
+        },
+        {
+          "i": 84,
+          "latency_s": 16.765379667282104
+        },
+        {
+          "i": 85,
+          "latency_s": 16.71173071861267
+        },
+        {
+          "i": 86,
+          "latency_s": 16.6578106880188
+        },
+        {
+          "i": 87,
+          "latency_s": 16.604172468185425
+        },
+        {
+          "i": 88,
+          "latency_s": 16.55029559135437
+        },
+        {
+          "i": 89,
+          "latency_s": 16.496610641479492
+        },
+        {
+          "i": 90,
+          "latency_s": 16.438900232315063
+        },
+        {
+          "i": 91,
+          "latency_s": 16.381340265274048
+        },
+        {
+          "i": 92,
+          "latency_s": 16.327661752700806
+        },
+        {
+          "i": 93,
+          "latency_s": 16.270448207855225
+        },
+        {
+          "i": 94,
+          "latency_s": 16.212958574295044
+        },
+        {
+          "i": 95,
+          "latency_s": 16.15442967414856
+        },
+        {
+          "i": 96,
+          "latency_s": 16.100131273269653
+        },
+        {
+          "i": 97,
+          "latency_s": 16.04572892189026
+        },
+        {
+          "i": 98,
+          "latency_s": 15.987962484359741
+        },
+        {
+          "i": 99,
+          "latency_s": 15.934016704559326
+        },
+        {
+          "i": 100,
+          "latency_s": 15.879700422286987
+        },
+        {
+          "i": 101,
+          "latency_s": 15.825570583343506
+        },
+        {
+          "i": 102,
+          "latency_s": 15.771613359451294
+        },
+        {
+          "i": 103,
+          "latency_s": 15.717958688735962
+        },
+        {
+          "i": 104,
+          "latency_s": 15.664414882659912
+        },
+        {
+          "i": 105,
+          "latency_s": 15.610493421554565
+        },
+        {
+          "i": 106,
+          "latency_s": 15.556851625442505
+        },
+        {
+          "i": 107,
+          "latency_s": 15.503206014633179
+        },
+        {
+          "i": 108,
+          "latency_s": 15.44962215423584
+        },
+        {
+          "i": 109,
+          "latency_s": 15.395747423171997
+        },
+        {
+          "i": 110,
+          "latency_s": 15.341195583343506
+        },
+        {
+          "i": 111,
+          "latency_s": 15.287428855895996
+        },
+        {
+          "i": 112,
+          "latency_s": 15.233140707015991
+        },
+        {
+          "i": 113,
+          "latency_s": 15.178665161132812
+        },
+        {
+          "i": 114,
+          "latency_s": 15.12446141242981
+        },
+        {
+          "i": 115,
+          "latency_s": 15.070531606674194
+        },
+        {
+          "i": 116,
+          "latency_s": 15.01651120185852
+        },
+        {
+          "i": 117,
+          "latency_s": 14.962253093719482
+        },
+        {
+          "i": 118,
+          "latency_s": 14.908369302749634
+        },
+        {
+          "i": 119,
+          "latency_s": 14.854703664779663
+        },
+        {
+          "i": 120,
+          "latency_s": 14.80100965499878
+        },
+        {
+          "i": 121,
+          "latency_s": 14.747268676757812
+        },
+        {
+          "i": 122,
+          "latency_s": 14.69280743598938
+        },
+        {
+          "i": 123,
+          "latency_s": 14.638489484786987
+        },
+        {
+          "i": 124,
+          "latency_s": 14.584643840789795
+        },
+        {
+          "i": 125,
+          "latency_s": 14.530683517456055
+        },
+        {
+          "i": 126,
+          "latency_s": 14.476921081542969
+        },
+        {
+          "i": 127,
+          "latency_s": 14.422914743423462
+        },
+        {
+          "i": 128,
+          "latency_s": 14.369601011276245
+        },
+        {
+          "i": 129,
+          "latency_s": 14.315864086151123
+        },
+        {
+          "i": 130,
+          "latency_s": 14.261378765106201
+        },
+        {
+          "i": 131,
+          "latency_s": 14.207699060440063
+        },
+        {
+          "i": 132,
+          "latency_s": 14.153988122940063
+        },
+        {
+          "i": 133,
+          "latency_s": 14.100461721420288
+        },
+        {
+          "i": 134,
+          "latency_s": 14.04589033126831
+        },
+        {
+          "i": 135,
+          "latency_s": 13.991978406906128
+        },
+        {
+          "i": 136,
+          "latency_s": 13.93835186958313
+        },
+        {
+          "i": 137,
+          "latency_s": 13.884522914886475
+        },
+        {
+          "i": 138,
+          "latency_s": 13.831115007400513
+        },
+        {
+          "i": 139,
+          "latency_s": 13.777286529541016
+        },
+        {
+          "i": 140,
+          "latency_s": 13.723201990127563
+        },
+        {
+          "i": 141,
+          "latency_s": 13.669127464294434
+        },
+        {
+          "i": 142,
+          "latency_s": 13.615082502365112
+        },
+        {
+          "i": 143,
+          "latency_s": 13.561020374298096
+        },
+        {
+          "i": 144,
+          "latency_s": 13.507257461547852
+        },
+        {
+          "i": 145,
+          "latency_s": 13.453478574752808
+        },
+        {
+          "i": 146,
+          "latency_s": 13.399878025054932
+        },
+        {
+          "i": 147,
+          "latency_s": 13.345353841781616
+        },
+        {
+          "i": 148,
+          "latency_s": 13.290048599243164
+        },
+        {
+          "i": 149,
+          "latency_s": 13.23566746711731
+        },
+        {
+          "i": 150,
+          "latency_s": 13.181565999984741
+        },
+        {
+          "i": 151,
+          "latency_s": 13.11901330947876
+        },
+        {
+          "i": 152,
+          "latency_s": 13.037452936172485
+        },
+        {
+          "i": 153,
+          "latency_s": 12.965229749679565
+        },
+        {
+          "i": 154,
+          "latency_s": 12.89304494857788
+        },
+        {
+          "i": 155,
+          "latency_s": 12.821032524108887
+        },
+        {
+          "i": 156,
+          "latency_s": 12.748450756072998
+        },
+        {
+          "i": 157,
+          "latency_s": 12.67689323425293
+        },
+        {
+          "i": 158,
+          "latency_s": 12.60565733909607
+        },
+        {
+          "i": 159,
+          "latency_s": 12.533626794815063
+        },
+        {
+          "i": 160,
+          "latency_s": 12.479347705841064
+        },
+        {
+          "i": 161,
+          "latency_s": 12.424783945083618
+        },
+        {
+          "i": 162,
+          "latency_s": 12.370368957519531
+        },
+        {
+          "i": 163,
+          "latency_s": 12.316193580627441
+        },
+        {
+          "i": 164,
+          "latency_s": 12.26199460029602
+        },
+        {
+          "i": 165,
+          "latency_s": 12.207959175109863
+        },
+        {
+          "i": 166,
+          "latency_s": 12.153632164001465
+        },
+        {
+          "i": 167,
+          "latency_s": 12.099764585494995
+        },
+        {
+          "i": 168,
+          "latency_s": 12.045736074447632
+        },
+        {
+          "i": 169,
+          "latency_s": 11.985426664352417
+        },
+        {
+          "i": 170,
+          "latency_s": 11.93125581741333
+        },
+        {
+          "i": 171,
+          "latency_s": 11.87679409980774
+        },
+        {
+          "i": 172,
+          "latency_s": 11.822416543960571
+        },
+        {
+          "i": 173,
+          "latency_s": 11.768181562423706
+        },
+        {
+          "i": 174,
+          "latency_s": 11.714056730270386
+        },
+        {
+          "i": 175,
+          "latency_s": 11.660086870193481
+        },
+        {
+          "i": 176,
+          "latency_s": 11.606443405151367
+        },
+        {
+          "i": 177,
+          "latency_s": 11.552699089050293
+        },
+        {
+          "i": 178,
+          "latency_s": 11.498833656311035
+        },
+        {
+          "i": 179,
+          "latency_s": 11.444287776947021
+        },
+        {
+          "i": 180,
+          "latency_s": 11.39045000076294
+        },
+        {
+          "i": 181,
+          "latency_s": 11.336606740951538
+        },
+        {
+          "i": 182,
+          "latency_s": 11.282856941223145
+        },
+        {
+          "i": 183,
+          "latency_s": 11.228227853775024
+        },
+        {
+          "i": 184,
+          "latency_s": 11.173893213272095
+        },
+        {
+          "i": 185,
+          "latency_s": 11.12006402015686
+        },
+        {
+          "i": 186,
+          "latency_s": 11.06566047668457
+        },
+        {
+          "i": 187,
+          "latency_s": 11.011433362960815
+        },
+        {
+          "i": 188,
+          "latency_s": 10.957488298416138
+        },
+        {
+          "i": 189,
+          "latency_s": 10.903377771377563
+        },
+        {
+          "i": 190,
+          "latency_s": 10.849542617797852
+        },
+        {
+          "i": 191,
+          "latency_s": 10.795708656311035
+        },
+        {
+          "i": 192,
+          "latency_s": 10.742138385772705
+        },
+        {
+          "i": 193,
+          "latency_s": 10.688540935516357
+        },
+        {
+          "i": 194,
+          "latency_s": 10.634711265563965
+        },
+        {
+          "i": 195,
+          "latency_s": 10.580886125564575
+        },
+        {
+          "i": 196,
+          "latency_s": 10.526135206222534
+        },
+        {
+          "i": 197,
+          "latency_s": 10.471765279769897
+        },
+        {
+          "i": 198,
+          "latency_s": 10.41760516166687
+        },
+        {
+          "i": 199,
+          "latency_s": 10.363630056381226
+        },
+        {
+          "i": 200,
+          "latency_s": 10.309139490127563
+        },
+        {
+          "i": 201,
+          "latency_s": 10.254390478134155
+        },
+        {
+          "i": 202,
+          "latency_s": 10.20023512840271
+        },
+        {
+          "i": 203,
+          "latency_s": 10.146135091781616
+        },
+        {
+          "i": 204,
+          "latency_s": 10.091919183731079
+        },
+        {
+          "i": 205,
+          "latency_s": 10.03736138343811
+        },
+        {
+          "i": 206,
+          "latency_s": 9.98335862159729
+        },
+        {
+          "i": 207,
+          "latency_s": 9.928940534591675
+        },
+        {
+          "i": 208,
+          "latency_s": 9.874553203582764
+        },
+        {
+          "i": 209,
+          "latency_s": 9.820484161376953
+        }
+      ],
+      "mode": "visibility_poll",
+      "node": "d",
+      "threads": 1
+    }
+  }
+}
