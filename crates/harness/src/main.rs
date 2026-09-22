@@ -121,6 +121,11 @@ fn main() -> Result<()> {
             for s in SCENARIOS {
                 println!("{:22} {}", s.name, s.desc);
             }
+            println!();
+            println!("known-bug reproductions (expected to FAIL until fixed):");
+            for s in scenarios::KNOWN_BUG_REPROS {
+                println!("{:22} {}", s.name, s.desc);
+            }
             Ok(())
         }
         Command::Run {
@@ -222,7 +227,11 @@ fn run(
     } else {
         let mut v = Vec::new();
         for n in &names {
-            match SCENARIOS.iter().find(|s| s.name == n) {
+            match SCENARIOS
+                .iter()
+                .chain(scenarios::KNOWN_BUG_REPROS.iter())
+                .find(|s| s.name == n)
+            {
                 Some(s) => v.push(s),
                 None => bail!("unknown scenario {n:?} (try `harness list`)"),
             }

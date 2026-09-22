@@ -3876,6 +3876,53 @@ No gap found; not a large change. Constellation already has adaptive sequential 
 - A forwarded op's own `Accepted` records keep being installed unconditionally. Skipping them above the ship floor left the caller's own op invisible until its segment landed, so its next write ran against a stale base (`disjoint-write-4` failed with EIO). **Open (precise fix):** a later record for the same entry could reach the requester before the reply is applied. That needs the record executed, made durable in S3 and pushed back within the reply's 1–3 ms round trip, so it is theoretical, but closing it needs the holder's journal position in both replies and segments, so a requester knows exactly when its own records have landed.
 - Harness: `S3Env` takes a host-wide `flock` on its docker prefix. A second concurrent `harness run` now fails immediately with an explanation, instead of force-removing the first run's containers and network (container-name conflicts and missing networks, which surfaced as spurious EIO/convergence failures).
 
+## Plan 30 M0 — reproduce bugs A and B: **DONE**
+
+Goal: scenarios that fail today for exactly the reasons in plan 30 §1.1, and pass once M2/M3 land. No product fix in this milestone — only a fault knob, a per-node S3 switch, and three new scenarios.
+
+| Item | Status | Where |
+|---|---|---|
+| `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` (default 0): sleeps this long, holder-side, immediately before a forwarded mutation's reply — after the op already executed and the keepers lock is already released. Read once (`OnceLock`); logs one `tracing::warn!` at daemon startup when non-zero | done | `crates/cli/src/node_runtime.rs` (`fault_forward_reply_delay_ms`, the `SyncRequest::Mutate` arm, `NodeRuntime::start`) |
+| Documented under a new "Fault injection (testing only)" heading | done | `docs/reference/configuration.md` |
+| `reqlog::CountingProxy::cut()`/`heal()`: a per-client S3 kill switch distinct from the shared `Toxiproxy::Proxy` one — closes every relayed connection within one ~100ms poll tick and refuses new ones while cut, restores on heal; counting unaffected | done | `crates/harness/src/reqlog.rs` |
+| `pub const KNOWN_BUG_REPROS: &[Scenario]`, printed by `harness list` under `known-bug reproductions (expected to FAIL until fixed):`; `harness run <name>` resolves either list; `harness run` with no names still runs `SCENARIOS` only | done | `crates/harness/src/scenarios.rs`, `crates/harness/src/main.rs` |
+| `wait_for_p2p`/`ensure_no_conflicts` generalized from `[&Client; 2]` to `&[&Client]` (21 call sites updated) | done | `crates/harness/src/scenarios.rs` |
+| `forward-timeout-reexec` (bug A): 5 rounds, alternating holder, `O_EXCL` create/`mkdir`/`unlink`/`rename`/`link` | done | `crates/harness/src/scenarios.rs` |
+| `holder-crash-phantom-shadow` (bug B, third node takes over) | done | `crates/harness/src/scenarios.rs` |
+| `holder-crash-phantom-new-holder` (bug B, requester takes over) | done | `crates/harness/src/scenarios.rs` |
+| TESTING.md "Known-bug reproductions" subsection | done | `docs/how-to-guides/development/TESTING.md` |
+
+**Verbatim failures (release build, seed 42, run twice each — identical both times):**
+
+```
+=== forward-timeout-reexec FAILED in ~6s: 3 of 5 round(s) anomalous:
+round 1 O_EXCL-create excl-1: returned File exists (os error 17) (expected success); holder executed it, the reply timed out, the requester re-executed it (plan 30 bug A)
+round 3 unlink unlink-me-3: returned No such file or directory (os error 2) (expected success); holder executed it, the reply timed out, the requester re-executed it (plan 30 bug A)
+round 4 rename rename-dst-4: returned No such file or directory (os error 2) (expected success); holder executed it, the reply timed out, the requester re-executed it (plan 30 bug A)
+
+=== holder-crash-phantom-shadow FAILED in ~30s: b and c disagree on "phantom" after takeover (b: present, c: absent): the requester kept the stranded forwarded create applied (plan 30 bug B)
+fresh node d bootstrapped from the head commit sees "phantom" but c does not: the stranded effect was published into the commit chain
+
+=== holder-crash-phantom-new-holder FAILED in ~9s: c's create of "phantom" returned File exists (os error 17) (expected success: the name was never created in the durable history); the new holder (b) validated the create against its own stranded phantom entry (plan 30 bug B)
+```
+
+**Design decisions:**
+
+- **The fault knob's sleep sits after the `Accepted { .. }`/`Nudge` bookkeeping, immediately before `reply.send`** — the spec's own wording ("immediately before that `reply.send`"). The keepers lock is already released by then (only held inside the `executed` block), so a concurrent `HandOff` request for the same partition is never blocked by the sleeping task — this is exactly what lets the holder cooperatively hand off while its reply is still in flight, the mechanism bug A needs.
+- **`CountingProxy::cut`/`heal` check the shared `AtomicBool` at the top of every loop iteration** of both relay directions (not only inside the existing `would_block` arm), so the ~100ms read-timeout granularity bounds the cut latency regardless of whether the connection is idle or mid-transfer. `cut` also refuses newly accepted connections immediately, so a client that reconnects mid-outage still sees a hard failure rather than silently recovering through a fresh socket.
+- **`forward-timeout-reexec`'s "establish holder" step is self-healing rather than assuming the previous round's fallback flipped the lease**: it only forces a local write when the intended holder does not already hold, so the scenario does not depend on knowing in advance which internal path (fast P2P handoff vs. plain CAS) the fallback used to change hands.
+- **An additional `ino_agrees` check ("verify the namespace shows exactly one execution")** beyond plain existence: create/mkdir/rename/link post-checks compare the kernel inode number of the resulting name across both nodes, catching a silent duplicate-then-idempotent-merge that a bare existence check would miss.
+- **`mkdir` and `link` (rounds 2 and 5) converge cleanly with no wrong errno**, deterministically, across every run. Root-caused, not a flake: `mutate_op_rebasable`'s fallback reuses the *same* `MutateOp` (same pre-allocated `ino`) for the local re-execution as for the original forward, so when the requester's own catch-up tail has not yet applied the holder's just-shipped segment at the moment of retry, the local `insert_new_node` (`crates/meta/src/store/writes.rs`) succeeds as a genuinely fresh local insert — but because it carries the identical `(ino, parent, name, attrs)` as the holder's already-shipped record, later replay treats the two segments' records as the same idempotent write (`store::tests::a_repeat_put_is_not_a_new_node`'s guarantee) rather than a namespace conflict. `O_EXCL` create, `unlink` and `rename` instead ran with the requester's tail already caught up at retry time, so their local re-execution saw the already-applied state and returned the wrong errno described in §1.1. Both outcomes are real: one is silent (no visible symptom, verified clean via `ino_agrees`), the other is the documented wrong-errno bug; the milestone's own gate text ("if every round behaved correctly, the scenario passes") anticipates that not every round need show a symptom, only that any that don't must be verified actually correct — which this scenario now does explicitly rather than by omission.
+- **`holder_crash_phantom_shadow`/`holder_crash_phantom_new_holder` share one `phantom_setup` + `strand_bs_forwarded_phantom` helper pair** rather than duplicating the three-node bring-up, since the two scenarios differ only in which node writes `after` (bug B's two shapes: a third node vs. the original requester taking over).
+
+**Flaky/surprising:** the very first `cargo test --workspace` attempt showed two unrelated `fusefs::quota_tests` cases (`usage_counter_tracks_replacing_rename`, `zero_ttl_disables_cache_while_positive_ttl_caches`) each "running for over 60 seconds" before being killed at ~42 minutes elapsed. Neither test touches anything this milestone changed (pure in-memory `Meta` calls, no `NodeRuntime`/forwarding). Isolated (`cargo test -p constellation --bin constellation fusefs::quota_tests::` and the single hung test by name), both passed in well under a second; the entire 227-test `constellation` binary also later passed in ~5s standalone. This was host contention (another active session's `cargo`/docker workload was running concurrently against the same 32 cores throughout this session), not a hang introduced by the fault-knob change — confirmed by inspecting the diff (the only product change is the reply-delay branch in `node_runtime.rs`'s `SyncRequest::Mutate` arm, on no path either test exercises) and by two subsequent full, unmodified `cargo test --workspace` runs completing cleanly with 0 failures.
+
+### Plan 30 M0 exit criteria
+- [x] `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` 0 failures (all workspace crates; confirmed via two full clean runs after ruling out the contention-caused hang above)
+- [x] `cargo build --release -p constellation -p constellation-harness`
+- [x] `target/release/harness list` shows the new "known-bug reproductions" section
+- [x] All three new scenarios FAIL with the documented diagnostics, twice each, byte-identical both times (verbatim above)
+- [x] `target/release/harness run forwarded-mutations lease-handover kill9-remount deposed-reintegration mkdir-p-race` — all PASSED (the fault knob defaults to off, so these are unaffected)
 ## Plan 30 M1 — Stateright model of the authority protocol: **DONE**
 
 | Item | State | Where |

@@ -4,6 +4,7 @@
 
 use crate::client::Client;
 use crate::model::Model;
+use crate::reqlog::CountingProxy;
 use crate::s3env::{S3Env, BUCKET};
 use crate::suites;
 use crate::workload::Workload;
@@ -486,6 +487,35 @@ pub const SCENARIOS: &[Scenario] = &[
     },
 ];
 
+/// Plan 30 M0: scenarios that reproduce a known, not-yet-fixed bug
+/// (`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md` §1.1).
+/// Kept out of [`SCENARIOS`] so a bare `harness run` (no names) never
+/// treats a documented bug as a regression: these are expected to FAIL
+/// until the milestone that fixes the underlying bug moves them into
+/// `SCENARIOS`, unchanged, as its regression test. `harness list` prints
+/// them under their own heading; `harness run <name>` resolves a name in
+/// either list.
+pub const KNOWN_BUG_REPROS: &[Scenario] = &[
+    Scenario {
+        name: "forward-timeout-reexec",
+        desc: "bug A: a forwarded mutation's reply races the requester's forward timeout; the requester falls back and re-executes the holder's already-applied op",
+        requires: &[],
+        run: forward_timeout_reexec,
+    },
+    Scenario {
+        name: "holder-crash-phantom-shadow",
+        desc: "bug B: a holder stranded (S3 cut, then killed) leaves its ack to a forwarded create applied only on the requester; a third node's takeover never sees it",
+        requires: &[],
+        run: holder_crash_phantom_shadow,
+    },
+    Scenario {
+        name: "holder-crash-phantom-new-holder",
+        desc: "bug B: the requester of a stranded forwarded create becomes the next holder and validates new ops against its own phantom entry",
+        requires: &[],
+        run: holder_crash_phantom_new_holder,
+    },
+];
+
 fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
     let env = S3Env::start().context("starting S3 environment")?;
     let mut root = tempfile::Builder::new()
@@ -516,6 +546,27 @@ fn ts() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos()
+}
+
+/// `open(O_CREAT | O_EXCL)`: succeeds only if `name` does not already
+/// exist under `mnt`. Used by the plan 30 M0 known-bug repros, which
+/// care about the exact POSIX outcome of a fresh create rather than
+/// merely writing some content.
+fn create_new(mnt: &std::path::Path, name: &str) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(mnt.join(name))
+        .map(|_| ())
+}
+
+/// The kernel inode number `path` currently resolves to, or `None` if it
+/// does not exist. Two nodes agreeing a name exists is not the same as
+/// agreeing *what* exists there — a bug that creates two independent
+/// entries under one name only shows up as an inode mismatch.
+fn ino_of(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.ino())
 }
 
 // --- scenarios ---
@@ -1646,7 +1697,7 @@ fn p2p_invalidation(_seed: u64) -> Result<()> {
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
-    wait_for_p2p([&c0, &c1])?;
+    wait_for_p2p(&[&c0, &c1])?;
 
     let mut pushed = Vec::new();
     for i in 0..5 {
@@ -1730,8 +1781,10 @@ fn wait_for_peers(clients: &[&Client]) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_p2p(clients: [&Client; 2]) -> Result<()> {
-    wait_for_peers(&[clients[0], clients[1]])
+/// As [`wait_for_peers`], for the common 2-node call shape; also usable
+/// directly with a slice for 3+ nodes (plan 30 M0).
+fn wait_for_p2p(clients: &[&Client]) -> Result<()> {
+    wait_for_peers(clients)
 }
 
 fn coop_of(c: &Client) -> Result<serde_json::Value> {
@@ -1875,7 +1928,7 @@ fn existence_peer_hint(_seed: u64) -> Result<()> {
     a.fs_create()?;
     a.mount()?;
     b.mount()?;
-    wait_for_p2p([&a, &b])?;
+    wait_for_p2p(&[&a, &b])?;
 
     let (data, _) = blob(8);
     std::fs::write(a.mnt.join("source"), &data)?;
@@ -1991,7 +2044,7 @@ fn coop_cache_hit(_seed: u64) -> Result<()> {
     a.fs_create()?;
     a.mount()?;
     b.mount()?;
-    wait_for_p2p([&a, &b])?;
+    wait_for_p2p(&[&a, &b])?;
 
     let n_chunks = 8usize;
     let (data, expected) = blob(n_chunks);
@@ -2058,7 +2111,7 @@ fn coop_fallback(_seed: u64) -> Result<()> {
     a.fs_create()?;
     a.mount()?;
     b.mount()?;
-    wait_for_p2p([&a, &b])?;
+    wait_for_p2p(&[&a, &b])?;
 
     let n_chunks = 8usize;
     let (data, expected) = blob(n_chunks);
@@ -2259,8 +2312,9 @@ fn conflicts_of(c: &Client) -> Result<u64> {
 
 /// Assert the leaseless conflict path never fired: with leases the
 /// authority holder is the only writer, so a skipped foreign record
-/// would mean the invariant broke somewhere.
-fn ensure_no_conflicts(clients: [&Client; 2]) -> Result<()> {
+/// would mean the invariant broke somewhere. Takes a slice (plan 30 M0)
+/// so 3- and 4-node scenarios can use it too.
+fn ensure_no_conflicts(clients: &[&Client]) -> Result<()> {
     for c in clients {
         let n = conflicts_of(c)?;
         anyhow::ensure!(
@@ -2346,7 +2400,7 @@ fn lease_handover(seed: u64) -> Result<()> {
         epochs.windows(2).all(|w| w[1] >= w[0]) && epochs.last() > epochs.first(),
         "lease epoch must advance across handovers, saw {epochs:?}"
     );
-    ensure_no_conflicts([&c0, &c1])?;
+    ensure_no_conflicts(&[&c0, &c1])?;
     eprintln!("    lease-handover: epochs {epochs:?}");
     c0.unmount()?;
     c1.unmount()?;
@@ -2537,7 +2591,7 @@ fn continuation_epoch(_seed: u64) -> Result<()> {
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
-    wait_for_p2p([&c0, &c1])?;
+    wait_for_p2p(&[&c0, &c1])?;
 
     // Make A the current p0 holder before S3 disappears.
     std::fs::create_dir(c0.mnt.join("a"))?;
@@ -2604,7 +2658,7 @@ fn continuation_epoch(_seed: u64) -> Result<()> {
             Ok(())
         },
     )?;
-    ensure_no_conflicts([&c0, &c1])?;
+    ensure_no_conflicts(&[&c0, &c1])?;
     c0.unmount()?;
     c1.unmount()?;
     Ok(())
@@ -2618,7 +2672,7 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
-    wait_for_p2p([&c0, &c1])?;
+    wait_for_p2p(&[&c0, &c1])?;
     std::fs::create_dir(c0.mnt.join("shared"))?;
     eventually("shared visible", Duration::from_secs(20), || {
         anyhow::ensure!(c1.mnt.join("shared").is_dir());
@@ -2656,7 +2710,7 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
         anyhow::ensure!(std::fs::read(c1.mnt.join("shared/after-resume"))? == b"ok");
         Ok(())
     })?;
-    ensure_no_conflicts([&c0, &c1])?;
+    ensure_no_conflicts(&[&c0, &c1])?;
     c0.unmount()?;
     c1.unmount()?;
     Ok(())
@@ -2688,7 +2742,7 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
-    wait_for_p2p([&c0, &c1])?;
+    wait_for_p2p(&[&c0, &c1])?;
 
     std::fs::create_dir(c0.mnt.join("shared"))?;
     std::fs::write(c0.mnt.join("shared/same"), b"baseline")?;
@@ -2913,7 +2967,7 @@ fn node_leave(_seed: u64) -> Result<()> {
             Ok(())
         },
     )?;
-    ensure_no_conflicts([&c0, &c1])?;
+    ensure_no_conflicts(&[&c0, &c1])?;
 
     // --- Half 2: self-leave of a live third writer ---
     // Remount C under a *fresh* state dir so it claims a new id, then leave.
@@ -3947,7 +4001,7 @@ fn p2p_handover(_seed: u64) -> Result<()> {
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
-    wait_for_p2p([&c0, &c1])?;
+    wait_for_p2p(&[&c0, &c1])?;
 
     // A becomes the active holder and stays busy.
     std::fs::write(c0.mnt.join("a-owns"), b"a")?;
@@ -3991,7 +4045,7 @@ fn p2p_handover(_seed: u64) -> Result<()> {
         model.verify(&c1.mnt).context("via c1")?;
         Ok(())
     })?;
-    ensure_no_conflicts([&c0, &c1])?;
+    ensure_no_conflicts(&[&c0, &c1])?;
     c0.unmount()?;
     c1.unmount()?;
     Ok(())
@@ -4021,7 +4075,7 @@ fn forwarded_mutations(_seed: u64) -> Result<()> {
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
-    wait_for_p2p([&c0, &c1])?;
+    wait_for_p2p(&[&c0, &c1])?;
 
     std::fs::write(c0.mnt.join("a-owns"), b"a")?;
     eventually("c0 holds the lease", Duration::from_secs(20), || {
@@ -4071,7 +4125,7 @@ fn forwarded_mutations(_seed: u64) -> Result<()> {
         model.verify(&c1.mnt).context("via c1")?;
         Ok(())
     })?;
-    ensure_no_conflicts([&c0, &c1])?;
+    ensure_no_conflicts(&[&c0, &c1])?;
     c0.unmount()?;
     c1.unmount()?;
     Ok(())
@@ -4092,7 +4146,7 @@ fn scratch_publish(_seed: u64) -> Result<()> {
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
-    wait_for_p2p([&c0, &c1])?;
+    wait_for_p2p(&[&c0, &c1])?;
 
     let scratch = c0.mnt.join("tmp");
     std::fs::create_dir(&scratch)?;
@@ -4136,7 +4190,7 @@ fn scratch_publish(_seed: u64) -> Result<()> {
         std::fs::read(c0.mnt.join("tmp/local-only"))? == b"private",
         "local scratch content changed"
     );
-    ensure_no_conflicts([&c0, &c1])?;
+    ensure_no_conflicts(&[&c0, &c1])?;
     c0.unmount()?;
     c1.unmount()?;
     Ok(())
@@ -4194,7 +4248,7 @@ fn p2p_partition_tolerance(seed: u64) -> Result<()> {
             Ok(())
         })?;
     }
-    ensure_no_conflicts([&c0, &c1])?;
+    ensure_no_conflicts(&[&c0, &c1])?;
     c0.unmount()?;
     c1.unmount()?;
     Ok(())
@@ -6088,7 +6142,7 @@ fn wan_writer_ships_put_only(seed: u64) -> Result<()> {
         converge_start.elapsed()
     );
     proxy.heal()?;
-    ensure_no_conflicts([&a, &b])?;
+    ensure_no_conflicts(&[&a, &b])?;
     a.unmount()?;
     b.unmount()?;
     Ok(())
@@ -6204,8 +6258,536 @@ fn sticky_lease_handoff_over_s3(_seed: u64) -> Result<()> {
         model.verify(&b.mnt).context("via B")?;
         Ok(())
     })?;
-    ensure_no_conflicts([&a, &b])?;
+    ensure_no_conflicts(&[&a, &b])?;
     a.unmount()?;
     b.unmount()?;
+    Ok(())
+}
+
+// --- Plan 30 M0: known-bug reproductions ---
+
+/// `control_status()["forwarded_err"]`: how many of this node's forwarded
+/// mutations came back Busy/NotHolder/timed-out/undecodable. The plan 30
+/// M0 repros use its *rise* across one op as proof the fault they
+/// configured actually engaged, rather than trusting that a slow CI host
+/// reproduces the exact race by accident.
+fn forwarded_err(c: &Client) -> Result<u64> {
+    Ok(c.control_status()?["forwarded_err"].as_u64().unwrap_or(0))
+}
+
+/// Bug A (`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md`
+/// §1.1): `request_mutate_with` maps a forward timeout to `Busy`, and
+/// `mutate_op_rebasable`'s fallback (`crates/cli/src/fusefs.rs`) then
+/// acquires the lease and executes the very op the holder already
+/// applied. `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` (1500ms) makes
+/// the holder's reply arrive well after the requester's
+/// `CONSTELLATION_FORWARD_TIMEOUT_MS` (default 500ms) gives up, so this
+/// reproduces deterministically without racing real scheduler timing.
+///
+/// Five rounds alternate which node holds the lease (a, b, a, b, a) and
+/// exercise the five create-family/delete-family ops POSIX distinguishes
+/// by idempotency: `O_EXCL` create and `mkdir` (EEXIST on replay),
+/// `unlink` (ENOENT on replay), `rename` (source already gone) and
+/// `link` (EEXIST on replay). The requester's own busy-fallback handoff
+/// request is what flips the holder for the next round — no separate
+/// mechanism is needed to alternate it.
+fn forward_timeout_reexec(_seed: u64) -> Result<()> {
+    let (env, root) = setup("forward-timeout-reexec")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/forward-timeout-{}", ts());
+    let tune = |c: Client| {
+        c.with_own_node_key()
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "10000")
+            .with_env("CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS", "1500")
+    };
+    let mut a = tune(Client::new(root.path(), "a", &env.endpoint, &backend)?);
+    let mut b = tune(Client::new(root.path(), "b", &env.endpoint, &backend)?);
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    wait_for_p2p(&[&a, &b])?;
+
+    let mut anomalies: Vec<String> = Vec::new();
+
+    for round in 1..=5u32 {
+        let (holder, requester): (&Client, &Client) =
+            if round % 2 == 1 { (&a, &b) } else { (&b, &a) };
+
+        // Establish the intended holder: a no-op if the previous round's
+        // fallback already left it holding (the common case from round 2
+        // on), otherwise force it via a local write of its own.
+        if lease_of(holder)?["held"] != true {
+            std::fs::write(holder.mnt.join(format!(".establish-holder-{round}")), b"x")
+                .with_context(|| {
+                    format!("round {round}: establishing {} as holder", holder.name)
+                })?;
+        }
+        eventually(
+            &format!("round {round}: {} holds the lease", holder.name),
+            Duration::from_secs(30),
+            || {
+                let lease = lease_of(holder)?;
+                anyhow::ensure!(
+                    lease["held"] == true,
+                    "{} not holding: {lease}",
+                    holder.name
+                );
+                Ok(())
+            },
+        )?;
+
+        // Seed any input the round's op needs, from the holder, and wait
+        // for the requester to see it — this must be visible before the
+        // fault-affected op below, or the op's own failure would be an
+        // ordinary race rather than the bug this scenario targets.
+        let seed = |name: &str, content: &[u8]| -> Result<()> {
+            std::fs::write(holder.mnt.join(name), content)
+                .with_context(|| format!("round {round}: seeding {name} on {}", holder.name))?;
+            eventually(
+                &format!("round {round}: {name} visible on {}", requester.name),
+                Duration::from_secs(15),
+                || {
+                    anyhow::ensure!(requester.mnt.join(name).exists(), "{name} not visible yet");
+                    Ok(())
+                },
+            )
+        };
+
+        let op_name;
+        let target: String;
+        let src: Option<String>;
+        let before = forwarded_err(requester)?;
+        let result: std::io::Result<()> = match round {
+            1 => {
+                op_name = "O_EXCL-create";
+                target = format!("excl-{round}");
+                src = None;
+                create_new(&requester.mnt, &target)
+            }
+            2 => {
+                op_name = "mkdir";
+                target = format!("dir-{round}");
+                src = None;
+                std::fs::create_dir(requester.mnt.join(&target))
+            }
+            3 => {
+                op_name = "unlink";
+                target = format!("unlink-me-{round}");
+                src = None;
+                seed(&target, b"doomed")?;
+                std::fs::remove_file(requester.mnt.join(&target))
+            }
+            4 => {
+                op_name = "rename";
+                let from = format!("rename-src-{round}");
+                let to = format!("rename-dst-{round}");
+                seed(&from, b"movable")?;
+                let result = std::fs::rename(requester.mnt.join(&from), requester.mnt.join(&to));
+                target = to;
+                src = Some(from);
+                result
+            }
+            5 => {
+                op_name = "link";
+                let from = format!("link-src-{round}");
+                let to = format!("link-dst-{round}");
+                seed(&from, b"linkable")?;
+                let result = std::fs::hard_link(requester.mnt.join(&from), requester.mnt.join(&to));
+                target = to;
+                src = Some(from);
+                result
+            }
+            _ => unreachable!(),
+        };
+        let after = forwarded_err(requester)?;
+
+        if after <= before {
+            anomalies.push(format!(
+                "round {round} {op_name} {target}: fault injection did not engage \
+                 ({}'s forwarded_err stayed at {before})",
+                requester.name
+            ));
+        }
+        eprintln!(
+            "    forward-timeout-reexec round {round} {op_name} {target}: holder={} \
+             requester={} forwarded_err {before}->{after} result={result:?}",
+            holder.name, requester.name
+        );
+        if let Err(e) = &result {
+            anomalies.push(format!(
+                "round {round} {op_name} {target}: returned {e} (expected success); \
+                 holder executed it, the reply timed out, the requester re-executed it \
+                 (plan 30 bug A)"
+            ));
+        }
+
+        // The intended effect must hold on both nodes regardless of what
+        // errno the requester's own re-execution saw — the holder's
+        // original execution is never in question here, only whether the
+        // requester's second attempt corrupted or duplicated it.
+        let post_check = |what: &str, f: &dyn Fn(&Client) -> bool| -> Result<()> {
+            eventually(
+                &format!("round {round}: {what}"),
+                Duration::from_secs(20),
+                || {
+                    for c in [&a, &b] {
+                        anyhow::ensure!(f(c), "{what} not satisfied on {}", c.name);
+                    }
+                    Ok(())
+                },
+            )
+        };
+        // Existence converging on both nodes is necessary but not
+        // sufficient: a create-family op whose local re-execution raced
+        // ahead of the holder's shipped record (rather than seeing it
+        // and failing EEXIST) creates a *second*, independent inode
+        // under the same name, which later log replay resolves via
+        // ordinary same-name-conflict handling — no errno reaches the
+        // caller, but the namespace briefly held two executions instead
+        // of one. `ino_agrees` is the plan's own "verify the namespace
+        // shows exactly one execution" check for that path.
+        let ino_agrees = |what: &str, name: &str| -> Result<()> {
+            eventually(
+                &format!("round {round}: {what} names one execution"),
+                Duration::from_secs(20),
+                || {
+                    let (ia, ib) = (ino_of(&a.mnt.join(name)), ino_of(&b.mnt.join(name)));
+                    anyhow::ensure!(
+                        ia.is_some() && ia == ib,
+                        "{name} has inode {ia:?} on a and {ib:?} on b"
+                    );
+                    Ok(())
+                },
+            )
+        };
+        let mut post_errs: Vec<String> = Vec::new();
+        match round {
+            1 | 2 => {
+                if let Err(e) = post_check(&format!("{target} exists"), &|c| {
+                    c.mnt.join(&target).exists()
+                }) {
+                    post_errs.push(format!("{e:#}"));
+                } else if let Err(e) = ino_agrees("the created name", &target) {
+                    post_errs.push(format!(
+                        "{e:#}: the requester's local re-execution created a second entry \
+                         instead of converging on the holder's (plan 30 bug A)"
+                    ));
+                }
+            }
+            3 => {
+                if let Err(e) = post_check(&format!("{target} is gone"), &|c| {
+                    !c.mnt.join(&target).exists()
+                }) {
+                    post_errs.push(format!("{e:#}"));
+                }
+            }
+            // rename: the source name must be gone.
+            4 => {
+                let src = src.clone().unwrap();
+                if let Err(e) =
+                    post_check(&format!("{src} is gone"), &|c| !c.mnt.join(&src).exists())
+                {
+                    post_errs.push(format!("{e:#}"));
+                }
+                if let Err(e) = post_check(&format!("{target} exists"), &|c| {
+                    c.mnt.join(&target).exists()
+                }) {
+                    post_errs.push(format!("{e:#}"));
+                } else if let Err(e) = ino_agrees("the rename target", &target) {
+                    post_errs.push(format!(
+                        "{e:#}: the requester's local re-execution created a second entry \
+                         instead of converging on the holder's (plan 30 bug A)"
+                    ));
+                }
+            }
+            // link: the source name must still exist too (unlike rename).
+            5 => {
+                let src = src.clone().unwrap();
+                if let Err(e) = post_check(&format!("{src} still exists"), &|c| {
+                    c.mnt.join(&src).exists()
+                }) {
+                    post_errs.push(format!("{e:#}"));
+                }
+                if let Err(e) = post_check(&format!("{target} exists"), &|c| {
+                    c.mnt.join(&target).exists()
+                }) {
+                    post_errs.push(format!("{e:#}"));
+                } else if let Err(e) = ino_agrees("the link target", &target) {
+                    post_errs.push(format!(
+                        "{e:#}: the requester's local re-execution created a second entry \
+                         instead of converging on the holder's (plan 30 bug A)"
+                    ));
+                }
+            }
+            _ => unreachable!(),
+        }
+        if !post_errs.is_empty() {
+            anomalies.push(format!(
+                "round {round} {op_name} {target}: {}",
+                post_errs.join("; ")
+            ));
+        }
+    }
+
+    a.unmount()?;
+    b.unmount()?;
+    if !anomalies.is_empty() {
+        bail!(
+            "{} of 5 round(s) anomalous:\n{}",
+            anomalies.len(),
+            anomalies.join("\n")
+        );
+    }
+    Ok(())
+}
+
+/// Poll `checks` until they all report the same value or `deadline`
+/// passes, returning the last observed `(name, value)` pair per check.
+/// Used where two replicas must agree on whether a stranded effect
+/// survived (bug B): a transient disagreement while sync catches up is
+/// not itself the bug, only one that persists past the deadline is.
+fn poll_for_agreement(
+    deadline: Duration,
+    checks: &[(&str, &dyn Fn() -> bool)],
+) -> Vec<(String, bool)> {
+    let start = std::time::Instant::now();
+    loop {
+        let states: Vec<(String, bool)> = checks
+            .iter()
+            .map(|(name, f)| ((*name).to_string(), f()))
+            .collect();
+        let all_same = states.iter().all(|(_, v)| *v == states[0].1);
+        if all_same || start.elapsed() > deadline {
+            return states;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Common setup for the two bug-B repros: three nodes, A's S3 behind its
+/// own switchable proxy, B and C on the ordinary shared one. Returns the
+/// three mounted clients plus the switch, positioned right after A has
+/// taken the lease and both B and C see its marker — i.e. right before
+/// the caller cuts A's S3 and does the stranding write.
+fn phantom_setup(
+    scenario: &str,
+) -> Result<(
+    S3Env,
+    tempfile::TempDir,
+    Client,
+    Client,
+    Client,
+    CountingProxy,
+)> {
+    let (env, root) = setup(scenario)?;
+    let _proxy = env.s3_proxy()?;
+    let sw = env.counting_proxy()?;
+    let backend = format!("s3://{BUCKET}/{scenario}-{}", ts());
+    let tune = |c: Client| {
+        c.with_own_node_key()
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "6000")
+    };
+    let mut a = tune(Client::new(root.path(), "a", &sw.endpoint(), &backend)?);
+    let mut b = tune(Client::new(root.path(), "b", &env.endpoint, &backend)?);
+    let mut c = tune(Client::new(root.path(), "c", &env.endpoint, &backend)?);
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    c.mount()?;
+    wait_for_p2p(&[&a, &b, &c])?;
+
+    std::fs::write(a.mnt.join("marker"), b"a")?;
+    eventually("A holds the lease", Duration::from_secs(20), || {
+        let lease = lease_of(&a)?;
+        anyhow::ensure!(lease["held"] == true, "A does not hold: {lease}");
+        Ok(())
+    })?;
+    eventually("marker visible on B and C", Duration::from_secs(20), || {
+        anyhow::ensure!(b.mnt.join("marker").is_file(), "marker missing on B");
+        anyhow::ensure!(c.mnt.join("marker").is_file(), "marker missing on C");
+        Ok(())
+    })?;
+    Ok((env, root, a, b, c, sw))
+}
+
+/// Strand B's forwarded create by cutting A's S3 immediately before B
+/// issues it (A still holds a valid, unexpired lease and acks purely
+/// from memory), then crash A so the ack can never ship.
+fn strand_bs_forwarded_phantom(a: &mut Client, b: &Client, sw: &CountingProxy) -> Result<()> {
+    sw.cut();
+    create_new(&b.mnt, "phantom")
+        .context("B's forwarded create must be acked while A's lease is still valid")?;
+    eventually("phantom visible on B", Duration::from_secs(10), || {
+        anyhow::ensure!(b.mnt.join("phantom").exists(), "phantom not yet on B");
+        Ok(())
+    })?;
+    a.kill9()?;
+    Ok(())
+}
+
+/// Bug B (`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md`
+/// §1.1), third-node-takeover shape: a requester (B) applies an accepted
+/// forwarded op to its own replica immediately
+/// (`forward::apply_accepted`); the shadow retires only once matching
+/// records arrive from the log (`shipper::shadow_retire_matching`). If
+/// the holder (A) dies before shipping, those records never arrive and
+/// the effect is stranded — present on B, absent from the durable log a
+/// third node's (C's) takeover, and a fresh bootstrap, see.
+fn holder_crash_phantom_shadow(_seed: u64) -> Result<()> {
+    let (env, root, mut a, mut b, mut c, sw) = phantom_setup("holder-crash-phantom-shadow")?;
+
+    strand_bs_forwarded_phantom(&mut a, &b, &sw)?;
+
+    // C's write forwards to (now-dead) A, fails, and C takes over once
+    // A's lease expires — legitimately several seconds (up to the
+    // remainder of A's TTL from its last renewal).
+    std::fs::write(c.mnt.join("after"), b"c").context("C must take over once A's lease expires")?;
+    eventually(
+        "B sees C's post-takeover write",
+        Duration::from_secs(30),
+        || {
+            anyhow::ensure!(std::fs::read(b.mnt.join("after"))? == b"c");
+            Ok(())
+        },
+    )?;
+
+    let mut findings: Vec<String> = Vec::new();
+
+    let phantom_states = poll_for_agreement(
+        Duration::from_secs(20),
+        &[
+            ("b", &|| b.mnt.join("phantom").exists()),
+            ("c", &|| c.mnt.join("phantom").exists()),
+        ],
+    );
+    let b_has_phantom = phantom_states[0].1;
+    let c_has_phantom = phantom_states[1].1;
+    eprintln!(
+        "    holder-crash-phantom-shadow: after takeover, b {} phantom, c {} phantom",
+        if b_has_phantom { "has" } else { "lacks" },
+        if c_has_phantom { "has" } else { "lacks" },
+    );
+    if b_has_phantom != c_has_phantom {
+        findings.push(format!(
+            "b and c disagree on \"phantom\" after takeover (b: {}, c: {}): the requester kept \
+             the stranded forwarded create applied (plan 30 bug B)",
+            if b_has_phantom { "present" } else { "absent" },
+            if c_has_phantom { "present" } else { "absent" },
+        ));
+    }
+
+    // Clean unmount of B publishes a metadata commit; a fresh node D
+    // then bootstraps purely from the bucket (head commit + log tail).
+    b.unmount()?;
+    let mut d = Client::new(root.path(), "d", &env.endpoint, &c.backend)?
+        .with_own_node_key()
+        .with_env("CONSTELLATION_LEASE_TTL_MS", "6000");
+    d.mount()?;
+    eventually(
+        "D sees C's post-takeover write",
+        Duration::from_secs(60),
+        || {
+            anyhow::ensure!(std::fs::read(d.mnt.join("after"))? == b"c");
+            Ok(())
+        },
+    )?;
+    let d_has_phantom = d.mnt.join("phantom").exists();
+    eprintln!(
+        "    holder-crash-phantom-shadow: fresh node d {} phantom",
+        if d_has_phantom {
+            "inherited"
+        } else {
+            "did not inherit"
+        },
+    );
+    if d_has_phantom != c_has_phantom {
+        findings.push(format!(
+            "fresh node d bootstrapped from the head commit {} \"phantom\" but c does {}: the \
+             stranded effect was {} into the commit chain",
+            if d_has_phantom {
+                "sees"
+            } else {
+                "does not see"
+            },
+            if c_has_phantom { "" } else { "not" },
+            if d_has_phantom {
+                "published"
+            } else {
+                "not published"
+            },
+        ));
+    }
+
+    c.unmount()?;
+    d.unmount()?;
+
+    if !findings.is_empty() {
+        bail!(findings.join("\n"));
+    }
+    Ok(())
+}
+
+/// Bug B, requester-takeover shape: same stranding as
+/// [`holder_crash_phantom_shadow`], but the *requester* (B) — not a
+/// third node — becomes the next holder. B then validates new creates
+/// against its own phantom entry: C's `create_new("phantom")` should
+/// succeed (the name was never created in the durable history) but is
+/// expected to see `EEXIST` instead.
+fn holder_crash_phantom_new_holder(_seed: u64) -> Result<()> {
+    let (_env, _root, mut a, mut b, mut c, sw) = phantom_setup("holder-crash-phantom-new-holder")?;
+
+    strand_bs_forwarded_phantom(&mut a, &b, &sw)?;
+
+    // B (the requester who applied the stranded ack) takes over as the
+    // new holder this time, instead of C.
+    std::fs::write(b.mnt.join("after"), b"b")
+        .context("B must take over as the new holder once A's lease expires")?;
+    eventually(
+        "C sees B's post-takeover write",
+        Duration::from_secs(30),
+        || {
+            anyhow::ensure!(std::fs::read(c.mnt.join("after"))? == b"b");
+            Ok(())
+        },
+    )?;
+
+    let mut findings: Vec<String> = Vec::new();
+    match create_new(&c.mnt, "phantom") {
+        Ok(()) => {}
+        Err(e) => {
+            findings.push(format!(
+                "c's create of \"phantom\" returned {e} (expected success: the name was never \
+                 created in the durable history); the new holder (b) validated the create \
+                 against its own stranded phantom entry (plan 30 bug B)"
+            ));
+        }
+    }
+
+    let states = poll_for_agreement(
+        Duration::from_secs(20),
+        &[
+            ("b", &|| b.mnt.join("phantom").exists()),
+            ("c", &|| c.mnt.join("phantom").exists()),
+        ],
+    );
+    eprintln!(
+        "    holder-crash-phantom-new-holder: after c's create attempt, b {} phantom, c {} phantom",
+        if states[0].1 { "has" } else { "lacks" },
+        if states[1].1 { "has" } else { "lacks" },
+    );
+    if states[0].1 != states[1].1 {
+        findings.push(format!(
+            "b and c disagree on \"phantom\" (b: {}, c: {})",
+            if states[0].1 { "present" } else { "absent" },
+            if states[1].1 { "present" } else { "absent" },
+        ));
+    }
+
+    b.unmount()?;
+    c.unmount()?;
+
+    if !findings.is_empty() {
+        bail!(findings.join("\n"));
+    }
     Ok(())
 }

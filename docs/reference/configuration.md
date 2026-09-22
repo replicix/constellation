@@ -24,6 +24,7 @@ not listed here.
   - [Filesystem stats](#filesystem-stats)
   - [Named filesystems and daemonization](#named-filesystems-and-daemonization)
   - [Control UI](#control-ui)
+  - [Fault injection (testing only)](#fault-injection-testing-only)
 - [Boolean values](#boolean-values)
 - [Build-time](#build-time)
 - [References](#references)
@@ -407,6 +408,16 @@ operator has cleared.
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_WEB_UI_PORT` | `0` (disabled) | TCP port | localhost control UI; bare `--web-ui` listens on `8080` |
+
+### Fault injection (testing only)
+
+Knobs with no purpose outside the fault-injection harness
+(`crates/harness`) and its scenarios. Never set these against a real
+filesystem.
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` | `0` (disabled) | milliseconds | sleeps this long, holder-side, immediately before replying to a forwarded mutation — after the op has already executed and the keepers lock has been released. Used to make a forwarded mutation's reply race the requester's own `CONSTELLATION_FORWARD_TIMEOUT_MS` deadline deterministically (plan 30 `forward-timeout-reexec`); logs one `tracing::warn!` at startup when non-zero |
 
 ## Boolean values
 

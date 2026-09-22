@@ -38,7 +38,7 @@ use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -81,6 +81,34 @@ fn clear_stale_mount(mountpoint: &std::path::Path) {
         "could not detach stale mount automatically; \
          run `fusermount3 -uz <mountpoint>` if the remount fails"
     );
+}
+
+/// Env: `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS`, milliseconds
+/// (default 0 = no delay, and no `tokio::time::sleep` call at all).
+///
+/// Fault injection only (plan 30 M0) — no other code path reads this.
+/// Delays a forwarded mutation's reply on the *holder* side
+/// (`SyncRequest::Mutate` below), after the op has already executed and
+/// the keepers lock has been released, so the delay races only the
+/// requester's own `CONSTELLATION_FORWARD_TIMEOUT_MS` deadline and
+/// blocks nothing else on this node. This reproduces bug A
+/// (`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md`
+/// §1.1): the requester's forward times out, `request_mutate_with` maps
+/// that to `Busy`, `mutate_op_rebasable` falls back to acquiring the
+/// lease, and it re-executes locally an op the holder already applied.
+///
+/// A `SIGSTOP`-based trigger cannot do this deterministically: the
+/// holder's `HandOff` arm and a forwarded execution race for the same
+/// keepers lock, so freezing the process can freeze the handoff instead
+/// of the reply. Read once: this is on the per-forward hot path.
+fn fault_forward_reply_delay_ms() -> u64 {
+    static DELAY_MS: OnceLock<u64> = OnceLock::new();
+    *DELAY_MS.get_or_init(|| {
+        std::env::var("CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 /// Ceiling of the sync task's idle poll backoff, in milliseconds
@@ -297,6 +325,14 @@ impl NodeRuntime {
             atime_mode,
             passphrase,
         } = cfg;
+
+        let fault_forward_delay_ms = fault_forward_reply_delay_ms();
+        if fault_forward_delay_ms > 0 {
+            tracing::warn!(
+                "fault injection: delaying forwarded-mutation replies by \
+                 {fault_forward_delay_ms} ms (testing only)"
+            );
+        }
 
         let backend = rt
             .block_on(crate::backend::open_backend(&s3))
@@ -1334,6 +1370,19 @@ impl NodeRuntime {
                                     }
                                     placement.note_forwarded(requester);
                                     let _ = sync_tx.send(fusefs::SyncRequest::Nudge);
+                                }
+                                // Fault injection only (plan 30 M0): the op
+                                // above already executed and the keepers
+                                // lock is already released, so this only
+                                // delays the reply the requester is
+                                // waiting on — see
+                                // `fault_forward_reply_delay_ms`'s doc.
+                                let fault_delay_ms = fault_forward_reply_delay_ms();
+                                if fault_delay_ms > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        fault_delay_ms,
+                                    ))
+                                    .await;
                                 }
                                 let _ = reply.send(outcome);
                             });

@@ -21,6 +21,14 @@
 //! It is chained *in front of* toxiproxy (client → counter → toxiproxy →
 //! floci) so latency and cut toxics still apply to the same connections
 //! being counted.
+//!
+//! Plan 30 M0 adds a second, unrelated capability: `cut()`/`heal()` turn
+//! this relay into a per-node S3 kill switch. Unlike `Toxiproxy::Proxy`'s
+//! `cut`/`heal` (shared by every client using that proxy, since it is one
+//! toxiproxy route), a `CountingProxy` is created per client
+//! (`S3Env::counting_proxy`), so cutting it takes exactly one node's S3
+//! path away — needed to reproduce bug B (a holder stranded mid-write
+//! while its peers keep working).
 
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
@@ -191,6 +199,8 @@ pub struct CountingProxy {
     log: Arc<Mutex<Vec<Request>>>,
     desyncs: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    /// Plan 30 M0's per-node S3 switch: see [`Self::cut`].
+    cut: Arc<AtomicBool>,
 }
 
 impl CountingProxy {
@@ -205,17 +215,33 @@ impl CountingProxy {
         let log = Arc::new(Mutex::new(Vec::new()));
         let desyncs = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let cut = Arc::new(AtomicBool::new(false));
         let upstream = upstream.to_string();
         {
-            let (log, desyncs, stop) = (log.clone(), desyncs.clone(), stop.clone());
+            let (log, desyncs, stop, cut) =
+                (log.clone(), desyncs.clone(), stop.clone(), cut.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((client, _)) => {
-                            let (log, desyncs, stop, upstream) =
-                                (log.clone(), desyncs.clone(), stop.clone(), upstream.clone());
+                            // While cut, a client retrying its connection
+                            // must see every attempt fail, not just watch
+                            // its existing connections drop — otherwise a
+                            // fresh connect would quietly restore service
+                            // through the accept loop alone.
+                            if cut.load(Ordering::Relaxed) {
+                                let _ = client.shutdown(std::net::Shutdown::Both);
+                                continue;
+                            }
+                            let (log, desyncs, stop, upstream, cut) = (
+                                log.clone(),
+                                desyncs.clone(),
+                                stop.clone(),
+                                upstream.clone(),
+                                cut.clone(),
+                            );
                             std::thread::spawn(move || {
-                                let _ = relay(client, &upstream, log, desyncs, stop);
+                                let _ = relay(client, &upstream, log, desyncs, stop, cut);
                             });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -231,12 +257,30 @@ impl CountingProxy {
             log,
             desyncs,
             stop,
+            cut,
         })
     }
 
     /// The endpoint constellation clients should use.
     pub fn endpoint(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Cut this proxy's S3 path: every connection currently relaying is
+    /// closed within one poll tick (~100 ms — the relay loops' existing
+    /// read-timeout granularity), and newly accepted connections are
+    /// refused immediately. Counting is unaffected. Pairs with
+    /// [`Self::heal`].
+    pub fn cut(&self) {
+        self.cut.store(true, Ordering::Relaxed);
+    }
+
+    /// Undo [`Self::cut`]: new connections relay normally again.
+    /// Connections closed while cut are not reopened — the S3 client
+    /// reconnects on its own retry, exactly as it would after a real
+    /// outage.
+    pub fn heal(&self) {
+        self.cut.store(false, Ordering::Relaxed);
     }
 
     pub fn requests(&self) -> Vec<Request> {
@@ -286,6 +330,7 @@ fn relay(
     log: Arc<Mutex<Vec<Request>>>,
     desyncs: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    cut: Arc<AtomicBool>,
 ) -> Result<()> {
     client.set_nodelay(true).ok();
     let server = TcpStream::connect(upstream).context("counting proxy upstream connect")?;
@@ -297,10 +342,18 @@ fn relay(
     // upstream -> client: a plain copy, nothing to parse.
     let back = {
         let (mut from, mut to) = (server.try_clone()?, client.try_clone()?);
-        let stop = stop.clone();
+        let (stop, cut) = (stop.clone(), cut.clone());
         std::thread::spawn(move || {
             let mut buf = [0u8; 64 << 10];
             loop {
+                // Checked every iteration, so a connection idling inside
+                // the blocking `read` below (bounded by the 100ms timeout
+                // set above) still notices a cut within one poll tick.
+                if cut.load(Ordering::Relaxed) {
+                    let _ = from.shutdown(std::net::Shutdown::Both);
+                    let _ = to.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
                 match from.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -324,6 +377,11 @@ fn relay(
     let mut parser = RequestParser::default();
     let mut buf = [0u8; 64 << 10];
     loop {
+        if cut.load(Ordering::Relaxed) {
+            let _ = from.shutdown(std::net::Shutdown::Both);
+            let _ = to.shutdown(std::net::Shutdown::Both);
+            break;
+        }
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {

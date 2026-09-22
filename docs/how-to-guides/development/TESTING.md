@@ -616,6 +616,61 @@ Requires docker + fusermount3 + a release binary on the host
 `constellation-harness=1` and removed on drop, even when a scenario
 panics.
 
+### Known-bug reproductions (plan 30 M0)
+
+`harness list` prints a second catalog after the ordinary scenario list,
+headed `known-bug reproductions (expected to FAIL until fixed)`, backed
+by `scenarios::KNOWN_BUG_REPROS` (`crates/harness/src/scenarios.rs`) —
+kept out of `SCENARIOS` so a bare `harness run` (no names) never treats
+a documented bug as a regression. `harness run <name>` resolves a name
+in either list. When a later milestone fixes the bug, its scenario
+moves into `SCENARIOS`, unchanged, as the regression test.
+
+Reproducing these needs two things no scenario had before:
+
+- `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` (default 0, see
+  [Configuration](../../reference/configuration.md)) sleeps this long,
+  holder-side, right before a forwarded mutation's reply is sent — after
+  the op already executed. A `SIGSTOP` cannot substitute: the holder's
+  handoff path and a forwarded execution race for the same lock, so
+  freezing the process risks freezing the handoff instead of the reply.
+- `reqlog::CountingProxy` (otherwise just a request counter) gained
+  `cut()`/`heal()`: a scenario hands one client `counting_proxy().endpoint()`
+  instead of the shared `env.endpoint`, so that one node's S3 path can
+  drop while its peers' stay up.
+
+Scenarios:
+
+- **`forward-timeout-reexec`** (bug A). Two nodes, `CONSTELLATION_LEASE_TTL_MS=10000`
+  and the fault delay above (1500 ms, over the 500 ms default forward
+  timeout) on both. Five rounds alternate which node holds the lease and
+  exercise `O_EXCL` create, `mkdir`, `unlink`, `rename`, and `link`: the
+  requester's forward times out after the holder already executed the
+  op, `mutate_op_rebasable` (`crates/cli/src/fusefs.rs`) falls back to
+  acquiring the lease, and re-executes it locally — wrong errno
+  (`EEXIST`/`ENOENT`) on a call POSIX says must succeed. Fails with one
+  line per anomalous round, including a non-vacuity check
+  (`forwarded_err` must rise, or the round reports the fault never
+  engaged); passes once M2 lands.
+- **`holder-crash-phantom-shadow`** (bug B, third node takes over). Three
+  nodes; A's S3 goes through its own `CountingProxy` switch. A takes the
+  lease, then its S3 is cut — it still acks a forwarded mutation from
+  memory for a few seconds — B's forwarded `create_new("phantom")` lands
+  and is applied on B's replica (`forward::apply_accepted`) before A is
+  killed. C takes over once A's lease expires and never saw the
+  stranded record. B and C disagree on `phantom`; a fresh node D, mounted
+  after B cleanly unmounts (publishing a commit), inherits whichever
+  side published first. Fails listing each disagreement; passes once M3
+  lands.
+- **`holder-crash-phantom-new-holder`** (bug B, the requester takes
+  over). Same stranding, but B itself becomes the next holder. C's
+  `create_new("phantom")` should then succeed — the name was never
+  created in the durable history — but B validates the create against
+  its own stranded phantom entry and answers `EEXIST`.
+
+All three poll the control API (`lease`, `forwarded_err`) and the
+mounted namespace with `eventually` rather than sleeping and hoping.
+
 The harness also runs **fully containerized** (`make harness-docker`,
 compose service `harness`): the image bundles the binaries plus fio and
 stress-ng, mounts the host docker socket (floci/toxiproxy become
