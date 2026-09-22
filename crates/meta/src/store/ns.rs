@@ -221,6 +221,34 @@ pub(crate) fn clear_spilled_xattrs(
     Ok(())
 }
 
+/// Write `ino`'s encoded `0x01` record and bring every `0x02` dentry
+/// copy of its attrs (§P6) in line, in the same transaction. Every
+/// `0x01` write goes through here: readdirplus, `recursive_size` and the
+/// published tree all read attrs from the dentry copy.
+pub(crate) fn put_inode_record(
+    tx: &mut SingleWriterWriteTx,
+    ns: &SingleWriterTxKeyspace,
+    dirty: Dirty,
+    ino: Ino,
+    record: &record::InodeRecord,
+) -> Result<(), MetaError> {
+    ns_insert(tx, ns, dirty, keys::inode(ino), record.encode())?;
+    for (parent, name) in links_of(tx, ns, ino)? {
+        let stale = get_dentry_record(tx, ns, parent, &name)?
+            .is_none_or(|d| d.ino != ino || d.attrs != record.attrs);
+        if stale {
+            ns_insert(
+                tx,
+                ns,
+                dirty,
+                keys::dentry(parent, name.as_bytes()),
+                DentryRecord::new(ino, record.attrs).encode(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Write `ino`'s `0x01` record (and any `0x03`/`blobs` bodies its
 /// xattr set or manifest/symlink spill to), applying §P6's plan_inode
 /// spill order. Returns the placement so the caller can maintain
@@ -241,7 +269,7 @@ pub(crate) fn put_inode(
     for blob in planned.blobs {
         Meta::put_blob(tx, blobs, blob);
     }
-    ns_insert(tx, ns, dirty, keys::inode(ino), planned.record.encode())?;
+    put_inode_record(tx, ns, dirty, ino, &planned.record)?;
     if planned.xattrs == XattrPlacement::Spilled {
         clear_spilled_xattrs(tx, ns, dirty, ino)?;
         for (name, value) in xattrs {

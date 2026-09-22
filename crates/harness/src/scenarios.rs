@@ -443,6 +443,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: disjoint_write_4,
     },
     Scenario {
+        name: "create-storm-s3-only",
+        desc: "3-way create/write/unlink storm in one shared dir, P2P off: a healthy but contended holder must never starve a waiter into EIO",
+        requires: &[],
+        run: create_storm_s3_only,
+    },
+    Scenario {
         name: "mtree-gc-plateau",
         desc: "plan 28 S7b: rewrite rounds with a metadata commit and a GC round each; the metadata pack footprint must plateau, and a fresh node still bootstraps",
         requires: &[],
@@ -4849,6 +4855,190 @@ fn chaos_ci(seed: u64) -> Result<()> {
     let profile = Profile::ci(seed, 3);
     Coordinator::run(&mut cluster, profile, &store)
         .with_context(|| format!("chaos-ci artifacts under {}", store.display()))?;
+
+    c0.unmount()?;
+    c1.unmount()?;
+    c2.unmount()?;
+    Ok(())
+}
+
+/// Plan 29 M3c: `chaos-ci`'s EIO ("unexpected errno EIO on worker N during
+/// create_storm") turned out to be P2P being dead (M3b gave every client
+/// its own node key, closing that gap). But with P2P genuinely unavailable
+/// — `CONSTELLATION_P2P=off`, or peers unreachable — a healthy, merely
+/// *contended* cluster must still never surface EIO: a non-holder's
+/// mutation falls back to the S3 lease CAS/TTL path, and under sustained
+/// 3-way contention the holder's own write-idle timer never fires (it
+/// never goes idle) and the sticky-lease `wanted_by` handoff can be starved
+/// by a continuously non-empty local journal — see the M3c fix in
+/// `crates/cli/src/lease.rs` for the mechanism.
+///
+/// Three clients, each with its own node key and `CONSTELLATION_P2P=off`
+/// (so forwarding/handoff can never mask a lease problem), hammer
+/// create/write(/read)/unlink of their own uniquely-named files in one
+/// shared directory for `CHAOS_CREATE_STORM_SECS` (default 30s). A lease
+/// TTL of 20s (FUSE acquire deadline 2xTTL = 40s) leaves real headroom
+/// over `LEASE_MIN_DWELL_MS`/`LEASE_WANTED_GRACE_MS` (5s each, fixed
+/// regardless of TTL): the sticky-lease notice delay is up to TTL/2 on
+/// its own, and a self-reclaim by the just-released holder (bounded by
+/// `HANDOFF_PAUSE_MS`, not eliminated by it) can chain a waiter through
+/// more than one dwell+grace cycle before it finally wins the CAS — an
+/// aggressively short TTL leaves too little margin over that compounded
+/// worst case, which is a test-tuning concern given the fixed floors,
+/// not something a shorter TTL is entitled to assume away. Every
+/// worker's storm result is checked for an unexpected errno (EIO chief
+/// among them); a final marker file per client proves the three mounts
+/// converge to the same listing and contents.
+fn create_storm_s3_only(seed: u64) -> Result<()> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    let (env, root) = setup("create-storm-s3-only")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/create-storm-s3-only-{}", ts());
+    let ttl_ms = 20_000u64;
+    let mk = |c: Client| {
+        c.with_own_node_key()
+            .with_env("CONSTELLATION_P2P", "off")
+            .with_env("CONSTELLATION_LEASE_TTL_MS", &ttl_ms.to_string())
+    };
+    let mut c0 = mk(Client::new(root.path(), "c0", &env.endpoint, &backend)?);
+    let mut c1 = mk(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
+    let mut c2 = mk(Client::new(root.path(), "c2", &env.endpoint, &backend)?);
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    c2.mount()?;
+
+    let dir = "storm";
+    std::fs::create_dir_all(c0.mnt.join(dir))?;
+    eventually(
+        "shared storm dir visible on all mounts",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(c1.mnt.join(dir).is_dir());
+            anyhow::ensure!(c2.mnt.join(dir).is_dir());
+            Ok(())
+        },
+    )?;
+
+    let storm_secs = std::env::var("CHAOS_CREATE_STORM_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let mounts = [c0.mnt.clone(), c1.mnt.clone(), c2.mnt.clone()];
+    let deadline = std::time::Instant::now() + Duration::from_secs(storm_secs);
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut handles = Vec::new();
+    for (idx, mnt) in mounts.iter().cloned().enumerate() {
+        let errors = errors.clone();
+        let dir = dir.to_string();
+        let mut wrng = StdRng::seed_from_u64(rng.random());
+        handles.push(std::thread::spawn(move || -> u64 {
+            let mut n = 0u64;
+            while std::time::Instant::now() < deadline {
+                n += 1;
+                let path = mnt.join(&dir).join(format!("w{idx}-{n}"));
+                let len = wrng.random_range(16..256);
+                let mut content = format!("worker {idx} file {n} ").into_bytes();
+                content.resize(len, b'x');
+                if let Err(e) = std::fs::write(&path, &content) {
+                    errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("worker {idx} write #{n} ({path:?}): {e}"));
+                    continue;
+                }
+                match std::fs::read(&path) {
+                    Ok(got) if got == content => {}
+                    Ok(got) => errors.lock().unwrap().push(format!(
+                        "worker {idx} read #{n} ({path:?}): content mismatch, got {} bytes want {}",
+                        got.len(),
+                        content.len()
+                    )),
+                    Err(e) => errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("worker {idx} read #{n} ({path:?}): {e}")),
+                }
+                if let Err(e) = std::fs::remove_file(&path) {
+                    errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("worker {idx} unlink #{n} ({path:?}): {e}"));
+                }
+                if wrng.random_bool(0.1) {
+                    std::thread::sleep(Duration::from_millis(wrng.random_range(0..5)));
+                }
+            }
+            n
+        }));
+    }
+    let mut totals = Vec::new();
+    for h in handles {
+        totals.push(
+            h.join()
+                .map_err(|_| anyhow::anyhow!("create-storm-s3-only: worker thread panicked"))?,
+        );
+    }
+    let errs = errors.lock().unwrap().clone();
+    if !errs.is_empty() {
+        eprintln!(
+            "create-storm-s3-only FAILED: {} unexpected errno(s)",
+            errs.len()
+        );
+        for c in [&c0, &c1, &c2] {
+            eprintln!("--- {} mount.log (tail) ---\n{}", c.name, c.tail_log_n(60));
+        }
+    }
+    anyhow::ensure!(
+        errs.is_empty(),
+        "create-storm-s3-only: {} unexpected errno(s) during the storm (totals {totals:?}):\n{}",
+        errs.len(),
+        errs.join("\n")
+    );
+    eprintln!("create-storm-s3-only: completed op counts per worker = {totals:?}");
+
+    // Convergence: one persistent marker per client, then every mount must
+    // agree on the shared directory's final listing and contents.
+    let mut markers = Vec::new();
+    for (idx, mnt) in mounts.iter().enumerate() {
+        let name = format!("marker-{idx}");
+        let content = format!("final marker from worker {idx}").into_bytes();
+        std::fs::write(mnt.join(dir).join(&name), &content)?;
+        markers.push((name, content));
+    }
+    let mut want: Vec<String> = markers.iter().map(|(n, _)| n.clone()).collect();
+    want.sort();
+    eventually(
+        "final storm-dir listing converges on all mounts",
+        Duration::from_secs(30),
+        || {
+            for mnt in &mounts {
+                let mut names: Vec<String> = std::fs::read_dir(mnt.join(dir))?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                anyhow::ensure!(
+                    names == want,
+                    "{}: storm-dir listing {:?} != expected {:?}",
+                    mnt.display(),
+                    names,
+                    want
+                );
+                for (name, content) in &markers {
+                    let got = std::fs::read(mnt.join(dir).join(name))?;
+                    anyhow::ensure!(
+                        &got == content,
+                        "{}: marker {name} content mismatch",
+                        mnt.display()
+                    );
+                }
+            }
+            Ok(())
+        },
+    )?;
 
     c0.unmount()?;
     c1.unmount()?;

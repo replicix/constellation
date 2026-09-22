@@ -1122,6 +1122,20 @@ impl NodeRuntime {
                                 keepers.insert(part.clone(), k);
                             }
                             let keeper = keepers.get_mut(&part).unwrap();
+                            if keeper.is_paused_for_handoff() {
+                                // The sync task is mid-way through forcing
+                                // this partition's backlog to zero for an
+                                // overdue handoff (plan 29 M3c). Answering
+                                // `Plan::Held` here — which is what a
+                                // same-node classify would otherwise see —
+                                // would let this node's own writes keep
+                                // flowing and defeat the pause. Decline;
+                                // the FUSE thread's own backoff retries
+                                // well within the pause's short budget.
+                                tracing::debug!(part, "declining Acquire: paused for handoff");
+                                let _ = reply.send(Ok(fusefs::AcquireProgress::busy(0, 0)));
+                                continue;
+                            }
                             keeper.note_acquire_reason("fuse-acquire");
                             let mut r = if epochs.writes_ok() {
                                 if keeper.holds_authority() {
@@ -1152,7 +1166,21 @@ impl NodeRuntime {
                             if let Err(e) = &r {
                                 tracing::warn!(error = %e, part, "lease acquisition failed");
                             }
-                            let _ = reply.send(r.map_err(|e| format!("{e:#}")));
+                            // A fresh classify (one extra GET, only paid on
+                            // the busy path) gives the caller a holder/epoch
+                            // snapshot to detect progress by — see
+                            // `fusefs::AcquireProgress`'s doc.
+                            let reply_progress = match r {
+                                Ok(true) => Ok(fusefs::AcquireProgress::acquired()),
+                                Ok(false) => Ok(match keeper.classify().await {
+                                    Ok(lease::Plan::Busy { holder, prev, .. }) => {
+                                        fusefs::AcquireProgress::busy(holder, prev.epoch)
+                                    }
+                                    _ => fusefs::AcquireProgress::busy(0, 0),
+                                }),
+                                Err(e) => Err(format!("{e:#}")),
+                            };
+                            let _ = reply.send(reply_progress);
                         }
                         Some(fusefs::SyncRequest::HandOff { part, reply }) => {
                             // Fast-path handoff (M3.3): flush this partition

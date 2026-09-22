@@ -2760,18 +2760,79 @@ async fn run_sync_round(
         }
     }
     ship.sync_all(&mut keepers).await?;
+    // First pass: the ordinary case, where the backlog already reads
+    // zero (either genuinely idle, or this round's `sync_all` above
+    // just drained it) — release immediately, no need to touch the
+    // fast path at all.
+    let mut stuck: Vec<String> = Vec::new();
     for (part, k) in keepers.iter_mut() {
         if k.is_lost() {
             continue;
         }
-        if k.idle_release_due(ship.journal_backlog_of(part)) {
+        let backlog = ship.journal_backlog_of(part);
+        if k.idle_release_due(backlog) {
             tracing::info!(part, "idle-releasing partition lease");
+            // Close our own fast path before releasing (plan 29 M3c):
+            // `idle_release_due` only fires with a registered waiter,
+            // and without this our own next local write — already
+            // queued on the same `Acquire` path, released to retry the
+            // instant the CAS lands — tends to win the reclaim race
+            // against that waiter's independently-scheduled retry.
+            k.begin_handoff_pause();
             // Ship-then-release (plan 20): flush any pending read-time
             // atime for this partition before the lease is gone, so a
             // read-heavy holder's bumps reach the cluster rather than
             // being stranded in a partition we will no longer ship.
             ship.ship_atime_before_release(part, k).await;
             k.release().await?;
+        } else if backlog > 0 && k.wants_handoff() {
+            stuck.push(part.clone());
+        }
+    }
+    // Second pass (plan 29 M3c): a busy local workload can keep
+    // `journal_backlog` above zero indefinitely, which used to mean a
+    // registered waiter never saw the round above release anything —
+    // sustained local traffic on the holder's own node starved every
+    // other node past the FUSE acquire deadline. Dwell/wanted already
+    // justify a handoff (`wants_handoff`); force it by briefly closing
+    // this node's own fast path (`begin_handoff_pause`) so no *new*
+    // local mutation can extend the backlog, then try once more to
+    // drain it.
+    //
+    // One attempt per round, not a busy-loop here: a record can be
+    // waiting on this round's own `upload_dirty_chunks` (called by our
+    // caller, `run_managed_sync_round`, *before* `run_sync_round`, not
+    // by `sync_all` itself), so spinning inside this function cannot
+    // make it ship any sooner — it would only burn the handoff-pause
+    // budget without giving the next round's upload a chance to run.
+    // The pause is self-expiring and outlives a single round
+    // (`HANDOFF_PAUSE_MS`), so a registered waiter still gets several
+    // of these attempts, each preceded by a fresh chunk-upload pass,
+    // before it lapses; if the backlog is still stuck by then the next
+    // round's `wants_handoff` check simply re-arms it.
+    for part in stuck {
+        if let Some(k) = keepers.get_mut(&part) {
+            k.begin_handoff_pause();
+        }
+        ship.sync_all(&mut keepers).await?;
+        let backlog = ship.journal_backlog_of(&part);
+        if backlog > 0 {
+            tracing::debug!(
+                part,
+                backlog,
+                "handoff pause set; backlog still non-zero, will retry next round"
+            );
+            continue;
+        }
+        if let Some(k) = keepers.get_mut(&part) {
+            if !k.is_lost() {
+                tracing::info!(
+                    part,
+                    "idle-releasing partition lease (forced drain under sustained local traffic)"
+                );
+                ship.ship_atime_before_release(&part, k).await;
+                k.release().await?;
+            }
         }
     }
     Ok(())
@@ -3401,9 +3462,9 @@ impl DaemonStatus {
         self.sync_tx
             .send(fusefs::SyncRequest::Acquire { part, reply })
             .map_err(|_| "sync task is not running".to_string())?;
-        let acquired = tokio::task::block_in_place(|| self.rt.block_on(receive))
+        let progress = tokio::task::block_in_place(|| self.rt.block_on(receive))
             .map_err(|_| "lease acquisition stopped".to_string())??;
-        if !acquired {
+        if !progress.acquired {
             return Err("subtree write lease is held by another node".into());
         }
         let (reply, receive) = tokio::sync::oneshot::channel();
@@ -4278,7 +4339,14 @@ impl constellation_api::StatusSource for DaemonStatus {
             .find(|m| m.mountpoint == mountpoint)
             .map(|m| m.id)
             .ok_or_else(|| format!("no view mounted at {}", mountpoint.display()))?;
-        self.node.remove_mount(id).map_err(|e| format!("{e:#}"))?;
+        // `remove_mount` calls `fusermount3 -u` and then joins the FUSE
+        // session's OS thread, which can legitimately take a while
+        // (draining in-flight requests). `dispatch` runs this on a tokio
+        // worker with no `.await` in between, so without `block_in_place`
+        // that worker — and every other task scheduled on it — would
+        // stall for however long the unmount takes, same class of bug as
+        // `reintegrate`/`gc_run`/`fsck_run` below already guard against.
+        tokio::task::block_in_place(|| self.node.remove_mount(id)).map_err(|e| format!("{e:#}"))?;
         Ok(format!("unmounted {}", mountpoint.display()))
     }
 

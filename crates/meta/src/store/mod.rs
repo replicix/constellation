@@ -835,3 +835,69 @@ mod tests {
         assert_eq!(meta.journal_len().unwrap(), before + 1);
     }
 }
+
+/// Plan 29 M3c: `recursive_size` (and readdirplus) read a file's attrs
+/// from the §P6 dentry copy, so every mutation, local or replayed, must
+/// keep each `0x02` copy equal to its `0x01` inode's attrs.
+#[cfg(test)]
+mod dentry_copy_tests {
+    use super::*;
+    use crate::{MetaStore, SetXattrMode};
+    use constellation_fs_core::types::ROOT_INO;
+    use constellation_mtree::record::{DentryRecord, InodeRecord};
+
+    fn assert_copies_match(meta: &Meta, label: &str) {
+        let r = meta.db.read_tx();
+        let range = keys::whole_range(keys::RANGE_DENTRY);
+        let mut n = 0;
+        for guard in r.range(&meta.ns, ns::key_range_bounds(&range)) {
+            let (k, v) = guard.into_inner().unwrap();
+            let d = DentryRecord::decode(&v).unwrap();
+            let rec: InodeRecord = ns::get_inode_record(&r, &meta.ns, d.ino)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label}: dangling dentry {k:?}"));
+            assert_eq!(
+                d.attrs, rec.attrs,
+                "{label}: stale dentry copy for ino {}",
+                d.ino
+            );
+            n += 1;
+        }
+        assert!(n > 0, "{label}: no dentries checked");
+    }
+
+    #[test]
+    fn every_mutation_keeps_dentry_attr_copies_in_sync_locally_and_on_replay() {
+        let a = Meta::open_in_memory().unwrap();
+        let d = a.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
+        let e = a.mkdir(ROOT_INO, "e", 0o755, 0, 0).unwrap().ino;
+        let f = a.create(d, "f", 0o644, 0, 0).unwrap().ino;
+        a.set_manifest(f, b"m1", 100).unwrap();
+        a.link(f, e, "f-link").unwrap();
+        a.set_manifest(f, b"m2", 250).unwrap();
+        a.setattr(f, Some(0o600), Some(7), Some(8), Some(10), None, Some(5))
+            .unwrap();
+        a.set_xattr(f, "user.k", b"v", SetXattrMode::Set).unwrap();
+        a.remove_xattr(f, "user.k").unwrap();
+        a.set_xattr(d, "user.big", &vec![7u8; 8192], SetXattrMode::Set)
+            .unwrap();
+        a.rename(d, "f", e, "g").unwrap();
+        a.symlink(e, "s", "target", 0, 0).unwrap();
+        let g = a.create(e, "h", 0o644, 0, 0).unwrap().ino;
+        a.rename(e, "h", e, "g").unwrap(); // replace
+        a.setattr(g, None, None, None, Some(3), Some(1), Some(2))
+            .unwrap();
+        a.rename(ROOT_INO, "d", e, "d2").unwrap(); // move a directory
+        assert_copies_match(&a, "local");
+
+        let b = Meta::open_in_memory().unwrap();
+        let records: Vec<_> = a
+            .take_journal(10_000)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        b.apply_records(&records).unwrap();
+        assert_copies_match(&b, "replay");
+    }
+}

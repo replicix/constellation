@@ -3752,3 +3752,44 @@ DESIGN.md.
 ### Plan 29 M3b exit criteria
 - [x] fmt, clippy `-D warnings`, `cargo test --workspace`, release build
 - [x] `atime-eventual`, `deposed-reintegration`, `chaos-ci`, `named-shared-daemon` each PASSED 3× (subagent) and again after the coordinator's lease/atime follow-ups; `baseline two-clients-shared lease-handover node-leave snapshot-churn e2e-two-nodes` PASSED; `tests/smoke.sh` PASSED
+
+## Plan 29 M3c — create-storm-s3-only, control-socket blocking handlers, per-directory recursive size: **DONE**
+
+| Item | Status | Where |
+|---|---|---|
+| `create-storm-s3-only` harness scenario: 3 clients, own node keys, `CONSTELLATION_P2P=off`, concurrent create/write/read/unlink storm in one shared directory for 30s, asserting no EIO/unexpected errno and final marker-file convergence | done | `crates/harness/src/scenarios.rs`, `docs/how-to-guides/development/TESTING.md` |
+| Root cause 1 (holder never releases under load): `idle_release_due`'s `journal_backlog == 0` term can never be true while the holder's own workload keeps writing, since new local mutations land straight in the journal with no lock the sync task holds. Added `LeaseKeeper::wants_handoff` (dwell+wanted timers only) to detect an overdue handoff regardless of backlog, and `begin_handoff_pause`/`is_paused_for_handoff` to briefly close *new* local mutations (checked at the `SyncRequest::Acquire` handler and the three FUSE-side mutation gates) so the sync task can force the backlog to zero and release | done | `crates/cli/src/lease.rs`, `crates/cli/src/main.rs` (`run_sync_round`), `crates/cli/src/node_runtime.rs` |
+| Root cause 2 (self-reclaim race): closing the fast path is not enough — the just-released holder's own blocked write sits in the same `Acquire` queue as the real waiter and, being local, tends to win the reclaim before the waiter's independently-scheduled retry arrives. The pause (`HANDOFF_PAUSE_MS`, self-expiring) now deliberately survives a *successful* release too, giving the waiter an uncontested window | done | `crates/cli/src/lease.rs` |
+| Root cause 3 (pause blocked shipping too): the pause was implemented by gating `LeaseView::usable()`, which `LeaseKeeper::ship_epoch` also reads — so `ship_part` refused to ship (and ack) the very backlog the pause exists to drain, and the pause could only ever succeed by the accident of expiring at the right instant relative to `run_sync_round`'s cadence. Split the gate: `usable()` (and so `ship_epoch`/shipping authority) is blind to the pause; a new `LeaseView::open_for_new_mutation` (checked at the FUSE-side mutation gates only) is the one that watches it | done | `crates/cli/src/lease.rs`, `crates/cli/src/fusefs.rs` |
+| Root cause 4 (phase-locked retry backoff): every blocked FUSE thread ran the identical deterministic backoff schedule (100ms→2s cap); several nodes mounted around the same instant retry in near-lockstep, so their `register_wanted`/claim CAS attempts kept colliding with *each other* rather than the holder. Retries are now jittered (0-50% extra, `fusefs::jitter_fraction`) | done | `crates/cli/src/fusefs.rs` |
+| Registration retry-after-conflict cooldown capped at 2s (was `ttl_ms/2`, up to 30s at the 60s default): a lost registration CAS can mean a second *waiter* collided with ours, not just the holder's own renewal, and a short TTL test left as few as 4 attempts inside the 2xTTL deadline | done | `crates/cli/src/shipper.rs` |
+| FUSE acquire deadline made progress-based, not a fixed 2xTTL wall clock: `SyncRequest::Acquire` now replies with an `AcquireProgress{acquired, holder, epoch}` snapshot; the retry loop resets its stall clock on any observed `(holder, epoch)` change and only gives up after `2xTTL` of *no* change — a genuinely unreachable S3 still fails fast via the existing hard-error path, unaffected | done | `crates/cli/src/fusefs.rs`, `crates/cli/src/node_runtime.rs` |
+| `mount_remove`'s control-socket handler ran `fusermount3 -u` + joined the FUSE session thread synchronously on a tokio worker with no `.await` in between — the same class of bug `reintegrate`/`gc_run`/`fsck_run` already guard against with `block_in_place`. Wrapped the same way. Audited every other `StatusSource` handler for the pattern (`reintegrate`, `gc_run`, `fsck_run`, `doctor`, `prune_run` already correct; `inspect`/`read_dir`/`cache_list`/`prune_ls` are bounded point-reads or single-directory listings, not full scans, and were previously audited in M3a) | done | `crates/cli/src/main.rs` |
+| `recursive_size` measured against the plan's decision rule (>100ms/100k warm ⇒ bad): comfortably fine (see measurements below), so kept the DFS and took the two cheap wins named in the plan — the root's `InodeRecord` was fetched twice (existence check, then size) for no reason; every child paid a `0x01` point read per file just to learn its size on top of the `0x02` range scan already visiting it, when the dentry's own attr copy already carries `size` (§P6, kept byte-for-byte in sync with `0x01` in the same commit) | done | `crates/meta/src/store/reads.rs` |
+| `#[ignore]`d release-mode measurement test: 100k flat dir and a 1,000,000-file/1,111-dir tree (fanout 10, depth 3 dirs + files), root and mid-level subtree, warm and cold (reopened store) | done | `crates/meta/tests/recursive_size_perf.rs` |
+
+**Measurements (Task 3, release build, `crates/meta/tests/recursive_size_perf.rs`):**
+
+| Case | Setup | Warm (1st / 2nd) | Cold (reopened) |
+|---|---|---|---|
+| 100k flat directory | 1.41s (100k creates) | 24.41ms / 24.74ms | 22.03ms |
+| 1M-file tree, root (1M files) | 25.46s (1M creates, 1,111 dirs) | 301.40ms / 158.11ms | 273.76ms |
+| 1M-file tree, mid-level subtree (10k files) | — | 1.24ms / 1.22ms | 1.21ms |
+
+Decision: DFS is fine (≈16ms/100k warm at 1M scale, well under the 100ms/100k threshold at every scale measured) — kept it, applied the two cheap fixes above, did not build maintained per-directory counters.
+
+**Design decisions:**
+
+- The FUSE acquire deadline's progress rule treats *any* observed `(holder, epoch)` change as progress, not just a change that hands the lease to *this* node — a healthy cluster rotating the lease among other nodes must not time out a waiter just because its own turn hasn't come yet, only genuine multi-cycle stagnation should.
+- `LeaseView::usable()` and the new `open_for_new_mutation()` are deliberately two different gates: `usable()` (and everything built on it — `ship_epoch`, `holds_authority`, the atime-forward partition set) must never be blind to a self-imposed local pause, or the pause can never let the shipper make the progress it exists to force.
+- `mount_remove` uses `block_in_place` rather than `spawn_blocking` to match the codebase's existing idiom for this exact problem (`reintegrate`/`gc_run`/`fsck_run`/`doctor`/`prune_run` all do the same), rather than introducing a second pattern for one call site.
+
+**Left over (explicitly deferred):** a residual, *statistical* (not structural) throughput-fairness gap under 3-way contention: the release-then-reclaim step is still a free-for-all CAS race with no ordering among registered waiters, so a lightly-loaded waiter can end up doing only one or two ops across a 30s storm while the other two nodes trade the lease between themselves — never EIO (the progress-based deadline tolerates it as long as the lease keeps changing hands to *anyone*), but real throughput unfairness a FIFO/ticket successor design would remove. Out of scope for this milestone. `Lease::wanted_by`'s sort-by-id (not arrival order) was left unchanged since nothing currently reads its order.
+
+### Plan 29 M3c exit criteria
+- [x] fmt clean, clippy `-D warnings` clean, `cargo test --workspace` 0 failures, `cargo build --release --workspace`
+- [x] `create-storm-s3-only` PASSED 3x in a row (116.6s, 113.2s, 118.8s)
+- [x] `chaos-ci` (4.5s) `lease-handover` (179.2s) `two-clients-shared` (241.7s) `deposed-reintegration` (23.8s) `named-shared-daemon` (1.4s) `node-leave` (34.0s) `baseline` (4.0s) `e2e-two-nodes` (4.3s) all PASSED
+- [x] `tests/smoke.sh` PASSED
+
+**Coordinator follow-up (M3c):** a new invariant test (`store::dentry_copy_tests`) showed the §P6 `0x02` attr copy went stale whenever a directory's nlink/mtime/ctime changed (`touch_times_tx`/`bump_nlink_tx` wrote only `0x01`), so readdirplus and the published tree carried stale subdirectory attrs. That became load-bearing once `recursive_size` started reading sizes from the copy. Every `0x01` write now goes through `ns::put_inode_record`, which refreshes each stale dentry copy in the same transaction; the test covers local mutations and journal replay on a second replica.

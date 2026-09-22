@@ -147,32 +147,43 @@ impl Meta {
     /// DFS over `0x02` in one snapshot: no maintained per-directory
     /// counter yet (plan 29 M3), so this walks the subtree exactly like
     /// the old `WITH RECURSIVE` CTE did.
+    ///
+    /// Plan 29 M3c measured this against the decision rule (>100ms per
+    /// 100k entries warm means bad): comfortably fine, so the fix here is
+    /// the two cheap wins the measurement's writeup called for rather
+    /// than maintained per-directory counters. (1) The root's
+    /// `InodeRecord` used to be fetched twice — once to check it exists,
+    /// once to read its size — for no reason; one lookup now does both.
+    /// (2) Every *child* used to cost a full `0x01` point read per file
+    /// just to learn its size, on top of the `0x02` range scan already
+    /// visiting it: the dentry's own attr copy (§P6, kept byte-for-byte
+    /// in sync with `0x01` in the same commit — see [`DentryRecord`]'s
+    /// doc) already carries `size`, so decoding the whole dentry instead
+    /// of just `ino_and_kind` answers a file child from the scan alone.
+    /// Directories still only need the ino to push onto the stack.
     pub fn recursive_size(&self, ino: Ino) -> Result<(u64, u64), MetaError> {
+        use constellation_mtree::record::{DentryRecord, Kind};
+
         let r = self.db.read_tx();
-        if ns::get_inode_record(&r, &self.ns, ino)?.is_none() {
-            return Err(MetaError::NoEnt(ino));
-        }
+        let root = ns::get_inode_record(&r, &self.ns, ino)?.ok_or(MetaError::NoEnt(ino))?;
         let (mut bytes, mut files) = (0u64, 0u64);
-        if let Some(rec) = ns::get_inode_record(&r, &self.ns, ino)? {
-            if rec.attrs.kind == constellation_mtree::record::Kind::File {
-                bytes += rec.attrs.size;
-                files += 1;
-            }
+        if root.attrs.kind == Kind::File {
+            bytes += root.attrs.size;
+            files += 1;
         }
         let mut stack = vec![ino];
         while let Some(dir) = stack.pop() {
             let range = keys::dentries_of(dir);
             for guard in r.range(&self.ns, ns::key_range_bounds(&range)) {
                 let (_, v) = guard.into_inner()?;
-                let (child_ino, kind) =
-                    constellation_mtree::record::DentryRecord::ino_and_kind(&v)?;
-                if kind == constellation_mtree::record::Kind::File {
-                    if let Some(rec) = ns::get_inode_record(&r, &self.ns, child_ino)? {
-                        bytes += rec.attrs.size;
+                let dentry = DentryRecord::decode(&v)?;
+                match dentry.attrs.kind {
+                    Kind::File => {
+                        bytes += dentry.attrs.size;
                         files += 1;
                     }
-                } else if kind == constellation_mtree::record::Kind::Dir {
-                    stack.push(child_ino);
+                    Kind::Dir => stack.push(dentry.ino),
+                    _ => {}
                 }
             }
         }

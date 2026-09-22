@@ -384,16 +384,6 @@ impl Meta {
                 .transpose()?,
             &xattrs,
         )?;
-        // Update dentry copies (attrs changed: size/mtime/ctime).
-        for (parent, name) in ns::links_of(tx, ns_ks, ino)? {
-            ns::ns_insert(
-                tx,
-                ns_ks,
-                dirty,
-                keys::dentry(parent, name.as_bytes()),
-                DentryRecord::new(ino, attrs).encode(),
-            )?;
-        }
         misc::track_manifest_transition_tx(
             tx,
             chunk_ref,
@@ -1357,22 +1347,7 @@ impl MetaStore for Meta {
         }
         rec.attrs.ctime_ns = t;
         let attrs = rec.attrs;
-        ns::ns_insert(
-            &mut tx,
-            &self.ns,
-            self.dirty_for_ns(),
-            keys::inode(ino),
-            rec.encode(),
-        )?;
-        for (parent, name) in ns::links_of(&tx, &self.ns, ino)? {
-            ns::ns_insert(
-                &mut tx,
-                &self.ns,
-                self.dirty_for_ns(),
-                keys::dentry(parent, name.as_bytes()),
-                DentryRecord::new(ino, attrs).encode(),
-            )?;
-        }
+        ns::put_inode_record(&mut tx, &self.ns, self.dirty_for_ns(), ino, &rec)?;
         if let Some(a) = atime_ns {
             atime::set_atime_tx(&mut tx, &self.atime, ino, a);
         }

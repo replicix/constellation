@@ -23,13 +23,7 @@ pub(crate) fn touch_times_tx(
     if let Some(mut rec) = ns::get_inode_record(tx, ns_ks, ino)? {
         rec.attrs.mtime_ns = t;
         rec.attrs.ctime_ns = t;
-        ns::ns_insert(
-            tx,
-            ns_ks,
-            dirty,
-            constellation_mtree::keys::inode(ino),
-            rec.encode(),
-        )?;
+        ns::put_inode_record(tx, ns_ks, dirty, ino, &rec)?;
     }
     Ok(())
 }
@@ -50,13 +44,7 @@ pub(crate) fn bump_nlink_tx(
     rec.attrs.nlink = (rec.attrs.nlink as i64 + delta).max(0) as u32;
     rec.attrs.mtime_ns = t;
     rec.attrs.ctime_ns = t;
-    ns::ns_insert(
-        tx,
-        ns_ks,
-        dirty,
-        constellation_mtree::keys::inode(ino),
-        rec.encode(),
-    )?;
+    ns::put_inode_record(tx, ns_ks, dirty, ino, &rec)?;
     Ok(Some(rec))
 }
 

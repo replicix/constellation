@@ -85,6 +85,10 @@ fn publish_idle_interval() -> std::time::Duration {
 /// Max journal records per segment.
 const SEGMENT_BATCH: usize = 10_000;
 
+/// Ceiling on [`Shipper::register_wanted_by`]'s retry-after-conflict
+/// cooldown, independent of TTL — see that function's doc.
+const REGISTER_WANTED_COOLDOWN_CEILING_MS: u64 = 2_000;
+
 /// Concurrent segment-payload GETs while tailing one partition, and the
 /// width of the speculative GET-next probe. Each GET is a full S3 round
 /// trip; a reader far from the bucket that fetched a burst's segments one
@@ -1382,12 +1386,25 @@ impl Shipper {
             return;
         }
         // Half a TTL is the holder's own renewal period: registering more
-        // often than it can look cannot make it release any sooner. The
+        // often than it can look cannot make it *notice* any sooner. The
         // timestamp is taken per *attempt*, not per success — a CAS that
         // lost still means the object moved under us, and hammering it
         // from a blocked FUSE thread would only add request traffic.
+        //
+        // Capped (plan 29 M3c): a lost CAS here can also mean a *second*
+        // waiter's registration collided with ours, not just the holder's
+        // own renewal — with several waiters and a short TTL, half-TTL
+        // spacing left as few as four attempts inside the FUSE acquire
+        // deadline (2xTTL), and `create-storm-s3-only` could see two
+        // simultaneously-blocked waiters repeatedly collide with each
+        // other, each collision costing a full half-TTL before either
+        // retried. The cap only shortens the *retry-after-conflict* path;
+        // once registered, `wanted_by.contains` above still skips every
+        // later attempt regardless of the cap, so a healthy single-waiter
+        // handoff is unaffected.
         let cooldown = std::time::Duration::from_millis(
-            constellation_store_s3::lease::lease_ttl_ms().max(2) / 2,
+            (constellation_store_s3::lease::lease_ttl_ms().max(2) / 2)
+                .min(REGISTER_WANTED_COOLDOWN_CEILING_MS),
         );
         if self
             .wanted_registered_at

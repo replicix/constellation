@@ -241,6 +241,24 @@ On failure, artifacts land under the scenario tempdir's `chaos-store/`
 use the same library over TCP — see
 [Run a chaos soak](run-chaos-soak.md).
 
+### Create storm without P2P (`create-storm-s3-only`)
+
+`harness run create-storm-s3-only` reproduces plan 29 M3's leftover: with
+`CONSTELLATION_P2P=off` (each client on its own node key, forwarding
+disabled), three clients hammer create/write/read/unlink of their own
+uniquely-named files in one shared directory for 30 s (`CHAOS_CREATE_STORM_SECS`
+overrides). A contended-but-healthy cluster must never surface EIO on a
+mutation just because another node holds the lease — only a genuinely
+unreachable S3 may. The FUSE acquire wait is progress-based (plan 29 M3c):
+it keeps retrying as long as the lease keeps changing hands (or its
+holder/epoch otherwise visibly moves), and only gives up once the same
+(holder, epoch) has sat unchanged for a full 2xTTL. The lease TTL is 20 s
+(deadline 40 s), leaving real headroom over the sticky-lease dwell/grace
+floors (5 s each, fixed regardless of TTL) even when a waiter needs more
+than one dwell+grace cycle to win the CAS. After the storm, every client
+writes a marker file and the scenario asserts all three mounts converge to
+the same directory listing and contents.
+
 Phase-3 scenarios exercise the partition lease (DESIGN.md §4/§5):
 `lease-handover` (A writes, goes write-idle, and cooperatively releases
 the lease; B must acquire it within a few seconds — not a 60 s TTL

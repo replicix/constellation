@@ -50,6 +50,20 @@ fn statfs_ttl_from_env() -> Duration {
     parse_statfs_ttl_secs(std::env::var("CONSTELLATION_STATFS_TTL_S").ok().as_deref())
 }
 
+/// A cheap, non-cryptographic random value in `[0, 1)`, fresh per call.
+/// `RandomState::new()` draws its keys from the OS RNG each time it is
+/// constructed, so hashing nothing still yields a value that varies
+/// call to call and thread to thread — exactly what jittering a retry
+/// backoff needs, without pulling in a `rand` dependency for one call
+/// site. Never used where actual unpredictability (security) matters.
+fn jitter_fraction() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    let bits = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
 /// `statfs` block arithmetic, as `(total, free)`.
 ///
 /// The two columns answer different questions and so read different
@@ -126,6 +140,31 @@ impl WriteShards {
     }
 }
 
+/// Outcome of a `SyncRequest::Acquire` attempt (see its doc).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AcquireProgress {
+    pub acquired: bool,
+    pub holder: u64,
+    pub epoch: u64,
+}
+
+impl AcquireProgress {
+    pub fn acquired() -> Self {
+        Self {
+            acquired: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn busy(holder: u64, epoch: u64) -> Self {
+        Self {
+            acquired: false,
+            holder,
+            epoch,
+        }
+    }
+}
+
 /// Outcome of a successful partition handoff (flush + lease release).
 #[derive(Debug, Clone)]
 pub struct HandoffResult {
@@ -161,11 +200,14 @@ pub enum SyncRequest {
     TailToHead {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
-    /// Take the lease for `part` if it is free. `Ok(false)` means a live
-    /// foreign holder still owns it.
+    /// Take the lease for `part` if it is free. `acquired: false` means a
+    /// live foreign holder still owns it — `holder`/`epoch` are a
+    /// best-effort snapshot of that holder (0/0 when unknown), letting a
+    /// retrying caller tell forward progress (the lease changing hands,
+    /// even to someone else) from a genuinely stuck wait (plan 29 M3c).
     Acquire {
         part: String,
-        reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
+        reply: tokio::sync::oneshot::Sender<Result<AcquireProgress, String>>,
     },
     /// A peer asked us to hand `part`'s lease over (M3.3 fast path):
     /// flush that partition's journal to S3 and release the lease.
@@ -1031,7 +1073,7 @@ impl ConstellationFs {
         {
             let map = h.leases.lock().unwrap();
             if let Some(view) = map.get(&part) {
-                if view.usable() {
+                if view.open_for_new_mutation() {
                     view.touch();
                     return Ok(());
                 }
@@ -1053,6 +1095,18 @@ impl ConstellationFs {
         // for the common case where the holder is about to let go, and a
         // long wait settles at one probe every 2 s.
         let mut backoff = Duration::from_millis(100);
+        // `h.acquire_deadline` (2xTTL) bounds *stalled* time, not total
+        // wait (plan 29 M3c): under sustained contention the lease can
+        // legitimately need several dwell/grace cycles to reach this
+        // node, each of which changes who holds it (or at least its
+        // epoch) well before any single such cycle takes 2xTTL. Resetting
+        // the clock on every observed change means this loop waits as
+        // long as the system keeps visibly making progress, and only
+        // gives up when the same (holder, epoch) has sat unchanged for a
+        // full 2xTTL — a holder that is truly frozen or unreachable, not
+        // one merely busy trading the lease among several waiters.
+        let mut last_seen: Option<(u64, u64)> = None;
+        let mut no_progress_since = start;
         loop {
             let (tx, rx) = tokio::sync::oneshot::channel();
             if h.tx
@@ -1065,28 +1119,48 @@ impl ConstellationFs {
                 return Err(libc::EIO);
             }
             match rx.blocking_recv() {
-                Ok(Ok(true)) => {
+                Ok(Ok(progress)) if progress.acquired => {
                     if let Some(view) = h.leases.lock().unwrap().get(&part) {
                         view.touch();
                     }
                     return Ok(());
                 }
-                Ok(Ok(false)) => {}
+                Ok(Ok(progress)) => {
+                    let seen = (progress.holder, progress.epoch);
+                    if last_seen != Some(seen) {
+                        last_seen = Some(seen);
+                        no_progress_since = std::time::Instant::now();
+                    }
+                }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "lease acquisition failed");
                     return Err(libc::EIO);
                 }
                 Err(_) => return Err(libc::EIO),
             }
-            if start.elapsed() >= h.acquire_deadline {
+            if no_progress_since.elapsed() >= h.acquire_deadline {
                 tracing::error!(
                     waited = ?start.elapsed(),
+                    stalled = ?no_progress_since.elapsed(),
                     part,
-                    "another node holds the partition lease; failing the write with EIO"
+                    "another node holds the partition lease with no progress; \
+                     failing the write with EIO"
                 );
                 return Err(libc::EIO);
             }
-            std::thread::sleep(backoff);
+            // Jittered, not a plain `sleep(backoff)` (plan 29 M3c): every
+            // blocked FUSE thread runs the exact same deterministic
+            // backoff schedule (100, 200, 400, ... capped at 2s), and
+            // several nodes mounted around the same moment start retrying
+            // at nearly the same wall-clock instant. Unjittered, their
+            // retries — and so their `register_wanted`/claim CAS attempts
+            // — stay phase-locked indefinitely, repeatedly colliding with
+            // each other rather than the holder: `create-storm-s3-only`
+            // reproduced a clean, unchanging (holder, epoch) for a full
+            // 2xTTL this way, which is a livelock between waiters, not
+            // contention with the holder. A random 0-50% stretch on each
+            // sleep breaks the lockstep after a handful of retries.
+            std::thread::sleep(backoff + backoff.mul_f64(jitter_fraction() * 0.5));
             backoff = (backoff * 2).min(Duration::from_millis(2000));
         }
     }
@@ -1158,7 +1232,7 @@ impl ConstellationFs {
         }
         let part = "p0".to_string();
         if let Some(view) = h.leases.lock().unwrap().get(&part) {
-            if view.usable() {
+            if view.open_for_new_mutation() {
                 let result = constellation_meta::execute_mutate(&self.meta, &op)
                     .map(|_| ())
                     .map_err(mutate_fail);
@@ -1702,7 +1776,7 @@ impl ConstellationFs {
                 .lock()
                 .unwrap()
                 .get(&part)
-                .is_some_and(|view| view.usable())
+                .is_some_and(|view| view.open_for_new_mutation())
         });
         if holds_lease {
             if let Err(error) =
@@ -1889,6 +1963,25 @@ impl ConstellationFs {
 
 // (Filesystem impl in fusefs_ops.rs include)
 include!("fusefs_ops.rs");
+
+#[cfg(test)]
+mod jitter_tests {
+    use super::jitter_fraction;
+
+    #[test]
+    fn jitter_fraction_stays_in_unit_range_and_varies() {
+        let samples: Vec<f64> = (0..64).map(|_| jitter_fraction()).collect();
+        for &v in &samples {
+            assert!((0.0..1.0).contains(&v), "{v} outside [0, 1)");
+        }
+        // Not a statistical test, just a guard against a constant
+        // fallback silently defeating the whole point of jittering.
+        assert!(
+            samples.windows(2).any(|w| w[0] != w[1]),
+            "jitter_fraction must not be constant: {samples:?}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod write_shard_tests {

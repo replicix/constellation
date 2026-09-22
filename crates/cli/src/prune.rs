@@ -769,7 +769,7 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
         return UnlinkResult::SkippedForward;
     }
     match rx.await {
-        Ok(Ok(true)) => {
+        Ok(Ok(progress)) if progress.acquired => {
             inc(&deps.stats.leases_acquired, 1);
             match constellation_meta::execute_mutate(&deps.meta, &op) {
                 Ok(_) => {

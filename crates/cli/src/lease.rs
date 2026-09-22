@@ -89,6 +89,42 @@ pub const LEASE_MIN_DWELL_MS: u64 = 5_000;
 /// handoff rate, so a lease cannot be traded more than once per dwell.
 pub const LEASE_WANTED_GRACE_MS: u64 = 5_000;
 
+/// How long [`LeaseKeeper::begin_handoff_pause`] closes this node's own
+/// FUSE fast path while the sync task forces a stuck backlog to zero.
+///
+/// `idle_release_due`'s `journal_backlog == 0` term is right for the
+/// common case (a genuinely idle holder), but under sustained local
+/// traffic — a create storm hammering the very node that holds the
+/// lease — `journal_backlog` can read non-zero on every single round
+/// indefinitely: new local mutations land straight in the journal via
+/// the fast path (no lock the sync task holds), so nothing ever forces a
+/// gap. `LEASE_WANTED_GRACE_MS` alone cannot fix this: it bounds how
+/// long a *check* waits before being willing to release, not whether the
+/// backlog the check inspects is ever actually zero. Without this pause,
+/// three-way contention with P2P unavailable could starve a waiter past
+/// the FUSE acquire deadline (2xTTL) and surface as EIO on an otherwise
+/// healthy, merely busy cluster — `create-storm-s3-only` reproduces
+/// exactly that (plan 29 M3c).
+///
+/// Self-expiring rather than manually cleared, for two independent
+/// reasons:
+///
+/// 1. The sync task's `select!` can drop a round mid-flight for a
+///    fresher request (same hazard `renew_now`/`release` were fixed for
+///    in M3b), and a pause that only ever got cleared on the success
+///    path would wedge this node's own writes forever if a round doing
+///    the draining got cancelled first.
+/// 2. It must survive a *successful* release, not just a failed one:
+///    once this node hands the lease back, its own blocked local writes
+///    are sitting in the same `Acquire` queue as the actual waiter and
+///    would otherwise race it for the reclaim on equal footing — and,
+///    being local, tend to win, since the waiter's retry is on its own
+///    independent backoff schedule while the pausing node's blocked
+///    write is released to retry the instant the CAS succeeds. Keeping
+///    the pause running past the release gives the waiter this window
+///    uncontested.
+pub const HANDOFF_PAUSE_MS: i64 = 2_000;
+
 /// Treat the lease as unusable this close to expiry: renewal happens at
 /// half-TTL, so a mutation landing inside the margin should route
 /// through the sync task instead of racing the clock.
@@ -127,14 +163,45 @@ pub struct LeaseView {
     last_write_ms: AtomicI64,
     /// Continuation-epoch local authority (no S3 lease object).
     epoch_held: AtomicBool,
+    /// Unix ms until which [`LeaseKeeper::begin_handoff_pause`] has
+    /// closed the ordinary (non-epoch) fast path; 0 or past means open.
+    handoff_pause_until_ms: AtomicI64,
 }
 
 impl LeaseView {
     /// Usable right now, with enough margin to finish an op.
+    ///
+    /// Deliberately blind to [`LeaseKeeper::begin_handoff_pause`]: this
+    /// is what [`LeaseKeeper::ship_epoch`] (and so the shipper's
+    /// authority to ship/ack the existing journal) is built on, and a
+    /// pause that also closed *this* would stop the very drain it
+    /// exists for from ever making progress — see
+    /// [`Self::open_for_new_mutation`] for the gate that does watch it.
     pub fn usable(&self) -> bool {
-        !self.lost.load(Ordering::Relaxed)
-            && (self.epoch_held.load(Ordering::Relaxed)
-                || self.valid_until_ms.load(Ordering::Relaxed) - now_unix_ms() > expiry_margin_ms())
+        if self.lost.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.epoch_held.load(Ordering::Relaxed) {
+            return true;
+        }
+        self.valid_until_ms.load(Ordering::Relaxed) - now_unix_ms() > expiry_margin_ms()
+    }
+
+    /// As [`Self::usable`], but also closed while
+    /// [`LeaseKeeper::begin_handoff_pause`] has this partition's *new*
+    /// local mutations paused (plan 29 M3c). Checked at every FUSE-side
+    /// point that would otherwise let a new create/write/unlink land
+    /// straight in the journal, bypassing the pause. `epoch_held` (the
+    /// P2P/continuation-epoch path) is unaffected either way, matching
+    /// the requirement to leave that path's behaviour alone.
+    pub fn open_for_new_mutation(&self) -> bool {
+        if self.epoch_held.load(Ordering::Relaxed) {
+            return self.usable();
+        }
+        if self.handoff_pause_until_ms.load(Ordering::Relaxed) > now_unix_ms() {
+            return false;
+        }
+        self.usable()
     }
 
     pub fn is_lost(&self) -> bool {
@@ -173,6 +240,11 @@ impl LeaseView {
     fn clear(&self) {
         self.valid_until_ms.store(0, Ordering::Relaxed);
         self.epoch_held.store(false, Ordering::Relaxed);
+        // Deliberately does *not* touch `handoff_pause_until_ms`: a
+        // pause must outlive a successful release (see that field's
+        // doc) so the waiter it was for gets a fair, uncontested window
+        // to claim the lease before this node's own blocked writes are
+        // allowed to compete for it again.
     }
 }
 
@@ -674,13 +746,42 @@ impl LeaseKeeper {
     /// it back the moment it wrote again. The dwell floor bounds the other
     /// direction: a lease handed over cannot be handed back immediately.
     pub fn idle_release_due(&self, journal_backlog: u64) -> bool {
+        journal_backlog == 0 && self.wants_handoff()
+    }
+
+    /// Same conditions as [`Self::idle_release_due`] minus the journal
+    /// backlog term: dwell and wanted timers alone justify handing the
+    /// lease back. Used to decide whether to *force* the backlog to zero
+    /// via [`Self::begin_handoff_pause`] rather than whether to release
+    /// this instant — a busy holder can have every timer here satisfied
+    /// while `journal_backlog` never once reads zero on its own (see
+    /// [`HANDOFF_PAUSE_MS`]'s doc).
+    pub fn wants_handoff(&self) -> bool {
         !self.view.epoch_held.load(Ordering::Relaxed)
             && self.held.is_some()
-            && journal_backlog == 0
             && !self.wanted.is_empty()
             && self.held_for_ms() >= LEASE_MIN_DWELL_MS as i64
             && (self.view.idle_for_ms() >= self.idle_release_ms as i64
                 || self.wanted_for_ms() >= LEASE_WANTED_GRACE_MS as i64)
+    }
+
+    /// Close this node's own FUSE fast path for [`HANDOFF_PAUSE_MS`]: new
+    /// local mutations fall back to the ordinary `Acquire` queue (the
+    /// `SyncRequest::Acquire` handler checks [`Self::is_paused_for_handoff`]
+    /// and declines rather than re-affirming `Plan::Held`, or the pause
+    /// would have no effect on this node's own writes). Gives the caller
+    /// a bounded window to drain `journal_backlog` to a true zero and
+    /// release, instead of waiting for a lull a sustained workload may
+    /// never give.
+    pub fn begin_handoff_pause(&self) {
+        self.view
+            .handoff_pause_until_ms
+            .store(now_unix_ms() + HANDOFF_PAUSE_MS, Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::begin_handoff_pause`]'s window is still open.
+    pub fn is_paused_for_handoff(&self) -> bool {
+        self.view.handoff_pause_until_ms.load(Ordering::Relaxed) > now_unix_ms()
     }
 
     /// How long somebody has been waiting for this partition, in ms. `0`
@@ -979,5 +1080,118 @@ mod tests {
         ka.renew_now().await.unwrap();
         assert!(ka.held.is_none());
         assert!(ka.is_lost(), "a real takeover must be reported as loss");
+    }
+
+    /// Root-cause regression for plan 29 M3c's `create-storm-s3-only`
+    /// EIO: `idle_release_due` requires `journal_backlog == 0`, which a
+    /// sustained local workload can keep from ever being true. Once
+    /// dwell/wanted alone justify a handoff, `wants_handoff` must say so
+    /// regardless of backlog — it is the signal `run_sync_round` uses to
+    /// start forcing the backlog down rather than waiting for a lull.
+    #[tokio::test]
+    async fn wants_handoff_ignores_backlog_but_idle_release_due_does_not() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let a = LeaseStore::new(store.clone(), "p0", LeaseMode::Cas);
+        let mut ka = LeaseKeeper::new(a, 1);
+        assert!(ka.commit(Plan::Create, None).await.unwrap());
+        assert!(!ka.wants_handoff(), "nobody is waiting yet");
+
+        let b = LeaseStore::new(store, "p0", LeaseMode::Cas);
+        let kb = LeaseKeeper::new(b, 2);
+        match ka.classify().await.unwrap() {
+            Plan::Held => {}
+            other => panic!("expected our own held lease, got {other:?}"),
+        }
+        // B registers itself as a waiter directly on the stored object
+        // (mirroring what `register_wanted` does over the wire).
+        let (cur, tag) = kb.store.get().await.unwrap().unwrap();
+        kb.store.try_swap(&cur.wanting(2), &tag).await.unwrap();
+        ka.renew_now().await.unwrap(); // picks up the edited `wanted_by`
+        assert_eq!(ka.wanted_by(), &[2]);
+
+        ka.expire_wanted_grace_for_test();
+        assert!(
+            ka.wants_handoff(),
+            "dwell + wanted grace elapsed must want a handoff regardless of backlog"
+        );
+        assert!(
+            !ka.idle_release_due(1),
+            "idle_release_due must still refuse while the backlog is non-zero"
+        );
+        assert!(
+            ka.idle_release_due(0),
+            "idle_release_due must agree once the backlog actually reads zero"
+        );
+    }
+
+    /// [`LeaseKeeper::begin_handoff_pause`] must close
+    /// [`LeaseView::open_for_new_mutation`] for a short, bounded window
+    /// and then reopen on its own — nothing explicitly clears it on the
+    /// "gave up this round" path, by design (see `HANDOFF_PAUSE_MS`'s
+    /// doc): a round that gets cancelled mid-drain must not wedge the
+    /// node forever. `usable()` (and so `ship_epoch`) must stay true
+    /// throughout: the shipper still needs authority to drain the
+    /// backlog the pause was started to force to zero.
+    #[tokio::test]
+    async fn handoff_pause_closes_new_mutations_but_not_shipping() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let s = LeaseStore::new(store, "p0", LeaseMode::Cas);
+        let mut k = LeaseKeeper::new(s, 1);
+        assert!(k.commit(Plan::Create, None).await.unwrap());
+        assert!(k.view().usable());
+        assert!(k.view().open_for_new_mutation());
+        assert!(!k.is_paused_for_handoff());
+
+        k.begin_handoff_pause();
+        assert!(k.is_paused_for_handoff());
+        assert!(
+            !k.view().open_for_new_mutation(),
+            "a paused keeper must refuse a *new* local mutation"
+        );
+        assert!(
+            k.view().usable(),
+            "a paused keeper must still be able to ship/ack its existing backlog"
+        );
+        assert!(
+            k.ship_epoch().is_some(),
+            "shipping authority must survive the pause"
+        );
+
+        // Self-expiry: manufacture an already-elapsed pause rather than
+        // sleeping past the real (2s) budget in a unit test.
+        k.view()
+            .handoff_pause_until_ms
+            .store(now_unix_ms() - 1, Ordering::Relaxed);
+        assert!(!k.is_paused_for_handoff());
+        assert!(
+            k.view().open_for_new_mutation(),
+            "new mutations must reopen on their own"
+        );
+    }
+
+    /// A successful release must *not* clear an in-progress pause: it
+    /// exists precisely to stop this node's own next local write from
+    /// winning the reclaim race against the waiter the release was for
+    /// (see [`HANDOFF_PAUSE_MS`]'s doc). Only its own expiry lifts it.
+    #[tokio::test]
+    async fn release_does_not_clear_an_in_progress_handoff_pause() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let s = LeaseStore::new(store, "p0", LeaseMode::Cas);
+        let mut k = LeaseKeeper::new(s, 1);
+        assert!(k.commit(Plan::Create, None).await.unwrap());
+        k.begin_handoff_pause();
+        assert!(k.is_paused_for_handoff());
+
+        k.release().await.unwrap();
+        assert!(
+            k.is_paused_for_handoff(),
+            "a release must not cut short an in-progress handoff pause"
+        );
+
+        // It still expires on its own.
+        k.view()
+            .handoff_pause_until_ms
+            .store(now_unix_ms() - 1, Ordering::Relaxed);
+        assert!(!k.is_paused_for_handoff());
     }
 }
