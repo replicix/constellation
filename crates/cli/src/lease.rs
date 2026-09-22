@@ -401,7 +401,16 @@ impl LeaseKeeper {
     /// has applied everything the old one flushed (DESIGN.md §4).
     pub async fn commit(&mut self, plan: Plan, tailed: Option<TailedToHead>) -> Result<bool> {
         let (lease, result) = match plan {
-            Plan::Held => return Ok(true),
+            Plan::Held => {
+                // `classify` just saw our own live, unreleased lease on S3.
+                // Re-arm the view: a release dropped mid-CAS leaves it
+                // cleared while `held` is still set.
+                if let Some((lease, _)) = &self.held {
+                    self.view.set_held(lease);
+                    self.view.touch();
+                }
+                return Ok(true);
+            }
             Plan::Busy { .. } => return Ok(false),
             Plan::Create => {
                 let lease = Lease::granted(self.store.partition(), self.node_id, 1, self.ttl_ms);
@@ -488,8 +497,25 @@ impl LeaseKeeper {
 
     /// Renew unconditionally (also the deposition probe: a CAS failure
     /// here is how a frozen-then-resumed holder learns it is out).
+    ///
+    /// Cancellation-safe by construction: `self.held`/`self.view` are only
+    /// ever *read* before the first await below, never taken or cleared —
+    /// every mutation happens after its triggering await has resolved. The
+    /// caller (`node_runtime`'s sync task) races this future's completion
+    /// against incoming `SyncRequest`s in a `tokio::select!` and drops it
+    /// unfinished when one arrives (e.g. a P2P-pushed segment, which is
+    /// exactly what a takeover announces). A frozen-then-resumed holder's
+    /// renewal is the case most likely to lose that race — it wakes up
+    /// already past its TTL, right as the depositor's segment is arriving
+    /// — so dropping mid-CAS used to leave the keeper stuck permanently:
+    /// `self.held.take()` had already cleared the lease (so nothing ever
+    /// renews it again) while the CAS result that would have called
+    /// `mark_lost` never got to run (so `lease_lost` was never persisted
+    /// either). Peeking with `clone()` instead means a cancelled attempt
+    /// leaves the keeper exactly as it was, so the very next round's
+    /// `renew_if_due` simply retries it to completion.
     pub async fn renew_now(&mut self) -> Result<()> {
-        let Some((lease, tag)) = self.held.take() else {
+        let Some((lease, tag)) = self.held.clone() else {
             return Ok(());
         };
         let renewed = lease.renewed(self.ttl_ms);
@@ -507,19 +533,12 @@ impl LeaseKeeper {
                 // concluding anything, and keep the view intact until we
                 // know — clearing it first would stall the FUSE threads on
                 // a lease we still hold.
-                // A read failure here is not evidence of anything. The
-                // lease was `take`n at the top of this function, so
-                // propagating with `?` would drop it on the floor and
-                // silently demote a holder that has not been deposed —
-                // and with the store unreachable it cannot re-acquire
-                // either, so the next mutation would fail with EIO.
-                let current = match self.store.get().await {
-                    Ok(current) => current,
-                    Err(e) => {
-                        self.held = Some((lease, tag));
-                        return Err(e.into());
-                    }
-                };
+                //
+                // A read failure here is not evidence of anything, and
+                // `self.held` is untouched (see above), so propagating it
+                // cannot silently demote a holder that has not been
+                // deposed.
+                let current = self.store.get().await?;
                 if let Some((cur, fresh_tag)) = current {
                     if cur.holder == self.node_id
                         && cur.epoch == lease.epoch
@@ -562,12 +581,10 @@ impl LeaseKeeper {
                 self.view.clear();
                 self.diagnose_lost_renew(&lease).await
             }
-            Err(e) => {
-                // Transient store failure: keep the lease we have and
-                // retry on the next tick (it is still unexpired).
-                self.held = Some((lease, tag));
-                Err(e.into())
-            }
+            // Transient store failure: `self.held` is untouched, so the
+            // lease we still (believe we) have is simply retried next
+            // tick — it is still unexpired from our own point of view.
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -719,22 +736,44 @@ impl LeaseKeeper {
     ///
     /// On a successful CAS swap, returns the new object's ETag so a
     /// peer can skip a classify GET and claim against that version.
+    ///
+    /// Cancellation-safe like [`Self::renew_now`]: `self.held` is only
+    /// peeked (`clone`), and every field this mutates is only mutated
+    /// after the CAS await resolves. The caller (the sync task's
+    /// `select!`) can drop this future mid-CAS when a fresher request
+    /// arrives; a `.take()` up front used to clear `held` regardless of
+    /// whether the release actually landed, so a cancelled release could
+    /// leave a node believing it had handed the lease back — and so never
+    /// retrying — while the S3 object still showed it as holder, which is
+    /// how a taken-over node's release could go unobserved by the very
+    /// reintegration it was supposed to unblock.
     pub async fn release(&mut self) -> Result<Option<String>> {
-        let Some((lease, tag)) = self.held.take() else {
+        let Some((lease, tag)) = self.held.clone() else {
             return Ok(None);
         };
+        // Fence the FUSE threads *before* the CAS: a mutation committed
+        // while the release is in flight would be journaled under an epoch
+        // the requester is about to supersede, after the caller's final
+        // flush. Clearing the view is still cancellation-safe: `held` is
+        // untouched, so a dropped release is followed by `renew_if_due`,
+        // whose `set_held` restores the view.
         self.view.clear();
-        // `Lease::released` drops `wanted_by`: the partition is free, so
-        // every pending request has just been answered.
-        self.wanted.clear();
-        self.wanted_since = None;
-        self.held_since = None;
         match self.store.try_swap(&lease.released(), &tag).await {
             Ok(new_tag) => {
+                // `Lease::released` drops `wanted_by`: the partition is
+                // free, so every pending request has just been answered.
+                self.wanted.clear();
+                self.wanted_since = None;
+                self.held_since = None;
+                self.held = None;
                 tracing::info!(epoch = lease.epoch, "released partition lease");
                 Ok(new_tag.etag())
             }
             Err(StoreError::CasConflict) => {
+                // Someone moved the object before our release landed (a
+                // takeover, or a `wanted_by` edit). `diagnose_lost_renew`
+                // re-reads and decides: still ours (a retried PUT landing
+                // twice) keeps `held` as-is, anyone else's marks us lost.
                 self.diagnose_lost_renew(&lease).await?;
                 Ok(None)
             }
@@ -764,5 +803,181 @@ mod tests {
             Plan::Busy { holder, .. } => assert_eq!(holder, 1),
             other => panic!("takeover must be refused, got {other:?}"),
         }
+    }
+
+    /// A backend whose `put_opts` never resolves, so a caller racing it in
+    /// a `tokio::select!` (like `node_runtime`'s sync task does against
+    /// incoming `SyncRequest`s) and dropping the loser gets a real,
+    /// mid-flight cancellation rather than a completed-then-discarded one.
+    #[derive(Debug)]
+    struct HangingStore(InMemory);
+
+    impl std::fmt::Display for HangingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HangingStore({})", self.0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for HangingStore {
+        async fn put_opts(
+            &self,
+            _location: &object_store::path::Path,
+            _payload: object_store::PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            std::future::pending().await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.0.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.0.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.0.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.0.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.0.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.0.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Root-cause regression for plan 29 M3b's `deposed-reintegration`
+    /// flake: `node_runtime`'s sync task races a round's completion
+    /// against incoming `SyncRequest`s in a `tokio::select!` and drops
+    /// the round when a request wins — exactly what happens when a
+    /// frozen-then-resumed holder's overdue renewal collides with the
+    /// depositor's segment arriving over the gossip push. `renew_now`
+    /// used to `.take()` `self.held` before the CAS await, so a
+    /// cancellation there permanently corrupted the keeper: nothing ever
+    /// renewed it again (`held` was gone) and nothing ever marked it lost
+    /// (the CAS-conflict path that calls `mark_lost` never got to run) —
+    /// the node was neither a holder nor a confirmed-deposed one, forever.
+    /// A cancelled attempt must leave the keeper exactly as it found it,
+    /// so the next attempt can simply retry to completion.
+    #[tokio::test]
+    async fn renew_now_is_cancellation_safe() {
+        let backend = InMemory::new();
+        // Seed the lease object through the real backend first, then swap
+        // the keeper onto a hanging decorator over the *same* backend so
+        // the CAS it attempts still targets real, pre-existing state.
+        let real: Arc<dyn object_store::ObjectStore> = Arc::new(backend);
+        let store = LeaseStore::new(real.clone(), "p0", LeaseMode::Cas);
+        let mut keeper = LeaseKeeper::new(store, 1);
+        assert!(keeper.commit(Plan::Create, None).await.unwrap());
+        assert!(keeper.held.is_some(), "must hold after a fresh Create");
+
+        // Swap in the hanging store (a distinct `LeaseStore`, same
+        // underlying object store) and race `renew_now` against a timeout
+        // that always loses — simulating the `select!` picking the other
+        // branch and dropping this future.
+        let hanging = LeaseStore::new(
+            Arc::new(HangingStore(InMemory::new())) as Arc<dyn object_store::ObjectStore>,
+            "p0",
+            LeaseMode::Cas,
+        );
+        // The hanging store has no lease object of its own, but `put_opts`
+        // never returns regardless of what `get` would say, so `renew_now`
+        // hangs at the CAS itself without ever needing a prior read.
+        keeper.store = hanging;
+        let held_before = keeper.held.clone();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(20), keeper.renew_now()).await;
+        assert!(outcome.is_err(), "the hanging store must actually time out");
+        assert_eq!(
+            keeper.held, held_before,
+            "a cancelled renewal must leave `held` exactly as it was"
+        );
+        assert!(
+            !keeper.is_lost(),
+            "a cancelled renewal must not be mistaken for a confirmed deposition"
+        );
+
+        // Swap back onto the real store: the next attempt must simply
+        // pick up where the cancelled one left off and succeed normally.
+        keeper.store = LeaseStore::new(real, "p0", LeaseMode::Cas);
+        keeper.renew_now().await.unwrap();
+        assert!(keeper.held.is_some());
+        assert!(!keeper.is_lost());
+    }
+
+    /// Companion to the cancellation test above: when the CAS genuinely
+    /// loses (a real takeover, not a dropped future), `renew_now` must
+    /// still reach `mark_lost` and report it — this is the path the
+    /// cancellation bug was stealing every time it fired.
+    #[tokio::test]
+    async fn renew_now_detects_a_genuine_takeover() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let a = LeaseStore::new(store.clone(), "p0", LeaseMode::Cas);
+        let mut ka = LeaseKeeper::new(a, 1);
+        ka.ttl_ms = 10; // expires almost immediately, below
+        assert!(ka.commit(Plan::Create, None).await.unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // B takes over from A's point of view: claim the same partition
+        // with a different node id, exactly like an expired-lease takeover.
+        let b = LeaseStore::new(store, "p0", LeaseMode::Cas);
+        let mut kb = LeaseKeeper::new(b, 2);
+        match kb.classify().await.unwrap() {
+            Plan::Claim { prev, tag, .. } => {
+                assert!(kb
+                    .commit(
+                        Plan::Claim {
+                            prev,
+                            tag,
+                            needs_tail: true
+                        },
+                        Some(TailedToHead::witness())
+                    )
+                    .await
+                    .unwrap());
+            }
+            other => panic!("expected a claimable lease, got {other:?}"),
+        }
+
+        // A's own renewal, still holding its stale tag, must now discover
+        // the takeover and mark itself lost rather than getting stuck.
+        ka.renew_now().await.unwrap();
+        assert!(ka.held.is_none());
+        assert!(ka.is_lost(), "a real takeover must be reported as loss");
     }
 }

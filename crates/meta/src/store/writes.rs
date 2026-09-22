@@ -1637,6 +1637,11 @@ impl MetaStore for Meta {
         atime::atime_backlog(&r, &self.atime_journal)
     }
 
+    fn atime_oldest_pending_ns(&self, _part: &str) -> Result<Option<i64>, MetaError> {
+        let r = self.db.read_tx();
+        atime::oldest_pending_time_ns(&r, &self.atime_journal)
+    }
+
     fn take_atime_of(&self, _part: &str, max: usize) -> Result<Vec<(Ino, i64, i64)>, MetaError> {
         let r = self.db.read_tx();
         atime::take_atime(&r, &self.atime_journal, max)

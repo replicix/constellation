@@ -97,15 +97,14 @@ pub fn max_pending() -> usize {
 
 /// Longest an atime-only partition may sit before it is shipped anyway.
 ///
-/// Gates the standalone "ship an atime-only partition on a timer" path.
-/// Eventual cross-node visibility is already guaranteed without it by
-/// two mechanisms: ride-along shipping (atime folds into any write
+/// Gates the standalone "ship an atime-only partition on a timer" path
+/// (`Shipper::ship_atime_if_stale`, checked once per sync round that
+/// shipped nothing else). Ride-along shipping (atime folds into any write
 /// segment for the partition) and ship-then-release (idle lease release
-/// flushes pending atime first). A pure-read holder's lease goes idle
-/// and releases, shipping its atime that way. The standalone timer is a
-/// deferred refinement for the corner case of a holder that neither
-/// writes nor idles; the knob is defined and documented now.
-#[allow(dead_code)]
+/// flushes pending atime first) both cover the common cases; this timer
+/// is what bounds the corner case of a holder that neither writes nor
+/// idles — busy serving reads under sustained traffic, so
+/// `LeaseView::idle_for_ms` never crosses `idle_release_ms` either.
 pub fn ship_max_delay() -> Duration {
     Duration::from_secs(env_u64("CONSTELLATION_ATIME_SHIP_MAX_DELAY_S", 300))
 }

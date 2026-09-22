@@ -1760,6 +1760,19 @@ async fn cmd_umount(target: String, state_dir: Option<PathBuf>) -> Result<()> {
             other => bail!("unexpected response: {other:?}"),
         }
     }
+    // Removing a view does not by itself mean the daemon is going away: it
+    // only runs its clean-shutdown sequence (and deletes `control.sock`)
+    // once its *last* view is gone (`NodeRuntime::remove_mount`). A
+    // `NAME:/sub` umount that leaves sibling views mounted must not wait on
+    // the socket at all — it would never disappear while the daemon keeps
+    // serving them, which is how `umount myfs:/sub` used to hang forever
+    // even though the daemon's own log showed the view cleanly detached
+    // ("FUSE detached") and moved on. Ask the daemon (if still reachable)
+    // whether any view is left before deciding to wait for it to exit.
+    let other_views_remain = matches!(
+        constellation_api::call(&sock, &constellation_api::Request::MountList).await,
+        Ok(constellation_api::Response::Mounts { mounts }) if !mounts.is_empty()
+    );
     // Wait for the daemon to actually exit if this removed its last view.
     // The daemon deletes `control.sock` only at the very end of its clean
     // shutdown (drain uploads + ship journal), so the socket's presence is
@@ -1767,7 +1780,7 @@ async fn cmd_umount(target: String, state_dir: Option<PathBuf>) -> Result<()> {
     // — which silently returned "done" while a large drain was still in
     // flight, tempting a remount that orphaned a mount — poll the live
     // status and report drain progress until the socket is gone.
-    if sock.exists() {
+    if !other_views_remain && sock.exists() {
         wait_for_daemon_exit(&sock).await;
     }
     Ok(())
@@ -4916,5 +4929,174 @@ mod pending_upload_tests {
         );
         assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
         assert!(f.meta.pending_uploads().unwrap().is_empty());
+    }
+}
+
+/// Regression for plan 29 M3b: `constellation umount myfs:/sub` used to
+/// hang forever on a shared daemon that still had sibling views mounted.
+/// `cmd_umount` unconditionally waited for `control.sock` to disappear,
+/// but `NodeRuntime::remove_mount` only ever deletes it when the removed
+/// view was the *last* one (`NodeRuntime::shutdown`) — a daemon that keeps
+/// serving another view never deletes it, so the wait never ended even
+/// though the view being unmounted had cleanly detached
+/// (`fusefs::run` logs "FUSE detached" and moves on).
+#[cfg(test)]
+mod umount_tests {
+    use super::*;
+    use constellation_store_s3::{ChunkStore, FsMeta};
+
+    /// One `NodeRuntime` with two real FUSE views (root + `/sub`), driven
+    /// through the shared registry/control-socket path exactly like the
+    /// `named-shared-daemon` harness scenario, but in-process so it runs
+    /// under `cargo test`. Removing the non-last view must return quickly
+    /// (well under the harness's minutes-long hang) and must leave the
+    /// daemon and the sibling view alive.
+    #[test]
+    fn umount_of_a_non_last_view_returns_and_leaves_the_daemon_serving_the_rest() {
+        unsafe {
+            std::env::set_var("CONSTELLATION_P2P", "off");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let backend = format!("file://{}/backend", root.path().display());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        {
+            let store = ChunkStore::new(
+                rt.block_on(backend::open_backend(&backend))
+                    .expect("open backend"),
+            );
+            let meta = FsMeta::new(1024 * 1024, "raw");
+            rt.block_on(store.create_fs(&meta)).expect("create_fs");
+        }
+
+        let root_mnt = root.path().join("root-mnt");
+        let sub_mnt = root.path().join("sub-mnt");
+        std::fs::create_dir_all(&root_mnt).unwrap();
+        std::fs::create_dir_all(&sub_mnt).unwrap();
+        let state_dir = root.path().join("state");
+
+        let node = node_runtime::NodeRuntime::start(
+            node_runtime::NodeConfig {
+                s3: backend.clone(),
+                state_dir: Some(state_dir.clone()),
+                cache_size: 16 * 1024 * 1024,
+                fsync_s3: false,
+                initial_write_mode: writeback::WriteMode::Through,
+                read_only_member: false,
+                web_ui: 0,
+                log_buffer: log_buffer::LogBuffer::default(),
+                atime_mode: atime::AtimeMode::Off,
+                passphrase: None,
+            },
+            rt.handle().clone(),
+        )
+        .expect("NodeRuntime::start");
+        node.add_mount(node_runtime::ViewConfig {
+            inner_path: "/".to_string(),
+            mountpoint: root_mnt.clone(),
+            allow_other: false,
+            fs_name: "constellation-test".to_string(),
+            fuse_threads: 1,
+            rw_snapshot: false,
+            clone_name: None,
+            ephemeral: false,
+        })
+        .expect("mount root");
+        std::fs::create_dir(root_mnt.join("sub")).expect("mkdir sub via root view");
+        node.add_mount(node_runtime::ViewConfig {
+            inner_path: "/sub".to_string(),
+            mountpoint: sub_mnt.clone(),
+            allow_other: false,
+            fs_name: "constellation-test".to_string(),
+            fuse_threads: 1,
+            rw_snapshot: false,
+            clone_name: None,
+            ephemeral: false,
+        })
+        .expect("mount sub");
+
+        // Register the name so `target::resolve("myfs:/sub", ..)` finds it
+        // (only its *presence*, and this test's explicit `--state-dir`
+        // equivalent, matter — `cmd_umount` never consults the registry's
+        // own stored state dir once one is passed explicitly).
+        let registry_path = root.path().join("registry.toml");
+        unsafe {
+            std::env::set_var("CONSTELLATION_REGISTRY", &registry_path);
+        }
+        let mut reg = registry::Registry::load_locked_at(registry_path.clone()).unwrap();
+        reg.merge_and_save(
+            "myfs",
+            registry::FsOverrides {
+                s3: Some(backend.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(reg);
+
+        let sock = state_dir.join(constellation_api::SOCKET_NAME);
+        let before = rt
+            .block_on(constellation_api::call(
+                &sock,
+                &constellation_api::Request::MountList,
+            ))
+            .unwrap();
+        assert!(
+            matches!(&before, constellation_api::Response::Mounts { mounts } if mounts.len() == 2),
+            "expected both views mounted before umount: {before:?}"
+        );
+
+        // The actual regression check: this must return promptly. The
+        // pre-fix code waited on `control.sock` disappearing, which never
+        // happens while the root view is still mounted — the harness
+        // caught this at minutes-long hangs, so a generous-but-bounded 10s
+        // here is already 10x-plus the margin needed once fixed.
+        let start = std::time::Instant::now();
+        rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                cmd_umount("myfs:/sub".to_string(), Some(state_dir.clone())),
+            )
+            .await
+            .expect("cmd_umount(\"myfs:/sub\") hung")
+            .expect("cmd_umount(\"myfs:/sub\") failed");
+        });
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "umount of a non-last view took {:?}, should return almost immediately",
+            start.elapsed()
+        );
+
+        // The daemon must still be up, still serving the root view, and no
+        // longer serving `/sub`.
+        let after = rt
+            .block_on(constellation_api::call(
+                &sock,
+                &constellation_api::Request::MountList,
+            ))
+            .expect("daemon should still be reachable (root view still mounted)");
+        match after {
+            constellation_api::Response::Mounts { mounts } => {
+                assert_eq!(
+                    mounts.len(),
+                    1,
+                    "expected exactly the root view left: {mounts:?}"
+                );
+                assert_eq!(mounts[0].subtree, "/");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert!(
+            std::fs::metadata(root_mnt.join("sub")).is_ok(),
+            "root view must still be serving reads after the sub view was unmounted"
+        );
+
+        // Clean up: unmount the remaining root view so the daemon exits.
+        rt.block_on(cmd_umount("myfs".to_string(), Some(state_dir.clone())))
+            .expect("final umount");
     }
 }

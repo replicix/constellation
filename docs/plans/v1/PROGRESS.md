@@ -3736,3 +3736,19 @@ DESIGN.md.
 - [x] `bash tests/smoke.sh` and `bash tests/integration.sh` — both PASSED
 - [x] Measurements above (ino locality 42.6×, bootstrap 1.34–1.56 s → 256–397 ms)
 
+
+## Plan 29 M3b — the four pre-existing failing scenarios: **DONE**
+
+| Item | Status | Where |
+|---|---|---|
+| `named-shared-daemon` umount hang: `cmd_umount` waited for `control.sock` to vanish after every `MountRemove`, but the daemon only deletes it when its *last* view goes. It now asks `MountList` and waits only when no view remains. Test `umount_tests::umount_of_a_non_last_view_returns_and_leaves_the_daemon_serving_the_rest` | done | `crates/cli/src/main.rs` |
+| `deposed-reintegration` (a): `LeaseKeeper::renew_now`/`release` `take()`d `held` before their CAS await; the sync task's `select!` drops rounds, so a cancelled renewal left a keeper that neither renewed nor reported deposition. Both now peek and mutate only after the await. `release` still clears the view (the FUSE fence) *before* the CAS, and `Plan::Held` re-arms the view, so a release dropped mid-CAS recovers on the next acquire. Tests `renew_now_is_cancellation_safe`, `renew_now_detects_a_genuine_takeover` | done | `crates/cli/src/lease.rs` |
+| `deposed-reintegration` (b): `classify`'s `WriteManifest` arm flagged every reintegrated create + first write as a conflict (`existing == None` vs a `Some` base). No current manifest now means clean, matching `set_manifest_tx`. Test `first_write_to_a_reintegrated_create_is_clean` | done | `crates/meta/src/reintegrate.rs` |
+| `atime-eventual`, `chaos-ci`: both scenarios gave every client the harness's shared node key, so `refresh_registry` refused to dial peers ("peer registered with OUR node key") and forwarding was dead. Scenarios now use `.with_own_node_key()` like `chaos-soak-4`. `deposed-reintegration` cuts A's S3 path before its stranded writes (a background ship could race `pause()`) and retries `reintegrate` (the first attempt is what registers `wanted_by`); final-state assertions unchanged | done | `crates/harness/src/scenarios.rs` |
+| `CONSTELLATION_ATIME_SHIP_MAX_DELAY_S` wired: `Shipper::ship_atime_if_stale` ships a held partition's read-time atime once the oldest pending row passes the ceiling, on rounds that shipped nothing else (`MetaStore::atime_oldest_pending_ns`). Atime-only segments (standalone and before-release) now also update the spool head and push to peers (`after_atime_segment`) | done | `crates/cli/src/{shipper,atime}.rs`, `crates/meta/src/store/atime.rs` |
+
+**Open, next round:** with P2P unavailable (shared key, or `CONSTELLATION_P2P=off`) a 3-node create storm can still starve on the S3 lease CAS and surface EIO; `chaos-ci` no longer exercises that path.
+
+### Plan 29 M3b exit criteria
+- [x] fmt, clippy `-D warnings`, `cargo test --workspace`, release build
+- [x] `atime-eventual`, `deposed-reintegration`, `chaos-ci`, `named-shared-daemon` each PASSED 3× (subagent) and again after the coordinator's lease/atime follow-ups; `baseline two-clients-shared lease-handover node-leave snapshot-churn e2e-two-nodes` PASSED; `tests/smoke.sh` PASSED

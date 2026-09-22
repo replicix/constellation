@@ -1302,8 +1302,20 @@ fn atime_eventual(seed: u64) -> Result<()> {
             .with_env("CONSTELLATION_ATIME_GRANULARITY_S", "0")
             .with_env("CONSTELLATION_ATIME_FLUSH_MS", "500")
     };
-    let mut writer = atime_env(Client::new(root.path(), "w", &env.endpoint, &backend)?);
-    let mut reader = atime_env(Client::new(root.path(), "r", &env.endpoint, &backend)?);
+    // Distinct P2P identities: this scenario's whole premise is the
+    // reader (a non-holder) *forwarding* its atime bump to the holder,
+    // which needs a real dial between the two nodes. Without its own key
+    // a client falls back to the harness's shared default node key path,
+    // so both clients register the same iroh identity; `refresh_registry`
+    // then refuses to dial "itself" and P2P silently degrades to the
+    // S3-only slow path for this pair (see its "peer registered with OUR
+    // node key" warning) — no mechanism ever ships a non-holder's
+    // atime-only bump over the S3 path, so the holder would never see it
+    // no matter how long the scenario waited.
+    let mut writer =
+        atime_env(Client::new(root.path(), "w", &env.endpoint, &backend)?.with_own_node_key());
+    let mut reader =
+        atime_env(Client::new(root.path(), "r", &env.endpoint, &backend)?.with_own_node_key());
     writer.fs_create()?;
     writer.mount()?;
     reader.mount()?;
@@ -2640,7 +2652,7 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
 
 fn deposed_reintegration(_seed: u64) -> Result<()> {
     let (env, root) = setup("deposed-reintegration")?;
-    let _proxy = env.s3_proxy()?;
+    let proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/reintegrate-{}", ts());
     let tune = |client: Client, key: &str| {
         client
@@ -2675,6 +2687,23 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     let a_epoch = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
 
     // Two stranded changes: one clean path and one deliberate edit conflict.
+    //
+    // Cut A's path to S3 *before* making them: a FUSE write only journals
+    // locally and returns immediately, but the sync task's background
+    // ship is nudged right away too, on its own tokio worker thread — with
+    // nothing to stop it, it can (and, empirically, about half the time
+    // did) win the race against the `pause()` call a few lines down,
+    // landing this "stranded" segment in S3 as ordinary history *before*
+    // SIGSTOP actually freezes the process. That defeats the scenario's
+    // premise (these records must still be sitting in A's local journal,
+    // unshipped, when A is deposed) without technically breaking
+    // anything — the log stays perfectly ordered either way — so it
+    // never produced a wrong-data failure, only an intermittent one
+    // further down where reintegration legitimately finds nothing left
+    // to reconcile. The cut removes the race outright: with S3
+    // unreachable the ship cannot possibly succeed, so the records are
+    // guaranteed to still be local when A is frozen a moment later.
+    proxy.cut()?;
     std::fs::write(c0.mnt.join("shared/clean-from-a"), b"clean")?;
     std::fs::write(c0.mnt.join("shared/same"), b"loser-from-a")?;
     anyhow::ensure!(
@@ -2685,6 +2714,9 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
         "A did not retain stranded records"
     );
     c0.pause()?;
+    // Safe to restore now: A cannot act on it while stopped, and B needs
+    // it to take over below.
+    proxy.heal()?;
 
     std::thread::sleep(Duration::from_millis(6500));
     std::fs::write(c1.mnt.join("shared/same"), b"winner-from-b")
@@ -2705,16 +2737,23 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
         anyhow::ensure!(lease_of(&c0)?["lost"] == true);
         Ok(())
     })?;
+    // Reintegration is operator-driven, not automatic: nothing registers A
+    // in B's `wanted_by` in the background just because A noticed its own
+    // deposition. That registration is a *side effect* of an attempted
+    // reintegration (`reintegrate::run` calls the ordinary lease-acquire
+    // path, which records `wanted_by` on a `Busy` lease before bailing
+    // with "could not acquire write lease for p0; retry reintegrate
+    // later"). So the first attempt below is expected to fail — it is
+    // what gets B to eventually release, once its dwell floor and
+    // wanted-grace window both elapse (`LEASE_MIN_DWELL_MS` +
+    // `LEASE_WANTED_GRACE_MS`, 5 s each) — and reintegrate must be
+    // retried until it lands, exactly as that error message tells an
+    // operator to do by hand.
     eventually(
-        "B releases the takeover lease for reintegration",
-        Duration::from_secs(20),
-        || {
-            let lease = lease_of(&c1)?;
-            anyhow::ensure!(lease["held"] == false, "B still holds the lease: {lease}");
-            Ok(())
-        },
+        "A reintegrates once B releases the takeover lease",
+        Duration::from_secs(30),
+        || c0.reintegrate(),
     )?;
-    c0.reintegrate()?;
 
     eventually(
         "clean branch and conflict materialization converge",
@@ -4770,9 +4809,22 @@ fn chaos_ci(seed: u64) -> Result<()> {
     let (env, root) = setup("chaos-ci")?;
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/chaos-{}", ts());
-    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
-    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?;
-    let mut c2 = Client::new(root.path(), "c2", &env.endpoint, &backend)?;
+    // Distinct P2P identities: three real nodes creating/writing
+    // concurrently in one namespace need the forward/handoff fast path to
+    // avoid piling onto the S3-only lease CAS/TTL wait — without its own
+    // key each client falls back to the harness's shared default node
+    // key, so all three register the *same* iroh identity and
+    // `refresh_registry` refuses to dial any of the others as "ourself"
+    // (see its "peer registered with OUR node key" warning). That leaves
+    // every non-holder's write with no path but the slow one, and with
+    // three-way contention on one partition it can starve past the FUSE
+    // acquire deadline (2×TTL) and surface as EIO — which is exactly
+    // "unexpected errno EIO on worker N during create_storm" (the sibling
+    // scenarios `chaos-soak-4`/`disjoint-write-4` already call this for
+    // the same reason).
+    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?.with_own_node_key();
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?.with_own_node_key();
+    let mut c2 = Client::new(root.path(), "c2", &env.endpoint, &backend)?.with_own_node_key();
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;

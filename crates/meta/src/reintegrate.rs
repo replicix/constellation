@@ -112,7 +112,26 @@ pub fn classify(view: &Meta, rec: &LogRecord) -> Result<Disposition, MetaError> 
             }),
             Ok(Some(_)) => {
                 let existing = view.manifest(*ino)?;
-                if existing == *base_manifest || existing.as_ref() == Some(manifest) {
+                if existing.is_none() {
+                    // The inode exists (checked above) but carries no
+                    // manifest at all yet: this is a brand-new file whose
+                    // own `Create` was just classified clean and applied to
+                    // this same side replica, immediately followed by its
+                    // first `WriteManifest` in the same stranded batch.
+                    // Nobody else can have an opinion about content on an
+                    // ino nobody else has ever seen, so there is nothing to
+                    // conflict with — matching `Meta::set_manifest_tx`'s own
+                    // optimistic-concurrency guard, which only ever raises a
+                    // conflict when there IS a *current* manifest to disagree
+                    // with (`if let (Some(base), Some(cur)) = ...`) and
+                    // otherwise accepts unconditionally. Comparing `existing`
+                    // (`None`) against `base_manifest` (`Some`, since even a
+                    // normal first write's recorded base is the wire
+                    // encoding of "empty," never a bare `None`) used to fail
+                    // that comparison and materialize a spurious conflict
+                    // file for content nobody else ever touched.
+                    Ok(Disposition::Clean)
+                } else if existing == *base_manifest || existing.as_ref() == Some(manifest) {
                     Ok(Disposition::Clean)
                 } else {
                     Ok(Disposition::Conflict {
@@ -314,6 +333,38 @@ mod tests {
             time_ns: 3,
         };
         assert_eq!(classify(&shared, &stranded).unwrap(), Disposition::Clean);
+    }
+
+    /// Root-cause regression for plan 29 M3b's `deposed-reintegration`
+    /// flake: a brand-new file's `Create` (classified clean, applied to
+    /// this same side replica by the caller) followed by its own first
+    /// `WriteManifest` in the same stranded batch must classify clean —
+    /// nobody else can have an opinion about content on an ino nobody
+    /// else has ever seen. `existing` (the side replica's manifest for
+    /// this fresh ino) is `None` here, while a normal write's own
+    /// `base_manifest` is `Some(<empty-manifest bytes>)` even for a file
+    /// it just created — comparing those with `==` used to always fail
+    /// and materialize a spurious `.constellation-conflict` entry for
+    /// every reintegrated `Create`+first-write pair.
+    #[test]
+    fn first_write_to_a_reintegrated_create_is_clean() {
+        let shared = Meta::open_in_memory().unwrap();
+        let ino = 42;
+        let create = rec_create(ROOT_INO, "clean-from-a", ino);
+        assert_eq!(classify(&shared, &create).unwrap(), Disposition::Clean);
+        shared.apply_records(std::slice::from_ref(&create)).unwrap();
+
+        // A normal first write's base is a real (non-`None`) encoding of
+        // "empty," exactly like the live write path always produces —
+        // never a bare `None`.
+        let first_write = LogRecord::WriteManifest {
+            ino,
+            base_manifest: Some(b"empty-file-manifest-encoding".to_vec()),
+            manifest: b"clean".to_vec(),
+            size: 5,
+            time_ns: 2,
+        };
+        assert_eq!(classify(&shared, &first_write).unwrap(), Disposition::Clean);
     }
 
     #[test]

@@ -160,6 +160,22 @@ pub(crate) fn atime_backlog(
     Ok(n)
 }
 
+/// The oldest `time_ns` across every pending row, or `None` if empty.
+/// Full scan, same cost class as [`atime_backlog`] (called at the same
+/// cadence — once per sync round that shipped nothing else).
+pub(crate) fn oldest_pending_time_ns(
+    r: &impl Readable,
+    aj: &SingleWriterTxKeyspace,
+) -> Result<Option<i64>, MetaError> {
+    let mut oldest: Option<i64> = None;
+    for guard in r.iter(aj) {
+        let (_, v) = guard.into_inner()?;
+        let row: AjRow = postcard::from_bytes(&v)?;
+        oldest = Some(oldest.map_or(row.time_ns, |o: i64| o.min(row.time_ns)));
+    }
+    Ok(oldest)
+}
+
 pub(crate) fn take_atime(
     r: &impl Readable,
     aj: &SingleWriterTxKeyspace,
@@ -203,4 +219,35 @@ pub(crate) fn drop_atime_all(
         tx.remove(aj, k);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::store::Meta;
+    use crate::MetaStore;
+    use constellation_fs_core::types::ROOT_INO;
+
+    /// Feeds `Shipper::ship_atime_if_stale` (plan 29 M3b): the oldest
+    /// pending row's observation time, not insertion order, is what the
+    /// standalone ship-max-delay ceiling checks against.
+    #[test]
+    fn oldest_pending_is_the_minimum_observation_time_not_insertion_order() {
+        let m = Meta::open_in_memory().unwrap();
+        let part = "p0";
+        assert_eq!(m.atime_oldest_pending_ns(part).unwrap(), None);
+
+        let a = m.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let b = m.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+        // Queued out of time order: b (older observation) after a.
+        m.queue_atime(&[(a.ino, 5_000, 5_000)]).unwrap();
+        m.queue_atime(&[(b.ino, 1_000, 1_000)]).unwrap();
+        assert_eq!(m.atime_oldest_pending_ns(part).unwrap(), Some(1_000));
+
+        // Clearing the actual oldest row moves the minimum forward.
+        m.clear_atime(part, &[b.ino]).unwrap();
+        assert_eq!(m.atime_oldest_pending_ns(part).unwrap(), Some(5_000));
+
+        m.clear_atime(part, &[a.ino]).unwrap();
+        assert_eq!(m.atime_oldest_pending_ns(part).unwrap(), None);
+    }
 }

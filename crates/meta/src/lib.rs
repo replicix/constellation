@@ -205,6 +205,13 @@ pub trait MetaStore: Send + Sync {
     /// Pending atime rows for a partition (does not count toward
     /// `journal_len`, which must keep meaning real write backlog).
     fn atime_backlog_of(&self, part: &str) -> Result<u64, MetaError>;
+    /// The oldest observation time (`time_ns`) among a partition's
+    /// pending atime rows, or `None` if it has none. Feeds the standalone
+    /// `CONSTELLATION_ATIME_SHIP_MAX_DELAY_S` ceiling: ride-along shipping
+    /// and ship-then-release both piggyback on other lease activity, so a
+    /// holder that only ever absorbs read-time bumps (never writes, never
+    /// idles) needs this to notice its backlog has gone stale.
+    fn atime_oldest_pending_ns(&self, part: &str) -> Result<Option<i64>, MetaError>;
     /// Read (without removing) up to `max` pending atime rows for a
     /// partition, as `(ino, atime_ns, time_ns)`. Delete only after the
     /// segment PUT succeeds, via `clear_atime`.

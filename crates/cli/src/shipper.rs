@@ -523,6 +523,18 @@ impl Shipper {
                 if self.publish_idle_due() {
                     self.publish().await?;
                 }
+                // Same reasoning for read-time atime (plan 29 M3b): a
+                // held partition with nothing else to ship this round may
+                // still be sitting on a backlog of read-time bumps from a
+                // holder that only ever serves reads (ride-along and
+                // ship-then-release both need other lease activity to
+                // fire). `held` is exactly this round's cache-coherent
+                // "we hold it" set, already computed above.
+                for part in &held {
+                    if let Some(lease) = leases.get(part) {
+                        self.ship_atime_if_stale(part, lease).await;
+                    }
+                }
                 return Ok(());
             }
         }
@@ -1081,9 +1093,8 @@ impl Shipper {
             Ok(()) => {
                 let inos: Vec<_> = rows.iter().map(|(ino, _, _)| *ino).collect();
                 let _ = self.meta.clear_atime(part, &inos);
-                let st = self.parts.get_mut(part).unwrap();
-                st.max_epoch = st.max_epoch.max(epoch);
-                st.next_seq = next_seq + 1;
+                self.after_atime_segment(part, next_seq, epoch, payload)
+                    .await;
                 tracing::debug!(
                     seq = next_seq,
                     part,
@@ -1097,6 +1108,105 @@ impl Shipper {
             Err(e) => {
                 tracing::debug!(error = %e, part, "final atime ship failed; dropping rows");
                 let _ = self.meta.drop_atime_of(part);
+            }
+        }
+    }
+
+    /// Bookkeeping after an atime-only segment landed at `seq`: advance
+    /// the stream, publish the spool head and push the segment to peers
+    /// (best effort, as in [`Self::ship_part`]).
+    async fn after_atime_segment(&mut self, part: &str, seq: u64, epoch: u64, payload: Vec<u8>) {
+        let st = self.parts.get_mut(part).unwrap();
+        st.max_epoch = st.max_epoch.max(epoch);
+        st.next_seq = seq + 1;
+        {
+            let mut spool = self.spool.lock().unwrap();
+            spool.head_seq = spool.head_seq.max(seq);
+        }
+        let pushed = if self.parts[part].log.is_e2e() {
+            self.parts[part].log.seal_segment(seq, &payload).ok()
+        } else {
+            Some(payload)
+        };
+        self.peers.announce_segment(part, seq, epoch, pushed).await;
+    }
+
+    /// Standalone atime-only ship (plan 29 M3b,
+    /// `CONSTELLATION_ATIME_SHIP_MAX_DELAY_S`). The two existing atime
+    /// ship paths both piggyback on other lease activity — `ship_part`'s
+    /// ride-along only fires behind a real write segment, and
+    /// `ship_atime_before_release` only fires when the lease is about to
+    /// be released — so a holder that keeps busily absorbing read-time
+    /// bumps but never writes and never idles would otherwise leave them
+    /// in `atime_journal` forever. Called once per sync round that
+    /// shipped nothing else; a no-op unless the oldest pending row is
+    /// older than the ceiling. Unlike the release-time drain, a failure
+    /// here leaves the rows queued for the next round rather than
+    /// dropping them — the lease is not going anywhere, so there is no
+    /// reason to give up on them.
+    pub async fn ship_atime_if_stale(&mut self, part: &str, lease: &LeaseKeeper) {
+        let Some(epoch) = lease.ship_epoch() else {
+            return;
+        };
+        let oldest_ns = match self.meta.atime_oldest_pending_ns(part) {
+            Ok(Some(t)) => t,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::debug!(error = %e, part, "atime staleness check failed");
+                return;
+            }
+        };
+        let age_ns = constellation_fs_core::types::now_ns().saturating_sub(oldest_ns);
+        if age_ns < crate::atime::ship_max_delay().as_nanos() as i64 {
+            return;
+        }
+        self.ensure_part(part);
+        let rows = match self.meta.take_atime_of(part, SEGMENT_BATCH) {
+            Ok(r) if !r.is_empty() => r,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::debug!(error = %e, part, "standalone atime drain read failed");
+                return;
+            }
+        };
+        let records: Vec<LogRecord> = rows
+            .iter()
+            .map(|(ino, atime_ns, time_ns)| LogRecord::Atime {
+                ino: *ino,
+                atime_ns: *atime_ns,
+                time_ns: *time_ns,
+            })
+            .collect();
+        let next_seq = self.parts[part].next_seq;
+        let payload = match encode(self.node_id, epoch, &records) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(error = %e, part, "standalone atime segment encode failed");
+                return;
+            }
+        };
+        match self.parts[part].log.put_segment(next_seq, &payload).await {
+            Ok(()) => {
+                let inos: Vec<_> = rows.iter().map(|(ino, _, _)| *ino).collect();
+                let _ = self.meta.clear_atime(part, &inos);
+                self.after_atime_segment(part, next_seq, epoch, payload)
+                    .await;
+                tracing::debug!(
+                    seq = next_seq,
+                    part,
+                    epoch,
+                    rows = records.len(),
+                    "shipped standalone atime segment (ship-max-delay)"
+                );
+            }
+            // Someone else advanced the stream: pick it up on the next
+            // tail rather than losing these rows or wedging on a stale
+            // sequence.
+            Err(constellation_store_s3::StoreError::AlreadyExists) => {
+                let _ = self.tail_part(part).await;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, part, "standalone atime ship failed; retrying next round");
             }
         }
     }
@@ -1587,6 +1697,71 @@ mod tests {
         assert!(ship.publish_is_due());
         ship.shipped_since_publish = PUBLISH_EVERY + 1;
         assert!(ship.publish_is_due());
+    }
+
+    /// Plan 29 M3b: `CONSTELLATION_ATIME_SHIP_MAX_DELAY_S` is the
+    /// standalone timer that ships a holder's pending read-time atime
+    /// even when it neither writes (no ride-along in `ship_part`) nor
+    /// releases the lease (no `ship_atime_before_release`) — the busy
+    /// read-only holder case. A fresh backlog under a generous ceiling
+    /// must be left alone; the same backlog under a zero ceiling (i.e.
+    /// already "stale") must ship and clear; a holder with nothing queued
+    /// must never ship an empty segment. One test, not three, because the
+    /// env var it drives is process-global — parallel `#[test]` fns
+    /// setting it independently would race.
+    #[tokio::test]
+    async fn ship_atime_if_stale_only_ships_past_the_ceiling() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        acquire_lease(&mut a.ship, &mut a.lease).await.unwrap();
+
+        // Nothing queued at all: must not ship an empty segment.
+        unsafe {
+            std::env::set_var("CONSTELLATION_ATIME_SHIP_MAX_DELAY_S", "0");
+        }
+        a.ship.ship_atime_if_stale(PARTITION, &a.lease).await;
+        assert_eq!(
+            a.meta.atime_backlog_of(PARTITION).unwrap(),
+            0,
+            "still nothing pending"
+        );
+
+        let f = a.meta.create(1, "f", 0o644, 0, 0).unwrap();
+        a.meta
+            .queue_atime(&[(f.ino, f.ctime_ns + 10, f.ctime_ns + 10)])
+            .unwrap();
+
+        unsafe {
+            std::env::set_var("CONSTELLATION_ATIME_SHIP_MAX_DELAY_S", "3600");
+        }
+        a.ship.ship_atime_if_stale(PARTITION, &a.lease).await;
+        assert_eq!(
+            a.meta.atime_backlog_of(PARTITION).unwrap(),
+            1,
+            "a backlog younger than the ceiling must not ship yet"
+        );
+
+        unsafe {
+            std::env::set_var("CONSTELLATION_ATIME_SHIP_MAX_DELAY_S", "0");
+        }
+        a.ship.ship_atime_if_stale(PARTITION, &a.lease).await;
+        assert_eq!(
+            a.meta.atime_backlog_of(PARTITION).unwrap(),
+            0,
+            "a backlog older than the ceiling must ship and clear"
+        );
+        let seg = segment(&store, a.ship.last_shipped_seq(PARTITION).unwrap()).await;
+        assert!(
+            seg.records
+                .iter()
+                .any(|r| matches!(r, LogRecord::Atime { ino, .. } if *ino == f.ino)),
+            "the shipped segment must carry the atime record: {:?}",
+            seg.records
+        );
+
+        unsafe {
+            std::env::remove_var("CONSTELLATION_ATIME_SHIP_MAX_DELAY_S");
+        }
     }
 
     fn node(store: &StdArc<InMemory>, id: u64) -> Node {
