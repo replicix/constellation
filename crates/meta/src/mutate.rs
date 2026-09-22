@@ -311,7 +311,7 @@ mod tests {
     fn atime_batch_applies_locally_queues_for_ship_and_journals_nothing() {
         let m = SqliteMeta::open_in_memory().unwrap();
         let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
-        let part = m.partition_of(f.ino).unwrap();
+        let part = "p0".to_string();
         let before = m.journal_len().unwrap();
         let t = f.ctime_ns + 10;
         let records = execute(

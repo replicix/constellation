@@ -333,15 +333,9 @@ pub struct StatusReport {
     pub uptime_s: u64,
     pub spool: SpoolStatus,
     pub cache: CacheStatus,
-    /// Write authority for the genesis partition (p0). Kept for
-    /// backward-compatible `status` consumers; per-partition detail is
-    /// in [`StatusReport::partitions`].
+    /// Write authority for the one metadata stream (`p0`).
     #[serde(default)]
     pub lease: LeaseStatus,
-    /// Partition map + per-partition lease (M3.2). Empty on pre-partition
-    /// daemons (serde default).
-    #[serde(default)]
-    pub partitions: Vec<PartitionStatus>,
     /// P2P fast path (M3.3). `enabled: false` on daemons without it, or
     /// when `CONSTELLATION_P2P=off`.
     #[serde(default)]
@@ -670,14 +664,6 @@ pub struct PeerStatus {
     /// Connectivity path: `direct`, `relay`, `unknown`, or empty for S3.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
-}
-
-/// One partition as exposed by the control API.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PartitionStatus {
-    pub id: String,
-    pub root_path: String,
-    pub lease: LeaseStatus,
 }
 
 /// Partition lease state (DESIGN.md §4). `held` is this node's own

@@ -260,11 +260,6 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.lease.epoch
     );
     gauge!(
-        "constellation_partitions",
-        "Partitions visible in the local replica.",
-        status.partitions.len()
-    );
-    gauge!(
         "constellation_prune_runs_total",
         "Retention prune passes completed.",
         status.prune.runs

@@ -137,18 +137,6 @@ pub const SCENARIOS: &[Scenario] = &[
         run: node_leave,
     },
     Scenario {
-        name: "partition-split",
-        desc: "two nodes, low split threshold: /hot becomes its own partition, then idles into a merge",
-        requires: &[],
-        run: partition_split,
-    },
-    Scenario {
-        name: "rename-across-partitions",
-        desc: "force a split, rename files between partitions from both nodes, kill9 the renamer and recover",
-        requires: &[],
-        run: rename_across_partitions,
-    },
-    Scenario {
         name: "p2p-invalidation",
         desc: "gossip push makes a write visible on the peer far faster than the S3 poll bound; P2P=off restores the old bound",
         requires: &[],
@@ -479,12 +467,6 @@ pub const SCENARIOS: &[Scenario] = &[
         run: sticky_lease_handoff_over_s3,
     },
     Scenario {
-        name: "multi-partition-retention-is-per-partition",
-        desc: "plan 26: GC floors log retention per partition, so a child's live segments survive a far-ahead p0",
-        requires: &[],
-        run: multi_partition_retention_is_per_partition,
-    },
-    Scenario {
         name: "named-shared-daemon",
         desc: "plan 21: mount NAME then NAME:/sub from a second CLI call share one daemon/node_id; umount tears down views one at a time, then the process",
         requires: &[],
@@ -671,10 +653,9 @@ fn e2e_two_nodes(_seed: u64) -> Result<()> {
 
 /// `fs passwd` must be a live operation: with two E2E nodes mounted,
 /// changing the passphrase rewraps only the master key, so both keep
-/// deriving the same DEKs and gossip seed and keep converging — including
-/// across a partition split, whose new DEK is derived (never a keyring
-/// write) — with no remount. Afterwards a fresh mount needs the new
-/// passphrase and the old one is refused.
+/// deriving the same DEKs and gossip seed and keep converging with no
+/// remount. Afterwards a fresh mount needs the new passphrase and the
+/// old one is refused.
 fn passwd_live_cluster(seed: u64) -> Result<()> {
     let (env, root) = setup("passwd-live-cluster")?;
     let _proxy = env.s3_proxy()?;
@@ -684,13 +665,8 @@ fn passwd_live_cluster(seed: u64) -> Result<()> {
     let old = "harness-correct-passphrase";
     let new = "harness-rotated-passphrase";
 
-    // Autosplit on with a low threshold so a hot directory carves out a
-    // second partition — exercising the derived-DEK-on-split path.
     let mk = |name: &str| -> Result<Client> {
-        Ok(coop_client(root.path(), name, &env.endpoint, &backend)?
-            .with_e2e()
-            .with_env("CONSTELLATION_PART_AUTOSPLIT", "on")
-            .with_env("CONSTELLATION_PART_SPLIT_OPS", "25"))
+        Ok(coop_client(root.path(), name, &env.endpoint, &backend)?.with_e2e())
     };
     let mut a = mk("passwd-a")?;
     let mut b = mk("passwd-b")?;
@@ -701,19 +677,15 @@ fn passwd_live_cluster(seed: u64) -> Result<()> {
     let marker = vec![b'Z'; 2 << 20];
     std::fs::write(a.mnt.join("known-marker"), &marker)?;
     std::fs::create_dir(a.mnt.join("hot"))?;
-    for i in 0..60 {
+    for i in 0..10 {
         std::fs::write(a.mnt.join("hot").join(format!("f{i}")), format!("v{i}"))?;
-        std::thread::sleep(Duration::from_millis(80));
     }
     eventually(
-        "pre-passwd split visible on B",
+        "pre-passwd writes visible on B",
         Duration::from_secs(40),
         || {
-            let st = b.control_status()?;
-            let parts = st["partitions"].as_array().map(|p| p.len()).unwrap_or(0);
-            anyhow::ensure!(parts > 1, "hot dir never split into a 2nd partition: {st}");
             anyhow::ensure!(
-                b.mnt.join("hot").join("f59").exists(),
+                b.mnt.join("hot").join("f9").exists(),
                 "pre-passwd tail incomplete"
             );
             Ok(())
@@ -728,13 +700,13 @@ fn passwd_live_cluster(seed: u64) -> Result<()> {
     );
 
     // The live nodes must keep working with the keys they already hold:
-    // A writes new metadata (into the split partition and a fresh model
-    // dir), B tails and decrypts it. No remount anywhere.
+    // A writes new metadata (into a fresh model dir and more of `hot`),
+    // B tails and decrypts it. No remount anywhere.
     let mut model = Model::default();
     let mut workload = Workload::new(seed, "w");
     std::fs::create_dir(a.mnt.join("model"))?;
     workload.run_block(&a.mnt.join("model"), &mut model, 40)?;
-    for i in 60..90 {
+    for i in 10..20 {
         std::fs::write(a.mnt.join("hot").join(format!("f{i}")), format!("v{i}"))?;
     }
     eventually(
@@ -743,7 +715,7 @@ fn passwd_live_cluster(seed: u64) -> Result<()> {
         || {
             anyhow::ensure!(a.is_mounted() && b.is_mounted(), "a node was remounted");
             anyhow::ensure!(
-                b.mnt.join("hot").join("f89").exists(),
+                b.mnt.join("hot").join("f19").exists(),
                 "post-passwd tail incomplete"
             );
             model.verify(&b.mnt.join("model"))
@@ -3865,224 +3837,6 @@ fn stress_ng_flap(_seed: u64) -> Result<()> {
     )
 }
 
-fn partition_ids(c: &Client) -> Result<Vec<String>> {
-    Ok(partition_ids_from(&c.control_status()?))
-}
-
-fn partition_ids_from(status: &serde_json::Value) -> Vec<String> {
-    status["partitions"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|p| p["id"].as_str().map(|s| s.to_string()))
-        .collect()
-}
-
-fn part_env(c: Client, split_ops: u64, merge_idle_s: u64) -> Client {
-    c.with_env("CONSTELLATION_PART_SPLIT_OPS", &split_ops.to_string())
-        .with_env("CONSTELLATION_PART_MERGE_IDLE_S", &merge_idle_s.to_string())
-        // Heat-driven splitting is off by default (forwarded mutations
-        // made directory heat a poor proxy for lease contention). These
-        // scenarios test the split/merge machinery, so they ask for it.
-        .with_env("CONSTELLATION_PART_AUTOSPLIT", "on")
-        .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "60000")
-}
-
-/// Hammer `/hot` with enough close()s to close two split windows, then
-/// wait until the control API shows a child partition rooted there.
-fn wait_for_split(c: &Client, hot: &std::path::Path, model: &mut Model, tag: &str) -> Result<()> {
-    for wave in 0..3 {
-        for i in 0..8 {
-            let rel = std::path::PathBuf::from(format!("hot/{tag}-w{wave}-{i}"));
-            let data = format!("{tag}-{wave}-{i}").into_bytes();
-            std::fs::write(hot.join(rel.file_name().unwrap()), &data)?;
-            model.write_file(&rel, data);
-        }
-        eventually(
-            &format!("wave {wave} shipped"),
-            Duration::from_secs(10),
-            || {
-                let b = c.control_status()?["spool"]["journal_backlog"]
-                    .as_u64()
-                    .unwrap_or(1);
-                anyhow::ensure!(b == 0, "backlog {b}");
-                Ok(())
-            },
-        )?;
-    }
-    eventually(
-        "split appears on control API",
-        Duration::from_secs(20),
-        || {
-            let status = c.control_status()?;
-            let ids = partition_ids_from(&status);
-            anyhow::ensure!(
-                ids.iter().any(|id| id != "p0"),
-                "still one partition: {ids:?} partitions={} log=\n{}",
-                status["partitions"],
-                c.tail_log_n(50)
-            );
-            Ok(())
-        },
-    )
-}
-
-/// Two nodes, one FS: node A hammers `/hot` until a split is visible on
-/// the control API; both trees match the model; then `/hot` goes idle
-/// and the child merges back into p0.
-fn partition_split(_seed: u64) -> Result<()> {
-    let (env, root) = setup("partition-split")?;
-    let _proxy = env.s3_proxy()?;
-    let backend = format!("s3://{BUCKET}/psplit-{}", ts());
-    let mut c0 = part_env(
-        Client::new(root.path(), "c0", &env.endpoint, &backend)?,
-        4,
-        8,
-    );
-    let mut c1 = part_env(
-        Client::new(root.path(), "c1", &env.endpoint, &backend)?,
-        4,
-        8,
-    );
-    c0.fs_create()?;
-    c0.mount()?;
-    c1.mount()?;
-
-    let mut model = Model::default();
-    std::fs::create_dir(c0.mnt.join("hot"))?;
-    model.mkdir(std::path::Path::new("hot"));
-    eventually("hot visible on B", Duration::from_secs(20), || {
-        anyhow::ensure!(c1.mnt.join("hot").is_dir(), "hot not on c1");
-        Ok(())
-    })?;
-
-    wait_for_split(&c0, &c0.mnt.join("hot"), &mut model, "a")?;
-    // A write after the split acquires the child lease so the parent
-    // holder can merge it once /hot goes idle.
-    std::fs::write(c0.mnt.join("hot/post"), b"post")?;
-    model.write_file(std::path::Path::new("hot/post"), b"post".to_vec());
-    eprintln!("    partition-split: after split {:?}", partition_ids(&c0)?);
-    eventually("trees match after split", Duration::from_secs(30), || {
-        model.verify(&c0.mnt).context("via c0")?;
-        model.verify(&c1.mnt).context("via c1")?;
-        Ok(())
-    })?;
-
-    // Keep p0 busy with an unrelated dir so the parent lease stays held
-    // while /hot goes idle long enough to merge.
-    std::fs::create_dir(c0.mnt.join("keep"))?;
-    model.mkdir(std::path::Path::new("keep"));
-    std::thread::sleep(Duration::from_secs(10));
-    std::fs::write(c0.mnt.join("keep/tick"), b"1")?;
-    model.write_file(std::path::Path::new("keep/tick"), b"1".to_vec());
-    eventually("child merged back into p0", Duration::from_secs(20), || {
-        let ids = partition_ids(&c0)?;
-        anyhow::ensure!(
-            ids == ["p0".to_string()] || (ids.len() == 1 && ids[0] == "p0"),
-            "still split: {ids:?}"
-        );
-        Ok(())
-    })?;
-    eventually("trees match after merge", Duration::from_secs(20), || {
-        model.verify(&c0.mnt).context("via c0")?;
-        model.verify(&c1.mnt).context("via c1")?;
-        Ok(())
-    })?;
-    ensure_no_conflicts([&c0, &c1])?;
-    c0.unmount()?;
-    c1.unmount()?;
-    Ok(())
-}
-
-/// Force a split, then rename across the two partitions from both
-/// nodes. Kill the renamer between operations; remount must keep the
-/// namespace correct (abort recovery if a half-committed xpart was
-/// stranded).
-fn rename_across_partitions(_seed: u64) -> Result<()> {
-    let (env, root) = setup("rename-xpart")?;
-    let _proxy = env.s3_proxy()?;
-    let backend = format!("s3://{BUCKET}/xpart-{}", ts());
-    let mut c0 = part_env(
-        Client::new(root.path(), "c0", &env.endpoint, &backend)?,
-        4,
-        3600,
-    );
-    let mut c1 = part_env(
-        Client::new(root.path(), "c1", &env.endpoint, &backend)?,
-        4,
-        3600,
-    );
-    c0.fs_create()?;
-    c0.mount()?;
-    c1.mount()?;
-
-    let mut model = Model::default();
-    std::fs::create_dir(c0.mnt.join("hot"))?;
-    std::fs::create_dir(c0.mnt.join("cold"))?;
-    model.mkdir(std::path::Path::new("hot"));
-    model.mkdir(std::path::Path::new("cold"));
-    eventually("dirs on B", Duration::from_secs(20), || {
-        anyhow::ensure!(c1.mnt.join("hot").is_dir() && c1.mnt.join("cold").is_dir());
-        Ok(())
-    })?;
-    wait_for_split(&c0, &c0.mnt.join("hot"), &mut model, "s")?;
-    anyhow::ensure!(
-        partition_ids(&c0)?.iter().any(|id| id != "p0"),
-        "expected a split before cross-partition rename"
-    );
-
-    std::fs::write(c0.mnt.join("hot/x"), b"from-a")?;
-    model.write_file(std::path::Path::new("hot/x"), b"from-a".to_vec());
-    std::fs::rename(c0.mnt.join("hot/x"), c0.mnt.join("cold/y"))?;
-    model.rename(
-        std::path::Path::new("hot/x"),
-        std::path::Path::new("cold/y"),
-    );
-    eventually("rename A->B visible", Duration::from_secs(20), || {
-        anyhow::ensure!(c1.mnt.join("cold/y").is_file(), "y not on c1");
-        anyhow::ensure!(!c1.mnt.join("hot/x").exists(), "x still on c1");
-        Ok(())
-    })?;
-
-    std::fs::write(c1.mnt.join("cold/p"), b"from-b")?;
-    model.write_file(std::path::Path::new("cold/p"), b"from-b".to_vec());
-    std::fs::rename(c1.mnt.join("cold/p"), c1.mnt.join("hot/q"))?;
-    model.rename(
-        std::path::Path::new("cold/p"),
-        std::path::Path::new("hot/q"),
-    );
-    eventually("rename B->A visible", Duration::from_secs(20), || {
-        anyhow::ensure!(c0.mnt.join("hot/q").is_file(), "q not on c0");
-        Ok(())
-    })?;
-
-    // Kill the renamer between operations; remount must recover.
-    std::fs::write(c0.mnt.join("hot/z"), b"z")?;
-    model.write_file(std::path::Path::new("hot/z"), b"z".to_vec());
-    c0.kill9()?;
-    c0.mount()?;
-    eventually("post-kill9 namespace", Duration::from_secs(30), || {
-        model.verify(&c0.mnt).context("via c0 after remount")?;
-        model.verify(&c1.mnt).context("via c1")?;
-        Ok(())
-    })?;
-    std::fs::rename(c0.mnt.join("hot/z"), c0.mnt.join("cold/z"))?;
-    model.rename(
-        std::path::Path::new("hot/z"),
-        std::path::Path::new("cold/z"),
-    );
-    eventually("final xpart rename", Duration::from_secs(20), || {
-        model.verify(&c0.mnt).context("via c0")?;
-        model.verify(&c1.mnt).context("via c1")?;
-        Ok(())
-    })?;
-    ensure_no_conflicts([&c0, &c1])?;
-    c0.unmount()?;
-    c1.unmount()?;
-    Ok(())
-}
-
 /// Lease handoff in ~1 RTT (roadmap M3.3 exit criterion).
 ///
 /// A holds the lease and keeps writing, so it never goes write-idle. B
@@ -5562,14 +5316,6 @@ fn xml_field<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
     Some(&xml[start..end])
 }
 
-fn raw_json(endpoint: &str, key: &str) -> Result<serde_json::Value> {
-    let body = ureq::get(&raw_key(endpoint, key))
-        .call()
-        .with_context(|| format!("fetching {key}"))?
-        .into_string()?;
-    serde_json::from_str(&body).with_context(|| format!("parsing {key}"))
-}
-
 /// The `<seq>.zst` snapshots under `checkpoints/p0/`, oldest first.
 fn checkpoint_snapshots(endpoint: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
     let mut out: Vec<(String, u64)> = raw_objects(endpoint, &format!("{prefix}/checkpoints/p0/"))?
@@ -6229,225 +5975,4 @@ fn sticky_lease_handoff_over_s3(_seed: u64) -> Result<()> {
     a.unmount()?;
     b.unmount()?;
     Ok(())
-}
-
-/// Log retention is per partition (plan 26 step 0) — the regression test
-/// for a latent data-loss bug.
-///
-/// GC used to compute one floor, `LATEST.seq - retention`, and apply it
-/// to every object under `log/`. `LATEST.seq` is the maximum sequence
-/// over *all* partitions, so a young child partition sitting at seq 10
-/// while p0 was thousands of segments ahead had its entire stream deleted
-/// — including the segments above `VECTOR.json`'s `applied[child]`, which
-/// is exactly the part no checkpoint can replace. A node bootstrapping
-/// afterwards would simply never see those files.
-///
-/// Force a split, get a checkpoint written while the child is quiet, then
-/// write into the child so its live segments sit *above* its vector
-/// entry, run GC, and require a fresh node to still see them.
-fn multi_partition_retention_is_per_partition(_seed: u64) -> Result<()> {
-    const RETENTION: u64 = 8;
-    let (env, root) = setup("multi-part-retention")?;
-    let _proxy = env.s3_proxy()?;
-    let prefix = format!("part-retention-{}", ts());
-    let backend = format!("s3://{BUCKET}/{prefix}");
-    let mk = |name: &str| -> Result<Client> {
-        Ok(part_env(
-            Client::new(root.path(), name, &env.endpoint, &backend)?,
-            4,
-            3_600,
-        )
-        .with_env(
-            "CONSTELLATION_LOG_RETENTION_SEGMENTS",
-            &RETENTION.to_string(),
-        )
-        // GC waits one full authority TTL before deleting; keep that
-        // mandatory wait short.
-        .with_env("CONSTELLATION_LEASE_TTL_MS", "2000"))
-    };
-    // The split heuristic requires at least two registered nodes.
-    let mut a = mk("part-a")?;
-    let mut b = mk("part-b")?;
-    a.fs_create()?;
-    a.mount()?;
-    b.mount()?;
-
-    let mut model = Model::default();
-    std::fs::create_dir(a.mnt.join("hot"))?;
-    model.mkdir(std::path::Path::new("hot"));
-    eventually("hot visible on B", Duration::from_secs(30), || {
-        anyhow::ensure!(b.mnt.join("hot").is_dir(), "hot not on B");
-        Ok(())
-    })?;
-    wait_for_split(&a, &a.mnt.join("hot"), &mut model, "split")?;
-    let child = partition_ids(&a)?
-        .into_iter()
-        .find(|id| id != "p0")
-        .context("no child partition after the split")?;
-
-    // Run p0 far ahead of the child and let a metadata commit land while
-    // the child is quiet, so its `applied` entry is low. (Plan 28: the
-    // commit's vector is the retention floor now; before it, the
-    // checkpoint's VECTOR.json was, with the same per-partition rule.)
-    //
-    // A checkpoint needs `CHECKPOINT_EVERY` (32) *shipped segments*, and a
-    // ship round takes the whole journal as one segment: 160 back-to-back
-    // writes coalesce into a handful of segments and never reach the
-    // floor, however long the wait. A brief pause between writes lets each
-    // close() nudge ship its own segment, so write in paced batches and
-    // stop only once p0 is far enough ahead rather than guessing a file
-    // count that happens to be enough.
-    //
-    // "Far enough" is the hazard's own definition: the *old* global floor
-    // was `LATEST.seq - retention` applied to every partition, so it only
-    // reaches the child's live segments when `LATEST.seq` outruns them by
-    // more than the retention window. Keep a margin on top for the child
-    // segments written next — they must land above the vector entry and
-    // still below the old floor.
-    const CHILD_MARGIN: u64 = 30;
-    std::fs::create_dir(a.mnt.join("cold"))?;
-    model.mkdir(std::path::Path::new("cold"));
-    let mut cold = 0usize;
-    let mut staged = false;
-    for _ in 0..30 {
-        for _ in 0..40 {
-            let rel = format!("cold/c{cold:04}");
-            let data = format!("cold-{cold}").into_bytes();
-            std::fs::write(a.mnt.join(&rel), &data)?;
-            model.write_file(std::path::Path::new(&rel), data);
-            cold += 1;
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        eventually("p0 ships", Duration::from_secs(60), || journal_drained(&a))?;
-        let Some(head) = head_commit(&env.direct_endpoint, &prefix)? else {
-            continue;
-        };
-        let covered = commit_covered(&head);
-        let child_max = log_segment_seqs(&env.direct_endpoint, &prefix, &child)?
-            .last()
-            .copied()
-            .unwrap_or(0);
-        if covered.saturating_sub(RETENTION) > child_max + CHILD_MARGIN {
-            staged = true;
-            break;
-        }
-    }
-    anyhow::ensure!(
-        staged,
-        "p0 never outran the child far enough for the old global floor to reach it \
-         after {cold} paced writes ({} p0 segment(s))",
-        log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?.len()
-    );
-
-    // Now write into the child, above whatever the checkpoint captured.
-    // A byte-proportional cadence will not fire another checkpoint for
-    // ten tiny segments, but assert the hazard exists rather than
-    // assuming it: the child's live segments must sit above its vector
-    // entry, and the *old* global floor must have covered them.
-    let mut hot_files = Vec::new();
-    let mut ready = false;
-    for attempt in 0..5 {
-        for i in 0..10 {
-            let rel = format!("hot/late-{attempt}-{i}");
-            let data = format!("late-{attempt}-{i}").into_bytes();
-            std::fs::write(a.mnt.join(&rel), &data)?;
-            model.write_file(std::path::Path::new(&rel), data.clone());
-            hot_files.push((rel, data));
-        }
-        eventually("child segments ship", Duration::from_secs(60), || {
-            journal_drained(&a)
-        })?;
-        let head =
-            head_commit(&env.direct_endpoint, &prefix)?.context("the head commit vanished")?;
-        let covered = commit_covered(&head);
-        let applied = head["applied"][&child].as_u64().unwrap_or(0);
-        let child_seqs = log_segment_seqs(&env.direct_endpoint, &prefix, &child)?;
-        let max_child = child_seqs.last().copied().unwrap_or(0);
-        eprintln!(
-            "    multi-partition-retention: attempt {attempt}: covered={covered} \
-             applied[{child}]={applied} child segments {:?}..{max_child} (n={})",
-            child_seqs.first(),
-            child_seqs.len()
-        );
-        if max_child > applied && covered.saturating_sub(RETENTION) > max_child {
-            ready = true;
-            break;
-        }
-    }
-    anyhow::ensure!(
-        ready,
-        "could not stage the hazard: the child's live segments never sat above its \
-         vector entry while under the old global floor"
-    );
-
-    let out = a.gc_run(false)?;
-    anyhow::ensure!(
-        out.status.success(),
-        "gc run failed: {}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let surviving = log_segment_seqs(&env.direct_endpoint, &prefix, &child)?;
-    let head = head_commit(&env.direct_endpoint, &prefix)?.context("no head commit after gc")?;
-    let applied = head["applied"][&child].as_u64().unwrap_or(0);
-    eprintln!(
-        "    multi-partition-retention: after gc, {} segment(s) left on {child}, \
-         vector applied {applied}",
-        surviving.len()
-    );
-    anyhow::ensure!(
-        surviving
-            .iter()
-            .all(|seq| *seq >= applied.saturating_sub(RETENTION)),
-        "GC pruned {child} below its own vector floor: {surviving:?} vs applied {applied}"
-    );
-
-    // Crash both nodes so no clean-unmount checkpoint can paper over a
-    // truncated child stream, then rebuild from the bucket alone.
-    a.kill9()?;
-    b.kill9()?;
-    let mut c = mk("part-c")?;
-    c.mount()
-        .context("fresh bootstrap after per-partition GC")?;
-    for (rel, data) in &hot_files {
-        let got = std::fs::read(c.mnt.join(rel))
-            .with_context(|| format!("{rel} missing on the fresh node after GC"))?;
-        anyhow::ensure!(got == *data, "{rel} has the wrong content after GC");
-    }
-    eventually(
-        "fresh node matches the oracle",
-        Duration::from_secs(120),
-        || model.verify(&c.mnt),
-    )?;
-    c.unmount()?;
-    Ok(())
-}
-
-/// The newest plan 28 commit object under `prefix`, as JSON (plain
-/// filesystems only).
-fn head_commit(endpoint: &str, prefix: &str) -> Result<Option<serde_json::Value>> {
-    let mut keys: Vec<String> = raw_objects(endpoint, &format!("{prefix}/commits/"))?
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect();
-    keys.sort();
-    match keys.last() {
-        Some(key) => Ok(Some(raw_json(endpoint, key)?)),
-        None => Ok(None),
-    }
-}
-
-/// What the old *global* floor was computed from: the highest sequence
-/// the head commit covers in any partition.
-fn commit_covered(commit: &serde_json::Value) -> u64 {
-    commit["applied"]
-        .as_object()
-        .map(|applied| {
-            applied
-                .values()
-                .filter_map(|v| v.as_u64())
-                .max()
-                .unwrap_or(0)
-        })
-        .unwrap_or(0)
 }

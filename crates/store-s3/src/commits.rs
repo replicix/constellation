@@ -180,35 +180,30 @@ pub struct Commit {
     pub intent: Intent,
     #[serde(default)]
     pub unix_ms: i64,
-    /// Log position this commit's tree reflects: partition id → the
-    /// highest segment sequence applied to the replica it was built
-    /// from (plan 28 §11, S5/S6).
+    /// Log position this commit's tree reflects: the highest segment
+    /// sequence applied to the replica it was built from (plan 28 §11,
+    /// S5/S6). One metadata stream since plan 29 M0a removed namespace
+    /// partitions.
     ///
-    /// Two jobs. A bootstrap restores the tree and resumes tailing each
-    /// partition from here, exactly as it used to resume from a
-    /// checkpoint's `VECTOR.json`. And it is the publisher's guard
-    /// against regressing the tree: a replica may only build on a head
-    /// whose vector its own dominates component-wise, because a replica
-    /// *behind* the head would otherwise overwrite newer values with
-    /// the older ones it still holds. Along the chain the vectors
-    /// therefore only grow.
+    /// Two jobs. A bootstrap restores the tree and resumes tailing the
+    /// log from here, exactly as it used to resume from a checkpoint's
+    /// `VECTOR.json`. And it is the publisher's guard against
+    /// regressing the tree: a replica may only build on a head whose
+    /// position its own covers, because a replica *behind* the head
+    /// would otherwise overwrite newer values with the older ones it
+    /// still holds. Along the chain the position therefore only grows.
     ///
     /// Like the checkpoint it replaces, the tree may additionally hold
     /// its author's not-yet-shipped journal suffix; the author holds
-    /// the partition lease, so the log appends that suffix after this
-    /// position and replay absorbs it.
+    /// the lease, so the log appends that suffix after this position
+    /// and replay absorbs it.
     #[serde(default)]
-    pub applied: BTreeMap<String, u64>,
+    pub applied: u64,
 }
 
-/// `mine` has applied at least as much of every partition's log as
-/// `theirs`. A partition `theirs` names and `mine` does not counts as
-/// position 0 — a replica that has never heard of a partition is behind
-/// on it by definition.
-pub fn vector_covers(mine: &BTreeMap<String, u64>, theirs: &BTreeMap<String, u64>) -> bool {
-    theirs
-        .iter()
-        .all(|(part, seq)| mine.get(part).copied().unwrap_or(0) >= *seq)
+/// `mine` has applied at least as much of the log as `theirs`.
+pub fn vector_covers(mine: u64, theirs: u64) -> bool {
+    mine >= theirs
 }
 
 fn default_version() -> u32 {
@@ -246,7 +241,7 @@ pub struct CommitPayload {
     pub epoch: u64,
     pub agg: CommitAgg,
     pub intent: Intent,
-    pub applied: BTreeMap<String, u64>,
+    pub applied: u64,
 }
 
 impl CommitPayload {
@@ -275,7 +270,7 @@ impl CommitPayload {
         self
     }
 
-    pub fn with_applied(mut self, applied: BTreeMap<String, u64>) -> CommitPayload {
+    pub fn with_applied(mut self, applied: u64) -> CommitPayload {
         self.applied = applied;
         self
     }
@@ -296,7 +291,7 @@ impl CommitPayload {
             agg: self.agg,
             intent: self.intent.clone(),
             unix_ms,
-            applied: self.applied.clone(),
+            applied: self.applied,
         }
     }
 }
@@ -599,9 +594,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = cache_for(store.clone(), &dir);
         let chain = CommitChain::new(store);
-        let payload = durable_payload(&cache, 300, 1)
-            .await
-            .with_applied(BTreeMap::from([("p0".into(), 41), ("p3".into(), 2)]));
+        let payload = durable_payload(&cache, 300, 1).await.with_applied(41);
         let root = payload.roots[SHARD0];
 
         let commit = chain
@@ -615,7 +608,7 @@ mod tests {
         assert_eq!((read.author, read.epoch), (7, 19));
         assert_eq!(read.intent, Intent::batch(300));
         assert_eq!(read.agg.keys, 300);
-        assert_eq!(read.applied.get("p0"), Some(&41));
+        assert_eq!(read.applied, 41);
         assert!(read.unix_ms > 0);
         assert!(!read.packs.is_empty());
     }
@@ -1123,20 +1116,10 @@ mod tests {
     }
 
     #[test]
-    fn vector_cover_is_componentwise_and_treats_unknown_parts_as_zero() {
-        let v = |pairs: &[(&str, u64)]| -> BTreeMap<String, u64> {
-            pairs.iter().map(|(p, s)| (p.to_string(), *s)).collect()
-        };
-        assert!(vector_covers(&v(&[("p0", 5)]), &v(&[("p0", 5)])));
-        assert!(vector_covers(&v(&[("p0", 6), ("p1", 1)]), &v(&[("p0", 5)])));
-        assert!(!vector_covers(
-            &v(&[("p0", 6)]),
-            &v(&[("p0", 5), ("p1", 1)])
-        ));
-        assert!(!vector_covers(
-            &v(&[("p0", 4), ("p1", 9)]),
-            &v(&[("p0", 5)])
-        ));
-        assert!(vector_covers(&v(&[]), &v(&[("p1", 0)])));
+    fn vector_cover_is_at_least_as_far_along() {
+        assert!(vector_covers(5, 5));
+        assert!(vector_covers(6, 5));
+        assert!(!vector_covers(5, 6));
+        assert!(vector_covers(0, 0));
     }
 }

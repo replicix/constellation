@@ -133,21 +133,18 @@ pub enum Subsystem {
     Quota = 0x03,
     Designation = 0x04,
     Hold = 0x05,
-    /// The partition map (id → root ino). Plan 28 (B) keeps namespace
-    /// partitions (§P4 deletes them only with the engine swap), and a
-    /// replica bootstrapped from a commit must know them to resume
-    /// tailing each partition's log.
-    Partition = 0x06,
+    // 0x06 was `Partition` (the namespace-partition map), retired by
+    // plan 29 M0a along with namespace partitions themselves. Reserved
+    // and deliberately unused rather than reassigned.
 }
 
 /// Every subsystem, in key order.
-pub const SUBSYSTEMS: [Subsystem; 6] = [
+pub const SUBSYSTEMS: [Subsystem; 5] = [
     Subsystem::Snapshot,
     Subsystem::Clone,
     Subsystem::Quota,
     Subsystem::Designation,
     Subsystem::Hold,
-    Subsystem::Partition,
 ];
 
 impl Subsystem {

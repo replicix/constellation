@@ -8,7 +8,7 @@ use crate::gc;
 use anyhow::{Context, Result};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::ChunkHash;
-use constellation_meta::{LogRecord, SqliteMeta};
+use constellation_meta::SqliteMeta;
 use constellation_store_s3::{CompressionSetting, GcJournalEntry, LeaseMode, LeaseStore, LogStore};
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -71,7 +71,6 @@ pub async fn run(
         &mut issues,
     )
     .await?;
-    check_xparts(&meta, repair, &mut issues)?;
     check_metadata_objects(&store, logs, &meta, repair, &mut issues).await?;
     check_metadata_tree(logs, &meta, state_dir, &mut issues).await?;
     check_leases(&store, lease_mode, repair, force_release, &mut issues).await?;
@@ -180,30 +179,6 @@ async fn record_missing(
     Ok(())
 }
 
-fn check_xparts(meta: &SqliteMeta, repair: bool, issues: &mut Vec<FsckIssue>) -> Result<()> {
-    for (txid, half, record) in meta.pending_xparts()? {
-        let repaired = if repair && half == "src" {
-            let part = match record {
-                LogRecord::RenameXpartSrc { part, .. } => part,
-                _ => "p0".into(),
-            };
-            meta.journal_on(&part, &LogRecord::RenameXpartAbort { txid })?;
-            meta.clear_pending_xpart(txid)?;
-            true
-        } else {
-            false
-        };
-        issues.push(FsckIssue {
-            class: "half_committed_xpart".into(),
-            key: None,
-            detail: format!("transaction {txid} has only {half} half"),
-            repaired,
-            unrepairable: repair && !repaired,
-        });
-    }
-    Ok(())
-}
-
 async fn check_metadata_objects(
     store: &Arc<dyn ObjectStore>,
     logs: &LogStore,
@@ -256,14 +231,13 @@ async fn check_metadata_objects(
             detail: "latest checkpoint pointer or payload is invalid".into(),
             repaired: if repair {
                 let vector = constellation_store_s3::CheckpointVector {
-                    applied: meta.applied_vector()?,
+                    applied: std::collections::BTreeMap::from([(
+                        constellation_store_s3::log::PARTITION.to_string(),
+                        meta.applied_seq()?,
+                    )]),
                 };
-                logs.put_checkpoint_with_vector(
-                    meta.applied_seq_of("p0")?,
-                    &meta.snapshot()?,
-                    &vector,
-                )
-                .await?;
+                logs.put_checkpoint_with_vector(meta.applied_seq()?, &meta.snapshot()?, &vector)
+                    .await?;
                 true
             } else {
                 false
@@ -382,7 +356,7 @@ async fn check_metadata_tree_in(
             }),
         }
 
-        let vector = meta.applied_vector()?;
+        let vector = meta.applied_seq()?;
         let Some(matching) = candidates
             .iter()
             .find(|commit| commit.applied == vector && meta.journal_len().unwrap_or(1) == 0)
@@ -586,7 +560,7 @@ async fn check_gc_journal(
 mod tests {
     use super::*;
     use constellation_fs_core::{DEFAULT_CHUNK_SIZE, INLINE_CHUNKS_MAX};
-    use constellation_meta::MetaStore;
+    use constellation_meta::{LogRecord, MetaStore};
     use object_store::memory::InMemory;
 
     #[tokio::test]

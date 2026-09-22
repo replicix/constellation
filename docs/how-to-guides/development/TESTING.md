@@ -290,27 +290,13 @@ not leave):
   A+B again form an epoch under cut. Registry records are retired
   tombstones, not deleted, so numeric ids are never recycled.
 
-M3.2 scenarios exercise the partition map (DESIGN.md §4):
-`partition-split` (two nodes, one FS; `CONSTELLATION_PART_SPLIT_OPS`
-is lowered so node A hammering `/hot` produces a child partition
-visible on the control API `partitions` list; both nodes'
-trees are model-verified; then `/hot` goes idle under a small
-`CONSTELLATION_PART_MERGE_IDLE_S` and the child merges back to `p0`
-with continued correctness) and `rename-across-partitions` (same low
-split threshold, then files/dirs renamed between `/hot` and `/cold`
-from both nodes — serialized by the two leases — model-verified;
-a `kill9` of the renamer between operations, remount, and a further
-cross-partition rename prove recovery, including the abort rule for
-a durable `RenameXpartSrc` whose dst half never appears). A
-single-node filesystem never splits (the heuristic requires ≥2
-registered nodes).
-
-**Both scenarios tune the policy through the environment, and the
-daemon reads those variables from its own environment.** Never export
-`CONSTELLATION_PART_*` into the shell that runs the harness: every
-other scenario inherits them, and a tiny split threshold makes
-otherwise-unrelated scenarios (`lease-handover`, which assumes a
-single partition) split and fail in confusing ways.
+Plan 29 M0a removed namespace partitions entirely (the `partition`
+table, autosplit/merge, and the `RenameXpartSrc`/`Dst`/`Abort` linked-pair
+rename protocol): there is exactly one metadata log stream and one
+partition lease, both named `p0`, and a cross-directory rename is an
+ordinary `Rename`. The `partition-split`, `rename-across-partitions`,
+and `multi-partition-retention-is-per-partition` scenarios that used to
+exercise that machinery are gone with it.
 
 M3.3 scenarios exercise the P2P fast path (DESIGN.md §8, §12). Each one
 sets a distinct `CONSTELLATION_NODE_KEY` per client, because the node key
@@ -585,15 +571,6 @@ so a miscounted stream fails the scenario instead of silently under-reporting.
   must then complete — not EIO — inside `TTL/2 + dwell + 10 s`, the fencing
   epoch must advance, and A must have released cooperatively rather than been
   deposed.
-- `multi-partition-retention-is-per-partition` is the regression test for the
-  finding-6 data-loss bug. It forces a split, drives p0 far enough ahead that
-  the *old* global floor (`LATEST.seq - retention`) would reach the child's
-  live segments, writes into the child above its `VECTOR.json` entry, runs `gc
-  run`, kill-9s both nodes so no clean-unmount checkpoint can paper over a
-  truncated stream, and requires a fresh node to still read every child file.
-  It asserts the hazard is staged before it asserts the fix, so it cannot pass
-  vacuously.
-
 `p2p-partition-tolerance` cuts P2P with the kill switch on one node
 (toxiproxy only fronts S3, so this is how plan 02 specifies simulating an
 unreachable peer) and re-runs the shared-filesystem workload: everything

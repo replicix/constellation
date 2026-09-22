@@ -127,46 +127,6 @@ pub enum LogRecord {
         name: String,
         time_ns: i64,
     },
-    /// Split a directory off as its own partition. Carried on the
-    /// *parent* partition's stream; the child stream starts empty at
-    /// seq 1 after this record is durable (DESIGN.md §4 "Partitions").
-    PartSplit {
-        part: String,
-        at_ino: Ino,
-        new_part: String,
-        time_ns: i64,
-    },
-    /// Absorb a child partition back into `into_part`. Carried on the
-    /// surviving (parent) stream; the child's stream is then sealed.
-    PartMerge {
-        part: String,
-        into_part: String,
-        time_ns: i64,
-    },
-    /// Source half of a cross-partition rename (linked two-record
-    /// commit). Applied only when the matching [`RenameXpartDst`] is
-    /// also present; otherwise parked, and aborted if the dst never
-    /// appears (see `replay` module docs).
-    RenameXpartSrc {
-        txid: u64,
-        part: String,
-        from_parent: Ino,
-        name: String,
-        ino: Ino,
-        time_ns: i64,
-    },
-    /// Destination half of a cross-partition rename.
-    RenameXpartDst {
-        txid: u64,
-        part: String,
-        to_parent: Ino,
-        new_name: String,
-        ino: Ino,
-        time_ns: i64,
-    },
-    /// Void an orphan [`RenameXpartSrc`] whose dst half never landed.
-    /// Only the current holder of the src partition may append this.
-    RenameXpartAbort { txid: u64 },
     SnapCreate {
         id: String,
         path: String,

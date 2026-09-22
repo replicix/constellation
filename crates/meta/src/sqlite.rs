@@ -140,16 +140,6 @@ CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS partition (
-    id       TEXT PRIMARY KEY,
-    root_ino INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS partition_by_root ON partition (root_ino);
-CREATE TABLE IF NOT EXISTS xpart_pending (
-    txid   INTEGER PRIMARY KEY,
-    half   TEXT NOT NULL,
-    record BLOB NOT NULL
-);
 CREATE TABLE IF NOT EXISTS pin (
     path      TEXT PRIMARY KEY,
     ino       INTEGER NOT NULL,
@@ -582,19 +572,13 @@ impl SqliteMeta {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        // Pre-partition DBs pick up the part column without a wipe.
+        // Older DBs pick up the part column without a wipe. One stream
+        // (`p0`) since plan 29 M0a removed namespace partitions; the
+        // column stays so `journal`'s shape does not change again.
         let _ = conn.execute(
             "ALTER TABLE journal ADD COLUMN part TEXT NOT NULL DEFAULT 'p0'",
             [],
         );
-        conn.execute(
-            "INSERT OR IGNORE INTO partition (id, root_ino) VALUES ('p0', ?1)",
-            params![ROOT_INO],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO kv (key, value) VALUES ('next_part', '1')",
-            [],
-        )?;
         // Root inode (FUSE ino 1).
         let n: u64 = conn.query_row(
             "SELECT COUNT(*) FROM inode WHERE ino = ?1",
@@ -784,33 +768,11 @@ impl SqliteMeta {
         Ok(())
     }
 
-    /// Applied sequence for one partition (`applied_seq/<part>`). The
-    /// legacy `applied_seq` key is p0 so pre-partition checkpoints still
-    /// bootstrap.
-    pub fn applied_seq_of(&self, part: &str) -> Result<u64, MetaError> {
-        if let Some(v) = self.kv_get(&format!("applied_seq/{part}"))? {
-            return Ok(v.parse().unwrap_or(0));
-        }
-        if part == "p0" {
-            return self.applied_seq();
-        }
-        Ok(0)
-    }
-
-    pub fn set_applied_seq_of(&self, part: &str, seq: u64) -> Result<(), MetaError> {
-        self.kv_set(&format!("applied_seq/{part}"), &seq.to_string())?;
-        if part == "p0" {
-            self.kv_set("applied_seq", &seq.to_string())?;
-        }
-        Ok(())
-    }
-
     /// Atomically ack specific journal rows and record the log position
-    /// that covers them for `part`.
+    /// that covers them.
     pub fn ack_journal_rows_at(
         &self,
         journal_seqs: &[u64],
-        part: &str,
         applied_seq: u64,
     ) -> Result<(), MetaError> {
         if journal_seqs.is_empty() {
@@ -822,15 +784,9 @@ impl SqliteMeta {
             tx.execute("DELETE FROM journal WHERE seq = ?1", params![seq])?;
         }
         tx.execute(
-            "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
-            params![format!("applied_seq/{part}"), applied_seq.to_string()],
+            "INSERT OR REPLACE INTO kv (key, value) VALUES ('applied_seq', ?1)",
+            params![applied_seq.to_string()],
         )?;
-        if part == "p0" {
-            tx.execute(
-                "INSERT OR REPLACE INTO kv (key, value) VALUES ('applied_seq', ?1)",
-                params![applied_seq.to_string()],
-            )?;
-        }
         tx.commit()?;
         Ok(())
     }
@@ -859,156 +815,17 @@ impl SqliteMeta {
         Ok(())
     }
 
+    /// One metadata log stream (`p0`; plan 29 M0a removed namespace
+    /// partitions, so this is a constant rather than a lookup).
     fn journal(conn: &Connection, record: &LogRecord) -> Result<(), MetaError> {
-        let part = Self::part_for_record(conn, record)?;
         conn.execute(
-            "INSERT INTO journal (record, part) VALUES (?1, ?2)",
-            params![record.to_postcard()?, part],
+            "INSERT INTO journal (record, part) VALUES (?1, 'p0')",
+            params![record.to_postcard()?],
         )?;
         Ok(())
     }
 
-    /// Which stream a freshly journaled record belongs to. Computed from
-    /// the mutated inode/dentry at journaling time so a later split
-    /// cannot re-home an already-journaled op.
-    fn part_for_record(conn: &Connection, rec: &LogRecord) -> Result<String, MetaError> {
-        match rec {
-            LogRecord::PartSplit { part, .. }
-            | LogRecord::PartMerge {
-                into_part: part, ..
-            }
-            | LogRecord::RenameXpartSrc { part, .. }
-            | LogRecord::RenameXpartDst { part, .. } => Ok(part.clone()),
-            LogRecord::RenameXpartAbort { .. }
-            | LogRecord::SnapCreate { .. }
-            | LogRecord::SnapDelete { .. }
-            | LogRecord::Clone { .. }
-            | LogRecord::SetQuota { .. } => Ok("p0".into()),
-            LogRecord::Mkdir { parent, .. }
-            | LogRecord::Create { parent, .. }
-            | LogRecord::Symlink { parent, .. }
-            | LogRecord::Mknod { parent, .. }
-            | LogRecord::Link { parent, .. }
-            | LogRecord::Unlink { parent, .. }
-            | LogRecord::Rmdir { parent, .. }
-            | LogRecord::Rename { parent, .. } => Self::partition_of_conn(conn, *parent),
-            LogRecord::Setattr { ino, .. }
-            | LogRecord::WriteManifest { ino, .. }
-            | LogRecord::SetXattr { ino, .. }
-            | LogRecord::RemoveXattr { ino, .. }
-            // Atime never reaches the `journal` table (it lives in
-            // `atime_journal`); this arm only keeps the match total.
-            | LogRecord::Atime { ino, .. } => Self::partition_of_conn(conn, *ino),
-        }
-    }
-
-    /// Journal a record onto a specific stream inside an existing
-    /// transaction (split/merge/xpart halves, whose stream is not
-    /// implied by a single inode).
-    fn journal_on_tx(conn: &Connection, part: &str, record: &LogRecord) -> Result<(), MetaError> {
-        conn.execute(
-            "INSERT INTO journal (record, part) VALUES (?1, ?2)",
-            params![record.to_postcard()?, part],
-        )?;
-        match record {
-            LogRecord::PartSplit {
-                at_ino, new_part, ..
-            } => {
-                conn.execute(
-                    "INSERT OR REPLACE INTO partition (id, root_ino) VALUES (?1, ?2)",
-                    params![new_part, at_ino],
-                )?;
-                conn.execute("DELETE FROM kv WHERE key LIKE 'part_of/%'", [])?;
-            }
-            LogRecord::PartMerge { part: child, .. } => {
-                conn.execute("DELETE FROM partition WHERE id = ?1", params![child])?;
-                conn.execute("DELETE FROM kv WHERE key LIKE 'part_of/%'", [])?;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Journal a record onto a specific stream (split/merge/xpart
-    /// halves, whose stream is not implied by a single inode).
-    pub fn journal_on(&self, part: &str, record: &LogRecord) -> Result<(), MetaError> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        Self::journal_on_tx(&tx, part, record)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Walk up the dentry tree to the nearest partition root. Root of
-    /// `/` is always `p0`. Cached in `kv` as `part_of/<ino>` and
-    /// invalidated on split/merge/rename that moves the inode.
-    pub fn partition_of(&self, ino: Ino) -> Result<String, MetaError> {
-        Self::partition_of_conn(&self.conn.lock().unwrap(), ino)
-    }
-
-    fn partition_of_conn(conn: &Connection, ino: Ino) -> Result<String, MetaError> {
-        let cache_key = format!("part_of/{ino}");
-        if let Some(cached) = conn
-            .query_row(
-                "SELECT value FROM kv WHERE key = ?1",
-                params![cache_key],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            return Ok(cached);
-        }
-        let part = Self::resolve_partition(conn, ino)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
-            params![cache_key, &part],
-        )?;
-        Ok(part)
-    }
-
-    fn resolve_partition(conn: &Connection, mut ino: Ino) -> Result<String, MetaError> {
-        loop {
-            if let Some(id) = conn
-                .query_row(
-                    "SELECT id FROM partition WHERE root_ino = ?1",
-                    params![ino],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?
-            {
-                return Ok(id);
-            }
-            if ino == ROOT_INO {
-                return Ok("p0".into());
-            }
-            ino = conn
-                .query_row(
-                    "SELECT parent FROM dentry WHERE ino = ?1 LIMIT 1",
-                    params![ino],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or(ROOT_INO);
-        }
-    }
-
-    pub fn invalidate_part_cache(conn: &Connection, ino: Ino) -> Result<(), MetaError> {
-        conn.execute(
-            "DELETE FROM kv WHERE key = ?1",
-            params![format!("part_of/{ino}")],
-        )?;
-        Ok(())
-    }
-
-    pub fn partitions(&self) -> Result<Vec<(String, Ino)>, MetaError> {
-        self.with_reader(|conn| {
-            let mut stmt = conn.prepare("SELECT id, root_ino FROM partition ORDER BY id")?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
-    }
-
-    /// Path of a partition root, for the control API. `/` for p0.
+    /// Path of a directory, for the control API. `/` for the root.
     pub fn path_of(&self, ino: Ino) -> Result<String, MetaError> {
         if ino == ROOT_INO {
             return Ok("/".into());
@@ -1033,11 +850,6 @@ impl SqliteMeta {
             parts.reverse();
             Ok(format!("/{}", parts.join("/")))
         })
-    }
-
-    /// Allocate the next partition id (see [`Self::alloc_part_id`]).
-    pub fn next_part_id(&self) -> Result<String, MetaError> {
-        Self::alloc_part_id(&self.conn.lock().unwrap())
     }
 
     /// Resolve an absolute path to its inode. `/` is the root.
@@ -1407,107 +1219,6 @@ impl SqliteMeta {
             .optional()?)
     }
 
-    /// Allocate the next partition id. Ids are **node-scoped**
-    /// (`p<node>_<n>`, or plain `p<n>` on the genesis prefix 0) because
-    /// the counter is local: two nodes splitting different directories at
-    /// the same time must never mint the same id, or the replicated
-    /// partition map would disagree per node.
-    pub fn alloc_part_id(conn: &Connection) -> Result<String, MetaError> {
-        let next: String = conn
-            .query_row("SELECT value FROM kv WHERE key = 'next_part'", [], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .unwrap_or_else(|| "1".into());
-        let n: u64 = next
-            .parse()
-            .map_err(|_| MetaError::Invalid("next_part".into()))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO kv (key, value) VALUES ('next_part', ?1)",
-            params![(n + 1).to_string()],
-        )?;
-        let prefix = Self::prefix_of(conn)?;
-        if prefix == 0 {
-            Ok(format!("p{n}"))
-        } else {
-            Ok(format!("p{prefix}_{n}"))
-        }
-    }
-
-    pub fn park_xpart(&self, txid: u64, half: &str, rec: &LogRecord) -> Result<(), MetaError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO xpart_pending (txid, half, record) VALUES (?1, ?2, ?3)",
-            params![txid, half, rec.to_postcard()?],
-        )?;
-        Ok(())
-    }
-
-    pub fn unpark_xpart(&self, txid: u64) -> Result<(), MetaError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
-        Ok(())
-    }
-
-    pub fn mark_xpart_dst(&self, txid: u64) -> Result<(), MetaError> {
-        self.kv_set(&format!("xpart_dst/{txid}"), "1")
-    }
-
-    pub fn xpart_dst_seen(&self, txid: u64) -> Result<bool, MetaError> {
-        Ok(self.kv_get(&format!("xpart_dst/{txid}"))?.is_some())
-    }
-
-    /// Parked cross-partition rename halves: `(txid, half)` where half
-    /// is `"src"` or `"dst"`.
-    pub fn pending_xparts(&self) -> Result<Vec<(u64, String, LogRecord)>, MetaError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT txid, half, record FROM xpart_pending")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, u64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (txid, half, bytes) = row?;
-            out.push((txid, half, LogRecord::from_postcard(&bytes)?));
-        }
-        Ok(out)
-    }
-
-    pub fn clear_pending_xpart(&self, txid: u64) -> Result<(), MetaError> {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
-        Ok(())
-    }
-
-    /// Whether the journal still holds the `dst` half of cross-partition
-    /// rename `txid` (i.e. it is written but not yet shipped).
-    ///
-    /// The shipper asks this once per `RenameXpartSrc` it sees, and used to
-    /// answer it by grouping and decoding the *entire* journal — up to
-    /// `SEGMENT_BATCH` records per partition materialized to settle a
-    /// yes/no question about one record. Records are opaque postcard blobs
-    /// to SQLite, so the scan cannot move into the query, but it can stop
-    /// at the first match and keep exactly one record alive at a time.
-    pub fn journal_has_xpart_dst(&self, txid: u64) -> Result<bool, MetaError> {
-        self.with_reader(|conn| {
-            let mut stmt = conn.prepare("SELECT record FROM journal")?;
-            let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
-            for row in rows {
-                let rec = LogRecord::from_postcard(&row?)?;
-                if matches!(rec, LogRecord::RenameXpartDst { txid: t, .. } if t == txid) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })
-    }
-
     /// Peek the journal grouped by partition, preserving per-partition
     /// order. Does not drain.
     pub fn take_journal_grouped(
@@ -1592,84 +1303,10 @@ impl SqliteMeta {
             .optional()?)
     }
 
-    /// Cross-partition rename: apply locally in one transaction and
-    /// journal a linked pair (`RenameXpartSrc` on `src_part`,
-    /// `RenameXpartDst` on `dst_part`) sharing a fresh txid. The
-    /// mutating node must already hold both leases (caller acquires in
-    /// canonical partition-id order).
-    pub fn rename_xpart(
-        &self,
-        parent: Ino,
-        name: &str,
-        new_parent: Ino,
-        new_name: &str,
-        src_part: &str,
-        dst_part: &str,
-    ) -> Result<(), MetaError> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // A POSIX no-op (both names are the same inode) journals nothing:
-        // there is no namespace change to replicate.
-        let mut delta = (0i64, 0i64);
-        let Some((ino, t)) =
-            Self::rename_in_tx(&tx, parent, name, new_parent, new_name, &mut delta)?
-        else {
-            tx.commit()?;
-            return Ok(());
-        };
-        let txid = Self::alloc_xpart_txid(&tx)?;
-        Self::journal_on_tx(
-            &tx,
-            src_part,
-            &LogRecord::RenameXpartSrc {
-                txid,
-                part: src_part.into(),
-                from_parent: parent,
-                name: name.into(),
-                ino,
-                time_ns: t,
-            },
-        )?;
-        Self::journal_on_tx(
-            &tx,
-            dst_part,
-            &LogRecord::RenameXpartDst {
-                txid,
-                part: dst_part.into(),
-                to_parent: new_parent,
-                new_name: new_name.into(),
-                ino,
-                time_ns: t,
-            },
-        )?;
-        tx.commit()?;
-        self.usage.adjust(delta.0, delta.1);
-        Ok(())
-    }
-
-    fn alloc_xpart_txid(conn: &Connection) -> Result<u64, MetaError> {
-        let n: String = conn
-            .query_row("SELECT value FROM kv WHERE key = 'next_xpart'", [], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .unwrap_or_else(|| "1".into());
-        let id: u64 = n
-            .parse()
-            .map_err(|_| MetaError::Invalid("next_xpart".into()))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO kv (key, value) VALUES ('next_xpart', ?1)",
-            params![(id + 1).to_string()],
-        )?;
-        Ok(id)
-    }
-
     /// The POSIX rename body, inside a caller-owned transaction. Returns
     /// `Some((ino, time_ns))` when the namespace actually changed, or
     /// `None` for the same-inode (hard link) no-op, which journals
-    /// nothing. Shared by `rename` and `rename_xpart` so the two can
-    /// never diverge and so the xpart pair commits atomically with the
-    /// mutation it describes.
+    /// nothing.
     fn rename_in_tx(
         tx: &Connection,
         parent: Ino,
@@ -1756,7 +1393,6 @@ impl SqliteMeta {
             "UPDATE dentry SET parent = ?3, name = ?4 WHERE parent = ?1 AND name = ?2",
             params![parent, name, new_parent, new_name],
         )?;
-        Self::invalidate_part_cache(tx, ino)?;
         // A moved directory re-parents its "..": fix both parents' nlink.
         if src.kind == InodeKind::Dir && parent != new_parent {
             tx.execute(
@@ -1914,35 +1550,17 @@ impl SqliteMeta {
         f()
     }
 
-    /// [`Self::applied_vector`] through the reader connection, so that it
+    /// [`Self::applied_seq`] through the reader connection, so that it
     /// participates in [`Self::read_consistent`].
-    pub fn applied_vector_reader(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, u64>, MetaError> {
+    pub fn applied_seq_reader(&self) -> Result<u64, MetaError> {
         self.with_reader(|conn| {
-            let kv = |key: &str| -> Result<Option<String>, MetaError> {
-                Ok(conn
-                    .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| {
-                        r.get(0)
-                    })
-                    .optional()?)
-            };
-            let mut stmt = conn.prepare_cached("SELECT id FROM partition ORDER BY id")?;
-            let parts: Vec<String> = stmt
-                .query_map([], |r| r.get(0))?
-                .collect::<Result<_, _>>()?;
-            let mut out = std::collections::BTreeMap::new();
-            for part in parts {
-                let seq = match kv(&format!("applied_seq/{part}"))? {
-                    Some(v) => v.parse().unwrap_or(0),
-                    None if part == "p0" => {
-                        kv("applied_seq")?.and_then(|v| v.parse().ok()).unwrap_or(0)
-                    }
-                    None => 0,
-                };
-                out.insert(part, seq);
-            }
-            Ok(out)
+            Ok(conn
+                .query_row("SELECT value FROM kv WHERE key = 'applied_seq'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0))
         })
     }
 
@@ -1974,18 +1592,6 @@ impl SqliteMeta {
                 })
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
-        })
-    }
-
-    /// Cross-partition rename halves parked waiting for their partner.
-    ///
-    /// Plan 28's publisher will not commit while any exist: a parked half
-    /// is replay state that lives only in this table, so a commit whose
-    /// vector fell between the two halves would hand a bootstrapping
-    /// replica the second half with nothing to pair it with.
-    pub fn xpart_pending_count_reader(&self) -> Result<u64, MetaError> {
-        self.with_reader(|conn| {
-            Ok(conn.query_row("SELECT count(*) FROM xpart_pending", [], |r| r.get(0))?)
         })
     }
 
@@ -2053,24 +1659,11 @@ impl SqliteMeta {
     /// creation-time cap applies as it does on any fresh replica).
     pub fn load_tree_subsystems(
         &self,
-        partitions: &[(String, Ino)],
         snapshots: &[SnapshotRow],
         quota: Option<Option<u64>>,
     ) -> Result<(), MetaError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        // Every filesystem has at least p0, so an empty map means a tree
-        // written before partitions were published, not "no partitions":
-        // keep the default rather than leave the replica with none.
-        if !partitions.is_empty() {
-            tx.execute("DELETE FROM partition", [])?;
-        }
-        for (id, root) in partitions {
-            tx.execute(
-                "INSERT INTO partition (id, root_ino) VALUES (?1, ?2)",
-                params![id, root],
-            )?;
-        }
         tx.execute("DELETE FROM snapshot", [])?;
         for row in snapshots {
             tx.execute(
@@ -2116,8 +1709,8 @@ impl SqliteMeta {
     /// published tree equals the replica that published it — the honest
     /// test that builder and reader agree, kept from plan 27. Covers the
     /// namespace (`inode` minus atime, which §P6 keeps out of the tree,
-    /// `dentry`, `xattr`) and the `0x30` subsystem state (`partition`,
-    /// `snapshot`, the replicated quota). Node-local and derived tables
+    /// `dentry`, `xattr`) and the `0x30` subsystem state (`snapshot`, the
+    /// replicated quota). Node-local and derived tables
     /// are not shared state and are left out, and so are `nlink == 0`
     /// inodes: unlinked-but-open files (and not yet reaped rows) that no
     /// other replica can reach.
@@ -2150,7 +1743,6 @@ impl SqliteMeta {
                 3,
                 "xattr",
             )?;
-            collect("SELECT id, root_ino FROM partition", 2, "partition")?;
             collect(
                 "SELECT id, path, name, root_hash, created_unix_ms FROM snapshot",
                 5,
@@ -2180,14 +1772,6 @@ impl SqliteMeta {
             let rows = stmt.query_map(params![after, limit as i64], |row| row.get(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
-    }
-
-    pub fn applied_vector(&self) -> Result<std::collections::BTreeMap<String, u64>, MetaError> {
-        let mut out = std::collections::BTreeMap::new();
-        for (id, _) in self.partitions()? {
-            out.insert(id.clone(), self.applied_seq_of(&id)?);
-        }
-        Ok(out)
     }
 
     pub fn persist_epoch(
@@ -2357,24 +1941,11 @@ impl SqliteMeta {
             // row is about inodes that no longer exist.
             tx.execute("DELETE FROM chunk_ref", [])?;
             Self::rebuild_chunk_ref(&tx)?;
-            tx.execute("DELETE FROM partition", [])?;
-            tx.execute(
-                "INSERT INTO partition SELECT * FROM reintegrated.partition",
-                [],
-            )?;
-            tx.execute("DELETE FROM xpart_pending", [])?;
-            tx.execute(
-                "INSERT INTO xpart_pending SELECT * FROM reintegrated.xpart_pending",
-                [],
-            )?;
-            tx.execute(
-                "DELETE FROM kv WHERE key = 'applied_seq' OR key LIKE 'applied_seq/%'",
-                [],
-            )?;
+            tx.execute("DELETE FROM kv WHERE key = 'applied_seq'", [])?;
             tx.execute(
                 "INSERT OR REPLACE INTO kv
                  SELECT key, value FROM reintegrated.kv
-                 WHERE key = 'applied_seq' OR key LIKE 'applied_seq/%'",
+                 WHERE key = 'applied_seq'",
                 [],
             )?;
             for (seq, disposition, detail) in dispositions {
@@ -2388,7 +1959,6 @@ impl SqliteMeta {
             for record in output {
                 Self::journal(&tx, record)?;
             }
-            tx.execute("DELETE FROM kv WHERE key LIKE 'part_of/%'", [])?;
             tx.commit()?;
             Ok(())
         })();
@@ -4093,14 +3663,13 @@ impl MetaStore for SqliteMeta {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (ino, atime_ns, time_ns) in bumps {
-            let part = Self::partition_of_conn(&tx, *ino)?;
             tx.execute(
-                "INSERT INTO atime_journal (ino, part, atime_ns, time_ns) VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO atime_journal (ino, part, atime_ns, time_ns) VALUES (?1, 'p0', ?2, ?3)
                  ON CONFLICT(ino) DO UPDATE SET
                      part     = excluded.part,
                      atime_ns = MAX(atime_ns, excluded.atime_ns),
                      time_ns  = MAX(time_ns,  excluded.time_ns)",
-                params![ino, part, atime_ns, time_ns],
+                params![ino, atime_ns, time_ns],
             )?;
         }
         tx.commit()?;
@@ -4393,29 +3962,29 @@ mod tests {
     fn read_consistent_pins_one_snapshot_across_reads() {
         let dir = tempfile::TempDir::new().unwrap();
         let meta = std::sync::Arc::new(SqliteMeta::open(dir.path().join("m.db")).unwrap());
-        meta.set_applied_seq_of("p0", 4).unwrap();
+        meta.set_applied_seq(4).unwrap();
         let writer = std::sync::Arc::clone(&meta);
         let (before, after, row) = meta
             .read_consistent(|| -> Result<_, MetaError> {
-                let before = meta.applied_vector_reader()?;
+                let before = meta.applied_seq_reader()?;
                 std::thread::spawn(move || {
-                    writer.set_applied_seq_of("p0", 9).unwrap();
+                    writer.set_applied_seq(9).unwrap();
                     writer.create(ROOT_INO, "late", 0o644, 0, 0).unwrap();
                 })
                 .join()
                 .unwrap();
                 Ok((
                     before,
-                    meta.applied_vector_reader()?,
+                    meta.applied_seq_reader()?,
                     meta.child_ino_reader(ROOT_INO, "late")?,
                 ))
             })
             .unwrap();
-        assert_eq!(before.get("p0"), Some(&4));
+        assert_eq!(before, 4);
         assert_eq!(after, before, "a write committed mid-snapshot leaked in");
         assert_eq!(row, None);
         // And the snapshot ends with the call.
-        assert_eq!(meta.applied_vector_reader().unwrap().get("p0"), Some(&9));
+        assert_eq!(meta.applied_seq_reader().unwrap(), 9);
         assert!(meta.child_ino_reader(ROOT_INO, "late").unwrap().is_some());
     }
 
@@ -4681,44 +4250,6 @@ mod tests {
         // Ack drains.
         m.ack_journal(recs[3].0).unwrap();
         assert_eq!(m.journal_len().unwrap(), 0);
-    }
-
-    /// The shipper decides whether an orphan `RenameXpartSrc` may be
-    /// aborted by asking whether its partner is still sitting unshipped in
-    /// the journal. The answer must be about that one txid, and must not
-    /// be confused by other cross-partition renames in flight.
-    #[test]
-    fn journal_has_xpart_dst_finds_only_the_named_txid() {
-        let m = store();
-        assert!(!m.journal_has_xpart_dst(7).unwrap());
-        m.journal_on(
-            "p0",
-            &LogRecord::RenameXpartSrc {
-                txid: 7,
-                part: "p0".into(),
-                from_parent: ROOT_INO,
-                name: "x".into(),
-                ino: 42,
-                time_ns: 1,
-            },
-        )
-        .unwrap();
-        // The src half alone is not the partner it is looking for.
-        assert!(!m.journal_has_xpart_dst(7).unwrap());
-        m.journal_on(
-            "p1",
-            &LogRecord::RenameXpartDst {
-                txid: 7,
-                part: "p1".into(),
-                to_parent: ROOT_INO,
-                new_name: "y".into(),
-                ino: 42,
-                time_ns: 2,
-            },
-        )
-        .unwrap();
-        assert!(m.journal_has_xpart_dst(7).unwrap());
-        assert!(!m.journal_has_xpart_dst(8).unwrap());
     }
 
     #[test]
@@ -5094,10 +4625,12 @@ mod tests {
         assert!(next.ino > ino);
     }
 
-    /// A cross-partition rename must journal exactly the linked pair and
-    /// must never disturb records that other ops already journaled.
+    /// Plan 29 M0a: a cross-directory rename is an ordinary `Rename`
+    /// (namespace partitions and the `RenameXpartSrc`/`Dst` linked-pair
+    /// protocol are gone). It must journal exactly one `Rename` record
+    /// and must never disturb records that other ops already journaled.
     #[test]
-    fn rename_xpart_journals_only_the_pair() {
+    fn cross_directory_rename_journals_a_single_rename_record() {
         let m = store();
         let hot = m.mkdir(ROOT_INO, "hot", 0o755, 0, 0).unwrap();
         let cold = m.mkdir(ROOT_INO, "cold", 0o755, 0, 0).unwrap();
@@ -5107,8 +4640,7 @@ mod tests {
         // An unrelated, still-unshipped record must survive the rename.
         let keep = m.create(cold.ino, "keep", 0o644, 0, 0).unwrap();
 
-        m.rename_xpart(hot.ino, "x", cold.ino, "y", "p1", "p0")
-            .unwrap();
+        m.rename(hot.ino, "x", cold.ino, "y").unwrap();
 
         let recs = m.take_journal(100).unwrap();
         assert!(
@@ -5116,21 +4648,11 @@ mod tests {
                 .any(|(_, r)| matches!(r, LogRecord::Create { ino, .. } if *ino == keep.ino)),
             "unrelated Create was dropped: {recs:#?}"
         );
-        assert!(
-            !recs
-                .iter()
-                .any(|(_, r)| matches!(r, LogRecord::Rename { .. })),
-            "plain Rename must be replaced by the xpart pair: {recs:#?}"
-        );
-        let src = recs
+        let renames = recs
             .iter()
-            .filter(|(_, r)| matches!(r, LogRecord::RenameXpartSrc { .. }))
+            .filter(|(_, r)| matches!(r, LogRecord::Rename { .. }))
             .count();
-        let dst = recs
-            .iter()
-            .filter(|(_, r)| matches!(r, LogRecord::RenameXpartDst { .. }))
-            .count();
-        assert_eq!((src, dst), (1, 1), "exactly one pair: {recs:#?}");
+        assert_eq!(renames, 1, "exactly one Rename record: {recs:#?}");
         assert_eq!(m.lookup(cold.ino, "y").unwrap().unwrap().ino, f.ino);
         assert!(m.lookup(hot.ino, "x").unwrap().is_none());
     }
@@ -5138,7 +4660,7 @@ mod tests {
     /// Renaming onto a hard link of the same inode is a POSIX no-op that
     /// journals nothing; it must not delete a previously journaled row.
     #[test]
-    fn rename_xpart_hardlink_noop_keeps_journal() {
+    fn cross_directory_rename_hardlink_noop_keeps_journal() {
         let m = store();
         let hot = m.mkdir(ROOT_INO, "hot", 0o755, 0, 0).unwrap();
         let cold = m.mkdir(ROOT_INO, "cold", 0o755, 0, 0).unwrap();
@@ -5149,8 +4671,7 @@ mod tests {
         let keep = m.create(cold.ino, "keep", 0o644, 0, 0).unwrap();
 
         // Same inode on both sides: POSIX no-op.
-        m.rename_xpart(hot.ino, "x", cold.ino, "same", "p1", "p0")
-            .unwrap();
+        m.rename(hot.ino, "x", cold.ino, "same").unwrap();
 
         let recs = m.take_journal(100).unwrap();
         assert!(
@@ -5235,29 +4756,6 @@ mod tests {
             .map(|(_, _, sz)| sz)
             .sum();
         assert_eq!(all, 70);
-    }
-
-    #[test]
-    fn partition_of_walks_to_nearest_root() {
-        let m = store();
-        assert_eq!(m.partition_of(ROOT_INO).unwrap(), "p0");
-        let d = m.mkdir(ROOT_INO, "hot", 0o755, 0, 0).unwrap();
-        let f = m.create(d.ino, "x", 0o644, 0, 0).unwrap();
-        assert_eq!(m.partition_of(d.ino).unwrap(), "p0");
-        assert_eq!(m.partition_of(f.ino).unwrap(), "p0");
-        {
-            let conn = m.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO partition (id, root_ino) VALUES ('p1', ?1)",
-                params![d.ino],
-            )
-            .unwrap();
-            SqliteMeta::invalidate_part_cache(&conn, d.ino).unwrap();
-            SqliteMeta::invalidate_part_cache(&conn, f.ino).unwrap();
-        }
-        assert_eq!(m.partition_of(d.ino).unwrap(), "p1");
-        assert_eq!(m.partition_of(f.ino).unwrap(), "p1");
-        assert_eq!(m.partition_of(ROOT_INO).unwrap(), "p0");
     }
 
     /// `set_manifest_dirty` inserts `pending_upload` rows in the same

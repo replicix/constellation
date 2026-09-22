@@ -88,6 +88,7 @@ use constellation_meta::{LogRecord, SqliteMeta, TreeInode};
 use constellation_mtree::{
     keys, record, Attrs, DentryRecord, Edit, Kind, NodeHash, NodeStore, Tree, VALUE_SPILL,
 };
+use constellation_store_s3::log::PARTITION;
 use constellation_store_s3::{
     vector_covers, BlobStore, Commit, CommitChain, CommitPayload, Intent, NodeCache, StoreError,
     SHARD0,
@@ -131,7 +132,7 @@ pub fn remember_loaded_commit(meta: &SqliteMeta, commit: &Commit) -> Result<()> 
     };
     meta.kv_set(KV_ROOT, &root.to_hex())?;
     meta.kv_set(KV_SEQ, &commit.seq.to_string())?;
-    meta.kv_set(KV_VECTOR, &encode_vector(&commit.applied))?;
+    meta.kv_set(KV_VECTOR, &encode_vector(commit.applied))?;
     Ok(())
 }
 
@@ -145,10 +146,9 @@ pub fn remember_loaded_commit(meta: &SqliteMeta, commit: &Commit) -> Result<()> 
 pub struct Touched {
     inodes: BTreeSet<Ino>,
     dentries: BTreeSet<(Ino, String)>,
-    /// A snapshot, quota or partition record moved, so the `0x30`
-    /// subsystem range is re-planned. It holds a handful of records per
-    /// filesystem, so re-deriving all of it is cheaper than tracking
-    /// which one.
+    /// A snapshot or quota record moved, so the `0x30` subsystem range
+    /// is re-planned. It holds a handful of records per filesystem, so
+    /// re-deriving all of it is cheaper than tracking which one.
     subsystems: bool,
     /// Set when the changed set is unknown and only a rebuild can
     /// restore agreement with the replica.
@@ -220,18 +220,6 @@ impl Touched {
                 self.dentry(*parent, name);
                 self.dentry(*new_parent, new_name);
             }
-            LogRecord::RenameXpartSrc {
-                from_parent,
-                name,
-                ino,
-                ..
-            } => self.link(*from_parent, name, *ino),
-            LogRecord::RenameXpartDst {
-                to_parent,
-                new_name,
-                ino,
-                ..
-            } => self.link(*to_parent, new_name, *ino),
             LogRecord::Setattr { ino, .. }
             | LogRecord::WriteManifest { ino, .. }
             | LogRecord::SetXattr { ino, .. }
@@ -241,20 +229,11 @@ impl Touched {
                     self.link(node.parent, &node.name, node.ino);
                 }
             }
-            // A cross-partition rename that never completed leaves the
-            // source where it was; the replica's own abort path is what
-            // restores it, and the next record it journals is what this
-            // sees. Nothing to do here.
-            LogRecord::RenameXpartAbort { .. } => {}
-            // The `0x30` records a bootstrap needs: snapshot rows, the
-            // replicated quota, and the partition map (which moves no
-            // inode, name or attribute, but tells a bootstrapped
-            // replica which logs to tail).
+            // The `0x30` records a bootstrap needs: snapshot rows and
+            // the replicated quota.
             LogRecord::SnapCreate { .. }
             | LogRecord::SnapDelete { .. }
-            | LogRecord::SetQuota { .. }
-            | LogRecord::PartSplit { .. }
-            | LogRecord::PartMerge { .. } => self.subsystems = true,
+            | LogRecord::SetQuota { .. } => self.subsystems = true,
             // The one record that must never move the tree. §P6
             // excludes atime from the encoding entirely; a tree that
             // changed on read would make `find` a publish storm.
@@ -375,20 +354,21 @@ pub struct TreePublisher {
 struct Published {
     root: NodeHash,
     seq: u64,
-    /// The commit's [`Commit::applied`] vector: what this tree reflects.
+    /// The commit's [`Commit::applied`] position: what this tree reflects.
     applied: Vector,
 }
 
-/// Partition id → highest applied log segment.
-type Vector = BTreeMap<String, u64>;
+/// Highest applied log segment. One metadata stream since plan 29 M0a
+/// removed namespace partitions.
+type Vector = u64;
 
 /// How one publish attempt ended.
 enum Outcome {
     Committed(Box<Commit>),
     /// The tree already reflects the batch; nothing to commit.
     Unchanged,
-    /// Not now: behind the head, a parked rename, or a declined splice.
-    /// The pending set is kept for the next round.
+    /// Not now: behind the head, or a declined splice. The pending set
+    /// is kept for the next round.
     Deferred,
 }
 
@@ -396,16 +376,11 @@ enum Outcome {
 enum Planned {
     /// A plan, the root it produces, and the vector it was read at.
     Ready(Plan, NodeHash, Vector),
-    /// This replica has applied less of some partition's log than the
-    /// head it would build on, so every value it holds for a key it
-    /// touched might be older than the head's. Publishing would regress
-    /// the tree; the tailer closes the gap and a later round publishes.
+    /// This replica has applied less of the log than the head it would
+    /// build on, so every value it holds for a key it touched might be
+    /// older than the head's. Publishing would regress the tree; the
+    /// tailer closes the gap and a later round publishes.
     Behind { mine: Vector, head: Vector },
-    /// A cross-partition rename half is parked waiting for its partner.
-    /// That state lives only in `xpart_pending`, which no commit
-    /// carries, so a commit now could fall between the two halves and
-    /// strand the second one on every replica bootstrapped from it.
-    Parked(u64),
 }
 
 impl TreePublisher {
@@ -476,8 +451,8 @@ impl TreePublisher {
             return Ok(());
         };
         let recorded = self.meta.kv_get(KV_VECTOR)?.unwrap_or_default();
-        let applied = self.meta.applied_vector()?;
-        if recorded != encode_vector(&applied) {
+        let applied = self.meta.applied_seq()?;
+        if recorded != encode_vector(applied) {
             tracing::info!(
                 "metadata tree is behind the replica; the next publish rebuilds it in full"
             );
@@ -609,7 +584,7 @@ impl TreePublisher {
             .set_condemned(constellation_store_s3::read_condemned_packs(&backend).await?);
         self.cache.start_dedup_log();
         let base = self.state.as_ref().map(|s| s.root);
-        let head_applied = self.state.as_ref().map(|s| s.applied.clone());
+        let head_applied = self.state.as_ref().map(|s| s.applied);
 
         let meta = Arc::clone(&self.meta);
         let cache = Arc::clone(&self.cache);
@@ -631,13 +606,9 @@ impl TreePublisher {
                 blobs: &blobs,
             };
             meta.read_consistent(|| -> Result<Planned> {
-                let vector = meta.applied_vector_reader()?;
-                if let Some(head) = head_applied.filter(|head| !vector_covers(&vector, head)) {
+                let vector = meta.applied_seq_reader()?;
+                if let Some(head) = head_applied.filter(|head| !vector_covers(vector, *head)) {
                     return Ok(Planned::Behind { mine: vector, head });
-                }
-                let parked = meta.xpart_pending_count_reader()?;
-                if parked > 0 {
-                    return Ok(Planned::Parked(parked));
                 }
                 let (plan, root) = match base {
                     Some(base) if !batch.needs_rebuild() => {
@@ -657,16 +628,9 @@ impl TreePublisher {
             Planned::Ready(plan, root, vector) => (plan, root, vector),
             Planned::Behind { mine, head } => {
                 tracing::debug!(
-                    mine = encode_vector(&mine),
-                    head = encode_vector(&head),
+                    mine = encode_vector(mine),
+                    head = encode_vector(head),
                     "metadata publish deferred: this replica is behind the chain head"
-                );
-                return Ok(Outcome::Deferred);
-            }
-            Planned::Parked(halves) => {
-                tracing::debug!(
-                    halves,
-                    "metadata publish deferred: a cross-partition rename is half applied"
                 );
                 return Ok(Outcome::Deferred);
             }
@@ -712,7 +676,7 @@ impl TreePublisher {
             .with_author(self.node_id, epoch)
             .with_intent(Intent::batch(plan.len() as u64))
             .with_agg(agg.into())
-            .with_applied(vector.clone());
+            .with_applied(vector);
 
         // §P3's rebase. `spliced` carries the root the *current*
         // payload was computed against, because a second lost race must
@@ -725,7 +689,7 @@ impl TreePublisher {
         let noted = Arc::clone(&declined);
         let cache = Arc::clone(&self.cache);
         let handle = self.handle.clone();
-        let mine = vector.clone();
+        let mine = vector;
         let commit = self
             .chain
             .publish(
@@ -734,8 +698,7 @@ impl TreePublisher {
                 payload,
                 move |payload: CommitPayload, winner: &Commit| {
                     let from = spliced.get();
-                    match Self::splice(&tree, &cache, &handle, &plan, &mine, from, winner, payload)
-                    {
+                    match Self::splice(&tree, &cache, &handle, &plan, mine, from, winner, payload) {
                         Ok((next, root)) => {
                             spliced.set(Some(root));
                             Ok(next)
@@ -798,7 +761,7 @@ impl TreePublisher {
         cache: &Arc<NodeCache>,
         handle: &tokio::runtime::Handle,
         plan: &Plan,
-        mine: &Vector,
+        mine: Vector,
         from: Option<NodeHash>,
         winner: &Commit,
         payload: CommitPayload,
@@ -809,11 +772,11 @@ impl TreePublisher {
         // batch, and a splice would overwrite them. `conflicts_with`
         // cannot see that case, because the stale value is ours and
         // never appears in the winner's diff.
-        if !vector_covers(mine, &winner.applied) {
+        if !vector_covers(mine, winner.applied) {
             return Err(StoreError::Conflict(format!(
                 "commit {} reflects log this replica has not applied ({} against {})",
                 winner.seq,
-                encode_vector(&winner.applied),
+                encode_vector(winner.applied),
                 encode_vector(mine)
             )));
         }
@@ -897,8 +860,7 @@ impl TreePublisher {
         };
         self.meta.kv_set(KV_ROOT, &state.root.to_hex())?;
         self.meta.kv_set(KV_SEQ, &state.seq.to_string())?;
-        self.meta
-            .kv_set(KV_VECTOR, &encode_vector(&state.applied))?;
+        self.meta.kv_set(KV_VECTOR, &encode_vector(state.applied))?;
         Ok(())
     }
 }
@@ -930,12 +892,8 @@ where
     }
 }
 
-fn encode_vector(vector: &std::collections::BTreeMap<String, u64>) -> String {
-    vector
-        .iter()
-        .map(|(part, seq)| format!("{part}:{seq}"))
-        .collect::<Vec<_>>()
-        .join(",")
+fn encode_vector(applied: Vector) -> String {
+    format!("{PARTITION}:{applied}")
 }
 
 /// Build the tree the replica's current state calls for, from nothing,
@@ -1827,13 +1785,13 @@ mod tests {
     async fn a_replica_behind_the_head_defers_instead_of_regressing() {
         let mut fx = Fixture::new();
         seed(&fx.meta, 5);
-        fx.meta.set_applied_seq_of("p0", 10).unwrap();
+        fx.meta.set_applied_seq(10).unwrap();
         let mut ahead = fx.publisher(1);
         let head = publish(&mut ahead, &fx.records()).await.unwrap();
-        assert_eq!(head.applied.get("p0"), Some(&10));
+        assert_eq!(head.applied, 10);
 
         // Same bucket, a replica that has applied less of p0.
-        fx.meta.set_applied_seq_of("p0", 3).unwrap();
+        fx.meta.set_applied_seq(3).unwrap();
         let mut behind = fx.publisher(2);
         assert!(
             behind.publish(7).await.unwrap().is_none(),
@@ -1846,13 +1804,13 @@ mod tests {
         // Once the tailer has caught up, the same publisher lands (with a
         // change of its own: a replica level with the head and holding
         // nothing new has nothing to commit).
-        fx.meta.set_applied_seq_of("p0", 10).unwrap();
+        fx.meta.set_applied_seq(10).unwrap();
         fx.meta
             .create(ROOT_INO, "after-catch-up", 0o644, 0, 0)
             .unwrap();
         behind.note(&fx.records());
         let landed = behind.publish(7).await.unwrap().expect("caught up");
-        assert_eq!((landed.seq, landed.applied.get("p0")), (2, Some(&10)));
+        assert_eq!((landed.seq, landed.applied), (2, 10));
     }
 
     /// The same guard on the lost-CAS path: a winner whose vector this
@@ -1867,15 +1825,15 @@ mod tests {
             &mut fx,
             |meta| {
                 meta.create(da, "a", 0o644, 0, 0).unwrap();
-                meta.set_applied_seq_of("p0", 10).unwrap();
+                meta.set_applied_seq(10).unwrap();
             },
             |meta| {
                 meta.create(db, "b", 0o644, 0, 0).unwrap();
-                meta.set_applied_seq_of("p0", 5).unwrap();
+                meta.set_applied_seq(5).unwrap();
             },
         )
         .await;
-        assert_eq!(won.applied.get("p0"), Some(&10));
+        assert_eq!(won.applied, 10);
         assert!(landed.is_none(), "an ahead winner must not be spliced onto");
         assert!(!loser.pending().is_empty());
     }

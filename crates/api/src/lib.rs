@@ -12,9 +12,9 @@ pub mod web;
 pub use types::{
     AtimeStatus, CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry,
     DoctorStatus, DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus,
-    MountInfo, MountViewOpts, P2pStatus, PartitionStatus, PeerStatus, PinStatus, PrefetchStatus,
-    PruneRootStatus, PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response,
-    SnapshotStatus, SourceStatus, SpoolStatus, StatusReport, WritebackStatus,
+    MountInfo, MountViewOpts, P2pStatus, PeerStatus, PinStatus, PrefetchStatus, PruneRootStatus,
+    PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response, SnapshotStatus, SourceStatus,
+    SpoolStatus, StatusReport, WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -364,7 +364,6 @@ mod tests {
                     expires_in_ms: 30_000,
                     lost: false,
                 },
-                partitions: vec![],
                 p2p: P2pStatus::default(),
                 pins: Vec::new(),
                 designations: Vec::new(),
@@ -458,144 +457,6 @@ mod tests {
 
         fn cache_prune(&self, target_bytes: u64) -> std::result::Result<String, String> {
             Ok(format!("pruned to {target_bytes} bytes"))
-        }
-    }
-
-    /// A `StatusSource` whose lease views live behind ONE mutex that both
-    /// the `lease` and `partitions` fields must read — exactly the shape
-    /// of the real daemon's `DaemonStatus`. In a struct literal every
-    /// temporary lives until the whole expression ends, so taking the
-    /// lock twice inside it self-deadlocks on the non-reentrant
-    /// `std::sync::Mutex` and `status` never answers (while `ping`,
-    /// which touches nothing, still does).
-    struct MultiPartition {
-        leases: std::sync::Mutex<std::collections::HashMap<String, LeaseStatus>>,
-    }
-
-    impl MultiPartition {
-        fn new() -> Self {
-            let mut m = std::collections::HashMap::new();
-            m.insert(
-                "p0".to_string(),
-                LeaseStatus {
-                    held: true,
-                    holder: 1,
-                    epoch: 4,
-                    expires_in_ms: 30_000,
-                    lost: false,
-                },
-            );
-            m.insert(
-                "p1".to_string(),
-                LeaseStatus {
-                    held: true,
-                    holder: 1,
-                    epoch: 2,
-                    expires_in_ms: 30_000,
-                    lost: false,
-                },
-            );
-            Self {
-                leases: std::sync::Mutex::new(m),
-            }
-        }
-    }
-
-    impl StatusSource for MultiPartition {
-        fn status(&self) -> StatusReport {
-            // Read everything the report needs BEFORE building it, so no
-            // two guards are ever alive inside the struct literal.
-            let lease = self.leases.lock().unwrap().get("p0").cloned();
-            let partitions: Vec<PartitionStatus> = {
-                let views = self.leases.lock().unwrap();
-                let mut v: Vec<PartitionStatus> = views
-                    .iter()
-                    .map(|(id, l)| PartitionStatus {
-                        id: id.clone(),
-                        root_path: if id == "p0" {
-                            "/".into()
-                        } else {
-                            "/hot".into()
-                        },
-                        lease: l.clone(),
-                    })
-                    .collect();
-                v.sort_by(|a, b| a.id.cmp(&b.id));
-                v
-            };
-            StatusReport {
-                fs_uuid: "multi".into(),
-                backend: "s3://bucket/prefix".into(),
-                mounts: vec![MountInfo {
-                    id: 1,
-                    subtree: String::new(),
-                    mountpoint: "/mnt/x".into(),
-                    mounted_ms_ago: 1000,
-                }],
-                node_id: 1,
-                version: "1.0.0-test".into(),
-                enrolled: true,
-                uptime_s: 1,
-                spool: SpoolStatus {
-                    journal_backlog: 0,
-                    head_seq: 9,
-                    conflicts: 0,
-                    last_ship_error: None,
-                },
-                cache: CacheStatus {
-                    used_bytes: 0,
-                    budget_bytes: 1,
-                    chunks: 0,
-                    pinned_bytes: 0,
-                    staging_bytes: 0,
-                    staging_budget_bytes: 0,
-                },
-                lease: lease.unwrap_or_default(),
-                partitions,
-                p2p: P2pStatus::default(),
-                pins: Vec::new(),
-                designations: Vec::new(),
-                epoch: EpochStatus::default(),
-                reintegration: ReintegrationStatus::default(),
-                coop: CoopStatus::default(),
-                prefetch: PrefetchStatus::default(),
-                writeback: WritebackStatus::default(),
-                forwarded_ok: 0,
-                forwarded_err: 0,
-                forward_p50_ms: None,
-                pushed_segments_applied: 0,
-                placement_reason: None,
-                quota: QuotaStatus::default(),
-                atime: AtimeStatus::default(),
-                prune: PruneStatus::default(),
-            }
-        }
-    }
-
-    /// `status` must answer promptly even when the report exposes the
-    /// whole partition map. Regression: the daemon locked its lease map
-    /// once per field inside the `StatusReport` literal and deadlocked,
-    /// which hung every control-API caller (`ping` kept working, so the
-    /// daemon looked alive).
-    #[tokio::test]
-    async fn status_with_partitions_does_not_deadlock() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = serve(dir.path(), Arc::new(MultiPartition::new())).unwrap();
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            call(&sock, &Request::Status),
-        )
-        .await
-        .expect("status deadlocked: the daemon never answered")
-        .unwrap();
-        match resp {
-            Response::Status(s) => {
-                let ids: Vec<&str> = s.partitions.iter().map(|p| p.id.as_str()).collect();
-                assert_eq!(ids, ["p0", "p1"]);
-                assert_eq!(s.lease.epoch, 4, "legacy lease field is p0");
-                assert_eq!(s.partitions[1].root_path, "/hot");
-            }
-            other => panic!("unexpected response {other:?}"),
         }
     }
 

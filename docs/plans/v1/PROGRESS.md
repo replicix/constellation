@@ -3519,3 +3519,46 @@ touch — `baseline`, `kill9-remount`, `cold-cache`, `fresh-node-bootstrap`,
 Partitions and splits remain in (B) because the per-partition op log is
 still the transport; §P4 deletes them with the §11b engine swap, which
 would also retire the split-timing scenario above.
+
+## Plan 29 M0a — remove namespace partitions: **DONE**
+
+| Item | State | Where |
+|---|---|---|
+| `partition` table/index, `alloc_part_id`/`next_part_id`/`partition_of`/`partition_of_conn`/`resolve_partition`/`partitions`/`invalidate_part_cache` and the `part_of/<ino>` kv cache deleted; every "which partition" lookup is now the constant `p0` | done | `meta::sqlite` |
+| `LogRecord::PartSplit`/`PartMerge`/`RenameXpartSrc`/`RenameXpartDst`/`RenameXpartAbort` variants, `rename_xpart`, `alloc_xpart_txid`, the `xpart_pending` table and `park_xpart`/`unpark_xpart`/`mark_xpart_dst`/`xpart_dst_seen`/`pending_xparts`/`clear_pending_xpart`/`journal_has_xpart_dst`/`xpart_pending_count_reader`/`journal_on`/`journal_on_tx` deleted; replay's `park_or_apply_xpart`/`apply_xpart_pair` deleted | done | `meta::{record,sqlite,replay,reintegrate}` |
+| FUSE cross-directory rename is now always a plain `MutateOp::Rename` through the ordinary forwarding/mutate path; no more dual-lease gating or `partition_of` lookup before acquiring a lease | done | `cli::fusefs_ops::rename`, `cli::fusefs::{require_lease_for,mutate_op_rebasable,finish_flush}` |
+| Shipper autosplit/merge removed: `maybe_split_merge`/`maybe_split`/`maybe_merge`/`split_candidates`, heat tracking (`DirTraffic`, `dir_ops`, `note_shipped`, `part_split_ops`/`part_merge_idle_s`/`part_autosplit` and their env vars `CONSTELLATION_PART_SPLIT_OPS`/`_AUTOSPLIT`/`_MERGE_IDLE_S`), `consider_xpart_aborts`/`_all`, `note_xpart_shipped`; `ensure_part`/`PartState` collapse to the single `p0` entry the shipper always attaches with | done | `cli::shipper` |
+| Per-partition applied vectors collapsed to a single `applied_seq`: `applied_seq_of`/`set_applied_seq_of`/`ack_journal_rows_at(..., part, ...)` removed in favor of the existing singular `applied_seq`/`set_applied_seq`/`ack_journal_at`; `SqliteMeta::applied_vector()` (a `BTreeMap<String,u64>`) replaced by `applied_seq()`/`applied_seq_reader()` | done | `meta::sqlite` |
+| `Commit`/`CommitPayload.applied` changed from `BTreeMap<String,u64>` to a plain `u64`; `vector_covers(mine, theirs)` takes/returns `u64` | done | `store-s3::commits` (design choice: `u64`, not a one-key map — see report) |
+| Publisher (`TreePublisher`), bootstrap (`shipper::{bootstrap,bootstrap_from_tree,replay_from}`, `mtree_read::bootstrap_from_commit`), and log retention (`gc::metadata_candidates`) updated for the `u64` position consistently | done | `cli::{mtree_publish,shipper,mtree_read,gc}` |
+| `mtree::keys::Subsystem::Partition` (`0x06`) retired — variant removed outright (no compatibility needed), `SUBSYSTEMS`/`PUBLISHED_SUBSYSTEMS` shrunk; `mtree_publish`/`mtree_read` no longer write or read a partition-map `0x30` record | done | `crates/mtree::keys`, `cli::{mtree_publish,mtree_read}` |
+| Control-API `StatusReport::partitions: Vec<PartitionStatus>` and the `constellation_partitions` web-UI gauge removed (the single `p0` lease is still reported via the existing `lease` field); `constellation_api` test `MultiPartition`/`status_with_partitions_does_not_deadlock` deleted (tested the now-removed field) | done | `api::{types,lib,web}` |
+| Harness scenarios `partition-split`, `rename-across-partitions`, `multi-partition-retention-is-per-partition` and their sole helpers (`partition_ids[_from]`, `part_env`, `wait_for_split`, `head_commit`, `commit_covered`, `raw_json`) deleted; `passwd_live_cluster` de-autosplit-ified (still proves live passphrase rotation across two mounted nodes, minus the split-triggered DEK-derivation angle, which no longer applies) | done | `harness::scenarios` |
+| `docs/reference/configuration.md` and `docs/how-to-guides/development/TESTING.md` updated: `CONSTELLATION_PART_SPLIT_OPS`/`_AUTOSPLIT`/`_MERGE_IDLE_S` rows and prose removed, log-retention prose de-partitioned | done | `docs/reference/configuration.md`, `docs/how-to-guides/development/TESTING.md` |
+| New/adjusted test coverage for cross-directory rename as a plain `Rename` and for the single-stream applied position | done | `meta::sqlite::tests::{cross_directory_rename_journals_a_single_rename_record,cross_directory_rename_hardlink_noop_keeps_journal}` (replace the deleted `rename_xpart_*` tests), `meta::sqlite::tests::read_consistent_pins_one_snapshot_across_reads`, `store_s3::commits::tests::vector_cover_is_at_least_as_far_along` |
+
+**Design choices:**
+- `Commit.applied`/`CommitPayload.applied`: `u64`, not a one-entry `BTreeMap<String, u64>` — simpler end state per the plan's explicit either/or, and every caller (publisher, bootstrap, GC, fsck) reads/writes one number now.
+- `journal`/`atime_journal`/`shadow`'s `part` columns and the `HashMap<String, LeaseKeeper>`/`HashMap<String, PartState>` shapes in `cli::shipper`/`cli::lease`/`cli::node_runtime` were **kept** rather than collapsed to bare fields: with autosplit/merge gone nothing ever inserts a second key, so they always hold exactly one `p0` entry. The plan allows this ("keep the code shape reasonable; a single `PartState` is fine"); collapsing them further touched many more call sites (forwarding, control-API status, node_runtime lease-map plumbing) for no behavior change.
+- `constellation_net::EpochPromise`/`EpochMachine`'s `base: BTreeMap<String, u64>` (continuation-epoch wire protocol) was left as a map, fed a one-entry `{"p0": applied_seq}` via a new `cli::main::epoch_base` helper — it is a separate, already-generic P2P structure outside this milestone's explicit removal list.
+- `mtree::keys::Subsystem::Partition` was removed outright (not just reserved) since no compatibility is required; `0x06` is documented as retired.
+
+**Left over:** one historical doc comment in `meta::sqlite` (`cross_directory_rename_journals_a_single_rename_record`'s doc) names `RenameXpartSrc`/`Dst` to explain what the test replaces — the only remaining hit of the milestone's grep gate, kept because it is explanatory, not dead code.
+
+DESIGN.md's "### Partitions" section (namespace split/merge, per-partition
+leases and logs) is now stale relative to the tree: plan 28 §P4 already
+called this out as something the eventual engine swap deletes, and M0a
+implements exactly that deletion ahead of schedule per plan 29's work
+order. Per CONVENTIONS this is recorded here rather than edited into
+DESIGN.md.
+
+### Plan 29 M0a exit criteria
+
+- [x] `partition` table, `xpart_pending`, and every symbol listed in the
+      milestone deleted; `grep -rn -i "xpart\|PartSplit\|PartMerge\|autosplit\|part_of\|partition_of" crates docs/reference`
+      returns only the one explanatory doc-comment hit above
+- [x] `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean
+- [x] `cargo test --workspace` — 0 failures (incl. `checkpoint_concurrency::snapshot_does_not_stall_concurrent_readers` on the first try)
+- [x] `cargo build --release --workspace`; `harness run baseline kill9-remount fresh-node-bootstrap two-clients-shared lease-handover snapshot-churn mtree-gc-plateau gc-lifecycle` — 8/8 PASSED
+- [x] `bash tests/smoke.sh` — PASSED
+- [x] `docker compose --profile test run --rm compliance` (pjdfstest) — 8798/8798 passed, empty baseline (run for extra confidence given the rename-path change; not in the milestone's explicit gate list)

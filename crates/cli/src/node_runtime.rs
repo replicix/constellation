@@ -1470,7 +1470,7 @@ impl NodeRuntime {
                             )
                             .await;
                             if r.is_ok() {
-                                let part = meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
+                                let part = "p0".to_string();
                                 let mut ship = ship.lock().await;
                                 let mut keepers = keepers.lock().await;
                                 r = match keepers.get_mut(&part) {
@@ -2225,17 +2225,11 @@ async fn atime_flush_once(
         }
         Err(e) => tracing::debug!(error = %e, "atime local apply failed"),
     }
-    // 2. Group by partition (resolve once per inode).
+    // 2. Group by partition. One stream (`p0`) since plan 29 M0a removed
+    // namespace partitions; the grouping stays so the rest of this
+    // function does not care how many streams there are.
     let mut by_part: HashMap<String, Vec<(constellation_fs_core::Ino, i64, i64)>> = HashMap::new();
-    for (ino, atime_ns, time_ns) in drained {
-        match meta.partition_of(ino) {
-            Ok(part) => by_part
-                .entry(part)
-                .or_default()
-                .push((ino, atime_ns, time_ns)),
-            Err(_) => continue,
-        }
-    }
+    by_part.entry("p0".to_string()).or_default().extend(drained);
     // 3. Snapshot the partitions this node currently holds a usable,
     //    non-lost shipping lease for.
     let held: std::collections::HashSet<String> = {

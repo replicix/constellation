@@ -709,10 +709,7 @@ async fn execute_unlink_no_policy(deps: &PruneDeps, _now_ns: i64, v: &VictimRef)
 }
 
 async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult {
-    let part = deps
-        .meta
-        .partition_of(v.parent)
-        .unwrap_or_else(|_| "p0".into());
+    let part = "p0".to_string();
     let op = MutateOp::Unlink {
         parent: v.parent,
         name: v.name.clone(),

@@ -11,7 +11,7 @@ not listed here.
 - [Environment variables](#environment-variables)
   - [Identity and secrets](#identity-and-secrets)
   - [Leases and mutations](#leases-and-mutations)
-  - [Metadata sync and partitions](#metadata-sync-and-partitions)
+  - [Metadata sync](#metadata-sync)
   - [Merkle metadata tree (plan 28)](#merkle-metadata-tree-plan-28)
   - [Read-time atime](#read-time-atime)
   - [P2P and cooperative cache](#p2p-and-cooperative-cache)
@@ -70,15 +70,12 @@ holder — while the common single-writer case loses three S3 round trips
 per cold write. See [Diagnose lease
 thrash](../how-to-guides/operations/diagnose-lease-thrash.md).
 
-### Metadata sync and partitions
+### Metadata sync
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_SYNC_INTERVAL_MS` | `500` | milliseconds | background log tail/ship poll; the **floor** of the idle backoff |
 | `CONSTELLATION_SYNC_IDLE_MAX_MS` | `10000` | milliseconds | **ceiling** of the idle poll backoff |
-| `CONSTELLATION_PART_SPLIT_OPS` | `512` | operations, positive | heat threshold used only when autosplit is on |
-| `CONSTELLATION_PART_AUTOSPLIT` | `off` | boolean | heat-driven automatic partition split |
-| `CONSTELLATION_PART_MERGE_IDLE_S` | `3600` | seconds | automatic idle partition merge |
 | `CONSTELLATION_CHECKPOINT_RATIO` | `1.0` | ratio, positive | shipped-log bytes ÷ last snapshot bytes needed to fire a checkpoint |
 | `CONSTELLATION_CHECKPOINT_MIN_INTERVAL_S` | `0` | seconds | minimum checkpoint spacing; `0` disables the time floor |
 | `CONSTELLATION_CHECKPOINT_IO_CONCURRENCY` | `8` | requests, positive | parallel 8 MiB ranges (GET) / parts (PUT) for a checkpoint transfer |
@@ -181,14 +178,6 @@ Superseded checkpoints are deleted inline once the new `LATEST` and
 `VECTOR.json` have both landed, keeping the newest two; GC is only the
 backstop for a failed prune.
 
-`CONSTELLATION_PART_AUTOSPLIT` is off unless set to `on`, `1`, or `true`.
-When it is off, directory heat does not carve new partitions; idle
-children still merge under `CONSTELLATION_PART_MERGE_IDLE_S`. Split/merge
-machinery remains for opt-in and for filesystems that already split.
-Heat was a proxy for lease contention from before forwarded mutations;
-a single-writer tree walk (rsync, unpack) otherwise splits every hot
-directory and leaves extra streams to LIST and leases to renew.
-
 ### Read-time atime
 
 Optional, best-effort, eventually-consistent access-time updates on
@@ -280,25 +269,20 @@ hinted), never "proven absent".
 |---|---:|---|---|
 | `CONSTELLATION_GC_INTERVAL_S` | `86400` | seconds | background GC tick interval |
 | `CONSTELLATION_GC_HORIZON_S` | `604800` | seconds | age before unreferenced chunks are eligible (`0` for tests) |
-| `CONSTELLATION_LOG_RETENTION_SEGMENTS` | `128` | segments | sealed log segments kept before GC, **per partition** |
+| `CONSTELLATION_LOG_RETENTION_SEGMENTS` | `128` | segments | sealed log segments kept before GC |
 | `CONSTELLATION_COMMIT_RETENTION` | `64` | commits, at least 1 | newest plan 28 metadata commits always kept by GC |
 | `CONSTELLATION_COMMIT_RETENTION_S` | `86400` | seconds | commits younger than this are kept however many there are; a commit is deleted only when it is outside the newest `CONSTELLATION_COMMIT_RETENTION` *and* older than this |
 | `CONSTELLATION_COMPACT_BYTES_PER_S` | `33554432` (32 MiB/s) | bytes per second; `0` unpaced | read budget for metadata pack deletion and compaction in a GC round |
 | `CONSTELLATION_GC_THREADS` | one per core | threads, positive | width of the metadata mark and pack rewrite pools |
 
-Log retention is evaluated per partition against the position a fresh
-replica resumes from: the head plan 28 commit's `applied` vector once a
-commit exists, otherwise `checkpoints/VECTOR.json`, which records how far
-the newest checkpoint has replayed each partition. (A bootstrap from a
-base the log was pruned past refuses instead of replaying from the gap.)
-A segment is prunable only when its own
-partition's entry in that vector is more than
-`CONSTELLATION_LOG_RETENTION_SEGMENTS` ahead of it, and a partition the
-vector does not mention yet is never pruned at all. (Flooring every
-partition against one cluster-wide sequence would delete a young child
-partition's whole log the moment a busy `p0` ran far ahead of it.) A
-`LATEST` checkpoint with no vector beside it is a corrupt bucket and
-fails the run rather than falling back to a global floor.
+Log retention is evaluated against the position a fresh replica resumes
+from: the head plan 28 commit's `applied` position once a commit exists,
+otherwise `checkpoints/VECTOR.json`, which records how far the newest
+checkpoint has replayed. (A bootstrap from a base the log was pruned
+past refuses instead of replaying from the gap.) A segment is prunable
+only when that position is more than `CONSTELLATION_LOG_RETENTION_SEGMENTS`
+ahead of it. A `LATEST` checkpoint with no vector beside it is a corrupt
+bucket and fails the run rather than falling back to a global floor.
 
 Metadata GC (plan 28 S7b) runs as a second phase of every GC round:
 commit retention by the two knobs above, a reachability mark from the
@@ -387,7 +371,7 @@ operator has cleared.
 
 ## Boolean values
 
-Most boolean switches are enabled when unset. `CONSTELLATION_PART_AUTOSPLIT`
+Most boolean switches are enabled when unset. `CONSTELLATION_CHECKPOINT_SNAPSHOT`
 and `CONSTELLATION_P2P_RELAY` default off. `off`, `0`, and `false`
 (case-insensitive) disable a switch that defaults on.
 

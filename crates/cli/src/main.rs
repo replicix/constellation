@@ -2200,11 +2200,10 @@ impl constellation_net::PeerService for P2pBridge {
     {
         Box::pin(async move {
             // We can ack once our own replica has tailed at least this
-            // seq for the partition — that IS "provably holds all
-            // committed changes" for this record. `applied_seq_of`
-            // reads the same kv counter the syncer advances after
-            // applying (or shipping) a segment.
-            let applied = self.meta.applied_seq_of(&part).unwrap_or(0);
+            // seq — that IS "provably holds all committed changes" for
+            // this record. `applied_seq` reads the same kv counter the
+            // syncer advances after applying (or shipping) a segment.
+            let applied = self.meta.applied_seq().unwrap_or(0);
             constellation_net::Payload::FlushAck {
                 path,
                 part,
@@ -2935,7 +2934,7 @@ async fn upload_dirty_chunks(
             continue;
         }
         if let Some(wanted) = only_part {
-            if meta.partition_of(ino).ok().as_deref() != Some(wanted) {
+            if wanted != "p0" {
                 continue;
             }
         }
@@ -3071,6 +3070,16 @@ async fn upload_dirty_chunks(
 /// error for spool observability. While active, a successful tail probe
 /// means S3 returned: upload dirty chunks first, close the promise, then
 /// resume ordinary CAS-serialized shipping.
+/// The continuation-epoch machinery (`constellation_net::EpochPromise`)
+/// still speaks in per-partition vectors; with plan 29 M0a's single
+/// stream that is always a one-entry map keyed by `p0`.
+fn epoch_base(meta: &SqliteMeta) -> Result<std::collections::BTreeMap<String, u64>> {
+    Ok(std::collections::BTreeMap::from([(
+        constellation_store_s3::log::PARTITION.to_string(),
+        meta.applied_seq()?,
+    )]))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_managed_sync_round(
     ship: &std::sync::Arc<tokio::sync::Mutex<shipper::Shipper>>,
@@ -3108,7 +3117,7 @@ async fn run_managed_sync_round(
             .await
             .values()
             .any(|keeper| keeper.holds_authority());
-        if !holds_epoch_lease && !epochs.shared_log_advanced(&meta.applied_vector()?) {
+        if !holds_epoch_lease && !epochs.shared_log_advanced(&epoch_base(meta)?) {
             // The current epoch holder must publish first. A previous
             // holder keeps its promise open until it has tailed that
             // publication, then follows with its older local journal.
@@ -3151,7 +3160,7 @@ async fn run_managed_sync_round(
     if let Err(error) =
         upload_dirty_chunks(cache, meta, store, compression, upload, None, None).await
     {
-        let base = meta.applied_vector()?;
+        let base = epoch_base(meta)?;
         if epochs.maybe_propose(base).await? {
             let ship = ship.lock().await;
             ship.set_skip_ship(true);
@@ -3191,7 +3200,7 @@ async fn run_managed_sync_round(
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            let base = meta.applied_vector()?;
+            let base = epoch_base(meta)?;
             if epochs.maybe_propose(base).await? {
                 let ship = ship.lock().await;
                 ship.set_skip_ship(true);
@@ -3321,10 +3330,7 @@ impl DaemonStatus {
             .resolve_path(path)
             .map_err(|error| error.to_string())?
             .unwrap_or(constellation_fs_core::types::ROOT_INO);
-        let part = self
-            .meta
-            .partition_of(ino)
-            .map_err(|error| error.to_string())?;
+        let part = "p0".to_string();
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sync_tx
             .send(fusefs::SyncRequest::Acquire { part, reply })
@@ -3372,29 +3378,13 @@ impl constellation_api::StatusSource for DaemonStatus {
     fn status(&self) -> constellation_api::StatusReport {
         let spool = self.spool.lock().unwrap().clone();
         let usage = self.cache.usage();
-        // Collect everything that needs the lease map BEFORE building the
-        // report: temporaries created inside a struct literal live until
-        // the whole literal is built, so locking twice in there would
-        // self-deadlock the non-reentrant mutex and hang every caller.
-        let (p0_lease, partitions) = {
-            let views = self.leases.lock().unwrap();
-            let p0 = views
-                .get(constellation_store_s3::log::PARTITION)
-                .map(|v| v.status())
-                .unwrap_or_default();
-            let parts: Vec<constellation_api::PartitionStatus> = self
-                .meta
-                .partitions()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(id, root)| constellation_api::PartitionStatus {
-                    root_path: self.meta.path_of(root).unwrap_or_else(|_| "/".into()),
-                    lease: views.get(&id).map(|v| v.status()).unwrap_or_default(),
-                    id,
-                })
-                .collect();
-            (p0, parts)
-        };
+        let p0_lease = self
+            .leases
+            .lock()
+            .unwrap()
+            .get(constellation_store_s3::log::PARTITION)
+            .map(|v| v.status())
+            .unwrap_or_default();
         let designations = self.list_designations();
         let epoch = self.epochs.status();
         let coop = self.coop.report();
@@ -3490,7 +3480,6 @@ impl constellation_api::StatusSource for DaemonStatus {
                 staging_budget_bytes: self.staging_budget.budget(),
             },
             lease: p0_lease,
-            partitions,
             p2p,
             pins: self.list_pins(),
             designations,

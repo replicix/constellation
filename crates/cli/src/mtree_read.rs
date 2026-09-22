@@ -11,11 +11,10 @@
 //! the chain head, walks the tree with one ordered cursor, and writes
 //! the rows straight into a fresh SQLite replica: `0x01` → `inode` (and
 //! inline `xattr`), `0x02` → `dentry`, `0x03` → spilled `xattr`, `0x30`
-//! → partitions, snapshot rows and the replicated quota. `0x04` is not
-//! loaded; it is the `dentry_by_ino` index, which SQLite derives. The
-//! caller then resumes tailing each partition from the commit's
-//! [`Commit::applied`] vector, exactly where a checkpoint's
-//! `VECTOR.json` used to put it.
+//! → snapshot rows and the replicated quota. `0x04` is not loaded; it is
+//! the `dentry_by_ino` index, which SQLite derives. The caller then
+//! resumes tailing the log from the commit's [`Commit::applied`]
+//! position, exactly where a checkpoint's `VECTOR.json` used to put it.
 //!
 //! Three things a checkpoint carried and a commit deliberately does not:
 //!
@@ -26,10 +25,6 @@
 //!   *faster*: a replica that never saw a dereference misses some
 //!   candidates, and the orphan LIST pass collects those later. Nothing
 //!   becomes unsafe.
-//! - **parked cross-partition renames.** The publisher refuses to commit
-//!   while `xpart_pending` is non-empty (see `mtree_publish`), so no
-//!   commit can split a rename pair and none needs to carry the table.
-//!
 //! ## The partial replica
 //!
 //! [`TreeReader`] answers FUSE's metadata questions — `lookup`,
@@ -84,10 +79,6 @@ pub(crate) fn snapshot_record(row: &SnapshotRow) -> Vec<u8> {
     ])
 }
 
-pub(crate) fn partition_record(root_ino: Ino) -> Vec<u8> {
-    record::encode_fields(&[&root_ino.to_le_bytes()])
-}
-
 fn fixed<const N: usize>(field: &[u8], what: &str) -> Result<[u8; N]> {
     field
         .try_into()
@@ -117,24 +108,16 @@ pub(crate) fn subsystem_state(meta: &SqliteMeta) -> Result<BTreeMap<Vec<u8>, Vec
         };
         out.insert(keys::subsystem(Subsystem::Quota, b""), quota_record(max));
     }
-    for (id, root) in meta.partitions()? {
-        out.insert(
-            keys::subsystem(Subsystem::Partition, id.as_bytes()),
-            partition_record(root),
-        );
-    }
     Ok(out)
 }
 
 /// The subsystem ranges the publisher owns. Clones, designations and
 /// holds have no replicated SQLite state in (B) and are left alone.
-pub(crate) const PUBLISHED_SUBSYSTEMS: [Subsystem; 3] =
-    [Subsystem::Snapshot, Subsystem::Quota, Subsystem::Partition];
+pub(crate) const PUBLISHED_SUBSYSTEMS: [Subsystem; 2] = [Subsystem::Snapshot, Subsystem::Quota];
 
 /// What the `0x30` range of a tree says.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Subsystems {
-    pub partitions: Vec<(String, Ino)>,
     pub snapshots: Vec<SnapshotRow>,
     pub quota: Option<Option<u64>>,
 }
@@ -161,15 +144,6 @@ impl Subsystems {
                     [max] => Some(u64::from_le_bytes(fixed(max, "quota")?)),
                     _ => bail!("quota record has {} fields", fields.len()),
                 });
-            }
-            Subsystem::Partition => {
-                let [root] = fields[..] else {
-                    bail!("partition record has {} fields", fields.len());
-                };
-                self.partitions.push((
-                    text(id, "partition id")?,
-                    u64::from_le_bytes(fixed(root, "partition root")?),
-                ));
             }
             // Not written by (B); ignore rather than refuse, so a later
             // writer adding them does not break an older reader.
@@ -556,11 +530,7 @@ pub(crate) fn load_tree(
         bail!("xattr keys for inode {ino}, which has no inode record");
     }
     flush(&mut inodes, &mut dentries)?;
-    meta.load_tree_subsystems(
-        &subsystems.partitions,
-        &subsystems.snapshots,
-        subsystems.quota,
-    )?;
+    meta.load_tree_subsystems(&subsystems.snapshots, subsystems.quota)?;
     meta.finish_tree_load()?;
     Ok((n_inodes, n_dentries))
 }
@@ -629,8 +599,8 @@ impl ChainReader {
 /// Load the chain head into a fresh replica at `meta`. `None` when the
 /// chain is empty and the caller should fall back to a checkpoint.
 ///
-/// The caller owns tailing: it resumes each partition's log from the
-/// returned commit's `applied` vector.
+/// The caller owns tailing: it resumes the log from the returned
+/// commit's `applied` position.
 pub(crate) async fn bootstrap_from_commit(
     reader: &ChainReader,
     meta: Arc<SqliteMeta>,

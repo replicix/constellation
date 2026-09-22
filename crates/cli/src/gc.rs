@@ -437,7 +437,10 @@ async fn metadata_candidates(
     let floor_source = match head {
         Some(commit) => Some((
             constellation_store_s3::log::CheckpointVector {
-                applied: commit.applied,
+                applied: BTreeMap::from([(
+                    constellation_store_s3::log::PARTITION.to_string(),
+                    commit.applied,
+                )]),
             },
             json!({"commit": commit.seq}),
         )),
@@ -705,7 +708,7 @@ mod tests {
             agg: CommitAgg::default(),
             intent: Intent::batch(0),
             unix_ms: 0,
-            applied: BTreeMap::from([("p0".to_string(), 250u64)]),
+            applied: 250,
         };
         constellation_store_s3::CommitChain::new(store.clone())
             .create(&commit)

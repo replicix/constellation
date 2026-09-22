@@ -122,12 +122,7 @@ pub fn classify(view: &SqliteMeta, rec: &LogRecord) -> Result<Disposition, MetaE
             }
             Err(e) => Err(e),
         },
-        LogRecord::PartSplit { .. }
-        | LogRecord::PartMerge { .. }
-        | LogRecord::RenameXpartSrc { .. }
-        | LogRecord::RenameXpartDst { .. }
-        | LogRecord::RenameXpartAbort { .. }
-        | LogRecord::SnapCreate { .. }
+        LogRecord::SnapCreate { .. }
         | LogRecord::SnapDelete { .. }
         | LogRecord::Clone { .. }
         | LogRecord::SetQuota { .. }

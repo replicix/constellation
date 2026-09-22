@@ -643,43 +643,15 @@ impl Filesystem for ConstellationFs {
                 Err(error) => reply.error(Errno::from_i32(error)),
             };
         }
-        let src_part = self.meta.partition_of(parent).unwrap_or_else(|_| "p0".into());
-        let dst_part = self
-            .meta
-            .partition_of(newparent)
-            .unwrap_or_else(|_| "p0".into());
-        // Canonical lock order: sort by partition id so two concurrent
-        // cross-partition renames cannot deadlock.
-        let (first, second) = if src_part <= dst_part {
-            (parent, newparent)
-        } else {
-            (newparent, parent)
+        let op = constellation_meta::MutateOp::Rename {
+            parent,
+            name,
+            new_parent: newparent,
+            new_name: newname,
         };
-        if src_part == dst_part {
-            let op = constellation_meta::MutateOp::Rename {
-                parent,
-                name,
-                new_parent: newparent,
-                new_name: newname,
-            };
-            return match self.mutate_op(parent, op) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(Errno::from_i32(e)),
-            };
-        }
-        gate!(self, first, reply);
-        if first != second {
-            if let Err(e) = self.require_lease_for(second) {
-                reply.error(Errno::from_i32(e));
-                return;
-            }
-        }
-        let result = self
-            .meta
-            .rename_xpart(parent, &name, newparent, &newname, &src_part, &dst_part);
-        match result {
+        match self.mutate_op(parent, op) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
 

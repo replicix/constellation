@@ -1004,7 +1004,7 @@ impl ConstellationFs {
             .as_ref()
             .is_some_and(|active| active.load(std::sync::atomic::Ordering::Relaxed))
         {
-            let part = self.meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
+            let part = "p0".to_string();
             let map = h.leases.lock().unwrap();
             if let Some(view) = map.get(&part) {
                 if view.usable() {
@@ -1014,7 +1014,7 @@ impl ConstellationFs {
             }
             // The sync task performs a P2P-only handoff in epoch mode.
         }
-        let part = self.meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
+        let part = "p0".to_string();
         {
             let map = h.leases.lock().unwrap();
             if let Some(view) = map.get(&part) {
@@ -1143,10 +1143,7 @@ impl ConstellationFs {
                 }
             }
         }
-        let part = self
-            .meta
-            .partition_of(part_hint_ino)
-            .unwrap_or_else(|_| "p0".into());
+        let part = "p0".to_string();
         if let Some(view) = h.leases.lock().unwrap().get(&part) {
             if view.usable() {
                 let result = constellation_meta::execute_mutate(&self.meta, &op)
@@ -1683,7 +1680,7 @@ impl ConstellationFs {
         epoch_active: bool,
     ) -> Result<(), i32> {
         let holds_lease = self.sync.as_ref().is_none_or(|handle| {
-            let part = self.meta.partition_of(ino).unwrap_or_else(|_| "p0".into());
+            let part = "p0".to_string();
             handle
                 .leases
                 .lock()

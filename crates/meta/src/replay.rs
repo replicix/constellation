@@ -16,28 +16,9 @@
 //! a forwarded mutation) has no such claim, and must never suppress a
 //! foreign record, or the two replicas diverge for good.
 //!
-//! ### Partition map
-//!
-//! `part_split` is carried on the **parent** partition's stream; the
-//! child stream starts empty at seq 1 after that record is durable.
-//! `part_merge` is carried on the surviving (parent) stream. Both
-//! mutate the `partition` table and nothing else — no data moves.
-//!
-//! ### Cross-partition rename
-//!
-//! A `rename_xpart` is a linked two-record commit: `RenameXpartSrc` on
-//! the source stream and `RenameXpartDst` on the destination stream,
-//! sharing a `txid`. A replica applies the rename only when it has
-//! **both** halves (parked in `xpart_pending` until the pair arrives).
-//!
-//! **Recovery rule.** A `RenameXpartSrc` whose partner never appears
-//! (writer crashed between the two PUTs) is resolved the next time
-//! *any* node writes to either stream: if the dst record is absent
-//! from the dst stream at or before that stream's head, the current
-//! holder of the src partition appends `RenameXpartAbort { txid }` to
-//! the src stream and the file stays at its source. Only the current
-//! holder of the src partition may append the abort (lease + epoch
-//! fencing makes this race-free).
+//! Plan 29 M0a removed namespace partitions: there is one metadata log
+//! stream (`p0`) and an ordinary cross-directory `rename` is a single
+//! `LogRecord::Rename`, applied in one transaction like any other op.
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
@@ -104,41 +85,17 @@ impl TouchSet {
             | LogRecord::RemoveXattr { ino, .. } => {
                 self.inos.insert(*ino);
             }
-            LogRecord::PartSplit { at_ino, .. } => {
-                self.inos.insert(*at_ino);
-            }
             // Atime is deliberately invisible to conflict detection: it
             // records neither a dentry nor an ino, so a pending local
             // atime bump never suppresses a foreign namespace/attr
             // record, and is never suppressed by pending local work.
-            LogRecord::PartMerge { .. }
-            | LogRecord::RenameXpartAbort { .. }
-            | LogRecord::SetQuota { .. }
-            | LogRecord::Atime { .. } => {}
+            LogRecord::SetQuota { .. } | LogRecord::Atime { .. } => {}
             LogRecord::SnapCreate { .. } | LogRecord::SnapDelete { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
                     self.dentries.insert((node.parent, node.name.clone()));
                     self.inos.insert(node.ino);
                 }
-            }
-            LogRecord::RenameXpartSrc {
-                from_parent,
-                name,
-                ino,
-                ..
-            } => {
-                self.dentries.insert((*from_parent, name.clone()));
-                self.inos.insert(*ino);
-            }
-            LogRecord::RenameXpartDst {
-                to_parent,
-                new_name,
-                ino,
-                ..
-            } => {
-                self.dentries.insert((*to_parent, new_name.clone()));
-                self.inos.insert(*ino);
             }
         }
     }
@@ -231,15 +188,11 @@ impl SqliteMeta {
     /// - `epochs` / `reintegration` (local continuation / stranded-branch
     ///   bookkeeping tied to this node's journal)
     /// - identity / apply-cursor kv keys (`node_id`, `node_prefix`,
-    ///   `next_ino`, `applied_seq*`, `part_of/%`) and other node-local kv
-    ///   (`left`, `read_only_member`, `lease_lost`, creation-quota mirror)
-    ///
-    /// `xpart_pending` is kept: it is convergent replay parking for
-    /// cross-partition renames that can span a checkpoint boundary, not
-    /// node-local writeback state.
+    ///   `next_ino`, `applied_seq*`) and other node-local kv (`left`,
+    ///   `read_only_member`, `lease_lost`, creation-quota mirror)
     ///
     /// Replicated namespace tables (`inode`, `dentry`, `xattr`, `snapshot`,
-    /// `chunk_ref`, `deref`, `partition`, …) are kept.
+    /// `chunk_ref`, `deref`, …) are kept.
     pub fn snapshot(&self) -> Result<Vec<u8>, MetaError> {
         // Unique per call: a daemon checkpoints per partition, so two
         // snapshots can be in flight at once. Sharing one scratch path
@@ -300,8 +253,6 @@ impl SqliteMeta {
                     'node_id', 'node_prefix', 'next_ino', 'applied_seq',
                     'left', 'read_only_member', 'lease_lost'
                  )
-                 OR key LIKE 'applied_seq/%'
-                 OR key LIKE 'part_of/%'
                  OR key = ?1",
                 params![QUOTA_CREATION_KV_KEY],
             )?;
@@ -693,7 +644,6 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
                 "UPDATE dentry SET parent = ?3, name = ?4 WHERE parent = ?1 AND name = ?2",
                 params![parent, name, new_parent, new_name],
             )?;
-            crate::sqlite::SqliteMeta::invalidate_part_cache(tx, ino)?;
             if src_is_dir && parent != new_parent {
                 tx.execute(
                     "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
@@ -828,35 +778,6 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
                 0,
                 time_ns / 1_000_000,
             )?;
-            Ok(Applied::Done)
-        }
-        LogRecord::PartSplit {
-            part,
-            at_ino,
-            new_part,
-            ..
-        } => {
-            let _ = part;
-            tx.execute(
-                "INSERT OR REPLACE INTO partition (id, root_ino) VALUES (?1, ?2)",
-                params![new_part, at_ino],
-            )?;
-            // Any cached resolution under this subtree is now stale.
-            tx.execute("DELETE FROM kv WHERE key LIKE 'part_of/%'", [])?;
-            Ok(Applied::Done)
-        }
-        LogRecord::PartMerge {
-            part, into_part, ..
-        } => {
-            let _ = into_part;
-            tx.execute("DELETE FROM partition WHERE id = ?1", params![part])?;
-            tx.execute("DELETE FROM kv WHERE key LIKE 'part_of/%'", [])?;
-            Ok(Applied::Done)
-        }
-        LogRecord::RenameXpartSrc { txid, .. } => park_or_apply_xpart(tx, usage, *txid, "src", rec),
-        LogRecord::RenameXpartDst { txid, .. } => park_or_apply_xpart(tx, usage, *txid, "dst", rec),
-        LogRecord::RenameXpartAbort { txid } => {
-            tx.execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
             Ok(Applied::Done)
         }
         LogRecord::SnapCreate {
@@ -1020,80 +941,6 @@ pub fn apply_atime_one(
         params![ino, claim, time_ns],
     )?;
     Ok(clamped)
-}
-
-fn park_or_apply_xpart(
-    tx: &Connection,
-    usage: &UsageTracker,
-    txid: u64,
-    half: &str,
-    rec: &LogRecord,
-) -> Result<Applied, MetaError> {
-    let other = if half == "src" { "dst" } else { "src" };
-    let partner: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT record FROM xpart_pending WHERE txid = ?1 AND half = ?2",
-            params![txid, other],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(bytes) = partner {
-        let other_rec = LogRecord::from_postcard(&bytes)?;
-        tx.execute("DELETE FROM xpart_pending WHERE txid = ?1", params![txid])?;
-        let (src, dst) = if half == "src" {
-            (rec, &other_rec)
-        } else {
-            (&other_rec, rec)
-        };
-        apply_xpart_pair(tx, usage, src, dst)
-    } else {
-        tx.execute(
-            "INSERT OR REPLACE INTO xpart_pending (txid, half, record) VALUES (?1, ?2, ?3)",
-            params![txid, half, rec.to_postcard()?],
-        )?;
-        Ok(Applied::Done)
-    }
-}
-
-fn apply_xpart_pair(
-    tx: &Connection,
-    usage: &UsageTracker,
-    src: &LogRecord,
-    dst: &LogRecord,
-) -> Result<Applied, MetaError> {
-    let LogRecord::RenameXpartSrc {
-        from_parent,
-        name,
-        ino,
-        time_ns,
-        ..
-    } = src
-    else {
-        return Ok(Applied::Skipped("malformed xpart src"));
-    };
-    let LogRecord::RenameXpartDst {
-        to_parent,
-        new_name,
-        ..
-    } = dst
-    else {
-        return Ok(Applied::Skipped("malformed xpart dst"));
-    };
-    // Same as an in-partition Rename, but the two halves may have
-    // arrived on different streams / in either order.
-    apply_one(
-        tx,
-        &LogRecord::Rename {
-            parent: *from_parent,
-            name: name.clone(),
-            new_parent: *to_parent,
-            new_name: new_name.clone(),
-            time_ns: *time_ns,
-        },
-        usage,
-    )?;
-    SqliteMeta::invalidate_part_cache(tx, *ino)?;
-    Ok(Applied::Done)
 }
 
 #[cfg(test)]
@@ -1371,7 +1218,7 @@ mod tests {
     fn atime_journal_coalesces_to_one_row_holding_the_max() {
         let m = SqliteMeta::open_in_memory().unwrap();
         let f = m.create(1, "f", 0o644, 0, 0).unwrap();
-        let part = m.partition_of(f.ino).unwrap();
+        let part = "p0".to_string();
         // Many "flushes" of the same inode.
         for t in [10i64, 50, 30, 40] {
             m.queue_atime(&[(f.ino, t, t)]).unwrap();
@@ -1422,7 +1269,7 @@ mod tests {
         let ino = (1 << 40) | 1;
 
         // A records reads and publishes them as Atime records.
-        let part = a.partition_of(ino).unwrap();
+        let part = "p0".to_string();
         a.queue_atime(&[(ino, 500, 500)]).unwrap();
         a.queue_atime(&[(ino, 300, 300)]).unwrap();
         let rows = a.take_atime_of(&part, 100).unwrap();
