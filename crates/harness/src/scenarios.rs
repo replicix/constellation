@@ -443,6 +443,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: disjoint_write_4,
     },
     Scenario {
+        name: "mkdir-p-race",
+        desc: "4 nodes race `mkdir -p` of the same fresh tree: a refusal the holder based on state this node lacks must not surface as ENOENT",
+        requires: &[],
+        run: mkdir_p_race,
+    },
+    Scenario {
         name: "create-storm-s3-only",
         desc: "3-way create/write/unlink storm in one shared dir, P2P off: a healthy but contended holder must never starve a waiter into EIO",
         requires: &[],
@@ -5106,6 +5112,105 @@ fn chaos_soak_4(seed: u64) -> Result<()> {
 /// Focused local repro of the fleet `disjoint_write` failure: four
 /// write-back mounts repeatedly run the write_disjoint shape (seeded
 /// zero file, then four concurrent disjoint WriteAts, then verify).
+/// Plan 29 M6: every node runs `mkdir -p <fresh>/<per-thread>` for the
+/// same fresh tree at once, then creates a file inside. Only one node's
+/// `mkdir` of each shared parent wins; the losers get `EEXIST` from the
+/// holder and must then be able to *resolve* that parent locally — the
+/// real-S3 benchmark (`bench/remote`, row 1) instead saw `ENOENT` from
+/// the very next step, because the holder's refusal reached the caller
+/// before the record it was based on reached the caller's replica.
+/// `create_dir_all` reproduces it exactly as `os.makedirs` did: on
+/// `EEXIST` it asks whether the path is a directory, which is a local
+/// lookup.
+fn mkdir_p_race(_seed: u64) -> Result<()> {
+    let (env, root) = setup("mkdir-p-race")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/mkdirrace-{}", ts());
+    let mut clients = Vec::new();
+    for i in 0..4 {
+        let mut c = Client::new(root.path(), &format!("m{i}"), &env.endpoint, &backend)?
+            .with_own_node_key();
+        if i == 0 {
+            c.fs_create()?;
+        }
+        c.mount()?;
+        clients.push(c);
+    }
+    eventually("four mounts live", Duration::from_secs(30), || {
+        let probe = clients[0].mnt.join(".probe");
+        std::fs::create_dir_all(&probe).ok();
+        anyhow::ensure!(clients.iter().all(|c| c.mnt.join(".probe").is_dir()));
+        Ok(())
+    })?;
+
+    let rounds = 8usize;
+    let threads = 4usize;
+    let mut failures = Vec::new();
+    for round in 0..rounds {
+        let base = format!("race{round}");
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        std::thread::scope(|scope| {
+            for c in &clients {
+                for t in 0..threads {
+                    let dir = c.mnt.join(&base).join(format!("t{t}"));
+                    let name = c.name.clone();
+                    let errors = errors.clone();
+                    scope.spawn(move || {
+                        if let Err(e) = std::fs::create_dir_all(&dir) {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("{name}: create_dir_all({dir:?}): {e}"));
+                            return;
+                        }
+                        let file = dir.join(format!("f-{name}"));
+                        if let Err(e) = std::fs::write(&file, b"x") {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("{name}: write({file:?}): {e}"));
+                        }
+                    });
+                }
+            }
+        });
+        let errors = std::sync::Arc::try_unwrap(errors)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        if !errors.is_empty() {
+            failures.push(format!(
+                "round {round}: {} error(s): {errors:?}",
+                errors.len()
+            ));
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "concurrent `mkdir -p` of a shared tree must never fail: {failures:?}"
+    );
+
+    // Every node must end up with the same tree.
+    let expected: std::collections::BTreeSet<String> = (0..rounds)
+        .flat_map(|r| {
+            (0..threads).flat_map(move |t| (0..4).map(move |n| format!("race{r}/t{t}/f-m{n}")))
+        })
+        .collect();
+    for c in &clients {
+        eventually(
+            &format!("{} sees every file", c.name),
+            Duration::from_secs(60),
+            || {
+                for rel in &expected {
+                    anyhow::ensure!(c.mnt.join(rel).is_file(), "{} missing {rel}", c.name);
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn disjoint_write_4(seed: u64) -> Result<()> {
     use constellation_chaos::cluster::Cluster;
     use constellation_chaos::op::{hash_bytes, Op, Outcome};

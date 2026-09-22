@@ -1273,6 +1273,8 @@ impl NodeRuntime {
                             // though each `holder_execute` itself is fast,
                             // and — on a cold cache — this arm's holder
                             // lookup can hit an S3 `GET`.
+                            let ship_floor =
+                                spool.lock().unwrap().head_seq.saturating_add(1);
                             let (keepers, forward, store_inner, meta, lease_views, placement, sync_tx) = (
                                 keepers.clone(),
                                 forward.clone(),
@@ -1299,7 +1301,7 @@ impl NodeRuntime {
                                         .unwrap_or((None, false));
                                     (ship_epoch.is_some() || is_lost).then(|| {
                                         forward::holder_execute(
-                                            &meta, ship_epoch, is_lost, node_id, &op,
+                                            &meta, ship_epoch, is_lost, node_id, &op, ship_floor,
                                         )
                                     })
                                 };
@@ -1321,7 +1323,7 @@ impl NodeRuntime {
                                     .map(|(lease, _)| lease.holder)
                                     .unwrap_or(0)
                                 };
-                                forward::holder_execute(&meta, None, false, known_holder, &op)
+                                forward::holder_execute(&meta, None, false, known_holder, &op, ship_floor)
                                 };
                                 if matches!(
                                     outcome,
@@ -1451,11 +1453,56 @@ impl NodeRuntime {
                                             .await;
                                         }
                                     }
+                                    if let constellation_meta::MutateOutcome::Exists {
+                                        ref records,
+                                        ship_floor,
+                                    } = outcome
+                                    {
+                                        // The entry the holder refused us comes
+                                        // back with the refusal: install it so
+                                        // the caller's next lookup of that name
+                                        // succeeds here too. Not shadowed —
+                                        // these are the holder's own records,
+                                        // and its segment re-applies them
+                                        // idempotently
+                                        // (`replay::insert_node`). Only below
+                                        // the holder's ship floor, though
+                                        // (`forward::safe_to_install_early`);
+                                        // above it the bounded wait below takes
+                                        // over, which only ever observes.
+                                        if forward::safe_to_install_early(&meta, ship_floor) {
+                                            if let Err(error) = meta.apply_records(records) {
+                                                tracing::warn!(
+                                                    %error,
+                                                    part,
+                                                    "failed to apply the entry behind an EEXIST refusal"
+                                                );
+                                            }
+                                        }
+                                    }
                                     if let constellation_meta::MutateOutcome::Accepted {
                                         epoch,
                                         ref records,
                                     } = outcome
                                     {
+                                        // Installed ahead of the log for
+                                        // read-your-writes: the caller's next op
+                                        // on this entry resolves it here. Unlike
+                                        // `Exists`, this is not skipped above
+                                        // the ship floor: skipping would leave
+                                        // the caller's own op invisible until
+                                        // its segment lands, and its next write
+                                        // would then run against a stale base
+                                        // (`disjoint-write-4` fails with EIO).
+                                        // The window where a *later* record for
+                                        // the same entry reaches this replica
+                                        // before this reply is applied needs that
+                                        // record executed, made durable in S3 and
+                                        // pushed back within the reply's own
+                                        // 1–3 ms round trip; closing it
+                                        // precisely needs the holder's journal
+                                        // position in replies and segments
+                                        // (tracked in PROGRESS.md, plan 29 M6).
                                         if let Err(error) =
                                             forward::apply_accepted(&meta, &part, epoch, records)
                                         {
@@ -1479,6 +1526,24 @@ impl NodeRuntime {
                                 // overlapping forward cannot even start its
                                 // own request until this one's apply has
                                 // landed.
+                                // Read-your-refusals: the errno is about an
+                                // entry the holder has and this replica may
+                                // not (yet), so wait for the holder's segment
+                                // before the caller acts on it. Still under
+                                // the gate, so overlapping forwards stay
+                                // ordered behind it.
+                                if let Some((parent, name, exists)) =
+                                    forward::causal_wait_target(&op, &outcome)
+                                {
+                                    let deadline = tokio::time::Instant::now() + forward::CAUSAL_WAIT;
+                                    use constellation_meta::MetaStore as _;
+                                    while meta.lookup(parent, &name).ok().flatten().is_some() != exists
+                                        && tokio::time::Instant::now() < deadline
+                                    {
+                                        let _ = sync_tx.send(fusefs::SyncRequest::Nudge);
+                                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                    }
+                                }
                                 if matches!(
                                     outcome,
                                     constellation_meta::MutateOutcome::Accepted { .. }

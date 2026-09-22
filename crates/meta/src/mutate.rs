@@ -158,6 +158,35 @@ pub enum MutateOutcome {
     Conflict {
         manifest: Option<Vec<u8>>,
     },
+    /// The holder refused a create-family op with `EEXIST`, and carries
+    /// the entry that *is* there so the requester can install it in the
+    /// same round trip.
+    ///
+    /// POSIX requires `mkdir`/`O_EXCL` on an existing name to fail, so
+    /// the refusal itself stands (`mkdir` is a lock primitive). But the
+    /// caller acts on that answer immediately — `mkdir -p` walks into
+    /// the directory it was just told exists — and until the holder's
+    /// segment reaches this replica, that lookup would fail with an
+    /// `ENOENT` the holder never said. Replay is idempotent for an
+    /// identical entry (`replay::insert_node` returns early when the
+    /// dentry already names the same ino), so installing it early and
+    /// applying the holder's segment later converge.
+    ///
+    /// Appended last, like `Conflict`: a peer too old to decode it falls
+    /// back to `Busy`.
+    Exists {
+        records: Vec<LogRecord>,
+        /// The lowest log sequence anything the holder does from now on
+        /// can ship in (its next segment). The entry exists on the
+        /// holder *now*, so any delete of it is still in the holder's
+        /// future and can only ship at or above this sequence: a
+        /// requester whose replay is below it cannot have seen one,
+        /// which is what makes installing the record early safe. At or
+        /// above it the record may already be stale, and installing it
+        /// would resurrect a deleted entry that the log has nothing left
+        /// to correct.
+        ship_floor: u64,
+    },
 }
 
 impl MutateOutcome {

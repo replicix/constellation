@@ -1330,7 +1330,22 @@ impl ConstellationFs {
         match crate::writeback::throttle_delay(dirty, budget) {
             Ok(delay) if !delay.is_zero() => std::thread::sleep(delay),
             Ok(_) => {}
-            Err(()) => return Err(libc::ENOSPC),
+            Err(()) => {
+                // Sealed chunks grow the dirty-cache budget in
+                // chunk-sized steps (plan 29 M6), exactly like staging
+                // below: a small `--cache-size` relative to the chunk
+                // size can cross the whole 75%-99% soft-pressure band in
+                // one write and hit the hard limit with no prior
+                // `throttle_delay` ever having slept. Without this grace
+                // sleep, whichever of the two budgets (this one or
+                // staging's, right below) happened to be the one that
+                // ran out first was timing-dependent, which is what made
+                // `writeback-backpressure` fail intermittently ("ENOSPC
+                // arrived without observable throttling") rather than
+                // consistently either way.
+                std::thread::sleep(Duration::from_millis(100));
+                return Err(libc::ENOSPC);
+            }
         }
         match crate::writeback::throttle_delay(
             self.staging_budget.used(),

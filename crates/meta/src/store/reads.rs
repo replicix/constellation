@@ -190,6 +190,75 @@ impl Meta {
         Ok((bytes, files))
     }
 
+    /// The record that would create `parent/name` as it exists now, for
+    /// a holder answering a create-family op with `EEXIST`
+    /// (`MutateOutcome::Exists`): the requester applies it so the entry
+    /// it was just refused is resolvable locally. `None` when the name
+    /// is free.
+    pub fn entry_as_record(
+        &self,
+        parent: Ino,
+        name: &str,
+    ) -> Result<Option<crate::record::LogRecord>, MetaError> {
+        use crate::record::LogRecord;
+        use constellation_mtree::record::Kind;
+
+        let r = self.db.read_tx();
+        let Some(dentry) = ns::get_dentry_record(&r, &self.ns, parent, name)? else {
+            return Ok(None);
+        };
+        let ino = dentry.ino;
+        let Some(rec) = ns::get_inode_record(&r, &self.ns, ino)? else {
+            return Ok(None);
+        };
+        let a = rec.attrs;
+        let (name, time_ns) = (name.to_string(), a.ctime_ns);
+        Ok(Some(match a.kind {
+            Kind::Dir => LogRecord::Mkdir {
+                parent,
+                name,
+                ino,
+                mode: a.mode,
+                uid: a.uid,
+                gid: a.gid,
+                time_ns,
+            },
+            Kind::File => LogRecord::Create {
+                parent,
+                name,
+                ino,
+                mode: a.mode,
+                uid: a.uid,
+                gid: a.gid,
+                time_ns,
+            },
+            Kind::Symlink => LogRecord::Symlink {
+                parent,
+                name,
+                ino,
+                target: String::from_utf8_lossy(&self.resolve_local_payload_at(
+                    &r,
+                    rec.symlink_target.as_ref().ok_or(MetaError::NoEnt(ino))?,
+                )?)
+                .into_owned(),
+                uid: a.uid,
+                gid: a.gid,
+                time_ns,
+            },
+            other => LogRecord::Mknod {
+                parent,
+                name,
+                ino,
+                kind: crate::store::ns::kind_from_mtree(other).as_u8(),
+                mode: a.mode,
+                uid: a.uid,
+                gid: a.gid,
+                rdev: a.rdev,
+                time_ns,
+            },
+        }))
+    }
+
     /// Every file's manifest under `ino` (including `ino` itself if it
     /// is a file): `(ino, manifest_bytes, logical_size)`. Used by pin
     /// admission to compute a subtree's chunk footprint.

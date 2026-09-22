@@ -4808,6 +4808,119 @@ mod pending_upload_tests {
         assert!(f.meta.pending_uploads().unwrap().is_empty());
     }
 
+    /// Plan 29 M6 characterization test (see `bench/remote/RESULTS.md`
+    /// anomaly #2 and `PROGRESS.md`'s "Plan 29 M6" section): a single
+    /// hash whose `pending_upload` row survives with no matching cache
+    /// entry — the "missing from local cache" condition seen under
+    /// concurrent load on real S3 — fails the *entire* round, even
+    /// though this same call's *other* pending chunk is healthy,
+    /// uploads fine, and gets acked. That all-or-nothing failure is
+    /// deliberate (see the comment above: bailing the whole round is
+    /// what stops the journal from shipping a manifest that names
+    /// content S3 will never have), but it means one permanently-
+    /// missing chunk anywhere on the node blocks every *other* inode's
+    /// manifest from ever publishing too, since
+    /// `run_managed_sync_round` only proceeds to `run_sync_round`
+    /// (which ships the journal) once this call returns `Ok` — and
+    /// nothing here ever removes the broken row, so every future round
+    /// fails identically, forever. This session could not pin down how
+    /// the cache entry first goes missing while its pending row
+    /// survives (every eviction path found protects `Dirty` entries),
+    /// so this test pins the *cascade*, not a fix for the trigger — see
+    /// PROGRESS.md for what was ruled out.
+    #[test]
+    fn one_missing_chunk_fails_the_whole_round_even_though_another_chunk_in_it_succeeds() {
+        let f = fixture();
+        let healthy_file = f
+            .meta
+            .create(
+                constellation_fs_core::types::ROOT_INO,
+                "healthy",
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+        let healthy_data = b"perfectly fine content".to_vec();
+        let healthy_hash = ChunkHash::of(&healthy_data);
+        f.cache
+            .insert(&healthy_hash, &healthy_data, ChunkState::Dirty)
+            .unwrap();
+        f.meta
+            .set_manifest_dirty(
+                healthy_file.ino,
+                None,
+                b"M",
+                healthy_data.len() as u64,
+                &[healthy_hash],
+            )
+            .unwrap();
+
+        // "broken": a pending_upload row with nothing behind it in the
+        // cache -- the observed field condition, reproduced directly
+        // rather than via whatever race produces it in practice.
+        let broken_file = f
+            .meta
+            .create(
+                constellation_fs_core::types::ROOT_INO,
+                "broken",
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+        let broken_hash = ChunkHash::of(b"bytes that are gone");
+        f.meta
+            .set_manifest_dirty(broken_file.ino, None, b"M2", 4, &[broken_hash])
+            .unwrap();
+        assert!(
+            f.cache.get(&broken_hash).unwrap().is_none(),
+            "the broken hash must not be in the cache"
+        );
+
+        let err = rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &UploadRuntime::for_test(true),
+            None,
+            None,
+        ));
+        assert!(
+            err.is_err(),
+            "the round fails whenever any pending chunk is unrecoverably missing"
+        );
+
+        // The healthy chunk still got uploaded and acked despite the
+        // round's overall failure: only the broken row remains pending.
+        assert_eq!(
+            f.meta.pending_uploads().unwrap(),
+            vec![(broken_hash, broken_file.ino)],
+            "an unrelated healthy chunk's pending row must still be acked \
+             even though the round as a whole errors"
+        );
+        let uploaded = rt().block_on(f.store.get_chunk(&healthy_hash)).unwrap();
+        assert_eq!(uploaded, healthy_data);
+
+        // Nothing ever drops the broken row: every future round fails
+        // identically, forever, which is the resilience gap this test
+        // pins (see the doc comment above).
+        let err2 = rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &UploadRuntime::for_test(true),
+            None,
+            None,
+        ));
+        assert!(
+            err2.is_err(),
+            "a missing chunk is never dropped or bounded -- it re-fails forever"
+        );
+    }
+
     #[test]
     fn upload_pool_honours_its_bound() {
         let f = fixture();

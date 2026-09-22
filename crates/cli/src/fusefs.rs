@@ -1260,6 +1260,12 @@ impl ConstellationFs {
                 Ok(Ok(constellation_meta::MutateOutcome::Errno(e))) => {
                     return Err(MutateFail::Errno(e))
                 }
+                // The name exists on the holder; the sync task has just
+                // installed the entry it sent with the refusal, so the
+                // caller's next lookup resolves here too.
+                Ok(Ok(constellation_meta::MutateOutcome::Exists { .. })) => {
+                    return Err(MutateFail::Errno(libc::EEXIST))
+                }
                 Ok(Ok(constellation_meta::MutateOutcome::Conflict { manifest })) => {
                     return Err(MutateFail::Conflict { manifest })
                 }

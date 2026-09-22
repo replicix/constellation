@@ -212,6 +212,7 @@ pub fn holder_execute(
     is_lost: bool,
     known_holder: u64,
     op_bytes: &[u8],
+    ship_floor: u64,
 ) -> MutateOutcome {
     if is_lost {
         return MutateOutcome::Busy;
@@ -235,9 +236,73 @@ pub fn holder_execute(
             },
             _ => MutateOutcome::Errno(libc::EAGAIN),
         },
+        // POSIX keeps the refusal (`mkdir` is a lock primitive), but this
+        // requester's replica may not have the entry the refusal is about
+        // yet, and its very next step resolves that name locally. Hand it
+        // back with the errno; `MutateOutcome::Exists` explains why
+        // applying it early is safe.
+        Err(constellation_meta::MetaError::Exists) => match named_child(&op) {
+            Some((parent, name)) => match meta.entry_as_record(parent, name) {
+                Ok(Some(record)) => MutateOutcome::Exists {
+                    records: vec![record],
+                    ship_floor,
+                },
+                _ => MutateOutcome::Errno(libc::EEXIST),
+            },
+            None => MutateOutcome::Errno(libc::EEXIST),
+        },
         Err(e) => MutateOutcome::Errno(meta_errno(&e)),
     }
 }
+
+/// The `(parent, name)` a create-family op names, if any.
+fn named_child(op: &MutateOp) -> Option<(Ino, &str)> {
+    match op {
+        MutateOp::Mkdir { parent, name, .. }
+        | MutateOp::Create { parent, name, .. }
+        | MutateOp::Symlink { parent, name, .. }
+        | MutateOp::Mknod { parent, name, .. }
+        | MutateOp::Link { parent, name, .. } => Some((*parent, name.as_str())),
+        _ => None,
+    }
+}
+
+/// After a forwarded op the holder refused because of state this replica
+/// may not have seen yet, the entry the refusal is about and whether it
+/// must exist locally before the errno reaches the caller.
+///
+/// The create-family `EEXIST` case is normally answered by
+/// [`MutateOutcome::Exists`] carrying the entry; this covers the cases
+/// where that record must not be applied (see the caller's
+/// applied-position guard) and the `unlink`/`rmdir` mirror image, where
+/// there is nothing to carry: `ENOENT` means the name is already gone on
+/// the holder, while a stale local entry would make the kernel answer
+/// the next `O_EXCL` create with `EEXIST` without ever asking the
+/// holder.
+pub fn causal_wait_target(op: &MutateOp, outcome: &MutateOutcome) -> Option<(Ino, String, bool)> {
+    match outcome {
+        // `Exists` normally carries the entry and is applied directly,
+        // but not when that would be unsafe (the requester applied log
+        // segments while the refusal was in flight, so the entry it
+        // carries may already have been deleted) or when the holder had
+        // nothing to send. Then this is the fallback.
+        MutateOutcome::Exists { .. } => named_child(op).map(|(p, n)| (p, n.to_string(), true)),
+        MutateOutcome::Errno(libc::EEXIST) => {
+            named_child(op).map(|(p, n)| (p, n.to_string(), true))
+        }
+        MutateOutcome::Errno(libc::ENOENT) => match op {
+            MutateOp::Unlink { parent, name } | MutateOp::Rmdir { parent, name } => {
+                Some((*parent, name.clone(), false))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// How long a requester waits for [`causal_wait_target`] to hold locally
+/// before returning the errno anyway (the entry may have changed again).
+pub const CAUSAL_WAIT: Duration = Duration::from_secs(3);
 
 /// Apply an accepted outcome on the requester: shadow + apply_foreign.
 pub fn apply_accepted(
@@ -249,6 +314,29 @@ pub fn apply_accepted(
     meta.shadow_insert(part, epoch, records)?;
     meta.apply_foreign(records, &TouchSet::default())?;
     Ok(())
+}
+
+/// Whether records the holder handed back may be installed ahead of the
+/// log on this replica.
+///
+/// Everything a replica applies from the log is applied in the holder's
+/// order, so it can only move forward. A forwarded op's reply is the one
+/// place records arrive *outside* that order, to spare the caller a
+/// round trip through S3 — and a record installed out of order can move
+/// the replica *backwards*: the entry it names may already have been
+/// deleted by a later record this replica has applied, and re-inserting
+/// it resurrects it for good, since the log has nothing after the delete
+/// to correct it with.
+///
+/// `ship_floor` is the lowest sequence anything the holder does from now
+/// on can ship in. A delete of what the reply describes is necessarily
+/// later than the reply, so it ships at or above the floor; a replica
+/// whose replay is still below the floor therefore cannot have seen one,
+/// and installing the records early is exactly equivalent to applying
+/// them in order, just sooner. At or above it, the caller must not
+/// install them: the log will deliver them in order anyway.
+pub fn safe_to_install_early(meta: &Meta, ship_floor: u64) -> bool {
+    meta.applied_seq().is_ok_and(|applied| applied < ship_floor)
 }
 
 /// Ask `holder` to execute `op`. Returns the outcome, or Busy on
@@ -337,6 +425,70 @@ pub async fn request_mutate_with(
 mod tests {
     use super::*;
 
+    /// Plan 29 M6: a create-family op the holder refuses with `EEXIST`
+    /// carries the entry that is already there, so the requester can
+    /// resolve that name without waiting for the holder's segment. The
+    /// refusal itself stands — POSIX requires `mkdir` on an existing
+    /// name to fail, and `mkdir` is a lock primitive — but a caller that
+    /// acts on it (`mkdir -p` walking in) must not then get `ENOENT`.
+    #[test]
+    fn an_eexist_refusal_carries_the_entry_that_is_already_there() {
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::MetaStore;
+
+        let holder = Meta::open_in_memory().unwrap();
+        let existing = holder.mkdir(ROOT_INO, "d", 0o755, 7, 9).unwrap();
+        let op = MutateOp::Mkdir {
+            parent: ROOT_INO,
+            name: "d".into(),
+            ino: 0,
+            mode: 0o755,
+            uid: 7,
+            gid: 9,
+        }
+        .to_postcard()
+        .unwrap();
+
+        let records = match holder_execute(&holder, Some(1), false, 1, &op, 1) {
+            MutateOutcome::Exists { records, .. } => records,
+            other => panic!("expected Exists, got {other:?}"),
+        };
+
+        // A replica that has never seen the entry can install it from the
+        // refusal alone, and the holder's later segment is idempotent.
+        let replica = Meta::open_in_memory().unwrap();
+        assert!(replica.lookup(ROOT_INO, "d").unwrap().is_none());
+        replica.apply_records(&records).unwrap();
+        let seen = replica.lookup(ROOT_INO, "d").unwrap().expect("installed");
+        assert_eq!(seen.ino, existing.ino);
+        let parent_nlink = replica.getattr(ROOT_INO).unwrap().unwrap().nlink;
+        replica.apply_records(&records).unwrap();
+        assert_eq!(
+            replica.getattr(ROOT_INO).unwrap().unwrap().nlink,
+            parent_nlink,
+            "re-applying the same creation must not double-count the parent's nlink"
+        );
+    }
+
+    /// A create-family op whose name is genuinely free is unaffected, and
+    /// a non-create op that fails with `EEXIST` keeps the bare errno.
+    #[test]
+    fn a_plain_errno_is_still_a_plain_errno() {
+        use constellation_fs_core::types::ROOT_INO;
+
+        let holder = Meta::open_in_memory().unwrap();
+        let op = MutateOp::Unlink {
+            parent: ROOT_INO,
+            name: "gone".into(),
+        }
+        .to_postcard()
+        .unwrap();
+        match holder_execute(&holder, Some(1), false, 1, &op, 1) {
+            MutateOutcome::Errno(e) => assert_eq!(e, libc::ENOENT),
+            other => panic!("expected a bare errno, got {other:?}"),
+        }
+    }
+
     #[test]
     fn holder_execute_not_holder() {
         let meta = Meta::open_in_memory().unwrap();
@@ -347,7 +499,7 @@ mod tests {
         .to_postcard()
         .unwrap();
 
-        match holder_execute(&meta, None, false, 7, &op) {
+        match holder_execute(&meta, None, false, 7, &op, 1) {
             MutateOutcome::NotHolder { holder: 7 } => {}
             other => panic!("{other:?}"),
         }
@@ -374,7 +526,7 @@ mod tests {
         .to_postcard()
         .unwrap();
 
-        match holder_execute(&meta, Some(1), false, 0, &op) {
+        match holder_execute(&meta, Some(1), false, 0, &op, 1) {
             MutateOutcome::Conflict { manifest } => {
                 assert_eq!(manifest.as_deref(), Some(&b"current"[..]))
             }
@@ -645,7 +797,7 @@ mod tests {
             };
             tokio::time::sleep(pre).await;
             let op_bytes = op.to_postcard().unwrap();
-            let outcome = holder_execute(holder, Some(1), false, 1, &op_bytes);
+            let outcome = holder_execute(holder, Some(1), false, 1, &op_bytes, 1);
             tokio::time::sleep(post).await;
             match outcome {
                 MutateOutcome::Accepted { epoch, records } => {

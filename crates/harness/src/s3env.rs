@@ -29,8 +29,55 @@ fn docker_prefix() -> String {
         .unwrap_or_else(|_| "constellation-harness".to_string())
 }
 
+/// Host-wide guard for one docker prefix, so two harness processes
+/// cannot quietly destroy each other's environment.
+///
+/// Startup force-removes every container under its prefix (a crashed run
+/// holds the network open, so it has to), which is exactly what makes a
+/// second concurrent run fatal to the first: its cleanup deletes the
+/// live S3 the first one is using, and the first then fails somewhere
+/// unrelated with a connection error, a "name is already in use"
+/// conflict, or a missing network. Rather than leave that to whoever
+/// remembers, take an advisory lock on the prefix and refuse up front.
+/// The lock file is never removed; only the `flock` matters, and it is
+/// released with the fd (including on a crash or a kill).
+struct PrefixLock {
+    _file: std::fs::File,
+}
+
+impl PrefixLock {
+    fn acquire(prefix: &str) -> Result<PrefixLock> {
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!(".{prefix}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening the harness lock file {}", path.display()))?;
+        // SAFETY: a plain `flock(2)` on a file descriptor we own.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!(
+                    "another harness run is already using the docker prefix `{prefix}` \
+                     (lock: {}). Harness runs share their containers, network and bucket, \
+                     so a second run would tear the first one's environment down. Wait for \
+                     it to finish, or give this run its own environment with \
+                     CONSTELLATION_HARNESS_DOCKER_PREFIX=<other-name>.",
+                    path.display()
+                );
+            }
+            return Err(
+                anyhow::Error::new(err).context(format!("locking the harness prefix {prefix}"))
+            );
+        }
+        Ok(PrefixLock { _file: file })
+    }
+}
+
 pub struct S3Env {
-    // Drop order matters: proxy state -> containers -> network.
+    // Drop order matters: proxy state -> containers -> network -> lock.
     pub toxiproxy: Toxiproxy,
     /// Container name of the S3 emulator, as toxiproxy resolves it on the
     /// private network.
@@ -38,6 +85,7 @@ pub struct S3Env {
     _toxi: Container,
     _floci: Container,
     _net: Network,
+    _lock: PrefixLock,
     /// S3 endpoint (through the proxy) for constellation clients.
     pub endpoint: String,
     /// S3 endpoint bypassing the proxy (for harness-side checks).
@@ -48,6 +96,7 @@ pub struct S3Env {
 impl S3Env {
     pub fn start() -> Result<S3Env> {
         let prefix = docker_prefix();
+        let lock = PrefixLock::acquire(&prefix)?;
         let floci_name = format!("{prefix}-floci");
         let toxi_name = format!("{prefix}-toxiproxy");
         // Leftovers from a crashed run would hold the network open.
@@ -94,6 +143,7 @@ impl S3Env {
             _toxi: toxi,
             _floci: floci,
             _net: net,
+            _lock: lock,
             endpoint: format!("http://127.0.0.1:{s3_via_proxy}"),
             direct_endpoint,
         })

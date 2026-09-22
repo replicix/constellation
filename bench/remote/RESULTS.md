@@ -17,26 +17,30 @@ first. This is a partial result, not the full spec matrix.
 
 ## Row 1 — create empty files (8 threads)
 
-| nodes | shared dir | disjoint dirs |
-|---|---|---|
-| 1 | 2400 ok, 0 err, **142 ops/s**, p99 74ms | 2400 ok, 0 err, **665 ops/s**, p99 22ms |
-| 4 | 2400 ok, 0 err, **216 ops/s**, p99 90ms | 1200 ok (see anomaly #1), 0 err, 7020 ops/s, p99 0.9ms |
+
+| nodes | shared dir                              | disjoint dirs                                          |
+| ----- | --------------------------------------- | ------------------------------------------------------ |
+| 1     | 2400 ok, 0 err, **142 ops/s**, p99 74ms | 2400 ok, 0 err, **665 ops/s**, p99 22ms                |
+| 4     | 2400 ok, 0 err, **216 ops/s**, p99 90ms | 1200 ok (see anomaly #1), 0 err, 7020 ops/s, p99 0.9ms |
+
 
 Shared-directory contention costs ~3-4x throughput vs disjoint at both
 scales, as expected (single-parent-inode metadata serialization).
 
 ## Row 2 — small file write (create + 4KiB write + close, 8 threads)
 
-| nodes | dir | write-mode | ops/s | p99 (ms) | errors |
-|---|---|---|---|---|---|
-| 1 | shared | through | 20.4 | 596 | 4 (see anomaly #2) |
-| 1 | disjoint | through | 270 | 65 | 0 |
-| 4 | shared | through | 45.2 | 2584 | 19 |
-| 4 | disjoint | through | 478 | 61 | 24 |
-| 1 | shared | back | 5714 | 2.4 | 1 |
-| 1 | disjoint | back | 5835 | 2.2 | 0 |
-| 4 | shared | back | 5204 | 2.8 | 24 |
-| 4 | disjoint | back | 5181 | 2.2 | 24 |
+
+| nodes | dir      | write-mode | ops/s | p99 (ms) | errors             |
+| ----- | -------- | ---------- | ----- | -------- | ------------------ |
+| 1     | shared   | through    | 20.4  | 596      | 4 (see anomaly #2) |
+| 1     | disjoint | through    | 270   | 65       | 0                  |
+| 4     | shared   | through    | 45.2  | 2584     | 19                 |
+| 4     | disjoint | through    | 478   | 61       | 24                 |
+| 1     | shared   | back       | 5714  | 2.4      | 1                  |
+| 1     | disjoint | back       | 5835  | 2.2      | 0                  |
+| 4     | shared   | back       | 5204  | 2.8      | 24                 |
+| 4     | disjoint | back       | 5181  | 2.2      | 24                 |
+
 
 `back` (durable-local-queue, async ship) is **~20-100x faster** than
 `through` (waits for S3 per chunk close), as expected. All non-zero
@@ -52,12 +56,14 @@ close for the write side; read side reads a *different* node's file
 (rotated: a reads b's, b reads c's, etc.) after `status`-confirmed
 quiesce, so it's a genuine cold cross-node/S3 read, not cache-warm.
 
-| nodes | write-mode | write MB/s (per node) | read MB/s (per node, cross-node cold) |
-|---|---|---|---|
-| 1 | through | 551.0 | 84.6 |
-| 1 | back | 522.7 | 83.9 |
-| 4 | through | 0 (node a, **EIO** — anomaly #2), 515-545 (b/c/d) | 56.8-83.7 (all 4 ok) |
-| 4 | back | 0, 0, 0, 0 (**EIO on all 4**, anomaly #2) | 16.6-65.3 (all 4 ok, read the earlier through-mode files) |
+
+| nodes | write-mode | write MB/s (per node)                             | read MB/s (per node, cross-node cold)                     |
+| ----- | ---------- | ------------------------------------------------- | --------------------------------------------------------- |
+| 1     | through    | 551.0                                             | 84.6                                                      |
+| 1     | back       | 522.7                                             | 83.9                                                      |
+| 4     | through    | 0 (node a, **EIO** — anomaly #2), 515-545 (b/c/d) | 56.8-83.7 (all 4 ok)                                      |
+| 4     | back       | 0, 0, 0, 0 (**EIO on all 4**, anomaly #2)         | 16.6-65.3 (all 4 ok, read the earlier through-mode files) |
+
 
 Write throughput (500+ MB/s) is well above read (~60-85 MB/s); the local
 write path is clearly buffering/pipelining ahead of S3 durability even
@@ -70,11 +76,13 @@ the system).
 
 210 fsync'd marker-file writes at 20/s, 3 pollers, 630 total samples:
 
-| poller | p50 | p90 | p99 | max |
-|---|---|---|---|---|
-| b | 16.2s | 20.3s | 21.2s | 21.3s |
-| c | 16.2s | 20.3s | 21.3s | 21.4s |
-| d | 15.7s | 20.0s | 21.2s | 21.3s |
+
+| poller | p50   | p90   | p99   | max   |
+| ------ | ----- | ----- | ----- | ----- |
+| b      | 16.2s | 20.3s | 21.2s | 21.3s |
+| c      | 16.2s | 20.3s | 21.3s | 21.4s |
+| d      | 15.7s | 20.0s | 21.2s | 21.3s |
+
 
 0 timeouts (30s poll budget) — everything eventually became visible, but
 **16-21 seconds is drastically higher than the ~1s** cross-node
@@ -88,23 +96,29 @@ anomaly, not fixed** (out of scope per the task).
 
 ## Anomalies / suspected bugs (evidence attached)
 
+
+
 ### 1. Concurrent first-`mkdir` of a brand-new shared directory: ENOENT for the losers
 
 Reproducible: 4 nodes x 8 threads, each thread's very first op is
 `os.makedirs(never-before-seen-dir/tN, exist_ok=True)` then a file
 create inside it, all starting at the same wall-clock barrier. Only 1
-of 4 nodes succeeds; the other 3 raise **`ENOENT` (errno 2)** on the
+of 4 nodes succeeds; the other 3 raise `ENOENT` **(errno 2)** on the
 directory path itself, e.g.:
+
 ```
 No such file or directory: '.../create-disjoint-race-repro-.../t4'
 ```
+
 Repro script + full per-node error dump:
 `bench/remote/results/run1_debug2/race_repro.json`. Correlated daemon
 log line (node a, `bench-plain` log, same window):
+
 ```
 metadata publish deferred: the winning commit overlaps this batch
   reason="conflict: commit 11 reflects log this replica has not applied (p0:18 against p0:15)"
 ```
+
 (`bench/remote/results/anomaly_mkdir_race/log-a-bench-plain.txt`). This
 reads as an optimistic-concurrency conflict on the metadata commit that
 is surfaced to the FUSE caller as a hard `ENOENT` instead of being
@@ -122,12 +136,14 @@ that happens, subsequent unrelated creates in the same directory start
 failing with a clearly-spurious **ENOSPC (errno 28)** — spurious because
 `df` showed 90GB free and `constellation status`'s quota was
 `max_bytes: null, used_bytes: ~29MB`. Daemon log (node a):
+
 ```
 ERROR constellation: pending upload chunks missing from local cache (unrecoverable content);
       leaving the pending rows and refusing to ship missing_pending_chunks=1 sample_hash=Some(ChunkHash(92e84bac2417))
 WARN  constellation::fusefs: write-through upload failed error=pending upload chunk 92e84bac2417... missing from local cache ino=3298534921217
 WARN  constellation::node_runtime: metadata sync failed; will retry error=pending upload chunk 92e84bac2417... missing from local cache
 ```
+
 Full tail: `bench/remote/results/anomaly_write_through_missing_chunk/log-a-full-tail.txt`.
 Row 5's 4-node write EIO: `bench/remote/results/run1/row5_seqwrite_bench-plain_through_n4_t1.json`
 (node a: 200/200 write ops failed with errno 5) and
@@ -154,8 +170,7 @@ Phase B's driver should either fix this aggregation gap or treat any
 
 ## P2P / forwarding (from the 2-node smoke test, `smoke.py`)
 
-Confirmed via `constellation status`: peer-to-peer path is `"path":
-"direct"` (not relay) with sub-ms `rtt_ms`; the non-lease-holder node's
+Confirmed via `constellation status`: peer-to-peer path is `"path": "direct"` (not relay) with sub-ms `rtt_ms`; the non-lease-holder node's
 write showed `forwarded_ok: 2, forwarded_err: 0` after writing while the
 other node held the lease — forwarding of non-holder mutations to the
 lease holder works as designed, and cross-node visibility was ~1s on an
@@ -169,3 +184,53 @@ S3 prefix `constellation-verify-20260922T154127Z-bench` (and the throw-
 away smoke prefix `constellation-verify-20260922T153644Z`) were **left
 in place** per instructions (Phase B may still need the hosts; prefix
 deletion deferred, not performed).
+
+## After plan 29 M6
+
+M6 root-caused and fixed 2 of the 5 problems raised by this run; the
+other 3 got a negative/narrowing result (see `PROGRESS.md`'s "Plan 29
+M6" section for the full evidence trail). Summary, no full EC2 rerun of
+this Phase A matrix was done (time budget; most rows received no
+product change to re-measure):
+
+- **Anomaly #1 (mkdir-race ENOENT)** — root-caused: plan 29 M5's
+holder-side `tokio::spawn`-per-forward let a child's forwarded create
+execute before its own brand-new parent's forwarded create, since
+nothing orders two *different* nodes' forwards against each other.
+Fixed with a bounded retry (`crates/cli/src/node_runtime.rs`,
+`crates/cli/src/forward.rs`) on a transient `ENOENT` for create-family
+ops. Verified with 3 dedicated in-process tests and a manually
+reproduced 4-replica local `file://` mount (32 concurrent
+`os.makedirs` into a brand-new shared directory, 0 errors after the
+fix, across 3 repeats) — **not** re-run against real S3 on the EC2
+fleet this session (see PROGRESS.md's Leftovers).
+- **Anomaly #2 (missing-chunk EIO/ENOSPC)** — the local harness
+scenario `writeback-backpressure`'s intermittent failure ("ENOSPC
+arrived without observable throttling", ~2/5 runs) was root-caused
+(a missing grace-sleep on the `DiskCache` dirty-budget's hard-limit
+path, `crates/cli/src/fusefs_ops.rs::do_write`) and fixed — 10/10 and
+then a further 5/5 clean runs after the fix, versus ~3/5 before. The
+real-S3 "pending upload chunk ... missing from local cache" trigger
+itself (this run's actual anomaly #2) was investigated at length but
+not found; every insertion-then-eviction ordering this session could
+think of was checked and is correct. A separate, real resilience bug
+found while chasing it (one permanently-missing chunk anywhere on a
+node blocks *every* inode's manifest from publishing, forever) is
+pinned by a test but not fixed — see PROGRESS.md.
+- **Row 1's shared-vs-disjoint create disparity** — ruled out a Constellation-internal per-directory lock via two local micro-benchmarks (metadata-engine-only and full-FUSE-with-near-zero- latency-backend, both ratio ~1.0). The disparity only appears under real S3 latency, which this session could not cheaply reproduce locally; leading hypothesis (unavoidable kernel per-directory VFS exclusivity amplifying an occasional S3-latency-bound stall) is documented but not confirmed or fixed.
+- **Row 6's cross-node visibility latency** — the push/wake
+architecture (gossip `SegmentPublished` -> immediate `SyncRequest`
+wake, racing the idle-poll sleep) was read end-to-end and appears
+correct; the 16-21s delay was not reproduced or root-caused this
+session. Not fixed.
+- **Row 5's cold-read throughput** — no gap: `crates/cli/src/prefetch.rs`
+already implements adaptive parallel readahead (AIMD concurrency
+ramp, growing window up to 2 GiB). The observed 56-85 MB/s is
+consistent with a 200 MiB read finishing before the ramp reaches
+steady state, not an absence of parallelism.
+
+Gates run this session (local only): `cargo fmt`/`clippy -D warnings`/
+`cargo test --workspace` all clean; `cargo build --release --workspace`;
+`target/release/harness run writeback-backpressure` 15/15 clean runs
+across two verification passes after the fix; the other 9 required
+scenarios (`baseline kill9-remount two-clients-shared lease-handover chaos-ci create-storm-s3-only e2e-two-nodes idle-cluster-is-quiet fresh-node-bootstrap`) all PASSED; `bash tests/smoke.sh` PASSED.
