@@ -107,6 +107,25 @@ work; larger packs mean slower cold directory fetches when a pack spans
 unrelated key ranges. The 4 MiB default sits in the measured sweet spot
 from plan 28 §P8 / §14.
 
+### Node-local metadata engine (plan 29)
+
+The node-local replica is an `fjall` 3 database (a directory,
+`meta.fjall`/`meta.db`), replacing the SQLite engine. One knob:
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_META_CACHE_BYTES` | `268435456` (256 MiB) | bytes | fjall block cache size (`Database::builder(..).cache_size(..)`); the plan 29 benchmarked configuration at 5M entries |
+
+`worker_threads` (fjall's compaction/flush pool) is not an env knob: it
+is derived as `min(available_parallelism, 16).max(4)` at open, since
+fjall's own default (`min(cores, 4)`) falls behind on compaction under
+sustained write churn (plan 29 `RESULTS.md` "fjall 3 tuning"). The `ns`
+and `scratch` keyspaces (the §P6-encoded namespace) additionally set
+`expect_point_read_hits`, a non-zero data-block hash-ratio, and pin
+L0–L2 filter/index blocks resident — not configurable, since they were
+chosen from the aged benchmark rather than as a workload-dependent
+trade-off.
+
 #### Idle poll backoff
 
 The sync task polls on a deadline that starts at

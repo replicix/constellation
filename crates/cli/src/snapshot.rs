@@ -19,7 +19,7 @@ use crate::mtree_read::{Resolver, TreeReader};
 use anyhow::{bail, Context, Result};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::{ChunkHash, Ino, InodeKind};
-use constellation_meta::{CloneSpec, MetaStore, SnapshotRow, SqliteMeta};
+use constellation_meta::{CloneSpec, Meta, MetaStore, SnapshotRow};
 use constellation_mtree::NodeHash;
 use constellation_store_s3::{
     BlobStore, NodeCache, SnapshotRecord, SnapshotStore, SnapshotTreeRoot, StoreError,
@@ -169,7 +169,7 @@ pub struct FrozenDir {
 
 #[derive(Clone)]
 pub struct SnapshotManager {
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
     records: SnapshotStore,
     chunk_size: u32,
@@ -180,7 +180,7 @@ pub struct SnapshotManager {
 
 impl SnapshotManager {
     pub fn new(
-        meta: Arc<SqliteMeta>,
+        meta: Arc<Meta>,
         chunks: Arc<constellation_store_s3::ChunkStore>,
         chunk_size: u32,
         creator: u64,
@@ -583,7 +583,7 @@ fn validate_name(name: &str) -> Result<()> {
 /// caller's runtime flavour and outlives the caller's.
 #[cfg(test)]
 pub(crate) fn test_manager(
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
     chunk_size: u32,
 ) -> (SnapshotManager, tempfile::TempDir) {
@@ -681,7 +681,7 @@ mod tests {
     /// xattrs and manifests, and GC's view of its chunks is the frozen one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_tree_snapshot_is_frozen_against_source_and_clone_writes() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let source = meta.mkdir(1, "source", 0o755, 1, 1).unwrap();
         meta.set_xattr(
             source.ino,

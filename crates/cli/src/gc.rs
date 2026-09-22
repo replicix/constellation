@@ -10,14 +10,14 @@
 use anyhow::Result;
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::ChunkHash;
-use constellation_meta::SqliteMeta;
+use constellation_meta::Meta;
 use constellation_store_s3::{
     append_journal, publish_condemned, read_condemned, GcJournalEntry, LeaseMode, SnapshotStore,
 };
 use futures::TryStreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ impl GcConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mark {
     pub key: String,
     pub rule: String,
@@ -61,7 +61,7 @@ pub struct Mark {
     hash: Option<ChunkHash>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcReport {
     pub verify_only: bool,
     pub candidates: Vec<Mark>,
@@ -76,7 +76,7 @@ pub struct GcReport {
 pub async fn run(
     object_store: Arc<dyn ObjectStore>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     lease_mode: LeaseMode,
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
@@ -92,7 +92,7 @@ pub async fn run(
 async fn run_held(
     store: Arc<dyn ObjectStore>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     config: &GcConfig,
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
@@ -125,7 +125,7 @@ async fn run_held(
 async fn run_chunks(
     store: Arc<dyn ObjectStore>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     config: &GcConfig,
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
@@ -226,7 +226,7 @@ async fn run_chunks(
 
 async fn live_roots(
     chunks: &constellation_store_s3::ChunkStore,
-    meta: &SqliteMeta,
+    meta: &Meta,
 ) -> Result<HashSet<ChunkHash>> {
     let mut roots = HashSet::new();
     for bytes in meta.live_manifests()? {

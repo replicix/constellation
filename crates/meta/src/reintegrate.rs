@@ -9,7 +9,7 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::sqlite::SqliteMeta;
+use crate::store::Meta;
 use crate::MetaStore;
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::{Ino, InodeKind};
@@ -45,7 +45,7 @@ impl Disposition {
 /// Classify one stranded record against `view` (the cluster replica,
 /// typically a side copy bootstrapped from S3, or the live replica
 /// after the winning side's records have been applied).
-pub fn classify(view: &SqliteMeta, rec: &LogRecord) -> Result<Disposition, MetaError> {
+pub fn classify(view: &Meta, rec: &LogRecord) -> Result<Disposition, MetaError> {
     match rec {
         LogRecord::Mkdir {
             parent, name, ino, ..
@@ -134,7 +134,7 @@ pub fn classify(view: &SqliteMeta, rec: &LogRecord) -> Result<Disposition, MetaE
 }
 
 fn classify_create(
-    view: &SqliteMeta,
+    view: &Meta,
     parent: Ino,
     name: &str,
     ino: Ino,
@@ -161,7 +161,7 @@ pub fn conflict_dentry_name(name: &str, node_id: u64, ts_unix: i64) -> String {
 /// The conflict dir is ordinary namespace content. Returns the relative
 /// path created (`<dir>/<name>@<node>-<ts>`).
 pub fn materialize(
-    live: &SqliteMeta,
+    live: &Meta,
     rec: &LogRecord,
     node_id: u64,
     ts_unix: i64,
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn create_create_same_name_is_conflict() {
-        let shared = SqliteMeta::open_in_memory().unwrap();
+        let shared = Meta::open_in_memory().unwrap();
         let winner = shared.create(ROOT_INO, "foo", 0o644, 0, 0).unwrap();
         let stranded = rec_create(ROOT_INO, "foo", winner.ino + 99);
         match classify(&shared, &stranded).unwrap() {
@@ -274,14 +274,14 @@ mod tests {
 
     #[test]
     fn create_into_free_name_is_clean() {
-        let shared = SqliteMeta::open_in_memory().unwrap();
+        let shared = Meta::open_in_memory().unwrap();
         let stranded = rec_create(ROOT_INO, "only-ours", 42);
         assert_eq!(classify(&shared, &stranded).unwrap(), Disposition::Clean);
     }
 
     #[test]
     fn parent_deleted_is_conflict() {
-        let shared = SqliteMeta::open_in_memory().unwrap();
+        let shared = Meta::open_in_memory().unwrap();
         let stranded = rec_create(999, "x", 42);
         match classify(&shared, &stranded).unwrap() {
             Disposition::Conflict { reason } => assert!(reason.contains("parent")),
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn edit_vs_edit_is_conflict() {
-        let shared = SqliteMeta::open_in_memory().unwrap();
+        let shared = Meta::open_in_memory().unwrap();
         let f = shared.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         shared.set_manifest(f.ino, b"winner", 6).unwrap();
         let stranded = rec_manifest(f.ino, b"loser-version");
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn edit_with_unchanged_baseline_is_clean() {
-        let shared = SqliteMeta::open_in_memory().unwrap();
+        let shared = Meta::open_in_memory().unwrap();
         let f = shared.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         shared.set_manifest(f.ino, b"baseline", 8).unwrap();
         let stranded = LogRecord::WriteManifest {
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn edit_vs_delete_is_conflict() {
-        let shared = SqliteMeta::open_in_memory().unwrap();
+        let shared = Meta::open_in_memory().unwrap();
         let stranded = rec_manifest(42, b"orphaned");
         match classify(&shared, &stranded).unwrap() {
             Disposition::Conflict { reason } => assert!(reason.contains("edit-vs-delete")),
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn materialize_layout_under_conflict_dir() {
-        let live = SqliteMeta::open_in_memory().unwrap();
+        let live = Meta::open_in_memory().unwrap();
         let stranded = rec_create(ROOT_INO, "foo", 99);
         let path = materialize(&live, &stranded, 7, 1_700_000_000).unwrap();
         assert_eq!(path, ".constellation-conflict/foo@7-1700000000");
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn materialize_manifest_keeps_stranded_bytes() {
-        let live = SqliteMeta::open_in_memory().unwrap();
+        let live = Meta::open_in_memory().unwrap();
         let f = live.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         live.set_manifest(f.ino, b"stranded", 8).unwrap();
         let rec = rec_manifest(f.ino, b"stranded");

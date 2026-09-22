@@ -245,18 +245,38 @@ fn sample_file_counts(
     })
 }
 
-fn db_stats(db: &Path) -> Result<(u64, u64, u64, u64)> {
-    let mut bytes = std::fs::metadata(db).map(|m| m.len()).unwrap_or(0);
-    let wal = db.with_extension("db-wal");
-    bytes += std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0);
-    let shm = db.with_extension("db-shm");
-    bytes += std::fs::metadata(shm).map(|m| m.len()).unwrap_or(0);
+/// Sums the on-disk size of the replica metadata store, walking it
+/// recursively so this works whether `db` is a single file (the legacy
+/// SQLite store) or a directory (the `fjall`-backed `constellation-meta`
+/// store, which is a keyspace directory rather than a single file).
+fn dir_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .map(|entry| dir_size(&entry.path()))
+            .sum()
+    } else {
+        meta.len()
+    }
+}
 
-    let conn = rusqlite::Connection::open(db)?;
-    let inode_rows: u64 = conn.query_row("SELECT COUNT(*) FROM inode", [], |r| r.get(0))?;
-    let dentry_rows: u64 = conn.query_row("SELECT COUNT(*) FROM dentry", [], |r| r.get(0))?;
-    let journal_rows: u64 = conn.query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))?;
-    Ok((bytes, inode_rows, dentry_rows, journal_rows))
+/// Returns `(on_disk_bytes, inode_rows, dentry_rows, journal_rows)` for the
+/// replica metadata store.
+///
+/// The row counts are always `0`: `fjall` enforces single-process access via
+/// a lock file, so this harness process cannot open the store while the node
+/// daemon still holds it (and once the daemon exits, the on-disk layout is
+/// `fjall`'s internal keyspace format, not something worth hand-decoding
+/// here). Exact row counts were never load-bearing for this benchmark --
+/// only the on-disk byte count is reported.
+fn db_stats(db: &Path) -> Result<(u64, u64, u64, u64)> {
+    Ok((dir_size(db), 0, 0, 0))
 }
 
 fn apply_s3_shape(proxy: &crate::toxiproxy::Proxy<'_>, cfg: &BenchConfig) -> Result<()> {

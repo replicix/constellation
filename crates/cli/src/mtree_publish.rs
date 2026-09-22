@@ -74,9 +74,10 @@
 //!
 //! ## Not stalling FUSE
 //!
-//! Every read this module makes goes through `SqliteMeta`'s per-thread
-//! read-only WAL connection, so a publish never takes the write mutex
-//! that FUSE writers contend on, and the tree build itself runs on a
+//! Every read this module makes goes through a lock-free `fjall`
+//! snapshot (`Meta::read_consistent`), so a publish never takes the
+//! single-writer transaction FUSE writers contend on, and the tree
+//! build itself runs on a
 //! blocking thread rather than a runtime worker. Replacing a
 //! `VACUUM INTO` stall with a tree-build stall would be a regression
 //! dressed as a win, so this is measured rather than asserted; the
@@ -84,7 +85,7 @@
 
 use anyhow::{Context, Result};
 use constellation_fs_core::{FileAttr, Ino};
-use constellation_meta::{LogRecord, SqliteMeta, TreeInode};
+use constellation_meta::{LogRecord, Meta, TreeInode};
 use constellation_mtree::{
     keys, record, Attrs, DentryRecord, Edit, Kind, NodeHash, NodeStore, Tree, VALUE_SPILL,
 };
@@ -117,7 +118,7 @@ const KV_SEQ: &str = "mtree/commit_seq";
 const KV_VECTOR: &str = "mtree/applied_vector";
 
 /// The commit this replica last published or was loaded from, if any.
-pub fn remembered_seq(meta: &SqliteMeta) -> Result<Option<u64>> {
+pub fn remembered_seq(meta: &Meta) -> Result<Option<u64>> {
     Ok(meta.kv_get(KV_SEQ)?.and_then(|seq| seq.parse().ok()))
 }
 
@@ -126,7 +127,7 @@ pub fn remembered_seq(meta: &SqliteMeta) -> Result<Option<u64>> {
 /// instead of rebuilding. `restore` still trusts it only if the replica
 /// has applied exactly `commit.applied` — a bootstrap that tailed past
 /// the commit leaves the vectors unequal and the first publish rebuilds.
-pub fn remember_loaded_commit(meta: &SqliteMeta, commit: &Commit) -> Result<()> {
+pub fn remember_loaded_commit(meta: &Meta, commit: &Commit) -> Result<()> {
     let Some(root) = commit.root(SHARD0) else {
         return Ok(());
     };
@@ -333,7 +334,7 @@ impl Plan {
 /// Owned by `shipper::Shipper` and driven by its publish cadence (plan 29
 /// M0b), which replaced the whole-DB checkpoint cadence this used to piggy-back on.
 pub struct TreePublisher {
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     cache: Arc<NodeCache>,
     blobs: BlobStore,
     chain: CommitChain,
@@ -384,7 +385,7 @@ enum Planned {
 
 impl TreePublisher {
     pub fn new(
-        meta: Arc<SqliteMeta>,
+        meta: Arc<Meta>,
         cache: Arc<NodeCache>,
         blobs: BlobStore,
         chain: CommitChain,
@@ -590,11 +591,11 @@ impl TreePublisher {
         let config = self.config;
         let blobs = self.blobs.clone();
         let batch = batch.clone();
-        // The tree build reads SQLite and decompresses nodes. Tens of
+        // The tree build reads fjall and decompresses nodes. Tens of
         // milliseconds on a large batch, so it does not belong on a
         // runtime worker any more than `VACUUM INTO` did.
         //
-        // The vector and every read the plan makes share one SQLite
+        // The vector and every read the plan makes share one fjall
         // snapshot (`read_consistent`), so the commit's `applied` claim
         // is exactly what the tree was built from.
         let planned = tokio::task::spawn_blocking(move || -> Result<Planned> {
@@ -604,19 +605,19 @@ impl TreePublisher {
                 tree: &tree,
                 blobs: &blobs,
             };
-            meta.read_consistent(|| -> Result<Planned> {
-                let vector = meta.applied_seq_reader()?;
+            meta.read_consistent(|snap| -> Result<Planned> {
+                let vector = meta.applied_seq_at(snap)?;
                 if let Some(head) = head_applied.filter(|head| !vector_covers(vector, *head)) {
                     return Ok(Planned::Behind { mine: vector, head });
                 }
                 let (plan, root) = match base {
                     Some(base) if !batch.needs_rebuild() => {
-                        let plan = builder.plan(Some(&base), &batch)?;
+                        let plan = builder.plan(snap, Some(&base), &batch)?;
                         let edits = plan.edits();
                         let root = tree.apply(&base, &edits).map_err(StoreError::from)?;
                         (plan, root)
                     }
-                    _ => builder.rebuild()?,
+                    _ => builder.rebuild(snap)?,
                 };
                 Ok(Planned::Ready(plan, root, vector))
             })
@@ -901,12 +902,12 @@ fn encode_vector(applied: Vector) -> String {
 /// agreement bug between them cannot hide here. Nothing is uploaded:
 /// spilled values are hashed, never stored.
 pub fn rebuild_root<S: NodeStore>(
-    meta: &SqliteMeta,
+    meta: &Meta,
     tree: &Tree<S>,
     blobs: &BlobStore,
 ) -> Result<NodeHash> {
     let builder = Builder { meta, tree, blobs };
-    meta.read_consistent(|| Ok(builder.rebuild()?.1))
+    meta.read_consistent(|snap| Ok(builder.rebuild(snap)?.1))
 }
 
 // ----------------------------------------------------------- the builder
@@ -920,7 +921,7 @@ type Entry = (Vec<u8>, Vec<u8>);
 /// path and the rebuild; the only difference between them is whether
 /// there is an old tree to diff against.
 struct Builder<'a, S> {
-    meta: &'a SqliteMeta,
+    meta: &'a Meta,
     tree: &'a Tree<S>,
     blobs: &'a BlobStore,
 }
@@ -936,24 +937,24 @@ impl<S: NodeStore> Builder<'_, S> {
     /// rather than a single streaming build; rebuilds are rare by
     /// construction, and an agreement bug here would be silent and
     /// permanent.
-    fn rebuild(&self) -> Result<(Plan, NodeHash)> {
+    fn rebuild(&self, snap: &fjall::Snapshot) -> Result<(Plan, NodeHash)> {
         let mut root = self.tree.empty().map_err(StoreError::from)?;
         let mut total = Plan::default();
         let mut after: Ino = 0;
         loop {
-            let page = self.meta.scan_inos(after, REBUILD_PAGE)?;
+            let page = self.meta.scan_inos_at(snap, after, REBUILD_PAGE)?;
             let Some(last) = page.last().copied() else {
                 break;
             };
             after = last;
-            let plan = self.plan(None, &Touched::from_inodes(page))?;
+            let plan = self.plan(snap, None, &Touched::from_inodes(page))?;
             self.absorb_page(&mut root, &mut total, plan)?;
         }
         let subsystems = Touched {
             subsystems: true,
             ..Touched::default()
         };
-        let plan = self.plan(None, &subsystems)?;
+        let plan = self.plan(snap, None, &subsystems)?;
         self.absorb_page(&mut root, &mut total, plan)?;
         // The rebuild depends on nothing in any previous tree, so its
         // read set is empty: a concurrent winner can change any key at
@@ -977,7 +978,12 @@ impl<S: NodeStore> Builder<'_, S> {
 
     /// The incremental plan: what has to change in the tree so that it
     /// agrees with the replica about `batch`'s entities.
-    fn plan(&self, base: Option<&NodeHash>, batch: &Touched) -> Result<Plan> {
+    fn plan(
+        &self,
+        snap: &fjall::Snapshot,
+        base: Option<&NodeHash>,
+        batch: &Touched,
+    ) -> Result<Plan> {
         let mut plan = Plan::default();
         let mut inodes: BTreeSet<Ino> = batch.inodes.clone();
         // Dentries whose `0x02` value has to be rewritten, either
@@ -994,36 +1000,36 @@ impl<S: NodeStore> Builder<'_, S> {
                 inodes.insert(DentryRecord::decode(&old)?.ino);
             }
             plan.reads.key(key);
-            if let Some(ino) = self.meta.child_ino_reader(*parent, name)? {
+            if let Some(ino) = self.meta.child_ino_at(snap, *parent, name)? {
                 inodes.insert(ino);
             }
         }
 
         let mut rows: BTreeMap<Ino, Option<TreeInode>> = BTreeMap::new();
         for ino in &inodes {
-            let row = self.meta.tree_inode(*ino)?;
-            let links = self.meta.links_of(*ino)?;
+            let row = self.meta.tree_inode_at(snap, *ino)?;
+            let links = self.meta.links_of_at(snap, *ino)?;
             // Every name pointing at this inode carries a copy of its
             // attrs (§P6's `0x02` value, S1's verdict), so an attribute
             // change fans out to each of them. Hard links are rare, so
             // this is one extra key in the common case.
             names.extend(links.iter().cloned());
             let present = row.as_ref().is_some_and(|row| row.attr.nlink > 0);
-            self.plan_inode(base, &mut plan, *ino, row.as_ref(), &links, present)?;
+            self.plan_inode(snap, base, &mut plan, *ino, row.as_ref(), &links, present)?;
             rows.insert(*ino, row);
         }
 
         for (parent, name) in &names {
             let key = keys::dentry(*parent, name.as_bytes());
             plan.reads.key(key.clone());
-            let ino = self.meta.child_ino_reader(*parent, name)?;
+            let ino = self.meta.child_ino_at(snap, *parent, name)?;
             let attrs = match ino {
                 Some(ino) => match rows.entry(ino) {
                     std::collections::btree_map::Entry::Occupied(row) => {
                         row.get().as_ref().map(|row| attrs_of(&row.attr))
                     }
                     std::collections::btree_map::Entry::Vacant(slot) => {
-                        let row = self.meta.tree_inode(ino)?;
+                        let row = self.meta.tree_inode_at(snap, ino)?;
                         let attrs = row.as_ref().map(|row| attrs_of(&row.attr));
                         slot.insert(row);
                         attrs
@@ -1040,7 +1046,7 @@ impl<S: NodeStore> Builder<'_, S> {
         }
 
         if batch.subsystems {
-            self.plan_subsystems(base, &mut plan)?;
+            self.plan_subsystems(snap, base, &mut plan)?;
         }
         plan.entities = inodes.len() + names.len() + usize::from(batch.subsystems);
         Ok(plan)
@@ -1048,8 +1054,13 @@ impl<S: NodeStore> Builder<'_, S> {
 
     /// The `0x30` records (B) publishes, re-derived whole: they are a
     /// handful per filesystem.
-    fn plan_subsystems(&self, base: Option<&NodeHash>, plan: &mut Plan) -> Result<()> {
-        let wanted = crate::mtree_read::subsystem_state(self.meta)?;
+    fn plan_subsystems(
+        &self,
+        snap: &fjall::Snapshot,
+        base: Option<&NodeHash>,
+        plan: &mut Plan,
+    ) -> Result<()> {
+        let wanted = crate::mtree_read::subsystem_state(self.meta, snap)?;
         for subsystem in crate::mtree_read::PUBLISHED_SUBSYSTEMS {
             let range = keys::records_of(subsystem);
             plan.reads.prefix(range.prefix().to_vec());
@@ -1066,8 +1077,10 @@ impl<S: NodeStore> Builder<'_, S> {
     }
 
     /// One inode's `0x01`, `0x03` and `0x04` keys.
+    #[allow(clippy::too_many_arguments)]
     fn plan_inode(
         &self,
+        _snap: &fjall::Snapshot,
         base: Option<&NodeHash>,
         plan: &mut Plan,
         ino: Ino,
@@ -1228,7 +1241,7 @@ mod tests {
     /// what §P3 splices, rather than two unrelated filesystems.
     struct Fixture {
         store: Arc<dyn ObjectStore>,
-        meta: Arc<SqliteMeta>,
+        meta: Arc<Meta>,
         dirs: Vec<TempDir>,
     }
 
@@ -1236,7 +1249,7 @@ mod tests {
         fn new() -> Fixture {
             Fixture {
                 store: Arc::new(InMemory::new()),
-                meta: Arc::new(SqliteMeta::open_in_memory().unwrap()),
+                meta: Arc::new(Meta::open_in_memory().unwrap()),
                 dirs: Vec::new(),
             }
         }
@@ -1310,7 +1323,7 @@ mod tests {
         publisher.publish(7).await.unwrap()
     }
 
-    fn seed(meta: &SqliteMeta, files: u64) -> Ino {
+    fn seed(meta: &Meta, files: u64) -> Ino {
         let dir = meta.mkdir(ROOT_INO, "d", 0o755, 1000, 1000).unwrap().ino;
         for i in 0..files {
             meta.create(dir, &format!("f{i}"), 0o644, 1000, 1000)
@@ -1662,8 +1675,8 @@ mod tests {
     /// loser's publish result.
     async fn race(
         fx: &mut Fixture,
-        a: impl FnOnce(&SqliteMeta),
-        b: impl FnOnce(&SqliteMeta),
+        a: impl FnOnce(&Meta),
+        b: impl FnOnce(&Meta),
     ) -> (Option<Commit>, Commit, TreePublisher) {
         let mut winner = fx.publisher(1);
         publish(&mut winner, &fx.records()).await.unwrap();
@@ -1965,7 +1978,7 @@ mod tests {
     async fn getattr_latency_during_a_publish() {
         let dir = TempDir::new().unwrap();
         let mut fx = Fixture::new();
-        fx.meta = Arc::new(SqliteMeta::open(dir.path().join("m.db")).unwrap());
+        fx.meta = Arc::new(Meta::open(dir.path().join("m.db")).unwrap());
         let files: u64 = std::env::var("GETATTR_BENCH_FILES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1983,21 +1996,20 @@ mod tests {
         }
         fx.records();
 
-        let sample =
-            |meta: Arc<SqliteMeta>, inos: Vec<u64>, stop: Arc<std::sync::atomic::AtomicBool>| {
-                std::thread::spawn(move || {
-                    let mut samples = Vec::new();
-                    let mut i = 0usize;
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        let t = std::time::Instant::now();
-                        meta.getattr(inos[(i * 7919) % inos.len()]).unwrap();
-                        samples.push(t.elapsed());
-                        i += 1;
-                    }
-                    samples.sort();
-                    samples
-                })
-            };
+        let sample = |meta: Arc<Meta>, inos: Vec<u64>, stop: Arc<std::sync::atomic::AtomicBool>| {
+            std::thread::spawn(move || {
+                let mut samples = Vec::new();
+                let mut i = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let t = std::time::Instant::now();
+                    meta.getattr(inos[(i * 7919) % inos.len()]).unwrap();
+                    samples.push(t.elapsed());
+                    i += 1;
+                }
+                samples.sort();
+                samples
+            })
+        };
         let pct = |s: &[std::time::Duration], p: f64| s[((s.len() as f64 - 1.0) * p) as usize];
 
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2035,7 +2047,7 @@ mod tests {
         let reader =
             crate::mtree_read::ChainReader::for_store(Arc::clone(&fx.store), None, scratch.path())
                 .unwrap();
-        let fresh = Arc::new(SqliteMeta::open(dir.path().join("fresh.db")).unwrap());
+        let fresh = Arc::new(Meta::open(dir.path().join("fresh.db")).unwrap());
         let started = std::time::Instant::now();
         let loaded = crate::mtree_read::bootstrap_from_commit(&reader, Arc::clone(&fresh))
             .await

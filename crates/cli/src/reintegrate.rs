@@ -6,7 +6,7 @@
 //! cleared so the node may acquire leases again.
 
 use anyhow::{Context, Result};
-use constellation_meta::{classify, materialize, Disposition, MetaStore, SqliteMeta};
+use constellation_meta::{classify, materialize, Disposition, Meta, MetaStore};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -38,7 +38,7 @@ impl ReintegrationState {
 }
 
 pub async fn run(
-    meta: &SqliteMeta,
+    meta: &Meta,
     ship: &mut Shipper,
     keepers: &mut HashMap<String, LeaseKeeper>,
     node_id: u64,
@@ -70,11 +70,11 @@ pub async fn run(
         }
 
         let view_path = state_dir.join(".reintegrate-view.db");
-        let _ = std::fs::remove_file(&view_path);
+        let _ = std::fs::remove_dir_all(&view_path);
         shipper::bootstrap(&view_path, ship.log())
             .await
             .context("bootstrapping shared-log view for reintegration")?;
-        let shared = SqliteMeta::open(&view_path)?;
+        let shared = Meta::open(&view_path)?;
 
         let stranded = meta.unmarked_journal()?;
         let ts = std::time::SystemTime::now()
@@ -145,9 +145,9 @@ pub async fn run(
                 .into_iter()
                 .map(|(_, record)| record),
         );
-        meta.commit_reintegration_batch(&view_path, &dispositions, &output)?;
+        meta.commit_reintegration_batch(&shared, &dispositions, &output)?;
         drop(shared);
-        let _ = std::fs::remove_file(&view_path);
+        let _ = std::fs::remove_dir_all(&view_path);
 
         ship.sync_all_for_reintegration(keepers)
             .await

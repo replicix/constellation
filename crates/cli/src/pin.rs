@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::{ChunkHash, Ino};
-use constellation_meta::SqliteMeta;
+use constellation_meta::Meta;
 use constellation_store_s3::ChunkStore;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ pub struct PinFootprint {
 }
 
 pub struct PinManager {
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     store: Arc<ChunkStore>,
     cache: Arc<DiskCache>,
     coop: Option<Arc<crate::coop::Coop>>,
@@ -46,7 +46,7 @@ pub struct PinManager {
 
 impl PinManager {
     pub fn new(
-        meta: Arc<SqliteMeta>,
+        meta: Arc<Meta>,
         store: Arc<ChunkStore>,
         cache: Arc<DiskCache>,
         coop: Option<Arc<crate::coop::Coop>>,
@@ -57,6 +57,13 @@ impl PinManager {
             cache,
             coop,
         }
+    }
+
+    /// The chunk store this node reads/writes through — reused by the
+    /// control-socket GC path, which runs in this same process rather
+    /// than opening a second `ChunkStore` for a one-off command.
+    pub fn chunks(&self) -> Arc<ChunkStore> {
+        self.store.clone()
     }
 
     /// Resolve a pin path to its inode, rejecting anything unusable with

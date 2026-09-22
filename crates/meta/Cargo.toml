@@ -7,12 +7,15 @@ license.workspace = true
 
 [dependencies]
 constellation-fs-core.workspace = true
-rusqlite.workspace = true
+constellation-mtree.workspace = true
+fjall = { version = "3.1", package = "fjall" }
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

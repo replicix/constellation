@@ -46,14 +46,14 @@
 
 use crate::mtree_read::ChainReader;
 use anyhow::{Context, Result};
-use constellation_meta::SqliteMeta;
+use constellation_meta::Meta;
 use constellation_mtree::NodeHash;
 use constellation_store_s3::{
     layout, CommitChain, CompactionPacer, Compactor, PackCatalog, PackHash, Sweep,
 };
 use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,7 +121,7 @@ impl MtreeGcConfig {
 }
 
 /// What a round did (or, verify-only, would do).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MtreeGcReport {
     pub commits: usize,
     pub commits_deleted: Vec<u64>,
@@ -157,7 +157,7 @@ impl CompactionPacer for RatePacer {
 pub fn run<'a>(
     store: Arc<dyn ObjectStore>,
     keys: Option<&'a constellation_store_s3::SharedE2eKeys>,
-    meta: &'a SqliteMeta,
+    meta: &'a Meta,
     config: &'a MtreeGcConfig,
     verify_only: bool,
 ) -> futures::future::BoxFuture<'a, Result<MtreeGcReport>> {
@@ -170,7 +170,7 @@ pub fn run<'a>(
 async fn run_inner(
     store: Arc<dyn ObjectStore>,
     keys: Option<&constellation_store_s3::SharedE2eKeys>,
-    meta: &SqliteMeta,
+    meta: &Meta,
     config: &MtreeGcConfig,
     verify_only: bool,
 ) -> Result<MtreeGcReport> {
@@ -460,14 +460,14 @@ async fn old_incomplete(
     Ok(old)
 }
 
-fn load_cursor(meta: &SqliteMeta, key: &str) -> Result<Option<PackHash>> {
+fn load_cursor(meta: &Meta, key: &str) -> Result<Option<PackHash>> {
     Ok(meta
         .kv_get(key)?
         .filter(|hex| !hex.is_empty())
         .and_then(|hex| PackHash::from_hex(&hex)))
 }
 
-fn save_cursor(meta: &SqliteMeta, key: &str, cursor: Option<PackHash>) -> Result<()> {
+fn save_cursor(meta: &Meta, key: &str, cursor: Option<PackHash>) -> Result<()> {
     meta.kv_set(key, &cursor.map(|hash| hash.to_hex()).unwrap_or_default())?;
     Ok(())
 }
@@ -528,11 +528,7 @@ mod tests {
         ))
     }
 
-    fn publisher(
-        meta: &Arc<SqliteMeta>,
-        store: &Arc<dyn ObjectStore>,
-        dir: &TempDir,
-    ) -> TreePublisher {
+    fn publisher(meta: &Arc<Meta>, store: &Arc<dyn ObjectStore>, dir: &TempDir) -> TreePublisher {
         TreePublisher::new(
             meta.clone(),
             cache(store, dir),
@@ -544,7 +540,7 @@ mod tests {
         )
     }
 
-    fn drain(meta: &SqliteMeta) -> Vec<constellation_meta::LogRecord> {
+    fn drain(meta: &Meta) -> Vec<constellation_meta::LogRecord> {
         let batch = meta.take_journal(usize::MAX).unwrap();
         if let Some((seq, _)) = batch.last() {
             meta.ack_journal(*seq).unwrap();
@@ -584,7 +580,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_round_reclaims_what_retired_commits_kept_and_nothing_else() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = TempDir::new().unwrap();
         let mut writer = publisher(&meta, &store, &dir);
         let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
@@ -676,7 +672,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_publisher_never_names_a_condemned_pack() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = TempDir::new().unwrap();
         let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
         for i in 0..50 {

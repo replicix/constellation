@@ -883,7 +883,7 @@ mod tests {
         assert_eq!(c.usage().used, 64);
         // Rescan legitimately returns Clean here: a directory listing
         // cannot distinguish uploaded content from un-uploaded content,
-        // so the cache does not try. `constellation_meta::SqliteMeta`'s
+        // so the cache does not try. `constellation_meta::Meta`'s
         // `pending_upload` table (written in the same transaction as
         // the journal record that made the content dirty) is the real
         // source of truth for what still owes S3 a PUT — see

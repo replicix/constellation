@@ -5,7 +5,7 @@
 //! three atomics (`active`, `frozen`, `blocks_takeover`).
 
 use anyhow::Result;
-use constellation_meta::SqliteMeta;
+use constellation_meta::Meta;
 use constellation_net::{component_covers_roster, EpochMachine, EpochPromise, Payload};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +20,7 @@ fn now_ms() -> i64 {
 
 pub struct EpochManager {
     node_id: u64,
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     peers: constellation_net::Peers,
     machine: Mutex<EpochMachine>,
     roster: Mutex<Vec<u64>>,
@@ -32,7 +32,7 @@ pub struct EpochManager {
 }
 
 impl EpochManager {
-    pub fn new(node_id: u64, meta: Arc<SqliteMeta>, peers: constellation_net::Peers) -> Self {
+    pub fn new(node_id: u64, meta: Arc<Meta>, peers: constellation_net::Peers) -> Self {
         let loaded = meta
             .load_open_epoch()
             .ok()

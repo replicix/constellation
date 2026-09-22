@@ -37,7 +37,7 @@ mod writeback;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use constellation_fs_core::cache::DiskCache;
-use constellation_meta::SqliteMeta;
+use constellation_meta::Meta;
 use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta, StoreError};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -1815,14 +1815,25 @@ async fn cmd_export(name: String, force: bool) -> Result<()> {
         .cloned()
         .with_context(|| format!("{name:?} is not a registered filesystem"))?;
     let db_path = entry.state_dir.join("meta.db");
-    let node_id_claimed = db_path.exists() && {
-        SqliteMeta::open(&db_path)
-            .ok()
-            .and_then(|m| m.kv_get("node_id").ok().flatten())
-            .is_some()
-    };
+    let sock = entry.state_dir.join(constellation_api::SOCKET_NAME);
+    // A running daemon holds `fjall`'s single-process lock on `meta.db`
+    // (unlike the old SQLite/WAL engine, which tolerated this direct
+    // open concurrently), so check aliveness first: if it answers at
+    // all it has necessarily already claimed a node id, and opening the
+    // store directly here would otherwise fail with `Locked` and be
+    // swallowed by `.ok()`, silently skipping the self-leave below.
+    let daemon_alive = matches!(
+        constellation_api::call(&sock, &constellation_api::Request::Ping).await,
+        Ok(constellation_api::Response::Pong)
+    );
+    let node_id_claimed = daemon_alive
+        || (db_path.exists() && {
+            Meta::open(&db_path)
+                .ok()
+                .and_then(|m| m.kv_get("node_id").ok().flatten())
+                .is_some()
+        });
     if node_id_claimed {
-        let sock = entry.state_dir.join(constellation_api::SOCKET_NAME);
         match constellation_api::call(
             &sock,
             &constellation_api::Request::Leave {
@@ -1871,7 +1882,7 @@ async fn cmd_export(name: String, force: bool) -> Result<()> {
                         }
                     }
                 }
-                let meta = std::sync::Arc::new(SqliteMeta::open(&db_path)?);
+                let meta = std::sync::Arc::new(Meta::open(&db_path)?);
                 let node_id: u64 = meta
                     .kv_get("node_id")?
                     .context("no node_id on record")?
@@ -1992,11 +2003,30 @@ async fn run_gc_cli(
     };
     let dir = state_dir.unwrap_or_else(|| default_state_dir(&fsmeta));
     std::fs::create_dir_all(&dir)?;
+
+    // `fjall` (unlike the old SQLite/WAL engine) refuses a second
+    // process's open of the same metadata store directory while a mount
+    // daemon holds it. If one is up for this state dir, run GC inside it
+    // over the control socket instead of racing it for the lock; a
+    // failed/absent connection means nothing is mounted here, so fall
+    // through to opening the store directly exactly as before.
+    let sock = dir.join(constellation_api::SOCKET_NAME);
+    match constellation_api::call(&sock, &constellation_api::Request::GcRun { verify_only }).await {
+        Ok(constellation_api::Response::GcReport { report }) => {
+            return Ok(serde_json::from_value(report)?);
+        }
+        Ok(constellation_api::Response::Error { message }) => {
+            bail!("gc failed in the running daemon: {message}");
+        }
+        Ok(other) => bail!("unexpected response from running daemon: {other:?}"),
+        Err(_) => {}
+    }
+
     let db = dir.join("meta.db");
     if !db.exists() {
         shipper::bootstrap(&db, &logs).await?;
     }
-    let meta = std::sync::Arc::new(SqliteMeta::open(db)?);
+    let meta = std::sync::Arc::new(Meta::open(db)?);
     let caps = chunks.probe_conditional_writes().await?;
     let mode = if caps.etag_cas {
         constellation_store_s3::LeaseMode::Cas
@@ -2035,7 +2065,7 @@ async fn run_fsck_cli(
     if !db.exists() {
         shipper::bootstrap(&db, &logs).await?;
     }
-    let meta = std::sync::Arc::new(SqliteMeta::open(db)?);
+    let meta = std::sync::Arc::new(Meta::open(db)?);
     let caps = chunks.probe_conditional_writes().await?;
     let mode = if caps.etag_cas {
         constellation_store_s3::LeaseMode::Cas
@@ -2060,11 +2090,11 @@ async fn run_fsck_cli(
     .await
 }
 
-fn remove_live_subtree(meta: &SqliteMeta, path: &str) -> Result<()> {
+fn remove_live_subtree(meta: &Meta, path: &str) -> Result<()> {
     let ino = meta
         .resolve_path(path)?
         .with_context(|| format!("clone path {path} disappeared"))?;
-    fn clear(meta: &SqliteMeta, ino: u64) -> Result<()> {
+    fn clear(meta: &Meta, ino: u64) -> Result<()> {
         for entry in constellation_meta::MetaStore::readdir(meta, ino)? {
             if entry.kind == constellation_fs_core::InodeKind::Dir {
                 clear(meta, entry.ino)?;
@@ -2097,7 +2127,7 @@ struct P2pBridge {
     node_id: u64,
     nudge: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
     designations: std::sync::Arc<designation::DesignationManager>,
-    meta: std::sync::Arc<SqliteMeta>,
+    meta: std::sync::Arc<Meta>,
     epochs: std::sync::Arc<epoch::EpochManager>,
     coop: std::sync::Arc<crate::coop::Coop>,
     forward: std::sync::Arc<forward::ForwardState>,
@@ -2706,7 +2736,7 @@ async fn run_sync_round(
     Ok(())
 }
 
-/// Drain `SqliteMeta::pending_uploads()` — the durable not-yet-uploaded
+/// Drain `Meta::pending_uploads()` — the durable not-yet-uploaded
 /// set (plan 07 step 1) — rather than `DiskCache::dirty_chunks()`,
 /// which cannot survive a crash (`DiskCache::rescan` legitimately marks
 /// everything `Clean`; only the meta journal's transaction-coupled
@@ -2907,7 +2937,7 @@ impl UploadRuntime {
 
 async fn upload_dirty_chunks(
     cache: &DiskCache,
-    meta: &SqliteMeta,
+    meta: &Meta,
     store: &ChunkStore,
     compression: CompressionSetting,
     upload: &UploadRuntime,
@@ -3063,7 +3093,7 @@ async fn upload_dirty_chunks(
 /// The continuation-epoch machinery (`constellation_net::EpochPromise`)
 /// still speaks in per-partition vectors; with plan 29 M0a's single
 /// stream that is always a one-entry map keyed by `p0`.
-fn epoch_base(meta: &SqliteMeta) -> Result<std::collections::BTreeMap<String, u64>> {
+fn epoch_base(meta: &Meta) -> Result<std::collections::BTreeMap<String, u64>> {
     Ok(std::collections::BTreeMap::from([(
         constellation_store_s3::log::PARTITION.to_string(),
         meta.applied_seq()?,
@@ -3077,7 +3107,7 @@ async fn run_managed_sync_round(
         tokio::sync::Mutex<std::collections::HashMap<String, lease::LeaseKeeper>>,
     >,
     epochs: &epoch::EpochManager,
-    meta: &SqliteMeta,
+    meta: &Meta,
     cache: &DiskCache,
     store: &ChunkStore,
     compression: CompressionSetting,
@@ -3211,7 +3241,7 @@ async fn run_managed_sync_round(
 /// costs nothing (and needs no lease) on every subsequent mount; when it
 /// does apply, it takes the lease like any other mutation.
 async fn adopt_root(
-    meta: &std::sync::Arc<SqliteMeta>,
+    meta: &std::sync::Arc<Meta>,
     ship: &mut shipper::Shipper,
     keeper: &mut lease::LeaseKeeper,
 ) -> Result<()> {
@@ -3254,7 +3284,7 @@ fn peer_addr_strings(addr: &constellation_net::EndpointAddr) -> Vec<String> {
 
 /// Live daemon state exposed over the control socket.
 struct DaemonStatus {
-    meta: std::sync::Arc<SqliteMeta>,
+    meta: std::sync::Arc<Meta>,
     cache: std::sync::Arc<DiskCache>,
     staging_budget: std::sync::Arc<staging::StagingBudget>,
     spool: std::sync::Arc<std::sync::Mutex<shipper::SpoolInfo>>,
@@ -4102,6 +4132,26 @@ impl constellation_api::StatusSource for DaemonStatus {
         Ok(out)
     }
 
+    fn gc_run(&self, verify_only: bool) -> std::result::Result<serde_json::Value, String> {
+        let store = self.store.clone();
+        let chunks = self.pins.chunks();
+        let meta = self.meta.clone();
+        let lease_mode = self.lease_mode;
+        let peers = self.peers.clone();
+        let report = tokio::task::block_in_place(|| {
+            self.rt.block_on(gc::run(
+                store,
+                chunks,
+                meta,
+                lease_mode,
+                verify_only,
+                Some(&peers),
+            ))
+        })
+        .map_err(|e| format!("{e:#}"))?;
+        serde_json::to_value(&report).map_err(|e| format!("{e:#}"))
+    }
+
     fn mount_add(
         &self,
         subtree: &str,
@@ -4469,7 +4519,7 @@ mod pending_upload_tests {
     }
 
     struct Fixture {
-        meta: SqliteMeta,
+        meta: Meta,
         cache: Arc<DiskCache>,
         cache_dir: PathBuf,
         store: Arc<ChunkStore>,
@@ -4491,7 +4541,7 @@ mod pending_upload_tests {
         let cache_tmp = tempfile::tempdir().unwrap();
         let cache_dir = cache_tmp.path().to_path_buf();
         Fixture {
-            meta: SqliteMeta::open_in_memory().unwrap(),
+            meta: Meta::open_in_memory().unwrap(),
             cache: Arc::new(DiskCache::open(&cache_dir, 64 * 1024 * 1024).unwrap()),
             cache_dir,
             store: Arc::new(ChunkStore::new(failing.clone() as Arc<dyn ObjectStore>)),

@@ -24,7 +24,7 @@
 //! `If-None-Match: *` PUT that fails safely on a hash already present.
 
 use constellation_fs_core::ChunkHash;
-use constellation_meta::SqliteMeta;
+use constellation_meta::Meta;
 use constellation_net::bloom::{Bloom, BITS_PER_ENTRY};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,7 +42,7 @@ fn enabled(name: &str) -> bool {
 
 pub struct Existence {
     bloom: Mutex<Bloom>,
-    meta: Option<Arc<SqliteMeta>>,
+    meta: Option<Arc<Meta>>,
     peer_hint_enabled: bool,
     bloom_hits: AtomicU64,
     chunk_ref_hits: AtomicU64,
@@ -64,7 +64,7 @@ impl Existence {
     /// Mount-path constructor: the replica is the hint source, and it is
     /// consulted lazily per upload rather than copied into the bloom, so
     /// there is no startup cost proportional to the bucket.
-    pub fn with_meta(meta: Arc<SqliteMeta>) -> Arc<Self> {
+    pub fn with_meta(meta: Arc<Meta>) -> Arc<Self> {
         let bytes = std::env::var("CONSTELLATION_EXISTENCE_BLOOM_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -77,11 +77,7 @@ impl Existence {
         )
     }
 
-    pub(crate) fn new(
-        bytes: usize,
-        peer_hint_enabled: bool,
-        meta: Option<Arc<SqliteMeta>>,
-    ) -> Arc<Self> {
+    pub(crate) fn new(bytes: usize, peer_hint_enabled: bool, meta: Option<Arc<Meta>>) -> Arc<Self> {
         let max_entries = bytes.saturating_mul(8) / BITS_PER_ENTRY;
         Arc::new(Self {
             bloom: Mutex::new(Bloom::with_capacity_and_max_bytes(max_entries, bytes)),
@@ -167,7 +163,7 @@ mod tests {
     #[test]
     fn chunk_ref_hit_selects_probe_without_a_list() {
         let hash = ChunkHash::of(b"written by another node");
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let existence = Existence::new(64, true, Some(meta.clone()));
         assert!(
             !existence.contains(&hash),

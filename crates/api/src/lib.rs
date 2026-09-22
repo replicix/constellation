@@ -156,6 +156,12 @@ pub trait StatusSource: Send + Sync + 'static {
         Err("pruning is not supported by this daemon".into())
     }
 
+    /// Run chunk + metadata-tree GC in this process (see
+    /// [`crate::Request::GcRun`]). Default refuses.
+    fn gc_run(&self, _verify_only: bool) -> std::result::Result<serde_json::Value, String> {
+        Err("gc is not supported by this daemon".into())
+    }
+
     /// Attach a new view. Default refuses so a provider (tests, older
     /// daemons) that predates multi-view mounts stays valid.
     fn mount_add(
@@ -206,6 +212,10 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
         Request::PruneRun { path, dry_run } => result(source.prune_run(path.as_deref(), dry_run)),
         Request::PruneList => match source.prune_ls() {
             Ok(roots) => Response::PruneRoots { roots },
+            Err(message) => Response::Error { message },
+        },
+        Request::GcRun { verify_only } => match source.gc_run(verify_only) {
+            Ok(report) => Response::GcReport { report },
             Err(message) => Response::Error { message },
         },
         Request::SnapshotList { path } | Request::ListSnapshots { path } => {

@@ -49,7 +49,7 @@
 use crate::lease::{LeaseKeeper, TailedToHead};
 use anyhow::{bail, Context, Result};
 use constellation_meta::replay::TouchSet;
-use constellation_meta::{LogRecord, MetaStore, SqliteMeta};
+use constellation_meta::{LogRecord, Meta, MetaStore};
 use constellation_store_s3::log::PARTITION;
 use constellation_store_s3::{Lease, LeaseMode, LeaseStore, LeaseTag, LogStore};
 use serde::{Deserialize, Serialize};
@@ -184,7 +184,7 @@ pub fn segment_node(payload: &[u8]) -> Option<u64> {
 }
 
 pub struct Shipper {
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     log: LogStore,
     node_id: u64,
     lease_mode: LeaseMode,
@@ -261,12 +261,12 @@ impl Shipper {
     /// position the replica covers (from the local kv store); segments
     /// beyond it are tailed on the first `sync`.
     #[allow(dead_code)]
-    pub fn attach(meta: Arc<SqliteMeta>, log: LogStore, node_id: u64) -> Result<Self> {
+    pub fn attach(meta: Arc<Meta>, log: LogStore, node_id: u64) -> Result<Self> {
         Self::attach_with_mode(meta, log, node_id, LeaseMode::Cas)
     }
 
     pub fn attach_with_mode(
-        meta: Arc<SqliteMeta>,
+        meta: Arc<Meta>,
         log: LogStore,
         node_id: u64,
         lease_mode: LeaseMode,
@@ -1430,7 +1430,7 @@ async fn bootstrap_from_tree(db_path: &std::path::Path, log: &LogStore) -> Resul
         if reader.head().await?.is_none() {
             return Ok(None);
         }
-        let meta = Arc::new(SqliteMeta::open(db_path)?);
+        let meta = Arc::new(Meta::open(db_path)?);
         let Some(loaded) =
             crate::mtree_read::bootstrap_from_commit(&reader, Arc::clone(&meta)).await?
         else {
@@ -1465,17 +1465,15 @@ async fn bootstrap_from_tree(db_path: &std::path::Path, log: &LogStore) -> Resul
     }
 }
 
+/// `db_path` is an fjall database directory (plan 29 M1: no more
+/// `.db`/`-wal`/`-shm` sibling files to clean up).
 fn remove_db(db_path: &std::path::Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut path = db_path.as_os_str().to_owned();
-        path.push(suffix);
-        let _ = std::fs::remove_file(std::path::PathBuf::from(path));
-    }
+    let _ = std::fs::remove_dir_all(db_path);
 }
 
 /// Apply `part`'s contiguous log run after `start` and record where it
 /// stopped. Shared by both bootstrap paths (from a commit, and genesis).
-async fn replay_from(meta: &SqliteMeta, log: &LogStore, part: &str, start: u64) -> Result<usize> {
+async fn replay_from(meta: &Meta, log: &LogStore, part: &str, start: u64) -> Result<usize> {
     let part_log = log.with_partition(part);
     let mut applied = start;
     let mut replayed = 0usize;
@@ -1517,7 +1515,7 @@ pub async fn bootstrap(db_path: &std::path::Path, log: &LogStore) -> Result<()> 
     if bootstrap_from_tree(db_path, log).await? {
         return Ok(());
     }
-    let meta = SqliteMeta::open(db_path)?;
+    let meta = Meta::open(db_path)?;
     let replayed = replay_from(&meta, log, PARTITION, 0).await?;
     for ino in meta.orphans()? {
         meta.reap_orphan(ino)?;
@@ -1548,7 +1546,7 @@ mod tests {
     use std::sync::Arc as StdArc;
 
     struct Node {
-        meta: Arc<SqliteMeta>,
+        meta: Arc<Meta>,
         ship: Shipper,
         lease: LeaseKeeper,
     }
@@ -1574,7 +1572,7 @@ mod tests {
     /// `node`, but over any backing store — the request-counting decorator
     /// below is not an `InMemory`.
     fn node_on(store: StdArc<dyn ObjectStore>, id: u64) -> Node {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         meta.set_node_prefix(id).unwrap();
         let log = LogStore::new(store.clone());
         let ship = Shipper::attach(meta.clone(), log, id).unwrap();
@@ -1604,7 +1602,7 @@ mod tests {
         }
     }
 
-    fn names(meta: &SqliteMeta, parent: u64) -> Vec<(String, u64)> {
+    fn names(meta: &Meta, parent: u64) -> Vec<(String, u64)> {
         let mut v: Vec<_> = meta
             .readdir(parent)
             .unwrap()
@@ -1699,7 +1697,7 @@ mod tests {
         a.ship.tail_to_head().await.unwrap();
         b.ship.tail_to_head().await.unwrap();
 
-        let mode_of = |m: &SqliteMeta| m.lookup(1, "duel").unwrap().unwrap().mode & 0o777;
+        let mode_of = |m: &Meta| m.lookup(1, "duel").unwrap().unwrap().mode & 0o777;
         assert_eq!(mode_of(&a.meta), 0o644, "requester must see the file first");
 
         // Each requester forwards a chmod: the holder executes and
@@ -2014,7 +2012,7 @@ mod tests {
 
         let boot = dir.path().join("boot.db");
         bootstrap(&boot, &log).await.unwrap();
-        let restored = SqliteMeta::open(&boot).unwrap();
+        let restored = Meta::open(&boot).unwrap();
         assert_eq!(restored.pending_upload_count().unwrap(), 0);
     }
 
@@ -2808,7 +2806,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("fresh.db");
         bootstrap(&db, &LogStore::new(store.clone())).await.unwrap();
-        let fresh = SqliteMeta::open(&db).unwrap();
+        let fresh = Meta::open(&db).unwrap();
         assert_replicas_equal(&fresh, &a.meta);
         assert_eq!(fresh.applied_seq().unwrap(), a.meta.applied_seq().unwrap());
         assert!(fresh.child_ino(d.ino, "late").unwrap().is_some());
@@ -2834,17 +2832,17 @@ mod tests {
             .delete(&constellation_store_s3::layout::log_segment(PARTITION, 1))
             .await
             .unwrap();
-        let fresh = SqliteMeta::open_in_memory().unwrap();
+        let fresh = Meta::open_in_memory().unwrap();
         let err = replay_from(&fresh, &log, PARTITION, 0).await.unwrap_err();
         assert!(err.to_string().contains("pruned"), "{err:#}");
         // From a base the log still covers, the same replay succeeds.
-        let covered = SqliteMeta::open_in_memory().unwrap();
+        let covered = Meta::open_in_memory().unwrap();
         assert!(replay_from(&covered, &log, PARTITION, 1).await.unwrap() > 0);
     }
 
     /// Table-by-table equality of two replicas' shared state, reporting
     /// only the rows that differ (a full dump buries them in manifests).
-    fn assert_replicas_equal(got: &SqliteMeta, want: &SqliteMeta) {
+    fn assert_replicas_equal(got: &Meta, want: &Meta) {
         let got = got.dump_replicated().unwrap();
         let want = want.dump_replicated().unwrap();
         let short = |row: &String| row.chars().take(240).collect::<String>();

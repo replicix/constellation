@@ -15,7 +15,7 @@ use crate::singleton::SingletonLease;
 use anyhow::Result;
 use constellation_fs_core::{Ino, InodeKind};
 use constellation_meta::prune::{Candidate, EntryFacts, Of, Policy, Verdict, Watermark};
-use constellation_meta::{MetaStore, MutateOp, MutateOutcome, SqliteMeta};
+use constellation_meta::{Meta, MetaStore, MutateOp, MutateOutcome};
 use constellation_store_s3::LeaseMode;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
@@ -145,7 +145,7 @@ pub struct RootReport {
 /// (all `Arc`/handles) and passed to [`run`].
 pub struct PruneDeps {
     pub store: Arc<dyn ObjectStore>,
-    pub meta: Arc<SqliteMeta>,
+    pub meta: Arc<Meta>,
     pub sync_tx: tokio::sync::mpsc::UnboundedSender<crate::fusefs::SyncRequest>,
     pub keepers: Arc<tokio::sync::Mutex<HashMap<String, crate::lease::LeaseKeeper>>>,
     pub forward: Arc<crate::forward::ForwardState>,
@@ -458,7 +458,7 @@ struct LruPool {
 
 #[allow(clippy::too_many_arguments)]
 fn walk(
-    meta: &SqliteMeta,
+    meta: &Meta,
     stats: &PruneStats,
     root_ino: Ino,
     dir: Ino,
@@ -786,7 +786,7 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
 
 // --- small helpers ---
 
-fn facts_of(meta: &SqliteMeta, name: &str, ino: Ino) -> Option<EntryFacts> {
+fn facts_of(meta: &Meta, name: &str, ino: Ino) -> Option<EntryFacts> {
     let attr = meta.getattr(ino).ok().flatten()?;
     Some(EntryFacts {
         name: name.to_string(),
@@ -866,7 +866,7 @@ mod tests {
 
     /// Drive the namespace walk over an in-memory replica and return the
     /// deterministic + keep victims as `(parent, name)`.
-    fn select_victims(meta: &SqliteMeta, root: Ino, expr: &str, now_ns: i64) -> Vec<(Ino, String)> {
+    fn select_victims(meta: &Meta, root: Ino, expr: &str, now_ns: i64) -> Vec<(Ino, String)> {
         let policy = Policy::parse(expr).unwrap();
         let stats = PruneStats::default();
         let mut rr = RootReport {
@@ -920,7 +920,7 @@ mod tests {
     }
 
     /// Backdate an inode's mtime/ctime/atime so age/unused rules fire.
-    fn backdate(meta: &SqliteMeta, ino: Ino, secs_ago: i64, now_ns: i64) {
+    fn backdate(meta: &Meta, ino: Ino, secs_ago: i64, now_ns: i64) {
         let ts = now_ns - secs_ago * S;
         meta.setattr(ino, None, None, None, None, Some(ts), Some(ts))
             .unwrap();
@@ -928,7 +928,7 @@ mod tests {
 
     #[test]
     fn walk_selects_old_files_and_skips_nested_and_scratch() {
-        let meta = SqliteMeta::open_in_memory().unwrap();
+        let meta = Meta::open_in_memory().unwrap();
         let now = 1_000_000 * S;
         let root = meta.mkdir(1, "data", 0o755, 0, 0).unwrap().ino;
         let old = meta.create(root, "old.log", 0o644, 0, 0).unwrap().ino;
@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn walk_keep_newest_n_per_directory() {
-        let meta = SqliteMeta::open_in_memory().unwrap();
+        let meta = Meta::open_in_memory().unwrap();
         let now = 1_000_000 * S;
         let root = meta.mkdir(1, "snaps", 0o755, 0, 0).unwrap().ino;
         // Five files, mtimes 10..50 days old; keep(2) drops the 3 oldest.

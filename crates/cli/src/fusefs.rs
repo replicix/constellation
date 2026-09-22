@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest, SparseChunks};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
-use constellation_meta::{MetaError, MetaStore, SqliteMeta};
+use constellation_meta::{Meta, MetaError, MetaStore};
 use constellation_store_s3::{ChunkStore, CompressionSetting, DecodePriority};
 use fuser::{
     BsdFileFlags, Errno, FileHandle, FileType, Filesystem, INodeNo, InitFlags, KernelConfig,
@@ -234,7 +234,7 @@ pub struct SyncHandle {
 /// format knobs (`chunk_size`, `compression`). Grouped so a new
 /// dependency cannot be silently swapped with a neighbour of the same type.
 pub struct FsDependencies {
-    pub meta: Arc<SqliteMeta>,
+    pub meta: Arc<Meta>,
     pub store: Arc<ChunkStore>,
     pub cache: Arc<DiskCache>,
     pub rt: Handle,
@@ -289,7 +289,7 @@ struct SyntheticRegistry {
 }
 
 pub struct ConstellationFs {
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     store: Arc<ChunkStore>,
     cache: Arc<DiskCache>,
     rt: Handle,
@@ -350,7 +350,12 @@ fn errno(e: &MetaError) -> i32 {
         MetaError::NoData => libc::ENODATA,
         MetaError::Invalid(_) => libc::EINVAL,
         MetaError::Conflict => libc::EAGAIN,
-        MetaError::Sqlite(_) | MetaError::Json(_) | MetaError::Postcard(_) => libc::EIO,
+        MetaError::Fjall(_)
+        | MetaError::Io(_)
+        | MetaError::Record(_)
+        | MetaError::Key(_)
+        | MetaError::Json(_)
+        | MetaError::Postcard(_) => libc::EIO,
     }
 }
 
@@ -1196,6 +1201,9 @@ impl ConstellationFs {
     /// fsync() barrier. In `--fsync-mode s3`, block until the journal
     /// (up to now) is durable in the shared log; otherwise just nudge.
     pub(crate) fn sync_barrier(&self, ino: Ino) -> Result<(), i32> {
+        // Local durability first, in every mode: the metadata engine
+        // commits to OS buffers, so fsync(2) must force them to disk.
+        self.meta.sync().map_err(|e| errno(&e))?;
         let Some(h) = &self.sync else { return Ok(()) };
         if !h.fsync_s3 {
             let _ = h.tx.send(SyncRequest::Nudge);
@@ -1899,7 +1907,7 @@ mod quota_tests {
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
-    fn test_fs(meta: Arc<SqliteMeta>) -> (ConstellationFs, TempDir) {
+    fn test_fs(meta: Arc<Meta>) -> (ConstellationFs, TempDir) {
         let dir = TempDir::new().unwrap();
         let cache = Arc::new(DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap());
         let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
@@ -1941,7 +1949,7 @@ mod quota_tests {
 
     #[test]
     fn quota_check_unlimited_always_ok() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         let (fs, _tmpdir) = test_fs(meta);
         assert!(fs.quota_check(f.ino, 1 << 40).is_ok());
@@ -1949,7 +1957,7 @@ mod quota_tests {
 
     #[test]
     fn quota_check_under_cap_ok_over_cap_enospc() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         meta.set_quota(Some(100)).unwrap();
         let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         meta.setattr(f.ino, None, None, None, Some(40), None, None)
@@ -1969,7 +1977,7 @@ mod quota_tests {
     /// against it would bill the same bytes twice.
     #[test]
     fn quota_check_does_not_double_count_a_sparse_truncate() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         meta.set_quota(Some(100)).unwrap();
         let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         // `truncate -s 60` with no manifest committed yet.
@@ -1988,7 +1996,7 @@ mod quota_tests {
 
     #[test]
     fn usage_counter_tracks_create_setattr_unlink() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         assert_eq!(meta.usage(), (0, 0));
         let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         assert_eq!(meta.usage(), (0, 1));
@@ -2008,7 +2016,7 @@ mod quota_tests {
     /// `evict_dentry` does the same on every peer).
     #[test]
     fn usage_counter_tracks_replacing_rename() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let a = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
         let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
         meta.setattr(a.ino, None, None, None, Some(100), None, None)
@@ -2035,13 +2043,13 @@ mod quota_tests {
 
     #[test]
     fn set_quota_round_trip_and_replay() {
-        let src = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let src = Arc::new(Meta::open_in_memory().unwrap());
         src.set_quota(Some(1234)).unwrap();
         assert_eq!(src.quota().unwrap(), Some(1234));
         src.set_quota(None).unwrap();
         assert_eq!(src.quota().unwrap(), None);
 
-        let src2 = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let src2 = Arc::new(Meta::open_in_memory().unwrap());
         src2.set_quota(Some(999)).unwrap();
         let records: Vec<_> = src2
             .take_journal(100)
@@ -2049,7 +2057,7 @@ mod quota_tests {
             .into_iter()
             .map(|(_, r)| r)
             .collect();
-        let dst = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let dst = Arc::new(Meta::open_in_memory().unwrap());
         dst.apply_records(&records).unwrap();
         assert_eq!(dst.quota().unwrap(), Some(999));
     }
@@ -2094,7 +2102,7 @@ mod quota_tests {
     /// is exact and never serves a stale aggregate.
     #[test]
     fn view_usage_of_a_full_mount_tracks_the_counter() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
         let a = meta.create(dir.ino, "a", 0o644, 0, 0).unwrap();
         let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
@@ -2112,7 +2120,7 @@ mod quota_tests {
 
     #[test]
     fn view_usage_scopes_to_subtree_mount() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
         let a = meta.create(dir.ino, "a", 0o644, 0, 0).unwrap();
         let b = meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
@@ -2129,7 +2137,7 @@ mod quota_tests {
 
     #[test]
     fn zero_ttl_disables_cache_while_positive_ttl_caches() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
         let f = meta.create(dir.ino, "f", 0o644, 0, 0).unwrap();
         meta.setattr(f.ino, None, None, None, Some(10), None, None)
@@ -2162,7 +2170,7 @@ mod quota_tests {
 
     #[test]
     fn view_usage_scopes_to_snapshot_mount() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let source = meta.mkdir(ROOT_INO, "source", 0o755, 0, 0).unwrap();
         let file = meta.create(source.ino, "file", 0o644, 0, 0).unwrap();
         meta.setattr(file.ino, None, None, None, Some(42), None, None)

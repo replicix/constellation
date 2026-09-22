@@ -6,7 +6,7 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::sqlite::SqliteMeta;
+use crate::store::Meta;
 use crate::{MetaStore, SetXattrMode};
 use constellation_fs_core::{Ino, InodeKind};
 use serde::{Deserialize, Serialize};
@@ -173,7 +173,7 @@ impl MutateOutcome {
 /// Execute `op` against the holder's authoritative replica and return
 /// the journal records that were appended. The caller is responsible
 /// for checking lease ownership first.
-pub fn execute(meta: &SqliteMeta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError> {
+pub fn execute(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError> {
     let before = meta.max_journal_seq()?;
     match op {
         MutateOp::Mkdir {
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn atime_batch_applies_locally_queues_for_ship_and_journals_nothing() {
-        let m = SqliteMeta::open_in_memory().unwrap();
+        let m = Meta::open_in_memory().unwrap();
         let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         let part = "p0".to_string();
         let before = m.journal_len().unwrap();
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn execute_create_journals_one_record() {
-        let m = SqliteMeta::open_in_memory().unwrap();
+        let m = Meta::open_in_memory().unwrap();
         let records = execute(
             &m,
             &MutateOp::Create {
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn execute_publish_carries_xattrs_and_roundtrips() {
-        let m = SqliteMeta::open_in_memory().unwrap();
+        let m = Meta::open_in_memory().unwrap();
         let ino = (1 << 40) | 9;
         let op = MutateOp::Publish {
             ino,

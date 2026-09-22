@@ -18,6 +18,7 @@ constellation-api = { workspace = true, features = ["web"] }
 constellation-net.workspace = true
 constellation-upload-concurrency.workspace = true
 constellation-store-s3.workspace = true
+fjall = { version = "3.1", package = "fjall" }
 anyhow.workspace = true
 clap.workspace = true
 fuser.workspace = true
@@ -39,4 +40,3 @@ zeroize = "1.9.0"
 tempfile.workspace = true
 async-trait = "0.1"
 futures = "0.3"
-rusqlite.workspace = true

@@ -459,8 +459,9 @@ mount-time bucket LIST with the replica's `chunk_ref` index):
   exact model verification.
 
 Phase 8d adds `snapshot-churn`, a seeded out-of-core lifecycle oracle. Its
-SQLite WAL stores live rows per writable root, immutable rows per snapshot, and
-clone lineage while four concurrent workers mutate disjoint `wN` prefixes
+disk-backed `fjall` database stores live rows per writable root, immutable
+rows per snapshot, and clone lineage while four concurrent workers mutate
+disjoint `wN` prefixes
 across `/tree` and current `/cN` roots. Every worker joins before lifecycle
 operations. Three default rounds create and delete origin and clone snapshots,
 create and delete clones, force a clone-of-clone, and write different bytes to
@@ -576,7 +577,7 @@ must still converge over S3.
 scenarios yet.** `pin-follow`, `offline-designee-writes`, and
 `offline-delegation` (plan 03's asks) are not automated; pin admission,
 overlap rejection, and delegation grant/expiry are covered by unit
-tests instead (`fs-core::cache`, `meta::sqlite`, `store-s3::designation`,
+tests instead (`fs-core::cache`, `meta::store`, `store-s3::designation`,
 `net::delegation`), and the operator-facing paths (`pin`/`unpin`/
 `offline`/`online`/`--ro`, admission refusal, overlap refusal,
 designee-writes-through, release-by-designee-only) were verified

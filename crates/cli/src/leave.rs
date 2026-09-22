@@ -10,7 +10,7 @@ use crate::designation::DesignationManager;
 use crate::epoch::EpochManager;
 use crate::lease::LeaseKeeper;
 use crate::shipper::Shipper;
-use constellation_meta::SqliteMeta;
+use constellation_meta::Meta;
 use object_store::ObjectStore;
 use std::collections::HashMap;
 use std::fmt;
@@ -111,7 +111,7 @@ pub async fn admin_leave(
 /// still refuse.
 pub async fn self_leave(
     store: Arc<dyn ObjectStore>,
-    meta: &SqliteMeta,
+    meta: &Meta,
     ship: &mut Shipper,
     keepers: &mut HashMap<String, LeaseKeeper>,
     designations: &DesignationManager,
@@ -173,8 +173,8 @@ mod tests {
     };
     use object_store::memory::InMemory;
 
-    fn open_meta() -> Arc<SqliteMeta> {
-        Arc::new(SqliteMeta::open_in_memory().unwrap())
+    fn open_meta() -> Arc<Meta> {
+        Arc::new(Meta::open_in_memory().unwrap())
     }
 
     #[tokio::test]

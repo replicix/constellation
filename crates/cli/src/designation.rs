@@ -21,7 +21,7 @@
 //! for write purposes.
 
 use anyhow::{bail, Context, Result};
-use constellation_meta::SqliteMeta;
+use constellation_meta::Meta;
 use constellation_net::Peers;
 use constellation_store_s3::designation::{Designation, DesignationStore};
 use std::sync::{Arc, Mutex};
@@ -40,7 +40,7 @@ const FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// P2P delegation state machines, and the FUSE write gate.
 pub struct DesignationManager {
     store: DesignationStore,
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     peers: Peers,
     node_id: u64,
     /// Cached snapshot of every live (non-released) designation,
@@ -71,7 +71,7 @@ pub enum GateDecision {
 }
 
 impl DesignationManager {
-    pub fn new(store: DesignationStore, meta: Arc<SqliteMeta>, peers: Peers, node_id: u64) -> Self {
+    pub fn new(store: DesignationStore, meta: Arc<Meta>, peers: Peers, node_id: u64) -> Self {
         Self {
             store,
             meta,
@@ -122,7 +122,7 @@ impl DesignationManager {
     /// See the module doc for the decision table. `path` should be the
     /// absolute path of the inode being mutated (or its parent, for ops
     /// that create/remove a name) — the caller resolves this once via
-    /// `SqliteMeta::path_of`.
+    /// `Meta::path_of`.
     pub async fn check(&self, path: &str) -> GateDecision {
         let Some(d) = self.covering(path) else {
             return GateDecision::NoDesignation;

@@ -29,7 +29,7 @@ before starting any plan. Every plan file assumes you did.
 - `docs/plans/v1/ROADMAP.md`, `docs/plans/v1/PROGRESS.md` — what exists, what is next.
 - `docs/how-to-guides/development/TESTING.md` — the test lanes and the fault-injection harness.
 - Crates: `fs-core` (chunking, manifests, disk cache), `store-s3`
-  (S3 layout/chunk store/log store/nodes/lease), `meta` (SQLite
+  (S3 layout/chunk store/log store/nodes/lease), `meta` (fjall
   replica, log records, convergent replay), `api` (control API types +
   unix-socket server), `cli` (the `constellation` binary: FUSE fs,
   shipper/syncer, lease keeper, mount wiring), `net` (P2P — may be
@@ -95,7 +95,7 @@ Every plan ends with ALL of these green, run in this order:
   defaults; document them where they are read.
 - Tests: unit tests co-located (`#[cfg(test)] mod tests`), using
   `object_store::memory::InMemory` for S3-shaped things and
-  `SqliteMeta::open_in_memory()` for metadata. Cross-node logic gets
+  `Meta::open_in_memory()` for metadata. Cross-node logic gets
   in-process multi-node tests (see the pattern at the bottom of
   `cli/src/shipper.rs`). System-level behavior gets a harness scenario.
 

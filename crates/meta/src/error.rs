@@ -32,12 +32,21 @@ pub enum MetaError {
     #[error("stale base: concurrent update")]
     Conflict,
 
-    #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    #[error("fjall: {0}")]
+    Fjall(#[from] fjall::Error),
+
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
     #[error("postcard: {0}")]
     Postcard(#[from] postcard::Error),
+
+    #[error("record: {0}")]
+    Record(#[from] constellation_mtree::record::RecordError),
+
+    #[error("key: {0}")]
+    Key(#[from] constellation_mtree::keys::KeyError),
 }

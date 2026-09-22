@@ -53,6 +53,16 @@ pub enum Request {
     },
     /// List every marked prune root and its effective policy.
     PruneList,
+    /// Run chunk + metadata-tree GC now, in the already-running daemon's
+    /// process. `fjall` (unlike SQLite/WAL) refuses a second process's
+    /// open of the same metadata store while a mount holds it, so
+    /// `constellation gc run`/`gc verify` route through here whenever a
+    /// daemon is up for the target state dir instead of opening the
+    /// store directly.
+    GcRun {
+        #[serde(default)]
+        verify_only: bool,
+    },
     SnapshotCreate {
         selector: String,
     },
@@ -210,6 +220,12 @@ pub enum Response {
     },
     PruneRoots {
         roots: Vec<PruneRootStatus>,
+    },
+    /// `cli::gc::GcReport`, carried as opaque JSON: `constellation-api`
+    /// sits below `cli` in the dependency graph and must not depend on
+    /// its report types.
+    GcReport {
+        report: serde_json::Value,
     },
     Error {
         message: String,

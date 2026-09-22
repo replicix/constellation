@@ -6,7 +6,7 @@
 
 use constellation_fs_core::manifest::{ChunkInfo, Manifest};
 use constellation_fs_core::{ChunkHash, Ino, InodeKind};
-use constellation_meta::{MetaStore, SqliteMeta};
+use constellation_meta::{Meta, MetaStore};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,7 +38,7 @@ struct Scan {
 }
 
 pub(crate) struct ScanAhead {
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     enabled: bool,
     max_window: u64,
     scans: Mutex<HashMap<Ino, Scan>>,
@@ -46,7 +46,7 @@ pub(crate) struct ScanAhead {
 }
 
 impl ScanAhead {
-    pub(crate) fn new(meta: Arc<SqliteMeta>, cache_budget: u64) -> Self {
+    pub(crate) fn new(meta: Arc<Meta>, cache_budget: u64) -> Self {
         let enabled = !std::env::var("CONSTELLATION_SCAN_AHEAD")
             .ok()
             .is_some_and(|value| {
@@ -58,7 +58,7 @@ impl ScanAhead {
         Self::with_enabled(meta, cache_budget, enabled)
     }
 
-    fn with_enabled(meta: Arc<SqliteMeta>, cache_budget: u64, enabled: bool) -> Self {
+    fn with_enabled(meta: Arc<Meta>, cache_budget: u64, enabled: bool) -> Self {
         Self {
             meta,
             enabled,
@@ -69,7 +69,7 @@ impl ScanAhead {
     }
 
     fn build_order(&self, root: Ino) -> Vec<Ino> {
-        fn visit(meta: &SqliteMeta, dir: Ino, depth: usize, out: &mut Vec<Ino>) {
+        fn visit(meta: &Meta, dir: Ino, depth: usize, out: &mut Vec<Ino>) {
             if depth > MAX_DFS_DEPTH || out.len() >= MAX_ORDER_ENTRIES {
                 return;
             }
@@ -256,8 +256,8 @@ mod tests {
     use constellation_fs_core::types::ROOT_INO;
     use constellation_fs_core::{ChunkHash, DEFAULT_CHUNK_SIZE, INLINE_CHUNKS_MAX};
 
-    fn fixture(files: usize, chunks: usize) -> (Arc<SqliteMeta>, Vec<Ino>) {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+    fn fixture(files: usize, chunks: usize) -> (Arc<Meta>, Vec<Ino>) {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let mut inos = Vec::new();
         for i in 0..files {
             let attr = meta
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn ordered_scan_descends_into_subdirectories() {
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let first = meta.create(ROOT_INO, "0000", 0o644, 1, 1).unwrap();
         let second = meta.create(ROOT_INO, "0001", 0o644, 1, 1).unwrap();
         let dir = meta.mkdir(ROOT_INO, "0002", 0o755, 1, 1).unwrap();

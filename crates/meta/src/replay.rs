@@ -1,37 +1,29 @@
-//! Replay: apply shipped log records to rebuild or advance a metadata
-//! replica (fresh-node bootstrap, commit-tree catch-up, live tailing of
-//! foreign segments). Replay writes use the recorded inos and
-//! timestamps and are NOT journaled — they already live in the log.
+//! Convergent replay: applying a batch of [`LogRecord`]s — from a
+//! shipped segment, a bootstrap replay of the whole log, or a
+//! reintegration decision — to the local replica.
 //!
-//! Replay is **convergent**, not strict: records apply with last-wins
-//! upsert semantics so that (a) segments replayed over a bootstrap base
-//! (a restored commit, or genesis) that already contains their effects
-//! are idempotent, and (b) two replicas that saw the same records in
-//! different interleavings agree (the record later in the global log
-//! wins). Conflicts with *pending* (unshipped) local records are skipped
-//! by the caller via [`TouchSet`] — our own records sit later in the
-//! global log than anything we are tailing, so ours win everywhere. That
-//! reasoning is what limits the set to *unshipped* records: a record
-//! already sequenced in the log (notably one a lease holder accepted for
-//! us as a forwarded mutation) has no such claim, and must never
-//! suppress a foreign record, or the two replicas diverge for good.
-//!
-//! Plan 29 M0a removed namespace partitions: there is one metadata log
-//! stream (`p0`) and an ordinary cross-directory `rename` is a single
-//! `LogRecord::Rename`, applied in one transaction like any other op.
-//! Plan 29 M0b retired the whole-DB `VACUUM INTO` checkpoint this module
-//! used to write (`SqliteMeta::snapshot`); a fresh replica now bootstraps
-//! from the plan 28 commit chain, or replays from genesis.
+//! The whole batch (every record plus the trailing ino-counter
+//! recompute) is one fjall write transaction, exactly as it was one
+//! SQLite transaction: a crash mid-batch must leave either the fully
+//! applied batch or none of it. Idempotency and "skip, don't error" are
+//! load-bearing here — the same segment can be tailed twice (at-least-
+//! once delivery), and a record whose target was already removed by an
+//! earlier-in-the-same-batch conflict must not abort the rest.
 
 use crate::error::MetaError;
-use crate::record::LogRecord;
-use crate::sqlite::{SqliteMeta, UsageTracker, INO_PREFIX_SHIFT, QUOTA_KV_KEY};
-use constellation_fs_core::InodeKind;
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::record::{CloneNode, LogRecord};
+use crate::store::{atime, misc, ns, reclaim_ino_counter, Meta};
+use constellation_fs_core::{Ino, InodeKind};
+use constellation_mtree::keys;
+use constellation_mtree::record::{self, Attrs, DentryRecord, Kind};
+use fjall::SingleWriterWriteTx;
 use std::collections::HashSet;
 
-/// The namespace state a set of log records reads or writes: used to
-/// detect foreign records conflicting with pending local ones.
+/// Which dentries/inos a batch of records touches, used to suppress a
+/// foreign record that collides with the caller's own not-yet-shipped
+/// work. Atime is deliberately invisible here (see [`LogRecord::Atime`]):
+/// it records neither a dentry nor an ino, so it can neither suppress
+/// nor be suppressed.
 #[derive(Default)]
 pub struct TouchSet {
     pub dentries: HashSet<(u64, String)>,
@@ -40,9 +32,9 @@ pub struct TouchSet {
 
 impl TouchSet {
     pub fn from_records<'a>(records: impl Iterator<Item = &'a LogRecord>) -> Self {
-        let mut set = Self::default();
-        for r in records {
-            set.add(r);
+        let mut set = TouchSet::default();
+        for rec in records {
+            set.add(rec);
         }
         set
     }
@@ -86,12 +78,10 @@ impl TouchSet {
             | LogRecord::RemoveXattr { ino, .. } => {
                 self.inos.insert(*ino);
             }
-            // Atime is deliberately invisible to conflict detection: it
-            // records neither a dentry nor an ino, so a pending local
-            // atime bump never suppresses a foreign namespace/attr
-            // record, and is never suppressed by pending local work.
-            LogRecord::SetQuota { .. } | LogRecord::Atime { .. } => {}
-            LogRecord::SnapCreate { .. } | LogRecord::SnapDelete { .. } => {}
+            LogRecord::SnapCreate { .. }
+            | LogRecord::SnapDelete { .. }
+            | LogRecord::SetQuota { .. }
+            | LogRecord::Atime { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
                     self.dentries.insert((node.parent, node.name.clone()));
@@ -102,82 +92,9 @@ impl TouchSet {
     }
 
     pub fn conflicts(&self, rec: &LogRecord) -> bool {
-        let mut single = TouchSet::default();
-        single.add(rec);
-        single.dentries.iter().any(|d| self.dentries.contains(d))
-            || single.inos.iter().any(|i| self.inos.contains(i))
-    }
-}
-
-impl SqliteMeta {
-    /// Apply a batch of records in one transaction (bootstrap, or
-    /// commit-tree catch-up), then advance this node's ino counter past
-    /// every inode seen under its own prefix.
-    pub fn apply_records(&self, records: &[LogRecord]) -> Result<(), MetaError> {
-        self.apply_foreign(records, &TouchSet::default())?;
-        Ok(())
-    }
-
-    /// Apply records tailed from other nodes' segments, skipping any
-    /// that conflict with pending (unshipped) local records. Returns
-    /// the number of records skipped as conflicts.
-    pub fn apply_foreign(
-        &self,
-        records: &[LogRecord],
-        pending: &TouchSet,
-    ) -> Result<usize, MetaError> {
-        let mut conn = self.raw();
-        let tx = conn.transaction()?;
-        // Usage deltas are staged and only folded into the live counter
-        // after the commit below: an aborted batch rolls the rows back,
-        // and the counter has to roll back with them.
-        let staged = UsageTracker::staging();
-        let mut skipped = 0usize;
-        for rec in records {
-            if pending.conflicts(rec) {
-                tracing::warn!(?rec, "conflict: pending local op wins over foreign record");
-                skipped += 1;
-                continue;
-            }
-            match apply_one(&tx, rec, &staged) {
-                Ok(Applied::Done) => {}
-                Ok(Applied::Skipped(why)) => {
-                    tracing::warn!(?rec, why, "skipped foreign record");
-                    skipped += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        // Our ino counter must clear everything ever allocated under
-        // our own prefix (relevant when replaying our own history).
-        let prefix: u64 = tx
-            .query_row("SELECT value FROM kv WHERE key = 'node_prefix'", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()?
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let (lo, hi) = (prefix << INO_PREFIX_SHIFT, (prefix + 1) << INO_PREFIX_SHIFT);
-        let max_counter: u64 = tx.query_row(
-            "SELECT COALESCE(MAX(ino), 0) FROM inode WHERE ino >= ?1 AND ino < ?2",
-            params![lo, hi],
-            |r| r.get::<_, i64>(0).map(|v| v as u64),
-        )? & ((1 << INO_PREFIX_SHIFT) - 1);
-        let next: u64 = tx
-            .query_row("SELECT value FROM kv WHERE key = 'next_ino'", [], |r| {
-                r.get::<_, String>(0)
-            })?
-            .parse()
-            .map_err(|_| MetaError::Invalid("next_ino".into()))?;
-        if max_counter + 1 > next {
-            tx.execute(
-                "UPDATE kv SET value = ?1 WHERE key = 'next_ino'",
-                params![(max_counter + 1).to_string()],
-            )?;
-        }
-        tx.commit()?;
-        staged.drain_into(self.usage_tracker());
-        Ok(skipped)
+        let touched = TouchSet::from_records(std::iter::once(rec));
+        touched.dentries.iter().any(|d| self.dentries.contains(d))
+            || touched.inos.iter().any(|i| self.inos.contains(i))
     }
 }
 
@@ -186,150 +103,70 @@ enum Applied {
     Skipped(&'static str),
 }
 
-fn dentry_ino(tx: &Connection, parent: u64, name: &str) -> Result<Option<u64>, MetaError> {
-    Ok(tx
-        .query_row(
-            "SELECT ino FROM dentry WHERE parent = ?1 AND name = ?2",
-            params![parent, name],
-            |r| r.get(0),
-        )
-        .optional()?)
-}
+impl Meta {
+    pub fn apply_records(&self, records: &[LogRecord]) -> Result<(), MetaError> {
+        self.apply_foreign(records, &TouchSet::default())?;
+        Ok(())
+    }
 
-fn kind_of(tx: &Connection, ino: u64) -> Result<Option<u8>, MetaError> {
-    Ok(tx
-        .query_row("SELECT kind FROM inode WHERE ino = ?1", params![ino], |r| {
-            r.get(0)
-        })
-        .optional()?)
-}
-
-fn ino_exists(tx: &Connection, ino: u64) -> Result<bool, MetaError> {
-    Ok(kind_of(tx, ino)?.is_some())
-}
-
-/// Drop an existing dentry so a later log record can claim the name
-/// (last-wins). Non-empty directories refuse: replacing them silently
-/// would drop a subtree.
-fn evict_dentry(
-    tx: &Connection,
-    usage: &UsageTracker,
-    parent: u64,
-    name: &str,
-    ino: u64,
-) -> Result<Applied, MetaError> {
-    if kind_of(tx, ino)? == Some(InodeKind::Dir.as_u8()) {
-        let children: u64 = tx.query_row(
-            "SELECT COUNT(*) FROM dentry WHERE parent = ?1",
-            params![ino],
-            |r| r.get(0),
-        )?;
-        if children > 0 {
-            return Ok(Applied::Skipped("name held by non-empty directory"));
-        }
-        tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
-        tx.execute("DELETE FROM inode WHERE ino = ?1", params![ino])?;
-        tx.execute(
-            "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
-            params![parent],
-        )?;
-    } else {
-        // nlink drops; a 0-nlink inode is an orphan, reaped at mount.
-        let (nlink, size, kind, manifest): (u32, i64, u8, Option<Vec<u8>>) = tx.query_row(
-            "SELECT nlink, size, kind, manifest FROM inode WHERE ino = ?1",
-            params![ino],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        tx.execute(
-            "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
-            params![ino],
-        )?;
-        if nlink == 1 {
-            tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
-            SqliteMeta::track_manifest_transition(tx, ino, manifest.as_deref(), None)?;
-            if kind == InodeKind::File.as_u8() {
-                usage.adjust(-size, -1);
+    /// Apply `records`, skipping any that collide with `pending` (the
+    /// caller's own unshipped local journal — see the module doc).
+    /// Returns how many were skipped (conflict or a downstream cascade).
+    pub fn apply_foreign(
+        &self,
+        records: &[LogRecord],
+        pending: &TouchSet,
+    ) -> Result<usize, MetaError> {
+        let mut tx = self.db.write_tx();
+        let staged = crate::store::UsageTracker::staging();
+        let mut skipped = 0usize;
+        for rec in records {
+            if pending.conflicts(rec) {
+                tracing::warn!(
+                    ?rec,
+                    "replay: skipping record that conflicts with pending local work"
+                );
+                skipped += 1;
+                continue;
+            }
+            match apply_one(&mut tx, self, rec, &staged)? {
+                Applied::Done => {}
+                Applied::Skipped(why) => {
+                    tracing::warn!(why, ?rec, "replay: skipped");
+                    skipped += 1;
+                }
             }
         }
-    }
-    tx.execute(
-        "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
-        params![parent, name],
-    )?;
-    Ok(Applied::Done)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_node(
-    tx: &Connection,
-    usage: &UsageTracker,
-    parent: u64,
-    name: &str,
-    ino: u64,
-    kind: InodeKind,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    rdev: u64,
-    nlink: u32,
-    size: u64,
-    target: Option<&str>,
-    t: i64,
-) -> Result<Applied, MetaError> {
-    if !ino_exists(tx, parent)? {
-        // Cascade of a skipped conflicting mkdir: the parent never
-        // materialized here. Skip the whole subtree.
-        return Ok(Applied::Skipped("parent does not exist"));
-    }
-    if let Some(existing) = dentry_ino(tx, parent, name)? {
-        if existing != ino {
-            // Last-wins: this record is later in the log than whatever
-            // holds the name now.
-            if let Applied::Skipped(why) = evict_dentry(tx, usage, parent, name, existing)? {
-                return Ok(Applied::Skipped(why));
+        for rec in records {
+            if let Some(ino) = primary_ino(rec) {
+                reclaim_ino_counter(&mut tx, &self.local, ino)?;
             }
         }
+        let (staged_bytes, staged_files) = staged.raw_delta();
+        crate::store::adjust_usage_tx(&mut tx, &self.local, staged_bytes, staged_files)?;
+        tx.commit()?;
+        staged.drain_into(self.usage_tracker());
+        Ok(skipped)
     }
-    let prior_file = kind == InodeKind::File && kind_of(tx, ino)? == Some(InodeKind::File.as_u8());
-    // OR REPLACE: idempotent under checkpoint/segment overlap.
-    tx.execute(
-        "INSERT OR REPLACE INTO inode (ino, kind, size, mode, uid, gid, nlink, atime_ns,
-                            mtime_ns, ctime_ns, rdev, symlink_target)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, ?9, ?10)",
-        params![
-            ino,
-            kind.as_u8(),
-            size as i64,
-            mode,
-            uid,
-            gid,
-            nlink,
-            t,
-            rdev as i64,
-            target
-        ],
-    )?;
-    let inserted = tx.execute(
-        "INSERT OR IGNORE INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
-        params![parent, name, ino],
-    )?;
-    if inserted > 0 && kind == InodeKind::Dir {
-        tx.execute(
-            "UPDATE inode SET nlink = nlink + 1 WHERE ino = ?1",
-            params![parent],
-        )?;
-    }
-    tx.execute(
-        "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
-        params![parent, t],
-    )?;
-    if kind == InodeKind::File && !prior_file {
-        usage.adjust(size as i64, 1);
-    }
-    Ok(Applied::Done)
 }
 
-fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<Applied, MetaError> {
+fn primary_ino(rec: &LogRecord) -> Option<Ino> {
+    match rec {
+        LogRecord::Mkdir { ino, .. }
+        | LogRecord::Create { ino, .. }
+        | LogRecord::Symlink { ino, .. }
+        | LogRecord::Mknod { ino, .. } => Some(*ino),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn apply_one(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    rec: &LogRecord,
+    staged: &crate::store::UsageTracker,
+) -> Result<Applied, MetaError> {
     match rec {
         LogRecord::Mkdir {
             parent,
@@ -341,11 +178,11 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             time_ns,
         } => insert_node(
             tx,
-            usage,
+            meta,
             *parent,
             name,
             *ino,
-            InodeKind::Dir,
+            Kind::Dir,
             *mode,
             *uid,
             *gid,
@@ -354,6 +191,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             0,
             None,
             *time_ns,
+            staged,
         ),
         LogRecord::Create {
             parent,
@@ -365,11 +203,11 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             time_ns,
         } => insert_node(
             tx,
-            usage,
+            meta,
             *parent,
             name,
             *ino,
-            InodeKind::File,
+            Kind::File,
             *mode,
             *uid,
             *gid,
@@ -378,6 +216,7 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             0,
             None,
             *time_ns,
+            staged,
         ),
         LogRecord::Symlink {
             parent,
@@ -389,19 +228,20 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             time_ns,
         } => insert_node(
             tx,
-            usage,
+            meta,
             *parent,
             name,
             *ino,
-            InodeKind::Symlink,
+            Kind::Symlink,
             0o777,
             *uid,
             *gid,
             0,
             1,
             target.len() as u64,
-            Some(target),
+            Some(target.clone()),
             *time_ns,
+            staged,
         ),
         LogRecord::Mknod {
             parent,
@@ -414,10 +254,25 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             rdev,
             time_ns,
         } => {
-            let k = InodeKind::from_u8(*kind)
-                .ok_or_else(|| MetaError::Invalid(format!("mknod kind {kind} in log")))?;
+            let Some(kind) = InodeKind::from_u8(*kind) else {
+                return Err(MetaError::Invalid(format!("unknown mknod kind {kind}")));
+            };
             insert_node(
-                tx, usage, *parent, name, *ino, k, *mode, *uid, *gid, *rdev, 1, 0, None, *time_ns,
+                tx,
+                meta,
+                *parent,
+                name,
+                *ino,
+                ns::kind_to_mtree(kind),
+                *mode,
+                *uid,
+                *gid,
+                *rdev,
+                1,
+                0,
+                None,
+                *time_ns,
+                staged,
             )
         }
         LogRecord::Link {
@@ -425,143 +280,24 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             parent,
             name,
             time_ns,
-        } => {
-            if !ino_exists(tx, *ino)? || !ino_exists(tx, *parent)? {
-                return Ok(Applied::Skipped("link target or parent missing"));
-            }
-            if let Some(existing) = dentry_ino(tx, *parent, name)? {
-                if existing == *ino {
-                    return Ok(Applied::Done); // idempotent re-apply
-                }
-                if let Applied::Skipped(why) = evict_dentry(tx, usage, *parent, name, existing)? {
-                    return Ok(Applied::Skipped(why));
-                }
-            }
-            tx.execute(
-                "INSERT INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
-                params![parent, name, ino],
-            )?;
-            tx.execute(
-                "UPDATE inode SET nlink = nlink + 1, ctime_ns = ?2 WHERE ino = ?1",
-                params![ino, time_ns],
-            )?;
-            tx.execute(
-                "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
-                params![parent, time_ns],
-            )?;
-            Ok(Applied::Done)
-        }
+        } => apply_link(tx, meta, *ino, *parent, name, *time_ns),
         LogRecord::Unlink {
             parent,
             name,
             time_ns,
-        } => {
-            let Some(ino) = dentry_ino(tx, *parent, name)? else {
-                return Ok(Applied::Done); // already gone: idempotent
-            };
-            let (nlink, size, kind, manifest): (u32, i64, u8, Option<Vec<u8>>) = tx.query_row(
-                "SELECT nlink, size, kind, manifest FROM inode WHERE ino = ?1",
-                params![ino],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
-            tx.execute(
-                "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
-                params![parent, name],
-            )?;
-            // Orphan rows (nlink = 0) are reaped at mount startup; no
-            // process holds them open on a replayed replica.
-            tx.execute(
-                "UPDATE inode SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1",
-                params![ino, time_ns],
-            )?;
-            if nlink == 1 {
-                tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
-                SqliteMeta::track_manifest_transition(tx, ino, manifest.as_deref(), None)?;
-                if kind == InodeKind::File.as_u8() {
-                    usage.adjust(-size, -1);
-                }
-            }
-            tx.execute(
-                "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
-                params![parent, time_ns],
-            )?;
-            Ok(Applied::Done)
-        }
+        } => apply_unlink(tx, meta, *parent, name, *time_ns),
         LogRecord::Rmdir {
             parent,
             name,
             time_ns,
-        } => {
-            let Some(ino) = dentry_ino(tx, *parent, name)? else {
-                return Ok(Applied::Done); // already gone: idempotent
-            };
-            let children: u64 = tx.query_row(
-                "SELECT COUNT(*) FROM dentry WHERE parent = ?1",
-                params![ino],
-                |r| r.get(0),
-            )?;
-            if children > 0 {
-                // A skipped-conflict cascade left local children here.
-                return Ok(Applied::Skipped("directory not empty locally"));
-            }
-            tx.execute(
-                "DELETE FROM dentry WHERE parent = ?1 AND name = ?2",
-                params![parent, name],
-            )?;
-            tx.execute("DELETE FROM xattr WHERE ino = ?1", params![ino])?;
-            tx.execute("DELETE FROM inode WHERE ino = ?1", params![ino])?;
-            tx.execute(
-                "UPDATE inode SET nlink = nlink - 1, mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
-                params![parent, time_ns],
-            )?;
-            Ok(Applied::Done)
-        }
+        } => apply_rmdir(tx, meta, *parent, name, *time_ns),
         LogRecord::Rename {
             parent,
             name,
             new_parent,
             new_name,
             time_ns,
-        } => {
-            let Some(ino) = dentry_ino(tx, *parent, name)? else {
-                return Ok(Applied::Done); // source gone: already applied
-            };
-            if !ino_exists(tx, *new_parent)? {
-                return Ok(Applied::Skipped("rename destination parent missing"));
-            }
-            let src_is_dir = kind_of(tx, ino)? == Some(InodeKind::Dir.as_u8());
-            if let Some(existing) = dentry_ino(tx, *new_parent, new_name)? {
-                if existing == ino {
-                    return Ok(Applied::Done); // hardlink pair: POSIX no-op
-                }
-                if let Applied::Skipped(why) =
-                    evict_dentry(tx, usage, *new_parent, new_name, existing)?
-                {
-                    return Ok(Applied::Skipped(why));
-                }
-            }
-            tx.execute(
-                "UPDATE dentry SET parent = ?3, name = ?4 WHERE parent = ?1 AND name = ?2",
-                params![parent, name, new_parent, new_name],
-            )?;
-            if src_is_dir && parent != new_parent {
-                tx.execute(
-                    "UPDATE inode SET nlink = nlink - 1 WHERE ino = ?1",
-                    params![parent],
-                )?;
-                tx.execute(
-                    "UPDATE inode SET nlink = nlink + 1 WHERE ino = ?1",
-                    params![new_parent],
-                )?;
-            }
-            for p in [parent, new_parent] {
-                tx.execute(
-                    "UPDATE inode SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1",
-                    params![p, time_ns],
-                )?;
-            }
-            Ok(Applied::Done)
-        }
+        } => apply_rename(tx, meta, *parent, name, *new_parent, new_name, *time_ns),
         LogRecord::Setattr {
             ino,
             mode,
@@ -571,107 +307,24 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             atime_ns,
             mtime_ns,
             time_ns,
-        } => {
-            if !ino_exists(tx, *ino)? {
-                return Ok(Applied::Done); // inode gone: attrs moot
-            }
-            if let Some(m) = mode {
-                tx.execute(
-                    "UPDATE inode SET mode = ?2 WHERE ino = ?1",
-                    params![ino, m & 0o7777],
-                )?;
-            }
-            if let Some(u) = uid {
-                tx.execute("UPDATE inode SET uid = ?2 WHERE ino = ?1", params![ino, u])?;
-            }
-            if let Some(g) = gid {
-                tx.execute("UPDATE inode SET gid = ?2 WHERE ino = ?1", params![ino, g])?;
-            }
-            if let Some(s) = size {
-                let (old_size, kind): (i64, u8) = tx.query_row(
-                    "SELECT size, kind FROM inode WHERE ino = ?1",
-                    params![ino],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?;
-                tx.execute(
-                    "UPDATE inode SET size = ?2, mtime_ns = ?3 WHERE ino = ?1",
-                    params![ino, *s as i64, time_ns],
-                )?;
-                if kind == InodeKind::File.as_u8() {
-                    usage.adjust(*s as i64 - old_size, 0);
-                }
-            }
-            if let Some(a) = atime_ns {
-                tx.execute(
-                    "UPDATE inode SET atime_ns = ?2 WHERE ino = ?1",
-                    params![ino, a],
-                )?;
-            }
-            if let Some(m) = mtime_ns {
-                tx.execute(
-                    "UPDATE inode SET mtime_ns = ?2 WHERE ino = ?1",
-                    params![ino, m],
-                )?;
-            }
-            tx.execute(
-                "UPDATE inode SET ctime_ns = ?2 WHERE ino = ?1",
-                params![ino, time_ns],
-            )?;
-            Ok(Applied::Done)
-        }
+        } => apply_setattr(
+            tx, meta, *ino, *mode, *uid, *gid, *size, *atime_ns, *mtime_ns, *time_ns, staged,
+        ),
+        LogRecord::WriteManifest {
+            ino,
+            manifest,
+            size,
+            time_ns,
+            ..
+        } => apply_write_manifest(tx, meta, *ino, manifest, *size, *time_ns, staged),
         LogRecord::SetXattr {
             ino,
             name,
             value,
             time_ns,
-        } => {
-            if !ino_exists(tx, *ino)? {
-                return Ok(Applied::Done);
-            }
-            tx.execute(
-                "INSERT OR REPLACE INTO xattr (ino, name, value) VALUES (?1, ?2, ?3)",
-                params![ino, name, value],
-            )?;
-            tx.execute(
-                "UPDATE inode SET ctime_ns = ?2 WHERE ino = ?1",
-                params![ino, time_ns],
-            )?;
-            Ok(Applied::Done)
-        }
+        } => apply_set_xattr(tx, meta, *ino, name, value, *time_ns),
         LogRecord::RemoveXattr { ino, name, time_ns } => {
-            tx.execute(
-                "DELETE FROM xattr WHERE ino = ?1 AND name = ?2",
-                params![ino, name],
-            )?;
-            tx.execute(
-                "UPDATE inode SET ctime_ns = ?2 WHERE ino = ?1",
-                params![ino, time_ns],
-            )?;
-            Ok(Applied::Done)
-        }
-        LogRecord::WriteManifest {
-            ino,
-            base_manifest: _,
-            manifest,
-            size,
-            time_ns,
-        } => {
-            if !ino_exists(tx, *ino)? {
-                return Ok(Applied::Done); // inode gone: data moot
-            }
-            let (old, old_size): (Option<Vec<u8>>, i64) = tx.query_row(
-                "SELECT manifest, size FROM inode WHERE ino = ?1",
-                params![ino],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            tx.execute(
-                "UPDATE inode SET manifest = ?2, size = ?3, mtime_ns = ?4, ctime_ns = ?4
-                 WHERE ino = ?1",
-                params![ino, manifest, *size as i64, time_ns],
-            )?;
-            usage.adjust(*size as i64 - old_size, 0);
-            SqliteMeta::track_manifest_transition(tx, *ino, old.as_deref(), Some(manifest))?;
-            Ok(Applied::Done)
+            apply_remove_xattr(tx, meta, *ino, name, *time_ns)
         }
         LogRecord::SnapCreate {
             id,
@@ -680,99 +333,33 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             root_hash,
             created_unix_ms,
         } => {
-            tx.execute(
-                "INSERT OR REPLACE INTO snapshot
-                 (id, path, name, root_hash, created_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, path, name, root_hash, created_unix_ms],
-            )?;
+            tx.insert(
+                &meta.ns,
+                keys::subsystem(keys::Subsystem::Snapshot, id.as_bytes()),
+                crate::store::snapshot_record(&crate::SnapshotRow {
+                    id: id.clone(),
+                    path: path.clone(),
+                    name: name.clone(),
+                    root_hash: root_hash.clone(),
+                    created_unix_ms: *created_unix_ms,
+                }),
+            );
             Ok(Applied::Done)
         }
         LogRecord::SnapDelete { id, .. } => {
-            tx.execute("DELETE FROM snapshot WHERE id = ?1", params![id])?;
+            tx.remove(
+                &meta.ns,
+                keys::subsystem(keys::Subsystem::Snapshot, id.as_bytes()),
+            );
             Ok(Applied::Done)
         }
-        LogRecord::Clone { nodes, .. } => {
-            for node in nodes {
-                let Some(kind) = InodeKind::from_u8(node.kind) else {
-                    return Err(MetaError::Invalid(format!(
-                        "clone inode {} has invalid kind {}",
-                        node.ino, node.kind
-                    )));
-                };
-                if !ino_exists(tx, node.parent)? {
-                    return Ok(Applied::Skipped("clone parent does not exist"));
-                }
-                let prior: Option<(i64, u8)> = tx
-                    .query_row(
-                        "SELECT size, kind FROM inode WHERE ino = ?1",
-                        params![node.ino],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO inode
-                     (ino, kind, size, mode, uid, gid, nlink, atime_ns, mtime_ns,
-                      ctime_ns, rdev, manifest, symlink_target)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, ?9, ?10, ?11)",
-                    params![
-                        node.ino,
-                        node.kind,
-                        node.size as i64,
-                        node.mode,
-                        node.uid,
-                        node.gid,
-                        if kind == InodeKind::Dir { 2 } else { 1 },
-                        node.mtime_ns,
-                        node.rdev as i64,
-                        node.manifest,
-                        node.target
-                    ],
-                )?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO dentry (parent, name, ino) VALUES (?1, ?2, ?3)",
-                    params![node.parent, node.name, node.ino],
-                )?;
-                tx.execute("DELETE FROM xattr WHERE ino = ?1", params![node.ino])?;
-                for (name, value) in &node.xattrs {
-                    tx.execute(
-                        "INSERT INTO xattr (ino, name, value) VALUES (?1, ?2, ?3)",
-                        params![node.ino, name, value],
-                    )?;
-                }
-                SqliteMeta::track_manifest_transition(
-                    tx,
-                    node.ino,
-                    None,
-                    node.manifest.as_deref(),
-                )?;
-                let prior_file_bytes = prior
-                    .filter(|(_, k)| *k == InodeKind::File.as_u8())
-                    .map(|(s, _)| s)
-                    .unwrap_or(0);
-                let prior_file = prior
-                    .map(|(_, k)| k == InodeKind::File.as_u8())
-                    .unwrap_or(false);
-                if kind == InodeKind::File {
-                    usage.adjust(
-                        node.size as i64 - prior_file_bytes,
-                        if prior_file { 0 } else { 1 },
-                    );
-                } else if prior_file {
-                    usage.adjust(-prior_file_bytes, -1);
-                }
-            }
-            Ok(Applied::Done)
-        }
+        LogRecord::Clone { nodes, .. } => apply_clone(tx, meta, nodes, staged),
         LogRecord::SetQuota { max_logical_bytes } => {
-            let value = match max_logical_bytes {
-                Some(n) => n.to_string(),
-                None => String::new(),
-            };
-            tx.execute(
-                "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
-                params![QUOTA_KV_KEY, value],
-            )?;
+            tx.insert(
+                &meta.ns,
+                keys::subsystem(keys::Subsystem::Quota, b""),
+                crate::store::quota_record(*max_logical_bytes),
+            );
             Ok(Applied::Done)
         }
         LogRecord::Atime {
@@ -780,345 +367,546 @@ fn apply_one(tx: &Connection, rec: &LogRecord, usage: &UsageTracker) -> Result<A
             atime_ns,
             time_ns,
         } => {
-            // Best-effort, order-free: one shared helper (clamp + ctime
-            // guard + max-merge) serves replay, the AtimeBatch handler,
-            // and the emitting node's own local flush, so a value
-            // applied locally can never be one a replica would reject.
-            apply_atime_one(tx, *ino, *atime_ns, *time_ns, atime_skew_tolerance_ns())?;
+            let skew = atime::atime_skew_tolerance_ns();
+            atime::apply_atime_one(
+                tx,
+                &meta.ns,
+                &meta.orphans,
+                &meta.atime,
+                *ino,
+                *atime_ns,
+                *time_ns,
+                skew,
+            )?;
             Ok(Applied::Done)
         }
     }
 }
 
-/// Default skew clamp: a bump's claimed atime is never accepted more
-/// than this far past the applying node's clock, so one badly skewed
-/// node cannot park an inode's atime in the far future.
-const ATIME_SKEW_TOLERANCE_S_DEFAULT: i64 = 300;
-
-/// Skew tolerance in nanoseconds, from `CONSTELLATION_ATIME_SKEW_TOLERANCE_S`.
-/// Read here (rather than threaded through every replay call site) so
-/// foreign-segment replay and bootstrap clamp identically to the local
-/// flush path without plumbing cli config into the meta crate.
-pub fn atime_skew_tolerance_ns() -> i64 {
-    std::env::var("CONSTELLATION_ATIME_SKEW_TOLERANCE_S")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(ATIME_SKEW_TOLERANCE_S_DEFAULT)
-        .saturating_mul(1_000_000_000)
-}
-
-/// Apply one atime bump to `inode`, the single definition of atime
-/// merge semantics. Clamps the claimed value to `now + skew_tol_ns`,
-/// then raises `atime_ns` to the max of its current value and the claim
-/// — but only while `ctime_ns < time_ns`, so any explicit attr change
-/// (a `touch -a`, a peer's write/chmod/truncate) that postdates the
-/// read keeps its authority. Never writes ctime. A missing inode is a
-/// no-op. Returns true if the claim was clamped (for `skew_clamped`).
-pub fn apply_atime_one(
-    tx: &Connection,
-    ino: u64,
-    atime_ns: i64,
-    time_ns: i64,
-    skew_tol_ns: i64,
-) -> Result<bool, MetaError> {
-    let ceiling = constellation_fs_core::types::now_ns().saturating_add(skew_tol_ns);
-    let (claim, clamped) = if atime_ns > ceiling {
-        (ceiling, true)
-    } else {
-        (atime_ns, false)
+#[allow(clippy::too_many_arguments)]
+fn insert_node(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    parent: Ino,
+    name: &str,
+    ino: Ino,
+    kind: Kind,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u64,
+    nlink: u32,
+    size: u64,
+    target: Option<String>,
+    t: i64,
+    staged: &crate::store::UsageTracker,
+) -> Result<Applied, MetaError> {
+    if ns::get_inode_record(tx, &meta.ns, parent)?.is_none() {
+        return Ok(Applied::Skipped("parent does not exist"));
+    }
+    if let Some(existing) = ns::get_dentry_record(tx, &meta.ns, parent, name)? {
+        if existing.ino == ino {
+            return Ok(Applied::Done);
+        }
+        match evict_dentry(tx, meta, parent, name, existing.ino, t)? {
+            Applied::Done => {}
+            skip => return Ok(skip),
+        }
+    }
+    let prior_file =
+        ns::get_inode_record(tx, &meta.ns, ino)?.is_some_and(|r| r.attrs.kind == Kind::File);
+    let attrs = Attrs {
+        kind,
+        mode: mode & 0o7777,
+        uid,
+        gid,
+        nlink,
+        size,
+        mtime_ns: t,
+        ctime_ns: t,
+        rdev,
     };
-    tx.execute(
-        "UPDATE inode SET atime_ns = MAX(atime_ns, ?2) WHERE ino = ?1 AND ctime_ns < ?3",
-        params![ino, claim, time_ns],
+    ns::put_inode(
+        tx,
+        &meta.ns,
+        &meta.blobs,
+        ino,
+        attrs,
+        None,
+        target.map(String::into_bytes),
+        &[],
     )?;
-    Ok(clamped)
+    let is_new_dentry = ns::get_dentry_record(tx, &meta.ns, parent, name)?.is_none();
+    ns::put_dentry(tx, &meta.ns, parent, name, ino, attrs);
+    atime::set_atime_tx(tx, &meta.atime, ino, t);
+    if is_new_dentry && kind == Kind::Dir {
+        misc::bump_nlink_tx(tx, &meta.ns, parent, 1, t)?;
+    }
+    misc::touch_times_tx(tx, &meta.ns, parent, t)?;
+    if kind == Kind::File && !prior_file {
+        // A fresh file always starts at 0 bytes (Create/Mkdir/Symlink/
+        // Mknod never carry file content), but the file *count* still
+        // moves, mirroring the local `create()` path's `adjust(0, 1)`.
+        staged.adjust(0, 1);
+    }
+    Ok(Applied::Done)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{atime_skew_tolerance_ns, TouchSet};
-    use crate::{LogRecord, MetaStore, SqliteMeta};
-
-    /// A batch that fails part way rolls the rows back; the usage counter
-    /// has to roll back with them, or the node mis-reports `df` and
-    /// mis-enforces the quota until it is remounted.
-    #[test]
-    fn failed_batch_leaves_the_usage_counter_untouched() {
-        let dst = SqliteMeta::open_in_memory().unwrap();
-        let before = dst.usage();
-        let records = vec![
-            LogRecord::Create {
-                parent: 1,
-                name: "f".into(),
-                ino: 4242,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                time_ns: 1,
-            },
-            // Undecodable kind: `apply_one` errors, aborting the batch.
-            LogRecord::Mknod {
-                parent: 1,
-                name: "bad".into(),
-                ino: 4243,
-                kind: 99,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                time_ns: 2,
-            },
-        ];
-        assert!(dst.apply_records(&records).is_err());
-        assert!(dst.lookup(1, "f").unwrap().is_none(), "rows rolled back");
-        assert_eq!(dst.usage(), before, "counter rolled back with the rows");
-        assert_eq!(dst.usage(), dst.recursive_size(1).unwrap());
-    }
-
-    /// The same batch applied cleanly does move the counter.
-    #[test]
-    fn applied_batch_moves_the_usage_counter() {
-        let dst = SqliteMeta::open_in_memory().unwrap();
-        dst.apply_records(&[LogRecord::Create {
-            parent: 1,
-            name: "f".into(),
-            ino: 4242,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            time_ns: 1,
-        }])
-        .unwrap();
-        assert_eq!(dst.usage(), (0, 1));
-        dst.apply_records(&[LogRecord::WriteManifest {
-            ino: 4242,
-            base_manifest: None,
-            manifest: b"m".to_vec(),
-            size: 500,
-            time_ns: 2,
-        }])
-        .unwrap();
-        assert_eq!(dst.usage(), (500, 1));
-        assert_eq!(dst.usage(), dst.recursive_size(1).unwrap());
-    }
-
-    /// Mutate one store, replay its journal into another, and compare.
-    #[test]
-    fn replay_reproduces_source() {
-        let src = SqliteMeta::open_in_memory().unwrap();
-        let d = src.mkdir(1, "dir", 0o755, 1000, 1000).unwrap();
-        let f = src.create(d.ino, "file", 0o644, 1000, 1000).unwrap();
-        src.set_manifest(f.ino, b"manifest-bytes", 123).unwrap();
-        src.symlink(1, "ln", "dir/file", 1000, 1000).unwrap();
-        let g = src.create(1, "gone", 0o644, 1000, 1000).unwrap();
-        src.link(f.ino, 1, "hard").unwrap();
-        src.unlink(1, "gone").unwrap();
-        src.reap_orphan(g.ino).unwrap();
-        src.rename(d.ino, "file", 1, "file2").unwrap();
-        src.setattr(f.ino, Some(0o600), None, None, None, None, None)
-            .unwrap();
-
-        let records: Vec<LogRecord> = src
-            .take_journal(1000)
-            .unwrap()
+/// Evict whatever currently sits at `(parent, name)` so a later insert
+/// can claim the name. Mirrors the old engine's rules: a non-empty
+/// directory is left alone (skip, don't cascade-delete a subtree), an
+/// empty directory or a dropped-to-zero non-directory is removed
+/// outright (an orphan reaped later, exactly like a local `unlink`).
+fn evict_dentry(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    parent: Ino,
+    name: &str,
+    ino: Ino,
+    t: i64,
+) -> Result<Applied, MetaError> {
+    let Some(rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
+        ns::remove_dentry(tx, &meta.ns, parent, name, ino);
+        return Ok(Applied::Done);
+    };
+    if rec.attrs.kind == Kind::Dir {
+        if ns::has_children(tx, &meta.ns, ino)? {
+            return Ok(Applied::Skipped("name held by non-empty directory"));
+        }
+        ns::remove_dentry(tx, &meta.ns, parent, name, ino);
+        tx.remove(&meta.ns, keys::inode(ino));
+        ns::clear_spilled_xattrs(tx, &meta.ns, ino)?;
+        let names: Vec<Vec<u8>> = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?
             .into_iter()
-            .map(|(_, r)| r)
+            .map(|(n, _)| n.into_bytes())
             .collect();
-        let dst = SqliteMeta::open_in_memory().unwrap();
-        dst.apply_records(&records).unwrap();
-        for ino in dst.orphans().unwrap() {
-            dst.reap_orphan(ino).unwrap();
+        misc::xattr_by_name_del_all_tx(tx, &meta.xattr_by_name, ino, names);
+        atime::remove_atime_tx(tx, &meta.atime, ino);
+    } else {
+        ns::remove_dentry(tx, &meta.ns, parent, name, ino);
+        if rec.attrs.nlink <= 1 {
+            let manifest_bytes = rec
+                .manifest
+                .as_ref()
+                .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
+                .transpose()?;
+            ns::clear_spilled_xattrs(tx, &meta.ns, ino)?;
+            let names: Vec<Vec<u8>> = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?
+                .into_iter()
+                .map(|(n, _)| n.into_bytes())
+                .collect();
+            misc::xattr_by_name_del_all_tx(tx, &meta.xattr_by_name, ino, names);
+            misc::track_manifest_transition_tx(
+                tx,
+                &meta.chunk_ref,
+                &meta.chunk_ref_by_ino,
+                ino,
+                manifest_bytes.as_deref(),
+                None,
+            )?;
+            let mut orphan_rec = rec.clone();
+            orphan_rec.attrs.nlink = 0;
+            orphan_rec.attrs.ctime_ns = t;
+            orphan_rec.xattrs.clear();
+            tx.insert(
+                &meta.orphans,
+                ino.to_be_bytes().to_vec(),
+                orphan_rec.encode(),
+            );
+            tx.remove(&meta.ns, keys::inode(ino));
+        } else {
+            misc::bump_nlink_tx(tx, &meta.ns, ino, -1, t)?;
         }
+    }
+    Ok(Applied::Done)
+}
 
-        // Same namespace, attributes, and manifests.
-        for (parent, name) in [(1u64, "dir"), (1, "ln"), (1, "file2"), (1, "hard")] {
-            let a = src.lookup(parent, name).unwrap().unwrap();
-            let b = dst.lookup(parent, name).unwrap().unwrap();
-            assert_eq!(a, b, "{name} attrs diverge");
+fn apply_link(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    ino: Ino,
+    parent: Ino,
+    name: &str,
+    t: i64,
+) -> Result<Applied, MetaError> {
+    if ns::get_inode_record(tx, &meta.ns, ino)?.is_none()
+        || ns::get_inode_record(tx, &meta.ns, parent)?.is_none()
+    {
+        return Ok(Applied::Skipped("link endpoint missing"));
+    }
+    if let Some(existing) = ns::get_dentry_record(tx, &meta.ns, parent, name)? {
+        if existing.ino == ino {
+            return Ok(Applied::Done);
         }
-        assert_eq!(src.manifest(f.ino).unwrap(), dst.manifest(f.ino).unwrap());
-        assert!(dst.lookup(1, "gone").unwrap().is_none());
-        // Ino allocation continues past everything replayed.
-        let n = dst.create(1, "new", 0o644, 0, 0).unwrap();
-        assert!(n.ino > f.ino.max(g.ino));
-    }
-
-    // --- read-time atime (plan 20) ---
-
-    fn atime_of(m: &SqliteMeta, ino: u64) -> i64 {
-        m.getattr(ino).unwrap().unwrap().atime_ns
-    }
-
-    fn atime_rec(ino: u64, atime_ns: i64, time_ns: i64) -> LogRecord {
-        LogRecord::Atime {
-            ino,
-            atime_ns,
-            time_ns,
+        match evict_dentry(tx, meta, parent, name, existing.ino, t)? {
+            Applied::Done => {}
+            skip => return Ok(skip),
         }
     }
+    let rec = misc::bump_nlink_tx(tx, &meta.ns, ino, 1, t)?.expect("checked above");
+    ns::put_dentry(tx, &meta.ns, parent, name, ino, rec.attrs);
+    misc::touch_times_tx(tx, &meta.ns, parent, t)?;
+    Ok(Applied::Done)
+}
 
-    #[test]
-    fn atime_merge_is_max_idempotent_and_order_free() {
-        let m = SqliteMeta::open_in_memory().unwrap();
-        let f = m.create(1, "f", 0o644, 0, 0).unwrap();
-        let base = f.ctime_ns; // reads always postdate creation
-                               // Out-of-order + duplicated records must converge on the max.
-        m.apply_records(&[
-            atime_rec(f.ino, base + 50, base + 50),
-            atime_rec(f.ino, base + 10, base + 10),
-            atime_rec(f.ino, base + 50, base + 50), // duplicate
-            atime_rec(f.ino, base + 30, base + 30),
-        ])
-        .unwrap();
-        assert_eq!(atime_of(&m, f.ino), base + 50);
-        // Replaying an older record again changes nothing (idempotent).
-        m.apply_records(&[atime_rec(f.ino, base + 10, base + 10)])
-            .unwrap();
-        assert_eq!(atime_of(&m, f.ino), base + 50);
+fn apply_unlink(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    parent: Ino,
+    name: &str,
+    t: i64,
+) -> Result<Applied, MetaError> {
+    let Some(d) = ns::get_dentry_record(tx, &meta.ns, parent, name)? else {
+        return Ok(Applied::Done);
+    };
+    let result = evict_dentry(tx, meta, parent, name, d.ino, t)?;
+    misc::touch_times_tx(tx, &meta.ns, parent, t)?;
+    Ok(result)
+}
+
+fn apply_rmdir(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    parent: Ino,
+    name: &str,
+    t: i64,
+) -> Result<Applied, MetaError> {
+    let Some(d) = ns::get_dentry_record(tx, &meta.ns, parent, name)? else {
+        return Ok(Applied::Done);
+    };
+    let Some(rec) = ns::get_inode_record(tx, &meta.ns, d.ino)? else {
+        ns::remove_dentry(tx, &meta.ns, parent, name, d.ino);
+        return Ok(Applied::Done);
+    };
+    if rec.attrs.kind != Kind::Dir {
+        return Ok(Applied::Skipped("rmdir target is not a directory"));
     }
-
-    #[test]
-    fn atime_ctime_guard_drops_pre_touch_record() {
-        let m = SqliteMeta::open_in_memory().unwrap();
-        let f = m.create(1, "f", 0o644, 0, 0).unwrap();
-        // A read observed before an explicit attr change (ctime bump).
-        let read_time = f.ctime_ns - 1;
-        // Simulate the explicit change: setattr bumps ctime to "now",
-        // which is >= f.ctime_ns > read_time.
-        m.setattr(f.ino, None, None, None, None, Some(1234), None)
-            .unwrap();
-        let after = m.getattr(f.ino).unwrap().unwrap();
-        assert!(after.ctime_ns >= f.ctime_ns);
-        m.apply_records(&[atime_rec(f.ino, read_time + 5, read_time)])
-            .unwrap();
-        // The in-flight read-bump is dropped: explicit atime survives.
-        assert_eq!(atime_of(&m, f.ino), 1234);
+    if ns::has_children(tx, &meta.ns, d.ino)? {
+        return Ok(Applied::Skipped("directory not empty locally"));
     }
+    ns::remove_dentry(tx, &meta.ns, parent, name, d.ino);
+    tx.remove(&meta.ns, keys::inode(d.ino));
+    ns::clear_spilled_xattrs(tx, &meta.ns, d.ino)?;
+    atime::remove_atime_tx(tx, &meta.atime, d.ino);
+    misc::bump_nlink_tx(tx, &meta.ns, parent, -1, t)?;
+    Ok(Applied::Done)
+}
 
-    #[test]
-    fn atime_for_missing_inode_is_a_noop() {
-        let m = SqliteMeta::open_in_memory().unwrap();
-        // No error, no row created.
-        m.apply_records(&[atime_rec(999_999, 1, 1)]).unwrap();
-        assert!(m.getattr(999_999).unwrap().is_none());
+fn apply_rename(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    parent: Ino,
+    name: &str,
+    new_parent: Ino,
+    new_name: &str,
+    t: i64,
+) -> Result<Applied, MetaError> {
+    let Some(src) = ns::get_dentry_record(tx, &meta.ns, parent, name)? else {
+        return Ok(Applied::Done);
+    };
+    let ino = src.ino;
+    if ns::get_inode_record(tx, &meta.ns, new_parent)?.is_none() {
+        return Ok(Applied::Skipped("rename destination parent missing"));
     }
-
-    #[test]
-    fn atime_skew_clamp_caps_a_far_future_claim() {
-        let m = SqliteMeta::open_in_memory().unwrap();
-        let f = m.create(1, "f", 0o644, 0, 0).unwrap();
-        let now = constellation_fs_core::types::now_ns();
-        // A claim a year in the future, with time_ns that passes the
-        // ctime guard.
-        let (applied, clamped) = m
-            .apply_atime(&[(f.ino, now + 365 * 86_400_000_000_000, now + 1)])
-            .unwrap();
-        assert_eq!((applied, clamped), (1, 1));
-        let got = atime_of(&m, f.ino);
-        let ceiling = now + atime_skew_tolerance_ns();
-        assert!(got <= ceiling + 1_000_000_000, "clamped near the ceiling");
-        assert!(got > now, "but still moved forward");
-    }
-
-    #[test]
-    fn atime_journal_coalesces_to_one_row_holding_the_max() {
-        let m = SqliteMeta::open_in_memory().unwrap();
-        let f = m.create(1, "f", 0o644, 0, 0).unwrap();
-        let part = "p0".to_string();
-        // Many "flushes" of the same inode.
-        for t in [10i64, 50, 30, 40] {
-            m.queue_atime(&[(f.ino, t, t)]).unwrap();
+    let Some(src_rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
+        return Ok(Applied::Done);
+    };
+    if let Some(existing) = ns::get_dentry_record(tx, &meta.ns, new_parent, new_name)? {
+        if existing.ino == ino {
+            return Ok(Applied::Done);
         }
-        assert_eq!(m.atime_backlog_of(&part).unwrap(), 1, "one row per inode");
-        let rows = m.take_atime_of(&part, 100).unwrap();
-        assert_eq!(rows, vec![(f.ino, 50, 50)], "holds the max");
-        m.clear_atime(&part, &[f.ino]).unwrap();
-        assert_eq!(m.atime_backlog_of(&part).unwrap(), 0);
+        match evict_dentry(tx, meta, new_parent, new_name, existing.ino, t)? {
+            Applied::Done => {}
+            skip => return Ok(skip),
+        }
     }
+    tx.remove(&meta.ns, keys::dentry(parent, name.as_bytes()));
+    tx.remove(&meta.ns, keys::rdentry(ino, parent, name.as_bytes()));
+    tx.insert(
+        &meta.ns,
+        keys::dentry(new_parent, new_name.as_bytes()),
+        DentryRecord::new(ino, src.attrs).encode(),
+    );
+    tx.insert(
+        &meta.ns,
+        keys::rdentry(ino, new_parent, new_name.as_bytes()),
+        record::RDENTRY_VALUE.to_vec(),
+    );
+    if src_rec.attrs.kind == Kind::Dir && parent != new_parent {
+        misc::bump_nlink_tx(tx, &meta.ns, parent, -1, t)?;
+        misc::bump_nlink_tx(tx, &meta.ns, new_parent, 1, t)?;
+    }
+    misc::touch_times_tx(tx, &meta.ns, parent, t)?;
+    misc::touch_times_tx(tx, &meta.ns, new_parent, t)?;
+    Ok(Applied::Done)
+}
 
-    #[test]
-    fn atime_backlog_does_not_count_toward_journal_len() {
-        let m = SqliteMeta::open_in_memory().unwrap();
-        let f = m.create(1, "f", 0o644, 0, 0).unwrap();
-        let before = m.journal_len().unwrap();
-        m.queue_atime(&[(f.ino, 100, 100)]).unwrap();
-        assert_eq!(
-            m.journal_len().unwrap(),
-            before,
-            "atime is not write backlog"
+#[allow(clippy::too_many_arguments)]
+fn apply_setattr(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    ino: Ino,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    size: Option<u64>,
+    atime_ns: Option<i64>,
+    mtime_ns: Option<i64>,
+    t: i64,
+    staged: &crate::store::UsageTracker,
+) -> Result<Applied, MetaError> {
+    let Some(mut rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
+        return Ok(Applied::Done);
+    };
+    let old_size = rec.attrs.size;
+    if let Some(m) = mode {
+        rec.attrs.mode = m & 0o7777;
+    }
+    if let Some(u) = uid {
+        rec.attrs.uid = u;
+    }
+    if let Some(g) = gid {
+        rec.attrs.gid = g;
+    }
+    if let Some(s) = size {
+        rec.attrs.size = s;
+        rec.attrs.mtime_ns = t;
+    }
+    if let Some(m) = mtime_ns {
+        rec.attrs.mtime_ns = m;
+    }
+    rec.attrs.ctime_ns = t;
+    let attrs = rec.attrs;
+    tx.insert(&meta.ns, keys::inode(ino), rec.encode());
+    for (parent, name) in ns::links_of(tx, &meta.ns, ino)? {
+        tx.insert(
+            &meta.ns,
+            keys::dentry(parent, name.as_bytes()),
+            DentryRecord::new(ino, attrs).encode(),
         );
     }
+    if let Some(a) = atime_ns {
+        atime::set_atime_tx(tx, &meta.atime, ino, a);
+    }
+    if size.is_some() && attrs.kind == Kind::File {
+        staged.adjust(attrs.size as i64 - old_size as i64, 0);
+    }
+    Ok(Applied::Done)
+}
 
-    #[test]
-    fn atime_converges_across_replicas_via_shipped_records() {
-        // Two replicas holding the same file. A's reads are shipped as
-        // Atime records and tailed by B (and re-applied by A); both must
-        // converge on the max regardless of arrival order, and an
-        // explicit backwards `touch -a` on B must survive.
-        let make = || {
-            let m = SqliteMeta::open_in_memory().unwrap();
-            // Use a fixed ino on both replicas.
-            m.apply_records(&[LogRecord::Create {
-                parent: 1,
-                name: "shared".into(),
-                ino: (1 << 40) | 1,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                time_ns: 100,
-            }])
-            .unwrap();
-            m
+fn apply_write_manifest(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    ino: Ino,
+    manifest: &[u8],
+    size: u64,
+    t: i64,
+    staged: &crate::store::UsageTracker,
+) -> Result<Applied, MetaError> {
+    let Some(rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
+        return Ok(Applied::Done);
+    };
+    let old_size = rec.attrs.size;
+    let current = rec
+        .manifest
+        .as_ref()
+        .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
+        .transpose()?;
+    let mut attrs = rec.attrs;
+    attrs.size = size;
+    attrs.mtime_ns = t;
+    attrs.ctime_ns = t;
+    let xattrs = rec.xattrs.clone();
+    ns::put_inode(
+        tx,
+        &meta.ns,
+        &meta.blobs,
+        ino,
+        attrs,
+        Some(manifest.to_vec()),
+        rec.symlink_target
+            .as_ref()
+            .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
+            .transpose()?,
+        &xattrs,
+    )?;
+    for (parent, name) in ns::links_of(tx, &meta.ns, ino)? {
+        tx.insert(
+            &meta.ns,
+            keys::dentry(parent, name.as_bytes()),
+            DentryRecord::new(ino, attrs).encode(),
+        );
+    }
+    misc::track_manifest_transition_tx(
+        tx,
+        &meta.chunk_ref,
+        &meta.chunk_ref_by_ino,
+        ino,
+        current.as_deref(),
+        Some(manifest),
+    )?;
+    staged.adjust(size as i64 - old_size as i64, 0);
+    Ok(Applied::Done)
+}
+
+fn apply_set_xattr(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    ino: Ino,
+    name: &str,
+    value: &[u8],
+    t: i64,
+) -> Result<Applied, MetaError> {
+    let Some(rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
+        return Ok(Applied::Done);
+    };
+    let mut xattrs = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?;
+    if let Some(slot) = xattrs.iter_mut().find(|(n, _)| n == name) {
+        slot.1 = value.to_vec();
+    } else {
+        xattrs.push((name.to_string(), value.to_vec()));
+    }
+    let mut attrs = rec.attrs;
+    attrs.ctime_ns = t;
+    let xattr_pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
+        .into_iter()
+        .map(|(n, v)| (n.into_bytes(), v))
+        .collect();
+    let manifest = rec
+        .manifest
+        .as_ref()
+        .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
+        .transpose()?;
+    let target = rec
+        .symlink_target
+        .as_ref()
+        .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
+        .transpose()?;
+    ns::put_inode(
+        tx,
+        &meta.ns,
+        &meta.blobs,
+        ino,
+        attrs,
+        manifest,
+        target,
+        &xattr_pairs,
+    )?;
+    misc::xattr_by_name_put_tx(tx, &meta.xattr_by_name, name, ino, value);
+    Ok(Applied::Done)
+}
+
+fn apply_remove_xattr(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    ino: Ino,
+    name: &str,
+    t: i64,
+) -> Result<Applied, MetaError> {
+    let Some(rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
+        return Ok(Applied::Done);
+    };
+    let mut xattrs = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?;
+    xattrs.retain(|(n, _)| n != name);
+    let mut attrs = rec.attrs;
+    attrs.ctime_ns = t;
+    let xattr_pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
+        .into_iter()
+        .map(|(n, v)| (n.into_bytes(), v))
+        .collect();
+    let manifest = rec
+        .manifest
+        .as_ref()
+        .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
+        .transpose()?;
+    let target = rec
+        .symlink_target
+        .as_ref()
+        .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
+        .transpose()?;
+    ns::put_inode(
+        tx,
+        &meta.ns,
+        &meta.blobs,
+        ino,
+        attrs,
+        manifest,
+        target,
+        &xattr_pairs,
+    )?;
+    misc::xattr_by_name_del_tx(tx, &meta.xattr_by_name, name, ino);
+    Ok(Applied::Done)
+}
+
+fn apply_clone(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    nodes: &[CloneNode],
+    staged: &crate::store::UsageTracker,
+) -> Result<Applied, MetaError> {
+    for node in nodes {
+        let Some(kind) = InodeKind::from_u8(node.kind) else {
+            return Err(MetaError::Invalid(format!(
+                "unknown clone node kind {}",
+                node.kind
+            )));
         };
-        let a = make();
-        let b = make();
-        let ino = (1 << 40) | 1;
-
-        // A records reads and publishes them as Atime records.
-        let part = "p0".to_string();
-        a.queue_atime(&[(ino, 500, 500)]).unwrap();
-        a.queue_atime(&[(ino, 300, 300)]).unwrap();
-        let rows = a.take_atime_of(&part, 100).unwrap();
-        let shipped: Vec<LogRecord> = rows
+        if ns::get_inode_record(tx, &meta.ns, node.parent)?.is_none() {
+            return Ok(Applied::Skipped("clone parent does not exist"));
+        }
+        let prior = ns::get_inode_record(tx, &meta.ns, node.ino)?;
+        let (prior_file, prior_size) = prior.as_ref().map_or((false, 0u64), |r| {
+            (r.attrs.kind == Kind::File, r.attrs.size)
+        });
+        let attrs = Attrs {
+            kind: ns::kind_to_mtree(kind),
+            mode: node.mode,
+            uid: node.uid,
+            gid: node.gid,
+            nlink: if kind == InodeKind::Dir { 2 } else { 1 },
+            size: node.size,
+            mtime_ns: node.mtime_ns,
+            ctime_ns: node.mtime_ns,
+            rdev: node.rdev,
+        };
+        let xattrs: Vec<(Vec<u8>, Vec<u8>)> = node
+            .xattrs
             .iter()
-            .map(|(i, at, t)| atime_rec(*i, *at, *t))
+            .map(|(n, v)| (n.as_bytes().to_vec(), v.clone()))
             .collect();
-
-        // B tails them out of order; A replays its own (idempotent).
-        let mut reordered = shipped.clone();
-        reordered.reverse();
-        b.apply_records(&reordered).unwrap();
-        a.apply_records(&shipped).unwrap();
-
-        assert_eq!(atime_of(&a, ino), 500);
-        assert_eq!(atime_of(&b, ino), 500, "replicas converge on the max");
-
-        // B sets atime backwards with an explicit touch (bumps ctime);
-        // a late-arriving read record from before it must not resurrect.
-        b.setattr(ino, None, None, None, None, Some(200), None)
-            .unwrap();
-        b.apply_records(&[atime_rec(ino, 450, 450)]).unwrap();
-        assert_eq!(atime_of(&b, ino), 200, "explicit touch -a survives");
+        ns::put_inode(
+            tx,
+            &meta.ns,
+            &meta.blobs,
+            node.ino,
+            attrs,
+            node.manifest.clone(),
+            node.target.clone().map(String::into_bytes),
+            &xattrs,
+        )?;
+        ns::put_dentry(tx, &meta.ns, node.parent, &node.name, node.ino, attrs);
+        atime::set_atime_tx(tx, &meta.atime, node.ino, node.mtime_ns);
+        misc::track_manifest_transition_tx(
+            tx,
+            &meta.chunk_ref,
+            &meta.chunk_ref_by_ino,
+            node.ino,
+            None,
+            node.manifest.as_deref(),
+        )?;
+        for (n, v) in &node.xattrs {
+            misc::xattr_by_name_put_tx(tx, &meta.xattr_by_name, n, node.ino, v);
+        }
+        if kind == InodeKind::Dir {
+            misc::bump_nlink_tx(tx, &meta.ns, node.parent, 1, node.mtime_ns)?;
+        }
+        let is_file = kind == InodeKind::File;
+        match (prior_file, is_file) {
+            (false, true) => staged.adjust(node.size as i64, 1),
+            (true, false) => staged.adjust(-(prior_size as i64), -1),
+            (true, true) => staged.adjust(node.size as i64 - prior_size as i64, 0),
+            (false, false) => {}
+        }
     }
-
-    #[test]
-    fn touchset_atime_neither_conflicts_nor_is_conflicted() {
-        let atime = atime_rec(42, 1, 1);
-        // An Atime record touches nothing.
-        let pending = TouchSet::from_records([atime.clone()].iter());
-        assert!(pending.dentries.is_empty() && pending.inos.is_empty());
-        // And a pending setattr on the same inode does not suppress it.
-        let setattr = LogRecord::Setattr {
-            ino: 42,
-            mode: Some(0o600),
-            uid: None,
-            gid: None,
-            size: None,
-            atime_ns: None,
-            mtime_ns: None,
-            time_ns: 1,
-        };
-        let pending = TouchSet::from_records([setattr].iter());
-        assert!(!pending.conflicts(&atime));
-    }
+    Ok(Applied::Done)
 }

@@ -1,18 +1,19 @@
-//! Seeded, concurrent snapshot/clone churn with a disk-backed SQLite oracle.
+//! Seeded, concurrent snapshot/clone churn with a disk-backed `fjall` oracle.
 //!
 //! The ordinary harness model intentionally keeps payloads in memory.  Churn
-//! instead records only hashes and metadata in WAL-backed SQLite, so increasing
-//! `CONSTELLATION_SNAPCHURN_*` does not make expected-state memory proportional
-//! to file content.  Lifecycle operations happen only after worker threads
-//! join: those quiesce points are the snapshot consistency boundary.
+//! instead records only hashes and metadata in an on-disk `fjall` database, so
+//! increasing `CONSTELLATION_SNAPCHURN_*` does not make expected-state memory
+//! proportional to file content.  Lifecycle operations happen only after
+//! worker threads join: those quiesce points are the snapshot consistency
+//! boundary.
 
 use crate::client::Client;
 use crate::s3env::{S3Env, BUCKET};
 use anyhow::{bail, Context, Result};
+use fjall::Readable as _;
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
 use rand::{Rng, SeedableRng};
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -66,7 +67,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Entry {
     path: String,
     kind: String,
@@ -76,50 +77,112 @@ struct Entry {
     mode: u32,
 }
 
+/// Encodes an `(owner, path)` pair into a sort-friendly key for the `live`
+/// and `snap_entry` keyspaces (`owner` is a churn root for `live`, a
+/// snapshot id for `snap_entry`). The owner is length-prefixed so the
+/// encoding stays unambiguous no matter what bytes `path` contains -- unlike
+/// a plain separator byte, a length prefix cannot collide with path content.
+fn owner_path_key(owner: &str, path: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + owner.len() + path.len());
+    key.extend_from_slice(&(owner.len() as u32).to_be_bytes());
+    key.extend_from_slice(owner.as_bytes());
+    key.extend_from_slice(path.as_bytes());
+    key
+}
+
+/// The prefix that selects every `owner_path_key` belonging to `owner`, and
+/// only those keys: the length prefix rules out any other owner's key ever
+/// sharing this byte sequence.
+fn owner_prefix(owner: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + owner.len());
+    key.extend_from_slice(&(owner.len() as u32).to_be_bytes());
+    key.extend_from_slice(owner.as_bytes());
+    key
+}
+
+/// Splits an `owner_path_key`-encoded key back into `(owner, path)`.
+fn split_owner_path_key(key: &[u8]) -> Result<(String, String)> {
+    anyhow::ensure!(key.len() >= 4, "oracle key too short: {} bytes", key.len());
+    let len = u32::from_be_bytes(key[0..4].try_into().expect("checked above")) as usize;
+    anyhow::ensure!(key.len() >= 4 + len, "oracle key truncated");
+    let owner = std::str::from_utf8(&key[4..4 + len])?.to_string();
+    let path = std::str::from_utf8(&key[4 + len..])?.to_string();
+    Ok((owner, path))
+}
+
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    Ok(postcard::to_allocvec(value)?)
+}
+
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    Ok(postcard::from_bytes(bytes)?)
+}
+
+/// Collects every key/value pair under `prefix` in `ks`, as seen through
+/// `read` (a [`fjall::SingleWriterWriteTx`] or a [`fjall::Snapshot`]).
+fn collect_prefix<R: fjall::Readable>(
+    read: &R,
+    ks: &fjall::SingleWriterTxKeyspace,
+    prefix: &[u8],
+) -> fjall::Result<Vec<(fjall::UserKey, fjall::UserValue)>> {
+    read.prefix(ks, prefix).map(|g| g.into_inner()).collect()
+}
+
+/// Test-harness bookkeeping oracle, tracking the expected file-tree state
+/// (paths, kinds, sizes, hashes, mtimes, modes) across a snapshot/clone
+/// churn run. Backed by an on-disk `fjall` database mirroring the four
+/// logical tables the SQLite version used:
+///
+/// - `live`: key = `owner_path_key(root, path)`, value = postcard `Entry`.
+/// - `snap`: key = `id` (raw bytes), value = postcard `(name, src_root, created_unix_ms)`.
+/// - `snap_entry`: key = `owner_path_key(id, path)`, value = postcard `Entry`.
+/// - `clone`: key = `dest_root` (raw bytes), value = postcard `(id, src_snap_id)`.
+///
+/// Cheap to clone (an `Arc`-backed database handle plus four keyspace
+/// handles, themselves `Arc`-backed): unlike the SQLite/WAL engine this
+/// replaces, `fjall` refuses more than one process-wide open of the
+/// same directory at a time, so concurrent workers must share one
+/// `Oracle` (via `clone`) rather than each opening their own by path.
+#[derive(Clone)]
 struct Oracle {
-    conn: Connection,
+    db: fjall::SingleWriterTxDatabase,
+    live: fjall::SingleWriterTxKeyspace,
+    snap: fjall::SingleWriterTxKeyspace,
+    snap_entry: fjall::SingleWriterTxKeyspace,
+    clone_ks: fjall::SingleWriterTxKeyspace,
 }
 
 impl Oracle {
     fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", 30_000)?;
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS live (
-                root TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL,
-                size INTEGER NOT NULL, hash TEXT NOT NULL,
-                mtime_ns INTEGER NOT NULL, mode INTEGER NOT NULL,
-                PRIMARY KEY(root, path)
-            );
-            CREATE TABLE IF NOT EXISTS snap (
-                id TEXT PRIMARY KEY, name TEXT NOT NULL, src_root TEXT NOT NULL,
-                created_unix_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS snap_entry (
-                id TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL,
-                size INTEGER NOT NULL, hash TEXT NOT NULL,
-                mtime_ns INTEGER NOT NULL, mode INTEGER NOT NULL,
-                PRIMARY KEY(id, path)
-            );
-            CREATE TABLE IF NOT EXISTS clone (
-                id TEXT PRIMARY KEY, dest_root TEXT NOT NULL UNIQUE,
-                src_snap_id TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS snap_entry_by_id ON snap_entry(id);
-            CREATE INDEX IF NOT EXISTS live_by_root ON live(root);
-            ",
-        )?;
-        Ok(Self { conn })
+        // `builder(path).open()` creates the store if it does not exist yet
+        // and simply re-opens it (without wiping data) if it does, matching
+        // the idempotent-reopen behavior `Connection::open` had.
+        let db = fjall::SingleWriterTxDatabase::builder(path).open()?;
+        let live = db.keyspace("live", fjall::KeyspaceCreateOptions::default)?;
+        let snap = db.keyspace("snap", fjall::KeyspaceCreateOptions::default)?;
+        let snap_entry = db.keyspace("snap_entry", fjall::KeyspaceCreateOptions::default)?;
+        let clone_ks = db.keyspace("clone", fjall::KeyspaceCreateOptions::default)?;
+        Ok(Self {
+            db,
+            live,
+            snap,
+            snap_entry,
+            clone_ks,
+        })
     }
 
     fn refresh_root(&mut self, root: &str, real: &Path) -> Result<()> {
         let entries = scan(real)?;
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM live WHERE root=?1", [root])?;
+        let mut tx = self.db.write_tx();
+        let prefix = owner_prefix(root);
+        let stale = collect_prefix(&tx, &self.live, &prefix)?;
+        for (key, _) in stale {
+            tx.remove(&self.live, key);
+        }
         for entry in entries.values() {
-            insert_entry(&tx, "live", Some(root), entry)?;
+            let key = owner_path_key(root, &entry.path);
+            let value = encode(entry)?;
+            tx.insert(&self.live, key.as_slice(), value.as_slice());
         }
         tx.commit()?;
         Ok(())
@@ -127,27 +190,29 @@ impl Oracle {
 
     fn refresh_prefix(&mut self, root: &str, prefix: &str, real: &Path) -> Result<()> {
         let entries = scan(real)?;
-        let like = format!("{prefix}/%");
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM live WHERE root=?1 AND (path=?2 OR path LIKE ?3)",
-            params![root, prefix, like],
-        )?;
+        let mut tx = self.db.write_tx();
+        let root_prefix = owner_prefix(root);
+        let candidates = collect_prefix(&tx, &self.live, &root_prefix)?;
+        let nested = format!("{prefix}/");
+        for (key, _) in candidates {
+            let (_owner, path) = split_owner_path_key(&key)?;
+            if path == prefix || path.starts_with(&nested) {
+                tx.remove(&self.live, key);
+            }
+        }
         if real.exists() {
             let meta = std::fs::symlink_metadata(real)?;
-            insert_entry(
-                &tx,
-                "live",
-                Some(root),
-                &Entry {
-                    path: prefix.to_string(),
-                    kind: "dir".to_string(),
-                    size: 0,
-                    hash: String::new(),
-                    mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
-                    mode: meta.mode() & 0o7777,
-                },
-            )?;
+            let dir_entry = Entry {
+                path: prefix.to_string(),
+                kind: "dir".to_string(),
+                size: 0,
+                hash: String::new(),
+                mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                mode: meta.mode() & 0o7777,
+            };
+            let key = owner_path_key(root, &dir_entry.path);
+            let value = encode(&dir_entry)?;
+            tx.insert(&self.live, key.as_slice(), value.as_slice());
         }
         for entry in entries.values() {
             let mut entry = entry.clone();
@@ -156,7 +221,9 @@ impl Oracle {
             } else {
                 format!("{prefix}/{}", entry.path)
             };
-            insert_entry(&tx, "live", Some(root), &entry)?;
+            let key = owner_path_key(root, &entry.path);
+            let value = encode(&entry)?;
+            tx.insert(&self.live, key.as_slice(), value.as_slice());
         }
         tx.commit()?;
         Ok(())
@@ -164,85 +231,108 @@ impl Oracle {
 
     fn freeze(&mut self, id: &str, name: &str, src_root: &str, frozen: &Path) -> Result<()> {
         let entries = scan(frozen)?;
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO snap(id,name,src_root,created_unix_ms) VALUES(?1,?2,?3,?4)",
-            params![id, name, src_root, unix_ms()],
-        )?;
+        let mut tx = self.db.write_tx();
+        let snap_value = encode(&(name.to_string(), src_root.to_string(), unix_ms()))?;
+        tx.insert(&self.snap, id.as_bytes(), snap_value.as_slice());
         for entry in entries.values() {
-            insert_entry(&tx, "snap_entry", Some(id), entry)?;
+            let key = owner_path_key(id, &entry.path);
+            let value = encode(entry)?;
+            tx.insert(&self.snap_entry, key.as_slice(), value.as_slice());
         }
         tx.commit()?;
         Ok(())
     }
 
     fn delete_snapshot(&mut self, id: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM snap_entry WHERE id=?1", [id])?;
-        tx.execute("DELETE FROM snap WHERE id=?1", [id])?;
+        let mut tx = self.db.write_tx();
+        let prefix = owner_prefix(id);
+        let stale = collect_prefix(&tx, &self.snap_entry, &prefix)?;
+        for (key, _) in stale {
+            tx.remove(&self.snap_entry, key);
+        }
+        tx.remove(&self.snap, id.as_bytes());
         tx.commit()?;
         Ok(())
     }
 
     fn create_clone(&mut self, id: &str, dest: &str, snap_id: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO clone(id,dest_root,src_snap_id) VALUES(?1,?2,?3)",
-            params![id, dest, snap_id],
-        )?;
-        tx.execute(
-            "INSERT INTO live(root,path,kind,size,hash,mtime_ns,mode)
-             SELECT ?1,path,kind,size,hash,mtime_ns,mode FROM snap_entry WHERE id=?2",
-            params![dest, snap_id],
-        )?;
+        let mut tx = self.db.write_tx();
+        let clone_value = encode(&(id.to_string(), snap_id.to_string()))?;
+        tx.insert(&self.clone_ks, dest.as_bytes(), clone_value.as_slice());
+
+        let prefix = owner_prefix(snap_id);
+        let source_entries = collect_prefix(&tx, &self.snap_entry, &prefix)?;
+        for (key, value) in source_entries {
+            let (_owner, path) = split_owner_path_key(&key)?;
+            let dest_key = owner_path_key(dest, &path);
+            tx.insert(&self.live, dest_key.as_slice(), value);
+        }
         tx.commit()?;
         Ok(())
     }
 
     fn delete_clone(&mut self, root: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM live WHERE root=?1", [root])?;
-        tx.execute("DELETE FROM clone WHERE dest_root=?1", [root])?;
+        let mut tx = self.db.write_tx();
+        let prefix = owner_prefix(root);
+        let stale = collect_prefix(&tx, &self.live, &prefix)?;
+        for (key, _) in stale {
+            tx.remove(&self.live, key);
+        }
+        tx.remove(&self.clone_ks, root.as_bytes());
         tx.commit()?;
         Ok(())
     }
 
     fn expected_live(&self, root: &str) -> Result<BTreeMap<String, Entry>> {
-        entries_query(
-            &self.conn,
-            "SELECT path,kind,size,hash,mtime_ns,mode FROM live
-             WHERE root=?1 ORDER BY path",
-            root,
-        )
+        self.entries_for(&self.live, root)
     }
 
     fn expected_snapshot(&self, id: &str) -> Result<BTreeMap<String, Entry>> {
-        entries_query(
-            &self.conn,
-            "SELECT path,kind,size,hash,mtime_ns,mode FROM snap_entry
-             WHERE id=?1 ORDER BY path",
-            id,
-        )
+        self.entries_for(&self.snap_entry, id)
+    }
+
+    fn entries_for(
+        &self,
+        ks: &fjall::SingleWriterTxKeyspace,
+        owner: &str,
+    ) -> Result<BTreeMap<String, Entry>> {
+        let read = self.db.read_tx();
+        let prefix = owner_prefix(owner);
+        let rows = collect_prefix(&read, ks, &prefix)?;
+        let mut result = BTreeMap::new();
+        for (key, value) in rows {
+            let (_owner, path) = split_owner_path_key(&key)?;
+            let entry: Entry = decode(&value)?;
+            result.insert(path, entry);
+        }
+        Ok(result)
     }
 
     fn snapshots(&self) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id,name,src_root FROM snap ORDER BY created_unix_ms,id")?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        let read = self.db.read_tx();
+        let mut rows: Vec<(String, String, String, u64)> = Vec::new();
+        for guard in read.iter(&self.snap) {
+            let (key, value) = guard.into_inner()?;
+            let id = std::str::from_utf8(&key)?.to_string();
+            let (name, src_root, created_unix_ms): (String, String, u64) = decode(&value)?;
+            rows.push((id, name, src_root, created_unix_ms));
+        }
+        rows.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.0.cmp(&b.0)));
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, src_root, _)| (id, name, src_root))
+            .collect())
     }
 
     fn roots(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT root FROM live ORDER BY root")?;
-        let roots = stmt
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(roots)
+        let read = self.db.read_tx();
+        let mut roots = std::collections::BTreeSet::new();
+        for guard in read.iter(&self.live) {
+            let (key, _value) = guard.into_inner()?;
+            let (root, _path) = split_owner_path_key(&key)?;
+            roots.insert(root);
+        }
+        Ok(roots.into_iter().collect())
     }
 
     fn verify_all(&self, mount: &Path) -> Result<()> {
@@ -266,72 +356,16 @@ impl Oracle {
     }
 
     fn count(&self, table: &str) -> Result<u64> {
-        Ok(self
-            .conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
+        let ks = match table {
+            "live" => &self.live,
+            "snap" => &self.snap,
+            "snap_entry" => &self.snap_entry,
+            "clone" => &self.clone_ks,
+            other => bail!("unknown oracle table {other}"),
+        };
+        let read = self.db.read_tx();
+        Ok(read.iter(ks).count() as u64)
     }
-}
-
-fn insert_entry(
-    tx: &rusqlite::Transaction<'_>,
-    table: &str,
-    owner: Option<&str>,
-    e: &Entry,
-) -> Result<()> {
-    match table {
-        "live" => {
-            tx.execute(
-                "INSERT INTO live(root,path,kind,size,hash,mtime_ns,mode)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    owner.unwrap(),
-                    e.path,
-                    e.kind,
-                    e.size,
-                    e.hash,
-                    e.mtime_ns,
-                    e.mode
-                ],
-            )?;
-        }
-        "snap_entry" => {
-            tx.execute(
-                "INSERT INTO snap_entry(id,path,kind,size,hash,mtime_ns,mode)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    owner.unwrap(),
-                    e.path,
-                    e.kind,
-                    e.size,
-                    e.hash,
-                    e.mtime_ns,
-                    e.mode
-                ],
-            )?;
-        }
-        _ => unreachable!(),
-    }
-    Ok(())
-}
-
-fn entries_query(conn: &Connection, sql: &str, owner: &str) -> Result<BTreeMap<String, Entry>> {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([owner], |r| {
-        Ok(Entry {
-            path: r.get(0)?,
-            kind: r.get(1)?,
-            size: r.get(2)?,
-            hash: r.get(3)?,
-            mtime_ns: r.get(4)?,
-            mode: r.get(5)?,
-        })
-    })?;
-    let mut result = BTreeMap::new();
-    for row in rows {
-        let entry = row?;
-        result.insert(entry.path.clone(), entry);
-    }
-    Ok(result)
 }
 
 fn scan(root: &Path) -> Result<BTreeMap<String, Entry>> {
@@ -568,13 +602,13 @@ fn live(seed: u64) -> Result<()> {
         for worker in 0..cfg.workers {
             let root = roots[worker % roots.len()].clone();
             let mount = client.mnt.clone();
-            let oracle_path = oracle_path.clone();
+            let worker_oracle = oracle.clone();
             let audit = audit.clone();
             let ops = cfg.ops;
             joins.push(std::thread::spawn(move || {
                 worker_round(
                     &mount,
-                    &oracle_path,
+                    worker_oracle,
                     &audit,
                     seed ^ ((round as u64 + 1) << 32) ^ worker as u64,
                     worker,
@@ -722,7 +756,7 @@ fn live(seed: u64) -> Result<()> {
     }
     remove_root(&client, &mut oracle, &audit, "/tree")?;
 
-    assert_replica_clean(&client.replica_db())?;
+    assert_replica_clean(&client)?;
     assert_prefix_empty(&env.direct_endpoint, &format!("{prefix}/snaps/"), "snaps/")?;
     audit.event(None, "gc", None, None, json!({}))?;
     let output = client.gc_run()?;
@@ -758,14 +792,13 @@ fn live(seed: u64) -> Result<()> {
 
 fn worker_round(
     mount: &Path,
-    oracle_path: &Path,
+    mut oracle: Oracle,
     audit: &Audit,
     seed: u64,
     worker: usize,
     root: &str,
     ops: usize,
 ) -> Result<()> {
-    let mut oracle = Oracle::open(oracle_path)?;
     let mut rng = StdRng::seed_from_u64(seed);
     let prefix = format!("w{worker}");
     let real_prefix = mount_path(mount, root).join(&prefix);
@@ -1209,7 +1242,7 @@ fn apply_event(
             return Ok(());
         }
         "gc" => {
-            assert_replica_clean(&client.replica_db())?;
+            assert_replica_clean(client)?;
             assert_prefix_empty(
                 &env.direct_endpoint,
                 &format!("{bucket_prefix}/snaps/"),
@@ -1240,18 +1273,26 @@ fn apply_event(
     Ok(())
 }
 
-fn assert_replica_clean(path: &Path) -> Result<()> {
-    let conn = Connection::open(path)?;
-    let snapshots: u64 = conn.query_row("SELECT COUNT(*) FROM snapshot", [], |r| r.get(0))?;
-    anyhow::ensure!(
-        snapshots == 0,
-        "replica snapshot table has {snapshots} rows"
-    );
-    let user_roots: u64 = conn.query_row(
-        "SELECT COUNT(*) FROM dentry WHERE parent=1 AND (name='tree' OR name GLOB 'c[0-9]*')",
-        [],
-        |r| r.get(0),
-    )?;
+/// Asks the *live* daemon (never a second process opening its metadata
+/// store directly — `fjall` enforces single-process access with a lock
+/// file, unlike the old SQLite/WAL engine, which tolerated a second
+/// read-only connection) whether it still holds any snapshots or churn
+/// roots.
+fn assert_replica_clean(client: &Client) -> Result<()> {
+    let snapshots = client.snapshot_count()?;
+    anyhow::ensure!(snapshots == 0, "replica reports {snapshots} snapshot(s)");
+
+    let is_churn_root = |name: &str| {
+        name == "tree"
+            || (name.starts_with('c')
+                && name.len() > 1
+                && name[1..].bytes().all(|b| b.is_ascii_digit()))
+    };
+    let user_roots = std::fs::read_dir(&client.mnt)
+        .with_context(|| format!("reading {}", client.mnt.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(is_churn_root))
+        .count();
     anyhow::ensure!(user_roots == 0, "replica retains {user_roots} churn roots");
     Ok(())
 }

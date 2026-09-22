@@ -8,7 +8,7 @@ use crate::gc;
 use anyhow::{Context, Result};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::ChunkHash;
-use constellation_meta::SqliteMeta;
+use constellation_meta::Meta;
 use constellation_store_s3::{CompressionSetting, GcJournalEntry, LeaseMode, LeaseStore, LogStore};
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -53,7 +53,7 @@ pub async fn run(
     store: Arc<dyn ObjectStore>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
     logs: &LogStore,
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     state_dir: Option<&std::path::Path>,
     compression: CompressionSetting,
     lease_mode: LeaseMode,
@@ -101,7 +101,7 @@ pub async fn run(
 async fn check_manifest_refs(
     store: &Arc<dyn ObjectStore>,
     chunks: &constellation_store_s3::ChunkStore,
-    meta: &SqliteMeta,
+    meta: &Meta,
     state_dir: Option<&std::path::Path>,
     compression: CompressionSetting,
     repair: bool,
@@ -244,7 +244,7 @@ async fn check_metadata_objects(
 /// not meaningful yet, and is skipped rather than reported.
 async fn check_metadata_tree(
     logs: &LogStore,
-    meta: &Arc<SqliteMeta>,
+    meta: &Arc<Meta>,
     state_dir: Option<&std::path::Path>,
     issues: &mut Vec<FsckIssue>,
 ) -> Result<()> {
@@ -260,7 +260,7 @@ async fn check_metadata_tree(
 
 async fn check_metadata_tree_in(
     logs: &LogStore,
-    meta: &Arc<SqliteMeta>,
+    meta: &Arc<Meta>,
     scratch: &std::path::Path,
     issues: &mut Vec<FsckIssue>,
 ) -> Result<()> {
@@ -504,7 +504,7 @@ fn check_cache_cruft(
 
 async fn check_gc_journal(
     store: &Arc<dyn ObjectStore>,
-    meta: &SqliteMeta,
+    meta: &Meta,
     issues: &mut Vec<FsckIssue>,
 ) -> Result<()> {
     let live: HashSet<_> = meta.live_manifest_hashes()?;
@@ -544,7 +544,7 @@ mod tests {
     async fn dangling_detector_never_silently_truncates() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let chunks = constellation_store_s3::ChunkStore::new(object_store.clone());
-        let meta = SqliteMeta::open_in_memory().unwrap();
+        let meta = Meta::open_in_memory().unwrap();
         let file = meta.create(1, "lost", 0o644, 0, 0).unwrap();
         let hash = chunks.hash(b"missing");
         let manifest =
@@ -583,12 +583,12 @@ mod tests {
         use constellation_store_s3::{BlobStore, CommitChain, NodeCache, PackStore};
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
         for i in 0..300 {
             meta.create(dir, &format!("f{i}"), 0o644, 0, 0).unwrap();
         }
-        let drain = |meta: &SqliteMeta| -> Vec<LogRecord> {
+        let drain = |meta: &Meta| -> Vec<LogRecord> {
             let batch = meta.take_journal(usize::MAX).unwrap();
             if let Some((seq, _)) = batch.last() {
                 meta.ack_journal(*seq).unwrap();

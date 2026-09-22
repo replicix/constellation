@@ -312,6 +312,38 @@ impl Client {
         self.control_command(&["clone", selector, destination])
     }
 
+    /// How many snapshots the live daemon reports, via the control
+    /// socket (`constellation snapshot ls`) rather than opening the
+    /// metadata store's own file/directory from a second process —
+    /// `fjall` (unlike SQLite/WAL) enforces single-process access with a
+    /// lock file, so a harness-side read of a still-mounted node's
+    /// replica must go through the daemon, not around it.
+    pub fn snapshot_count(&self) -> Result<usize> {
+        let output = self
+            .cmd(&[
+                "snapshot",
+                "ls",
+                "/",
+                "--state-dir",
+                self.state.to_str().unwrap(),
+            ])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "snapshot ls failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).with_context(|| {
+                format!(
+                    "parsing snapshot ls output: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            })?;
+        Ok(value.as_array().map(Vec::len).unwrap_or(0))
+    }
+
     pub fn replica_db(&self) -> PathBuf {
         self.state.join("meta.db")
     }

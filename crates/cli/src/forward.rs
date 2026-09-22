@@ -4,9 +4,7 @@
 //! Safety still comes from the S3 lease (ADR-2): the holder is the only
 //! appender. This module is the requester/holder glue around that rule.
 
-use constellation_meta::{
-    execute_mutate, MetaStore, MutateOp, MutateOutcome, SqliteMeta, TouchSet,
-};
+use constellation_meta::{execute_mutate, Meta, MetaStore, MutateOp, MutateOutcome, TouchSet};
 use constellation_net::{Payload, Peers};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -109,13 +107,13 @@ pub fn meta_errno(e: &constellation_meta::MetaError) -> i32 {
         NoData => libc::ENODATA,
         Invalid(_) => libc::EINVAL,
         Conflict => libc::EAGAIN,
-        Sqlite(_) | Json(_) | Postcard(_) => libc::EIO,
+        Fjall(_) | Io(_) | Record(_) | Key(_) | Json(_) | Postcard(_) => libc::EIO,
     }
 }
 
 /// Holder: execute a forwarded op if we hold the lease for `part`.
 pub fn holder_execute(
-    meta: &SqliteMeta,
+    meta: &Meta,
     ship_epoch: Option<u64>,
     is_lost: bool,
     known_holder: u64,
@@ -149,7 +147,7 @@ pub fn holder_execute(
 
 /// Apply an accepted outcome on the requester: shadow + apply_foreign.
 pub fn apply_accepted(
-    meta: &SqliteMeta,
+    meta: &Meta,
     part: &str,
     epoch: u64,
     records: &[constellation_meta::LogRecord],
@@ -247,7 +245,7 @@ mod tests {
 
     #[test]
     fn holder_execute_not_holder() {
-        let meta = SqliteMeta::open_in_memory().unwrap();
+        let meta = Meta::open_in_memory().unwrap();
         let op = MutateOp::Unlink {
             parent: 1,
             name: "x".into(),
@@ -268,7 +266,7 @@ mod tests {
     /// rebase without waiting to tail the holder's segment.
     #[test]
     fn holder_execute_returns_the_current_manifest_on_a_stale_base() {
-        let meta = SqliteMeta::open_in_memory().unwrap();
+        let meta = Meta::open_in_memory().unwrap();
         let f = meta.create(1, "wd", 0o644, 0, 0).unwrap();
         meta.set_manifest_with_base(f.ino, None, b"current", 7)
             .unwrap();

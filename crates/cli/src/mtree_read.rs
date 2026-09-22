@@ -46,7 +46,7 @@
 
 use anyhow::{bail, Context, Result};
 use constellation_fs_core::{FileAttr, Ino, InodeKind};
-use constellation_meta::{SnapshotRow, SqliteMeta, TreeInode};
+use constellation_meta::{Meta, SnapshotRow, TreeInode};
 use constellation_mtree::keys::{self, Key, Subsystem};
 use constellation_mtree::record::{self, DentryRecord, InodeRecord, Payload};
 use constellation_mtree::{NodeHash, NodeRef, NodeStore, Tree};
@@ -59,25 +59,11 @@ type Pair = (Vec<u8>, Vec<u8>);
 
 // ------------------------------------------------------ 0x30 record codec
 
-/// The replicated quota is stored under `QUOTA_KV_KEY` as a decimal
-/// string, empty meaning "explicitly unlimited". An absent key and an
-/// empty one differ (the first defers to the creation-time cap), so the
-/// tree distinguishes them too: no record, or a record with no field.
-pub(crate) fn quota_record(max_bytes: Option<u64>) -> Vec<u8> {
-    match max_bytes {
-        Some(n) => record::encode_fields(&[&n.to_le_bytes()]),
-        None => record::encode_fields(&[]),
-    }
-}
-
-pub(crate) fn snapshot_record(row: &SnapshotRow) -> Vec<u8> {
-    record::encode_fields(&[
-        row.path.as_bytes(),
-        row.name.as_bytes(),
-        row.root_hash.as_bytes(),
-        &row.created_unix_ms.to_le_bytes(),
-    ])
-}
+// `snapshot_record`/`quota_record` (and their parsers) now live in
+// `constellation_meta::store` so both the replica and the publisher
+// share one codec; see `constellation_meta::store::{snapshot_record,
+// quota_record, parse_snapshot_record, parse_quota_record}`.
+use constellation_meta::store::snapshot_record;
 
 fn fixed<const N: usize>(field: &[u8], what: &str) -> Result<[u8; N]> {
     field
@@ -90,23 +76,23 @@ fn text(field: &[u8], what: &str) -> Result<String> {
 }
 
 /// The `0x30` keys and values the replica's current state calls for,
-/// read through the reader connection so the publisher's snapshot
-/// covers them.
-pub(crate) fn subsystem_state(meta: &SqliteMeta) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+/// read through the caller's fjall snapshot so the publisher's
+/// point-in-time view covers them.
+pub(crate) fn subsystem_state(
+    meta: &Meta,
+    snap: &fjall::Snapshot,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
     let mut out = BTreeMap::new();
-    for row in meta.snapshots_reader()? {
+    for row in meta.snapshots_at(snap, None)? {
         out.insert(
             keys::subsystem(Subsystem::Snapshot, row.id.as_bytes()),
             snapshot_record(&row),
         );
     }
-    if let Some(raw) = meta.kv_get_reader(constellation_meta::sqlite::QUOTA_KV_KEY)? {
-        let max = if raw.is_empty() {
-            None
-        } else {
-            Some(raw.parse::<u64>().context("replicated quota")?)
-        };
-        out.insert(keys::subsystem(Subsystem::Quota, b""), quota_record(max));
+    // `ns` already holds the quota subsystem record in exactly the
+    // tree's shape, under the same snapshot as the rest of this plan.
+    if let Some(bytes) = meta.replicated_quota_record_at(snap)? {
+        out.insert(keys::subsystem(Subsystem::Quota, b""), bytes);
     }
     Ok(out)
 }
@@ -469,7 +455,7 @@ pub(crate) struct Loaded {
 pub(crate) fn load_tree(
     tree: &Tree<Arc<NodeCache>>,
     root: &NodeHash,
-    meta: &SqliteMeta,
+    meta: &Meta,
     resolver: &Resolver<'_>,
 ) -> Result<(u64, u64)> {
     // A `0x01` record whose xattr set spilled cannot be finished without
@@ -604,7 +590,7 @@ impl ChainReader {
 /// commit's `applied` position.
 pub(crate) async fn bootstrap_from_commit(
     reader: &ChainReader,
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
 ) -> Result<Option<Loaded>> {
     let Some(commit) = reader.head().await? else {
         return Ok(None);
@@ -673,9 +659,9 @@ mod tests {
     async fn published(
         dirs: u64,
         files: u64,
-    ) -> (Arc<dyn ObjectStore>, Arc<SqliteMeta>, Commit, Vec<Ino>) {
+    ) -> (Arc<dyn ObjectStore>, Arc<Meta>, Commit, Vec<Ino>) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let meta = Arc::new(SqliteMeta::open_in_memory().unwrap());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
         let mut inos = Vec::new();
         for d in 0..dirs {
             let dir = meta

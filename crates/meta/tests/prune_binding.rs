@@ -3,16 +3,16 @@
 
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::prune::PRUNE_XATTR;
-use constellation_meta::{MetaStore, SetXattrMode, SqliteMeta};
+use constellation_meta::{Meta, MetaStore, SetXattrMode};
 
-fn set(meta: &SqliteMeta, ino: u64, value: &str) {
+fn set(meta: &Meta, ino: u64, value: &str) {
     meta.set_xattr(ino, PRUNE_XATTR, value.as_bytes(), SetXattrMode::Set)
         .unwrap();
 }
 
 #[test]
 fn effective_policy_resolves_nearest_ancestor() {
-    let meta = SqliteMeta::open_in_memory().unwrap();
+    let meta = Meta::open_in_memory().unwrap();
     let keep = meta.mkdir(ROOT_INO, "keep", 0o755, 0, 0).unwrap();
     let build = meta.mkdir(keep.ino, "build", 0o755, 0, 0).unwrap();
     let file = meta.create(build.ino, "artifact.o", 0o644, 0, 0).unwrap();
@@ -38,7 +38,7 @@ fn effective_policy_resolves_nearest_ancestor() {
 
 #[test]
 fn prune_roots_lists_every_marked_directory() {
-    let meta = SqliteMeta::open_in_memory().unwrap();
+    let meta = Meta::open_in_memory().unwrap();
     let a = meta.mkdir(ROOT_INO, "a", 0o755, 0, 0).unwrap();
     let b = meta.mkdir(ROOT_INO, "b", 0o755, 0, 0).unwrap();
     set(&meta, a.ino, "age(30d)");

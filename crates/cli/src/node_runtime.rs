@@ -33,7 +33,7 @@
 
 use anyhow::{bail, Context, Result};
 use constellation_fs_core::cache::DiskCache;
-use constellation_meta::SqliteMeta;
+use constellation_meta::Meta;
 use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -222,7 +222,7 @@ pub struct NodeRuntime {
     fsmeta: FsMeta,
     backend_url: String,
     state_dir: PathBuf,
-    meta: Arc<SqliteMeta>,
+    meta: Arc<Meta>,
     store: Arc<ChunkStore>,
     cache: Arc<DiskCache>,
     compression: CompressionSetting,
@@ -337,7 +337,7 @@ impl NodeRuntime {
             rt.block_on(shipper::bootstrap(&db_path, &log))
                 .context("bootstrapping metadata replica")?;
         }
-        let meta = Arc::new(SqliteMeta::open(&db_path)?);
+        let meta = Arc::new(Meta::open(&db_path)?);
         meta.scratch_purge_all()?;
         if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
             bail!(
@@ -412,12 +412,12 @@ impl NodeRuntime {
         match fsmeta.max_logical_bytes {
             Some(cap) => {
                 meta.kv_set(
-                    constellation_meta::sqlite::QUOTA_CREATION_KV_KEY,
+                    constellation_meta::store::QUOTA_CREATION_KV_KEY,
                     &cap.to_string(),
                 )?;
                 tracing::info!(cap, "filesystem quota from meta.json");
             }
-            None => meta.kv_del(constellation_meta::sqlite::QUOTA_CREATION_KV_KEY)?,
+            None => meta.kv_del(constellation_meta::store::QUOTA_CREATION_KV_KEY)?,
         }
 
         // Mount-time staging GC (plan 05a step 6): nothing under
@@ -2196,7 +2196,7 @@ impl std::fmt::Debug for MountId {
 /// Atime never acquires a lease and never wakes the shipper.
 async fn atime_flush_once(
     atime: &crate::atime::AtimeAccumulator,
-    meta: &Arc<SqliteMeta>,
+    meta: &Arc<Meta>,
     keepers: &Arc<tokio::sync::Mutex<HashMap<String, lease::LeaseKeeper>>>,
     forward: &Arc<forward::ForwardState>,
     peers: &constellation_net::Peers,

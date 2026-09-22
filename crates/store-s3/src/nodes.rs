@@ -1,6 +1,6 @@
 //! Node registry: each mounting node claims a small, cluster-unique
 //! integer id with a CAS-create on `nodes/<id>` (DESIGN.md §2). The id
-//! scopes ino allocation (`SqliteMeta::set_node_prefix`) and marks log
+//! scopes ino allocation (`Meta::set_node_prefix`) and marks log
 //! segment origin, so it must never be shared by two live state dirs.
 //!
 //! From M3.3 the record also carries the host's P2P identity: its

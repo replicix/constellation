@@ -59,7 +59,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd = "0.13"
-rusqlite = { version = "0.32", features = ["bundled"] }
 object_store = { version = "0.14", features = ["aws"] }
 toml = "1"
 # Default features include SSO + credentials-process — the same chain
