@@ -126,6 +126,7 @@ function peerDetail(p){
     ${row("version", esc(p.version||"—"))}
     ${row("connected", p.connected?'<span class="ok">yes</span>':'<span class="bad">no</span>')}
     ${row("path", esc(p.path||p.coop?.path||"—"))}
+    ${row("open paths", p.paths&&(p.paths.direct||p.paths.relay)?`${p.paths.direct||0} direct · ${p.paths.relay||0} relay${p.paths.multipath?" (multipath)":""}${(p.paths.rtts||[]).length?" · "+esc(p.paths.rtts.join(", ")):""}`:"—")}
     ${row("read-only", p.ro?"yes":"no")}
     ${row("epoch member", p.epoch_member?"yes":"no")}
     ${row("RTT", dur(p.rtt_ms))}

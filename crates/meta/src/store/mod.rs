@@ -46,8 +46,10 @@
 //!   mirror of `UsageTracker`, updated in the same transaction as the
 //!   change that moves them — replacing the old O(namespace)
 //!   `recursive_size(ROOT)` seed at open), quota's node-local mirror,
-//!   `left`/`lease_lost`/`read_only_member`, and the mtree publisher's
-//!   own bookkeeping keys (`cli::mtree_publish`).
+//!   `left`/`lease_lost`/`read_only_member`, the mtree publisher's
+//!   own bookkeeping keys (`cli::mtree_publish`), and (plan 30 §M4) the
+//!   `poisoned/<hash><ino>` marks of pending uploads whose chunk is gone
+//!   from the local cache (`store::held`).
 //! - `pending_upload` — `hash(32) ++ ino(8 BE) -> ()`.
 //! - `chunk_ref` / `chunk_ref_by_ino` — `hash(32) ++ ino(8 BE) -> ()`
 //!   and its by-ino mirror `ino(8 BE) ++ hash(32) -> ()`, maintained in
@@ -86,6 +88,7 @@
 
 pub(crate) mod atime;
 mod bootstrap;
+pub mod held;
 pub(crate) mod journal;
 pub(crate) mod local;
 pub(crate) mod misc;
@@ -184,6 +187,11 @@ pub(crate) const KV_LOCAL_SPEC_COUNT: &str = "local_spec_count";
 pub(crate) const KV_UNCAPTURED_TX_COUNT: &str = "uncaptured_tx_count";
 pub(crate) const KV_SPEC_FLOOR: &str = "spec_floor";
 pub(crate) const KV_JOURNAL_ACKED: &str = "journal_acked";
+/// Plan 30 §M4: how many unrecoverable-chunk marks (`poisoned/` keys in
+/// `local`, `store::held`) exist, so the ship path's "is anything
+/// poisoned?" is one point read, not a range scan of a keyspace every
+/// journaled write rewrites.
+pub(crate) const KV_POISONED_COUNT: &str = "poisoned_count";
 /// Monotonic counter behind the `dirty` keyspace (plan 29 M2): every key
 /// written to `ns` records the counter value it was touched at, so
 /// `clear_dirty_upto` can tell "still dirty at the counter a publish
@@ -520,6 +528,17 @@ pub struct Meta {
     /// and a deposed holder rebuilds its namespace from the head commit
     /// instead of rolling back (`cli::recovery::recover_deposed`).
     pub(crate) holder_capture: AtomicBool,
+    /// Plan 30 §M4: what the last ship plan held back behind an
+    /// unrecoverable pending chunk (`store::held`), for `status`.
+    pub(crate) held: std::sync::Mutex<held::HeldSummary>,
+    /// Whether `held` may be non-default, so a ship with nothing poisoned
+    /// does not take its lock (plan 30 §M4 round 2).
+    pub(crate) held_any: AtomicBool,
+    /// How many times a ship plan, a retirement or an ack took a held-set
+    /// path (plan 30 §M4 round 2). Only ever moves while something is
+    /// poisoned or held; the cost tests in `store::local` pin that it stays
+    /// at zero otherwise.
+    pub(crate) held_work: AtomicU64,
     usage: UsageTracker,
     #[allow(dead_code)]
     path: Option<PathBuf>,
@@ -613,6 +632,9 @@ impl Meta {
             recent: std::sync::Mutex::new(std::collections::HashMap::new()),
             holder_epoch: Arc::new(AtomicU64::new(0)),
             holder_capture: AtomicBool::new(holder_capture_default()),
+            held: std::sync::Mutex::new(held::HeldSummary::default()),
+            held_any: AtomicBool::new(false),
+            held_work: AtomicU64::new(0),
             usage: UsageTracker::new(0, 0),
             path,
         };

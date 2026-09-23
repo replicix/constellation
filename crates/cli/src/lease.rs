@@ -777,6 +777,26 @@ impl LeaseKeeper {
         self.view.touch();
     }
 
+    /// Plan 30 §M4 item 1: whether committing `plan` re-adopts a lease the
+    /// bucket says is this node's own and unreleased, which this keeper
+    /// does not track — a restart of the process that held it, or, in the
+    /// same process, a takeover CAS whose reply was lost (a timeout;
+    /// `object_store` does not retry a conditional PUT on one) although the
+    /// write landed. Either way the previous acquisition may have stopped
+    /// between its CAS and its takeover gate, so this one is gated like a
+    /// takeover: the caller tails to head, and `commit_cas` ships an epoch
+    /// marker and runs the strand-and-replay gate. Only with etag CAS: a
+    /// single-writer backend has no one to fence.
+    pub fn readopts(&self, plan: &Plan) -> bool {
+        self.held.is_none()
+            && self.store.mode() == LeaseMode::Cas
+            && matches!(
+                plan,
+                Plan::Claim { prev, needs_tail: false, .. }
+                    if prev.holder == self.node_id && !prev.released
+            )
+    }
+
     pub fn release_local(&mut self) {
         self.held = None;
         self.view.clear();
@@ -920,10 +940,22 @@ impl LeaseKeeper {
                 } else {
                     prev.epoch + 1
                 };
+                // Plan 30 §M4: a re-adoption the caller tailed for is gated
+                // like a takeover (see `Self::readopts`).
+                let readopt = prev.holder == self.node_id
+                    && !prev.released
+                    && self.held.is_none()
+                    && tailed.is_some()
+                    && self.store.mode() == LeaseMode::Cas;
                 let lease =
                     Lease::granted(self.store.partition(), self.node_id, epoch, self.ttl_ms);
                 let r = self.store.try_swap(&lease, &tag).await;
-                (lease, needs_tail, needs_tail && !prev.released, r)
+                (
+                    lease,
+                    needs_tail || readopt,
+                    (needs_tail && !prev.released) || readopt,
+                    r,
+                )
             }
         };
         match result {

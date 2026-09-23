@@ -26,7 +26,7 @@
 
 use crate::error::StoreError;
 use futures::TryStreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -67,6 +67,14 @@ pub struct NodeInfo {
     /// When the record was retired; absent on live members.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_unix: Option<i64>,
+    /// Plan 30 §M4: a random nonce written by the claiming CAS-create and
+    /// kept for the record's lifetime. It makes the claim's body unique to
+    /// the claiming process, so a claim that "lost" with a 412 can be read
+    /// back and recognized as its own write (a create that landed behind a
+    /// retried 5xx or a lost reply) instead of claiming a second id. The
+    /// hostname and a seconds timestamp alone could repeat across hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<String>,
 }
 
 impl NodeInfo {
@@ -106,6 +114,7 @@ pub async fn claim_node_id(store: Arc<dyn ObjectStore>) -> Result<u64, StoreErro
         })
         .collect();
     let mut candidate = taken.iter().copied().max().unwrap_or(0) + 1;
+    let claim = uuid::Uuid::new_v4().to_string();
     loop {
         let info = NodeInfo {
             node_id: candidate,
@@ -118,19 +127,26 @@ pub async fn claim_node_id(store: Arc<dyn ObjectStore>) -> Result<u64, StoreErro
             ro: false,
             retired: false,
             retired_unix: None,
+            claim: Some(claim.clone()),
         };
         let body = serde_json::to_vec(&info)?;
-        match store
-            .put_opts(
-                &node_key(candidate),
-                PutPayload::from(body),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
+        // Plan 30 §M4 item 1 (`crate::cas`): a 409 retries this candidate;
+        // a 412 moves on to the next one unless the record there is our
+        // own claim (same nonce) that landed behind a retried 5xx or a
+        // lost reply — claiming the next id as well would register this
+        // node twice, and the ghost record would count as a write-eligible
+        // member that never answers (continuation epochs need them all).
+        match crate::cas::put_conditional(
+            store.as_ref(),
+            &node_key(candidate),
+            body.into(),
+            PutMode::Create,
+            crate::cas::Verify::Body,
+        )
+        .await?
         {
-            Ok(_) => return Ok(candidate),
-            Err(object_store::Error::AlreadyExists { .. }) => candidate += 1,
-            Err(e) => return Err(e.into()),
+            crate::cas::CasPut::Won(_) => return Ok(candidate),
+            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => candidate += 1,
         }
     }
 }
@@ -329,6 +345,7 @@ pub async fn publish_p2p(
         ro: existing.ro,
         retired: false,
         retired_unix: None,
+        claim: existing.claim,
     };
     store
         .put(&key, PutPayload::from(serde_json::to_vec(&info)?))
@@ -376,6 +393,7 @@ pub async fn publish_ro(
         ro,
         retired: false,
         retired_unix: None,
+        claim: existing.as_ref().and_then(|i| i.claim.clone()),
     };
     store
         .put(&key, PutPayload::from(serde_json::to_vec(&info)?))
@@ -393,6 +411,35 @@ fn hostname() -> String {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    /// Plan 30 §M4 item 1: the registry claim under each error code. A
+    /// 409 retries the same id; a claim that landed behind a 412 is ours
+    /// (one id, not two); another node's record moves on to the next id;
+    /// a 500 is the store's error.
+    #[tokio::test]
+    async fn registry_claim_error_codes() {
+        use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
+        let faulty = FaultyStore::new();
+        let store: Arc<dyn ObjectStore> = faulty.clone();
+        faulty.script(OpKind::Put, "nodes/", Calls::Nth(1), Fault::Status(409));
+        assert_eq!(claim_node_id(store.clone()).await.unwrap(), 1);
+        faulty.clear();
+        faulty.script(
+            OpKind::Put,
+            "nodes/",
+            Calls::Nth(1),
+            Fault::AppliedThen(412),
+        );
+        assert_eq!(claim_node_id(store.clone()).await.unwrap(), 2);
+        assert_eq!(list_node_ids(store.clone()).await.unwrap(), vec![1, 2]);
+        faulty.clear();
+        faulty.script(OpKind::Put, "nodes/", Calls::Nth(1), Fault::Status(500));
+        assert!(matches!(
+            claim_node_id(store.clone()).await,
+            Err(StoreError::ObjectStore(_))
+        ));
+        assert_eq!(list_node_ids(store).await.unwrap(), vec![1, 2]);
+    }
 
     #[tokio::test]
     async fn ids_are_unique_and_monotonic() {

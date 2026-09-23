@@ -71,19 +71,21 @@ pub async fn publish_condemned(
         hashes,
         published_ms,
     };
-    match store
-        .put_opts(
-            &layout::gc_condemned(),
-            PutPayload::from(serde_json::to_vec(&list)?),
-            PutOptions::from(mode),
-        )
-        .await
+    // Plan 30 §M4 item 1 (`crate::cas`): a 409 retries the same attempt,
+    // and a 412/404 is a lost race unless the pointer is this very list
+    // (epoch, hashes and a millisecond timestamp: our own earlier attempt
+    // landed behind a retried 5xx or a lost reply).
+    match crate::cas::put_conditional(
+        store.as_ref(),
+        &layout::gc_condemned(),
+        serde_json::to_vec(&list)?.into(),
+        mode,
+        crate::cas::Verify::Body,
+    )
+    .await?
     {
-        Ok(_) => Ok(list),
-        Err(object_store::Error::AlreadyExists { .. })
-        | Err(object_store::Error::Precondition { .. })
-        | Err(object_store::Error::NotModified { .. }) => Err(StoreError::CasConflict),
-        Err(error) => Err(error.into()),
+        crate::cas::CasPut::Won(_) => Ok(list),
+        crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => Err(StoreError::CasConflict),
     }
 }
 
@@ -203,6 +205,40 @@ pub async fn append_journal(
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    /// Plan 30 §M4 item 1: the condemned pointer's CAS under each error
+    /// code. A 409 is retried; a publish that landed behind a 412 is ours;
+    /// a genuine 412 (another GC round's pointer) is a conflict; a 500 is
+    /// the store's error.
+    #[tokio::test]
+    async fn condemned_pointer_cas_error_codes() {
+        use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
+        let faulty = FaultyStore::new();
+        let store: Arc<dyn ObjectStore> = faulty.clone();
+        faulty.script(OpKind::Put, "condemned", Calls::Nth(1), Fault::Status(409));
+        assert_eq!(publish_condemned(&store, vec![], 1).await.unwrap().epoch, 1);
+        faulty.clear();
+        faulty.script(
+            OpKind::Put,
+            "condemned",
+            Calls::Nth(1),
+            Fault::AppliedThen(412),
+        );
+        assert_eq!(publish_condemned(&store, vec![], 2).await.unwrap().epoch, 2);
+        faulty.clear();
+        faulty.script(OpKind::Put, "condemned", Calls::Nth(1), Fault::Status(412));
+        assert!(matches!(
+            publish_condemned(&store, vec![], 3).await,
+            Err(StoreError::CasConflict)
+        ));
+        faulty.clear();
+        faulty.script(OpKind::Put, "condemned", Calls::Nth(1), Fault::Status(500));
+        assert!(matches!(
+            publish_condemned(&store, vec![], 4).await,
+            Err(StoreError::ObjectStore(_))
+        ));
+        assert_eq!(read_condemned(&store).await.unwrap().unwrap().epoch, 2);
+    }
 
     #[tokio::test]
     async fn condemned_pointer_advances_and_is_queryable() {

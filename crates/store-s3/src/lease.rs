@@ -32,7 +32,7 @@
 
 use crate::error::StoreError;
 use crate::layout;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -259,25 +259,27 @@ impl LeaseStore {
         self.put(lease, mode).await
     }
 
+    /// One conditional write, with plan 30 §M4's error-code rules
+    /// (`crate::cas`): a 409 retries the same attempt, a 412 or a 404 on
+    /// `If-Match` is [`StoreError::CasConflict`] (the caller re-reads) —
+    /// unless the object turns out to be this very lease, byte for byte,
+    /// in which case an earlier attempt of ours landed (a 5xx retried by
+    /// `object_store`, or a timed-out reply) and the write is ours. A lease
+    /// body carries its holder, epoch and a millisecond expiry, so no other
+    /// writer can have produced the same bytes.
     async fn put(&self, lease: &Lease, mode: PutMode) -> Result<LeaseTag, StoreError> {
         let body = serde_json::to_vec(lease)?;
-        match self
-            .store
-            .put_opts(
-                &layout::lease(&self.partition),
-                PutPayload::from(body),
-                PutOptions::from(mode),
-            )
-            .await
+        match crate::cas::put_conditional(
+            self.store.as_ref(),
+            &layout::lease(&self.partition),
+            body.into(),
+            mode,
+            crate::cas::Verify::Body,
+        )
+        .await?
         {
-            Ok(r) => Ok(LeaseTag(UpdateVersion {
-                e_tag: r.e_tag,
-                version: r.version,
-            })),
-            Err(object_store::Error::AlreadyExists { .. })
-            | Err(object_store::Error::Precondition { .. })
-            | Err(object_store::Error::NotModified { .. }) => Err(StoreError::CasConflict),
-            Err(e) => Err(e.into()),
+            crate::cas::CasPut::Won(version) => Ok(LeaseTag(version)),
+            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => Err(StoreError::CasConflict),
         }
     }
 }
@@ -315,7 +317,9 @@ pub async fn live_leases_held_by(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
     use object_store::memory::InMemory;
+    use object_store::PutPayload;
 
     const P: &str = "p0";
     const TTL: u64 = 60_000;
@@ -496,5 +500,139 @@ mod tests {
         let (empty, _) = s2.get().await.unwrap().unwrap();
         assert_eq!(empty.holder, 0);
         assert!(empty.is_claimable(now_unix_ms()));
+    }
+
+    // ---- plan 30 §M4 item 1: each error code, at both lease CAS sites ----
+
+    fn faulty(store: &Arc<FaultyStore>) -> LeaseStore {
+        LeaseStore::new(store.clone(), P, LeaseMode::Cas)
+    }
+
+    /// 409 on the create: the same attempt is retried and lands.
+    #[tokio::test]
+    async fn create_retries_a_409() {
+        let store = FaultyStore::new();
+        store.script(OpKind::Put, "leases/", Calls::Nth(1), Fault::Status(409));
+        let s = faulty(&store);
+        s.try_create(&Lease::granted(P, 7, 1, TTL)).await.unwrap();
+        assert_eq!(s.get().await.unwrap().unwrap().0.holder, 7);
+        assert_eq!(store.calls(OpKind::Put, "leases/"), 2);
+    }
+
+    /// 409 on a swap: retried as the same attempt, with the same etag.
+    #[tokio::test]
+    async fn swap_retries_a_409() {
+        let store = FaultyStore::new();
+        let s = faulty(&store);
+        s.try_create(&Lease::granted(P, 7, 1, TTL)).await.unwrap();
+        let (lease, tag) = s.get().await.unwrap().unwrap();
+        store.script(OpKind::Put, "leases/", Calls::First(2), Fault::Status(409));
+        s.try_swap(&lease.renewed(TTL), &tag).await.unwrap();
+        assert_eq!(s.get().await.unwrap().unwrap().0.holder, 7);
+    }
+
+    /// Our takeover landed but the reply was a 412 (a 5xx retried by
+    /// `object_store` after the write was applied): it is our lease, and
+    /// the returned tag is the live one, so the next renewal works.
+    #[tokio::test]
+    async fn a_takeover_that_landed_behind_a_412_is_won() {
+        let store = FaultyStore::new();
+        let s = faulty(&store);
+        s.try_create(&Lease::granted(P, 1, 1, 0)).await.unwrap();
+        let (old, tag) = s.get().await.unwrap().unwrap();
+        store.script(
+            OpKind::Put,
+            "leases/",
+            Calls::Nth(1),
+            Fault::AppliedThen(412),
+        );
+        let mine = Lease::granted(P, 2, old.epoch + 1, TTL);
+        let new_tag = s.try_swap(&mine, &tag).await.unwrap();
+        s.try_swap(&mine.renewed(TTL), &new_tag).await.unwrap();
+        assert_eq!(s.get().await.unwrap().unwrap().0.holder, 2);
+    }
+
+    /// A create that landed behind a 412 is ours as well.
+    #[tokio::test]
+    async fn a_create_that_landed_behind_a_412_is_won() {
+        let store = FaultyStore::new();
+        store.script(
+            OpKind::Put,
+            "leases/",
+            Calls::Nth(1),
+            Fault::AppliedThen(412),
+        );
+        let s = faulty(&store);
+        s.try_create(&Lease::granted(P, 7, 1, TTL)).await.unwrap();
+    }
+
+    /// A genuine 412 (another holder's object is there) is a lost race.
+    #[tokio::test]
+    async fn a_genuine_412_is_a_conflict() {
+        let store = FaultyStore::new();
+        let s = faulty(&store);
+        s.try_create(&Lease::granted(P, 1, 1, 0)).await.unwrap();
+        let (_, tag) = s.get().await.unwrap().unwrap();
+        s.try_swap(&Lease::granted(P, 2, 2, TTL), &tag)
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.try_swap(&Lease::granted(P, 3, 2, TTL), &tag).await,
+            Err(StoreError::CasConflict)
+        ));
+    }
+
+    /// 404 on `If-Match` (the lease object was deleted under us): a
+    /// conflict, and the caller's re-read finds no lease.
+    #[tokio::test]
+    async fn a_404_on_if_match_is_a_conflict_and_the_reread_sees_nothing() {
+        let store = FaultyStore::new();
+        let s = faulty(&store);
+        s.try_create(&Lease::granted(P, 1, 1, TTL)).await.unwrap();
+        let (lease, tag) = s.get().await.unwrap().unwrap();
+        store.inner().delete(&layout::lease(P)).await.unwrap();
+        assert!(matches!(
+            s.try_swap(&lease.renewed(TTL), &tag).await,
+            Err(StoreError::CasConflict)
+        ));
+        assert!(s.get().await.unwrap().is_none());
+    }
+
+    /// A scripted AWS-style 404 on `If-Match` (rewritten to `Precondition`
+    /// by the S3 client) is classified the same way.
+    #[tokio::test]
+    async fn an_aws_style_404_is_a_conflict() {
+        let store = FaultyStore::new();
+        let s = faulty(&store);
+        s.try_create(&Lease::granted(P, 1, 1, TTL)).await.unwrap();
+        let (lease, tag) = s.get().await.unwrap().unwrap();
+        store.script(OpKind::Put, "leases/", Calls::Nth(1), Fault::Status(404));
+        // Renew with a TTL far enough from the original that the two
+        // millisecond expiries can never coincide (the own-write
+        // recognition this exercises is byte equality, so a renewal
+        // landing in the same millisecond as the grant would otherwise
+        // make this flaky rather than a real conflict).
+        assert!(matches!(
+            s.try_swap(&lease.renewed(TTL + 10_000), &tag).await,
+            Err(StoreError::CasConflict)
+        ));
+    }
+
+    /// 500 and timeouts are transient errors, never a conflict: a renewal
+    /// must not conclude it was deposed from them.
+    #[tokio::test]
+    async fn a_500_or_timeout_is_an_error_not_a_conflict() {
+        let store = FaultyStore::new();
+        let s = faulty(&store);
+        s.try_create(&Lease::granted(P, 1, 1, TTL)).await.unwrap();
+        let (lease, tag) = s.get().await.unwrap().unwrap();
+        for fault in [Fault::Status(500), Fault::Timeout] {
+            store.clear();
+            store.script(OpKind::Put, "leases/", Calls::Nth(1), fault);
+            match s.try_swap(&lease.renewed(TTL), &tag).await {
+                Err(StoreError::ObjectStore(_)) => {}
+                other => panic!("{fault:?}: {other:?}"),
+            }
+        }
     }
 }

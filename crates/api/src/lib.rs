@@ -16,6 +16,7 @@ pub use types::{
     PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response, SnapshotStatus, SourceStatus,
     SpeculationStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
+pub use types::{CasProbeStatus, HeldInodeStatus, HeldStatus, PeerPathsStatus};
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -124,6 +125,12 @@ pub trait StatusSource: Send + Sync + 'static {
 
     fn doctor(&self) -> std::result::Result<DoctorStatus, String> {
         Err("backend probes are not supported by this daemon".into())
+    }
+
+    /// Plan 30 §M4: discard the records held back behind `ino`'s
+    /// unrecoverable chunk(s) into a conflict copy.
+    fn drop_held(&self, _ino: u64) -> std::result::Result<String, String> {
+        Err("drop-held is not supported by this daemon".into())
     }
 
     fn cache_list(&self) -> Vec<CacheEntryStatus> {
@@ -287,6 +294,7 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
         Request::MountList => Response::Mounts {
             mounts: source.mount_list(),
         },
+        Request::DropHeld { ino } => result(source.drop_held(ino)),
     }
 }
 
@@ -399,6 +407,7 @@ mod tests {
                 epoch: EpochStatus::default(),
                 reintegration: ReintegrationStatus::default(),
                 speculation: SpeculationStatus::default(),
+                held: HeldStatus::default(),
                 coop: CoopStatus::default(),
                 prefetch: PrefetchStatus::default(),
                 writeback: WritebackStatus::default(),
@@ -477,6 +486,7 @@ mod tests {
             Ok(DoctorStatus {
                 create_if_absent: true,
                 etag_cas: true,
+                ..Default::default()
             })
         }
 

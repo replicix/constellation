@@ -239,6 +239,14 @@ impl Peers {
         }
     }
 
+    /// Plan 30 §M4: the open paths of this node's pooled connection to
+    /// `node_id` (see `crate::paths`), without waiting.
+    pub fn path_summary(&self, node_id: u64) -> Option<crate::paths::PathSummary> {
+        let inner = self.inner.as_ref()?;
+        let id = inner.peers.lock().unwrap().get(&node_id)?.addr.id;
+        inner.p2p.path_summary_now(id)
+    }
+
     pub fn snapshot(&self) -> Vec<Peer> {
         let Some(inner) = self.inner.as_ref() else {
             return Vec::new();

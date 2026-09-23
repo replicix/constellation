@@ -66,7 +66,22 @@ fn paired(history: &History) -> Vec<(Event, Event)> {
     out
 }
 
+/// Every history checker: the per-step invariants below, plus plan 30
+/// §M4's exactly-once checker (`crate::exactly_once`) and Elle-style
+/// dependency-cycle detection over rename and link histories
+/// (`crate::elle`). Run on the whole history at the end of a run and by
+/// the offline `chaos check`.
 pub fn check_history(history: &History) -> Result<(), CheckFailure> {
+    check_step_invariants(history)?;
+    crate::exactly_once::check_history_exactly_once(history)?;
+    crate::elle::check_cycles(history)?;
+    Ok(())
+}
+
+/// The cheap checkers the coordinator runs after every step (each is
+/// linear in the history; the whole-history ones above run once, at the
+/// end).
+pub fn check_step_invariants(history: &History) -> Result<(), CheckFailure> {
     check_unexpected_errno(history)?;
     check_exactly_one_winner(history)?;
     check_write_full_register(history)?;

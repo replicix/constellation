@@ -5,6 +5,7 @@
 
 pub mod aws_auth;
 pub mod blobs;
+pub mod cas;
 pub mod codec;
 pub mod commits;
 pub mod compact;
@@ -12,6 +13,8 @@ pub mod decode_gate;
 pub mod designation;
 pub mod e2e;
 pub mod error;
+#[cfg(test)]
+pub(crate) mod faulty;
 pub mod format;
 pub mod gc;
 pub mod layout;
@@ -22,6 +25,7 @@ pub mod node_cache;
 pub mod nodes;
 pub mod packs;
 pub mod parallel;
+pub mod probe;
 pub mod snapshot;
 pub mod store;
 
@@ -55,5 +59,6 @@ pub use packs::{
     PackStore,
 };
 pub use parallel::{effective_threads, gc_threads};
+pub use probe::{probe_cas_semantics, CasProbe, CasProbeReport, Versioning};
 pub use snapshot::{snapshot_id, SnapshotRecord, SnapshotStore, SnapshotTreeRoot};
 pub use store::{Capabilities, ChunkPutMode, ChunkPutResult, ChunkStore, FsMeta, PreflightCheck};

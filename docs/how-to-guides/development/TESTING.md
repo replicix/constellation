@@ -235,6 +235,24 @@ history.
 cargo run -p constellation-harness --release -- run chaos-ci --seed 42
 ```
 
+Plan 30 M4 added three whole-history checkers and two whole-cluster
+checks. The history checkers run on the complete history at the end of
+the run (the cheap per-step invariants still run after every step):
+**exactly-once** (a `create` refused with `EEXIST` whose own unique
+content is in the file, a storm whose effect happened with no attempt
+succeeding, an `append` applied twice or after reporting failure) and
+**Elle-style dependency cycles** over rename and link histories (the
+`move_read` and `link_read` families race renames and hard links of a
+seeded file against reads of every name; each path is single-assignment,
+so every observation maps to one version and any `ww`/`wr`/`rw`/real-time
+cycle is a linearizability violation). After the history passes, both
+`chaos-ci` and `chaos-soak-4` wait for every node to drain, mount a
+**fresh node** from the bucket, and require every replica's tree under
+the work root — the fresh one's included — to be identical
+(**convergence at quiescence**), then decode every log segment in the
+bucket and require every `Completed { rid }` to appear once
+(**exactly-once in the log**).
+
 On failure, artifacts land under the scenario tempdir's `chaos-store/`
 (`config.json`, `history.jsonl`, `failure.md`). Re-check offline with
 `chaos check --history …/history.jsonl`. Multi-node hour-long soaks
@@ -819,8 +837,39 @@ was rewritten for the same milestone):
   commit that carried the dead holder's unshipped work would show up on
   D only).
 
+- **`poison-record-isolation`** (plan 30 M4, L7). Deterministic through
+  two test-only fault points on holder A (write-back):
+  `CONSTELLATION_FAULT_LOSE_CHUNKS` (the upload pass drops `broken`'s one
+  chunk from the cache right before reading it) and
+  `CONSTELLATION_FAULT_HOLD_SYNC_FILE` (A's sync rounds are held while the
+  file exists; A writes `<file>.held` once a round has seen the hold, so
+  no round is in flight). With rounds held, A writes `broken`, `chmod`s it
+  (a record that depends on the held manifest) and writes `after`; the
+  hold is lifted and the first round finds the chunk gone. B must see
+  `after` and `broken`'s create (empty, mode unchanged) — everything but
+  the held manifest and chmod; A's `status.held` must list the inode, its
+  one lost chunk and both held transactions; A must publish a new commit
+  while they are held, and a fresh node D bootstrapped from the bucket
+  must see exactly what B sees. `repair drop-held` over the control
+  socket must then replay the chmod (B sees mode 0600), materialize
+  `/.constellation-conflict/broken@…` (full length, the lost chunk a
+  hole of zeros), and leave A's held set, pending conflict copies and
+  journal empty.
+- **`publish-only-holder`** (plan 30 M4, L8; a measurement). Three nodes,
+  each behind its own counting relay, `CONSTELLATION_PUBLISH_IDLE_S=2`,
+  lease placement off. A 20 s idle window and a 20 s busy window (all
+  three nodes writing 512 B files every 20 ms, the followers' through
+  forwarding), each followed by a drain. Prints each node's requests by
+  class and bucket area per window (the milestone's request-count record)
+  and requires that a node which did not hold the lease during a window
+  PUT no commit and read no condemned list, and that the holder published
+  during the busy window.
+
 All of them poll the control API and the mounted namespace with
-`eventually` rather than sleeping and hoping.
+`eventually` rather than sleeping and hoping. (Since plan 30 M4 only the
+lease holder publishes commits, so a follower's clean unmount no longer
+does; a fresh node bootstraps from whatever head commit the holder last
+published plus the log after it, which is the same state.)
 
 The harness also runs **fully containerized** (`make harness-docker`,
 compose service `harness`): the image bundles the binaries plus fio and

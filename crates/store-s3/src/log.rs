@@ -19,7 +19,7 @@ use crate::e2e::{decrypt_object, encrypt_object, SharedE2eKeys};
 use crate::error::StoreError;
 use crate::layout;
 use futures::TryStreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 use std::sync::Arc;
 
 /// Genesis partition id. A filesystem always has at least this one.
@@ -127,21 +127,30 @@ impl LogStore {
 
     /// CAS-create segment `seq`. `AlreadyExists` when the sequence was
     /// already written (crash replay or a second writer).
+    ///
+    /// Plan 30 §M4 item 1 (`crate::cas`): a 409 retries the same create
+    /// (before, it read as `AlreadyExists`, and the shipper's tail then
+    /// found nothing at `seq` and came straight back), and a 412 whose
+    /// object is this very segment — our own create that landed behind a
+    /// retried 5xx or a lost reply, which includes a takeover's epoch
+    /// marker — is a success, not a collision. Only another writer's
+    /// segment is `AlreadyExists`.
     pub async fn put_segment(&self, seq: u64, payload: &[u8]) -> Result<(), StoreError> {
         let key = layout::log_segment(&self.partition, seq);
         let body = self.seal_segment(seq, payload)?;
-        match self
-            .store
-            .put_opts(
-                &key,
-                PutPayload::from(body),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
+        match crate::cas::put_conditional(
+            self.store.as_ref(),
+            &key,
+            body.into(),
+            PutMode::Create,
+            crate::cas::Verify::Body,
+        )
+        .await?
         {
-            Ok(_) => Ok(()),
-            Err(object_store::Error::AlreadyExists { .. }) => Err(StoreError::AlreadyExists),
-            Err(e) => Err(e.into()),
+            crate::cas::CasPut::Won(_) => Ok(()),
+            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => {
+                Err(StoreError::AlreadyExists)
+            }
         }
     }
 
@@ -265,6 +274,50 @@ mod tests {
             Err(StoreError::AlreadyExists)
         ));
         assert_eq!(s.get_segment(1).await.unwrap(), b"first");
+    }
+
+    /// Plan 30 §M4 item 1: segment create (and so the epoch marker, which
+    /// is an empty segment) under each error code.
+    #[tokio::test]
+    async fn segment_create_error_codes() {
+        use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
+        let faulty = FaultyStore::new();
+        let s = LogStore::new(faulty.clone());
+        // 409: the same create again, which lands.
+        faulty.script(OpKind::Put, "log/", Calls::Nth(1), Fault::Status(409));
+        s.put_segment(1, b"one").await.unwrap();
+        // Our own create landed behind a 412 (or a lost reply): ours.
+        faulty.clear();
+        faulty.script(OpKind::Put, "log/", Calls::Nth(1), Fault::AppliedThen(412));
+        s.put_segment(2, b"").await.unwrap();
+        // Another writer's segment: a collision.
+        faulty.clear();
+        assert!(matches!(
+            s.put_segment(2, b"theirs").await,
+            Err(StoreError::AlreadyExists)
+        ));
+        // A 500 or a timeout is the store's error, never a collision.
+        for fault in [Fault::Status(500), Fault::Timeout] {
+            faulty.clear();
+            faulty.script(OpKind::Put, "log/", Calls::Nth(1), fault);
+            assert!(matches!(
+                s.put_segment(3, b"three").await,
+                Err(StoreError::ObjectStore(_))
+            ));
+        }
+        // A timed-out reply whose write landed: the retry meets our own
+        // object and is a success.
+        faulty.clear();
+        faulty.script(
+            OpKind::Put,
+            "log/",
+            Calls::Nth(1),
+            Fault::AppliedThenTimeout,
+        );
+        assert!(s.put_segment(3, b"three").await.is_err());
+        s.put_segment(3, b"three").await.unwrap();
+        assert_eq!(s.list_segments().await.unwrap(), vec![1, 2, 3]);
+        assert_eq!(s.get_segment(2).await.unwrap(), b"");
     }
 
     #[tokio::test]

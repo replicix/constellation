@@ -514,6 +514,28 @@ impl Client {
         Ok(())
     }
 
+    /// This client's state directory (plan 30 §M4: the poison scenario
+    /// removes a pending chunk from `<state>/cache`).
+    pub fn state_dir(&self) -> &Path {
+        &self.state
+    }
+
+    /// Send one raw control-API request (a JSON object) and return the
+    /// response.
+    pub fn control(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
+        use std::io::{BufRead, BufReader, Write};
+        let sock = self.state.join("control.sock");
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
+            .with_context(|| format!("connecting to {}", sock.display()))?;
+        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+        let mut line = serde_json::to_string(request)?;
+        line.push('\n');
+        stream.write_all(line.as_bytes())?;
+        let mut reply = String::new();
+        BufReader::new(stream).read_line(&mut reply)?;
+        Ok(serde_json::from_str(&reply)?)
+    }
+
     pub fn control_status(&self) -> Result<serde_json::Value> {
         use std::io::{BufRead, BufReader, Write};
         use std::time::Duration;

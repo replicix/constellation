@@ -70,7 +70,7 @@ use crate::node_cache::NodeCache;
 use crate::packs::{PackHash, PackStore};
 use constellation_mtree::NodeHash;
 use futures::TryStreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -346,18 +346,22 @@ impl CommitChain {
             }
             None => json,
         };
-        match self
-            .store
-            .put_opts(
-                &key,
-                PutPayload::from(body),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
+        // Plan 30 §M4 item 1 (`crate::cas`): a 409 retries the same
+        // create (it used to read as a lost race, and the winner read-back
+        // then found an empty slot and reported bucket corruption); a 412
+        // is a lost race unless the object is this commit byte for byte —
+        // our own create that landed behind a retried 5xx or a lost reply.
+        match crate::cas::put_conditional(
+            self.store.as_ref(),
+            &key,
+            body.into(),
+            PutMode::Create,
+            crate::cas::Verify::Body,
+        )
+        .await?
         {
-            Ok(_) => Ok(()),
-            Err(object_store::Error::AlreadyExists { .. }) => Err(StoreError::CasConflict),
-            Err(e) => Err(e.into()),
+            crate::cas::CasPut::Won(_) => Ok(()),
+            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => Err(StoreError::CasConflict),
         }
     }
 
@@ -561,7 +565,7 @@ mod tests {
     use object_store::path::Path as OPath;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        ObjectStoreExt, PutMultipartOptions, PutResult,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
@@ -635,6 +639,51 @@ mod tests {
             Err(StoreError::CasConflict)
         ));
         assert_eq!(chain.get(1).await.unwrap().unwrap(), commit);
+    }
+
+    /// Plan 30 §M4 item 1: the commit create under each error code. A
+    /// 409 is retried as the same attempt (before M4 it read as a lost
+    /// race and `publish` then found the slot empty and reported
+    /// corruption); a create that landed behind a 412 is ours; a genuine
+    /// 412 is a conflict; a 500 or a timeout is the store's error.
+    #[tokio::test]
+    async fn commit_create_error_codes() {
+        use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
+        let faulty = FaultyStore::new();
+        let chain = CommitChain::new(faulty.clone());
+        faulty.script(OpKind::Put, "commits/", Calls::Nth(1), Fault::Status(409));
+        chain
+            .create(&CommitPayload::default().at(1, 1))
+            .await
+            .unwrap();
+        faulty.clear();
+        faulty.script(
+            OpKind::Put,
+            "commits/",
+            Calls::Nth(1),
+            Fault::AppliedThen(412),
+        );
+        chain
+            .create(&CommitPayload::default().at(2, 2))
+            .await
+            .unwrap();
+        faulty.clear();
+        let mut evil = CommitPayload::default().at(2, 3);
+        evil.author = 99;
+        assert!(matches!(
+            chain.create(&evil).await,
+            Err(StoreError::CasConflict)
+        ));
+        for fault in [Fault::Status(500), Fault::Timeout] {
+            faulty.clear();
+            faulty.script(OpKind::Put, "commits/", Calls::Nth(1), fault);
+            assert!(matches!(
+                chain.create(&CommitPayload::default().at(3, 4)).await,
+                Err(StoreError::ObjectStore(_))
+            ));
+        }
+        assert_eq!(chain.get(2).await.unwrap().unwrap().unix_ms, 2);
+        assert_eq!(chain.get(3).await.unwrap(), None);
     }
 
     /// Two writers race for `seq + 1`. One wins; the loser sees 412,

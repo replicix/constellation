@@ -288,19 +288,51 @@ pub(crate) fn ack_upto(
 /// `seqs` — a takeover's epoch-marker segment carries no journal rows but
 /// is still this replica's own, applied segment.
 ///
-/// `seqs` is always the journal's head (a shipped batch, or our own
-/// recovered segment), so its highest seq becomes the acked watermark.
+/// `seqs` is usually the journal's head, so its highest seq becomes the
+/// acked watermark. Plan 30 §M4: a ship may skip held-back transactions
+/// (`store::held`), leaving rows below that; the watermark then stops
+/// just below the oldest one still here, so every journal scan (which
+/// starts past the watermark) keeps seeing it. Only then (`held_below`,
+/// from `spec::retire_local_tx`'s scan) is that row looked up; the
+/// ordinary ack does no extra read (plan 30 §M4 round 2).
 pub(crate) fn ack_rows_at(
     tx: &mut SingleWriterWriteTx,
     journal: &SingleWriterTxKeyspace,
     local: &SingleWriterTxKeyspace,
     seqs: &[u64],
     applied_seq: u64,
+    held_below: bool,
 ) -> Result<(), MetaError> {
     for seq in seqs {
         tx.remove(journal, seq_key(*seq));
     }
     if let Some(&upto) = seqs.iter().max() {
+        if !held_below {
+            note_acked_tx(tx, local, upto)?;
+            kv_set_tx(
+                tx,
+                local,
+                crate::store::KV_APPLIED_SEQ,
+                &applied_seq.to_string(),
+            );
+            return Ok(());
+        }
+        let from = acked_watermark(tx, local)?.saturating_add(1);
+        let remaining = match tx.range(journal, seq_key(from)..=seq_key(upto)).next() {
+            Some(guard) => {
+                let (k, _) = guard.into_inner()?;
+                Some(u64::from_be_bytes(
+                    k.as_ref()
+                        .try_into()
+                        .map_err(|_| MetaError::Invalid("journal key".into()))?,
+                ))
+            }
+            None => None,
+        };
+        let upto = match remaining {
+            Some(held) => held.saturating_sub(1),
+            None => upto,
+        };
         note_acked_tx(tx, local, upto)?;
     }
     kv_set_tx(

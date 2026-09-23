@@ -82,9 +82,28 @@ impl Meta {
         journal_seqs: &[u64],
         applied_seq: u64,
     ) -> Result<(), MetaError> {
+        use crate::store::spec::{retire_local_tx, Shipped};
         let mut tx = self.db.write_tx();
+        let mut held_below = false;
         if let Some(&upto) = journal_seqs.iter().max() {
-            crate::store::spec::retire_local_tx(&mut tx, self, upto, applied_seq)?;
+            // Plan 30 §M4: exactly these rows shipped — a held-back
+            // transaction between them stays outstanding (`store::held`).
+            // The ordinary ship is one contiguous run, checked without a
+            // set (round 2: no per-ack allocation on the hot path).
+            let first = journal_seqs.iter().copied().min().unwrap_or(upto);
+            let set: std::collections::HashSet<u64>;
+            let only = if upto - first + 1 == journal_seqs.len() as u64 {
+                Shipped::Run(first)
+            } else {
+                set = journal_seqs.iter().copied().collect();
+                Shipped::Set(&set)
+            };
+            let retired = retire_local_tx(&mut tx, self, upto, applied_seq, Some(only))?;
+            held_below = retired.held_below;
+            if held_below {
+                self.held_work
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         crate::store::journal::ack_rows_at(
             &mut tx,
@@ -92,6 +111,7 @@ impl Meta {
             &self.local,
             journal_seqs,
             applied_seq,
+            held_below,
         )?;
         tx.commit()?;
         Ok(())
@@ -105,11 +125,15 @@ impl Meta {
     /// Plan 30 §M3b: the batch always ends on a transaction boundary (it
     /// may run past `max_per_part` to reach one), so a caller shipping it
     /// whole never splits an op's records from its `Completed { rid }`.
+    ///
+    /// Plan 30 §M4: transactions held back behind an unrecoverable pending
+    /// chunk are skipped, and whatever does not depend on them ships
+    /// (`store::held`).
     pub fn take_journal_grouped(
         &self,
         max_per_part: usize,
     ) -> Result<Vec<(String, crate::store::JournalBatch)>, MetaError> {
-        let batch = self.take_journal_whole_txs(max_per_part)?;
+        let batch = self.take_shippable(max_per_part)?;
         if batch.is_empty() {
             Ok(Vec::new())
         } else {
@@ -1638,7 +1662,7 @@ impl MetaStore for Meta {
     fn ack_journal(&self, upto_seq: u64) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let applied = crate::store::applied_seq_at(&tx, &self.local)?;
-        crate::store::spec::retire_local_tx(&mut tx, self, upto_seq, applied)?;
+        crate::store::spec::retire_local_tx(&mut tx, self, upto_seq, applied, None)?;
         journal::ack_upto(&mut tx, &self.journal_ks, &self.local, upto_seq)?;
         tx.commit()?;
         Ok(())

@@ -246,15 +246,21 @@ impl ChunkStore {
     /// if a `meta.json` is already present (conditional create).
     pub async fn create_fs(&self, meta: &FsMeta) -> Result<(), StoreError> {
         let body = serde_json::to_vec_pretty(meta)?;
-        let opts = PutOptions::from(PutMode::Create);
-        match self
-            .store
-            .put_opts(&layout::meta_json(), PutPayload::from(body), opts)
-            .await
+        // Plan 30 §M4 item 1: a 409 retries; our own create that landed
+        // behind a 412 is ours (the body carries a fresh uuid).
+        match crate::cas::put_conditional(
+            self.store.as_ref(),
+            &layout::meta_json(),
+            body.into(),
+            PutMode::Create,
+            crate::cas::Verify::Body,
+        )
+        .await?
         {
-            Ok(_) => Ok(()),
-            Err(object_store::Error::AlreadyExists { .. }) => Err(StoreError::AlreadyExists),
-            Err(e) => Err(e.into()),
+            crate::cas::CasPut::Won(_) => Ok(()),
+            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => {
+                Err(StoreError::AlreadyExists)
+            }
         }
     }
 
@@ -367,26 +373,19 @@ impl ChunkStore {
             }
         })
         .await?;
-        let result = match mode {
+        match mode {
+            // Plan 30 §M4 item 1: a 409 is retried, never a dedup hit
+            // (`crate::cas::create_content_addressed`).
             ChunkPutMode::Create => {
-                self.store
-                    .put_opts(
-                        &key,
-                        PutPayload::from(obj),
-                        PutOptions::from(PutMode::Create),
-                    )
-                    .await
+                let existed =
+                    crate::cas::create_content_addressed(self.store.as_ref(), &key, obj.into())
+                        .await?;
+                Ok(ChunkPutResult { existed })
             }
             ChunkPutMode::Probe | ChunkPutMode::Overwrite => {
-                self.store.put(&key, PutPayload::from(obj)).await
+                self.store.put(&key, PutPayload::from(obj)).await?;
+                Ok(ChunkPutResult { existed: false })
             }
-        };
-        match result {
-            Ok(_) => Ok(ChunkPutResult { existed: false }),
-            Err(object_store::Error::AlreadyExists { .. }) if mode == ChunkPutMode::Create => {
-                Ok(ChunkPutResult { existed: true })
-            }
-            Err(error) => Err(error.into()),
         }
     }
 
@@ -885,9 +884,14 @@ mod tests {
         assert_eq!(loaded.uuid, meta.uuid);
         assert_eq!(loaded.chunk_size, DEFAULT_CHUNK_SIZE);
         assert_eq!(loaded.gossip_secret, meta.gossip_secret);
-        // Second create refused.
+        // Second create refused. A real second attempt carries its own
+        // fresh uuid/gossip secret (`FsMeta::default()` randomizes both),
+        // so use a distinct instance rather than replaying the first
+        // one's exact bytes — otherwise this would exercise the "our own
+        // create landed behind a 412" recognition instead of a genuine
+        // conflict between two different filesystems.
         assert!(matches!(
-            s.create_fs(&meta).await,
+            s.create_fs(&FsMeta::default()).await,
             Err(StoreError::AlreadyExists)
         ));
     }

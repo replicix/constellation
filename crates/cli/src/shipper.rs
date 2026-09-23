@@ -325,6 +325,11 @@ pub struct SpoolInfo {
     pub depositions: u64,
     /// Plan 30 §M3b: epoch-marker segments shipped after a takeover.
     pub epoch_markers: u64,
+    /// Plan 30 §M4: refused replays whose conflict copy could not be made
+    /// yet (at least one failed attempt), and those failing for at least
+    /// `recovery::LEASE_FALLBACK` — gauges the replay drain sets.
+    pub replay_copies_pending: u64,
+    pub replay_copies_stalled: u64,
 }
 
 impl Shipper {
@@ -488,6 +493,37 @@ impl Shipper {
             && self.last_publish_attempt.elapsed() >= publish_idle_interval()
     }
 
+    /// Plan 30 §M4 item 3: whether this node publishes commits at all —
+    /// only while it holds the lease (`Meta::holder_epoch`, which the lease
+    /// keeper sets the moment its CAS wins and clears on release or
+    /// deposition). Every other node tails the same log the holder
+    /// publishes from.
+    fn is_publisher(&self) -> bool {
+        self.meta.holder_epoch() != 0
+    }
+
+    /// The idle publish: the holder publishes; a follower instead clears
+    /// the dirty keys the head commit already covers
+    /// (`TreePublisher::follow_head`), so its dirty set does not grow
+    /// without bound and it stays ready to publish the moment it becomes
+    /// the holder. Best effort, like every publish.
+    async fn publish_or_follow(&mut self) -> Result<()> {
+        if self.is_publisher() {
+            return self.publish().await;
+        }
+        self.last_publish_attempt = Instant::now();
+        let Some(mut publisher) = self.take_publisher(false).await else {
+            return Ok(());
+        };
+        let task = tokio::spawn(async move { publisher.follow_head().await });
+        match task.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::debug!(error = %e, "follower head check failed; retrying later"),
+            Err(e) => tracing::debug!(error = %e, "follower head check task failed"),
+        }
+        Ok(())
+    }
+
     /// The published root, for tests.
     #[cfg(test)]
     pub fn tree_published(&self) -> Option<(constellation_mtree::NodeHash, u64)> {
@@ -578,7 +614,7 @@ impl Shipper {
                 // segments, would otherwise never publish on its own —
                 // check the idle timer here instead.
                 if self.publish_idle_due() {
-                    self.publish().await?;
+                    self.publish_or_follow().await?;
                 }
                 // Same reasoning for read-time atime (plan 29 M3b): a
                 // held partition with nothing else to ship this round may
@@ -641,7 +677,7 @@ impl Shipper {
             let grouped = self.meta.take_journal_grouped(SEGMENT_BATCH)?;
             if grouped.is_empty() {
                 if self.publish_idle_due() {
-                    self.publish().await?;
+                    self.publish_or_follow().await?;
                 }
                 if !held.is_empty() {
                     let g = keepers.lock().await;
@@ -960,17 +996,15 @@ impl Shipper {
                 .iter()
                 .filter(|r| !matches!(r, LogRecord::Atime { .. }))
                 .collect();
-            let journal = MetaStore::take_journal(&*self.meta, journaled.len())?;
-            let matches = journal.len() == journaled.len()
-                && journal.iter().map(|(_, r)| r).eq(journaled.iter().copied());
-            if !matches {
+            // Plan 30 §M4: the head, or — when held-back transactions
+            // were skipped — a subsequence of whole transactions.
+            let Some(seqs) = self.meta.match_own_segment(&journaled)? else {
                 bail!(
                     "segment {seq} of {part} claims our node id {} but does not match \
-                     the journal head: state dir reuse or id collision",
+                     the journal: state dir reuse or id collision",
                     self.node_id
                 );
-            }
-            let seqs: Vec<u64> = journal.iter().map(|(s, _)| *s).collect();
+            };
             self.meta.ack_journal_rows_at(&seqs, seq)?;
             tracing::info!(
                 seq,
@@ -1628,7 +1662,11 @@ impl Shipper {
                 break;
             }
         }
-        if self.meta.has_dirty() {
+        // Plan 30 §M4 item 3: only the lease holder publishes. A follower's
+        // dirty keys are the holder's to publish (it tailed the same log).
+        if self.meta.has_dirty()
+            && (self.is_publisher() || leases.values().any(|k| k.ship_epoch().is_some()))
+        {
             self.publish().await?;
         }
         if initial > 0 {
@@ -1842,7 +1880,10 @@ pub async fn acquire_lease_for(
         );
         ship.register_wanted_by(keeper, part, prev, tag).await;
     }
-    let takeover = plan.needs_tail();
+    // Plan 30 §M4: a re-adoption of our own unreleased lease that this
+    // keeper does not track is gated like a takeover, so it tails first too
+    // (`LeaseKeeper::readopts`).
+    let takeover = plan.needs_tail() || keeper.readopts(&plan);
     let tailed = if takeover {
         Some(ship.tail_part_to_head(part).await?)
     } else {
@@ -2569,6 +2610,60 @@ mod tests {
         assert!(a.meta.lookup(1, "stranded").unwrap().is_none());
         assert_eq!(a.meta.pending_replays().unwrap().len(), 1);
         assert!(a.ship.log.list_segments().await.unwrap().is_empty());
+    }
+
+    /// Plan 30 §M4 item 1: a keeper that does not track the lease the
+    /// bucket says is its own (a restart, or a takeover CAS whose reply was
+    /// lost though it landed) re-adopts it through the takeover gate: an
+    /// epoch marker at the same epoch, and a queued replay executed before
+    /// the view opens. A keeper that does track it re-adopts as before.
+    #[tokio::test]
+    async fn a_restart_readopts_its_own_lease_through_the_gate() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        a.meta.mkdir(1, "shipped", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        assert_eq!(a.ship.spool.lock().unwrap().epoch_markers, 0);
+        // Something the previous incarnation left queued for replay.
+        let rid = constellation_meta::Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 7,
+        };
+        let op = constellation_meta::MutateOp::Mkdir {
+            parent: 1,
+            name: "queued".into(),
+            ino: (1 << 40) | 600,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        a.meta.queue_replay(rid, &op).unwrap();
+
+        // "Restart": a fresh keeper for the same node over the same bucket.
+        let mut restarted = LeaseKeeper::new(
+            LeaseStore::new(
+                store.clone() as StdArc<dyn ObjectStore>,
+                constellation_store_s3::log::PARTITION,
+                LeaseMode::Cas,
+            ),
+            1,
+        );
+        assert!(acquire_lease(&mut a.ship, &mut restarted).await.unwrap());
+        assert_eq!(restarted.ship_epoch(), Some(1), "same holder, same epoch");
+        assert_eq!(a.ship.spool.lock().unwrap().epoch_markers, 1);
+        let marker = segment(&store, 2).await;
+        assert_eq!((marker.node, marker.epoch), (1, 1));
+        assert!(marker.records.is_empty());
+        assert!(
+            a.meta.lookup(1, "queued").unwrap().is_some(),
+            "gate replayed it"
+        );
+        assert!(a.meta.pending_replays().unwrap().is_empty());
+
+        // The keeper that tracks its lease re-adopts without a gate.
+        assert!(acquire_lease(&mut a.ship, &mut restarted).await.unwrap());
+        assert_eq!(a.ship.spool.lock().unwrap().epoch_markers, 1);
     }
 
     /// Plan 30 §M3b, end to end on two replicas: a holder with captured,

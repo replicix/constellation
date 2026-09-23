@@ -1104,6 +1104,7 @@ dependencies = [
  "blake3",
  "clap",
  "constellation-chaos",
+ "constellation-meta",
  "fjall",
  "libc",
  "postcard",

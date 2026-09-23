@@ -41,6 +41,12 @@ pub enum Op {
         from: String,
         to: String,
     },
+    /// Hard link `to` to the file at `from` (plan 30 §M4: link histories
+    /// for the dependency-cycle checker).
+    Link {
+        from: String,
+        to: String,
+    },
     WriteFull {
         path: String,
         content: Vec<u8>,
@@ -214,6 +220,17 @@ pub fn execute_op(root: &Path, op: &Op) -> Result<Complete> {
                 let _ = fs::create_dir_all(parent);
             }
             match fs::rename(&src, &dst) {
+                Ok(()) => Ok(Complete::ok_timed(start)),
+                Err(e) => Ok(Complete::fail(start, e)),
+            }
+        }
+        Op::Link { from, to } => {
+            let src = resolve(root, from)?;
+            let dst = resolve(root, to)?;
+            if let Some(parent) = dst.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            match fs::hard_link(&src, &dst) {
                 Ok(()) => Ok(Complete::ok_timed(start)),
                 Err(e) => Ok(Complete::fail(start, e)),
             }

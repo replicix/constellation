@@ -23,7 +23,7 @@
 use crate::error::StoreError;
 use crate::layout;
 use futures::TryStreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -253,25 +253,25 @@ impl DesignationStore {
         self.put(d, mode).await
     }
 
+    /// One conditional write under plan 30 §M4's error-code rules
+    /// (`crate::cas`, and `crate::lease::LeaseStore::put` for the same
+    /// reasoning): 409 retries the attempt; 412 or a 404 on `If-Match` is
+    /// [`StoreError::CasConflict`] unless the object is this designation
+    /// byte for byte (path, designee and a millisecond creation time make
+    /// the body unique to this attempt).
     async fn put(&self, d: &Designation, mode: PutMode) -> Result<DesignationTag, StoreError> {
         let body = serde_json::to_vec(d)?;
-        match self
-            .store
-            .put_opts(
-                &layout::designation(&path_hash(&d.path)),
-                PutPayload::from(body),
-                PutOptions::from(mode),
-            )
-            .await
+        match crate::cas::put_conditional(
+            self.store.as_ref(),
+            &layout::designation(&path_hash(&d.path)),
+            body.into(),
+            mode,
+            crate::cas::Verify::Body,
+        )
+        .await?
         {
-            Ok(r) => Ok(DesignationTag(UpdateVersion {
-                e_tag: r.e_tag,
-                version: r.version,
-            })),
-            Err(object_store::Error::AlreadyExists { .. })
-            | Err(object_store::Error::Precondition { .. })
-            | Err(object_store::Error::NotModified { .. }) => Err(StoreError::CasConflict),
-            Err(e) => Err(e.into()),
+            crate::cas::CasPut::Won(version) => Ok(DesignationTag(version)),
+            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => Err(StoreError::CasConflict),
         }
     }
 }
@@ -279,6 +279,7 @@ impl DesignationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
     use object_store::memory::InMemory;
 
     fn ds() -> DesignationStore {
@@ -375,5 +376,78 @@ mod tests {
         s.create(&Designation::new("/site", 1, true)).await.unwrap();
         let (d, _) = s.get("/site").await.unwrap().unwrap();
         assert!(d.read_only);
+    }
+
+    // ---- plan 30 §M4 item 1: error codes at the designation CAS ----
+
+    /// 409 on the create is retried as the same attempt; a create that
+    /// landed behind a 412 is ours.
+    #[tokio::test]
+    async fn create_survives_a_409_and_a_landed_412() {
+        let store = FaultyStore::new();
+        store.script(
+            OpKind::Put,
+            "designations/",
+            Calls::Nth(1),
+            Fault::Status(409),
+        );
+        store.script(
+            OpKind::Put,
+            "designations/",
+            Calls::Nth(2),
+            Fault::AppliedThen(412),
+        );
+        let s = DesignationStore::new(store.clone(), DesignationMode::Cas);
+        s.create(&Designation::new("/site", 1, false))
+            .await
+            .unwrap();
+        let (d, _) = s.get("/site").await.unwrap().unwrap();
+        assert_eq!((d.designee, d.released), (1, false));
+    }
+
+    /// A release whose tag went stale (412) or whose object vanished (404)
+    /// is a conflict, never silently "done".
+    #[tokio::test]
+    async fn release_conflicts_on_412_and_404() {
+        let store = FaultyStore::new();
+        let s = DesignationStore::new(store.clone(), DesignationMode::Cas);
+        let d = Designation::new("/site", 1, false);
+        s.create(&d).await.unwrap();
+        let (cur, tag) = s.get("/site").await.unwrap().unwrap();
+        store.script(
+            OpKind::Put,
+            "designations/",
+            Calls::Nth(1),
+            Fault::Status(412),
+        );
+        assert!(matches!(
+            s.release(&cur, &tag).await,
+            Err(StoreError::CasConflict)
+        ));
+        store.clear();
+        store.script(
+            OpKind::Put,
+            "designations/",
+            Calls::Nth(1),
+            Fault::Status(404),
+        );
+        assert!(matches!(
+            s.release(&cur, &tag).await,
+            Err(StoreError::CasConflict)
+        ));
+        // Neither attempt took effect.
+        assert!(!s.get("/site").await.unwrap().unwrap().0.released);
+        // A 500 is the store's error.
+        store.clear();
+        store.script(
+            OpKind::Put,
+            "designations/",
+            Calls::Nth(1),
+            Fault::Status(500),
+        );
+        assert!(matches!(
+            s.release(&cur, &tag).await,
+            Err(StoreError::ObjectStore(_))
+        ));
     }
 }

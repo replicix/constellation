@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod coop_churn;
+/// Plan 30 §M4's scenarios and the chaos runs' whole-cluster checks.
+mod m4;
 
 pub struct Scenario {
     pub name: &'static str,
@@ -534,6 +536,18 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M3b: a holder publishes while its journal is non-empty; every commit equals the log prefix, so after a mid-burst kill a fresh node matches the log-tailing follower exactly",
         requires: &[],
         run: holder_publishes_log_prefix,
+    },
+    Scenario {
+        name: "poison-record-isolation",
+        desc: "plan 30 M4: a pending chunk lost from the holder's cache holds back only its manifest and what depends on it; everything else ships, status lists it, and `repair drop-held` drops it into a conflict copy and replays the dependents",
+        requires: &[],
+        run: m4::poison_record_isolation,
+    },
+    Scenario {
+        name: "publish-only-holder",
+        desc: "plan 30 M4: S3 requests per node by area on an idle and a busy 3-node cluster; only the lease holder PUTs commits or reads condemned lists",
+        requires: &[],
+        run: m4::publish_only_holder,
     },
 ];
 
@@ -5067,8 +5081,12 @@ fn chaos_ci(seed: u64) -> Result<()> {
     let mounts = vec![c0.mnt.clone(), c1.mnt.clone(), c2.mnt.clone()];
     let mut cluster = LocalCluster::new(mounts)?;
     let profile = Profile::ci(seed, 3);
+    let work_root = profile.work_root.clone();
     Coordinator::run(&mut cluster, profile, &store)
         .with_context(|| format!("chaos-ci artifacts under {}", store.display()))?;
+    // Plan 30 M4: convergence at quiescence (a fresh replica included)
+    // and exactly-once in the log.
+    m4::after_chaos(&env, root.path(), &backend, &[&c0, &c1, &c2], &work_root)?;
 
     c0.unmount()?;
     c1.unmount()?;
@@ -5302,7 +5320,13 @@ fn chaos_soak_4(seed: u64) -> Result<()> {
     );
     let mut cluster = LocalCluster::new(mounts)?;
     let profile = Profile::soak(seed, 4, duration_secs);
-    let result = Coordinator::run(&mut cluster, profile, &store);
+    let work_root = profile.work_root.clone();
+    let result = Coordinator::run(&mut cluster, profile, &store).and_then(|()| {
+        // Plan 30 M4: convergence at quiescence (a fresh replica
+        // included) and exactly-once in the log.
+        let refs: Vec<&Client> = clients.iter().collect();
+        m4::after_chaos(&env, root.path(), &backend, &refs, &work_root)
+    });
     if let Err(ref e) = result {
         eprintln!("chaos-soak-4 FAILED: {e}");
         eprintln!("artifacts kept at: {}", store.display());

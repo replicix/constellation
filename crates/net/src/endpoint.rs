@@ -409,6 +409,15 @@ impl P2p {
         }
     }
 
+    /// Plan 30 §M4: every open path of the pooled connection to `id`,
+    /// without waiting (`None` if none is pooled, or one is being dialed
+    /// right now). For `status`, which must not block.
+    pub fn path_summary_now(&self, id: iroh::EndpointId) -> Option<crate::paths::PathSummary> {
+        let gate = self.connections.lock().unwrap().get(&id).cloned()?;
+        let slot = gate.try_lock().ok()?;
+        slot.as_ref().map(crate::paths::PathSummary::of)
+    }
+
     /// Selected-path kind for a pooled connection, if any.
     pub async fn path_kind(&self, id: iroh::EndpointId) -> PathKind {
         let gate = self.connections.lock().unwrap().get(&id).cloned();

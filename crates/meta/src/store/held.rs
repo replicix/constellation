@@ -1,0 +1,658 @@
+//! Poison-record isolation (plan 30 §M4 item 2): one unrecoverable
+//! pending chunk holds back only the journal records that need it.
+//!
+//! # The problem
+//!
+//! A manifest record may only ship once every chunk it names is in S3 —
+//! otherwise every other node would bootstrap a file whose content the
+//! bucket never received. `cli::upload_dirty_chunks` uploads the pending
+//! chunks before each round ships the journal. When a pending chunk is
+//! gone from the local cache (the plan 29 M6 "missing from local cache"
+//! condition), it can never be uploaded, and before M4 the whole round
+//! failed so that the manifest would not ship — and with it every other
+//! record of every other file, forever (plan 30 §1.2, L7).
+//!
+//! # What is held
+//!
+//! The upload pass records the unrecoverable `(chunk, ino)` pairs here
+//! ([`Meta::note_unrecoverable_chunks`], persisted under `local`'s
+//! `poisoned/` prefix, so a restart holds them back before its first
+//! upload pass). A ship then plans over the whole unshipped journal,
+//! transaction by transaction, in journal order ([`plan`]):
+//!
+//! - a **seed** is a transaction with a `WriteManifest` for a poisoned
+//!   inode that names one of its unrecoverable chunks (a spilled or
+//!   undecodable manifest is assumed to);
+//! - a transaction is **held** if it is a seed, or if it touches an `ns`
+//!   key a held transaction touched — its key set is its captured
+//!   before-image keys (`store::spec`), exactly what the M3b capture
+//!   recorded. Held keys accumulate, so the rule is transitive;
+//! - everything else ships, in journal order, skipping the held ones.
+//!
+//! Only earlier transactions can be depended on, and a shipped
+//! transaction touches no held key, so shipping it ahead of the held ones
+//! yields the same state as shipping in journal order would once they
+//! ship: the two commute. An **uncaptured** transaction (holder capture
+//! off) has no known key set: once anything is held, it and everything
+//! after it is held — the pre-M4 behaviour, from that point on.
+//!
+//! # How held work stays speculative and consistent (M3b)
+//!
+//! Nothing new is needed for a held transaction to stay speculation: it
+//! is an ordinary outstanding `Local` row (its `journal_tx` row and
+//! before-images stay), so
+//! - the **publisher** substitutes its keys' earliest before-images
+//!   (`Meta::publish_basis_at`); a transaction that shipped past it becomes
+//!   a `Foreign` row (`spec::retire_local_tx`), which the substitution
+//!   skips because it touches none of the held keys;
+//! - a **transaction never splits**: holding is per transaction, and a
+//!   ship's byte cut still goes through `Meta::whole_tx_prefix`;
+//! - a **deposition** strands it like any unshipped `Local` row (rollback,
+//!   replay by rid through the new holder, where it is a seed again);
+//! - a **segment inserted before local work** redoes the out-of-order
+//!   shipped rows ahead of the inserted segment (`spec::rewind_tx`),
+//!   because they precede it in the log;
+//! - the journal's acked watermark stops below the oldest held row
+//!   (`journal::ack_rows_at`), so every journal scan still sees it.
+//!
+//! The held journal still counts as backlog, so a holder with held records
+//! does not idle-release its lease (nobody else could ship them); other
+//! nodes keep writing through it by forwarding.
+//!
+//! # Dropping
+//!
+//! `constellation repair drop-held <ino>` ([`Meta::drop_held`]) rolls the
+//! inode's seeds and every held transaction depending on them back from
+//! their before-images (the deposition machinery, restricted to those
+//! rows), queues the dependents for replay by rid, and turns each seed
+//! into a refused replay whose conflict copy — the manifest with the
+//! unrecoverable chunks as holes — the replay drain materializes under
+//! `.constellation-conflict/`. The unrecoverable pending rows go with it.
+//!
+//! # Cost
+//!
+//! Nothing when no chunk is poisoned: one counter read
+//! (`store::KV_POISONED_COUNT`) per ship round and per full upload pass,
+//! none per inode drain, and nothing on the ack (plan 30 §M4 round 2;
+//! round 1 prefix-scanned `local` there and computed a conversion
+//! boundary on every ack — see `spec::retire_local_tx`). With one, every round re-plans the whole unshipped journal,
+//! reading each captured transaction's key set; that grows with what is
+//! held, which `status` shows and `drop-held` ends.
+
+use crate::error::MetaError;
+use crate::mutate::MutateOp;
+use crate::record::LogRecord;
+use crate::store::{
+    adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, journal, local, spec, Meta,
+    UsageTracker, KV_POISONED_COUNT,
+};
+use constellation_fs_core::{ChunkHash, ChunkInfo, Ino, Manifest};
+use fjall::Readable;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::atomic::Ordering;
+
+const POISON_PREFIX: &[u8] = b"poisoned/";
+
+fn poison_key(hash: &ChunkHash, ino: Ino) -> Vec<u8> {
+    let mut k = POISON_PREFIX.to_vec();
+    k.extend_from_slice(&hash.0);
+    k.extend_from_slice(&ino.to_be_bytes());
+    k
+}
+
+fn pending_key(hash: &ChunkHash, ino: Ino) -> Vec<u8> {
+    let mut k = hash.0.to_vec();
+    k.extend_from_slice(&ino.to_be_bytes());
+    k
+}
+
+/// Unrecoverable chunks per inode.
+pub(crate) type PoisonMap = BTreeMap<Ino, BTreeSet<ChunkHash>>;
+
+/// The recorded unrecoverable pairs that still have a pending-upload row
+/// (a row acked or cancelled since — the chunk turned up after all, or
+/// the file was rewritten — no longer poisons anything).
+///
+/// Plan 30 §M4 round 2: one point read (`KV_POISONED_COUNT`) when nothing
+/// is recorded — the ship path's cost with no poison — and only then the
+/// prefix scan. A malformed mark is an error, not skipped, so a path that
+/// scans when it should not is caught by `local.rs`'s cost tests.
+fn read_poisoned(r: &impl Readable, meta: &Meta) -> Result<PoisonMap, MetaError> {
+    let mut out = PoisonMap::new();
+    if counter_get(r, &meta.local, KV_POISONED_COUNT)? == 0 {
+        return Ok(out);
+    }
+    for guard in r.prefix(&meta.local, POISON_PREFIX) {
+        let (k, _) = guard.into_inner()?;
+        let rest = &k[POISON_PREFIX.len()..];
+        if rest.len() != 40 {
+            return Err(MetaError::Invalid(format!(
+                "malformed unrecoverable-chunk mark ({} bytes)",
+                rest.len()
+            )));
+        }
+        let hash = ChunkHash(rest[..32].try_into().expect("32 bytes"));
+        let ino = u64::from_be_bytes(rest[32..].try_into().expect("8 bytes"));
+        if r.get(&meta.pending_upload, pending_key(&hash, ino))?
+            .is_some()
+        {
+            out.entry(ino).or_default().insert(hash);
+        }
+    }
+    Ok(out)
+}
+
+/// What the last ship plan held back (`Meta::held_summary`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldSummary {
+    pub transactions: u64,
+    pub records: u64,
+    /// The oldest held journal seq.
+    pub oldest_seq: Option<u64>,
+    /// Every poisoned inode: its unrecoverable chunks and how many held
+    /// transactions are seeds for it.
+    pub inodes: BTreeMap<Ino, HeldInode>,
+    /// An uncaptured transaction was held, so everything after it is too.
+    pub opaque: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldInode {
+    pub missing: Vec<ChunkHash>,
+    pub seeds: u64,
+}
+
+/// What `repair drop-held` did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DroppedHeld {
+    /// Seed transactions dropped into conflict copies.
+    pub dropped: usize,
+    /// Dependent transactions rolled back and queued for replay by rid.
+    pub requeued: usize,
+    /// Unrecoverable pending-upload rows removed.
+    pub pending_removed: usize,
+    /// Queued replays (from an earlier deposition) of this inode's
+    /// manifest, turned into conflict copies as well.
+    pub queued_dropped: usize,
+}
+
+/// One unshipped transaction as the planner sees it.
+struct Tx {
+    first: u64,
+    last: u64,
+    spec_seq: Option<u64>,
+    rows: Vec<(u64, LogRecord)>,
+}
+
+/// The unshipped journal grouped into transactions, in journal order.
+/// Rows without a `journal_tx` row are one-row, uncaptured transactions.
+fn transactions(r: &impl Readable, meta: &Meta) -> Result<Vec<Tx>, MetaError> {
+    let rows = journal::take(r, &meta.journal_ks, &meta.local, usize::MAX)?;
+    let heads: BTreeMap<u64, local::JournalTxHead> =
+        local::read_journal_tx_heads(r, meta)?.into_iter().collect();
+    let mut out: Vec<Tx> = Vec::new();
+    for (seq, rec) in rows {
+        if let Some(open) = out.last_mut() {
+            if seq <= open.last {
+                open.rows.push((seq, rec));
+                continue;
+            }
+        }
+        let (last, spec_seq) = match heads.get(&seq) {
+            Some(head) => (head.last.max(seq), head.spec_seq),
+            None => (seq, None),
+        };
+        out.push(Tx {
+            first: seq,
+            last,
+            spec_seq,
+            rows: vec![(seq, rec)],
+        });
+    }
+    Ok(out)
+}
+
+/// Does `manifest` (a `WriteManifest` record's bytes) name any of
+/// `missing`? A spilled or undecodable manifest cannot be checked here and
+/// is assumed to.
+fn names_any(manifest: &[u8], missing: &BTreeSet<ChunkHash>) -> bool {
+    match Manifest::decode(manifest) {
+        Ok(m) => match m.chunks {
+            ChunkInfo::Inline(chunks) => chunks.values().any(|h| missing.contains(h)),
+            ChunkInfo::Spilled(_) => true,
+        },
+        Err(_) => true,
+    }
+}
+
+/// The poisoned inodes `tx` is a seed for.
+fn seed_inos(tx: &Tx, poisoned: &PoisonMap) -> Vec<Ino> {
+    let mut out = Vec::new();
+    for (_, rec) in &tx.rows {
+        if let LogRecord::WriteManifest { ino, manifest, .. } = rec {
+            if let Some(missing) = poisoned.get(ino) {
+                if names_any(manifest, missing) && !out.contains(ino) {
+                    out.push(*ino);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A held-back transaction: the transaction, the poisoned inodes it is a
+/// seed for (empty for a dependent), and its key set (`None`: uncaptured).
+type Held = (Tx, Vec<Ino>, Option<Vec<Vec<u8>>>);
+
+/// A ship plan: the transactions to ship (in order) and those held back.
+struct Plan {
+    ship: Vec<Tx>,
+    held: Vec<Held>,
+    opaque: bool,
+}
+
+/// See the module doc's "What is held".
+fn plan(r: &impl Readable, meta: &Meta, poisoned: &PoisonMap) -> Result<Plan, MetaError> {
+    let mut tainted: HashSet<Vec<u8>> = HashSet::new();
+    let mut opaque = false;
+    let mut out = Plan {
+        ship: Vec::new(),
+        held: Vec::new(),
+        opaque: false,
+    };
+    for tx in transactions(r, meta)? {
+        let seeds = seed_inos(&tx, poisoned);
+        let keys = match tx.spec_seq {
+            Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|(keys, _)| keys),
+            None => None,
+        };
+        let held = opaque
+            || !seeds.is_empty()
+            || match &keys {
+                Some(keys) => keys.iter().any(|k| tainted.contains(k)),
+                // Unknown keys: held once anything is.
+                None => !out.held.is_empty(),
+            };
+        if !held {
+            out.ship.push(tx);
+            continue;
+        }
+        match &keys {
+            Some(keys) => tainted.extend(keys.iter().cloned()),
+            None => opaque = true,
+        }
+        out.held.push((tx, seeds, keys));
+    }
+    out.opaque = opaque;
+    Ok(out)
+}
+
+fn summarize(plan: &Plan, poisoned: &PoisonMap) -> HeldSummary {
+    let mut inodes: BTreeMap<Ino, HeldInode> = poisoned
+        .iter()
+        .map(|(ino, missing)| {
+            (
+                *ino,
+                HeldInode {
+                    missing: missing.iter().copied().collect(),
+                    seeds: 0,
+                },
+            )
+        })
+        .collect();
+    for (_, seeds, _) in &plan.held {
+        for ino in seeds {
+            if let Some(entry) = inodes.get_mut(ino) {
+                entry.seeds += 1;
+            }
+        }
+    }
+    HeldSummary {
+        transactions: plan.held.len() as u64,
+        records: plan.held.iter().map(|(t, _, _)| t.rows.len() as u64).sum(),
+        oldest_seq: plan.held.first().map(|(t, _, _)| t.first),
+        inodes,
+        opaque: plan.opaque,
+    }
+}
+
+/// `manifest` with every chunk in `missing` turned into a hole: what a
+/// dropped manifest's conflict copy keeps. A spilled manifest's chunk list
+/// is not readable here, so its copy keeps only the length (all holes).
+fn sanitize_manifest(manifest: &[u8], missing: &BTreeSet<ChunkHash>) -> Option<Vec<u8>> {
+    let m = Manifest::decode(manifest).ok()?;
+    let chunks = match m.chunks {
+        ChunkInfo::Inline(chunks) => chunks
+            .into_iter()
+            .filter(|(_, h)| !missing.contains(h))
+            .collect(),
+        ChunkInfo::Spilled(_) => Default::default(),
+    };
+    Some(
+        Manifest {
+            layout: m.layout,
+            file_len: m.file_len,
+            chunks: ChunkInfo::Inline(chunks),
+        }
+        .encode(),
+    )
+}
+
+impl Meta {
+    /// Record the pending uploads whose chunks the upload pass found
+    /// missing from the local cache. With `complete` (a full pass over
+    /// every pending row) the set is replaced; otherwise (a pass limited
+    /// to one inode) the pairs are added.
+    pub fn note_unrecoverable_chunks(
+        &self,
+        missing: &[(ChunkHash, Ino)],
+        complete: bool,
+    ) -> Result<(), MetaError> {
+        // Plan 30 §M4 round 2: the common case — nothing missing — costs
+        // nothing on a limited pass (a write-through close's inode drain)
+        // and one counter read on a full pass.
+        if missing.is_empty() {
+            if !complete {
+                return Ok(());
+            }
+            let r = self.db.read_tx();
+            if counter_get(&r, &self.local, KV_POISONED_COUNT)? == 0 {
+                return Ok(());
+            }
+        }
+        let r = self.db.read_tx();
+        let existing: BTreeSet<Vec<u8>> = r
+            .prefix(&self.local, POISON_PREFIX)
+            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+        drop(r);
+        let wanted: BTreeSet<Vec<u8>> = missing.iter().map(|(h, i)| poison_key(h, *i)).collect();
+        let stale: Vec<&Vec<u8>> = if complete {
+            existing.difference(&wanted).collect()
+        } else {
+            Vec::new()
+        };
+        let fresh: Vec<&Vec<u8>> = wanted.difference(&existing).collect();
+        if stale.is_empty() && fresh.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.write_tx();
+        let marks = existing.len() - stale.len() + fresh.len();
+        for key in stale {
+            tx.remove(&self.local, key.clone());
+        }
+        for key in &fresh {
+            tx.insert(&self.local, (*key).clone(), Vec::new());
+        }
+        counter_set_tx(&mut tx, &self.local, KV_POISONED_COUNT, marks as u64);
+        tx.commit()?;
+        if !fresh.is_empty() {
+            tracing::error!(
+                newly_unrecoverable = fresh.len(),
+                "pending upload chunk(s) missing from the local cache: the records that need \
+                 them are held back (see `status`'s `held`; `constellation repair drop-held \
+                 <ino>` discards them into a conflict copy); everything else keeps shipping"
+            );
+        }
+        Ok(())
+    }
+
+    /// The unrecoverable pending uploads currently recorded.
+    pub fn unrecoverable_chunks(&self) -> Result<Vec<(ChunkHash, Ino)>, MetaError> {
+        let r = self.db.read_tx();
+        Ok(read_poisoned(&r, self)?
+            .into_iter()
+            .flat_map(|(ino, hashes)| hashes.into_iter().map(move |h| (h, ino)))
+            .collect())
+    }
+
+    /// Up to `max` journal rows to ship, from the head, whole transactions
+    /// only (see `take_journal_whole_txs`) — skipping, when a chunk is
+    /// unrecoverable, every held-back transaction (see the module doc).
+    /// Refreshes [`Meta::held_summary`].
+    pub(crate) fn take_shippable(&self, max: usize) -> Result<Vec<(u64, LogRecord)>, MetaError> {
+        let r = self.db.read_tx();
+        let poisoned = read_poisoned(&r, self)?;
+        if poisoned.is_empty() {
+            drop(r);
+            if self.held_any.swap(false, Ordering::Relaxed) {
+                *self.held.lock().unwrap() = HeldSummary::default();
+            }
+            return self.take_journal_whole_txs(max);
+        }
+        self.held_any.store(true, Ordering::Relaxed);
+        self.held_work.fetch_add(1, Ordering::Relaxed);
+        let plan = plan(&r, self, &poisoned)?;
+        *self.held.lock().unwrap() = summarize(&plan, &poisoned);
+        let mut batch = Vec::new();
+        for tx in plan.ship {
+            if !batch.is_empty() && batch.len() >= max {
+                break;
+            }
+            batch.extend(tx.rows);
+        }
+        Ok(batch)
+    }
+
+    /// The journal rows making up `records`, a segment this node shipped
+    /// but never acked (found again by a tail, typically after a restart):
+    /// before plan 30 §M4 always the journal's head; with held-back
+    /// transactions skipped, a subsequence of whole transactions, in
+    /// order. `None` if `records` is not one.
+    pub fn match_own_segment(&self, records: &[&LogRecord]) -> Result<Option<Vec<u64>>, MetaError> {
+        let r = self.db.read_tx();
+        let mut seqs = Vec::new();
+        let mut at = 0;
+        for tx in transactions(&r, self)? {
+            if at == records.len() {
+                break;
+            }
+            let n = tx.rows.len();
+            if at + n <= records.len()
+                && tx
+                    .rows
+                    .iter()
+                    .zip(&records[at..at + n])
+                    .all(|((_, mine), theirs)| mine == *theirs)
+            {
+                seqs.extend(tx.rows.iter().map(|(seq, _)| *seq));
+                at += n;
+            }
+        }
+        Ok((at == records.len()).then_some(seqs))
+    }
+
+    /// What the last ship round held back (empty when nothing is
+    /// poisoned). In memory, refreshed by every ship plan.
+    pub fn held_summary(&self) -> HeldSummary {
+        self.held.lock().unwrap().clone()
+    }
+
+    /// `constellation repair drop-held <ino>` (see the module doc's
+    /// "Dropping"). `now_unix` stamps the conflict copies' names.
+    pub fn drop_held(&self, ino: Ino, now_unix: i64) -> Result<DroppedHeld, MetaError> {
+        let mut tx = self.db.write_tx();
+        let poisoned = read_poisoned(&tx, self)?;
+        let Some(missing) = poisoned.get(&ino).cloned() else {
+            return Err(MetaError::Invalid(format!(
+                "nothing is held for inode {ino}: no unrecoverable pending chunk is recorded \
+                 for it"
+            )));
+        };
+        let held = plan(&tx, self, &poisoned)?;
+        // The inode's seeds, and every held transaction that depends on
+        // them (key overlap, transitively, in journal order).
+        let mut tainted: HashSet<Vec<u8>> = HashSet::new();
+        let mut seeds: Vec<(Tx, u64, u64)> = Vec::new(); // (tx, spec_seq, origin)
+        let mut dependents: Vec<u64> = Vec::new(); // spec_seqs
+        for (t, seed_inos, keys) in held.held {
+            let is_seed = seed_inos.contains(&ino);
+            let depends = keys
+                .as_ref()
+                .is_some_and(|keys| keys.iter().any(|k| tainted.contains(k)));
+            if !is_seed && !depends {
+                continue;
+            }
+            let (Some(spec_seq), Some(keys)) = (t.spec_seq, keys) else {
+                return Err(MetaError::Invalid(format!(
+                    "held transaction at journal seq {} was not captured (holder capture \
+                     off), so it cannot be rolled back; turn CONSTELLATION_HOLDER_CAPTURE on \
+                     and remount, or rebuild this replica",
+                    t.first
+                )));
+            };
+            tainted.extend(keys);
+            let origin = spec::row_keys_and_origin(&tx, self, spec_seq)?
+                .map(|(_, origin)| origin)
+                .unwrap_or(spec_seq);
+            if is_seed {
+                seeds.push((t, spec_seq, origin));
+            } else {
+                dependents.push(spec_seq);
+            }
+        }
+        let mut seqs: HashSet<u64> = dependents.iter().copied().collect();
+        seqs.extend(seeds.iter().map(|(_, seq, _)| *seq));
+        let staged = UsageTracker::staging();
+        spec::strand_seqs_tx(&mut tx, self, &staged, &seqs)?;
+        let refusal = |hashes: &BTreeSet<ChunkHash>| spec::Refusal {
+            reason: format!(
+                "dropped by `constellation repair drop-held {ino}`: chunk(s) {} unrecoverable",
+                hashes
+                    .iter()
+                    .map(|h| h.to_hex()[..12].to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            ts_unix: now_unix,
+        };
+        // Each seed: its queued replay becomes a refused one carrying the
+        // manifest with the lost chunks as holes, so the drain makes the
+        // conflict copy and never re-executes the seed.
+        for (t, _, origin) in &seeds {
+            let Some((manifest, size)) = t.rows.iter().rev().find_map(|(_, rec)| match rec {
+                LogRecord::WriteManifest {
+                    ino: m,
+                    manifest,
+                    size,
+                    ..
+                } if *m == ino => Some((manifest.clone(), *size)),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let rid = match spec::queued_at(&tx, self, *origin)? {
+                Some((rid, _)) => rid,
+                None => spec::replay_rid_for(&tx, self, t.first)?,
+            };
+            let op = MutateOp::SetManifest {
+                ino,
+                base_manifest: None,
+                manifest: sanitize_manifest(&manifest, &missing).unwrap_or_default(),
+                size,
+            };
+            spec::refuse_queued_tx(&mut tx, self, *origin, rid, op, refusal(&missing))?;
+        }
+        // Replays of this inode's manifest already queued by an earlier
+        // deposition: the same treatment.
+        let mut queued_dropped = 0;
+        for queued in spec::read_pending_replays(&tx, self)? {
+            if queued.refused.is_some() {
+                continue;
+            }
+            let (m, manifest, size) = match &queued.op {
+                MutateOp::SetManifest {
+                    ino: m,
+                    manifest,
+                    size,
+                    ..
+                }
+                | MutateOp::Publish {
+                    ino: m,
+                    manifest,
+                    size,
+                    ..
+                } => (*m, manifest, *size),
+                _ => continue,
+            };
+            if m != ino || !names_any(manifest, &missing) {
+                continue;
+            }
+            let op = MutateOp::SetManifest {
+                ino,
+                base_manifest: None,
+                manifest: sanitize_manifest(manifest, &missing).unwrap_or_default(),
+                size,
+            };
+            spec::refuse_queued_tx(
+                &mut tx,
+                self,
+                queued.queue_seq,
+                queued.rid,
+                op,
+                refusal(&missing),
+            )?;
+            queued_dropped += 1;
+        }
+        let mut pending_removed = 0;
+        let mut marks_removed = 0i64;
+        for hash in &missing {
+            if tx
+                .get(&self.pending_upload, pending_key(hash, ino))?
+                .is_some()
+            {
+                tx.remove(&self.pending_upload, pending_key(hash, ino));
+                pending_removed += 1;
+            }
+            if tx.get(&self.local, poison_key(hash, ino))?.is_some() {
+                tx.remove(&self.local, poison_key(hash, ino));
+                marks_removed += 1;
+            }
+        }
+        counter_add_tx(&mut tx, &self.local, KV_POISONED_COUNT, -marks_removed)?;
+        let (bytes, files) = staged.raw_delta();
+        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        tx.commit()?;
+        staged.drain_into(self.usage_tracker());
+        *self.held.lock().unwrap() = HeldSummary::default();
+        tracing::warn!(
+            ino,
+            dropped = seeds.len(),
+            requeued = dependents.len(),
+            queued_dropped,
+            pending_removed,
+            "held records dropped into conflict copies"
+        );
+        Ok(DroppedHeld {
+            dropped: seeds.len(),
+            requeued: dependents.len(),
+            pending_removed,
+            queued_dropped,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hole_replaces_each_lost_chunk() {
+        let a = ChunkHash::of(b"a");
+        let b = ChunkHash::of(b"b");
+        let chunks = BTreeMap::from([(0u64, a), (1u64, b)]);
+        let m = Manifest {
+            layout: constellation_fs_core::ChunkLayout::new(4),
+            file_len: 8,
+            chunks: ChunkInfo::Inline(chunks),
+        }
+        .encode();
+        assert!(names_any(&m, &BTreeSet::from([b])));
+        assert!(!names_any(&m, &BTreeSet::from([ChunkHash::of(b"c")])));
+        let clean = sanitize_manifest(&m, &BTreeSet::from([b])).unwrap();
+        let clean = Manifest::decode(&clean).unwrap();
+        assert_eq!(clean.file_len, 8);
+        assert_eq!(clean.chunks, ChunkInfo::Inline(BTreeMap::from([(0u64, a)])));
+        assert!(names_any(b"not a manifest", &BTreeSet::from([a])));
+    }
+}

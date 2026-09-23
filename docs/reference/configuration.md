@@ -184,20 +184,29 @@ cadence: a publish costs O(keys changed), not O(database), so there is
 nothing to sub-linearly amortize against namespace size the way the old
 ratio gate did.
 
-The cadence is:
+Only the lease holder publishes (plan 30 M4). Every node used to
+publish its own view of the same log, which cost each of them the
+condemned-list reads, the head discovery and the planning of every
+publish, and grew with the node count. The cadence, on the holder, is:
 
 - a plain count floor — at least 32 shipped segments since the last
   publish (`PUBLISH_EVERY`, not currently a knob);
 - an idle timer — `dirty` is non-empty and no publish has run for
   `CONSTELLATION_PUBLISH_IDLE_S` (default 30), checked once per sync
-  round after there is nothing left to ship. Without this, a node that
-  is mostly idle, or mostly tailing *foreign* segments (which dirty `ns`
-  just as surely as a local write, but never advance the shipped-segment
-  counter), could leave its head commit — and the log-retention floor
-  riding on it — stale indefinitely;
-- an unconditional publish on clean unmount (or whenever the mount
-  otherwise drains its journal for shutdown), gated only on `dirty`
-  being non-empty.
+  round after there is nothing left to ship. Without this, a holder
+  that is mostly idle could leave its head commit — and the
+  log-retention floor riding on it — stale indefinitely;
+- a publish on clean unmount (or whenever the mount otherwise drains
+  its journal for shutdown), when `dirty` is non-empty and the node
+  still holds the lease.
+
+A node that does not hold the lease runs the idle timer too, but instead
+of publishing it probes the chain head: once the head commit's `applied`
+position covers its own applied position, and it has nothing speculative
+outstanding and nothing of its own journaled, it clears the dirty marks
+the head already reflects (so its dirty set does not grow without bound,
+and it can publish the moment it becomes the holder). An explicit
+publish — a snapshot — still publishes on any node.
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
@@ -272,6 +281,7 @@ protocol, message bounds and counters.
 |---|---:|---|---|
 | `CONSTELLATION_S3_MAX_RETRIES` | object_store default | count | override `RetryConfig.max_retries` for `s3://` backends |
 | `CONSTELLATION_S3_RETRY_TIMEOUT_MS` | object_store default | milliseconds | override `RetryConfig.retry_timeout` for `s3://` backends |
+| `CONSTELLATION_CAS_BUSY_RETRIES` | `5` | count | plan 30 M4: how many times a conditional PUT answered `409 Conflict` (another conditional write on the key in flight) is retried as the same attempt, backing off 50 ms doubling to 1 s, before the round reports the store's error. See [write-path hygiene](features/write-path-hygiene.md) |
 
 ### Existence hints
 
@@ -434,6 +444,8 @@ filesystem.
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` | `0` (disabled) | milliseconds | sleeps this long, holder-side, immediately before replying to a forwarded mutation — after the op has already executed and the keepers lock has been released. Used to make a forwarded mutation's reply race the requester's own `CONSTELLATION_FORWARD_TIMEOUT_MS` deadline deterministically (plan 30 `forward-timeout-reexec`); logs one `tracing::warn!` at startup when non-zero |
+| `CONSTELLATION_FAULT_LOSE_CHUNKS` | unset | comma-separated chunk hashes (hex) | plan 30 M4: the upload pass deletes these chunks from the local cache right before reading them, so a pending upload of one finds its content gone (the "missing from local cache" condition, at a precise point; `poison-record-isolation`) |
+| `CONSTELLATION_FAULT_HOLD_SYNC_FILE` | unset | a file path | plan 30 M4: while the file exists every managed sync round returns at once (nothing uploads, ships or publishes, and the lease is not renewed — keep holds short); a held round writes `<path>.held`, so a harness knows no round is still in flight |
 
 ## Boolean values
 

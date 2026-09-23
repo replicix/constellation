@@ -17,6 +17,7 @@ pub use record::{CloneNode, LogRecord};
 pub use reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 pub use replay::TouchSet;
 pub use rid::Rid;
+pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::spec::{
     Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp,
     LOCAL_REPLAY_INCARNATION,

@@ -144,7 +144,15 @@ impl Generator {
         }
         let n = self.profile.workers;
         let families: &[&str] = match self.profile.scenarios {
-            ScenarioSet::Namespace => &["create", "mkdir", "unlink", "rmdir", "rename"],
+            ScenarioSet::Namespace => &[
+                "create",
+                "mkdir",
+                "unlink",
+                "rmdir",
+                "rename",
+                "move_read",
+                "link_read",
+            ],
             ScenarioSet::Data => &[
                 "write_full",
                 "write_overlap",
@@ -159,6 +167,8 @@ impl Generator {
                 "unlink",
                 "rmdir",
                 "rename",
+                "move_read",
+                "link_read",
                 "write_full",
                 "write_overlap",
                 "write_disjoint",
@@ -175,6 +185,8 @@ impl Generator {
             "unlink" => self.storm_unlink(n),
             "rmdir" => self.storm_rmdir(n),
             "rename" => self.storm_rename(n),
+            "move_read" => self.move_read(n),
+            "link_read" => self.link_read(n),
             "write_full" => self.duel_write_full(n),
             "write_overlap" => self.duel_write_overlap(n),
             "write_disjoint" => self.duel_write_disjoint(n),
@@ -275,6 +287,63 @@ impl Generator {
                 })
                 .collect(),
             tag: format!("rename_storm:{id}"),
+        }
+    }
+
+    /// Plan 30 §M4: a rename racing reads of both of its names, on a
+    /// seeded file (the coordinator creates `mv{id}` first). Every path
+    /// here is single-assignment, which is what lets `crate::elle` place
+    /// every observation in the one possible version order.
+    fn move_read(&mut self, n: usize) -> Step {
+        let id = self.next_id();
+        let src = self.path(&format!("mv{id}"));
+        let dst = self.path(&format!("mv{id}_to"));
+        let ops = (0..n)
+            .map(|i| match i {
+                0 => Some(Op::Rename {
+                    from: src.clone(),
+                    to: dst.clone(),
+                }),
+                i if i % 2 == 1 => Some(Op::Read { path: src.clone() }),
+                _ => Some(Op::Read { path: dst.clone() }),
+            })
+            .collect();
+        Step {
+            start_barrier: Some(format!("mv-start-{}", self.round)),
+            ops,
+            quiesce_barrier: Some(format!("mv-q-{}", self.round)),
+            verify_reads: vec![Op::Stat { path: src }, Op::Read { path: dst }],
+            tag: format!("move_read:{id}"),
+        }
+    }
+
+    /// Plan 30 §M4: concurrent hard links of one seeded file (the
+    /// coordinator creates `ln{id}` first) to distinct fresh names, racing
+    /// reads of a link and a stat of the source.
+    fn link_read(&mut self, n: usize) -> Step {
+        let id = self.next_id();
+        let src = self.path(&format!("ln{id}"));
+        let link = |i: usize| self.path(&format!("ln{id}_l{i}"));
+        let mut verify = vec![Op::Stat { path: src.clone() }];
+        let ops = (0..n)
+            .map(|i| match i % 4 {
+                0 | 1 => {
+                    verify.push(Op::Read { path: link(i) });
+                    Some(Op::Link {
+                        from: src.clone(),
+                        to: link(i),
+                    })
+                }
+                2 => Some(Op::Read { path: link(0) }),
+                _ => Some(Op::Stat { path: src.clone() }),
+            })
+            .collect();
+        Step {
+            start_barrier: Some(format!("ln-start-{}", self.round)),
+            ops,
+            quiesce_barrier: Some(format!("ln-q-{}", self.round)),
+            verify_reads: verify,
+            tag: format!("link_read:{id}"),
         }
     }
 

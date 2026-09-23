@@ -235,6 +235,16 @@ impl Meta {
         for k in keys {
             tx.remove(&self.pending_upload, k);
         }
+        // Plan 30 §M4: the unrecoverable marks describe pending rows; with
+        // the rows gone they would only be filtered out, so drop them too.
+        let marks: Vec<Vec<u8>> = tx
+            .prefix(&self.local, b"poisoned/")
+            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+        for k in marks {
+            tx.remove(&self.local, k);
+        }
+        crate::store::counter_set_tx(&mut tx, &self.local, crate::store::KV_POISONED_COUNT, 0);
         tx.commit()?;
         Ok(())
     }

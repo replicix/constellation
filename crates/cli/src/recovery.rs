@@ -65,6 +65,7 @@ use constellation_meta::reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 use constellation_meta::{
     execute_mutate, Meta, MetaStore, MutateOp, MutateOutcome, Refusal, Rid, StrandedOp,
 };
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -286,12 +287,67 @@ fn replay_locally(
     Ok(())
 }
 
+/// First and largest pause between attempts at a refused replay's
+/// conflict copy that could not be made yet (plan 30 §M4, round 2).
+const COPY_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const COPY_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+/// Retry bookkeeping for one refused replay whose conflict copy has not
+/// been materialized yet (see [`DrainState`]).
+#[derive(Clone, Copy, Debug)]
+struct CopyRetry {
+    attempts: u32,
+    /// When the first attempt failed: how long the copy has been stalled.
+    since: tokio::time::Instant,
+    /// Not before this.
+    next_at: tokio::time::Instant,
+}
+
 /// The drain task's persistent state between ticks.
+///
+/// Plan 30 §M4 (round 2): a refused replay's conflict copy is made
+/// through the forward path (`materialize_remote`), and M3a's rule is that
+/// it never holds up the rest of the queue — the refused op itself will
+/// never take effect, only its copy lags. Before this, a copy that could
+/// not be made was simply retried on every 250 ms tick, forever, with a
+/// warning each time, and — because it counted as "resolved as far as
+/// ordering goes" — it never fed the stuck-head logic that asks for the
+/// lease. That is what the M4 tester saw after a sustained S3 cut: the
+/// node still named in the lease object (its own view closed, so its own
+/// forwards answer `Busy`) never re-acquired it, and the copy never
+/// landed. Now each copy backs off (250 ms doubling to 10 s), asks for the
+/// lease itself once it has been stalled for [`LEASE_FALLBACK`] (at most
+/// once per that interval), and shows up in `status` as stalled; it is
+/// never dropped, since it may be the only surviving copy of the data.
 #[derive(Default)]
 pub struct DrainState {
     /// When the head of the queue last stopped making progress, if it is
     /// stuck.
     stuck_since: Option<Instant>,
+    /// Refused replays whose conflict copy failed at least once, by queue
+    /// seq.
+    copies: HashMap<u64, CopyRetry>,
+    /// When a stalled copy last asked for the lease.
+    copy_acquired_at: Option<tokio::time::Instant>,
+}
+
+impl DrainState {
+    /// `(pending, stalled)`: copies that failed at least once, and those
+    /// failing for at least [`LEASE_FALLBACK`].
+    fn copy_counts(&self) -> (u64, u64) {
+        let stalled = self
+            .copies
+            .values()
+            .filter(|c| c.since.elapsed() >= LEASE_FALLBACK)
+            .count();
+        (self.copies.len() as u64, stalled as u64)
+    }
+}
+
+fn copy_backoff(attempts: u32) -> Duration {
+    COPY_BACKOFF_MIN
+        .saturating_mul(1u32 << attempts.saturating_sub(1).min(16))
+        .min(COPY_BACKOFF_MAX)
 }
 
 /// One drain pass: replay queued stranded ops, oldest first, through the
@@ -343,6 +399,16 @@ pub async fn drain_pending_replays(
             return;
         }
     };
+    // Copies resolved by another path (the takeover gate) are forgotten.
+    state
+        .copies
+        .retain(|seq, _| queued.iter().any(|q| q.queue_seq == *seq));
+    {
+        let (pending, stalled) = state.copy_counts();
+        let mut spool = spool.lock().unwrap();
+        spool.replay_copies_pending = pending;
+        spool.replay_copies_stalled = stalled;
+    }
     if queued.is_empty() {
         state.stuck_since = None;
         return;
@@ -356,7 +422,7 @@ pub async fn drain_pending_replays(
             spool.lock().unwrap().stranded_replayed += 1;
             continue;
         }
-        match drain_one(meta, spool, sync_tx, forward, node_id, part, op).await {
+        match drain_one(meta, spool, sync_tx, forward, node_id, part, op, state).await {
             Ok(true) => state.stuck_since = None,
             Ok(false) => {
                 // The cached holder may be the dead one that stranded the
@@ -389,7 +455,9 @@ pub async fn drain_pending_replays(
 }
 
 /// Try to resolve one queued op. `Ok(true)` once it is resolved (and
-/// forgotten), `Ok(false)` when no holder could take it yet.
+/// forgotten) — or, for a refused op, once it no longer holds up the
+/// queue — `Ok(false)` when no holder could take it yet.
+#[allow(clippy::too_many_arguments)]
 async fn drain_one(
     meta: &Meta,
     spool: &Mutex<SpoolInfo>,
@@ -398,14 +466,16 @@ async fn drain_one(
     node_id: u64,
     part: &str,
     queued: &StrandedOp,
+    state: &mut DrainState,
 ) -> anyhow::Result<bool> {
     if let Some(refusal) = &queued.refused {
         // The op itself will never take effect, so later ops need not
         // wait for its conflict copy: it stays queued until the copy is
         // made, without holding up the rest of the queue.
-        if materialize_remote(meta, sync_tx, forward, node_id, part, &queued.op, refusal).await? {
-            meta.forget_replay(queued.queue_seq)?;
-        }
+        materialize_copy(
+            meta, sync_tx, forward, node_id, part, queued, refusal, state,
+        )
+        .await?;
         return Ok(true);
     }
     if meta.completed_position(queued.rid)?.is_some() {
@@ -452,11 +522,88 @@ async fn drain_one(
         "stranded op replay refused; materializing a conflict copy"
     );
     spool.lock().unwrap().replay_conflicts += 1;
-    if materialize_remote(meta, sync_tx, forward, node_id, part, &queued.op, &refusal).await? {
-        meta.forget_replay(queued.queue_seq)?;
-    }
+    materialize_copy(
+        meta, sync_tx, forward, node_id, part, queued, &refusal, state,
+    )
+    .await?;
     // Resolved as far as ordering goes either way (see above).
     Ok(true)
+}
+
+/// One attempt, subject to backoff, at `queued`'s conflict copy (see
+/// [`DrainState`]): forget the replay once the copy exists; otherwise
+/// back off, and ask for the lease once the copy has been stalled for
+/// [`LEASE_FALLBACK`]. Never blocks the queue, never drops the copy.
+#[allow(clippy::too_many_arguments)]
+async fn materialize_copy(
+    meta: &Meta,
+    sync_tx: &tokio::sync::mpsc::UnboundedSender<SyncRequest>,
+    forward: &ForwardState,
+    node_id: u64,
+    part: &str,
+    queued: &StrandedOp,
+    refusal: &Refusal,
+    state: &mut DrainState,
+) -> anyhow::Result<()> {
+    let now = tokio::time::Instant::now();
+    if state
+        .copies
+        .get(&queued.queue_seq)
+        .is_some_and(|retry| now < retry.next_at)
+    {
+        return Ok(());
+    }
+    let made = match materialize_remote(meta, sync_tx, forward, node_id, part, &queued.op, refusal)
+        .await
+    {
+        Ok(made) => made,
+        Err(error) => {
+            tracing::debug!(%error, rid = ?queued.rid, "conflict copy attempt failed");
+            false
+        }
+    };
+    if made {
+        meta.forget_replay(queued.queue_seq)?;
+        state.copies.remove(&queued.queue_seq);
+        return Ok(());
+    }
+    let retry = state.copies.entry(queued.queue_seq).or_insert(CopyRetry {
+        attempts: 0,
+        since: now,
+        next_at: now,
+    });
+    retry.attempts += 1;
+    retry.next_at = now + copy_backoff(retry.attempts);
+    let (attempts, stalled_for) = (retry.attempts, now.duration_since(retry.since));
+    if attempts == 1 || attempts.is_multiple_of(10) {
+        tracing::warn!(
+            rid = ?queued.rid,
+            attempts,
+            stalled_s = stalled_for.as_secs(),
+            "a refused replay's conflict copy could not be made yet; backing off"
+        );
+    }
+    // No holder took the steps: often this node is still named in the
+    // lease object with its own view closed (after an S3 outage), so its
+    // forwards answer `Busy` and nothing else would re-acquire. Ask for the
+    // lease, as a stuck queue head does.
+    let asked_recently = state
+        .copy_acquired_at
+        .is_some_and(|at| now.duration_since(at) < LEASE_FALLBACK);
+    if stalled_for >= LEASE_FALLBACK && !asked_recently {
+        tracing::warn!(
+            rid = ?queued.rid,
+            stalled_s = stalled_for.as_secs(),
+            "a conflict copy has been stalled; acquiring the lease to make it locally"
+        );
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let _ = sync_tx.send(SyncRequest::Acquire {
+            part: part.to_string(),
+            reply,
+        });
+        state.copy_acquired_at = Some(now);
+    }
+    Ok(())
 }
 
 /// Send `op` down the ordinary forward path (holder-local execution, or a
@@ -713,7 +860,8 @@ async fn materialize_remote(
             | Some(MutateOutcome::Exists { .. })
             | Some(MutateOutcome::Errno(libc::EEXIST)) => true,
             Some(other) => {
-                tracing::warn!(?other, "conflict copy step not accepted yet");
+                // The caller logs (with backoff) when a copy keeps failing.
+                tracing::debug!(?other, "conflict copy step not accepted yet");
                 false
             }
             None => false,
@@ -981,5 +1129,157 @@ mod tests {
         assert!(requester.pending_replays().unwrap().is_empty());
         assert!(requester.lookup(ROOT_INO, CONFLICT_DIR).unwrap().is_none());
         assert_eq!(spool.lock().unwrap().replay_conflicts, 0);
+    }
+
+    /// Plan 30 §M4 round 2: a refused replay's conflict copy on a node that
+    /// cannot reach a holder (its S3 path is gone, so its own forwards
+    /// answer `Busy`): the copy never holds up later replays, is retried
+    /// with backoff rather than every tick, asks for the lease once it has
+    /// been stalled for `LEASE_FALLBACK`, shows as stalled, is never
+    /// dropped — and is made as soon as a holder takes the steps again.
+    #[tokio::test]
+    async fn a_stalled_conflict_copy_backs_off_and_never_blocks_the_queue() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let spool = Mutex::new(SpoolInfo::default());
+        let forward = ForwardState::new(1);
+        meta.queue_replay(rid(1), &create_op("lost", (5 << 40) | 1))
+            .unwrap();
+        meta.queue_replay(rid(2), &create_op("later", (5 << 40) | 2))
+            .unwrap();
+        let first = meta.pending_replays().unwrap()[0].queue_seq;
+        meta.mark_replay_refused(
+            first,
+            Refusal {
+                reason: "test".into(),
+                ts_unix: 1,
+            },
+        )
+        .unwrap();
+
+        // The sync task of a node whose S3 path is gone: whatever needs the
+        // holder answers `Busy` (the ordinary replay goes to a reachable
+        // holder), until `available` flips and ops execute here.
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let acquires = Arc::new(AtomicUsize::new(0));
+        let available = Arc::new(AtomicBool::new(false));
+        {
+            let (meta, attempts, acquires, available) = (
+                meta.clone(),
+                attempts.clone(),
+                acquires.clone(),
+                available.clone(),
+            );
+            tokio::spawn(async move {
+                while let Some(req) = sync_rx.recv().await {
+                    match req {
+                        SyncRequest::Forward { op, reply, .. } => {
+                            let later =
+                                matches!(&op, MutateOp::Create { name, .. } if name == "later");
+                            let outcome = if later {
+                                MutateOutcome::Accepted {
+                                    epoch: 1,
+                                    records: Vec::new(),
+                                }
+                            } else if available.load(Ordering::SeqCst) {
+                                let records = execute_mutate(&meta, &op, None).unwrap();
+                                MutateOutcome::Accepted { epoch: 1, records }
+                            } else {
+                                attempts.fetch_add(1, Ordering::SeqCst);
+                                MutateOutcome::Busy
+                            };
+                            let _ = reply.send(Ok(outcome));
+                        }
+                        SyncRequest::Acquire { .. } => {
+                            acquires.fetch_add(1, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+        async fn pass(
+            meta: &Arc<Meta>,
+            spool: &Mutex<SpoolInfo>,
+            sync_tx: &tokio::sync::mpsc::UnboundedSender<SyncRequest>,
+            forward: &ForwardState,
+            state: &mut DrainState,
+        ) {
+            drain_pending_replays(meta, spool, sync_tx, forward, 2, "p0", None, state).await;
+            // Let the fake sync task see what was sent.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut state = DrainState::default();
+
+        // The copy fails; the later replay is not held up.
+        pass(&meta, &spool, &sync_tx, &forward, &mut state).await;
+        let left = meta.pending_replays().unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].queue_seq, first);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(spool.lock().unwrap().stranded_replayed, 1);
+
+        // Right away again: backing off, no new attempt.
+        pass(&meta, &spool, &sync_tx, &forward, &mut state).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Due again: one more attempt, and the backoff doubles.
+        let now = tokio::time::Instant::now();
+        state.copies.get_mut(&first).unwrap().next_at = now;
+        pass(&meta, &spool, &sync_tx, &forward, &mut state).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let wait = state.copies[&first].next_at - tokio::time::Instant::now();
+        assert!(wait > Duration::from_millis(300), "{wait:?}");
+        assert_eq!(acquires.load(Ordering::SeqCst), 0);
+
+        // Stalled for LEASE_FALLBACK: it asks for the lease (once per
+        // interval), and status shows it; it is still queued.
+        let now = tokio::time::Instant::now();
+        {
+            let retry = state.copies.get_mut(&first).unwrap();
+            retry.since = now
+                .checked_sub(LEASE_FALLBACK + Duration::from_secs(1))
+                .unwrap();
+            retry.next_at = now;
+        }
+        pass(&meta, &spool, &sync_tx, &forward, &mut state).await;
+        assert_eq!(acquires.load(Ordering::SeqCst), 1);
+        state.copies.get_mut(&first).unwrap().next_at = tokio::time::Instant::now();
+        pass(&meta, &spool, &sync_tx, &forward, &mut state).await;
+        assert_eq!(
+            acquires.load(Ordering::SeqCst),
+            1,
+            "at most once per interval"
+        );
+        {
+            let spool = spool.lock().unwrap();
+            assert_eq!(
+                (spool.replay_copies_pending, spool.replay_copies_stalled),
+                (1, 1)
+            );
+        }
+        assert_eq!(meta.pending_replays().unwrap().len(), 1, "never dropped");
+
+        // A holder takes the steps again: the copy is made and forgotten.
+        available.store(true, Ordering::SeqCst);
+        state.copies.get_mut(&first).unwrap().next_at = tokio::time::Instant::now();
+        pass(&meta, &spool, &sync_tx, &forward, &mut state).await;
+        assert!(meta.pending_replays().unwrap().is_empty());
+        let dir = meta
+            .lookup(ROOT_INO, CONFLICT_DIR)
+            .unwrap()
+            .expect("conflict directory");
+        let copies = meta.readdir(dir.ino).unwrap();
+        assert!(
+            copies.iter().any(|c| c.name.starts_with("lost@2-")),
+            "{copies:?}"
+        );
+        pass(&meta, &spool, &sync_tx, &forward, &mut state).await;
+        let spool = spool.lock().unwrap();
+        assert_eq!(
+            (spool.replay_copies_pending, spool.replay_copies_stalled),
+            (0, 0)
+        );
     }
 }

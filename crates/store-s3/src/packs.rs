@@ -79,7 +79,7 @@
 use crate::error::StoreError;
 use crate::layout;
 use constellation_mtree::{MtreeError, NodeHash, NodeRef};
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 
 const ZSTD_LEVEL: i32 = 3;
@@ -650,18 +650,10 @@ impl PackStore {
         key: &object_store::path::Path,
         body: Vec<u8>,
     ) -> Result<(), StoreError> {
-        match self
-            .store
-            .put_opts(
-                key,
-                PutPayload::from(body),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
-        {
-            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        // Content-addressed; plan 30 §M4 item 1: a 409 retries rather than
+        // passing for "already there".
+        crate::cas::create_content_addressed(self.store.as_ref(), key, body.into()).await?;
+        Ok(())
     }
 
     pub async fn get_index(&self, hash: &PackHash) -> Result<PackIndex, StoreError> {

@@ -60,6 +60,8 @@ cargo run -p constellation-harness --release -- run chaos-ci --seed 42
 | WriteAt (disjoint) | All patches persist |
 | Append / Truncate / Chmod | Concurrent metadata/data races |
 | Read / ReadAt / Stat | Quiesce / close-to-open observation |
+| Rename racing reads (`move_read`) | Single-assignment paths for the cycle checker |
+| Link racing reads and stats (`link_read`) | Hard links; single-assignment paths for the cycle checker |
 
 ### Checkers
 
@@ -74,6 +76,33 @@ cargo run -p constellation-harness --release -- run chaos-ci --seed 42
   `path@offset+len` for `ReadAt` — so the several spans of a
   `write_disjoint` round are compared span-by-span, not against each other
 - Unexpected-errno allowlist (`EEXIST`, `ENOENT`, `EISDIR`, `ENOTDIR`, `ENOTEMPTY`, `ESTALE`, …)
+
+The checkers above run after every step. Plan 30 M4 added three that run
+once over the whole history (and in `chaos check`):
+
+- **Exactly-once** (`exactly_once.rs`): no op takes effect twice, and none
+  reports failure after taking effect. A `create` refused with `EEXIST`
+  whose own unique content is what the file holds; a storm over one fresh
+  name whose effect is visible afterwards although no attempt succeeded
+  (`mkdir`, `unlink`, `rename`); an `append` of unique bytes present twice,
+  or present although it failed.
+- **Dependency cycles** (`elle.rs`, after Elle): over paths that receive
+  one file at most once and lose it at most once, every observation maps
+  to one version, so `ww`, `wr`, `rw` and real-time edges between the
+  operations are sound; a cycle is reported with Elle's class (`G0`,
+  `G1c`, `G-single`, `G2`, `-realtime`). Two successful removals of one
+  file are reported directly.
+
+And two that need the cluster rather than the history, which the harness
+runs after `chaos-ci` and `chaos-soak-4`:
+
+- **Convergence at quiescence** (`converge.rs`): after every node drains,
+  every replica's tree — including a node freshly bootstrapped from the
+  bucket — is identical (entry kinds, modes, sizes, link counts, content
+  hashes).
+- **Exactly-once in the log** (`exactly_once::check_log_completions`):
+  every `Completed { rid }` record in the bucket's log appears once. A
+  second one means an op's records were executed and shipped twice.
 
 ### Failure pack
 

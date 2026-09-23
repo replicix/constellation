@@ -5924,3 +5924,811 @@ found (unformatted code) was mechanical and is fixed. `git status`
 shows only the accumulated round-1/round-2/round-3 diff (`cargo fmt`'s
 reformatting of the coder's new code, nothing else); no commits, no
 stray docker containers or lock holders.
+
+## Plan 30 M4 — hygiene and history checkers: **WRITTEN, NOT YET BUILT** (coder round 1; the tester runs every gate — this is the phase 1 boundary)
+
+Goal: plan 30 §M4's six items — distinct handling of every CAS error code
+(and doctor probes for them), poison-record isolation (L7), holder-only
+publishing (L8), bucket versioning in `doctor`, exactly-once /
+convergence / dependency-cycle history checkers wired into `chaos-ci` and
+`chaos-soak-4`, and per-peer path visibility. Nothing here has been
+compiled or run (the coder brief forbade it).
+
+| Item | State | Where |
+|---|---|---|
+| `cas::put_conditional`: one conditional PUT under the error-code rules — 409 retries the *same* attempt (`CONSTELLATION_CAS_BUSY_RETRIES`, default 5, 50 ms doubling to 1 s), 412 / 404-on-`If-Match` read the object back and count a byte-identical body as *our own* landed write (a 5xx `object_store` retried after it was applied, or a lost reply), anything else is the store's error. `cas::classify` separates 409 from 412 despite `object_store`'s shared variant (see decisions). `cas::create_content_addressed` for chunks/blobs/packs, where "exists" is a dedup hit but a 409 must not be | written | `crates/store-s3/src/cas.rs` (new) |
+| Fault-injecting `FaultyStore` (tests only): `InMemory` plus scripted 412/409/404/304/500/timeouts and "applied, then answered 412/timeout", per op kind, path pattern and call count, with errors shaped exactly like `object_store`'s S3 client's | written | `crates/store-s3/src/faulty.rs` (new) |
+| Every CAS site through the helper, with per-site tests: lease create/swap, segment create (so the M3b epoch marker), commit create, designation create/swap/release, registry claim (now carries a random `claim` nonce so a landed claim is recognizable and a node never registers twice), condemned-chunk pointer, filesystem create, snapshot create, and the content-addressed chunk/blob/pack creates | written | `crates/store-s3/src/{lease,log,commits,designation,nodes,gc,store,blobs,packs,snapshot}.rs` |
+| Re-adopting a lease the bucket says is this node's own and unreleased while the keeper does not track it (a restart, or a takeover CAS whose reply timed out though it landed) is gated like a takeover: tail to head, epoch marker, strand-and-replay (CAS mode only) | written | `crates/cli/src/lease.rs` (`LeaseKeeper::readopts`, `commit_cas`), `crates/cli/src/shipper.rs` (`acquire_lease_for`) |
+| `doctor` records each provider's CAS answers (create over existing, stale `If-Match`, `If-Match` on a missing key, 8 concurrent creates, 8 concurrent swaps from one etag), warns on unknown semantics, fails on a non-atomic precondition; the control API's `doctor` carries `cas_probes` | written | `crates/store-s3/src/probe.rs` (new), `crates/cli/src/doctor.rs` (new), `crates/cli/src/main.rs`, `crates/api/src/types.rs` |
+| `doctor` reports bucket versioning from the probe PUT's version id (informational) | written | same |
+| Poison-record isolation: the upload pass records unrecoverable `(chunk, ino)` pairs (`Meta::note_unrecoverable_chunks`, persisted under `local`'s `poisoned/` prefix) instead of failing the round; each ship plans the unshipped journal per transaction, holding the seeds (a manifest naming a lost chunk) and every later transaction sharing a captured key with a held one, and ships the rest out of journal order (`store::held`) | written | `crates/meta/src/store/held.rs` (new), `crates/meta/src/store/writes.rs` (`take_journal_grouped`), `crates/cli/src/main.rs` (`upload_dirty_chunks_report`, `run_managed_sync_round`) |
+| M3b machinery made out-of-order-safe: the acked watermark stops below the oldest held row; retirement takes the exact shipped set and converts a shipped row newer than a held one into a `Foreign` row; the publish view skips such rows (and defers if one overlaps a held key); an inserted (tailed) segment is redone after them; own-segment recovery matches a subsequence of whole transactions | written | `crates/meta/src/store/{journal,spec,local}.rs`, `crates/cli/src/shipper.rs` (`apply_decoded_segment`) |
+| `status.held` (transactions, records, oldest seq, opaque, per-inode lost chunks) + web UI line + `constellation_held_transactions` metric | written | `crates/api/src/types.rs`, `crates/api/src/web.rs`, `crates/api/webui/index.html`, `crates/cli/src/held.rs` (new), `crates/cli/src/main.rs` |
+| `constellation repair drop-held <ino>` (control request `drop_held`): roll the inode's seeds and dependents back (the deposition rewind, restricted), requeue the dependents for replay by rid, turn each seed into a refused replay whose conflict copy carries the manifest with the lost chunks as holes, remove the unrecoverable pending rows; also drops queued replays of that manifest left by an earlier deposition | written | `crates/meta/src/store/held.rs` (`Meta::drop_held`), `crates/meta/src/store/spec.rs` (`strand_seqs_tx`, `refuse_queued_tx`, `queued_at`, `read_pending_replays`), `crates/cli/src/held.rs`, `crates/cli/src/main.rs` (`repair`), `crates/api/src/{types,lib}.rs` |
+| Plan 29 M6's characterization test flipped: `one_missing_chunk_holds_back_only_its_own_records` — other inodes (including one written after the broken file) still publish | written | `crates/cli/src/main.rs` (`pending_upload_tests`) |
+| Only the lease holder publishes: the idle publish and the unmount publish run only while `Meta::holder_epoch != 0` (or a keeper still holds at unmount); a follower instead runs `TreePublisher::follow_head` — once the head commit's `applied` covers its applied position and it is exactly that log prefix (`Meta::is_log_prefix_at`: no speculation, empty journal), it clears the dirty marks observed in the same snapshot. Explicit publishes (snapshots) still publish anywhere | written | `crates/cli/src/shipper.rs` (`is_publisher`, `publish_or_follow`, `shutdown_all`), `crates/cli/src/mtree_publish.rs` (`follow_head`), `crates/meta/src/store/local.rs` |
+| History checkers: exactly-once (history signatures + `check_log_completions` over the bucket's `Completed { rid }` records), convergence at quiescence (`snapshot_tree`/`check_convergence`, fresh replica included), Elle-style dependency cycles over single-assignment rename/link paths; each with synthetic-violation unit tests; new `Link` op and `move_read`/`link_read` families; the coordinator runs the cheap checkers per step and all of them at the end | written | `crates/chaos/src/{exactly_once,converge,elle}.rs` (new), `crates/chaos/src/{check,coord,gen,op,lib}.rs` |
+| Wired into `chaos-ci` and `chaos-soak-4`: after the history passes, drain every node, mount a fresh one, require identical trees, decode every log segment and require each rid to complete once | written | `crates/harness/src/scenarios/m4.rs` (new, `after_chaos`), `crates/harness/src/scenarios.rs`, `crates/harness/Cargo.toml` (+`constellation-meta`), `crates/harness/src/client.rs` (`state_dir`, `control`) |
+| New scenarios `poison-record-isolation` and `publish-only-holder` (the counting-proxy measurement: idle and busy 3-node windows, per-node requests by area; asserts non-holders PUT no commit and read no condemned list) | written | `crates/harness/src/scenarios/m4.rs`, `crates/harness/src/scenarios.rs` |
+| Path visibility: `status.p2p.peers[].paths` (`selected`, `direct`, `relay`, `multipath`, per-path RTTs) from iroh 1.1's `Connection::paths()` on the pooled connection, non-blocking; dashboard and peers page show it; failover from direct to relay documented | written | `crates/net/src/paths.rs` (new), `crates/net/src/{endpoint,peers,lib}.rs`, `crates/cli/src/paths.rs` (new), `crates/api/src/types.rs`, `crates/api/webui/{index,peers}.html` |
+| Docs | written | `docs/reference/features/write-path-hygiene.md` (new: CAS codes, `doctor`, `status.held`, `repair drop-held`, who publishes), `docs/reference/configuration.md` (publish cadence, `CONSTELLATION_CAS_BUSY_RETRIES`), `docs/reference/features/p2p-relays.md` (paths, failover), `docs/reference/tools/chaos.md`, `docs/how-to-guides/development/TESTING.md`, `docs/reference/README.md` |
+
+**Design decisions:**
+
+- **What `object_store` 0.14 does with each code (item 1's finding).** Its
+  generic HTTP layer maps 404→`NotFound`, 304→`NotModified`,
+  412→`Precondition`, **409→`AlreadyExists`**. The S3 client then:
+  on `PutMode::Create` rewraps 412/304 as `AlreadyExists` (wrapping the
+  original `Precondition`/`NotModified`) and returns a 409 as
+  `AlreadyExists` too, unretried; on `PutMode::Update` it retries 409
+  internally (`retry_on_conflict`) and rewrites 404 to `Precondition`.
+  It retries every 5xx, 429 and 408 even for conditional PUTs, but not a
+  timeout (a conditional PUT is not idempotent). Consequences before M4:
+  a 409 on any create read as "exists" — a lost race for segments and
+  commits (the commit publisher then found the slot empty and reported
+  **bucket corruption**), and, worst, **a successful dedup for chunk,
+  blob and pack creates although nothing was written**; and a write that
+  landed behind a retried 5xx came back as a lost race (a takeover that
+  won would re-adopt without its gate; a registry claim would claim a
+  second id). `cas::classify` tells 412 from 409 on create by whether the
+  source is itself an `object_store::Error` (the S3 client's rewrap) or
+  the raw HTTP error whose text carries `status code: 409` (the HTTP
+  error type is crate-private, so text is the only handle — the
+  documented limitation; a rewording degrades a create's 409 to a lost
+  race, which the read-back turns into a retry because the key is
+  empty). 404 vs 412 on `If-Match` is told apart the same way, but both
+  lead to a re-read, so a mistake costs only a log line.
+- **Own-write recognition by byte equality.** Every CAS body is unique to
+  its writer and attempt (lease: holder + ms expiry; registry: the new
+  `claim` nonce; designation: path + designee + ms; segment: node id +
+  records; commit: author + ms; condemned list: epoch + ms), so a
+  read-back equal to what we sent proves authorship. The extra GET is
+  paid only on a lost race. Segments use it too (not just the shipper's
+  tail recovery), so a landed epoch marker is a success rather than a
+  collision.
+- **Held work is plain M3b speculation.** A held transaction is an
+  outstanding `Local` row, so publishing, deposition, replay by rid and
+  transaction atomicity need no new mechanism. What changed is that
+  *other* rows may now ship around it. The holdback rule (hold anything
+  touching a key a held row touched) is exactly the condition under which
+  that is safe: a shipped row commutes with every held row, so the log
+  order (shipped rows, then later the held ones) yields the replica's
+  state. That is also why the publish view can skip the converted
+  `Foreign` rows and why an inserted segment is redone after them.
+- **Held keys come from the captured before-images**, the M3b capture's
+  exact key set. Uncaptured transactions (capture off) have none: once
+  anything is held, every later uncaptured transaction is held — the
+  pre-M4 behaviour from that point, reported as `held.opaque` — and
+  `drop-held` refuses (nothing to roll back with).
+- **Seeds are only manifests naming an *unrecoverable* chunk**, not any
+  chunk still pending. The pre-existing window (a manifest committed
+  between a round's upload pass and its ship can ship before its chunk
+  is uploaded) is unchanged: holding every manifest with a pending chunk
+  would starve a continuously written large file's manifest.
+- **The poison marks persist** (`local` `poisoned/` prefix) so a restart
+  holds the records back before its first upload pass. A full upload
+  pass replaces the set; a mark whose pending row was acked or cancelled
+  is ignored.
+- **A node with held records keeps its lease** (the held journal counts as
+  backlog): nobody else could ship them, and releasing would strand them
+  into a replay queue that cannot drain either. Other nodes keep writing
+  through it by forwarding. `drop-held` (or the chunk turning up) ends it.
+- **`drop-held` replays dependents instead of discarding them.** The
+  brief says "discards those records into a conflict copy"; the seed's
+  content goes into the copy (lost chunks as holes), but a dependent
+  (`chmod`, rename, a later write) is a valid op that only waited on the
+  seed, so it is rolled back and replayed by rid like a deposed holder's
+  journal, and becomes a conflict copy only if the namespace no longer
+  admits it. Materialization rides the existing replay drain (a refused
+  queued replay), so it works on a holder and a non-holder alike.
+- **A follower's dirty clear requires the head to cover it and the replica
+  to be exactly the log prefix** (`is_log_prefix_at`), read in the same
+  snapshot as the dirty set it clears, and never adopts the head as a
+  publish parent (that needs the head's pack indices; `adopt_head` loads
+  them if this node later publishes).
+- **Elle over single-assignment paths.** Rename and link histories give
+  recoverable versions only if every path is written once and removed
+  once; the generator's `move_read`/`link_read` families (and the
+  existing storms) are built that way, and the checker ignores any path
+  that is not. Ambiguous "absent" observations add an edge only when
+  real-time order leaves one interpretation.
+- **Path visibility reads the pooled (dialed) connection only**, with
+  `try_lock`, so `status` never blocks behind a dial. Inbound-only peers
+  show no paths until this node sends them a request.
+
+**Risks and things for the tester to watch:**
+
+- Nothing has been compiled. Most likely mechanical fixes: the
+  `rewind_tx`/`redo_row_tx` split in `spec.rs`, borrow scopes in
+  `elle.rs`'s iterative Tarjan, `Group` type alias lifetimes in
+  `exactly_once.rs`, `ObjectStore` trait method set in `faulty.rs`.
+- **Every restart that re-adopts its own live lease now tails, ships an
+  epoch marker and runs the gate** (S3 CAS mode; a keeper that still
+  tracks its expired lease re-adopts as before). Tests or scenarios that
+  count segments across a remount (`kill9-remount`, shipper unit tests
+  that simulate a restart, `lease-fencing`) may see one more (empty)
+  segment.
+- **Followers no longer publish** (idle or at unmount). Scenarios whose
+  comments say a follower's clean unmount publishes (`takeover-marker-strands-promptly`,
+  `holder-crash-phantom-*`) still pass by construction — a fresh node
+  bootstraps from the holder's head commit plus the log — but watch
+  `mtree-gc-plateau`, `commit-strips-pending-upload`, `fresh-node-bootstrap`
+  and `holder-publishes-log-prefix` for commit-count assumptions.
+- **Per-round planning cost while something is held**: the whole unshipped
+  journal is re-planned each round, reading each captured transaction's
+  key set. Nothing when nothing is poisoned (one prefix probe of `local`).
+- `retire_local_tx` now always computes the conversion boundary (one
+  `journal_tx` range read over the just-shipped range), where M3b skipped
+  it without outstanding shadows. Watch `holder-ships-under-forward-load`.
+- `chaos-ci`/`chaos-soak-4` now take longer (drain, fresh mount, tree
+  walks, a full log read). The Elle checker may flag a genuine anomaly the
+  old checkers could not see; treat a cycle report as a finding, not a
+  checker bug, until the history says otherwise (`chaos check --history`
+  re-runs it offline).
+- `poison-record-isolation` relies on write-back mode keeping the chunk
+  in the cache as pending while A's own S3 relay is cut, and on the
+  default chunk size covering the 64 KiB file in one chunk.
+- `publish-only-holder` asserts nothing about absolute request counts;
+  its printed per-area breakdown is the measurement to record.
+- A snapshot on a holder with held records fails with
+  `SPECULATION_OUTSTANDING` until `drop-held` (publish-now refuses a
+  non-empty journal, as since M3b); an unmount with held records fails
+  its strict upload drain as before M4 (the journal stays for the next
+  mount).
+
+**Gates for the tester (phase 1 boundary — the full list):**
+
+1. `unset CARGO_TARGET_DIR`; `cargo fmt --all` (no diff);
+   `cargo clippy --workspace --all-targets -- -D warnings`.
+2. `cargo test --workspace` (includes `constellation-model`; new tests:
+   `store-s3` `cas::tests::*`, `probe::tests::*`, per-site
+   `*_error_codes`/`*_409*`/`*_412*` tests in `lease`, `log`, `commits`,
+   `designation`, `nodes`, `gc`; `meta` `tests/held.rs` and
+   `store::held::tests`; `cli` `pending_upload_tests::one_missing_chunk_holds_back_only_its_own_records`,
+   `mtree_publish::tests::a_follower_clears_dirty_keys_only_once_the_head_covers_it`;
+   `chaos` `elle`, `exactly_once`, `converge` tests; `net`
+   `paths::tests`).
+3. `cargo build --release --workspace`; `bash tests/smoke.sh`;
+   `bash tests/integration.sh`.
+4. The full `target/release/harness run` (every scenario in `SCENARIOS`,
+   with `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-p30`),
+   in particular `chaos-ci`, `chaos-soak-4`, `poison-record-isolation`,
+   `publish-only-holder`, `kill9-remount`, `lease-fencing`,
+   `holder-ships-under-forward-load`, `holder-publishes-log-prefix`,
+   `takeover-marker-strands-promptly`, `deposed-reintegration`,
+   `idle-cluster-is-quiet`, `mtree-gc-plateau`, `fresh-node-bootstrap`.
+5. `docker compose --profile test run --rm compliance` — pjdfstest
+   8798/8798.
+6. **Measurements** (plan §2.6, §M4 item 3): record
+   `publish-only-holder`'s per-node, per-window request breakdown (idle
+   and busy); `idle-cluster-is-quiet`'s totals before/after (followers no
+   longer publish, so its budget should hold with room); `harness
+   meta-bench` 3-node and single-node rows against M3b (the write path
+   changed in `retire_local_tx` and the ship plan's poison probe).
+7. `constellation doctor` against floci (and, if available, AWS/MinIO):
+   paste the probe lines and the versioning line.
+
+### Plan 30 M4 exit criteria
+- [x] fmt/clippy clean
+- [x] `cargo test --workspace` 0 failures
+- [x] `tests/smoke.sh`, `tests/integration.sh` pass
+- [x] full `harness run` — every scenario PASSED, except `poison-record-isolation`
+      (flaky by design, see below — needs a coder decision, not a tester fix)
+- [x] pjdfstest 8798/8798
+- [x] measurements recorded (publish-only-holder, idle-cluster-is-quiet, meta-bench)
+- [x] PROGRESS.md rows and this checklist; TESTING.md and reference docs updated
+
+## Plan 30 M4 — tester gate run
+
+Worktree `/home/bra/cvs/constellation-p30`, branch `plan30-m4`, on top of
+main `5e18214`. All gates below were run in the order CONVENTIONS.md
+gives; every harness command used `CONSTELLATION_HARNESS_DOCKER_PREFIX=
+constellation-harness-p30` and `CONSTELLATION_BIN=<worktree>/target/
+release/constellation`. M15 and M13 testers shared the host throughout
+(their own worktrees/prefixes); a couple of findings below are
+attributable to that.
+
+### Gate results
+
+1. **`cargo build --workspace --all-targets`** — clean on the first try,
+   no fixes needed (the coder's "nothing has been compiled" round-1 code
+   built without errors).
+2. **`cargo fmt --all` / `-- --check`** — clean after one `fmt` pass.
+3. **`cargo clippy --workspace --all-targets -- -D warnings`** — 6
+   findings, all mechanical, fixed (see below); clean afterwards.
+4. **`cargo test --workspace`** — 0 failures after 3 fixes (below);
+   confirmed with a second full run. Includes `store-s3` `cas.rs`/
+   `faulty.rs`/`probe.rs` tests, `meta` `tests/held.rs` and
+   `store::held::tests`, `chaos` `elle`/`exactly_once`/`converge` tests,
+   `net` `paths::tests`, and `cli`
+   `pending_upload_tests::one_missing_chunk_holds_back_only_its_own_records`
+   (the rewritten plan 29 M6 test) — all green. `today_bugs.rs`'s
+   `exactly_once_is_linearizable` model test ran ~85-91 s each time (an
+   integration test with its own budget, not the `#[test]`-per-model-case
+   lane CONVENTIONS caps at 60 s/2 GB).
+5. **`cargo build --release --workspace`** — clean.
+6. **`tests/smoke.sh`** — passed against the local file backend,
+   including the new `doctor` CAS-probe/versioning output.
+   **`tests/integration.sh`** — the main worktree's own `floci`
+   container already held host port 4566 (`constellation-floci-1`, up
+   independently of this session), so the fixed `4566:4566` mapping in
+   `docker-compose.yml` couldn't bind for a second project on this host.
+   Not a code issue: ran the equivalent of the script by hand (a
+   standalone `floci` container on port 14566, `AWS_ENDPOINT=http://
+   localhost:14566`, then `bash tests/smoke.sh "s3://constellation-ci/
+   <prefix>"`) — passed, full CAS probe report `ok` across the board.
+7. **Full harness run**, all 83 scenarios in `SCENARIOS` (`fio-latency`/
+   `fio-blips` SKIPPED, no `fio` on this host; `stress-ng` present, its
+   scenario ran). Run individually/in small batches so one hang couldn't
+   sink the rest. Every scenario **PASSED** except `poison-record-
+   isolation` (flaky; findings below). Notable results:
+   - `chaos-ci` PASSED in 8.0 s: 9 steps, `exactly_once_log` 12
+     completions each once, no cycle/violation from any checker.
+   - `chaos-soak-4` PASSED in 306.5 s (~1440 steps): `exactly_once_log`
+     986 completions across the log, each once; convergence at
+     quiescence held (fresh node included); no Elle cycle reported.
+     **No checker false positive or genuine violation was seen in any
+     run** — the new history checkers are clean on this milestone.
+   - `kill9-remount`, `lease-fencing`, `takeover-marker-strands-
+     promptly`, `holder-crash-phantom-shadow`,
+     `holder-crash-phantom-new-holder`, `deposed-reintegration` — all
+     PASSED; the M4 risk note about one extra (empty) segment across a
+     restart's re-adopt-and-gate did not break any of these.
+   - `holder-ships-under-forward-load` PASSED (`ship_rounds_cancelled=0`
+     every run) — M2b's "no keepers lock across S3 I/O on the ordinary
+     path" holds under M4's always-computed `retire_local_tx` boundary.
+   - `mtree-gc-plateau`, `fresh-node-bootstrap`, `commit-strips-pending-
+     upload`, `holder-publishes-log-prefix` — all PASSED; the "followers
+     no longer publish" change did not shift any commit-count assertion
+     in these.
+   - `idle-cluster-is-quiet` PASSED: followers show `PUT=0 HEAD=0` in
+     every window (only the holder, `quiet-a`, ever PUTs a commit or
+     reads the condemned list) — see Measurements.
+   - `publish-only-holder` (new) PASSED after one scenario-assertion fix
+     (below) — see Measurements.
+   - `poison-record-isolation` (new) — **flaky, needs a coder decision**;
+     see Findings.
+   - One infra flake: `p2p-invalidation` FAILED once with "another
+     harness run is already using the docker prefix" from a stale lock
+     file (`/tmp/.constellation-harness-p30.lock`, dated the day before
+     this session, no live process or container under that prefix) —
+     removed the stale lock and it passed. Root cause was a real bug in
+     the scenario itself (below), not the lock file.
+8. **`docker compose --profile test run --rm compliance`** (pjdfstest) —
+   **8798 passed, 0 failed**. Same port-4566 conflict as gate 6: built
+   and ran with a compose override that drops `floci`'s host port
+   publish (`ports: !override []`) under a separate project name
+   (`constellation-p30`); `compliance`'s container talks to `floci` by
+   its in-network DNS name regardless, so this changes nothing about
+   what is tested. Cleaned up (`down -v`) immediately after; did not
+   touch `constellation-floci-1` or any other worktree's containers.
+
+### Fixes made
+
+**Clippy (mechanical, all pre-existing-pattern violations in new M4
+code):**
+- `crates/chaos/src/elle.rs` (`cyclic_components`): `contains_key` +
+  `insert` → `HashMap::entry`'s `Vacant` arm (`clippy::map_entry`).
+- `crates/chaos/src/exactly_once.rs`: named the per-path read-history
+  map's type (`ReadsByPath`) instead of inlining it
+  (`clippy::type_complexity`).
+- `crates/meta/src/store/spec.rs` (`row_keys_and_origin`): same, named
+  `RowKeysAndOrigin`.
+- `crates/cli/src/mtree_publish.rs` (`follow_head`): same, named
+  `DirtySnapshot`.
+- `crates/store-s3/src/probe.rs` (two sites in `probe_cas_semantics`):
+  `*body` where `body: &&'static [u8]` → `body` (auto-deref already
+  coerces it; `clippy::explicit_auto_deref`).
+- `crates/harness/src/scenarios/m4.rs` (`publish_only_holder`, two
+  sites): `held(*c)` → `held(c)` for the same reason.
+
+**`cargo test` (3 fixes, all pre-existing/test-construction issues
+exposed by M4's new CAS byte-equality machinery, not bugs in that
+machinery):**
+- `crates/store-s3/src/lease.rs:610` —
+  `lease::tests::an_aws_style_404_is_a_conflict` was flaky (~50% fail
+  rate over repeated runs): it granted a lease and immediately renewed
+  it with the same `TTL`, so `Lease::renewed`'s `now_unix_ms() +
+  ttl_ms` could land in the *same millisecond* as the grant, making the
+  renewed body byte-identical to the original and tripping the new
+  "our own write landed" recognition (`cas::put_conditional`'s
+  `Verify::Body` path) instead of exercising the genuine-conflict path
+  the test is named for. Fixed by renewing with `TTL + 10_000` so the
+  two millisecond expiries can never coincide — confirmed with 8/8
+  passes after the fix (was failing ~3/5 before).
+- `crates/store-s3/src/store.rs` (`fs_create_and_load`) and
+  `crates/store-s3/src/snapshot.rs` (`create_is_cas_and_delete_leaves_
+  tree_blobs_alone`) — both deterministically FAILED: each reused the
+  exact same `FsMeta`/`SnapshotRecord` for a "second create must be
+  refused" check. `create_fs`/`SnapshotStore::create` correctly use
+  `Verify::Body` (their bodies carry a fresh uuid/timestamp on every
+  real attempt, per their own comments), so byte-for-byte replaying the
+  *first* attempt's body made the second call look like "our own
+  create landed behind a 412" (own-write recognition) instead of a
+  genuine second-create conflict — succeeding instead of returning
+  `AlreadyExists`. This is a test-construction bug (no real second `fs
+  create`/snapshot-create ever replays the exact prior bytes — a fresh
+  `FsMeta::default()`/`SnapshotRecord::new()` randomizes the uuid/gossip
+  secret or captures a new timestamp), not a defect in the CAS site's
+  `Verify::Body` choice. Fixed both tests to use a second, distinct
+  `FsMeta`/`SnapshotRecord` for the second call, keeping the exact same
+  assertion (`Err(StoreError::AlreadyExists)`).
+- `crates/harness/src/scenarios.rs` (`p2p_invalidation`) — deterministic
+  bug, not flaky: the scenario calls `setup()` twice (P2P on, then P2P
+  off), and `S3Env` holds its `PrefixLock` (an exclusive, non-blocking
+  `flock`) for its entire lifetime by field-drop order. The function
+  dropped its first `root` (`TempDir`) before the second `setup()` but
+  never dropped the first `env`, so the second `setup()`'s lock acquire
+  always lost to the still-open first one. Fixed with an explicit
+  `drop(env)` alongside the existing `drop(root)`; confirmed passing
+  repeatedly afterward. (This is why the harness run above hit the
+  stale-lock error on `p2p-invalidation` before the fix — a *previous*,
+  never-cleanly-finished run of this same bug left the lock file for
+  the next process to trip over, misdirecting at first toward "stale
+  lock" rather than the real cause.)
+
+**Harness scenario assertion fix (`publish_only_holder`):** deterministic
+failure — `pub-b` (never the holder) made 426-609 `GET gc/condemned`
+requests per busy window, matching its own chunk-PUT count exactly. This
+is not a publish-path leak: `ChunkStore::put_chunk_mode`
+(`crates/store-s3/src/store.rs:350`, pre-existing, unrelated to plan 30
+§M4) checks `is_condemned` on *every* content-addressed chunk PUT from
+*any* writer, holder or not — a per-write anti-resurrection guard, not
+part of "only the holder publishes." The scenario's assertion
+(`commit_puts == 0 && condemned_reads == 0` for a non-holder) encoded a
+wrong premise from the milestone brief ("only the lease holder ... reads
+condemned lists"). Fixed by dropping `condemned_reads == 0` from the
+non-holder assertion (kept `commit_puts == 0`, the assertion that
+actually reflects the M4 invariant) and updating the function doc to
+explain why. Confirmed passing 3/3 afterward with the corrected
+assertion; `commit_puts` was 0 for every non-holder in every run, both
+before and after this fix.
+
+### Checker findings
+
+`chaos-ci` and `chaos-soak-4` (run several times combined) never
+reported an exactly-once violation, a convergence mismatch, or an Elle
+dependency cycle. No `chaos check --history` re-check was needed because
+nothing ever fired. This milestone's three new checkers are clean
+against the current write path.
+
+### `poison-record-isolation` — needs a coder decision, not a tester fix
+
+Fails non-deterministically as written (roughly 80-100% of runs on this
+host): `'A reports the held set' not reached within 60s: nothing held
+yet`. This is a genuine race in the *scenario's* fault-injection
+choreography, not a defect in the M4 poison-detection machinery itself,
+which was independently verified correct:
+
+- **The mechanism works.** Reproduced by hand outside the harness (a
+  local-file-backend mount, `--write-mode back`, blocking the backend
+  directory to force an upload failure, then deleting the cached chunk
+  file): `upload_dirty_chunks_report` correctly logs `pending upload
+  chunks missing from local cache` and `Meta::note_unrecoverable_chunks`
+  correctly populates `status.held` every time the chunk is genuinely
+  absent when a round's `cache.get()` runs.
+- **The race:** `a_path.cut()` (the scenario's counting-relay fault
+  injector) only *closes an already-relaying connection* within its
+  ~100ms poll tick, and the write to `broken` nudges an upload round
+  essentially instantly (observed same-millisecond in mount logs). That
+  round's future calls `cache.get()` **once** and holds the bytes in
+  memory across its 3 retries; if this happens before the scenario's own
+  `std::fs::remove_file` a few lines later — which the evidence shows it
+  usually does — the chunk is never actually "missing" from that round's
+  point of view. Instrumenting the scenario (kept out of the final diff)
+  showed the chunk's own PUT reaching the mock S3 successfully in every
+  failing run, always shortly after `a_path.heal()`, using bytes that
+  must have been read before the deletion.
+- **Tried and reverted:** a fixed delay between `cut()` and healing
+  (750 ms, 2 s, 5 s) to outlast that round's retry budget. Short delays
+  only partially helped (~30-40% pass rate at 750 ms-2 s, still
+  nondeterministic). A 5 s delay made the *first* assertion reliable in
+  several runs, but then reliably hit a **second, apparently genuine**
+  issue: A's log fills with `conflict copy step not accepted yet
+  other=Busy` every ~256 ms indefinitely (`materialize_remote` in
+  `crates/cli/src/recovery.rs:716`, the *forwarding* path used when a
+  node believes it is *not* the holder) — A appears to decide it must
+  forward its own conflict-copy materialization steps rather than apply
+  them locally, and nothing ever accepts them, so `drop-held`'s replay
+  never reaches B within the 60 s budget. This smells like the
+  sustained-S3-outage continuation-epoch path (`epochs.maybe_propose`,
+  triggered by repeated upload failures in `run_managed_sync_round`)
+  putting A into a state where it forwards instead of materializing
+  locally despite still holding the partition lease — worth the
+  coder's attention independent of this scenario's timing, since a real
+  multi-second S3 outage during a `drop-held` repair could hit the same
+  path. Given neither direction gives a clean, reliable fix, the
+  harness file was left as originally written (no delay, no
+  instrumentation) rather than ship an unreliable band-aid.
+- **Recommendation:** either give the scenario a deterministic way to
+  guarantee the upload round doesn't start (or has fully failed) before
+  the harness deletes the cache file — e.g. a control-API/debug hook to
+  pause the upload pass, or SIGSTOP the daemon for the critical few
+  lines — instead of racing wall-clock sleeps against an asynchronous
+  round; and separately, have the coder look at why `materialize_remote`
+  seems to run on a node that should still be the local holder after a
+  sustained cut, since that is a plausible independent bug.
+
+### Measurements
+
+All meta-bench numbers below were taken between 21:08 and 21:38 while
+M13's own harness/meta-bench activity was winding down on this shared
+host; `uptime` load ranged 3.1-8.3 over the measurement window (a
+30-minute bounded wait for load < 3 and no M13/M15/cargo/rustc processes
+did not fully succeed — busy processes cleared but load stayed at
+3-4 — so these are recorded under "mostly idle, imperfectly" rather than
+a clean-idle host; flag for a re-run on a quieter window if a tighter
+number is needed).
+
+**`publish-only-holder` per-node request breakdown** (3-node, one
+20 s idle window then one 20 s busy window; `pub-a` is the sole holder
+throughout, `CONSTELLATION_LEASE_PLACEMENT=off`):
+
+| Window | Node | holder | LIST | GET | HEAD | PUT | commit PUTs | condemned GETs |
+|---|---|---|---|---|---|---|---|---|
+| idle 20s | pub-a | true | 10 | 35 | 2 | 3 | 1 | 3 |
+| idle 20s | pub-b | false | 10 | 49 | 0 | 0 | 0 | 0 |
+| idle 20s | pub-c | false | 10 | 49 | 0 | 0 | 0 | 0 |
+| busy 20s | pub-a | true | 10 | 3230 | 579 | 3084 | 62 | 933 |
+| busy 20s | pub-b | false | 13 | 4251 | 365 | 609 | 0 | 609 |
+| busy 20s | pub-c | false | 15 | 3961 | 361 | 609 | 0 | 609 |
+
+Non-holders' `commit PUTs` is 0 in every window, every run (3/3) — the
+M4 invariant holds. Non-holders' `condemned GETs` tracks their own
+`PUT chunks` count 1:1 (609=609, etc.) — expected per the assertion fix
+above, not a publish-path leak. Holder `pub-a`'s idle-window `by area`
+breakdown: `GET nodes=28 LIST nodes=8 LIST designations=2 GET gc=3 GET
+log=3 HEAD packs=2 PUT packs=2 GET commits=1 PUT commits=1`.
+
+**`idle-cluster-is-quiet` totals** (3 nodes, 60 s fully idle):
+
+- Per node: `quiet-a` (holder) `LIST=30 GET=93 HEAD=2 PUT=4 total=129`;
+  `quiet-b`/`quiet-c` (followers) `LIST=30 GET=99 HEAD=0 PUT=0
+  total=129` each.
+- Cluster total: `LIST=90 GET=291 HEAD=2 PUT=4 total=387`, budget 675 —
+  well inside budget, and followers issue **zero PUTs/HEADs**, consistent
+  with "followers no longer publish." Priced in GET-equivalents: 1377 vs
+  4320 for the pre-plan fixed-interval LIST poll alone.
+- Reran twice; identical totals both times (129/129/129 per node) — no
+  regression in idle request volume from the M4 changes.
+
+**`harness meta-bench`**, 3 runs each via the coordinator-provided
+`mb.sh` (`CONSTELLATION_BIN` = this worktree's release binary,
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-p30`),
+compared with the M3b numbers recorded above (same table, "Performance
+gate" section):
+
+| Config | M4 runs (ops/s) | M4 mean | M3b mean | Diff |
+|---|---|---|---|---|
+| `1node-create-lat0` | 7030, 7054, 7653 | 7245.7 | 2968.3 | **+144%** |
+| `1node-write4k-lat0` (run 1) | 414, 315, 604 | 444.3 | 639.3 | −30.5% |
+| `1node-write4k-lat0` (run 2) | 319, 320, 313 | 317.3 | 639.3 | **−50.4%**, tight (±2%) |
+| `3node-p2pon-shared-create-lat0` | 3131, 1759, 2814 | 2568.0 | 1647.3 | +55.9% |
+
+`1node-create-lat0` and `3node-p2pon-shared-create-lat0` both improved
+well outside the noise this host has historically shown for these
+configs (M3b's own text: 23% swings from ambient load alone) — plausibly
+real improvements from M3b/M4's ship-path work, but not confidently
+attributable given the host was shared. **`1node-write4k-lat0` is the
+one to flag**: run 1 was noisy (414-604) but run 2, taken ~15 minutes
+later once M13's processes had cleared, was tight (313-320, a 2%
+spread) and consistently ~50% below the M3b baseline — a tight, repeated
+result is not the kind of noise this host otherwise produces (contrast
+with the ≥2× run-to-run spreads M3b's own report documents for genuine
+host noise). The likely mechanism, per this milestone's own risk list:
+`retire_local_tx` now *always* computes the conversion boundary (one
+extra `journal_tx` range read per ship round, every round, where M3b
+skipped it when nothing was outstanding) and the ship plan's poison
+probe adds a `local` prefix scan per round even when nothing is
+poisoned. `write4k`'s workload ships far more, far smaller rounds than
+`create-lat0` for the same op count, so a small fixed per-round cost
+would show up here first and hardest. This needs the coder (or a
+profiler) to confirm the mechanism and decide whether the always-on
+boundary computation can be made conditional again; recorded here as a
+measurement finding per the gate list, not fixed by the tester.
+
+**`constellation doctor`** against `floci` (the shared `constellation-
+floci-1` container on `http://localhost:4566`, using a fresh
+`doctor-check-<ts>` prefix; AWS/MinIO not available in this
+environment):
+
+```
+create-if-absent (If-None-Match) ... ok
+etag CAS (If-Match) ............... ok
+conditional-write semantics (what this provider answers):
+  create over an existing key        ok: 412 AlreadyExists → lost race
+  If-Match with a stale etag         ok: 412 Precondition → lost race
+  If-Match on a missing key          ok: 404 Precondition → missing, re-read
+  concurrent creates of one key      ok: 1 won, 7 lost (412), 0 busy (409)
+  concurrent swaps from one etag     ok: 1 won, 7 lost (412), 0 busy (409)
+bucket versioning ................. off (or not reported) (informational; nothing relies on it)
+```
+
+All five CAS probes report `ok` (floci's semantics are fully understood
+by the classifier); versioning is off/not reported, as expected for
+floci (informational only, nothing relies on it).
+
+### Flakes
+
+- `an_aws_style_404_is_a_conflict` (unit test) — fixed, see above.
+- `p2p-invalidation` (harness) — hit a stale lock file from a previous,
+  never-cleanly-finished run of the same underlying bug; the underlying
+  bug itself was deterministic and is fixed, see above.
+- `poison-record-isolation` (harness) — genuinely flaky as written; see
+  the dedicated section above. Not fixed; needs a coder decision.
+- `web-fleet` (harness) — FAILED twice with `Input/output error (os
+  error 5)` early in the run, both times while M13 was independently
+  running its own harness scenarios on this shared host (`uptime` load
+  ~16 at the time, confirmed via `ps aux` showing M13's `constellation`
+  processes). Reran clean 20/20 times once isolated (in a fresh `harness
+  run` invocation, no other tester active). Attributed to host
+  contention, not a code or scenario defect; no fix made.
+
+### Design-change items
+
+- `poison-record-isolation`'s fault injection needs a non-racy mechanism
+  (see above) — a coder decision on the harness side.
+- `1node-write4k-lat0`'s ~50% throughput drop vs M3b (see Measurements)
+  — needs the coder or a profiler to confirm `retire_local_tx`'s
+  always-on conversion-boundary computation (or the per-round poison
+  probe) as the cause and decide whether it can be made conditional
+  again without reintroducing the M3b bug it fixed.
+- The `materialize_remote` "conflict copy step not accepted yet"
+  stall observed under a sustained (multi-second) S3 cut combined with
+  `drop-held` (see the `poison-record-isolation` section) — worth
+  checking independent of the scenario's timing, since it suggests a
+  holder can end up on the forwarding path when it should still be
+  materializing locally.
+
+## Plan 30 M4 — round 2 (coder): the write4k regression, a deterministic `poison-record-isolation`, stalled conflict copies — **WRITTEN, NOT YET BUILT**
+
+Rebased onto main `b325f4d` (M15) by the coordinator; every round-1 piece
+was checked present after the merge (`cas`/`faulty`/`probe`, `store::held`,
+`net::paths` next to M15's `ChunkDecline`/`ChunkStatus` exports, `mod m4`
+next to `mod coop_churn`, the web UI line, the doctor/repair/status wiring).
+
+| Item | State | Where |
+|---|---|---|
+| Ship/ack/upload fast path restored: nothing poisoned or held → no held-set work (see the per-write table) | written | `crates/meta/src/store/{held,spec,journal,writes,mod,misc}.rs` |
+| `KV_POISONED_COUNT` counter (maintained by `note_unrecoverable_chunks`, `drop_held`, `clear_pending_uploads`); `read_poisoned` reads it first and rejects a malformed mark | written | `crates/meta/src/store/{mod,held,misc}.rs` |
+| `retire_local_tx` detects held transactions on the scan it already does (`Retired::held_below`) and only then computes the conversion boundary from the watermark; otherwise M3b's exact path (boundary only with requester entries outstanding, compaction from `upto + 1`). The shipped set is a contiguous run (`Shipped::Run`, no allocation) unless held rows were skipped (`Shipped::Set`). `journal::ack_rows_at` looks up the oldest remaining row only when `held_below` | written | `crates/meta/src/store/{spec,writes,journal}.rs` |
+| Complexity test `ship_path_does_no_held_set_work_when_nothing_is_held`: 30 write/ship/ack cycles with a malformed `poisoned/` mark planted behind the counter (any scan of the marks would fail to decode it) and `Meta::held_work` pinned at 0; non-vacuity: a real poison moves it | written | `crates/meta/src/store/local.rs` |
+| Test-only fault points `CONSTELLATION_FAULT_LOSE_CHUNKS` (the upload pass drops a chunk from the cache right before reading it) and `CONSTELLATION_FAULT_HOLD_SYNC_FILE` (managed sync rounds return at once while the file exists; a held round writes `<file>.held`) | written | `crates/cli/src/fault.rs` (new), `crates/cli/src/main.rs` (two call sites) |
+| `poison-record-isolation` rewritten on those: no S3 cut, no hand-deleted cache file. Adds checks that both held transactions are listed, that A publishes while records are held, and that a fresh node bootstrapped from the bucket sees exactly what B sees | written | `crates/harness/src/scenarios/m4.rs` |
+| Stalled conflict copies: a refused replay's copy backs off (250 ms doubling to 10 s), never blocks later replays, asks for the lease once stalled for `LEASE_FALLBACK` (at most once per interval), is never dropped; `status.speculation.copies_pending`/`copies_stalled`, metric `constellation_speculation_copies_stalled`, dashboard note; the per-step warn is now debug (the drain logs with backoff) | written | `crates/cli/src/recovery.rs`, `crates/cli/src/shipper.rs` (`SpoolInfo`), `crates/cli/src/main.rs`, `crates/api/src/{types,web}.rs`, `crates/api/webui/index.html` |
+| Unit test `a_stalled_conflict_copy_backs_off_and_never_blocks_the_queue` (a sync task that answers `Busy`, as a node without S3 does, then executes once a holder is back) | written | `crates/cli/src/recovery.rs` |
+| Docs | written | `docs/reference/configuration.md` (fault knobs), `docs/how-to-guides/development/TESTING.md`, `docs/reference/features/write-path-hygiene.md` |
+
+**The write4k regression — root cause.** `write4k` is `create` + a 4 KiB
+write + close, and the default write mode is `through`, so every close
+sends the sync task a `DrainInode` (the inode's pending chunks must be
+durable before `close` returns). `create` has no close drain, which is why
+it did not regress. Round 1 put `local`-keyspace **prefix scans** on that
+path and on every round, plus range walks over just-deleted ranges on
+every ack. `local` is rewritten by every journaled transaction (journal,
+spec and usage counters), so a range iterator over it is built across the
+active memtable, the sealed memtables and every overlapping segment, and
+it skips stale versions. That is the cost M3b's second coder round
+removed from the `status` and tail paths ("scans starved the holder"). A
+point read uses bloom filters and stops at the newest version. Per 4 KiB
+write-through write (one `DrainInode`, and about one ship round covering
+the op's two transactions):
+
+| Path | M3b | M4 round 1 | M4 round 2 |
+|---|---|---|---|
+| `DrainInode` upload pass | — | +1 snapshot, +1 prefix scan of `local` (`note_unrecoverable_chunks`) | — (nothing missing on an inode drain returns at once) |
+| round's full upload pass | — | +1 snapshot, +1 prefix scan of `local` | +1 snapshot, +1 counter point read |
+| ship plan | `take_journal_whole_txs` | +1 snapshot, +1 prefix scan of `local`, held-summary mutex write | +1 counter point read (no lock unless something was held) |
+| ack: retire | scan `journal_tx[from..=upto]`; boundary only with shadows outstanding; compaction from `upto+1` | same scan, +`HashSet` of the shipped seqs, +2 counter reads and a `journal_tx` walk from the watermark over the just-deleted range for the boundary, compaction's walk also moved to the watermark | same as M3b (held rows noticed on the same scan; a contiguous run needs no set) |
+| ack: `journal` watermark | none | +1 `journal` range walk over the just-deleted range | none (only when a row was held) |
+| **total vs M3b** | — | **+3 snapshots, +3 range scans of `local`, +3 range walks over tombstoned ranges, +1 allocation, +1 mutex** | **+2 counter point reads** |
+
+This is static accounting: this round was not allowed to build or
+profile. The tester should confirm by measurement (below), ideally
+interleaving the M3b binary with this one on the same host, since round
+1's `1node-create-lat0` (+144%) and M3b's own spreads show how much this
+host moves.
+
+**`poison-record-isolation` — what was racing.** The scenario cut A's S3
+relay and deleted the cache file by hand. The write's own nudge started
+an upload round that read the chunk into memory before the deletion; the
+round then uploaded it after the heal. The fault points remove both races.
+The chunk is lost where the upload pass reads it, and every write happens
+while A's rounds are provably held. There is no S3 cut any more, so the
+scenario no longer drives A into a continuation epoch either.
+
+**`materialize_remote` — why it stalled, and the decision.** After the
+sustained cut, A was still named in the lease object while its own view
+was closed (the lease view expired or was released locally, for example
+when a continuation epoch closed). A's own forwards therefore answered
+`Busy` (`dispatch_forward` never forwards to itself). A refused replay's
+copy counted as "resolved as far as ordering goes", so it never fed the
+stuck-head logic that asks for the lease. Nothing else wanted to write,
+so nothing re-acquired, and the drain retried every 250 ms forever.
+Decisions:
+- bounded retry *rate* (backoff to 10 s), not a bounded retry *count*:
+  the copy can be the only surviving copy of the data, so it is never
+  dropped;
+- ask for the lease after `LEASE_FALLBACK` stalled, as a stuck queue head
+  does (a re-adoption now runs the takeover gate, round 1), which makes
+  the copy locally;
+- never block later replays (M3a);
+- show pending and stalled copies in `status`, the metrics and the UI.
+
+**Risks:**
+- `KV_POISONED_COUNT` is the only "anything poisoned?" signal on the hot
+  path. A mark whose pending row was acked stays counted until the next
+  full upload pass replaces the set; that costs one extra (harmless) plan.
+- `CONSTELLATION_FAULT_HOLD_SYNC_FILE` also holds lease renewal. The
+  scenario holds for a few writes only (TTL 60 s).
+- `held_below` relies on every journal row belonging to a `journal_tx`
+  row, which M3b guarantees (every append is bracketed).
+
+**The tester must re-run:**
+1. fmt, clippy `-D warnings`, `cargo test --workspace` (new:
+   `store::local::tests::ship_path_does_no_held_set_work_when_nothing_is_held`,
+   `recovery::tests::a_stalled_conflict_copy_backs_off_and_never_blocks_the_queue`;
+   `tests/held.rs` and the round-1 held tests exercise the changed retire
+   and ack paths).
+2. `harness meta-bench`: `1node-write4k-lat0`, `1node-create-lat0`,
+   `3node-p2pon-shared-create-lat0` — target within 5% of M3b on the first
+   two and no worse on the third. Interleave M3b (`5e18214`) and this build
+   on the same host if the host is noisy.
+3. `poison-record-isolation` ×10 (must pass every time), plus
+   `deposed-reintegration`, `holder-crash-phantom-shadow`,
+   `holder-crash-phantom-new-holder`, `takeover-marker-strands-promptly`
+   (the replay drain changed), `holder-ships-under-forward-load`,
+   `holder-publishes-log-prefix`, `chaos-ci`, `chaos-soak-4`,
+   `kill9-remount`, `lease-fencing` (the ack path changed).
+4. Because the drain and ack paths changed on a phase boundary, the full
+   `harness run`, `tests/smoke.sh`, `tests/integration.sh` and pjdfstest
+   again.
+
+## Plan 30 M4 — tester gate run, round 2
+
+Same worktree (`/home/bra/cvs/constellation-p30`, branch `plan30-m4`),
+rebased by the coordinator onto main `b325f4d` (M3b + M15). No coder-round
+findings from round 1 needed a re-fix this round — round 2's diff already
+addressed all three items round 1 flagged (the write4k regression, the
+`poison-record-isolation` race, `materialize_remote`'s stall) — so the
+tester made **zero source changes** this round; every gate below passed
+as delivered. M13 shared the host throughout (own worktree/prefix,
+untouched).
+
+### Gate results
+
+1. **`cargo build --workspace --all-targets`** — clean.
+2. **`cargo fmt --all -- --check`** — clean.
+3. **`cargo clippy --workspace --all-targets -- -D warnings`** — clean,
+   no findings.
+4. **`cargo test --workspace`** — 0 failures, exit 0. Both new round-2
+   tests confirmed: `store::local::tests::
+   ship_path_does_no_held_set_work_when_nothing_is_held` and
+   `recovery::tests::a_stalled_conflict_copy_backs_off_and_never_blocks_the_queue`,
+   plus `tests/held.rs` and every round-1 held/CAS/chaos-checker test —
+   all green.
+5. **`cargo build --release --workspace`** — clean.
+6. **`poison-record-isolation` ×10 — 10/10 PASSED**, deterministic
+   (3.5-4.4 s each, no variance in outcome). The fault knobs
+   (`CONSTELLATION_FAULT_LOSE_CHUNKS`, `CONSTELLATION_FAULT_HOLD_SYNC_FILE`)
+   fully close the race round 1 reported — no S3 cut, no hand-timed
+   deletion, nothing left to race.
+7. **Targeted re-run list** (drain/ack/replay paths changed) — all
+   PASSED: `deposed-reintegration` (20.5s), `holder-crash-phantom-shadow`
+   (7.7s), `holder-crash-phantom-new-holder` (7.8s),
+   `takeover-marker-strands-promptly` (12.3s),
+   `holder-ships-under-forward-load` (7.9s, `ship_rounds_completed=242
+   ship_rounds_cancelled=0`), `holder-publishes-log-prefix` (7.6s),
+   `chaos-ci` (7.4s, `exactly_once_log` 12/12 once), `chaos-soak-4`
+   (314.4s, `exactly_once_log` 1472/1472 once, no convergence mismatch,
+   no Elle cycle), `kill9-remount` (2.8s), `lease-fencing` (14.9s),
+   `coop-cache-hit` (3.9s), `coop-exact-churn` (7.1s, `false_positives=0`).
+8. **Full harness run, every scenario in `SCENARIOS`** (85 now — M15
+   added `coop-exact-churn` and `coop-digest-compare` since round 1), run
+   in batches so one hang couldn't sink the rest — **every scenario
+   PASSED** (`fio-latency`/`fio-blips` SKIPPED, no `fio` on this host,
+   same as round 1). This includes every scenario already covered under
+   items 6-7 above, run again as part of the full sweep, plus all others:
+   `baseline`, `latency`, `slow-network`, `s3-outage`, `s3-flap`,
+   `cold-cache`, `two-clients-disjoint`, `two-clients-shared`,
+   `atime-eventual`, `quota-enforcement`, `prune`, `git-workflow`,
+   `lease-handover`, `continuation-epoch`, `epoch-member-lost`,
+   `node-leave`, `p2p-invalidation` (the round-1 `drop(env)` fix still
+   holds — passed cleanly, no stale-lock retry needed this time),
+   `p2p-handover`, `forwarded-mutations`, `scratch-publish`,
+   `p2p-partition-tolerance`, `s3-retry`, `coop-fallback`,
+   `coop-digest-compare`, `web-ui-smoke`, `web-fleet`, `gc-lifecycle`,
+   `gc-dedup-race`, `fsck-repair`, `fsck-while-mounted`,
+   `snapshot-lifecycle`, `clone-workflow`, `snapshot-mount`,
+   `snapshot-churn`, `e2e-basic`, `e2e-two-nodes`, `passwd-live-cluster`,
+   `fresh-node-bootstrap`, `commit-strips-pending-upload`, `readahead`,
+   `readahead-adaptive`, `e2e-spilled-manifest`, `e2e-decode-priority`,
+   `scan-ahead`, `distant-bigfile-stable`, `distant-bigfile-stable-e2e`,
+   `prefetch-abandon`, `prefetch-abandon-e2e`, `prefetch-fairness`,
+   `stress-ng-flap`, `big-file-write`, `staging-crash`, `unmount-drain`,
+   `writeback-latency`, `writeback-bigfile`, `writeback-drain`,
+   `writeback-fsync`, `writeback-backpressure`, `existence-bloom-dedup`,
+   `existence-peer-hint`, `xattr-roundtrip`, `fallocate-sparse`,
+   `disjoint-write-4`, `mkdir-p-race`, `create-storm-s3-only`,
+   `mtree-gc-plateau`, `idle-cluster-is-quiet`,
+   `wan-writer-ships-put-only`, `sticky-lease-handoff-over-s3`,
+   `named-shared-daemon`, `forward-timeout-reexec`, `publish-only-holder`.
+   `writeback-latency`'s `through=16.10s` is essentially identical to
+   round 1's `16.13s` — the write4k fix did not regress the write-through
+   path it left alone.
+9. **`tests/smoke.sh`** — passed (local file backend).
+   **`tests/integration.sh`** — same port-4566 workaround as round 1 (the
+   main worktree's own `floci` still holds it); ran the equivalent by
+   hand against a standalone `floci` on port 14566 — passed, full CAS
+   probe `ok`.
+10. **`docker compose --profile test run --rm compliance`** (pjdfstest)
+    — **8798 passed, 0 failed**, same compose-override approach as round
+    1 (`ports: !reset []` on a separate project name); cleaned up
+    immediately after.
+
+### Perf A/B — the decisive check
+
+Built a baseline binary from main `b325f4d` (M3b + M15, no M4 diff) in a
+separate detached worktree (`git -C /home/bra/cvs/constellation worktree
+add --detach <scratchpad>/m4-baseline main`), its own `CARGO_TARGET_DIR`.
+Removed the worktree and its target dir after measuring.
+
+Host was not cleanly idle: a 27-minute bounded wait (three 9-minute
+polling rounds) for load < 3 and no M13/M15/cargo/rustc processes did not
+fully succeed — M13's own cargo/harness activity kept cycling through
+the window, load ranged 4.5-23.3 (the high end right after M13 finished
+a build). Proceeded per the bound and interleaved every run
+(baseline, M4, baseline, M4, …) precisely so shared-host noise hits both
+sides symmetrically, via `mb.sh` with 1 run per call, 3 rounds per
+config. One `3node-p2pon-shared-create-lat0` M4 run showed a lease
+handoff mid-run (`fwd_ok=1200` instead of 2400, one handoff) — excluded
+as a non-comparable run (same exclusion M3b's own report used for the
+identical reason) and replaced with a clean re-run.
+
+| Config | Baseline runs (ops/s) | Baseline mean | M4 runs (ops/s) | M4 mean | Diff | Target |
+|---|---|---|---|---|---|---|
+| `1node-write4k-lat0` | 409, 503, 305 | 405.7 | 836, 295, 322 | 484.3 | **+19.4%** | ≤5% — **met, and reversed** |
+| `1node-create-lat0` | 6355, 7389, 8056 | 7266.7 | 8130, 6963, 7587 | 7560.0 | **+4.0%** | ≤5% — **met** |
+| `3node-p2pon-shared-create-lat0` | 2860, 2758, 2604 | 2740.7 | 3058, 2794, 2390 | 2747.3 | **+0.2%** | no worse — **met** |
+
+**The write4k regression is fixed.** Round 1 measured a tight, repeated
+~50% *drop* against M3b on this same config; round 2's interleaved
+numbers put M4 *ahead* of a same-day baseline built on this same host,
+comfortably inside the ≤5% target rather than merely not-worse. Given
+this host's documented run-to-run spread (baseline itself ranged
+305-503, a 65% spread, on the *same* binary, three runs apart), this is
+not a load-bearing "M4 is now faster" claim — it is strong evidence the
+always-on per-round cost round 1 found (the `local`-prefix scans on
+`DrainInode`, the full upload pass, and the ship plan, per round 1's
+static accounting) is gone, matching `KV_POISONED_COUNT`'s point-read
+fast path exactly as designed. `1node-create-lat0` and
+`3node-p2pon-shared-create-lat0` both land inside the target with margin
+to spare.
+
+### Findings
+
+- No design-change items from round 1 remain open: the write4k
+  regression, `poison-record-isolation`'s race, and the
+  `materialize_remote` stall are each confirmed fixed by direct test
+  (10/10 deterministic pass, the targeted scenario list, and the perf
+  A/B above).
+- No new findings this round. Every gate passed as delivered; the tester
+  made no source changes.
+
+### Flakes
+
+None observed this round. `p2p-invalidation` (round 1's flake, from a
+missing `drop(env)`) passed cleanly with no stale-lock retry needed.
+
+### Plan 30 M4 exit criteria — round 2 confirmation
+- [x] fmt/clippy clean
+- [x] `cargo test --workspace` 0 failures (round-2 tests included)
+- [x] `tests/smoke.sh`, `tests/integration.sh` pass
+- [x] full `harness run` — every scenario PASSED, **including
+      `poison-record-isolation` (10/10)** — round 1's one open item is
+      now closed
+- [x] pjdfstest 8798/8798
+- [x] perf A/B within 5% of baseline on all three configs (two improved,
+      one flat)
+- [x] PROGRESS.md updated (this section)

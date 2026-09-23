@@ -190,6 +190,16 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.speculation.epoch_markers
     );
     gauge!(
+        "constellation_speculation_copies_stalled",
+        "Refused replays whose conflict copy has failed for 10 s or more.",
+        status.speculation.copies_stalled
+    );
+    gauge!(
+        "constellation_held_transactions",
+        "Journaled transactions held back behind unrecoverable pending chunks.",
+        status.held.transactions
+    );
+    gauge!(
         "constellation_cache_used_bytes",
         "Bytes resident in the local chunk cache.",
         status.cache.used_bytes

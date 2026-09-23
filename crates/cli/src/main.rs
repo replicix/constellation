@@ -5,12 +5,15 @@ mod backend;
 mod coop;
 mod daemonize;
 mod designation;
+mod doctor;
 mod epoch;
 mod existence;
+mod fault;
 mod forward;
 mod fsck;
 mod fusefs;
 mod gc;
+mod held;
 mod keygate;
 mod lease;
 mod leave;
@@ -20,6 +23,7 @@ mod mtree_publish;
 mod mtree_read;
 mod node_runtime;
 mod parallelism;
+mod paths;
 mod pin;
 mod placement;
 mod prefetch;
@@ -307,6 +311,27 @@ enum Command {
         /// Explicitly release this expired partition lease while repairing.
         #[arg(long, requires = "repair")]
         force_release: Option<String>,
+    },
+    /// Repair verbs for a running mount (plan 30 §M4).
+    Repair {
+        #[command(subcommand)]
+        command: RepairCommand,
+    },
+}
+
+/// `constellation repair ...`.
+#[derive(Subcommand)]
+enum RepairCommand {
+    /// Discard the journal records held back behind an inode's
+    /// unrecoverable pending chunk(s) (`status`'s `held` section) into a
+    /// `.constellation-conflict/` copy whose lost chunks read as holes.
+    /// Records that only depended on them are rolled back and replayed.
+    DropHeld {
+        target: String,
+        /// The inode `status` lists under `held.inodes`.
+        ino: u64,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
 }
 
@@ -817,6 +842,10 @@ fn main() -> Result<()> {
                      therefore multi-node mounts — need If-Match"
                 );
             }
+            // Plan 30 §M4 items 1 and 4: what each CAS edge answers, and
+            // bucket versioning.
+            let report = rt.block_on(constellation_store_s3::probe_cas_semantics(store.inner()))?;
+            doctor::print_cas_report(&report)?;
             print!("filesystem at prefix .............. ");
             match rt.block_on(store.load_fs()) {
                 Ok(meta) => println!("ok ({}, format v{})", meta.uuid, meta.format_version),
@@ -905,6 +934,20 @@ fn main() -> Result<()> {
         Command::Reintegrate { target, state_dir } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
             rt.block_on(control_call(&dir, constellation_api::Request::Reintegrate))
+        }
+        Command::Repair {
+            command:
+                RepairCommand::DropHeld {
+                    target,
+                    ino,
+                    state_dir,
+                },
+        } => {
+            let (_, dir) = resolve_target(&target, state_dir)?;
+            rt.block_on(control_call(
+                &dir,
+                constellation_api::Request::DropHeld { ino },
+            ))
         }
         Command::Leave {
             target,
@@ -3184,6 +3227,10 @@ impl UploadRuntime {
     }
 }
 
+/// Plan 30 §M4: [`upload_dirty_chunks_report`] for a caller that needs
+/// every pending chunk durable — an inode drain before a replay or an
+/// `fsync`, a handoff's or an unmount's final flush — so an unrecoverable
+/// chunk is still an error here.
 async fn upload_dirty_chunks(
     cache: &DiskCache,
     meta: &Meta,
@@ -3193,6 +3240,38 @@ async fn upload_dirty_chunks(
     only_ino: Option<constellation_fs_core::Ino>,
     only_part: Option<&str>,
 ) -> Result<()> {
+    let report =
+        upload_dirty_chunks_report(cache, meta, store, compression, upload, only_ino, only_part)
+            .await?;
+    if let Some((hash, _)) = report.missing.first() {
+        bail!("pending upload chunk {hash} missing from local cache");
+    }
+    Ok(())
+}
+
+/// What one upload pass found it cannot upload.
+#[derive(Debug, Default)]
+struct UploadReport {
+    /// Pending `(chunk, ino)` rows whose chunk is gone from the local
+    /// cache: unrecoverable content (plan 30 §M4).
+    missing: Vec<(constellation_fs_core::ChunkHash, constellation_fs_core::Ino)>,
+}
+
+/// Upload every pending chunk (or one inode's). A chunk missing from the
+/// local cache is no longer an error (plan 30 §M4 item 2): it is reported,
+/// and recorded in `Meta::note_unrecoverable_chunks`, so the ship plan
+/// holds back just the records that need it and everything else ships.
+/// Any other failure (S3 unreachable, a PUT that keeps failing) is still
+/// an error for the round.
+async fn upload_dirty_chunks_report(
+    cache: &DiskCache,
+    meta: &Meta,
+    store: &ChunkStore,
+    compression: CompressionSetting,
+    upload: &UploadRuntime,
+    only_ino: Option<constellation_fs_core::Ino>,
+    only_part: Option<&str>,
+) -> Result<UploadReport> {
     use futures::StreamExt;
     let mut grouped: std::collections::HashMap<
         constellation_fs_core::ChunkHash,
@@ -3231,11 +3310,20 @@ async fn upload_dirty_chunks(
     let missing_sample = std::sync::Arc::new(std::sync::Mutex::new(
         None::<constellation_fs_core::ChunkHash>,
     ));
+    let missing_rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
+        constellation_fs_core::ChunkHash,
+        constellation_fs_core::Ino,
+    )>::new()));
     let in_flight = futures::stream::iter(grouped.into_iter().map(|(hash, inos)| {
         let missing_count = missing_count.clone();
         let missing_sample = missing_sample.clone();
+        let missing_rows = missing_rows.clone();
         async move {
             let _permit = upload.permit().await;
+            if fault::lose_chunk(&hash) {
+                tracing::warn!(%hash, "fault injection: dropping a pending chunk from the cache");
+                let _ = cache.remove(&hash);
+            }
             let Some(data) = cache.get(&hash)? else {
                 missing_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 {
@@ -3244,7 +3332,11 @@ async fn upload_dirty_chunks(
                         *sample = Some(hash);
                     }
                 }
-                bail!("pending upload chunk {hash} missing from local cache");
+                missing_rows
+                    .lock()
+                    .unwrap()
+                    .extend(inos.iter().map(|ino| (hash, *ino)));
+                return Ok(None);
             };
             let bytes = data.len() as u64;
             let mode = upload.put_mode(&hash);
@@ -3261,7 +3353,7 @@ async fn upload_dirty_chunks(
                         if !result.existed {
                             upload.record_success(bytes, now.duration_since(started), now);
                         }
-                        return Ok((hash, inos, mode, result.existed));
+                        return Ok(Some((hash, inos, mode, result.existed)));
                     }
                     Err(error) => last = Some(error),
                 }
@@ -3286,7 +3378,8 @@ async fn upload_dirty_chunks(
         .unwrap_or_else(|| std::time::Duration::from_secs(10));
     while let Some(result) = in_flight.next().await {
         match result {
-            Ok((hash, inos, mode, existed)) => {
+            Ok(None) => {}
+            Ok(Some((hash, inos, mode, existed))) => {
                 upload.existence.insert(&hash);
                 if mode == constellation_store_s3::ChunkPutMode::Probe {
                     upload.probe.lock().unwrap().record(existed);
@@ -3316,22 +3409,29 @@ async fn upload_dirty_chunks(
         }
     }
     let missing = missing_count.load(std::sync::atomic::Ordering::Relaxed);
+    let missing_rows = std::mem::take(&mut *missing_rows.lock().unwrap());
     if missing > 0 {
         let sample = *missing_sample.lock().unwrap();
-        tracing::error!(
+        tracing::warn!(
             missing_pending_chunks = missing,
             sample_hash = ?sample,
             "pending upload chunks missing from local cache (unrecoverable content); \
-             leaving the pending rows and refusing to ship"
+             leaving the pending rows and holding back only the records that need them"
         );
     }
+    // A full pass sees every pending row, so its list replaces the
+    // recorded set (a chunk that turned up again stops poisoning); a
+    // limited pass only adds to it.
+    meta.note_unrecoverable_chunks(&missing_rows, only_ino.is_none())?;
     if let Some(error) = first_error {
         return Err(error);
     }
     if total > 0 {
         tracing::debug!(uploaded = total, "pending chunk upload complete");
     }
-    Ok(())
+    Ok(UploadReport {
+        missing: missing_rows,
+    })
 }
 
 /// Drive either the ordinary S3 authority path or a continuation epoch.
@@ -3363,6 +3463,10 @@ async fn run_managed_sync_round(
     upload: &UploadRuntime,
     state_dir: &std::path::Path,
 ) -> Result<()> {
+    // Test-only fault point (`fault::sync_held`, plan 30 §M4 round 2).
+    if fault::sync_held() {
+        return Ok(());
+    }
     let (spool, node_id) = {
         let ship = ship.lock().await;
         (ship.spool.clone(), ship.node_id())
@@ -3396,7 +3500,9 @@ async fn run_managed_sync_round(
             // publication, then follows with its older local journal.
             return Ok(());
         }
-        upload_dirty_chunks(cache, meta, store, compression, upload, None, None).await?;
+        // Plan 30 §M4: an unrecoverable chunk holds back only what needs
+        // it (`upload_dirty_chunks_report`); the rest of the journal ships.
+        upload_dirty_chunks_report(cache, meta, store, compression, upload, None, None).await?;
         {
             let ship = ship.lock().await;
             ship.set_skip_ship(false);
@@ -3435,8 +3541,12 @@ async fn run_managed_sync_round(
         return result;
     }
 
+    // Plan 30 §M4 item 2: a chunk missing from the local cache no longer
+    // fails the round — the ship plan holds back only the records that
+    // need it (`constellation_meta::store::held`), and every other inode
+    // keeps publishing. Only a real upload failure fails the round.
     if let Err(error) =
-        upload_dirty_chunks(cache, meta, store, compression, upload, None, None).await
+        upload_dirty_chunks_report(cache, meta, store, compression, upload, None, None).await
     {
         let base = epoch_base(meta)?;
         if epochs.maybe_propose(base).await? {
@@ -3762,6 +3872,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                 coop,
                 s3: false,
                 path,
+                paths: paths::status(self.peers.path_summary(p.node_id)),
             }
         }));
         let p2p = constellation_api::P2pStatus {
@@ -3832,8 +3943,11 @@ impl constellation_api::StatusSource for DaemonStatus {
                     depositions: spool.depositions,
                     epoch_markers: spool.epoch_markers,
                     gate_pending,
+                    copies_pending: spool.replay_copies_pending,
+                    copies_stalled: spool.replay_copies_stalled,
                 }
             },
+            held: held::status(&self.meta),
             coop,
             prefetch: self.prefetch_stats.snapshot(),
             writeback: {
@@ -4323,14 +4437,26 @@ impl constellation_api::StatusSource for DaemonStatus {
         self.log_buffer.tail(lines)
     }
 
+    fn drop_held(&self, ino: u64) -> std::result::Result<String, String> {
+        held::drop_held(&self.meta, ino)
+    }
+
     fn doctor(&self) -> std::result::Result<constellation_api::DoctorStatus, String> {
         let store = ChunkStore::new(self.store.clone());
-        tokio::task::block_in_place(|| self.rt.block_on(store.probe_conditional_writes()))
-            .map(|caps| constellation_api::DoctorStatus {
-                create_if_absent: caps.create_if_absent,
-                etag_cas: caps.etag_cas,
+        tokio::task::block_in_place(|| {
+            self.rt.block_on(async {
+                let caps = store.probe_conditional_writes().await?;
+                let report = constellation_store_s3::probe_cas_semantics(store.inner()).await?;
+                Ok::<_, constellation_store_s3::StoreError>((caps, report))
             })
-            .map_err(|error| error.to_string())
+        })
+        .map(|(caps, report)| constellation_api::DoctorStatus {
+            create_if_absent: caps.create_if_absent,
+            etag_cas: caps.etag_cas,
+            cas_probes: doctor::api_probes(&report),
+            versioning: report.versioning.as_str().to_string(),
+        })
+        .map_err(|error| error.to_string())
     }
 
     fn cache_list(&self) -> Vec<constellation_api::CacheEntryStatus> {
@@ -5039,29 +5165,20 @@ mod pending_upload_tests {
         assert!(f.meta.pending_uploads().unwrap().is_empty());
     }
 
-    /// Plan 29 M6 characterization test (see `bench/remote/RESULTS.md`
-    /// anomaly #2 and `PROGRESS.md`'s "Plan 29 M6" section): a single
-    /// hash whose `pending_upload` row survives with no matching cache
-    /// entry — the "missing from local cache" condition seen under
-    /// concurrent load on real S3 — fails the *entire* round, even
-    /// though this same call's *other* pending chunk is healthy,
-    /// uploads fine, and gets acked. That all-or-nothing failure is
-    /// deliberate (see the comment above: bailing the whole round is
-    /// what stops the journal from shipping a manifest that names
-    /// content S3 will never have), but it means one permanently-
-    /// missing chunk anywhere on the node blocks every *other* inode's
-    /// manifest from ever publishing too, since
-    /// `run_managed_sync_round` only proceeds to `run_sync_round`
-    /// (which ships the journal) once this call returns `Ok` — and
-    /// nothing here ever removes the broken row, so every future round
-    /// fails identically, forever. This session could not pin down how
-    /// the cache entry first goes missing while its pending row
-    /// survives (every eviction path found protects `Dirty` entries),
-    /// so this test pins the *cascade*, not a fix for the trigger — see
-    /// PROGRESS.md for what was ruled out.
+    /// Plan 29 M6's characterization test, flipped by plan 30 §M4 item 2
+    /// (see `bench/remote/RESULTS.md` anomaly #2): a pending row whose chunk
+    /// is gone from the local cache used to fail the *entire* round, and so
+    /// block every other inode's manifest from ever shipping, forever. Now
+    /// the upload pass reports it instead of failing, records it as
+    /// unrecoverable, and the ship plan holds back only that inode's
+    /// manifest (and whatever depends on it): **other inodes still
+    /// publish**, including ones written after the broken one.
     #[test]
-    fn one_missing_chunk_fails_the_whole_round_even_though_another_chunk_in_it_succeeds() {
+    fn one_missing_chunk_holds_back_only_its_own_records() {
         let f = fixture();
+        // Holder capture on (this node holds the lease), so every
+        // transaction has a key set and the isolation is exact.
+        f.meta.set_holder_epoch(1);
         let healthy_file = f
             .meta
             .create(
@@ -5108,48 +5225,92 @@ mod pending_upload_tests {
             f.cache.get(&broken_hash).unwrap().is_none(),
             "the broken hash must not be in the cache"
         );
+        // Written after the broken one, touching none of its keys.
+        let later_file = f
+            .meta
+            .create(constellation_fs_core::types::ROOT_INO, "later", 0o644, 0, 0)
+            .unwrap();
 
-        let err = rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &UploadRuntime::for_test(true),
-            None,
-            None,
-        ));
-        assert!(
-            err.is_err(),
-            "the round fails whenever any pending chunk is unrecoverably missing"
+        let report = rt()
+            .block_on(upload_dirty_chunks_report(
+                &f.cache,
+                &f.meta,
+                &f.store,
+                CompressionSetting::RAW,
+                &UploadRuntime::for_test(true),
+                None,
+                None,
+            ))
+            .expect("a missing chunk no longer fails the round");
+        assert_eq!(report.missing, vec![(broken_hash, broken_file.ino)]);
+        assert_eq!(
+            f.meta.unrecoverable_chunks().unwrap(),
+            vec![(broken_hash, broken_file.ino)]
         );
-
-        // The healthy chunk still got uploaded and acked despite the
-        // round's overall failure: only the broken row remains pending.
+        // The healthy chunk uploaded and acked; only the broken row stays.
         assert_eq!(
             f.meta.pending_uploads().unwrap(),
-            vec![(broken_hash, broken_file.ino)],
-            "an unrelated healthy chunk's pending row must still be acked \
-             even though the round as a whole errors"
+            vec![(broken_hash, broken_file.ino)]
         );
         let uploaded = rt().block_on(f.store.get_chunk(&healthy_hash)).unwrap();
         assert_eq!(uploaded, healthy_data);
+        // A caller that needs everything durable (an fsync, an unmount's
+        // final flush) still gets the error.
+        assert!(rt()
+            .block_on(upload_dirty_chunks(
+                &f.cache,
+                &f.meta,
+                &f.store,
+                CompressionSetting::RAW,
+                &UploadRuntime::for_test(true),
+                None,
+                None,
+            ))
+            .is_err());
 
-        // Nothing ever drops the broken row: every future round fails
-        // identically, forever, which is the resilience gap this test
-        // pins (see the doc comment above).
-        let err2 = rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &UploadRuntime::for_test(true),
-            None,
-            None,
-        ));
-        assert!(
-            err2.is_err(),
-            "a missing chunk is never dropped or bounded -- it re-fails forever"
-        );
+        // The ship plan: everything but the broken manifest ships — the
+        // healthy file, the broken file's own create (it names no chunk),
+        // and the later file.
+        let batch: Vec<(u64, constellation_meta::LogRecord)> = f
+            .meta
+            .take_journal_grouped(10_000)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, batch)| batch)
+            .collect();
+        let manifests: Vec<u64> = batch
+            .iter()
+            .filter_map(|(_, rec)| match rec {
+                constellation_meta::LogRecord::WriteManifest { ino, .. } => Some(*ino),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(manifests, vec![healthy_file.ino]);
+        let creates: Vec<String> = batch
+            .iter()
+            .filter_map(|(_, rec)| match rec {
+                constellation_meta::LogRecord::Create { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates, vec!["healthy", "broken", "later"]);
+        let held = f.meta.held_summary();
+        assert_eq!(held.transactions, 1, "{held:?}");
+        assert_eq!(held.inodes[&broken_file.ino].missing, vec![broken_hash]);
+        assert!(later_file.ino != broken_file.ino);
+
+        // Ship what was planned: the held manifest is still journaled,
+        // still outstanding speculation, and still held next round.
+        let seqs: Vec<u64> = batch.iter().map(|(seq, _)| *seq).collect();
+        f.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        let rest: Vec<(u64, constellation_meta::LogRecord)> =
+            constellation_meta::MetaStore::take_journal(&f.meta, usize::MAX).unwrap();
+        assert!(rest.iter().any(|(_, rec)| matches!(
+            rec,
+            constellation_meta::LogRecord::WriteManifest { ino, .. } if *ino == broken_file.ino
+        )));
+        assert!(f.meta.take_journal_grouped(10_000).unwrap().is_empty());
+        assert_eq!(f.meta.speculation_counts().unwrap().local, 1);
     }
 
     #[test]

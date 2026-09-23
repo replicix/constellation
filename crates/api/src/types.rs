@@ -145,6 +145,12 @@ pub enum Request {
     },
     /// Every view currently mounted by this daemon.
     MountList,
+    /// Plan 30 §M4: `constellation repair drop-held <ino>` — discard the
+    /// journal records held back behind `ino`'s unrecoverable chunk(s)
+    /// into a conflict copy (see `StatusReport::held`).
+    DropHeld {
+        ino: u64,
+    },
 }
 
 /// Per-view mount options, mirroring today's `mount` CLI flags that are
@@ -295,6 +301,25 @@ pub struct ManifestStatus {
 pub struct DoctorStatus {
     pub create_if_absent: bool,
     pub etag_cas: bool,
+    /// Plan 30 §M4: what the provider answered at each CAS edge
+    /// (`constellation_store_s3::probe`).
+    #[serde(default)]
+    pub cas_probes: Vec<CasProbeStatus>,
+    /// Plan 30 §M4: bucket versioning as seen on a probe PUT
+    /// (informational).
+    #[serde(default)]
+    pub versioning: String,
+}
+
+/// One conditional-write probe (plan 30 §M4).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CasProbeStatus {
+    pub name: String,
+    pub observed: String,
+    /// The answer has a meaning the CAS rules know.
+    pub known: bool,
+    /// The provider did not enforce the precondition atomically.
+    pub violation: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -388,6 +413,10 @@ pub struct StatusReport {
     /// Plan 30 §M3a speculation log and stranded-op recovery.
     #[serde(default)]
     pub speculation: SpeculationStatus,
+    /// Plan 30 §M4: journal records held back behind unrecoverable
+    /// pending chunks (everything else keeps shipping).
+    #[serde(default)]
+    pub held: HeldStatus,
     /// Cooperative cache (phase 5, DESIGN.md §7).
     #[serde(default)]
     pub coop: CoopStatus,
@@ -737,6 +766,14 @@ pub struct SpeculationStatus {
     /// refused until a sync round completes it.
     #[serde(default)]
     pub gate_pending: bool,
+    /// Plan 30 §M4: refused replays whose `.constellation-conflict/` copy
+    /// could not be made yet (retried with backoff; later ops are not held
+    /// up), and those failing for at least 10 s — a stall worth looking
+    /// at (the node then also asks for the lease to make them locally).
+    #[serde(default)]
+    pub copies_pending: u64,
+    #[serde(default)]
+    pub copies_stalled: u64,
 }
 
 /// P2P fast-path state. Purely observational: the filesystem is correct
@@ -798,6 +835,68 @@ pub struct PeerStatus {
     /// Connectivity path: `direct`, `relay`, `unknown`, or empty for S3.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
+    /// Plan 30 §M4: every open QUIC path to this peer right now.
+    #[serde(default)]
+    pub paths: PeerPathsStatus,
+}
+
+/// Plan 30 §M4: the open network paths of the pooled connection to one
+/// peer (iroh 1.x on noq keeps several open at once: typically the relay
+/// path and, once holepunching succeeds, a direct one).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerPathsStatus {
+    /// Kind of the path application data currently uses: `direct`,
+    /// `relay`, or empty when no connection is pooled.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub selected: String,
+    /// Open direct (IP) paths.
+    #[serde(default)]
+    pub direct: u32,
+    /// Open relay paths.
+    #[serde(default)]
+    pub relay: u32,
+    /// More than one path is open, so a failure of the selected one can
+    /// fail over without a new handshake.
+    #[serde(default)]
+    pub multipath: bool,
+    /// Round-trip estimate of each open path, `kind:ms`, selected first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rtts: Vec<String>,
+}
+
+/// Plan 30 §M4: records held back behind unrecoverable pending chunks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HeldStatus {
+    /// Journaled transactions held back (the seeds and everything that
+    /// depends on them).
+    #[serde(default)]
+    pub transactions: u64,
+    #[serde(default)]
+    pub records: u64,
+    /// The oldest held journal seq.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_seq: Option<u64>,
+    /// An uncaptured transaction (holder capture off) was held, so every
+    /// transaction after it is held too.
+    #[serde(default)]
+    pub opaque: bool,
+    /// Each inode with unrecoverable chunks: `constellation repair
+    /// drop-held <ino>` discards its held records.
+    #[serde(default)]
+    pub inodes: Vec<HeldInodeStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HeldInodeStatus {
+    pub ino: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Hex hashes of the pending chunks gone from the local cache.
+    #[serde(default)]
+    pub missing_chunks: Vec<String>,
+    /// Held transactions whose manifest names them.
+    #[serde(default)]
+    pub seeds: u64,
 }
 
 /// Partition lease state (DESIGN.md §4). `held` is this node's own

@@ -11,7 +11,7 @@
 
 use crate::{layout, StoreError};
 use futures::StreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -89,18 +89,21 @@ impl SnapshotStore {
 
     pub async fn create(&self, record: &SnapshotRecord) -> Result<(), StoreError> {
         let body = serde_json::to_vec_pretty(record)?;
-        match self
-            .store
-            .put_opts(
-                &layout::snapshot(&record.id()),
-                PutPayload::from(body),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
+        // Plan 30 §M4 item 1: a 409 retries; our own create that landed
+        // behind a 412 is ours, not "already exists".
+        match crate::cas::put_conditional(
+            self.store.as_ref(),
+            &layout::snapshot(&record.id()),
+            body.into(),
+            PutMode::Create,
+            crate::cas::Verify::Body,
+        )
+        .await?
         {
-            Ok(_) => Ok(()),
-            Err(object_store::Error::AlreadyExists { .. }) => Err(StoreError::AlreadyExists),
-            Err(error) => Err(error.into()),
+            crate::cas::CasPut::Won(_) => Ok(()),
+            crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => {
+                Err(StoreError::AlreadyExists)
+            }
         }
     }
 
@@ -162,8 +165,25 @@ mod tests {
             },
         );
         snapshots.create(&record).await.unwrap();
+        // Second create of the same (path, name) is refused. Use a
+        // second record that collides on the same key but differs in
+        // content (a real second attempt is never byte-for-byte the
+        // first — even a retry of the same command captures a fresh
+        // tree root) so this exercises a genuine conflict rather than
+        // the "our own create landed behind a 412" recognition.
+        let second = SnapshotRecord::new(
+            "/data",
+            "daily",
+            8,
+            SnapshotTreeRoot {
+                seq: 4,
+                root: "cd".repeat(32),
+                ino: 9,
+            },
+        );
+        assert_eq!(second.id(), record.id());
         assert!(matches!(
-            snapshots.create(&record).await,
+            snapshots.create(&second).await,
             Err(StoreError::AlreadyExists)
         ));
         assert_eq!(snapshots.list().await.unwrap(), vec![record.clone()]);

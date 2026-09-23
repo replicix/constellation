@@ -50,7 +50,7 @@
 use crate::error::StoreError;
 use crate::layout;
 use constellation_mtree::{BlobHash, Hasher, NodeHash};
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 
 /// Read and write `blobs/*` against one bucket prefix.
@@ -107,21 +107,10 @@ impl BlobStore {
             }
             None => bytes,
         };
-        match self
-            .store
-            .put_opts(
-                &path,
-                PutPayload::from(body),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            // Content-addressed: the object already there *is* these
-            // bytes. Nothing to reconcile.
-            Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        // Content-addressed: an object already there *is* these bytes.
+        // Plan 30 §M4 item 1: a 409 retries rather than passing for one.
+        crate::cas::create_content_addressed(self.store.as_ref(), &path, body.into()).await?;
+        Ok(())
     }
 
     /// Fetch and verify. A blob may arrive from an untrusted bucket, so
@@ -178,6 +167,7 @@ impl BlobStore {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    use object_store::PutPayload;
 
     fn store() -> (Arc<dyn ObjectStore>, BlobStore) {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

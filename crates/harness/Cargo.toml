@@ -18,6 +18,9 @@ anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
 constellation-chaos.workspace = true
+# Plan 30 §M4: decode log segments' records (the chaos scenarios' log-level
+# exactly-once check reads every `Completed { rid }` in the bucket).
+constellation-meta.workspace = true
 fjall = { version = "3.1", package = "fjall" }
 libc.workspace = true
 postcard.workspace = true

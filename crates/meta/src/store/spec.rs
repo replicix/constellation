@@ -520,7 +520,7 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
     }
 }
 
-fn replay_rid_for(r: &impl Readable, meta: &Meta, first: u64) -> Result<Rid, MetaError> {
+pub(crate) fn replay_rid_for(r: &impl Readable, meta: &Meta, first: u64) -> Result<Rid, MetaError> {
     let node = kv_get_tx(r, &meta.local, KV_NODE_PREFIX)?
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
@@ -678,6 +678,13 @@ struct Inserted<'a> {
 /// `spec_seq`s after the inserted one, keeping their relative order.
 /// Usage moves are staged into `staged`; the caller persists and drains
 /// it. Returns what stranded and how many inserted records were skipped.
+///
+/// Plan 30 §M4: with `insert`, `Foreign` rows in the range are redone
+/// *before* the inserted segment. Such a row is one of this node's own
+/// transactions that shipped while an older one was held back
+/// (`store::held`), so it precedes the inserted segment in the log; it
+/// touches none of the held rows' keys, so redoing it ahead of them is
+/// the same state.
 fn rewind_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
@@ -699,10 +706,27 @@ fn rewind_tx(
         staged.adjust(-row.usage.0, -row.usage.1);
     }
 
-    // 2. The inserted segment, in the rolled-back rows' place.
     let renumber = insert.is_some();
+    let mut out = Stranded::default();
     let mut skipped = 0;
-    if let Some(ins) = insert {
+    let Some(ins) = insert else {
+        // 3. Redo, oldest first, what still stands.
+        for (seq, row) in rows {
+            redo_row_tx(tx, meta, staged, live, stranded, &mut out, false, seq, row)?;
+        }
+        return Ok((out, skipped));
+    };
+
+    // 2a. Rows already in the log ahead of the inserted segment.
+    let (durable, rest): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|(_, row)| matches!(row.kind, SpecKind::Foreign { .. }));
+    for (seq, row) in durable {
+        redo_row_tx(tx, meta, staged, live, stranded, &mut out, true, seq, row)?;
+    }
+
+    // 2b. The inserted segment, in the rolled-back rows' place.
+    {
         let capture = Capture::new();
         let row_staged = UsageTracker::staging();
         let (count, applied) = {
@@ -728,95 +752,115 @@ fn rewind_tx(
     }
 
     // 3. Redo, oldest first, what still stands.
-    let mut out = Stranded::default();
-    for (seq, mut row) in rows {
-        if stranded.contains(&seq) {
-            tx.remove(&meta.spec, seq_key(seq));
-            if matches!(row.kind, SpecKind::Shadow { .. } | SpecKind::Hint { .. }) {
-                tx.remove(&meta.spec_live, seq_key(seq));
-                counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)?;
-            }
-            match row.kind {
-                SpecKind::Shadow { rid, op, .. } => {
-                    enqueue_replay_tx(tx, meta, row.origin, rid, op)?;
-                    out.shadows += 1;
-                }
-                SpecKind::Local { first, .. } => {
-                    strand_local_tx(tx, meta, first, row.origin)?;
-                    out.locals += 1;
-                }
-                SpecKind::Hint { .. } | SpecKind::Foreign { .. } => out.hints += 1,
-            }
-            continue;
-        }
-        let durable = matches!(row.kind, SpecKind::Foreign { .. });
-        if !durable && !live.contains_key(&seq) {
-            // Retired speculation: the segment that retired it was
-            // captured after it (it was outstanding then), and that
-            // `Foreign` row's redo carries its effect. (A `Local` row that
-            // shipped while older speculation was outstanding was turned
-            // into a `Foreign` row at that moment — `retire_local_tx`.)
-            tx.remove(&meta.spec, seq_key(seq));
-            continue;
-        }
-        let records: Vec<LogRecord> = match &row.kind {
-            SpecKind::Local { first, .. } => {
-                let last = local::get_journal_tx_head(&*tx, meta, *first)?
-                    .map(|t| t.last)
-                    .ok_or_else(|| {
-                        MetaError::Invalid(format!(
-                            "Local speculation row {seq} has no journal_tx row at {first}"
-                        ))
-                    })?;
-                local::journal_records(&*tx, meta, *first, last)?
-                    .into_iter()
-                    .map(|(_, rec)| rec)
-                    .collect()
-            }
-            _ => row.records.clone(),
-        };
-        let capture = Capture::new();
-        let row_staged = UsageTracker::staging();
-        {
-            let cx = ApplyCx {
-                dirty: meta.dirty_capturing(&capture),
-                durable,
-            };
-            for rec in &records {
-                if let Some(why) = apply_record(tx, meta, cx, rec, &row_staged)? {
-                    tracing::debug!(why, ?rec, "speculation redo: record skipped");
-                }
-            }
-        }
-        row.usage = row_staged.raw_delta();
-        staged.adjust(row.usage.0, row.usage.1);
-        row.before = capture.into_before();
-        if !renumber {
-            put_row(tx, &meta.spec, seq, &row)?;
-            continue;
-        }
-        tx.remove(&meta.spec, seq_key(seq));
-        let new_seq = next_spec_seq_tx(tx, &meta.local)?;
-        put_row(tx, &meta.spec, new_seq, &row)?;
-        match live.get(&seq) {
-            Some(LiveEntry::Local { first, .. }) => {
-                if let Some(mut jt) = local::get_journal_tx(&*tx, meta, *first)? {
-                    jt.spec_seq = Some(new_seq);
-                    local::put_journal_tx(tx, meta, *first, &jt)?;
-                }
-            }
-            Some(entry) => {
-                tx.remove(&meta.spec_live, seq_key(seq));
-                tx.insert(
-                    &meta.spec_live,
-                    seq_key(new_seq),
-                    postcard::to_allocvec(entry)?,
-                );
-            }
-            None => {}
-        }
+    for (seq, row) in rest {
+        redo_row_tx(
+            tx, meta, staged, live, stranded, &mut out, renumber, seq, row,
+        )?;
     }
     Ok((out, skipped))
+}
+
+/// One row of [`rewind_tx`]'s redo: take it out if stranded, drop it if it
+/// is retired speculation, otherwise re-apply its records under a fresh
+/// capture (and, with `renumber`, move it to a fresh `spec_seq`).
+#[allow(clippy::too_many_arguments)]
+fn redo_row_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    staged: &UsageTracker,
+    live: &HashMap<u64, LiveEntry>,
+    stranded: &HashSet<u64>,
+    out: &mut Stranded,
+    renumber: bool,
+    seq: u64,
+    mut row: SpecRow,
+) -> Result<(), MetaError> {
+    if stranded.contains(&seq) {
+        tx.remove(&meta.spec, seq_key(seq));
+        if matches!(row.kind, SpecKind::Shadow { .. } | SpecKind::Hint { .. }) {
+            tx.remove(&meta.spec_live, seq_key(seq));
+            counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)?;
+        }
+        match row.kind {
+            SpecKind::Shadow { rid, op, .. } => {
+                enqueue_replay_tx(tx, meta, row.origin, rid, op)?;
+                out.shadows += 1;
+            }
+            SpecKind::Local { first, .. } => {
+                strand_local_tx(tx, meta, first, row.origin)?;
+                out.locals += 1;
+            }
+            SpecKind::Hint { .. } | SpecKind::Foreign { .. } => out.hints += 1,
+        }
+        return Ok(());
+    }
+    let durable = matches!(row.kind, SpecKind::Foreign { .. });
+    if !durable && !live.contains_key(&seq) {
+        // Retired speculation: the segment that retired it was
+        // captured after it (it was outstanding then), and that
+        // `Foreign` row's redo carries its effect. (A `Local` row that
+        // shipped while older speculation was outstanding was turned
+        // into a `Foreign` row at that moment — `retire_local_tx`.)
+        tx.remove(&meta.spec, seq_key(seq));
+        return Ok(());
+    }
+    let records: Vec<LogRecord> = match &row.kind {
+        SpecKind::Local { first, .. } => {
+            let last = local::get_journal_tx_head(&*tx, meta, *first)?
+                .map(|t| t.last)
+                .ok_or_else(|| {
+                    MetaError::Invalid(format!(
+                        "Local speculation row {seq} has no journal_tx row at {first}"
+                    ))
+                })?;
+            local::journal_records(&*tx, meta, *first, last)?
+                .into_iter()
+                .map(|(_, rec)| rec)
+                .collect()
+        }
+        _ => row.records.clone(),
+    };
+    let capture = Capture::new();
+    let row_staged = UsageTracker::staging();
+    {
+        let cx = ApplyCx {
+            dirty: meta.dirty_capturing(&capture),
+            durable,
+        };
+        for rec in &records {
+            if let Some(why) = apply_record(tx, meta, cx, rec, &row_staged)? {
+                tracing::debug!(why, ?rec, "speculation redo: record skipped");
+            }
+        }
+    }
+    row.usage = row_staged.raw_delta();
+    staged.adjust(row.usage.0, row.usage.1);
+    row.before = capture.into_before();
+    if !renumber {
+        put_row(tx, &meta.spec, seq, &row)?;
+        return Ok(());
+    }
+    tx.remove(&meta.spec, seq_key(seq));
+    let new_seq = next_spec_seq_tx(tx, &meta.local)?;
+    put_row(tx, &meta.spec, new_seq, &row)?;
+    match live.get(&seq) {
+        Some(LiveEntry::Local { first, .. }) => {
+            if let Some(mut jt) = local::get_journal_tx(&*tx, meta, *first)? {
+                jt.spec_seq = Some(new_seq);
+                local::put_journal_tx(tx, meta, *first, &jt)?;
+            }
+        }
+        Some(entry) => {
+            tx.remove(&meta.spec_live, seq_key(seq));
+            tx.insert(
+                &meta.spec_live,
+                seq_key(new_seq),
+                postcard::to_allocvec(entry)?,
+            );
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 /// Roll back and take out every outstanding entry `strands` selects (see
@@ -951,28 +995,53 @@ fn journal_from(r: &impl Readable, meta: &Meta) -> Result<u64, MetaError> {
 /// row that must survive compaction (something older is still
 /// outstanding) is turned into a `Foreign` row carrying its records, so a
 /// later rollback past it redoes it as the durable content it now is.
+///
+/// Plan 30 §M4 (poison-record isolation, `store::held`): a ship may skip
+/// held-back transactions, so the shipped set is not always "everything
+/// up to `upto`". With `only`, just the transactions it covers retire; a
+/// held transaction below `upto` stays outstanding, and every shipped row
+/// newer than it becomes a `Foreign` row — shipped out of order, but by
+/// construction touching none of its keys. `None` means everything from
+/// the acked watermark through `upto` (`Meta::ack_journal`).
 pub(crate) fn retire_local_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     upto: u64,
     applied_seq: u64,
-) -> Result<usize, MetaError> {
+    only: Option<Shipped<'_>>,
+) -> Result<Retired, MetaError> {
     // From the acked watermark (not the start of the keyspace): the cost
     // is what just shipped, not everything ever shipped.
     let from = journal_from(tx, meta)?;
     if upto < from {
-        return Ok(0);
+        return Ok(Retired::default());
     }
     let mut shipped: Vec<(u64, local::JournalTxHead)> = Vec::new();
+    // Plan 30 §M4: a transaction in the shipped range that did not ship
+    // was held back (`store::held`). Noticed for free on the scan this
+    // retirement does anyway, and it is what decides whether any of the
+    // held-set work below is needed at all.
+    let mut held_below = false;
     for guard in tx.range(&meta.journal_tx, local::tx_key(from)..=local::tx_key(upto)) {
         let (k, v) = guard.into_inner()?;
         let row: local::JournalTxHead = postcard::from_bytes(&v)?;
-        if row.last <= upto {
-            shipped.push((local::decode_tx_key(&k)?, row));
+        let first = local::decode_tx_key(&k)?;
+        let in_ship = match only {
+            Some(Shipped::Run(start)) => first >= start,
+            Some(Shipped::Set(set)) => set.contains(&first),
+            None => true,
+        };
+        if row.last <= upto && in_ship {
+            shipped.push((first, row));
+        } else {
+            held_below = true;
         }
     }
     if shipped.is_empty() {
-        return Ok(0);
+        return Ok(Retired {
+            retired: 0,
+            held_below,
+        });
     }
     let captured = shipped
         .iter()
@@ -988,13 +1057,24 @@ pub(crate) fn retire_local_tx(
         KV_UNCAPTURED_TX_COUNT,
         -((shipped.len() - captured) as i64),
     )?;
-    // A retired row only outlives compaction when an older requester
-    // entry is still outstanding (`Local` rows retire in journal order):
-    // only then does it need converting.
-    let boundary = if counter_get(tx, &meta.local, KV_SPEC_LIVE_COUNT)? > 0 {
-        oldest_outstanding(tx, meta, upto.saturating_add(1))?
+    // A retired row outlives compaction when an older entry is still
+    // outstanding: a requester shadow or hint, or (plan 30 §M4) one of
+    // this node's own transactions held back below `upto`. Only then does
+    // it need converting. `Local` rows otherwise retire in journal order,
+    // so with nothing held and no requester entry outstanding there is no
+    // boundary and nothing to look up — M3b's fast path, which plan 30 §M4
+    // round 1 lost by always computing it from `from` (a counter read per
+    // kind plus a `journal_tx` walk over the just-deleted range, twice
+    // with the compaction below, on every ack).
+    let (boundary, compact_from) = if held_below {
+        (oldest_outstanding(tx, meta, from)?, from)
+    } else if counter_get(tx, &meta.local, KV_SPEC_LIVE_COUNT)? > 0 {
+        (
+            oldest_outstanding(tx, meta, upto.saturating_add(1))?,
+            upto.saturating_add(1),
+        )
     } else {
-        None
+        (None, upto.saturating_add(1))
     };
     let mut retired = 0;
     for (first, row) in &shipped {
@@ -1015,15 +1095,48 @@ pub(crate) fn retire_local_tx(
             put_row(tx, &meta.spec, seq, &spec_row)?;
         }
     }
-    compact_tx(tx, meta, upto.saturating_add(1))?;
-    Ok(retired)
+    compact_tx(tx, meta, compact_from)?;
+    Ok(Retired {
+        retired,
+        held_below,
+    })
+}
+
+/// Which journal rows a ship covered, for [`retire_local_tx`] (plan 30
+/// §M4): the ordinary contiguous run — checked without building a set —
+/// or, when held transactions were skipped, the exact set of seqs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Shipped<'a> {
+    /// Every row from this seq through `upto`.
+    Run(u64),
+    Set(&'a HashSet<u64>),
+}
+
+/// What [`retire_local_tx`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Retired {
+    /// Captured transactions retired.
+    pub retired: usize,
+    /// A transaction inside the shipped range did not ship (it is held
+    /// back, `store::held`): the journal's acked watermark must stop below
+    /// it (`journal::ack_rows_at`).
+    pub held_below: bool,
 }
 
 /// The earliest before-image of every key touched by the rows from
 /// `first` (the oldest outstanding `Local` row) on, for the publisher
-/// (`Meta::publish_basis_at`). `None` if anything but `Local` rows sits in
-/// that range — a state the insert-before rule should never leave, but in
-/// which the overlay would not be the log prefix, so the publish defers.
+/// (`Meta::publish_basis_at`).
+///
+/// Plan 30 §M4: a `Foreign` row in that range is one of this node's own
+/// transactions that shipped while an older one was held back
+/// (`store::held`). It is in the log, so its keys keep their current
+/// values — which is right only if it touched none of the keys an older
+/// outstanding row did (the holdback rule guarantees exactly that: a
+/// transaction touching a held key is held too). A later outstanding row
+/// may touch its keys; that row's before-image then already includes it.
+/// `None` if a `Foreign` row does overlap, or anything but `Local` and
+/// `Foreign` rows sits in the range: the overlay would not be the log
+/// prefix, so the publish defers.
 pub(crate) fn local_before_images_from(
     r: &impl Readable,
     meta: &Meta,
@@ -1031,11 +1144,18 @@ pub(crate) fn local_before_images_from(
 ) -> Result<Option<LogPrefixView>, MetaError> {
     let mut view = LogPrefixView::default();
     for (_, row) in read_rows_from(r, &meta.spec, first)? {
-        if !matches!(row.kind, SpecKind::Local { .. }) {
-            return Ok(None);
-        }
-        for (key, before) in &row.before {
-            view.note(key, before);
+        match row.kind {
+            SpecKind::Local { .. } => {
+                for (key, before) in &row.before {
+                    view.note(key, before);
+                }
+            }
+            SpecKind::Foreign { .. } => {
+                if row.before.iter().any(|(key, _)| view.contains(key)) {
+                    return Ok(None);
+                }
+            }
+            SpecKind::Shadow { .. } | SpecKind::Hint { .. } => return Ok(None),
         }
     }
     Ok(Some(view))
@@ -1082,6 +1202,124 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
     let from = journal_from(tx, meta)?;
     compact_tx(tx, meta, from)?;
     Ok(())
+}
+
+// ------------------------------------------------- poison isolation
+
+/// The `ns` keys a captured row touched, and the `spec_seq` it was first
+/// recorded under.
+type RowKeysAndOrigin = Option<(Vec<Vec<u8>>, u64)>;
+
+/// Plan 30 §M4 (`store::held`): the `ns` keys a captured row touched and
+/// the `spec_seq` it was first recorded under, without its values.
+pub(crate) fn row_keys_and_origin(
+    r: &impl Readable,
+    meta: &Meta,
+    seq: u64,
+) -> Result<RowKeysAndOrigin, MetaError> {
+    match r.get(&meta.spec, seq_key(seq))? {
+        Some(v) => {
+            let row: SpecRow = postcard::from_bytes(&v)?;
+            Ok(Some((
+                row.before.into_iter().map(|(key, _)| key).collect(),
+                row.origin,
+            )))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Plan 30 §M4's `repair drop-held`: roll back the captured transactions
+/// whose `spec_seq`s are `seqs` (and nothing else), in the caller's
+/// transaction. Exactly a deposition's stranding (`rewind_tx`), restricted
+/// to these rows: their effects are undone, their journal rows deleted,
+/// their ops queued for replay by rid under their origin; everything after
+/// them that still stands is redone.
+pub(crate) fn strand_seqs_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    staged: &UsageTracker,
+    seqs: &HashSet<u64>,
+) -> Result<Stranded, MetaError> {
+    let live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
+    let stranded: HashSet<u64> = seqs
+        .iter()
+        .copied()
+        .filter(|seq| matches!(live.get(seq), Some(LiveEntry::Local { .. })))
+        .collect();
+    let Some(&cutoff) = stranded.iter().min() else {
+        return Ok(Stranded::default());
+    };
+    let out = rewind_tx(tx, meta, staged, &live, &stranded, cutoff, None)?.0;
+    let from = journal_from(tx, meta)?;
+    compact_tx(tx, meta, from)?;
+    Ok(out)
+}
+
+/// Replace the queued replay at `key` with `op`, already refused for
+/// `refusal`: the drain then materializes `op`'s conflict copy instead of
+/// replaying it (`cli::recovery`). Used by `repair drop-held`, whose
+/// dropped transaction must never be re-executed.
+pub(crate) fn refuse_queued_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    key: u64,
+    rid: Rid,
+    op: MutateOp,
+    refusal: Refusal,
+) -> Result<(), MetaError> {
+    if tx.get(&meta.pending_replay, seq_key(key))?.is_none() {
+        counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, 1)?;
+    }
+    let row = QueuedReplay {
+        rid,
+        op,
+        refused: Some(refusal),
+    };
+    tx.insert(
+        &meta.pending_replay,
+        seq_key(key),
+        postcard::to_allocvec(&row)?,
+    );
+    Ok(())
+}
+
+/// The queued replay at `key`, if any: `(rid, op)`.
+pub(crate) fn queued_at(
+    r: &impl Readable,
+    meta: &Meta,
+    key: u64,
+) -> Result<Option<(Rid, MutateOp)>, MetaError> {
+    match r.get(&meta.pending_replay, seq_key(key))? {
+        Some(v) => {
+            let row: QueuedReplay = postcard::from_bytes(&v)?;
+            Ok(Some((row.rid, row.op)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Every queued replay, oldest first, read through `r` (see
+/// [`Meta::pending_replays`]).
+pub(crate) fn read_pending_replays(
+    r: &impl Readable,
+    meta: &Meta,
+) -> Result<Vec<StrandedOp>, MetaError> {
+    let mut out = Vec::new();
+    if counter_get(r, &meta.local, KV_PENDING_REPLAY_COUNT)? == 0 {
+        return Ok(out);
+    }
+    for guard in r.iter(&meta.pending_replay) {
+        let (k, v) = guard.into_inner()?;
+        let row: QueuedReplay = postcard::from_bytes(&v)?;
+        out.push(StrandedOp {
+            queue_seq: decode_seq(&k)?,
+            rid: row.rid,
+            op: row.op,
+            refused: row.refused,
+        });
+    }
+    Ok(out)
 }
 
 // ------------------------------------------------------------ Meta API
@@ -1341,21 +1579,7 @@ impl Meta {
     /// replay drain asks every 250 ms; an empty queue is one counter read.
     pub fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {
         let r = self.db.read_tx();
-        let mut out = Vec::new();
-        if counter_get(&r, &self.local, KV_PENDING_REPLAY_COUNT)? == 0 {
-            return Ok(out);
-        }
-        for guard in r.iter(&self.pending_replay) {
-            let (k, v) = guard.into_inner()?;
-            let row: QueuedReplay = postcard::from_bytes(&v)?;
-            out.push(StrandedOp {
-                queue_seq: decode_seq(&k)?,
-                rid: row.rid,
-                op: row.op,
-                refused: row.refused,
-            });
-        }
-        Ok(out)
+        read_pending_replays(&r, self)
     }
 
     /// Queue `op` for replay by `rid` directly, after everything already

@@ -576,6 +576,18 @@ impl Meta {
         }
     }
 
+    /// Plan 30 §M4 item 3: whether `ns` under `snap` is exactly the log
+    /// prefix at its `applied_seq` — nothing speculative outstanding and
+    /// nothing of this node's own journaled. Only then may a follower
+    /// treat a commit that covers its applied position as covering every
+    /// key it has dirty (`cli::mtree_publish::TreePublisher::follow_head`).
+    pub fn is_log_prefix_at(&self, snap: &Snapshot) -> Result<bool, MetaError> {
+        Ok(counter_get(snap, &self.local, KV_SPEC_LIVE_COUNT)? == 0
+            && counter_get(snap, &self.local, KV_LOCAL_SPEC_COUNT)? == 0
+            && counter_get(snap, &self.local, KV_UNCAPTURED_TX_COUNT)? == 0
+            && journal::take(snap, &self.journal_ks, &self.local, 1)?.is_empty())
+    }
+
     /// `ns`'s value at `key` under `view` (see [`LogPrefixView::get`]).
     pub fn ns_get_via_at(
         &self,
@@ -787,6 +799,69 @@ mod tests {
                 "a ship-path scan reached below its floor"
             );
         }
+    }
+
+    /// Plan 30 §M4 round 2: with nothing poisoned or held, the ship plan,
+    /// the upload pass's bookkeeping, the retirement and the ack do no
+    /// held-set work at all — M3b's ship path, unchanged. A malformed
+    /// `poisoned/` mark is planted behind the counter's back: any path that
+    /// scans the marks while the counter reads zero fails to decode it. The
+    /// held-work counter stays at zero across many writes and ships, and
+    /// moves once something is held (non-vacuity).
+    #[test]
+    fn ship_path_does_no_held_set_work_when_nothing_is_held() {
+        use std::sync::atomic::Ordering;
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        {
+            let mut tx = meta.db.write_tx();
+            tx.insert(&meta.local, b"poisoned/garbage".to_vec(), Vec::new());
+            tx.commit().unwrap();
+        }
+        let mut segment = 0;
+        for n in 1..=30 {
+            create(&meta, n);
+            meta.note_unrecoverable_chunks(&[], false).unwrap();
+            meta.note_unrecoverable_chunks(&[], true).unwrap();
+            let rows: Vec<u64> = meta
+                .take_journal_grouped(usize::MAX)
+                .unwrap()
+                .into_iter()
+                .flat_map(|(_, b)| b)
+                .map(|(s, _)| s)
+                .collect();
+            assert_eq!(rows.len(), 2, "op + Completed");
+            segment += 1;
+            meta.ack_journal_rows_at(&rows, segment).unwrap();
+        }
+        assert_eq!(meta.journal_len().unwrap(), 0);
+        assert_eq!(meta.speculation_counts().unwrap().local, 0);
+        assert_eq!(meta.held_work.load(Ordering::Relaxed), 0);
+        assert!(meta.unrecoverable_chunks().unwrap().is_empty());
+
+        // Non-vacuity: once a chunk is recorded unrecoverable and a
+        // manifest names it, the held-set paths run.
+        let mut tx = meta.db.write_tx();
+        tx.remove(&meta.local, b"poisoned/garbage".to_vec());
+        tx.commit().unwrap();
+        let lost = constellation_fs_core::ChunkHash::of(b"gone");
+        let ino = (3 << 40) | 1;
+        meta.set_manifest_dirty(ino, None, b"not a manifest", 4, &[lost])
+            .unwrap();
+        create(&meta, 31);
+        meta.note_unrecoverable_chunks(&[(lost, ino)], true)
+            .unwrap();
+        let rows: Vec<u64> = meta
+            .take_journal_grouped(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, b)| b)
+            .map(|(s, _)| s)
+            .collect();
+        segment += 1;
+        meta.ack_journal_rows_at(&rows, segment).unwrap();
+        assert!(meta.held_work.load(Ordering::Relaxed) >= 2, "plan and ack");
+        assert_eq!(meta.held_summary().transactions, 1);
     }
 
     /// Retiring a ship's transactions deletes exactly their `spec` rows and

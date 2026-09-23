@@ -195,6 +195,9 @@ pub struct TreePublisher {
     /// seq 1 is proof enough that the chain is still empty.
     empty_chain_seen: Option<std::time::Instant>,
     handle: tokio::runtime::Handle,
+    /// Plan 30 §M4 item 3: the newest commit [`Self::follow_head`] has
+    /// seen, so a follower's head probe starts from there.
+    followed: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -264,6 +267,7 @@ impl TreePublisher {
             hydrated: false,
             empty_chain_seen: None,
             handle,
+            followed: 0,
         }
     }
 
@@ -386,6 +390,60 @@ impl TreePublisher {
                 Ok(Some(commit))
             }
         }
+    }
+
+    /// Plan 30 §M4 item 3: what a node that does not hold the lease does
+    /// instead of publishing. Only the holder publishes commits — every
+    /// other node used to publish its own view of the same log too, which
+    /// cost each of them the condemned-list reads, the head discovery and
+    /// the planning of every publish, and grew with the node count (L8) —
+    /// so a follower's dirty set would otherwise only grow. Once the head
+    /// commit's `applied` covers this replica's applied position, and the
+    /// replica is exactly that log prefix (no speculation, nothing of its
+    /// own journaled), every key it has dirty is reflected in the head
+    /// tree: the dirty marks observed in that same snapshot are cleared.
+    /// A key re-dirtied since keeps its mark (`Meta::clear_dirty_upto`).
+    ///
+    /// Costs one head probe (the same GET-next probe a publish makes) per
+    /// call, which the caller makes at most once per idle-publish interval
+    /// and only while something is dirty. Does not adopt the head as a
+    /// publish parent: that needs the head's pack indices, which only a
+    /// publish loads (`adopt_head`), should this node become the holder.
+    /// Returns how many dirty keys were cleared.
+    pub async fn follow_head(&mut self) -> Result<usize> {
+        if !self.meta.has_dirty() || self.meta.has_outstanding_speculation() {
+            return Ok(0);
+        }
+        let known = self
+            .followed
+            .max(self.state.as_ref().map(|s| s.seq).unwrap_or(0));
+        let Some(head) = self.chain.discover_head(known).await? else {
+            return Ok(0);
+        };
+        self.followed = head;
+        let Some(commit) = self.chain.get(head).await? else {
+            return Ok(0);
+        };
+        let meta = Arc::clone(&self.meta);
+        type DirtySnapshot = Vec<(Vec<u8>, u64)>;
+        let observed = meta.read_consistent(|snap| -> Result<Option<DirtySnapshot>> {
+            let mine = meta.applied_seq_at(snap)?;
+            if !vector_covers(commit.applied, mine) || !meta.is_log_prefix_at(snap)? {
+                return Ok(None);
+            }
+            Ok(Some(meta.dirty_snapshot(snap)?))
+        })?;
+        let Some(observed) = observed else {
+            return Ok(0);
+        };
+        self.meta.clear_dirty_upto(&observed)?;
+        tracing::debug!(
+            head,
+            applied = commit.applied,
+            cleared = observed.len(),
+            "follower cleared dirty keys the head commit covers"
+        );
+        Ok(observed.len())
     }
 
     /// Publish whatever is dirty and return the commit that now
@@ -1127,6 +1185,51 @@ mod tests {
                 .unwrap();
         }
         dir
+    }
+
+    /// Plan 30 §M4 item 3: a follower never publishes; it clears its dirty
+    /// keys once — and only once — the head commit covers its applied
+    /// position, and writes nothing to the bucket doing so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_clears_dirty_keys_only_once_the_head_covers_it() {
+        let mut f = Fixture::new();
+        seed(&f.meta, 3);
+        f.meta.set_applied_seq(5).unwrap();
+        let mut holder = f.publisher(1);
+        let commit = publish(&mut holder).await.expect("a commit");
+        assert_eq!(commit.applied, 5);
+
+        // A follower that tailed the same records (durable, unjournaled).
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        meta.set_node_prefix(2).unwrap();
+        let records: Vec<LogRecord> = f
+            .meta
+            .peek_journal_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        meta.apply_records(&records).unwrap();
+        let store = Arc::clone(&f.store);
+        let mut follower = f.publisher_over(Arc::clone(&meta), store, 2);
+        assert!(meta.has_dirty());
+
+        // Ahead of the head: the head misses what it applied since.
+        meta.set_applied_seq(6).unwrap();
+        assert_eq!(follower.follow_head().await.unwrap(), 0);
+        assert!(meta.has_dirty());
+
+        // Covered: every dirty key clears, and no commit is written.
+        meta.set_applied_seq(5).unwrap();
+        assert!(follower.follow_head().await.unwrap() > 0);
+        assert!(!meta.has_dirty());
+        let chain = CommitChain::new(Arc::clone(&f.store));
+        assert_eq!(chain.discover_head(0).await.unwrap(), Some(commit.seq));
+
+        // A local journaled write is not in any commit: nothing clears.
+        meta.create(ROOT_INO, "mine", 0o644, 0, 0).unwrap();
+        assert_eq!(follower.follow_head().await.unwrap(), 0);
+        assert!(meta.has_dirty());
     }
 
     /// The claim the whole step rests on: a tree grown one publish at a

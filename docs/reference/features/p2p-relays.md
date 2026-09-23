@@ -119,6 +119,39 @@ custom URL, or `custom(N urls)`. The peers UI shows it next to the P2P
 enabled flag. Per-peer coop stats may report `path: relay` once a transfer
 actually used a relayed QUIC path.
 
+Plan 30 M4: each peer's `paths` object shows the open network paths of
+this node's pooled connection to it right now (iroh 1.x runs on `noq`,
+which does QUIC multipath: one connection keeps several paths open):
+
+| Field | Meaning |
+|---|---|
+| `selected` | `direct` or `relay`: the path application data uses now; empty when no connection is pooled |
+| `direct`, `relay` | how many direct (UDP/IP) and relay paths are open |
+| `multipath` | more than one path is open, so the selected one can fail over without a new handshake |
+| `rtts` | each open path's RTT estimate, `kind:ms`, selected first |
+
+The dashboard shows `direct · 1d/1r` when both are open; the peers page
+lists every path. The snapshot covers connections this node dialed; a
+peer that only ever dials in shows none until this node sends it a
+request.
+
+#### Failover from a direct path to a relay
+
+With relays enabled, a connection starts on the relay path and adds a
+direct path once holepunching validates one; iroh then selects the direct
+path, and the relay path stays open alongside it (`multipath: true`,
+`1d/1r`). When the direct path fails — a NAT rebinding, a firewall
+change, a laptop switching networks — the connection does not drop:
+`noq` moves traffic to the still-open relay path, QUIC streams in flight
+continue, and `selected` flips to `relay`. Constellation notices only a
+higher RTT for that peer (source selection and lease placement use
+measured RTTs, never the path kind). iroh keeps trying to re-establish a
+direct path and switches back when one validates. Only if every path is
+gone does the connection close; the next request dials afresh, and every
+P2P caller already falls back to S3 on a failed request. With relays
+disabled there is no second path: a failed direct path closes the
+connection, and the next request re-dials the registry addresses.
+
 ## Troubleshooting
 
 ### Peers stay disconnected with relays enabled

@@ -1,6 +1,6 @@
 //! Transport-agnostic run loop.
 
-use crate::check::{check_history, CheckFailure};
+use crate::check::{check_history, check_step_invariants, CheckFailure};
 use crate::cluster::Cluster;
 use crate::gen::{Generator, Profile, Step};
 use crate::history::History;
@@ -60,7 +60,7 @@ impl Coordinator {
                 tracing::info!(tag = %step.tag, elapsed_s = started.elapsed().as_secs(), "step ok");
                 {
                     let h = history.lock().expect("history");
-                    if let Err(e) = check_history(&h) {
+                    if let Err(e) = check_step_invariants(&h) {
                         bail!("{e}");
                     }
                 }
@@ -333,6 +333,10 @@ fn prep_step(
         let id_str = step.tag.strip_prefix("rename_storm:").unwrap_or("");
         let path = format!("{work}/rs{id_str}");
         seed_create(cluster, history, op_ids, &path)?;
+    } else if let Some(id_str) = step.tag.strip_prefix("move_read:") {
+        seed_create(cluster, history, op_ids, &format!("{work}/mv{id_str}"))?;
+    } else if let Some(id_str) = step.tag.strip_prefix("link_read:") {
+        seed_create(cluster, history, op_ids, &format!("{work}/ln{id_str}"))?;
     } else if step.tag.starts_with("chmod_duel:") {
         let name = step.tag.strip_prefix("chmod_duel:").unwrap_or("");
         let path = format!("{work}/{name}");
@@ -372,7 +376,7 @@ fn extract_work_root(step: &Step) -> String {
             | Op::Read { path }
             | Op::ReadAt { path, .. }
             | Op::Stat { path } => path.as_str(),
-            Op::Rename { from, .. } => from.as_str(),
+            Op::Rename { from, .. } | Op::Link { from, .. } => from.as_str(),
         };
         if let Some((root, _)) = path.split_once('/') {
             return root.to_string();
