@@ -182,6 +182,20 @@ pub enum Payload {
         epoch_seen: u64,
         /// Postcard bytes of `constellation_meta::MutateOp`.
         op: Vec<u8>,
+        /// Plan 30 §M2: this op's exactly-once identity. Stable across
+        /// every retry of the same op (unlike `req_id`, a fresh
+        /// per-attempt correlation id every time) — the holder keys its
+        /// dedup/`recent`-outcome lookup on this, not on `req_id`. A
+        /// plain `(u64, u32, u64)` here rather than importing
+        /// `constellation_meta::Rid`: this crate stays free of the
+        /// metadata dependency (see the module doc).
+        rid: (u64, u32, u64),
+        /// Plan 30 §M2 GC: the highest contiguous `rid.seq` of this
+        /// requester's current incarnation whose reply it has already
+        /// received. The holder drops `recent` outcomes for that
+        /// requester's incarnation up to this seq — a request carries
+        /// its own future GC receipt.
+        acked_through: u64,
     },
     /// Holder's answer: postcard-encoded `MutateOutcome`.
     MutateReply {

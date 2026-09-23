@@ -157,6 +157,7 @@ pub trait PeerService: Send + Sync + 'static {
     }
     /// Non-holder asked us to journal `op`. Default declines with an
     /// empty outcome; callers treat that as `MutateOutcome::Busy`.
+    #[allow(clippy::too_many_arguments)]
     fn mutate_requested(
         &self,
         _part: String,
@@ -164,6 +165,8 @@ pub trait PeerService: Send + Sync + 'static {
         req_id: u64,
         _epoch_seen: u64,
         _op: Vec<u8>,
+        _rid: (u64, u32, u64),
+        _acked_through: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::MutateReply {

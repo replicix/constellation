@@ -223,11 +223,21 @@ pub enum SyncRequest {
         part: String,
         requester: u64,
         op: Vec<u8>,
+        /// Plan 30 §M2: the op's exactly-once identity, for holder-side
+        /// dedup (`forward::holder_execute`).
+        rid: constellation_meta::Rid,
+        /// Plan 30 §M2 GC: prune `recent` outcomes for `requester`'s
+        /// current incarnation up to this seq.
+        acked_through: u64,
         reply: tokio::sync::oneshot::Sender<constellation_meta::MutateOutcome>,
     },
     Forward {
         part: String,
         op: constellation_meta::MutateOp,
+        /// Plan 30 §M2: allocated once in `mutate_op_rebasable` and kept
+        /// across every retry this op goes through (forward, redirected
+        /// forward, or the lease path).
+        rid: constellation_meta::Rid,
         reply: tokio::sync::oneshot::Sender<Result<constellation_meta::MutateOutcome, String>>,
     },
     ApplyPushed {
@@ -278,6 +288,27 @@ pub struct SyncHandle {
     /// A read-only registry member never enters the write gate.
     pub read_only_member: bool,
     pub write_mode: Arc<crate::writeback::WriteModeState>,
+    /// Plan 30 §M2: this mount's node id and incarnation, and the
+    /// shared per-incarnation seq counter — everything
+    /// `mutate_op_rebasable` needs to allocate this op's rid at the top,
+    /// before any forward or lease-acquisition attempt.
+    pub node_id: u64,
+    pub incarnation: u32,
+    pub next_rid_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Plan 30 §M2: incremented when the lease-path, last-resort check
+    /// (`self.meta.completed_position(rid)`) finds an op already
+    /// completed and returns success without executing it again — the
+    /// in-doubt case the coverage rule resolves. Distinct from
+    /// `ForwardState::dedup_hits` (the holder-side, network-visible
+    /// dedup), since this happens purely locally after a takeover.
+    pub indoubt_resolved: Arc<std::sync::atomic::AtomicU64>,
+    /// Plan 30 §M2 GC: the *same* tracker `h.forward`'s `ForwardState`
+    /// uses (shared via `Arc`, see `ForwardState::acked`'s doc) — every
+    /// completion path in `mutate_op_rebasable` marks this op's rid done
+    /// here exactly once, whether or not it ever went through a forward
+    /// at all, so `acked_through` has no gaps for the holder to stall
+    /// behind.
+    pub acked: Arc<std::sync::Mutex<crate::forward::AckTracker>>,
 }
 
 /// Everything [`ConstellationFs::new`] needs besides the two filesystem
@@ -1185,6 +1216,21 @@ impl ConstellationFs {
     /// As [`Self::mutate_op`], but reporting an optimistic-concurrency
     /// rejection as [`MutateFail::Conflict`] so a caller holding the
     /// material to recompose its update can rebase and retry.
+    ///
+    /// Plan 30 §M2 GC: every completion path — success, an explicit
+    /// refusal, or giving up entirely — marks this op's rid "acked"
+    /// exactly once before returning (never left for only the forward
+    /// path to do, which is what previously stalled `acked_through`
+    /// forever behind the first op that executed locally, took a
+    /// designation/read-only/departed refusal, or fell back to the
+    /// lease path). A rid that this call never actually sends anywhere
+    /// (an early refusal, or forwarding disabled) still gets marked: the
+    /// holder never learned of it, so marking it is a no-op for GC
+    /// purposes, but *skipping* it would leave a permanent hole in the
+    /// contiguous `acked_through` floor for every later op's seq to
+    /// stall behind. The one exception is the earliest checks
+    /// (`is_synthetic`, no `self.sync`), which run *before* a rid is
+    /// even allocated — there is nothing to mark yet.
     pub(crate) fn mutate_op_rebasable(
         &self,
         part_hint_ino: Ino,
@@ -1194,10 +1240,36 @@ impl ConstellationFs {
             return Err(MutateFail::Errno(libc::EROFS));
         }
         let Some(h) = &self.sync else {
-            return constellation_meta::execute_mutate(&self.meta, &op)
+            return constellation_meta::execute_mutate(&self.meta, &op, None)
                 .map(|_| ())
                 .map_err(mutate_fail);
         };
+        // This op's exactly-once identity, allocated once, here, before
+        // any forward or lease-acquisition attempt below, and kept
+        // unchanged across every retry this call goes through (a
+        // forward, a redirected forward, or the lease-path fallback). A
+        // caller that needs a genuinely new op after a rebase (e.g.
+        // `SetManifest`'s optimistic-concurrency retry) calls back into
+        // this function again, which allocates a fresh one.
+        let rid = constellation_meta::Rid {
+            node: h.node_id,
+            incarnation: h.incarnation,
+            seq: h
+                .next_rid_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        let result = self.mutate_op_rebasable_with_rid(h, part_hint_ino, &op, rid);
+        h.acked.lock().unwrap().mark_done(rid.seq);
+        result
+    }
+
+    fn mutate_op_rebasable_with_rid(
+        &self,
+        h: &SyncHandle,
+        part_hint_ino: Ino,
+        op: &constellation_meta::MutateOp,
+        rid: constellation_meta::Rid,
+    ) -> Result<(), MutateFail> {
         if h.read_only_member {
             return Err(MutateFail::Errno(libc::EROFS));
         }
@@ -1221,7 +1293,7 @@ impl ConstellationFs {
             match self.rt.block_on(designations.check(&path)) {
                 crate::designation::GateDecision::NoDesignation => {}
                 crate::designation::GateDecision::Proceed => {
-                    return constellation_meta::execute_mutate(&self.meta, &op)
+                    return constellation_meta::execute_mutate(&self.meta, op, Some(rid))
                         .map(|_| ())
                         .map_err(mutate_fail);
                 }
@@ -1233,7 +1305,7 @@ impl ConstellationFs {
         let part = "p0".to_string();
         if let Some(view) = h.leases.lock().unwrap().get(&part) {
             if view.open_for_new_mutation() {
-                let result = constellation_meta::execute_mutate(&self.meta, &op)
+                let result = constellation_meta::execute_mutate(&self.meta, op, Some(rid))
                     .map(|_| ())
                     .map_err(mutate_fail);
                 if result.is_ok() {
@@ -1246,15 +1318,25 @@ impl ConstellationFs {
             }
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // Plan 30 §M2: set only once this op is actually handed to the
+        // sync task for forwarding — the in-doubt check below is only
+        // ever worth paying for an op that really might already have
+        // executed somewhere else. A fresh op that was never forwarded
+        // at all (forwarding disabled, or no channel to send on) cannot
+        // possibly be in `completed`, so it skips straight to executing,
+        // exactly as before M2.
+        let mut attempted_forward = false;
         if crate::forward::forwarding_enabled()
             && h.tx
                 .send(SyncRequest::Forward {
                     part: part.clone(),
                     op: op.clone(),
+                    rid,
                     reply: tx,
                 })
                 .is_ok()
         {
+            attempted_forward = true;
             match rx.blocking_recv() {
                 Ok(Ok(constellation_meta::MutateOutcome::Accepted { .. })) => return Ok(()),
                 Ok(Ok(constellation_meta::MutateOutcome::Errno(e))) => {
@@ -1281,7 +1363,32 @@ impl ConstellationFs {
         }
         self.require_lease_for(part_hint_ino)
             .map_err(MutateFail::Errno)?;
-        constellation_meta::execute_mutate(&self.meta, &op)
+        // Plan 30 §M2 in-doubt resolution, last resort: every forward
+        // attempt above ended in doubt (never an explicit refusal — that
+        // returns early above), so this op might already have taken
+        // effect on the node that used to hold. Only worth checking when
+        // a forward genuinely left the op in doubt — a fresh op that was
+        // never forwarded at all cannot possibly be in `completed` yet.
+        //
+        // Unlike the first cut of this check, there is no polling here:
+        // `require_lease_for`'s success is now an *exact* coverage
+        // witness, not a heuristic. A genuine S3-CAS takeover already
+        // tails to head as part of committing the claim
+        // (`shipper::acquire_lease_for`'s `needs_tail` /
+        // `TailedToHead`). A P2P handoff additionally waits, inside the
+        // `SyncRequest::Acquire` arm itself (before ever reporting
+        // "acquired"), until this replica's own tail reaches the
+        // departing holder's reported `head_seq` — see that arm's
+        // `pending_catchup` handling. So by the time this line runs,
+        // `completed`'s answer is final: found means the op already
+        // happened, absent means it never happened anywhere this
+        // replica could not have seen.
+        if attempted_forward && matches!(self.meta.completed_position(rid), Ok(Some(_))) {
+            h.indoubt_resolved
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        constellation_meta::execute_mutate(&self.meta, op, Some(rid))
             .map(|_| ())
             .map_err(mutate_fail)
     }

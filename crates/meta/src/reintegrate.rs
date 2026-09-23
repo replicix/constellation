@@ -148,7 +148,13 @@ pub fn classify(view: &Meta, rec: &LogRecord) -> Result<Disposition, MetaError> 
         // Atime never enters the `journal`, so reintegration of stranded
         // journal records should not see one; if it somehow does, it is
         // droppable by definition — never a conflict.
-        | LogRecord::Atime { .. } => Ok(Disposition::Clean),
+        | LogRecord::Atime { .. }
+        // `Completed` touches no inode/dentry and carries no effect of
+        // its own to reconcile — droppable by definition, like `Atime`.
+        // A stranded branch's own `Completed` row is meaningless once
+        // its op has been classified independently (the op's own record
+        // is what a conflict, if any, attaches to).
+        | LogRecord::Completed { .. } => Ok(Disposition::Clean),
     }
 }
 

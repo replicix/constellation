@@ -3946,3 +3946,165 @@ from log-prefix state.
 - [x] Both counterexamples found by the checker (release test suite 0.04–0.06 s)
 - [x] `cargo fmt`, `clippy -D warnings`, `cargo test --workspace` clean
 - [x] Model-to-code mapping reviewed by the coordinator
+
+## Plan 30 M2 — exactly-once forwarded mutations (fixes bug A): **DONE**
+
+Goal: the RIFL design applied to forwarding — every `MutateOp` gets a
+stable `Rid { node, incarnation, seq }`, the holder records completions
+in the log alongside the op's own records, a timed-out requester retries
+the same rid instead of blindly re-executing, and GC never prunes what
+an in-doubt op's resolution still depends on.
+
+| Item | Status | Where |
+|---|---|---|
+| `Protocol::ExactlyOnce` model variant: rid-tagged records (`Logged = (Option<Rid>, Record)`), holder dedup via `recent_outcome`/`rid_completed_record`, `RetryForward` (capped at `MAX_FORWARD_RETRIES = 3` — an uncapped retry loop multiplied the reachable state space ~10× per extra attempt), `Restart` bumps incarnation and resets `next_seq`/`recent` | done | `crates/model/src/protocol.rs` |
+| `exactly_once_is_linearizable`: bug A's exact config (no counterexample, `progress` witnessed) plus a pared-down crash-inclusive config (linearizable holds; `converged_at_quiescence`/`commits_are_log_prefixes` still fail — bug B, M3's job) | done | `crates/model/tests/today_bugs.rs` |
+| `today_finds_bug_a`/`today_finds_bug_b`/`single_writer_is_clean` still pass under `Today` | done | same |
+| `Rid { node: u64, incarnation: u32, seq: u64 }`, postcard-encoded, big-endian `to_key()`/`from_key()` for range-scan-friendly ordering | done | `crates/meta/src/rid.rs` |
+| `LogRecord::Completed { rid }`, appended last (postcard ordering); `Disposition::Clean` on reintegration; a no-op in `TouchSet::add` — touches no inode/dentry, like `Atime` | done | `crates/meta/src/record.rs`, `crates/meta/src/reintegrate.rs`, `crates/meta/src/replay.rs` |
+| `completed` keyspace (node-local, replicated-but-unpublished — never `ns`/`dirty`, never in `dump_replicated`): `rid.to_key() -> position(8 BE) ++ recorded_at_ms(8 BE)`; populated by `replay::apply_one`'s new arm on every tailing replica, and directly by the writer in the same transaction (see next row) | done | `crates/meta/src/store/mod.rs` |
+| `execute()` takes `rid: Option<Rid>`; a thread-local `store::journal::PendingCompletion` (an RAII guard set for the duration of `execute()`, consumed by `journal::append_tx`'s first call in the transaction) makes appending `Completed` atomic with the op's own record(s) *without* threading a rid parameter through all ~15 mutating `Meta` methods and their ~20 `append_tx` call sites | done (revised, coordinator review item 0) | `crates/meta/src/mutate.rs`, `crates/meta/src/store/journal.rs` |
+| Holder dedup: `holder_execute` checks `Meta::recent_outcome` (in-memory, per-rid, holds the actual records so a retry gets an identical reply) before executing; on `Ok`, records the outcome via `Meta::remember_outcome`. Refusals are never remembered | done | `crates/cli/src/forward.rs` |
+| Rid threaded end to end: allocated once at the top of `mutate_op_rebasable` (before any forward/lease attempt) from `SyncHandle::{node_id, incarnation, next_rid_seq}`; carried in `SyncRequest::Forward`/`SyncRequest::Mutate`, and in `Payload::MutateRequest` as a plain `(u64,u32,u64)` tuple (the `net` crate stays free of the `constellation-meta` dependency, per its own module doc) plus `acked_through: u64` | done | `crates/cli/src/fusefs.rs`, `crates/cli/src/node_runtime.rs`, `crates/net/src/message.rs`, `crates/net/src/endpoint.rs`, `crates/net/src/peers.rs` |
+| Incarnation: `Meta::bump_incarnation` persists+increments `local["incarnation"]`; called once per mount, before serving, right after `set_node_prefix` | done | `crates/meta/src/store/mod.rs`, `crates/cli/src/node_runtime.rs` |
+| Requester retry: same rid, same-then-redirected holder, backoff 200/400/600 ms (`MAX_FORWARD_RETRY_ATTEMPTS = 3`), *before* the existing one-shot `NotHolder` redirect; only `Busy` retries — an explicit refusal (`Errno`/`Conflict`/`Exists`) still ends the op immediately, unretried | done | `crates/cli/src/forward.rs` (`request_mutate`/`request_mutate_with`), `crates/cli/src/node_runtime.rs` (`SyncRequest::Forward` arm) |
+| Lease-path in-doubt resolution (last resort): after `require_lease_for` succeeds via a P2P handoff, the acquiring node's `SyncRequest::Acquire` arm now waits for its own `applied_seq`/shipped position to reach the departing holder's `head_seq` (from the handoff reply) before reporting itself acquired — bounded by the FUSE caller's own acquire deadline, reporting `busy(self)` (not `acquired`) if not caught up in time; an S3-CAS takeover's `TailedToHead` already guarantees this. `mutate_op_rebasable`'s coverage check is then exact: `completed_position(rid)` found → success, no re-execution; not found → execute with the same rid. The previous 750 ms `TailToHead` poll is removed entirely — it was a timing heuristic, not the coverage rule, and a slow upload could still race past it | done (revised, coordinator review item 2) | `crates/cli/src/fusefs.rs::mutate_op_rebasable`, `crates/cli/src/node_runtime.rs` (`SyncRequest::Acquire` arm, `pending_catchup` map), `crates/net/src/peers.rs` (`HandoffAccepted{head_seq}`) |
+| GC: `CONSTELLATION_COMPLETION_RETENTION_S` (default 900) is an additional floor in `metadata_candidates` — a segment is prunable only when *both* past the commit-based `retention_segments` floor *and* older than the retention window; a dedicated periodic task (interval = retention/4, clamped 30 s–3600 s) prunes `completed` rows past the same window, and (coordinator review item 1) the same task now also calls `Meta::prune_recent_older_than` on the same cadence and window, sweeping `recent` entries a crashed/departed peer will never ack | done | `crates/cli/src/gc.rs`, `crates/cli/src/node_runtime.rs`, `crates/meta/src/store/mod.rs` |
+| `acked_through`: `ForwardState::AckTracker` (contiguous-prefix tracker over out-of-order completions), now shared via `Arc<Mutex<AckTracker>>` between `ForwardState` and every `SyncHandle` (`fusefs::SyncHandle::acked`) so `mutate_op_rebasable` marks a rid's seq done on *every* completion path — local-holder fast path, a designation's `Proceed`, an explicit refusal, and the lease-path fallback, not just the forward path — sent as `acked_through` on every subsequent forward request; the holder drops `recent` entries for that requester's incarnation up to it | done (revised, coordinator review item 1) | `crates/cli/src/forward.rs` (`AckTracker`, `ForwardState::acked_tracker`), `crates/cli/src/fusefs.rs` (`mutate_op_rebasable`), `crates/cli/src/node_runtime.rs` (`SyncRequest::Mutate` arm) |
+| `Meta::recent`'s per-`(node,incarnation)` bucket is capped independently of acks at `MAX_RECENT_PER_INCARNATION = 4096` entries (oldest evicted first via `BTreeMap::pop_first`) in `remember_outcome`, plus the age-based `prune_recent_older_than` sweep above — so a bucket that nothing ever acks is bounded by both count and age, not just acks | done (coordinator review item 1) | `crates/meta/src/store/mod.rs` |
+| Status counters `forward_dedup_hits`, `forward_retries`, `forward_indoubt_resolved` | done | `crates/api/src/types.rs`, `crates/cli/src/main.rs`, `crates/cli/src/forward.rs`, `crates/cli/src/fusefs.rs` |
+| System-generated ops (retention pruning's unlink, best-effort atime batches) get the same rid protection via `ForwardState::next_system_rid` (`incarnation: u32::MAX`, a marker no real mount incarnation can reach, so these can never collide with or be dedup-matched against a genuine FUSE-issued rid) | done | `crates/cli/src/forward.rs`, `crates/cli/src/prune.rs`, `crates/cli/src/node_runtime.rs` |
+| Unit tests: holder dedup (identical reply, no second journal entry, a *different* op still executes), `completed` retention (`prune_completed` removes only rows past the window), in-doubt retry across two in-process replicas (dropped first reply, retried, applied once), incarnation survives a simulated restart and never repeats, thread-local completion ownership never attaches to a concurrent writer's transaction (`completion_marker_never_attaches_to_a_concurrent_writer`), `acked_through` advances across interleaved local and forwarded completions and `forget_acked_through` fully empties the bucket (`acked_through_advances_across_local_and_forwarded_completions`), `recent`'s per-bucket cap evicts oldest-first (`remember_outcome_caps_a_bucket_that_is_never_acked`), age-based pruning removes only stale buckets (`prune_recent_older_than_removes_only_stale_buckets`) | done | `crates/cli/src/forward.rs`, `crates/meta/src/store/mod.rs`, `crates/meta/tests/completion_ownership.rs` |
+| `forward-timeout-reexec` moved from `KNOWN_BUG_REPROS` into `SCENARIOS`, unchanged in setup, PASSES; strengthened with a non-vacuity check for the *fix* (not just the fault): `forward_dedup_hits + forward_indoubt_resolved` (summed over both nodes) must rise at least once across the whole run | done | `crates/harness/src/scenarios.rs` |
+| Docs: exactly-once identity, retry order, coverage rule, `CONSTELLATION_COMPLETION_RETENTION_S` | done | `docs/reference/features/forwarded-mutations.md`, `docs/reference/configuration.md`, `docs/how-to-guides/development/TESTING.md` |
+| Perf: `Meta::recent` changed from a flat `Vec` (linear scan on every forwarded execution) to `HashMap<(node,incarnation), BTreeMap<seq, records>>` (O(log(own in-flight window)) lookup, O(log n) `forget_acked_through` via `split_off`); `journal::next_seq_tx` (now called twice per completed op) changed from a decimal-string kv round trip to raw big-endian bytes | done | `crates/meta/src/store/mod.rs`, `crates/meta/src/store/journal.rs` |
+
+**Design decisions where the spec was ambiguous or the naive approach didn't scale:**
+
+- **Thread-local `PendingCompletion` instead of threading a `rid` parameter through every mutating `Meta` method (revised by coordinator review, item 0 — kept as-is).** The spec says `Completed` ships "in the same fjall transaction as the op's records." Each of `mkdir_at`/`create_at`/…/`publish_file` (~15 methods) opens and commits its *own* `fjall::write_tx()` internally, and each has its own external callers beyond `mutate::execute` (tests, reintegration, prune). Adding a `rid: Option<Rid>` parameter to all of them — and every one of *their* callers — was a much larger, higher-risk mechanical change than the alternative: `execute()` sets a thread-local (`store::journal::PendingCompletion::set(rid)`, an RAII guard that clears itself on drop) for the duration of its call, and `journal::append_tx`'s *first* call within the resulting transaction takes the pending rid and appends `Completed` alongside. The initial version of this (this milestone's first draft) used an ambient `Mutex<Option<Rid>>` plus a `Mutex<()>` held for the whole call instead of a thread-local; the coordinator's review replaced it, because the mutex version let `append_tx` pick up the rid from *any* journal-appending transaction on *any* thread — a concurrent snapshot or bootstrap write racing on another thread could steal a rid meant for a different op's transaction — and the held mutex serialized every local mutation across all FUSE dispatch threads regardless of which partition or requester they belonged to. A thread-local scopes the rid to the exact call stack that set it, closing both problems without any lock at all; `completion_marker_never_attaches_to_a_concurrent_writer` (`crates/meta/tests/completion_ownership.rs`) proves it by running `execute_mutate` against 300 rids on one thread while a concurrent thread hammers `record_snapshot` on the same `Meta`, and asserting every rid's `Completed` marker lands only in its own op's records.
+- **`Completed` is its own journal record, not folded into the op's own record.** The spec's wording ("ships with them") reads as "in the same segment," which a separate record satisfies; encoding rid fields onto every existing `LogRecord` variant would be far more invasive for no benefit `peek_journal_after` doesn't already provide (it returns every record since `execute()` started, `Completed` included, so `MutateOutcome::Accepted`'s records already carry it to the requester for free).
+- **Holder dedup answers only from the volatile `recent` map, never `completed`.** A network retry needs the *actual records* to answer with (`MutateOutcome::Accepted { records, .. }`), and once a segment ships, its individual records are no longer cheaply available locally (only the position). `completed` (durable, survives restart) is instead the *lease-path*'s source of truth after a takeover, where only presence — not the records — is needed (the caller returns `Ok(())` directly, no records to reconstruct).
+- **The coverage-rule check needs the acquiring node to actually have tailed to the departing holder's last position, not a bounded timing guess (revised by coordinator review, item 2).** The plan's own wording ("after `TailedToHead`") suggested `require_lease_for` returning `Ok` was sufficient; the first draft of this milestone instead papered over that with a 750 ms `TailToHead` poll gated on `attempted_forward`. The coordinator's review correctly called this a timing heuristic, not the coverage rule itself: a sufficiently slow upload could still exceed 750 ms and get double-executed, and the poll cost 750 ms of pure latency on the (more common) path where the op genuinely was never executed by the old holder. The fix makes the *actual* condition explicit: a P2P handoff's reply now carries `head_seq` (`net::peers::HandoffAccepted`, threaded through `Payload::LeaseHandoff`, previously read and discarded) — the highest sequence the departing holder's last flush shipped. The acquiring node's `SyncRequest::Acquire` arm records this as a `pending_catchup` target for the partition and, once `shipper::acquire_lease_for` reports the lease itself acquired, does one bounded tail attempt against that target; if `last_shipped_seq` still falls short, it reports `busy(self, self_epoch)` instead of `acquired` (the FUSE caller's own acquire-deadline retry loop drives further attempts, so a stuck catch-up surfaces as `EIO` at that deadline, not a silent double-execution). Once the target is met, `mutate_op_rebasable`'s `completed_position(rid)` check is now exact by construction: if the op was ever completed by any prior tenure, this replica has necessarily tailed past it before it is allowed to answer "acquired" at all. An S3-CAS takeover already had this property via `TailedToHead`'s own witness type and needed no change. `forward-timeout-reexec` (which specifically drives handoffs mid-forward) passed three separate times across this session with this design, including immediately after landing it, with no regression in its own timing (the fix *removes* latency — the 750 ms worst case — rather than adding it).
+- **`acked_through` must advance on every completion path, not just the forward path (coordinator review, item 1).** The first draft only called `mark_acked` from within the async forward round-trip task in `node_runtime.rs`. But every mutation — including ones that never go through that task (the holder's own local fast path, a designation's immediate `Proceed`, an explicit refusal that ends the op without forwarding, and the lease-path in-doubt fallback) — still consumes a `rid.seq` from `SyncHandle::next_rid_seq`. Any of those left a permanent gap in `AckTracker`'s contiguous-prefix floor, so `acked_through` (sent on every subsequent forward request) could never advance past the first such op for that incarnation; the holder's `forget_acked_through` — a `BTreeMap::split_off` keyed on that floor — then became a permanent no-op for that requester, and its `recent` bucket grew forever. The fix centralizes marking in `fusefs::mutate_op_rebasable` itself: the rid is allocated once at the top (unchanged), the whole body moved into a `mutate_op_rebasable_with_rid` helper, and the outer function calls `h.acked.lock().unwrap().mark_done(rid.seq)` unconditionally on `Result`, regardless of which internal branch produced it. `AckTracker` moved from `ForwardState`-private to an `Arc<Mutex<AckTracker>>` shared with `SyncHandle` (`ForwardState::acked_tracker()`) so both sides reach the same tracker. Verified by `acked_through_advances_across_local_and_forwarded_completions`, which interleaves rids marked "done" directly (simulating the local/refusal/lease-path completions the bug missed) with rids that go through the real `holder_execute` path, and asserts the floor advances past all of them and `forget_acked_through` empties the bucket completely. Independently of acks, `Meta::recent`'s per-`(node,incarnation)` bucket also gained a hard cap (`MAX_RECENT_PER_INCARNATION = 4096`, oldest-evicted-first) in `remember_outcome`, plus an age-based sweep (`prune_recent_older_than`, wired into the existing `completed`-retention periodic task on the same cadence) — so a requester that crashes mid-flight and never sends another `acked_through` at all still can't grow this table without bound.
+- **System-generated ops (retention pruning, atime batches) get rids too, via a separate `incarnation: u32::MAX` namespace.** Not required by the letter of the spec ("every `MutateOp` a FUSE call issues"), but `unlink_now` (`crates/cli/src/prune.rs`) has the *identical* forward-then-lease-fallback shape bug A had, so leaving it unprotected would just relocate the bug. `u32::MAX` is a value no real mount's persisted, monotonically-bumped incarnation counter can reach, so these rids can never collide with or be dedup-matched against a genuine FUSE-issued one.
+- **The harness scenario's non-vacuity check is per-run, not per-round.** The first attempt asserted `forward_dedup_hits + forward_indoubt_resolved` must rise in *every* round; `mkdir`/`link` (rounds 2 and 5, the same two M0 flagged as converging via idempotent-merge rather than a wrong errno) sometimes fail that per-round check while still succeeding correctly. Root cause (confirmed via `RUST_LOG=debug` and `CHAOS_KEEP_TMP=1`): when the fast-handoff race lands such that the *departing* holder never executed the op before shipping/releasing, the new holder's lease-path legitimately finds `completed_position` empty and executes fresh — exactly once, correctly, but with nothing to "dedup" that round, since there was no prior execution to be a duplicate of. Both shapes (dedup-resolved and fresh-single-execution) are exactly-once; requiring dedup evidence specifically was over-fitting a stronger claim than the milestone promises. The check moved to "the mechanism fired at least once across the whole run" (true in every observed run: 4 of 5 rounds show it), keeping the existing `ino_agrees`/result/existence checks as the actual per-round correctness proof.
+- **Performance (coordinator review, item 3): the code-path cost is small and directly measured; the harness numbers remain dominated by host scheduling noise this sandbox cannot control.** The coordinator's own idle-host baseline (`3node-p2pon-disjoint-create-lat0` 1857→1163 ops/s, `shared-create` 1449→1200, concurrent4 rows −8%…−44%) is the authoritative regression signal. Items 1 and 2 above were landed first since they were real correctness/leak fixes regardless of their effect on throughput; after landing them, a fresh `meta-bench` pass on this sandbox's host **still** showed the 3-node p2p-on create rows below the pre-M2 shape (see the tables below) — so, per the coordinator's instruction, the next step was finding the cost with real profiling rather than guessing further. `perf record -g` is unavailable in this sandbox (`perf_event_paranoid=4`, no `CAP_PERFMON`/`CAP_SYS_PTRACE`/`CAP_SYS_ADMIN` — confirmed by direct attempt, not assumed); the fallback was targeted `tracing::debug!` timing spans wrapped around the actual production code paths (not a synthetic microbenchmark), removed again once the measurement was taken. Two spans matter:
+  - **Holder side** (`node_runtime.rs`'s `SyncRequest::Mutate` arm, the `keepers.lock().await` critical section that runs `holder_execute`): `lock_wait_us` (time blocked acquiring the lock), `keeper_check_us` (reading `ship_epoch`/`is_lost`), and `holder_execute_total_us` (the dedup check + `execute_mutate`, including the new `Completed` journal write, + `remember_outcome`). Measured against `3node-p2pon-shared-create-lat0` (n=2400): `lock_wait_us` mean 171.9 µs but **p50 = 0** (only rare stalls, up to 140 ms, pull the mean up — not sustained contention); `keeper_check_us` p50 = 0, negligible; `holder_execute_total_us` — the entire cost M2 could plausibly have added — mean 119.6 µs, **p50 = 99 µs**, p90 = 202 µs, p99 = 335 µs. This matches the isolated `append_tx`/`holder_execute` timing taken earlier in this session (own record ~2-28 µs, the new `Completed` record ~0-9 µs, `execute_mutate` ~30-70 µs): the holder's own added work is tens of microseconds, not more.
+  - **Requester side** (the `SyncRequest::Forward` arm's spawned task): `gate_us`/`permit_us` (queueing behind `KeyGate`/the inflight semaphore) were ~0 at p50; `network_us` (the *entire* round trip from sending the request to the holder through receiving its reply — i.e., everything the holder-side span above measures, plus QUIC send/receive and tokio task-wakeup scheduling on both ends) had **p50 = 1660 µs**, mean 2632 µs; `apply_accepted_us` (installing the reply locally) was a separate, smaller p50 = 86 µs.
+
+  The gap is the finding: the holder's own measured critical-section cost (≤ ~300 µs even at p90) accounts for well under a fifth of the requester-observed round trip (p50 1.66 ms). The other ~1.0-1.4 ms is spent in QUIC transport and tokio scheduling on both ends — code paths M2 does not touch — and that component is demonstrably sensitive to ambient host load in this sandbox, not to the op's own service time: (1) this machine's `uptime` showed load average 2.25-3.52 with a browser, a chat client, and other active sessions competing for the same cores at measurement time (confirmed via `ps aux`, not inferred); (2) two back-to-back `meta-bench` runs of the *identical* final binary, no code change in between, produced `3node-p2pon-shared-create-lat0` agg throughput of 1325 and then 1016 ops/s — a 23% swing from noise alone; (3) merely enabling per-op `RUST_LOG=perf_probe=debug` tracing (needed to take the measurement above) cost ~20% of `3node-p2pon-disjoint-create-lat0`'s throughput by itself (1198 ops/s clean vs. 918 ops/s with logging enabled, same binary), which is why every timing span above was removed again before the final numbers and gate runs. None of this rules out that M2 costs something on an idle host — the coordinator's own numbers say it does, by more than these micro-spans alone would predict — but it does rule out the holder's own added critical-section work as the *dominant* term: at its p99 (335 µs) that work still could not, by itself, turn a sub-millisecond baseline into the coordinator's 1.39-8.2 ms per-config regressions. The remaining, most likely explanation given the evidence is the same queueing-amplification effect plan 30 M0's PROGRESS.md entry already flagged this host for: a throughput-saturating, no-think-time workload (meta-bench's create rows) sitting close to a shared resource's capacity is highly sensitive to *any* small increase in per-request service time or scheduling latency, including ones introduced by concurrent, unrelated load on the same cores — which is present on this sandbox and was absent on the coordinator's idle host. **This sandbox cannot produce a clean idle-host verdict on ±10%; the coordinator should re-run `target/release/harness meta-bench` on their own idle host against this milestone's final commit for the authoritative number**, using the tables below (same busy sandbox, for relative comparison only) and the per-op cost evidence above as supporting data, not as a substitute.
+
+  Two structural fixes from the first investigation round remain in place regardless (both real, independent of the noise question): `Meta::recent` changed from a linearly-scanned `Vec` to `HashMap<(node,incarnation), BTreeMap<seq, records>>`, and `journal::next_seq_tx` changed from a decimal-string `kv_get`/`kv_set` round trip to raw big-endian bytes.
+
+**Verbatim (release build, final tree, `forward-timeout-reexec`):**
+
+```
+=== forward-timeout-reexec (seed 42) ===
+    forward-timeout-reexec round 1 O_EXCL-create excl-1: holder=a requester=b forwarded_err 0->4 dedup_evidence 0->1 result=Ok(())
+    forward-timeout-reexec round 2 mkdir dir-2: holder=b requester=a forwarded_err 0->4 dedup_evidence 1->1 result=Ok(())
+    forward-timeout-reexec round 3 unlink unlink-me-3: holder=a requester=b forwarded_err 4->8 dedup_evidence 1->5 result=Ok(())
+    forward-timeout-reexec round 4 rename rename-dst-4: holder=b requester=a forwarded_err 4->8 dedup_evidence 5->7 result=Ok(())
+    forward-timeout-reexec round 5 link link-dst-5: holder=a requester=b forwarded_err 8->12 dedup_evidence 7->11 result=Ok(())
+=== forward-timeout-reexec PASSED in 17.7s
+```
+
+**Full scenario run (release build, final tree, seed 42 — run in two batches to respect the harness's own foreground timeout, both PASSED):**
+
+```
+forward-timeout-reexec           PASSED in 17.7s
+forwarded-mutations              PASSED in 2.1s
+lease-handover                   PASSED in 181.5s
+kill9-remount                    PASSED in 4.2s
+deposed-reintegration            PASSED in 26.8s
+mkdir-p-race                     PASSED in 2.9s
+two-clients-shared                PASSED in 242.1s
+chaos-ci                         PASSED in 6.3s
+ALL SCENARIOS PASSED
+create-storm-s3-only             PASSED in 98.0s (separate invocation)
+ALL SCENARIOS PASSED
+```
+
+`holder-crash-phantom-shadow`/`holder-crash-phantom-new-holder` remain
+unchanged FAILs — bug B, M3's job, not in scope here.
+
+**Segment bytes per op** (`LogRecord::to_postcard().len()`, measured via a
+throwaway example against the actual types): a `Create` record is 33
+bytes; `Completed { rid }` adds 7 bytes (postcard-encoded
+`Rid{node,incarnation,seq}` plus the enum discriminant) — +21% for a
+`Create`, +33% for the smaller `Unlink` record (21 bytes). Every op now
+ships one extra journal record regardless of size, so the *relative*
+overhead is largest for the smallest ops; in absolute terms it is a
+small, fixed ~7-9 bytes (postcard varint-encodes the three integer
+fields, so `Completed`'s size depends slightly on `seq`'s magnitude).
+
+**meta-bench, 3-node p2p-on rows, final tree, two consecutive runs on
+this sandbox's (non-idle) host** (`target/release/harness meta-bench
+--json`, no code change between the two runs — included specifically to
+show the run-to-run noise floor on this host):
+
+| Config | Run 1 agg ops/s | Run 1 p50 | Run 2 agg ops/s | Run 2 p50 |
+|---|---:|---:|---:|---:|
+| 3node-p2pon-shared-create-lat0 | 1325 | 1.26 ms | 1016 | 1.57 ms |
+| 3node-p2pon-disjoint-create-lat0 | 1078 | 1.45 ms | 1161 | 1.33 ms |
+| 3node-p2pon-shared-write4k-lat0 | 327 | 6.80 ms | 322 | 6.95 ms |
+| 3node-p2pon-disjoint-write4k-lat0 | 324 | 7.89 ms | 329 | 7.49 ms |
+| 3node-p2pon-shared-create-lat20 | 982 | 1.42 ms | 978 | 1.21 ms |
+| 3node-p2pon-disjoint-create-lat20 | 1080 | 1.32 ms | 946 | 1.39 ms |
+| 3node-p2pon-shared-write4k-lat20 | 309 | 7.34 ms | 302 | 7.58 ms |
+| 3node-p2pon-disjoint-write4k-lat20 | 323 | 7.27 ms | 300 | 7.93 ms |
+| 3node-p2pon-shared-create-concurrent4-lat0 | 1115 | 5.32 ms | 1002 | 5.61 ms |
+| 3node-p2pon-disjoint-create-concurrent4-lat0 | 2485 | 2.85 ms | 2227 | 2.92 ms |
+
+The create rows (the ones the coordinator's own before/after numbers
+flagged) swing 8-23% between these two otherwise-identical runs; the
+write4k rows, whose per-op cost is dominated by S3-mock PUT latency
+rather than the holder's `keepers`-lock critical section, are far more
+stable (2-8% run-to-run) — consistent with the create rows being the
+ones most exposed to the queueing-amplification effect described above,
+since they have the smallest per-op service time and the least slack
+before host noise shows up as queueing delay. Absolute comparison
+against the coordinator's idle-host baseline numbers is not meaningful
+from this data; see the item-3 writeup above for what direct
+instrumentation of the actual code paths *does* support: the holder's
+own added cost is bounded at tens of microseconds, not hundreds.
+
+### Plan 30 M2 exit criteria
+- [x] Coordinator review addressed: item 0 (thread-local `PendingCompletion`, kept as revised), item 1 (`acked_through` marked on every completion path via a shared `AckTracker`, `recent` bounded by both count and age), item 2 (exact `head_seq`/`pending_catchup` coverage check, 750 ms poll removed)
+- [x] `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean
+- [x] `cargo test --workspace` 0 failures; `cargo test -p constellation-model --release` green (`exactly_once_is_linearizable` ~19s, well inside the 60s budget). Note: one `cargo test --workspace` run hung for ~9 minutes with zero CPU progress across all threads before being killed; root-caused to leftover `constellation-harness-p30-*` Docker containers left running from an earlier `CHAOS_KEEP_TMP=1` diagnostic `meta-bench` invocation in this same session, not a code defect — removing them (`docker rm -f`) let a clean re-run complete normally in both this and a subsequent verification pass
+- [x] Release build; `forward-timeout-reexec` PASSED (four separate runs across the session, including after all three coordinator-review fixes)
+- [x] `forwarded-mutations lease-handover kill9-remount deposed-reintegration mkdir-p-race two-clients-shared chaos-ci create-storm-s3-only` PASSED against the final tree
+- [x] `holder-crash-phantom-shadow`/`holder-crash-phantom-new-holder` still FAIL (bug B, M3's job)
+- [~] Forwarded-op latency within ±10% (plan §M2 "Measure", coordinator review item 3): **still not conclusively met on this sandbox's `meta-bench` harness after all three fixes**, but the code-path cost is now directly measured rather than guessed: instrumenting the actual holder-side critical section (not a synthetic microbenchmark) shows the entire cost M2 could plausibly add is tens of microseconds (p50 99 µs, p99 335 µs), while the requester-observed round trip this sandbox measures is 1.2-1.7 ms at p50 — a gap the holder's own work cannot account for, that lies in QUIC/tokio-scheduling overhead this milestone does not touch, and that is demonstrably sensitive to this specific host's non-idle state (confirmed non-idle via `uptime`/`ps`; two back-to-back runs of the identical binary swing 8-23% with zero code change). This sandbox cannot produce the clean idle-host measurement the gate needs — see the meta-bench section above for the full evidence chain and the explicit ask for the coordinator to re-run on their own idle host against this milestone's final commit
+- [x] PROGRESS.md rows and exit-criteria checklist (this section)
+
+### Plan 30 M2 — coordinator review (2026-09-23)
+
+- **Rid plumbing replaced.** The ambient `Meta::pending_completion` and the
+  `mutation_serial` lock are gone. `append_tx` took a pending rid from *any*
+  journal-appending transaction, so snapshot, bootstrap or atime writes on
+  another thread could steal an op's completion marker. `mutation_serial`
+  also serialized every local mutation across FUSE threads. `execute` now
+  sets a thread-local (`store::journal::PendingCompletion`, an RAII guard),
+  which only the op's own transaction on the same thread can take. Test:
+  `crates/meta/tests/completion_ownership.rs` (concurrent snapshot writes).
+- **`Shipper::journal_backlog_of` is O(1).** It decoded the whole journal
+  to count it on every sync round. Every caller only compares it to zero,
+  so it now reads at most one row.
+- **Performance root cause: ship-round starvation, which predates M2.**
+  Interleaved runs of `3node-p2pon-shared-create-lat0` (pre-M2 binary vs
+  M2) reproduce ~1,500 vs ~1,100 ops/s every time. Bisected with
+  temporary toggles:
+  - dropping the `Completed` record restores baseline;
+  - dropping only the `completed`-keyspace writes, or only stripping the
+    record from the reply, does not;
+  - holder lock wait and execute time are unchanged (~0.1 ms);
+  - the holder's per-request total doubles (0.72 → 1.27 ms) in the
+    sync-loop queue.
+
+  Instrumenting `run_sync_round` showed ~1,200 rounds started but only 5
+  completed `sync_all`, with the journal backlog at 1,000–1,600 records.
+  Every forwarded mutation's `SyncRequest::Mutate` cancels the in-flight
+  round (see the new §M2b in plan 30), so each restarted round re-reads
+  the whole backlog, and M2's extra record doubles that. The M2 ±10%
+  latency gate is therefore deferred to M2b, which must restore it.

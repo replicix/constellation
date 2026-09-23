@@ -716,6 +716,12 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
     };
     // freed iff this was the last link (bytes actually reclaimed).
     let freed = nlink <= 1;
+    // Plan 30 §M2: allocated once, kept across the forward attempt below
+    // and the lease-acquisition fallback further down, exactly like
+    // `mutate_op_rebasable` — this unlink has the same at-least-once
+    // shape bug A did if a forward times out after the holder already
+    // executed it and this node then falls back to a local retry.
+    let rid = deps.forward.next_system_rid(deps.node_id);
 
     // Held locally with a usable, non-lost shipping lease → execute
     // directly (no `touch()`, so a pure prune never pins the lease).
@@ -727,7 +733,7 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
             .unwrap_or(false)
     };
     if held {
-        match constellation_meta::execute_mutate(&deps.meta, &op) {
+        match constellation_meta::execute_mutate(&deps.meta, &op, Some(rid)) {
             Ok(_) => {
                 let _ = deps.sync_tx.send(crate::fusefs::SyncRequest::Nudge);
                 return UnlinkResult::Done { freed };
@@ -745,6 +751,8 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
             deps.node_id,
             holder,
             &op,
+            rid,
+            deps.forward.acked_through(),
             forward_timeout(),
         )
         .await;
@@ -771,7 +779,13 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
     match rx.await {
         Ok(Ok(progress)) if progress.acquired => {
             inc(&deps.stats.leases_acquired, 1);
-            match constellation_meta::execute_mutate(&deps.meta, &op) {
+            // Plan 30 §M2 in-doubt resolution: the forward above may
+            // already have taken effect on the node that used to hold
+            // (see `fusefs.rs::mutate_op_rebasable`'s identical check).
+            if matches!(deps.meta.completed_position(rid), Ok(Some(_))) {
+                return UnlinkResult::Done { freed };
+            }
+            match constellation_meta::execute_mutate(&deps.meta, &op, Some(rid)) {
                 Ok(_) => {
                     let _ = deps.sync_tx.send(crate::fusefs::SyncRequest::Nudge);
                     UnlinkResult::Done { freed }

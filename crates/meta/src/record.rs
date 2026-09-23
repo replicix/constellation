@@ -2,6 +2,7 @@
 //! registry. Serialized as postcard in the local journal and in zstd
 //! S3 log segments (same codec as P2P gossip envelopes).
 
+use crate::rid::Rid;
 use constellation_fs_core::Ino;
 use serde::{Deserialize, Serialize};
 
@@ -163,6 +164,21 @@ pub enum LogRecord {
         /// explicitly (the `ctime_ns < time_ns` guard in replay).
         time_ns: i64,
     },
+    /// Plan 30 §M2 (RIFL for forwarding): `rid` identifies the op whose
+    /// own records this shipped alongside, in the same fjall
+    /// transaction. Applying it inserts `rid -> position` into the
+    /// node-local, unpublished `completed` keyspace on every replica
+    /// that tails it — never the tree, never `dirty`. Touches no
+    /// inode/dentry, so it never enters conflict detection (see
+    /// `TouchSet::add`) and is always `Disposition::Clean` on
+    /// reintegration, exactly like `Atime`.
+    ///
+    /// Appended last, like `Atime`: a peer too old to decode it would
+    /// simply fail to parse this record, which the plan accepts (plan
+    /// 30 explicitly waives wire/on-disk compatibility) but which this
+    /// ordering makes moot in the one case that still matters — a
+    /// mid-rollout mismatch is out of scope, not a live concern.
+    Completed { rid: Rid },
 }
 
 impl LogRecord {

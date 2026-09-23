@@ -139,6 +139,12 @@ pub(crate) const KV_NEXT_INO: &str = "next_ino";
 pub(crate) const KV_APPLIED_SEQ: &str = "applied_seq";
 pub(crate) const KV_NEXT_JOURNAL_SEQ: &str = "next_journal_seq";
 pub(crate) const KV_NEXT_SHADOW_ID: &str = "next_shadow_id";
+/// Plan 30 §M2: this node's mount counter, bumped once at every mount
+/// before serving any mutation (`bump_incarnation`). Persisted so it
+/// survives a crash — the volatile per-incarnation rid `seq` counter
+/// does not need to, since the incarnation bump alone is what keeps a
+/// post-restart rid from ever colliding with a pre-crash one.
+pub(crate) const KV_INCARNATION: &str = "incarnation";
 pub(crate) const KV_USAGE_BYTES: &str = "usage_bytes";
 pub(crate) const KV_USAGE_FILES: &str = "usage_files";
 /// Monotonic counter behind the `dirty` keyspace (plan 29 M2): every key
@@ -148,6 +154,24 @@ pub(crate) const KV_USAGE_FILES: &str = "usage_files";
 pub(crate) const KV_NEXT_DIRTY_SEQ: &str = "next_dirty_seq";
 
 pub type JournalBatch = Vec<(u64, crate::record::LogRecord)>;
+/// Plan 30 §M2: `Meta::recent`'s value type — see that field's doc. Each
+/// leaf carries the local wall-clock time (ms) it was recorded at, so a
+/// periodic sweep can drop entries older than the completion retention
+/// window independently of whether `acked_through` ever arrives for
+/// them (a requester that crashes or never sends another op would
+/// otherwise leave its rids in here forever).
+pub(crate) type RecentOutcomes = std::collections::HashMap<
+    (u64, u32),
+    std::collections::BTreeMap<u64, (i64, Vec<crate::record::LogRecord>)>,
+>;
+/// Plan 30 §M2: cap on how many rids one (node, incarnation)'s `recent`
+/// bucket keeps, independent of `acked_through` ever advancing — a
+/// second line of defense (the first is fixing `acked_through` itself
+/// to advance on every completion path, not just the forward one)
+/// against an unbounded requester (crashed, or simply never sending
+/// another op) pinning memory here forever. Oldest (lowest seq) entries
+/// are dropped first when a bucket would exceed this.
+pub(crate) const MAX_RECENT_PER_INCARNATION: usize = 4096;
 pub type EpochRow = (
     String,
     Vec<u64>,
@@ -316,6 +340,32 @@ pub struct Meta {
     /// it is pure allocation policy and every node has its own disjoint
     /// ino-prefix range to draw blocks from.
     pub(crate) ino_alloc: SingleWriterTxKeyspace,
+    /// Plan 30 §M2: `Rid::to_key() -> postcard(CompletedRow)`. Node-local
+    /// and replicated-but-unpublished, like `shadow`/`pins`/`epochs` —
+    /// never touches `ns`/`dirty`, never appears in `dump_replicated`,
+    /// but (unlike those ephemeral ones) is populated by replaying the
+    /// durable log (`LogRecord::Completed`), so it survives a
+    /// re-bootstrap the same way `ns` itself does.
+    pub(crate) completed: SingleWriterTxKeyspace,
+    /// Plan 30 §M2 holder dedup: the in-memory "recent outcomes" map for
+    /// ops this node executed as holder but has not yet shipped.
+    /// Deliberately not a keyspace — it is volatile by design (lost on
+    /// restart; that's fine, an already-shipped completion is covered by
+    /// `completed`/the log instead).
+    ///
+    /// Keyed `(node, incarnation) -> (seq -> records)` rather than a
+    /// flat list: `recent_outcome`/`remember_outcome` are on the hot
+    /// path (every forwarded execution checks this before running), so
+    /// a lookup must not scan every other requester's in-flight ops to
+    /// find this one's — that turned an O(1)-ish operation into an
+    /// O(total in-flight across every requester) one under concurrent
+    /// load, which is exactly where the plan's own "forwarded latency
+    /// within ±10%" measurement caught it (a flat `Vec` regressed
+    /// several `meta-bench` 3-node configs by 20-45%). The inner
+    /// `BTreeMap` also makes `forget_acked_through`'s "drop everything
+    /// at or below this seq" a single `split_off`, not a linear
+    /// `retain`.
+    pub(crate) recent: std::sync::Mutex<RecentOutcomes>,
     usage: UsageTracker,
     #[allow(dead_code)]
     path: Option<PathBuf>,
@@ -377,6 +427,7 @@ impl Meta {
         let shadow = db.keyspace("shadow", KeyspaceCreateOptions::default)?;
         let blobs = db.keyspace("blobs", KeyspaceCreateOptions::default)?;
         let ino_alloc = db.keyspace("ino_alloc", KeyspaceCreateOptions::default)?;
+        let completed = db.keyspace("completed", KeyspaceCreateOptions::default)?;
 
         let meta = Meta {
             db,
@@ -398,6 +449,8 @@ impl Meta {
             shadow,
             blobs,
             ino_alloc,
+            completed,
+            recent: std::sync::Mutex::new(std::collections::HashMap::new()),
             usage: UsageTracker::new(0, 0),
             path,
         };
@@ -528,6 +581,160 @@ impl Meta {
         let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, dir)?;
         tx.commit()?;
         Ok(ino)
+    }
+
+    // ---- incarnation (plan 30 §M2) ----
+
+    /// Bump and persist this node's incarnation, returning the new
+    /// value. Called once per mount, before serving any mutation
+    /// (`node_runtime.rs`), so every rid this mount allocates carries an
+    /// incarnation strictly greater than any previous mount's — the
+    /// property that keeps a rid from ever being reused even though the
+    /// per-incarnation `seq` counter itself restarts at 0 every time.
+    pub fn bump_incarnation(&self) -> Result<u32, MetaError> {
+        let mut tx = self.db.write_tx();
+        let current: u32 = kv_get_u64(&tx, &self.local, KV_INCARNATION)?.unwrap_or(0) as u32;
+        let next = current + 1;
+        kv_set_tx(&mut tx, &self.local, KV_INCARNATION, &next.to_string());
+        tx.commit()?;
+        Ok(next)
+    }
+
+    // ---- completed (plan 30 §M2 exactly-once) ----
+
+    /// The position (journal seq) `rid` was completed at, if this
+    /// replica has tailed a segment carrying its `Completed` record (or,
+    /// for a rid this node itself executed as holder and has not yet
+    /// shipped, the record it produced — see `recent_outcome`).
+    pub fn completed_position(&self, rid: crate::rid::Rid) -> Result<Option<u64>, MetaError> {
+        let r = self.db.read_tx();
+        match r.get(&self.completed, rid.to_key())? {
+            Some(v) => {
+                let bytes: [u8; 8] = v
+                    .get(0..8)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| MetaError::Invalid("completed row".into()))?;
+                Ok(Some(u64::from_be_bytes(bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Encode a `completed` row value: `position(8 BE) ++
+    /// recorded_at_ms(8 BE)`. `recorded_at_ms` is this replica's own
+    /// clock at apply time (not the writer's), matching the tolerance
+    /// the rest of the system already gives cross-node clocks (e.g.
+    /// atime's skew guard) — retention only needs a rough age, not a
+    /// linearizable one.
+    pub(crate) fn encode_completed_row(position: u64, recorded_at_ms: i64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(&position.to_be_bytes());
+        v.extend_from_slice(&recorded_at_ms.to_be_bytes());
+        v
+    }
+
+    /// The holder's in-memory answer for `rid`, if it executed it as
+    /// holder and has not yet dropped it from `recent` (shipped-and-
+    /// acked, or aged out — see `forget_acked_through`). Kept separate
+    /// from `completed_position` because `recent` also carries *which*
+    /// records the reply must repeat verbatim, not just "did this
+    /// happen".
+    pub fn recent_outcome(&self, rid: crate::rid::Rid) -> Option<Vec<crate::record::LogRecord>> {
+        let recent = self.recent.lock().unwrap();
+        recent
+            .get(&(rid.node, rid.incarnation))?
+            .get(&rid.seq)
+            .map(|(_, recs)| recs.clone())
+    }
+
+    /// Record that the holder just executed `rid`, producing `records`,
+    /// so a retry (same rid, same still-live holder) gets an identical
+    /// reply instead of executing again. Refusals are never recorded
+    /// here (per plan 30 §M2: "a retried refused op is re-evaluated").
+    ///
+    /// Bounds the per-`(node, incarnation)` bucket at
+    /// [`MAX_RECENT_PER_INCARNATION`] regardless of whether
+    /// `acked_through` ever advances for it — dropping the oldest
+    /// (lowest-seq) entries first, since those are the ones a live
+    /// requester would have acked first if it were still around. This
+    /// is defense in depth: the primary fix is every completion path in
+    /// `mutate_op_rebasable` calling `mark_acked`, so the requester's own
+    /// `acked_through` should keep this bucket far under the cap in
+    /// practice.
+    pub fn remember_outcome(&self, rid: crate::rid::Rid, records: &[crate::record::LogRecord]) {
+        let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
+        let mut recent = self.recent.lock().unwrap();
+        let bucket = recent.entry((rid.node, rid.incarnation)).or_default();
+        let entry = bucket
+            .entry(rid.seq)
+            .or_insert_with(|| (now_ms, Vec::new()));
+        entry.1.extend(records.iter().cloned());
+        while bucket.len() > MAX_RECENT_PER_INCARNATION {
+            bucket.pop_first();
+        }
+    }
+
+    /// Drop every `recent` entry, across every requester, whose recorded
+    /// time is older than `retention_ms` — the age-based half of
+    /// [`Self::remember_outcome`]'s size cap, for a requester that never
+    /// sends another op (so `acked_through` never arrives) or crashes
+    /// outright. Meant to run on a periodic timer (like
+    /// [`Self::prune_completed`]), not per request: it walks every
+    /// bucket, which `forget_acked_through`'s per-request, single-bucket
+    /// `split_off` deliberately does not.
+    pub fn prune_recent_older_than(&self, now_ms: i64, retention_ms: i64) -> u64 {
+        let mut recent = self.recent.lock().unwrap();
+        let mut pruned = 0u64;
+        recent.retain(|_, bucket| {
+            let before = bucket.len();
+            bucket
+                .retain(|_, (recorded_at, _)| now_ms.saturating_sub(*recorded_at) <= retention_ms);
+            pruned += (before - bucket.len()) as u64;
+            !bucket.is_empty()
+        });
+        pruned
+    }
+
+    /// Drop every `recent` entry for `node`'s incarnation at or below
+    /// `acked_through` (plan 30 §M2 GC: a request's `acked_through` is
+    /// the highest contiguous seq of its own incarnation whose reply the
+    /// requester has already received, so the holder no longer needs to
+    /// keep those outcomes around for a retry).
+    pub fn forget_acked_through(&self, node: u64, incarnation: u32, acked_through: u64) {
+        let mut recent = self.recent.lock().unwrap();
+        let key = (node, incarnation);
+        let now_empty = if let Some(inner) = recent.get_mut(&key) {
+            *inner = inner.split_off(&(acked_through + 1));
+            inner.is_empty()
+        } else {
+            false
+        };
+        if now_empty {
+            recent.remove(&key);
+        }
+    }
+
+    /// Remove every `completed` row whose value (recorded at apply time)
+    /// is older than `retention_ms`. Returns the number of rows removed.
+    /// `now_ms` is the caller's clock (unit-testable without sleeping).
+    pub fn prune_completed(&self, now_ms: i64, retention_ms: i64) -> Result<u64, MetaError> {
+        let mut tx = self.db.write_tx();
+        let stale: Vec<Vec<u8>> = tx
+            .iter(&self.completed)
+            .map(|g| g.into_inner())
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let recorded_at = i64::from_be_bytes(v.get(8..16)?.try_into().ok()?);
+                (now_ms.saturating_sub(recorded_at) > retention_ms).then(|| k.to_vec())
+            })
+            .collect();
+        let n = stale.len() as u64;
+        for k in stale {
+            tx.remove(&self.completed, k);
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     // ---- applied seq ----
@@ -833,6 +1040,174 @@ mod tests {
         let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
         assert!(meta.getattr(f.ino).unwrap().is_some());
         assert_eq!(meta.journal_len().unwrap(), before + 1);
+    }
+
+    /// Plan 30 §M2: the incarnation counter is what keeps a rid unique
+    /// across a crash — `next_seq` itself (owned by `ForwardState`/
+    /// `SyncHandle`, not `Meta`) restarts at 0 every mount, so the
+    /// persisted incarnation must strictly increase, never repeat or
+    /// reset, across a simulated "kill9-remount" (re-opening the same
+    /// on-disk state and bumping again).
+    #[test]
+    fn bump_incarnation_survives_a_simulated_restart_and_never_repeats() {
+        let dir = tempfile::Builder::new()
+            .prefix("constellation-meta-incarnation-")
+            .tempdir()
+            .unwrap();
+        let first = {
+            let meta = Meta::open(dir.path()).unwrap();
+            let a = meta.bump_incarnation().unwrap();
+            let b = meta.bump_incarnation().unwrap();
+            assert!(
+                b > a,
+                "incarnation must strictly increase within one process too"
+            );
+            b
+        };
+        // Simulate a crash + remount: fresh `Meta` handle over the same
+        // on-disk state.
+        let meta = Meta::open(dir.path()).unwrap();
+        let after_restart = meta.bump_incarnation().unwrap();
+        assert!(
+            after_restart > first,
+            "incarnation must never repeat or reset across a restart \
+             (first={first}, after_restart={after_restart})"
+        );
+    }
+
+    /// Plan 30 §M2 GC: a `completed` row older than the retention window
+    /// is pruned; a fresher one, or one right at the boundary, survives.
+    #[test]
+    fn prune_completed_removes_only_rows_past_retention() {
+        let meta = Meta::open_in_memory().unwrap();
+        let old_rid = crate::rid::Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        };
+        let fresh_rid = crate::rid::Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 2,
+        };
+        let now = 1_000_000i64;
+        let retention_ms = 60_000i64;
+        {
+            let mut tx = meta.db.write_tx();
+            tx.insert(
+                &meta.completed,
+                old_rid.to_key(),
+                Meta::encode_completed_row(1, now - retention_ms - 1),
+            );
+            tx.insert(
+                &meta.completed,
+                fresh_rid.to_key(),
+                Meta::encode_completed_row(2, now - retention_ms + 1),
+            );
+            tx.commit().unwrap();
+        }
+        let pruned = meta.prune_completed(now, retention_ms).unwrap();
+        assert_eq!(pruned, 1);
+        assert!(meta.completed_position(old_rid).unwrap().is_none());
+        assert!(meta.completed_position(fresh_rid).unwrap().is_some());
+    }
+
+    /// Plan 30 §M2 coordinator review: `remember_outcome` must bound a
+    /// `(node, incarnation)` bucket at `MAX_RECENT_PER_INCARNATION`
+    /// *independent of whether anything ever acks it* — a requester that
+    /// never sends `acked_through` (crashed, or simply idle) must not
+    /// let this grow without bound. Oldest (lowest-seq) entries drop
+    /// first.
+    #[test]
+    fn remember_outcome_caps_a_bucket_that_is_never_acked() {
+        let meta = Meta::open_in_memory().unwrap();
+        let over = MAX_RECENT_PER_INCARNATION as u64 + 10;
+        for seq in 0..over {
+            let rid = crate::rid::Rid {
+                node: 1,
+                incarnation: 1,
+                seq,
+            };
+            meta.remember_outcome(
+                rid,
+                &[crate::record::LogRecord::Unlink {
+                    parent: 1,
+                    name: format!("f{seq}"),
+                    time_ns: 0,
+                }],
+            );
+        }
+        // The oldest 10 were dropped to stay at the cap...
+        for seq in 0..10 {
+            let rid = crate::rid::Rid {
+                node: 1,
+                incarnation: 1,
+                seq,
+            };
+            assert!(
+                meta.recent_outcome(rid).is_none(),
+                "seq {seq} should have been evicted"
+            );
+        }
+        // ...but the most recent MAX_RECENT_PER_INCARNATION are intact.
+        for seq in (over - MAX_RECENT_PER_INCARNATION as u64)..over {
+            let rid = crate::rid::Rid {
+                node: 1,
+                incarnation: 1,
+                seq,
+            };
+            assert!(
+                meta.recent_outcome(rid).is_some(),
+                "seq {seq} should still be cached"
+            );
+        }
+    }
+
+    /// A periodic age-based sweep (the other half of the bound) removes
+    /// entries older than the retention window across every bucket, not
+    /// just the one a request happens to name.
+    #[test]
+    fn prune_recent_older_than_removes_only_stale_buckets() {
+        let meta = Meta::open_in_memory().unwrap();
+        let old_rid = crate::rid::Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        };
+        let fresh_rid = crate::rid::Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        {
+            let mut recent = meta.recent.lock().unwrap();
+            recent.entry((1, 1)).or_default().insert(
+                1,
+                (
+                    0,
+                    vec![crate::record::LogRecord::Unlink {
+                        parent: 1,
+                        name: "old".into(),
+                        time_ns: 0,
+                    }],
+                ),
+            );
+            recent.entry((2, 1)).or_default().insert(
+                1,
+                (
+                    100_000,
+                    vec![crate::record::LogRecord::Unlink {
+                        parent: 1,
+                        name: "fresh".into(),
+                        time_ns: 0,
+                    }],
+                ),
+            );
+        }
+        let pruned = meta.prune_recent_older_than(100_000, 60_000);
+        assert_eq!(pruned, 1);
+        assert!(meta.recent_outcome(old_rid).is_none());
+        assert!(meta.recent_outcome(fresh_rid).is_some());
     }
 }
 

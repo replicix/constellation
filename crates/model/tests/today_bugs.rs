@@ -2,7 +2,7 @@
 //! under `cargo test -p constellation-model --release`; timings are
 //! printed so a coordinator can see the margin.
 
-use constellation_model::protocol::{Action, AuthorityModel};
+use constellation_model::protocol::{Action, AuthorityModel, Protocol};
 use constellation_model::{NsOp, N_NAMES};
 use stateright::{Checker, Model};
 use std::time::Instant;
@@ -154,6 +154,106 @@ fn today_finds_bug_b() {
         println!("  {a:?}");
     }
     checker.assert_discovery(prop_name, takeover_path);
+}
+
+/// Plan 30 §M2: the `ExactlyOnce` variant on bug A's exact configuration
+/// (same nodes, same never-expiring initial holder, same workload) must
+/// no longer violate linearizability — the fix is the rid dedup at the
+/// holder (`DeliverForwardRequest`) plus the completed-table check before
+/// `AcquireLease` re-executes (`rid_completed_record`). `progress` must
+/// still be witnessed at least once, so the fix is not vacuous (e.g. by
+/// accidentally making every op stall forever).
+///
+/// A second, crash-inclusive configuration reuses bug B's shape (a
+/// holder accepts a forward, crashes before shipping, the requester's
+/// shadow strands) to show the fix holds *with* crashes present too, not
+/// just in the crash-free case above. Bounds are pared down hard from
+/// `today_finds_bug_b`'s (2 nodes rather than 3, `max_seq`/`lease_ttl`
+/// shrunk to 1, `with_lossy(false)`): `RetryForward`'s extra branch point
+/// at every `NeedsLease`-while-busy state multiplies the reachable space
+/// by roughly an order of magnitude per allowed attempt (measured while
+/// tuning this test), so reproducing bug B's own 3-node bounds here would
+/// blow well past the ~60s budget. This shape is still exactly bug B's:
+/// `converged_at_quiescence`/`commits_are_log_prefixes` are deliberately
+/// not asserted here — bug B (the shadow stranded by the crash) is still
+/// expected to violate them under `ExactlyOnce` — recovering from that is
+/// M3's job, not this milestone's. (Confirmed by hand while tuning this
+/// test: both do still fail at these bounds — that is the expected,
+/// unfixed state, not a gap in this test.)
+#[test]
+fn exactly_once_is_linearizable() {
+    let started = Instant::now();
+    let model = AuthorityModel::new(2)
+        .with_protocol(Protocol::ExactlyOnce)
+        .with_initial_holder(0, 255) // effectively never expires
+        .with_max_tick(0)
+        .with_max_seq(2)
+        .with_op(1, NsOp::CreateExcl(name(0)));
+
+    let checker = model.checker().spawn_bfs().join();
+    println!(
+        "exactly_once_is_linearizable (bug A config): {} states ({} unique), max depth {}, {:?}",
+        checker.state_count(),
+        checker.unique_state_count(),
+        checker.max_depth(),
+        started.elapsed()
+    );
+    assert!(
+        checker.is_done(),
+        "expected exhaustive exploration within budget"
+    );
+    assert!(
+        checker.discovery("linearizable").is_none(),
+        "ExactlyOnce must not violate linearizability on bug A's own path: {:?}",
+        checker.discovery("linearizable").map(|p| p.into_actions())
+    );
+    assert!(
+        checker.discovery("progress").is_some(),
+        "expected at least one run where every op completes (non-vacuous fix)"
+    );
+
+    let started = Instant::now();
+    let model_b = AuthorityModel::new(2)
+        .with_protocol(Protocol::ExactlyOnce)
+        .with_initial_holder(0, 1)
+        .with_max_tick(3)
+        .with_lease_ttl(1)
+        .with_max_seq(1)
+        .with_max_crashes(1)
+        .with_lossy(false)
+        .with_op(1, NsOp::CreateExcl(name(0)));
+    let checker_b = model_b.checker().spawn_bfs().join();
+    println!(
+        "exactly_once_is_linearizable (bug B config): {} states ({} unique), max depth {}, {:?}",
+        checker_b.state_count(),
+        checker_b.unique_state_count(),
+        checker_b.max_depth(),
+        started.elapsed()
+    );
+    assert!(
+        checker_b.is_done(),
+        "expected exhaustive exploration within budget"
+    );
+    assert!(
+        checker_b.discovery("linearizable").is_none(),
+        "ExactlyOnce must not violate linearizability even with a holder crash present: {:?}",
+        checker_b
+            .discovery("linearizable")
+            .map(|p| p.into_actions())
+    );
+    assert!(
+        checker_b.discovery("progress").is_some(),
+        "expected at least one run where every op completes (non-vacuous fix)"
+    );
+    // Bug B itself is untouched by M2: convergence still fails when the
+    // crashed holder's shadow is stranded. Not asserted as a failure
+    // requirement (a future fix must not break this test by accident),
+    // just noted for the record.
+    let bug_b_still_open = checker_b.discovery("converged_at_quiescence").is_some()
+        || checker_b.discovery("commits_are_log_prefixes").is_some();
+    println!(
+        "exactly_once_is_linearizable: bug B (convergence) still open under ExactlyOnce: {bug_b_still_open} (expected true; M3 fixes it)"
+    );
 }
 
 /// A single writer that never crashes, pauses, or gets forwarded to

@@ -485,6 +485,12 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         run: named_shared_daemon,
     },
+    Scenario {
+        name: "forward-timeout-reexec",
+        desc: "plan 30 M2 (fixes bug A): a forwarded mutation's reply races the requester's forward timeout; exactly-once forwarding resolves it via dedup or the completed table instead of re-executing",
+        requires: &[],
+        run: forward_timeout_reexec,
+    },
 ];
 
 /// Plan 30 M0: scenarios that reproduce a known, not-yet-fixed bug
@@ -496,12 +502,6 @@ pub const SCENARIOS: &[Scenario] = &[
 /// them under their own heading; `harness run <name>` resolves a name in
 /// either list.
 pub const KNOWN_BUG_REPROS: &[Scenario] = &[
-    Scenario {
-        name: "forward-timeout-reexec",
-        desc: "bug A: a forwarded mutation's reply races the requester's forward timeout; the requester falls back and re-executes the holder's already-applied op",
-        requires: &[],
-        run: forward_timeout_reexec,
-    },
     Scenario {
         name: "holder-crash-phantom-shadow",
         desc: "bug B: a holder stranded (S3 cut, then killed) leaves its ack to a forwarded create applied only on the requester; a third node's takeover never sees it",
@@ -6275,14 +6275,37 @@ fn forwarded_err(c: &Client) -> Result<u64> {
     Ok(c.control_status()?["forwarded_err"].as_u64().unwrap_or(0))
 }
 
+/// Plan 30 §M2 non-vacuity: the sum of every way an in-doubt retry can
+/// resolve *without* re-executing the op — the holder answering a
+/// retried rid from `recent`/`completed` (`forward_dedup_hits`) or the
+/// requester's own lease-path finding the rid already in `completed`
+/// after a takeover (`forward_indoubt_resolved`). Summed across *both*
+/// nodes: either one could be the node that actually resolves a given
+/// round's retry, depending on which path the fault race takes.
+fn dedup_evidence(clients: &[&Client]) -> Result<u64> {
+    let mut total = 0u64;
+    for c in clients {
+        let status = c.control_status()?;
+        total += status["forward_dedup_hits"].as_u64().unwrap_or(0);
+        total += status["forward_indoubt_resolved"].as_u64().unwrap_or(0);
+    }
+    Ok(total)
+}
+
 /// Bug A (`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md`
-/// §1.1): `request_mutate_with` maps a forward timeout to `Busy`, and
+/// §1.1), fixed by plan 30 M2's exactly-once forwarding: without a rid,
+/// `request_mutate_with` maps a forward timeout to `Busy`, and
 /// `mutate_op_rebasable`'s fallback (`crates/cli/src/fusefs.rs`) then
 /// acquires the lease and executes the very op the holder already
 /// applied. `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` (1500ms) makes
 /// the holder's reply arrive well after the requester's
 /// `CONSTELLATION_FORWARD_TIMEOUT_MS` (default 500ms) gives up, so this
 /// reproduces deterministically without racing real scheduler timing.
+/// With M2, the requester retries the same rid to the same holder
+/// (which answers from `recent` without re-executing — the fault delay
+/// applies to every reply, so these retries time out too) until it
+/// falls to the lease path, where the coverage rule resolves it against
+/// `completed` instead of executing again.
 ///
 /// Five rounds alternate which node holds the lease (a, b, a, b, a) and
 /// exercise the five create-family/delete-family ops POSIX distinguishes
@@ -6308,6 +6331,7 @@ fn forward_timeout_reexec(_seed: u64) -> Result<()> {
     wait_for_p2p(&[&a, &b])?;
 
     let mut anomalies: Vec<String> = Vec::new();
+    let dedup_at_start = dedup_evidence(&[&a, &b])?;
 
     for round in 1..=5u32 {
         let (holder, requester): (&Client, &Client) =
@@ -6357,6 +6381,7 @@ fn forward_timeout_reexec(_seed: u64) -> Result<()> {
         let target: String;
         let src: Option<String>;
         let before = forwarded_err(requester)?;
+        let dedup_before = dedup_evidence(&[&a, &b])?;
         let result: std::io::Result<()> = match round {
             1 => {
                 op_name = "O_EXCL-create";
@@ -6400,6 +6425,7 @@ fn forward_timeout_reexec(_seed: u64) -> Result<()> {
             _ => unreachable!(),
         };
         let after = forwarded_err(requester)?;
+        let dedup_after = dedup_evidence(&[&a, &b])?;
 
         if after <= before {
             anomalies.push(format!(
@@ -6408,9 +6434,24 @@ fn forward_timeout_reexec(_seed: u64) -> Result<()> {
                 requester.name
             ));
         }
+        // Diagnostic only, not a per-round requirement: dedup/in-doubt-
+        // resolution evidence rising shows *this* round's retry landed
+        // on an already-completed op and was recognized as a duplicate
+        // rather than re-executed. It rising is sufficient proof of
+        // that, but it *not* rising is not by itself a bug — a race can
+        // just as correctly resolve the other way, with the lease path
+        // discovering the op was never durably completed anywhere yet
+        // (nobody executed it before the holder handed off) and
+        // legitimately executing it fresh, exactly once, with no
+        // duplicate to detect. Either shape is fine; what must never
+        // happen is a *second* execution, which `ino_agrees` below
+        // catches directly by comparing inode numbers. The aggregate
+        // check after the loop confirms the dedup path is not simply
+        // dead code across the whole run.
         eprintln!(
             "    forward-timeout-reexec round {round} {op_name} {target}: holder={} \
-             requester={} forwarded_err {before}->{after} result={result:?}",
+             requester={} forwarded_err {before}->{after} dedup_evidence {dedup_before}->{dedup_after} \
+             result={result:?}",
             holder.name, requester.name
         );
         if let Err(e) = &result {
@@ -6529,8 +6570,21 @@ fn forward_timeout_reexec(_seed: u64) -> Result<()> {
         }
     }
 
+    let dedup_at_end = dedup_evidence(&[&a, &b])?;
     a.unmount()?;
     b.unmount()?;
+    // Plan 30 M2 non-vacuity for the fix itself (distinct from the
+    // per-round `forwarded_err` check, which only proves the *fault*
+    // engaged): across the whole run, the dedup/in-doubt-resolution
+    // path must have fired at least once, or every round resolved by
+    // coincidence rather than by the mechanism plan 30 M2 adds.
+    if dedup_at_end <= dedup_at_start {
+        anomalies.push(format!(
+            "no round showed dedup/in-doubt-resolution evidence anywhere \
+             (forward_dedup_hits + forward_indoubt_resolved stayed at {dedup_at_start} \
+             across both nodes for the whole run) — exactly-once forwarding may not be engaging"
+        ));
+    }
     if !anomalies.is_empty() {
         bail!(
             "{} of 5 round(s) anomalous:\n{}",

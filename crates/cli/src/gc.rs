@@ -96,12 +96,20 @@ impl GcTail {
 pub const DEFAULT_GC_INTERVAL_S: u64 = 86_400;
 pub const DEFAULT_GC_HORIZON_S: u64 = 7 * 86_400;
 pub const DEFAULT_LOG_RETENTION_SEGMENTS: u64 = 128;
+/// Plan 30 §M2: default `CONSTELLATION_COMPLETION_RETENTION_S`. An
+/// in-doubt op's coverage rule needs every log segment younger than
+/// this window to still exist, whatever the head commit's own
+/// `retention_segments` floor would otherwise allow deleting — the FUSE
+/// deadline (2×lease TTL) keeps any real retry far inside it.
+pub const DEFAULT_COMPLETION_RETENTION_S: u64 = 900;
 
 #[derive(Debug, Clone)]
 pub struct GcConfig {
     pub horizon_ms: i64,
     pub retention_segments: u64,
     pub lease_ttl_ms: u64,
+    /// Plan 30 §M2 coverage rule floor, in milliseconds.
+    pub completion_retention_ms: i64,
 }
 
 impl GcConfig {
@@ -119,6 +127,11 @@ impl GcConfig {
                 DEFAULT_LOG_RETENTION_SEGMENTS,
             ),
             lease_ttl_ms: constellation_store_s3::lease::lease_ttl_ms(),
+            completion_retention_ms: seconds(
+                "CONSTELLATION_COMPLETION_RETENTION_S",
+                DEFAULT_COMPLETION_RETENTION_S,
+            ) as i64
+                * 1000,
         }
     }
 }
@@ -271,7 +284,7 @@ async fn run_chunks(
             });
         }
     }
-    candidates.extend(metadata_candidates(&store, chunks.e2e_keys(), config).await?);
+    candidates.extend(metadata_candidates(&store, chunks.e2e_keys(), config, now).await?);
     candidates.sort_by(|a, b| a.key.cmp(&b.key));
 
     if verify_only || candidates.is_empty() {
@@ -450,10 +463,19 @@ fn collect_hash_strings(value: &serde_json::Value, out: &mut HashSet<ChunkHash>)
 /// log is the only copy of its history — so nothing is pruned. A bootstrap
 /// whose base the log was pruned past refuses rather than silently
 /// stopping at the gap (`shipper::replay_from`).
+///
+/// Plan 30 §M2 coverage rule: whatever the commit-based floor above would
+/// otherwise allow, a segment younger than `completion_retention_ms` is
+/// never marked — an in-doubt op's resolution against `completed` is
+/// only valid if every segment since the op was first sent is still
+/// there to have tailed. Retention only ever *widens* what survives, so
+/// this can only keep more segments than the seq-based floor alone,
+/// never fewer.
 async fn metadata_candidates(
     store: &Arc<dyn ObjectStore>,
     keys: Option<&constellation_store_s3::SharedE2eKeys>,
     config: &GcConfig,
+    now_ms: i64,
 ) -> Result<Vec<Mark>> {
     let chain = constellation_store_s3::CommitChain::new(store.clone())
         .with_sealing(constellation_store_s3::TreeSealing::for_keys(keys));
@@ -481,7 +503,9 @@ async fn metadata_candidates(
         else {
             continue;
         };
-        if seq < floor {
+        let within_completion_retention =
+            object.last_modified.timestamp_millis() > now_ms - config.completion_retention_ms;
+        if seq < floor && !within_completion_retention {
             marks.push(Mark {
                 key: object.location.to_string(),
                 rule: "log-retention".into(),
@@ -512,6 +536,7 @@ mod tests {
             horizon_ms: 100,
             retention_segments: 2,
             lease_ttl_ms: 1,
+            completion_retention_ms: 0,
         };
         assert_eq!(250 - config.horizon_ms, 150);
     }
@@ -538,11 +563,17 @@ mod tests {
             horizon_ms: 0,
             retention_segments: 128,
             lease_ttl_ms: 1,
+            completion_retention_ms: 0,
         };
-        assert!(metadata_candidates(&store, None, &config)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(metadata_candidates(
+            &store,
+            None,
+            &config,
+            constellation_store_s3::lease::now_unix_ms()
+        )
+        .await
+        .unwrap()
+        .is_empty());
     }
 
     /// Plan 28: once a commit exists, retention floors on the head
@@ -586,19 +617,25 @@ mod tests {
             horizon_ms: 0,
             retention_segments: 128,
             lease_ttl_ms: 1,
+            completion_retention_ms: 0,
         };
-        let marked: Vec<u64> = metadata_candidates(&store, None, &config)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|mark| mark.rule == "log-retention")
-            .map(|mark| {
-                assert!(mark.key.starts_with("log/p0/"), "{}", mark.key);
-                assert_eq!(mark.evidence["commit"], 1);
-                let name = mark.key.rsplit('/').next().unwrap();
-                u64::from_str_radix(name.trim_end_matches(".zst"), 16).unwrap()
-            })
-            .collect();
+        let marked: Vec<u64> = metadata_candidates(
+            &store,
+            None,
+            &config,
+            constellation_store_s3::lease::now_unix_ms(),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|mark| mark.rule == "log-retention")
+        .map(|mark| {
+            assert!(mark.key.starts_with("log/p0/"), "{}", mark.key);
+            assert_eq!(mark.evidence["commit"], 1);
+            let name = mark.key.rsplit('/').next().unwrap();
+            u64::from_str_radix(name.trim_end_matches(".zst"), 16).unwrap()
+        })
+        .collect();
         // Floor 250 - 128 = 122: segments 1..=121.
         assert_eq!(marked.len(), 121);
         assert_eq!(marked.iter().max(), Some(&121));
@@ -701,6 +738,7 @@ mod tests {
             horizon_ms: 0,
             retention_segments: 128,
             lease_ttl_ms: 1,
+            completion_retention_ms: 0,
         };
         let tail = GcTail::standalone(LogStore::new(store.clone()), &meta_b).unwrap();
         let report = run_chunks(

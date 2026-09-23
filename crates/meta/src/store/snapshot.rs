@@ -88,6 +88,7 @@ impl Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::SnapCreate {
                 id: row.id.clone(),
                 path: row.path.clone(),
@@ -129,6 +130,7 @@ impl Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::SnapDelete {
                 id,
                 path: path.to_string(),
@@ -212,6 +214,7 @@ impl Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::SetQuota { max_logical_bytes },
         )?;
         tx.commit()?;
@@ -347,6 +350,7 @@ impl Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Clone {
                 source_path: source_path.to_string(),
                 snapshot: snapshot.to_string(),

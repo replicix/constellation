@@ -2314,6 +2314,7 @@ impl constellation_net::PeerService for P2pBridge {
         self.node_id
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn mutate_requested(
         &self,
         part: String,
@@ -2321,10 +2322,17 @@ impl constellation_net::PeerService for P2pBridge {
         req_id: u64,
         _epoch_seen: u64,
         op: Vec<u8>,
+        rid: (u64, u32, u64),
+        acked_through: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
             self.forward.note_holder(&part, self.node_id);
+            let rid = constellation_meta::Rid {
+                node: rid.0,
+                incarnation: rid.1,
+                seq: rid.2,
+            };
             let (reply, receive) = tokio::sync::oneshot::channel();
             let outcome = if self
                 .nudge
@@ -2332,6 +2340,8 @@ impl constellation_net::PeerService for P2pBridge {
                     part,
                     requester,
                     op,
+                    rid,
+                    acked_through,
                     reply,
                 })
                 .is_ok()
@@ -3642,6 +3652,18 @@ impl constellation_api::StatusSource for DaemonStatus {
             pushed_segments_applied: self
                 .forward
                 .pushed_applied
+                .load(std::sync::atomic::Ordering::Relaxed),
+            forward_dedup_hits: self
+                .forward
+                .dedup_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            forward_retries: self
+                .forward
+                .retries
+                .load(std::sync::atomic::Ordering::Relaxed),
+            forward_indoubt_resolved: self
+                .node
+                .indoubt_resolved
                 .load(std::sync::atomic::Ordering::Relaxed),
             placement_reason: self.placement.last_reason.lock().unwrap().clone(),
             atime: {

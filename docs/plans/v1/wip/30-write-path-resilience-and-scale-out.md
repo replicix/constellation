@@ -153,7 +153,8 @@ bend the constraint.
 | 1. Correctness | **M0** Reproduce A and B | failing scenarios, fault knob, per-node S3 switch | — | S |
 | | **M1** Stateright model v1 | finds A and B as counterexamples | M0 | M |
 | | **M2** Exactly-once forwarding | bug A | M1 | M |
-| | **M3** Speculation log, stranded-op recovery, clean commits | bug B, both sides | M2 | L |
+| | **M2b** Stop cancelling the holder's ship round | ship starvation under forwarding load (found measuring M2) | M2 | M |
+| | **M3** Speculation log, stranded-op recovery, clean commits | bug B, both sides | M2b | L |
 | | **M4** Hygiene and history checkers | L7, L8, error codes, checkers | M3 | M |
 | 2. Test infrastructure | **M5** Sans-IO authority core + deterministic simulation | deterministic tests of the real code | M4 | L |
 | 3. Consistency | **M6** Positions and session guarantees | L4 (sessions) | M5 | M |
@@ -427,6 +428,65 @@ without execution. A `SetManifest` rebase is a new op with a new rid.
 
 **Measure.** Forwarded-op latency on `meta-bench` 3-node configs must stay
 within ±10%. Record segment bytes per op before and after.
+
+### M2b — Stop cancelling the holder's ship round (found while measuring M2)
+
+**Finding (coordinator, 2026-09-23).** In `node_runtime.rs`'s sync loop,
+the in-flight sync round (`run_managed_sync_round`) is polled in a
+`select!` against `sync_rx`. Every request other than `Nudge` breaks out
+of that loop and **drops the round**. That includes the holder's
+`SyncRequest::Mutate` for each forwarded mutation, and a requester's
+`SyncRequest::Forward`.
+
+Under forwarding load a request arrives every ~0.7 ms, while a round takes
+~2 ms (one S3 PUT), so the holder almost never finishes a round:
+- An instrumented `3node-p2pon-shared-create-lat0` run entered ~1,200
+  rounds, and only 5 reached the end of `sync_all`.
+- The journal backlog sat at 1,000–1,600 records.
+- Every restarted round re-read and re-encoded the whole backlog, and
+  started a PUT, before being cancelled again.
+
+M2's extra `Completed` record doubles that wasted work, and that is the
++0.4–0.5 ms per forwarded op M2 measured. The costs:
+- starved shipping, which delays S3 durability and cross-node visibility;
+- a growing stranding window (bug B's exposure);
+- wasted CPU.
+
+**Why it isn't a one-liner.** `run_sync_round` holds the keepers lock
+across `renew_if_due` (an S3 CAS) and `sync_all` (an S3 PUT). A forwarded
+execute needs that lock, so simply *not* cancelling the round would make
+every forwarded op wait on S3.
+
+**Design.**
+1. **Don't interrupt the round for spawn-only requests.** `Mutate`, and a
+   `Forward` that goes over the network, only spawn tasks (plan 29 M5), so
+   dispatch them from inside the round's `select!` loop without dropping
+   the round. Other requests keep today's behaviour.
+2. **Stop holding the keepers lock across S3 I/O on the ordinary ship
+   path.** Read the ship epoch under the lock, release it for the PUT, and
+   re-take it for acks and bookkeeping. The ship mutex already serializes
+   shipping against handoff. The invariant the lock protects ("an accepted
+   op never lands after the *final* flush of a release/handoff") is kept
+   by holding the lock across flush + release CAS on the release and
+   handoff paths only.
+3. **Renew outside the lock.** Executing under a still-valid lease while
+   its renewal CAS is in flight is safe; the lease view is updated when
+   the CAS returns.
+
+Update the model (M1) if the lock scope changes what it abstracts.
+
+**Tests.**
+- A harness scenario, `holder-ships-under-forward-load`: 3 nodes, a
+  sustained forwarded create burst. The holder's `journal_backlog` in
+  `status` stays below a small bound throughout, and followers see creates
+  within 2 s.
+- A unit or in-process test proving a forwarded execute cannot land
+  between a release's final flush and its release CAS.
+
+**Measure.** `meta-bench` 3-node P2P rows against the pre-M2 baseline,
+run several times on an idle host. This milestone must bring M2's rows
+back within ±10% of the pre-M2 baseline. Also count completed rounds per
+second on the holder.
 
 ### M3 — Speculation log, stranded-op recovery, clean commits (fixes B)
 

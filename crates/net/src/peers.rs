@@ -23,6 +23,15 @@ use std::time::{Duration, Instant};
 /// falling back to the S3 path. Generous enough for a WAN round trip,
 /// short enough that it never dominates the idle-release window.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// A holder agreed to hand `part` over — see [`Peers::request_lease`].
+#[derive(Debug, Clone, Copy)]
+pub struct HandoffAccepted {
+    /// The highest log sequence the holder's flush shipped before
+    /// releasing, if it reported one. Plan 30 §M2: the requester must
+    /// tail at least this far before trusting a `completed` lookup.
+    pub head_seq: Option<u64>,
+}
 /// A chunk includes its body, unlike the small control requests above.
 /// Keep this named and single-layered so source hedging/cancellation has
 /// one predictable upper bound.
@@ -353,19 +362,26 @@ impl Peers {
 
     /// Ask whoever holds `part` to hand the lease over.
     ///
-    /// Returns `true` only when a holder said it flushed and released, so
-    /// the caller should attempt its CAS immediately. Everything else —
-    /// no peers, no answer, a decline, a forged reply — returns `false`
+    /// `Some(accepted)` only when a holder said it flushed and released,
+    /// so the caller should attempt its CAS immediately —
+    /// `accepted.head_seq` is the highest sequence that flush shipped
+    /// (plan 30 §M2 coverage rule: the caller must tail at least this
+    /// far, not just run its ordinary claim-time tail, before treating
+    /// any `completed` lookup as authoritative — see
+    /// `node_runtime.rs`'s `SyncRequest::Acquire` arm). Everything else —
+    /// no peers, no answer, a decline, a forged reply — returns `None`
     /// and leaves the caller on the S3 path.
     ///
     /// When `holder_id` is known, that peer is asked first.
-    pub async fn request_lease(&self, part: &str, holder_id: Option<u64>) -> bool {
-        let Some(inner) = self.inner.as_ref() else {
-            return false;
-        };
+    pub async fn request_lease(
+        &self,
+        part: &str,
+        holder_id: Option<u64>,
+    ) -> Option<HandoffAccepted> {
+        let inner = self.inner.as_ref()?;
         let mut peers = self.snapshot();
         if peers.is_empty() {
-            return false;
+            return None;
         }
         if let Some(id) = holder_id {
             peers.sort_by_key(|p| if p.node_id == id { 0u8 } else { 1 });
@@ -392,7 +408,11 @@ impl Peers {
                             took_ms = started.elapsed().as_millis(),
                             "peer handed the lease over"
                         );
-                        return true;
+                        let head_seq = match &body {
+                            Payload::LeaseHandoff { head_seq, .. } => *head_seq,
+                            _ => None,
+                        };
+                        return Some(HandoffAccepted { head_seq });
                     }
                 }
                 Ok(Err(e)) => {
@@ -405,7 +425,7 @@ impl Peers {
                 }
             }
         }
-        false
+        None
     }
 
     fn note_rtt(&self, node_id: u64, took: Duration, ok: bool, path: PathKind) {
@@ -699,9 +719,19 @@ pub async fn run_gossip<S: PeerService>(
                 req_id,
                 epoch_seen,
                 op,
+                rid,
+                acked_through,
             } => {
                 let _ = service
-                    .mutate_requested(part.clone(), *requester, *req_id, *epoch_seen, op.clone())
+                    .mutate_requested(
+                        part.clone(),
+                        *requester,
+                        *req_id,
+                        *epoch_seen,
+                        op.clone(),
+                        *rid,
+                        *acked_through,
+                    )
                     .await;
             }
             Payload::LeaseOffer { part, epoch } => {
@@ -868,9 +898,11 @@ async fn handle_stream<S: PeerService>(
             req_id,
             epoch_seen,
             op,
+            rid,
+            acked_through,
         } => Some(
             service
-                .mutate_requested(part, requester, req_id, epoch_seen, op)
+                .mutate_requested(part, requester, req_id, epoch_seen, op, rid, acked_through)
                 .await,
         ),
         Payload::LeaseOffer { part, epoch } => {
@@ -1045,7 +1077,7 @@ mod tests {
         p.refresh_registry(vec![(1, "aa".into(), serde_json::json!({}))]);
         p.announce_segment("p0", 1, 1, None).await;
         assert!(
-            !p.request_lease("p0", None).await,
+            p.request_lease("p0", None).await.is_none(),
             "no fast path means the caller must use S3"
         );
     }
@@ -1056,7 +1088,7 @@ mod tests {
     async fn lease_request_reaches_the_holder_and_releases() {
         let (_holder, asker, service) = pair(true).await;
         assert!(
-            asker.request_lease("p0", None).await,
+            asker.request_lease("p0", None).await.is_some(),
             "a released lease must tell the caller to CAS now"
         );
         assert_eq!(
@@ -1076,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn declined_lease_request_keeps_the_caller_waiting() {
         let (_holder, asker, service) = pair(false).await;
-        assert!(!asker.request_lease("p0", None).await);
+        assert!(asker.request_lease("p0", None).await.is_none());
         assert_eq!(service.lease_asks.lock().unwrap().len(), 1);
     }
 
@@ -1189,7 +1221,7 @@ mod tests {
             ),
         ]);
         assert!(
-            !stranger.request_lease("p0", None).await,
+            stranger.request_lease("p0", None).await.is_none(),
             "an unenrolled peer must not get a handoff"
         );
         assert!(
@@ -1489,7 +1521,10 @@ mod tests {
             serde_json::to_value(&own_addr).unwrap(),
         )]);
         assert!(peers.snapshot().is_empty(), "must not dial ourselves");
-        assert!(!peers.request_lease("p0", None).await, "nobody else to ask");
+        assert!(
+            peers.request_lease("p0", None).await.is_none(),
+            "nobody else to ask"
+        );
     }
 
     /// A registry record whose address will not parse must not drop the

@@ -616,7 +616,53 @@ Requires docker + fusermount3 + a release binary on the host
 `constellation-harness=1` and removed on drop, even when a scenario
 panics.
 
-### Known-bug reproductions (plan 30 M0)
+### `forward-timeout-reexec` (plan 30 M2, exactly-once forwarding)
+
+Two nodes, `CONSTELLATION_LEASE_TTL_MS=10000` and
+`CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS=1500` (over the 500 ms
+default forward timeout) on both. Five rounds alternate which node
+holds the lease and exercise `O_EXCL` create, `mkdir`, `unlink`,
+`rename`, and `link`: the requester's forward times out after the
+holder already executed the op. Before plan 30 M2,
+`mutate_op_rebasable` (`crates/cli/src/fusefs.rs`) fell back to
+acquiring the lease and re-executing the op locally — wrong errno
+(`EEXIST`/`ENOENT`) on a call POSIX says must succeed (bug A). With M2's
+rid-based exactly-once identity, the same fallback instead retries the
+same rid (to the same holder, then a redirected one) and, failing that,
+resolves the in-doubt op against the `completed` keyspace before ever
+executing it again.
+
+Two non-vacuity checks, both required, checking different things:
+
+- **Per round**, `forwarded_err` must rise — proves the fault actually
+  engaged (a slow host that raced the fault deterministically anyway
+  would make this scenario pass for the wrong reason).
+- **Across the whole run**, `forward_dedup_hits + forward_indoubt_resolved`
+  (summed over both nodes) must rise at least once — proves the
+  exactly-once *mechanism* engaged somewhere, not just that every round
+  happened to resolve safely by coincidence (e.g. mkdir/link's
+  idempotent-merge convergence, below). This is checked in aggregate,
+  not per round: a race can correctly resolve *either* by the holder or
+  lease path recognizing a genuine retry (dedup rises) *or* by the
+  lease path legitimately finding the op was never completed anywhere
+  and executing it fresh exactly once (no dedup signal at all, since
+  there was nothing to dedup) — both are correct, and which one a given
+  round takes depends on exactly when the holder ships relative to the
+  requester's retry timing. What must never happen — a second execution
+  — is what the existing `ino_agrees` check (below) catches directly.
+
+The failure message lists every anomalous round: op, errno (or missing
+dedup evidence for the whole run), and a diagnosis.
+
+**`ino_agrees`**: existence converging on both nodes is necessary but
+not sufficient — a create-family op whose local re-execution raced
+ahead of the holder's shipped record (rather than seeing it and failing
+`EEXIST`) creates a *second*, independent inode under the same name,
+which ordinary same-name-conflict replay resolves silently. `ino_agrees`
+compares the kernel inode number of the resulting name across both
+nodes, catching that even when no errno reaches the caller.
+
+### Known-bug reproductions (plan 30 M0/M1, bug B pending M3)
 
 `harness list` prints a second catalog after the ordinary scenario list,
 headed `known-bug reproductions (expected to FAIL until fixed)`, backed
@@ -641,17 +687,6 @@ Reproducing these needs two things no scenario had before:
 
 Scenarios:
 
-- **`forward-timeout-reexec`** (bug A). Two nodes, `CONSTELLATION_LEASE_TTL_MS=10000`
-  and the fault delay above (1500 ms, over the 500 ms default forward
-  timeout) on both. Five rounds alternate which node holds the lease and
-  exercise `O_EXCL` create, `mkdir`, `unlink`, `rename`, and `link`: the
-  requester's forward times out after the holder already executed the
-  op, `mutate_op_rebasable` (`crates/cli/src/fusefs.rs`) falls back to
-  acquiring the lease, and re-executes it locally — wrong errno
-  (`EEXIST`/`ENOENT`) on a call POSIX says must succeed. Fails with one
-  line per anomalous round, including a non-vacuity check
-  (`forwarded_err` must rise, or the round reports the fault never
-  engaged); passes once M2 lands.
 - **`holder-crash-phantom-shadow`** (bug B, third node takes over). Three
   nodes; A's S3 goes through its own `CountingProxy` switch. A takes the
   lease, then its S3 is cut — it still acks a forwarded mutation from

@@ -366,7 +366,17 @@ impl Meta {
             tx.remove(&self.journal_ks, seq.to_be_bytes().to_vec());
         }
         for record in output {
-            journal::append_tx(&mut tx, &self.journal_ks, &self.local, record)?;
+            // `output` is already-decided reintegration merge output
+            // (verbatim stranded records, possibly including a
+            // `Completed` row from the branch's own original execution)
+            // — never a fresh op, so nothing is pending here.
+            journal::append_tx(
+                &mut tx,
+                &self.journal_ks,
+                &self.local,
+                &self.completed,
+                record,
+            )?;
         }
         tx.commit()?;
         Ok(())

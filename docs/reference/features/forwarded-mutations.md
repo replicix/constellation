@@ -2,13 +2,16 @@
 
 Forwarded mutations let a non-holder ask the partition lease holder to
 sequence a write over iroh. They reduce lease churn without changing S3
-authority.
+authority. Delivery is **exactly-once** (plan 30 M2, the RIFL design
+applied to forwarding): a forwarded mutation carries a stable request
+id, and neither a slow reply nor a takeover can make it execute twice.
 
 ## Table of Contents
 
 - [Terminology](#terminology)
 - [Wire messages](#wire-messages)
 - [Request flow](#request-flow)
+- [Exactly-once identity and in-doubt handling](#exactly-once-identity-and-in-doubt-handling)
 - [Acknowledgement and durability](#acknowledgement-and-durability)
 - [Status and logs](#status-and-logs)
 - [Failure and fallback](#failure-and-fallback)
@@ -21,6 +24,8 @@ authority.
 - **Requester**: a non-holder sending an operation to the sequencer.
 - **Shadow**: accepted records stored and applied locally by the requester
   before the corresponding S3 segment arrives.
+- **Rid**: `(node, incarnation, seq)`, the exactly-once identity of one
+  mutation — see below.
 
 ## Wire messages
 
@@ -30,9 +35,16 @@ Both messages are signed iroh payloads. Mutation bodies use postcard encoding.
 
 - `part`: target partition.
 - `requester`: requester's node id.
-- `req_id`: requester-local correlation id.
+- `req_id`: requester-local correlation id, fresh on every attempt (wire
+  request/reply matching only — see `rid` below for the identity that
+  matters for exactly-once execution).
 - `epoch_seen`: epoch hint; currently sent as `0`.
 - `op`: encoded `MutateOp`.
+- `rid`: `(node, incarnation, seq)` — stable across every retry of this
+  op, unlike `req_id`.
+- `acked_through`: the highest contiguous `rid.seq` of this requester's
+  incarnation whose reply it has already received; lets the holder drop
+  its in-memory dedup cache for anything it no longer needs.
 
 `MutateReply` contains the matching `req_id` and an encoded `MutateOutcome`:
 
@@ -59,6 +71,64 @@ An empty or undecodable outcome is treated as `Busy`.
 
 A `NotHolder` response updates the cached holder and permits one retry at the
 redirected node.
+
+## Exactly-once identity and in-doubt handling
+
+Every `MutateOp` a FUSE call issues is assigned one rid at the top of
+`mutate_op_rebasable`, before any forward or lease-acquisition attempt,
+and keeps that same rid across every retry — the same holder, a
+redirected holder, or the lease-acquisition fallback. `incarnation` is
+this mount's own counter, persisted in the node-local `local` keyspace
+and bumped once, before serving any mutation; `seq` is a per-incarnation
+counter that resets to 0 every mount, but the incarnation bump alone
+keeps the pair from ever repeating even across a crash (`kill9-remount`
+never reuses a rid).
+
+**Holder-side dedup.** Executing an op appends `LogRecord::Completed
+{ rid }` in the same fjall transaction as the op's own record(s), so it
+ships in the same segment. Before executing a forwarded op, the holder
+checks:
+
+- an in-memory `recent` map of rids it has executed as holder but not
+  yet had acknowledged (`acked_through`) — this answers a retry against
+  a still-live holder with the identical `Accepted` reply, without
+  re-executing;
+- the durable, node-local `completed` keyspace, populated by replaying
+  `Completed` records — this is what a *different* node (after a
+  takeover) checks instead.
+
+An executed rid is never executed again. Refusals are not recorded: a
+retried refused op is simply re-evaluated, and takes effect (or not) at
+the retry, which is still linearizable. A `SetManifest` rebase is a new
+op with a new rid.
+
+**Requester-side retry.** A timeout, a transport error, or `Busy` leaves
+the op *in doubt*, never refused — only an explicit `Errno`, `Conflict`,
+or `Exists` ends an op without executing it. An in-doubt op retries the
+same rid, in order:
+
+1. the same holder, with backoff (three attempts, ~200ms/400ms/600ms —
+   a slow holder is more common than a dead one);
+2. a redirected holder, if a `NotHolder` reply named one;
+3. only then the lease-acquisition path. Once it holds (tailing to head
+   first — see below), it looks the rid up in `completed`: found means
+   the op already happened, so it returns success without executing;
+   not found means it executes locally, with the same rid.
+
+**Coverage rule.** Resolving an in-doubt op against `completed` is only
+valid if this replica has tailed every segment since the op was first
+sent — otherwise an execution sitting in a segment it has not seen yet
+would look like "never happened" and get re-executed. A fast P2P
+handoff can leave the tail briefly behind the departing holder's last
+upload, so the lease-acquisition fallback tails to head, and polls for
+up to ~750ms, before trusting `completed`'s silence. GC respects the
+same rule: log segments and `completed` rows younger than
+`CONSTELLATION_COMPLETION_RETENTION_S` (default 900s, see
+[Configuration](../configuration.md)) are never pruned, regardless of
+what `CONSTELLATION_LOG_RETENTION_SEGMENTS` would otherwise allow. A
+node that re-bootstraps across a gap wider than that window cannot
+resolve an op stranded in it; such an op fails with `EIO`, never with a
+re-execution.
 
 ## Acknowledgement and durability
 
@@ -143,6 +213,12 @@ execution order.
 - `forward_p50_ms`: median of the last 256 successful forward latencies.
 - `pushed_segments_applied`: segment payloads applied directly without an S3
   fetch.
+- `forward_dedup_hits`: forwarded requests the holder answered from
+  `recent`/`completed` instead of re-executing (plan 30 M2).
+- `forward_retries`: same-rid forward retries this node's requester side
+  made before falling back to the lease-acquisition path (plan 30 M2).
+- `forward_indoubt_resolved`: in-doubt ops the lease path resolved
+  against `completed` instead of re-executing (plan 30 M2).
 - `placement_reason`: the last holder placement recommendation.
 
 Under a steady multi-writer workload, `forwarded_ok` should rise while
@@ -153,17 +229,22 @@ not stable.
 ## Failure and fallback
 
 Forwarding is optional. A timeout, empty reply, `Busy`, stale holder, disabled
-P2P, or unreachable peer falls back to the normal lease acquisition path.
-Handoff can release a reachable holder immediately; otherwise the requester
-waits for release or TTL expiry and claims through S3 CAS.
+P2P, or unreachable peer leaves the op in doubt and retries the same rid (see
+above) before falling back to the normal lease-acquisition path. Handoff can
+release a reachable holder immediately; otherwise the requester waits for
+release or TTL expiry and claims through S3 CAS. Every path — same-holder
+retry, redirected-holder retry, or the lease-acquisition fallback — resolves
+to exactly one execution, never a repeat.
 
 The default request timeout is 500 ms
 (`CONSTELLATION_FORWARD_TIMEOUT_MS`). Setting `CONSTELLATION_FORWARD=off`
 disables requester-side forwarding entirely: every non-holder mutation
-takes the lease-acquisition path (P2P handoff, then S3 CAS), restoring
-writer-follows-lease placement. A holder crash after `Accepted` can
-strand records in its journal. Epoch fencing prevents a competing append
-history; reintegration reports and resolves the stranded branch.
+takes the lease-acquisition path (P2P handoff, then S3 CAS) directly, with
+no rid retries to attempt first, restoring writer-follows-lease placement.
+A holder crash after `Accepted` can still strand records in its journal
+(plan 30 M3 fixes the resulting divergence; M2 only fixes at-least-once
+delivery). Epoch fencing prevents a competing append history; reintegration
+reports and resolves the stranded branch.
 
 ## References
 

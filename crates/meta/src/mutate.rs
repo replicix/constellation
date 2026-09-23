@@ -200,9 +200,29 @@ impl MutateOutcome {
 }
 
 /// Execute `op` against the holder's authoritative replica and return
-/// the journal records that were appended. The caller is responsible
-/// for checking lease ownership first.
-pub fn execute(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError> {
+/// the journal records that were appended (including a trailing
+/// `LogRecord::Completed { rid }` when `rid` is given — plan 30 §M2).
+/// The caller is responsible for checking lease ownership first.
+///
+/// `rid` should be `Some` for every FUSE-issued mutation (local fast
+/// path, holder-side forward execution, or a lease-path retry) and
+/// `None` for op executions that are not part of the exactly-once
+/// forwarding protocol at all (system-generated unlinks from retention
+/// pruning, reintegration replay of already-decided records, tests that
+/// do not exercise M2). The rid reaches `journal::append_tx` through a
+/// thread-local set for the duration of this call
+/// (`store::journal::PendingCompletion`), so the op's own transaction —
+/// and only it — carries the completion marker.
+pub fn execute(
+    meta: &Meta,
+    op: &MutateOp,
+    rid: Option<crate::rid::Rid>,
+) -> Result<Vec<LogRecord>, MetaError> {
+    let _pending = crate::store::journal::PendingCompletion::set(rid);
+    execute_inner(meta, op)
+}
+
+fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError> {
     let before = meta.max_journal_seq()?;
     match op {
         MutateOp::Mkdir {
@@ -348,6 +368,7 @@ mod tests {
             &MutateOp::AtimeBatch {
                 entries: vec![(f.ino, t, t)],
             },
+            None,
         )
         .unwrap();
         // The holder appends nothing to the write journal...
@@ -386,6 +407,7 @@ mod tests {
                 uid: 0,
                 gid: 0,
             },
+            None,
         )
         .unwrap();
         assert_eq!(records.len(), 1);
@@ -415,7 +437,7 @@ mod tests {
         let bytes = op.to_postcard().unwrap();
         assert_eq!(MutateOp::from_postcard(&bytes).unwrap(), op);
 
-        let records = execute(&m, &op).unwrap();
+        let records = execute(&m, &op, None).unwrap();
         assert_eq!(records.len(), 3);
         assert!(matches!(records[0], LogRecord::Create { .. }));
         assert!(matches!(records[1], LogRecord::WriteManifest { .. }));
@@ -427,5 +449,89 @@ mod tests {
             m.get_xattr(ino, "user.passsage.meta").unwrap().as_deref(),
             Some(b"blob".as_slice())
         );
+    }
+
+    fn rid(seq: u64) -> crate::rid::Rid {
+        crate::rid::Rid {
+            node: 1,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    /// Plan 30 §M2: passing a rid appends `LogRecord::Completed` in the
+    /// same call, and it lands in the `completed` keyspace immediately
+    /// (no separate replay step needed on the writer's own replica).
+    #[test]
+    fn execute_with_rid_appends_completed_and_populates_completed_keyspace() {
+        let m = Meta::open_in_memory().unwrap();
+        let r = rid(1);
+        let records = execute(
+            &m,
+            &MutateOp::Create {
+                parent: ROOT_INO,
+                name: "f".into(),
+                ino: (1 << 40) | 7,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(r),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 2, "op record + Completed");
+        assert!(matches!(records[0], LogRecord::Create { .. }));
+        assert!(matches!(records[1], LogRecord::Completed { rid } if rid == r));
+        assert!(m.completed_position(r).unwrap().is_some());
+    }
+
+    /// A multi-record op (`Publish` appends 3) still gets exactly one
+    /// `Completed`, appended once, in the same transaction — not once
+    /// per underlying record.
+    #[test]
+    fn execute_with_rid_on_multi_record_op_completes_once() {
+        let m = Meta::open_in_memory().unwrap();
+        let r = rid(2);
+        let ino = (1 << 40) | 9;
+        let op = MutateOp::Publish {
+            ino,
+            parent: ROOT_INO,
+            name: "published".into(),
+            mode: 0o640,
+            uid: 1000,
+            gid: 1000,
+            mtime_ns: 123,
+            manifest: b"MANIFEST".to_vec(),
+            size: 42,
+            xattrs: vec![("user.passsage.meta".into(), b"blob".to_vec())],
+        };
+        let records = execute(&m, &op, Some(r)).unwrap();
+        assert_eq!(records.len(), 4, "3 op records + one Completed");
+        let completed_count = records
+            .iter()
+            .filter(|r| matches!(r, LogRecord::Completed { .. }))
+            .count();
+        assert_eq!(completed_count, 1);
+        assert!(m.completed_position(r).unwrap().is_some());
+    }
+
+    /// A refused op (here: `Create` on an already-existing name) is
+    /// never completed — plan 30 §M2: "refusals are not recorded."
+    #[test]
+    fn execute_with_rid_on_refusal_does_not_complete() {
+        let m = Meta::open_in_memory().unwrap();
+        let op = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "dup".into(),
+            ino: (1 << 40) | 11,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        execute(&m, &op, Some(rid(3))).unwrap();
+        let r2 = rid(4);
+        let err = execute(&m, &op, Some(r2)).unwrap_err();
+        assert!(matches!(err, MetaError::Exists));
+        assert!(m.completed_position(r2).unwrap().is_none());
     }
 }

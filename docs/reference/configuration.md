@@ -299,14 +299,23 @@ hinted), never "proven absent".
 | `CONSTELLATION_COMMIT_RETENTION_S` | `86400` | seconds | commits younger than this are kept however many there are; a commit is deleted only when it is outside the newest `CONSTELLATION_COMMIT_RETENTION` *and* older than this |
 | `CONSTELLATION_COMPACT_BYTES_PER_S` | `33554432` (32 MiB/s) | bytes per second; `0` unpaced | read budget for metadata pack deletion and compaction in a GC round |
 | `CONSTELLATION_GC_THREADS` | one per core | threads, positive | width of the metadata mark and pack rewrite pools |
+| `CONSTELLATION_COMPLETION_RETENTION_S` | `900` | seconds | plan 30 M2: how long the node-local `completed` keyspace is retained, and the floor log-segment retention respects regardless of `CONSTELLATION_LOG_RETENTION_SEGMENTS` |
 
 Log retention is evaluated against the position a fresh replica resumes
 from: the head plan 28 commit's `applied` position. With no commit yet
 (a genuinely fresh filesystem), nothing is pruned — the log is the only
 copy of history there is. A segment is prunable only once the head
 commit's `applied` position is more than
-`CONSTELLATION_LOG_RETENTION_SEGMENTS` ahead of it. (A bootstrap from a
-base the log was pruned past refuses instead of replaying from the gap.)
+`CONSTELLATION_LOG_RETENTION_SEGMENTS` ahead of it *and* it is older
+than `CONSTELLATION_COMPLETION_RETENTION_S` (plan 30 M2's coverage
+rule: an in-doubt forwarded op can only be resolved against `completed`
+if every segment since it was first sent is still there to have been
+tailed, so retention never drops a segment younger than that window no
+matter how far ahead the head commit has moved). A node that
+re-bootstraps across a gap wider than the retention window cannot
+resolve an op stranded in that gap; such an op fails with `EIO` rather
+than being retried or re-executed. (A bootstrap from a base the log was
+pruned past refuses instead of replaying from the gap.)
 
 Metadata GC (plan 28 S7b) runs as a second phase of every GC round:
 commit retention by the two knobs above, a reachability mark from the

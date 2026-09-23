@@ -402,6 +402,20 @@ pub struct StatusReport {
     pub forward_p50_ms: Option<u64>,
     #[serde(default)]
     pub pushed_segments_applied: u64,
+    /// Plan 30 §M2: forwarded requests the holder answered from
+    /// `recent`/`completed` instead of re-executing (a retried rid).
+    #[serde(default)]
+    pub forward_dedup_hits: u64,
+    /// Plan 30 §M2: same-rid forward retries this node's requester side
+    /// made (same holder, or a redirected one) before falling back to
+    /// the lease-acquisition path.
+    #[serde(default)]
+    pub forward_retries: u64,
+    /// Plan 30 §M2: in-doubt ops the lease-path resolved against
+    /// `completed` instead of re-executing (a genuine takeover finding
+    /// the op already happened).
+    #[serde(default)]
+    pub forward_indoubt_resolved: u64,
     #[serde(default)]
     pub placement_reason: Option<String>,
     /// Optional cluster-wide logical byte cap and current used bytes.

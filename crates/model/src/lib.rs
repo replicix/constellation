@@ -24,6 +24,10 @@
 //! `tests/` for worked examples, including how to print a discovered
 //! counterexample path with `Checker::discovery`).
 //!
+//! [`protocol::Protocol::ExactlyOnce`] (plan 30 §M2) adds `Rid`-keyed
+//! exactly-once forwarding on top of `Today`; see the "Action → code
+//! mapping" and "Simplifications" sections below for what changed.
+//!
 //! # What is modeled
 //!
 //! - **Actors.** `N` `Node`s (2–3 across the tests) plus one implicit
@@ -68,6 +72,7 @@
 //! | `DeliverForwardRequest` | `crates/cli/src/node_runtime.rs` `SyncRequest::Mutate` arm → `crates/cli/src/forward.rs::holder_execute` |
 //! | `DeliverForwardReply` (Accepted) | `crates/cli/src/forward.rs::apply_accepted` (`shadow_insert` + `apply_foreign`) |
 //! | `ForwardTimeout` | `crates/cli/src/forward.rs::request_mutate_with`'s `tokio::time::timeout` → `MutateOutcome::Busy` |
+//! | `RetryForward` (`ExactlyOnce` only) | `crates/cli/src/forward.rs::request_mutate_with`'s same-rid retry loop: the same holder if `state.lease` (the model's stand-in for the peer directory's belief) still names it, else the redirected one — plan 30 §M2's "retry the same rid... same holder... then a redirected holder" |
 //! | `RequestHandoff` / `DeliverHandoffRequest` / `DeliverHandoffReply` | `crates/cli/src/node_runtime.rs` `SyncRequest::HandOff` arm (`ship.sync_one` + `LeaseKeeper::release`) and the `peers.request_lease` fast-path retry in the `SyncRequest::Acquire` arm |
 //! | `AcquireLease` | `crates/cli/src/lease.rs::LeaseKeeper::classify`/`commit` (`Plan::Create`/`Plan::Claim`, `TailedToHead`) + `crates/cli/src/shipper.rs::acquire_lease_for`/`tail_to_head` |
 //! | `Renew` (success / deposition) | `crates/cli/src/lease.rs::LeaseKeeper::renew_now` → `diagnose_lost_renew` → `mark_lost` |
@@ -111,11 +116,27 @@
 //! 6. The plan 29 M6 "an `EEXIST` refusal carries the existing entry"
 //!    hint (`causal_wait_target`/`MutateOutcome::Exists`) is not modeled;
 //!    a refused create-family op here just returns `EEXIST`.
-//! 7. `Rid`/`Completed` exactly-once identity (plan 30 M2) is
-//!    *deliberately absent* — that omission is exactly what lets
-//!    `today_finds_bug_a` reproduce bug A. `Protocol::Today` is the only
-//!    variant this milestone implements; see [`protocol::Protocol`]'s
-//!    doc for where later milestones extend it.
+//! 7. `Rid`/`Completed` exactly-once identity (plan 30 §M2) is present
+//!    (`protocol::Rid`, `protocol::Logged`, `protocol::rid_completed_record`)
+//!    but only ever *read* under `Protocol::ExactlyOnce` — `Today` still
+//!    allocates a rid and tags every record with it (structurally
+//!    harmless plumbing shared by both variants), but never consults it,
+//!    which is exactly what lets `today_finds_bug_a` still reproduce bug
+//!    A. `ExactlyOnce`'s own forward-retry attempts are capped at
+//!    `protocol::MAX_FORWARD_RETRIES` (plan 30 §M2's "three attempts") —
+//!    not for fidelity alone, but because each additional attempt
+//!    revisits the whole tick/renew/ship/crash interleaving space and
+//!    multiplied the reachable state count roughly tenfold per attempt
+//!    when this was tuned, so a config exercising crashes under
+//!    `ExactlyOnce` needs noticeably tighter bounds than the equivalent
+//!    `Today` config to stay inside the ~60s budget (see
+//!    `exactly_once_is_linearizable`'s doc comment for the measured
+//!    numbers). GC/retention (`acked_through`, `CONSTELLATION_COMPLETION_RETENTION_S`)
+//!    and the incarnation bump surviving a real restart are product-level
+//!    concerns validated by unit/integration tests, not by this model —
+//!    `Restart` here already bumps `incarnation`/resets `next_seq` purely
+//!    to keep a rid from ever being reallocated, which is the one part of
+//!    that machinery a safety property could actually depend on.
 //! 8. Log capacity (`max_seq`) and the tick horizon (`max_tick`) are
 //!    small, per-test bounds chosen to keep exhaustive BFS within the
 //!    ~60s budget; a config that needs to be bigger should be

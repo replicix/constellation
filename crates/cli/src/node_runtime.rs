@@ -247,6 +247,18 @@ struct MountHandle {
 
 pub struct NodeRuntime {
     node_id: u64,
+    /// Plan 30 §M2: this mount's incarnation (bumped once, before
+    /// serving, in `NodeRuntime::new`). Part of every rid this mount
+    /// allocates.
+    incarnation: u32,
+    /// Plan 30 §M2: the next `seq` to allocate within this incarnation.
+    /// Shared with every `SyncHandle` this runtime hands out (one per
+    /// mounted view) so rid allocation is unique across all of them, not
+    /// just within one. Volatile — restarts at 0 every mount; the
+    /// incarnation bump is what keeps that safe.
+    next_rid_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Plan 30 §M2 status counter: see `fusefs::SyncHandle::indoubt_resolved`.
+    pub(crate) indoubt_resolved: Arc<std::sync::atomic::AtomicU64>,
     fsmeta: FsMeta,
     backend_url: String,
     state_dir: PathBuf,
@@ -425,6 +437,13 @@ impl NodeRuntime {
             bail!("--read-only-member is fixed on first mount for this state directory");
         }
         meta.set_node_prefix(node_id)?;
+        // Plan 30 §M2: bump this node's incarnation before serving any
+        // mutation. This is what keeps a rid unique across a crash: the
+        // volatile per-incarnation seq counter (`ForwardState`'s
+        // `next_rid_seq`) restarts at 0 every mount, but the persisted
+        // incarnation never repeats, so the pair never does either.
+        let incarnation = meta.bump_incarnation()?;
+        tracing::info!(node_id, incarnation, "node incarnation");
         // Plan 25: drop pending_upload rows that belong to another node's
         // ino prefix (a copied meta.db dropped into an existing state
         // dir). Same-prefix rows stay for crash recovery. On a fresh
@@ -628,6 +647,53 @@ impl NodeRuntime {
                 }
             })
         };
+        // Plan 30 §M2: prune `completed` entries older than the
+        // retention window on a cadence tied to that window itself
+        // (a quarter of it, clamped to something reasonable) rather
+        // than the much coarser bucket-GC interval above — the two
+        // serve different purposes (bucket cleanup vs. bounding this
+        // node-local table's size) and the default retention (900s) is
+        // far shorter than the default GC interval (a day).
+        let _completed_prune_task = {
+            let meta = meta.clone();
+            let retention_s = std::env::var("CONSTELLATION_COMPLETION_RETENTION_S")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(crate::gc::DEFAULT_COMPLETION_RETENTION_S);
+            let prune_interval = (retention_s / 4).clamp(30, 3600);
+            rt.spawn(async move {
+                let mut timer =
+                    tokio::time::interval(std::time::Duration::from_secs(prune_interval));
+                timer.tick().await;
+                loop {
+                    timer.tick().await;
+                    let now_ms = constellation_store_s3::lease::now_unix_ms();
+                    match meta.prune_completed(now_ms, retention_s as i64 * 1000) {
+                        Ok(0) => {}
+                        Ok(pruned) => tracing::debug!(pruned, "pruned expired completed rids"),
+                        Err(error) => tracing::warn!(%error, "completed-table prune failed"),
+                    }
+                    // Plan 30 §M2 coordinator review item 1: the
+                    // per-(node,incarnation) entry cap in
+                    // `Meta::remember_outcome` bounds `recent`'s *size*
+                    // on every insert, but a low-traffic requester whose
+                    // in-flight ops never get acked (a crash, a
+                    // permanently departed peer) can sit under that cap
+                    // indefinitely with genuinely stale entries. Same
+                    // cadence and window as the `completed` prune above
+                    // — both bound memory/lookup cost for rids nothing
+                    // will ever ack.
+                    let pruned_recent =
+                        meta.prune_recent_older_than(now_ms, retention_s as i64 * 1000);
+                    if pruned_recent > 0 {
+                        tracing::debug!(
+                            pruned = pruned_recent,
+                            "pruned stale recent-outcome entries"
+                        );
+                    }
+                }
+            })
+        };
         let epochs = Arc::new(epoch::EpochManager::new(
             node_id,
             meta.clone(),
@@ -737,6 +803,11 @@ impl NodeRuntime {
             m.insert(constellation_store_s3::log::PARTITION.to_string(), keeper);
             m
         }));
+        // Plan 30 §M2 coverage rule: `part -> highest seq a P2P handoff
+        // told us it shipped`, cleared once this node's own tail reaches
+        // it. See the `SyncRequest::Acquire` arm.
+        let pending_catchup: Arc<tokio::sync::Mutex<HashMap<String, u64>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let reintegration = Arc::new(reintegrate::ReintegrationState::default());
         // Only a persisted deposition is known to be a stranded branch.
         // Ordinary crash-recovery journals must retain their existing
@@ -1185,7 +1256,7 @@ impl NodeRuntime {
                             let mut r = if epochs.writes_ok() {
                                 if keeper.holds_authority() {
                                     Ok(true)
-                                } else if peers.request_lease(&part, None).await {
+                                } else if peers.request_lease(&part, None).await.is_some() {
                                     keeper.adopt_epoch_hold(keeper.authority_epoch());
                                     Ok(true)
                                 } else {
@@ -1200,30 +1271,87 @@ impl NodeRuntime {
                             // when the plain CAS just failed, and the retry
                             // is still an ordinary CAS — S3 stays the commit
                             // point, so a lying peer only wastes one round.
-                            if !epochs.is_open()
-                                && matches!(r, Ok(false))
-                                && peers.is_enabled()
-                                && peers.request_lease(&part, None).await
-                            {
-                                keeper.note_acquire_reason("fuse-acquire-after-handoff");
-                                r = shipper::acquire_lease_for(&mut ship, keeper, &part).await;
+                            //
+                            // Plan 30 §M2 coverage rule: `acquire_lease_for`
+                            // already tails to head for a *genuine* S3-CAS
+                            // takeover (`classify`'s `needs_tail`), but a
+                            // handoff's own `head_seq` is a stronger, more
+                            // direct witness of exactly how far the
+                            // departing holder's own flush went — record it
+                            // in `pending_catchup` so the check below waits
+                            // for it explicitly, rather than trusting
+                            // `classify`'s belief alone (a fast handoff can
+                            // race its own upload's visibility).
+                            if !epochs.is_open() && matches!(r, Ok(false)) && peers.is_enabled() {
+                                if let Some(handoff) = peers.request_lease(&part, None).await {
+                                    keeper.note_acquire_reason("fuse-acquire-after-handoff");
+                                    r = shipper::acquire_lease_for(&mut ship, keeper, &part).await;
+                                    if matches!(r, Ok(true)) {
+                                        if let Some(target) = handoff.head_seq {
+                                            let mut pending = pending_catchup.lock().await;
+                                            pending
+                                                .entry(part.clone())
+                                                .and_modify(|t| *t = (*t).max(target))
+                                                .or_insert(target);
+                                        }
+                                    }
+                                }
                             }
                             if let Err(e) = &r {
                                 tracing::warn!(error = %e, part, "lease acquisition failed");
+                            }
+                            // Plan 30 §M2: whether `r` just became `Ok(true)`
+                            // above or was already `Ok(true)` from
+                            // `keeper.holds_authority()` (a *previous*
+                            // Acquire call already committed the claim but
+                            // had not yet caught up), a pending catch-up
+                            // target for this part must be reached before
+                            // this node may report itself acquired. One
+                            // bounded tail attempt per call: if it does not
+                            // land, report "held by us but not ready"
+                            // (holder=self, same epoch, unchanged across
+                            // retries) rather than acquired — that is what
+                            // lets `require_lease_for`'s own no-progress /
+                            // 2×TTL deadline serve as the timeout for this
+                            // wait too (an unchanging (holder, epoch) is
+                            // exactly what that deadline watches for),
+                            // rather than duplicating a second one here. A
+                            // caller that gives up this way gets EIO, never
+                            // executes.
+                            let mut not_yet_caught_up = false;
+                            if matches!(r, Ok(true)) {
+                                let target = pending_catchup.lock().await.get(&part).copied();
+                                if let Some(target) = target {
+                                    if ship.last_shipped_seq(&part).unwrap_or(0) < target {
+                                        let _ = ship.tail_part_to_head(&part).await;
+                                    }
+                                    if ship.last_shipped_seq(&part).unwrap_or(0) >= target {
+                                        pending_catchup.lock().await.remove(&part);
+                                    } else {
+                                        not_yet_caught_up = true;
+                                    }
+                                }
                             }
                             // A fresh classify (one extra GET, only paid on
                             // the busy path) gives the caller a holder/epoch
                             // snapshot to detect progress by — see
                             // `fusefs::AcquireProgress`'s doc.
-                            let reply_progress = match r {
-                                Ok(true) => Ok(fusefs::AcquireProgress::acquired()),
-                                Ok(false) => Ok(match keeper.classify().await {
-                                    Ok(lease::Plan::Busy { holder, prev, .. }) => {
-                                        fusefs::AcquireProgress::busy(holder, prev.epoch)
-                                    }
-                                    _ => fusefs::AcquireProgress::busy(0, 0),
-                                }),
-                                Err(e) => Err(format!("{e:#}")),
+                            let reply_progress = if not_yet_caught_up {
+                                Ok(fusefs::AcquireProgress::busy(
+                                    node_id,
+                                    keeper.authority_epoch(),
+                                ))
+                            } else {
+                                match r {
+                                    Ok(true) => Ok(fusefs::AcquireProgress::acquired()),
+                                    Ok(false) => Ok(match keeper.classify().await {
+                                        Ok(lease::Plan::Busy { holder, prev, .. }) => {
+                                            fusefs::AcquireProgress::busy(holder, prev.epoch)
+                                        }
+                                        _ => fusefs::AcquireProgress::busy(0, 0),
+                                    }),
+                                    Err(e) => Err(format!("{e:#}")),
+                                }
                             };
                             let _ = reply.send(reply_progress);
                         }
@@ -1291,6 +1419,8 @@ impl NodeRuntime {
                             part,
                             requester,
                             op,
+                            rid,
+                            acked_through,
                             reply,
                         }) => {
                             // Symmetric with the `Forward` arm above (plan
@@ -1337,10 +1467,37 @@ impl NodeRuntime {
                                         .unwrap_or((None, false));
                                     (ship_epoch.is_some() || is_lost).then(|| {
                                         forward::holder_execute(
-                                            &meta, ship_epoch, is_lost, node_id, &op, ship_floor,
+                                            &meta,
+                                            ship_epoch,
+                                            is_lost,
+                                            node_id,
+                                            &op,
+                                            ship_floor,
+                                            rid,
+                                            Some(&*forward),
                                         )
                                     })
                                 };
+                                // Plan 30 §M2 GC: this requester tells us
+                                // it has already received replies for
+                                // every seq of its current incarnation up
+                                // to `acked_through`, so our `recent`
+                                // cache for those rids only wastes memory
+                                // now. Done here, inside the spawned
+                                // task, not inline on the main sync loop:
+                                // that arm exists specifically so one
+                                // slow/contended step in servicing a
+                                // forward never delays the *next*
+                                // request's own dispatch (see the comment
+                                // above `tokio::spawn`) — an inline call
+                                // here reintroduced exactly that funnel
+                                // and was the dominant cost behind the
+                                // meta-bench regression this milestone's
+                                // coordinator review caught (confirmed:
+                                // holder_execute/append_tx themselves
+                                // cost tens of microseconds; the
+                                // regression was hundreds).
+                                meta.forget_acked_through(rid.node, rid.incarnation, acked_through);
                                 let outcome = if let Some(outcome) = executed {
                                     outcome
                                 } else {
@@ -1359,7 +1516,16 @@ impl NodeRuntime {
                                     .map(|(lease, _)| lease.holder)
                                     .unwrap_or(0)
                                 };
-                                forward::holder_execute(&meta, None, false, known_holder, &op, ship_floor)
+                                forward::holder_execute(
+                                    &meta,
+                                    None,
+                                    false,
+                                    known_holder,
+                                    &op,
+                                    ship_floor,
+                                    rid,
+                                    Some(&*forward),
+                                )
                                 };
                                 if matches!(
                                     outcome,
@@ -1387,7 +1553,7 @@ impl NodeRuntime {
                                 let _ = reply.send(outcome);
                             });
                         }
-                        Some(fusefs::SyncRequest::Forward { part, op, reply }) => {
+                        Some(fusefs::SyncRequest::Forward { part, op, rid, reply }) => {
                             let local_epoch = {
                                 let keepers = keepers.lock().await;
                                 keepers.get(&part).and_then(|keeper| keeper.ship_epoch())
@@ -1397,7 +1563,8 @@ impl NodeRuntime {
                                 // write, not a network round trip, so it
                                 // stays inline (plan 29 M5 only targets the
                                 // network-bound non-holder path below).
-                                let outcome = match constellation_meta::execute_mutate(&meta, &op)
+                                let outcome =
+                                    match constellation_meta::execute_mutate(&meta, &op, Some(rid))
                                 {
                                     Ok(records) => {
                                         if let Some(view) = lease_views.lock().unwrap().get(&part) {
@@ -1483,8 +1650,45 @@ impl NodeRuntime {
                                         node_id,
                                         holder,
                                         &op,
+                                        rid,
+                                        forward.acked_through(),
                                     )
                                     .await;
+                                    // Plan 30 §M2: a timeout/transport
+                                    // error/Busy leaves this op in doubt,
+                                    // not refused — retry the *same rid*
+                                    // a few times (a slow holder is more
+                                    // common than a dead one) before
+                                    // falling through to the
+                                    // lease-acquisition path below. Each
+                                    // attempt re-reads the cached holder,
+                                    // which is also how this loop covers
+                                    // "then a redirected holder": a
+                                    // `NotHolder` reply updates the cache
+                                    // (`request_mutate_with`'s
+                                    // `note_holder`) before the next
+                                    // attempt reads it.
+                                    let mut attempt = 0u32;
+                                    while matches!(outcome, constellation_meta::MutateOutcome::Busy)
+                                        && attempt < forward::MAX_FORWARD_RETRY_ATTEMPTS
+                                    {
+                                        attempt += 1;
+                                        forward.retries.fetch_add(1, Ordering::Relaxed);
+                                        tokio::time::sleep(forward::forward_retry_backoff(attempt))
+                                            .await;
+                                        holder = forward.cached_holder(&part).unwrap_or(holder);
+                                        outcome = forward::request_mutate(
+                                            &peers,
+                                            &forward,
+                                            &part,
+                                            node_id,
+                                            holder,
+                                            &op,
+                                            rid,
+                                            forward.acked_through(),
+                                        )
+                                        .await;
+                                    }
                                     if let constellation_meta::MutateOutcome::NotHolder {
                                         holder: next,
                                     } = outcome
@@ -1498,6 +1702,8 @@ impl NodeRuntime {
                                                 node_id,
                                                 holder,
                                                 &op,
+                                                rid,
+                                                forward.acked_through(),
                                             )
                                             .await;
                                         }
@@ -1552,9 +1758,9 @@ impl NodeRuntime {
                                         // precisely needs the holder's journal
                                         // position in replies and segments
                                         // (tracked in PROGRESS.md, plan 29 M6).
-                                        if let Err(error) =
-                                            forward::apply_accepted(&meta, &part, epoch, records)
-                                        {
+                                        let apply_result =
+                                            forward::apply_accepted(&meta, &part, epoch, records);
+                                        if let Err(error) = apply_result {
                                             tracing::warn!(
                                                 %error,
                                                 part,
@@ -1603,6 +1809,21 @@ impl NodeRuntime {
                                     // same way any other caller does.
                                     let _ = sync_tx.send(fusefs::SyncRequest::Nudge);
                                 }
+                                // Plan 30 §M2 GC: marking this rid's seq
+                                // "acked" (so a later request can tell
+                                // the holder to drop it from `recent`)
+                                // is centralized in
+                                // `fusefs::mutate_op_rebasable`, which
+                                // sees every completion path an op can
+                                // take (this forward reply, but also the
+                                // local-holder fast path, a refusal
+                                // before ever forwarding, and the
+                                // lease-path fallback) — not just this
+                                // one. Marking it here too, for only the
+                                // forward-reply path, previously left
+                                // every other path's rid unmarked
+                                // forever, permanently stalling the
+                                // contiguous `acked_through` floor.
                                 let _ = reply.send(Ok(outcome));
                             });
                         }
@@ -1930,6 +2151,9 @@ impl NodeRuntime {
 
         let node = Arc::new(NodeRuntime {
             node_id,
+            incarnation,
+            next_rid_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            indoubt_resolved: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fsmeta,
             backend_url: s3,
             state_dir,
@@ -2118,6 +2342,11 @@ impl NodeRuntime {
                     departed: Some(departed),
                     read_only_member: self.read_only_member,
                     write_mode: self.write_mode.clone(),
+                    node_id: self.node_id,
+                    incarnation: self.incarnation,
+                    next_rid_seq: self.next_rid_seq.clone(),
+                    indoubt_resolved: self.indoubt_resolved.clone(),
+                    acked: self.forward.acked_tracker(),
                 }),
                 coop: Some(self.coop.clone()),
                 staging_dir: self.staging_dir.clone(),
@@ -2501,8 +2730,19 @@ async fn atime_flush_once(
                 continue;
             };
             let op = constellation_meta::MutateOp::AtimeBatch { entries };
-            match forward::request_mutate_with(peers, forward, &part, node_id, holder, &op, timeout)
-                .await
+            let rid = forward.next_system_rid(node_id);
+            match forward::request_mutate_with(
+                peers,
+                forward,
+                &part,
+                node_id,
+                holder,
+                &op,
+                rid,
+                forward.acked_through(),
+                timeout,
+            )
+            .await
             {
                 constellation_meta::MutateOutcome::Accepted { .. } => {
                     stats.forward_ok.fetch_add(1, Ordering::Relaxed);

@@ -81,7 +81,10 @@ impl TouchSet {
             LogRecord::SnapCreate { .. }
             | LogRecord::SnapDelete { .. }
             | LogRecord::SetQuota { .. }
-            | LogRecord::Atime { .. } => {}
+            | LogRecord::Atime { .. }
+            // Touches no dentry/ino: it can neither suppress nor be
+            // suppressed, exactly like `Atime` (see this type's doc).
+            | LogRecord::Completed { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
                     self.dentries.insert((node.parent, node.name.clone()));
@@ -384,6 +387,29 @@ fn apply_one(
                 *time_ns,
                 skew,
             )?;
+            Ok(Applied::Done)
+        }
+        // Plan 30 §M2: node-local and unpublished, exactly like `Atime`
+        // above — writes directly to `completed`, never through
+        // `ns`/`dirty`. Idempotent: replaying the same segment twice (or
+        // a rid whose row this replica already has, e.g. because it was
+        // the holder that recorded it in `recent` before shipping) just
+        // overwrites the same key with the same value.
+        LogRecord::Completed { rid } => {
+            // The position stored here is informational only (nothing
+            // in the retry-resolution path needs anything but presence,
+            // `Meta::completed_position` is a diagnostic), so a replica
+            // applying a *tailed* segment (as opposed to the writer's
+            // own `journal::append_tx`, which knows its real seq) just
+            // records 0 rather than opening a second, MVCC-snapshotted
+            // read transaction nested inside this write transaction for
+            // a value nothing consults.
+            let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
+            tx.insert(
+                &meta.completed,
+                rid.to_key(),
+                crate::store::Meta::encode_completed_row(0, now_ms),
+            );
             Ok(Applied::Done)
         }
     }

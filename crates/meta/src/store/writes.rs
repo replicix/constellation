@@ -147,6 +147,7 @@ impl Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Mkdir {
                 parent,
                 name: name.to_string(),
@@ -200,6 +201,7 @@ impl Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Create {
                 parent,
                 name: name.to_string(),
@@ -255,6 +257,7 @@ impl Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Symlink {
                 parent,
                 name: name.to_string(),
@@ -314,6 +317,7 @@ impl Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Mknod {
                 parent,
                 name: name.to_string(),
@@ -342,6 +346,7 @@ impl Meta {
         chunk_ref_by_ino: &SingleWriterTxKeyspace,
         journal_ks: &SingleWriterTxKeyspace,
         local: &SingleWriterTxKeyspace,
+        completed: &SingleWriterTxKeyspace,
         ino: Ino,
         expected_base: Option<&[u8]>,
         manifest: &[u8],
@@ -396,6 +401,7 @@ impl Meta {
             tx,
             journal_ks,
             local,
+            completed,
             &LogRecord::WriteManifest {
                 ino,
                 base_manifest: journal_base,
@@ -425,6 +431,7 @@ impl Meta {
             &self.chunk_ref_by_ino,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             ino,
             base_manifest,
             manifest,
@@ -458,6 +465,7 @@ impl Meta {
             &self.chunk_ref_by_ino,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             ino,
             base_manifest,
             manifest,
@@ -550,6 +558,7 @@ impl Meta {
                 &mut tx,
                 &self.journal_ks,
                 &self.local,
+                &self.completed,
                 &LogRecord::Unlink {
                     parent,
                     name: name.to_string(),
@@ -602,6 +611,7 @@ impl Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Create {
                 parent,
                 name: name.to_string(),
@@ -624,6 +634,7 @@ impl Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::WriteManifest {
                 ino,
                 base_manifest: None,
@@ -638,6 +649,7 @@ impl Meta {
                 &mut tx,
                 &self.journal_ks,
                 &self.local,
+                &self.completed,
                 &LogRecord::SetXattr {
                     ino,
                     name: name.clone(),
@@ -938,6 +950,7 @@ impl MetaStore for Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Mkdir {
                 parent,
                 name: name.to_string(),
@@ -991,6 +1004,7 @@ impl MetaStore for Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Create {
                 parent,
                 name: name.to_string(),
@@ -1046,6 +1060,7 @@ impl MetaStore for Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Symlink {
                 parent,
                 name: name.to_string(),
@@ -1104,6 +1119,7 @@ impl MetaStore for Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Mknod {
                 parent,
                 name: name.to_string(),
@@ -1147,6 +1163,7 @@ impl MetaStore for Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Link {
                 ino,
                 parent,
@@ -1216,6 +1233,7 @@ impl MetaStore for Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Unlink {
                 parent,
                 name: name.to_string(),
@@ -1258,6 +1276,7 @@ impl MetaStore for Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Rmdir {
                 parent,
                 name: name.to_string(),
@@ -1296,6 +1315,7 @@ impl MetaStore for Meta {
                 &mut tx,
                 &self.journal_ks,
                 &self.local,
+                &self.completed,
                 &LogRecord::Rename {
                     parent,
                     name: name.to_string(),
@@ -1356,6 +1376,7 @@ impl MetaStore for Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::Setattr {
                 ino,
                 mode,
@@ -1386,6 +1407,7 @@ impl MetaStore for Meta {
             &self.chunk_ref_by_ino,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             ino,
             None,
             manifest,
@@ -1453,6 +1475,7 @@ impl MetaStore for Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::SetXattr {
                 ino,
                 name: name.to_string(),
@@ -1508,6 +1531,7 @@ impl MetaStore for Meta {
             &mut tx,
             &self.journal_ks,
             &self.local,
+            &self.completed,
             &LogRecord::RemoveXattr {
                 ino,
                 name: name.to_string(),

@@ -124,6 +124,56 @@ pub struct ForwardState {
     /// Bounds forwards actually in flight (network round trip + apply)
     /// at once; see [`forward_max_inflight`].
     pub inflight: Arc<tokio::sync::Semaphore>,
+    /// Plan 30 §M2 status counters: holder-side dedup hits (a retried
+    /// rid answered from `recent`/`completed` instead of re-executed)
+    /// and requester-side same-rid forward retries.
+    pub dedup_hits: AtomicU64,
+    pub retries: AtomicU64,
+    /// Plan 30 §M2 GC: this requester's own "highest contiguous rid.seq
+    /// whose reply arrived" tracker, sent as `acked_through` on every
+    /// subsequent request so the holder can drop its `recent` cache for
+    /// this requester's incarnation up to that point.
+    ///
+    /// Shared (via `Arc`) with every `SyncHandle` this node hands out
+    /// (`fusefs::SyncHandle::acked`), not owned solely by `ForwardState`:
+    /// a rid's seq must be marked done on *every* completion path of
+    /// `mutate_op_rebasable` — the local-holder fast path, a
+    /// designation's `Proceed`, an explicit refusal, and the lease-path
+    /// fallback all end an op without ever going through this module —
+    /// not just the forward path this struct otherwise deals with.
+    /// Missing any of those left `acked_through` permanently stuck
+    /// behind the first such op, which in turn made every later
+    /// `forget_acked_through` call a no-op and the holder's `recent` map
+    /// grow without bound (plan 30 M2 coordinator review).
+    acked: Arc<Mutex<AckTracker>>,
+    /// Allocator behind [`ForwardState::next_system_rid`].
+    system_rid_seq: AtomicU64,
+}
+
+/// Tracks the highest contiguous seq acknowledged, from a set of
+/// out-of-order completions (disjoint forwards may finish in any
+/// order). `floor` only ever advances past a run with no gap.
+///
+/// `pub(crate)` (not private): shared via `Arc` with
+/// `fusefs::SyncHandle`, so `mutate_op_rebasable` can mark a rid done on
+/// paths this module never sees.
+#[derive(Default)]
+pub(crate) struct AckTracker {
+    floor: u64,
+    done: std::collections::BTreeSet<u64>,
+}
+
+impl AckTracker {
+    pub(crate) fn mark_done(&mut self, seq: u64) {
+        self.done.insert(seq);
+        while self.done.remove(&(self.floor + 1)) {
+            self.floor += 1;
+        }
+    }
+
+    fn floor(&self) -> u64 {
+        self.floor
+    }
 }
 
 impl Default for ForwardState {
@@ -137,6 +187,10 @@ impl Default for ForwardState {
             next_req_id: AtomicU64::new(0),
             gate: KeyGate::new(),
             inflight: Arc::new(tokio::sync::Semaphore::new(forward_max_inflight())),
+            dedup_hits: AtomicU64::new(0),
+            retries: AtomicU64::new(0),
+            acked: Arc::new(Mutex::new(AckTracker::default())),
+            system_rid_seq: AtomicU64::new(0),
         }
     }
 }
@@ -159,6 +213,23 @@ impl ForwardState {
 
     pub fn clear_holder(&self, part: &str) {
         self.holders.lock().unwrap().remove(part);
+    }
+
+    /// A rid for a mutation not issued through the FUSE write path's own
+    /// allocator (`fusefs::SyncHandle::next_rid_seq`) — retention
+    /// pruning's forwarded unlinks and best-effort atime batches.
+    /// `incarnation: u32::MAX` is a reserved marker no real mount
+    /// incarnation (bumped by one per mount) can ever reach, so these
+    /// can never collide with — or be dedup-matched against — a
+    /// genuine FUSE-issued rid from the same node. Each call still
+    /// allocates a fresh `seq`, so two *different* system-generated ops
+    /// are never confused for retries of each other either.
+    pub fn next_system_rid(&self, node: u64) -> constellation_meta::Rid {
+        constellation_meta::Rid {
+            node,
+            incarnation: u32::MAX,
+            seq: self.system_rid_seq.fetch_add(1, Ordering::Relaxed),
+        }
     }
 
     pub fn next_req_id(&self) -> u64 {
@@ -187,6 +258,23 @@ impl ForwardState {
         v.sort_unstable();
         Some(v[v.len() / 2] / 1000)
     }
+
+    /// The value to send as `acked_through` on the next request. Marking
+    /// a rid done (`AckTracker::mark_done`) happens on the shared
+    /// tracker directly — see [`ForwardState::acked_tracker`] and
+    /// `fusefs::SyncHandle::acked` — since every completion path of
+    /// `mutate_op_rebasable` must do it, not just the forward path this
+    /// struct otherwise deals with.
+    pub fn acked_through(&self) -> u64 {
+        self.acked.lock().unwrap().floor()
+    }
+
+    /// The shared tracker itself, for `fusefs::SyncHandle` to hold its
+    /// own clone of — see [`ForwardState::acked`]'s doc for why a single
+    /// `Arc` needs to reach both sides.
+    pub(crate) fn acked_tracker(&self) -> Arc<Mutex<AckTracker>> {
+        self.acked.clone()
+    }
 }
 
 /// Map MetaError to errno (same table as fusefs::errno).
@@ -206,6 +294,20 @@ pub fn meta_errno(e: &constellation_meta::MetaError) -> i32 {
 }
 
 /// Holder: execute a forwarded op if we hold the lease for `part`.
+///
+/// Plan 30 §M2 dedup: before executing, checks whether `rid` already
+/// completed — either durably (`meta.completed_position`, a segment
+/// this replica has tailed, which for the *holder's own* replica means
+/// an earlier tenure already shipped it) or in the volatile `recent`
+/// map (this same tenure executed it moments ago and has not shipped
+/// yet). Either way, the reply is the identical `Accepted` a retry must
+/// see — "an executed rid is never executed again." Only a fresh
+/// (never-seen) rid reaches `execute_mutate`, and only its `Ok` outcome
+/// is remembered: a refusal is never recorded, so a retried refused op
+/// is simply re-evaluated (plan 30 §M2: "a retried refused op is
+/// re-evaluated, and takes effect (or not) at the retry, which is
+/// linearizable").
+#[allow(clippy::too_many_arguments)]
 pub fn holder_execute(
     meta: &Meta,
     ship_epoch: Option<u64>,
@@ -213,6 +315,8 @@ pub fn holder_execute(
     known_holder: u64,
     op_bytes: &[u8],
     ship_floor: u64,
+    rid: constellation_meta::Rid,
+    forward: Option<&ForwardState>,
 ) -> MutateOutcome {
     if is_lost {
         return MutateOutcome::Busy;
@@ -226,8 +330,24 @@ pub fn holder_execute(
         Ok(o) => o,
         Err(_) => return MutateOutcome::Errno(libc::EINVAL),
     };
-    match execute_mutate(meta, &op) {
-        Ok(records) => MutateOutcome::Accepted { epoch, records },
+    // Only the volatile `recent` map can answer a *network* retry with
+    // full records (an already-shipped rid's records are no longer
+    // cheaply available locally — see `Meta::recent_outcome`'s doc); the
+    // durable `completed` keyspace resolves the lease-path retry
+    // instead (`fusefs.rs::mutate_op_rebasable`), where only presence,
+    // not the records, is needed.
+    if let Some(records) = meta.recent_outcome(rid) {
+        if let Some(forward) = forward {
+            forward.dedup_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        return MutateOutcome::Accepted { epoch, records };
+    }
+    let executed = execute_mutate(meta, &op, Some(rid));
+    match executed {
+        Ok(records) => {
+            meta.remember_outcome(rid, &records);
+            MutateOutcome::Accepted { epoch, records }
+        }
         // Hand back what is current so the requester can rebase its
         // whole-file manifest without waiting to tail our segment.
         Err(constellation_meta::MetaError::Conflict) => match &op {
@@ -339,8 +459,23 @@ pub fn safe_to_install_early(meta: &Meta, ship_floor: u64) -> bool {
     meta.applied_seq().is_ok_and(|applied| applied < ship_floor)
 }
 
-/// Ask `holder` to execute `op`. Returns the outcome, or Busy on
-/// transport / decode failure.
+/// Plan 30 §M2: "the same holder, with backoff (three attempts or 2s)"
+/// before falling to a redirected holder and then the lease path.
+pub const MAX_FORWARD_RETRY_ATTEMPTS: u32 = 3;
+
+/// Backoff before retry `attempt` (1-based): 200ms, 400ms, 600ms — three
+/// attempts sum to 1.2s, comfortably under the plan's "2s" budget even
+/// with the request timeouts themselves on top.
+pub fn forward_retry_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(200 * u64::from(attempt))
+}
+
+/// Ask `holder` to execute `op`, identified by `rid` (plan 30 §M2:
+/// stable across every retry, unlike the wire `req_id` correlation id
+/// minted fresh below). Returns the outcome, or Busy on transport /
+/// decode failure. `acked_through` is this requester's own GC receipt
+/// (see [`ForwardState::acked_through`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn request_mutate(
     peers: &Peers,
     forward: &ForwardState,
@@ -348,6 +483,8 @@ pub async fn request_mutate(
     requester: u64,
     holder: u64,
     op: &MutateOp,
+    rid: constellation_meta::Rid,
+    acked_through: u64,
 ) -> MutateOutcome {
     request_mutate_with(
         peers,
@@ -356,6 +493,8 @@ pub async fn request_mutate(
         requester,
         holder,
         op,
+        rid,
+        acked_through,
         Duration::from_millis(forward_timeout_ms()),
     )
     .await
@@ -372,6 +511,8 @@ pub async fn request_mutate_with(
     requester: u64,
     holder: u64,
     op: &MutateOp,
+    rid: constellation_meta::Rid,
+    acked_through: u64,
     timeout: Duration,
 ) -> MutateOutcome {
     let op_bytes = match op.to_postcard() {
@@ -385,15 +526,17 @@ pub async fn request_mutate_with(
         req_id,
         epoch_seen: 0,
         op: op_bytes,
+        rid: (rid.node, rid.incarnation, rid.seq),
+        acked_through,
     };
     let started = Instant::now();
     let reply = tokio::time::timeout(timeout, peers.request_to_node(holder, &payload)).await;
     match reply {
         Ok(Ok(body)) => match body {
             Payload::MutateReply {
-                req_id: rid,
+                req_id: reply_req_id,
                 outcome,
-            } if rid == req_id => {
+            } if reply_req_id == req_id => {
                 let outcome = if outcome.is_empty() {
                     MutateOutcome::Busy
                 } else {
@@ -425,6 +568,235 @@ pub async fn request_mutate_with(
 mod tests {
     use super::*;
 
+    fn test_rid(seq: u64) -> constellation_meta::Rid {
+        constellation_meta::Rid {
+            node: 1,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    /// Plan 30 §M2 holder dedup, as a unit test: a second `holder_execute`
+    /// call with the *same* rid must not execute the op again (no second
+    /// journal row), and must answer with the identical records the
+    /// first call produced — the shape a retried forward relies on. A
+    /// *different* rid for a different op still executes normally.
+    #[test]
+    fn holder_execute_dedups_a_retried_rid() {
+        use constellation_fs_core::types::ROOT_INO;
+
+        let holder = Meta::open_in_memory().unwrap();
+        let op_bytes = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "f".into(),
+            ino: (1 << 40) | 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+        .to_postcard()
+        .unwrap();
+        let rid = test_rid(1);
+        let forward = ForwardState::new();
+
+        let first = holder_execute(
+            &holder,
+            Some(1),
+            false,
+            1,
+            &op_bytes,
+            1,
+            rid,
+            Some(&forward),
+        );
+        let first_records = match first {
+            MutateOutcome::Accepted { records, .. } => records,
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+        assert_eq!(forward.dedup_hits.load(Ordering::Relaxed), 0);
+        let journal_len_after_first = holder.journal_len().unwrap();
+
+        // Retry: identical reply, no second execution.
+        let second = holder_execute(
+            &holder,
+            Some(1),
+            false,
+            1,
+            &op_bytes,
+            1,
+            rid,
+            Some(&forward),
+        );
+        let second_records = match second {
+            MutateOutcome::Accepted { records, .. } => records,
+            other => panic!("expected Accepted (from cache), got {other:?}"),
+        };
+        assert_eq!(
+            first_records, second_records,
+            "a retried rid must get an identical reply"
+        );
+        assert_eq!(
+            holder.journal_len().unwrap(),
+            journal_len_after_first,
+            "an executed rid must never be executed again"
+        );
+        assert_eq!(forward.dedup_hits.load(Ordering::Relaxed), 1);
+
+        // A genuinely different op (fresh rid) still executes.
+        let op2_bytes = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "g".into(),
+            ino: (1 << 40) | 2,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+        .to_postcard()
+        .unwrap();
+        let third = holder_execute(
+            &holder,
+            Some(1),
+            false,
+            1,
+            &op2_bytes,
+            1,
+            test_rid(2),
+            Some(&forward),
+        );
+        assert!(matches!(third, MutateOutcome::Accepted { .. }));
+        assert_eq!(
+            holder.journal_len().unwrap(),
+            journal_len_after_first + 2,
+            "a different op must still execute (its own record + Completed)"
+        );
+        assert_eq!(forward.dedup_hits.load(Ordering::Relaxed), 1, "unaffected");
+    }
+
+    /// Plan 30 §M2 coordinator review: `acked_through` must advance past
+    /// an op that never went through `holder_execute`/`ForwardState` at
+    /// all — the shape `mutate_op_rebasable`'s local-holder fast path,
+    /// an early refusal, or the lease-path fallback takes. Simulated
+    /// here by marking some seqs done directly on the *shared* tracker
+    /// (`ForwardState::acked_tracker`, the same `Arc`
+    /// `fusefs::SyncHandle::acked` holds) with no forward involved,
+    /// interleaved with seqs that genuinely go through `holder_execute`.
+    /// Before this fix, only the forwarded seqs ever got marked, so the
+    /// very first "local" seq in the sequence would permanently stall
+    /// the contiguous floor.
+    #[test]
+    fn acked_through_advances_across_local_and_forwarded_completions() {
+        use constellation_fs_core::types::ROOT_INO;
+
+        let forward = ForwardState::new();
+        let acked = forward.acked_tracker();
+        let holder = Meta::open_in_memory().unwrap();
+        const N: u64 = 30;
+
+        for seq in 0..N {
+            let rid = test_rid(seq);
+            if seq % 3 == 0 {
+                // "Local" completion: mutate_op_rebasable's own paths
+                // that never touch `forward`/`holder_execute` at all.
+                acked.lock().unwrap().mark_done(seq);
+            } else {
+                let op_bytes = MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: format!("f{seq}"),
+                    ino: (1 << 40) | seq,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                }
+                .to_postcard()
+                .unwrap();
+                let outcome = holder_execute(
+                    &holder,
+                    Some(1),
+                    false,
+                    1,
+                    &op_bytes,
+                    1,
+                    rid,
+                    Some(&forward),
+                );
+                assert!(matches!(outcome, MutateOutcome::Accepted { .. }));
+                acked.lock().unwrap().mark_done(seq);
+            }
+        }
+        assert_eq!(
+            forward.acked_through(),
+            N - 1,
+            "the contiguous floor must reach the last seq even though \
+             two thirds of them never went through a forward"
+        );
+
+        // `recent` on the holder must now be fully reclaimable: nothing
+        // is younger than `acked_through`, so pruning empties this
+        // requester's whole bucket, not just the forwarded third of it.
+        holder.forget_acked_through(1, 1, forward.acked_through());
+        for seq in 0..N {
+            if seq % 3 != 0 {
+                assert!(
+                    holder.recent_outcome(test_rid(seq)).is_none(),
+                    "seq {seq} should have been forgotten once fully acked"
+                );
+            }
+        }
+    }
+
+    /// Plan 30 §M2's in-doubt retry, in process on two replicas (the
+    /// requester's own `Meta` and the holder's): the first attempt's
+    /// reply is dropped (simulating the timeout `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS`
+    /// reproduces in the harness), so the requester never applies it.
+    /// The retry, under the *same* rid, gets the holder's cached
+    /// outcome and the requester applies that instead — exactly once,
+    /// converging both replicas without a second execution anywhere.
+    #[test]
+    fn in_doubt_retry_across_two_replicas_executes_exactly_once() {
+        use constellation_fs_core::types::ROOT_INO;
+
+        let holder = Meta::open_in_memory().unwrap();
+        let requester = Meta::open_in_memory().unwrap();
+        let op = MutateOp::Mkdir {
+            parent: ROOT_INO,
+            name: "d".into(),
+            ino: (1 << 40) | 1,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        let op_bytes = op.to_postcard().unwrap();
+        let rid = test_rid(1);
+
+        // Attempt 1: holder executes, but the reply is lost (the
+        // requester's `tokio::time::timeout` fires first) — it is never
+        // applied here.
+        let attempt1 = holder_execute(&holder, Some(1), false, 1, &op_bytes, 1, rid, None);
+        assert!(matches!(attempt1, MutateOutcome::Accepted { .. }));
+
+        // Attempt 2: the requester retries the *same* rid to the same
+        // holder. Plan 30 §M2's fix is exactly this: the holder answers
+        // from `recent` instead of re-executing, so this reply is safe
+        // to apply even though the op already took effect.
+        let attempt2 = holder_execute(&holder, Some(1), false, 1, &op_bytes, 1, rid, None);
+        let (epoch, records) = match attempt2 {
+            MutateOutcome::Accepted { epoch, records } => (epoch, records),
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+        apply_accepted(&requester, "p0", epoch, &records).unwrap();
+
+        assert_eq!(
+            holder.journal_len().unwrap(),
+            2,
+            "executed exactly once (the Mkdir record + its Completed marker)"
+        );
+        assert_eq!(
+            holder.dump_replicated().unwrap(),
+            requester.dump_replicated().unwrap(),
+            "both replicas converge on a single execution"
+        );
+    }
+
     /// Plan 29 M6: a create-family op the holder refuses with `EEXIST`
     /// carries the entry that is already there, so the requester can
     /// resolve that name without waiting for the holder's segment. The
@@ -449,7 +821,7 @@ mod tests {
         .to_postcard()
         .unwrap();
 
-        let records = match holder_execute(&holder, Some(1), false, 1, &op, 1) {
+        let records = match holder_execute(&holder, Some(1), false, 1, &op, 1, test_rid(1), None) {
             MutateOutcome::Exists { records, .. } => records,
             other => panic!("expected Exists, got {other:?}"),
         };
@@ -483,7 +855,7 @@ mod tests {
         }
         .to_postcard()
         .unwrap();
-        match holder_execute(&holder, Some(1), false, 1, &op, 1) {
+        match holder_execute(&holder, Some(1), false, 1, &op, 1, test_rid(2), None) {
             MutateOutcome::Errno(e) => assert_eq!(e, libc::ENOENT),
             other => panic!("expected a bare errno, got {other:?}"),
         }
@@ -499,7 +871,7 @@ mod tests {
         .to_postcard()
         .unwrap();
 
-        match holder_execute(&meta, None, false, 7, &op, 1) {
+        match holder_execute(&meta, None, false, 7, &op, 1, test_rid(3), None) {
             MutateOutcome::NotHolder { holder: 7 } => {}
             other => panic!("{other:?}"),
         }
@@ -526,7 +898,7 @@ mod tests {
         .to_postcard()
         .unwrap();
 
-        match holder_execute(&meta, Some(1), false, 0, &op, 1) {
+        match holder_execute(&meta, Some(1), false, 0, &op, 1, test_rid(4), None) {
             MutateOutcome::Conflict { manifest } => {
                 assert_eq!(manifest.as_deref(), Some(&b"current"[..]))
             }
@@ -797,7 +1169,17 @@ mod tests {
             };
             tokio::time::sleep(pre).await;
             let op_bytes = op.to_postcard().unwrap();
-            let outcome = holder_execute(holder, Some(1), false, 1, &op_bytes, 1);
+            // Every call is logically a distinct op (this helper is
+            // invoked once per op throughout this module's tests, never
+            // as a retry of a prior call), so each needs its own rid —
+            // a shared/fixed one would make `holder_execute`'s plan 30
+            // §M2 dedup wrongly treat the second op as a replay of the
+            // first and answer from `recent` instead of executing it.
+            static NEXT_TEST_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let seq = NEXT_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let outcome =
+                holder_execute(holder, Some(1), false, 1, &op_bytes, 1, test_rid(seq), None);
             tokio::time::sleep(post).await;
             match outcome {
                 MutateOutcome::Accepted { epoch, records } => {

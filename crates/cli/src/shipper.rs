@@ -1360,12 +1360,15 @@ impl Shipper {
         MetaStore::journal_len(&*self.meta).unwrap_or(0)
     }
 
-    pub fn journal_backlog_of(&self, part: &str) -> u64 {
-        self.meta
-            .take_journal_grouped(usize::MAX)
-            .ok()
-            .and_then(|g| g.into_iter().find(|(p, _)| p == part))
-            .map(|(_, r)| r.len() as u64)
+    /// Whether `part` has unshipped journal records: 0 or 1, never a
+    /// count. Every caller only asks "is anything left?", and it runs
+    /// on every sync round, so it reads at most one row instead of
+    /// decoding the whole journal (which made each round O(backlog)
+    /// while forwarded mutations queued behind it). There is one
+    /// partition since plan 29 M0a, so `part` is not consulted.
+    pub fn journal_backlog_of(&self, _part: &str) -> u64 {
+        MetaStore::take_journal(&*self.meta, 1)
+            .map(|rows| rows.len() as u64)
             .unwrap_or(0)
     }
 
@@ -1936,7 +1939,7 @@ mod tests {
                 atime_ns: None,
                 mtime_ns: None,
             };
-            let records = execute_mutate(&holder.meta, &op).unwrap();
+            let records = execute_mutate(&holder.meta, &op, None).unwrap();
             crate::forward::apply_accepted(&requester.meta, part, 1, &records).unwrap();
             assert_eq!(mode_of(&requester.meta), mode, "read-your-write");
         }

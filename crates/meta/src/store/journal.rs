@@ -10,36 +10,112 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::store::{kv_get_tx, kv_set_tx, KV_NEXT_JOURNAL_SEQ, KV_NEXT_SHADOW_ID};
+use crate::rid::Rid;
+use crate::store::{kv_get_tx, kv_set_tx, Meta, KV_NEXT_JOURNAL_SEQ, KV_NEXT_SHADOW_ID};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
 
 fn seq_key(seq: u64) -> Vec<u8> {
     seq.to_be_bytes().to_vec()
 }
 
+/// Plan 30 §M2: every mutation now calls this at least twice per
+/// transaction (the op's own record, then `Completed`), so the decimal-
+/// string `kv_get_tx`/`kv_set_tx` round trip this used before (parse on
+/// read, `to_string()`-allocate on write) is worth avoiding — raw
+/// big-endian bytes on the same `local` key, read/written directly
+/// against the transaction. `KV_NEXT_JOURNAL_SEQ` has no other reader
+/// (checked: only this function touches it), so changing its on-disk
+/// encoding is safe without a migration (plan 30: no backward
+/// compatibility required at any level).
 fn next_seq_tx(
     tx: &mut SingleWriterWriteTx,
     local: &SingleWriterTxKeyspace,
 ) -> Result<u64, MetaError> {
-    let next: u64 = match kv_get_tx(tx, local, KV_NEXT_JOURNAL_SEQ)? {
-        Some(s) => s
-            .parse()
-            .map_err(|_| MetaError::Invalid("next_journal_seq".into()))?,
+    let key = KV_NEXT_JOURNAL_SEQ.as_bytes();
+    let next: u64 = match tx.get(local, key)? {
+        Some(v) => u64::from_be_bytes(
+            v.as_ref()
+                .try_into()
+                .map_err(|_| MetaError::Invalid("next_journal_seq".into()))?,
+        ),
         None => 1,
     };
-    kv_set_tx(tx, local, KV_NEXT_JOURNAL_SEQ, &(next + 1).to_string());
+    tx.insert(local, key.to_vec(), (next + 1).to_be_bytes().to_vec());
     Ok(next)
 }
 
+thread_local! {
+    static PENDING_COMPLETION: std::cell::Cell<Option<Rid>> = const { std::cell::Cell::new(None) };
+}
+
+/// The rid `mutate::execute` is completing, visible only to the thread
+/// running it.
+///
+/// Every `Meta` mutating method opens, fills and commits its fjall write
+/// transaction synchronously on the calling thread, so a thread-local set
+/// for the duration of one `execute` call reaches exactly that op's
+/// transaction and nothing else: a snapshot, bootstrap or atime write
+/// appending to the journal on another thread at the same moment cannot
+/// take it. The guard clears it on drop, so an error or early return never
+/// leaks a rid into the next call on this thread.
+pub(crate) struct PendingCompletion;
+
+impl PendingCompletion {
+    pub(crate) fn set(rid: Option<Rid>) -> PendingCompletionGuard {
+        PENDING_COMPLETION.with(|c| c.set(rid));
+        PendingCompletionGuard
+    }
+
+    fn take() -> Option<Rid> {
+        PENDING_COMPLETION.with(|c| c.take())
+    }
+}
+
+pub(crate) struct PendingCompletionGuard;
+
+impl Drop for PendingCompletionGuard {
+    fn drop(&mut self) {
+        PENDING_COMPLETION.with(|c| c.set(None));
+    }
+}
+
 /// Append `record` under a fresh seq, in the caller's write transaction.
+///
+/// Plan 30 §M2: if `execute` (`mutate.rs`) has a rid pending completion
+/// on this thread (see [`PendingCompletion`]), the *first* call to `append_tx`
+/// within it also appends `LogRecord::Completed { rid }` under its own
+/// fresh seq and writes `rid -> position` into `completed` — all before
+/// this same transaction commits, so an op's own record(s) and its
+/// completion marker are atomic: either both are durable or neither is.
+/// `pending` is taken (cleared) on first use, so a method that calls
+/// `append_tx` more than once per transaction (e.g. `publish_file`,
+/// which appends three records) only completes the op once. See
+/// [`PendingCompletion`] for why a thread-local is safe here rather than
+/// threading a rid through every mutating method.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn append_tx(
     tx: &mut SingleWriterWriteTx,
     journal: &SingleWriterTxKeyspace,
     local: &SingleWriterTxKeyspace,
+    completed: &SingleWriterTxKeyspace,
     record: &LogRecord,
 ) -> Result<u64, MetaError> {
     let seq = next_seq_tx(tx, local)?;
     tx.insert(journal, seq_key(seq), record.to_postcard()?);
+    if let Some(rid) = PendingCompletion::take() {
+        let cseq = next_seq_tx(tx, local)?;
+        tx.insert(
+            journal,
+            seq_key(cseq),
+            LogRecord::Completed { rid }.to_postcard()?,
+        );
+        let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
+        tx.insert(
+            completed,
+            rid.to_key(),
+            Meta::encode_completed_row(cseq, now_ms),
+        );
+    }
     Ok(seq)
 }
 
