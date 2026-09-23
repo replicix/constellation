@@ -1232,7 +1232,7 @@ impl NodeRuntime {
             Some(coop.clone()),
             crate::existence::Existence::with_meta(meta.clone()),
         ));
-        let forward = forward::ForwardState::new();
+        let forward = forward::ForwardState::new(incarnation);
         let placement = Arc::new(placement::Placement::new());
         let departed = Arc::new(AtomicBool::new(false));
         let atime_stats = crate::atime::AtimeStats::new();
@@ -3345,7 +3345,7 @@ mod tests {
             lease_mode: constellation_store_s3::LeaseMode::Cas,
             spool: Arc::new(Mutex::new(shipper::SpoolInfo::default())),
             keepers,
-            forward: forward::ForwardState::new(),
+            forward: forward::ForwardState::new(1),
             store_inner: backend,
             meta,
             lease_views,

@@ -107,6 +107,10 @@ pub fn forwarding_enabled() -> bool {
     })
 }
 
+/// The `Rid::incarnation` every [`ForwardState::next_system_rid`]
+/// carries: a reserved namespace no mount incarnation reaches.
+pub const SYSTEM_RID_INCARNATION: u32 = u32::MAX;
+
 /// Cached holder id per partition, plus forward counters for status.
 pub struct ForwardState {
     holders: Mutex<HashMap<String, u64>>,
@@ -146,7 +150,12 @@ pub struct ForwardState {
     /// `forget_acked_through` call a no-op and the holder's `recent` map
     /// grow without bound (plan 30 M2 coordinator review).
     acked: Arc<Mutex<AckTracker>>,
-    /// Allocator behind [`ForwardState::next_system_rid`].
+    /// This mount's persisted incarnation (`Meta::bump_incarnation`),
+    /// folded into every [`ForwardState::next_system_rid`] so system
+    /// rids never repeat across mounts.
+    mount_incarnation: u32,
+    /// Per-mount counter behind [`ForwardState::next_system_rid`];
+    /// restarts at 0 on every mount (only its low 32 bits are used).
     system_rid_seq: AtomicU64,
 }
 
@@ -176,9 +185,11 @@ impl AckTracker {
     }
 }
 
-impl Default for ForwardState {
-    fn default() -> Self {
-        Self {
+impl ForwardState {
+    /// `mount_incarnation` is the value this mount's
+    /// `Meta::bump_incarnation` returned.
+    pub fn new(mount_incarnation: u32) -> Arc<Self> {
+        Arc::new(Self {
             holders: Mutex::new(HashMap::new()),
             ok: AtomicU64::new(0),
             err: AtomicU64::new(0),
@@ -190,14 +201,9 @@ impl Default for ForwardState {
             dedup_hits: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             acked: Arc::new(Mutex::new(AckTracker::default())),
+            mount_incarnation,
             system_rid_seq: AtomicU64::new(0),
-        }
-    }
-}
-
-impl ForwardState {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        })
     }
 
     pub fn note_holder(&self, part: &str, holder: u64) {
@@ -217,18 +223,30 @@ impl ForwardState {
 
     /// A rid for a mutation not issued through the FUSE write path's own
     /// allocator (`fusefs::SyncHandle::next_rid_seq`) — retention
-    /// pruning's forwarded unlinks and best-effort atime batches.
-    /// `incarnation: u32::MAX` is a reserved marker no real mount
-    /// incarnation (bumped by one per mount) can ever reach, so these
-    /// can never collide with — or be dedup-matched against — a
-    /// genuine FUSE-issued rid from the same node. Each call still
-    /// allocates a fresh `seq`, so two *different* system-generated ops
-    /// are never confused for retries of each other either.
+    /// pruning's forwarded unlinks, conflict-copy steps and best-effort
+    /// atime batches.
+    ///
+    /// `incarnation` is the reserved [`SYSTEM_RID_INCARNATION`]
+    /// (`u32::MAX`), which no real mount incarnation (bumped by one per
+    /// mount) can ever reach, so these never collide with — or share a
+    /// holder `recent` bucket with — a genuine FUSE-issued rid from the
+    /// same node. `seq` is `mount_incarnation << 32 | counter`: the
+    /// counter is volatile and restarts at 0 every mount, so the mount's
+    /// persisted incarnation in the high bits is what keeps a system rid
+    /// from being reissued after a restart and answered as "already
+    /// done" from a `completed` row (or a holder's `recent` entry) the
+    /// previous mount left behind within the retention window. Each call
+    /// still allocates a fresh counter value, so two *different*
+    /// system-generated ops are never confused for retries of each
+    /// other. The counter wraps within its 32 bits rather than spilling
+    /// into the incarnation bits; a reuse would take 2^32 system ops in
+    /// one mount, all within one completion-retention window.
     pub fn next_system_rid(&self, node: u64) -> constellation_meta::Rid {
+        let counter = self.system_rid_seq.fetch_add(1, Ordering::Relaxed) & u64::from(u32::MAX);
         constellation_meta::Rid {
             node,
-            incarnation: u32::MAX,
-            seq: self.system_rid_seq.fetch_add(1, Ordering::Relaxed),
+            incarnation: SYSTEM_RID_INCARNATION,
+            seq: (u64::from(self.mount_incarnation) << 32) | counter,
         }
     }
 
@@ -621,7 +639,7 @@ mod tests {
         .to_postcard()
         .unwrap();
         let rid = test_rid(1);
-        let forward = ForwardState::new();
+        let forward = ForwardState::new(1);
 
         let first = holder_execute(
             &holder,
@@ -711,7 +729,7 @@ mod tests {
     fn acked_through_advances_across_local_and_forwarded_completions() {
         use constellation_fs_core::types::ROOT_INO;
 
-        let forward = ForwardState::new();
+        let forward = ForwardState::new(1);
         let acked = forward.acked_tracker();
         let holder = Meta::open_in_memory().unwrap();
         const N: u64 = 30;
@@ -848,7 +866,7 @@ mod tests {
         holder.forget_acked_through(rid.node, rid.incarnation, rid.seq);
         assert!(holder.recent_outcome(rid).is_none());
 
-        let forward = ForwardState::new();
+        let forward = ForwardState::new(1);
         let retry = holder_execute(
             &holder,
             Some(1),
@@ -869,6 +887,80 @@ mod tests {
             "not re-executed"
         );
         assert_eq!(forward.dedup_hits.load(Ordering::Relaxed), 1);
+    }
+
+    /// System rids must not repeat across mounts: the per-mount counter
+    /// restarts at 0, so two successive mounts' first system rids differ
+    /// only because the mount incarnation is folded in. They stay in the
+    /// reserved system namespace, disjoint from FUSE rids.
+    #[test]
+    fn system_rids_differ_across_mounts() {
+        let first_mount = ForwardState::new(1);
+        let second_mount = ForwardState::new(2);
+        let a = first_mount.next_system_rid(7);
+        let b = second_mount.next_system_rid(7);
+        assert_ne!(a, b);
+        assert_eq!(a.incarnation, SYSTEM_RID_INCARNATION);
+        assert_eq!(b.incarnation, SYSTEM_RID_INCARNATION);
+        assert_ne!(first_mount.next_system_rid(7), a, "fresh rid per call");
+    }
+
+    /// A restarted node's first system op (e.g. a retention prune's
+    /// `unlink_now`) must execute, not be answered from the `completed`
+    /// row — or the holder's `recent` entry — the previous mount's first
+    /// system op left behind within the retention window.
+    #[test]
+    fn a_second_mounts_system_op_is_not_answered_from_the_first_mounts_completion() {
+        use constellation_fs_core::types::ROOT_INO;
+
+        let holder = Meta::open_in_memory().unwrap();
+        let create = |name: &str, ino| {
+            MutateOp::Create {
+                parent: ROOT_INO,
+                name: name.into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            }
+            .to_postcard()
+            .unwrap()
+        };
+
+        let first_mount = ForwardState::new(1);
+        let rid1 = first_mount.next_system_rid(1);
+        let first = holder_execute(
+            &holder,
+            Some(1),
+            false,
+            1,
+            &create("a", (1 << 40) | 1),
+            1,
+            rid1,
+            Some(&first_mount),
+        );
+        assert!(matches!(first, MutateOutcome::Accepted { .. }));
+        assert!(holder.completed_position(rid1).unwrap().is_some());
+        let journal_len = holder.journal_len().unwrap();
+
+        let second_mount = ForwardState::new(2);
+        let rid2 = second_mount.next_system_rid(1);
+        let second = holder_execute(
+            &holder,
+            Some(1),
+            false,
+            1,
+            &create("b", (1 << 40) | 2),
+            1,
+            rid2,
+            Some(&second_mount),
+        );
+        match second {
+            MutateOutcome::Accepted { records, .. } => assert!(!records.is_empty()),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        assert!(holder.journal_len().unwrap() > journal_len, "executed");
+        assert_eq!(second_mount.dedup_hits.load(Ordering::Relaxed), 0);
     }
 
     /// Plan 29 M6: a create-family op the holder refuses with `EEXIST`
