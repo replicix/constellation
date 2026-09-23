@@ -24,6 +24,7 @@ mod pin;
 mod placement;
 mod prefetch;
 mod prune;
+mod recovery;
 mod registry;
 mod reintegrate;
 mod scan;
@@ -2877,6 +2878,14 @@ async fn run_sync_round(
                     part,
                     "idle-releasing partition lease (forced drain under sustained local traffic)"
                 );
+                // Re-arm the pause right before the final flush, as the
+                // first pass does. The one set above may have lapsed
+                // during a slow `sync_all`. The pause is what keeps this
+                // node's own forwards out of the gap between this flush
+                // and `release`'s view clear, because `dispatch_forward`
+                // no longer waits on the keepers lock held here (see
+                // `lease.rs`'s module doc, "Locking rules").
+                k.begin_handoff_pause();
                 ship.ship_atime_before_release(&part, k).await;
                 k.release().await?;
             }
@@ -3352,14 +3361,18 @@ async fn run_managed_sync_round(
     }
     if result.is_ok() && epochs.is_flushing() {
         let ship = ship.lock().await;
-        let drained = {
-            let keepers = keepers.lock().await;
-            keepers
-                .keys()
-                .all(|part| ship.journal_backlog_of(part) == 0)
-        };
+        // One lock hold for both the drained check and the release, with
+        // no await between them. `dispatch_forward` runs on this same task
+        // and only gets in at this future's await points. A second
+        // `keepers.lock().await` here used to be such a point: a local
+        // forward could run in it, find the view still open and journal
+        // an op after the drained check but before `release` cleared the
+        // view.
+        let mut keepers = keepers.lock().await;
+        let drained = keepers
+            .keys()
+            .all(|part| ship.journal_backlog_of(part) == 0);
         if drained {
-            let mut keepers = keepers.lock().await;
             for keeper in keepers.values_mut() {
                 keeper.release().await?;
             }
@@ -3551,6 +3564,11 @@ impl DaemonStatus {
 impl constellation_api::StatusSource for DaemonStatus {
     fn status(&self) -> constellation_api::StatusReport {
         let spool = self.spool.lock().unwrap().clone();
+        let speculation = (
+            spool.speculation_rolled_back,
+            spool.stranded_replayed,
+            spool.replay_conflicts,
+        );
         let usage = self.cache.usage();
         let p0_lease = self
             .leases
@@ -3663,6 +3681,16 @@ impl constellation_api::StatusSource for DaemonStatus {
             reintegration: self
                 .reintegration
                 .snapshot(self.meta.unmarked_journal_len().unwrap_or(0)),
+            speculation: {
+                let counts = self.meta.speculation_counts().unwrap_or_default();
+                constellation_api::SpeculationStatus {
+                    outstanding: counts.outstanding,
+                    pending_replay: counts.pending_replay,
+                    rolled_back: speculation.0,
+                    stranded_replayed: speculation.1,
+                    replay_conflicts: speculation.2,
+                }
+            },
             coop,
             prefetch: self.prefetch_stats.snapshot(),
             writeback: {

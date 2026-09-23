@@ -14,7 +14,7 @@ pub use types::{
     DoctorStatus, DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus,
     MountInfo, MountViewOpts, P2pStatus, PeerStatus, PinStatus, PrefetchStatus, PruneRootStatus,
     PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response, SnapshotStatus, SourceStatus,
-    SpoolStatus, StatusReport, WritebackStatus,
+    SpeculationStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -398,6 +398,7 @@ mod tests {
                 designations: Vec::new(),
                 epoch: EpochStatus::default(),
                 reintegration: ReintegrationStatus::default(),
+                speculation: SpeculationStatus::default(),
                 coop: CoopStatus::default(),
                 prefetch: PrefetchStatus::default(),
                 writeback: WritebackStatus::default(),

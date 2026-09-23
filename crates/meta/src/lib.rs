@@ -17,6 +17,7 @@ pub use record::{CloneNode, LogRecord};
 pub use reintegrate::{classify, materialize, Disposition, CONFLICT_DIR};
 pub use replay::TouchSet;
 pub use rid::Rid;
+pub use store::spec::{Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp};
 pub use store::{BootstrapIndexBuilder, JournalBatch, Meta, SCRATCH_XATTR};
 
 use constellation_fs_core::{FileAttr, Ino};

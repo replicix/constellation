@@ -4284,3 +4284,282 @@ Interleaved single-config runs (`3node-p2pon-shared-create-lat0`, 4 rounds each;
 | M2 + M2b | 1897 / 1301 / 1479 / 1682 (mean ~1590) | 0.66–0.76 ms | 5.2–8.9 ms |
 
 Aggregate throughput is within ~4% of the pre-M2 baseline and median latency is ~20% better, so the M2 latency gate is met. p99 rose. That is expected: the holder now completes its ship rounds (31 of 31 during the burst, against 5 of ~1,200 before), so followers actually tail and apply segments while the benchmark runs. The old baseline looked faster partly because shipping was starved.
+
+## Plan 30 M3a — speculation log and stranded-op recovery, requester side (fixes bug B): **IN PROGRESS** (tester gate run below; one bug found and fixed, no design change)
+
+Goal: plan 30 §M3, requester half. Everything a requester applies ahead
+of the durable log (forwarded-op shadows, `Exists` hints) is captured with
+before-images in a node-local speculation log. It retires by rid (or
+position), and is rolled back when a later epoch strands it; stranded ops
+are replayed by rid, exactly once. Commits are only published from
+log-prefix state, and a new holder never validates against phantom state.
+The holder side (its own unshipped journal as speculation, log-prefix
+publishing from the holder, replacing `reintegrate::classify`) is M3b.
+
+| Item | State | Where |
+|---|---|---|
+| Model: `Protocol::Recovery` on top of `ExactlyOnce` — shadows carry their accepting epoch and retire by rid; a segment from a higher epoch strands lower-epoch shadows (dropped from the overlay, queued for replay); `ReplayStranded` replays the oldest queued op through the lease holder, or locally when holding; the takeover gate in `AcquireLease` strands and replays locally before the client op validates; no `Publish` while a shadow is outstanding; no shadow install for a rid the applied log already completed; authority bounded in time like `LeaseView::usable` (Recovery only). Publish-on-empty-journal (simplification 9) kept for M3b | written | `crates/model/src/protocol.rs`, `crates/model/src/lib.rs` |
+| Model tests: `recovery_fixes_bug_b_third_node_takeover` (the exact `today_finds_bug_b` config, `with_forward_retries(0)`, plus the explicit crash → takeover → strand → replay → retire path), `recovery_fixes_bug_b_requester_takeover` (2 nodes, the requester's second op forces its takeover), `recovery_fixes_bug_b_exactly_once_config` (`exactly_once_is_linearizable`'s bug-B config): `linearizable`, `converged_at_quiescence`, `commits_are_log_prefixes` hold, `progress` witnessed | written | `crates/model/tests/today_bugs.rs` |
+| Capture context threaded through the `ns` write funnel: `ns::Dirty::Tracked` carries `Option<&spec::Capture>`; `ns_insert`/`ns_remove` record each key's first before-image in the same transaction. Replay's apply path takes the `Dirty` (and a `durable` flag) explicitly (`replay::ApplyCx`) instead of calling `dirty_for_ns()` | written | `crates/meta/src/store/ns.rs`, `crates/meta/src/replay.rs` |
+| Speculation log: `spec` (`spec_seq → {kind, records, before, usage}`), `spec_live` (outstanding shadows/hints), `pending_replay` (stranded ops in original order). Kinds `Shadow { rid, epoch, op }`, `Hint { floor, epoch }`, `Foreign { segment_seq }`. Old `shadow` keyspace and record-equality retirement removed | written | `crates/meta/src/store/spec.rs`, `crates/meta/src/store/mod.rs` |
+| `Meta::install_shadow` (skips a rid `completed` already has), `Meta::install_hint`, `Meta::apply_segment` (strand → apply, captured as `Foreign` while anything is outstanding → retire → compact → `applied_seq`, one transaction), `Meta::strand_below_epoch` (takeover gate), replay-queue API, `has_outstanding_speculation`, `speculation_counts` | written | `crates/meta/src/store/spec.rs` |
+| Speculative applications never write `completed` (only durable log content may claim a rid took effect) | written | `crates/meta/src/replay.rs` (`ApplyCx::durable`) |
+| Rollback restores before-images in reverse order, re-derives `chunk_ref`/`chunk_ref_by_ino`/`xattr_by_name`/`orphans` from restored inode/xattr keys, dirties every restored key; redo re-captures before-images and usage | written | `crates/meta/src/store/spec.rs` (`restore_key_tx`, `strand_tx`) |
+| Reintegration's wholesale `ns` replacement requeues outstanding shadows for replay and clears the log | written | `crates/meta/src/store/bootstrap.rs` |
+| `MutateOutcome::Exists` carries the answering holder's epoch (hints strand like shadows) | written | `crates/meta/src/mutate.rs`, `crates/cli/src/forward.rs` |
+| Holder dedup also answers a rid found in `completed` (no longer in `recent`) as `Accepted` with no records, never re-executing it | written | `crates/cli/src/forward.rs` (`holder_execute`) |
+| Tailing uses `Meta::apply_segment`; stranding counted in `status` | written | `crates/cli/src/shipper.rs` (`apply_decoded_segment`) |
+| Takeover gate: `LeaseKeeper::commit_gated` runs `recovery::takeover_gate` after the CAS and before the view opens (strand below the new epoch on a takeover, then replay the whole queue locally, in order) | written | `crates/cli/src/lease.rs`, `crates/cli/src/shipper.rs` (`acquire_lease_for`), `crates/cli/src/recovery.rs` |
+| Before claiming a lease handed off over P2P, tail to the departing holder's `head_seq` (bounded), so the gate never strands a shadow whose confirming segment is merely not applied yet | written | `crates/cli/src/node_runtime.rs` (`catch_up_to`, `Acquire`/`ClaimOffer` arms) |
+| Replay drain task: queued ops, in order, through `SyncRequest::Forward` (holder-local or forwarded, M2 retries); refusals persisted then materialized as `.constellation-conflict/` copies through the same path; `unlink`/`rmdir` + `ENOENT` counted as satisfied; after 10 s without a holder, acquire the lease (the gate replays locally) | written | `crates/cli/src/recovery.rs`, `crates/cli/src/node_runtime.rs` |
+| Publish rule: `TreePublisher::publish` defers (and `publish_now` errors with `SPECULATION_OUTSTANDING`) while speculation is outstanding — covers cadence, idle, shutdown and snapshot publishes; the snapshot publisher retries that error for up to 10 s | written | `crates/cli/src/mtree_publish.rs`, `crates/cli/src/node_runtime.rs` |
+| A forward reply from an older epoch that lands after this node took the lease is stranded at once (and the drain sweeps a holder's older-epoch speculation each tick), since a holder never tails the later-epoch segment that would strand it | written | `crates/cli/src/node_runtime.rs` (`dispatch_forward`), `crates/cli/src/recovery.rs` |
+| Status/UI: `status.speculation.{outstanding, pending_replay, rolled_back, stranded_replayed, replay_conflicts}`, web UI line, `constellation_speculation_*` metrics | written | `crates/api/src/types.rs`, `crates/api/src/web.rs`, `crates/api/webui/index.html`, `crates/cli/src/main.rs`, `crates/cli/src/shipper.rs` (`SpoolInfo`) |
+| Tests: property test (random shadows, hints, partial-journal segments, retirements, strandings, takeovers; `ns` must equal the log replayed from scratch plus surviving speculation; 64 seeds × 60 steps, `#[ignore]` 2,000 × 200), unit tests incl. rollback/redo with overlapping parent keys, a retired shadow behind a stranded one, hints, takeover ordering, stranded unlink; holder dedup from `completed`; takeover gate replay, refused replay → conflict copy, satisfied unlink | written | `crates/meta/tests/speculation.rs`, `crates/cli/src/forward.rs`, `crates/cli/src/recovery.rs` |
+| Harness: `holder-crash-phantom-shadow`, `holder-crash-phantom-new-holder` moved from `KNOWN_BUG_REPROS` into `SCENARIOS` with the post-fix expectations: the stranded create is replayed and b, c and a fresh d see it as one inode; in the new-holder shape c's `O_EXCL` create gets `EEXIST`; both check `status.speculation` for a rollback and a replay (non-vacuity) | written | `crates/harness/src/scenarios.rs`, `docs/how-to-guides/development/TESTING.md` |
+| Docs: speculation and stranded-op recovery | written | `docs/reference/features/forwarded-mutations.md` |
+
+**Design decisions:**
+
+- **Explicit capture context, not a thread-local.** The draft this
+  milestone started from captured through a thread-local like M2's
+  `PendingCompletion`. The plan asks for a capture context on the `Dirty`
+  parameter, and only the replay apply path ever needs it (the holder's
+  own writes are M3b), so `Dirty::Tracked` carries `Option<&Capture>` and
+  replay's helpers take the `Dirty` as a parameter. No ambient state, and
+  a write outside a capturing apply can never be captured by accident.
+- **Stranding is by epoch; retirement is by rid.** Fencing guarantees an
+  epoch adds nothing to the log once a later epoch has a segment, so the
+  first such segment is proof. A segment that itself completes a
+  lower-epoch shadow (the new holder replayed or deduplicated it) retires
+  it instead of stranding it.
+- **Retired rows are not redone.** When rolling back past a retired
+  shadow or hint, its effect comes back through the captured `Foreign`
+  row that retired it (it was outstanding, so that segment was captured).
+- **Replay rides the ordinary forward path** (`SyncRequest::Forward`), so
+  it gets holder-local execution, the M2 same-rid retries, redirects,
+  shadow installation and the `Exists` hint for free. The takeover gate
+  replays locally inside the lease commit, before the view opens, so no
+  FUSE fast-path op or forwarded op can run ahead of it.
+- **Hints get an epoch.** An `Exists` entry can be the answering holder's
+  own unshipped work; before M3a it was installed permanently. It now
+  strands like a shadow (and is dropped: a refusal has nothing to replay).
+- **A holder answers a completed rid with no records.** M2 answered retries
+  only from `recent`, so a replay arriving after `acked_through` dropped
+  the entry would have executed again. The requester learns the effect by
+  tailing.
+
+**Risks and follow-ups for the tester / M3b:**
+
+- Nothing here has been compiled or run. The model tests' state-space
+  sizes are unmeasured: if `recovery_fixes_bug_b_third_node_takeover` does
+  not fit the 60 s budget, pare a bound (lossy off first) and keep the
+  exact config as an `#[ignore]` test.
+- Performance: a requester under sustained forwarding almost always has
+  an outstanding shadow, so nearly every tailed segment is captured
+  (before-image reads plus a `Foreign` row) and compacted soon after.
+  Measure the 3-node p2p-on `meta-bench` rows.
+- A hint retires when the applied position reaches its floor. If the
+  holder's journal ships in more than one segment, that can happen before
+  the hinted entry itself arrives; a takeover in between then leaves it in
+  place (the pre-M3a behaviour, in a narrower window). M6's positions make
+  the floor exact.
+- A takeover whose own op is refused ships no segment, so a third node's
+  shadow from the dead holder strands only at the next segment anyone
+  ships (the model's `failover_pending` exemption covers the dead-holder
+  case only).
+- Segment boundaries can split an op's records from its `Completed`
+  (only at `SEGMENT_BATCH`/byte-cap boundaries). If the holder dies between
+  the two, the op took effect but its rid never completes, and a replay
+  re-executes it. Pre-existing for M2's lease path; M3b should keep a
+  transaction's records in one segment.
+- Rollback leaves `atime` rows for rolled-back creates (node-local,
+  harmless).
+
+### Plan 30 M3a: `kill9-remount` hang, a latent M2b self-deadlock (fixed)
+
+M3a testing found that `kill9-remount` hung on every run. After `kill -9`
+and a remount, the node's FUSE ops blocked forever. The cause is a bug
+that M2b introduced (`ea36020`). M3a did not cause it.
+
+- **Root cause.** While a ship round is in flight, the sync task polls it
+  in a `select!` against `sync_rx`. M2b dispatches `SyncRequest::Forward`
+  inline in that `select!` with `dispatch_forward(..).await`.
+  `dispatch_forward` first awaited `keepers.lock()` to read
+  `ship_epoch()`. `run_managed_sync_round`/`run_sync_round` hold that
+  lock across S3 awaits on several paths: `LeaseKeeper::release`, the
+  handoff flush, and the lease CAS/acquire. While the arm body awaits,
+  the round is not polled. So the round never finished its S3 await or
+  dropped the guard, and the forward waited for it forever. A tokio task
+  dump of a hung node showed the sync task parked in `dispatch_forward`
+  at `keepers.lock().await`. The only FUSE thread in application code
+  was in `blocking_recv` for that forward's reply, and the lease PUT had
+  already completed server-side. The hang needs a forward to arrive while
+  the round holds the lock, which is why M2b's gates passed once.
+- **Probably seen before.** M2b's exit notes (above) record a
+  `kill9-remount` hang, a FUSE round trip stuck in `request_wait_answer`.
+  They attributed it to the sandbox's cross-scenario batch flakiness
+  documented under M2. It was most likely this bug.
+- **Fix.** `dispatch_forward` is now a plain `fn` and awaits nothing. It
+  admits a local forward as holder through `LeaseView::new_mutation_epoch`,
+  a new lock-free accessor. That accessor is `ship_epoch()` plus the
+  handoff pause, i.e. the `open_for_new_mutation` gate the FUSE fast path
+  uses. It is closed by the handoff pause `run_sync_round` sets before
+  its final flush, by `release`'s view clear before the CAS, and until
+  `commit_gated`'s takeover gate has run. Because the check and the fjall
+  write run on the sync task with no await between them, the round
+  cannot move between the two. So a local forward is kept out of
+  release/handoff/takeover windows at least as well as a local FUSE
+  write. The non-holder branch no longer forwards to this node's own id,
+  which the lease object still names while paused or released. It
+  answers `Busy`, so the FUSE thread takes the lease path. Two related
+  changes in the round: the forced-drain pass re-arms the pause right
+  before its final flush, and the epoch-flushing release takes the
+  keepers lock once for the drained check and the release. Before, a
+  second `lock().await` between them was an await point where a forward
+  could land. The `select!` now documents the invariant: arm bodies
+  never await anything the in-flight round may hold.
+- **Behaviour change.** While the holder is paused for a handoff, its own
+  forwarded ops used to execute locally anyway (`ship_epoch` ignores the
+  pause). They now go to the `Acquire` path, which declines while paused,
+  as they already did with forwarding off (plan 29 M3c's intent).
+- **Residual, shared with the FUSE fast path.** The pause is
+  time-bounded (`HANDOFF_PAUSE_MS`). A final atime flush slower than that
+  reopens the view before `release` clears it. A FUSE thread's
+  check-then-write is not atomic with the round either.
+- **Tests.** `node_runtime`:
+  - `dispatch_forward_does_not_wait_for_a_round_holding_the_keepers_lock`
+    (the sync loop's `biased` select shape, under a deadline);
+  - `dispatch_forward_completes_while_another_task_holds_the_keepers_lock`;
+  - `dispatch_forward_does_not_execute_locally_while_paused_for_handoff`;
+  - `dispatch_forward_does_not_execute_locally_during_or_after_release`;
+  - `dispatch_forward_does_not_execute_locally_inside_the_takeover_gate`.
+
+  `lease`: `new_mutation_epoch_tracks_ship_epoch_and_the_pause`.
+
+### Plan 30 M3a — tester gate run (2026-09-23)
+
+Built and ran every gate against the M3a working tree (speculation log,
+takeover gate, replay-by-rid, plus the sync-loop self-deadlock fix
+above), in the `constellation-p30` worktree. One bug found and fixed
+along the way (below); everything else was clean on the first pass.
+
+- [x] `cargo fmt --all -- --check` — **failed** on first run (six blocks
+  in `node_runtime.rs`'s new `dispatch_forward_*` tests and one in
+  `main.rs`, all just line-wrapping); `cargo fmt --all` fixed it, clean
+  on re-check.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean,
+  0 warnings.
+- [x] `cargo test --workspace` (debug, `--exclude constellation-model`
+  run separately below) — 0 failures across every crate. The named
+  tests all present and passing: `dispatch_forward_does_not_wait_for_a_round_holding_the_keepers_lock`,
+  `dispatch_forward_completes_while_another_task_holds_the_keepers_lock`,
+  `dispatch_forward_does_not_execute_locally_while_paused_for_handoff`,
+  `dispatch_forward_does_not_execute_locally_during_or_after_release`,
+  `dispatch_forward_does_not_execute_locally_inside_the_takeover_gate`,
+  `new_mutation_epoch_tracks_ship_epoch_and_the_pause`,
+  `crates/meta/tests/speculation.rs` (9 passed, 1 `#[ignore]`d property
+  test correctly skipped), `crates/meta/tests/completion_ownership.rs`
+  (1 passed).
+- [x] Model tests (release, one process each, `/usr/bin/time -v`), all
+  well inside the 60 s / ~2 GB caps:
+
+  | Test | States (unique) | Time | Peak RSS |
+  |---|---|---|---|
+  | `today_finds_bug_a` | 2,260 (477) | 7.6 ms | 71 MB |
+  | `today_finds_bug_b` | 105,622 (33,476) | 43 ms | 71 MB |
+  | `exactly_once_is_linearizable` | 6.5M + 39.5M (710K + 7.2M) | 21.6 s | 1.78 GB |
+  | `recovery_fixes_bug_b_third_node_takeover` | 211,708 (65,921) | 93 ms | 71 MB |
+  | `recovery_fixes_bug_b_requester_takeover` | 1.43M (328,836) | 692 ms | 71 MB |
+  | `recovery_fixes_bug_b_exactly_once_config` | 95,961 (24,120) | 35 ms | 71 MB |
+  | `single_writer_is_clean` | 2,215 (504) | 1.3 ms | 71 MB |
+
+  `recovery_fixes_bug_b_third_node_takeover_deep` is `#[ignore]`d and was
+  not run (per the milestone rule).
+- [x] `cargo build --release --workspace` — clean.
+- [x] Harness, all PASS after the fix below:
+  - `kill9-remount` × 5: 5.5s/3.0s/3.1s/3.2s/3.4s — every run PASSED.
+  - `holder-crash-phantom-shadow` (8.7s/11.5s across two runs),
+    `holder-crash-phantom-new-holder` (8.6s/8.4s) — both PASS, each
+    showing `rolled_back:1, stranded_replayed:1` (non-vacuous
+    rollback+replay) and the expected `EEXIST` for the new-holder shape's
+    `O_EXCL` create.
+  - `forward-timeout-reexec` — **failed** on every attempt before the
+    fix below (see next section); PASSES 3/3 after it (19.1–19.2s).
+  - `forwarded-mutations` (2.1–2.3s), `holder-ships-under-forward-load`
+    (15.6s, `ship_rounds_cancelled=0`), `lease-handover` (179.3s — within
+    the 178.3–182.8s range recorded for M2/M2b, no regression),
+    `lease-fencing` (10.2s), `continuation-epoch` (7.7s),
+    `epoch-member-lost` (6.0s), `deposed-reintegration` (24.1s, matches
+    the 23.8s recorded for M3c), `mkdir-p-race` (2.7s), `two-clients-shared`
+    (238.6s), `p2p-handover` (2.4s), `sticky-lease-handoff-over-s3`
+    (13.1s, matches the 12.9s recorded for M2), `chaos-ci` (7.3s, in the
+    4.5–7.3s range recorded across milestones), `create-storm-s3-only`
+    (113.7s, in the 97.6–119s range recorded across milestones),
+    `baseline` (4.8s), `cold-cache` (3.9s), `fresh-node-bootstrap`
+    (63.0s), `staging-crash` (2.0s), `unmount-drain` (6.7s),
+    `idle-cluster-is-quiet` (62.4s) — all PASS, no timing regressions
+    against the watch-list in the milestone brief.
+- [x] Perf sanity: `meta-bench` `3node-p2pon-shared-create-lat0` (the
+  forwarded-writer config: one shared directory, 3 nodes, P2P on, 0ms
+  extra S3 latency), 3 runs each, this milestone's release binary vs.
+  the M2b comparison binary:
+
+  | Binary | agg ops/s | p50 | p99 |
+  |---|---|---|---|
+  | M3a (this tree) | 1484 / 1389 / 1150 (mean 1341) | 0.76–0.88 ms | 9.87–15.28 ms |
+  | M2b comparison | 1183 / 1228 / 1153 (mean 1188) | 0.81–0.90 ms | 9.51–9.83 ms |
+
+  Aggregate throughput is ~13% *above* the M2b comparison binary (no
+  regression) and median latency is essentially unchanged. p99 is
+  higher and more variable in 2 of 3 M3a runs (11.0ms, 15.3ms vs. M2b's
+  steady ~9.5–9.8ms) — consistent with the M3a risk note that a
+  requester under sustained forwarding almost always has an outstanding
+  shadow, so most tailed segments now pay a speculation-log capture
+  (before-image reads plus a `Foreign` row) and compaction. Not a
+  blocking regression (throughput is unaffected, and this workload is
+  the case the risk note already named), but worth the same "measure
+  again on an idle host" caveat M2b's own perf numbers carry.
+
+**Bug found and fixed — stale self-cache defeats the self-forward guard**
+(not a design change; a narrow correctness fix inside the fix already in
+the tree):
+
+`forward-timeout-reexec` failed deterministically (same seed, same
+round every time): round 2 (a `mkdir`, holder=b/requester=a) never
+tripped the injected forward-reply delay (`a`'s `forwarded_err` stayed
+at 0 while every other round's did rise). Bisecting with temporary
+`tracing::warn!` calls (removed afterward) at
+`fusefs.rs::mutate_op_rebasable_with_rid`'s holder check and
+`node_runtime.rs::dispatch_forward`'s network branch showed: `a`
+correctly saw itself as *not* holding (`open=false`) and attempted to
+forward, but `ForwardState::cached_holder` returned `Some(1)` — `a`'s
+*own* node id — for a partition `b` actually held. This fix's new
+"never forward to ourselves, answer `Busy`" branch
+(`node_runtime.rs`, `dispatch_forward`) then fired on that stale
+self-entry and answered `Busy` immediately, with no network round trip
+and so no chance for the injected delay/timeout to engage; the FUSE
+thread fell through to `require_lease_for` and completed the op that
+way instead (still correct, just needlessly expensive — a full lease
+acquisition instead of one forward).
+
+Root cause: `ForwardState.holders` (the forward-routing cache, distinct
+from the authoritative `LeaseView`) is only refreshed on a cache miss or
+an explicit `NotHolder` redirect from an actual network round trip.
+Once it holds this node's own id — which happens the ordinary way,
+by this node genuinely having held the partition earlier — nothing
+invalidates it when this node later loses the lease via its *own*
+release/handoff path, since that path never touches `ForwardState`.
+The new self-filter then trusted that stale entry as if it were the
+fresh read the surrounding comment assumed.
+
+Fix (`crates/cli/src/node_runtime.rs`, `dispatch_forward`): treat a
+cached holder equal to `ctx.node_id` the same as an empty cache — force
+the fresh `LeaseStore::get()` read before deciding whether to
+self-answer `Busy`. A genuinely paused/releasing/takeover-gated node
+still gets a fast, correct `Busy` (the fresh read still names it); a
+merely stale cache now gets corrected first, so the forward goes to the
+real current holder. Verified: `forward-timeout-reexec` PASSES 3/3 after
+the fix, `cargo test --workspace` and the full harness list above are
+otherwise unaffected, `kill9-remount` still PASSES 5/5, and the two
+bug-B scenarios and `holder-ships-under-forward-load` are unchanged.

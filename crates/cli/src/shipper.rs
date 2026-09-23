@@ -294,6 +294,16 @@ pub struct SpoolInfo {
     /// (frequent handoffs, or peers hammering a busy partition) will
     /// still show real cancellations here even after this milestone.
     pub ship_rounds_cancelled: u64,
+    /// Plan 30 §M3a: speculative entries (requester shadows and `Exists`
+    /// hints) rolled back because a later epoch stranded them.
+    pub speculation_rolled_back: u64,
+    /// Stranded ops replayed by rid and accepted (by the current holder,
+    /// or executed locally by the takeover gate).
+    pub stranded_replayed: u64,
+    /// Stranded ops whose replay was refused and materialized as a
+    /// `.constellation-conflict/` copy (or, for an op with nothing to
+    /// copy, only counted and logged).
+    pub replay_conflicts: u64,
 }
 
 impl Shipper {
@@ -956,16 +966,37 @@ impl Shipper {
         } else {
             // Only *pending* (unshipped) local records may suppress a
             // foreign one: ours sit later in the global log than
-            // anything we tail, so ours win everywhere. Shadowed
-            // forwarded records must NOT suppress: the holder already
-            // sequenced them, so a peer's record for the same inode can
-            // legitimately follow ours. Skipping it would drop it for
-            // good — `set_applied_seq` below never revisits a
+            // anything we tail, so ours win everywhere. Speculative
+            // forwarded records (shadows) must NOT suppress: the holder
+            // already sequenced them, so a peer's record for the same
+            // inode can legitimately follow ours. Skipping it would drop
+            // it for good — the applied position never revisits a
             // segment — leaving each requester pinned to its own value.
             let pending =
                 TouchSet::from_records(self.meta.take_journal(usize::MAX)?.iter().map(|(_, r)| r));
-            let skipped = self.meta.apply_foreign(&seg.records, &pending)?;
-            self.meta.shadow_retire_matching(seg.epoch, &seg.records)?;
+            // Plan 30 §M3a: one transaction strands whatever speculation
+            // this segment's epoch supersedes (rolled back, redone around,
+            // shadows queued for replay by rid — `recovery::
+            // drain_pending_replays` runs them), applies the records,
+            // retires shadows by rid and hints by position, and advances
+            // `applied_seq`.
+            let applied = self
+                .meta
+                .apply_segment(seq, seg.epoch, &seg.records, &pending)?;
+            let skipped = applied.skipped;
+            if applied.stranded.any() {
+                tracing::warn!(
+                    seq,
+                    part,
+                    epoch = seg.epoch,
+                    shadows = applied.stranded.shadows,
+                    hints = applied.stranded.hints,
+                    "segment from a later epoch stranded speculative state; rolled back, \
+                     stranded ops queued for replay by rid"
+                );
+                self.spool.lock().unwrap().speculation_rolled_back +=
+                    (applied.stranded.shadows + applied.stranded.hints) as u64;
+            }
             if skipped > 0 {
                 self.spool.lock().unwrap().conflicts += skipped as u64;
             }
@@ -978,7 +1009,6 @@ impl Shipper {
                 skipped,
                 "applied foreign segment"
             );
-            self.meta.set_applied_seq(seq)?;
         }
         let st = self.parts.get_mut(part).unwrap();
         st.max_epoch = st.max_epoch.max(seg.epoch);
@@ -1444,6 +1474,9 @@ impl Shipper {
 
     /// Enough segments shipped since the last publish. Shutdown and
     /// explicit sync paths bypass this and publish unconditionally.
+    /// (Plan 30 §M3a's "a node with outstanding speculation does not
+    /// publish" is enforced below all of them, in
+    /// `TreePublisher::publish`.)
     fn publish_is_due(&self) -> bool {
         self.shipped_since_publish >= PUBLISH_EVERY
     }
@@ -1720,12 +1753,24 @@ pub async fn acquire_lease_for(
         );
         ship.register_wanted_by(keeper, part, prev, tag).await;
     }
-    let tailed = if plan.needs_tail() {
+    let takeover = plan.needs_tail();
+    let tailed = if takeover {
         Some(ship.tail_part_to_head(part).await?)
     } else {
         None
     };
-    keeper.commit(plan, tailed).await
+    // Plan 30 §M3a takeover gate: once the CAS makes this node the holder,
+    // and before anything can execute against this replica as holder,
+    // roll back the speculation the new epoch strands and replay every
+    // queued stranded op locally, in order (see `recovery::takeover_gate`).
+    let meta = ship.meta.clone();
+    let spool = ship.spool.clone();
+    let node_id = ship.node_id;
+    keeper
+        .commit_gated(plan, tailed, move |epoch| {
+            crate::recovery::takeover_gate(&meta, &spool, node_id, epoch, takeover);
+        })
+        .await
 }
 
 #[allow(dead_code)]
@@ -2077,7 +2122,6 @@ mod tests {
         let mut holder = node(&store, 1);
         let mut a = node(&store, 2);
         let mut b = node(&store, 3);
-        let part = constellation_store_s3::log::PARTITION;
 
         // The holder owns the file; both requesters tail it in.
         let f = holder.meta.create(1, "duel", 0o644, 0, 0).unwrap();
@@ -2091,7 +2135,10 @@ mod tests {
         // Each requester forwards a chmod: the holder executes and
         // journals it, the requester shadows and applies the records so
         // it can read its own write before the segment ships.
-        for (requester, mode) in [(&mut a, 0o600u32), (&mut b, 0o640u32)] {
+        for (i, (requester, mode)) in [(&mut a, 0o600u32), (&mut b, 0o640u32)]
+            .into_iter()
+            .enumerate()
+        {
             let op = MutateOp::Setattr {
                 ino: f.ino,
                 mode: Some(mode),
@@ -2101,8 +2148,13 @@ mod tests {
                 atime_ns: None,
                 mtime_ns: None,
             };
-            let records = execute_mutate(&holder.meta, &op, None).unwrap();
-            crate::forward::apply_accepted(&requester.meta, part, 1, &records).unwrap();
+            let rid = constellation_meta::Rid {
+                node: 2 + i as u64,
+                incarnation: 1,
+                seq: 0,
+            };
+            let records = execute_mutate(&holder.meta, &op, Some(rid)).unwrap();
+            crate::forward::apply_accepted(&requester.meta, 1, rid, &op, &records).unwrap();
             assert_eq!(mode_of(&requester.meta), mode, "read-your-write");
         }
 

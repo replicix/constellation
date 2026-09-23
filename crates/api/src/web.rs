@@ -145,6 +145,31 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.spool.head_seq
     );
     gauge!(
+        "constellation_speculation_outstanding",
+        "Shadows and hints applied ahead of the log, not yet confirmed.",
+        status.speculation.outstanding
+    );
+    gauge!(
+        "constellation_speculation_pending_replay",
+        "Stranded ops queued for replay by rid.",
+        status.speculation.pending_replay
+    );
+    gauge!(
+        "constellation_speculation_rolled_back_total",
+        "Speculative entries rolled back because a later epoch stranded them.",
+        status.speculation.rolled_back
+    );
+    gauge!(
+        "constellation_speculation_replayed_total",
+        "Stranded ops replayed by rid and accepted.",
+        status.speculation.stranded_replayed
+    );
+    gauge!(
+        "constellation_speculation_replay_conflicts_total",
+        "Refused stranded-op replays materialized as conflict copies.",
+        status.speculation.replay_conflicts
+    );
+    gauge!(
         "constellation_cache_used_bytes",
         "Bytes resident in the local chunk cache.",
         status.cache.used_bytes

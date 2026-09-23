@@ -1,11 +1,53 @@
-//! Plan 30 §M1's three required tests. Each must finish within ~60s
-//! under `cargo test -p constellation-model --release`; timings are
-//! printed so a coordinator can see the margin.
+//! Plan 30 §M1's three required tests, §M2's `ExactlyOnce` check and
+//! §M3a's `Recovery` checks. Each finishes within ~60s under
+//! `cargo test -p constellation-model --release`; timings are printed so
+//! a coordinator can see the margin. None of them assert a wall-clock
+//! bound, so a slower `cargo test --workspace` debug build (this file's
+//! tests are its slowest, `exactly_once_is_linearizable` especially —
+//! ~80s single-threaded, see `safety_net_cap`'s doc comment) still
+//! passes; it just takes longer.
+//!
+//! Every `checker()` call below carries an explicit
+//! `target_state_count`/`target_max_depth`/`timeout` — never an
+//! uncapped BFS, after a 3-node `Recovery` config with the then-default
+//! `max_forward_retries` OOM'd a `cargo test --workspace` run at 27GB
+//! (plan 30 M3a's PROGRESS.md entry has the story). For `Today`/
+//! `ExactlyOnce` and the smaller `Recovery` configs the cap is a
+//! generous safety net only (exhaustive completion is reached far below
+//! it, so `checker.is_done()` still reflects true exhaustion).
+//! `Recovery`'s 3-node third-node-takeover config is different: even at
+//! the smallest bounds that still reach the bug B shape, its state space
+//! (two independently-timed client ops plus the shadow/replay dimension)
+//! did not finish exhaustively within a 20M state / 6GB probe, so its
+//! default-run test is a deliberately bounded, non-exhaustive smoke
+//! check — `is_done()` there just means "hit the cap", not "explored
+//! everything" — backed by the same explicit, hand-built path check
+//! every such test also has (cheap: one deterministic trace, not a
+//! search) and by a separate `#[ignore]`d test with a much larger cap
+//! for deeper (still non-exhaustive) manual exploration.
 
 use constellation_model::protocol::{Action, AuthorityModel, Protocol};
 use constellation_model::{NsOp, N_NAMES};
 use stateright::{Checker, Model};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// A generous safety-net cap for configs expected to finish exhaustively
+/// (`checker.is_done()` should reflect true completion, not this cap).
+/// Sized with margin above `exactly_once_is_linearizable`'s bug-B config,
+/// the largest legitimately-exhaustive search here: measured at 39.5M
+/// states / 7.2M unique / depth 28, 1.9GB peak RSS, ~19s in release and
+/// ~80s single-threaded in debug (this file's tests are `cargo
+/// test --workspace`'s slowest, but no test here asserts a wall-clock
+/// bound — only `is_done()` and the discoveries, so a slow-but-complete
+/// debug run still passes; see the module doc comment).
+fn safety_net_cap<M: Model>(
+    builder: stateright::CheckerBuilder<M>,
+) -> stateright::CheckerBuilder<M> {
+    builder
+        .target_state_count(60_000_000)
+        .target_max_depth(100)
+        .timeout(Duration::from_secs(180))
+}
 
 fn name(n: u8) -> u8 {
     assert!(n < N_NAMES);
@@ -27,7 +69,7 @@ fn today_finds_bug_a() {
         .with_max_seq(2)
         .with_op(1, NsOp::CreateExcl(name(0)));
 
-    let checker = model.checker().spawn_bfs().join();
+    let checker = safety_net_cap(model.checker()).spawn_bfs().join();
     println!(
         "today_finds_bug_a: {} states ({} unique), max depth {}, {:?}",
         checker.state_count(),
@@ -90,7 +132,7 @@ fn today_finds_bug_b() {
         .with_op(1, NsOp::CreateExcl(name(0)))
         .with_op(2, NsOp::CreateExcl(name(1)));
 
-    let checker = model.checker().spawn_bfs().join();
+    let checker = safety_net_cap(model.checker()).spawn_bfs().join();
     println!(
         "today_finds_bug_b: {} states ({} unique), max depth {}, {:?}",
         checker.state_count(),
@@ -190,7 +232,7 @@ fn exactly_once_is_linearizable() {
         .with_max_seq(2)
         .with_op(1, NsOp::CreateExcl(name(0)));
 
-    let checker = model.checker().spawn_bfs().join();
+    let checker = safety_net_cap(model.checker()).spawn_bfs().join();
     println!(
         "exactly_once_is_linearizable (bug A config): {} states ({} unique), max depth {}, {:?}",
         checker.state_count(),
@@ -222,7 +264,7 @@ fn exactly_once_is_linearizable() {
         .with_max_crashes(1)
         .with_lossy(false)
         .with_op(1, NsOp::CreateExcl(name(0)));
-    let checker_b = model_b.checker().spawn_bfs().join();
+    let checker_b = safety_net_cap(model_b.checker()).spawn_bfs().join();
     println!(
         "exactly_once_is_linearizable (bug B config): {} states ({} unique), max depth {}, {:?}",
         checker_b.state_count(),
@@ -256,6 +298,247 @@ fn exactly_once_is_linearizable() {
     );
 }
 
+/// Run `model` exhaustively (a generous safety-net cap only) and assert
+/// that `Recovery` (plan 30 §M3a) holds every safety property there and
+/// still reaches `progress`.
+fn assert_recovery_clean(label: &str, model: AuthorityModel) {
+    assert_recovery_bounded(label, model, None);
+}
+
+/// Like [`assert_recovery_clean`], but with an explicit
+/// `(target_state_count, target_max_depth, timeout)` cap. When `cap` is
+/// `Some`, exhaustiveness is not asserted (the cap may well be what
+/// stopped the search) — only that no safety violation was *found*
+/// within the explored region, which is a strictly weaker guarantee the
+/// caller's doc comment must spell out.
+fn assert_recovery_bounded(
+    label: &str,
+    model: AuthorityModel,
+    cap: Option<(usize, usize, Duration)>,
+) {
+    let started = Instant::now();
+    let mut builder = model.checker();
+    builder = if let Some((states, depth, timeout)) = cap {
+        builder
+            .target_state_count(states)
+            .target_max_depth(depth)
+            .timeout(timeout)
+    } else {
+        safety_net_cap(builder)
+    };
+    let checker = builder.spawn_bfs().join();
+    println!(
+        "{label}: {} states ({} unique), max depth {}, is_done={}, {:?}",
+        checker.state_count(),
+        checker.unique_state_count(),
+        checker.max_depth(),
+        checker.is_done(),
+        started.elapsed()
+    );
+    if cap.is_none() {
+        assert!(
+            checker.is_done(),
+            "expected exhaustive exploration within budget ({label})"
+        );
+    } else {
+        println!("{label}: bounded, non-exhaustive exploration (capped at the numbers above)");
+    }
+    for prop in [
+        "linearizable",
+        "converged_at_quiescence",
+        "commits_are_log_prefixes",
+    ] {
+        assert!(
+            checker.discovery(prop).is_none(),
+            "Recovery must not violate {prop} ({label}): {:?}",
+            checker.discovery(prop).map(|p| p.into_actions())
+        );
+    }
+    assert!(
+        checker.discovery("progress").is_some(),
+        "expected at least one run where every op completes ({label})"
+    );
+}
+
+/// Plan 30 §M3a: `Recovery` on the exact configuration where
+/// `today_finds_bug_b` finds bug B (three nodes; node 0 holds, crashes
+/// after accepting node 1's forwarded create; node 2 takes over for its
+/// own create).
+///
+/// The one bound changed from `today_finds_bug_b` is
+/// `with_forward_retries(0)`: `Today` has no same-rid retry at all, and
+/// `RetryForward` (bug A's fix, covered by `exactly_once_is_linearizable`)
+/// multiplies the state space roughly tenfold per allowed attempt without
+/// touching the stranding path this test is about. Dedup itself stays on
+/// (`Recovery` is built on `ExactlyOnce`), which is what replay by rid
+/// relies on.
+///
+/// Unlike every other `Recovery` test here, exhaustive coverage of this
+/// exact, 3-node config is not attempted in the default run: it has two
+/// independently-timed client ops (one on the stranded requester, one on
+/// the node that takes over) on top of `Recovery`'s shadow/replay
+/// dimension, and even at the smallest bounds that still reach the bug B
+/// shape (`max_tick`/`lease_ttl`/`max_seq` all down at 1, `max_next_id`
+/// down at 10), it did not finish exhaustively within a 20-million-state,
+/// ~6GB probe (measured while tuning this test; see PROGRESS.md's plan
+/// 30 M3a entry for the numbers) — so this is a deliberately bounded,
+/// non-exhaustive smoke check of the exact scenario, backed by the
+/// explicit hand-built path below (a single deterministic trace, not a
+/// search, so it stays exact and cheap) for the real regression
+/// guarantee. `recovery_fixes_bug_b_third_node_takeover_deep` is a larger
+/// (still capped, still non-exhaustive) `#[ignore]`d sibling for manual,
+/// deeper exploration.
+#[test]
+fn recovery_fixes_bug_b_third_node_takeover() {
+    let model = AuthorityModel::new(3)
+        .with_protocol(Protocol::Recovery)
+        .with_forward_retries(0)
+        .with_initial_holder(0, 1)
+        .with_max_tick(6)
+        .with_lease_ttl(2)
+        .with_max_seq(2)
+        .with_max_crashes(1)
+        .with_op(1, NsOp::CreateExcl(name(0)))
+        .with_op(2, NsOp::CreateExcl(name(1)));
+    assert_recovery_bounded(
+        "recovery (bug B, third node takes over)",
+        model.clone(),
+        Some((200_000, 20, Duration::from_secs(15))),
+    );
+
+    // The concrete bug B path from `today_finds_bug_b`, continued with
+    // recovery: node 1 tails node 2's post-takeover segment, which strands
+    // its shadow; the replay by rid goes to node 2, which executes it and
+    // ships it; node 1 tails that and retires the replayed shadow.
+    let path = vec![
+        Action::ClientInvoke(1),
+        Action::DeliverForwardRequest(0),
+        Action::Crash(0),
+        Action::DeliverForwardReply(1),
+        Action::ClientInvoke(2),
+        Action::ForwardTimeout(2),
+        Action::Tick,
+        Action::AcquireLease(2),
+        Action::Ship(2),
+        Action::Tail(1),
+        Action::ReplayStranded(1),
+        // Ids 0/1 were the original request/reply and 2 node 2's own
+        // (never delivered) forward to the dead holder; the replay
+        // request is 3 and node 2's reply to it 4.
+        Action::DeliverForwardRequest(3),
+        Action::DeliverForwardReply(4),
+        Action::Ship(2),
+        Action::Tail(1),
+    ];
+    let init = model.init_states().into_iter().next().unwrap();
+    let end = stateright::Path::from_actions(&model, init, &path)
+        .unwrap_or_else(|| panic!("recovery path not reachable: {path:?}"))
+        .last_state()
+        .clone();
+    let node1 = &end.nodes[1];
+    assert!(
+        node1.shadows.is_empty() && node1.replays.is_empty(),
+        "node 1 has no outstanding speculation once recovery completes: {node1:?}"
+    );
+    let head = end
+        .log
+        .iter()
+        .flatten()
+        .flat_map(|seg| seg.records.iter())
+        .filter(|(_, rec)| *rec == NsOp::CreateExcl(name(0)))
+        .count();
+    assert_eq!(
+        head, 1,
+        "the stranded create is in the durable log exactly once: {:?}",
+        end.log
+    );
+    println!("recovery_fixes_bug_b_third_node_takeover: explicit recovery path verified");
+}
+
+/// A larger (still explicitly capped, still non-exhaustive) exploration
+/// of `recovery_fixes_bug_b_third_node_takeover`'s exact config, for
+/// manual, deeper coverage than the default run's budget allows.
+/// `#[ignore]`d: run with `cargo test -p constellation-model --release --
+/// --ignored recovery_fixes_bug_b_third_node_takeover_deep --nocapture`.
+#[test]
+#[ignore]
+fn recovery_fixes_bug_b_third_node_takeover_deep() {
+    let model = AuthorityModel::new(3)
+        .with_protocol(Protocol::Recovery)
+        .with_forward_retries(0)
+        .with_initial_holder(0, 1)
+        .with_max_tick(6)
+        .with_lease_ttl(2)
+        .with_max_seq(2)
+        .with_max_crashes(1)
+        .with_op(1, NsOp::CreateExcl(name(0)))
+        .with_op(2, NsOp::CreateExcl(name(1)));
+    assert_recovery_bounded(
+        "recovery (bug B, third node takes over, deep)",
+        model,
+        Some((20_000_000, 60, Duration::from_secs(60))),
+    );
+}
+
+/// Plan 30 §M3a: the other shape of bug B (M0's
+/// `holder-crash-phantom-new-holder`): the stranded requester itself
+/// takes over. Node 1's create is accepted by node 0, node 0 crashes, and
+/// node 1's *next* op (an unlink of the same name) can only run after node
+/// 1 takes the lease — so the takeover gate must replay the stranded
+/// create first, or the unlink would either validate against phantom
+/// state (bug B) or miss the create entirely (a linearizability failure).
+///
+/// `with_forward_retries(0)`, not `today_finds_bug_b`'s/plan 30 §M2's
+/// three: measured while tuning this test, `RetryForward`'s branch point
+/// under `Recovery` (stacked on top of `ReplayStranded`'s own retry
+/// dimension) made even one allowed attempt blow past a 20-million-state
+/// probe here, where it stayed uncapped at zero (328,836 unique states,
+/// well under a second). `recovery_fixes_bug_b_third_node_takeover`
+/// already covers the same fix with `RetryForward` reachable via
+/// `exactly_once_is_linearizable`'s own bug-A config, so nothing here
+/// goes untested elsewhere.
+#[test]
+fn recovery_fixes_bug_b_requester_takeover() {
+    let model = AuthorityModel::new(2)
+        .with_protocol(Protocol::Recovery)
+        .with_forward_retries(0)
+        .with_initial_holder(0, 1)
+        .with_max_tick(3)
+        .with_lease_ttl(1)
+        .with_max_seq(2)
+        .with_max_crashes(1)
+        .with_lossy(false)
+        .with_op(1, NsOp::CreateExcl(name(0)))
+        .with_op(1, NsOp::Unlink(name(0)));
+    assert_recovery_clean("recovery (bug B, requester takes over)", model);
+}
+
+/// Plan 30 §M3a: `Recovery` on `exactly_once_is_linearizable`'s own
+/// crash-inclusive configuration (bug B's shape pared down to two nodes),
+/// where `ExactlyOnce` still fails convergence.
+///
+/// `with_forward_retries(0)`: unlike `exactly_once_is_linearizable`'s own
+/// use of this exact shape (which keeps the full default retry count),
+/// `Recovery`'s added replay dimension makes even one allowed
+/// `RetryForward` attempt here explode well past budget (measured while
+/// tuning this test: the uncapped checker exceeded 6GB within 19s at the
+/// default three retries). At zero it is exhaustive (95,961 states,
+/// under 50ms).
+#[test]
+fn recovery_fixes_bug_b_exactly_once_config() {
+    let model = AuthorityModel::new(2)
+        .with_protocol(Protocol::Recovery)
+        .with_forward_retries(0)
+        .with_initial_holder(0, 1)
+        .with_max_tick(3)
+        .with_lease_ttl(1)
+        .with_max_seq(1)
+        .with_max_crashes(1)
+        .with_lossy(false)
+        .with_op(1, NsOp::CreateExcl(name(0)));
+    assert_recovery_clean("recovery (ExactlyOnce's bug B config)", model);
+}
+
 /// A single writer that never crashes, pauses, or gets forwarded to
 /// (forwarding is simply never reachable: the sole writer already holds
 /// the lease for the whole run) must satisfy every property throughout
@@ -271,7 +554,7 @@ fn single_writer_is_clean() {
         .with_op(0, NsOp::CreateExcl(name(0)))
         .with_op(0, NsOp::Unlink(name(0)));
 
-    let checker = model.checker().spawn_bfs().join();
+    let checker = safety_net_cap(model.checker()).spawn_bfs().join();
     println!(
         "single_writer_is_clean: {} states ({} unique), max depth {}, {:?}",
         checker.state_count(),

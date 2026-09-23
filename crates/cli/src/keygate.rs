@@ -9,11 +9,12 @@
 //! the same directory both bump the parent's mtime/ctime/nlink; two
 //! `SetManifest`s on one file race each other's base; a rename touches
 //! two parents. If both reach the holder and get applied back here
-//! (`forward::apply_accepted`'s `shadow_insert` + `apply_foreign`) in a
-//! different relative order than the holder actually executed them, the
-//! requester's replica can diverge from the holder's: `apply_foreign`
-//! replays records assuming they arrive in the holder's causal order,
-//! and shadow suppression of the holder's own tail assumes the same.
+//! (`forward::apply_accepted` → `Meta::install_shadow`) in a different
+//! relative order than the holder actually executed them, the
+//! requester's replica can diverge from the holder's: replay applies
+//! records assuming they arrive in the holder's causal order, and the
+//! speculation log's rollback (plan 30 §M3a) assumes shadows were
+//! captured in that order too.
 //!
 //! `KeyGate` is a coarse, all-or-nothing mutex over conflict keys
 //! (`forward::conflict_keys`'s output, ordinarily inode numbers):

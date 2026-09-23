@@ -698,7 +698,7 @@ Two checks:
 - Every one of the 6,400 created files is visible from both non-holder
   mounts within 2 seconds of the burst ending.
 
-### Known-bug reproductions (plan 30 M0/M1, bug B pending M3)
+### Known-bug reproductions (plan 30 M0; currently empty)
 
 `harness list` prints a second catalog after the ordinary scenario list,
 headed `known-bug reproductions (expected to FAIL until fixed)`, backed
@@ -706,9 +706,11 @@ by `scenarios::KNOWN_BUG_REPROS` (`crates/harness/src/scenarios.rs`) —
 kept out of `SCENARIOS` so a bare `harness run` (no names) never treats
 a documented bug as a regression. `harness run <name>` resolves a name
 in either list. When a later milestone fixes the bug, its scenario
-moves into `SCENARIOS`, unchanged, as the regression test.
+moves into `SCENARIOS` as the regression test. Plan 30 M2 moved
+`forward-timeout-reexec` (bug A) and M3a moved both bug B scenarios
+below, so the list is empty today.
 
-Reproducing these needs two things no scenario had before:
+Reproducing these needed two things no scenario had before:
 
 - `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` (default 0, see
   [Configuration](../../reference/configuration.md)) sleeps this long,
@@ -721,26 +723,29 @@ Reproducing these needs two things no scenario had before:
   instead of the shared `env.endpoint`, so that one node's S3 path can
   drop while its peers' stay up.
 
-Scenarios:
+Bug B scenarios (plan 30 M3a regression tests, in `SCENARIOS`):
 
-- **`holder-crash-phantom-shadow`** (bug B, third node takes over). Three
+- **`holder-crash-phantom-shadow`** (third node takes over). Three
   nodes; A's S3 goes through its own `CountingProxy` switch. A takes the
   lease, then its S3 is cut — it still acks a forwarded mutation from
   memory for a few seconds — B's forwarded `create_new("phantom")` lands
-  and is applied on B's replica (`forward::apply_accepted`) before A is
-  killed. C takes over once A's lease expires and never saw the
-  stranded record. B and C disagree on `phantom`; a fresh node D, mounted
-  after B cleanly unmounts (publishing a commit), inherits whichever
-  side published first. Fails listing each disagreement; passes once M3
-  lands.
-- **`holder-crash-phantom-new-holder`** (bug B, the requester takes
-  over). Same stranding, but B itself becomes the next holder. C's
-  `create_new("phantom")` should then succeed — the name was never
-  created in the durable history — but B validates the create against
-  its own stranded phantom entry and answers `EEXIST`.
+  and is installed on B's replica as a speculation-log shadow
+  (`forward::apply_accepted`) before A is killed. C takes over once A's
+  lease expires. C's first segment strands B's shadow: B rolls it back
+  and replays the create by rid through C. Passes when B and C see
+  `phantom` as the same inode, B's `status.speculation` shows the
+  rollback and the replay (non-vacuity) and no replay conflict, and a
+  fresh node D — mounted after B cleanly unmounts and publishes — sees it
+  too, as the same inode.
+- **`holder-crash-phantom-new-holder`** (the requester takes over). Same
+  stranding, but B itself becomes the next holder. B's takeover gate
+  rolls the shadow back and replays the create locally before B serves
+  anything, so C's `create_new("phantom")` must fail with `EEXIST` (the
+  create B's application was told succeeded is durable), and B, C and a
+  fresh D agree the name exists, as one inode.
 
-All three poll the control API (`lease`, `forwarded_err`) and the
-mounted namespace with `eventually` rather than sleeping and hoping.
+All of them poll the control API and the mounted namespace with
+`eventually` rather than sleeping and hoping.
 
 The harness also runs **fully containerized** (`make harness-docker`,
 compose service `harness`): the image bundles the binaries plus fio and

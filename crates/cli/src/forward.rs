@@ -6,7 +6,7 @@
 
 use crate::keygate::KeyGate;
 use constellation_fs_core::Ino;
-use constellation_meta::{execute_mutate, Meta, MetaStore, MutateOp, MutateOutcome, TouchSet};
+use constellation_meta::{execute_mutate, Meta, MetaStore, MutateOp, MutateOutcome};
 use constellation_net::{Payload, Peers};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -342,6 +342,23 @@ pub fn holder_execute(
         }
         return MutateOutcome::Accepted { epoch, records };
     }
+    // Plan 30 §M3a: a rid whose outcome `recent` no longer holds (acked
+    // and dropped, aged out, or completed by an earlier tenure) may still
+    // have taken effect. The requester that retries it — a stranded op's
+    // replay by rid above all — must not have it executed twice, so a
+    // rid the log (or this tenure's own journal, which writes `completed`
+    // in the op's transaction) already completed is answered as accepted
+    // with no records: the effect is already in the log, and reaches the
+    // requester by tailing.
+    if meta.completed_position(rid).ok().flatten().is_some() {
+        if let Some(forward) = forward {
+            forward.dedup_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        return MutateOutcome::Accepted {
+            epoch,
+            records: Vec::new(),
+        };
+    }
     let executed = execute_mutate(meta, &op, Some(rid));
     match executed {
         Ok(records) => {
@@ -366,6 +383,7 @@ pub fn holder_execute(
                 Ok(Some(record)) => MutateOutcome::Exists {
                     records: vec![record],
                     ship_floor,
+                    epoch,
                 },
                 _ => MutateOutcome::Errno(libc::EEXIST),
             },
@@ -424,15 +442,21 @@ pub fn causal_wait_target(op: &MutateOp, outcome: &MutateOutcome) -> Option<(Ino
 /// before returning the errno anyway (the entry may have changed again).
 pub const CAUSAL_WAIT: Duration = Duration::from_secs(3);
 
-/// Apply an accepted outcome on the requester: shadow + apply_foreign.
+/// Apply an accepted outcome on the requester: install its records ahead
+/// of the log as a speculation-log shadow (plan 30 §M3a,
+/// `Meta::install_shadow`), recording `rid`, `op` and the accepting
+/// holder's `epoch` so the shadow retires when its `Completed` arrives
+/// from the log, or is rolled back and replayed by rid if a later epoch
+/// strands it. Skipped (and `Ok`) when this replica already tailed the
+/// op's completion: the effect is already part of the log prefix.
 pub fn apply_accepted(
     meta: &Meta,
-    part: &str,
     epoch: u64,
+    rid: constellation_meta::Rid,
+    op: &MutateOp,
     records: &[constellation_meta::LogRecord],
 ) -> Result<(), constellation_meta::MetaError> {
-    meta.shadow_insert(part, epoch, records)?;
-    meta.apply_foreign(records, &TouchSet::default())?;
+    meta.install_shadow(rid, epoch, op, records)?;
     Ok(())
 }
 
@@ -783,7 +807,7 @@ mod tests {
             MutateOutcome::Accepted { epoch, records } => (epoch, records),
             other => panic!("expected Accepted, got {other:?}"),
         };
-        apply_accepted(&requester, "p0", epoch, &records).unwrap();
+        apply_accepted(&requester, epoch, rid, &op, &records).unwrap();
 
         assert_eq!(
             holder.journal_len().unwrap(),
@@ -795,6 +819,56 @@ mod tests {
             requester.dump_replicated().unwrap(),
             "both replicas converge on a single execution"
         );
+    }
+
+    /// Plan 30 §M3a: once `recent` no longer holds a rid's outcome (acked
+    /// and dropped, aged out, or completed by an earlier tenure), a retry
+    /// of it — a stranded op's replay by rid, typically — is still
+    /// answered from `completed`, with no records, and never executed a
+    /// second time.
+    #[test]
+    fn holder_execute_answers_a_completed_rid_without_reexecuting() {
+        use constellation_fs_core::types::ROOT_INO;
+
+        let holder = Meta::open_in_memory().unwrap();
+        let op_bytes = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "f".into(),
+            ino: (1 << 40) | 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+        .to_postcard()
+        .unwrap();
+        let rid = test_rid(1);
+        let first = holder_execute(&holder, Some(1), false, 1, &op_bytes, 1, rid, None);
+        assert!(matches!(first, MutateOutcome::Accepted { .. }));
+        let journal_len = holder.journal_len().unwrap();
+        holder.forget_acked_through(rid.node, rid.incarnation, rid.seq);
+        assert!(holder.recent_outcome(rid).is_none());
+
+        let forward = ForwardState::new();
+        let retry = holder_execute(
+            &holder,
+            Some(1),
+            false,
+            1,
+            &op_bytes,
+            1,
+            rid,
+            Some(&forward),
+        );
+        match retry {
+            MutateOutcome::Accepted { records, .. } => assert!(records.is_empty()),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        assert_eq!(
+            holder.journal_len().unwrap(),
+            journal_len,
+            "not re-executed"
+        );
+        assert_eq!(forward.dedup_hits.load(Ordering::Relaxed), 1);
     }
 
     /// Plan 29 M6: a create-family op the holder refuses with `EEXIST`
@@ -1183,7 +1257,7 @@ mod tests {
             tokio::time::sleep(post).await;
             match outcome {
                 MutateOutcome::Accepted { epoch, records } => {
-                    apply_accepted(requester, "p0", epoch, &records).unwrap();
+                    apply_accepted(requester, epoch, test_rid(seq), &op, &records).unwrap();
                 }
                 other => panic!("expected Accepted, got {other:?}"),
             }

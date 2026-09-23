@@ -42,7 +42,7 @@
 //!   the one implicit partition.
 //! - `local` — node-local string-keyed settings and counters:
 //!   `node_prefix`, `next_ino`, `applied_seq`, `next_journal_seq`,
-//!   `next_shadow_id`, `usage_bytes`/`usage_files` (the persisted
+//!   `next_spec_seq`, `usage_bytes`/`usage_files` (the persisted
 //!   mirror of `UsageTracker`, updated in the same transaction as the
 //!   change that moves them — replacing the old O(namespace)
 //!   `recursive_size(ROOT)` seed at open), quota's node-local mirror,
@@ -59,8 +59,13 @@
 //! - `scratch` — a scratch directory's private content, same
 //!   `constellation_mtree` key/value encoding as `ns` (so scratch → shared
 //!   publish is a record copy), but never journaled or replicated.
-//! - `pins`, `epochs`, `reintegration`, `shadow` — node-local, one
-//!   reasonable key layout each (see their modules).
+//! - `pins`, `epochs`, `reintegration` — node-local, one reasonable key
+//!   layout each (see their modules).
+//! - `spec`, `spec_live`, `pending_replay` — plan 30 §M3a's speculation
+//!   log: every effect applied to `ns` ahead of the durable log, with
+//!   its before-images; the index of outstanding entries; and the
+//!   replay-by-rid queue of stranded ops. Node-local, never published.
+//!   See `store::spec`.
 //! - `blobs` — `blake3(bytes) -> bytes`, the local content-addressed
 //!   store `Payload::Spilled` values resolve against. §P6's spill rule
 //!   (`VALUE_SPILL = 1024 B`) is applied locally exactly as it will be
@@ -82,6 +87,7 @@ pub(crate) mod ns;
 mod reads;
 mod scratch;
 pub(crate) mod snapshot;
+pub mod spec;
 mod writes;
 
 pub use bootstrap::BootstrapIndexBuilder;
@@ -138,7 +144,10 @@ pub(crate) const KV_NODE_PREFIX: &str = "node_prefix";
 pub(crate) const KV_NEXT_INO: &str = "next_ino";
 pub(crate) const KV_APPLIED_SEQ: &str = "applied_seq";
 pub(crate) const KV_NEXT_JOURNAL_SEQ: &str = "next_journal_seq";
-pub(crate) const KV_NEXT_SHADOW_ID: &str = "next_shadow_id";
+/// Plan 30 §M3a: the speculation log's row counter (`store::spec`), raw
+/// big-endian bytes like `KV_NEXT_JOURNAL_SEQ`. Never rolled back, so a
+/// `spec_seq` is never reused.
+pub(crate) const KV_NEXT_SPEC_SEQ: &str = "next_spec_seq";
 /// Plan 30 §M2: this node's mount counter, bumped once at every mount
 /// before serving any mutation (`bump_incarnation`). Persisted so it
 /// survives a crash — the volatile per-incarnation rid `seq` counter
@@ -332,7 +341,19 @@ pub struct Meta {
     pub(crate) pins: SingleWriterTxKeyspace,
     pub(crate) epochs: SingleWriterTxKeyspace,
     pub(crate) reintegration: SingleWriterTxKeyspace,
-    pub(crate) shadow: SingleWriterTxKeyspace,
+    /// Plan 30 §M3a speculation log (`store::spec`): `spec_seq(8 BE) ->
+    /// postcard(SpecRow)`, every captured application to `ns` ahead of
+    /// (or, for `Foreign` rows, while older speculation is outstanding
+    /// alongside) the durable log, with the before-images to undo it.
+    pub(crate) spec: SingleWriterTxKeyspace,
+    /// Plan 30 §M3a: `spec_seq(8 BE) -> postcard(LiveEntry)`, the
+    /// outstanding (unretired, unstranded) shadow and hint entries —
+    /// what the tailer's stranding check, the publish rule and `status`
+    /// read, without decoding `spec` rows.
+    pub(crate) spec_live: SingleWriterTxKeyspace,
+    /// Plan 30 §M3a: `spec_seq(8 BE) -> postcard(QueuedReplay)`, stranded
+    /// ops rolled back and queued for replay by rid, in original order.
+    pub(crate) pending_replay: SingleWriterTxKeyspace,
     pub(crate) blobs: SingleWriterTxKeyspace,
     /// Plan 28 §S1b: `dir_ino(8 BE) -> block_start(8 BE) ++ used(4 BE)`,
     /// the per-directory ino allocation cursor `alloc_ino_tx` reads and
@@ -341,7 +362,7 @@ pub struct Meta {
     /// ino-prefix range to draw blocks from.
     pub(crate) ino_alloc: SingleWriterTxKeyspace,
     /// Plan 30 §M2: `Rid::to_key() -> postcard(CompletedRow)`. Node-local
-    /// and replicated-but-unpublished, like `shadow`/`pins`/`epochs` —
+    /// and replicated-but-unpublished, like `spec`/`pins`/`epochs` —
     /// never touches `ns`/`dirty`, never appears in `dump_replicated`,
     /// but (unlike those ephemeral ones) is populated by replaying the
     /// durable log (`LogRecord::Completed`), so it survives a
@@ -424,7 +445,9 @@ impl Meta {
         let pins = db.keyspace("pins", KeyspaceCreateOptions::default)?;
         let epochs = db.keyspace("epochs", KeyspaceCreateOptions::default)?;
         let reintegration = db.keyspace("reintegration", KeyspaceCreateOptions::default)?;
-        let shadow = db.keyspace("shadow", KeyspaceCreateOptions::default)?;
+        let spec = db.keyspace("spec", KeyspaceCreateOptions::default)?;
+        let spec_live = db.keyspace("spec_live", KeyspaceCreateOptions::default)?;
+        let pending_replay = db.keyspace("pending_replay", KeyspaceCreateOptions::default)?;
         let blobs = db.keyspace("blobs", KeyspaceCreateOptions::default)?;
         let ino_alloc = db.keyspace("ino_alloc", KeyspaceCreateOptions::default)?;
         let completed = db.keyspace("completed", KeyspaceCreateOptions::default)?;
@@ -446,7 +469,9 @@ impl Meta {
             pins,
             epochs,
             reintegration,
-            shadow,
+            spec,
+            spec_live,
+            pending_replay,
             blobs,
             ino_alloc,
             completed,
@@ -785,6 +810,13 @@ impl Meta {
     /// to route its writes through the tracked path.
     pub(crate) fn dirty_for_ns(&self) -> ns::Dirty<'_> {
         ns::Dirty::tracked(&self.dirty, &self.local)
+    }
+
+    /// As [`Self::dirty_for_ns`], additionally recording every touched
+    /// key's before-image into `capture` (plan 30 §M3a speculation log,
+    /// `store::spec`).
+    pub(crate) fn dirty_capturing<'a>(&'a self, capture: &'a spec::Capture) -> ns::Dirty<'a> {
+        ns::Dirty::capturing(&self.dirty, &self.local, capture)
     }
 
     /// Every `(key, counter)` currently in `dirty`, under the caller's

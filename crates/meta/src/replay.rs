@@ -101,9 +101,46 @@ impl TouchSet {
     }
 }
 
-enum Applied {
+pub(crate) enum Applied {
     Done,
     Skipped(&'static str),
+}
+
+/// How one record is applied: which `Dirty` context its `ns` writes go
+/// through (plain dirty-tracking, or dirty-tracking plus a speculation
+/// capture — plan 30 §M3a), and whether it is durable log content.
+///
+/// `durable` only decides one thing: whether a `Completed { rid }` record
+/// is written to the `completed` keyspace. That keyspace is the M2
+/// coverage oracle ("did this rid take effect in the log?"), so a
+/// requester's shadow or `Exists` hint — records applied *ahead of* the
+/// log — must never populate it; only a tailed segment (or a redo of one)
+/// may.
+#[derive(Clone, Copy)]
+pub(crate) struct ApplyCx<'a> {
+    pub dirty: ns::Dirty<'a>,
+    pub durable: bool,
+}
+
+/// Apply one record in the caller's transaction (the shared body of
+/// [`Meta::apply_foreign`], `Meta::apply_segment` and the speculation
+/// log's install/redo paths in `store::spec`). Returns whether it was
+/// skipped, and why, for the caller to count or log.
+pub(crate) fn apply_record(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    cx: ApplyCx<'_>,
+    rec: &LogRecord,
+    staged: &crate::store::UsageTracker,
+) -> Result<Option<&'static str>, MetaError> {
+    let applied = apply_one(tx, meta, cx.dirty, cx.durable, rec, staged)?;
+    if let Some(ino) = primary_ino(rec) {
+        reclaim_ino_counter(tx, &meta.local, ino)?;
+    }
+    Ok(match applied {
+        Applied::Done => None,
+        Applied::Skipped(why) => Some(why),
+    })
 }
 
 impl Meta {
@@ -115,6 +152,10 @@ impl Meta {
     /// Apply `records`, skipping any that collide with `pending` (the
     /// caller's own unshipped local journal — see the module doc).
     /// Returns how many were skipped (conflict or a downstream cascade).
+    ///
+    /// Durable content, applied without speculation capture. The tailer
+    /// uses `Meta::apply_segment` instead, which also runs the plan 30
+    /// §M3a stranding/retirement rules around the same application.
     pub fn apply_foreign(
         &self,
         records: &[LogRecord],
@@ -122,35 +163,54 @@ impl Meta {
     ) -> Result<usize, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = crate::store::UsageTracker::staging();
-        let mut skipped = 0usize;
-        for rec in records {
-            if pending.conflicts(rec) {
-                tracing::warn!(
-                    ?rec,
-                    "replay: skipping record that conflicts with pending local work"
-                );
-                skipped += 1;
-                continue;
-            }
-            match apply_one(&mut tx, self, rec, &staged)? {
-                Applied::Done => {}
-                Applied::Skipped(why) => {
-                    tracing::warn!(why, ?rec, "replay: skipped");
-                    skipped += 1;
-                }
-            }
-        }
-        for rec in records {
-            if let Some(ino) = primary_ino(rec) {
-                reclaim_ino_counter(&mut tx, &self.local, ino)?;
-            }
-        }
+        let cx = ApplyCx {
+            dirty: self.dirty_for_ns(),
+            durable: true,
+        };
+        let (skipped, _) = apply_batch_tx(&mut tx, self, cx, records, pending, &staged, false)?;
         let (staged_bytes, staged_files) = staged.raw_delta();
         crate::store::adjust_usage_tx(&mut tx, &self.local, staged_bytes, staged_files)?;
         tx.commit()?;
         staged.drain_into(self.usage_tracker());
         Ok(skipped)
     }
+}
+
+/// Apply `records` in order inside `tx`, skipping (and counting) any that
+/// collide with `pending` or that `apply_one` itself skips. Returns the
+/// skip count and — when `keep` is set — the records that were actually
+/// handed to `apply_one` (everything not suppressed by `pending`): what a
+/// speculation-log entry must redo later. The plain tailing path passes
+/// `keep: false` and pays for no copies.
+pub(crate) fn apply_batch_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    cx: ApplyCx<'_>,
+    records: &[LogRecord],
+    pending: &TouchSet,
+    staged: &crate::store::UsageTracker,
+    keep: bool,
+) -> Result<(usize, Vec<LogRecord>), MetaError> {
+    let mut skipped = 0usize;
+    let mut applied = Vec::with_capacity(if keep { records.len() } else { 0 });
+    for rec in records {
+        if pending.conflicts(rec) {
+            tracing::warn!(
+                ?rec,
+                "replay: skipping record that conflicts with pending local work"
+            );
+            skipped += 1;
+            continue;
+        }
+        if let Some(why) = apply_record(tx, meta, cx, rec, staged)? {
+            tracing::warn!(why, ?rec, "replay: skipped");
+            skipped += 1;
+        }
+        if keep {
+            applied.push(rec.clone());
+        }
+    }
+    Ok((skipped, applied))
 }
 
 fn primary_ino(rec: &LogRecord) -> Option<Ino> {
@@ -167,6 +227,8 @@ fn primary_ino(rec: &LogRecord) -> Option<Ino> {
 fn apply_one(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
+    durable: bool,
     rec: &LogRecord,
     staged: &crate::store::UsageTracker,
 ) -> Result<Applied, MetaError> {
@@ -182,6 +244,7 @@ fn apply_one(
         } => insert_node(
             tx,
             meta,
+            dirty,
             *parent,
             name,
             *ino,
@@ -207,6 +270,7 @@ fn apply_one(
         } => insert_node(
             tx,
             meta,
+            dirty,
             *parent,
             name,
             *ino,
@@ -232,6 +296,7 @@ fn apply_one(
         } => insert_node(
             tx,
             meta,
+            dirty,
             *parent,
             name,
             *ino,
@@ -263,6 +328,7 @@ fn apply_one(
             insert_node(
                 tx,
                 meta,
+                dirty,
                 *parent,
                 name,
                 *ino,
@@ -283,24 +349,33 @@ fn apply_one(
             parent,
             name,
             time_ns,
-        } => apply_link(tx, meta, *ino, *parent, name, *time_ns),
+        } => apply_link(tx, meta, dirty, *ino, *parent, name, *time_ns),
         LogRecord::Unlink {
             parent,
             name,
             time_ns,
-        } => apply_unlink(tx, meta, *parent, name, *time_ns),
+        } => apply_unlink(tx, meta, dirty, *parent, name, *time_ns),
         LogRecord::Rmdir {
             parent,
             name,
             time_ns,
-        } => apply_rmdir(tx, meta, *parent, name, *time_ns),
+        } => apply_rmdir(tx, meta, dirty, *parent, name, *time_ns),
         LogRecord::Rename {
             parent,
             name,
             new_parent,
             new_name,
             time_ns,
-        } => apply_rename(tx, meta, *parent, name, *new_parent, new_name, *time_ns),
+        } => apply_rename(
+            tx,
+            meta,
+            dirty,
+            *parent,
+            name,
+            *new_parent,
+            new_name,
+            *time_ns,
+        ),
         LogRecord::Setattr {
             ino,
             mode,
@@ -311,7 +386,7 @@ fn apply_one(
             mtime_ns,
             time_ns,
         } => apply_setattr(
-            tx, meta, *ino, *mode, *uid, *gid, *size, *atime_ns, *mtime_ns, *time_ns, staged,
+            tx, meta, dirty, *ino, *mode, *uid, *gid, *size, *atime_ns, *mtime_ns, *time_ns, staged,
         ),
         LogRecord::WriteManifest {
             ino,
@@ -319,15 +394,15 @@ fn apply_one(
             size,
             time_ns,
             ..
-        } => apply_write_manifest(tx, meta, *ino, manifest, *size, *time_ns, staged),
+        } => apply_write_manifest(tx, meta, dirty, *ino, manifest, *size, *time_ns, staged),
         LogRecord::SetXattr {
             ino,
             name,
             value,
             time_ns,
-        } => apply_set_xattr(tx, meta, *ino, name, value, *time_ns),
+        } => apply_set_xattr(tx, meta, dirty, *ino, name, value, *time_ns),
         LogRecord::RemoveXattr { ino, name, time_ns } => {
-            apply_remove_xattr(tx, meta, *ino, name, *time_ns)
+            apply_remove_xattr(tx, meta, dirty, *ino, name, *time_ns)
         }
         LogRecord::SnapCreate {
             id,
@@ -339,7 +414,7 @@ fn apply_one(
             ns::ns_insert(
                 tx,
                 &meta.ns,
-                meta.dirty_for_ns(),
+                dirty,
                 keys::subsystem(keys::Subsystem::Snapshot, id.as_bytes()),
                 crate::store::snapshot_record(&crate::SnapshotRow {
                     id: id.clone(),
@@ -355,17 +430,17 @@ fn apply_one(
             ns::ns_remove(
                 tx,
                 &meta.ns,
-                meta.dirty_for_ns(),
+                dirty,
                 keys::subsystem(keys::Subsystem::Snapshot, id.as_bytes()),
             )?;
             Ok(Applied::Done)
         }
-        LogRecord::Clone { nodes, .. } => apply_clone(tx, meta, nodes, staged),
+        LogRecord::Clone { nodes, .. } => apply_clone(tx, meta, dirty, nodes, staged),
         LogRecord::SetQuota { max_logical_bytes } => {
             ns::ns_insert(
                 tx,
                 &meta.ns,
-                meta.dirty_for_ns(),
+                dirty,
                 keys::subsystem(keys::Subsystem::Quota, b""),
                 crate::store::quota_record(*max_logical_bytes),
             )?;
@@ -395,6 +470,11 @@ fn apply_one(
         // a rid whose row this replica already has, e.g. because it was
         // the holder that recorded it in `recent` before shipping) just
         // overwrites the same key with the same value.
+        // Plan 30 §M3a: only durable log content may say a rid took
+        // effect. A speculative install (shadow, hint) carries its op's
+        // `Completed` too, but recording it would make the M2 coverage
+        // check believe an op the log may never contain had completed.
+        LogRecord::Completed { .. } if !durable => Ok(Applied::Done),
         LogRecord::Completed { rid } => {
             // The position stored here is informational only (nothing
             // in the retry-resolution path needs anything but presence,
@@ -419,6 +499,7 @@ fn apply_one(
 fn insert_node(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     parent: Ino,
     name: &str,
     ino: Ino,
@@ -440,7 +521,7 @@ fn insert_node(
         if existing.ino == ino {
             return Ok(Applied::Done);
         }
-        match evict_dentry(tx, meta, parent, name, existing.ino, t)? {
+        match evict_dentry(tx, meta, dirty, parent, name, existing.ino, t)? {
             Applied::Done => {}
             skip => return Ok(skip),
         }
@@ -461,7 +542,7 @@ fn insert_node(
     ns::put_inode(
         tx,
         &meta.ns,
-        meta.dirty_for_ns(),
+        dirty,
         &meta.blobs,
         ino,
         attrs,
@@ -470,12 +551,12 @@ fn insert_node(
         &[],
     )?;
     let is_new_dentry = ns::get_dentry_record(tx, &meta.ns, parent, name)?.is_none();
-    ns::put_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, ino, attrs)?;
+    ns::put_dentry(tx, &meta.ns, dirty, parent, name, ino, attrs)?;
     atime::set_atime_tx(tx, &meta.atime, ino, t);
     if is_new_dentry && kind == Kind::Dir {
-        misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, 1, t)?;
+        misc::bump_nlink_tx(tx, &meta.ns, dirty, parent, 1, t)?;
     }
-    misc::touch_times_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, t)?;
+    misc::touch_times_tx(tx, &meta.ns, dirty, parent, t)?;
     if kind == Kind::File && !prior_file {
         // A fresh file always starts at 0 bytes (Create/Mkdir/Symlink/
         // Mknod never carry file content), but the file *count* still
@@ -493,22 +574,23 @@ fn insert_node(
 fn evict_dentry(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     parent: Ino,
     name: &str,
     ino: Ino,
     t: i64,
 ) -> Result<Applied, MetaError> {
     let Some(rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
-        ns::remove_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, ino)?;
+        ns::remove_dentry(tx, &meta.ns, dirty, parent, name, ino)?;
         return Ok(Applied::Done);
     };
     if rec.attrs.kind == Kind::Dir {
         if ns::has_children(tx, &meta.ns, ino)? {
             return Ok(Applied::Skipped("name held by non-empty directory"));
         }
-        ns::remove_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, ino)?;
-        ns::ns_remove(tx, &meta.ns, meta.dirty_for_ns(), keys::inode(ino))?;
-        ns::clear_spilled_xattrs(tx, &meta.ns, meta.dirty_for_ns(), ino)?;
+        ns::remove_dentry(tx, &meta.ns, dirty, parent, name, ino)?;
+        ns::ns_remove(tx, &meta.ns, dirty, keys::inode(ino))?;
+        ns::clear_spilled_xattrs(tx, &meta.ns, dirty, ino)?;
         let names: Vec<Vec<u8>> = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?
             .into_iter()
             .map(|(n, _)| n.into_bytes())
@@ -516,14 +598,14 @@ fn evict_dentry(
         misc::xattr_by_name_del_all_tx(tx, &meta.xattr_by_name, ino, names);
         atime::remove_atime_tx(tx, &meta.atime, ino);
     } else {
-        ns::remove_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, ino)?;
+        ns::remove_dentry(tx, &meta.ns, dirty, parent, name, ino)?;
         if rec.attrs.nlink <= 1 {
             let manifest_bytes = rec
                 .manifest
                 .as_ref()
                 .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
                 .transpose()?;
-            ns::clear_spilled_xattrs(tx, &meta.ns, meta.dirty_for_ns(), ino)?;
+            ns::clear_spilled_xattrs(tx, &meta.ns, dirty, ino)?;
             let names: Vec<Vec<u8>> = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?
                 .into_iter()
                 .map(|(n, _)| n.into_bytes())
@@ -546,9 +628,9 @@ fn evict_dentry(
                 ino.to_be_bytes().to_vec(),
                 orphan_rec.encode(),
             );
-            ns::ns_remove(tx, &meta.ns, meta.dirty_for_ns(), keys::inode(ino))?;
+            ns::ns_remove(tx, &meta.ns, dirty, keys::inode(ino))?;
         } else {
-            misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), ino, -1, t)?;
+            misc::bump_nlink_tx(tx, &meta.ns, dirty, ino, -1, t)?;
         }
     }
     Ok(Applied::Done)
@@ -557,6 +639,7 @@ fn evict_dentry(
 fn apply_link(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     ino: Ino,
     parent: Ino,
     name: &str,
@@ -571,29 +654,21 @@ fn apply_link(
         if existing.ino == ino {
             return Ok(Applied::Done);
         }
-        match evict_dentry(tx, meta, parent, name, existing.ino, t)? {
+        match evict_dentry(tx, meta, dirty, parent, name, existing.ino, t)? {
             Applied::Done => {}
             skip => return Ok(skip),
         }
     }
-    let rec =
-        misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), ino, 1, t)?.expect("checked above");
-    ns::put_dentry(
-        tx,
-        &meta.ns,
-        meta.dirty_for_ns(),
-        parent,
-        name,
-        ino,
-        rec.attrs,
-    )?;
-    misc::touch_times_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, t)?;
+    let rec = misc::bump_nlink_tx(tx, &meta.ns, dirty, ino, 1, t)?.expect("checked above");
+    ns::put_dentry(tx, &meta.ns, dirty, parent, name, ino, rec.attrs)?;
+    misc::touch_times_tx(tx, &meta.ns, dirty, parent, t)?;
     Ok(Applied::Done)
 }
 
 fn apply_unlink(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     parent: Ino,
     name: &str,
     t: i64,
@@ -601,14 +676,15 @@ fn apply_unlink(
     let Some(d) = ns::get_dentry_record(tx, &meta.ns, parent, name)? else {
         return Ok(Applied::Done);
     };
-    let result = evict_dentry(tx, meta, parent, name, d.ino, t)?;
-    misc::touch_times_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, t)?;
+    let result = evict_dentry(tx, meta, dirty, parent, name, d.ino, t)?;
+    misc::touch_times_tx(tx, &meta.ns, dirty, parent, t)?;
     Ok(result)
 }
 
 fn apply_rmdir(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     parent: Ino,
     name: &str,
     t: i64,
@@ -617,7 +693,7 @@ fn apply_rmdir(
         return Ok(Applied::Done);
     };
     let Some(rec) = ns::get_inode_record(tx, &meta.ns, d.ino)? else {
-        ns::remove_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, d.ino)?;
+        ns::remove_dentry(tx, &meta.ns, dirty, parent, name, d.ino)?;
         return Ok(Applied::Done);
     };
     if rec.attrs.kind != Kind::Dir {
@@ -626,17 +702,19 @@ fn apply_rmdir(
     if ns::has_children(tx, &meta.ns, d.ino)? {
         return Ok(Applied::Skipped("directory not empty locally"));
     }
-    ns::remove_dentry(tx, &meta.ns, meta.dirty_for_ns(), parent, name, d.ino)?;
-    ns::ns_remove(tx, &meta.ns, meta.dirty_for_ns(), keys::inode(d.ino))?;
-    ns::clear_spilled_xattrs(tx, &meta.ns, meta.dirty_for_ns(), d.ino)?;
+    ns::remove_dentry(tx, &meta.ns, dirty, parent, name, d.ino)?;
+    ns::ns_remove(tx, &meta.ns, dirty, keys::inode(d.ino))?;
+    ns::clear_spilled_xattrs(tx, &meta.ns, dirty, d.ino)?;
     atime::remove_atime_tx(tx, &meta.atime, d.ino);
-    misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, -1, t)?;
+    misc::bump_nlink_tx(tx, &meta.ns, dirty, parent, -1, t)?;
     Ok(Applied::Done)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_rename(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     parent: Ino,
     name: &str,
     new_parent: Ino,
@@ -657,43 +735,38 @@ fn apply_rename(
         if existing.ino == ino {
             return Ok(Applied::Done);
         }
-        match evict_dentry(tx, meta, new_parent, new_name, existing.ino, t)? {
+        match evict_dentry(tx, meta, dirty, new_parent, new_name, existing.ino, t)? {
             Applied::Done => {}
             skip => return Ok(skip),
         }
     }
+    ns::ns_remove(tx, &meta.ns, dirty, keys::dentry(parent, name.as_bytes()))?;
     ns::ns_remove(
         tx,
         &meta.ns,
-        meta.dirty_for_ns(),
-        keys::dentry(parent, name.as_bytes()),
-    )?;
-    ns::ns_remove(
-        tx,
-        &meta.ns,
-        meta.dirty_for_ns(),
+        dirty,
         keys::rdentry(ino, parent, name.as_bytes()),
     )?;
     ns::ns_insert(
         tx,
         &meta.ns,
-        meta.dirty_for_ns(),
+        dirty,
         keys::dentry(new_parent, new_name.as_bytes()),
         DentryRecord::new(ino, src.attrs).encode(),
     )?;
     ns::ns_insert(
         tx,
         &meta.ns,
-        meta.dirty_for_ns(),
+        dirty,
         keys::rdentry(ino, new_parent, new_name.as_bytes()),
         record::RDENTRY_VALUE.to_vec(),
     )?;
     if src_rec.attrs.kind == Kind::Dir && parent != new_parent {
-        misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, -1, t)?;
-        misc::bump_nlink_tx(tx, &meta.ns, meta.dirty_for_ns(), new_parent, 1, t)?;
+        misc::bump_nlink_tx(tx, &meta.ns, dirty, parent, -1, t)?;
+        misc::bump_nlink_tx(tx, &meta.ns, dirty, new_parent, 1, t)?;
     }
-    misc::touch_times_tx(tx, &meta.ns, meta.dirty_for_ns(), parent, t)?;
-    misc::touch_times_tx(tx, &meta.ns, meta.dirty_for_ns(), new_parent, t)?;
+    misc::touch_times_tx(tx, &meta.ns, dirty, parent, t)?;
+    misc::touch_times_tx(tx, &meta.ns, dirty, new_parent, t)?;
     Ok(Applied::Done)
 }
 
@@ -701,6 +774,7 @@ fn apply_rename(
 fn apply_setattr(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     ino: Ino,
     mode: Option<u32>,
     uid: Option<u32>,
@@ -733,18 +807,12 @@ fn apply_setattr(
     }
     rec.attrs.ctime_ns = t;
     let attrs = rec.attrs;
-    ns::ns_insert(
-        tx,
-        &meta.ns,
-        meta.dirty_for_ns(),
-        keys::inode(ino),
-        rec.encode(),
-    )?;
+    ns::ns_insert(tx, &meta.ns, dirty, keys::inode(ino), rec.encode())?;
     for (parent, name) in ns::links_of(tx, &meta.ns, ino)? {
         ns::ns_insert(
             tx,
             &meta.ns,
-            meta.dirty_for_ns(),
+            dirty,
             keys::dentry(parent, name.as_bytes()),
             DentryRecord::new(ino, attrs).encode(),
         )?;
@@ -758,9 +826,11 @@ fn apply_setattr(
     Ok(Applied::Done)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_write_manifest(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     ino: Ino,
     manifest: &[u8],
     size: u64,
@@ -784,7 +854,7 @@ fn apply_write_manifest(
     ns::put_inode(
         tx,
         &meta.ns,
-        meta.dirty_for_ns(),
+        dirty,
         &meta.blobs,
         ino,
         attrs,
@@ -799,7 +869,7 @@ fn apply_write_manifest(
         ns::ns_insert(
             tx,
             &meta.ns,
-            meta.dirty_for_ns(),
+            dirty,
             keys::dentry(parent, name.as_bytes()),
             DentryRecord::new(ino, attrs).encode(),
         )?;
@@ -819,6 +889,7 @@ fn apply_write_manifest(
 fn apply_set_xattr(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     ino: Ino,
     name: &str,
     value: &[u8],
@@ -852,7 +923,7 @@ fn apply_set_xattr(
     ns::put_inode(
         tx,
         &meta.ns,
-        meta.dirty_for_ns(),
+        dirty,
         &meta.blobs,
         ino,
         attrs,
@@ -867,6 +938,7 @@ fn apply_set_xattr(
 fn apply_remove_xattr(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     ino: Ino,
     name: &str,
     t: i64,
@@ -895,7 +967,7 @@ fn apply_remove_xattr(
     ns::put_inode(
         tx,
         &meta.ns,
-        meta.dirty_for_ns(),
+        dirty,
         &meta.blobs,
         ino,
         attrs,
@@ -910,6 +982,7 @@ fn apply_remove_xattr(
 fn apply_clone(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
+    dirty: ns::Dirty<'_>,
     nodes: &[CloneNode],
     staged: &crate::store::UsageTracker,
 ) -> Result<Applied, MetaError> {
@@ -946,7 +1019,7 @@ fn apply_clone(
         ns::put_inode(
             tx,
             &meta.ns,
-            meta.dirty_for_ns(),
+            dirty,
             &meta.blobs,
             node.ino,
             attrs,
@@ -957,7 +1030,7 @@ fn apply_clone(
         ns::put_dentry(
             tx,
             &meta.ns,
-            meta.dirty_for_ns(),
+            dirty,
             node.parent,
             &node.name,
             node.ino,
@@ -976,14 +1049,7 @@ fn apply_clone(
             misc::xattr_by_name_put_tx(tx, &meta.xattr_by_name, n, node.ino, v);
         }
         if kind == InodeKind::Dir {
-            misc::bump_nlink_tx(
-                tx,
-                &meta.ns,
-                meta.dirty_for_ns(),
-                node.parent,
-                1,
-                node.mtime_ns,
-            )?;
+            misc::bump_nlink_tx(tx, &meta.ns, dirty, node.parent, 1, node.mtime_ns)?;
         }
         let is_file = kind == InodeKind::File;
         match (prior_file, is_file) {

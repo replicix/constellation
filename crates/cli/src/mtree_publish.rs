@@ -92,6 +92,14 @@ use std::sync::Arc;
 /// of retries will not fix.
 const PUBLISH_ATTEMPTS: usize = 4;
 
+/// [`TreePublisher::publish_now`]'s error while this replica has
+/// outstanding speculation (plan 30 §M3a): forwarded ops the log has not
+/// confirmed yet, so no commit can reflect the replica. Transient — it
+/// clears as soon as the holder ships them — so callers that must have a
+/// commit (a snapshot) retry on it.
+pub const SPECULATION_OUTSTANDING: &str = "this replica has forwarded ops the log has not \
+     confirmed yet (plan 30 speculation), so no commit can reflect it yet; retry shortly";
+
 /// Publish attempts [`TreePublisher::publish_now`] makes before it
 /// reports a deferral.
 const PUBLISH_NOW_ATTEMPTS: usize = 3;
@@ -333,8 +341,20 @@ impl TreePublisher {
     /// explicit request arrives) leaves `dirty` exactly as it was, so
     /// the next publish (in this process or, after a crash, the next
     /// one) picks the same keys back up.
+    ///
+    /// Plan 30 §M3a: a commit is only ever built from log-prefix state, so
+    /// nothing is published while this replica has outstanding
+    /// speculation — a shadow or `Exists` hint applied ahead of the log
+    /// (`Meta::has_outstanding_speculation`). That covers every publish
+    /// path (cadence, idle, shutdown, snapshot). `dirty` keeps
+    /// accumulating meanwhile, and the next publish after the speculation
+    /// retires (or is rolled back) carries it.
     pub async fn publish(&mut self, epoch: u64) -> Result<Option<Commit>> {
         if !self.meta.has_dirty() {
+            return Ok(None);
+        }
+        if self.meta.has_outstanding_speculation() {
+            tracing::debug!("publish deferred: speculation outstanding");
             return Ok(None);
         }
         let started = std::time::Instant::now();
@@ -363,6 +383,9 @@ impl TreePublisher {
     /// error, because a caller asking for "now" (a snapshot) must not be
     /// handed an older state.
     pub async fn publish_now(&mut self, epoch: u64) -> Result<(u64, NodeHash)> {
+        if self.meta.has_dirty() && self.meta.has_outstanding_speculation() {
+            anyhow::bail!("{SPECULATION_OUTSTANDING}");
+        }
         // A deferral that the next attempt resolves by itself — most
         // often a pack GC condemned after this batch deduplicated against
         // it, which the retry re-uploads — is retried here rather than

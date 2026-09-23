@@ -358,6 +358,10 @@ impl Meta {
             &self.chunk_ref_by_ino,
             &self.xattr_by_name,
         )?;
+        // Plan 30 §M3a: the speculation log's before-images describe the
+        // namespace just replaced; queue its outstanding shadows for
+        // replay and drop the rest.
+        crate::store::spec::reset_for_rebuilt_ns_tx(&mut tx, self)?;
         if let Some(v) = side_snap.get(&side.local, KV_APPLIED_SEQ.as_bytes())? {
             tx.insert(&self.local, KV_APPLIED_SEQ.as_bytes().to_vec(), v.to_vec());
         }

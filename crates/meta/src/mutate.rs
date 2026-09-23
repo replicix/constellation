@@ -186,6 +186,12 @@ pub enum MutateOutcome {
         /// would resurrect a deleted entry that the log has nothing left
         /// to correct.
         ship_floor: u64,
+        /// The answering holder's epoch. Plan 30 §M3a: the installed
+        /// entry is speculation (`Meta::install_hint`) and is rolled back
+        /// if a segment from a later epoch reaches this replica before
+        /// the floor does — the entry may have been this holder's own
+        /// unshipped work, stranded with it.
+        epoch: u64,
     },
 }
 

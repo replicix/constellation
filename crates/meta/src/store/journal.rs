@@ -1,6 +1,7 @@
 //! The `journal` keyspace (the local write-ahead log FUSE mutations and
-//! replay both append to), and the `reintegration`/`shadow` bookkeeping
-//! keyspaces that ride alongside it.
+//! replay both append to), and the `reintegration` bookkeeping keyspace
+//! that rides alongside it. (Requester shadows moved to the speculation
+//! log, `store::spec`, in plan 30 §M3a.)
 //!
 //! `seq` is a `u64` big-endian key; SQLite's `AUTOINCREMENT` (monotonic,
 //! never reused even across deletes) is replaced by an explicit counter
@@ -11,7 +12,7 @@
 use crate::error::MetaError;
 use crate::record::LogRecord;
 use crate::rid::Rid;
-use crate::store::{kv_get_tx, kv_set_tx, Meta, KV_NEXT_JOURNAL_SEQ, KV_NEXT_SHADOW_ID};
+use crate::store::{kv_set_tx, Meta, KV_NEXT_JOURNAL_SEQ};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
 
 fn seq_key(seq: u64) -> Vec<u8> {
@@ -298,69 +299,4 @@ pub(crate) fn conflict_count(
         }
     }
     Ok(n)
-}
-
-// ------------------------------------------------------------------ shadow
-
-fn shadow_key(epoch: u64, id: u64) -> Vec<u8> {
-    let mut k = epoch.to_be_bytes().to_vec();
-    k.extend_from_slice(&id.to_be_bytes());
-    k
-}
-
-pub(crate) fn shadow_insert_tx(
-    tx: &mut SingleWriterWriteTx,
-    shadow: &SingleWriterTxKeyspace,
-    local: &SingleWriterTxKeyspace,
-    epoch: u64,
-    records: &[LogRecord],
-) -> Result<(), MetaError> {
-    let id: u64 = match kv_get_tx(tx, local, KV_NEXT_SHADOW_ID)? {
-        Some(s) => s.parse().unwrap_or(0),
-        None => 0,
-    };
-    kv_set_tx(tx, local, KV_NEXT_SHADOW_ID, &(id + 1).to_string());
-    tx.insert(
-        shadow,
-        shadow_key(epoch, id),
-        postcard::to_allocvec(&records.to_vec())?,
-    );
-    Ok(())
-}
-
-pub(crate) fn shadow_retire_matching_tx(
-    tx: &mut SingleWriterWriteTx,
-    shadow: &SingleWriterTxKeyspace,
-    epoch: u64,
-    records: &[LogRecord],
-) -> Result<(), MetaError> {
-    // Keys are `epoch_be ++ id_be`, so every shadow row with `epoch <=
-    // given` is a prefix range from the keyspace start.
-    let end = {
-        let mut e = epoch.to_be_bytes().to_vec();
-        e.push(0xff);
-        e.push(0xff);
-        e.push(0xff);
-        e.push(0xff);
-        e.push(0xff);
-        e.push(0xff);
-        e.push(0xff);
-        e.push(0xff);
-        e
-    };
-    let rows: Vec<(Vec<u8>, Vec<LogRecord>)> = tx
-        .range(shadow, Vec::new()..=end)
-        .map(|g| {
-            g.into_inner().map_err(MetaError::from).and_then(|(k, v)| {
-                let recs: Vec<LogRecord> = postcard::from_bytes(&v)?;
-                Ok((k.to_vec(), recs))
-            })
-        })
-        .collect::<Result<_, MetaError>>()?;
-    for (key, shadow_records) in rows {
-        if shadow_records.iter().all(|rec| records.contains(rec)) {
-            tx.remove(shadow, key);
-        }
-    }
-    Ok(())
 }

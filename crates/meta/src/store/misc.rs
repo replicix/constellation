@@ -458,33 +458,4 @@ impl Meta {
         let r = self.db.read_tx();
         crate::store::journal::conflict_count(&r, &self.reintegration)
     }
-
-    pub fn shadow_insert(
-        &self,
-        _part: &str,
-        epoch: u64,
-        records: &[crate::record::LogRecord],
-    ) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        crate::store::journal::shadow_insert_tx(
-            &mut tx,
-            &self.shadow,
-            &self.local,
-            epoch,
-            records,
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn shadow_retire_matching(
-        &self,
-        epoch: u64,
-        records: &[crate::record::LogRecord],
-    ) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        crate::store::journal::shadow_retire_matching_tx(&mut tx, &self.shadow, epoch, records)?;
-        tx.commit()?;
-        Ok(())
-    }
 }

@@ -60,6 +60,9 @@ struct SyncDispatchCtx {
     node_id: u64,
     lease_mode: constellation_store_s3::LeaseMode,
     spool: Arc<Mutex<shipper::SpoolInfo>>,
+    /// Only for [`dispatch_mutate`]'s spawned task. [`dispatch_forward`]
+    /// runs inline in the sync task and must never await this lock (see
+    /// its doc).
     keepers: Arc<tokio::sync::Mutex<HashMap<String, lease::LeaseKeeper>>>,
     forward: Arc<forward::ForwardState>,
     store_inner: Arc<dyn ObjectStore>,
@@ -190,30 +193,43 @@ fn dispatch_mutate(
 /// `SyncRequest::Forward` dispatch: this node's own FUSE thread needs a
 /// mutation applied and may or may not be the current holder.
 ///
-/// The local-holder branch below runs inline (a local fjall write, not a
-/// network round trip) and returns once it has replied — safe to call
-/// from inside the round's `select!` loop (plan 30 M2b item 1) because
-/// its only await, the initial `keepers.lock()`, resolves quickly: the
-/// ordinary ship path never holds that lock across S3 I/O any more (see
-/// `lease.rs`'s module doc, "Locking rules", and
-/// `Shipper::run_ordinary_round`), so this never ends up queued behind a
-/// PUT or a renewal CAS.
+/// Synchronous, and it must stay that way. It runs inline in the sync
+/// task, including from inside the `select!` that polls an in-flight
+/// round (plan 30 M2b item 1). While it runs, that round is not polled,
+/// so awaiting anything the round may hold would never finish. The
+/// round holds the keepers lock across S3 I/O on its release, handoff
+/// and lease-acquire paths. The M2b version awaited
+/// `keepers.lock()` here and deadlocked exactly that way: the plan 30
+/// M3a `kill9-remount` hang.
 ///
-/// The non-holder branch spawns the actual network round trip (plan 29
-/// M4/M5: awaiting it inline would serialize every FUSE thread's forward
-/// behind whichever one is currently in flight), so this function's own
-/// await is always brief either way.
-async fn dispatch_forward(
+/// The holder check is therefore [`lease::LeaseView::new_mutation_epoch`],
+/// the lock-free gate the FUSE fast path uses (`open_for_new_mutation`).
+/// It is closed by the handoff pause, which `run_sync_round` sets before
+/// its final flush, by `LeaseKeeper::release`'s view clear before the
+/// CAS, and until `commit_gated`'s takeover gate has run. So a local
+/// forward gets the same treatment as a local FUSE write in those
+/// windows. It is also atomic with respect to the round in a way a FUSE
+/// thread is not. The check and the fjall write below run with no await
+/// between them, on the same task as the round, so the round cannot move
+/// between the check and the write.
+///
+/// The local-holder branch runs inline (a local fjall write) and replies
+/// before returning. The non-holder branch spawns the network round trip
+/// (plan 29 M4/M5: running it inline would serialize every FUSE thread's
+/// forward behind whichever one is in flight).
+fn dispatch_forward(
     ctx: SyncDispatchCtx,
     part: String,
     op: constellation_meta::MutateOp,
     rid: constellation_meta::Rid,
     reply: tokio::sync::oneshot::Sender<Result<constellation_meta::MutateOutcome, String>>,
 ) {
-    let local_epoch = {
-        let keepers = ctx.keepers.lock().await;
-        keepers.get(&part).and_then(|keeper| keeper.ship_epoch())
-    };
+    let local_epoch = ctx
+        .lease_views
+        .lock()
+        .unwrap()
+        .get(&part)
+        .and_then(|view| view.new_mutation_epoch(ctx.node_id));
     if let Some(epoch) = local_epoch {
         let outcome = match constellation_meta::execute_mutate(&ctx.meta, &op, Some(rid)) {
             Ok(records) => {
@@ -260,7 +276,18 @@ async fn dispatch_forward(
         let _gate = ctx.forward.gate.acquire(keys).await;
         let _permit = ctx.forward.inflight.clone().acquire_owned().await;
         let mut holder = ctx.forward.cached_holder(&part);
-        if holder.is_none() {
+        // A cache hit naming *this* node is not trustworthy on its own:
+        // this node was the holder at some earlier point (the only way
+        // its own id ever lands in this cache — see below), and nothing
+        // invalidates the entry when it later loses the lease, since
+        // that happens on this node's own lease-keeper path, never
+        // through a `NotHolder` redirect (the only other place that
+        // refreshes this cache). Treat it the same as an empty cache and
+        // re-read the lease object fresh, so a merely stale self-entry
+        // does not fall into the self-forward short-circuit below and
+        // silently skip a forward that would otherwise have gone to the
+        // real current holder.
+        if holder.is_none() || holder == Some(ctx.node_id) {
             let store = constellation_store_s3::LeaseStore::new(
                 ctx.store_inner.clone(),
                 &part,
@@ -277,7 +304,18 @@ async fn dispatch_forward(
                 ctx.forward.note_holder(&part, holder);
             }
         }
-        let outcome = if let Some(mut holder) = holder {
+        // Never forward to ourselves. The lease object (freshly read
+        // just above whenever the cache named us) still names this node
+        // while it is paused for a handoff, releasing or released, or
+        // inside the takeover gate. `new_mutation_epoch` declined above
+        // for exactly that reason. A request addressed to our own id
+        // would either fail and use up the retry budget below, or come
+        // back in through `dispatch_mutate`, which does not see the
+        // pause. Answer `Busy` now instead, so the FUSE thread takes the
+        // lease path (`require_lease_for`), the same as a local write
+        // does with forwarding off. Also drop the cache entry so the
+        // next forward re-reads who holds the lease.
+        let outcome = if let Some(mut holder) = holder.filter(|holder| *holder != ctx.node_id) {
             let mut outcome = forward::request_mutate(
                 &ctx.peers,
                 &ctx.forward,
@@ -336,19 +374,23 @@ async fn dispatch_forward(
             if let constellation_meta::MutateOutcome::Exists {
                 ref records,
                 ship_floor,
+                epoch: hint_epoch,
             } = outcome
             {
                 // The entry the holder refused us comes back with the
                 // refusal: install it so the caller's next lookup of
-                // that name succeeds here too. Not shadowed — these are
-                // the holder's own records, and its segment re-applies
-                // them idempotently (`replay::insert_node`). Only below
+                // that name succeeds here too. Its segment re-applies
+                // it idempotently (`replay::insert_node`). Only below
                 // the holder's ship floor, though
                 // (`forward::safe_to_install_early`); above it the
                 // bounded wait below takes over, which only ever
-                // observes.
+                // observes. Plan 30 §M3a: installed as a speculation-log
+                // hint, so it retires once this replica's applied
+                // position reaches the floor, and is rolled back if a
+                // later epoch's segment gets here first (the entry may
+                // have been the answering holder's own unshipped work).
                 if forward::safe_to_install_early(&ctx.meta, ship_floor) {
-                    if let Err(error) = ctx.meta.apply_records(records) {
+                    if let Err(error) = ctx.meta.install_hint(records, ship_floor, hint_epoch) {
                         tracing::warn!(
                             %error,
                             part,
@@ -372,7 +414,7 @@ async fn dispatch_forward(
                 // precisely needs the holder's journal position in
                 // replies and segments (tracked in PROGRESS.md, plan 29
                 // M6).
-                let apply_result = forward::apply_accepted(&ctx.meta, &part, epoch, records);
+                let apply_result = forward::apply_accepted(&ctx.meta, epoch, rid, &op, records);
                 if let Err(error) = apply_result {
                     tracing::warn!(
                         %error,
@@ -381,6 +423,25 @@ async fn dispatch_forward(
                     );
                     let _ = reply.send(Err(error.to_string()));
                     return;
+                }
+                // Plan 30 §M3a: a reply from an older epoch that lands
+                // after this node itself took the lease over missed the
+                // takeover gate, and as holder this node never tails a
+                // later-epoch segment that would strand it. Strand it
+                // here; the replay drain then executes it locally, by
+                // rid.
+                let view = ctx.lease_views.lock().unwrap().get(&part).cloned();
+                if let Some(view) = view {
+                    let lease = view.status();
+                    if lease.held && lease.holder == ctx.node_id && lease.epoch > epoch {
+                        if let Err(error) = ctx.meta.strand_below_epoch(lease.epoch) {
+                            tracing::warn!(
+                                %error,
+                                part,
+                                "failed to strand a reply that arrived after this node's takeover"
+                            );
+                        }
+                    }
                 }
             }
             outcome
@@ -423,6 +484,43 @@ async fn dispatch_forward(
         // the contiguous `acked_through` floor.
         let _ = reply.send(Ok(outcome));
     });
+}
+
+/// How many tail attempts [`catch_up_to`] makes before giving up.
+const HANDOFF_CATCH_UP_ATTEMPTS: u32 = 10;
+
+/// After a P2P handoff, tail `part` until this replica has applied the
+/// departing holder's last shipped segment (`head_seq` from its reply),
+/// before claiming the lease. Bounded (about half a second); a claim that
+/// goes ahead short of it is still covered by the `pending_catchup` check
+/// after the claim (plan 30 §M2).
+///
+/// Plan 30 §M3a needs this *before* the claim: the takeover gate runs
+/// inside it and strands every shadow the departing holder has not
+/// confirmed by then. A shadow whose confirming segment this replica has
+/// simply not seen yet would be replayed locally — a second execution
+/// once that segment lands.
+async fn catch_up_to(ship: &mut shipper::Shipper, part: &str, head_seq: Option<u64>) {
+    let Some(target) = head_seq else {
+        return;
+    };
+    for attempt in 0..HANDOFF_CATCH_UP_ATTEMPTS {
+        if ship.last_shipped_seq(part).unwrap_or(0) >= target {
+            return;
+        }
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if let Err(error) = ship.tail_part_to_head(part).await {
+            tracing::debug!(%error, part, target, "handoff catch-up tail failed");
+        }
+    }
+    tracing::warn!(
+        part,
+        target,
+        applied = ship.last_shipped_seq(part).unwrap_or(0),
+        "claiming a handed-off lease before applying the departing holder's last segment"
+    );
 }
 
 /// Detach a stale FUSE mount left behind by a previous daemon that exited
@@ -971,13 +1069,30 @@ impl NodeRuntime {
             snapshots_base.with_publisher(Arc::new(move || {
                 let tx = tx.clone();
                 Box::pin(async move {
-                    let (reply, receive) = tokio::sync::oneshot::channel();
-                    tx.send(fusefs::SyncRequest::Publish { reply })
-                        .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
-                    receive
-                        .await
-                        .map_err(|_| anyhow::anyhow!("metadata publish stopped"))?
-                        .map_err(|e| anyhow::anyhow!(e))
+                    // Plan 30 §M3a: a replica with forwarded ops the log
+                    // has not confirmed yet cannot publish; that clears
+                    // as soon as the holder ships them, so wait it out
+                    // (bounded) rather than fail the snapshot.
+                    let mut waited = 0u32;
+                    loop {
+                        let (reply, receive) = tokio::sync::oneshot::channel();
+                        tx.send(fusefs::SyncRequest::Publish { reply })
+                            .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
+                        match receive
+                            .await
+                            .map_err(|_| anyhow::anyhow!("metadata publish stopped"))?
+                        {
+                            Ok(commit) => return Ok(commit),
+                            Err(e)
+                                if e.contains(crate::mtree_publish::SPECULATION_OUTSTANDING)
+                                    && waited < 100 =>
+                            {
+                                waited += 1;
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            Err(e) => return Err(anyhow::anyhow!(e)),
+                        }
+                    }
                 })
             }))
         });
@@ -1423,6 +1538,46 @@ impl NodeRuntime {
                 }
             });
         }
+        // Plan 30 §M3a: the replay-by-rid drain. Tailing a segment from a
+        // later epoch (`Meta::apply_segment`) rolls stranded shadows back
+        // and queues their ops in `pending_replay`; this sends them, in
+        // order, down the ordinary forward path to whoever holds the lease
+        // now (see `recovery`'s module doc). A separate ticker rather than
+        // part of the sync loop: the queue is normally empty, and each
+        // replay is a network round trip that must not hold up shipping.
+        // A read-only member never forwards, so it never has anything to
+        // replay.
+        if !read_only_member {
+            let (meta, spool, forward, sync_tx, lease_views, stop) = (
+                meta.clone(),
+                spool.clone(),
+                forward.clone(),
+                sync_tx.clone(),
+                lease_views.clone(),
+                stop.clone(),
+            );
+            rt.spawn(async move {
+                let part = constellation_store_s3::log::PARTITION;
+                let mut state = crate::recovery::DrainState::default();
+                loop {
+                    tokio::time::sleep(crate::recovery::DRAIN_INTERVAL).await;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let held_epoch = lease_views
+                        .lock()
+                        .unwrap()
+                        .get(part)
+                        .map(|view| view.status())
+                        .filter(|lease| lease.held && lease.holder == node_id)
+                        .map(|lease| lease.epoch);
+                    crate::recovery::drain_pending_replays(
+                        &meta, &spool, &sync_tx, &forward, node_id, part, held_epoch, &mut state,
+                    )
+                    .await;
+                }
+            });
+        }
         // Retention pruner ticker (plan 22, Step 4). The default has no
         // marked roots, so a run walks nothing and is cheap; it only does
         // work once an operator sets a `user.constellation.prune` policy.
@@ -1682,6 +1837,7 @@ impl NodeRuntime {
                             if !epochs.is_open() && matches!(r, Ok(false)) && peers.is_enabled() {
                                 if let Some(handoff) = peers.request_lease(&part, None).await {
                                     keeper.note_acquire_reason("fuse-acquire-after-handoff");
+                                    catch_up_to(&mut ship, &part, handoff.head_seq).await;
                                     r = shipper::acquire_lease_for(&mut ship, keeper, &part).await;
                                     if matches!(r, Ok(true)) {
                                         if let Some(target) = handoff.head_seq {
@@ -1831,7 +1987,7 @@ impl NodeRuntime {
                             );
                         }
                         Some(fusefs::SyncRequest::Forward { part, op, rid, reply }) => {
-                            dispatch_forward(dispatch_ctx.clone(), part, op, rid, reply).await;
+                            dispatch_forward(dispatch_ctx.clone(), part, op, rid, reply);
                         }
                         Some(fusefs::SyncRequest::ApplyPushed {
                             part,
@@ -1880,7 +2036,9 @@ impl NodeRuntime {
                                     .insert(part.clone(), keeper.view());
                                 keepers.insert(part.clone(), keeper);
                             }
-                            let _ = peers.request_lease(&part, forward.cached_holder(&part)).await;
+                            let handoff =
+                                peers.request_lease(&part, forward.cached_holder(&part)).await;
+                            catch_up_to(&mut ship, &part, handoff.and_then(|h| h.head_seq)).await;
                             if let Some(keeper) = keepers.get_mut(&part) {
                                 keeper.note_acquire_reason("claim-offer");
                                 if shipper::acquire_lease_for(&mut ship, keeper, &part)
@@ -2047,6 +2205,17 @@ impl NodeRuntime {
                             );
                             tokio::pin!(round);
                             let mut completed = false;
+                            // Invariant: the `sync_rx` arm bodies below must never
+                            // await anything the in-flight `round` may hold or be
+                            // waiting on. That includes the keepers lock, the
+                            // shipper, a `tokio::sync` lock held across I/O, and a
+                            // channel only the round drains. While an arm body runs,
+                            // `round` is not polled, so it cannot finish its own
+                            // await and release what the arm is waiting for. That
+                            // is the plan 30 M3a `kill9-remount` self-deadlock
+                            // (`dispatch_forward` awaited `keepers.lock()`). Arms
+                            // either run synchronously (std mutexes that no await
+                            // holds, fjall writes, unbounded sends) or spawn.
                             loop {
                                 tokio::select! {
                                     biased;
@@ -2079,7 +2248,8 @@ impl NodeRuntime {
                                         }
                                         // Plan 30 M2b item 1: these two spawn (or,
                                         // for a local `Forward`, run one quick
-                                        // fjall write) and never need to interrupt
+                                        // fjall write, synchronously — see the
+                                        // invariant above) and never need to interrupt
                                         // an in-flight round to be serviced — see
                                         // `dispatch_mutate`/`dispatch_forward`'s
                                         // docs. Dispatching them here, instead of
@@ -2107,8 +2277,13 @@ impl NodeRuntime {
                                             );
                                         }
                                         Some(fusefs::SyncRequest::Forward { part, op, rid, reply }) => {
-                                            dispatch_forward(dispatch_ctx.clone(), part, op, rid, reply)
-                                                .await;
+                                            dispatch_forward(
+                                                dispatch_ctx.clone(),
+                                                part,
+                                                op,
+                                                rid,
+                                                reply,
+                                            );
                                         }
                                         Some(request) => {
                                             // Explicit operations retain their old
@@ -3155,6 +3330,31 @@ mod tests {
         }
     }
 
+    /// A [`SyncDispatchCtx`] for node 1 over `backend`, P2P disabled. The
+    /// sync channel's receiver is dropped: the `Nudge`s a dispatch sends
+    /// are best effort and ignored.
+    fn test_dispatch_ctx(
+        backend: Arc<dyn ObjectStore>,
+        keepers: Arc<tokio::sync::Mutex<HashMap<String, lease::LeaseKeeper>>>,
+        lease_views: Arc<Mutex<HashMap<String, Arc<lease::LeaseView>>>>,
+        meta: Arc<Meta>,
+    ) -> SyncDispatchCtx {
+        let (sync_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        SyncDispatchCtx {
+            node_id: 1,
+            lease_mode: constellation_store_s3::LeaseMode::Cas,
+            spool: Arc::new(Mutex::new(shipper::SpoolInfo::default())),
+            keepers,
+            forward: forward::ForwardState::new(),
+            store_inner: backend,
+            meta,
+            lease_views,
+            placement: Arc::new(placement::Placement::new()),
+            sync_tx,
+            peers: constellation_net::Peers::disabled(),
+        }
+    }
+
     /// Plan 30 M2b: proves the invariant the release/handoff path's
     /// "keep holding the keepers lock across the final flush and the
     /// release CAS" is *for* — a forwarded execute must never land in the
@@ -3192,20 +3392,12 @@ mod tests {
             tokio::sync::Mutex::new(HashMap::from([("p0".to_string(), keeper)])),
         );
         let meta = Arc::new(Meta::open_in_memory().expect("in-memory meta"));
-        let (sync_tx, _sync_rx) = tokio::sync::mpsc::unbounded_channel();
-        let ctx = SyncDispatchCtx {
-            node_id: 1,
-            lease_mode: constellation_store_s3::LeaseMode::Cas,
-            spool: Arc::new(Mutex::new(shipper::SpoolInfo::default())),
-            keepers: keepers.clone(),
-            forward: forward::ForwardState::new(),
-            store_inner: backend,
-            meta: meta.clone(),
-            lease_views: Arc::new(Mutex::new(HashMap::new())),
-            placement: Arc::new(placement::Placement::new()),
-            sync_tx,
-            peers: constellation_net::Peers::disabled(),
-        };
+        let ctx = test_dispatch_ctx(
+            backend,
+            keepers.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+            meta.clone(),
+        );
 
         // Task A: `run_sync_round`'s release pass, exactly as written
         // there — take the lock, release (final flush is a no-op here;
@@ -3261,5 +3453,349 @@ mod tests {
             meta.lookup(ROOT_INO, "race").ok().flatten().is_none(),
             "a forwarded op must not be applied once this node has released the lease"
         );
+    }
+
+    /// A `Mkdir` of `name` under the root, as a local FUSE thread would
+    /// hand it to `dispatch_forward`, with a rid unique to `seq`.
+    fn local_mkdir(
+        name: &str,
+        seq: u64,
+    ) -> (constellation_meta::MutateOp, constellation_meta::Rid) {
+        (
+            constellation_meta::MutateOp::Mkdir {
+                parent: constellation_fs_core::types::ROOT_INO,
+                name: name.into(),
+                ino: (1 << 40) | seq,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+            },
+            constellation_meta::Rid {
+                node: 1,
+                incarnation: 1,
+                seq,
+            },
+        )
+    }
+
+    fn exists(meta: &Meta, name: &str) -> bool {
+        use constellation_meta::MetaStore as _;
+        meta.lookup(constellation_fs_core::types::ROOT_INO, name)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Bound on every wait below: a regression fails here instead of
+    /// hanging the test binary.
+    const DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A lease store over `backend`, a keeper that holds `p0` at epoch 1,
+    /// and the keepers/views maps a node would build around it.
+    #[allow(clippy::type_complexity)]
+    async fn held_p0(
+        backend: Arc<dyn ObjectStore>,
+    ) -> (
+        Arc<tokio::sync::Mutex<HashMap<String, lease::LeaseKeeper>>>,
+        Arc<Mutex<HashMap<String, Arc<lease::LeaseView>>>>,
+        Arc<lease::LeaseView>,
+    ) {
+        let mut keeper = lease::LeaseKeeper::new(
+            constellation_store_s3::LeaseStore::new(
+                backend,
+                "p0",
+                constellation_store_s3::LeaseMode::Cas,
+            ),
+            1,
+        );
+        assert!(keeper
+            .commit(lease::Plan::Create, None)
+            .await
+            .expect("create the lease"));
+        let view = keeper.view();
+        let views = Arc::new(Mutex::new(HashMap::from([(
+            "p0".to_string(),
+            view.clone(),
+        )])));
+        let keepers = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            "p0".to_string(),
+            keeper,
+        )])));
+        (keepers, views, view)
+    }
+
+    /// Plan 30 M3a regression guard for the `kill9-remount` hang: the
+    /// sync task runs `dispatch_forward` inline, inside the `select!` that
+    /// polls the in-flight round, and the round holds the keepers lock
+    /// across S3 I/O on its release/handoff/acquire paths. The M2b
+    /// version awaited that lock, so the arm never finished, the round
+    /// was never polled again, and the lock was never released.
+    ///
+    /// Reproduces that loop's shape exactly: a `biased` select between a
+    /// "round" that takes the keepers lock and then needs further polls to
+    /// finish (the stand-in for its S3 await), and a request channel whose
+    /// arm dispatches the forward. The local-holder forward must complete
+    /// (and the round after it), all within the deadline.
+    #[tokio::test]
+    async fn dispatch_forward_does_not_wait_for_a_round_holding_the_keepers_lock() {
+        let backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (keepers, views, _view) = held_p0(backend.clone()).await;
+        let meta = Arc::new(Meta::open_in_memory().expect("in-memory meta"));
+        let ctx = test_dispatch_ctx(backend, keepers.clone(), views, meta.clone());
+
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let (op, rid) = local_mkdir("while-round-holds-keepers", 1);
+        req_tx.send((op, rid, reply_tx)).unwrap();
+
+        let round_held_lock = Arc::new(AtomicBool::new(false));
+        let round = {
+            let (keepers, round_held_lock) = (keepers.clone(), round_held_lock.clone());
+            async move {
+                let _held = keepers.lock().await;
+                round_held_lock.store(true, Ordering::SeqCst);
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+        let driven = tokio::time::timeout(DISPATCH_DEADLINE, async {
+            tokio::pin!(round);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut round => break,
+                    Some((op, rid, reply)) = req_rx.recv() => {
+                        assert!(
+                            round_held_lock.load(Ordering::SeqCst),
+                            "the test must dispatch while the round holds the lock"
+                        );
+                        dispatch_forward(ctx.clone(), "p0".to_string(), op, rid, reply);
+                    }
+                }
+            }
+            reply_rx.await
+        })
+        .await;
+        let outcome = driven
+            .expect("dispatch_forward blocked on the keepers lock the in-flight round holds")
+            .expect("dispatch_forward always replies")
+            .expect("local execute succeeds");
+        assert!(
+            matches!(
+                outcome,
+                constellation_meta::MutateOutcome::Accepted { epoch: 1, .. }
+            ),
+            "the holder executes its own forward locally: {outcome:?}"
+        );
+        assert!(exists(&meta, "while-round-holds-keepers"));
+    }
+
+    /// The same guarantee against another task holding the keepers lock
+    /// outright (a peer's `dispatch_mutate`, the atime task, a sync-task
+    /// arm): the local-holder branch neither waits for it nor needs it.
+    #[tokio::test]
+    async fn dispatch_forward_completes_while_another_task_holds_the_keepers_lock() {
+        let backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (keepers, views, _view) = held_p0(backend.clone()).await;
+        let meta = Arc::new(Meta::open_in_memory().expect("in-memory meta"));
+        let ctx = test_dispatch_ctx(backend, keepers.clone(), views, meta.clone());
+
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (unlock_tx, unlock_rx) = tokio::sync::oneshot::channel::<()>();
+        let holder = tokio::spawn({
+            let keepers = keepers.clone();
+            async move {
+                let _held = keepers.lock().await;
+                let _ = locked_tx.send(());
+                let _ = unlock_rx.await;
+            }
+        });
+        locked_rx
+            .await
+            .expect("the other task took the keepers lock");
+
+        let (op, rid) = local_mkdir("while-lock-held", 1);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let outcome = tokio::time::timeout(DISPATCH_DEADLINE, async {
+            dispatch_forward(ctx, "p0".to_string(), op, rid, reply_tx);
+            reply_rx.await
+        })
+        .await
+        .expect("dispatch_forward waited for the keepers lock")
+        .expect("dispatch_forward always replies")
+        .expect("local execute succeeds");
+        assert!(matches!(
+            outcome,
+            constellation_meta::MutateOutcome::Accepted { epoch: 1, .. }
+        ));
+        assert!(exists(&meta, "while-lock-held"));
+
+        let _ = unlock_tx.send(());
+        holder.await.expect("lock holder task");
+    }
+
+    /// Dispatch one local forward for `p0` and wait (bounded) for its
+    /// reply.
+    async fn forward_once(
+        ctx: SyncDispatchCtx,
+        name: &str,
+        seq: u64,
+    ) -> constellation_meta::MutateOutcome {
+        let (op, rid) = local_mkdir(name, seq);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        dispatch_forward(ctx, "p0".to_string(), op, rid, reply_tx);
+        tokio::time::timeout(DISPATCH_DEADLINE, reply_rx)
+            .await
+            .expect("dispatch_forward replies within the deadline")
+            .expect("dispatch_forward always replies")
+            .expect("no transport error")
+    }
+
+    /// Gate semantics, handoff pause: `run_sync_round` pauses the view
+    /// before its final flush. A local forward arriving then must not
+    /// execute here as holder, even though `ship_epoch()` (which the M2b
+    /// code checked) is still `Some`. It must get what a local FUSE write
+    /// gets: the lease path, here via an immediate `Busy`. It must also
+    /// not be forwarded to this node's own id, which the lease object
+    /// still names.
+    #[tokio::test]
+    async fn dispatch_forward_does_not_execute_locally_while_paused_for_handoff() {
+        let backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let (keepers, views, view) = held_p0(backend.clone()).await;
+        let meta = Arc::new(Meta::open_in_memory().expect("in-memory meta"));
+        let ctx = test_dispatch_ctx(backend, keepers.clone(), views, meta.clone());
+
+        keepers
+            .lock()
+            .await
+            .get("p0")
+            .expect("p0 keeper")
+            .begin_handoff_pause();
+        assert!(keepers.lock().await["p0"].ship_epoch().is_some());
+        assert_eq!(view.new_mutation_epoch(1), None);
+
+        let outcome = forward_once(ctx.clone(), "paused", 1).await;
+        assert!(
+            matches!(outcome, constellation_meta::MutateOutcome::Busy),
+            "a paused holder must send its own forward to the lease path: {outcome:?}"
+        );
+        assert!(!exists(&meta, "paused"));
+        assert_eq!(
+            ctx.forward.cached_holder("p0"),
+            None,
+            "this node must not stay cached as the forwarding target"
+        );
+    }
+
+    /// Gate semantics, release: `LeaseKeeper::release` clears the view
+    /// before its CAS, while `run_sync_round` holds the keepers lock
+    /// across the whole call. A local forward arriving mid-CAS must
+    /// neither wait for that lock nor execute here, and after the release
+    /// lands it must still not execute here.
+    #[tokio::test]
+    async fn dispatch_forward_does_not_execute_locally_during_or_after_release() {
+        let delay = std::time::Duration::from_millis(150);
+        let backend: Arc<dyn ObjectStore> =
+            Arc::new(DelayedStore(object_store::memory::InMemory::new(), delay));
+        let (keepers, views, view) = held_p0(backend.clone()).await;
+        let meta = Arc::new(Meta::open_in_memory().expect("in-memory meta"));
+        let ctx = test_dispatch_ctx(backend, keepers.clone(), views, meta.clone());
+
+        let release_task = tokio::spawn({
+            let keepers = keepers.clone();
+            async move {
+                let mut g = keepers.lock().await;
+                g.get_mut("p0")
+                    .expect("partition present")
+                    .release()
+                    .await
+                    .expect("release succeeds");
+            }
+        });
+        // `release` clears the view synchronously before its first await
+        // (the delayed CAS PUT), so yielding until the view closes is
+        // enough to put the dispatch below inside that window.
+        let mut yields = 0;
+        while view.usable() {
+            assert!(yields < 1_000, "the release never started");
+            yields += 1;
+            tokio::task::yield_now().await;
+        }
+        assert!(!release_task.is_finished(), "must dispatch mid-CAS");
+
+        let during = forward_once(ctx.clone(), "during-release", 1).await;
+        assert!(
+            !matches!(during, constellation_meta::MutateOutcome::Accepted { .. }),
+            "a forward executed locally while the release CAS was in flight: {during:?}"
+        );
+        release_task.await.expect("release task");
+
+        let after = forward_once(ctx, "after-release", 2).await;
+        assert!(
+            !matches!(after, constellation_meta::MutateOutcome::Accepted { .. }),
+            "a forward executed locally after the release: {after:?}"
+        );
+        assert!(!exists(&meta, "during-release"));
+        assert!(!exists(&meta, "after-release"));
+    }
+
+    /// Gate semantics, takeover gate: `commit_gated` runs plan 30 M3a's
+    /// gate after the CAS but before `set_held`. A local forward arriving
+    /// then must not execute ahead of the gate's replays. Dispatching from
+    /// inside the gate closure puts it exactly in that window. Once the
+    /// view opens, the next forward executes locally as usual.
+    #[tokio::test]
+    async fn dispatch_forward_does_not_execute_locally_inside_the_takeover_gate() {
+        let backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut keeper = lease::LeaseKeeper::new(
+            constellation_store_s3::LeaseStore::new(
+                backend.clone(),
+                "p0",
+                constellation_store_s3::LeaseMode::Cas,
+            ),
+            1,
+        );
+        let views = Arc::new(Mutex::new(HashMap::from([(
+            "p0".to_string(),
+            keeper.view(),
+        )])));
+        let meta = Arc::new(Meta::open_in_memory().expect("in-memory meta"));
+        let ctx = test_dispatch_ctx(
+            backend,
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            views,
+            meta.clone(),
+        );
+
+        let (op, rid) = local_mkdir("inside-gate", 1);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let gate_ctx = ctx.clone();
+        assert!(keeper
+            .commit_gated(lease::Plan::Create, None, move |_epoch| {
+                dispatch_forward(gate_ctx, "p0".to_string(), op, rid, reply_tx);
+            })
+            .await
+            .expect("create the lease"));
+        let inside = tokio::time::timeout(DISPATCH_DEADLINE, reply_rx)
+            .await
+            .expect("dispatch_forward replies within the deadline")
+            .expect("dispatch_forward always replies")
+            .expect("no transport error");
+        assert!(
+            !matches!(inside, constellation_meta::MutateOutcome::Accepted { .. }),
+            "a forward executed locally inside the takeover gate: {inside:?}"
+        );
+        assert!(!exists(&meta, "inside-gate"));
+
+        let opened = forward_once(ctx, "after-gate", 2).await;
+        assert!(
+            matches!(
+                opened,
+                constellation_meta::MutateOutcome::Accepted { epoch: 1, .. }
+            ),
+            "once the view is armed the holder executes locally: {opened:?}"
+        );
+        assert!(exists(&meta, "after-gate"));
     }
 }

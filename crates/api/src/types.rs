@@ -385,6 +385,9 @@ pub struct StatusReport {
     /// Stranded-journal reintegration (phase 4b).
     #[serde(default)]
     pub reintegration: ReintegrationStatus,
+    /// Plan 30 §M3a speculation log and stranded-op recovery.
+    #[serde(default)]
+    pub speculation: SpeculationStatus,
     /// Cooperative cache (phase 5, DESIGN.md §7).
     #[serde(default)]
     pub coop: CoopStatus,
@@ -648,6 +651,32 @@ pub struct ReintegrationStatus {
     pub conflicts_materialized: u64,
     #[serde(default)]
     pub in_progress: bool,
+}
+
+/// Plan 30 §M3a: this node's speculation log (`constellation_meta::
+/// store::spec`) — effects applied ahead of the durable log, and the
+/// stranded ops being replayed by rid.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SpeculationStatus {
+    /// Outstanding shadows (accepted forwarded ops) and `Exists` hints not
+    /// yet confirmed by the log. While non-zero this node does not publish
+    /// commits.
+    #[serde(default)]
+    pub outstanding: u64,
+    /// Stranded ops queued for replay by rid.
+    #[serde(default)]
+    pub pending_replay: u64,
+    /// Speculative entries rolled back because a later epoch stranded
+    /// them, since start.
+    #[serde(default)]
+    pub rolled_back: u64,
+    /// Stranded ops replayed by rid and accepted, since start.
+    #[serde(default)]
+    pub stranded_replayed: u64,
+    /// Stranded ops whose replay was refused and materialized as a
+    /// `.constellation-conflict/` copy, since start.
+    #[serde(default)]
+    pub replay_conflicts: u64,
 }
 
 /// P2P fast-path state. Purely observational: the filesystem is correct

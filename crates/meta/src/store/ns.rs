@@ -378,12 +378,22 @@ pub(crate) fn key_range_bounds(r: &KeyRange) -> std::ops::Range<Vec<u8>> {
 /// published tree's key set; `scratch` (private, never published) is
 /// not, and never journaled/replicated content should not be able to
 /// forget which side of that line it is on.
+///
+/// A tracked write may also carry a speculation capture context (plan 30
+/// §M3a, [`crate::store::spec::Capture`]): every key it touches then has
+/// its before-image recorded, so the write can later be rolled back.
+/// Only `ns` is ever captured — the same "this is the published tree"
+/// reasoning that makes only `ns` dirty-tracked makes only `ns` worth
+/// undoing; derived indexes (`chunk_ref`, `xattr_by_name`, `orphans`)
+/// are recomputed from the restored records instead
+/// (`spec::restore_key_tx`).
 #[derive(Clone, Copy)]
 pub(crate) enum Dirty<'a> {
     Untracked,
     Tracked {
         dirty: &'a SingleWriterTxKeyspace,
         local: &'a SingleWriterTxKeyspace,
+        capture: Option<&'a crate::store::spec::Capture>,
     },
 }
 
@@ -392,13 +402,53 @@ impl<'a> Dirty<'a> {
         dirty: &'a SingleWriterTxKeyspace,
         local: &'a SingleWriterTxKeyspace,
     ) -> Self {
-        Dirty::Tracked { dirty, local }
+        Dirty::Tracked {
+            dirty,
+            local,
+            capture: None,
+        }
+    }
+
+    /// As [`Self::tracked`], additionally recording before-images into
+    /// `capture`.
+    pub(crate) fn capturing(
+        dirty: &'a SingleWriterTxKeyspace,
+        local: &'a SingleWriterTxKeyspace,
+        capture: &'a crate::store::spec::Capture,
+    ) -> Self {
+        Dirty::Tracked {
+            dirty,
+            local,
+            capture: Some(capture),
+        }
     }
 
     fn mark(self, tx: &mut SingleWriterWriteTx, key: &[u8]) -> Result<(), MetaError> {
-        if let Dirty::Tracked { dirty, local } = self {
+        if let Dirty::Tracked { dirty, local, .. } = self {
             let seq = crate::store::next_dirty_seq_tx(tx, local)?;
             tx.insert(dirty, key.to_vec(), seq.to_be_bytes().to_vec());
+        }
+        Ok(())
+    }
+
+    /// Record `key`'s current value in `ks` as its before-image, when this
+    /// write carries a capture context. Must run before the write it
+    /// describes.
+    fn capture(
+        self,
+        tx: &mut SingleWriterWriteTx,
+        ks: &SingleWriterTxKeyspace,
+        key: &[u8],
+    ) -> Result<(), MetaError> {
+        if let Dirty::Tracked {
+            capture: Some(capture),
+            ..
+        } = self
+        {
+            if !capture.has_seen(key) {
+                let before = tx.get(ks, key)?.map(|v| v.to_vec());
+                capture.note_before(key, before);
+            }
         }
         Ok(())
     }
@@ -408,9 +458,10 @@ impl<'a> Dirty<'a> {
 /// first when `dirty` says to track it. The one place every write to
 /// `ns` funnels through — directly, or via [`put_inode`]/[`put_dentry`]/
 /// [`remove_dentry`]/[`clear_spilled_xattrs`] below, which all call this
-/// — so dirty-tracking cannot be forgotten on a new write path (plan 29
-/// M2's `dirty_snapshot`/`clear_dirty_upto` test exercises every
-/// mutating API to check exactly that).
+/// — so dirty-tracking (and, plan 30 §M3a, speculation capture) cannot
+/// be forgotten on a new write path (plan 29 M2's `dirty_snapshot`/
+/// `clear_dirty_upto` test exercises every mutating API to check exactly
+/// that).
 pub(crate) fn ns_insert(
     tx: &mut SingleWriterWriteTx,
     ks: &SingleWriterTxKeyspace,
@@ -419,6 +470,7 @@ pub(crate) fn ns_insert(
     value: Vec<u8>,
 ) -> Result<(), MetaError> {
     dirty.mark(tx, &key)?;
+    dirty.capture(tx, ks, &key)?;
     tx.insert(ks, key, value);
     Ok(())
 }
@@ -431,6 +483,7 @@ pub(crate) fn ns_remove(
     key: Vec<u8>,
 ) -> Result<(), MetaError> {
     dirty.mark(tx, &key)?;
+    dirty.capture(tx, ks, &key)?;
     tx.remove(ks, key);
     Ok(())
 }

@@ -13,6 +13,7 @@ id, and neither a slow reply nor a takeover can make it execute twice.
 - [Request flow](#request-flow)
 - [Exactly-once identity and in-doubt handling](#exactly-once-identity-and-in-doubt-handling)
 - [Acknowledgement and durability](#acknowledgement-and-durability)
+- [Speculation and stranded-op recovery](#speculation-and-stranded-op-recovery)
 - [Status and logs](#status-and-logs)
 - [Failure and fallback](#failure-and-fallback)
 - [References](#references)
@@ -22,8 +23,14 @@ id, and neither a slow reply nor a takeover can make it execute twice.
 - **Holder / sequencer**: the node with the live S3 lease and the only node
   allowed to append the partition log.
 - **Requester**: a non-holder sending an operation to the sequencer.
-- **Shadow**: accepted records stored and applied locally by the requester
-  before the corresponding S3 segment arrives.
+- **Speculation**: anything a node applied to its replica ahead of the
+  durable log, recorded with the before-images needed to undo it (plan 30
+  M3a, the node-local speculation log).
+- **Shadow**: a speculation entry for a forwarded op's accepted records,
+  applied by the requester before the holder's segment arrives. It
+  carries the op and its rid, so it can be replayed if it is stranded.
+- **Hint**: a speculation entry for the entry an `EEXIST` refusal was
+  about, installed early so the caller's next lookup finds it.
 - **Rid**: `(node, incarnation, seq)`, the exactly-once identity of one
   mutation — see below.
 
@@ -52,6 +59,9 @@ Both messages are signed iroh payloads. Mutation bodies use postcard encoding.
 - `Errno(errno)`
 - `NotHolder { holder }`
 - `Busy`
+- `Conflict { manifest }`: a stale `SetManifest` base (see below).
+- `Exists { records, ship_floor, epoch }`: an `EEXIST` refusal carrying the
+  entry that is there, the holder's next ship position, and its epoch.
 
 An empty or undecodable outcome is treated as `Busy`.
 
@@ -64,8 +74,9 @@ An empty or undecodable outcome is treated as `Busy`.
    `MutateRequest`.
 4. The receiver verifies that its lease is usable, executes the mutation in
    one metadata transaction, and returns the journal records.
-5. The requester inserts those records into its shadow table and applies them
-   to its local replica.
+5. The requester applies those records to its local replica as a shadow in
+   its speculation log, in one transaction with the before-images of every
+   key they touch.
 6. The holder ships its journal to S3. A small segment may also be carried in
    the `SegmentPublished` gossip payload; larger segments are fetched from S3.
 
@@ -141,6 +152,58 @@ Mounts using `--fsync-mode s3` add the existing inode/partition `Barrier`:
 The default `--fsync-mode local` only requires local durability and nudges the
 background shipper.
 
+## Speculation and stranded-op recovery
+
+Plan 30 M3a makes the requester's optimism explicit. A node's replica is
+always a prefix of the durable log plus speculation it can take back:
+
+- **Capture.** A shadow or hint is applied through a capture context
+  threaded into the one funnel every namespace write goes through, so the
+  before-image of every key it touches — and the usage delta — lands in
+  the node-local `spec` keyspace in the same transaction as the write. A
+  segment tailed while older speculation is outstanding is captured the
+  same way (as redo material), even though it is durable.
+- **Retirement.** A shadow retires when a tailed segment carries its
+  `Completed { rid }`. A hint retires when the applied position reaches
+  the floor the holder answered with. Rows are deleted once nothing older
+  is outstanding.
+- **Stranding.** The fencing rule means a holder's epoch can no longer add
+  to the log once a segment from a later epoch exists. So applying a
+  segment from a later epoch than an outstanding shadow's or hint's
+  *strands* it: the holder that accepted it died or was deposed with the
+  op still unshipped. A takeover strands everything below the new epoch
+  the same way.
+- **Rollback and redo.** Stranding restores before-images in reverse order
+  down to the earliest stranded entry (usage too, and the chunk-reference,
+  xattr and orphan indexes derived from the restored records), then
+  re-applies everything after it that still stands — captured segments
+  from their records, still-outstanding speculation from its records — in
+  one transaction. The replica is then exactly the log prefix plus the
+  surviving speculation.
+- **Replay by rid.** Each stranded shadow's op is queued, in original
+  order, and sent again with its original rid down the ordinary forward
+  path to whoever holds the lease now; if a queued op cannot reach a
+  holder for 10 s, the node takes the lease itself. Exactly-once holds
+  because every holder answers a rid it already executed from `recent` or
+  `completed` without executing it again. An accepted replay becomes a
+  fresh shadow and retires normally.
+- **Refusals.** A replay the log no longer admits (the name was taken in
+  the meantime, the target is gone) is a genuine conflict. It is
+  materialized as a `.constellation-conflict/<name>@<node>-<ts>` copy,
+  like a reintegration conflict, and counted. An `unlink`/`rmdir` refused
+  with `ENOENT` is not a conflict: the name is gone either way.
+- **Takeover gate.** A node that wins a lease CAS rolls back what the new
+  epoch strands and executes every queued replay locally, in order,
+  before its lease view opens. A new holder therefore never validates an
+  op against phantom state, and an op its own clients were told succeeded
+  lands before anything issued after the takeover. Before a claim that
+  follows a P2P handoff, the node first tails to the departing holder's
+  last shipped segment, so nothing it shipped is mistaken for stranded.
+- **Publishing.** A node with outstanding speculation does not publish a
+  metadata commit; its dirty set waits for the speculation to retire or
+  roll back. Commits are therefore built from log-prefix state. (The
+  holder's own unshipped journal is plan 30 M3b.)
+
 ### The shadow does not win conflicts
 
 A shadowed record is an optimism about *timing*, never about *order*. The
@@ -196,12 +259,11 @@ mtime/ctime; two `SetManifest`s on one file race each other's base; a
 rename touches two parents and possibly the moved/replaced inodes).
 Ops with disjoint key sets run fully in parallel; overlapping ops
 resolve in the order this node issued them, so they land on the holder,
-and get applied back into the requester's shadow table, in that same
-order. Without this, two forwards that race the network could complete
-out of order and leave the requester's replica permanently diverged
-from the holder's — the shadow table's suppression of the holder's own
-tail (above) depends on replaying records in the holder's actual
-execution order.
+and get installed back as shadows on the requester, in that same order.
+Without this, two forwards that race the network could complete out of
+order and leave the requester's replica diverged from the holder's —
+replay assumes records arrive in the holder's execution order, and the
+speculation log's rollback assumes shadows were captured in it.
 
 ## Status and logs
 
@@ -220,6 +282,19 @@ execution order.
 - `forward_indoubt_resolved`: in-doubt ops the lease path resolved
   against `completed` instead of re-executing (plan 30 M2).
 - `placement_reason`: the last holder placement recommendation.
+- `speculation.outstanding`: shadows and hints not yet confirmed by the
+  log. While non-zero, this node does not publish commits.
+- `speculation.pending_replay`: stranded ops queued for replay by rid.
+- `speculation.rolled_back`: shadows and hints rolled back because a later
+  epoch stranded them.
+- `speculation.stranded_replayed`: stranded ops replayed and accepted.
+- `speculation.replay_conflicts`: refused replays materialized as conflict
+  copies.
+
+The same counters are exported as `constellation_speculation_*` metrics.
+A rollback logs `segment from a later epoch stranded speculative state`
+(or `takeover stranded speculative state`); a refused replay logs
+`stranded op replay refused; materializing a conflict copy`.
 
 Under a steady multi-writer workload, `forwarded_ok` should rise while
 `handed the lease to a peer` should disappear. That log line means the older
@@ -241,10 +316,11 @@ The default request timeout is 500 ms
 disables requester-side forwarding entirely: every non-holder mutation
 takes the lease-acquisition path (P2P handoff, then S3 CAS) directly, with
 no rid retries to attempt first, restoring writer-follows-lease placement.
-A holder crash after `Accepted` can still strand records in its journal
-(plan 30 M3 fixes the resulting divergence; M2 only fixes at-least-once
-delivery). Epoch fencing prevents a competing append history; reintegration
-reports and resolves the stranded branch.
+A holder crash after `Accepted` strands the op in its unshipped journal;
+the requester's speculation log rolls the shadow back and replays the op by
+rid through the next holder (see above). The dead holder's own unshipped
+journal is still resolved by reintegration until plan 30 M3b. Epoch
+fencing prevents a competing append history.
 
 ## References
 

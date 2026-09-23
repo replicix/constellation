@@ -579,6 +579,36 @@ If it costs more:
     overlaps;
   - `mkdir-p-race` still passes (hints are speculation now).
 
+**Split.** M3 ships in two parts:
+- M3a: the requester side — capture, the speculation log, stranding,
+  replay by rid, the takeover gate, and the publish deferral.
+- M3b: the holder side — holder capture, holder publish by before-image
+  substitution, deposed-holder rollback plus replay (with the
+  `deposed-reintegration` update), dropping model simplification 9, and
+  the performance gate.
+
+M3b must also close these gaps, found while reviewing and testing M3a:
+- Keep an op's records and its `Completed { rid }` in one segment. A
+  holder dying between the two leaves the op in effect with an
+  uncompleted rid, so a replay re-executes it.
+- A takeover whose own op is refused ships no segment. Speculation that
+  the new epoch strands on third nodes then waits for the next segment
+  anyone ships.
+- The continuation-epoch path (`adopt_epoch_hold`) bypasses the takeover
+  gate.
+- A forward reply that races a takeover can install an older-epoch shadow
+  on the new holder. The holder then validates against it until the next
+  drain tick strands it. Refuse the install (queue the op for replay
+  directly) when this node holds a higher epoch.
+- The takeover gate is best effort. If a local replay fails, the view
+  opens with ops still queued, and the drain replays them later, out of
+  order with ops the new holder has already accepted.
+- Release and handoff fence new mutations only through the handoff pause
+  (time-bounded to 2 s) and `release()`'s view clear. A FUSE thread's
+  check-then-write is not atomic with the round. Replace this with a
+  drop-reset "releasing" flag on `LeaseView`, held for the whole
+  final-flush-plus-CAS section.
+
 ### M4 — Hygiene and history checkers
 
 1. **Error-code robustness.**

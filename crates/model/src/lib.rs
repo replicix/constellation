@@ -28,6 +28,15 @@
 //! exactly-once forwarding on top of `Today`; see the "Action → code
 //! mapping" and "Simplifications" sections below for what changed.
 //!
+//! [`protocol::Protocol::Recovery`] (plan 30 §M3a) adds the requester
+//! half of the speculation log on top of `ExactlyOnce`: shadows retire by
+//! rid, a segment or takeover at a higher epoch strands them (rolled back
+//! and queued for replay by rid), `ReplayStranded` replays them through
+//! the current holder, the takeover gate replays them locally before the
+//! new holder validates anything, and a node with an outstanding shadow
+//! does not publish. `Recovery` also bounds authority in time the way
+//! `LeaseView::usable` does (see `protocol::Protocol`'s doc).
+//!
 //! # What is modeled
 //!
 //! - **Actors.** `N` `Node`s (2–3 across the tests) plus one implicit
@@ -70,15 +79,17 @@
 //! | `ClientInvoke` (node holds) | `crates/cli/src/fusefs.rs::mutate_op_rebasable` (`open_for_new_mutation()` branch → `execute_mutate`) |
 //! | `ClientInvoke` (node forwards) | `crates/cli/src/fusefs.rs::mutate_op_rebasable` (`SyncRequest::Forward` send) + `crates/cli/src/forward.rs::request_mutate_with` |
 //! | `DeliverForwardRequest` | `crates/cli/src/node_runtime.rs` `SyncRequest::Mutate` arm → `crates/cli/src/forward.rs::holder_execute` |
-//! | `DeliverForwardReply` (Accepted) | `crates/cli/src/forward.rs::apply_accepted` (`shadow_insert` + `apply_foreign`) |
+//! | `DeliverForwardReply` (Accepted) | `crates/cli/src/forward.rs::apply_accepted` → `Meta::install_shadow` (a `spec` row of kind `Shadow`; skipped when `completed` already has the rid) |
+//! | `DeliverForwardReply` (replay reply, `Recovery`) | `crates/cli/src/recovery.rs::drain_pending_replays` (accepted → a fresh shadow; refused → `.constellation-conflict/` copy) |
+//! | `ReplayStranded` (`Recovery`) | `crates/cli/src/recovery.rs::drain_pending_replays` (`SyncRequest::Forward` with the stranded rid) |
 //! | `ForwardTimeout` | `crates/cli/src/forward.rs::request_mutate_with`'s `tokio::time::timeout` → `MutateOutcome::Busy` |
 //! | `RetryForward` (`ExactlyOnce` only) | `crates/cli/src/forward.rs::request_mutate_with`'s same-rid retry loop: the same holder if `state.lease` (the model's stand-in for the peer directory's belief) still names it, else the redirected one — plan 30 §M2's "retry the same rid... same holder... then a redirected holder" |
 //! | `RequestHandoff` / `DeliverHandoffRequest` / `DeliverHandoffReply` | `crates/cli/src/node_runtime.rs` `SyncRequest::HandOff` arm (`ship.sync_one` + `LeaseKeeper::release`) and the `peers.request_lease` fast-path retry in the `SyncRequest::Acquire` arm |
-//! | `AcquireLease` | `crates/cli/src/lease.rs::LeaseKeeper::classify`/`commit` (`Plan::Create`/`Plan::Claim`, `TailedToHead`) + `crates/cli/src/shipper.rs::acquire_lease_for`/`tail_to_head` |
+//! | `AcquireLease` | `crates/cli/src/lease.rs::LeaseKeeper::classify`/`commit` (`Plan::Create`/`Plan::Claim`, `TailedToHead`) + `crates/cli/src/shipper.rs::acquire_lease_for`/`tail_to_head`; under `Recovery` also the takeover gate (`LeaseKeeper::commit_gated` → `recovery::takeover_gate`: `Meta::strand_below_epoch` + `recovery::replay_locally`) |
 //! | `Renew` (success / deposition) | `crates/cli/src/lease.rs::LeaseKeeper::renew_now` → `diagnose_lost_renew` → `mark_lost` |
 //! | `Ship` (incl. collision absorption) | `crates/cli/src/shipper.rs::ship_part` (`put_segment` create-if-absent; `Err(AlreadyExists) => tail_part`) |
-//! | `Tail` (fencing + shadow retirement) | `crates/cli/src/shipper.rs::apply_decoded_segment` (epoch fencing, `apply_foreign`, `shadow_retire_matching`) |
-//! | `Publish` | `crates/cli/src/mtree_publish.rs::TreePublisher::publish`/`publish_batch` |
+//! | `Tail` (fencing + shadow retirement) | `crates/cli/src/shipper.rs::apply_decoded_segment` (epoch fencing) → `Meta::apply_segment` (stranding rollback/redo, apply, retirement by rid under `Recovery`; record equality before M3a) |
+//! | `Publish` | `crates/cli/src/mtree_publish.rs::TreePublisher::publish`/`publish_batch` (deferred while `Meta::has_outstanding_speculation`, `Recovery`) |
 //! | `Crash` | fail-stop (harness `kill9`; `LeaseKeeper`'s "deposition is terminal" module doc) |
 //! | `Restart` | fail-stop-then-rejoin with the durable journal intact (`crates/cli/src/shipper.rs::bootstrap`, minus lease authority) |
 //! | `Pause` / `Resume` | a stopped node whose timers keep running (the shape of `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` in `node_runtime.rs`'s `SyncRequest::Mutate` task, generalized to the whole node) |
@@ -151,7 +162,17 @@
 //!    holder side has the same shape" of bug B) but a different one from
 //!    what `single_writer_is_clean` exists to rule out. A lingering
 //!    *shadow* (a forwarded op the log will never confirm — the actual
-//!    bug B shape) is unaffected by this gate.
+//!    bug B shape) is unaffected by this gate. `Recovery` keeps this
+//!    gate; plan 30 §M3b replaces it with log-prefix publishing from the
+//!    holder.
+//! 10. `Recovery` does not require convergence while the lease still
+//!     names a crashed node (`failover_pending`): nobody can tell a dead
+//!     holder from a slow one, so a shadow it accepted is in doubt, not
+//!     stranded, until some node takes over — which is what the next write
+//!     anywhere does. A refused replay is dropped rather than materialized
+//!     (the model has no conflict files), and a replay may be re-sent at
+//!     most `MAX_REPLAY_ATTEMPTS` times (the real drain retries forever;
+//!     each retry only mints a fresh message id).
 
 pub mod namespace;
 pub mod protocol;

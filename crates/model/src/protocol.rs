@@ -1,6 +1,6 @@
 //! The `stateright::Model` implementation itself: state, actions,
-//! transitions and properties for the "Today" authority protocol (plan
-//! 30 §M1). See the crate-level docs for the action → code mapping table
+//! transitions and properties for the authority protocol variants of plan
+//! 30 (`Today` from §M1, `ExactlyOnce` from §M2, `Recovery` from §M3a). See the crate-level docs for the action → code mapping table
 //! and the list of deliberate simplifications.
 
 use crate::namespace::{eval, force_apply, DirState, Errno, NamespaceSpec, NsOp, NsRet, Record};
@@ -102,12 +102,49 @@ const MAX_FORWARD_RETRIES: u8 = 3;
 /// (`forward.rs::MutateOutcome`, reduced: `Busy` and `NotHolder` are the
 /// same fallback for the caller — see `fusefs.rs`'s `Busy | NotHolder`
 /// arm — so this model only has `NotHolder`).
+///
+/// `Accepted` carries the epoch the answering holder executed (or first
+/// executed) the op under (`MutateOutcome::Accepted { epoch, .. }`): a
+/// `Recovery` shadow remembers it, so a later segment or takeover at a
+/// higher epoch recognizes the shadow as stranded (`ShadowEntry::epoch`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Outcome {
-    Accepted(Record),
+    Accepted(Record, Epoch),
     Errno(Errno),
     NotHolder,
 }
+
+/// One outstanding requester shadow (plan 30 §M3a's `spec` entry of kind
+/// `Shadow { rid, epoch }`, reduced to what the model's rules read): the
+/// op's rid (retirement and replay are by rid under `Recovery`), the
+/// epoch that accepted it (stranding compares it against applied
+/// segments and takeovers), and the record it installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShadowEntry {
+    pub rid: Rid,
+    pub epoch: Epoch,
+    pub rec: Record,
+}
+
+/// `Recovery` only: a stranded op queued for replay by rid
+/// (`Meta::pending_replays`), in original order. `inflight` is the `corr`
+/// of the replay request currently awaiting a reply, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ReplayEntry {
+    pub rid: Rid,
+    pub op: NsOp,
+    pub inflight: Option<MsgId>,
+    /// How many replay requests this entry has sent. Capped at
+    /// [`MAX_REPLAY_ATTEMPTS`] for the same reason `ClientOp::attempts`
+    /// is: the real drain retries forever, but every retry mints a fresh
+    /// message id, so an uncapped retry loop only grows the state space
+    /// without reaching a new kind of state.
+    pub attempts: u8,
+}
+
+/// Replay requests one stranded op may send before the model stops
+/// offering `ReplayStranded` for it (see [`ReplayEntry::attempts`]).
+const MAX_REPLAY_ATTEMPTS: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MsgBody {
@@ -159,9 +196,14 @@ pub struct Node {
     pub applied_seq: Seq,
     /// Unshipped local records, in order (the fjall journal).
     pub journal: Vec<Logged>,
-    /// At most one outstanding shadow row (`shadow_insert`), matching the
-    /// one-client-op-per-node simplification below.
-    pub shadow: Option<Record>,
+    /// Outstanding shadows (`forward.rs::apply_accepted`), oldest first.
+    /// `Today`/`ExactlyOnce` never hold more than one at a time (one
+    /// client op per node); `Recovery` can briefly hold a replayed op's
+    /// shadow next to a new client op's.
+    pub shadows: Vec<ShadowEntry>,
+    /// `Recovery` only: stranded ops awaiting replay by rid, oldest first
+    /// (`Meta::pending_replays`). Durable, like the `spec` keyspace.
+    pub replays: Vec<ReplayEntry>,
     pub client_op: Option<ClientOp>,
     /// Ops this node's (single, serialized) FUSE-calling client will
     /// still issue, oldest first.
@@ -177,8 +219,9 @@ pub struct Node {
     /// this node has executed as holder but not yet shipped, so a retry
     /// against the same still-live holder gets an identical reply without
     /// re-executing. Volatile: lost on `Restart`, unlike the durable,
-    /// log-derived `completed` table (see `rid_completed_record`).
-    pub recent: Vec<(Rid, Record)>,
+    /// log-derived `completed` table (see `rid_completed_record`). The
+    /// epoch is the one the op executed under, answered back on a retry.
+    pub recent: Vec<(Rid, Record, Epoch)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -219,6 +262,10 @@ pub enum Action {
     RequestHandoff(NodeId),
     DeliverHandoffRequest(MsgId),
     DeliverHandoffReply(MsgId),
+    /// `Recovery` only: replay the oldest stranded op by rid — locally if
+    /// this node holds a usable lease, else to whoever `state.lease`
+    /// names (`recovery::drain_pending_replays`).
+    ReplayStranded(NodeId),
     Tail(NodeId),
     Ship(NodeId),
     Renew(NodeId),
@@ -242,15 +289,47 @@ pub enum Action {
 ///   before `AcquireLease` would otherwise re-execute a `NeedsLease` op.
 ///   `RetryForward` is also only ever offered under this variant — see
 ///   the comments at all three call sites.
-/// - `Recovery` (M3) would replace "stranded journal never resolves"
-///   (the `Renew` deposition arm, and `Crash`) with an explicit
-///   reintegration action.
+/// - `Recovery` (M3a, the requester side of plan 30 §M3), layered on
+///   `ExactlyOnce` (replay by rid is only exactly-once because of M2's
+///   dedup):
+///   - a shadow carries the epoch that accepted it and retires by rid
+///     (`Completed { rid }` in an applied segment), not by record
+///     equality;
+///   - applying a segment whose epoch is higher than an outstanding
+///     shadow's strands the shadow: it is rolled back (dropped from the
+///     overlay) and queued for replay by rid (`tail_one`);
+///   - `ReplayStranded` replays the oldest queued op through whoever
+///     holds the lease, or executes it locally when this node does;
+///   - the takeover gate: `AcquireLease` strands every shadow below the
+///     new epoch and executes every queued replay locally, in order,
+///     before anything validates against the replica;
+///   - `Publish` is not offered while a shadow is outstanding;
+///   - a requester never installs a shadow for a rid its applied log
+///     already completed (the reply raced the requester's own tail);
+///   - authority is time-bounded (`authority`): a holder whose lease
+///     expired or moved may not execute or ship, as
+///     `LeaseView::usable`/`LeaseKeeper::ship_epoch` enforce. `Today` and
+///     `ExactlyOnce` keep the looser "trust `held_epoch` until `Renew`"
+///     abstraction M1 shipped with.
+///
+///   The holder side (a holder's own unshipped journal as speculation,
+///   log-prefix publishing from a holder) is M3b; simplification 9 still
+///   gates `Publish` on an empty journal.
 /// - `Positions`/`Backup`/`FlexEpochs`/`Delegation` (M6/M9/M10/M11) each
 ///   extend `State`/`Action` further; none are added speculatively here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Protocol {
     Today,
     ExactlyOnce,
+    Recovery,
+}
+
+impl Protocol {
+    /// Rid-keyed dedup (plan 30 §M2): `ExactlyOnce`, and `Recovery` on
+    /// top of it.
+    fn dedups(self) -> bool {
+        matches!(self, Protocol::ExactlyOnce | Protocol::Recovery)
+    }
 }
 
 /// A model instance: which protocol variant, how many nodes, the bounds
@@ -266,9 +345,22 @@ pub struct AuthorityModel {
     pub allow_restart: bool,
     pub allow_pause: bool,
     pub allow_lossy: bool,
+    /// Same-rid forward retries offered per client op (`RetryForward`,
+    /// dedup variants only). Defaults to plan 30 §M2's three; a config
+    /// that is about something else (bug B's stranding shape) may lower
+    /// it to keep exhaustive exploration inside the test budget.
+    pub max_forward_retries: u8,
     pub initial_holder: Option<NodeId>,
     pub initial_expiry: Tick,
     pub workload: Vec<(NodeId, NsOp)>,
+    /// `within_boundary`'s message-id backstop (see its doc comment).
+    /// Defaults to 200, generous enough for `Today`/`ExactlyOnce`'s
+    /// smaller action set. `Recovery` adds a whole extra dimension
+    /// (shadows/replays and `ReplayStranded`) that multiplies branching
+    /// per state; a config that needs exhaustive `Recovery` exploration
+    /// inside the test budget lowers this explicitly rather than relying
+    /// on the generous default meant for the other two variants.
+    pub max_next_id: MsgId,
 }
 
 impl AuthorityModel {
@@ -283,9 +375,11 @@ impl AuthorityModel {
             allow_restart: false,
             allow_pause: false,
             allow_lossy: true,
+            max_forward_retries: MAX_FORWARD_RETRIES,
             initial_holder: None,
             initial_expiry: 0,
             workload: Vec::new(),
+            max_next_id: 200,
         }
     }
 
@@ -335,9 +429,54 @@ impl AuthorityModel {
         self
     }
 
+    pub fn with_forward_retries(mut self, n: u8) -> Self {
+        self.max_forward_retries = n;
+        self
+    }
+
     pub fn with_op(mut self, node: NodeId, op: NsOp) -> Self {
         self.workload.push((node, op));
         self
+    }
+
+    pub fn with_max_next_id(mut self, n: MsgId) -> Self {
+        self.max_next_id = n;
+        self
+    }
+}
+
+impl AuthorityModel {
+    /// `forward.rs::apply_accepted` → `Meta::install_shadow`: apply an
+    /// accepted op ahead of the log. Under `Recovery` the install is
+    /// skipped when this replica's applied log already completed the rid
+    /// (the reply lost a race with the requester's own tail), since the
+    /// effect is then already part of the log prefix and re-applying it
+    /// on top of later records would move the replica backwards.
+    fn install_shadow(&self, s: &mut State, id: NodeId, rid: Rid, epoch: Epoch, rec: Record) {
+        if self.protocol == Protocol::Recovery && rid_in_applied_log(s, id, rid) {
+            return;
+        }
+        s.nodes[id as usize]
+            .shadows
+            .push(ShadowEntry { rid, epoch, rec });
+    }
+
+    /// Execute a stranded op locally, by rid, as the holder
+    /// (`recovery::replay_locally`): skipped if the rid already took
+    /// effect (M2 dedup), journaled if it still validates, and otherwise
+    /// refused — the real code materializes that refusal as a conflict
+    /// copy; the model just drops it.
+    fn replay_locally(&self, s: &mut State, id: NodeId, rid: Rid, op: NsOp) {
+        if rid_completed_record(s, id, rid).is_some() {
+            return;
+        }
+        let base = node_replica(s, id);
+        let (ret, _) = eval(base, op);
+        if ret == NsRet::Ok {
+            let epoch = s.nodes[id as usize].held_epoch.unwrap_or(0);
+            s.nodes[id as usize].journal.push((Some(rid), op));
+            s.nodes[id as usize].recent.push((rid, op, epoch));
+        }
     }
 }
 
@@ -357,7 +496,8 @@ fn is_live(state: &State, id: NodeId) -> bool {
 /// §M2's `completed` keyspace (`replay.rs::apply_one`'s `Completed`
 /// arm, folded into the same pass since nothing here ever needs the two
 /// separately).
-fn log_fold(log: &[Option<Segment>], upto: Seq) -> (DirState, Epoch, Vec<(Rid, Record)>) {
+#[allow(clippy::type_complexity)]
+fn log_fold(log: &[Option<Segment>], upto: Seq) -> (DirState, Epoch, Vec<(Rid, Record, Epoch)>) {
     let mut dir: DirState = 0;
     let mut max_epoch: Epoch = 0;
     let mut completions = Vec::new();
@@ -368,7 +508,7 @@ fn log_fold(log: &[Option<Segment>], upto: Seq) -> (DirState, Epoch, Vec<(Rid, R
                 for (rid, r) in &seg.records {
                     dir = force_apply(dir, *r);
                     if let Some(rid) = rid {
-                        completions.push((*rid, *r));
+                        completions.push((*rid, *r, seg.epoch));
                     }
                 }
                 max_epoch = max_epoch.max(seg.epoch);
@@ -387,22 +527,60 @@ fn log_state_and_epoch(log: &[Option<Segment>], upto: Seq) -> (DirState, Epoch) 
 /// segment it has tailed carries the completion (durable, survives
 /// `Restart` — the `completed` keyspace), or `id` itself executed it as
 /// holder and still has it in the volatile `recent` map (not yet
-/// shipped). Only ever consulted under `Protocol::ExactlyOnce`. Returns
-/// the record the rid produced, so the caller can answer with an
-/// identical outcome rather than deriving one afresh.
-fn rid_completed_record(state: &State, id: NodeId, rid: Rid) -> Option<Record> {
+/// shipped). Only ever consulted by the dedup variants. Returns the
+/// record the rid produced and the epoch it took effect under (the
+/// segment's, or the executing tenure's), so the caller can answer with
+/// an identical outcome rather than deriving one afresh — and so a
+/// `Recovery` shadow installed from a dedup answer is never stranded by
+/// a segment that precedes the one completing it.
+fn rid_completed_record(state: &State, id: NodeId, rid: Rid) -> Option<(Record, Epoch)> {
     let node = &state.nodes[id as usize];
     let (_, _, completions) = log_fold(&state.log, node.applied_seq);
     completions
         .into_iter()
-        .find(|(r, _)| *r == rid)
-        .map(|(_, rec)| rec)
+        .find(|(r, _, _)| *r == rid)
+        .map(|(_, rec, epoch)| (rec, epoch))
         .or_else(|| {
             node.recent
                 .iter()
-                .find(|(r, _)| *r == rid)
-                .map(|(_, rec)| *rec)
+                .find(|(r, _, _)| *r == rid)
+                .map(|(_, rec, epoch)| (*rec, *epoch))
         })
+}
+
+/// Whether `id`'s applied log prefix already carries `rid`'s completion
+/// (the `completed` keyspace alone, without the holder's `recent` map).
+/// `Recovery`'s requester consults it before installing a shadow: a
+/// reply that arrives after the requester already tailed the segment
+/// completing it must not be re-applied on top of later records
+/// (`Meta::install_shadow`).
+fn rid_in_applied_log(state: &State, id: NodeId, rid: Rid) -> bool {
+    let node = &state.nodes[id as usize];
+    let (_, _, completions) = log_fold(&state.log, node.applied_seq);
+    completions.iter().any(|(r, _, _)| *r == rid)
+}
+
+/// The epoch `id` may execute and ship under right now, if any.
+///
+/// `Today`/`ExactlyOnce` trust the node's cached `held_epoch` until a
+/// `Renew` notices deposition (M1's abstraction). `Recovery` also models
+/// the time bound the real `LeaseView::usable`/`LeaseKeeper::ship_epoch`
+/// enforce: the lease register must still name this node at this epoch,
+/// unreleased and unexpired. Without it a holder whose lease expired
+/// could still execute forwarded ops and ship them after a takeover,
+/// which the real code forbids and which would make `Recovery`'s
+/// takeover-time replay look like a double execution.
+fn authority(state: &State, id: NodeId, protocol: Protocol) -> Option<Epoch> {
+    let held = state.nodes[id as usize].held_epoch?;
+    if protocol != Protocol::Recovery {
+        return Some(held);
+    }
+    let lease = &state.lease;
+    (lease.holder == Some(id)
+        && lease.epoch == held
+        && !lease.released
+        && lease.expires_at > state.tick)
+        .then_some(held)
 }
 
 /// The highest occupied log slot. Always contiguous from 1 (see the
@@ -417,14 +595,15 @@ fn log_head(log: &[Option<Segment>]) -> Seq {
 }
 
 /// What a node's replica currently shows: the log-derived state at its
-/// own `applied_seq`, overlaid with its pending shadow (a forwarded op's
-/// reply, applied ahead of the log — `forward.rs::apply_accepted`) and
-/// its own unshipped journal (a holder's local writes not yet shipped).
+/// own `applied_seq`, overlaid with its outstanding shadows (forwarded
+/// ops' replies, applied ahead of the log — `forward.rs::apply_accepted`)
+/// and its own unshipped journal (a holder's local writes not yet
+/// shipped).
 fn node_replica(state: &State, id: NodeId) -> DirState {
     let node = &state.nodes[id as usize];
     let (mut dir, _) = log_state_and_epoch(&state.log, node.applied_seq);
-    if let Some(r) = node.shadow {
-        dir = force_apply(dir, r);
+    for sh in &node.shadows {
+        dir = force_apply(dir, sh.rec);
     }
     for (_, r) in &node.journal {
         dir = force_apply(dir, *r);
@@ -433,11 +612,16 @@ fn node_replica(state: &State, id: NodeId) -> DirState {
 }
 
 /// Apply exactly the next log slot to `id`'s tailer state
-/// (`shipper.rs::apply_decoded_segment`): advance `applied_seq`, and, if
-/// the segment was not fenced out, retire a matching shadow row
-/// (`shadow_retire_matching`). Panics if there is no next slot to apply;
-/// callers only invoke this when `log_head > applied_seq`.
-fn tail_one(s: &mut State, id: NodeId) {
+/// (`shipper.rs::apply_decoded_segment` → `Meta::apply_segment`): advance
+/// `applied_seq` and, if the segment was not fenced out, retire the
+/// shadows it confirms. `Today`/`ExactlyOnce` match by record equality
+/// (the pre-M3a `shadow_retire_matching`); `Recovery` matches by rid and
+/// then strands every remaining shadow whose epoch this segment
+/// supersedes — rolled back (dropped from the overlay, which
+/// `node_replica` reads live) and queued for replay by rid. Panics if
+/// there is no next slot to apply; callers only invoke this when
+/// `log_head > applied_seq`.
+fn tail_one(s: &mut State, id: NodeId, protocol: Protocol) {
     let node = &s.nodes[id as usize];
     let (_, max_before) = log_state_and_epoch(&s.log, node.applied_seq);
     let target = node.applied_seq + 1;
@@ -445,13 +629,28 @@ fn tail_one(s: &mut State, id: NodeId) {
         .clone()
         .expect("caller checked log_head > applied_seq");
     let fenced = seg.epoch > 0 && seg.epoch < max_before;
-    s.nodes[id as usize].applied_seq = target;
-    if !fenced {
-        if let Some(sh) = s.nodes[id as usize].shadow {
-            if seg.records.iter().any(|(_, r)| *r == sh) {
-                s.nodes[id as usize].shadow = None;
-            }
+    let node = &mut s.nodes[id as usize];
+    node.applied_seq = target;
+    if fenced {
+        return;
+    }
+    if protocol == Protocol::Recovery {
+        node.shadows
+            .retain(|sh| !seg.records.iter().any(|(rid, _)| *rid == Some(sh.rid)));
+        let (stranded, kept): (Vec<ShadowEntry>, Vec<ShadowEntry>) =
+            node.shadows.iter().partition(|sh| sh.epoch < seg.epoch);
+        node.shadows = kept;
+        for sh in stranded {
+            node.replays.push(ReplayEntry {
+                rid: sh.rid,
+                op: sh.rec,
+                inflight: None,
+                attempts: 0,
+            });
         }
+    } else {
+        node.shadows
+            .retain(|sh| !seg.records.iter().any(|(_, r)| *r == sh.rec));
     }
 }
 
@@ -461,7 +660,7 @@ fn tail_one(s: &mut State, id: NodeId) {
 /// holder racing a new one) is absorbed by tailing that slot instead,
 /// exactly once, matching `Err(AlreadyExists) => { self.tail_part(...); }`.
 /// Returns whether the journal ended up empty (shipped, or already was).
-fn try_ship_once(s: &mut State, id: NodeId, max_seq: Seq) -> bool {
+fn try_ship_once(s: &mut State, id: NodeId, max_seq: Seq, protocol: Protocol) -> bool {
     let node = &s.nodes[id as usize];
     if node.journal.is_empty() {
         return true;
@@ -470,10 +669,11 @@ fn try_ship_once(s: &mut State, id: NodeId, max_seq: Seq) -> bool {
     if target > max_seq {
         return false;
     }
+    let Some(epoch) = authority(s, id, protocol) else {
+        // `ship_epoch()` is `None`: nothing ships until a renewal.
+        return false;
+    };
     if s.log[target as usize].is_none() {
-        let epoch = s.nodes[id as usize]
-            .held_epoch
-            .expect("Ship requires holding");
         let records = std::mem::take(&mut s.nodes[id as usize].journal);
         s.log[target as usize] = Some(Segment {
             node: id,
@@ -483,7 +683,7 @@ fn try_ship_once(s: &mut State, id: NodeId, max_seq: Seq) -> bool {
         s.nodes[id as usize].applied_seq = target;
         true
     } else {
-        tail_one(s, id);
+        tail_one(s, id, protocol);
         s.nodes[id as usize].journal.is_empty()
     }
 }
@@ -491,13 +691,13 @@ fn try_ship_once(s: &mut State, id: NodeId, max_seq: Seq) -> bool {
 /// A handoff's inline flush: keep absorbing collisions and re-attempting
 /// the ship until the journal is empty or the log is full
 /// (`node_runtime.rs`'s `HandOff` arm: `ship.sync_one` then `release()`).
-fn flush_for_handoff(s: &mut State, id: NodeId, max_seq: Seq) -> bool {
+fn flush_for_handoff(s: &mut State, id: NodeId, max_seq: Seq, protocol: Protocol) -> bool {
     loop {
         if s.nodes[id as usize].journal.is_empty() {
             return true;
         }
         let before = s.nodes[id as usize].applied_seq;
-        if !try_ship_once(s, id, max_seq) && s.nodes[id as usize].applied_seq == before {
+        if !try_ship_once(s, id, max_seq, protocol) && s.nodes[id as usize].applied_seq == before {
             // Log is full and no progress was made: decline the handoff,
             // keeping the lease ("declining is always safe").
             return false;
@@ -537,7 +737,8 @@ impl Model for AuthorityModel {
                 held_epoch: None,
                 applied_seq: 0,
                 journal: Vec::new(),
-                shadow: None,
+                shadows: Vec::new(),
+                replays: Vec::new(),
                 client_op: None,
                 pending_ops: Vec::new(),
                 incarnation: 0,
@@ -630,8 +831,8 @@ impl Model for AuthorityModel {
                                         // meaningful once there is
                                         // dedup on the other end to
                                         // retry safely against.
-                                        if self.protocol == Protocol::ExactlyOnce
-                                            && cop.attempts < MAX_FORWARD_RETRIES
+                                        if self.protocol.dedups()
+                                            && cop.attempts < self.max_forward_retries
                                         {
                                             actions.push(Action::RetryForward(id));
                                         }
@@ -643,7 +844,7 @@ impl Model for AuthorityModel {
                     Phase::WaitingHandoff { .. } => {}
                 }
             }
-            if node.held_epoch.is_some()
+            if authority(state, id, self.protocol).is_some()
                 && !node.journal.is_empty()
                 && node.applied_seq < self.max_seq
             {
@@ -654,6 +855,17 @@ impl Model for AuthorityModel {
             }
             if log_head(&state.log) > node.applied_seq {
                 actions.push(Action::Tail(id));
+            }
+            // Plan 30 §M3a: replay the oldest stranded op, in order — only
+            // once its previous request (if any) has been answered, and
+            // only when there is somewhere to send it: this node itself
+            // (usable authority) or a holder the lease names elsewhere.
+            if let Some(head) = node.replays.first() {
+                let target_exists = authority(state, id, self.protocol).is_some()
+                    || state.lease.holder.is_some_and(|h| h != id);
+                if head.inflight.is_none() && head.attempts < MAX_REPLAY_ATTEMPTS && target_exists {
+                    actions.push(Action::ReplayStranded(id));
+                }
             }
             // `mtree_publish` runs on the same per-partition sync cycle
             // that ships first (`node_runtime.rs`'s round: `ship_all`,
@@ -669,7 +881,13 @@ impl Model for AuthorityModel {
             // `single_writer_is_clean` exists to rule out. A lingering
             // *shadow* (the actual bug B shape) is untouched by this
             // gate and still reaches `Publish`.
-            if node.journal.is_empty() {
+            // Plan 30 §M3a publish rule, `Recovery` only: a node with an
+            // outstanding shadow does not publish (`TreePublisher::publish`
+            // defers while `Meta::has_outstanding_speculation`). Queued
+            // replays do not block it: stranded effects are already rolled
+            // back, so the replica is a log prefix plus live shadows.
+            let speculating = self.protocol == Protocol::Recovery && !node.shadows.is_empty();
+            if node.journal.is_empty() && !speculating {
                 actions.push(Action::Publish(id));
             }
             if self.max_crashes > state.crashes_used {
@@ -721,7 +939,7 @@ impl Model for AuthorityModel {
                     incarnation: s.nodes[id as usize].incarnation,
                     seq,
                 };
-                let held = s.nodes[id as usize].held_epoch;
+                let held = authority(&s, id, self.protocol);
                 if held.is_some() {
                     // Fast path: `fusefs.rs::mutate_op_rebasable`'s
                     // `view.open_for_new_mutation()` branch — a
@@ -784,25 +1002,29 @@ impl Model for AuthorityModel {
                 // never executed again"). Refusals are never recorded —
                 // only `Ok` outcomes reach `completed`/`recent` — so a
                 // retried refused op is re-evaluated at the retry.
-                let dedup = self.protocol == Protocol::ExactlyOnce;
-                let cached = if dedup {
+                let dedup = self.protocol.dedups();
+                let held = authority(&s, to, self.protocol);
+                // `holder_execute` answers `NotHolder` before it looks at
+                // anything else; `Today`/`ExactlyOnce` keep M1/M2's order
+                // (dedup first), which only matters for a node that is no
+                // longer holder but still remembers the rid.
+                let cached = if dedup && (held.is_some() || self.protocol != Protocol::Recovery) {
                     rid_completed_record(&s, to, rid)
                 } else {
                     None
                 };
-                let held = s.nodes[to as usize].held_epoch;
-                let outcome = if let Some(rec) = cached {
-                    Outcome::Accepted(rec)
-                } else if held.is_some() {
+                let outcome = if let Some((rec, epoch)) = cached {
+                    Outcome::Accepted(rec, epoch)
+                } else if let Some(epoch) = held {
                     let base = node_replica(&s, to);
                     let (ret, _) = eval(base, op);
                     match ret {
                         NsRet::Ok => {
                             s.nodes[to as usize].journal.push((Some(rid), op));
                             if dedup {
-                                s.nodes[to as usize].recent.push((rid, op));
+                                s.nodes[to as usize].recent.push((rid, op, epoch));
                             }
-                            Outcome::Accepted(op)
+                            Outcome::Accepted(op, epoch)
                         }
                         NsRet::Err(e) => Outcome::Errno(e),
                     }
@@ -832,11 +1054,11 @@ impl Model for AuthorityModel {
                     if let Phase::WaitingReply { corr: waiting, .. } = cop.phase {
                         if waiting == corr {
                             match outcome {
-                                Outcome::Accepted(rec) => {
+                                Outcome::Accepted(rec, epoch) => {
                                     // `forward.rs::apply_accepted`: shadow
                                     // insert + apply immediately, ahead of
                                     // the log.
-                                    s.nodes[to as usize].shadow = Some(rec);
+                                    self.install_shadow(&mut s, to, cop.rid, epoch, rec);
                                     completed = Some(NsRet::Ok);
                                 }
                                 Outcome::Errno(e) => completed = Some(NsRet::Err(e)),
@@ -851,6 +1073,34 @@ impl Model for AuthorityModel {
                 if let Some(ret) = completed {
                     s.history.push(HistEvt::Return(to, ret));
                     s.nodes[to as usize].client_op = None;
+                }
+                // Plan 30 §M3a: or the reply to a replay-by-rid request.
+                // Client forwards and replays each mint their own `corr`,
+                // so at most one of the two ever matches.
+                let replay = s.nodes[to as usize]
+                    .replays
+                    .iter()
+                    .position(|r| r.inflight == Some(corr));
+                if let Some(i) = replay {
+                    let entry = s.nodes[to as usize].replays[i];
+                    match outcome {
+                        Outcome::Accepted(rec, epoch) => {
+                            // Replayed: a fresh shadow under the new
+                            // holder's epoch, retiring like any other.
+                            s.nodes[to as usize].replays.remove(i);
+                            self.install_shadow(&mut s, to, entry.rid, epoch, rec);
+                        }
+                        Outcome::Errno(_) => {
+                            // Refused: the real code materializes a
+                            // `.constellation-conflict/` copy and counts
+                            // it; the model has no conflict files, so the
+                            // op is simply resolved.
+                            s.nodes[to as usize].replays.remove(i);
+                        }
+                        Outcome::NotHolder => {
+                            s.nodes[to as usize].replays[i].inflight = None;
+                        }
+                    }
                 }
             }
             Action::ForwardTimeout(id) => {
@@ -914,8 +1164,8 @@ impl Model for AuthorityModel {
                     MsgBody::HandoffReq { from, to, corr } => (from, to, corr),
                     _ => return None,
                 };
-                let ok = if s.nodes[to as usize].held_epoch.is_some() {
-                    if flush_for_handoff(&mut s, to, self.max_seq) {
+                let ok = if authority(&s, to, self.protocol).is_some() {
+                    if flush_for_handoff(&mut s, to, self.max_seq, self.protocol) {
                         s.nodes[to as usize].held_epoch = None;
                         s.lease.released = true;
                         true
@@ -953,10 +1203,10 @@ impl Model for AuthorityModel {
                 }
             }
             Action::Tail(id) => {
-                tail_one(&mut s, id);
+                tail_one(&mut s, id, self.protocol);
             }
             Action::Ship(id) => {
-                try_ship_once(&mut s, id, self.max_seq);
+                try_ship_once(&mut s, id, self.max_seq, self.protocol);
             }
             Action::Renew(id) => {
                 let epoch = s.nodes[id as usize]
@@ -985,6 +1235,37 @@ impl Model for AuthorityModel {
                     released: false,
                 };
                 s.nodes[id as usize].held_epoch = Some(new_epoch);
+                if self.protocol == Protocol::Recovery {
+                    // Plan 30 §M3a takeover gate
+                    // (`shipper::acquire_lease_for` → `LeaseKeeper::
+                    // commit_gated`): after tailing to head and winning
+                    // the CAS, but before this node validates anything
+                    // against its replica, strand every shadow the new
+                    // epoch supersedes and execute every queued replay
+                    // locally, in original order. The client op below
+                    // therefore never sees phantom state, and a stranded
+                    // op lands before any op that arrives after the
+                    // takeover.
+                    let node = &mut s.nodes[id as usize];
+                    let (stranded, kept): (Vec<ShadowEntry>, Vec<ShadowEntry>) =
+                        node.shadows.iter().partition(|sh| sh.epoch < new_epoch);
+                    node.shadows = kept;
+                    for sh in stranded {
+                        node.replays.push(ReplayEntry {
+                            rid: sh.rid,
+                            op: sh.rec,
+                            inflight: None,
+                            attempts: 0,
+                        });
+                    }
+                    // In-flight ones too: their target's authority ended
+                    // with this CAS, so it can only answer `NotHolder`,
+                    // and that late answer then matches nothing.
+                    let queued = std::mem::take(&mut s.nodes[id as usize].replays);
+                    for entry in queued {
+                        self.replay_locally(&mut s, id, entry.rid, entry.op);
+                    }
+                }
                 // `mutate_op_rebasable`: `require_lease_for` succeeding
                 // falls straight into `execute_mutate`, synchronously —
                 // but under `ExactlyOnce`, only after checking whether
@@ -995,7 +1276,7 @@ impl Model for AuthorityModel {
                 // every completion up to the point the takeover
                 // happened).
                 if let Some(cop) = s.nodes[id as usize].client_op.clone() {
-                    let dedup = self.protocol == Protocol::ExactlyOnce;
+                    let dedup = self.protocol.dedups();
                     let cached = if dedup {
                         rid_completed_record(&s, id, cop.rid)
                     } else {
@@ -1013,6 +1294,39 @@ impl Model for AuthorityModel {
                     };
                     s.history.push(HistEvt::Return(id, ret));
                     s.nodes[id as usize].client_op = None;
+                }
+            }
+            Action::ReplayStranded(id) => {
+                // Plan 30 §M3a recovery step 3: "replay the stranded ops,
+                // by rid and in original order, to the current sequencer
+                // (or execute them locally if this node is now the
+                // holder)". No `Invoke`/`Return` is recorded: the client
+                // already got its answer when the op was first accepted;
+                // replay only makes the log agree with that answer.
+                let entry = *s.nodes[id as usize].replays.first()?;
+                if entry.inflight.is_some() {
+                    return None;
+                }
+                if authority(&s, id, self.protocol).is_some() {
+                    s.nodes[id as usize].replays.remove(0);
+                    self.replay_locally(&mut s, id, entry.rid, entry.op);
+                } else {
+                    let h = s.lease.holder.filter(|h| *h != id)?;
+                    let corr = s.next_id;
+                    s.next_id += 1;
+                    s.network.push(Envelope {
+                        id: corr,
+                        body: MsgBody::MutateReq {
+                            from: id,
+                            to: h,
+                            corr,
+                            op: entry.op,
+                            rid: entry.rid,
+                        },
+                    });
+                    let head = &mut s.nodes[id as usize].replays[0];
+                    head.inflight = Some(corr);
+                    head.attempts += 1;
                 }
             }
             Action::Publish(id) => {
@@ -1046,6 +1360,11 @@ impl Model for AuthorityModel {
                 s.nodes[id as usize].incarnation += 1;
                 s.nodes[id as usize].next_seq = 0;
                 s.nodes[id as usize].recent.clear();
+                // The replay queue is durable (`pending_replay`); a
+                // request that was in flight is simply re-sent later.
+                for entry in &mut s.nodes[id as usize].replays {
+                    entry.inflight = None;
+                }
             }
             Action::Pause(id) => {
                 s.nodes[id as usize].paused = true;
@@ -1077,8 +1396,14 @@ impl Model for AuthorityModel {
     /// forever" edge (e.g. a handoff that always declines because the
     /// log is full) fails a bounded exploration loudly instead of
     /// hanging the checker.
+    ///
+    /// `max_next_id` (default 200) is `Recovery`'s escape valve: its
+    /// added shadow/replay dimension multiplies branching per state far
+    /// beyond what `Today`/`ExactlyOnce` reach at the same message-id
+    /// budget, so a `Recovery` config that needs exhaustive coverage
+    /// inside the test time/memory budget lowers it explicitly.
     fn within_boundary(&self, state: &State) -> bool {
-        state.next_id < 200 && state.history.len() < 64
+        state.next_id < self.max_next_id && state.history.len() < 64
     }
 }
 
@@ -1096,8 +1421,26 @@ fn prop_linearizable(_m: &AuthorityModel, s: &State) -> bool {
     tester.is_consistent()
 }
 
+/// No client op is in flight anywhere, and (`Recovery`) no live node
+/// still has a stranded op waiting to be replayed: a queued replay is
+/// outstanding work exactly like an in-flight client op.
 fn no_client_op_in_flight(s: &State) -> bool {
-    s.nodes.iter().all(|n| n.client_op.is_none())
+    s.nodes
+        .iter()
+        .all(|n| n.client_op.is_none() && (!n.alive || n.replays.is_empty()))
+}
+
+/// `Recovery` only: the lease still names a node that has crashed, so
+/// nobody has failed over yet. Stranding is detected only by a segment
+/// or a takeover at a higher epoch (a requester can never tell a dead
+/// holder from a slow one — plan 30 §2 constraint 5), so until some node
+/// takes over, a shadow accepted by the dead holder is still legitimately
+/// in doubt rather than stranded: the real cluster resolves it at the
+/// next write anyone makes, which is what a takeover is. This mirrors the
+/// dead holder's own unshipped journal, which
+/// `every_durable_slot_applied_everywhere` already exempts.
+fn failover_pending(s: &State) -> bool {
+    s.lease.holder.is_some_and(|h| !s.nodes[h as usize].alive)
 }
 
 /// "Every durable slot is applied on every live node" — but a live node
@@ -1113,8 +1456,11 @@ fn every_durable_slot_applied_everywhere(s: &State) -> bool {
         .all(|n| !n.alive || (n.applied_seq == head && n.journal.is_empty()))
 }
 
-fn prop_converged_at_quiescence(_m: &AuthorityModel, s: &State) -> bool {
+fn prop_converged_at_quiescence(m: &AuthorityModel, s: &State) -> bool {
     if !no_client_op_in_flight(s) || !every_durable_slot_applied_everywhere(s) {
+        return true;
+    }
+    if m.protocol == Protocol::Recovery && failover_pending(s) {
         return true;
     }
     let head = log_head(&s.log);
