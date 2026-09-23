@@ -71,6 +71,8 @@ struct SyncDispatchCtx {
     placement: Arc<placement::Placement>,
     sync_tx: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
     peers: constellation_net::Peers,
+    /// Plan 30 §M13: the S3 inbox, [`dispatch_forward`]'s last resort.
+    inbox: Arc<crate::inbox::InboxRuntime>,
 }
 
 /// `SyncRequest::Mutate` dispatch: a peer forwarded a mutation to this
@@ -293,8 +295,14 @@ fn dispatch_forward(
         // not sit on an in-flight permit that a disjoint forward could
         // use.
         let keys = forward::conflict_keys(&op, &ctx.meta);
-        let _gate = ctx.forward.gate.acquire(keys).await;
-        let _permit = ctx.forward.inflight.clone().acquire_owned().await;
+        let gate = ctx.forward.gate.acquire(keys).await;
+        let permit = ctx
+            .forward
+            .inflight
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("forward inflight semaphore is never closed");
         let mut holder = ctx.forward.cached_holder(&part);
         // A cache hit naming *this* node is not trustworthy on its own:
         // this node was the holder at some earlier point (the only way
@@ -336,17 +344,46 @@ fn dispatch_forward(
         // does with forwarding off. Also drop the cache entry so the
         // next forward re-reads who holds the lease.
         let outcome = if let Some(mut holder) = holder.filter(|holder| *holder != ctx.node_id) {
-            let mut outcome = forward::request_mutate(
-                &ctx.peers,
-                &ctx.forward,
-                &part,
-                ctx.node_id,
-                holder,
-                &op,
-                rid,
-                ctx.forward.acked_through(),
-            )
-            .await;
+            // Plan 30 §M13 (round 3a's rule): P2P is the path whenever
+            // the directory knows the holder and no transport failure to
+            // it has outlasted `CONSTELLATION_INBOX_P2P_GRACE_MS` — a peer
+            // never talked to is dialed, as before M13. Only when there is
+            // no path is the inbox the path, and then no request is made
+            // and no retry backoff paid. A slow or timing-out reply within
+            // the grace stays on M2's same-rid retries and the lease
+            // fallback below, exactly as before M13.
+            let p2p = ctx.inbox.p2p_reaches(&ctx.peers, holder);
+            if !p2p {
+                tracing::debug!(
+                    part,
+                    holder,
+                    p2p_enabled = ctx.peers.is_enabled(),
+                    outage_ms = ctx.inbox.outage_ms(holder),
+                    "no P2P path to the holder: forwarding through its inbox"
+                );
+            }
+            if p2p && ctx.inbox.pending_ops() > 0 {
+                // Per-requester FIFO across a path switch: ops this node
+                // queued through the inbox land before this one.
+                ctx.inbox
+                    .wait_quiescent(std::time::Duration::from_secs(10))
+                    .await;
+            }
+            let mut outcome = if p2p {
+                forward::request_mutate(
+                    &ctx.peers,
+                    &ctx.forward,
+                    &part,
+                    ctx.node_id,
+                    holder,
+                    &op,
+                    rid,
+                    ctx.forward.acked_through(),
+                )
+                .await
+            } else {
+                constellation_meta::MutateOutcome::Busy
+            };
             // Plan 30 §M2: a timeout/transport error/Busy leaves this op
             // in doubt, not refused — retry the *same rid* a few times
             // (a slow holder is more common than a dead one) before
@@ -356,7 +393,8 @@ fn dispatch_forward(
             // reply updates the cache (`request_mutate_with`'s
             // `note_holder`) before the next attempt reads it.
             let mut attempt = 0u32;
-            while matches!(outcome, constellation_meta::MutateOutcome::Busy)
+            while p2p
+                && matches!(outcome, constellation_meta::MutateOutcome::Busy)
                 && attempt < forward::MAX_FORWARD_RETRY_ATTEMPTS
             {
                 attempt += 1;
@@ -390,6 +428,31 @@ fn dispatch_forward(
                     )
                     .await;
                 }
+            }
+            if p2p {
+                // What the attempts learned about the path (round 3a).
+                ctx.inbox
+                    .note_p2p_attempt(&ctx.peers, holder, &outcome)
+                    .await;
+            }
+            // Plan 30 §M13: no P2P path to the holder — through its S3
+            // inbox. The ordering guards go with the op and are released
+            // once it is queued (see `forward_via_inbox`). `Busy` back
+            // means the inbox could not be used either (no live holder to
+            // leave it with, S3 refused the batch, or the deadline
+            // passed); the caller's lease path resolves the rid against
+            // `completed` after its takeover gate has drained whatever
+            // this op left in the bucket.
+            if !p2p && matches!(outcome, constellation_meta::MutateOutcome::Busy) {
+                outcome = crate::inbox::forward_via_inbox(
+                    &ctx.inbox,
+                    &ctx.meta,
+                    &part,
+                    &op,
+                    rid,
+                    Some((gate, permit)),
+                )
+                .await;
             }
             if let constellation_meta::MutateOutcome::Exists {
                 ref records,
@@ -646,6 +709,12 @@ const SYNC_IDLE_MAX_MS: u64 = 10_000;
 /// A node that *holds* a lease is clamped tighter still — see
 /// [`lease_poll_cap_ms`], because this deadline is also the only thing
 /// driving lease renewal.
+/// Plan 30 §M13 round 2: the floor of a sync round's sleep while the
+/// inbox needs it hot (a holder polling a requester that is writing, a
+/// requester waiting on an outcome). Below this the round's own
+/// overhead dominates.
+const INBOX_MIN_ROUND_MS: u64 = 5;
+
 fn next_poll_ms(interval_ms: u64, idle_rounds: u32, max_ms: u64) -> u64 {
     // Shifting by >= 64 is UB-adjacent nonsense and the product overflows
     // long before that; either way the answer is "the ceiling".
@@ -784,6 +853,8 @@ pub struct NodeRuntime {
     upload: Arc<crate::UploadRuntime>,
     forward: Arc<forward::ForwardState>,
     placement: Arc<placement::Placement>,
+    /// Plan 30 §M13: the S3 inbox runtime (`status.inbox`).
+    inbox: Arc<crate::inbox::InboxRuntime>,
     departed: Arc<AtomicBool>,
     /// Node-level read-time atime accumulator + counters (plan 20),
     /// shared by every view's FUSE fs and drained by the flush ticker.
@@ -820,6 +891,11 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
+    /// Plan 30 §M13: the S3 inbox runtime, for `status.inbox`.
+    pub fn inbox(&self) -> &Arc<crate::inbox::InboxRuntime> {
+        &self.inbox
+    }
+
     /// Per-node setup: open the backend/replica/cache, claim or validate
     /// node identity, start the lease keeper, P2P endpoint, periodic GC,
     /// and the metadata shipper/sync task. No view is mounted yet.
@@ -1226,7 +1302,8 @@ impl NodeRuntime {
                 store.inner().clone(),
             ))
             .context("loading write-eligible roster")?;
-        epochs.set_roster(roster);
+        epochs.set_roster(roster.clone());
+        let initial_roster = roster;
 
         let designations = Arc::new(designation::DesignationManager::new(
             constellation_store_s3::designation::DesignationStore::new(
@@ -1275,6 +1352,25 @@ impl NodeRuntime {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(SYNC_IDLE_MAX_MS);
+        // Plan 30 §M13: the S3 inbox — both the requester queue and the
+        // holder poll state; one submitter task per node.
+        let inbox = crate::inbox::InboxRuntime::new(
+            node_id,
+            incarnation,
+            store.inner().clone(),
+            e2e_keys.clone(),
+            lease_mode,
+            peers.clone(),
+            interval_ms,
+            keeper.ttl_ms(),
+            std::env::var("CONSTELLATION_COMPLETION_RETENTION_S")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(crate::gc::DEFAULT_COMPLETION_RETENTION_S),
+        );
+        inbox.set_roster(initial_roster);
+        inbox.spawn_submitter(&rt);
+        inbox.spawn_escalator(&rt, sync_tx.clone(), lease_views.clone());
         let ship = shipper::Shipper::attach_with_mode(meta.clone(), log, node_id, lease_mode)?;
         let spool = ship.spool.clone();
         let mut ship = ship;
@@ -1284,6 +1380,7 @@ impl NodeRuntime {
         }
         ship.set_peers(peers.clone());
         ship.set_designations(designations.clone());
+        ship.set_inbox(inbox.clone());
         // Plan 28 §11: publish the §P6 tree on the publish cadence.
         // A read-only member publishes nothing: it ships no segments, so
         // it has no authority to commit one.
@@ -1447,11 +1544,22 @@ impl NodeRuntime {
                 node_id,
                 meta.clone(),
             );
+            let inbox_roster = inbox.clone();
+            let sync_tx_roster = sync_tx.clone();
             rt.spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     match constellation_store_s3::write_eligible_roster(store_inner.clone()).await {
-                        Ok(roster) => epochs.set_roster(roster),
+                        Ok(roster) => {
+                            // A requester this holder has not polled yet
+                            // (a node that mounted after our last read):
+                            // poll it now rather than after the sync
+                            // loop's idle backoff (plan 30 M13 round 2).
+                            if inbox_roster.set_roster(roster.clone()) {
+                                let _ = sync_tx_roster.send(fusefs::SyncRequest::Nudge);
+                            }
+                            epochs.set_roster(roster)
+                        }
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
@@ -1716,6 +1824,7 @@ impl NodeRuntime {
                 placement: placement.clone(),
                 sync_tx: sync_tx.clone(),
                 peers: peers.clone(),
+                inbox: inbox.clone(),
             };
             rt.spawn(async move {
                 let mut pending: Option<fusefs::SyncRequest> = None;
@@ -2345,10 +2454,14 @@ impl NodeRuntime {
                                 let head_after = spool.lock().unwrap().head_seq;
                                 let backlog =
                                     constellation_meta::MetaStore::journal_len(&*meta).unwrap_or(0);
+                                // Plan 30 §M13: an op waiting on its inbox
+                                // outcome needs the log tailed at the base
+                                // interval, not the idle ceiling.
                                 let productive = nudged
                                     || head_after != head_before
                                     || backlog > 0
-                                    || !poll_triggered;
+                                    || !poll_triggered
+                                    || dispatch_ctx.inbox.pending_ops() > 0;
                                 let was = idle_rounds;
                                 if productive {
                                     idle_rounds = 0;
@@ -2372,6 +2485,19 @@ impl NodeRuntime {
                                 // one backoff interval" instead.
                                 let next_ms = match lease_poll_cap_ms(&keepers).await {
                                     Some(cap) => next_ms.min(cap),
+                                    None => next_ms,
+                                };
+                                // Plan 30 §M13: a holder wakes for its inbox
+                                // polls on their own (per-requester) schedule,
+                                // down to the hot interval; a requester with
+                                // an op waiting on its outcome tails at the
+                                // hot interval too (round 2).
+                                let next_ms = match dispatch_ctx.inbox.holder_min_delay_ms() {
+                                    Some(cap) => next_ms.min(cap.max(INBOX_MIN_ROUND_MS)),
+                                    None => next_ms,
+                                };
+                                let next_ms = match dispatch_ctx.inbox.tail_interval_ms() {
+                                    Some(tail) => next_ms.min(tail.max(INBOX_MIN_ROUND_MS)),
                                     None => next_ms,
                                 };
                                 if productive && was > 0 {
@@ -2440,6 +2566,7 @@ impl NodeRuntime {
             upload,
             forward,
             placement,
+            inbox,
             departed,
             atime,
             prune_stats,
@@ -3400,6 +3527,7 @@ mod tests {
             placement: Arc::new(placement::Placement::new()),
             sync_tx,
             peers: constellation_net::Peers::disabled(),
+            inbox: crate::inbox::InboxRuntime::disabled(1),
         }
     }
 

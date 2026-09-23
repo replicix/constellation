@@ -107,7 +107,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "lease-handover",
-        desc: "A writes then goes idle; B must take the partition lease within seconds and write too",
+        desc: "S3-only pair: each node's sustained block is answered while the other holds, then it takes the lease (plan 30 M13 hybrid) and both converge",
         requires: &[],
         run: lease_handover,
     },
@@ -548,6 +548,30 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M4: S3 requests per node by area on an idle and a busy 3-node cluster; only the lease holder PUTs commits or reads condemned lists",
         requires: &[],
         run: m4::publish_only_holder,
+    },
+    Scenario {
+        name: "inbox-create-storm-p2p-off",
+        desc: "plan 30 M13 (hybrid): with P2P off, two non-holders sustain a create/unlink storm; sustained inbox demand escalates to a lease request, every op gets its errno right, and throughput is never worse than lease ping-pong (>= 41 ops/s)",
+        requires: &[],
+        run: inbox_create_storm_p2p_off,
+    },
+    Scenario {
+        name: "inbox-sporadic-write-p2p-off",
+        desc: "plan 30 M13 (hybrid): with P2P off, a non-holder writes one file every few seconds for a minute through the holder's inbox; zero lease handoffs, no escalation, every write visible on the holder, p50/p99 latency bounded by the warm poll tier",
+        requires: &[],
+        run: inbox_sporadic_write_p2p_off,
+    },
+    Scenario {
+        name: "inbox-requester-crash-mid-batch",
+        desc: "plan 30 M13: a requester dies right after submitting a batch the holder has not read; the batch executes exactly once anyway, and the remounted requester resumes its numbering (LIST-last) so its next batches are polled",
+        requires: &[],
+        run: inbox_requester_crash_mid_batch,
+    },
+    Scenario {
+        name: "inbox-holder-takeover-pending-batch",
+        desc: "plan 30 M13: the holder dies with an unread inbox batch; the next holder's takeover gate drains it before serving, the blocked requester's create returns success (not EIO), and every node sees one inode",
+        requires: &[],
+        run: inbox_holder_takeover_pending_batch,
     },
 ];
 
@@ -2380,20 +2404,38 @@ fn ensure_no_conflicts(clients: &[&Client]) -> Result<()> {
 }
 
 /// Write authority handover on the single shared partition (DESIGN.md
-/// §4): A writes, goes write-idle and cooperatively releases the lease;
-/// B must take it within a couple of seconds — no 60 s TTL wait — and
-/// write its own files. Both nodes then see both sets, the epoch has
-/// advanced across the handover, and neither node recorded a conflict
-/// (with leases the leaseless conflict path must be unreachable).
+/// §4) between two nodes with no P2P path (they share one node key, so
+/// every dial fails "connecting to ourself" — the S3-only cluster). Plan
+/// 30 M13's hybrid changed what the first write from the non-holder
+/// does: it is served through the holder's inbox at once, without
+/// moving the lease (the round-4 note in PROGRESS.md records why the
+/// pre-M13 shape of this scenario — "B's first write blocks until A's
+/// idle release, then B holds" — passed only because that write blocked
+/// for up to half a TTL inside `eventually`). What must hold now, per
+/// round and in both directions: a node that writes a sustained block
+/// while the other holds gets every op answered (through the inbox, then
+/// locally), escalates, and holds the lease itself within one dwell plus
+/// the holder's next renew (half the TTL) plus the wanted grace; both
+/// nodes then see both sets, the epoch advances across every handover,
+/// and neither node recorded a conflict (with leases the leaseless
+/// conflict path must be unreachable).
 fn lease_handover(seed: u64) -> Result<()> {
     let (env, root) = setup("lease-handover")?;
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/lease-{}", ts());
-    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
-    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?;
+    // A holder learns of a waiter at its next renew, half a TTL away:
+    // 10 s keeps the handover inside `HANDOVER` without touching the
+    // dwell/grace rules being exercised.
+    let tune = |c: Client| c.with_env("CONSTELLATION_LEASE_TTL_MS", "10000");
+    let mut c0 = tune(Client::new(root.path(), "c0", &env.endpoint, &backend)?);
+    let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
+
+    /// Dwell (5 s) + half the TTL (5 s) + wanted grace (5 s) + the
+    /// escalator's retry (2 s), with margin.
+    const HANDOVER: Duration = Duration::from_secs(30);
 
     let mut m = Model::default();
     let mut w0 = Workload::new(seed, "a");
@@ -2405,34 +2447,51 @@ fn lease_handover(seed: u64) -> Result<()> {
         Ok(())
     })?;
 
+    // One node's turn: a sustained block of writes (answered whether or
+    // not it holds yet), then it must hold the lease — probing with a
+    // write+remove pair so its demand stays sustained until the holder's
+    // renew sees `wanted_by` and hands over.
+    let turn =
+        |c: &Client, w: &mut Workload, m: &mut Model, who: &str, round: usize| -> Result<u64> {
+            // The other node's block has to be visible here first: the
+            // workload renames and removes what the model says exists.
+            eventually(
+                &format!("{who} sees the other node's block, round {round}"),
+                Duration::from_secs(30),
+                || m.verify(&c.mnt.join("shared")),
+            )?;
+            w.run_block(&c.mnt.join("shared"), m, 25)?;
+            eventually(
+                &format!("{who} holds the lease after its block, round {round}"),
+                HANDOVER,
+                || {
+                    let probe = c.mnt.join(format!("shared/probe-{who}-{round}"));
+                    std::fs::write(&probe, b"p")?;
+                    std::fs::remove_file(&probe)?;
+                    let l = lease_of(c)?;
+                    anyhow::ensure!(
+                        l["held"] == true && l["lost"] == false,
+                        "{who} does not hold the lease: {l}"
+                    );
+                    Ok(())
+                },
+            )?;
+            let inbox = inbox_of(c)?;
+            eprintln!(
+                "    lease-handover: round {round} {who} holds; escalations {} lease_requests {} \
+             inbox_ops {} local_ops {}",
+                inbox["escalations"],
+                inbox["lease_requests"],
+                inbox["inbox_ops"],
+                inbox["local_ops"]
+            );
+            Ok(lease_of(c)?["epoch"].as_u64().unwrap_or(0))
+        };
+
     let mut epochs = Vec::new();
     for round in 0..3 {
-        // A takes (or keeps) authority and writes.
-        w0.run_block(&c0.mnt.join("shared"), &mut m, 25)?;
-        let a_lease = lease_of(&c0)?;
-        anyhow::ensure!(
-            a_lease["held"] == true && a_lease["lost"] == false,
-            "A should hold the lease while writing, got {a_lease}"
-        );
-        epochs.push(a_lease["epoch"].as_u64().unwrap_or(0));
-
-        // A goes write-idle: the cooperative idle release must hand the
-        // lease over quickly, and B's first mutation must then succeed.
-        eventually(
-            &format!("B acquires the lease, round {round}"),
-            Duration::from_secs(15),
-            || {
-                let probe = c1.mnt.join(format!("shared/probe-{round}"));
-                std::fs::write(&probe, b"b")?;
-                std::fs::remove_file(&probe)?;
-                let l = lease_of(&c1)?;
-                anyhow::ensure!(l["held"] == true, "B does not hold the lease: {l}");
-                Ok(())
-            },
-        )?;
-        let b_lease = lease_of(&c1)?;
-        epochs.push(b_lease["epoch"].as_u64().unwrap_or(0));
-        w1.run_block(&c1.mnt.join("shared"), &mut m, 25)?;
+        epochs.push(turn(&c0, &mut w0, &mut m, "A", round)?);
+        epochs.push(turn(&c1, &mut w1, &mut m, "B", round)?);
 
         // Both nodes converge on the union of both nodes' writes.
         eventually(
@@ -2447,8 +2506,17 @@ fn lease_handover(seed: u64) -> Result<()> {
     }
 
     anyhow::ensure!(
-        epochs.windows(2).all(|w| w[1] >= w[0]) && epochs.last() > epochs.first(),
-        "lease epoch must advance across handovers, saw {epochs:?}"
+        epochs.windows(2).all(|w| w[1] > w[0]),
+        "lease epoch must advance across every handover, saw {epochs:?}"
+    );
+    // Non-vacuity: B never held before its first block, so its lease
+    // came from the hybrid's escalation, not from a pre-M13 lease-path
+    // write.
+    let b_inbox = inbox_of(&c1)?;
+    anyhow::ensure!(
+        b_inbox["escalations"].as_u64().unwrap_or(0) >= 1
+            && b_inbox["inbox_ops"].as_u64().unwrap_or(0) >= 1,
+        "B's lease must have come from sustained inbox demand: {b_inbox}"
     );
     ensure_no_conflicts(&[&c0, &c1])?;
     eprintln!("    lease-handover: epochs {epochs:?}");
@@ -7686,4 +7754,638 @@ fn holder_publishes_log_prefix(_seed: u64) -> Result<()> {
     b.unmount()?;
     d.unmount()?;
     checked
+}
+
+// ---------------------------------------------------------------------------
+// Plan 30 M13 — forwarding through S3 when P2P is unavailable.
+//
+// Three scenarios, in [`SCENARIOS`] above: the P2P-off storm (the
+// ping-pong replacement, measured), a requester crash mid-batch, and a
+// holder takeover with a pending batch. Every M13 status field is read
+// through `serde_json::Value` indexing (`status["inbox"]`, see
+// `constellation_api::InboxStatus`), so a renamed field reads as zero and
+// the non-vacuity checks fail loudly.
+// ---------------------------------------------------------------------------
+
+/// Plan 30 M13's `status["inbox"]` block, `Null` (every field zero)
+/// until phase 2 lands.
+fn inbox_of(c: &Client) -> Result<serde_json::Value> {
+    Ok(c.control_status()?["inbox"].clone())
+}
+
+fn inbox_counter(c: &Client, field: &str) -> Result<u64> {
+    Ok(inbox_of(c)?[field].as_u64().unwrap_or(0))
+}
+
+/// Batch objects under `<prefix>/inbox/` right now, by key.
+fn inbox_objects(env: &S3Env, prefix: &str) -> Result<Vec<String>> {
+    Ok(
+        raw_objects(&env.direct_endpoint, &format!("{prefix}/inbox/"))?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect(),
+    )
+}
+
+/// Three P2P-off nodes with a short TTL, the holder on a counting
+/// relay of its own and the two requesters on one each, so requests
+/// per op can be attributed per role. Returns `(env, root, prefix,
+/// holder, r1, r2, counters)`.
+#[allow(clippy::type_complexity)]
+fn inbox_cluster(
+    scenario: &str,
+    ttl_ms: u64,
+) -> Result<(
+    S3Env,
+    tempfile::TempDir,
+    String,
+    Client,
+    Client,
+    Client,
+    [CountingProxy; 3],
+)> {
+    let (env, root) = setup(scenario)?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("{scenario}-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let counters = [
+        env.counting_proxy()?,
+        env.counting_proxy()?,
+        env.counting_proxy()?,
+    ];
+    let mk = |name: &str, endpoint: &str| -> Result<Client> {
+        Ok(Client::new(root.path(), name, endpoint, &backend)?
+            .with_own_node_key()
+            .with_env("CONSTELLATION_P2P", "off")
+            .with_env("CONSTELLATION_LEASE_TTL_MS", &ttl_ms.to_string())
+            // The holder must keep the lease across the whole run: the
+            // point of the inbox is that nobody needs to pull it away.
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000"))
+    };
+    let mut holder = mk("holder", &counters[0].endpoint())?;
+    let mut r1 = mk("r1", &counters[1].endpoint())?;
+    let mut r2 = mk("r2", &counters[2].endpoint())?;
+    holder.fs_create()?;
+    holder.mount()?;
+    r1.mount()?;
+    r2.mount()?;
+
+    std::fs::write(holder.mnt.join(".establish-holder"), b"x")
+        .context("establishing the holder")?;
+    eventually("holder holds the lease", Duration::from_secs(20), || {
+        let lease = lease_of(&holder)?;
+        anyhow::ensure!(lease["held"] == true, "holder not holding: {lease}");
+        Ok(())
+    })?;
+    for r in [&r1, &r2] {
+        eventually(
+            &format!("{} sees the holder's marker", r.name),
+            Duration::from_secs(30),
+            || {
+                anyhow::ensure!(r.mnt.join(".establish-holder").is_file());
+                Ok(())
+            },
+        )?;
+    }
+    Ok((env, root, prefix, holder, r1, r2, counters))
+}
+
+/// The storm under the hybrid (plan 30 M13 round 3b). Two requesters
+/// run a create/read/unlink storm into one shared directory with P2P
+/// off, the shape of `create-storm-s3-only`. Linux serializes creates in
+/// one directory (the parent's `i_rwsem`), so each requester thread's
+/// ops are one sequential inbox round trip each and batches cannot form;
+/// the requesters' demand is therefore *sustained*, they escalate to a
+/// lease request (`wanted_by`, plan 26), and the lease moves between
+/// them at the holder's dwell — today's ping-pong, with the non-holder
+/// of the moment still served by the inbox instead of blocked. The bar
+/// is the revised M13 target: never worse than ping-pong, i.e. at least
+/// `PING_PONG_FLOOR_OPS_PER_S` (the bottom of the 41–57 ops/s band plan
+/// 29 M6 and the round-2 gate measured for `CONSTELLATION_INBOX=off` on
+/// this shape). An absolute floor rather than a same-run baseline: a
+/// baseline needs a second three-node cluster and another storm-length
+/// run, doubling the scenario, for a number the meta-bench sweep already
+/// reports on every gate. Every op must still get its errno right, and
+/// the round-2 breakdown plus escalations/handoffs are printed for the
+/// milestone's measurement table.
+///
+/// Several threads per requester (`THREADS_PER_REQUESTER`), so a
+/// requester keeps the inbox busy in between handoffs and its demand
+/// window fills the way a real multi-process writer's would.
+fn inbox_create_storm_p2p_off(seed: u64) -> Result<()> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    const PING_PONG_FLOOR_OPS_PER_S: f64 = 41.0;
+    const THREADS_PER_REQUESTER: usize = 16;
+    /// Metadata ops per worker round: create, the close's manifest
+    /// commit, unlink.
+    const OPS_PER_FILE: u64 = 3;
+
+    let (_env, _root, _prefix, holder, r1, r2, counters) =
+        inbox_cluster("inbox-create-storm-p2p-off", 20_000)?;
+    let dir = "storm";
+    std::fs::create_dir_all(holder.mnt.join(dir))?;
+    eventually(
+        "storm dir visible on the requesters",
+        Duration::from_secs(30),
+        || {
+            anyhow::ensure!(r1.mnt.join(dir).is_dir() && r2.mnt.join(dir).is_dir());
+            Ok(())
+        },
+    )?;
+    let epoch_before = lease_of(&holder)?["epoch"].as_u64().unwrap_or(0);
+    for c in &counters {
+        c.reset();
+    }
+
+    let storm_secs = std::env::var("CHAOS_CREATE_STORM_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(storm_secs);
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut rng = StdRng::seed_from_u64(seed);
+    let started = std::time::Instant::now();
+    let mut handles = Vec::new();
+    for (idx, mnt) in [r1.mnt.clone(), r2.mnt.clone()].into_iter().enumerate() {
+        for tid in 0..THREADS_PER_REQUESTER {
+            let mnt = mnt.clone();
+            let errors = errors.clone();
+            let dir = dir.to_string();
+            let mut wrng = StdRng::seed_from_u64(rng.random());
+            handles.push(std::thread::spawn(move || -> u64 {
+                let mut n = 0u64;
+                while std::time::Instant::now() < deadline {
+                    n += 1;
+                    let path = mnt.join(&dir).join(format!("w{idx}-t{tid}-{n}"));
+                    let len = wrng.random_range(16..256);
+                    let mut content = format!("worker {idx} file {n} ").into_bytes();
+                    content.resize(len, b'x');
+                    if let Err(e) = std::fs::write(&path, &content) {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("worker {idx} write #{n} ({path:?}): {e}"));
+                        continue;
+                    }
+                    match std::fs::read(&path) {
+                        Ok(got) if got == content => {}
+                        Ok(got) => errors.lock().unwrap().push(format!(
+                            "worker {idx} read #{n}: content mismatch, got {} bytes want {}",
+                            got.len(),
+                            content.len()
+                        )),
+                        Err(e) => errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("worker {idx} read #{n} ({path:?}): {e}")),
+                    }
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("worker {idx} unlink #{n} ({path:?}): {e}"));
+                    }
+                }
+                n
+            }));
+        }
+    }
+    let mut totals = Vec::new();
+    for h in handles {
+        totals.push(
+            h.join()
+                .map_err(|_| anyhow::anyhow!("inbox-create-storm-p2p-off: worker panicked"))?,
+        );
+    }
+    let elapsed = started.elapsed();
+    let errs = errors.lock().unwrap().clone();
+    if !errs.is_empty() {
+        for c in [&holder, &r1, &r2] {
+            eprintln!("--- {} mount.log (tail) ---\n{}", c.name, c.tail_log_n(60));
+        }
+    }
+    anyhow::ensure!(
+        errs.is_empty(),
+        "inbox-create-storm-p2p-off: {} unexpected errno(s) (totals {totals:?}):\n{}",
+        errs.len(),
+        errs.join("\n")
+    );
+
+    let files: u64 = totals.iter().sum();
+    let ops_per_s = (files * OPS_PER_FILE) as f64 / elapsed.as_secs_f64();
+    let roles = ["holder", "r1", "r2"];
+    for (counter, role) in counters.iter().zip(roles) {
+        counter.ensure_sane()?;
+        let requests = counter.requests();
+        let t = crate::reqlog::tally(&requests);
+        eprintln!(
+            "    inbox-create-storm-p2p-off: {role:>6} {t} ({:.2} req/file)\n           by area: {}",
+            t.total() as f64 / files.max(1) as f64,
+            crate::reqlog::breakdown(&requests)
+        );
+    }
+    eprintln!(
+        "    inbox-create-storm-p2p-off: {files} files ({} ops) in {elapsed:?} = {ops_per_s:.1} \
+         ops/s with {THREADS_PER_REQUESTER} threads per requester (ping-pong floor \
+         {PING_PONG_FLOOR_OPS_PER_S} ops/s); per worker {totals:?}",
+        files * OPS_PER_FILE
+    );
+    // The round-2 breakdown (plan 30 M13): where an inbox op's time goes.
+    for r in [&r1, &r2] {
+        let i = inbox_of(r)?;
+        eprintln!(
+            "    inbox-create-storm-p2p-off: {:>3} batches {} ops {} (avg {:.1}/batch, max {}) \
+             queue {:.1}ms + outcome {:.1}ms = {:.1}ms round trip; unavailable {}",
+            r.name,
+            i["submitted_batches"],
+            i["submitted_ops"],
+            i["avg_batch_ops"].as_f64().unwrap_or(0.0),
+            i["largest_batch_ops"],
+            i["avg_queue_wait_ms"].as_f64().unwrap_or(0.0),
+            i["avg_outcome_wait_ms"].as_f64().unwrap_or(0.0),
+            i["avg_round_trip_ms"].as_f64().unwrap_or(0.0),
+            i["unavailable"]
+        );
+    }
+    let h = inbox_of(&holder)?;
+    eprintln!(
+        "    inbox-create-storm-p2p-off: holder polls {} hits {} executed {} refused {} deduped {} \
+         pickup {:.1}ms execute {:.2}ms/hit",
+        h["polls"],
+        h["poll_hits"],
+        h["executed_ops"],
+        h["refused_ops"],
+        h["deduped_ops"],
+        h["avg_pickup_ms"].as_f64().unwrap_or(0.0),
+        h["avg_execute_ms"].as_f64().unwrap_or(0.0)
+    );
+
+    // The hybrid's shape: escalations on the requesters, handoffs as the
+    // epoch delta (each move bumps it), local vs inbox ops per node.
+    let epoch_after = [&holder, &r1, &r2]
+        .iter()
+        .filter_map(|c| lease_of(c).ok()?["epoch"].as_u64())
+        .max()
+        .unwrap_or(epoch_before);
+    let handoffs = epoch_after.saturating_sub(epoch_before);
+    let mut escalations = 0u64;
+    for c in [&holder, &r1, &r2] {
+        let i = inbox_of(c)?;
+        escalations += i["escalations"].as_u64().unwrap_or(0);
+        eprintln!(
+            "    inbox-create-storm-p2p-off: {:>6} escalations {} lease requests {} inbox ops {} \
+             local ops {}",
+            c.name, i["escalations"], i["lease_requests"], i["inbox_ops"], i["local_ops"]
+        );
+    }
+    eprintln!(
+        "    inbox-create-storm-p2p-off: {handoffs} lease handoff(s) (epoch {epoch_before} -> \
+         {epoch_after}), {escalations} escalation(s)"
+    );
+    // Non-vacuity: the requesters submitted batches and the holder
+    // executed ops from them (before any escalation moved the lease).
+    let submitted = inbox_counter(&r1, "submitted_ops")? + inbox_counter(&r2, "submitted_ops")?;
+    let executed: u64 = [&holder, &r1, &r2]
+        .iter()
+        .map(|c| inbox_counter(c, "executed_ops").unwrap_or(0))
+        .sum();
+    anyhow::ensure!(
+        submitted > 0 && executed > 0,
+        "no inbox traffic: submitted_ops={submitted} executed_ops={executed} (status.inbox: {} / {})",
+        inbox_of(&r1)?,
+        inbox_of(&holder)?
+    );
+    // Requester inbox PUTs, for the record (batches cannot amortize on a
+    // VFS-serialized directory; this is not asserted).
+    for (counter, r) in counters[1..].iter().zip([&r1, &r2]) {
+        let puts = counter
+            .requests()
+            .iter()
+            .filter(|req| req.method == "PUT" && req.area() == "inbox")
+            .count() as u64;
+        eprintln!(
+            "    inbox-create-storm-p2p-off: {:>6} {puts} inbox PUTs for {} submitted ops",
+            r.name,
+            inbox_counter(r, "submitted_ops")?
+        );
+    }
+    anyhow::ensure!(
+        ops_per_s >= PING_PONG_FLOOR_OPS_PER_S,
+        "inbox-create-storm-p2p-off: {ops_per_s:.1} ops/s is worse than lease ping-pong's \
+         {PING_PONG_FLOOR_OPS_PER_S} ops/s floor"
+    );
+
+    // Convergence, as in create-storm-s3-only.
+    let mut want = Vec::new();
+    for (idx, mnt) in [&r1.mnt, &r2.mnt].into_iter().enumerate() {
+        let name = format!("marker-{idx}");
+        std::fs::write(mnt.join(dir).join(&name), format!("marker {idx}"))?;
+        want.push(name);
+    }
+    want.sort();
+    eventually("final listing converges", Duration::from_secs(60), || {
+        for mnt in [&holder.mnt, &r1.mnt, &r2.mnt] {
+            let mut names: Vec<String> = std::fs::read_dir(mnt.join(dir))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            anyhow::ensure!(names == want, "{}: {names:?} != {want:?}", mnt.display());
+        }
+        Ok(())
+    })?;
+    ensure_no_conflicts(&[&holder, &r1, &r2])?;
+    let (mut holder, mut r1, mut r2) = (holder, r1, r2);
+    holder.unmount()?;
+    r1.unmount()?;
+    r2.unmount()?;
+    Ok(())
+}
+
+/// The sporadic case the hybrid keeps on the inbox (plan 30 M13 round
+/// 3b). With P2P off, `r1` writes one file every ~3 s for about a minute
+/// while the holder stays put: no lease handoff (the epoch never moves),
+/// no escalation on `r1`, every file visible on the holder, and the
+/// per-write latency printed and bounded. The first write pays the
+/// first-contact tax (the holder learns of `r1` from the 5 s registry
+/// poll) and is printed separately; after it, `r1` is a *warm* requester
+/// on the holder's poll schedule (`CONSTELLATION_INBOX_IDLE_MAX_MS`,
+/// 2 s), so a write waits at most that plus a ship and a hot tail: the
+/// bound is p50 within the warm ceiling and p99 within the warm ceiling
+/// plus a second. Today's path for the same write registers `wanted_by`
+/// and waits for the holder's next lease round (up to TTL/4, 5 s here),
+/// moves the lease, and moves it back on the holder's next write.
+fn inbox_sporadic_write_p2p_off(seed: u64) -> Result<()> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    const WRITES: usize = 16;
+    const WARM_CEILING: Duration = Duration::from_millis(2_000);
+    let (_env, _root, _prefix, holder, r1, r2, _counters) =
+        inbox_cluster("inbox-sporadic-write-p2p-off", 20_000)?;
+    let epoch_before = lease_of(&holder)?["epoch"].as_u64().unwrap_or(0);
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let mut latencies: Vec<Duration> = Vec::with_capacity(WRITES);
+    for i in 0..WRITES {
+        let name = format!("sporadic-{i}");
+        let started = std::time::Instant::now();
+        create_new(&r1.mnt, &name).with_context(|| format!("r1's write {i}"))?;
+        latencies.push(started.elapsed());
+        std::thread::sleep(Duration::from_millis(rng.random_range(2_500..3_500)));
+    }
+    let first = latencies[0];
+    let mut steady: Vec<Duration> = latencies[1..].to_vec();
+    steady.sort();
+    let p50 = steady[steady.len() / 2];
+    let p99 = steady[(steady.len() * 99 / 100).min(steady.len() - 1)];
+    eprintln!(
+        "    inbox-sporadic-write-p2p-off: {WRITES} writes, first {first:?} (first contact), then \
+         p50 {p50:?} p99 {p99:?} max {:?}; r1 {}",
+        steady.last().copied().unwrap_or_default(),
+        inbox_of(&r1)?
+    );
+
+    eventually(
+        "every sporadic write is on the holder",
+        Duration::from_secs(30),
+        || {
+            for i in 0..WRITES {
+                anyhow::ensure!(
+                    holder.mnt.join(format!("sporadic-{i}")).is_file(),
+                    "sporadic-{i} missing on the holder"
+                );
+            }
+            Ok(())
+        },
+    )?;
+    let epoch_after = lease_of(&holder)?["epoch"].as_u64().unwrap_or(0);
+    anyhow::ensure!(
+        lease_of(&holder)?["held"] == true && epoch_after == epoch_before,
+        "the lease moved for sporadic writes (epoch {epoch_before} -> {epoch_after})"
+    );
+    anyhow::ensure!(
+        inbox_counter(&r1, "escalations")? == 0 && inbox_counter(&r1, "lease_requests")? == 0,
+        "a sporadic writer escalated: {}",
+        inbox_of(&r1)?
+    );
+    anyhow::ensure!(
+        inbox_counter(&r1, "inbox_ops")? >= WRITES as u64,
+        "not every write went through the inbox: {}",
+        inbox_of(&r1)?
+    );
+    anyhow::ensure!(
+        p50 <= WARM_CEILING,
+        "p50 {p50:?} exceeds the warm poll ceiling {WARM_CEILING:?}"
+    );
+    anyhow::ensure!(
+        p99 <= WARM_CEILING + Duration::from_secs(1),
+        "p99 {p99:?} exceeds the warm poll ceiling plus a second"
+    );
+    ensure_no_conflicts(&[&holder, &r1, &r2])?;
+    let (mut holder, mut r1, mut r2) = (holder, r1, r2);
+    holder.unmount()?;
+    r1.unmount()?;
+    r2.unmount()?;
+    Ok(())
+}
+
+/// A requester that dies between submitting a batch and learning its
+/// outcome. The holder's S3 is cut so it cannot poll; `r1` submits (its
+/// FUSE thread blocks on the outcome), the batch is observed in the
+/// bucket, `r1` is killed. The holder heals, polls, and executes the
+/// batch — exactly once, though nobody is waiting for it. `r1` remounts
+/// under a new incarnation, resumes its numbering past the batch the
+/// holder kept as its high-water mark, and its next write is polled and
+/// executed, so nothing it submits is ever stranded behind a stale
+/// cursor.
+fn inbox_requester_crash_mid_batch(_seed: u64) -> Result<()> {
+    let (env, _root, prefix, holder, r1, r2, counters) =
+        inbox_cluster("inbox-requester-crash-mid-batch", 20_000)?;
+    let (mut holder, mut r1, mut r2) = (holder, r1, r2);
+    let holder_s3 = &counters[0];
+
+    // The holder cannot read its inbox (or renew) while cut; the TTL is
+    // long enough that nobody takes over meanwhile.
+    holder_s3.cut();
+    let mnt = r1.mnt.clone();
+    let writer = std::thread::spawn(move || create_new(&mnt, "orphan"));
+    eventually(
+        "r1's batch reaches the bucket",
+        Duration::from_secs(20),
+        || {
+            let objects = inbox_objects(&env, &prefix)?;
+            anyhow::ensure!(!objects.is_empty(), "no inbox object yet");
+            Ok(())
+        },
+    )?;
+    let batches_before = inbox_objects(&env, &prefix)?;
+    r1.kill9()?;
+    // The FUSE call died with its mount; whatever it returned is moot.
+    let _ = writer.join();
+    holder_s3.heal();
+
+    // The batch executes without its requester: the name appears on the
+    // holder and on r2, once.
+    eventually(
+        "the orphaned batch executes",
+        Duration::from_secs(30),
+        || {
+            let h = ino_of(&holder.mnt.join("orphan")).context("orphan missing on the holder")?;
+            let o = ino_of(&r2.mnt.join("orphan")).context("orphan missing on r2")?;
+            anyhow::ensure!(
+                h == o,
+                "holder and r2 disagree on orphan's inode: {h} vs {o}"
+            );
+            Ok(())
+        },
+    )?;
+    anyhow::ensure!(
+        inbox_counter(&holder, "executed_ops")? >= 1,
+        "the holder did not count an inbox execution: {}",
+        inbox_of(&holder)?
+    );
+
+    // Remount r1: a new incarnation, numbering resumed by LIST-last, so
+    // its next batch lands where the holder's cursor is.
+    r1.mount()?;
+    eventually(
+        "r1 sees its orphaned create",
+        Duration::from_secs(30),
+        || {
+            anyhow::ensure!(r1.mnt.join("orphan").is_file(), "orphan missing on r1");
+            Ok(())
+        },
+    )?;
+    let ino_r1 = ino_of(&r1.mnt.join("orphan")).context("orphan on r1")?;
+    let ino_h = ino_of(&holder.mnt.join("orphan")).context("orphan on the holder")?;
+    anyhow::ensure!(
+        ino_r1 == ino_h,
+        "one inode everywhere: r1 {ino_r1} vs holder {ino_h}"
+    );
+    create_new(&r1.mnt, "after-restart").context("r1's first write after the restart")?;
+    eventually(
+        "r1's post-restart write executes",
+        Duration::from_secs(30),
+        || {
+            anyhow::ensure!(
+                holder.mnt.join("after-restart").is_file(),
+                "not on the holder yet"
+            );
+            anyhow::ensure!(r2.mnt.join("after-restart").is_file(), "not on r2 yet");
+            Ok(())
+        },
+    )?;
+    let batches_after = inbox_objects(&env, &prefix)?;
+    eprintln!(
+        "    inbox-requester-crash-mid-batch: batches before the kill {batches_before:?}, \
+         after the restart {batches_after:?}; r1 next_n={}",
+        inbox_counter(&r1, "next_n")?
+    );
+    anyhow::ensure!(
+        inbox_counter(&r1, "next_n")? >= 2,
+        "r1 restarted its numbering from zero instead of resuming past its orphaned batch: {}",
+        inbox_of(&r1)?
+    );
+    ensure_no_conflicts(&[&holder, &r1, &r2])?;
+    holder.unmount()?;
+    r1.unmount()?;
+    r2.unmount()?;
+    Ok(())
+}
+
+/// The holder dies with an unread batch. The holder's S3 is cut (it
+/// can neither poll nor renew), `r1` submits a create and blocks on the
+/// outcome, the batch is observed in the bucket, the holder is killed.
+/// `r2` writes, which makes it want the lease once the TTL runs out.
+/// Whoever wins the takeover — `r2` for its own write, or `r1` itself
+/// once its inbox wait finds the register claimable and takes the lease
+/// path — drains the old epoch's inbox inside its takeover gate before
+/// serving, so `r1`'s create returns success (not `EIO`) exactly once,
+/// and the surviving nodes agree on one inode. Non-vacuity: some node's
+/// `drained_batches` rose, and the epoch-1 batch is gone from the bucket
+/// afterwards.
+fn inbox_holder_takeover_pending_batch(_seed: u64) -> Result<()> {
+    const TTL_MS: u64 = 6_000;
+    let (env, _root, prefix, holder, r1, r2, counters) =
+        inbox_cluster("inbox-holder-takeover-pending-batch", TTL_MS)?;
+    let (mut holder, mut r1, mut r2) = (holder, r1, r2);
+    let holder_s3 = &counters[0];
+
+    holder_s3.cut();
+    let mnt = r1.mnt.clone();
+    let writer = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        (create_new(&mnt, "pending"), started.elapsed())
+    });
+    eventually(
+        "r1's batch reaches the bucket",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(
+                !inbox_objects(&env, &prefix)?.is_empty(),
+                "no inbox object yet"
+            );
+            Ok(())
+        },
+    )?;
+    holder.kill9()?;
+
+    // r2's own write forces a takeover once the dead holder's lease
+    // expires (r1's pending inbox wait may win it instead); the winner's
+    // gate drains r1's batch first.
+    std::fs::write(r2.mnt.join("after"), b"r2").context("r2's post-crash write")?;
+    eventually(
+        "someone took the lease over",
+        Duration::from_secs(30),
+        || {
+            let (l1, l2) = (lease_of(&r1)?, lease_of(&r2)?);
+            anyhow::ensure!(
+                l1["held"] == true || l2["held"] == true,
+                "nobody holds yet: r1 {l1} r2 {l2}"
+            );
+            Ok(())
+        },
+    )?;
+    let (result, waited) = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("r1's writer thread panicked"))?;
+    result.with_context(|| {
+        format!("r1's create must succeed through the new holder's drain (waited {waited:?})")
+    })?;
+    eprintln!("    inbox-holder-takeover-pending-batch: r1's create returned after {waited:?}");
+    eventually(
+        "pending visible everywhere as one inode",
+        Duration::from_secs(30),
+        || {
+            let a = ino_of(&r1.mnt.join("pending")).context("pending missing on r1")?;
+            let b = ino_of(&r2.mnt.join("pending")).context("pending missing on r2")?;
+            anyhow::ensure!(a == b, "r1 and r2 disagree on pending's inode: {a} vs {b}");
+            anyhow::ensure!(r1.mnt.join("after").is_file(), "r2's write not on r1 yet");
+            Ok(())
+        },
+    )?;
+    let drained = inbox_counter(&r1, "drained_batches")? + inbox_counter(&r2, "drained_batches")?;
+    anyhow::ensure!(
+        drained >= 1,
+        "no takeover gate drained the old epoch's inbox: r1 {} r2 {}",
+        inbox_of(&r1)?,
+        inbox_of(&r2)?
+    );
+    // The stale batch is gone once its outcome shipped.
+    eventually(
+        "old-epoch batches are GC'd",
+        Duration::from_secs(30),
+        || {
+            let left: Vec<String> = inbox_objects(&env, &prefix)?
+                .into_iter()
+                .filter(|k| k.contains("/inbox/0000000000000001/"))
+                .collect();
+            anyhow::ensure!(left.is_empty(), "epoch-1 batches still present: {left:?}");
+            Ok(())
+        },
+    )?;
+    ensure_no_conflicts(&[&r1, &r2])?;
+    let _ = holder.unmount();
+    r1.unmount()?;
+    r2.unmount()?;
+    Ok(())
 }

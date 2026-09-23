@@ -96,15 +96,21 @@ fn logged_completions(
             postcard::from_bytes(&payload).with_context(|| format!("decoding {key}"))?;
         anyhow::ensure!(v == 2, "{key}: unexpected segment envelope version {v}");
         for (index, rec) in records.iter().enumerate() {
-            if let constellation_meta::LogRecord::Completed { rid } = rec {
-                out.push(constellation_chaos::LoggedCompletion {
-                    segment: seq,
-                    index,
-                    node,
-                    epoch,
-                    rid: (rid.node, rid.incarnation, rid.seq),
-                });
-            }
+            // Plan 30 §M13: a `Refused` (an inbox refusal the holder
+            // shipped) is an outcome too.
+            let (rid, refused) = match rec {
+                constellation_meta::LogRecord::Completed { rid } => (rid, false),
+                constellation_meta::LogRecord::Refused { rid, .. } => (rid, true),
+                _ => continue,
+            };
+            out.push(constellation_chaos::LoggedCompletion {
+                segment: seq,
+                index,
+                node,
+                epoch,
+                rid: (rid.node, rid.incarnation, rid.seq),
+                refused,
+            });
         }
     }
     Ok(out)
@@ -184,7 +190,8 @@ pub(super) fn after_chaos(
         }
         let completions = logged_completions(&env.direct_endpoint, prefix_of(backend)?)?;
         eprintln!(
-            "    exactly_once_log: {} completions across the log, each rid once",
+            "    exactly_once_log: {} outcomes (completions and refusals) across the log, each \
+             rid once",
             completions.len()
         );
         constellation_chaos::check_log_completions(&completions)

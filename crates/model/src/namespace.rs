@@ -72,6 +72,27 @@ pub enum Errno {
 pub enum NsRet {
     Ok,
     Err(Errno),
+    /// Plan 30 §M3b/§M13 (model round 3a): the op was acknowledged by a
+    /// holder that was then deposed before the op reached the log — the
+    /// documented acked-before-durable gap (L2/L3, closed by M9's
+    /// `ack=s3`). Its acknowledgement is *tentative*: the op may still
+    /// land later (its replay by rid executes on the new holder) or
+    /// resolve as a conflict copy, and nothing in between may be required
+    /// to see it. The history is rewritten to this the moment the tenure
+    /// ends (`protocol::mark_tentative`, at the takeover CAS or the
+    /// stranding), and `protocol::prop_linearizable` feeds such an op to
+    /// the checker as an operation still in flight on a thread of its own:
+    /// free to linearize anywhere after its invocation, or not at all.
+    /// Only a deposed holder's own journaled ops get this; an op
+    /// acknowledged to a requester from a shadow is checked strictly.
+    Tentative,
+    /// A tentative op whose replay by rid was refused: the real code
+    /// materializes a `.constellation-conflict/` copy
+    /// (`recovery::materialize_remote`), or counts an `ENOENT`ed unlink
+    /// as satisfied. Fed to the checker exactly like [`NsRet::Tentative`]
+    /// (an in-flight op that need not linearize); kept distinct so a
+    /// history reads as what happened.
+    Conflicted,
 }
 
 /// A durable record: what actually happened, applied unconditionally

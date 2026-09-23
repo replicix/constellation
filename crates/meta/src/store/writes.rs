@@ -114,6 +114,11 @@ impl Meta {
             held_below,
         )?;
         tx.commit()?;
+        // Plan 30 §M13: what shipped is in `completed`; `recent` need not
+        // remember it any more (see `Meta::prune_recent_shipped`).
+        if let Some(&upto) = journal_seqs.iter().max() {
+            self.prune_recent_shipped(upto)?;
+        }
         Ok(())
     }
 

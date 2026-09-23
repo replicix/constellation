@@ -496,9 +496,21 @@ fn enqueue_replay_tx(
 /// "edit-vs-edit"); anything else is re-applied through the replay path
 /// as-is (`MutateOp::Records`).
 fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
+    // Plan 30 §M13: a refusal or an inbox ack is an outcome of the lost
+    // tenure, not an effect to redo. A transaction made only of those
+    // (an inbox refusal, a deduplicated batch position) replays nothing:
+    // the requester re-submits, or the successor's drain re-evaluates.
     let effective: Vec<&LogRecord> = records
         .iter()
-        .filter(|rec| !matches!(rec, LogRecord::Completed { .. } | LogRecord::Atime { .. }))
+        .filter(|rec| {
+            !matches!(
+                rec,
+                LogRecord::Completed { .. }
+                    | LogRecord::Atime { .. }
+                    | LogRecord::Refused { .. }
+                    | LogRecord::InboxAck { .. }
+            )
+        })
         .collect();
     match effective.as_slice() {
         [] => None,
@@ -563,6 +575,15 @@ fn strand_local_tx(
         meta.forget_recent(rid);
     }
     let records: Vec<LogRecord> = rows.into_iter().map(|(_, rec)| rec).collect();
+    // Plan 30 §M13: a refusal this tenure journaled but never shipped was
+    // evaluated against state that is being rolled back; its `completed`
+    // row must go with it, or this node would answer the rid "refused"
+    // from a decision the log never carried.
+    for rec in &records {
+        if let LogRecord::Refused { rid, .. } = rec {
+            tx.remove(&meta.completed, rid.to_key());
+        }
+    }
     let rid = match row.rid {
         Some(rid) => rid,
         None => replay_rid_for(&*tx, meta, first)?,

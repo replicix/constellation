@@ -1408,6 +1408,19 @@ impl ConstellationFs {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
+        // Plan 30 §M13: an inbox refusal is an outcome too — the holder
+        // that refused it may be gone, but the refusal it shipped stands.
+        if attempted_forward {
+            if let Ok(Some(errno)) = self.meta.refused_errno(rid) {
+                h.indoubt_resolved
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(if errno == libc::ESTALE {
+                    MutateFail::Conflict { manifest: None }
+                } else {
+                    MutateFail::Errno(errno)
+                });
+            }
+        }
         constellation_meta::execute_mutate(&self.meta, op, Some(rid))
             .map(|_| ())
             .map_err(mutate_fail)

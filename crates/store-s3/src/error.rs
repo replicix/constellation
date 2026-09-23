@@ -20,6 +20,12 @@ pub enum StoreError {
     #[error("conditional write refused: the object changed since it was read")]
     CasConflict,
 
+    /// An inbox batch (plan 30 §M13) written by a binary whose batch
+    /// format this one does not read. Plan 30 waives compatibility, so
+    /// this is a refusal, never a migration.
+    #[error("inbox batch format version {0} is not supported by this binary")]
+    InboxVersion(u32),
+
     #[error("conflict: {0}")]
     Conflict(String),
 

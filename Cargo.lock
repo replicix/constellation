@@ -1184,6 +1184,7 @@ dependencies = [
  "futures",
  "memmap2",
  "object_store",
+ "postcard",
  "rand 0.9.5",
  "rayon",
  "region",

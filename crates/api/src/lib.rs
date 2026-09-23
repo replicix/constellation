@@ -11,10 +11,10 @@ pub mod web;
 
 pub use types::{
     AtimeStatus, CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry,
-    DoctorStatus, DownloadSession, EpochStatus, InspectStatus, LeaseStatus, ManifestStatus,
-    MountInfo, MountViewOpts, P2pStatus, PeerStatus, PinStatus, PrefetchStatus, PruneRootStatus,
-    PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response, SnapshotStatus, SourceStatus,
-    SpeculationStatus, SpoolStatus, StatusReport, WritebackStatus,
+    DoctorStatus, DownloadSession, EpochStatus, InboxStatus, InspectStatus, LeaseStatus,
+    ManifestStatus, MountInfo, MountViewOpts, P2pStatus, PeerStatus, PinStatus, PrefetchStatus,
+    PruneRootStatus, PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response,
+    SnapshotStatus, SourceStatus, SpeculationStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
 pub use types::{CasProbeStatus, HeldInodeStatus, HeldStatus, PeerPathsStatus};
 
@@ -422,6 +422,7 @@ mod tests {
                 quota: QuotaStatus::default(),
                 atime: AtimeStatus::default(),
                 prune: PruneStatus::default(),
+                inbox: InboxStatus::default(),
             }
         }
 

@@ -448,6 +448,9 @@ pub struct StatusReport {
     /// the op already happened).
     #[serde(default)]
     pub forward_indoubt_resolved: u64,
+    /// Plan 30 §M13: the S3 inbox (forwarding without P2P).
+    #[serde(default)]
+    pub inbox: InboxStatus,
     #[serde(default)]
     pub placement_reason: Option<String>,
     /// Optional cluster-wide logical byte cap and current used bytes.
@@ -774,6 +777,93 @@ pub struct SpeculationStatus {
     pub copies_pending: u64,
     #[serde(default)]
     pub copies_stalled: u64,
+}
+
+/// Plan 30 §M13: the S3 inbox — a non-holder's forwarded mutations
+/// when it has no P2P path to the holder, and the holder's polling of
+/// them. Requester-side counters (`submitted_*`, `resubmitted_ops`,
+/// `unavailable`, `pending_ops`, `next_n`) and holder-side ones
+/// (`executed_ops`, `refused_ops`, `deduped_ops`, `drained_*`, `polls`,
+/// `poll_hits`, `gc_deleted`, `tracked_requesters`) are both reported by
+/// every node; whichever role it plays moves.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InboxStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub submitted_batches: u64,
+    #[serde(default)]
+    pub submitted_ops: u64,
+    /// Ops re-submitted under a newer epoch because a takeover stranded
+    /// their batch.
+    #[serde(default)]
+    pub resubmitted_ops: u64,
+    /// Forwards the inbox could not take (no live holder to leave them
+    /// with, S3 refused the batch, or the in-doubt deadline passed); they
+    /// took the lease path.
+    #[serde(default)]
+    pub unavailable: u64,
+    /// Submitted ops still waiting for their outcome in the log.
+    #[serde(default)]
+    pub pending_ops: u64,
+    /// This node's next batch number under its current epoch.
+    #[serde(default)]
+    pub next_n: u64,
+    #[serde(default)]
+    pub executed_ops: u64,
+    #[serde(default)]
+    pub refused_ops: u64,
+    /// Batch positions answered without executing (rid already had an
+    /// outcome, or the position was below the watermark).
+    #[serde(default)]
+    pub deduped_ops: u64,
+    #[serde(default)]
+    pub drained_batches: u64,
+    #[serde(default)]
+    pub drained_ops: u64,
+    #[serde(default)]
+    pub polls: u64,
+    #[serde(default)]
+    pub poll_hits: u64,
+    #[serde(default)]
+    pub gc_deleted: u64,
+    #[serde(default)]
+    pub tracked_requesters: u64,
+    /// Round-2 instrumentation, requester side: mean time from queueing
+    /// an op to its batch being durable, from durable to its outcome
+    /// applied from the log, and their sum.
+    #[serde(default)]
+    pub avg_queue_wait_ms: f64,
+    #[serde(default)]
+    pub avg_outcome_wait_ms: f64,
+    #[serde(default)]
+    pub avg_round_trip_ms: f64,
+    /// Holder side: mean time from a batch's submission stamp to its
+    /// poll hit (requester and holder clocks), and per-hit execute time.
+    #[serde(default)]
+    pub avg_pickup_ms: f64,
+    #[serde(default)]
+    pub avg_execute_ms: f64,
+    /// Requester side: ops per batch, mean and maximum.
+    #[serde(default)]
+    pub avg_batch_ops: f64,
+    #[serde(default)]
+    pub largest_batch_ops: u64,
+    /// Plan 30 M13 round 3b (the hybrid): whether this node's inbox
+    /// demand is currently sustained enough that it is asking for the
+    /// lease; how many times it started asking; the lease requests it
+    /// sent for that; ops it forwarded through the inbox vs. ops it
+    /// executed locally as holder.
+    #[serde(default)]
+    pub escalated: bool,
+    #[serde(default)]
+    pub escalations: u64,
+    #[serde(default)]
+    pub lease_requests: u64,
+    #[serde(default)]
+    pub inbox_ops: u64,
+    #[serde(default)]
+    pub local_ops: u64,
 }
 
 /// P2P fast-path state. Purely observational: the filesystem is correct

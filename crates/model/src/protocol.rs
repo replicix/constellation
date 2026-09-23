@@ -2,7 +2,10 @@
 //! transitions and properties for the authority protocol variants of plan
 //! 30 (`Today` from §M1, `ExactlyOnce` from §M2, `Recovery` from §M3a
 //! and §M3b). See the crate-level docs for the action → code mapping
-//! table and the list of deliberate simplifications.
+//! table and the list of deliberate simplifications. Plan 30 §M13's S3
+//! inbox (`AuthorityModel::inbox`, an orthogonal "P2P unavailable" knob
+//! rather than a protocol variant) lives in `crate::inbox`; this file
+//! only carries its state and the hooks that call into it.
 
 use crate::namespace::{
     eval, force_apply, present, with_presence, DirState, Errno, NamespaceSpec, NsOp, NsRet, Record,
@@ -79,6 +82,20 @@ pub struct Segment {
     pub node: NodeId,
     pub epoch: Epoch,
     pub records: Vec<Logged>,
+    /// Plan 30 §M13: `Refused { rid, errno }` records shipped in this
+    /// segment — a holder's answer to an inbox-submitted op it refused,
+    /// which has no reply to ride on. Kept beside `records` rather than
+    /// inside `Logged` because nothing folds a refusal into the
+    /// namespace; only outcome lookups read it. `None` when empty (the
+    /// case without the inbox), so a segment costs one word, not a `Vec`
+    /// header, in every state of the configurations that never refuse.
+    pub refused: Option<Box<Vec<(Rid, Errno)>>>,
+}
+
+impl Segment {
+    pub fn refused(&self) -> &[(Rid, Errno)] {
+        self.refused.as_deref().map(Vec::as_slice).unwrap_or(&[])
+    }
 }
 
 /// The S3 lease register (`leases/p0.json`, `store-s3::Lease`), modeled
@@ -109,6 +126,12 @@ pub enum Phase {
     NeedsLease,
     /// Asked the (still-believed-live) holder for a fast handoff.
     WaitingHandoff { corr: MsgId, holder: NodeId },
+    /// Plan 30 §M13: submitted as inbox batch `n` under `epoch`, waiting
+    /// for the outcome to arrive through the log (`crate::inbox`).
+    InboxPending {
+        epoch: Epoch,
+        n: crate::inbox::BatchNo,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -166,6 +189,12 @@ pub struct ShadowEntry {
 pub struct ReplayEntry {
     pub rid: Rid,
     pub op: NsOp,
+    /// Plan 30 §M3b: this is a deposed holder's own journaled op, which
+    /// its client was already answered for; a refused replay of it is a
+    /// materialized conflict copy (`NsRet::Conflicted`), never a lost
+    /// acknowledgement. A stranded *shadow*'s refusal (acked before
+    /// durable, the L2/L3 gap) is not excused this way.
+    pub deposed: bool,
     pub inflight: Option<MsgId>,
     /// How many replay requests this entry has sent. Capped at
     /// [`MAX_REPLAY_ATTEMPTS`] for the same reason `ClientOp::attempts`
@@ -258,12 +287,73 @@ pub struct Node {
     /// Under `Recovery` a Local entry rolled back on deposition takes its
     /// `recent` outcome with it (`strand_local`).
     pub recent: Vec<(Rid, Record, Epoch)>,
+    /// Plan 30 §M13: the node's inbox-side state, boxed and `None` while
+    /// it is at its defaults (no unshipped refusals, every cursor at
+    /// zero) — one word per node in every state of a configuration that
+    /// never uses the inbox (model round 3a's memory trim). Read through
+    /// [`Node::refusals`]/[`Node::cursor`], written through
+    /// [`Node::inbox_mut`] and normalized back to `None` afterwards.
+    pub inbox: Option<Box<NodeInbox>>,
 }
+
+/// See [`Node::inbox`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub struct NodeInbox {
+    /// Plan 30 §M13: refusals of inbox-submitted ops this holder has
+    /// journaled but not yet shipped (`Refused { rid, errno }` rows in
+    /// the fjall journal). Ship with the next segment (`Segment::
+    /// refused`), and count as unshipped work exactly like `journal`.
+    pub refusals: Vec<(Rid, Errno, Epoch)>,
+    /// Plan 30 §M13: this holder's GET-next cursor per requester
+    /// (`InboxPoller`), indexed by node id, for the epoch it holds.
+    /// Volatile and per tenure: reset whenever the held epoch changes.
+    pub cursor: [crate::inbox::BatchNo; MAX_NODES],
+}
+
+impl Node {
+    pub fn refusals(&self) -> &[(Rid, Errno, Epoch)] {
+        self.inbox
+            .as_ref()
+            .map(|i| i.refusals.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn cursor(&self, requester: NodeId) -> crate::inbox::BatchNo {
+        self.inbox
+            .as_ref()
+            .map(|i| i.cursor[requester as usize])
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn inbox_mut(&mut self) -> &mut NodeInbox {
+        self.inbox.get_or_insert_with(Default::default)
+    }
+
+    /// Back to `None` when at the defaults, so equal states hash equal.
+    pub(crate) fn normalize_inbox(&mut self) {
+        if self
+            .inbox
+            .as_ref()
+            .is_some_and(|i| i.refusals.is_empty() && i.cursor == [0; MAX_NODES])
+        {
+            self.inbox = None;
+        }
+    }
+}
+
+/// Upper bound on `n_nodes`, so per-node cursors are a fixed array (no
+/// heap allocation per state — model round 2 trimmed `today_bugs.rs`'s
+/// peak memory back under 2 GB this way).
+pub const MAX_NODES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum HistEvt {
-    Invoke(NodeId, NsOp),
-    Return(NodeId, NsRet),
+    /// The rid identifies the op for `mark_tentative`/`mark_conflicted`
+    /// (model rounds 2–3a): an invocation the checker has already seen
+    /// may later turn out to be tentative, and is then replayed to the
+    /// checker on a thread of its own (`prop_linearizable`).
+    Invoke(NodeId, NsOp, Rid),
+    Return(NodeId, NsRet, Rid),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -281,6 +371,29 @@ pub struct State {
     pub history: Vec<HistEvt>,
     pub next_id: MsgId,
     pub crashes_used: u8,
+    /// Plan 30 §M13: the `inbox/` prefix — every batch object currently
+    /// in the bucket, sorted by `(epoch, node, n)` (the LIST order).
+    /// S3 state like `lease` and `log`, not a message queue. `None` when
+    /// empty (one word per state without the inbox); read through
+    /// [`State::inbox`], written through [`State::inbox_mut`] and
+    /// normalized afterwards.
+    pub inbox: Option<Box<Vec<crate::inbox::InboxBatch>>>,
+}
+
+impl State {
+    pub fn inbox(&self) -> &[crate::inbox::InboxBatch] {
+        self.inbox.as_deref().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub(crate) fn inbox_mut(&mut self) -> &mut Vec<crate::inbox::InboxBatch> {
+        self.inbox.get_or_insert_with(Default::default)
+    }
+
+    pub(crate) fn normalize_inbox(&mut self) {
+        if self.inbox.as_ref().is_some_and(|b| b.is_empty()) {
+            self.inbox = None;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -312,6 +425,16 @@ pub enum Action {
     Pause(NodeId),
     Resume(NodeId),
     DropMessage(MsgId),
+    /// Plan 30 §M13 (`inbox` only): holder `.0` fetches and executes
+    /// requester `.1`'s next batch (`InboxPoller::poll` hitting).
+    PollInbox(NodeId, NodeId),
+    /// Plan 30 §M13: holder deletes every executed batch whose outcome
+    /// its applied log carries (`InboxPoller::delete`).
+    GcInbox(NodeId),
+    /// Plan 30 §M13: a requester whose inbox op was stranded by a
+    /// takeover re-submits the same rid under the new epoch (or resolves
+    /// it against its own applied log first).
+    ResubmitInbox(NodeId),
 }
 
 /// Selects the modeled protocol variant. `Today` (M1) and `ExactlyOnce`
@@ -438,6 +561,26 @@ pub struct AuthorityModel {
     /// actually constrains M3b's holder publish (it is not true merely by
     /// construction).
     pub raw_holder_publish: bool,
+    /// Plan 30 §M13: P2P is unavailable — non-holders submit through
+    /// the S3 inbox instead of forwarding, and no P2P message exists.
+    /// Orthogonal to `protocol` (meant for `Recovery`, whose
+    /// time-bounded `authority` the inbox rules assume). See
+    /// `crate::inbox`.
+    pub inbox: bool,
+    /// `inbox` only, default `true`: the takeover drain deduplicates
+    /// each batch's rid against the log before executing it. `false` is
+    /// the naive variant the tests show double-executes.
+    pub inbox_drain_dedup: bool,
+    /// `inbox` only, default `true`: a `Refused { rid }` in the log (or
+    /// this holder's unshipped refusals) is an outcome and is never
+    /// re-evaluated. `false` is the naive variant (M2's "refusals are not
+    /// recorded" applied to a holder-driven retry) the tests show to
+    /// create phantom effects.
+    pub inbox_record_refusals: bool,
+    /// Names present before any client op runs, as a genesis segment
+    /// (epoch 0, slot 1, no rids) every node has applied. Lets a config
+    /// start with something to unlink or refuse to create.
+    pub genesis: Vec<NsOp>,
 }
 
 impl AuthorityModel {
@@ -458,6 +601,10 @@ impl AuthorityModel {
             workload: Vec::new(),
             max_next_id: 200,
             raw_holder_publish: false,
+            inbox: false,
+            inbox_drain_dedup: true,
+            inbox_record_refusals: true,
+            genesis: Vec::new(),
         }
     }
 
@@ -526,6 +673,33 @@ impl AuthorityModel {
         self.raw_holder_publish = b;
         self
     }
+
+    /// Plan 30 §M13: P2P unavailable, forward through the S3 inbox.
+    pub fn with_inbox(mut self, b: bool) -> Self {
+        self.inbox = b;
+        self
+    }
+
+    pub fn with_inbox_drain_dedup(mut self, b: bool) -> Self {
+        self.inbox_drain_dedup = b;
+        self
+    }
+
+    pub fn with_inbox_record_refusals(mut self, b: bool) -> Self {
+        self.inbox_record_refusals = b;
+        self
+    }
+
+    /// A name that exists before the workload starts (see `genesis`).
+    pub fn with_genesis_present(mut self, name: crate::namespace::Name) -> Self {
+        self.genesis.push(NsOp::CreateExcl(name));
+        self
+    }
+
+    /// The directory state the genesis segment establishes.
+    pub fn genesis_dir(&self) -> DirState {
+        self.genesis.iter().fold(0, |dir, op| force_apply(dir, *op))
+    }
 }
 
 impl AuthorityModel {
@@ -549,8 +723,22 @@ impl AuthorityModel {
     /// effect (M2 dedup), journaled if it still validates, and otherwise
     /// refused — the real code materializes that refusal as a conflict
     /// copy; the model just drops it.
-    fn replay_locally(&self, s: &mut State, id: NodeId, rid: Rid, op: NsOp) {
+    fn replay_locally(&self, s: &mut State, id: NodeId, entry: ReplayEntry) {
+        let ReplayEntry {
+            rid, op, deposed, ..
+        } = entry;
         if rid_completed_record(s, id, rid, self.protocol).is_some() {
+            return;
+        }
+        // Plan 30 §M13 (D1): `recovery::replay_locally` answers a rid a
+        // holder refused through its inbox from `refused_errno` — an
+        // outcome, not a re-evaluation; a deposed holder's replay then
+        // ends as a conflict copy, as a refused P2P replay would.
+        if self.inbox && crate::inbox::rid_refused(s, id, rid, self.inbox_record_refusals).is_some()
+        {
+            if deposed {
+                mark_conflicted(s, rid);
+            }
             return;
         }
         let base = node_replica(s, id);
@@ -559,6 +747,9 @@ impl AuthorityModel {
             let epoch = s.nodes[id as usize].held_epoch.unwrap_or(0);
             self.journal_push(s, id, rid, op, epoch);
             s.nodes[id as usize].recent.push((rid, op, epoch));
+        } else if deposed {
+            // `recovery::replay_locally`'s refusal branch: a conflict copy.
+            mark_conflicted(s, rid);
         }
     }
 
@@ -568,7 +759,14 @@ impl AuthorityModel {
     /// read from the node's replica view as it stands immediately before
     /// the entry applies, which already includes every earlier journal
     /// entry. The other variants capture nothing (see [`JournalEntry`]).
-    fn journal_push(&self, s: &mut State, id: NodeId, rid: Rid, rec: Record, epoch: Epoch) {
+    pub(crate) fn journal_push(
+        &self,
+        s: &mut State,
+        id: NodeId,
+        rid: Rid,
+        rec: Record,
+        epoch: Epoch,
+    ) {
         let entry = if self.protocol == Protocol::Recovery {
             let view = node_replica(s, id);
             JournalEntry {
@@ -605,6 +803,13 @@ impl AuthorityModel {
 fn is_live(state: &State, id: NodeId) -> bool {
     let n = &state.nodes[id as usize];
     n.alive && !n.paused
+}
+
+/// Whether `node` has journal rows its next `Ship` would carry: op
+/// records, or (plan 30 §M13) refusals of inbox-submitted ops, which are
+/// journal rows too and ship the same way.
+fn has_unshipped(node: &Node) -> bool {
+    !node.journal.is_empty() || !node.refusals().is_empty()
 }
 
 /// Replay `log[1..=upto]` applying epoch fencing the way
@@ -666,7 +871,7 @@ fn log_state_and_epoch(log: &[Option<Segment>], upto: Seq) -> (DirState, Epoch) 
 /// gap: the old holder's journal was never visible to the new one) from
 /// running twice. A rolled-back entry leaves the journal, and with it
 /// this answer.
-fn rid_completed_record(
+pub(crate) fn rid_completed_record(
     state: &State,
     id: NodeId,
     rid: Rid,
@@ -701,7 +906,7 @@ fn rid_completed_record(
 /// reply that arrives after the requester already tailed the segment
 /// completing it must not be re-applied on top of later records
 /// (`Meta::install_shadow`).
-fn rid_in_applied_log(state: &State, id: NodeId, rid: Rid) -> bool {
+pub(crate) fn rid_in_applied_log(state: &State, id: NodeId, rid: Rid) -> bool {
     let node = &state.nodes[id as usize];
     let (_, _, completions) = log_fold(&state.log, node.applied_seq);
     completions.iter().any(|(r, _, _)| *r == rid)
@@ -717,7 +922,7 @@ fn rid_in_applied_log(state: &State, id: NodeId, rid: Rid) -> bool {
 /// could still execute forwarded ops and ship them after a takeover,
 /// which the real code forbids and which would make `Recovery`'s
 /// takeover-time replay look like a double execution.
-fn authority(state: &State, id: NodeId, protocol: Protocol) -> Option<Epoch> {
+pub(crate) fn authority(state: &State, id: NodeId, protocol: Protocol) -> Option<Epoch> {
     let held = state.nodes[id as usize].held_epoch?;
     if protocol != Protocol::Recovery {
         return Some(held);
@@ -734,7 +939,7 @@ fn authority(state: &State, id: NodeId, protocol: Protocol) -> Option<Epoch> {
 /// crate doc: every successful `put_segment` targets the writer's own
 /// `applied_seq + 1`, and a collision is absorbed by tailing instead of
 /// writing elsewhere), so this doubles as "how many slots exist".
-fn log_head(log: &[Option<Segment>]) -> Seq {
+pub(crate) fn log_head(log: &[Option<Segment>]) -> Seq {
     log.iter()
         .rposition(|s| s.is_some())
         .map(|i| i as Seq)
@@ -746,7 +951,7 @@ fn log_head(log: &[Option<Segment>]) -> Seq {
 /// ops' replies, applied ahead of the log — `forward.rs::apply_accepted`)
 /// and its own unshipped journal (a holder's local writes not yet
 /// shipped).
-fn node_replica(state: &State, id: NodeId) -> DirState {
+pub(crate) fn node_replica(state: &State, id: NodeId) -> DirState {
     let mut dir = replica_below_journal(state, id);
     for e in &state.nodes[id as usize].journal {
         dir = force_apply(dir, e.rec);
@@ -824,15 +1029,66 @@ fn strand_local(s: &mut State, id: NodeId, below: Epoch) {
     let (stranded, kept): (Vec<JournalEntry>, Vec<JournalEntry>) =
         node.journal.iter().partition(|e| e.epoch < below);
     node.journal = kept;
+    // Plan 30 §M13: an unshipped refusal of the lost tenure is a journal
+    // row like any other — dropped, never replayed (the requester never
+    // saw it; it re-submits, or the successor's drain re-evaluates).
+    if let Some(inbox) = node.inbox.as_mut() {
+        inbox.refusals.retain(|(_, _, e)| *e >= below);
+    }
+    node.normalize_inbox();
+    let mut tentative = Vec::new();
     for e in stranded {
         if let Some(rid) = e.rid {
             node.recent.retain(|(r, _, _)| *r != rid);
             node.replays.push(ReplayEntry {
                 rid,
                 op: e.rec,
+                deposed: true,
                 inflight: None,
                 attempts: 0,
             });
+            if rid.node == id {
+                tentative.push(rid);
+            }
+        }
+    }
+    // Normally already tentative since the takeover CAS; a `Renew`
+    // deposition that precedes any takeover this node could observe is
+    // the case this covers. Own ops only, as at the CAS.
+    for rid in tentative {
+        mark_tentative(s, rid);
+    }
+}
+
+/// Model round 3a: the op `rid` was acknowledged by a holder whose
+/// tenure has now ended with the op unshipped (a takeover CAS by another
+/// node, or the holder's own stranding on learning of one). Its
+/// acknowledgement is tentative from here on — see [`NsRet::Tentative`]
+/// for how the checker treats it. Idempotent.
+fn mark_tentative(s: &mut State, rid: Rid) {
+    for evt in s.history.iter_mut() {
+        if let HistEvt::Return(_, ret, r) = evt {
+            if *r == rid && *ret == NsRet::Ok {
+                *ret = NsRet::Tentative;
+            }
+        }
+    }
+}
+
+/// Model round 2: the op `rid` was acknowledged, its holder deposed
+/// before shipping it, and its replay by rid refused — the real code
+/// materializes a `.constellation-conflict/` copy
+/// (`recovery::materialize_remote`/`materialize_local`, or counts an
+/// `ENOENT`ed unlink as satisfied). Its recorded return becomes
+/// [`NsRet::Conflicted`], which the spec accepts without a directory
+/// effect. Nothing to rewrite if the op never returned (it was answered
+/// by a takeover gate's replay instead) or already conflicted.
+fn mark_conflicted(s: &mut State, rid: Rid) {
+    for evt in s.history.iter_mut() {
+        if let HistEvt::Return(_, ret, r) = evt {
+            if *r == rid && matches!(ret, NsRet::Ok | NsRet::Tentative) {
+                *ret = NsRet::Conflicted;
+            }
         }
     }
 }
@@ -872,6 +1128,10 @@ fn tail_one(s: &mut State, id: NodeId, protocol: Protocol) {
     if fenced {
         return;
     }
+    // Plan 30 §M13: a pending inbox op learns its outcome (or its
+    // stranding) from the segment just applied.
+    crate::inbox::on_tailed(s, id, &seg);
+    let node = &mut s.nodes[id as usize];
     if protocol == Protocol::Recovery {
         node.shadows
             .retain(|sh| !seg.records.iter().any(|(rid, _)| *rid == Some(sh.rid)));
@@ -882,6 +1142,7 @@ fn tail_one(s: &mut State, id: NodeId, protocol: Protocol) {
             node.replays.push(ReplayEntry {
                 rid: sh.rid,
                 op: sh.rec,
+                deposed: false,
                 inflight: None,
                 attempts: 0,
             });
@@ -905,7 +1166,7 @@ fn tail_one(s: &mut State, id: NodeId, protocol: Protocol) {
 /// Returns whether the journal ended up empty (shipped, or already was).
 fn try_ship_once(s: &mut State, id: NodeId, max_seq: Seq, protocol: Protocol) -> bool {
     let node = &s.nodes[id as usize];
-    if node.journal.is_empty() {
+    if !has_unshipped(node) {
         return true;
     }
     let target = node.applied_seq + 1;
@@ -921,16 +1182,26 @@ fn try_ship_once(s: &mut State, id: NodeId, max_seq: Seq, protocol: Protocol) ->
         // entry retires when its record ships"), before-images and all.
         let journal = std::mem::take(&mut s.nodes[id as usize].journal);
         let records = journal.iter().map(|e| (e.rid, e.rec)).collect();
+        let refused: Vec<(Rid, Errno)> = s.nodes[id as usize]
+            .inbox
+            .as_mut()
+            .map(|i| std::mem::take(&mut i.refusals))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(rid, errno, _)| (rid, errno))
+            .collect();
+        s.nodes[id as usize].normalize_inbox();
         s.log[target as usize] = Some(Segment {
             node: id,
             epoch,
             records,
+            refused: (!refused.is_empty()).then(|| Box::new(refused)),
         });
         s.nodes[id as usize].applied_seq = target;
         true
     } else {
         tail_one(s, id, protocol);
-        s.nodes[id as usize].journal.is_empty()
+        !has_unshipped(&s.nodes[id as usize])
     }
 }
 
@@ -939,7 +1210,7 @@ fn try_ship_once(s: &mut State, id: NodeId, max_seq: Seq, protocol: Protocol) ->
 /// (`node_runtime.rs`'s `HandOff` arm: `ship.sync_one` then `release()`).
 fn flush_for_handoff(s: &mut State, id: NodeId, max_seq: Seq, protocol: Protocol) -> bool {
     loop {
-        if s.nodes[id as usize].journal.is_empty() {
+        if !has_unshipped(&s.nodes[id as usize]) {
             return true;
         }
         let before = s.nodes[id as usize].applied_seq;
@@ -981,6 +1252,7 @@ fn ship_epoch_marker(
                 node: id,
                 epoch,
                 records: Vec::new(),
+                refused: None,
             });
             s.nodes[id as usize].applied_seq = target;
             return true;
@@ -994,7 +1266,7 @@ fn ship_epoch_marker(
 /// (`LeaseKeeper::classify`'s `Plan::Claim{needs_tail}` /
 /// `TailedToHead`). `None` means not claimable at all (someone else holds
 /// an unexpired, unreleased lease).
-fn claim_kind(state: &State, id: NodeId) -> Option<bool> {
+pub(crate) fn claim_kind(state: &State, id: NodeId) -> Option<bool> {
     match state.lease.holder {
         None => Some(false),
         Some(h) if h == id && !state.lease.released => Some(false),
@@ -1013,6 +1285,10 @@ impl Model for AuthorityModel {
     type Action = Action;
 
     fn init_states(&self) -> Vec<State> {
+        assert!(
+            self.n_nodes as usize <= MAX_NODES,
+            "at most {MAX_NODES} nodes (protocol::MAX_NODES)"
+        );
         let mut nodes = Vec::new();
         for _ in 0..self.n_nodes {
             nodes.push(Node {
@@ -1028,10 +1304,26 @@ impl Model for AuthorityModel {
                 incarnation: 0,
                 next_seq: 0,
                 recent: Vec::new(),
+                inbox: None,
             });
         }
         for (n, op) in &self.workload {
             nodes[*n as usize].pending_ops.push(*op);
+        }
+        let mut log = vec![None; self.max_seq as usize + 1];
+        if !self.genesis.is_empty() {
+            // The genesis segment: epoch 0 (never fenced, never fencing),
+            // no rids, applied by everyone before anything else happens.
+            assert!(self.max_seq >= 1, "genesis needs a log slot");
+            log[1] = Some(Segment {
+                node: 0,
+                epoch: 0,
+                records: self.genesis.iter().map(|op| (None, *op)).collect(),
+                refused: None,
+            });
+            for node in &mut nodes {
+                node.applied_seq = 1;
+            }
         }
         let lease = if let Some(h) = self.initial_holder {
             nodes[h as usize].held_epoch = Some(1);
@@ -1052,13 +1344,14 @@ impl Model for AuthorityModel {
         vec![State {
             tick: 0,
             lease,
-            log: vec![None; self.max_seq as usize + 1],
+            log,
             commit: None,
             nodes,
             network: Vec::new(),
             history: Vec::new(),
             next_id: 0,
             crashes_used: 0,
+            inbox: None,
         }]
     }
 
@@ -1117,7 +1410,15 @@ impl Model for AuthorityModel {
                             // keeps the reachable state space finite.
                             None => {
                                 if let Some(h) = state.lease.holder {
-                                    if h != id {
+                                    if self.inbox {
+                                        // Plan 30 §M13: no P2P, so no
+                                        // handoff and no retry to ask
+                                        // for. The live holder is reached
+                                        // through its inbox instead.
+                                        if h != id {
+                                            actions.push(Action::ResubmitInbox(id));
+                                        }
+                                    } else if h != id {
                                         actions.push(Action::RequestHandoff(id));
                                         // Plan 30 §M2: retry the same rid
                                         // before falling back to the
@@ -1136,13 +1437,26 @@ impl Model for AuthorityModel {
                         }
                     }
                     Phase::WaitingHandoff { .. } => {}
+                    // Plan 30 §M13: waiting on the log. The only way out
+                    // other than tailing the outcome is the lease path,
+                    // once the holder it submitted to is gone (released
+                    // or expired): the takeover gate then drains the
+                    // batch itself.
+                    Phase::InboxPending { .. } => {
+                        if crate::inbox::pending_may_acquire(self, state, id) {
+                            actions.push(Action::AcquireLease(id));
+                        }
+                    }
                 }
             }
             if authority(state, id, self.protocol).is_some()
-                && !node.journal.is_empty()
+                && has_unshipped(node)
                 && node.applied_seq < self.max_seq
             {
                 actions.push(Action::Ship(id));
+            }
+            if self.inbox {
+                crate::inbox::holder_actions(self, state, id, actions);
             }
             if node.held_epoch.is_some() {
                 actions.push(Action::Renew(id));
@@ -1187,7 +1501,7 @@ impl Model for AuthorityModel {
             // unshipped entries (`log_prefix_view`, see `Publish`). The
             // shadow deferral stays.
             let speculating = self.protocol == Protocol::Recovery && !node.shadows.is_empty();
-            let journal_gate = self.protocol != Protocol::Recovery && !node.journal.is_empty();
+            let journal_gate = self.protocol != Protocol::Recovery && has_unshipped(node);
             if !journal_gate && !speculating {
                 actions.push(Action::Publish(id));
             }
@@ -1228,7 +1542,6 @@ impl Model for AuthorityModel {
             }
             Action::ClientInvoke(id) => {
                 let op = s.nodes[id as usize].pending_ops.remove(0);
-                s.history.push(HistEvt::Invoke(id, op));
                 // Rid allocated at the top, unconditionally, and kept
                 // across every retry this op goes through (plan 30 §M2:
                 // "every `MutateOp` a FUSE call issues gets its rid at
@@ -1240,6 +1553,7 @@ impl Model for AuthorityModel {
                     incarnation: s.nodes[id as usize].incarnation,
                     seq,
                 };
+                s.history.push(HistEvt::Invoke(id, op, rid));
                 let held = authority(&s, id, self.protocol);
                 if let Some(epoch) = held {
                     // Fast path: `fusefs.rs::mutate_op_rebasable`'s
@@ -1250,7 +1564,21 @@ impl Model for AuthorityModel {
                     if ret == NsRet::Ok {
                         self.journal_push(&mut s, id, rid, op, epoch);
                     }
-                    s.history.push(HistEvt::Return(id, ret));
+                    s.history.push(HistEvt::Return(id, ret, rid));
+                } else if self.inbox {
+                    // Plan 30 §M13: no P2P. A live, unexpired holder is
+                    // reached through its inbox; a claimable register
+                    // (nobody holds, or the holder released or expired)
+                    // means taking the lease is the way, as today.
+                    s.nodes[id as usize].client_op = Some(ClientOp {
+                        op,
+                        phase: Phase::NeedsLease,
+                        rid,
+                        attempts: 0,
+                    });
+                    if claim_kind(&s, id).is_none() {
+                        crate::inbox::submit(&mut s, id, op, rid);
+                    }
                 } else if let Some(h) = s.lease.holder {
                     // `forward.rs::request_mutate_with`: send once, block
                     // on the reply (modeled as entering `WaitingReply`).
@@ -1300,8 +1628,8 @@ impl Model for AuthorityModel {
                 // redirected) is answered from the recorded outcome
                 // instead of being re-executed
                 // (`forward.rs::holder_execute`'s "an executed rid is
-                // never executed again"). Refusals are never recorded —
-                // only `Ok` outcomes reach `completed`/`recent` — so a
+                // never executed again"). P2P refusals are never recorded
+                // — only `Ok` outcomes reach `completed`/`recent` — so a
                 // retried refused op is re-evaluated at the retry.
                 let dedup = self.protocol.dedups();
                 let held = authority(&s, to, self.protocol);
@@ -1314,8 +1642,25 @@ impl Model for AuthorityModel {
                 } else {
                     None
                 };
+                // Plan 30 §M13 (D1): a rid a holder refused through its
+                // inbox is an outcome in the log, and `holder_execute`
+                // answers it from `refused_errno` right after its
+                // `completed_position` check — also for a deposed
+                // holder's replay of that rid, which then lands as a
+                // conflict copy rather than a second decision (model
+                // round 4: without this, a takeover's drain refusing the
+                // rid against a stale replica, followed by the old
+                // holder's replay of the same rid succeeding here, gave
+                // one rid two outcomes).
+                let refused = if cached.is_none() && self.inbox && held.is_some() {
+                    crate::inbox::rid_refused(&s, to, rid, self.inbox_record_refusals)
+                } else {
+                    None
+                };
                 let outcome = if let Some((rec, epoch)) = cached {
                     Outcome::Accepted(rec, epoch)
+                } else if let Some(e) = refused {
+                    Outcome::Errno(e)
                 } else if let Some(epoch) = held {
                     let base = node_replica(&s, to);
                     let (ret, _) = eval(base, op);
@@ -1328,6 +1673,10 @@ impl Model for AuthorityModel {
                             Outcome::Accepted(op, epoch)
                         }
                         NsRet::Err(e) => Outcome::Errno(e),
+                        NsRet::Tentative | NsRet::Conflicted => unreachable!(
+                            "eval() never returns Tentative/Conflicted; only mark_tentative/\
+                             mark_conflicted rewrite an already-recorded Return to them"
+                        ),
                     }
                 } else {
                     Outcome::NotHolder
@@ -1369,6 +1718,7 @@ impl Model for AuthorityModel {
                                             s.nodes[to as usize].replays.push(ReplayEntry {
                                                 rid: cop.rid,
                                                 op: rec,
+                                                deposed: false,
                                                 inflight: None,
                                                 attempts: 0,
                                             });
@@ -1388,7 +1738,12 @@ impl Model for AuthorityModel {
                     }
                 }
                 if let Some(ret) = completed {
-                    s.history.push(HistEvt::Return(to, ret));
+                    let rid = s.nodes[to as usize]
+                        .client_op
+                        .as_ref()
+                        .expect("completed only with a client op")
+                        .rid;
+                    s.history.push(HistEvt::Return(to, ret, rid));
                     s.nodes[to as usize].client_op = None;
                 }
                 // Plan 30 §M3a: or the reply to a replay-by-rid request.
@@ -1424,9 +1779,15 @@ impl Model for AuthorityModel {
                         Outcome::Errno(_) => {
                             // Refused: the real code materializes a
                             // `.constellation-conflict/` copy and counts
-                            // it; the model has no conflict files, so the
-                            // op is simply resolved.
+                            // it (`recovery::drain_one`). A deposed
+                            // holder's own op becomes that copy in the
+                            // history (model round 2); a stranded
+                            // shadow's refusal is simply resolved, as
+                            // before (the acked-before-durable gap).
                             s.nodes[to as usize].replays.remove(i);
+                            if entry.deposed {
+                                mark_conflicted(&mut s, entry.rid);
+                            }
                         }
                         Outcome::NotHolder => {
                             s.nodes[to as usize].replays[i].inflight = None;
@@ -1568,11 +1929,33 @@ impl Model for AuthorityModel {
                 // `Recovery`. Decided before the CAS below rewrites the
                 // register `claim_kind` reads.
                 let takeover = claim_kind(&s, id) == Some(true);
+                let prev_held = s.nodes[id as usize].held_epoch;
                 let new_epoch = match s.lease.holder {
                     None => 1,
                     Some(h) if h == id && !s.lease.released => s.lease.epoch.max(1),
                     _ => s.lease.epoch + 1,
                 };
+                // Model round 3a: from this CAS on, everything the
+                // previous holder acknowledged but has not shipped is
+                // tentative (`NsRet::Tentative`) — it will be stranded
+                // and replayed by rid, landing later or as a conflict
+                // copy, and the new holder may answer conflicting ops
+                // meanwhile (the acked-before-durable gap).
+                // Only the previous holder's *own* client ops (their rid
+                // names it): an op it executed for a requester is that
+                // requester's shadow, which stays strict (see
+                // `NsRet::Tentative`).
+                if let Some(prev) = s.lease.holder.filter(|h| *h != id) {
+                    let unshipped: Vec<Rid> = s.nodes[prev as usize]
+                        .journal
+                        .iter()
+                        .filter_map(|e| e.rid)
+                        .filter(|rid| rid.node == prev)
+                        .collect();
+                    for rid in unshipped {
+                        mark_tentative(&mut s, rid);
+                    }
+                }
                 s.lease = LeaseReg {
                     holder: Some(id),
                     epoch: new_epoch,
@@ -1629,6 +2012,7 @@ impl Model for AuthorityModel {
                         node.replays.push(ReplayEntry {
                             rid: sh.rid,
                             op: sh.rec,
+                            deposed: false,
                             inflight: None,
                             attempts: 0,
                         });
@@ -1647,8 +2031,14 @@ impl Model for AuthorityModel {
                     // and that late answer then matches nothing.
                     let queued = std::mem::take(&mut s.nodes[id as usize].replays);
                     for entry in queued {
-                        self.replay_locally(&mut s, id, entry.rid, entry.op);
+                        self.replay_locally(&mut s, id, entry);
                     }
+                }
+                if self.inbox {
+                    // Plan 30 §M13: still inside the gate, after this
+                    // node's own stranded ops and before its view opens,
+                    // drain every batch of every lower epoch.
+                    crate::inbox::drain_below(self, &mut s, id, prev_held, new_epoch);
                 }
                 // `mutate_op_rebasable`: `require_lease_for` succeeding
                 // falls straight into `execute_mutate`, synchronously —
@@ -1666,7 +2056,17 @@ impl Model for AuthorityModel {
                     } else {
                         None
                     };
-                    let ret = if cached.is_some() {
+                    // Plan 30 §M13: a refusal in the log is an outcome
+                    // too (a holder may have refused this rid from its
+                    // inbox before the takeover).
+                    let refused = if self.inbox {
+                        crate::inbox::rid_refused(&s, id, cop.rid, self.inbox_record_refusals)
+                    } else {
+                        None
+                    };
+                    let ret = if let Some(e) = refused {
+                        NsRet::Err(e)
+                    } else if cached.is_some() {
                         NsRet::Ok
                     } else {
                         let base = node_replica(&s, id);
@@ -1676,9 +2076,18 @@ impl Model for AuthorityModel {
                         }
                         ret
                     };
-                    s.history.push(HistEvt::Return(id, ret));
+                    s.history.push(HistEvt::Return(id, ret, cop.rid));
                     s.nodes[id as usize].client_op = None;
                 }
+            }
+            Action::PollInbox(h, r) => {
+                crate::inbox::poll(self, &mut s, h, r)?;
+            }
+            Action::GcInbox(h) => {
+                crate::inbox::gc(self, &mut s, h)?;
+            }
+            Action::ResubmitInbox(id) => {
+                crate::inbox::resubmit(self, &mut s, id)?;
             }
             Action::ReplayStranded(id) => {
                 // Plan 30 §M3a recovery step 3: "replay the stranded ops,
@@ -1693,7 +2102,7 @@ impl Model for AuthorityModel {
                 }
                 if authority(&s, id, self.protocol).is_some() {
                     s.nodes[id as usize].replays.remove(0);
-                    self.replay_locally(&mut s, id, entry.rid, entry.op);
+                    self.replay_locally(&mut s, id, entry);
                 } else {
                     let h = s.lease.holder.filter(|h| *h != id)?;
                     let corr = s.next_id;
@@ -1779,6 +2188,10 @@ impl Model for AuthorityModel {
             Property::always("linearizable", prop_linearizable),
             Property::always("converged_at_quiescence", prop_converged_at_quiescence),
             Property::always("commits_are_log_prefixes", prop_commits_are_log_prefixes),
+            Property::always(
+                "no_rid_executes_twice",
+                crate::inbox::prop_no_rid_executes_twice,
+            ),
             Property::sometimes("progress", prop_progress),
         ]
     }
@@ -1802,12 +2215,38 @@ impl Model for AuthorityModel {
     }
 }
 
-fn prop_linearizable(_m: &AuthorityModel, s: &State) -> bool {
-    let mut tester = LinearizabilityTester::<NodeId, NamespaceSpec>::new(NamespaceSpec::default());
-    for evt in &s.history {
+/// Linearizability of the recorded client history, with plan 30's
+/// acked-before-durable gap made explicit (model round 3a): an op whose
+/// return is [`NsRet::Tentative`] or [`NsRet::Conflicted`] — acknowledged
+/// by a holder that was deposed before shipping it — is fed to the
+/// checker as an operation still *in flight* on a synthetic thread of
+/// its own (`TENTATIVE_THREAD_BASE + its history index`), invoked at its
+/// real invocation point and never returned. The checker may then
+/// linearize it anywhere after that point (when its replay lands) or
+/// leave it out (a conflict copy), and never requires it to be visible
+/// in between. Everything else is checked strictly on its node's thread,
+/// including the later ops of the very node whose earlier op is
+/// tentative.
+fn prop_linearizable(m: &AuthorityModel, s: &State) -> bool {
+    let tentative: Vec<Rid> = s
+        .history
+        .iter()
+        .filter_map(|e| match e {
+            HistEvt::Return(_, NsRet::Tentative | NsRet::Conflicted, rid) => Some(*rid),
+            _ => None,
+        })
+        .collect();
+    let mut tester = LinearizabilityTester::<NodeId, NamespaceSpec>::new(NamespaceSpec {
+        present: m.genesis_dir(),
+    });
+    for (idx, evt) in s.history.iter().enumerate() {
         let r = match evt {
-            HistEvt::Invoke(n, op) => tester.on_invoke(*n, *op),
-            HistEvt::Return(n, ret) => tester.on_return(*n, *ret),
+            HistEvt::Invoke(_, op, rid) if tentative.contains(rid) => {
+                tester.on_invoke(TENTATIVE_THREAD_BASE + idx as NodeId, *op)
+            }
+            HistEvt::Invoke(n, op, _) => tester.on_invoke(*n, *op),
+            HistEvt::Return(_, NsRet::Tentative | NsRet::Conflicted, _) => continue,
+            HistEvt::Return(n, ret, _) => tester.on_return(*n, *ret),
         };
         if r.is_err() {
             return false;
@@ -1815,6 +2254,11 @@ fn prop_linearizable(_m: &AuthorityModel, s: &State) -> bool {
     }
     tester.is_consistent()
 }
+
+/// Thread ids for tentative ops in `prop_linearizable`: above any node
+/// id, plus the op's history index (`within_boundary` keeps the history
+/// under 64 events, so these never wrap or collide).
+const TENTATIVE_THREAD_BASE: NodeId = 128;
 
 /// No client op is in flight anywhere, and (`Recovery`) no live node
 /// still has a stranded op waiting to be replayed: a queued replay is
@@ -1848,7 +2292,7 @@ fn every_durable_slot_applied_everywhere(s: &State) -> bool {
     let head = log_head(&s.log);
     s.nodes
         .iter()
-        .all(|n| !n.alive || (n.applied_seq == head && n.journal.is_empty()))
+        .all(|n| !n.alive || (n.applied_seq == head && !has_unshipped(n)))
 }
 
 fn prop_converged_at_quiescence(m: &AuthorityModel, s: &State) -> bool {

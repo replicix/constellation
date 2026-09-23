@@ -15,7 +15,7 @@ use crate::rid::Rid;
 use crate::store::{kv_set_tx, Meta, KV_NEXT_JOURNAL_SEQ};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
 
-fn seq_key(seq: u64) -> Vec<u8> {
+pub(crate) fn seq_key(seq: u64) -> Vec<u8> {
     seq.to_be_bytes().to_vec()
 }
 
@@ -28,7 +28,7 @@ fn seq_key(seq: u64) -> Vec<u8> {
 /// (checked: only this function touches it), so changing its on-disk
 /// encoding is safe without a migration (plan 30: no backward
 /// compatibility required at any level).
-fn next_seq_tx(
+pub(crate) fn next_seq_tx(
     tx: &mut SingleWriterWriteTx,
     local: &SingleWriterTxKeyspace,
 ) -> Result<u64, MetaError> {
@@ -122,6 +122,40 @@ impl PendingCompletion {
 
 pub(crate) struct PendingCompletionGuard;
 
+thread_local! {
+    static PENDING_INBOX_ACK: std::cell::Cell<Option<crate::store::inbox::InboxAck>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Plan 30 §M13: the inbox position whose outcome the transaction being
+/// written on this thread decides. Set by the holder's inbox executor
+/// around `execute` (or around a refusal/skip transaction) and taken by
+/// the first `append_tx` of that transaction, which appends
+/// `LogRecord::InboxAck` right after the op's `Completed` and advances
+/// the node-local watermark — atomic with the outcome, for the same
+/// reason `PendingCompletion` is a thread-local: no rid or position
+/// parameter threaded through every mutating method.
+pub(crate) struct PendingInboxAck;
+
+impl PendingInboxAck {
+    pub(crate) fn set(ack: crate::store::inbox::InboxAck) -> PendingInboxAckGuard {
+        PENDING_INBOX_ACK.with(|c| c.set(Some(ack)));
+        PendingInboxAckGuard
+    }
+
+    pub(crate) fn take() -> Option<crate::store::inbox::InboxAck> {
+        PENDING_INBOX_ACK.with(|c| c.take())
+    }
+}
+
+pub(crate) struct PendingInboxAckGuard;
+
+impl Drop for PendingInboxAckGuard {
+    fn drop(&mut self) {
+        PENDING_INBOX_ACK.with(|c| c.set(None));
+    }
+}
+
 impl Drop for PendingCompletionGuard {
     fn drop(&mut self) {
         PENDING_COMPLETION.with(|c| c.set(None));
@@ -164,6 +198,13 @@ pub(crate) fn append_tx(
             rid.to_key(),
             Meta::encode_completed_row(cseq, now_ms),
         );
+    }
+    // Plan 30 §M13: the inbox position this transaction answers, right
+    // behind the completion, plus the watermark it advances.
+    if let Some(ack) = PendingInboxAck::take() {
+        let aseq = next_seq_tx(tx, local)?;
+        tx.insert(journal, seq_key(aseq), ack.record().to_postcard()?);
+        crate::store::inbox::set_inbox_ack_tx(tx, local, ack)?;
     }
     Ok(seq)
 }

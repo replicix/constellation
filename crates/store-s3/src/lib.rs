@@ -17,6 +17,7 @@ pub mod error;
 pub(crate) mod faulty;
 pub mod format;
 pub mod gc;
+pub mod inbox;
 pub mod layout;
 pub mod lease;
 pub mod log;
@@ -45,6 +46,10 @@ pub use gc::{
     append_journal, is_condemned, publish_condemned, publish_condemned_blobs,
     publish_condemned_packs, read_condemned, read_condemned_blobs, read_condemned_packs,
     CondemnedList, GcJournalEntry,
+};
+pub use inbox::{
+    gc_keep_newest, InboxBatch, InboxKey, InboxOp, InboxPoller, InboxRid, InboxStore,
+    InboxSubmitter, PollBackoff, PutBatch, INBOX_VERSION,
 };
 pub use lease::{live_leases_held_by, Lease, LeaseMode, LeaseStore, LeaseTag};
 pub use log::LogStore;

@@ -143,6 +143,33 @@ pub fn gc_journal_prefix() -> Path {
     Path::from("gc/journal")
 }
 
+/// `inbox/<epoch>/<node>/<n>`: one CAS-created batch of forwarded
+/// mutations a non-holder submits through S3 when it cannot reach the
+/// holder over P2P (plan 30 §M13). Every component is zero-padded hex, so
+/// a LIST of any prefix comes back in `(epoch, node, n)` order — the
+/// order a takeover drains old-epoch batches in — and `n` sorts
+/// numerically for the requester's LIST-last resume after a restart.
+///
+/// The epoch is the outermost level on purpose: the holder of epoch `e`
+/// only ever probes `inbox/<e>/...` with GET-next, and a new holder
+/// drains everything below its epoch with one LIST of `inbox/` — every
+/// object it must consider is a prefix-sorted range in front of its own.
+pub fn inbox_batch(epoch: u64, node: u64, n: u64) -> Path {
+    Path::from(format!("inbox/{epoch:016x}/{node:016x}/{n:016x}"))
+}
+
+pub fn inbox_prefix() -> Path {
+    Path::from("inbox")
+}
+
+pub fn inbox_epoch_prefix(epoch: u64) -> Path {
+    Path::from(format!("inbox/{epoch:016x}"))
+}
+
+pub fn inbox_requester_prefix(epoch: u64, node: u64) -> Path {
+    Path::from(format!("inbox/{epoch:016x}/{node:016x}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +193,27 @@ mod tests {
         assert_eq!(commit(1).to_string(), "commits/0000000000000001");
         assert!(commit(255).to_string() < commit(256).to_string());
         assert!(commit(u64::MAX - 1).to_string() < commit(u64::MAX).to_string());
+    }
+
+    #[test]
+    fn inbox_keys_sort_by_epoch_then_node_then_n() {
+        assert_eq!(
+            inbox_batch(1, 0xab, 2).to_string(),
+            "inbox/0000000000000001/00000000000000ab/0000000000000002"
+        );
+        assert!(inbox_batch(1, 9, 255).to_string() < inbox_batch(1, 9, 256).to_string());
+        assert!(inbox_batch(1, 255, 0).to_string() < inbox_batch(1, 256, 0).to_string());
+        assert!(inbox_batch(255, 0, 0).to_string() < inbox_batch(256, 0, 0).to_string());
+        assert!(inbox_batch(1, u64::MAX, u64::MAX).to_string() < inbox_batch(2, 0, 0).to_string());
+        assert!(inbox_batch(3, 4, 5)
+            .to_string()
+            .starts_with(&inbox_requester_prefix(3, 4).to_string()));
+        assert!(inbox_requester_prefix(3, 4)
+            .to_string()
+            .starts_with(&inbox_epoch_prefix(3).to_string()));
+        assert!(inbox_epoch_prefix(3)
+            .to_string()
+            .starts_with(&inbox_prefix().to_string()));
     }
 
     #[test]

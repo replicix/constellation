@@ -14,6 +14,7 @@ mod fsck;
 mod fusefs;
 mod gc;
 mod held;
+mod inbox;
 mod keygate;
 mod lease;
 mod leave;
@@ -2921,6 +2922,14 @@ async fn run_sync_round(
             }
         }
     }
+    // Plan 30 §M13: the holder's inbox — GC what shipped, GET-next every
+    // due requester, execute what it finds — under the lease view, never
+    // under the keepers lock across S3 I/O (`inbox::holder_round`).
+    if let Some(inbox) = ship.inbox().cloned() {
+        if let Err(error) = inbox::holder_round(&inbox, ship.meta(), keepers).await {
+            tracing::warn!(error = %error, "inbox poll failed; will retry next round");
+        }
+    }
     // Ordinary shipping (plan 30 M2b): `Shipper::run_ordinary_round` takes
     // the keepers `Arc` itself and never holds it across the segment PUT
     // — see its doc and `lease.rs`'s module doc for the reasoning.
@@ -3988,6 +3997,17 @@ impl constellation_api::StatusSource for DaemonStatus {
                 .node
                 .indoubt_resolved
                 .load(std::sync::atomic::Ordering::Relaxed),
+            inbox: {
+                let mut inbox = self.node.inbox().status();
+                inbox.local_ops = self
+                    .leases
+                    .lock()
+                    .unwrap()
+                    .get(constellation_store_s3::log::PARTITION)
+                    .map(|v| v.touches())
+                    .unwrap_or(0);
+                inbox
+            },
             placement_reason: self.placement.last_reason.lock().unwrap().clone(),
             atime: {
                 use std::sync::atomic::Ordering::Relaxed;

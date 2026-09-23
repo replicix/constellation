@@ -418,6 +418,24 @@ impl P2p {
         slot.as_ref().map(crate::paths::PathSummary::of)
     }
 
+    /// Whether a pooled, still-open QUIC connection to `id` exists right
+    /// now. A request that timed out at the application level leaves
+    /// the connection in the pool (only a transport error invalidates
+    /// it), so this distinguishes "slow to answer" from "cannot be
+    /// reached": a dial failure never pools anything, a transport error
+    /// evicts it, and a peer that went away closes it (or the idle
+    /// timeout does). Plan 30 §M13 uses it to start a P2P outage only
+    /// from the latter.
+    pub async fn connection_alive(&self, id: iroh::EndpointId) -> bool {
+        let gate = self.connections.lock().unwrap().get(&id).cloned();
+        let Some(gate) = gate else {
+            return false;
+        };
+        let slot = gate.lock().await;
+        slot.as_ref()
+            .is_some_and(|conn| conn.close_reason().is_none())
+    }
+
     /// Selected-path kind for a pooled connection, if any.
     pub async fn path_kind(&self, id: iroh::EndpointId) -> PathKind {
         let gate = self.connections.lock().unwrap().get(&id).cloned();

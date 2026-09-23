@@ -257,6 +257,9 @@ pub struct LeaseView {
     lost: AtomicBool,
     /// Unix ms of the last gated mutation, for idle release.
     last_write_ms: AtomicI64,
+    /// Plan 30 §M13 round 3b: gated local mutations since start
+    /// (`status.inbox.local_ops`, against the inbox-forwarded count).
+    touches: AtomicU64,
     /// Continuation-epoch local authority (no S3 lease object).
     epoch_held: AtomicBool,
     /// Unix ms until which [`LeaseKeeper::begin_handoff_pause`] has
@@ -425,6 +428,12 @@ impl LeaseView {
     /// under a running workload.
     pub fn touch(&self) {
         self.last_write_ms.store(now_unix_ms(), Ordering::Relaxed);
+        self.touches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Gated local mutations since start (see `touches`).
+    pub fn touches(&self) -> u64 {
+        self.touches.load(Ordering::Relaxed)
     }
 
     pub fn idle_for_ms(&self) -> i64 {

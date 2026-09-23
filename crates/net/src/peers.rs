@@ -586,6 +586,20 @@ impl Peers {
         }
     }
 
+    /// Whether an open QUIC connection to `node_id` is pooled right now
+    /// (see [`crate::endpoint::P2p::connection_alive`]); `false` with P2P
+    /// disabled or the node unknown.
+    pub async fn connection_alive(&self, node_id: u64) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        let id = inner.peers.lock().unwrap().get(&node_id).map(|p| p.addr.id);
+        match id {
+            Some(id) => inner.p2p.connection_alive(id).await,
+            None => false,
+        }
+    }
+
     /// Direct request to a registry-known node id.
     pub async fn request_to_node(&self, node_id: u64, payload: &Payload) -> Result<Payload> {
         let addr = self

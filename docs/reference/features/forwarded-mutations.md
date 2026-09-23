@@ -16,6 +16,7 @@ id, and neither a slow reply nor a takeover can make it execute twice.
 - [Speculation and stranded-op recovery](#speculation-and-stranded-op-recovery)
 - [Status and logs](#status-and-logs)
 - [Failure and fallback](#failure-and-fallback)
+- [The inbox: forwarding without P2P](#the-inbox-forwarding-without-p2p)
 - [References](#references)
 
 ## Terminology
@@ -410,6 +411,121 @@ rid through the next holder (see above). A holder that was deposed rather
 than killed rolls its own unshipped journal back the same way and replays
 it by rid through the new holder. Epoch fencing, and the new holder's
 epoch marker, prevent a competing append history.
+
+## The inbox: forwarding without P2P
+
+Plan 30 M13. When a requester has no P2P path to the holder — P2P is
+off, the holder is not in its peer directory, or an *outage* to it has
+lasted longer than `CONSTELLATION_INBOX_P2P_GRACE_MS` with nothing
+heard from it since — it forwards through the bucket instead of taking
+the lease (the "ping-pong" that capped P2P-off clusters at 41–57
+ops/s). An outage is a failed dial or a transport error that evicted
+the connection: a forward that came back `Busy` with no open QUIC
+connection to the holder. A slow or timing-out reply on a connection
+that is still open is never an outage, however long it goes on — it
+stays on the same-rid retries above and the lease fallback, as before
+M13. And an outage ends the moment anything is heard from the holder:
+its entry in the peer directory shows it connected, or any successful
+exchange with it (a lease request, a ping, a chunk fetch, a gossip
+neighbor-up) is later than the outage began. That is the whole rule: a
+peer the requester has never talked to is reachable and gets dialed,
+as before M13, and the inbox engages only for a holder that cannot be
+reached at all.
+
+**The hybrid.** The inbox is for *sporadic* writes: one occasional
+write from a non-holder is answered without moving the lease and
+without disturbing the holder. A requester whose inbox demand is
+*sustained* — at least `CONSTELLATION_INBOX_ESCALATE_OPS` (20)
+inbox-answered ops, or at least five ops that together (leaving the
+single slowest out) waited `CONSTELLATION_INBOX_ESCALATE_WAIT_MS` (3 s)
+on their round trips, within `CONSTELLATION_INBOX_ESCALATE_WINDOW_MS`
+(10 s) — *escalates*: it asks
+for the lease through the ordinary lease path (`wanted_by`, answered by
+the holder's dwell and grace rules, so no new ping-pong is created) and
+keeps writing through the inbox until the lease arrives; the takeover
+gate's drain of lower epochs then executes whatever is still queued, in
+order, before its first local op, and later writes run locally at full
+speed. It stops asking once the window has fallen below half of both
+thresholds; when it goes quiet as holder, the usual idle release hands
+the lease back or on. Why: Linux serializes creates in one directory
+(the parent's lock is held for the whole create), so on a create storm
+each op is one sequential inbox round trip and batches cannot form —
+there the lease must move, as it does today. `status.inbox.escalated`,
+`escalations`, `lease_requests`, `inbox_ops` and `local_ops` show which
+regime a node is in. A node that has inbox ops waiting and then finds a
+P2P path again lets them finish before forwarding over it, so its
+overlapping ops still land in issue order.
+
+1. The op, with its rid, goes into the next **batch object**
+   `inbox/<epoch>/<node>/<n>` under the epoch the lease object currently
+   shows (one CAS-created PUT; everything a node's FUSE threads queue
+   while a PUT is in flight shares the next batch, so requests per op
+   fall as load rises). The requester-side ordering gate is released as
+   soon as the op is queued — its order is the queue's, which the holder
+   honours — so overlapping ops (every create in one directory) pipeline
+   instead of taking one round trip each. Numbering is per `(epoch,
+   node)`, restarts at 0 in every epoch, and a (re)started requester
+   resumes it with one LIST of its own prefix.
+2. The **holder polls** each requester's next batch with one GET
+   (`inbox/<epoch>/<node>/<cursor>`), on a per-requester schedule: every
+   `CONSTELLATION_INBOX_HOT_MS` (20 ms) right after a hit and for ~25
+   misses after it, then doubling from the sync interval up to
+   `CONSTELLATION_INBOX_IDLE_MAX_MS` (2 s) for a requester that submitted
+   within the last minute, up to the sync loop's idle ceiling (10 s)
+   after that. A requester with an outcome pending tails the log every
+   `CONSTELLATION_INBOX_TAIL_MS` (20 ms), so a round trip on a local S3
+   is a few tens of milliseconds. The holder polls the write-eligible
+   roster minus itself minus the peers it is P2P-connected to, so a
+   single node and a healthy P2P cluster poll nothing; a node that
+   appears in the roster is polled at the next round (the registry poll
+   nudges one). Batches execute in order through the same dedup a P2P
+   forward gets (`recent`, `completed`).
+3. **Outcomes ride the log.** An executed op ships its records,
+   `Completed { rid }` and an `InboxAck` (its batch position); a refused
+   one ships `Refused { rid, errno }` plus the ack. The requester, which
+   tails the log anyway, returns to the FUSE caller when the outcome is
+   applied — success once its own records are in the replica
+   (read-your-write holds), or the errno. A stale manifest base comes
+   back as `ESTALE` and the requester rebases from its own replica,
+   which has tailed the refusing segment. Nothing is speculated: an
+   inbox op installs no shadow.
+4. **GC.** The holder deletes a batch once the segment with its outcomes
+   has shipped, keeping each requester's newest one (the high-water mark
+   a restarted requester resumes from). A takeover drains every older
+   epoch's batches inside its gate — after its own stranded ops, before
+   its view opens — and deletes them.
+
+**Why refusals are outcomes here, unlike on the P2P path.** Above, a
+refusal rides the reply and is not recorded: only the requester ever
+retries, and a requester that holds a refusal never retries it. On the
+inbox path the *holder* re-reads batches (a successor's drain), and a
+requester may re-submit a rid whose refusal sits in a segment it has
+not tailed yet (it noticed the takeover by reading the lease). Re-
+evaluating a refused `create(x)` after `x` was unlinked would execute
+it: the caller was told `EEXIST` and `x` appears anyway. So a
+`Refused` record enters `completed` on every replica, and every dedup
+site — the holder's executor, the drain, the lease path's in-doubt
+check, a stranded replay — answers the rid with the errno. The
+Stateright model shows both naive variants failing
+(`crates/model/tests/inbox.rs`: a drain without rid dedup, and refusals
+not deduplicated).
+
+**Exactly-once across epochs.** An epoch-`e` batch when the lease moves
+to `e+1`: the new holder drains it inside its gate, and the requester —
+which learns of the takeover from the lease object it re-reads every
+`CONSTELLATION_INBOX_RECHECK_MS` while waiting — deletes its stale batch
+and re-submits the same rid under `e+1`; a deposed holder's rollback
+replays the same rid a third way. All three meet the same dedup. The
+`InboxAck` watermark (per `(epoch, node)`, never pruned) keeps a drain
+older than the `completed` retention window exact without trusting a
+clock. An op with no outcome by `min(2 × TTL, retention/2)` is in doubt
+and takes the lease path, whose takeover gate drains the batch and whose
+in-doubt check then finds the rid.
+
+`status.inbox` reports both roles' counters (`submitted_ops`,
+`pending_ops`, `resubmitted_ops`, `unavailable`, `executed_ops`,
+`refused_ops`, `deduped_ops`, `drained_batches`, `polls`, `poll_hits`,
+`gc_deleted`, `tracked_requesters`), exported as `constellation_inbox_*`.
 
 ## References
 

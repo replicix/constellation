@@ -89,6 +89,7 @@
 pub(crate) mod atime;
 mod bootstrap;
 pub mod held;
+pub mod inbox;
 pub(crate) mod journal;
 pub(crate) mod local;
 pub(crate) mod misc;
@@ -822,18 +823,16 @@ impl Meta {
     /// replica has tailed a segment carrying its `Completed` record (or,
     /// for a rid this node itself executed as holder and has not yet
     /// shipped, the record it produced — see `recent_outcome`).
+    ///
+    /// Plan 30 §M13: an *executed* rid only. A rid the log refused
+    /// (`LogRecord::Refused`, inbox path) has a `completed` row too but
+    /// answers `None` here and `Some(errno)` from [`Self::refused_errno`];
+    /// every dedup site asks both (`Self::completed_outcome`).
     pub fn completed_position(&self, rid: crate::rid::Rid) -> Result<Option<u64>, MetaError> {
-        let r = self.db.read_tx();
-        match r.get(&self.completed, rid.to_key())? {
-            Some(v) => {
-                let bytes: [u8; 8] = v
-                    .get(0..8)
-                    .and_then(|s| s.try_into().ok())
-                    .ok_or_else(|| MetaError::Invalid("completed row".into()))?;
-                Ok(Some(u64::from_be_bytes(bytes)))
-            }
-            None => Ok(None),
-        }
+        Ok(match self.completed_outcome(rid)? {
+            Some(inbox::CompletedOutcome::Executed { position }) => Some(position),
+            _ => None,
+        })
     }
 
     /// Encode a `completed` row value: `position(8 BE) ++
@@ -846,6 +845,17 @@ impl Meta {
         let mut v = Vec::with_capacity(16);
         v.extend_from_slice(&position.to_be_bytes());
         v.extend_from_slice(&recorded_at_ms.to_be_bytes());
+        v
+    }
+
+    /// Plan 30 §M13: a `completed` row for a rid the log *refused*:
+    /// the executed row's 16 bytes (so retention reads the same
+    /// `recorded_at`), then an outcome tag `1` and the errno. An executed
+    /// row is exactly 16 bytes; anything longer with tag `1` is a refusal.
+    pub(crate) fn encode_refused_row(position: u64, recorded_at_ms: i64, errno: i32) -> Vec<u8> {
+        let mut v = Self::encode_completed_row(position, recorded_at_ms);
+        v.push(inbox::ROW_TAG_REFUSED);
+        v.extend_from_slice(&errno.to_be_bytes());
         v
     }
 

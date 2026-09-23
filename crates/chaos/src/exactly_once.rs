@@ -32,7 +32,9 @@ use crate::history::{EventKind, History};
 use crate::op::{hash_bytes, Complete, Op, Outcome};
 use std::collections::{BTreeMap, HashMap};
 
-/// One `Completed { rid }` record found in the shared log.
+/// One outcome record for a rid found in the shared log: a
+/// `Completed { rid }`, or (plan 30 §M13) a `Refused { rid, errno }` the
+/// holder shipped for an op it refused from a requester's S3 inbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggedCompletion {
     /// The segment's sequence number and the record's index in it.
@@ -43,23 +45,42 @@ pub struct LoggedCompletion {
     pub epoch: u64,
     /// `(node, incarnation, seq)`.
     pub rid: (u64, u32, u64),
+    /// A `Refused` record rather than a `Completed` one. A refusal is
+    /// an outcome like a completion (the inbox path deduplicates it, so a
+    /// refused rid is never re-evaluated): one rid with two outcomes of
+    /// any kind — executed twice, refused twice, or executed and refused
+    /// — is a double decision.
+    pub refused: bool,
 }
 
-/// Every rid completes at most once in the log.
+/// Every rid has at most one outcome in the log. `entries` in segment
+/// order; a segment whose epoch is lower than one shipped before it is
+/// fenced (every replica's log reader skips it, so nothing in it took
+/// effect anywhere) and is left out, as the model's
+/// `no_rid_executes_twice` leaves it out.
 pub fn check_log_completions(entries: &[LoggedCompletion]) -> Result<(), CheckFailure> {
     let mut seen: HashMap<(u64, u32, u64), &LoggedCompletion> = HashMap::new();
+    let mut max_epoch = 0u64;
     for e in entries {
+        if e.epoch > 0 && e.epoch < max_epoch {
+            continue;
+        }
+        max_epoch = max_epoch.max(e.epoch);
         if let Some(first) = seen.insert(e.rid, e) {
+            let kind = |c: &LoggedCompletion| if c.refused { "refused" } else { "completed" };
             return Err(CheckFailure {
                 checker: "exactly_once_log".into(),
                 message: format!(
-                    "rid {:?} completed twice in the log: segment {} #{} (node {}, epoch {}) \
-                     and segment {} #{} (node {}, epoch {}) — its op took effect twice",
+                    "rid {:?} decided twice in the log: {} in segment {} #{} (node {}, epoch \
+                     {}) and {} in segment {} #{} (node {}, epoch {}) — its op was decided \
+                     twice",
                     e.rid,
+                    kind(first),
                     first.segment,
                     first.index,
                     first.node,
                     first.epoch,
+                    kind(e),
                     e.segment,
                     e.index,
                     e.node,
@@ -411,11 +432,42 @@ mod tests {
             node: 3,
             epoch: 1,
             rid: rid(seq),
+            refused: false,
         };
         check_log_completions(&[entry(1, 1), entry(1, 2), entry(2, 3)]).unwrap();
         let err = check_log_completions(&[entry(1, 1), entry(2, 2), entry(5, 1)]).unwrap_err();
         assert_eq!(err.checker, "exactly_once_log");
         assert!(err.message.contains("segment 1") && err.message.contains("segment 5"));
+    }
+
+    /// Plan 30 §M13: a refusal is an outcome. A rid refused and later
+    /// completed (or refused twice) is a double decision; a refusal in a
+    /// fenced segment (an older epoch shipped after a newer one) never
+    /// took effect and does not count.
+    #[test]
+    fn a_refusal_is_an_outcome_and_fenced_segments_are_skipped() {
+        let entry = |segment, epoch, seq, refused| LoggedCompletion {
+            segment,
+            index: 0,
+            node: 3,
+            epoch,
+            rid: rid(seq),
+            refused,
+        };
+        check_log_completions(&[entry(1, 1, 1, true), entry(2, 1, 2, false)]).unwrap();
+        let err =
+            check_log_completions(&[entry(1, 1, 1, true), entry(2, 1, 1, false)]).unwrap_err();
+        assert!(err.message.contains("refused") && err.message.contains("completed"));
+        let err = check_log_completions(&[entry(1, 1, 1, true), entry(2, 1, 1, true)]).unwrap_err();
+        assert!(err.message.contains("decided twice"));
+        // Segment 3 carries epoch 1 after epoch 2 shipped at segment 2:
+        // fenced, its refusal of rid 1 is not a second decision.
+        check_log_completions(&[
+            entry(1, 1, 1, false),
+            entry(2, 2, 2, false),
+            entry(3, 1, 1, true),
+        ])
+        .unwrap();
     }
 
     /// Bug A's symptom: the holder executed the create, the requester's

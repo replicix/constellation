@@ -180,6 +180,27 @@ pub enum LogRecord {
     /// ordering makes moot in the one case that still matters — a
     /// mid-rollout mismatch is out of scope, not a live concern.
     Completed { rid: Rid },
+    /// Plan 30 §M13: the holder refused the inbox-submitted op `rid` with
+    /// `errno`. An inbox op has no reply to carry its refusal, so it rides
+    /// the log like a completion; applying it inserts `rid -> refused(errno)`
+    /// into `completed`, and every dedup site answers the rid with that
+    /// errno from then on — a refusal is an outcome, never re-evaluated
+    /// (see `docs/reference/features/forwarded-mutations.md`, "The inbox").
+    /// Touches no inode/dentry (see `TouchSet::add`). Only inbox-executed
+    /// ops produce this record; a P2P refusal still rides its reply.
+    Refused { rid: Rid, errno: i32 },
+    /// Plan 30 §M13: position `(n, i)` of requester `node`'s inbox batch
+    /// under `epoch` has an outcome (executed, refused or deduplicated)
+    /// in this transaction. Every replica keeps the highest such position
+    /// per `(epoch, node)` in a node-local watermark that retention never
+    /// prunes, so a takeover drain older than the `completed` retention
+    /// window still skips what was already answered. Touches nothing.
+    InboxAck {
+        epoch: u64,
+        node: u64,
+        n: u64,
+        i: u32,
+    },
 }
 
 impl LogRecord {

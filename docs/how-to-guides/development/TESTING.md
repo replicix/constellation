@@ -278,10 +278,14 @@ writes a marker file and the scenario asserts all three mounts converge to
 the same directory listing and contents.
 
 Phase-3 scenarios exercise the partition lease (DESIGN.md §4/§5):
-`lease-handover` (A writes, goes write-idle, and cooperatively releases
-the lease; B must acquire it within a few seconds — not a 60 s TTL
-wait — and write its own files; the epoch strictly advances across
-each handover and both nodes report zero conflicts) and `lease-fencing`
+`lease-handover` (two nodes with no P2P path — they share one node
+key — and a 10 s TTL: in each of three rounds and both directions, a
+node writes a 25-op block while the other holds, every op is answered
+(through the holder's inbox, then locally — plan 30 M13's hybrid), it
+escalates and holds the lease within dwell + half a TTL + the wanted
+grace, both converge on the model; the epoch strictly advances across
+every handover, B's lease provably came from sustained inbox demand,
+and both nodes report zero conflicts) and `lease-fencing`
 (A holds the lease with unshipped records and is frozen with
 `SIGSTOP`; after the TTL expires B takes over — legally, only after
 tailing everything A had flushed — and writes; A is then resumed with
@@ -864,6 +868,54 @@ was rewritten for the same milestone):
   and requires that a node which did not hold the lease during a window
   PUT no commit and read no condemned list, and that the holder published
   during the busy window.
+Plan 30 M13 scenarios (the S3 inbox; all three run with
+`CONSTELLATION_P2P=off`, the holder and each requester on a counting
+relay of its own so requests can be attributed per role):
+
+- **`inbox-create-storm-p2p-off`** (the hybrid on a storm, measured).
+  Three nodes, the holder established first with a 20 s TTL and idle
+  release off. Two requesters run `create-storm-s3-only`'s
+  create/read/unlink loop into one shared directory for 30 s
+  (`CHAOS_CREATE_STORM_SECS`), 16 threads each. Linux serializes creates
+  in a directory, so every op is one sequential inbox round trip and
+  the requesters' demand is sustained: they escalate (`wanted_by`), the
+  lease moves at the holder's dwell, and the non-holder of the moment is
+  still served by the inbox. Every op must get its errno right; the
+  requesters' `status.inbox.submitted_ops` and somebody's `executed_ops`
+  must be non-zero; and the aggregate rate must be at least the 41 ops/s
+  floor of the ping-pong band (an absolute floor: a same-run
+  `CONSTELLATION_INBOX=off` baseline would need a second cluster and
+  another storm-length run, and the meta-bench sweep reports that
+  number on every gate). Prints the round-2 breakdown, escalations and
+  lease requests per node, the handoff count (epoch delta) and each
+  requester's inbox PUT count (batching is not asserted: it cannot form
+  on a VFS-serialized directory).
+- **`inbox-sporadic-write-p2p-off`** (the hybrid on sporadic writes).
+  Same rig; `r1` writes one file every 2.5–3.5 s, 16 times. The lease
+  epoch must not move, `r1`'s `escalations` and `lease_requests` must be
+  zero, every file must appear on the holder, at least 16 ops must have
+  gone through the inbox, and — excluding the first write, which pays
+  the 5 s registry first-contact tax and is printed separately — p50
+  must be within the warm poll ceiling (`CONSTELLATION_INBOX_IDLE_MAX_MS`,
+  2 s) and p99 within it plus a second. Today's path for the same write
+  registers `wanted_by`, waits up to TTL/4 for the holder's lease round,
+  and moves the lease twice.
+- **`inbox-requester-crash-mid-batch`**. The holder's S3 is cut (it can
+  neither poll nor renew), `r1` submits a create (its FUSE thread blocks
+  on the outcome), the batch is seen in the bucket, `r1` is SIGKILLed,
+  the holder heals. The orphaned batch executes exactly once (the name
+  appears on the holder and on `r2` as one inode). `r1` remounts under a
+  new incarnation, resumes its numbering by LIST-last past the batch the
+  holder kept as its high-water mark (`status.inbox.next_n >= 2` after
+  its next write), and that next write is polled and executed.
+- **`inbox-holder-takeover-pending-batch`**. Same rig; the holder is
+  killed with `r1`'s batch unread. `r2` writes and wants the lease once
+  the 6 s TTL runs out; whichever node takes over (`r2`, or `r1` itself
+  once its inbox wait finds the register claimable) drains the old
+  epoch's inbox inside its takeover gate. `r1`'s blocked create returns
+  success — not `EIO` — exactly once, `r1` and `r2` agree on one inode,
+  some node's `drained_batches` rose, and the epoch-1 batch objects are
+  gone from the bucket.
 
 All of them poll the control API and the mounted namespace with
 `eventually` rather than sleeping and hoping. (Since plan 30 M4 only the

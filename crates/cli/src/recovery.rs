@@ -260,6 +260,20 @@ fn replay_locally(
         meta.forget_replay(queued.queue_seq)?;
         return Ok(());
     }
+    // Plan 30 §M13: refused through a holder's inbox before this node
+    // took over — an outcome, not a re-evaluation.
+    if let Some(errno) = meta.refused_errno(queued.rid)? {
+        if !refusal_is_satisfied(&queued.op, errno) {
+            let refusal = refusal_now(format!("refused with errno {errno} (inbox)"));
+            meta.mark_replay_refused(queued.queue_seq, refusal.clone())?;
+            spool.lock().unwrap().replay_conflicts += 1;
+            materialize_local(meta, node_id, &queued.op, &refusal)?;
+        } else {
+            spool.lock().unwrap().stranded_replayed += 1;
+        }
+        meta.forget_replay(queued.queue_seq)?;
+        return Ok(());
+    }
     match execute_mutate(meta, &queued.op, Some(queued.rid)) {
         Ok(_) => {
             tracing::info!(rid = ?queued.rid, "stranded op replayed locally");
@@ -480,6 +494,29 @@ async fn drain_one(
     }
     if meta.completed_position(queued.rid)?.is_some() {
         meta.forget_replay(queued.queue_seq)?;
+        return Ok(true);
+    }
+    // Plan 30 §M13: a replay the holder refused through its inbox is an
+    // outcome in the log, not something to submit again; it ends like a
+    // refused P2P replay would.
+    if let Some(errno) = meta.refused_errno(queued.rid)? {
+        if refusal_is_satisfied(&queued.op, errno) {
+            spool.lock().unwrap().stranded_replayed += 1;
+            meta.forget_replay(queued.queue_seq)?;
+            return Ok(true);
+        }
+        let refusal = refusal_now(format!("refused with errno {errno} (inbox)"));
+        meta.mark_replay_refused(queued.queue_seq, refusal.clone())?;
+        tracing::error!(
+            rid = ?queued.rid,
+            op = ?queued.op,
+            reason = %refusal.reason,
+            "stranded op replay refused through the inbox; materializing a conflict copy"
+        );
+        spool.lock().unwrap().replay_conflicts += 1;
+        if materialize_remote(meta, sync_tx, forward, node_id, part, &queued.op, &refusal).await? {
+            meta.forget_replay(queued.queue_seq)?;
+        }
         return Ok(true);
     }
     // Plan 30 §M3b: a deposed holder's own manifest commit names chunks

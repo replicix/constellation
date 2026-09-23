@@ -961,18 +961,47 @@ S3 request counts must stay unchanged.
 
 ### M13 — Forwarding through S3 when P2P is unavailable
 
-- **Inbox objects.** A requester that can't reach the holder over P2P
-  writes batched ops (with rids) as CAS-created objects
-  `inbox/<epoch>/<node>/<n>`.
-- **The holder polls** each known requester with GET-next and idle
-  backoff, and executes batches in order.
+**Revised goal (user decision, 2026-09-23, the "hybrid").** The inbox
+serves *sporadic* writes from non-holders without moving the lease. A
+requester whose inbox demand is *sustained* asks for the lease through
+today's mechanism (`wanted_by` / sticky-lease handoff over S3, plans 26
+and 29) and executes locally once it holds it, as today. Target: never
+worse than lease ping-pong on storms; better than today on sporadic
+writes (latency, and no lease disturbance for the holder). The reason
+the inbox cannot replace ping-pong outright: Linux serializes creates
+in one directory (the parent's `i_rwsem` is held for the whole create),
+so each op is one sequential inbox round trip and batches cannot form
+on that workload.
+
+- **Inbox objects.** A requester with no P2P path to the holder — P2P
+  disabled, a holder its peer directory does not know, or a transport
+  failure that outlasts a grace — writes batched ops (with rids) as
+  CAS-created objects `inbox/<epoch>/<node>/<n>`.
+- **The holder polls** each known requester with GET-next and a
+  per-requester backoff (hot after a hit, a warm ceiling for a minute,
+  the sync loop's cold ceiling after that), and executes batches in
+  order.
 - **Outcomes ride the log**: `Completed{rid}`, plus
-  `Refused { rid, errno }` for refusals. The requester already tails the
-  log, so it reads outcomes there.
-- **Effect:** this replaces lease ping-pong in P2P-off clusters.
+  `Refused { rid, errno }` for refusals — an outcome that is
+  deduplicated like a completion, unlike M2's P2P refusals. The
+  requester already tails the log, so it reads outcomes there.
+- **Escalation.** A sliding window over the requester's inbox-answered
+  ops (`CONSTELLATION_INBOX_ESCALATE_WINDOW_MS`, 10 s): at least
+  `CONSTELLATION_INBOX_ESCALATE_OPS` (20) ops, or at least five ops
+  that together (the single slowest left out) spent
+  `CONSTELLATION_INBOX_ESCALATE_WAIT_MS` (3 s) waiting on their round
+  trips, means sustained demand: the requester asks for the lease
+  (`SyncRequest::Acquire`, backed off to 2 s) while its writes keep
+  going through the inbox. The takeover gate's drain of lower epochs
+  executes what is still queued, in order, before the first local op.
+  It stops asking once the window falls below half of both thresholds;
+  once it holds and goes quiet, the existing idle release hands the
+  lease back or on.
 - **Measure:**
-  - `create-storm-s3-only` and the P2P-off `meta-bench` configs, against
-    the 41–57 ops/s baseline;
+  - `inbox-create-storm-p2p-off` against the 41 ops/s floor of the
+    ping-pong band, and `inbox-sporadic-write-p2p-off`'s p50/p99;
+  - the P2P-off `meta-bench` configs with and without
+    `CONSTELLATION_INBOX=off`;
   - S3 requests per op.
 
 ### M14 — Strict mode: cross-node `flock` and `fcntl`

@@ -200,6 +200,76 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.held.transactions
     );
     gauge!(
+        "constellation_inbox_submitted_ops_total",
+        "Mutations this node forwarded through the S3 inbox (plan 30 M13).",
+        status.inbox.submitted_ops
+    );
+    gauge!(
+        "constellation_inbox_submitted_batches_total",
+        "Inbox batch objects this node wrote.",
+        status.inbox.submitted_batches
+    );
+    gauge!(
+        "constellation_inbox_pending_ops",
+        "Inbox-submitted mutations still waiting for their outcome in the log.",
+        status.inbox.pending_ops
+    );
+    gauge!(
+        "constellation_inbox_executed_ops_total",
+        "Inbox-submitted mutations this node executed as holder.",
+        status.inbox.executed_ops
+    );
+    gauge!(
+        "constellation_inbox_refused_ops_total",
+        "Inbox-submitted mutations this node refused as holder (Refused records).",
+        status.inbox.refused_ops
+    );
+    gauge!(
+        "constellation_inbox_deduped_ops_total",
+        "Inbox batch positions answered without executing (rid or watermark dedup).",
+        status.inbox.deduped_ops
+    );
+    gauge!(
+        "constellation_inbox_drained_batches_total",
+        "Older epochs' inbox batches drained inside a takeover gate.",
+        status.inbox.drained_batches
+    );
+    gauge!(
+        "constellation_inbox_polls_total",
+        "GET-next inbox polls this node made as holder.",
+        status.inbox.polls
+    );
+    gauge!(
+        "constellation_inbox_poll_hits_total",
+        "Inbox polls that found a batch.",
+        status.inbox.poll_hits
+    );
+    gauge!(
+        "constellation_inbox_unavailable_total",
+        "Forwards the inbox could not take; they took the lease path.",
+        status.inbox.unavailable
+    );
+    gauge!(
+        "constellation_inbox_avg_round_trip_ms",
+        "Mean inbox round trip (queue to outcome) on this node, ms.",
+        status.inbox.avg_round_trip_ms
+    );
+    gauge!(
+        "constellation_inbox_avg_batch_ops",
+        "Mean ops per inbox batch this node submitted.",
+        status.inbox.avg_batch_ops
+    );
+    gauge!(
+        "constellation_inbox_escalations_total",
+        "Times sustained inbox demand made this node ask for the lease (plan 30 M13 hybrid).",
+        status.inbox.escalations
+    );
+    gauge!(
+        "constellation_inbox_local_ops_total",
+        "Mutations this node executed locally as holder.",
+        status.inbox.local_ops
+    );
+    gauge!(
         "constellation_cache_used_bytes",
         "Bytes resident in the local chunk cache.",
         status.cache.used_bytes

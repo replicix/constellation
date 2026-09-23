@@ -464,10 +464,15 @@ impl Meta {
                 true,
             )?
         };
-        for rec in applied
-            .iter()
-            .filter(|rec| !matches!(rec, LogRecord::Completed { .. } | LogRecord::Atime { .. }))
-        {
+        for rec in applied.iter().filter(|rec| {
+            !matches!(
+                rec,
+                LogRecord::Completed { .. }
+                    | LogRecord::Atime { .. }
+                    | LogRecord::Refused { .. }
+                    | LogRecord::InboxAck { .. }
+            )
+        }) {
             journal::append_tx(&mut tx, &self.journal_ks, &self.local, &self.completed, rec)?;
         }
         let (bytes, files) = staged.raw_delta();

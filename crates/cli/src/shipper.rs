@@ -276,6 +276,10 @@ pub struct Shipper {
     /// publish immediately — the idle window is measured from "since
     /// this node last did anything", and mounting counts.
     last_publish_attempt: Instant,
+    /// Plan 30 §M13: the S3 inbox, when the daemon wired one up: polled
+    /// from the sync round (`inbox::holder_round`) and drained inside the
+    /// takeover gate (`complete_gate`). `None` for tests and tools.
+    inbox: Option<Arc<crate::inbox::InboxRuntime>>,
 }
 
 struct PartState {
@@ -377,6 +381,7 @@ impl Shipper {
             publisher: None,
             last_ship_epoch: 0,
             last_publish_attempt: Instant::now(),
+            inbox: None,
         })
     }
 
@@ -546,6 +551,15 @@ impl Shipper {
     pub fn set_skip_ship(&self, skip: bool) {
         self.skip_ship
             .store(skip, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Plan 30 §M13: attach the S3 inbox runtime.
+    pub fn set_inbox(&mut self, inbox: Arc<crate::inbox::InboxRuntime>) {
+        self.inbox = Some(inbox);
+    }
+
+    pub fn inbox(&self) -> Option<&Arc<crate::inbox::InboxRuntime>> {
+        self.inbox.as_ref()
     }
 
     /// Attach the offline-designation manager (DESIGN.md §5.2) so a
@@ -1963,6 +1977,26 @@ pub async fn complete_gate(ship: &mut Shipper, keeper: &mut LeaseKeeper, part: &
     let spool = ship.spool.clone();
     match crate::recovery::takeover_gate(&meta, &spool, ship.node_id, gate.epoch, gate.takeover) {
         Ok(()) => {
+            // Plan 30 §M13: still inside the gate, after this node's own
+            // stranded ops and before the view opens, every batch of
+            // every older epoch's inbox — a requester's op the previous
+            // holder never polled lands before anything issued after the
+            // takeover, and one the previous holder did execute is
+            // deduplicated. A failed drain keeps the gate pending like a
+            // failed replay would.
+            if let Some(inbox) = ship.inbox.clone() {
+                if let Err(error) =
+                    crate::inbox::drain_at_takeover(&inbox, &meta, ship.node_id, gate.epoch).await
+                {
+                    tracing::error!(
+                        %error,
+                        part,
+                        epoch = gate.epoch,
+                        "takeover gate: draining older epochs' inbox batches failed; the gate                          stays pending and new mutations wait"
+                    );
+                    return false;
+                }
+            }
             keeper.finish_gate();
             true
         }

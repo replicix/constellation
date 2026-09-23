@@ -84,7 +84,9 @@ impl TouchSet {
             | LogRecord::Atime { .. }
             // Touches no dentry/ino: it can neither suppress nor be
             // suppressed, exactly like `Atime` (see this type's doc).
-            | LogRecord::Completed { .. } => {}
+            | LogRecord::Completed { .. }
+            | LogRecord::Refused { .. }
+            | LogRecord::InboxAck { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
                     self.dentries.insert((node.parent, node.name.clone()));
@@ -490,6 +492,33 @@ fn apply_one(
                 rid.to_key(),
                 crate::store::Meta::encode_completed_row(0, now_ms),
             );
+            Ok(Applied::Done)
+        }
+        // Plan 30 §M13: a refusal is an outcome too, with the same
+        // durable-only rule as `Completed` (an inbox op is never installed
+        // speculatively, so `!durable` cannot happen for it in practice).
+        LogRecord::Refused { .. } if !durable => Ok(Applied::Done),
+        LogRecord::Refused { rid, errno } => {
+            let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
+            tx.insert(
+                &meta.completed,
+                rid.to_key(),
+                crate::store::Meta::encode_refused_row(0, now_ms, *errno),
+            );
+            Ok(Applied::Done)
+        }
+        LogRecord::InboxAck { .. } if !durable => Ok(Applied::Done),
+        LogRecord::InboxAck { epoch, node, n, i } => {
+            crate::store::inbox::set_inbox_ack_tx(
+                tx,
+                &meta.local,
+                crate::store::inbox::InboxAck {
+                    epoch: *epoch,
+                    node: *node,
+                    n: *n,
+                    i: *i,
+                },
+            )?;
             Ok(Applied::Done)
         }
     }

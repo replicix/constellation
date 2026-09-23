@@ -47,6 +47,16 @@
 //! before its gate runs, and a forward reply from an epoch the receiving
 //! node has already superseded is queued for replay instead of installed.
 //!
+//! Plan 30 §M13 (`AuthorityModel::with_inbox(true)`, module [`inbox`])
+//! is an orthogonal "P2P is unavailable" knob on top of `Recovery`, not
+//! a protocol variant: non-holders submit ops as CAS-created batch
+//! objects in the bucket, the holder polls and executes them, outcomes
+//! (`Completed { rid }` and the new `Refused { rid, errno }`) ride the
+//! log, a takeover drains every older epoch's batches inside its gate,
+//! and no P2P message exists at all. It adds the property
+//! `no_rid_executes_twice`, and two naive-variant knobs the tests use
+//! to show the model finds the bugs in the obvious design.
+//!
 //! # What is modeled
 //!
 //! - **Actors.** `N` `Node`s (2–3 across the tests) plus one implicit
@@ -107,6 +117,12 @@
 //! | `Restart` | fail-stop-then-rejoin with the durable journal intact (`crates/cli/src/shipper.rs::bootstrap`, minus lease authority) |
 //! | `Pause` / `Resume` | a stopped node whose timers keep running (the shape of `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` in `node_runtime.rs`'s `SyncRequest::Mutate` task, generalized to the whole node) |
 //! | `DropMessage` | WAN loss/reordering of iroh P2P messages (`crates/net`) |
+//! | `ClientInvoke` (node submits through the inbox, `inbox`) | `crates/cli/src/fusefs.rs::mutate_op_rebasable`'s P2P-unavailable branch → `store_s3::inbox::InboxSubmitter::submit` (one CAS-created `inbox/<epoch>/<node>/<n>` batch) |
+//! | `PollInbox` (`inbox`) | the holder's sync round → `store_s3::inbox::InboxPoller::poll` (GET-next with idle backoff) → `forward::holder_execute` per op, outcome journaled (`Completed`/`Refused`), no reply |
+//! | `Tail` (outcome for a pending inbox op, `inbox`) | `Meta::apply_segment` notifying the inbox waiter keyed by rid: `Completed { rid }` → success, `Refused { rid, errno }` → errno; a higher-epoch segment with neither strands the op |
+//! | `ResubmitInbox` (`inbox`) | the stranded requester's re-submission of the same rid under the new epoch (after resolving against its own `completed` first, and deleting its stale batch) |
+//! | `AcquireLease` (drain, `inbox`) | `store_s3::inbox::InboxStore::drain_below` executed inside `shipper::complete_gate`, after the stranded-op replays and before the view opens |
+//! | `GcInbox` (`inbox`) | `store_s3::inbox::InboxPoller::delete` after the outcome's segment shipped, keeping each requester's newest consumed batch (`gc_keep_newest`) |
 //!
 //! # Simplifications
 //!
@@ -183,12 +199,24 @@
 //!     names a crashed node (`failover_pending`): nobody can tell a dead
 //!     holder from a slow one, so a shadow it accepted is in doubt, not
 //!     stranded, until some node takes over — which is what the next write
-//!     anywhere does. A refused replay is dropped rather than materialized
-//!     (the model has no conflict files), and a replay may be re-sent at
-//!     most `MAX_REPLAY_ATTEMPTS` times (the real drain retries forever;
-//!     each retry only mints a fresh message id). The same holds for a
-//!     deposed holder's rolled-back Local entries, which replay through
-//!     the same queue (plan 30 §M3b).
+//!     anywhere does. A refused replay of a stranded *shadow* is dropped
+//!     rather than materialized (the model has no conflict files; the
+//!     acked-before-durable gap is L2/L3, closed by M9's `ack=s3`), and
+//!     a replay may be re-sent at most `MAX_REPLAY_ATTEMPTS` times (the
+//!     real drain retries forever; each retry only mints a fresh message
+//!     id). A *deposed holder's own* acknowledged-but-unshipped ops (plan
+//!     30 §M3b, `ReplayEntry::deposed`) are the acked-before-durable gap
+//!     made explicit (model round 3a): from the takeover CAS their
+//!     recorded returns become `NsRet::Tentative`, and a refused replay
+//!     makes one `NsRet::Conflicted` (the conflict copy the real code
+//!     materializes, `protocol::mark_conflicted`). `prop_linearizable`
+//!     feeds both to the checker as ops still in flight on threads of
+//!     their own — free to linearize when the replay lands, or never —
+//!     while every other op, including the same node's later ones, is
+//!     checked strictly. M9's `ack=s3` is what removes the gap itself.
+//!     Under `inbox`, replays still travel as `MutateReq` messages; the
+//!     real drain submits them through the inbox when P2P is unavailable,
+//!     which at this abstraction is the same exchange.
 //! 11. Holder-side before-images are one bit per journal entry (every
 //!     modeled record touches exactly one name), and the redo after a
 //!     tail or a stranded shadow is modeled as re-capturing those bits,
@@ -224,7 +252,24 @@
 //!     (simplification 2) makes its client path hard to reach: a node only
 //!     acquires the lease for its own `NeedsLease` op, so its forward
 //!     never overlaps its own takeover the way two FUSE threads' ops can.
+//! 16. (`inbox`) One op per batch: with one client op per node
+//!     (simplification 2) a requester never has two ops to batch. The
+//!     real batch is a group-commit window; its ops are mutually
+//!     non-conflicting by the requester's keygate and execute in order,
+//!     each acked in its own transaction, so per-op reasoning is the
+//!     whole story. The requester's numbering is derived by LIST-last
+//!     from the bucket state rather than stored, which is also what a
+//!     restarted requester does. Retention pruning of `completed` is not
+//!     modeled (the model's `completed` is the whole log), so the
+//!     `InboxAck` position watermark the design adds for drains older
+//!     than the retention window has no model counterpart. A requester
+//!     submits under the epoch the register shows at that instant; a
+//!     stale lease read is not modeled, so re-submission is reached
+//!     through the takeover epoch marker (simplification 12): the
+//!     stranded requester tails the empty higher-epoch segment before
+//!     the drain's outcome ships (`inbox_marker_strands_and_resubmits`).
 
+pub mod inbox;
 pub mod namespace;
 pub mod protocol;
 

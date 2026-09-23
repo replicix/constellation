@@ -385,6 +385,15 @@ pub fn holder_execute(
             records: Vec::new(),
         };
     }
+    // Plan 30 §M13: a rid the log *refused* (an inbox refusal, which is
+    // an outcome — see `docs/reference/features/forwarded-mutations.md`,
+    // "The inbox") is answered with that errno, never re-evaluated.
+    if let Some(errno) = meta.refused_errno(rid).ok().flatten() {
+        if let Some(forward) = forward {
+            forward.dedup_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        return MutateOutcome::Errno(errno);
+    }
     let executed = execute_mutate(meta, &op, Some(rid));
     match executed {
         Ok(records) => {
