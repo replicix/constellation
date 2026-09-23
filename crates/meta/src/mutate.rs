@@ -123,6 +123,16 @@ pub enum MutateOp {
         size: u64,
         xattrs: Vec<(String, Vec<u8>)>,
     },
+    /// Plan 30 §M3b: re-apply already-decided records through the replay
+    /// path and journal them — how a deposed holder's stranded
+    /// transaction that had no op of its own (a snapshot row, a quota
+    /// change, a clone) is replayed by rid on the current holder
+    /// (`store::spec`'s `derive_replay_op`). The records apply with the
+    /// same skip-on-conflict rules every tailing replica uses, so the
+    /// result is whatever the log order makes of them.
+    Records {
+        records: Vec<LogRecord>,
+    },
 }
 
 impl MutateOp {
@@ -225,6 +235,10 @@ pub fn execute(
     rid: Option<crate::rid::Rid>,
 ) -> Result<Vec<LogRecord>, MetaError> {
     let _pending = crate::store::journal::PendingCompletion::set(rid);
+    // Plan 30 §M3b: the op's own journaled transaction records `(rid, op)`
+    // in its `journal_tx` row (`store::local`), so a deposition can replay
+    // it by rid.
+    let _op = crate::store::journal::PendingLocalOp::set(rid, op);
     execute_inner(meta, op)
 }
 
@@ -342,6 +356,9 @@ fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError
             meta.publish_file(
                 *parent, name, *ino, *mode, *uid, *gid, *mtime_ns, manifest, *size, xattrs,
             )?;
+        }
+        MutateOp::Records { records } => {
+            meta.apply_records_journaled(records)?;
         }
         MutateOp::AtimeBatch { entries } => {
             // Apply to the holder's own inode table (so its stat reflects

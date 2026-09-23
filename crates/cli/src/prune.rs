@@ -725,20 +725,25 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
 
     // Held locally with a usable, non-lost shipping lease → execute
     // directly (no `touch()`, so a pure prune never pins the lease).
-    let held = {
+    // Plan 30 §M3b: admitted through the lease view like every other
+    // local mutation, so a release's final flush cannot miss it (see
+    // `lease.rs`'s module doc, "The releasing flag").
+    let held_view = {
         let keepers = deps.keepers.lock().await;
         keepers
             .get(&part)
-            .map(|k| !k.is_lost() && k.ship_epoch().is_some() && k.view().usable())
-            .unwrap_or(false)
+            .filter(|k| !k.is_lost() && k.ship_epoch().is_some())
+            .map(|k| k.view())
     };
-    if held {
-        match constellation_meta::execute_mutate(&deps.meta, &op, Some(rid)) {
-            Ok(_) => {
-                let _ = deps.sync_tx.send(crate::fusefs::SyncRequest::Nudge);
-                return UnlinkResult::Done { freed };
+    if let Some(view) = held_view {
+        if let Some(_admitted) = view.admit() {
+            match constellation_meta::execute_mutate(&deps.meta, &op, Some(rid)) {
+                Ok(_) => {
+                    let _ = deps.sync_tx.send(crate::fusefs::SyncRequest::Nudge);
+                    return UnlinkResult::Done { freed };
+                }
+                Err(_) => return UnlinkResult::SkippedForward,
             }
-            Err(_) => return UnlinkResult::SkippedForward,
         }
     }
 

@@ -1,18 +1,30 @@
-//! Plan 30 §M3a: replaying stranded ops by rid, and the takeover gate.
+//! Plan 30 §M3a/§M3b: replaying stranded ops by rid, the takeover gate,
+//! and a deposed holder's recovery.
 //!
-//! When a later epoch strands a requester's speculation
-//! (`Meta::apply_segment` while tailing, or `Meta::strand_below_epoch` at
-//! a takeover), the speculation log rolls the effects back and queues
-//! each stranded shadow's op, with its original rid, in `pending_replay`.
-//! This module turns that queue back into log records, exactly once:
+//! When a later epoch strands speculation — a requester's shadows and
+//! hints, or (§M3b) a deposed holder's own unshipped journal — the
+//! speculation log rolls the effects back and queues each stranded op,
+//! with its original rid, in `pending_replay` (`Meta::apply_segment` while
+//! tailing, `Meta::strand_below_epoch` at a takeover or deposition). This
+//! module turns that queue back into log records, exactly once:
 //!
 //! - **Takeover gate** ([`takeover_gate`]). A node that wins a lease CAS
-//!   first rolls back everything the new epoch strands, then executes
-//!   every queued op locally, in order, before its view opens
-//!   (`LeaseKeeper::commit_gated`). A new holder therefore never validates
-//!   an op against phantom state (bug B's second shape), and the ops its
-//!   own clients were already told succeeded land before anything that
-//!   arrives after the takeover.
+//!   first ships an empty epoch-marker segment (a takeover only —
+//!   `shipper::complete_gate`), then rolls back everything the new epoch
+//!   strands, then executes every queued op locally, in order, before its
+//!   view opens. A new holder therefore never validates an op against
+//!   phantom state (bug B's second shape), and the ops its own clients
+//!   were already told succeeded land before anything that arrives after
+//!   the takeover. The continuation-epoch path runs the same gate
+//!   ([`adopt_epoch_hold_gated`]).
+//! - **Deposition** ([`recover_deposed`], §M3b). A holder that learns it
+//!   was deposed — a renewal finds another holder, or a segment from a
+//!   later epoch arrives (the new holder's marker, at the latest) — rolls
+//!   its unshipped journal back and queues its ops. This replaces
+//!   reintegration's classify-against-a-side-replica pass: every
+//!   transaction is re-executed through the current holder by rid, so
+//!   only a genuine overlap (the log did something the op now conflicts
+//!   with) becomes a conflict copy.
 //! - **Drain** ([`drain_pending_replays`], a periodic task). A node that
 //!   does not hold the lease sends each queued op, oldest first and one at
 //!   a time, down the ordinary forward path (`SyncRequest::Forward`, the
@@ -25,19 +37,24 @@
 //!
 //! Exactly-once comes from M2: every path checks `completed` first, and
 //! a holder answers a rid it already executed from `recent` or `completed`
-//! (`forward::holder_execute`) rather than executing it again.
+//! (`forward::holder_execute`) rather than executing it again. A stranded
+//! transaction's own `completed` row is deleted with it (it never took
+//! effect in the log), so neither check can claim it did.
 //!
 //! **Refusals.** A replay the current state no longer admits (the name
 //! now exists, the target is gone, a manifest's base is stale) is a
 //! genuine conflict between the stranded op and what the log did instead.
-//! It is materialized the way reintegration materializes a stranded
-//! journal record: a `<parent>/.constellation-conflict/<name>@<node>-<ts>`
-//! copy (empty file or directory, carrying the op's manifest when it had
-//! one), plus a status counter. An `unlink`/`rmdir` refused with `ENOENT`
-//! is not a conflict — the name is gone, which is what the op wanted
-//! (reintegration's "gone already is clean"). The refusal (reason and
-//! timestamp) is persisted before the copy is made, so an interrupted
-//! materialization resumes with the same name.
+//! It is materialized as a
+//! `<parent>/.constellation-conflict/<name>@<node>-<ts>` copy (empty file
+//! or directory, carrying the op's manifest when it had one), plus a
+//! status counter. An `unlink`/`rmdir` refused with `ENOENT` is not a
+//! conflict — the name is gone, which is what the op wanted. A size-only
+//! `setattr` (the FUSE `O_TRUNC` path) queued ahead of a manifest commit
+//! for the same inode is folded into it, as reintegration did: the commit
+//! carries the final size, and replaying the truncate alone would cut
+//! whatever the log put there instead when the commit is then refused.
+//! The refusal (reason and timestamp) is persisted before the copy is
+//! made, so an interrupted materialization resumes with the same name.
 
 use crate::forward::{self, ForwardState};
 use crate::fusefs::SyncRequest;
@@ -63,58 +80,165 @@ pub const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
 /// acknowledged ops for long.
 pub const LEASE_FALLBACK: Duration = Duration::from_secs(10);
 
-/// Plan 30 §M3a's takeover gate, run by `LeaseKeeper::commit_gated` right
-/// after this node's lease CAS won at `epoch` and before its view opens.
+/// The takeover gate (plan 30 §M3), run by `shipper::complete_gate` once
+/// this node's lease CAS won at `epoch` (and, for a takeover, its epoch
+/// marker is durable), before its view opens.
 ///
 /// For a takeover (the lease moved here from another node), roll back
-/// every speculative entry accepted below `epoch`: the tail to head that
-/// preceded the CAS retired everything the previous holders shipped, so
-/// what is left can never reach the log. Then execute every queued
-/// stranded op locally, in order — for a takeover, and for any other
-/// acquisition that finds the queue non-empty.
+/// every speculative entry accepted below `epoch` — this node's own
+/// shadows and hints, and any of its own transactions left from an older
+/// tenure: the tail to head that preceded the CAS retired everything the
+/// previous holders shipped, so what is left can never reach the log.
+/// Then execute every queued stranded op locally, in order — for a
+/// takeover, and for any other acquisition that finds the queue non-empty.
 ///
-/// Best effort by construction: it runs inside the commit, after the CAS,
-/// where there is nothing left to abort. A failure is logged and the
-/// queue keeps whatever was not resolved, for the drain to retry.
+/// Idempotent, so a failed gate is simply run again: an error leaves
+/// whatever was not resolved queued, and the caller keeps the view closed
+/// (`shipper::complete_gate`'s doc says why).
 pub(crate) fn takeover_gate(
     meta: &Meta,
     spool: &Mutex<SpoolInfo>,
     node_id: u64,
     epoch: u64,
     takeover: bool,
-) {
+) -> anyhow::Result<()> {
     if takeover {
-        match meta.strand_below_epoch(epoch) {
-            Ok(stranded) if stranded.any() => {
-                tracing::warn!(
-                    epoch,
-                    shadows = stranded.shadows,
-                    hints = stranded.hints,
-                    "takeover stranded speculative state; rolled back, replaying stranded ops"
-                );
-                spool.lock().unwrap().speculation_rolled_back +=
-                    (stranded.shadows + stranded.hints) as u64;
-            }
-            Ok(_) => {}
+        let stranded = meta.strand_below_epoch(epoch)?;
+        if stranded.any() {
+            tracing::warn!(
+                epoch,
+                shadows = stranded.shadows,
+                hints = stranded.hints,
+                local = stranded.locals,
+                "takeover stranded speculative state; rolled back, replaying stranded ops"
+            );
+            let mut spool = spool.lock().unwrap();
+            spool.speculation_rolled_back += (stranded.shadows + stranded.hints) as u64;
+            spool.local_rolled_back += stranded.locals as u64;
+        }
+    }
+    let queued = meta.pending_replays()?;
+    for op in &queued {
+        if folded_into_later_manifest(op, &queued) {
+            meta.forget_replay(op.queue_seq)?;
+            spool.lock().unwrap().stranded_replayed += 1;
+            continue;
+        }
+        replay_locally(meta, spool, node_id, op)?;
+    }
+    Ok(())
+}
+
+/// Plan 30 §M3b: the continuation-epoch counterpart of the S3 path's
+/// takeover gate. Taking continuation authority over P2P changes no epoch
+/// (the previous authority keeps its journal and ships it later), so
+/// nothing is stranded; the queued replays still run locally before the
+/// view opens. A failure leaves the gate pending, and the next round's
+/// re-adoption retries it.
+pub(crate) fn adopt_epoch_hold_gated(
+    keeper: &mut crate::lease::LeaseKeeper,
+    meta: &Meta,
+    spool: &Mutex<SpoolInfo>,
+    node_id: u64,
+    epoch: u64,
+) {
+    keeper.adopt_epoch_hold_gated(epoch, |epoch| {
+        match takeover_gate(meta, spool, node_id, epoch, false) {
+            Ok(()) => true,
             Err(error) => {
-                tracing::error!(%error, epoch, "takeover gate: rolling back stranded speculation failed");
-                return;
+                tracing::error!(%error, epoch, "continuation-epoch gate failed; retrying next round");
+                false
             }
         }
+    });
+}
+
+/// Plan 30 §M3b: this node was deposed (`keeper` is lost). Tail to head —
+/// so this node's own segments that landed without an ack are recognized
+/// as shipped, and the new holder's segments strand what they strand —
+/// then strand whatever of its own unshipped work is left below
+/// `keeper.lost_floor()` and clear the deposition. From here the node is
+/// an ordinary non-holder: the drain replays the queued ops by rid
+/// through the new holder, which executes each exactly once.
+///
+/// With holder capture off (the performance-gate fallback) there are no
+/// before-images to roll back with, so the namespace is rebuilt from the
+/// shared log instead (a side replica bootstrapped from the head commit
+/// and the log after it, swapped in by `Meta::replace_ns_from_rebuilt`),
+/// with the journal's ops queued the same way.
+pub(crate) async fn recover_deposed(
+    ship: &mut crate::shipper::Shipper,
+    keeper: &mut crate::lease::LeaseKeeper,
+    state_dir: Option<&std::path::Path>,
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+    ship.tail_to_head()
+        .await
+        .context("tailing to head before a deposition recovery")?;
+    let meta = ship.meta().clone();
+    let spool = ship.spool.clone();
+    let floor = keeper.lost_floor().max(1);
+    let mut rolled_back = 0usize;
+    let mut how = "rolled back from before-images";
+    if meta.holder_capture() {
+        rolled_back += meta.strand_below_epoch(floor)?.locals;
     }
-    let queued = match meta.pending_replays() {
-        Ok(queued) => queued,
-        Err(error) => {
-            tracing::error!(%error, "takeover gate: reading the replay queue failed");
-            return;
-        }
+    // Whatever is still journaled was never captured (capture off, or a
+    // transaction from before it was switched on): no before-images to
+    // undo it with, so rebuild from the log and queue it all.
+    let uncaptured = meta.journal_len()? as usize;
+    if uncaptured > 0 {
+        let dir = state_dir.context("rebuilding a deposed replica needs a state directory")?;
+        let view_path = dir.join(".deposition-rebuild.db");
+        let _ = std::fs::remove_dir_all(&view_path);
+        crate::shipper::bootstrap(&view_path, ship.log())
+            .await
+            .context("bootstrapping the shared log for a deposition rebuild")?;
+        let side = Meta::open(&view_path)?;
+        meta.replace_ns_from_rebuilt(&side)?;
+        drop(side);
+        let _ = std::fs::remove_dir_all(&view_path);
+        rolled_back += uncaptured;
+        how = "rolled back (rebuilt from the shared log where uncaptured)";
+    }
+    keeper.clear_lost();
+    meta.kv_set("lease_lost", "0")?;
+    {
+        let mut spool = spool.lock().unwrap();
+        spool.depositions += 1;
+        spool.local_rolled_back += rolled_back as u64;
+    }
+    let queued = meta.pending_replays()?.len();
+    let summary = format!(
+        "deposition recovered: {rolled_back} unshipped transaction(s) {how}; \
+         {queued} op(s) queued for replay by rid"
+    );
+    tracing::warn!(floor, rolled_back, queued, "{summary}");
+    Ok(summary)
+}
+
+/// Whether `op` is a size-only `setattr` (the FUSE truncate path) with a
+/// manifest commit for the same inode queued after it: the commit carries
+/// the final size, so the truncate is folded into it (see the module
+/// doc's "Refusals").
+fn folded_into_later_manifest(op: &StrandedOp, queue: &[StrandedOp]) -> bool {
+    let MutateOp::Setattr {
+        ino,
+        mode: None,
+        uid: None,
+        gid: None,
+        size: Some(_),
+        atime_ns: None,
+        mtime_ns: None,
+    } = &op.op
+    else {
+        return false;
     };
-    for op in queued {
-        if let Err(error) = replay_locally(meta, spool, node_id, &op) {
-            tracing::error!(%error, rid = ?op.rid, "takeover gate: local replay failed");
-            return;
-        }
-    }
+    op.refused.is_none()
+        && queue.iter().any(|later| {
+            later.queue_seq > op.queue_seq
+                && matches!(&later.op, MutateOp::SetManifest { ino: m, .. } if m == ino)
+        })
 }
 
 /// Execute one queued op on this node, as the holder: skip it if its rid
@@ -175,10 +299,12 @@ pub struct DrainState {
 /// resolved yet (order matters: a later op may depend on an earlier one).
 ///
 /// `held_epoch` is the epoch this node holds `part` at, if it does. A
-/// holder never tails a later-epoch segment, so a shadow from an older
-/// epoch that was installed after its takeover gate ran (a forward's
-/// reply racing the takeover) would otherwise never strand; the pass
-/// strands it here first, and then replays it like any other.
+/// holder never tails a later-epoch segment, so speculation from an older
+/// epoch left on it would otherwise never strand; the pass strands it here
+/// first, and then replays it like any other. Plan 30 §M3b made the main
+/// source of that — a forward's reply racing this node's own takeover —
+/// impossible (`Meta::install_shadow` queues it instead), so this is a
+/// backstop.
 #[allow(clippy::too_many_arguments)]
 pub async fn drain_pending_replays(
     meta: &Arc<Meta>,
@@ -198,10 +324,12 @@ pub async fn drain_pending_replays(
                         epoch,
                         shadows = stranded.shadows,
                         hints = stranded.hints,
+                        local = stranded.locals,
                         "holder had speculation from an older epoch; rolled back for replay"
                     );
-                    spool.lock().unwrap().speculation_rolled_back +=
-                        (stranded.shadows + stranded.hints) as u64;
+                    let mut spool = spool.lock().unwrap();
+                    spool.speculation_rolled_back += (stranded.shadows + stranded.hints) as u64;
+                    spool.local_rolled_back += stranded.locals as u64;
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "stranding older-epoch speculation failed"),
@@ -219,8 +347,16 @@ pub async fn drain_pending_replays(
         state.stuck_since = None;
         return;
     }
-    for op in queued {
-        match drain_one(meta, spool, sync_tx, forward, node_id, part, &op).await {
+    for op in &queued {
+        if folded_into_later_manifest(op, &queued) {
+            if let Err(error) = meta.forget_replay(op.queue_seq) {
+                tracing::warn!(%error, "dropping a folded truncate from the replay queue failed");
+                return;
+            }
+            spool.lock().unwrap().stranded_replayed += 1;
+            continue;
+        }
+        match drain_one(meta, spool, sync_tx, forward, node_id, part, op).await {
             Ok(true) => state.stuck_since = None,
             Ok(false) => {
                 // The cached holder may be the dead one that stranded the
@@ -275,6 +411,17 @@ async fn drain_one(
     if meta.completed_position(queued.rid)?.is_some() {
         meta.forget_replay(queued.queue_seq)?;
         return Ok(true);
+    }
+    // Plan 30 §M3b: a deposed holder's own manifest commit names chunks
+    // it may not have uploaded yet (it was still holding, so its round
+    // would have uploaded them before shipping). A forwarded manifest must
+    // never name a hash S3 does not have (`fusefs::commit_manifest_forwarded`
+    // uploads first for the same reason), so drain the inode's pending
+    // chunks before the replay leaves this node.
+    if let MutateOp::SetManifest { ino, .. } | MutateOp::Publish { ino, .. } = &queued.op {
+        if !drain_inode(sync_tx, *ino).await {
+            return Ok(false);
+        }
     }
     let Some(outcome) = submit(sync_tx, part, queued.op.clone(), queued.rid).await else {
         return Ok(false);
@@ -331,6 +478,27 @@ async fn submit(
         })
         .ok()?;
     rx.await.ok()?.ok()
+}
+
+/// Upload `ino`'s pending chunks through the sync task
+/// (`SyncRequest::DrainInode`). `false` when that failed or the task is
+/// gone; the caller retries the replay later.
+async fn drain_inode(sync_tx: &tokio::sync::mpsc::UnboundedSender<SyncRequest>, ino: Ino) -> bool {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    if sync_tx
+        .send(SyncRequest::DrainInode { ino, reply })
+        .is_err()
+    {
+        return false;
+    }
+    match rx.await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, ino, "chunk drain before a manifest replay failed; retrying");
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// A refusal that is not a conflict: removing a name that is already gone
@@ -423,7 +591,8 @@ fn conflict_copy(meta: &Meta, op: &MutateOp) -> Option<ConflictCopy> {
         | MutateOp::Rename { .. }
         | MutateOp::SetXattr { .. }
         | MutateOp::RemoveXattr { .. }
-        | MutateOp::AtimeBatch { .. } => return None,
+        | MutateOp::AtimeBatch { .. }
+        | MutateOp::Records { .. } => return None,
     };
     let parent = if meta.getattr(copy.parent).ok().flatten().is_some() {
         copy.parent
@@ -630,7 +799,7 @@ mod tests {
         assert!(requester.has_outstanding_speculation());
         assert_eq!(requester.journal_len().unwrap(), 0);
 
-        takeover_gate(&requester, &spool, 2, 2, true);
+        takeover_gate(&requester, &spool, 2, 2, true).unwrap();
 
         assert!(!requester.has_outstanding_speculation());
         assert!(requester.pending_replays().unwrap().is_empty());
@@ -678,7 +847,7 @@ mod tests {
             .unwrap();
         assert_eq!(applied.stranded.shadows, 1);
 
-        takeover_gate(&requester, &spool, 2, 3, true);
+        takeover_gate(&requester, &spool, 2, 3, true).unwrap();
 
         assert!(requester.pending_replays().unwrap().is_empty());
         assert_eq!(
@@ -698,6 +867,103 @@ mod tests {
         assert_eq!(spool.stranded_replayed, 0);
     }
 
+    /// Plan 30 §M3b: a deposed holder's `O_TRUNC` + write (a size-only
+    /// `setattr`, then a manifest commit composed on the old manifest)
+    /// against a log that moved the file on: the truncate folds into the
+    /// commit, the commit is refused as an edit-vs-edit overlap and
+    /// materialized, and the log's version keeps its content and size.
+    #[test]
+    fn a_truncate_before_a_refused_manifest_commit_is_folded_not_replayed() {
+        let holder = Meta::open_in_memory().unwrap();
+        let spool = Mutex::new(SpoolInfo::default());
+        let f = holder.create(ROOT_INO, "same", 0o644, 0, 0).unwrap().ino;
+        holder.set_manifest(f, b"winner", 6).unwrap();
+        holder
+            .queue_replay(
+                rid(1),
+                &MutateOp::Setattr {
+                    ino: f,
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    size: Some(0),
+                    atime_ns: None,
+                    mtime_ns: None,
+                },
+            )
+            .unwrap();
+        holder
+            .queue_replay(
+                rid(2),
+                &MutateOp::SetManifest {
+                    ino: f,
+                    base_manifest: Some(b"baseline".to_vec()),
+                    manifest: b"loser".to_vec(),
+                    size: 5,
+                },
+            )
+            .unwrap();
+
+        takeover_gate(&holder, &spool, 2, 3, false).unwrap();
+
+        assert!(holder.pending_replays().unwrap().is_empty());
+        assert_eq!(holder.manifest(f).unwrap().as_deref(), Some(&b"winner"[..]));
+        assert_eq!(holder.getattr(f).unwrap().unwrap().size, 6);
+        let dir = holder
+            .lookup(ROOT_INO, CONFLICT_DIR)
+            .unwrap()
+            .expect("conflict directory");
+        let copies = holder.readdir(dir.ino).unwrap();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert!(copies[0].name.starts_with("same@2-"), "{copies:?}");
+        let copy = copies[0].ino;
+        assert_eq!(
+            holder.manifest(copy).unwrap().as_deref(),
+            Some(&b"loser"[..])
+        );
+        let spool = spool.lock().unwrap();
+        assert_eq!(spool.replay_conflicts, 1);
+    }
+
+    /// Plan 30 §M3b: a holder's own unshipped transaction, stranded by a
+    /// deposition, replays by rid on the next holder exactly like a
+    /// requester's shadow does: the new holder's gate executes it once,
+    /// and a second replay of the same rid is answered from `completed`.
+    #[test]
+    fn a_deposed_holders_transaction_replays_once_on_the_next_holder() {
+        let deposed = Meta::open_in_memory().unwrap();
+        let next = Meta::open_in_memory().unwrap();
+        let spool = Mutex::new(SpoolInfo::default());
+        let op = create_op("stranded-local", (5 << 40) | 9);
+        deposed.set_holder_epoch(1);
+        execute_mutate(&deposed, &op, Some(rid(4))).unwrap();
+        deposed.set_holder_epoch(0);
+        let stranded = deposed.strand_below_epoch(2).unwrap();
+        assert_eq!(stranded.locals, 1);
+        let queued = deposed.pending_replays().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].rid, rid(4));
+        assert!(deposed
+            .lookup(ROOT_INO, "stranded-local")
+            .unwrap()
+            .is_none());
+
+        // The next holder replays it (as the drain's forward would).
+        next.queue_replay(queued[0].rid, &queued[0].op).unwrap();
+        next.queue_replay(queued[0].rid, &queued[0].op).unwrap();
+        takeover_gate(&next, &spool, 7, 2, true).unwrap();
+        assert!(next.lookup(ROOT_INO, "stranded-local").unwrap().is_some());
+        let journal = next.take_journal(usize::MAX).unwrap();
+        let creates = journal
+            .iter()
+            .filter(
+                |(_, r)| matches!(r, LogRecord::Create { name, .. } if name == "stranded-local"),
+            )
+            .count();
+        assert_eq!(creates, 1, "exactly once: {journal:?}");
+        assert_eq!(spool.lock().unwrap().stranded_replayed, 1);
+    }
+
     /// A stranded unlink of a name that is already gone is satisfied, not
     /// a conflict.
     #[test]
@@ -711,7 +977,7 @@ mod tests {
         requester
             .install_shadow(rid(1), 1, &op, &[LogRecord::Completed { rid: rid(1) }])
             .unwrap();
-        takeover_gate(&requester, &spool, 2, 2, true);
+        takeover_gate(&requester, &spool, 2, 2, true).unwrap();
         assert!(requester.pending_replays().unwrap().is_empty());
         assert!(requester.lookup(ROOT_INO, CONFLICT_DIR).unwrap().is_none());
         assert_eq!(spool.lock().unwrap().replay_conflicts, 0);

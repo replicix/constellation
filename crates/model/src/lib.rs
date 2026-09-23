@@ -37,6 +37,16 @@
 //! does not publish. `Recovery` also bounds authority in time the way
 //! `LeaseView::usable` does (see `protocol::Protocol`'s doc).
 //!
+//! Plan 30 §M3b adds the holder half to the same `Recovery` variant: a
+//! holder's journal entries carry their epoch and a captured
+//! before-image (`protocol::JournalEntry`), a node publishes while its
+//! journal is non-empty by substituting those before-images (so the
+//! commit is the log prefix at its applied position), a deposed holder
+//! rolls its journal back and replays it by rid instead of shipping it
+//! under a lost epoch, a takeover ships an empty epoch-marker segment
+//! before its gate runs, and a forward reply from an epoch the receiving
+//! node has already superseded is queued for replay instead of installed.
+//!
 //! # What is modeled
 //!
 //! - **Actors.** `N` `Node`s (2–3 across the tests) plus one implicit
@@ -86,10 +96,13 @@
 //! | `RetryForward` (`ExactlyOnce` only) | `crates/cli/src/forward.rs::request_mutate_with`'s same-rid retry loop: the same holder if `state.lease` (the model's stand-in for the peer directory's belief) still names it, else the redirected one — plan 30 §M2's "retry the same rid... same holder... then a redirected holder" |
 //! | `RequestHandoff` / `DeliverHandoffRequest` / `DeliverHandoffReply` | `crates/cli/src/node_runtime.rs` `SyncRequest::HandOff` arm (`ship.sync_one` + `LeaseKeeper::release`) and the `peers.request_lease` fast-path retry in the `SyncRequest::Acquire` arm |
 //! | `AcquireLease` | `crates/cli/src/lease.rs::LeaseKeeper::classify`/`commit` (`Plan::Create`/`Plan::Claim`, `TailedToHead`) + `crates/cli/src/shipper.rs::acquire_lease_for`/`tail_to_head`; under `Recovery` also the takeover gate (`LeaseKeeper::commit_gated` → `recovery::takeover_gate`: `Meta::strand_below_epoch` + `recovery::replay_locally`) |
-//! | `Renew` (success / deposition) | `crates/cli/src/lease.rs::LeaseKeeper::renew_now` → `diagnose_lost_renew` → `mark_lost` |
-//! | `Ship` (incl. collision absorption) | `crates/cli/src/shipper.rs::ship_part` (`put_segment` create-if-absent; `Err(AlreadyExists) => tail_part`) |
-//! | `Tail` (fencing + shadow retirement) | `crates/cli/src/shipper.rs::apply_decoded_segment` (epoch fencing) → `Meta::apply_segment` (stranding rollback/redo, apply, retirement by rid under `Recovery`; record equality before M3a) |
-//! | `Publish` | `crates/cli/src/mtree_publish.rs::TreePublisher::publish`/`publish_batch` (deferred while `Meta::has_outstanding_speculation`, `Recovery`) |
+//! | `AcquireLease` (takeover, `Recovery`: epoch marker) | `crates/cli/src/shipper.rs::Shipper::ship_epoch_marker`, called from `shipper::acquire_lease_for` before `recovery::takeover_gate` (modeled inside the same atomic step; see the comment at its call site) |
+//! | Holder-side capture (`ClientInvoke`/`DeliverForwardRequest`/`AcquireLease`/local replay journaling, `Recovery`) | `crates/meta/src/store/local.rs` (`Meta::begin_local`/`finish_local`) and `crates/meta/src/store/spec.rs` (`SpecKind::Local`): `protocol::JournalEntry`'s epoch and before-image |
+//! | `Renew` (success / deposition) | `crates/cli/src/lease.rs::LeaseKeeper::renew_now` → `diagnose_lost_renew` → `mark_lost`; under `Recovery` the deposition then runs `crates/cli/src/recovery.rs::recover_deposed` (Local entries rolled back, queued for replay by rid) |
+//! | `Ship` (incl. collision absorption) | `crates/cli/src/shipper.rs::ship_part` (`put_segment` create-if-absent; `Err(AlreadyExists) => tail_part`); shipping retires the shipped Local entries (`Recovery`) |
+//! | `Tail` (fencing + shadow retirement) | `crates/cli/src/shipper.rs::apply_decoded_segment` (epoch fencing) → `Meta::apply_segment` (stranding rollback/redo, apply, retirement by rid under `Recovery`; record equality before M3a); under `Recovery` also `Meta::apply_segment`'s epoch stranding of Local entries → `recovery::recover_deposed`, and re-capture of the surviving Local entries' before-images |
+//! | `DeliverForwardReply` (Accepted below this node's held epoch, `Recovery`) | `Meta::install_shadow` refusing below `Meta::holder_epoch`; the op is queued for replay by rid instead |
+//! | `Publish` | `crates/cli/src/mtree_publish.rs::TreePublisher::publish`/`publish_batch` (deferred while a shadow is outstanding, `Meta::has_outstanding_speculation`, `Recovery`); under `Recovery` the holder publishes through `plan_from_dirty` with `Meta::publish_basis_at` before-image substitution (`protocol::log_prefix_view`) |
 //! | `Crash` | fail-stop (harness `kill9`; `LeaseKeeper`'s "deposition is terminal" module doc) |
 //! | `Restart` | fail-stop-then-rejoin with the durable journal intact (`crates/cli/src/shipper.rs::bootstrap`, minus lease authority) |
 //! | `Pause` / `Resume` | a stopped node whose timers keep running (the shape of `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` in `node_runtime.rs`'s `SyncRequest::Mutate` task, generalized to the whole node) |
@@ -152,19 +165,20 @@
 //!    small, per-test bounds chosen to keep exhaustive BFS within the
 //!    ~60s budget; a config that needs to be bigger should be
 //!    `#[ignore]`d rather than raised for everyone.
-//! 9. `Publish` is only offered while the publishing node's own journal
-//!    is empty (see the comment at its `actions()` call site): real
-//!    `mtree_publish` runs on the same per-partition cycle that ships
-//!    first, so a live, still-acting node's journal is already drained
-//!    by the time it publishes. Without this, *any* solitary holder
-//!    could publish speculative, unshipped local state the instant after
-//!    executing it — a real defect (plan 30 §1.1 also describes "the
-//!    holder side has the same shape" of bug B) but a different one from
-//!    what `single_writer_is_clean` exists to rule out. A lingering
-//!    *shadow* (a forwarded op the log will never confirm — the actual
-//!    bug B shape) is unaffected by this gate. `Recovery` keeps this
-//!    gate; plan 30 §M3b replaces it with log-prefix publishing from the
-//!    holder.
+//! 9. `Today` and `ExactlyOnce` only offer `Publish` while the
+//!    publishing node's own journal is empty (see the comment at its
+//!    `actions()` call site): real `mtree_publish` runs on the same
+//!    per-partition cycle that ships first, and without the gate *any*
+//!    solitary holder could publish speculative, unshipped local state the
+//!    instant after executing it — a real defect (plan 30 §1.1's "the
+//!    holder side has the same shape" of bug B) but not the one
+//!    `single_writer_is_clean` exists to rule out. `Recovery` no longer
+//!    has this gate (plan 30 §M3b): a node with a non-empty journal
+//!    publishes its replica with every name an unshipped entry touches
+//!    replaced by that name's earliest captured before-image, at its
+//!    `applied_seq`, which `commits_are_log_prefixes` then checks
+//!    against the log (`with_raw_holder_publish(true)` publishes the raw
+//!    replica instead, to show the property is not vacuous).
 //! 10. `Recovery` does not require convergence while the lease still
 //!     names a crashed node (`failover_pending`): nobody can tell a dead
 //!     holder from a slow one, so a shadow it accepted is in doubt, not
@@ -172,7 +186,44 @@
 //!     anywhere does. A refused replay is dropped rather than materialized
 //!     (the model has no conflict files), and a replay may be re-sent at
 //!     most `MAX_REPLAY_ATTEMPTS` times (the real drain retries forever;
-//!     each retry only mints a fresh message id).
+//!     each retry only mints a fresh message id). The same holds for a
+//!     deposed holder's rolled-back Local entries, which replay through
+//!     the same queue (plan 30 §M3b).
+//! 11. Holder-side before-images are one bit per journal entry (every
+//!     modeled record touches exactly one name), and the redo after a
+//!     tail or a stranded shadow is modeled as re-capturing those bits,
+//!     since the model's replica is a fold of log, shadows and journal
+//!     computed on demand rather than a store that needs physically
+//!     undoing (`protocol::recapture_before_images`). The fold always
+//!     layers shadows beneath the journal, where the real `spec` log
+//!     orders all speculation by `spec_seq`; this only matters while a
+//!     shadow is outstanding, when `Publish` is not offered anyway.
+//!     Given exclusive, time-bounded authority and the atomic marker
+//!     (simplification 12), no reachable state should tail a foreign
+//!     segment under Local entries that survive it (a foreign segment is
+//!     always a newer tenure's, which strands them), so the redo path is
+//!     exercised mainly by shadows retired or stranded beneath the
+//!     journal; it is modeled for every tail anyway.
+//! 12. The takeover epoch marker is shipped inside the atomic
+//!     `AcquireLease` step, together with the CAS, the tail-to-head check
+//!     and the gate (see the comment at its call site for why no other
+//!     node's action could interleave distinguishably). Its "slot already
+//!     taken by a late segment" retry is kept but unreachable here. Like
+//!     `Ship`, a takeover is not offered when the log is full, so every
+//!     `Recovery` config needs one more `max_seq` slot per takeover it
+//!     wants to see complete.
+//! 13. Under `Recovery`, dedup (`protocol::rid_completed_record`) also
+//!     consults the node's own unshipped journal, standing in for the
+//!     real journal writing `completed` in the op's own transaction. The
+//!     other variants keep M2's log-plus-`recent` lookup unchanged.
+//! 14. The continuation-epoch path (`adopt_epoch_hold`) is not modeled,
+//!     so it cannot bypass the takeover gate here; plan 30 §M3b lists
+//!     that bypass as a product-code gap.
+//! 15. The reply-racing-takeover refusal (`protocol::Protocol`'s M3b
+//!     list) is modeled on both reply paths, but one client op per node
+//!     (simplification 2) makes its client path hard to reach: a node only
+//!     acquires the lease for its own `NeedsLease` op, so its forward
+//!     never overlaps its own takeover the way two FUSE threads' ops can.
 
 pub mod namespace;
 pub mod protocol;

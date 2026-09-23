@@ -677,6 +677,29 @@ pub struct SpeculationStatus {
     /// `.constellation-conflict/` copy, since start.
     #[serde(default)]
     pub replay_conflicts: u64,
+    /// Plan 30 §M3b: this node's own journaled transactions captured as
+    /// speculation and not yet shipped (a holder's unshipped journal).
+    /// Unlike `outstanding`, these do not stop a publish: the publisher
+    /// substitutes their before-images.
+    #[serde(default)]
+    pub local: u64,
+    /// Plan 30 §M3b: this node's own unshipped transactions rolled back
+    /// because it was deposed (and queued for replay by rid), since start.
+    #[serde(default)]
+    pub local_rolled_back: u64,
+    /// Plan 30 §M3b: deposition recoveries run (rollback plus replay, or
+    /// the capture-off rebuild), since start.
+    #[serde(default)]
+    pub depositions: u64,
+    /// Plan 30 §M3b: epoch-marker segments this node shipped right after a
+    /// takeover, since start.
+    #[serde(default)]
+    pub epoch_markers: u64,
+    /// Plan 30 §M3b: this node holds the lease but its takeover gate has
+    /// not completed (a marker or a local replay failed); new mutations are
+    /// refused until a sync round completes it.
+    #[serde(default)]
+    pub gate_pending: bool,
 }
 
 /// P2P fast-path state. Purely observational: the filesystem is correct

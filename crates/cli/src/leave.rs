@@ -41,7 +41,7 @@ impl fmt::Display for LeaveError {
             ),
             Self::StrandedJournal => write!(
                 f,
-                "this node was deposed with a stranded journal; run `reintegrate` before leaving"
+                "this node was deposed and its deposition recovery has not run yet; run `reintegrate` (or wait for the next sync round) before leaving"
             ),
             Self::SelfViaAdminForm => write!(
                 f,
@@ -135,6 +135,14 @@ pub async fn self_leave(
             return Err(LeaveError::LiveDesignation { node_id, path });
         }
     }
+    // Plan 30 §M3b: this node's own new mutations are fenced (and those
+    // already admitted drained) from before the final flush through the
+    // release CAS.
+    let releasing: Vec<crate::lease::ReleasingGuard> =
+        keepers.values().map(|k| k.begin_releasing()).collect();
+    for guard in &releasing {
+        guard.wait_quiescent().await;
+    }
     ship.shutdown_all(keepers).await.map_err(|e| {
         LeaveError::Other(format!(
             "cannot flush before leave (is S3 reachable?): {e:#}"
@@ -145,6 +153,7 @@ pub async fn self_leave(
             .await
             .map_err(|e| LeaveError::Other(format!("releasing lease: {e:#}")))?;
     }
+    drop(releasing);
     constellation_store_s3::leave_node(store, node_id)
         .await
         .map_err(|e| LeaveError::Other(format!("retiring node {node_id}: {e}")))?;

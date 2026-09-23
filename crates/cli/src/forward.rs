@@ -84,6 +84,14 @@ pub fn conflict_keys(op: &MutateOp, meta: &Meta) -> Vec<Ino> {
         // Best-effort batch; included for completeness (see the module
         // doc on why `AtimeBatch` never actually goes through the gate).
         MutateOp::AtimeBatch { entries } => entries.iter().map(|(ino, ..)| *ino).collect(),
+        // Plan 30 §M3b: a replayed transaction without an op of its own.
+        // Every inode and parent its records name.
+        MutateOp::Records { records } => {
+            let touched = constellation_meta::TouchSet::from_records(records.iter());
+            let mut k: Vec<Ino> = touched.inos.into_iter().collect();
+            k.extend(touched.dentries.into_iter().map(|(parent, _)| parent));
+            k
+        }
     };
     keys.sort_unstable();
     keys.dedup();
@@ -465,17 +473,19 @@ pub const CAUSAL_WAIT: Duration = Duration::from_secs(3);
 /// `Meta::install_shadow`), recording `rid`, `op` and the accepting
 /// holder's `epoch` so the shadow retires when its `Completed` arrives
 /// from the log, or is rolled back and replayed by rid if a later epoch
-/// strands it. Skipped (and `Ok`) when this replica already tailed the
-/// op's completion: the effect is already part of the log prefix.
+/// strands it. Returns whether it was installed: not when this replica
+/// already tailed the op's completion (the effect is already part of the
+/// log prefix), and — plan 30 §M3b — not when this node now holds the
+/// lease at a higher epoch than the one that accepted it (the op is
+/// queued for replay by rid instead; see `Meta::install_shadow`).
 pub fn apply_accepted(
     meta: &Meta,
     epoch: u64,
     rid: constellation_meta::Rid,
     op: &MutateOp,
     records: &[constellation_meta::LogRecord],
-) -> Result<(), constellation_meta::MetaError> {
-    meta.install_shadow(rid, epoch, op, records)?;
-    Ok(())
+) -> Result<bool, constellation_meta::MetaError> {
+    meta.install_shadow(rid, epoch, op, records)
 }
 
 /// Whether records the holder handed back may be installed ahead of the

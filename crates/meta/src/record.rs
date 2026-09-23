@@ -170,8 +170,9 @@ pub enum LogRecord {
     /// node-local, unpublished `completed` keyspace on every replica
     /// that tails it — never the tree, never `dirty`. Touches no
     /// inode/dentry, so it never enters conflict detection (see
-    /// `TouchSet::add`) and is always `Disposition::Clean` on
-    /// reintegration, exactly like `Atime`.
+    /// `TouchSet::add`), exactly like `Atime`. Plan 30 §M3b: a
+    /// transaction's records and its `Completed` always ship in the same
+    /// segment (`Meta::whole_tx_prefix`).
     ///
     /// Appended last, like `Atime`: a peer too old to decode it would
     /// simply fail to parse this record, which the plan accepts (plan

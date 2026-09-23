@@ -76,7 +76,7 @@
 //! blocking thread rather than a runtime worker.
 
 use anyhow::{Context, Result};
-use constellation_meta::Meta;
+use constellation_meta::{LogPrefixView, Meta, PublishBasis};
 use constellation_mtree::{keys, record, ChangeKind, NodeHash, NodeStore, Tree, VALUE_SPILL};
 use constellation_store_s3::log::PARTITION;
 use constellation_store_s3::{
@@ -229,6 +229,9 @@ enum Planned {
     Ready(Plan, NodeHash, Vector, Vec<(Vec<u8>, u64)>),
     /// Nothing was dirty.
     Empty,
+    /// Plan 30 §M3: no commit can reflect this replica right now
+    /// (`Meta::publish_basis_at` said `Defer`).
+    Speculating,
     /// This replica has applied less of the log than the head it would
     /// build on, so every value it holds for a key it touched might be
     /// older than the head's. Publishing would regress the tree; the
@@ -343,12 +346,20 @@ impl TreePublisher {
     /// one) picks the same keys back up.
     ///
     /// Plan 30 §M3a: a commit is only ever built from log-prefix state, so
-    /// nothing is published while this replica has outstanding
+    /// nothing is published while this replica has outstanding requester
     /// speculation — a shadow or `Exists` hint applied ahead of the log
     /// (`Meta::has_outstanding_speculation`). That covers every publish
     /// path (cadence, idle, shutdown, snapshot). `dirty` keeps
     /// accumulating meanwhile, and the next publish after the speculation
     /// retires (or is rolled back) carries it.
+    ///
+    /// Plan 30 §M3b: a holder's own unshipped journal no longer blocks a
+    /// publish. Every key it touched is published at its earliest captured
+    /// before-image instead — exactly its value at `applied_seq`, the
+    /// position the commit claims (`Meta::publish_basis_at`) — and stays
+    /// dirty, so the publish after the journal ships carries the real
+    /// value. With holder capture off (the performance-gate fallback) the
+    /// journal is uncaptured and a holder defers until it is empty.
     pub async fn publish(&mut self, epoch: u64) -> Result<Option<Commit>> {
         if !self.meta.has_dirty() {
             return Ok(None);
@@ -383,7 +394,13 @@ impl TreePublisher {
     /// error, because a caller asking for "now" (a snapshot) must not be
     /// handed an older state.
     pub async fn publish_now(&mut self, epoch: u64) -> Result<(u64, NodeHash)> {
-        if self.meta.has_dirty() && self.meta.has_outstanding_speculation() {
+        // Plan 30 §M3b: a commit substituted around unshipped local work
+        // would be the log prefix, not "now" — so for a caller that needs
+        // the replica as it stands (a snapshot), unshipped work is as
+        // transient a blocker as requester speculation: the caller ships
+        // first and retries.
+        let unshipped = constellation_meta::MetaStore::journal_len(&*self.meta).unwrap_or(0) > 0;
+        if self.meta.has_dirty() && (self.meta.has_outstanding_speculation() || unshipped) {
             anyhow::bail!("{SPECULATION_OUTSTANDING}");
         }
         // A deferral that the next attempt resolves by itself — most
@@ -452,11 +469,27 @@ impl TreePublisher {
                 if let Some(head) = head_applied.filter(|head| !vector_covers(vector, *head)) {
                     return Ok(Planned::Behind { mine: vector, head });
                 }
+                // Plan 30 §M3: what the commit is built from — `ns` as it
+                // stands, or `ns` with this holder's unshipped work
+                // substituted by its before-images — read in the same
+                // snapshot as `vector` and the dirty set.
+                let view = match meta.publish_basis_at(snap)? {
+                    PublishBasis::Defer => return Ok(Planned::Speculating),
+                    PublishBasis::AsIs => LogPrefixView::default(),
+                    PublishBasis::Substituted(view) => view,
+                };
                 let dirty = meta.dirty_snapshot(snap)?;
                 if dirty.is_empty() {
                     return Ok(Planned::Empty);
                 }
-                let plan = plan_from_dirty(&meta, snap, &blobs, &dirty)?;
+                let plan = plan_from_dirty(&meta, snap, &view, &blobs, &dirty)?;
+                // A substituted key was published at its log-prefix value,
+                // not its current one: it stays dirty for the publish after
+                // its transaction ships.
+                let dirty: Vec<(Vec<u8>, u64)> = dirty
+                    .into_iter()
+                    .filter(|(key, _)| !view.contains(key))
+                    .collect();
                 let base_for_apply = match base {
                     Some(root) => root,
                     None => tree.empty().map_err(StoreError::from)?,
@@ -472,6 +505,10 @@ impl TreePublisher {
         let (plan, root, vector, observed_dirty) = match planned {
             Planned::Ready(plan, root, vector, dirty) => (plan, root, vector, dirty),
             Planned::Empty => return Ok(Outcome::Unchanged),
+            Planned::Speculating => {
+                tracing::debug!("metadata publish deferred: speculation outstanding");
+                return Ok(Outcome::Deferred);
+            }
             Planned::Behind { mine, head } => {
                 tracing::debug!(
                     mine = encode_vector(mine),
@@ -795,13 +832,16 @@ fn parse_vector(s: &str) -> Option<Vector> {
 fn republish_present(
     meta: &Meta,
     snap: &fjall::Snapshot,
+    view: &LogPrefixView,
     blobs: &BlobStore,
     key: &[u8],
     value: &[u8],
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
     match keys::Key::parse(key)? {
         keys::Key::Inode { ino } => {
-            let row = meta.tree_inode_at(snap, ino)?.with_context(|| {
+            // Through the view: the record and its spilled xattrs as they
+            // stand at the log prefix (plan 30 §M3b).
+            let row = meta.tree_inode_via_at(snap, view, ino)?.with_context(|| {
                 format!("inode {ino}: present in ns but tree_inode_at found nothing")
             })?;
             let xattrs: Vec<(Vec<u8>, Vec<u8>)> = row
@@ -835,20 +875,24 @@ fn republish_present(
 }
 
 /// Turn a `dirty_snapshot` into a [`Plan`]: for each key, read `ns`'s
-/// current raw value under the same snapshot (absent → delete edit),
-/// converting `0x01`/`0x03` payloads to their published form.
+/// raw value under the same snapshot — through `view`, so a key carrying
+/// a holder's unshipped work gets its log-prefix value (plan 30 §M3b) —
+/// (absent → delete edit), converting `0x01`/`0x03` payloads to their
+/// published form.
 fn plan_from_dirty(
     meta: &Meta,
     snap: &fjall::Snapshot,
+    view: &LogPrefixView,
     blobs: &BlobStore,
     dirty: &[(Vec<u8>, u64)],
 ) -> Result<Plan> {
     let mut plan = Plan::default();
     for (key, _counter) in dirty {
-        match meta.ns_get_at(snap, key)? {
+        match meta.ns_get_via_at(snap, view, key)? {
             None => plan.remove(key.clone()),
             Some(value) => {
-                let (published, new_blobs) = republish_present(meta, snap, blobs, key, &value)?;
+                let (published, new_blobs) =
+                    republish_present(meta, snap, view, blobs, key, &value)?;
                 plan.blobs.extend(new_blobs);
                 plan.upsert(key.clone(), published);
             }
@@ -879,8 +923,9 @@ pub fn rebuild_root<S: NodeStore>(
     meta.read_consistent(|snap| -> Result<NodeHash> {
         let dump = meta.ns_dump_at(snap)?;
         let mut pairs = Vec::with_capacity(dump.len());
+        let view = LogPrefixView::default();
         for (key, value) in &dump {
-            let (published, _blobs) = republish_present(meta, snap, blobs, key, value)?;
+            let (published, _blobs) = republish_present(meta, snap, &view, blobs, key, value)?;
             pairs.push((key.clone(), published));
         }
         Ok(tree.build(pairs).map_err(StoreError::from)?)

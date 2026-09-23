@@ -66,6 +66,11 @@
 //!   its before-images; the index of outstanding entries; and the
 //!   replay-by-rid queue of stranded ops. Node-local, never published.
 //!   See `store::spec`.
+//! - `journal_tx` — plan 30 §M3b: one row per journaled transaction,
+//!   keyed by its first journal seq: where it ends (so a segment never
+//!   splits it), the op and rid a replay re-executes, the epoch it ran
+//!   under, and — when holder capture is on — the `spec` row holding its
+//!   before-images. See `store::local`.
 //! - `blobs` — `blake3(bytes) -> bytes`, the local content-addressed
 //!   store `Payload::Spilled` values resolve against. §P6's spill rule
 //!   (`VALUE_SPILL = 1024 B`) is applied locally exactly as it will be
@@ -82,6 +87,7 @@
 pub(crate) mod atime;
 mod bootstrap;
 pub(crate) mod journal;
+pub(crate) mod local;
 pub(crate) mod misc;
 pub(crate) mod ns;
 mod reads;
@@ -91,6 +97,7 @@ pub mod spec;
 mod writes;
 
 pub use bootstrap::BootstrapIndexBuilder;
+pub use local::{LogPrefixView, PublishBasis};
 pub use snapshot::{quota_record, snapshot_record};
 
 use crate::error::MetaError;
@@ -103,7 +110,8 @@ use fjall::{
     SingleWriterWriteTx, Snapshot,
 };
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Inos are `node_prefix << 40 | counter`: 24 bits of node id, 40 bits
 /// (~1.1e12) of per-node allocations. Prefix 0 belongs to `fs create`
@@ -156,6 +164,26 @@ pub(crate) const KV_NEXT_SPEC_SEQ: &str = "next_spec_seq";
 pub(crate) const KV_INCARNATION: &str = "incarnation";
 pub(crate) const KV_USAGE_BYTES: &str = "usage_bytes";
 pub(crate) const KV_USAGE_FILES: &str = "usage_files";
+/// Plan 30 §M3b bookkeeping, raw big-endian `u64`s in `local`, each
+/// maintained incrementally in the same transaction as the change it
+/// describes, so that no hot path — a journaled write, a ship's ack, a
+/// tailed segment, a `status` call — has to scan a keyspace to answer:
+/// - `spec_live_count`: rows in `spec_live` (outstanding shadows/hints);
+/// - `pending_replay_count`: rows in `pending_replay`;
+/// - `local_spec_count`: `journal_tx` rows with a `spec_seq` (outstanding
+///   captured `Local` transactions);
+/// - `uncaptured_tx_count`: `journal_tx` rows without one;
+/// - `spec_floor`: every `spec` row below it is deleted, so compaction
+///   ranges from here instead of from the (tombstone-laden) start;
+/// - `journal_acked`: every `journal` and `journal_tx` row at or below it
+///   is deleted (acks always remove a head prefix), so journal and
+///   `journal_tx` scans start past the shipped history's tombstones.
+pub(crate) const KV_SPEC_LIVE_COUNT: &str = "spec_live_count";
+pub(crate) const KV_PENDING_REPLAY_COUNT: &str = "pending_replay_count";
+pub(crate) const KV_LOCAL_SPEC_COUNT: &str = "local_spec_count";
+pub(crate) const KV_UNCAPTURED_TX_COUNT: &str = "uncaptured_tx_count";
+pub(crate) const KV_SPEC_FLOOR: &str = "spec_floor";
+pub(crate) const KV_JOURNAL_ACKED: &str = "journal_acked";
 /// Monotonic counter behind the `dirty` keyspace (plan 29 M2): every key
 /// written to `ns` records the counter value it was touched at, so
 /// `clear_dirty_upto` can tell "still dirty at the counter a publish
@@ -252,6 +280,71 @@ impl UsageTracker {
     }
 }
 
+/// Read one of the raw big-endian `u64` counters in `local` (0 if unset).
+pub(crate) fn counter_get(
+    r: &impl Readable,
+    local: &SingleWriterTxKeyspace,
+    key: &str,
+) -> Result<u64, MetaError> {
+    match r.get(local, key.as_bytes())? {
+        Some(v) => {
+            Ok(u64::from_be_bytes(v.as_ref().try_into().map_err(|_| {
+                MetaError::Invalid(format!("{key} counter"))
+            })?))
+        }
+        None => Ok(0),
+    }
+}
+
+pub(crate) fn counter_set_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    key: &str,
+    value: u64,
+) {
+    tx.insert(local, key.as_bytes().to_vec(), value.to_be_bytes().to_vec());
+}
+
+/// Move a counter by `delta`, saturating at zero.
+pub(crate) fn counter_add_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    key: &str,
+    delta: i64,
+) -> Result<(), MetaError> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let now = counter_get(tx, local, key)?;
+    let next = if delta >= 0 {
+        now.saturating_add(delta as u64)
+    } else {
+        now.saturating_sub(delta.unsigned_abs())
+    };
+    counter_set_tx(tx, local, key, next);
+    Ok(())
+}
+
+thread_local! {
+    static USAGE_NOTE: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Plan 30 §M3b: start noting every usage move `adjust_usage_tx` makes on
+/// this thread, for a captured transaction's `Local` row
+/// (`store::local`). Cheaper than reading the persisted counters before
+/// and after: a thread-local add instead of four point reads and two
+/// decimal parses per journaled write. A write transaction runs start to
+/// commit on one call stack, and `Meta::begin_local` resets the note, so a
+/// note left behind by a transaction that errored out is never read.
+pub(crate) fn usage_note_begin() {
+    USAGE_NOTE.with(|c| c.set(Some((0, 0))));
+}
+
+/// The usage moved since [`usage_note_begin`], ending the note.
+pub(crate) fn usage_note_take() -> (i64, i64) {
+    USAGE_NOTE.with(|c| c.take()).unwrap_or((0, 0))
+}
+
 /// Fold `(d_bytes, d_files)` into the persisted `usage_bytes`/`usage_files`
 /// counters in `local`, inside the caller's write transaction — the
 /// durable half of every usage change; the in-memory [`UsageTracker`] is
@@ -265,6 +358,11 @@ pub(crate) fn adjust_usage_tx(
     if d_bytes == 0 && d_files == 0 {
         return Ok(());
     }
+    USAGE_NOTE.with(|c| {
+        if let Some((b, f)) = c.get() {
+            c.set(Some((b + d_bytes, f + d_files)));
+        }
+    });
     let bytes = kv_get_i64(tx, local, KV_USAGE_BYTES)?.unwrap_or(0) + d_bytes;
     let files = kv_get_i64(tx, local, KV_USAGE_FILES)?.unwrap_or(0) + d_files;
     kv_set_tx(tx, local, KV_USAGE_BYTES, &bytes.to_string());
@@ -284,6 +382,19 @@ fn kv_get_i64(
             .map_err(|_| MetaError::Invalid(format!("{key} is not an i64"))),
         None => Ok(None),
     }
+}
+
+/// `CONSTELLATION_HOLDER_CAPTURE` (plan 30 §M3b): `0`/`off`/`false`
+/// turns holder-side speculation capture off (see `Meta::holder_capture`);
+/// anything else, or unset, leaves it on. An internal switch for the
+/// milestone's performance gate, not a tuning knob.
+fn holder_capture_default() -> bool {
+    !matches!(
+        std::env::var("CONSTELLATION_HOLDER_CAPTURE")
+            .ok()
+            .as_deref(),
+        Some("0" | "off" | "false")
+    )
 }
 
 /// `CONSTELLATION_META_CACHE_BYTES`, default 256 MiB (plan 29's
@@ -354,6 +465,11 @@ pub struct Meta {
     /// Plan 30 §M3a: `spec_seq(8 BE) -> postcard(QueuedReplay)`, stranded
     /// ops rolled back and queued for replay by rid, in original order.
     pub(crate) pending_replay: SingleWriterTxKeyspace,
+    /// Plan 30 §M3b: `first_journal_seq(8 BE) -> postcard(JournalTx)`, one
+    /// row per journaled transaction still in `journal` (see
+    /// `store::local`). Removed with the transaction's journal rows when
+    /// they ship, or when a deposition strands them.
+    pub(crate) journal_tx: SingleWriterTxKeyspace,
     pub(crate) blobs: SingleWriterTxKeyspace,
     /// Plan 28 §S1b: `dir_ino(8 BE) -> block_start(8 BE) ++ used(4 BE)`,
     /// the per-directory ino allocation cursor `alloc_ino_tx` reads and
@@ -387,6 +503,23 @@ pub struct Meta {
     /// at or below this seq" a single `split_off`, not a linear
     /// `retain`.
     pub(crate) recent: std::sync::Mutex<RecentOutcomes>,
+    /// Plan 30 §M3b: the lease epoch this node currently executes under
+    /// as holder, 0 when it holds none. Written by the lease layer
+    /// (`cli::lease::LeaseKeeper`, through [`Self::holder_epoch_cell`])
+    /// the moment a CAS makes this node the holder — before the takeover
+    /// gate runs — and cleared when it releases or is deposed. Two things
+    /// read it: holder capture stamps every `Local` speculation row with
+    /// it (`store::local`), and [`Self::install_shadow`] refuses to
+    /// install a forward reply accepted at a lower epoch (the op is
+    /// queued for replay instead).
+    pub(crate) holder_epoch: Arc<AtomicU64>,
+    /// Plan 30 §M3b's internal switch for holder-side capture
+    /// (`CONSTELLATION_HOLDER_CAPTURE`, default on). Off is the plan's
+    /// performance-gate fallback: a holder's own writes carry no
+    /// before-images, a holder with an unshipped journal does not publish,
+    /// and a deposed holder rebuilds its namespace from the head commit
+    /// instead of rolling back (`cli::recovery::recover_deposed`).
+    pub(crate) holder_capture: AtomicBool,
     usage: UsageTracker,
     #[allow(dead_code)]
     path: Option<PathBuf>,
@@ -448,6 +581,7 @@ impl Meta {
         let spec = db.keyspace("spec", KeyspaceCreateOptions::default)?;
         let spec_live = db.keyspace("spec_live", KeyspaceCreateOptions::default)?;
         let pending_replay = db.keyspace("pending_replay", KeyspaceCreateOptions::default)?;
+        let journal_tx = db.keyspace("journal_tx", KeyspaceCreateOptions::default)?;
         let blobs = db.keyspace("blobs", KeyspaceCreateOptions::default)?;
         let ino_alloc = db.keyspace("ino_alloc", KeyspaceCreateOptions::default)?;
         let completed = db.keyspace("completed", KeyspaceCreateOptions::default)?;
@@ -472,10 +606,13 @@ impl Meta {
             spec,
             spec_live,
             pending_replay,
+            journal_tx,
             blobs,
             ino_alloc,
             completed,
             recent: std::sync::Mutex::new(std::collections::HashMap::new()),
+            holder_epoch: Arc::new(AtomicU64::new(0)),
+            holder_capture: AtomicBool::new(holder_capture_default()),
             usage: UsageTracker::new(0, 0),
             path,
         };
@@ -608,6 +745,38 @@ impl Meta {
         Ok(ino)
     }
 
+    // ---- holder state (plan 30 §M3b) ----
+
+    /// The shared cell behind [`Self::holder_epoch`], for the lease layer
+    /// to write (`LeaseKeeper::share_holder_epoch`).
+    pub fn holder_epoch_cell(&self) -> Arc<AtomicU64> {
+        self.holder_epoch.clone()
+    }
+
+    /// The epoch this node executes under as holder, 0 when it holds none.
+    pub fn holder_epoch(&self) -> u64 {
+        self.holder_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Set (or, with 0, clear) the holder epoch directly. The daemon goes
+    /// through [`Self::holder_epoch_cell`]; tests use this.
+    pub fn set_holder_epoch(&self, epoch: u64) {
+        self.holder_epoch.store(epoch, Ordering::SeqCst);
+    }
+
+    /// Whether holder-side capture is on (see the field's doc).
+    pub fn holder_capture(&self) -> bool {
+        self.holder_capture.load(Ordering::Relaxed)
+    }
+
+    /// Switch holder-side capture. Only meant for tests and for the
+    /// performance gate's fallback; flipping it while this node holds a
+    /// non-empty journal leaves that journal partly captured, which the
+    /// publisher treats as uncaptured (it defers).
+    pub fn set_holder_capture(&self, on: bool) {
+        self.holder_capture.store(on, Ordering::Relaxed);
+    }
+
     // ---- incarnation (plan 30 §M2) ----
 
     /// Bump and persist this node's incarnation, returning the new
@@ -696,6 +865,26 @@ impl Meta {
         entry.1.extend(records.iter().cloned());
         while bucket.len() > MAX_RECENT_PER_INCARNATION {
             bucket.pop_first();
+        }
+    }
+
+    /// Forget the holder's answer for `rid` (plan 30 §M3b): its
+    /// transaction was stranded and rolled back, so a retry must not be
+    /// told it took effect. Called from inside the stranding transaction;
+    /// if that transaction then fails to commit, the only cost is one
+    /// retry answered from `completed` instead of from here.
+    pub(crate) fn forget_recent(&self, rid: crate::rid::Rid) {
+        let mut recent = self.recent.lock().unwrap();
+        let key = (rid.node, rid.incarnation);
+        let now_empty = match recent.get_mut(&key) {
+            Some(bucket) => {
+                bucket.remove(&rid.seq);
+                bucket.is_empty()
+            }
+            None => false,
+        };
+        if now_empty {
+            recent.remove(&key);
         }
     }
 

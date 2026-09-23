@@ -643,6 +643,17 @@ mod tests {
     use constellation_fs_core::DEFAULT_CHUNK_SIZE;
     use object_store::memory::InMemory;
 
+    /// Plan 30 §M3b: `publish_now` refuses while the journal is non-empty
+    /// (`SPECULATION_OUTSTANDING`) so it never publishes speculation.
+    /// This test's bare `Meta` has no shipper acking it, so simulate one
+    /// ship of everything journaled so far under `segment`, exactly as
+    /// production does when a segment lands.
+    fn ship_all(meta: &Meta, segment: u64) {
+        let rows = meta.take_journal(usize::MAX).unwrap();
+        let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+        meta.ack_journal_rows_at(&seqs, segment).unwrap();
+    }
+
     #[test]
     fn selector_uses_the_last_at_sign() {
         assert_eq!(
@@ -707,6 +718,7 @@ mod tests {
         )));
         let (manager, _nodes) = test_manager(meta.clone(), chunks.clone(), DEFAULT_CHUNK_SIZE);
 
+        ship_all(&meta, 1);
         let created = manager.create("/source", "before").await.unwrap();
         assert!(created.contains("metadata commit"), "{created}");
         let row = manager.list(Some("/source")).unwrap().remove(0);

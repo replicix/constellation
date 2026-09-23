@@ -13,11 +13,13 @@
 //!    holder flushed. [`LeaseKeeper::commit`] refuses such a claim
 //!    unless the caller hands over a [`TailedToHead`] witness, which
 //!    only the shipper's tail produces.
-//! 2. **Deposition is terminal.** Once a renew CAS fails and the lease
-//!    turns out to belong to somebody else, this node never ships
-//!    again: its unshipped journal is a stranded branch whose
-//!    reintegration is phase 4, and silently discarding or replaying it
-//!    would be data loss either way.
+//! 2. **Deposition ends the tenure.** Once a renew CAS fails and the
+//!    lease turns out to belong to somebody else, this node never ships
+//!    under that epoch again. Plan 30 §M3b: its unshipped journal is
+//!    then rolled back from its captured before-images and each
+//!    transaction's op replayed by rid through the new holder
+//!    (`recovery::recover_deposed`), after which the node is an ordinary
+//!    non-holder again.
 //!
 //! The FUSE threads do not talk to S3. They read [`LeaseView`], a
 //! handful of atomics, on every mutating op (nanoseconds) and only fall
@@ -106,19 +108,53 @@
 //!   `kill9-remount` self-deadlock). It admits this node's own forwarded
 //!   ops through [`LeaseView::new_mutation_epoch`] instead, the gate the
 //!   FUSE fast path uses (`open_for_new_mutation`). So it is fenced out of
-//!   release/handoff by what fences the FUSE fast path:
-//!   `begin_handoff_pause` before `run_sync_round`'s final flush, and
-//!   [`LeaseKeeper::release`]'s view clear before the CAS. It is not
-//!   fenced by the lock. The P2P `HandOff` arm needs neither, because it
-//!   runs on the sync task itself and `dispatch_forward` cannot run
-//!   concurrently with it.
+//!   release/handoff by what fences the FUSE fast path — the "releasing"
+//!   flag below — not by the lock.
+//!
+//! ### The releasing flag (plan 30 §M3b)
+//!
+//! The keepers lock keeps *peers'* forwarded ops out of a release/handoff's
+//! final flush + CAS. This node's own new mutations (FUSE threads and
+//! local forwards) never take that lock, so they are fenced by
+//! [`LeaseView`] instead. Before M3b that fence was the handoff pause,
+//! which is time-bounded (a slow final flush outlived it) and was checked
+//! by a FUSE thread in a check-then-write that is not atomic with the
+//! round. Now:
+//!
+//! - every release/handoff path holds a [`ReleasingGuard`]
+//!   ([`LeaseKeeper::begin_releasing`]) for its whole final-flush-plus-CAS
+//!   section. It closes [`LeaseView::open_for_new_mutation`] and
+//!   [`LeaseView::new_mutation_epoch`], and resets on drop — so a round
+//!   the sync task's `select!` drops mid-release reopens the view, and a
+//!   release that completed leaves it closed by `release`'s own view clear;
+//! - a new mutation runs under an [`AdmitGuard`] ([`LeaseView::admit`]):
+//!   it counts itself in-flight *before* checking the gate, and the
+//!   releaser, after raising the flag, waits for the in-flight count to
+//!   drain ([`ReleasingGuard::wait_quiescent`]) before it checks the
+//!   backlog. With both sides sequentially consistent, either the
+//!   admitter sees the flag and backs out, or the releaser sees it in
+//!   flight and waits for its journal row — never neither;
+//! - the takeover gate uses the same fence ([`LeaseView`]'s
+//!   `gate_pending`): from the CAS until the gate completes, nothing new
+//!   executes, and if the gate fails the fence stays up until a later sync
+//!   round completes it (`shipper::complete_gate`).
+//!
+//! The handoff pause stays, for what it was also for: forcing a busy
+//! holder's backlog to zero, and keeping this node's own blocked writes
+//! from winning the reclaim race against the waiter a release was for.
 
 use anyhow::{bail, Result};
 use constellation_store_s3::lease::{lease_ttl_ms, now_unix_ms, LeaseMode};
 use constellation_store_s3::{Lease, LeaseStore, LeaseTag, StoreError};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// How long [`ReleasingGuard::wait_quiescent`] waits for admitted
+/// mutations to finish their (local, sub-millisecond) fjall write before
+/// giving up and proceeding. Only reached if a FUSE thread is stuck inside
+/// a metadata write, which no release can wait out anyway.
+const QUIESCE_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Default write-idle period after which a holder hands the lease back
 /// so a peer can take it without waiting out the TTL.
@@ -226,6 +262,59 @@ pub struct LeaseView {
     /// Unix ms until which [`LeaseKeeper::begin_handoff_pause`] has
     /// closed the ordinary (non-epoch) fast path; 0 or past means open.
     handoff_pause_until_ms: AtomicI64,
+    /// Plan 30 §M3b: live [`ReleasingGuard`]s. Non-zero closes new
+    /// mutations for a release/handoff's final flush + CAS (see the module
+    /// doc, "The releasing flag").
+    releasing: AtomicU32,
+    /// Plan 30 §M3b: this node won the lease but its takeover gate has not
+    /// completed; new mutations stay closed until it does.
+    gate_pending: AtomicBool,
+    /// Plan 30 §M3b: mutations admitted by [`Self::admit`] and still
+    /// executing.
+    inflight: AtomicU32,
+}
+
+/// A new mutation admitted through [`LeaseView::admit`]: counted in
+/// flight until dropped, so a release that raised its flag after the
+/// admission waits for this mutation's journal row before its final flush.
+pub struct AdmitGuard<'a>(&'a LeaseView);
+
+impl Drop for AdmitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Held for a release/handoff's whole final-flush-plus-CAS section
+/// ([`LeaseKeeper::begin_releasing`]); lowers the releasing flag on drop,
+/// including when the sync task drops the round holding it.
+pub struct ReleasingGuard {
+    view: Arc<LeaseView>,
+}
+
+impl ReleasingGuard {
+    /// Wait for every mutation admitted before the flag went up to finish
+    /// (bounded by [`QUIESCE_MAX`]). After this, anything the final flush
+    /// does not see was never admitted.
+    pub async fn wait_quiescent(&self) {
+        let deadline = Instant::now() + QUIESCE_MAX;
+        while self.view.inflight.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    inflight = self.view.inflight.load(Ordering::SeqCst),
+                    "a release waited {QUIESCE_MAX:?} for admitted mutations to finish; proceeding"
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+}
+
+impl Drop for ReleasingGuard {
+    fn drop(&mut self) {
+        self.view.releasing.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl LeaseView {
@@ -255,6 +344,12 @@ impl LeaseView {
     /// P2P/continuation-epoch path) is unaffected either way, matching
     /// the requirement to leave that path's behaviour alone.
     pub fn open_for_new_mutation(&self) -> bool {
+        // Plan 30 §M3b: a release/handoff in its final section, or a
+        // takeover whose gate has not completed, closes every new mutation
+        // — continuation-epoch authority included.
+        if self.releasing.load(Ordering::SeqCst) > 0 || self.gate_pending.load(Ordering::SeqCst) {
+            return false;
+        }
         if self.epoch_held.load(Ordering::Relaxed) {
             return self.usable();
         }
@@ -272,13 +367,15 @@ impl LeaseView {
     /// path uses, so it never has to wait for the keepers lock that an
     /// in-flight sync round may hold across S3 I/O.
     ///
-    /// Agrees with `ship_epoch` whenever the pause is not set, because
-    /// every `LeaseKeeper` path that changes `held` also updates the view
-    /// in the same synchronous step: `set_held` next to each assignment
-    /// of our own lease, and `clear` (or `force_lost`/`mark_lost`) next
-    /// to each `held = None`. `release` clears the view before its CAS,
-    /// and `commit_gated` runs the takeover gate before `set_held`, so
-    /// this reads `None` throughout both.
+    /// Agrees with `ship_epoch` whenever neither the pause nor the
+    /// releasing flag is set, because every `LeaseKeeper` path that
+    /// changes `held` also updates the view in the same synchronous step:
+    /// `set_held` next to each assignment of our own lease, and `clear`
+    /// (or `force_lost`/`mark_lost`) next to each `held = None`. A release
+    /// holds the releasing flag and clears the view before its CAS, and a
+    /// won lease stays closed until its takeover gate completes
+    /// (`commit_cas` does not open the view; `open_won` opens it only
+    /// without a pending gate), so this reads `None` throughout both.
     pub fn new_mutation_epoch(&self, node_id: u64) -> Option<u64> {
         if !self.open_for_new_mutation() {
             return None;
@@ -292,6 +389,32 @@ impl LeaseView {
         }
         (self.holder.load(Ordering::Relaxed) == node_id)
             .then_some(self.epoch.load(Ordering::Relaxed))
+    }
+
+    /// Admit one new mutation, atomically with respect to a release (see
+    /// the module doc, "The releasing flag"): `None` when
+    /// [`Self::open_for_new_mutation`] is closed. Hold the guard across
+    /// the mutation's metadata write, and no longer.
+    pub fn admit(&self) -> Option<AdmitGuard<'_>> {
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        if self.open_for_new_mutation() {
+            Some(AdmitGuard(self))
+        } else {
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// Whether a release/handoff is in its final section or the takeover
+    /// gate is pending: a peer's forwarded op must not execute either
+    /// (`node_runtime::dispatch_mutate`).
+    pub fn fenced(&self) -> bool {
+        self.releasing.load(Ordering::SeqCst) > 0 || self.gate_pending.load(Ordering::SeqCst)
+    }
+
+    /// Whether the takeover gate is still pending (`status`).
+    pub fn gate_pending(&self) -> bool {
+        self.gate_pending.load(Ordering::SeqCst)
     }
 
     pub fn is_lost(&self) -> bool {
@@ -410,8 +533,66 @@ pub struct LeaseKeeper {
     takeover_gate: Arc<AtomicBool>,
     /// Diagnostic tag naming the mechanism behind the next acquisition
     /// (fuse-acquire, claim-offer, ship-journal, ...). Logged by
-    /// [`Self::commit`] so lease churn can be attributed from logs alone.
+    /// [`Self::commit_cas`] so lease churn can be attributed from logs
+    /// alone.
     acquire_reason: &'static str,
+    /// Plan 30 §M3b: `Meta::holder_epoch_cell`, written the moment a CAS
+    /// makes this node the holder (before the takeover gate) and cleared
+    /// whenever it stops holding. `None` for keepers that never execute
+    /// (tests, the GC/prune leases).
+    holder_epoch: Option<Arc<AtomicU64>>,
+    /// Plan 30 §M3b: a won lease whose takeover gate has not completed
+    /// (see [`PendingGate`]).
+    pending_gate: Option<PendingGate>,
+    /// Plan 30 §M3b: after a deposition, the lowest epoch that strands
+    /// this node's own unshipped work (`recovery::recover_deposed`).
+    lost_floor: u64,
+}
+
+/// A lease a CAS just won, not yet opened to new mutations
+/// ([`LeaseKeeper::commit_cas`] → the takeover gate →
+/// [`LeaseKeeper::open_won`]).
+pub struct Won {
+    lease: Lease,
+    tag: LeaseTag,
+    /// Whether the lease came from another node (the gate strands what
+    /// the new epoch supersedes).
+    pub takeover: bool,
+    /// Whether the new tenure must open with an epoch-marker segment: a
+    /// takeover from a holder that did *not* release (it expired, or was
+    /// paused). A holder that released flushed everything first and will
+    /// never ship at its epoch again, so there is nothing to fence and
+    /// nothing for third nodes to strand.
+    pub marker: bool,
+}
+
+impl Won {
+    pub fn epoch(&self) -> u64 {
+        self.lease.epoch
+    }
+}
+
+/// What [`LeaseKeeper::commit_cas`] did.
+pub enum CasOutcome {
+    /// Already ours and still valid; nothing changed hands.
+    Held,
+    /// A live foreign holder, or a lost CAS: the caller retries.
+    NotWon,
+    /// The CAS made this node the holder.
+    Won(Won),
+}
+
+/// Plan 30 §M3b: the takeover gate of a won lease, still to run or to
+/// finish (`shipper::complete_gate`). While one is pending the view stays
+/// closed to new mutations and nothing ships from this partition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingGate {
+    pub epoch: u64,
+    /// A takeover from another node: the gate strands the older epochs'
+    /// speculation, after an epoch-marker segment has been shipped.
+    pub takeover: bool,
+    /// The marker is durable (or none is needed).
+    pub marker_shipped: bool,
 }
 
 impl LeaseKeeper {
@@ -428,7 +609,66 @@ impl LeaseKeeper {
             wanted_since: None,
             takeover_gate: Arc::new(AtomicBool::new(false)),
             acquire_reason: "unspecified",
+            holder_epoch: None,
+            pending_gate: None,
+            lost_floor: 0,
         }
+    }
+
+    /// Plan 30 §M3b: keep `cell` (`Meta::holder_epoch_cell`) equal to the
+    /// epoch this node executes under as holder, 0 when it holds none.
+    #[allow(dead_code)] // mutator sibling of `with_holder_epoch`; exercised by tests
+    pub fn share_holder_epoch(&mut self, cell: Arc<AtomicU64>) {
+        self.holder_epoch = Some(cell);
+    }
+
+    /// The builder form of [`Self::share_holder_epoch`].
+    pub fn with_holder_epoch(mut self, cell: Arc<AtomicU64>) -> Self {
+        self.holder_epoch = Some(cell);
+        self
+    }
+
+    fn note_holder_epoch(&self, epoch: u64) {
+        if let Some(cell) = &self.holder_epoch {
+            cell.store(epoch, Ordering::SeqCst);
+        }
+    }
+
+    /// Raise the releasing flag for a release/handoff's final flush + CAS
+    /// (see the module doc). Drop the guard when the section ends, however
+    /// it ends; call [`ReleasingGuard::wait_quiescent`] before the final
+    /// flush.
+    pub fn begin_releasing(&self) -> ReleasingGuard {
+        self.view.releasing.fetch_add(1, Ordering::SeqCst);
+        ReleasingGuard {
+            view: self.view.clone(),
+        }
+    }
+
+    /// The pending takeover gate, if any.
+    pub fn pending_gate(&self) -> Option<PendingGate> {
+        self.pending_gate
+    }
+
+    /// Record progress on the pending gate (the marker landed).
+    pub fn set_pending_gate(&mut self, gate: Option<PendingGate>) {
+        self.pending_gate = gate;
+        self.view
+            .gate_pending
+            .store(gate.is_some(), Ordering::SeqCst);
+    }
+
+    /// The takeover gate completed: open the view to new mutations.
+    pub fn finish_gate(&mut self) {
+        self.set_pending_gate(None);
+    }
+
+    /// After a deposition, the epoch below which this node's own
+    /// unshipped work is stranded: above both the epoch it held and the
+    /// one that deposed it (`u64::MAX` when neither is known, e.g. a
+    /// deposition persisted across a restart).
+    pub fn lost_floor(&self) -> u64 {
+        self.lost_floor
     }
 
     /// Tag the mechanism that is about to acquire (purely diagnostic).
@@ -454,6 +694,13 @@ impl LeaseKeeper {
         if self.view.is_lost() {
             return None;
         }
+        // Plan 30 §M3b: nothing ships under a won epoch before its
+        // takeover gate completes — the gate's marker must be the epoch's
+        // first segment, and a journal from before the takeover must be
+        // stranded, not shipped under the new epoch.
+        if self.pending_gate.is_some() {
+            return None;
+        }
         if self.view.epoch_held.load(Ordering::Relaxed) {
             let e = self.view.epoch.load(Ordering::Relaxed);
             return Some(e.max(1));
@@ -476,17 +723,49 @@ impl LeaseKeeper {
 
     pub fn force_lost(&mut self) {
         self.held = None;
+        self.set_pending_gate(None);
         self.view.clear();
         self.view.lost.store(true, Ordering::Relaxed);
+        self.note_holder_epoch(0);
+        self.lost_floor = u64::MAX;
     }
 
     pub fn clear_lost(&mut self) {
         self.view.lost.store(false, Ordering::Relaxed);
+        self.lost_floor = 0;
     }
 
     /// Epoch-local authority: no S3 CAS. Used while a continuation epoch
     /// is the authority root (handoff without shipping).
+    ///
+    /// Plan 30 §M3b: `gate` runs before the view opens — the takeover gate
+    /// the S3 path runs inside `shipper::acquire_lease_for`
+    /// (`recovery::adopt_epoch_hold_gated`). When it reports failure the
+    /// view stays closed with a pending gate, exactly as on the S3 path.
+    /// (The holder epoch is recorded as 0: see [`Self::adopt_epoch_hold`].)
+    pub fn adopt_epoch_hold_gated(&mut self, epoch: u64, gate: impl FnOnce(u64) -> bool) {
+        let epoch = epoch.max(1);
+        self.note_holder_epoch(0);
+        let pending = (!gate(epoch)).then_some(PendingGate {
+            epoch,
+            takeover: false,
+            marker_shipped: true,
+        });
+        self.set_pending_gate(pending);
+        self.adopt_epoch_hold(epoch);
+    }
+
+    /// Epoch-local authority without a gate: a holder re-affirming the
+    /// authority it already has (`run_managed_sync_round`) and tests.
+    ///
+    /// Plan 30 §M3b: the holder epoch is recorded as 0 here, not as the
+    /// continuation authority's epoch. That number is not an S3 lease
+    /// epoch (nothing fences on it), and a continuation epoch's journal
+    /// ships verbatim, in the order the epoch protocol gives it, once S3
+    /// returns — so writes made under it must never strand by epoch the
+    /// way a deposed S3 holder's do.
     pub fn adopt_epoch_hold(&mut self, epoch: u64) {
+        self.note_holder_epoch(0);
         self.view.lost.store(false, Ordering::Relaxed);
         self.view.holder.store(self.node_id, Ordering::Relaxed);
         self.view.epoch.store(epoch.max(1), Ordering::Relaxed);
@@ -501,6 +780,7 @@ impl LeaseKeeper {
     pub fn release_local(&mut self) {
         self.held = None;
         self.view.clear();
+        self.note_holder_epoch(0);
     }
 
     pub fn extend_local(&mut self) {
@@ -561,36 +841,39 @@ impl LeaseKeeper {
         })
     }
 
-    /// Commit an acquisition. `tailed` must be present for a takeover
+    /// Commit an acquisition and open the view at once, with no takeover
+    /// gate. Production goes through [`Self::commit_cas`] and
+    /// [`Self::open_won`] (`shipper::acquire_lease_for`, which runs the
+    /// gate in between); this is for tests that do not need it.
+    #[cfg(test)]
+    pub async fn commit(&mut self, plan: Plan, tailed: Option<TailedToHead>) -> Result<bool> {
+        match self.commit_cas(plan, tailed).await? {
+            CasOutcome::Held => Ok(true),
+            CasOutcome::NotWon => Ok(false),
+            CasOutcome::Won(won) => {
+                self.open_won(won, None).await;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Run an acquisition's CAS. `tailed` must be present for a takeover
     /// from another node: the new holder may only start writing once it
     /// has applied everything the old one flushed (DESIGN.md §4).
     ///
-    /// Production always goes through [`Self::commit_gated`] directly (the
-    /// takeover gate must run); this ungated wrapper is kept for tests that
-    /// don't need it.
-    #[cfg(test)]
-    pub async fn commit(&mut self, plan: Plan, tailed: Option<TailedToHead>) -> Result<bool> {
-        self.commit_gated(plan, tailed, |_| {}).await
-    }
-
-    /// [`Self::commit`], running `gate(epoch)` once the CAS has made this
-    /// node the holder at `epoch` but before the view opens: until `gate`
-    /// returns, no FUSE thread's fast path, no local forward
-    /// ([`LeaseView::new_mutation_epoch`] is still `None`) and no peer's
-    /// forwarded op (`ship_epoch()` is still `None`, and the caller holds
-    /// the keepers lock) can execute against this replica.
-    ///
-    /// Plan 30 §M3a's takeover gate runs here (`recovery::takeover_gate`):
-    /// stranded speculation is rolled back and its ops replayed locally
-    /// before this node validates anything as holder. Not called for
-    /// `Plan::Held` (nothing changed hands) or a lost CAS.
-    pub async fn commit_gated(
+    /// A won CAS records the new epoch as this node's holder epoch
+    /// (`Meta::holder_epoch`) at once — so a forward reply from an older
+    /// epoch is refused from this instant (`Meta::install_shadow`) — but
+    /// does **not** open the view: until [`Self::open_won`], no FUSE
+    /// thread's fast path, no local forward and no peer's forwarded op can
+    /// execute against this replica, and nothing ships. Plan 30's takeover
+    /// gate runs in between (`shipper::acquire_lease_for`).
+    pub async fn commit_cas(
         &mut self,
         plan: Plan,
         tailed: Option<TailedToHead>,
-        gate: impl FnOnce(u64) + Send,
-    ) -> Result<bool> {
-        let (lease, result) = match plan {
+    ) -> Result<CasOutcome> {
+        let (lease, takeover, marker, result) = match plan {
             Plan::Held => {
                 // `classify` just saw our own live, unreleased lease on S3.
                 // Re-arm the view: a release dropped mid-CAS leaves it
@@ -598,14 +881,15 @@ impl LeaseKeeper {
                 if let Some((lease, _)) = &self.held {
                     self.view.set_held(lease);
                     self.view.touch();
+                    self.note_holder_epoch(lease.epoch);
                 }
-                return Ok(true);
+                return Ok(CasOutcome::Held);
             }
-            Plan::Busy { .. } => return Ok(false),
+            Plan::Busy { .. } => return Ok(CasOutcome::NotWon),
             Plan::Create => {
                 let lease = Lease::granted(self.store.partition(), self.node_id, 1, self.ttl_ms);
                 let r = self.store.try_create(&lease).await;
-                (lease, r)
+                (lease, false, false, r)
             }
             Plan::Claim {
                 prev,
@@ -639,7 +923,7 @@ impl LeaseKeeper {
                 let lease =
                     Lease::granted(self.store.partition(), self.node_id, epoch, self.ttl_ms);
                 let r = self.store.try_swap(&lease, &tag).await;
-                (lease, r)
+                (lease, needs_tail, needs_tail && !prev.released, r)
             }
         };
         match result {
@@ -649,26 +933,39 @@ impl LeaseKeeper {
                     epoch = lease.epoch,
                     ttl_ms = self.ttl_ms,
                     reason = self.acquire_reason,
+                    takeover,
                     "acquired partition lease"
                 );
-                gate(lease.epoch);
-                self.view.set_held(&lease);
-                self.view.touch();
-                // A fresh grant answers every pending request by definition
-                // (`Lease::granted` clears `wanted_by`), and starts the
-                // dwell clock that keeps the next one from being answered
-                // the instant it arrives.
-                self.wanted.clear();
-                self.wanted_since = None;
-                self.held_since = Some(Instant::now());
-                self.held = Some((lease, tag));
-                self.refresh_condemned().await;
-                Ok(true)
+                self.note_holder_epoch(lease.epoch);
+                Ok(CasOutcome::Won(Won {
+                    lease,
+                    tag,
+                    takeover,
+                    marker,
+                }))
             }
             // Somebody else got there first; the caller retries.
-            Err(StoreError::CasConflict) => Ok(false),
+            Err(StoreError::CasConflict) => Ok(CasOutcome::NotWon),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Take ownership of a won lease: `held`, renewal, shipping authority.
+    /// With `pending` the view stays closed to new mutations (and nothing
+    /// ships) until [`Self::finish_gate`]; without it, it opens now.
+    pub async fn open_won(&mut self, won: Won, pending: Option<PendingGate>) {
+        self.set_pending_gate(pending);
+        self.view.set_held(&won.lease);
+        self.view.touch();
+        // A fresh grant answers every pending request by definition
+        // (`Lease::granted` clears `wanted_by`), and starts the dwell
+        // clock that keeps the next one from being answered the instant
+        // it arrives.
+        self.wanted.clear();
+        self.wanted_since = None;
+        self.held_since = Some(Instant::now());
+        self.held = Some((won.lease, won.tag));
+        self.refresh_condemned().await;
     }
 
     /// Renew when past half-TTL. Detects deposition.
@@ -744,6 +1041,14 @@ impl LeaseKeeper {
         if lease.expires_in_ms(now_unix_ms()) > (self.ttl_ms / 2) as i64 {
             return None;
         }
+        self.prepare_renew_unconditional()
+    }
+
+    /// [`Self::prepare_renew`] without the due-check: renew this round.
+    /// Plan 30 §M3b: `run_sync_round` uses it when this node has tailed a
+    /// higher epoch than the one it believes it holds, so the renewal's
+    /// deposition probe runs now rather than at half-TTL.
+    pub fn prepare_renew_now(&mut self) -> Option<RenewAttempt> {
         self.prepare_renew_unconditional()
     }
 
@@ -871,18 +1176,22 @@ impl LeaseKeeper {
 
     fn mark_lost(&mut self, holder: u64, epoch: u64, my_epoch: u64) {
         self.held = None;
+        self.set_pending_gate(None);
         self.view.clear();
         self.view.lost.store(true, Ordering::Relaxed);
         self.view.holder.store(holder, Ordering::Relaxed);
         self.view.epoch.store(epoch, Ordering::Relaxed);
+        self.note_holder_epoch(0);
+        self.lost_floor = epoch.max(my_epoch.saturating_add(1));
         tracing::error!(
             new_holder = holder,
             new_epoch = epoch,
             my_epoch,
             node = self.node_id,
             "LEASE LOST: another node took write authority for this partition. \
-             Refusing to ship further segments. Unshipped local writes stay in \
-             the journal for reintegration (not yet implemented)."
+             Refusing to ship further segments; the unshipped journal is rolled \
+             back and its ops replayed by rid through the new holder \
+             (recovery::recover_deposed)."
         );
     }
 
@@ -1016,6 +1325,8 @@ impl LeaseKeeper {
                 self.wanted_since = None;
                 self.held_since = None;
                 self.held = None;
+                self.set_pending_gate(None);
+                self.note_holder_epoch(0);
                 tracing::info!(epoch = lease.epoch, "released partition lease");
                 Ok(new_tag.etag())
             }
@@ -1567,20 +1878,39 @@ mod tests {
         assert_eq!(k.view().new_mutation_epoch(1), None, "never acquired");
 
         // Inside the takeover gate: the CAS landed, the view is not armed.
-        let view = k.view();
-        let seen_in_gate = Arc::new(std::sync::Mutex::new(Some(Some(0))));
-        let seen = seen_in_gate.clone();
-        assert!(k
-            .commit_gated(Plan::Create, None, move |_| {
-                *seen.lock().unwrap() = Some(view.new_mutation_epoch(1));
-            })
-            .await
-            .unwrap());
+        let holder_epoch = Arc::new(AtomicU64::new(0));
+        k.share_holder_epoch(holder_epoch.clone());
+        let won = match k.commit_cas(Plan::Create, None).await.unwrap() {
+            CasOutcome::Won(won) => won,
+            _ => panic!("a fresh lease must be won"),
+        };
         assert_eq!(
-            *seen_in_gate.lock().unwrap(),
-            Some(None),
+            k.view().new_mutation_epoch(1),
+            None,
             "the takeover gate must run with the view still closed"
         );
+        assert_eq!(
+            holder_epoch.load(Ordering::SeqCst),
+            1,
+            "the holder epoch is recorded before the gate runs"
+        );
+        // A gate still pending keeps it closed after the view is armed.
+        k.open_won(
+            won,
+            Some(PendingGate {
+                epoch: 1,
+                takeover: false,
+                marker_shipped: true,
+            }),
+        )
+        .await;
+        assert_eq!(k.view().new_mutation_epoch(1), None);
+        assert_eq!(
+            k.ship_epoch(),
+            None,
+            "nothing ships before the gate completes"
+        );
+        k.finish_gate();
 
         // Held: same epoch as `ship_epoch`, and only for our own node id.
         assert_eq!(k.view().new_mutation_epoch(1), k.ship_epoch());
@@ -1613,5 +1943,53 @@ mod tests {
         k.force_lost();
         assert_eq!(k.ship_epoch(), None);
         assert_eq!(k.view().new_mutation_epoch(1), None);
+        assert_eq!(holder_epoch.load(Ordering::SeqCst), 0);
+    }
+
+    /// Plan 30 §M3b: the releasing flag closes new mutations for as long
+    /// as its guard lives — not for a fixed time — and a mutation admitted
+    /// before the flag went up is waited for.
+    #[tokio::test]
+    async fn the_releasing_flag_is_held_until_dropped_and_waits_for_admitted_mutations() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let s = LeaseStore::new(store, "p0", LeaseMode::Cas);
+        let mut k = LeaseKeeper::new(s, 1);
+        assert!(k.commit(Plan::Create, None).await.unwrap());
+        let view = k.view();
+
+        // An admitted mutation in flight when the release begins.
+        let admitted = view.admit().expect("open");
+        let guard = k.begin_releasing();
+        assert!(!view.open_for_new_mutation());
+        assert!(view.admit().is_none(), "nothing new is admitted");
+        assert_eq!(view.new_mutation_epoch(1), None);
+        assert!(view.fenced());
+        assert!(k.ship_epoch().is_some(), "the final flush still ships");
+        // A second guard on the same view waits like the first.
+        let second = k.begin_releasing();
+        let wait = tokio::spawn(async move {
+            second.wait_quiescent().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !wait.is_finished(),
+            "the release waits for the admitted write"
+        );
+        drop(admitted);
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait)
+            .await
+            .expect("quiesces once the admitted write finishes")
+            .unwrap();
+        guard.wait_quiescent().await;
+
+        // Long past the handoff pause's budget, still closed: the flag is
+        // not time-bounded.
+        view.handoff_pause_until_ms.store(0, Ordering::Relaxed);
+        assert!(!view.open_for_new_mutation());
+        drop(guard);
+        assert!(
+            view.open_for_new_mutation(),
+            "dropping the guard (a round cancelled mid-release) reopens the view"
+        );
     }
 }

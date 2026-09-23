@@ -109,7 +109,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "lease-fencing",
-        desc: "freeze the lease holder (SIGSTOP), let B take over after expiry, then resume A: A must detect deposition and refuse to ship",
+        desc: "freeze the lease holder (SIGSTOP), let B take over after expiry, then resume A: A must detect deposition, never ship under its old epoch, and replay its stranded write through B exactly once",
         requires: &[],
         run: lease_fencing,
     },
@@ -127,7 +127,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "deposed-reintegration",
-        desc: "reintegrate a deposed holder: clean writes append and a deliberate edit conflict materializes",
+        desc: "plan 30 M3b: a deposed holder recovers automatically; its non-overlapping stranded edits replay cleanly and only the true edit-vs-edit overlap materializes a conflict copy",
         requires: &[],
         run: deposed_reintegration,
     },
@@ -508,6 +508,18 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M3a (fixes bug B): the requester of a stranded forwarded create becomes the next holder; its takeover gate replays the create before serving, so another node's O_EXCL create of the name gets EEXIST and b, c and a fresh d agree",
         requires: &[],
         run: holder_crash_phantom_new_holder,
+    },
+    Scenario {
+        name: "takeover-marker-strands-promptly",
+        desc: "plan 30 M3b: a takeover whose own op is refused still strands a third node's shadow promptly (the new holder's epoch marker); the stranded create then replays exactly once",
+        requires: &[],
+        run: takeover_marker_strands_promptly,
+    },
+    Scenario {
+        name: "holder-publishes-log-prefix",
+        desc: "plan 30 M3b: a holder publishes while its journal is non-empty; every commit equals the log prefix, so after a mid-burst kill a fresh node matches the log-tailing follower exactly",
+        requires: &[],
+        run: holder_publishes_log_prefix,
     },
 ];
 
@@ -2415,11 +2427,12 @@ fn lease_handover(seed: u64) -> Result<()> {
 /// Fencing (DESIGN.md §4): A holds the lease with unshipped records and
 /// is frozen with SIGSTOP, so it stops renewing. After expiry B takes
 /// over — legally, having applied everything A flushed — and writes.
-/// Resumed, A must discover it was deposed, refuse to ship, and say so
-/// through the control API. A's unshipped writes are expected to be
-/// stranded (phase-4 reintegration); what must hold is that nothing
-/// *shared* is damaged: B's namespace stays exactly model-correct and a
-/// third, fresh node rebuilds the same world from the log alone.
+/// Resumed, A must discover it was deposed and never ship under its old
+/// epoch. Plan 30 §M3b: A's unshipped write is then rolled back and
+/// replayed by rid through B (exactly once, no conflict copy), A becomes
+/// an ordinary node that writes through B, and nothing *shared* is
+/// damaged: both namespaces stay exactly model-correct and a third,
+/// fresh node rebuilds the same world from the log alone.
 fn lease_fencing(_seed: u64) -> Result<()> {
     eprintln!("    lease-fencing: starting S3 env");
     let (env, root) = setup("lease-fencing")?;
@@ -2432,8 +2445,18 @@ fn lease_fencing(_seed: u64) -> Result<()> {
             // Long enough that A never releases voluntarily here.
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
     };
-    let mut c0 = short(Client::new(root.path(), "c0", &env.endpoint, &backend)?);
-    let mut c1 = short(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
+    // Plan 30 §M3b: A's deposition recovery now replays its stranded
+    // journal through B over the ordinary forward path
+    // (`recovery::drain_pending_replays`), which needs live P2P to be
+    // fast; without it every attempt falls through to the S3-only slow
+    // path until `recovery::LEASE_FALLBACK` gives up and A just acquires
+    // the lease itself, costing this scenario ~30s it does not need to
+    // spend. Give each client its own P2P identity (see
+    // `Client::with_own_node_key`'s doc for the shared-key failure mode).
+    let mut c0 =
+        short(Client::new(root.path(), "c0", &env.endpoint, &backend)?.with_own_node_key());
+    let mut c1 =
+        short(Client::new(root.path(), "c1", &env.endpoint, &backend)?.with_own_node_key());
     c0.fs_create()?;
     eprintln!("    lease-fencing: mounting");
     c0.mount()?;
@@ -2489,42 +2512,69 @@ fn lease_fencing(_seed: u64) -> Result<()> {
         "takeover must not lose the predecessor's flushed writes"
     );
 
-    // Resume A: its next renew CAS fails and it must declare itself out.
+    // Resume A: it learns it was deposed (its renewal CAS fails, or it
+    // tails B's epoch marker and renews at once). Plan 30 §M3b: nothing is
+    // left stranded any more — A rolls its unshipped `mkdir` back from its
+    // captured before-image and replays it by rid through B, exactly once,
+    // with no operator step. What must hold is that nothing reached the log
+    // behind B's back under A's old epoch: the mkdir arrives only as B's
+    // own execution of the replay.
     c0.resume()?;
-    eventually("A reports the lost lease", Duration::from_secs(30), || {
-        let l = lease_of(&c0)?;
-        anyhow::ensure!(l["lost"] == true, "A does not report lost: {l}");
-        anyhow::ensure!(l["held"] == false, "A still claims to hold it: {l}");
-        Ok(())
-    })?;
-    // Its stranded records stay in the journal — neither shipped behind
-    // B's back nor silently dropped (phase-4 reintegration).
-    let a_spool = c0.control_status()?["spool"].clone();
-    anyhow::ensure!(
-        a_spool["journal_backlog"].as_u64().unwrap_or(0) > 0,
-        "a deposed node must keep its unshipped journal: {a_spool}"
+    eventually(
+        "A recovers from the deposition by itself",
+        Duration::from_secs(40),
+        || {
+            let status = c0.control_status()?;
+            let spec = &status["speculation"];
+            anyhow::ensure!(
+                spec["depositions"].as_u64().unwrap_or(0) >= 1
+                    && spec["local_rolled_back"].as_u64().unwrap_or(0) >= 1,
+                "A has not rolled back its stranded journal: {spec}"
+            );
+            anyhow::ensure!(
+                status["lease"]["lost"] == false,
+                "the recovery must clear `lost`: {}",
+                status["lease"]
+            );
+            anyhow::ensure!(
+                status["spool"]["journal_backlog"].as_u64() == Some(0)
+                    && spec["pending_replay"].as_u64() == Some(0),
+                "A still holds stranded work: spool {} speculation {spec}",
+                status["spool"]
+            );
+            Ok(())
+        },
+    )?;
+    model.mkdir(std::path::Path::new("shared/stranded"));
+    // A is an ordinary node again: its next write goes through B.
+    std::fs::write(c0.mnt.join("shared/after-deposition"), b"ok")
+        .context("a recovered node must accept writes again (through the holder)")?;
+    model.write_file(
+        std::path::Path::new("shared/after-deposition"),
+        b"ok".to_vec(),
     );
-    // And it refuses further mutations rather than writing behind B.
-    let refused = std::fs::write(c0.mnt.join("shared/after-deposition"), b"nope");
+    let b_lease = lease_of(&c1)?;
     anyhow::ensure!(
-        refused.is_err(),
-        "a deposed node must not accept new mutations"
+        b_lease["epoch"].as_u64().unwrap_or(0) > a_epoch,
+        "nothing may run under A's deposed epoch again: {b_lease}"
     );
 
-    // B's view is exactly the model, and A's stranded records never
-    // reached the shared log.
+    // B's view is exactly the model — A's replayed mkdir included, once.
     eventually(
         "B's namespace is model-correct",
-        Duration::from_secs(20),
-        || model.verify(&c1.mnt),
+        Duration::from_secs(30),
+        || {
+            model.verify(&c1.mnt)?;
+            model.verify(&c0.mnt)
+        },
     )?;
     anyhow::ensure!(
-        !c1.mnt.join("shared/stranded").exists(),
-        "a deposed holder's unshipped write must not appear on the new holder"
+        c0.control_status()?["speculation"]["replay_conflicts"].as_u64() == Some(0),
+        "a non-overlapping stranded op must replay without a conflict copy"
     );
 
     // The shared log is uncorrupted: a fresh node rebuilds B's world.
-    c0.kill9()?; // A's journal stays stranded on disk, by design
+    c0.kill9()?;
     c1.unmount()?;
     let mut c2 = short(Client::new(root.path(), "c2", &env.endpoint, &backend)?);
     c2.mount().context("fresh node bootstrap after fencing")?;
@@ -2611,19 +2661,33 @@ fn continuation_epoch(_seed: u64) -> Result<()> {
     wait_for_epoch([&c0, &c1])?;
 
     std::fs::write(c0.mnt.join("a/from-a"), b"epoch-a")?;
-    // B's write forces a P2P-only p0 handoff from A.
+    let b_forwarded_before = c1.control_status()?["forwarded_ok"].as_u64().unwrap_or(0);
+    // B's write reaches the epoch authority over P2P only: either a
+    // P2P-only p0 handoff from A (B then journals it locally), or — when B
+    // already knows A as the holder (A's pre-cut segments were pushed to
+    // it, which caches the holder) — a forward that A executes and
+    // journals. Which one depends on whether B learned of A through the
+    // push or through its own S3 tail, a race this scenario does not
+    // control; both are correct. What must hold is that nothing shipped:
+    // every write is sitting in some journal while S3 is cut. (This used
+    // to require B's own backlog to be non-empty, which the forward path
+    // legitimately leaves at zero: a flaky assertion, not an ordering bug.)
     std::fs::write(c1.mnt.join("b/from-b"), b"epoch-b")?;
+    let a_status = c0.control_status()?;
+    let b_status = c1.control_status()?;
     anyhow::ensure!(
-        c0.control_status()?["spool"]["journal_backlog"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0
+        a_status["spool"]["journal_backlog"].as_u64().unwrap_or(0) > 0,
+        "A's epoch write must be journaled locally: {}",
+        a_status["spool"]
     );
+    let b_backlog = b_status["spool"]["journal_backlog"].as_u64().unwrap_or(0);
+    let b_forwarded = b_status["forwarded_ok"].as_u64().unwrap_or(0) > b_forwarded_before;
     anyhow::ensure!(
-        c1.control_status()?["spool"]["journal_backlog"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0
+        b_backlog > 0 || b_forwarded,
+        "B's epoch write was neither journaled on B (handoff) nor forwarded to A: \
+         B spool {}, forwarded_ok {}",
+        b_status["spool"],
+        b_status["forwarded_ok"]
     );
 
     proxy.heal()?;
@@ -2721,6 +2785,19 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
     Ok(())
 }
 
+/// Plan 30 §M3b: a deposed holder recovers on its own. A holds the lease
+/// and journals three stranded edits while its S3 path is cut — a new
+/// file (`clean-from-a`), an overwrite of a baseline file B never touches
+/// (`a-only`), and an overwrite of a file B then overwrites too (`same`)
+/// — and is frozen before any of it ships. B takes the expired lease
+/// (shipping an epoch marker, since A never released) and writes `same`.
+/// Resumed, A learns it was deposed at its next renewal (or from B's
+/// marker), rolls its unshipped journal back from before-images and
+/// replays every transaction by rid through B — with no operator
+/// `reintegrate` call. Only the genuine overlap is refused: `same` keeps
+/// B's winner and A's bytes land as exactly one
+/// `.constellation-conflict/same@<node>-<ts>` copy, while `clean-from-a`
+/// and `a-only` replay cleanly with no conflict copy at all.
 fn deposed_reintegration(_seed: u64) -> Result<()> {
     let (env, root) = setup("deposed-reintegration")?;
     let proxy = env.s3_proxy()?;
@@ -2729,10 +2806,11 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
         client
             .with_env("CONSTELLATION_NODE_KEY", key)
             .with_env("CONSTELLATION_LEASE_TTL_MS", "5000")
-            // Keep B's takeover live long enough for resumed A to
-            // deterministically observe the fencing CAS failure. We
-            // explicitly wait for B's later idle release before asking A
-            // to reintegrate.
+            // Keep B holding for a while after its takeover write, so
+            // resumed A's renewal finds B's lease (the deposition path
+            // under test) and its replay drain forwards to a live holder.
+            // If B has released by then anyway, the drain's own lease
+            // fallback replays locally instead; either converges.
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "10000")
             .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "3000")
     };
@@ -2751,13 +2829,16 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
 
     std::fs::create_dir(c0.mnt.join("shared"))?;
     std::fs::write(c0.mnt.join("shared/same"), b"baseline")?;
+    std::fs::write(c0.mnt.join("shared/a-only"), b"baseline-a")?;
     eventually("baseline visible on B", Duration::from_secs(30), || {
         anyhow::ensure!(std::fs::read(c1.mnt.join("shared/same"))? == b"baseline");
+        anyhow::ensure!(std::fs::read(c1.mnt.join("shared/a-only"))? == b"baseline-a");
         Ok(())
     })?;
     let a_epoch = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
 
-    // Two stranded changes: one clean path and one deliberate edit conflict.
+    // Three stranded changes: a new file and an overwrite nobody else
+    // touches (both must replay cleanly), and a deliberate edit conflict.
     //
     // Cut A's path to S3 *before* making them: a FUSE write only journals
     // locally and returns immediately, but the sync task's background
@@ -2770,19 +2851,27 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     // unshipped, when A is deposed) without technically breaking
     // anything — the log stays perfectly ordered either way — so it
     // never produced a wrong-data failure, only an intermittent one
-    // further down where reintegration legitimately finds nothing left
-    // to reconcile. The cut removes the race outright: with S3
-    // unreachable the ship cannot possibly succeed, so the records are
-    // guaranteed to still be local when A is frozen a moment later.
+    // further down where the recovery legitimately finds nothing left
+    // to replay. The cut removes the race outright: with S3 unreachable
+    // the ship cannot possibly succeed, so the records are guaranteed to
+    // still be local when A is frozen a moment later.
     proxy.cut()?;
     std::fs::write(c0.mnt.join("shared/clean-from-a"), b"clean")?;
+    std::fs::write(c0.mnt.join("shared/a-only"), b"stranded-from-a")?;
     std::fs::write(c0.mnt.join("shared/same"), b"loser-from-a")?;
+    let a_before = c0.control_status()?;
     anyhow::ensure!(
-        c0.control_status()?["spool"]["journal_backlog"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0,
-        "A did not retain stranded records"
+        a_before["spool"]["journal_backlog"].as_u64().unwrap_or(0) > 0,
+        "A did not retain stranded records: {}",
+        a_before["spool"]
+    );
+    // Plan 30 §M3b holder capture: the holder's own unshipped
+    // transactions are speculation with before-images — what the
+    // deposition recovery below rolls back with.
+    anyhow::ensure!(
+        a_before["speculation"]["local"].as_u64().unwrap_or(0) > 0,
+        "A's unshipped writes were not captured as local speculation: {}",
+        a_before["speculation"]
     );
     c0.pause()?;
     // Safe to restore now: A cannot act on it while stopped, and B needs
@@ -2803,31 +2892,44 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
         Ok(())
     })?;
 
+    // No `reintegrate` call from here on: A notices the deposition by
+    // itself (its renewal finds B's lease, or it tails B's epoch marker),
+    // rolls back and queues its ops, and the replay drain (every 250 ms)
+    // forwards them to B. `lost` is not polled for `true`: the recovery
+    // clears it within one sync round, so a `true` sample is a race.
     c0.resume()?;
-    eventually("A reports deposition", Duration::from_secs(20), || {
-        anyhow::ensure!(lease_of(&c0)?["lost"] == true);
-        Ok(())
-    })?;
-    // Reintegration is operator-driven, not automatic: nothing registers A
-    // in B's `wanted_by` in the background just because A noticed its own
-    // deposition. That registration is a *side effect* of an attempted
-    // reintegration (`reintegrate::run` calls the ordinary lease-acquire
-    // path, which records `wanted_by` on a `Busy` lease before bailing
-    // with "could not acquire write lease for p0; retry reintegrate
-    // later"). So the first attempt below is expected to fail — it is
-    // what gets B to eventually release, once its dwell floor and
-    // wanted-grace window both elapse (`LEASE_MIN_DWELL_MS` +
-    // `LEASE_WANTED_GRACE_MS`, 5 s each) — and reintegrate must be
-    // retried until it lands, exactly as that error message tells an
-    // operator to do by hand.
     eventually(
-        "A reintegrates once B releases the takeover lease",
-        Duration::from_secs(30),
-        || c0.reintegrate(),
-    )?;
+        "A recovers from the deposition and drains its replay queue",
+        Duration::from_secs(60),
+        || {
+            let status = c0.control_status()?;
+            let spec = &status["speculation"];
+            anyhow::ensure!(
+                spec["depositions"].as_u64().unwrap_or(0) >= 1
+                    && spec["local_rolled_back"].as_u64().unwrap_or(0) >= 1,
+                "A has not run a deposition recovery yet: {spec}"
+            );
+            anyhow::ensure!(
+                status["lease"]["lost"] == false,
+                "the recovery must clear `lost`: {}",
+                status["lease"]
+            );
+            anyhow::ensure!(
+                spec["pending_replay"].as_u64() == Some(0)
+                    && spec["outstanding"].as_u64() == Some(0),
+                "A is still replaying: {spec}"
+            );
+            anyhow::ensure!(
+                spec["replay_conflicts"].as_u64().unwrap_or(0) >= 1,
+                "A's replay of `same` must have been refused and materialized: {spec}"
+            );
+            Ok(())
+        },
+    )
+    .with_context(|| format!("--- c0 log ---\n{}", c0.tail_log_n(80)))?;
 
     eventually(
-        "clean branch and conflict materialization converge",
+        "clean replays and the one conflict copy converge on both nodes",
         Duration::from_secs(40),
         || {
             for client in [&c0, &c1] {
@@ -2840,25 +2942,53 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
                     client.control_status()?,
                     client.tail_log_n(80)
                 );
-                anyhow::ensure!(std::fs::read(client.mnt.join("shared/clean-from-a"))? == b"clean");
-                let dir = client.mnt.join("shared/.constellation-conflict");
-                let conflict = std::fs::read_dir(&dir)?
-                    .filter_map(|entry| entry.ok())
-                    .find(|entry| entry.file_name().to_string_lossy().starts_with("same@"))
-                    .context("same@ conflict file missing")?;
-                anyhow::ensure!(std::fs::read(conflict.path())? == b"loser-from-a");
-                let status = client.control_status()?;
                 anyhow::ensure!(
-                    status["reintegration"]["conflicts_materialized"]
-                        .as_u64()
-                        .unwrap_or(0)
-                        >= 1
-                        || client.name == "c1"
+                    std::fs::read(client.mnt.join("shared/clean-from-a"))? == b"clean",
+                    "{}: clean-from-a did not replay",
+                    client.name
+                );
+                anyhow::ensure!(
+                    std::fs::read(client.mnt.join("shared/a-only"))? == b"stranded-from-a",
+                    "{}: a-only (never touched by B) did not replay A's content",
+                    client.name
+                );
+                // Conflicts only for true overlaps: exactly one copy, for
+                // `same` — none for `clean-from-a` or `a-only`.
+                let dir = client.mnt.join("shared/.constellation-conflict");
+                let entries: Vec<std::fs::DirEntry> =
+                    std::fs::read_dir(&dir)?.collect::<std::io::Result<Vec<_>>>()?;
+                let names: Vec<String> = entries
+                    .iter()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect();
+                anyhow::ensure!(
+                    entries.len() == 1 && names[0].starts_with("same@"),
+                    "{} must hold exactly one conflict copy, same@<node>-<ts>; found {names:?}",
+                    client.name
+                );
+                anyhow::ensure!(
+                    std::fs::read(entries[0].path())? == b"loser-from-a",
+                    "{}: {} does not carry A's losing bytes",
+                    client.name,
+                    names[0]
                 );
             }
+            let status = c0.control_status()?;
+            anyhow::ensure!(
+                status["reintegration"]["conflicts_materialized"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    >= 1,
+                "conflicts_materialized must mirror replay_conflicts: {}",
+                status["reintegration"]
+            );
             Ok(())
         },
     )?;
+    eprintln!(
+        "    deposed-reintegration: c0 speculation after recovery: {}",
+        speculation_of(&c0)?
+    );
     c0.unmount()?;
     c1.unmount()?;
     Ok(())
@@ -6814,23 +6944,37 @@ fn forward_timeout_reexec(_seed: u64) -> Result<()> {
 /// three mounted clients plus the switch, positioned right after A has
 /// taken the lease and both B and C see its marker — i.e. right before
 /// the caller cuts A's S3 and does the stranding write.
-fn phantom_setup(
-    scenario: &str,
-) -> Result<(
+fn phantom_setup(scenario: &str) -> Result<PhantomRig> {
+    phantom_setup_with(scenario, &[])
+}
+
+/// What [`phantom_setup`] hands back: the environment, the scratch root,
+/// nodes A, B and C, and A's S3 switch.
+type PhantomRig = (
     S3Env,
     tempfile::TempDir,
     Client,
     Client,
     Client,
     CountingProxy,
-)> {
+);
+
+/// As [`phantom_setup`], with `extra` environment on all three nodes
+/// (plan 30 M3b: `takeover-marker-strands-promptly` shortens the idle
+/// poll ceiling so its promptness bound does not ride on the P2P push).
+fn phantom_setup_with(scenario: &str, extra: &[(&str, &str)]) -> Result<PhantomRig> {
     let (env, root) = setup(scenario)?;
     let _proxy = env.s3_proxy()?;
     let sw = env.counting_proxy()?;
     let backend = format!("s3://{BUCKET}/{scenario}-{}", ts());
     let tune = |c: Client| {
-        c.with_own_node_key()
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "6000")
+        let mut c = c
+            .with_own_node_key()
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "6000");
+        for (key, value) in extra {
+            c = c.with_env(key, value);
+        }
+        c
     };
     let mut a = tune(Client::new(root.path(), "a", &sw.endpoint(), &backend)?);
     let mut b = tune(Client::new(root.path(), "b", &env.endpoint, &backend)?);
@@ -7046,4 +7190,457 @@ fn holder_crash_phantom_new_holder(_seed: u64) -> Result<()> {
     let mut d = checked?;
     d.unmount()?;
     Ok(())
+}
+
+/// The envelope of log segment `seq` in partition `part`, straight from
+/// the bucket: `(node, epoch, record count)`. A non-E2E segment is a zstd
+/// postcard `SegmentEnvelope { v, node, epoch, records }`
+/// (`crates/cli/src/shipper.rs`); every field up to the record vector's
+/// length prefix is a plain varint, so the header decodes without the
+/// record types. Plan 30 M3b uses it to identify an epoch marker (an
+/// empty segment at the new holder's epoch).
+fn segment_header(endpoint: &str, prefix: &str, part: &str, seq: u64) -> Result<(u64, u64, u64)> {
+    let key = format!("{prefix}/log/{part}/{seq:016x}.zst");
+    let mut compressed = Vec::new();
+    ureq::get(&raw_key(endpoint, &key))
+        .call()
+        .with_context(|| format!("fetching {key}"))?
+        .into_reader()
+        .read_to_end(&mut compressed)?;
+    let payload =
+        zstd::decode_all(&compressed[..]).with_context(|| format!("decompressing {key}"))?;
+    let ((v, node, epoch, records), _) =
+        postcard::take_from_bytes::<(u32, u64, u64, u64)>(&payload)
+            .with_context(|| format!("decoding {key}'s envelope"))?;
+    anyhow::ensure!(v == 2, "{key}: unexpected segment envelope version {v}");
+    Ok((node, epoch, records))
+}
+
+/// Every commit object's key under `prefix`, oldest first (`commits/`
+/// keys are zero-padded hex sequence numbers, so lexical order is chain
+/// order).
+fn commit_keys(endpoint: &str, prefix: &str) -> Result<Vec<String>> {
+    let mut keys: Vec<String> = raw_objects(endpoint, &format!("{prefix}/commits/"))?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
+
+/// One commit object, parsed (a non-E2E commit is plain JSON:
+/// `store-s3::commits::Commit`).
+fn read_commit(endpoint: &str, key: &str) -> Result<serde_json::Value> {
+    let mut body = Vec::new();
+    ureq::get(&raw_key(endpoint, key))
+        .call()
+        .with_context(|| format!("fetching {key}"))?
+        .into_reader()
+        .read_to_end(&mut body)?;
+    serde_json::from_slice(&body).with_context(|| format!("parsing commit {key}"))
+}
+
+/// Plan 30 §M3b's epoch marker, as a regression test. A holds the lease;
+/// C's forwarded create is accepted by A from memory (A's S3 is cut) and
+/// sits on C as a speculation-log shadow; A dies without shipping it. B
+/// then takes the expired lease through an op that is *refused* — `rmdir`
+/// of a non-empty directory, `ENOTEMPTY` — so B's own op ships nothing.
+/// (Not `mkdir` of an existing name: the kernel can answer that `EEXIST`
+/// from its dentry cache without ever calling the daemon, so it might not
+/// take the lease at all. `rmdir`'s emptiness check is the filesystem's.)
+/// Before M3b C's shadow stayed in place until B next happened to write
+/// something; now B's takeover ships an empty segment at its new epoch
+/// right after the CAS, and C must strand the shadow within a few seconds
+/// of B's `rmdir` returning. The first segment of B's epoch in the bucket
+/// must be that marker (B's node, zero records), and the stranded create
+/// is then replayed by rid through B exactly once: B, C and a fresh node
+/// D all see `phantom` as one inode.
+fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
+    use std::time::Instant;
+    /// How long after B's takeover C may take to strand its shadow. The
+    /// marker is pushed over P2P at once, and the idle poll ceiling is
+    /// lowered to 1 s as the fallback; nothing else B does in this window
+    /// ships anything that could strand it.
+    const PROMPT: Duration = Duration::from_secs(5);
+    let (env, root, mut a, mut b, mut c, sw) = phantom_setup_with(
+        "takeover-marker-strands-promptly",
+        &[("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")],
+    )?;
+    let prefix = b
+        .backend
+        .strip_prefix(&format!("s3://{BUCKET}/"))
+        .context("backend is not on the harness bucket")?
+        .to_string();
+    let a_epoch = lease_of(&a)?["epoch"].as_u64().unwrap_or(0);
+    let b_node = b.control_status()?["node_id"]
+        .as_u64()
+        .context("b reports no node_id")?;
+
+    // The non-empty directory B's refused op targets, made while A's S3 is
+    // still up so it is ordinary shipped history everywhere.
+    std::fs::create_dir_all(a.mnt.join("full/child"))?;
+    eventually(
+        "full/child visible on B and C",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(b.mnt.join("full/child").is_dir(), "full/child missing on B");
+            anyhow::ensure!(c.mnt.join("full/child").is_dir(), "full/child missing on C");
+            Ok(())
+        },
+    )?;
+    let rolled_before = speculation_of(&c)?["rolled_back"].as_u64().unwrap_or(0);
+
+    // Strand C's forwarded create the way the M3a scenarios strand B's:
+    // cut A's S3 (A still holds a valid lease and acks from memory), then
+    // crash A so the ack can never ship.
+    sw.cut();
+    create_new(&c.mnt, "phantom")
+        .context("C's forwarded create must be acked while A's lease is still valid")?;
+    eventually("phantom visible on C", Duration::from_secs(10), || {
+        anyhow::ensure!(c.mnt.join("phantom").exists(), "phantom not yet on C");
+        Ok(())
+    })?;
+    a.kill9()?;
+    let spec = speculation_of(&c)?;
+    anyhow::ensure!(
+        spec["outstanding"].as_u64().unwrap_or(0) >= 1,
+        "C must hold the accepted create as an outstanding shadow: {spec}"
+    );
+
+    let checked = (|| -> Result<Client> {
+        // B's refused op: it forwards to dead A, fails, waits out A's
+        // lease and takes over (CAS, epoch marker, takeover gate), then
+        // executes locally and is refused. Nothing of its own ships.
+        match std::fs::remove_dir(b.mnt.join("full")) {
+            Ok(()) => bail!("B's rmdir of the non-empty `full` succeeded"),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => {}
+            Err(e) => bail!("B's rmdir of the non-empty `full` returned {e}, expected ENOTEMPTY"),
+        }
+        let took_over = Instant::now();
+        let lease = lease_of(&b)?;
+        let b_epoch = lease["epoch"].as_u64().unwrap_or(0);
+        anyhow::ensure!(
+            lease["held"] == true && b_epoch > a_epoch,
+            "B's refused op must still have taken the lease at an epoch newer than A's \
+             {a_epoch}: {lease}"
+        );
+        eventually("C's shadow strands after B's takeover", PROMPT, || {
+            let spec = speculation_of(&c)?;
+            anyhow::ensure!(
+                spec["rolled_back"].as_u64().unwrap_or(0) > rolled_before,
+                "C has not rolled its shadow back: {spec}"
+            );
+            Ok(())
+        })
+        .context(
+            "B's own op was refused and shipped nothing, so only B's epoch marker can strand \
+             C's shadow this soon (plan 30 M3b)",
+        )?;
+        let strand_ms = took_over.elapsed().as_millis();
+        let b_spec = speculation_of(&b)?;
+        anyhow::ensure!(
+            b_spec["epoch_markers"].as_u64().unwrap_or(0) >= 1,
+            "B took over from a holder that never released but shipped no epoch marker: {b_spec}"
+        );
+        // The first segment of B's epoch is B's empty marker.
+        let mut marker = None;
+        for seq in log_segment_seqs(&env.direct_endpoint, &prefix, "p0")? {
+            let (node, epoch, records) = segment_header(&env.direct_endpoint, &prefix, "p0", seq)?;
+            if epoch > a_epoch {
+                marker = Some((seq, node, epoch, records));
+                break;
+            }
+        }
+        let (seq, node, epoch, records) =
+            marker.context("no log segment carries an epoch newer than A's")?;
+        anyhow::ensure!(
+            node == b_node && epoch == b_epoch && records == 0,
+            "the first segment of the new epoch (seq {seq}) must be B's (node {b_node}) empty \
+             epoch-{b_epoch} marker; it is node {node}, epoch {epoch}, {records} record(s)"
+        );
+        eprintln!(
+            "    takeover-marker-strands-promptly: c stranded its shadow {strand_ms} ms after b's \
+             refused takeover op; marker at seq {seq}"
+        );
+
+        // The stranded create is replayed by rid through B exactly once.
+        phantom_everywhere(&[("b", &b), ("c", &c)], Duration::from_secs(40))
+            .context("C's stranded create must be replayed through B")?;
+        let spec = speculation_of(&c)?;
+        anyhow::ensure!(
+            spec["stranded_replayed"].as_u64().unwrap_or(0) >= 1,
+            "C's status shows no replay — the recovery path did not engage: {spec}"
+        );
+        anyhow::ensure!(
+            spec["replay_conflicts"].as_u64().unwrap_or(0) == 0,
+            "the replay was refused, but nothing else ever took the name: {spec}"
+        );
+        eventually("c's speculation retires", Duration::from_secs(30), || {
+            let spec = speculation_of(&c)?;
+            anyhow::ensure!(
+                spec["outstanding"].as_u64() == Some(0)
+                    && spec["pending_replay"].as_u64() == Some(0),
+                "c still speculating: {spec}"
+            );
+            Ok(())
+        })?;
+        // A fresh node bootstraps from the bucket alone (head commit plus
+        // the log after it) and must agree too. C's clean unmount
+        // publishes a commit first, as in the M3a scenarios.
+        std::fs::write(b.mnt.join("after"), b"b")?;
+        eventually("C sees B's later write", Duration::from_secs(30), || {
+            anyhow::ensure!(std::fs::read(c.mnt.join("after"))? == b"b");
+            Ok(())
+        })?;
+        c.unmount()?;
+        let d = fresh_node(&env, root.path(), &b.backend, b"b")?;
+        phantom_everywhere(&[("b", &b), ("d", &d)], Duration::from_secs(30))
+            .context("a fresh node must see the replayed create exactly as b does")?;
+        Ok(d)
+    })();
+
+    // A no-op when the closure already unmounted C.
+    c.unmount()?;
+    b.unmount()?;
+    let mut d = checked?;
+    d.unmount()?;
+    Ok(())
+}
+
+/// Name of the burst writer's `i`-th directory in
+/// `holder-publishes-log-prefix`: zero-padded, so a sorted listing is
+/// creation order.
+fn burst_name(i: u64) -> String {
+    format!("d{i:06}")
+}
+
+/// `burst/`'s entries under `mnt`, sorted.
+fn burst_listing(mnt: &std::path::Path) -> Result<Vec<String>> {
+    let mut names = std::fs::read_dir(mnt.join("burst"))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    Ok(names)
+}
+
+/// Plan 30 §M3b's publish rule, as a regression test: a holder publishes
+/// while its journal is non-empty, and every commit equals the log prefix
+/// at its `applied` position (unshipped keys are published at their
+/// before-images). Before M3b a commit could also carry the author's
+/// unshipped journal suffix — harmless while the author lived to ship it,
+/// but if it died first, a node bootstrapping from that commit showed
+/// effects the log never received.
+///
+/// Holder A runs a paced `mkdir` burst (metadata only: no close nudge,
+/// no chunk uploads) with a 50 ms sync interval under 25 ms of injected S3
+/// latency each way, so every ship round leaves fresh transactions in the
+/// journal behind it and the 32-segment publish cadence fires every few
+/// seconds mid-burst. (`CONSTELLATION_PUBLISH_IDLE_S` is deliberately not
+/// set: the idle publish only runs on a round whose journal is empty, so
+/// it is not what publishes mid-burst, and its commits would only blur the
+/// sampling below.) Non-vacuity: at least one status sample must see a
+/// new A-authored commit appear while A's `speculation.local` is non-zero.
+/// A is then SIGKILLed right after its next commit becomes visible in the
+/// bucket — before its round, which sees the CAS reply 25 ms later, can
+/// ship what was journaled meanwhile. B has tailed the log from the start;
+/// a fresh node D bootstraps from the head commit plus the log after it.
+/// D and B must list exactly the same `burst/` entries, those must be a
+/// contiguous prefix of A's mkdir sequence, and A must have acknowledged
+/// more mkdirs than that prefix (the kill caught an unshipped tail, which
+/// neither node may show).
+///
+/// What this cannot check directly is "commit == log prefix at `applied`"
+/// in isolation: the harness cannot decode log records, and D replays the
+/// log after `applied` on top of the commit. The two differ observably
+/// only when the commit holds something the log never received — exactly
+/// the crash case above, which D == B catches.
+fn holder_publishes_log_prefix(_seed: u64) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Instant;
+    /// Pause between the writer's mkdirs: ~200/s, a few dozen per ship
+    /// round (sync interval plus one PUT under the injected latency).
+    const PACE: Duration = Duration::from_millis(5);
+    let (env, root) = setup("holder-publishes-log-prefix")?;
+    let proxy = env.s3_proxy()?;
+    let prefix = format!("log-prefix-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    // A 1 s idle poll ceiling so B and D reach the final head promptly.
+    let tune = |c: Client| {
+        c.with_own_node_key()
+            .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")
+    };
+    let mut a = tune(Client::new(root.path(), "a", &env.endpoint, &backend)?)
+        .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "50");
+    let mut b = tune(Client::new(root.path(), "b", &env.endpoint, &backend)?);
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    wait_for_p2p(&[&a, &b])?;
+    let a_node = a.control_status()?["node_id"]
+        .as_u64()
+        .context("a reports no node_id")?;
+    std::fs::create_dir(a.mnt.join("burst"))?;
+    eventually("burst/ visible on B", Duration::from_secs(20), || {
+        anyhow::ensure!(b.mnt.join("burst").is_dir(), "burst/ missing on B");
+        Ok(())
+    })?;
+    proxy.latency(25, 0)?;
+
+    // The writer counts only mkdirs that returned success. After the kill
+    // its next mkdir fails (ENOTCONN, or ENOENT once the dead mount is
+    // detached: the bare mountpoint has no `burst/`), which ends it.
+    let stop = Arc::new(AtomicBool::new(false));
+    let acked = Arc::new(AtomicU64::new(0));
+    let writer = {
+        let dir = a.mnt.join("burst");
+        let (stop, acked) = (stop.clone(), acked.clone());
+        std::thread::spawn(move || -> Option<String> {
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                if let Err(e) = std::fs::create_dir(dir.join(burst_name(i))) {
+                    return Some(format!("mkdir #{i}: {e}"));
+                }
+                i += 1;
+                acked.store(i, Ordering::Relaxed);
+                std::thread::sleep(PACE);
+            }
+            None
+        })
+    };
+
+    // Whether the head commit is new since `seen` and authored by A (B
+    // may publish too, from what it tailed).
+    let new_a_commit = |seen: &mut Option<String>| -> Result<bool> {
+        let Some(head) = commit_keys(&env.direct_endpoint, &prefix)?.pop() else {
+            return Ok(false);
+        };
+        if seen.as_deref() == Some(head.as_str()) {
+            return Ok(false);
+        }
+        let commit = read_commit(&env.direct_endpoint, &head)?;
+        *seen = Some(head);
+        Ok(commit["author"].as_u64() == Some(a_node))
+    };
+    let burst = (|| -> Result<(u32, u32, u64)> {
+        let mut seen = commit_keys(&env.direct_endpoint, &prefix)?.pop();
+        let (mut samples, mut hits, mut max_local) = (0u32, 0u32, 0u64);
+        let sampling = Instant::now();
+        while hits < 2 && sampling.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_millis(100));
+            anyhow::ensure!(!writer.is_finished(), "the burst writer stopped early");
+            let local = speculation_of(&a)?["local"].as_u64().unwrap_or(0);
+            max_local = max_local.max(local);
+            samples += 1;
+            if new_a_commit(&mut seen)? && local > 0 {
+                hits += 1;
+            }
+        }
+        anyhow::ensure!(
+            hits >= 1,
+            "no sample saw a new commit from A while A's journal held captured local work \
+             ({samples} samples, max speculation.local {max_local}) — the publish-while-\
+             unshipped path was never exercised"
+        );
+        // Kill A the moment its next commit is visible (the harness reads
+        // the bucket directly, with no injected latency).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !new_a_commit(&mut seen)? {
+            anyhow::ensure!(!writer.is_finished(), "the burst writer stopped early");
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "A published no further commit within 60 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        a.kill9()?;
+        Ok((samples, hits, max_local))
+    })();
+    stop.store(true, Ordering::Relaxed);
+    let writer_end = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("the burst writer panicked"))?;
+    let (samples, hits, max_local) =
+        burst.with_context(|| format!("burst writer ended with: {writer_end:?}"))?;
+    let acked_n = acked.load(Ordering::Relaxed);
+    proxy.remove_all_toxics()?;
+
+    let mut d = tune(Client::new(root.path(), "d", &env.endpoint, &backend)?);
+    let checked = (|| -> Result<()> {
+        d.mount()
+            .context("fresh node bootstrap from the head commit plus the log after it")?;
+        let mut listing = Vec::new();
+        eventually(
+            "b and the fresh d converge on the shipped log",
+            Duration::from_secs(90),
+            || {
+                // Re-read every time: a PUT already on the wire when A
+                // died may still land.
+                let head = log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?
+                    .last()
+                    .copied()
+                    .unwrap_or(0);
+                for c in [&b, &d] {
+                    let at = c.control_status()?["spool"]["head_seq"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    anyhow::ensure!(
+                        at >= head,
+                        "{} applied through {at}, log head {head}",
+                        c.name
+                    );
+                }
+                let on_b = burst_listing(&b.mnt)?;
+                let on_d = burst_listing(&d.mnt)?;
+                anyhow::ensure!(
+                    on_b == on_d,
+                    "b lists {} burst dirs, the fresh d {} (first difference at {:?})",
+                    on_b.len(),
+                    on_d.len(),
+                    on_b.iter().zip(&on_d).position(|(x, y)| x != y)
+                );
+                listing = on_b;
+                Ok(())
+            },
+        )
+        .context("a node bootstrapped from the commit chain must see exactly the log")?;
+        let shipped = listing.len() as u64;
+        for (i, name) in listing.iter().enumerate() {
+            anyhow::ensure!(
+                *name == burst_name(i as u64),
+                "the visible burst is not a contiguous prefix of A's mkdir sequence: \
+                 position {i} holds {name}"
+            );
+        }
+        anyhow::ensure!(shipped > 0, "none of A's burst reached the log");
+        anyhow::ensure!(
+            shipped < acked_n,
+            "A acknowledged {acked_n} mkdirs and all {shipped} are visible: the kill caught no \
+             unshipped tail, so nothing here tested a commit published over one"
+        );
+        let head_key = commit_keys(&env.direct_endpoint, &prefix)?
+            .pop()
+            .context("no commit was ever published")?;
+        let head = read_commit(&env.direct_endpoint, &head_key)?;
+        let applied = head["applied"].as_u64().unwrap_or(0);
+        let log_head = log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?
+            .last()
+            .copied()
+            .unwrap_or(0);
+        anyhow::ensure!(
+            applied <= log_head,
+            "head commit {head_key} claims log position {applied}, past the log head {log_head}"
+        );
+        eprintln!(
+            "    holder-publishes-log-prefix: {hits}/{samples} samples saw a new commit over \
+             unshipped work (max local {max_local}); A acked {acked_n} mkdirs, {shipped} \
+             reached the log, {} unshipped tail never visible; head commit applied {applied}, \
+             log head {log_head}",
+            acked_n - shipped
+        );
+        Ok(())
+    })();
+
+    b.unmount()?;
+    d.unmount()?;
+    checked
 }

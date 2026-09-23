@@ -396,7 +396,9 @@ fn recovery_fixes_bug_b_third_node_takeover() {
         .with_initial_holder(0, 1)
         .with_max_tick(6)
         .with_lease_ttl(2)
-        .with_max_seq(2)
+        // One more slot than `today_finds_bug_b`: plan 30 §M3b's takeover
+        // epoch marker occupies one.
+        .with_max_seq(3)
         .with_max_crashes(1)
         .with_op(1, NsOp::CreateExcl(name(0)))
         .with_op(2, NsOp::CreateExcl(name(1)));
@@ -407,9 +409,11 @@ fn recovery_fixes_bug_b_third_node_takeover() {
     );
 
     // The concrete bug B path from `today_finds_bug_b`, continued with
-    // recovery: node 1 tails node 2's post-takeover segment, which strands
-    // its shadow; the replay by rid goes to node 2, which executes it and
-    // ships it; node 1 tails that and retires the replayed shadow.
+    // recovery: node 1 tails node 2's takeover epoch marker (slot 1, plan
+    // 30 §M3b), which strands its shadow; the replay by rid goes to node
+    // 2, which executes it and ships it; node 1 tails node 2's own create
+    // (slot 2) and then the replay (slot 3), which retires the replayed
+    // shadow.
     let path = vec![
         Action::ClientInvoke(1),
         Action::DeliverForwardRequest(0),
@@ -428,6 +432,7 @@ fn recovery_fixes_bug_b_third_node_takeover() {
         Action::DeliverForwardRequest(3),
         Action::DeliverForwardReply(4),
         Action::Ship(2),
+        Action::Tail(1),
         Action::Tail(1),
     ];
     let init = model.init_states().into_iter().next().unwrap();
@@ -469,7 +474,9 @@ fn recovery_fixes_bug_b_third_node_takeover_deep() {
         .with_initial_holder(0, 1)
         .with_max_tick(6)
         .with_lease_ttl(2)
-        .with_max_seq(2)
+        // One more slot than `today_finds_bug_b`: plan 30 §M3b's takeover
+        // epoch marker occupies one.
+        .with_max_seq(3)
         .with_max_crashes(1)
         .with_op(1, NsOp::CreateExcl(name(0)))
         .with_op(2, NsOp::CreateExcl(name(1)));
@@ -493,7 +500,9 @@ fn recovery_fixes_bug_b_third_node_takeover_deep() {
 /// under `Recovery` (stacked on top of `ReplayStranded`'s own retry
 /// dimension) made even one allowed attempt blow past a 20-million-state
 /// probe here, where it stayed uncapped at zero (328,836 unique states,
-/// well under a second). `recovery_fixes_bug_b_third_node_takeover`
+/// well under a second, at M3a's `max_seq` of 2; M3b's marker slot
+/// raises `max_seq` to 3, so expect a few times more).
+/// `recovery_fixes_bug_b_third_node_takeover`
 /// already covers the same fix with `RetryForward` reachable via
 /// `exactly_once_is_linearizable`'s own bug-A config, so nothing here
 /// goes untested elsewhere.
@@ -505,7 +514,10 @@ fn recovery_fixes_bug_b_requester_takeover() {
         .with_initial_holder(0, 1)
         .with_max_tick(3)
         .with_lease_ttl(1)
-        .with_max_seq(2)
+        // 3, not M3a's 2: plan 30 §M3b's takeover epoch marker takes a
+        // slot, and without the extra one the "holder shipped before
+        // crashing" branch could no longer ship after the takeover.
+        .with_max_seq(3)
         .with_max_crashes(1)
         .with_lossy(false)
         .with_op(1, NsOp::CreateExcl(name(0)))
@@ -523,7 +535,8 @@ fn recovery_fixes_bug_b_requester_takeover() {
 /// `RetryForward` attempt here explode well past budget (measured while
 /// tuning this test: the uncapped checker exceeded 6GB within 19s at the
 /// default three retries). At zero it is exhaustive (95,961 states,
-/// under 50ms).
+/// under 50ms, at M3a's `max_seq` of 1; M3b's marker slot raises it to
+/// 2).
 #[test]
 fn recovery_fixes_bug_b_exactly_once_config() {
     let model = AuthorityModel::new(2)
@@ -532,7 +545,9 @@ fn recovery_fixes_bug_b_exactly_once_config() {
         .with_initial_holder(0, 1)
         .with_max_tick(3)
         .with_lease_ttl(1)
-        .with_max_seq(1)
+        // 2, not `exactly_once_is_linearizable`'s 1: plan 30 §M3b's
+        // takeover epoch marker takes a slot of its own.
+        .with_max_seq(2)
         .with_max_crashes(1)
         .with_lossy(false)
         .with_op(1, NsOp::CreateExcl(name(0)));

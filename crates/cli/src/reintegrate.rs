@@ -1,175 +1,69 @@
-//! Stranded-journal reintegration for the mount daemon.
+//! Deposition recovery on demand (the `reintegrate` control command).
 //!
-//! Classifies each unmarked journal record against a side replica
-//! bootstrapped from the shared log, then either re-journals (clean) or
-//! materializes a conflict file. After success the `lost` flag is
-//! cleared so the node may acquire leases again.
+//! Plan 30 §M3b replaced reintegration — classifying a deposed holder's
+//! stranded journal against a side replica and re-journaling the "clean"
+//! records — with rollback plus replay by rid
+//! (`recovery::recover_deposed`): the unshipped transactions are rolled
+//! back from their captured before-images and re-executed, exactly once,
+//! through whoever holds the lease now. That runs by itself on the next
+//! sync round after a node learns it was deposed; this module keeps the
+//! operator-facing command, which runs it at once and reports what it
+//! did, and the `status.reintegration` block.
 
-use anyhow::{Context, Result};
-use constellation_meta::{classify, materialize, Disposition, Meta, MetaStore};
+use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::lease::LeaseKeeper;
-use crate::shipper::{self, Shipper};
+use crate::shipper::Shipper;
 
+#[derive(Default)]
 pub struct ReintegrationState {
     pub in_progress: AtomicBool,
-    pub conflicts: AtomicU64,
-}
-
-impl Default for ReintegrationState {
-    fn default() -> Self {
-        Self {
-            in_progress: AtomicBool::new(false),
-            conflicts: AtomicU64::new(0),
-        }
-    }
 }
 
 impl ReintegrationState {
-    pub fn snapshot(&self, stranded: u64) -> constellation_api::ReintegrationStatus {
+    /// `stranded`: journal rows still waiting on a deposition recovery;
+    /// `conflicts`: refused replays materialized as conflict copies.
+    pub fn snapshot(
+        &self,
+        stranded: u64,
+        conflicts: u64,
+    ) -> constellation_api::ReintegrationStatus {
         constellation_api::ReintegrationStatus {
             stranded_records: stranded,
-            conflicts_materialized: self.conflicts.load(Ordering::Relaxed),
+            conflicts_materialized: conflicts,
             in_progress: self.in_progress.load(Ordering::Relaxed),
         }
     }
 }
 
+/// Run the deposition recovery for every partition this node was deposed
+/// from (its keeper is lost, or a deposition was persisted before a
+/// restart). A node that was not deposed has nothing to recover.
 pub async fn run(
-    meta: &Meta,
     ship: &mut Shipper,
     keepers: &mut HashMap<String, LeaseKeeper>,
-    node_id: u64,
     state_dir: &std::path::Path,
     flags: &ReintegrationState,
 ) -> Result<String> {
     flags.in_progress.store(true, Ordering::Relaxed);
     let _guard = InProgressGuard(flags);
-    flags.conflicts.store(
-        meta.reintegration_conflict_count().unwrap_or(0),
-        Ordering::Relaxed,
-    );
-
-    let result = async {
-        // Need write leases: reintegration appends records like any writer.
-        for part in meta.unmarked_journal_parts()? {
-            keepers
-                .entry(part.clone())
-                .or_insert_with(|| ship.lease_keeper(&part));
+    let persisted = matches!(ship.meta().kv_get("lease_lost")?.as_deref(), Some("1"));
+    let mut summaries = Vec::new();
+    for keeper in keepers.values_mut() {
+        if !keeper.is_lost() && !persisted {
+            continue;
         }
-        for (part, keeper) in keepers.iter_mut() {
-            // The persisted lost bit remains set until the whole procedure
-            // succeeds; this temporary in-memory unlock only permits the
-            // explicit reintegration acquisition path.
-            keeper.clear_lost();
-            if !shipper::acquire_lease_for(ship, keeper, part).await? {
-                anyhow::bail!("could not acquire write lease for {part}; retry reintegrate later");
-            }
-        }
-
-        let view_path = state_dir.join(".reintegrate-view.db");
-        let _ = std::fs::remove_dir_all(&view_path);
-        shipper::bootstrap(&view_path, ship.log())
-            .await
-            .context("bootstrapping shared-log view for reintegration")?;
-        let shared = Meta::open(&view_path)?;
-
-        let stranded = meta.unmarked_journal()?;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let mut cleaned = 0u64;
-        let mut conflicts = 0u64;
-        let mut dispositions = Vec::new();
-        let mut output = Vec::new();
-        for (index, (seq, rec)) in stranded.iter().enumerate() {
-            // The FUSE truncate path journals a size-only Setattr immediately
-            // before the WriteManifest that commits the replacement bytes.
-            // Treat that pair as one logical edit during reintegration. If the
-            // manifest conflicts, replaying the otherwise-"clean" truncate
-            // after the shared winner would leave the winner at size zero;
-            // if it is clean, WriteManifest already carries the final size.
-            let folded_size = matches!(
-                rec,
-                constellation_meta::LogRecord::Setattr {
-                    ino,
-                    mode: None,
-                    uid: None,
-                    gid: None,
-                    size: Some(_),
-                    atime_ns: None,
-                    mtime_ns: None,
-                    ..
-                } if stranded[index + 1..].iter().any(|(_, later)| matches!(
-                    later,
-                    constellation_meta::LogRecord::WriteManifest { ino: later_ino, .. }
-                        if later_ino == ino
-                ))
-            );
-            if folded_size {
-                cleaned += 1;
-                dispositions.push((*seq, "clean".into(), "folded into write_manifest".into()));
-                continue;
-            }
-            let disp = classify(&shared, rec)?;
-            match &disp {
-                Disposition::Clean => {
-                    // Advance the reconciled namespace in journal order;
-                    // the same record is appended under a fresh local seq.
-                    shared.apply_records(std::slice::from_ref(rec))?;
-                    output.push(rec.clone());
-                    cleaned += 1;
-                }
-                Disposition::Conflict { reason } => {
-                    let path = materialize(&shared, rec, node_id, ts)?;
-                    tracing::error!(
-                        seq,
-                        path,
-                        reason,
-                        "reintegration conflict: stranded version materialized"
-                    );
-                    conflicts += 1;
-                    flags.conflicts.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            dispositions.push((*seq, disp.as_str().to_string(), disp.detail()));
-        }
-        // Materialization used ordinary namespace operations on the side
-        // replica; append those generated records too.
-        output.extend(
-            shared
-                .take_journal(usize::MAX)?
-                .into_iter()
-                .map(|(_, record)| record),
-        );
-        meta.commit_reintegration_batch(&shared, &dispositions, &output)?;
-        drop(shared);
-        let _ = std::fs::remove_dir_all(&view_path);
-
-        ship.sync_all_for_reintegration(keepers)
-            .await
-            .context("shipping reintegrated journal")?;
-
-        for keeper in keepers.values_mut() {
-            keeper.clear_lost();
-        }
-        meta.kv_set("lease_lost", "0")?;
-
-        Ok(format!(
-            "reintegrated: {cleaned} clean, {conflicts} conflict(s) materialized"
-        ))
-    }
-    .await;
-
-    if result.is_err() {
-        for keeper in keepers.values_mut() {
+        if !keeper.is_lost() {
             keeper.force_lost();
         }
+        summaries.push(crate::recovery::recover_deposed(ship, keeper, Some(state_dir)).await?);
     }
-    result
+    if summaries.is_empty() {
+        return Ok("not deposed: nothing to recover".into());
+    }
+    Ok(summaries.join("; "))
 }
 
 struct InProgressGuard<'a>(&'a ReintegrationState);

@@ -31,6 +31,11 @@ id, and neither a slow reply nor a takeover can make it execute twice.
   carries the op and its rid, so it can be replayed if it is stranded.
 - **Hint**: a speculation entry for the entry an `EEXIST` refusal was
   about, installed early so the caller's next lookup finds it.
+- **Local entry**: a speculation entry for one of this node's own
+  journaled transactions — a holder's unshipped journal (plan 30 M3b).
+  It retires when the transaction ships.
+- **Epoch marker**: an empty log segment a new holder ships right after
+  taking the lease over from a holder that did not release it.
 - **Rid**: `(node, incarnation, seq)`, the exactly-once identity of one
   mutation — see below.
 
@@ -154,55 +159,127 @@ background shipper.
 
 ## Speculation and stranded-op recovery
 
-Plan 30 M3a makes the requester's optimism explicit. A node's replica is
+Plan 30 M3 makes every node's optimism explicit. A node's replica is
 always a prefix of the durable log plus speculation it can take back:
 
-- **Capture.** A shadow or hint is applied through a capture context
-  threaded into the one funnel every namespace write goes through, so the
+- **Capture.** A shadow, a hint, or — on the holder — one of its own
+  journaled transactions is applied through a capture context threaded
+  into the one funnel every namespace write goes through, so the
   before-image of every key it touches — and the usage delta — lands in
   the node-local `spec` keyspace in the same transaction as the write. A
   segment tailed while older speculation is outstanding is captured the
-  same way (as redo material), even though it is durable.
+  same way (as redo material), even though it is durable. While any
+  speculation exists, every namespace write is captured.
+- **Holder capture (M3b).** The holder's unshipped journal is speculation
+  too: each journaled transaction writes, in its own fjall transaction, a
+  `journal_tx` row (where it ends in the journal, the op and rid a replay
+  re-executes, the epoch it ran under) and a `Local` speculation row with
+  its before-images. Capture is on by default; the internal switch
+  `CONSTELLATION_HOLDER_CAPTURE=0` turns the before-images off (the
+  milestone's performance-gate fallback, see "Publishing" and
+  "Deposition").
+- **Transactions ship whole.** A shipped segment never splits a journaled
+  transaction: batches end on a transaction boundary and the byte cap cuts
+  before one. An op's records and its `Completed { rid }` therefore reach
+  the log together or not at all, so a replay by rid can never re-execute
+  an op that took effect.
 - **Retirement.** A shadow retires when a tailed segment carries its
   `Completed { rid }`. A hint retires when the applied position reaches
-  the floor the holder answered with. Rows are deleted once nothing older
-  is outstanding.
+  the floor the holder answered with. A local entry retires when its
+  transaction ships. Rows are deleted once nothing older is outstanding.
 - **Stranding.** The fencing rule means a holder's epoch can no longer add
   to the log once a segment from a later epoch exists. So applying a
-  segment from a later epoch than an outstanding shadow's or hint's
-  *strands* it: the holder that accepted it died or was deposed with the
-  op still unshipped. A takeover strands everything below the new epoch
-  the same way.
+  segment from a later epoch than an outstanding entry's *strands* it: the
+  holder that accepted it died or was deposed with the op still unshipped.
+  A takeover strands everything below the new epoch the same way, and so
+  does a holder learning it was deposed (see "Deposition").
 - **Rollback and redo.** Stranding restores before-images in reverse order
   down to the earliest stranded entry (usage too, and the chunk-reference,
   xattr and orphan indexes derived from the restored records), then
   re-applies everything after it that still stands — captured segments
   from their records, still-outstanding speculation from its records — in
   one transaction. The replica is then exactly the log prefix plus the
-  surviving speculation.
-- **Replay by rid.** Each stranded shadow's op is queued, in original
-  order, and sent again with its original rid down the ordinary forward
-  path to whoever holds the lease now; if a queued op cannot reach a
-  holder for 10 s, the node takes the lease itself. Exactly-once holds
-  because every holder answers a rid it already executed from `recent` or
-  `completed` without executing it again. An accepted replay becomes a
-  fresh shadow and retires normally.
+  surviving speculation. A stranded local transaction's journal rows are
+  deleted, and so is its rid's `completed` row: it never took effect.
+- **A late segment goes before local work.** A holder's unshipped
+  transactions can only ship after anything it tails. So a segment tailed
+  while it has any (a deposed holder's late, unfenced write) is applied
+  *before* them: they are rolled back, the segment applied, and they are
+  redone on top through the replay path — exactly what every other
+  replica computes once they ship after it.
+- **Replay by rid.** Each stranded op is queued, in original order, and
+  sent again with its original rid down the ordinary forward path to
+  whoever holds the lease now; if a queued op cannot reach a holder for
+  10 s, the node takes the lease itself. Exactly-once holds because every
+  holder answers a rid it already executed from `recent` or `completed`
+  without executing it again. An accepted replay becomes a fresh shadow
+  and retires normally. A stranded transaction without an op of its own is
+  replayed from its records: a lone manifest commit as an optimistic
+  `SetManifest`, anything else (a snapshot row, a quota change, a clone)
+  as `MutateOp::Records`, under a rid derived from its journal position.
+  A manifest replay first uploads the inode's pending chunks, so the
+  holder never receives a manifest naming a chunk S3 does not have.
 - **Refusals.** A replay the log no longer admits (the name was taken in
-  the meantime, the target is gone) is a genuine conflict. It is
-  materialized as a `.constellation-conflict/<name>@<node>-<ts>` copy,
-  like a reintegration conflict, and counted. An `unlink`/`rmdir` refused
-  with `ENOENT` is not a conflict: the name is gone either way.
-- **Takeover gate.** A node that wins a lease CAS rolls back what the new
-  epoch strands and executes every queued replay locally, in order,
-  before its lease view opens. A new holder therefore never validates an
-  op against phantom state, and an op its own clients were told succeeded
-  lands before anything issued after the takeover. Before a claim that
-  follows a P2P handoff, the node first tails to the departing holder's
-  last shipped segment, so nothing it shipped is mistaken for stranded.
-- **Publishing.** A node with outstanding speculation does not publish a
-  metadata commit; its dirty set waits for the speculation to retire or
-  roll back. Commits are therefore built from log-prefix state. (The
-  holder's own unshipped journal is plan 30 M3b.)
+  the meantime, the target is gone, a manifest's base moved on) is a
+  genuine conflict. It is materialized as a
+  `.constellation-conflict/<name>@<node>-<ts>` copy and counted. An
+  `unlink`/`rmdir` refused with `ENOENT` is not a conflict: the name is
+  gone either way. A size-only `setattr` (the `O_TRUNC` half of a
+  truncating write) queued before a manifest commit for the same inode is
+  folded into it: the commit carries the final size, and truncating on its
+  own would cut whatever the log put there when the commit is refused.
+- **Takeover gate and epoch marker.** A node that wins a lease CAS keeps
+  its lease view closed — no FUSE write, local forward or peer's forwarded
+  op executes, and nothing ships — until its gate completes:
+  1. a takeover from a holder that did not release first ships an empty
+     *epoch-marker* segment at the new epoch. It fences any late segment
+     of the old epoch, so nothing the gate replays can be duplicated by a
+     late copy of the same op, and every other node strands the old
+     epoch's speculation as soon as it tails it — even when the takeover's
+     own triggering op is refused and ships nothing;
+  2. it rolls back what the new epoch strands and executes every queued
+     replay locally, in order.
+
+  A new holder therefore never validates an op against phantom state, and
+  an op its own clients were told succeeded lands before anything issued
+  after the takeover. If the marker or a local replay fails, the lease
+  stays held with the view closed and every sync round retries the gate;
+  new mutations wait (and fail with `EIO` at the acquire deadline if the
+  gate can never complete) rather than run ahead of the queued ops. The
+  continuation-epoch path runs the same gate. Before a claim that follows
+  a P2P handoff, the node first tails to the departing holder's last
+  shipped segment, so nothing it shipped is mistaken for stranded. A
+  forward reply accepted at an older epoch that arrives after this node's
+  takeover is not installed; the op is queued for replay, and the caller
+  is answered `Busy` so its lease path executes it here by the same rid.
+- **Deposition (M3b).** A holder learns it was deposed when a renewal
+  finds another holder, or when it tails a segment from a later epoch (the
+  new holder's marker, at the latest; a holder that has tailed a higher
+  epoch than its own renews at once). The next sync round tails to head
+  and strands its unshipped transactions: rolled back from their
+  before-images and queued for replay by rid through the new holder.
+  Only a genuine overlap then becomes a conflict copy. This replaced
+  reintegration's classify-against-a-side-replica pass; the `reintegrate`
+  command still exists and runs the same recovery at once. With holder
+  capture off, the namespace is instead rebuilt from the shared log (a
+  side replica bootstrapped from the head commit) and the journal's ops
+  queued the same way.
+- **Publishing.** A commit is always the log-prefix state at the
+  `applied` position it claims. A node with outstanding shadows or hints
+  does not publish; its dirty set waits for them to retire or roll back. A
+  holder with an unshipped journal publishes with every key that journal
+  touched replaced by its earliest before-image — exactly its value at the
+  last shipped position — and leaves those keys dirty for the publish
+  after the journal ships. With holder capture off, a holder does not
+  publish while its journal is non-empty. A snapshot (which needs a commit
+  reflecting the replica as it stands) ships first and retries while any
+  of this is outstanding.
+- **Releases are fenced exactly.** A release or handoff raises a
+  "releasing" flag on the lease view for its whole final flush and release
+  CAS, and every local mutation is admitted through that view (counted in
+  flight before it checks the flag, and waited for by the release). No
+  local write can land between the final flush and the release, however
+  slow the flush.
 
 ### The shadow does not win conflicts
 
@@ -290,11 +367,22 @@ speculation log's rollback assumes shadows were captured in it.
 - `speculation.stranded_replayed`: stranded ops replayed and accepted.
 - `speculation.replay_conflicts`: refused replays materialized as conflict
   copies.
+- `speculation.local`: this node's own unshipped transactions captured as
+  speculation (a holder's journal). These do not stop a publish.
+- `speculation.local_rolled_back`: own transactions rolled back after a
+  deposition.
+- `speculation.depositions`: deposition recoveries run.
+- `speculation.epoch_markers`: epoch-marker segments shipped after a
+  takeover.
+- `speculation.gate_pending`: this node holds the lease but its takeover
+  gate has not completed; new mutations wait.
 
 The same counters are exported as `constellation_speculation_*` metrics.
 A rollback logs `segment from a later epoch stranded speculative state`
 (or `takeover stranded speculative state`); a refused replay logs
-`stranded op replay refused; materializing a conflict copy`.
+`stranded op replay refused; materializing a conflict copy`; a deposition
+logs `LEASE LOST` and then `deposition recovered`; a marker logs
+`shipped the takeover's epoch marker`.
 
 Under a steady multi-writer workload, `forwarded_ok` should rise while
 `handed the lease to a peer` should disappear. That log line means the older
@@ -318,9 +406,10 @@ takes the lease-acquisition path (P2P handoff, then S3 CAS) directly, with
 no rid retries to attempt first, restoring writer-follows-lease placement.
 A holder crash after `Accepted` strands the op in its unshipped journal;
 the requester's speculation log rolls the shadow back and replays the op by
-rid through the next holder (see above). The dead holder's own unshipped
-journal is still resolved by reintegration until plan 30 M3b. Epoch
-fencing prevents a competing append history.
+rid through the next holder (see above). A holder that was deposed rather
+than killed rolls its own unshipped journal back the same way and replays
+it by rid through the new holder. Epoch fencing, and the new holder's
+epoch marker, prevent a competing append history.
 
 ## References
 

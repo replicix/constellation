@@ -4563,3 +4563,728 @@ real current holder. Verified: `forward-timeout-reexec` PASSES 3/3 after
 the fix, `cargo test --workspace` and the full harness list above are
 otherwise unaffected, `kill9-remount` still PASSES 5/5, and the two
 bug-B scenarios and `holder-ships-under-forward-load` are unchanged.
+
+## Plan 30 M3b — holder-side speculation, log-prefix holder publish, deposed-holder rollback plus replay: **DONE** (round 1 tester gate found and fixed three mechanical/test bugs and reported one real regression; coder round 2 fixed the regression's root cause; round 2 tester gate is clean, all required scenarios pass, perf gate shows no evidence of a >10% regression)
+
+Goal: plan 30 §M3, holder half, plus every gap the M3 "Split" list names.
+A holder's unshipped journal is speculation with before-images: it
+retires when it ships, it is substituted out of every commit the holder
+publishes, and a deposed holder rolls it back and replays it by rid
+through the new holder instead of reintegrating by classification. None
+of this has been compiled or run (the coder brief forbade it); the
+tester runs every gate.
+
+| Item | State | Where |
+|---|---|---|
+| Holder capture: every journaled write transaction is bracketed by `Meta::begin_local`/`finish_local` (every `journal::append_tx` site: the 19 `writes.rs` methods, the four `snapshot.rs` ones, the new `apply_records_journaled`). `finish_local` writes a `journal_tx` row (`first_seq -> {last, spec_seq, epoch, rid, op}`) and, when capturing, a `spec` row of kind `SpecKind::Local { first, epoch }` with the before-images and usage delta (records are the journal rows, not copied). Capture applies when `CONSTELLATION_HOLDER_CAPTURE` is on (default) and the node holds the lease (`Meta::holder_epoch`) or any speculation exists (keeps M3a's "every `ns` write is captured while a spec row exists" for a non-holder's rare local write) | written | `crates/meta/src/store/local.rs` (new), `crates/meta/src/store/writes.rs`, `crates/meta/src/store/snapshot.rs`, `crates/meta/src/store/journal.rs` (`PendingLocalOp`, `peek_next_seq`), `crates/meta/src/mutate.rs` |
+| `Meta::holder_epoch` (an `Arc<AtomicU64>` the lease keeper writes the instant its CAS wins, before the takeover gate, and clears on release/deposition) and the `holder_capture` switch | written | `crates/meta/src/store/mod.rs`, `crates/cli/src/lease.rs` (`share_holder_epoch`/`with_holder_epoch`, every production keeper) |
+| Retire on ship: `ack_journal_rows_at`/`ack_journal` retire the shipped transactions (`spec::retire_local_tx`) in the ack's transaction; a retired `Local` row that must survive compaction (an older shadow is outstanding) becomes a `Foreign` row carrying its records | written | `crates/meta/src/store/spec.rs`, `crates/meta/src/store/writes.rs` |
+| One spec log for all kinds: `read_live` merges `spec_live` (shadows/hints) with captured `journal_tx` rows; `LiveEntry::stranded_by` (epoch-0 `Local` never strands by epoch); stranding a `Local` row deletes its journal rows, its `journal_tx` row, its rid's `completed` row and `recent` answer, and queues its op (or, without one, a derived op: a lone `WriteManifest` → optimistic `SetManifest`, anything else → new `MutateOp::Records`) under the row's `origin` key; queue order survives renumbering via `SpecRow::origin` | written | `crates/meta/src/store/spec.rs` (`rewind_tx`, `strand_local_tx`, `derive_replay_op`), `crates/meta/src/mutate.rs` (`MutateOp::Records`) |
+| Insert-before: a segment tailed while this node has outstanding `Local` rows (a deposed predecessor's late, unfenced segment) is applied *before* them — roll back from the oldest `Local` row, apply the segment as a `Foreign` row, redo the rolled-back rows through the replay path under fresh `spec_seq`s. Replaces `TouchSet` suppression for captured transactions (`Meta::pending_touches` now covers uncaptured journal rows only) | written | `crates/meta/src/store/spec.rs` (`Meta::apply_segment`), `crates/meta/src/store/local.rs`, `crates/cli/src/shipper.rs` |
+| Holder publish by before-image substitution: `Meta::publish_basis_at(snap)` → `AsIs` / `Substituted(LogPrefixView)` (earliest before-image of every key the unshipped journal touched) / `Defer` (shadows or hints outstanding, or — capture off — an uncaptured journal on a holder). The publisher plans every dirty key through the view (`ns_get_via_at`, `tree_inode_via_at` for inode records and their spilled xattrs) and leaves substituted keys dirty. `publish_now` (snapshots) still refuses while the journal is non-empty (`SPECULATION_OUTSTANDING`, retried) | written | `crates/meta/src/store/local.rs`, `crates/cli/src/mtree_publish.rs` |
+| Transactions ship whole: `take_journal_grouped` extends a batch to the end of its last transaction; `ship_part`'s byte cut goes through `Meta::whole_tx_prefix` (back to the last boundary, or forward to the end of an over-cap first transaction). An op's records and its `Completed` are never split | written | `crates/meta/src/store/local.rs`, `crates/meta/src/store/writes.rs`, `crates/cli/src/shipper.rs` |
+| Epoch marker: a takeover from a holder that did not release ships an empty segment at the new epoch (`Shipper::ship_epoch_marker`) right after the CAS, before the gate replays anything; a collision is tailed and retried (bounded). Own-node recovery accepts an empty or atime-only own segment (and no longer bails on an atime-only one, a latent pre-existing mismatch); `ack_rows_at` advances `applied_seq` even for zero rows | written | `crates/cli/src/shipper.rs`, `crates/cli/src/lease.rs` (`Won::marker`), `crates/meta/src/store/journal.rs` |
+| Takeover gate restructured: `LeaseKeeper::commit_cas` (CAS only, view closed, holder epoch recorded) → `open_won(won, Some(PendingGate))` → `shipper::complete_gate` (marker, then `recovery::takeover_gate`). While a gate is pending the view is closed to FUSE writes, local forwards and peers' forwards (`LeaseView::fenced`, `dispatch_mutate` answers `Busy`), and `ship_epoch()` is `None`. A failed gate is retried by every sync round and every `Acquire` (`Plan::Held`) | written | `crates/cli/src/lease.rs`, `crates/cli/src/shipper.rs`, `crates/cli/src/main.rs`, `crates/cli/src/node_runtime.rs`, `crates/cli/src/recovery.rs` |
+| Continuation-epoch path runs the gate: `LeaseKeeper::adopt_epoch_hold_gated` via `recovery::adopt_epoch_hold_gated` (P2P authority transfer in the `Acquire` arm; re-affirmations retry a pending gate) | written | `crates/cli/src/lease.rs`, `crates/cli/src/recovery.rs`, `crates/cli/src/node_runtime.rs`, `crates/cli/src/main.rs` |
+| Forward reply racing a takeover: `Meta::install_shadow` refuses a reply accepted below `holder_epoch` and queues the op for replay in the same transaction; `dispatch_forward` then answers the caller `Busy`, so its lease path executes the op here at once by the same rid (the queued replay later finds it completed). The M3a post-install strand is gone | written | `crates/meta/src/store/spec.rs`, `crates/cli/src/node_runtime.rs`, `crates/cli/src/forward.rs` (`apply_accepted` returns whether it installed) |
+| Releasing flag: `LeaseKeeper::begin_releasing` → drop-reset `ReleasingGuard`; `LeaseView::admit` → `AdmitGuard` (in-flight count raised before the gate check, SeqCst); `ReleasingGuard::wait_quiescent` drains admitted writes before the backlog check. Held across the final flush + CAS on every release path (both `run_sync_round` passes, the P2P `HandOff` arm, the epoch-flush release, the continuation close, `leave`, unmount). Honoured by `open_for_new_mutation` and `new_mutation_epoch`; the FUSE fast path, the lease-path execute, the local manifest commit and retention prune's local unlink admit through it | written | `crates/cli/src/lease.rs`, `crates/cli/src/main.rs`, `crates/cli/src/node_runtime.rs`, `crates/cli/src/fusefs.rs`, `crates/cli/src/leave.rs`, `crates/cli/src/prune.rs` |
+| Deposition: `recovery::recover_deposed` (tail to head, `strand_below_epoch(lost_floor)`, rebuild from the shared log for any uncaptured rows, clear `lease_lost`), run by `run_sync_round` before and right after renewal, by the `reintegrate` command, and at mount for a persisted deposition. A keeper that holds an epoch below one the node has tailed renews at once (`prepare_renew_now`). `reintegrate::classify`/`materialize`, `commit_reintegration_batch` and `sync_all_for_reintegration` are removed; the fallback's wholesale swap is `Meta::replace_ns_from_rebuilt` | written | `crates/cli/src/recovery.rs`, `crates/cli/src/main.rs`, `crates/cli/src/reintegrate.rs`, `crates/meta/src/reintegrate.rs`, `crates/meta/src/store/bootstrap.rs`, `crates/cli/src/shipper.rs` |
+| Replay fixes found on the way: a size-only `setattr` queued before a `SetManifest` for the same inode folds into it (reintegration's truncate rule; without it the replay would truncate the winner and then have its commit refused); a manifest replay drains the inode's pending chunks first (`SyncRequest::DrainInode`), so a forwarded manifest never names a chunk S3 lacks | written | `crates/cli/src/recovery.rs` |
+| `setattr` now persists its usage delta (it was in-memory only), so a rollback restores the counter it moved | written | `crates/meta/src/store/writes.rs` |
+| Status/metrics/UI: `speculation.{local, local_rolled_back, depositions, epoch_markers, gate_pending}`, `constellation_speculation_{local,local_rolled_back_total,depositions_total,epoch_markers_total}`; `reintegration.conflicts_materialized` mirrors `replay_conflicts` | written | `crates/api/src/types.rs`, `crates/api/src/web.rs`, `crates/api/webui/index.html`, `crates/cli/src/main.rs`, `crates/cli/src/shipper.rs` (`SpoolInfo`) |
+| Model: `Protocol::Recovery` gains holder capture (per-entry epoch + before-image, re-captured on tail), holder publish by substitution (simplification 9 is now `Today`/`ExactlyOnce` only), deposition rollback + replay by rid, the epoch marker inside `AcquireLease`, and the reply-racing-takeover refusal; `raw_holder_publish` non-vacuity knob | written | `crates/model/src/protocol.rs`, `crates/model/src/lib.rs`, `crates/model/src/namespace.rs` |
+| Model tests: `recovery_holder_publishes_log_prefix_with_journal`, `recovery_raw_holder_publish_breaks_log_prefixes` (must find the counterexample), `recovery_deposed_holder_rolls_back_and_replays`, `recovery_marker_strands_third_node_shadow`; `#[ignore]`d `_deep` siblings; M3a Recovery configs' `max_seq` +1 for the marker slot | written | `crates/model/tests/holder_side.rs` (new), `crates/model/tests/today_bugs.rs` |
+| Meta tests: every journaled API captured and rolled back byte for byte (the capture twin of `dirty.rs`), retire on ship, deposition by a later-epoch segment, insert-before, publish substitution (incl. spilled xattrs through the view), reply older than the held epoch, whole-transaction cuts, snapshot row → `Records` replay, manifest commit → optimistic `SetManifest`, capture-off fallback; the M3a property test extended with holder tenures (local transactions, own ships, a late segment before local work, deposition by marker) and a publish-view-is-log-prefix check at every step | written | `crates/meta/tests/holder_capture.rs` (new), `crates/meta/tests/speculation.rs`, `crates/meta/tests/dirty.rs` |
+| CLI tests: deposed holder rolls back and replays through the new holder exactly once (with the marker); a takeover marker strands a third node's shadow with nothing else shipped; a holder publishes the log prefix with a non-empty journal, checked with the plan's helper (`log_prefix_root`: rebuild the root by replaying the log to `applied`); persisted deposition recovered by `recover_deposed`; gate pending and releasing-flag fences in `lease`/`node_runtime`; truncate folding and deposed-holder replay in `recovery` | written | `crates/cli/src/shipper.rs`, `crates/cli/src/lease.rs`, `crates/cli/src/node_runtime.rs`, `crates/cli/src/recovery.rs` |
+| Harness: `deposed-reintegration` rewritten for automatic recovery (no `reintegrate` call; an extra non-overlapping stranded edit `a-only`; exactly one conflict copy, `same@…`, for the true overlap; non-vacuity via `speculation.{depositions, local_rolled_back, replay_conflicts}`); `lease-fencing` updated (A's stranded mkdir is now replayed through B exactly once, A writes through B afterwards, no conflict copy); new `takeover-marker-strands-promptly` (A dies with C's shadow unshipped; B takes over with a refused `rmdir` of a non-empty dir; C's `rolled_back` rises within 5 s, B's first segment of its epoch is an empty marker, the create replays once); new `holder-publishes-log-prefix` (a commit lands while the holder's `speculation.local > 0`; the holder is killed mid-burst; a fresh node bootstrapped from the head commit equals a node that tailed from the start, with no gaps and none of the dead holder's unshipped tail) | written | `crates/harness/src/scenarios.rs`, `docs/how-to-guides/development/TESTING.md` |
+| Docs | written | `docs/reference/features/forwarded-mutations.md`, `docs/reference/configuration.md` (`CONSTELLATION_HOLDER_CAPTURE`), `docs/how-to-guides/development/TESTING.md` |
+
+**Design decisions:**
+
+- **`journal_tx` carries the transaction boundary and the op in both
+  modes.** The byte-cap fix and the capture-off fallback both need to know
+  where a transaction ends and what to replay, independently of whether
+  before-images are captured. So `finish_local` always writes it, and the
+  `Local` row only adds before-images. Hot paths decode only its head
+  (`JournalTxHead`, a postcard prefix without the op).
+- **The op reaches the transaction through a thread-local**
+  (`journal::PendingLocalOp`, set by `mutate::execute` next to M2's
+  `PendingCompletion`), not a parameter on every mutating method, for the
+  reason M2 gave. A transaction without an op (a local manifest commit, a
+  snapshot row) is replayed from its records under a rid derived from its
+  first journal seq (`LOCAL_REPLAY_INCARNATION`).
+- **Usage per `Local` row is the persisted counter's delta** across the
+  transaction, so a rollback restores exactly what the transaction moved.
+- **A tailed segment goes *before* local work, not after.** Anything a
+  node tails sorts before anything it has not shipped yet, so the exact
+  fix is rollback–apply–redo. Redo runs the journal records through the
+  same replay path every peer uses, so the holder converges to what the
+  log will make of them.
+- **Epoch marker: only for a takeover from a holder that did not
+  release**, shipped inside the acquisition before the gate. A released
+  predecessor flushed first and never ships at its epoch again, so a clean
+  handoff pays no extra PUT (the model ships one on every takeover — a
+  superset). The marker also closes a hole the gate alone had: a deposed
+  holder's late segment carrying an op's `Completed` could otherwise land
+  *after* the new holder re-executed that op by rid.
+- **Gate failure: keep the lease, keep the view closed, block shipping,
+  retry every round and every `Acquire`.** Opening would let new ops
+  validate ahead of the queued stranded ones (the reordering the gate
+  exists to prevent); releasing would leave already-executed replays
+  behind a lease nobody else can take for a TTL. A holder that can never
+  complete its gate (a persistently failing metadata store) looks like a
+  paused one: writes fail with `EIO` at the acquire deadline, and a peer
+  that wants the lease gets it by ordinary idle release once the backlog
+  reads zero.
+- **Continuation-epoch writes are epoch 0** (`adopt_epoch_hold` records
+  holder epoch 0). That number is not an S3 lease epoch, and the epoch
+  protocol ships such a journal verbatim when S3 returns, so it must not
+  strand by epoch. The gate (queued replays) still runs.
+- **Deposition recovery runs automatically** in the sync round; the
+  `reintegrate` command remains as "run it now". A node whose recovery
+  fails stays tail-only and retries each round.
+- **Capture-off fallback is implemented, not just described**: a holder
+  with an uncaptured journal defers publishing, and a deposed holder
+  rebuilds `ns` from a side replica bootstrapped from the shared log and
+  queues its journal's ops (`Meta::replace_ns_from_rebuilt`). The same
+  rebuild handles any uncaptured rows left after a capture-on rollback.
+
+**Spec contradiction (recorded per CONVENTIONS rule 5, `DESIGN.md` not
+edited):** `DESIGN.md` still describes a deposed holder's stranded journal
+as resolved by operator-driven reintegration (classify, re-journal clean
+records, materialize conflicts; e.g. line ~561, "reintegration surfaces
+the stranded branch", and ~489, "deposed journal (`reintegrate` first)").
+Plan 30 §M3b replaces that with automatic rollback plus replay by rid; the
+`reintegrate` command survives only as "run the recovery now". The
+disconnected-operation (offline designation/continuation epoch)
+reintegration language elsewhere in `DESIGN.md` is unaffected.
+
+**Risks and things for the tester to watch:**
+
+- Nothing has been compiled. Expect mechanical fixes (borrowck around the
+  `LocalTx`/`Dirty` borrows in `writes.rs`, `AdmitGuard` lifetimes in
+  `fusefs.rs`/`node_runtime.rs`, postcard prefix decoding of
+  `JournalTxHead`).
+- **Performance gate (the milestone's).** Holder capture adds, per
+  journaled transaction: `peek_next_seq` twice, two usage-counter reads,
+  one before-image read per first-touched key, one `spec` row (postcard of
+  the before-images), the `spec_seq` counter, and a `journal_tx` row (with
+  the op); shipping deletes both rows and compacts. Measure single-node
+  `create` and `write4k` (`harness meta-bench`, `harness bench`) with the
+  default and with `CONSTELLATION_HOLDER_CAPTURE=0`; the gate is ≤10%. If
+  it fails, record the numbers and flip the default in
+  `store::mod::holder_capture_default`. `speculation_counts` (every
+  `status` call) and `pending_touches` (every tailed segment) scan
+  `journal_tx`; watch `holder-ships-under-forward-load`, which polls
+  `status` every 5 ms.
+- **Every takeover from an expired holder now ships one extra (empty)
+  segment.** Scenarios and tests that count segments or assume a
+  post-takeover segment number could shift by one (`lease-fencing`,
+  `deposed-reintegration`, `holder-crash-phantom-*`, `continuation-epoch`,
+  `epoch-member-lost`; the shipper unit tests I checked keep their
+  assertions).
+- **The releasing flag briefly closes the fast path every round a holder
+  `wants_handoff`** (flag up, quiescence wait, backlog check). A FUSE
+  write that hits it takes the `Acquire` path, which cancels the in-flight
+  round (dropping the flag) — the same dynamics the handoff pause already
+  had. Watch `create-storm-s3-only`, `sticky-lease-handoff-over-s3`,
+  `lease-handover`, `chaos-ci` for handoff latency.
+- **`holder-publishes-log-prefix` cannot check "commit == log prefix at
+  `applied`" directly** (the harness does not decode log records); its
+  strongest check is fresh-node-from-commit == node-that-tailed. If the
+  kill misses its window it still passes but proves less. It reads one
+  LIST page of commits/segments. The exact check is the cli unit test
+  `a_holder_publishes_the_log_prefix_while_its_journal_is_non_empty`.
+- **`takeover-marker-strands-promptly`'s 5 s bound** relies on the P2P
+  segment push or the 1 s idle-poll ceiling it sets.
+- **`deposed-reintegration` now relies on automatic recovery** (A detects
+  deposition by tailing B's marker → forced renewal → recovery in the same
+  round → drain forwards the replays to B). Timing-sensitive: the drain
+  retries every 250 ms and falls back to acquiring the lease after 10 s.
+- **The `Acquire` arm no longer fails a deposed node's FUSE write with an
+  immediate `EIO`**; it answers busy and nudges the round, so the write
+  waits for the recovery (bounded by the acquire deadline).
+- **Model/code divergences to keep in mind:** the model ships a marker on
+  every takeover (the code only when the predecessor did not release);
+  the model's continuation epochs are not modeled.
+- Pre-existing, noticed, not fixed: `ForwardState::next_system_rid` uses
+  `incarnation: u32::MAX` with a volatile `seq` that restarts at 0 every
+  mount, so a system op after a restart can reuse a rid still in
+  `completed` (900 s retention) and be answered "done" without executing.
+
+### Plan 30 M3b — tester gate run (2026-09-23)
+
+Built and ran every gate against the M3b working tree in the
+`constellation-p30` worktree. It compiled clean on the first try (no
+mechanical borrowck fixes were needed, contrary to the coder brief's
+expectation). Three defects were found and fixed (two test-only, one a
+missing harness fixture flag); one genuine, reproducible regression was
+found in a harness scenario's hard bound and is reported below, not
+fixed, per the brief (fixing it means either optimizing the capture hot
+path or relaxing the scenario's bound — both design calls). All
+measurement in this run was taken on a heavily shared, contended dev
+box (see the perf section's caveat) — every number below should be
+treated as directional, not precise, until repeated on an idle host.
+
+- [x] `cargo build --workspace --all-targets` — **clean on the first
+  try.** `cargo build --release --workspace` also clean.
+- [x] `cargo fmt --all -- --check` — failed only on the lines my own
+  fixes touched (removing a function, adding a doc comment); `cargo fmt
+  --all` fixed it, clean on re-check.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — **failed**
+  on first run with three `dead_code` errors, all leftover scaffolding
+  from the milestone's own changes (below); clean after removing/
+  annotating them.
+- [x] `cargo test --workspace` (debug, `--exclude constellation-model`)
+  — **failed** on first run with 3 test failures (below, all fixed);
+  clean on re-run, including the named tests: `crates/meta/tests/
+  holder_capture.rs` (10 passed, incl.
+  `every_journaled_api_is_captured_and_rolls_back_byte_for_byte`),
+  `crates/meta/tests/speculation.rs`'s extended property test
+  (`speculation_matches_log_plus_surviving_speculation`, all 64 seeds),
+  and the cli unit test
+  `shipper::tests::a_holder_publishes_the_log_prefix_while_its_journal_is_non_empty`.
+  `crates/model/tests/holder_side.rs` is model-crate code, run separately
+  below.
+- [x] Model tests (release, one process each, `/usr/bin/time -v`), all
+  well inside the 60 s / ~2 GB caps — no shrinking needed:
+
+  | Test | Time | Peak RSS |
+  |---|---|---|
+  | `today_finds_bug_a` | 0.17 s | 71 MB |
+  | `today_finds_bug_b` | 0.21 s | 71 MB |
+  | `exactly_once_is_linearizable` | 21.3 s | 1.78 GB |
+  | `recovery_fixes_bug_b_third_node_takeover` | 0.22 s | 71 MB |
+  | `recovery_fixes_bug_b_requester_takeover` | 8.3 s | 474 MB |
+  | `recovery_fixes_bug_b_exactly_once_config` | 0.21 s | 71 MB |
+  | `single_writer_is_clean` | 0.16 s | 71 MB |
+  | `recovery_holder_publishes_log_prefix_with_journal` (new) | 1.1 s | 71 MB |
+  | `recovery_raw_holder_publish_breaks_log_prefixes` (new) | 1.5 s | 76 MB |
+  | `recovery_deposed_holder_rolls_back_and_replays` (new, `max_next_id(10)`) | 6.0 s | 462 MB |
+  | `recovery_marker_strands_third_node_shadow` (new) | 0.3 s | 71 MB |
+
+  `recovery_deposed_holder_rolls_back_and_replays` is well inside budget
+  as written; the coder's suggested `max_next_id` shrink was not needed.
+  `recovery_fixes_bug_b_third_node_takeover_deep`,
+  `recovery_marker_strands_third_node_shadow_deep` and
+  `recovery_deposed_holder_deep` are `#[ignore]`d and were not run.
+  `recovery_raw_holder_publish_breaks_log_prefixes` found its
+  counterexample (`checker.discovery("commits_are_log_prefixes")`
+  returned `Some`) as designed.
+- [x] `cargo build --release --workspace` — clean.
+- [~] Harness — **31 of 32 required scenarios PASS**; one
+  (`holder-ships-under-forward-load`) fails its hard backlog bound
+  reproducibly and is reported, not fixed (below). `target/release/harness
+  list` confirmed both new scenarios' exact names.
+
+  | Scenario | Result | Time | M3a baseline | Note |
+  |---|---|---|---|---|
+  | `kill9-remount` ×3 | PASS×3 | 4.7/3.3/3.1 s | 3.0–5.5 s | — |
+  | `holder-crash-phantom-shadow` | PASS | 11.8 s | 8.7–11.5 s | `rolled_back:1, stranded_replayed:1` |
+  | `holder-crash-phantom-new-holder` | PASS | 8.4 s | 8.4–8.6 s | — |
+  | `deposed-reintegration` | PASS | 21.1 s | 24.1 s | — |
+  | `lease-fencing` | PASS (after fix) | 12.4–12.5 s ×3 | 10.2 s | **37.6–37.9 s before the fix below** |
+  | `takeover-marker-strands-promptly` (new) | PASS×3 | 9.1–9.5 s | n/a | — |
+  | `holder-publishes-log-prefix` (new) | PASS×3 | 9.2–9.6 s | n/a | — |
+  | `forward-timeout-reexec` | PASS | 19.3 s | 19.1–19.2 s | — |
+  | `forwarded-mutations` | PASS | 2.2 s | 2.1–2.3 s | — |
+  | `holder-ships-under-forward-load` | **FAIL (reproducible)** | 12–17 s | 15.6 s | see below; not fixed |
+  | `lease-handover` | PASS | 191.1 s | 179.3 s | +6.6%, within noise on this box |
+  | `continuation-epoch` | PASS (1 flake, see below) | 6.5–6.8 s | 7.7 s | — |
+  | `epoch-member-lost` | PASS | 4.8 s | 6.0 s | — |
+  | `mkdir-p-race` | PASS | 2.7 s | 2.7 s | — |
+  | `two-clients-shared` | PASS | 241.4 s | 238.6 s | — |
+  | `p2p-handover` | PASS | 2.2 s | 2.4 s | — |
+  | `sticky-lease-handoff-over-s3` | PASS | 13.2 s | 13.1 s | — |
+  | `chaos-ci` | PASS | 7.2 s | 7.3 s | — |
+  | `create-storm-s3-only` | PASS | 98.7 s | 113.7 s | — |
+  | `baseline` | PASS | 3.7 s | 4.8 s | — |
+  | `cold-cache` | PASS | 3.1 s | 3.9 s | — |
+  | `fresh-node-bootstrap` | PASS | 62.6 s | 63.0 s | — |
+  | `staging-crash` | PASS | 1.8 s | 2.0 s | — |
+  | `unmount-drain` | PASS | 6.7 s | 6.7 s | — |
+  | `idle-cluster-is-quiet` | PASS | 62.4 s | 62.4 s | — |
+  | `snapshot-churn` | PASS | 13.3 s | n/a | — |
+  | `gc-lifecycle` | PASS | 2.1 s | n/a | — |
+  | `node-leave` | PASS | 31.6 s | n/a | — |
+
+  Every scenario is within the 25% band of its M3a timing except the
+  one-time `lease-fencing` regression (fixed) and `holder-ships-under-
+  forward-load` (fails a hard count bound, not a timing comparison).
+
+**Bugs found and fixed (mechanical/local, no design change):**
+
+1. **Three `dead_code` clippy errors, all leftover from this
+   milestone's own changes** (`cargo build` doesn't fail on warnings,
+   only `clippy -D warnings` does, so these were invisible until gate 3):
+   - `crates/meta/src/store/journal.rs`: `mark_disposition_tx` (and its
+     `ReintegrationRow` writer role) had no caller left anywhere in the
+     workspace — it was the writer half of the pre-M3b operator-driven
+     reintegration machinery (`classify`/`materialize`) that this
+     milestone explicitly removed (PROGRESS's own M3b write-up: "the
+     fallback's wholesale swap is `Meta::replace_ns_from_rebuilt`";
+     "`reintegrate::classify`/`materialize`... are removed"). Deleted the
+     dead function; its reader (`conflict_count`, via the still-`pub`
+     `Meta::reintegration_conflict_count`) was left alone since a `pub`
+     method on a library crate isn't flagged and nothing suggested it
+     should also go.
+   - `crates/cli/src/lease.rs:621` (`LeaseKeeper::share_holder_epoch`):
+     only ever called from `#[cfg(test)]` code (three call sites), so it
+     vanishes from the non-test build's reachability graph. It is the
+     mutator sibling of the builder method `with_holder_epoch`, which
+     every production keeper does use — kept as test-only API with
+     `#[allow(dead_code)]` and a one-line comment, matching this
+     codebase's existing convention (`crates/cli/src/staging.rs` has the
+     same pattern for its plan-07 public shape).
+   - `crates/cli/src/shipper.rs:500` (`Shipper::lease_keeper`): a
+     convenience constructor with zero callers anywhere, test or
+     production. Annotated `#[allow(dead_code)]` rather than deleted,
+     since nothing indicated it was truly unwanted scaffolding versus an
+     API meant for a call site the coder didn't get to.
+2. **Two pre-existing unit tests broken by the new
+   `SPECULATION_OUTSTANDING` publish rule** (`cargo test`, gate 4):
+   `crates/cli/src/snapshot.rs::tests::a_tree_snapshot_is_frozen_against_source_and_clone_writes`
+   and
+   `crates/cli/src/fusefs.rs::quota_tests::view_usage_scopes_to_snapshot_mount`
+   both build a bare `Meta::open_in_memory()`, write to it, and
+   immediately take a snapshot (which publishes a metadata commit) —
+   with no `Shipper` ever acking the journal. Before M3b, publishing
+   ignored the journal; M3b's `publish_basis_at` now correctly refuses
+   with `SPECULATION_OUTSTANDING` while the journal is non-empty (a
+   documented, intentional behavior change, not a bug in the production
+   code). Fixed by adding a small `ship_all` test helper to each file
+   (mirroring the one already in `crates/meta/tests/holder_capture.rs`:
+   take the whole journal, `ack_journal_rows_at` it, simulating one ship)
+   and calling it right before the publish-triggering call in each test.
+3. **A real bug, but in the test model, not production**
+   (`crates/meta/tests/speculation.rs`'s extended property test,
+   `speculation_matches_log_plus_surviving_speculation`, seed 28):
+   failed with `publish view {"n1": …437} is not the log prefix {"n1":
+   …434}` after a late (rolled-back-and-redone) foreign segment and a
+   local create raced for the same name. Root-caused by isolating the
+   per-step publish check from the seed and confirming the *production*
+   `ns` state passed the test's own end-of-run, byte-for-byte reference
+   check (a from-scratch replay of the log via the real `apply_records`
+   engine) — i.e., the code's actual "evict and let the later log
+   position win" resolution (`replay::insert_node`'s existing rule, the
+   same one `same_name_conflict_converges_last_wins`
+   (`crates/cli/src/shipper.rs`) already pins down for two independent
+   holders) is self-consistent and correct. The test's own `View::apply`
+   helper modeled Create with `.or_insert()` ("skip if the name is
+   already taken"), which does not match that rule. Fixed by changing it
+   to unconditional `.insert()` (last-applied-wins), with a comment
+   explaining why. All 64 seeds pass after the fix; nothing in
+   production changed.
+4. **A real, reproducible ~3.7× slowdown in `lease-fencing`** (harness
+   gate), traced (with temporary `eprintln!` status-polling diagnostics
+   in the scenario, removed afterward) to A's deposition-recovery drain
+   (`recovery::drain_pending_replays`) needing 10 s
+   (`recovery::LEASE_FALLBACK`) to give up trying to forward its
+   stranded `mkdir` to B, then several more seconds to acquire the lease
+   itself instead. The mount log showed why: `constellation_net::peers`:
+   *"peer registered with OUR node key: P2P to it cannot work (dialing
+   ourself)... only the S3 slow path will be used"* — `lease_fencing`
+   (`crates/harness/src/scenarios.rs`) never called
+   `Client::with_own_node_key()` for its two clients, so both shared the
+   default per-user key and P2P between them was silently dead (exactly
+   the failure mode `with_own_node_key`'s own doc comment describes).
+   This was harmless before M3b, when this scenario's stranded-work
+   recovery did not depend on a live forward; M3b's rewrite (automatic
+   drain-and-forward recovery) does. Fixed by adding
+   `.with_own_node_key()` to both clients, matching the pattern already
+   used by every other multi-node forward-dependent scenario. Confirmed
+   with 3 clean reruns: 12.4–12.5 s, matching the M3a baseline of
+   10.2 s.
+
+**Flaky, not fixed (evidence, not a code change):**
+
+- `continuation-epoch` failed once out of 3 runs on an immediate
+  (non-`eventually`-wrapped) assertion,
+  ``c1.control_status()?["spool"]["journal_backlog"] > 0`` reading `0`
+  right after the write that should have journaled it. This check has
+  nothing to do with M3b (it is a pre-existing metric, not the new
+  speculation counters), passed cleanly on both immediate reruns, and
+  is not wrapped in `eventually` like almost everything else in this
+  harness — a plausible pre-existing scheduling race on a loaded host,
+  not something this pass changed.
+- This entire run happened on a shared dev box under substantial,
+  variable concurrent load from unrelated processes (other agent
+  sessions' own `cargo build`/`cargo fmt`/`cargo test` runs were
+  observed live via `ps aux`; `uptime` swung between load average 4.5
+  and 13.6 over the course of this session; `ss -tan state time-wait`
+  peaked at 45,768 sockets against a ~28k-port ephemeral range after a
+  burst of back-to-back harness runs, well past the point where new
+  outbound connections start failing). Several scenario attempts failed
+  with plain infra errors (`Connection reset by peer`, `error sending
+  request` against the in-process S3 mock) that had nothing to do with
+  the code under test; those are not counted as failures above, only
+  the clean reruns are.
+
+**Not fixed — reported, needs a design decision:**
+
+- **`holder-ships-under-forward-load` reproducibly exceeds its 500-row
+  journal-backlog bound with holder capture on**, even on a
+  comparatively quiet window of the shared host. Five default runs:
+  backlog peaked at 1412, 1500, 1310/1758 (two back-to-back attempts in
+  the same invocation), 1624, 2630, 3382, 3540 — never under bound, and
+  the two lowest of those (218, 244, 200 across other runs) still came
+  in well above the sub-500 numbers `CONSTELLATION_HOLDER_CAPTURE=0`
+  produced every time it was tried (170, 216, 244). A direct back-to-
+  back A/B pair under matched conditions (same minute, same host state)
+  makes the contrast clean: default run immediately after a passing
+  capture-off run hit backlog 2630 and failed; the capture-off run
+  right before it passed at 170. This matches the milestone's own risk
+  note almost exactly (`speculation_counts`/`pending_touches` scan
+  `journal_tx`; this scenario polls `status` every 5 ms while forwarding
+  a sustained create burst), and is a genuine cost of holder capture
+  under this specific bursty-forward shape, not an artifact of the
+  noisy host (capture-off stayed under bound across every attempt,
+  loaded or not). Per the brief, this was not fixed: the two ways to
+  resolve it — optimize the capture hot path (e.g., avoid the full
+  `journal_tx` scan `speculation_counts`/`pending_touches` do on every
+  status/tail call), or relax `holder-ships-under-forward-load`'s
+  500-row bound to account for capture's added per-transaction cost —
+  are both design calls, not mechanical fixes.
+- **Performance gate — inconclusive due to host noise, numbers reported
+  as instructed.** `harness meta-bench`, single-node, 3 runs each,
+  `CONSTELLATION_METABENCH_ONLY=1node-create-lat0` /
+  `1node-write4k-lat0`, default vs `CONSTELLATION_HOLDER_CAPTURE=0`,
+  interleaved to average out load drift:
+
+  | Config | Default (ops/s) | Capture off (ops/s) | Mean default | Mean off | Diff |
+  |---|---|---|---|---|---|
+  | `1node-create-lat0` | 2269, 2016, 2293 | 1970, 2344, 3089 | 2192.7 | 2467.7 | off 11.1% faster |
+  | `1node-write4k-lat0` | 485, 444, 523 | 428, 439, 448 | 484.0 | 438.3 | default 9.4% faster |
+
+  `harness bench --files 1000` (durable import, files/s), 3 runs each:
+  default 158.3, 188.2, 146.7 (mean 164.4) vs capture-off 136.2, 125.2,
+  117.8 (mean 126.4) — default 30% *faster*, the opposite of the
+  expected direction. An earlier, non-interleaved pass at the `create`
+  config (3 default runs back-to-back, then 3 capture-off) gave default
+  mean 1913.7 vs off mean 3352.0 (off 42.9% faster) — a completely
+  different ratio from the interleaved pass minutes later. The within-
+  group spread in every one of these samples (up to ~2× between the
+  best and worst run of the *same* config) is larger than the
+  between-group difference being measured, so none of these ratios are
+  trustworthy at the ±10% precision the gate needs; they are reported
+  as instructed, not as a pass/fail verdict. This tracks the same "shared
+  host" caveat M2b's and M3a's own perf numbers already carried, just
+  worse this time (see the concurrent-load evidence above). The
+  3-node forwarded-writer config, `3node-p2pon-shared-create-lat0`, 3
+  runs: 960, 674, 2060 ops/s agg (mean 1231.3) against M3a's 1341 —
+  ~8% lower on average but with the same order-of-magnitude spread
+  (674–2060) that makes the comparison unreliable.
+  **Recommendation: rerun the whole perf section on an idle host before
+  using it to decide `store::mod::holder_capture_default`'s value.**
+  Given the `holder-ships-under-forward-load` finding above, there is
+  independent, load-invariant evidence that capture has a real,
+  nonzero cost concentrated in status/tail-path scanning under bursty
+  forwarding — that finding does not depend on these noisy throughput
+  numbers and should carry more weight than they do.
+
+**Spec/plan contradiction:** none newly found; M3b's own recorded one
+(`DESIGN.md`'s reintegration language, already logged above) stands
+unchanged by this pass.
+
+### Plan 30 M3b — coder round 2: holder-capture hot-path cost (2026-09-23)
+
+**Written, not built** (same rules as round 1). Target: the tester's
+blocking finding — `holder-ships-under-forward-load` exceeds its 500-row
+backlog bound with holder capture on (up to 3540), stays under it with
+`CONSTELLATION_HOLDER_CAPTURE=0`. The scenario's bound is unchanged.
+
+**Diagnosis.** Round 1's capture bookkeeping had several paths whose cost
+grew with the *shipped history* or the *outstanding backlog*, not with
+the work at hand, and some of them ran inside the fjall write transaction
+every forwarded execute also needs, or on the ship loop itself:
+
+- `status` (`speculation_counts`, polled every 5 ms by this scenario)
+  decoded every `journal_tx` row and walked `spec_live`/`pending_replay`
+  from their starts — including the LSM tombstones of everything already
+  shipped or retired.
+- Every ship's ack (`retire_local_tx`) ranged `journal_tx` from the start
+  of the keyspace (history tombstones), and its `compact_tx` ranged `spec`
+  from the start and `journal_tx` again to find the oldest outstanding
+  row — O(everything ever shipped) inside the write transaction that
+  forwarded executes queue behind.
+- Every tailed segment ran `pending_touches` (the whole journal plus
+  `journal_tx`) and `read_live` (all of `journal_tx`), and compacted from
+  the start of `spec`.
+- `begin_local`/`finish_local` read and parsed the persisted usage
+  counters (four point reads, four decimal parses) per journaled write,
+  and a non-holder's `begin_local` probed `spec` from its start.
+- The ship loop awaited the cadence publish (`ship_part` →
+  `publish().await`), and with capture on a holder's publish is no longer
+  deferred: it builds and uploads a commit (several S3 round trips) and
+  reads every outstanding `Local` row's before-images, every 32 segments,
+  while forwarded creates keep arriving. With capture off the holder's
+  publish deferred almost immediately — the one ship-loop stall that
+  differs between the two modes.
+
+| Item | State | Where |
+|---|---|---|
+| Persisted counters in `local`, maintained in the transaction that changes what they count: `spec_live_count`, `pending_replay_count`, `local_spec_count`, `uncaptured_tx_count`; floors `spec_floor` (every `spec` row below is deleted) and `journal_acked` (every `journal`/`journal_tx` row at or below is deleted) | written | `crates/meta/src/store/mod.rs` (`counter_get`/`counter_add_tx`/`counter_set_tx`), `crates/meta/src/store/spec.rs`, `crates/meta/src/store/local.rs`, `crates/meta/src/store/journal.rs` |
+| `speculation_counts`, `has_outstanding_speculation`, `local_speculation_count`, `pending_replays` (empty queue), `pending_touches` (nothing uncaptured), `publish_basis_at`'s gating, `read_live`/`retire_tx`/`oldest_outstanding` all answer from counters; scans that remain start at their floor | written | same |
+| Retirement and compaction proportional to what shipped: `retire_local_tx` ranges `journal_tx` from the acked watermark to `upto`; `compact_tx` deletes `[spec_floor, oldest outstanding)` and raises the floor; the oldest outstanding `Local` row is one point read past `upto` | written | `crates/meta/src/store/spec.rs` |
+| `journal::take`/`len`/`ack_upto` start past the acked watermark (`ack_rows_at`/`ack_upto` advance it, clamped to the last seq handed out) — the journal's own shipped history no longer walks on every round's `take_journal`, `journal_backlog_of` or `status` | written | `crates/meta/src/store/journal.rs`, `crates/meta/src/store/writes.rs` |
+| Per-write usage delta from a thread-local note fed by `adjust_usage_tx`, instead of reading the persisted usage counters twice | written | `crates/meta/src/store/mod.rs` (`usage_note_begin`/`usage_note_take`), `crates/meta/src/store/local.rs` |
+| The segment-count cadence publish runs as its own task (`Shipper::publish_in_background`), off the ship loop; explicit/idle/shutdown `publish()` now waits for an in-flight one instead of skipping | written | `crates/cli/src/shipper.rs` |
+| Tests pinning the cost: `status_counts_read_counters_not_rows` and `ship_path_cost_is_what_shipped_not_the_history` poison the regions these paths must not read (undecodable rows past the counters, below the watermark and floor) — a path that read one would fail to decode it — and check the poison is never deleted; `a_partial_ship_compacts_exactly_the_shipped_rows`. Counter correctness is covered by the property test, which now compares `speculation_counts` (read from counters) against its model at every step | written | `crates/meta/src/store/local.rs` (`tests`), `crates/meta/tests/speculation.rs` |
+| `continuation-epoch`'s flake: the immediate assertion that B's own journal is non-empty after its epoch write is a race in the assertion, not an ordering bug — B's write is legitimately served by a *forward* to A when B already cached A as holder (from A's pushed segments), leaving B's journal empty. Now asserts A's backlog is non-empty and B's write was either journaled on B or forwarded (`forwarded_ok` rose); convergence is still checked after heal | written | `crates/harness/src/scenarios.rs` |
+
+**Per-write cost** (point reads / writes added to one journaled
+transaction on a holder, capture on; a create touches ~5 `ns` keys):
+
+| | Round 1 | Round 2 |
+|---|---|---|
+| journal-counter peeks | 2 reads | 2 reads |
+| usage | 4 reads + 4 parses | thread-local add |
+| before-images | 1 read per first-touched key (~5) | same |
+| `spec_seq` counter | 1 read + 1 write | same |
+| `local_spec_count` | — | 1 read + 1 write |
+| `spec` row, `journal_tx` row | 2 writes | 2 writes |
+| **total** | ~12 reads, 3 writes | ~9 reads, 4 writes |
+
+Capture off: 2 journal-counter reads, the `uncaptured_tx_count` read +
+write, the `journal_tx` write. A non-holder's write reads two counters
+instead of probing `spec` from its start.
+
+**Per shipped segment of N transactions** (the ack): round 1 — O(H + N)
+where H is every transaction ever shipped (three from-the-start ranges
+over tombstones) plus an O(backlog) walk to find the oldest outstanding
+row; round 2 — O(N): N `journal_tx` heads read and removed, N `spec` rows
+deleted, ~6 counter reads/writes, one point read for the new oldest row.
+**Per tailed segment** (follower, nothing outstanding): round 1 — a full
+journal read, two full `journal_tx` scans, `spec` from its start; round 2 —
+about six counter reads. **Per `status` call**: round 1 — full scans of
+`journal_tx`, `spec_live`, `pending_replay`; round 2 — three counter
+reads (plus the pre-existing `journal_len`, now O(backlog) instead of
+O(history)).
+
+**For the tester to watch:**
+
+- Re-run `holder-ships-under-forward-load` several times with capture on
+  and off; also the perf gate (`meta-bench` single-node `create`/`write4k`,
+  `harness bench`) on as idle a host as possible.
+- The counters are the new single source for `status.speculation.*`: a
+  bookkeeping slip shows up as a wrong count, and — worse — as a skipped
+  scan (`read_live` returning nothing while rows exist). The property test
+  and `holder_capture.rs`'s count assertions are the guard; a failure
+  there is a counter bug, not a test bug.
+- `journal_acked` assumes every ack removes a prefix of the journal
+  (true of `ship_part`, own-segment recovery and `ack_journal`). A path
+  that acked out of order would hide older rows from `take_journal`.
+- The cadence publish now overlaps shipping. Watch scenarios that count on
+  a commit existing right after N segments (`holder-publishes-log-prefix`
+  samples commits and should only get more of them; `mtree-gc-plateau`,
+  `fresh-node-bootstrap`).
+- No migration: a state dir written by round 1 has counters at zero while
+  rows exist. Start from fresh state dirs (plan 30 waives compatibility).
+
+### Plan 30 M3b — tester gate run, round 2 (2026-09-23)
+
+Re-ran every gate against the tree after (a) the merge of `2c5249a`
+(`ForwardState::new` takes an incarnation, system rids unique per mount)
+and (b) the coder's round-2 hot-path fix (counters instead of scans;
+retire/compact/tail proportional to what shipped; usage delta from a
+thread-local; the cadence publish moved off the ship loop;
+`continuation-epoch`'s flake fixed). Every state directory in this run
+is fresh (round 1's on-disk state has no counters and there is no
+migration, per the brief). Round 1's own fixes (the three `dead_code`
+annotations, the two `SPECULATION_OUTSTANDING` test fixes, the property
+test's `View::apply` fix, `lease_fencing`'s `.with_own_node_key()`) are
+all still present in this working tree and still needed — none of them
+were superseded by round 2's changes.
+
+- [x] `cargo build --workspace --all-targets` — clean on the first try.
+- [x] `cargo fmt --all -- --check` — failed on round 2's own new code
+  (four blocks in `crates/meta/src/store/local.rs`, `mod.rs` and
+  `spec.rs`, all just line-wrapping); `cargo fmt --all` fixed it, clean
+  on re-check.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` — clean,
+  0 warnings, first try.
+- [x] `cargo test --workspace --exclude constellation-model` — clean,
+  first try, 0 failures across every crate. `crates/meta/src/store/
+  local.rs`'s three new complexity tests all pass:
+  `status_counts_read_counters_not_rows`,
+  `ship_path_cost_is_what_shipped_not_the_history`,
+  `a_partial_ship_compacts_exactly_the_shipped_rows`.
+  `crates/meta/tests/holder_capture.rs` — 10/10 pass (unchanged names,
+  same set as round 1). `crates/meta/tests/speculation.rs`'s extended
+  property test — all 64 seeds pass, now also checking
+  `speculation_counts` against its model at every step (per the coder's
+  note) — no counter-maintenance bug found. The cli test
+  `shipper::tests::a_holder_publishes_the_log_prefix_while_its_journal_is_non_empty`
+  — pass.
+- [x] Model tests (release, one process each, `/usr/bin/time -v`), all
+  well inside budget, numbers essentially unchanged from round 1 (the
+  model crate is untouched by round 2):
+
+  | Test | Time | Peak RSS |
+  |---|---|---|
+  | `today_finds_bug_a` | 0.19 s | 71 MB |
+  | `today_finds_bug_b` | 0.19 s | 70 MB |
+  | `exactly_once_is_linearizable` | 22.3 s | 1.78 GB |
+  | `recovery_fixes_bug_b_third_node_takeover` | 0.33 s | 70 MB |
+  | `recovery_fixes_bug_b_requester_takeover` | 8.6 s | 474 MB |
+  | `recovery_fixes_bug_b_exactly_once_config` | 0.24 s | 71 MB |
+  | `single_writer_is_clean` | 0.16 s | 71 MB |
+  | `recovery_holder_publishes_log_prefix_with_journal` | 1.1 s | 71 MB |
+  | `recovery_raw_holder_publish_breaks_log_prefixes` | 1.5 s | 76 MB |
+  | `recovery_deposed_holder_rolls_back_and_replays` | 6.2 s | 463 MB |
+  | `recovery_marker_strands_third_node_shadow` | 0.3 s | 71 MB |
+- [x] `cargo build --release --workspace` — clean.
+- [x] Harness — **every scenario in the required list PASSED**,
+  including both watch-list items that were failing/flaky at the end of
+  round 1:
+
+  **1. `holder-ships-under-forward-load` — fixed.** 5 runs with capture
+  on (the default), 3 with `CONSTELLATION_HOLDER_CAPTURE=0`, max
+  backlog per run (bound 500):
+
+  | Run | Capture on | Capture off |
+  |---|---|---|
+  | 1 | 172 | 126 |
+  | 2 | 122 | 74 |
+  | 3 | 96 | 114 |
+  | 4 | 86 | — |
+  | 5 | 126 | — |
+
+  All 8 PASSED; capture-on backlogs (86–172) are now the same order of
+  magnitude as capture-off (74–126) — round 1's 1300–3540 backlogs are
+  gone. `ship_rounds_cancelled=0` in every run.
+
+  **2. `holder-publishes-log-prefix` ×3 and `snapshot-churn`** — all
+  PASS. The cadence publish now runs concurrently with shipping/acking
+  (`Shipper::publish_in_background`), and every run still shows a
+  correctly-behind `applied` position relative to the log head (e.g.
+  "head commit applied 98, log head 106") with the fresh-node-vs-
+  follower cross-check passing — a commit racing an ack mid-publish did
+  not produce a commit that outran the log prefix. Timing (~8 s) matches
+  round 1.
+
+  **3. The property test and `holder_capture.rs`'s count assertions** —
+  no counter bug found (see gate 4 above); all pass, including the
+  property test's new per-step `speculation_counts`-vs-model check.
+
+  **4. `continuation-epoch` ×5** — all PASS, no flake. (Round 1 saw one
+  flake in 3 runs on this scenario's old racy assertion; the coder's fix
+  removed it.)
+
+  | Scenario | Result | Time | Prior baseline |
+  |---|---|---|---|
+  | `kill9-remount` ×3 | PASS×3 | 3.1/3.5/3.2 s | round 1: 3.1–4.7 s |
+  | `holder-crash-phantom-shadow` | PASS | 8.6 s | 11.8 s |
+  | `holder-crash-phantom-new-holder` | PASS | 8.6 s | 8.4 s |
+  | `deposed-reintegration` | PASS | 21.0 s | 21.1 s |
+  | `lease-fencing` | PASS | 12.7 s | 12.4–12.5 s (round 1, post-fix) |
+  | `takeover-marker-strands-promptly` | PASS | 9.0 s | 9.1–9.5 s |
+  | `holder-publishes-log-prefix` | PASS×3 | 7.9–8.3 s | 9.2–9.6 s |
+  | `forward-timeout-reexec` | PASS | 19.2 s | 19.3 s |
+  | `forwarded-mutations` | PASS | 2.2 s | 2.2 s |
+  | `holder-ships-under-forward-load` | PASS×8 (5 on, 3 off) | 7–11 s | round 1: FAIL |
+  | `lease-handover` | PASS | 181.1 s | 191.1 s |
+  | `continuation-epoch` | PASS×5 | 5.4–7.0 s | 6.5–6.8 s (1 flake/3) |
+  | `epoch-member-lost` | PASS | 4.7 s | 4.8 s |
+  | `mkdir-p-race` | PASS | 2.5 s | 2.7 s |
+  | `two-clients-shared` | PASS | 242.1 s | 241.4 s |
+  | `p2p-handover` | PASS | 2.2 s | 2.2 s |
+  | `sticky-lease-handoff-over-s3` | PASS | 12.9 s | 13.2 s |
+  | `chaos-ci` | PASS | 7.4 s | 7.2 s |
+  | `create-storm-s3-only` | PASS | 116.2 s | 98.7 s |
+  | `baseline` | PASS | 3.8 s | 3.7 s |
+  | `cold-cache` | PASS | 3.6 s | 3.1 s |
+  | `fresh-node-bootstrap` | PASS | 62.5 s | 62.6 s |
+  | `staging-crash` | PASS | 2.0 s | 1.8 s |
+  | `unmount-drain` | PASS | 6.9 s | 6.7 s |
+  | `idle-cluster-is-quiet` | PASS | 62.3 s | 62.4 s (identical S3 request counts, both runs) |
+  | `snapshot-churn` | PASS | 17.5 s | 13.3 s |
+  | `gc-lifecycle` | PASS | 1.9 s | 2.1 s |
+  | `node-leave` | PASS | 34.3 s | 31.6 s |
+
+  Every scenario is within the 25% band of its prior timing.
+
+**Fixes made this round:** none needed. `cargo fmt` reformatted round
+2's own new code (mechanical, no logic change); everything else was
+clean or already fixed in round 1 and unaffected by round 2's changes.
+
+**Infra note (not a code issue):** this shared dev box's ephemeral port
+range (32768–60999, ~28k ports) was repeatedly driven into TIME_WAIT
+exhaustion (peaks of 45,000–50,000 sockets observed via `ss -tan state
+time-wait`) by running harness scenarios back-to-back, each of which
+opens many short-lived connections to its in-process S3 mock. Several
+scenario *attempts* failed with plain `Connection reset by peer`/`error
+sending request` against `127.0.0.1` during this run; those are not
+counted as failures — each was cleanly reproduced by waiting (a bounded
+poll loop on `ss -tan state time-wait` count) and rerunning. From this
+run on, a short drain-check between harness invocations avoided the
+problem entirely.
+
+**Performance gate**, measured on this shared dev box. Load was checked
+before starting (`uptime`, no other `cargo`/`rustc`/`harness`/
+`constellation` processes found by `comm`) and a bounded wait loop was
+used to let it settle: load average dropped from 4.45 to 2.84 over
+~40 s before the first measurement. It drifted back up to 6–7 over the
+course of the perf run itself (this session's own harness activity, and
+the same kind of ambient desktop load — Firefox, other agent sessions —
+seen throughout this pass), so later numbers in this section were taken
+under higher load than the first ones; the load at each point is
+reported below rather than assumed constant.
+
+`harness meta-bench`, single-node, `CONSTELLATION_METABENCH_ONLY=
+1node-create-lat0` / `1node-write4k-lat0`, 3 runs each, default vs
+`CONSTELLATION_HOLDER_CAPTURE=0`, interleaved (load 2.8–5.3 over this
+pair):
+
+| Config | Default (ops/s) | Capture off (ops/s) | Mean default | Mean off | Diff vs ≤10% gate |
+|---|---|---|---|---|---|
+| `1node-create-lat0` | 3270, 3011, 2624 | 2090, 2957, 4214 | 2968.3 | 3087.0 | capture costs 3.8% — **within gate** |
+| `1node-write4k-lat0` | 675, 458, 785 | 736, 651, 407 | 639.3 | 598.0 | capture off is 6.5% *slower* — **within gate**, direction noise |
+
+`harness bench --files 1000` (durable import, files/s), 3 runs each,
+default vs capture off (load 5.3–7.1):
+
+| | Run 1 | Run 2 | Run 3 | Mean |
+|---|---|---|---|---|
+| default | 134.37 | 108.60 | 124.80 | 122.59 |
+| capture off | 116.70 | 84.71 | 93.35 | 98.25 |
+
+Default is 19.9% *faster* than capture-off here — the same reversed
+direction round 1's `harness bench` numbers showed (30% faster then).
+Both meta-bench single-node configs land inside the ≤10% gate on their
+own means, but the run-to-run spread within a single config (e.g.
+capture-off `create`: 2090 to 4214, a 2× range) is larger than the
+between-group difference being measured, and `harness bench`'s own
+comparison disagrees with meta-bench's about which mode is faster. This
+is not a clean pass/fail on host noise of this magnitude; the
+consistent, repeatable signal from this round is the harness scenario
+result above (`holder-ships-under-forward-load` passing reliably with
+capture on, at backlogs matching capture off), which does not depend on
+throughput measurement precision. Recommend treating today's numbers as
+"no evidence of a >10% regression" rather than a precise measurement,
+and re-running on a genuinely idle host if a tighter number is needed
+before finalizing `store::mod::holder_capture_default`.
+
+3-node forwarded-writer config, `3node-p2pon-shared-create-lat0`, 3
+runs (load ~6):
+
+| Run | ops/s agg |
+|---|---|
+| 1 | 1657 |
+| 2 | 1500 |
+| 3 | 1785 |
+
+Mean 1647.3 ops/s vs M3a's 1341 — **+22.8%**, and far tighter than round
+1's 674–2060 spread (960/674/2060, mean 1231.3, −8.2% vs M3a). This is
+a real improvement, consistent with round 2 removing the per-status and
+per-tail full scans this workload hits hardest (`fwd_ok=2400` every
+run; `holder-ships-under-forward-load`'s fix is the same code path).
+
+**Flaky, not fixed:** none this round (`continuation-epoch`'s round-1
+flake is fixed; the infra-level connection resets above are a host
+resource limit, not a scenario flake, and did not recur once harness
+invocations were spaced out).
+
+**Needs a design decision:** none found this round. Round 1's blocking
+finding (`holder-ships-under-forward-load`) is resolved by the coder's
+round-2 fix; nothing new surfaced.

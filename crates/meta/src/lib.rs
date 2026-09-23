@@ -14,11 +14,16 @@ pub use error::MetaError;
 pub use mutate::{execute as execute_mutate, MutateOp, MutateOutcome};
 pub use prune::{Policy, PolicyError, PRUNE_XATTR};
 pub use record::{CloneNode, LogRecord};
-pub use reintegrate::{classify, materialize, Disposition, CONFLICT_DIR};
+pub use reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 pub use replay::TouchSet;
 pub use rid::Rid;
-pub use store::spec::{Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp};
-pub use store::{BootstrapIndexBuilder, JournalBatch, Meta, SCRATCH_XATTR};
+pub use store::spec::{
+    Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp,
+    LOCAL_REPLAY_INCARNATION,
+};
+pub use store::{
+    BootstrapIndexBuilder, JournalBatch, LogPrefixView, Meta, PublishBasis, SCRATCH_XATTR,
+};
 
 use constellation_fs_core::{FileAttr, Ino};
 

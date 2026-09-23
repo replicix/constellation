@@ -40,15 +40,29 @@
 //! k round trips when genuinely behind.
 //!
 //! The leaseless convergence path (foreign records that touch pending
-//! local state are skipped via [`TouchSet`], ours being later in the
-//! global log) is retained as a safety net. With leases it is
-//! unreachable in normal operation — the harness asserts the conflict
-//! counter stays at zero — but a backend without `If-Match`, or a
-//! future relaxed mode, still needs deterministic convergence.
+//! local state are skipped via `TouchSet`, ours being later in the
+//! global log) is retained as a safety net for journal rows that were not
+//! captured as speculation. Plan 30 §M3b made the captured case exact
+//! instead: a segment tailed while this node has unshipped captured
+//! transactions is applied *before* them (`Meta::apply_segment`). With
+//! leases neither is reached in normal operation — the harness asserts
+//! the conflict counter stays at zero — but a backend without `If-Match`,
+//! or a future relaxed mode, still needs deterministic convergence.
+//!
+//! Plan 30 §M3b also adds the **epoch marker**: right after the CAS of a
+//! takeover from a holder that did not release (its lease expired — it
+//! died, or is paused), before its takeover gate replays anything, the new
+//! holder ships an empty segment at its epoch
+//! ([`Shipper::ship_epoch_marker`]). It
+//! fences any late segment of the old epoch (a deposed holder's PUT
+//! racing the takeover), so the gate's replays by rid can never be
+//! duplicated by a late copy of the same op; and it makes the stranding
+//! visible to every other node at once — their tailers strand the old
+//! epoch's shadows on it — instead of whenever the new holder next
+//! happens to write.
 
 use crate::lease::{LeaseKeeper, TailedToHead};
 use anyhow::{bail, Context, Result};
-use constellation_meta::replay::TouchSet;
 use constellation_meta::{LogRecord, Meta, MetaStore};
 use constellation_store_s3::log::PARTITION;
 use constellation_store_s3::{Lease, LeaseMode, LeaseStore, LeaseTag, LogStore};
@@ -304,6 +318,13 @@ pub struct SpoolInfo {
     /// `.constellation-conflict/` copy (or, for an op with nothing to
     /// copy, only counted and logged).
     pub replay_conflicts: u64,
+    /// Plan 30 §M3b: this node's own unshipped transactions rolled back
+    /// because it was deposed (queued for replay by rid).
+    pub local_rolled_back: u64,
+    /// Plan 30 §M3b: deposition recoveries run.
+    pub depositions: u64,
+    /// Plan 30 §M3b: epoch-marker segments shipped after a takeover.
+    pub epoch_markers: u64,
 }
 
 impl Shipper {
@@ -352,6 +373,14 @@ impl Shipper {
             last_ship_epoch: 0,
             last_publish_attempt: Instant::now(),
         })
+    }
+
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    pub fn meta(&self) -> &Arc<Meta> {
+        &self.meta
     }
 
     /// Attach the P2P handle so shipped segments are announced to peers.
@@ -411,12 +440,13 @@ impl Shipper {
     /// Publish the current dirty set as a commit. Best effort: a publish
     /// that cannot land must not stop the log from shipping. `dirty`
     /// survives a failure, so the next round carries the same keys.
-    async fn publish_tree(&mut self) {
+    async fn publish_tree(&mut self, wait: bool) {
         self.last_publish_attempt = Instant::now();
         let epoch = self.last_ship_epoch;
         // Busy means the previous publish is still running; it will be
-        // followed by the next cadence's.
-        let Some(mut publisher) = self.take_publisher(false).await else {
+        // followed by the next cadence's (unless the caller must publish
+        // now — shutdown — and waits for it instead).
+        let Some(mut publisher) = self.take_publisher(wait).await else {
             return;
         };
         let task = tokio::spawn(async move { publisher.publish(epoch).await.map(|_| ()) });
@@ -468,11 +498,13 @@ impl Shipper {
         &self.log
     }
 
+    #[allow(dead_code)] // convenience constructor for a keeper matching this shipper; not yet wired to a call site
     pub fn lease_keeper(&self, part: &str) -> LeaseKeeper {
         LeaseKeeper::new(
             LeaseStore::new(self.log.inner(), part, self.lease_mode),
             self.node_id,
         )
+        .with_holder_epoch(self.meta.holder_epoch_cell())
     }
 
     pub fn set_skip_ship(&self, skip: bool) {
@@ -511,40 +543,30 @@ impl Shipper {
         self.parts.get(PARTITION).map(|p| p.next_seq).unwrap_or(1)
     }
 
+    /// The highest lease epoch applied or shipped on `part`'s stream
+    /// (0 if unknown). Plan 30 §M3b: a keeper holding a lower epoch than
+    /// this was deposed (`main::run_sync_round` renews it at once).
+    pub fn max_epoch(&self, part: &str) -> u64 {
+        self.parts.get(part).map(|p| p.max_epoch).unwrap_or(0)
+    }
+
     /// Last shipped sequence for `part` (`next_seq - 1`), if known.
     pub fn last_shipped_seq(&self, part: &str) -> Option<u64> {
         self.parts.get(part).map(|p| p.next_seq.saturating_sub(1))
     }
 
-    /// One full ordinary sync round. A persisted deposition is terminal:
-    /// tailing may continue, but no lease may be acquired and no local
-    /// journal may ship until explicit reintegration succeeds.
+    /// One full ordinary sync round. A persisted deposition keeps the node
+    /// tail-only: no lease may be acquired and no local journal may ship
+    /// until the deposition recovery (plan 30 §M3b,
+    /// `recovery::recover_deposed`) has rolled the stranded journal back
+    /// and cleared it.
     pub async fn sync_all(&mut self, leases: &mut HashMap<String, LeaseKeeper>) -> Result<()> {
-        self.sync_all_inner(leases, false).await
-    }
-
-    /// The explicit reintegration path is the sole exception to the
-    /// persisted deposition gate. It needs temporary write authority to
-    /// append the classified records, while `lease_lost` remains durable
-    /// until the complete procedure succeeds.
-    pub async fn sync_all_for_reintegration(
-        &mut self,
-        leases: &mut HashMap<String, LeaseKeeper>,
-    ) -> Result<()> {
-        self.sync_all_inner(leases, true).await
-    }
-
-    async fn sync_all_inner(
-        &mut self,
-        leases: &mut HashMap<String, LeaseKeeper>,
-        reintegrating: bool,
-    ) -> Result<()> {
         loop {
             let held = self.held_partitions(leases);
             self.tail_all_except(&held).await?;
-            if !reintegrating && matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
+            if matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
                 tracing::debug!(
-                    "deposed node remains tail-only until reintegration; \
+                    "deposed node remains tail-only until its deposition recovery runs; \
                      refusing ordinary lease acquisition and journal shipping"
                 );
                 return Ok(());
@@ -611,7 +633,7 @@ impl Shipper {
             self.tail_all_except(&held).await?;
             if matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
                 tracing::debug!(
-                    "deposed node remains tail-only until reintegration; \
+                    "deposed node remains tail-only until its deposition recovery runs; \
                      refusing ordinary lease acquisition and journal shipping"
                 );
                 return Ok(());
@@ -659,7 +681,8 @@ impl Shipper {
                         let mut keeper = LeaseKeeper::new(
                             LeaseStore::new(self.log.inner(), &part, self.lease_mode),
                             self.node_id,
-                        );
+                        )
+                        .with_holder_epoch(self.meta.holder_epoch_cell());
                         keeper.note_acquire_reason("ship-pending-journal");
                         match acquire_lease_for(self, &mut keeper, &part).await {
                             Ok(true) => {
@@ -928,14 +951,18 @@ impl Shipper {
 
     fn apply_decoded_segment(&mut self, part: &str, seq: u64, seg: Segment) -> Result<()> {
         if seg.node == self.node_id {
-            let grouped = self.meta.take_journal_grouped(seg.records.len())?;
-            let journal = grouped
-                .into_iter()
-                .find(|(p, _)| p == part)
-                .map(|(_, r)| r)
-                .unwrap_or_default();
-            let matches = journal.len() == seg.records.len()
-                && journal.iter().map(|(_, r)| r).eq(seg.records.iter());
+            // Our own segment, shipped but not acked before a restart (or a
+            // takeover's epoch marker). Ride-along atime rows never come
+            // from the journal, so only the rest must match its head; an
+            // atime-only or empty (marker) segment matches an empty head.
+            let journaled: Vec<&LogRecord> = seg
+                .records
+                .iter()
+                .filter(|r| !matches!(r, LogRecord::Atime { .. }))
+                .collect();
+            let journal = MetaStore::take_journal(&*self.meta, journaled.len())?;
+            let matches = journal.len() == journaled.len()
+                && journal.iter().map(|(_, r)| r).eq(journaled.iter().copied());
             if !matches {
                 bail!(
                     "segment {seq} of {part} claims our node id {} but does not match \
@@ -972,14 +999,18 @@ impl Shipper {
             // inode can legitimately follow ours. Skipping it would drop
             // it for good — the applied position never revisits a
             // segment — leaving each requester pinned to its own value.
-            let pending =
-                TouchSet::from_records(self.meta.take_journal(usize::MAX)?.iter().map(|(_, r)| r));
-            // Plan 30 §M3a: one transaction strands whatever speculation
-            // this segment's epoch supersedes (rolled back, redone around,
-            // shadows queued for replay by rid — `recovery::
-            // drain_pending_replays` runs them), applies the records,
-            // retires shadows by rid and hints by position, and advances
-            // `applied_seq`.
+            //
+            // Plan 30 §M3b: only this node's *uncaptured* journal suppresses
+            // (`Meta::pending_touches`). Captured transactions are exact
+            // instead: the segment is inserted before them.
+            let pending = self.meta.pending_touches()?;
+            // Plan 30 §M3: one transaction strands whatever speculation
+            // this segment's epoch supersedes — requester shadows and hints,
+            // and, if this node was deposed, its own unshipped transactions
+            // (rolled back, redone around, ops queued for replay by rid —
+            // `recovery::drain_pending_replays` runs them) — applies the
+            // records, retires shadows by rid and hints by position, and
+            // advances `applied_seq`.
             let applied = self
                 .meta
                 .apply_segment(seq, seg.epoch, &seg.records, &pending)?;
@@ -991,11 +1022,23 @@ impl Shipper {
                     epoch = seg.epoch,
                     shadows = applied.stranded.shadows,
                     hints = applied.stranded.hints,
+                    local = applied.stranded.locals,
                     "segment from a later epoch stranded speculative state; rolled back, \
                      stranded ops queued for replay by rid"
                 );
-                self.spool.lock().unwrap().speculation_rolled_back +=
+                let mut spool = self.spool.lock().unwrap();
+                spool.speculation_rolled_back +=
                     (applied.stranded.shadows + applied.stranded.hints) as u64;
+                spool.local_rolled_back += applied.stranded.locals as u64;
+            }
+            if applied.inserted_before_local {
+                tracing::info!(
+                    seq,
+                    part,
+                    epoch = seg.epoch,
+                    "applied a late segment before this node's unshipped transactions \
+                     (rolled back, applied, redone)"
+                );
             }
             if skipped > 0 {
                 self.spool.lock().unwrap().conflicts += skipped as u64;
@@ -1047,7 +1090,8 @@ impl Shipper {
                 let mut keeper = LeaseKeeper::new(
                     LeaseStore::new(self.log.inner(), &part, self.lease_mode),
                     self.node_id,
-                );
+                )
+                .with_holder_epoch(self.meta.holder_epoch_cell());
                 keeper.note_acquire_reason("ship-pending-journal");
                 match acquire_lease_for(self, &mut keeper, &part).await {
                     Ok(true) => {
@@ -1165,9 +1209,22 @@ impl Shipper {
         // are droppable by definition, and a journaled record cut here is
         // simply shipped by the next round (this returns `true`, so the
         // caller comes straight back).
+        //
+        // Plan 30 §M3b: never inside a transaction. An op's records and its
+        // `Completed { rid }` ship together or not at all — a holder dying
+        // between two segments that split them would leave the op in
+        // effect with its rid uncompleted, and a replay by rid would then
+        // execute it a second time. `batch` itself ends on a transaction
+        // boundary (`take_journal_grouped`); a byte cut is moved back to
+        // the last boundary before it, or — when even the first
+        // transaction is over the cap — forward to the end of that one.
         let fits = records_within_cap(&records)?;
-        let shipped_journal = fits.min(journaled);
-        let shipped_atime = fits.saturating_sub(journaled);
+        let (shipped_journal, shipped_atime) = if fits >= journaled {
+            (journaled, fits - journaled)
+        } else {
+            (self.meta.whole_tx_prefix(&batch, fits)?, 0)
+        };
+        let fits = shipped_journal + shipped_atime;
         records.truncate(fits);
         let batch = &batch[..shipped_journal];
         let atime_rows = &atime_rows[..shipped_atime];
@@ -1248,9 +1305,35 @@ impl Shipper {
         }
         self.shipped_since_publish += 1;
         if self.publish_is_due() {
-            self.publish().await?;
+            self.publish_in_background();
         }
         Ok(true)
+    }
+
+    /// The segment-count cadence's publish, off the ship path (plan 30
+    /// §M3b). A publish is several S3 round trips (pack and blob PUTs, the
+    /// commit CAS, condemned-list reads) and, for a holder with an
+    /// unshipped journal, reads every outstanding `Local` row's
+    /// before-images; awaited here it stalled shipping for all of that
+    /// every `PUBLISH_EVERY` segments while forwarded ops kept arriving.
+    /// It needs nothing from this round: it reads one fjall snapshot and
+    /// holds only the publisher's own lock, so it runs as its own task and
+    /// the next cadence skips while it is still busy.
+    fn publish_in_background(&mut self) {
+        self.shipped_since_publish = 0;
+        self.last_publish_attempt = Instant::now();
+        let epoch = self.last_ship_epoch;
+        let Some(publisher) = self.publisher.clone() else {
+            return;
+        };
+        let Ok(mut publisher) = publisher.try_lock_owned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(e) = publisher.publish(epoch).await {
+                tracing::warn!(error = %e, "metadata tree publish failed; retrying next round");
+            }
+        });
     }
 
     /// Drain a partition's pending read-time atime (plan 20) into one
@@ -1493,8 +1576,12 @@ impl Shipper {
         // following segment. A cancelled publish now simply waits for the
         // next cadence — the publish itself runs in a spawned task
         // ([`Shipper::publish_tree`]) and is cancellation-safe regardless.
+        //
+        // Plan 30 §M3b: waits for a cadence publish still running in the
+        // background (`publish_in_background`) rather than skipping — an
+        // explicit, idle or shutdown publish must actually publish.
         self.shipped_since_publish = 0;
-        self.publish_tree().await;
+        self.publish_tree(true).await;
         Ok(())
     }
 
@@ -1520,7 +1607,7 @@ impl Shipper {
             if matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
                 tracing::info!(
                     journal_backlog = MetaStore::journal_len(&*self.meta).unwrap_or(0),
-                    "deposed node remains tail-only until reintegration; \
+                    "deposed node remains tail-only until its deposition recovery runs; \
                      journal will not ship on this unmount"
                 );
                 return Ok(());
@@ -1726,8 +1813,10 @@ impl Shipper {
 /// Acquire the lease for `part` if it is free, tailing that stream to
 /// head first when this would be a takeover from another node. Returns
 /// false when a live foreign holder still owns it (the caller waits and
-/// retries). This is the *only* acquisition path, which is what makes
-/// the takeover ordering rule structural.
+/// retries), or when this node holds it but its takeover gate has not
+/// completed yet (retried by the next call or sync round). This is the
+/// *only* acquisition path, which is what makes the takeover ordering rule
+/// structural.
 pub async fn acquire_lease(ship: &mut Shipper, keeper: &mut LeaseKeeper) -> Result<bool> {
     acquire_lease_for(ship, keeper, PARTITION).await
 }
@@ -1759,18 +1848,127 @@ pub async fn acquire_lease_for(
     } else {
         None
     };
-    // Plan 30 §M3a takeover gate: once the CAS makes this node the holder,
-    // and before anything can execute against this replica as holder,
-    // roll back the speculation the new epoch strands and replay every
-    // queued stranded op locally, in order (see `recovery::takeover_gate`).
+    match keeper.commit_cas(plan, tailed).await? {
+        crate::lease::CasOutcome::NotWon => Ok(false),
+        // Ours already. A gate left pending by an earlier failure is
+        // retried here, so a FUSE thread's own `Acquire` drives it too.
+        crate::lease::CasOutcome::Held => Ok(complete_gate(ship, keeper, part).await),
+        crate::lease::CasOutcome::Won(won) => {
+            // Plan 30 §M3 takeover gate. The view stays closed (and
+            // nothing ships) from the CAS until the gate completes:
+            // 1. a takeover from a holder that did not release ships an
+            //    empty epoch-marker segment first, so no late segment of
+            //    the old epoch can land after anything the gate replays,
+            //    and third nodes strand promptly (a released predecessor
+            //    flushed first and ships nothing more: no marker);
+            // 2. roll back what the new epoch strands and replay every
+            //    queued stranded op locally, in order
+            //    (`recovery::takeover_gate`).
+            // A failure leaves the gate pending (see `complete_gate`).
+            let pending = crate::lease::PendingGate {
+                epoch: won.epoch(),
+                takeover: won.takeover,
+                marker_shipped: !won.marker,
+            };
+            keeper.open_won(won, Some(pending)).await;
+            Ok(complete_gate(ship, keeper, part).await)
+        }
+    }
+}
+
+/// Run, or resume, `keeper`'s pending takeover gate (plan 30 §M3b).
+/// Returns whether it is complete (always, when none is pending).
+///
+/// Called right after a won CAS (`acquire_lease_for`), by a later
+/// `Acquire` that finds the lease already ours, and by every sync round
+/// (`main::run_sync_round`) while one is pending. Holds whatever the
+/// caller holds (the keepers lock, the shipper) across the marker PUT:
+/// this is the acquisition path, which already does S3 I/O under them.
+///
+/// **Failure** leaves the lease held but the view closed: no FUSE write,
+/// local forward or peer's forwarded op executes, and nothing ships
+/// (`LeaseKeeper::ship_epoch` is `None`), until a retry completes the
+/// gate. Opening anyway would let new ops run ahead of — and validate
+/// without — the stranded ops still queued, which is the reordering the
+/// gate exists to prevent; releasing would strand the replays the gate
+/// already executed behind a lease nobody else can take for a TTL. A
+/// holder that can never complete it (a persistently failing metadata
+/// store) behaves like a paused one: writes wait out the FUSE acquire
+/// deadline and fail with `EIO`, and a peer that wants the lease gets it
+/// by the ordinary idle release once the backlog reads zero.
+pub async fn complete_gate(ship: &mut Shipper, keeper: &mut LeaseKeeper, part: &str) -> bool {
+    let Some(mut gate) = keeper.pending_gate() else {
+        return true;
+    };
+    if !gate.marker_shipped {
+        match ship.ship_epoch_marker(part, gate.epoch).await {
+            Ok(()) => {
+                gate.marker_shipped = true;
+                keeper.set_pending_gate(Some(gate));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    part,
+                    epoch = gate.epoch,
+                    "could not ship the takeover's epoch marker; the takeover gate stays \
+                     pending and new mutations wait"
+                );
+                return false;
+            }
+        }
+    }
     let meta = ship.meta.clone();
     let spool = ship.spool.clone();
-    let node_id = ship.node_id;
-    keeper
-        .commit_gated(plan, tailed, move |epoch| {
-            crate::recovery::takeover_gate(&meta, &spool, node_id, epoch, takeover);
-        })
-        .await
+    match crate::recovery::takeover_gate(&meta, &spool, ship.node_id, gate.epoch, gate.takeover) {
+        Ok(()) => {
+            keeper.finish_gate();
+            true
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                part,
+                epoch = gate.epoch,
+                "takeover gate failed; this node holds the lease but keeps new mutations \
+                 closed until a later round completes the gate"
+            );
+            false
+        }
+    }
+}
+
+impl Shipper {
+    /// Plan 30 §M3b: ship an empty segment at `epoch` as the first segment
+    /// of a takeover's tenure (see the module doc). A collision is a late
+    /// segment of an older epoch, or our own unacked segment from before a
+    /// restart; it is absorbed by tailing, exactly like `ship_part`'s, and
+    /// the marker retried at the next sequence. Bounded: a stream that
+    /// keeps moving under a node that holds its lease is a fault, not a
+    /// race.
+    pub async fn ship_epoch_marker(&mut self, part: &str, epoch: u64) -> Result<()> {
+        self.ensure_part(part);
+        for _ in 0..16 {
+            let payload = encode(self.node_id, epoch, &[])?;
+            let seq = self.parts[part].next_seq;
+            match self.parts[part].log.put_segment(seq, &payload).await {
+                Ok(()) => {
+                    // Our own segment, applied here trivially: advance the
+                    // position (it carries no journal rows to ack).
+                    self.meta.ack_journal_rows_at(&[], seq)?;
+                    self.after_atime_segment(part, seq, epoch, payload).await;
+                    self.spool.lock().unwrap().epoch_markers += 1;
+                    tracing::info!(seq, part, epoch, "shipped the takeover's epoch marker");
+                    return Ok(());
+                }
+                Err(constellation_store_s3::StoreError::AlreadyExists) => {
+                    self.tail_part(part).await?;
+                }
+                Err(e) => return Err(e).context("shipping the epoch marker"),
+            }
+        }
+        bail!("{part}: the log kept moving while shipping the epoch-{epoch} marker")
+    }
 }
 
 #[allow(dead_code)]
@@ -2340,7 +2538,10 @@ mod tests {
     /// The durable lost bit is an authority gate, not just mount-time
     /// recovery metadata. Even if the in-memory keeper map is empty, an
     /// ordinary sync must not manufacture a fresh keeper and ship the
-    /// stranded branch. Explicit reintegration is the only bypass.
+    /// stranded branch. Plan 30 §M3b: the deposition recovery is what
+    /// clears it — the stranded transaction (uncaptured here: this node
+    /// never recorded a holder epoch, so it is rebuilt from the log) leaves
+    /// the journal and is queued for replay by rid, never shipped from here.
     #[tokio::test]
     async fn persisted_deposition_blocks_ordinary_reacquisition() {
         let store = StdArc::new(InMemory::new());
@@ -2357,12 +2558,213 @@ mod tests {
         assert_eq!(a.meta.journal_len().unwrap(), 1);
         assert!(a.ship.log.list_segments().await.unwrap().is_empty());
 
-        a.ship
-            .sync_all_for_reintegration(&mut leases)
+        let dir = tempfile::TempDir::new().unwrap();
+        a.lease.force_lost();
+        crate::recovery::recover_deposed(&mut a.ship, &mut a.lease, Some(dir.path()))
             .await
             .unwrap();
+        assert!(!a.lease.is_lost());
+        assert_eq!(a.meta.kv_get("lease_lost").unwrap().as_deref(), Some("0"));
         assert_eq!(a.meta.journal_len().unwrap(), 0);
-        assert_eq!(a.ship.log.list_segments().await.unwrap(), [1]);
+        assert!(a.meta.lookup(1, "stranded").unwrap().is_none());
+        assert_eq!(a.meta.pending_replays().unwrap().len(), 1);
+        assert!(a.ship.log.list_segments().await.unwrap().is_empty());
+    }
+
+    /// Plan 30 §M3b, end to end on two replicas: a holder with captured,
+    /// unshipped work is deposed by a takeover after its lease expired.
+    /// The new holder's first segment is an empty epoch marker; tailing it
+    /// strands the old holder's transaction (rolled back, queued by rid);
+    /// replayed through the new holder, it lands exactly once.
+    #[tokio::test]
+    async fn a_deposed_holder_rolls_back_and_replays_through_the_new_holder() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let mut b = node(&store, 2);
+        a.lease.share_holder_epoch(a.meta.holder_epoch_cell());
+        b.lease.share_holder_epoch(b.meta.holder_epoch_cell());
+
+        a.meta.mkdir(1, "shipped", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        assert_eq!(a.meta.holder_epoch(), 1);
+        let rid = constellation_meta::Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        };
+        let op = constellation_meta::MutateOp::Mkdir {
+            parent: 1,
+            name: "stranded".into(),
+            ino: (1 << 40) | 500,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        constellation_meta::execute_mutate(&a.meta, &op, Some(rid)).unwrap();
+        assert_eq!(a.meta.speculation_counts().unwrap().local, 1);
+
+        // A stops renewing; B takes over after expiry.
+        expire_lease(&store).await;
+        b.sync().await;
+        assert_eq!(b.meta.holder_epoch(), 2);
+        let marker = segment(&store, 2).await;
+        assert_eq!((marker.node, marker.epoch), (2, 2));
+        assert!(marker.records.is_empty(), "the marker is empty");
+        assert_eq!(b.ship.spool.lock().unwrap().epoch_markers, 1);
+
+        // A resumes and tails: the marker strands its transaction.
+        a.ship.tail_to_head().await.unwrap();
+        assert!(a.meta.lookup(1, "stranded").unwrap().is_none());
+        assert!(a.meta.lookup(1, "shipped").unwrap().is_some());
+        assert_eq!(a.meta.journal_len().unwrap(), 0);
+        assert_eq!(a.meta.completed_position(rid).unwrap(), None);
+        let queued = a.meta.pending_replays().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!((queued[0].rid, &queued[0].op), (rid, &op));
+        assert_eq!(a.ship.spool.lock().unwrap().local_rolled_back, 1);
+
+        // A's renewal now finds B: the deposition recovery has nothing left
+        // to roll back and clears the loss.
+        a.lease.renew_now().await.unwrap();
+        assert!(a.lease.is_lost());
+        crate::recovery::recover_deposed(&mut a.ship, &mut a.lease, None)
+            .await
+            .unwrap();
+        assert!(!a.lease.is_lost());
+
+        // The replay reaches B (as the drain's forward would) — twice, as
+        // a retry would; B executes it once.
+        for _ in 0..2 {
+            if b.meta.completed_position(rid).unwrap().is_none() {
+                constellation_meta::execute_mutate(&b.meta, &queued[0].op, Some(rid)).unwrap();
+            }
+        }
+        b.sync().await;
+        a.ship.tail_to_head().await.unwrap();
+        for replica in [&a.meta, &b.meta] {
+            assert_eq!(
+                names(replica, 1)
+                    .iter()
+                    .filter(|(n, _)| n == "stranded")
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(names(&a.meta, 1), names(&b.meta, 1));
+    }
+
+    /// Plan 30 §M3b: a third node's shadow accepted by a holder that died
+    /// strands as soon as the next holder's epoch marker arrives, even
+    /// though the takeover's own op ships nothing.
+    #[tokio::test]
+    async fn a_takeover_marker_strands_a_third_nodes_shadow_at_once() {
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        let mut b = node(&store, 2);
+        let mut c = node(&store, 3);
+        a.sync().await; // A holds epoch 1.
+        let rid = constellation_meta::Rid {
+            node: 3,
+            incarnation: 1,
+            seq: 1,
+        };
+        let op = constellation_meta::MutateOp::Mkdir {
+            parent: 1,
+            name: "phantom".into(),
+            ino: (3 << 40) | 1,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        let records = constellation_meta::execute_mutate(&a.meta, &op, Some(rid)).unwrap();
+        crate::forward::apply_accepted(&c.meta, 1, rid, &op, &records).unwrap();
+        assert!(c.meta.has_outstanding_speculation());
+
+        // A dies before shipping; B takes over and ships nothing but its
+        // marker (its own op, say, was refused).
+        expire_lease(&store).await;
+        assert!(acquire_lease(&mut b.ship, &mut b.lease).await.unwrap());
+        c.ship.tail_to_head().await.unwrap();
+        assert!(
+            !c.meta.has_outstanding_speculation(),
+            "the marker alone strands the dead holder's shadow"
+        );
+        assert!(c.meta.lookup(1, "phantom").unwrap().is_none());
+        assert_eq!(c.meta.pending_replays().unwrap().len(), 1);
+    }
+
+    /// Plan 30 §M3b's publish rule, with the plan's test helper: a holder
+    /// with unshipped (captured) work publishes, and the commit's root is
+    /// exactly the root of a replica rebuilt by replaying the log up to the
+    /// commit's `applied` position — not the holder's live replica.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_holder_publishes_the_log_prefix_while_its_journal_is_non_empty() {
+        use constellation_store_s3::{CommitChain, SHARD0};
+
+        let store = StdArc::new(InMemory::new());
+        let mut a = node(&store, 1);
+        a.lease.share_holder_epoch(a.meta.holder_epoch_cell());
+        let backend = store.clone() as StdArc<dyn ObjectStore>;
+        let _nodes = enable_publisher(&mut a, &store, 1);
+
+        let d = a.meta.mkdir(1, "d", 0o755, 0, 0).unwrap();
+        a.meta.create(d.ino, "shipped", 0o644, 0, 0).unwrap();
+        a.sync().await;
+        // Unshipped, captured work on top of the shipped prefix.
+        a.meta.create(d.ino, "unshipped", 0o644, 0, 0).unwrap();
+        a.meta.rename(d.ino, "shipped", 1, "moved").unwrap();
+        assert!(a.meta.journal_len().unwrap() > 0);
+        assert_eq!(a.meta.speculation_counts().unwrap().local, 2);
+        a.ship.publish().await.unwrap();
+
+        let chain = CommitChain::new(backend.clone());
+        let head = chain.discover_head(0).await.unwrap().expect("a commit");
+        let commit = chain.get(head).await.unwrap().unwrap();
+        assert_eq!(commit.applied, a.meta.applied_seq().unwrap());
+        let published = commit.root(SHARD0).unwrap();
+        let want = log_prefix_root(&store, commit.applied).await;
+        assert_eq!(published, want, "the commit is the log prefix at `applied`");
+        assert!(
+            a.meta.has_dirty(),
+            "the substituted keys stay dirty for the next publish"
+        );
+
+        // Once the work ships, the next publish carries it.
+        a.sync().await;
+        a.ship.publish().await.unwrap();
+        let head = chain.discover_head(0).await.unwrap().unwrap();
+        let commit = chain.get(head).await.unwrap().unwrap();
+        let want = log_prefix_root(&store, commit.applied).await;
+        assert_eq!(commit.root(SHARD0).unwrap(), want);
+    }
+
+    /// Plan 30 §M3's test helper: the root of a fresh replica built by
+    /// replaying the shared log up to `applied` — what a commit claiming
+    /// that position must equal.
+    async fn log_prefix_root(
+        store: &StdArc<InMemory>,
+        applied: u64,
+    ) -> constellation_mtree::NodeHash {
+        use constellation_fs_core::cache::DiskCache;
+        use constellation_mtree::{record, Hasher, Tree};
+        use constellation_store_s3::{BlobStore, NodeCache, PackStore};
+        let log = LogStore::new(store.clone());
+        let replica = Meta::open_in_memory().unwrap();
+        for seq in 1..=applied {
+            let seg = decode(&log.get_segment(seq).await.unwrap()).unwrap();
+            replica.apply_records(&seg.records).unwrap();
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let backend = StdArc::new(InMemory::new()) as StdArc<dyn ObjectStore>;
+        let cache = Arc::new(NodeCache::new(
+            PackStore::new(backend.clone()),
+            Arc::new(DiskCache::open(dir.path(), 1 << 30).unwrap()),
+            Hasher::Plain,
+            tokio::runtime::Handle::current(),
+        ));
+        let tree = Tree::with_config(cache, record::config()).unwrap();
+        crate::mtree_publish::rebuild_root(&replica, &tree, &BlobStore::new(backend, Hasher::Plain))
+            .unwrap()
     }
 
     /// A late segment stamped with a superseded epoch is fenced out

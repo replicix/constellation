@@ -45,8 +45,56 @@ fn next_seq_tx(
     Ok(next)
 }
 
+/// The journal counter's next value, without advancing it: where the
+/// caller's transaction's first appended row will land
+/// (`store::local::LocalTx`).
+pub(crate) fn peek_next_seq(
+    r: &impl Readable,
+    local: &SingleWriterTxKeyspace,
+) -> Result<u64, MetaError> {
+    match r.get(local, KV_NEXT_JOURNAL_SEQ.as_bytes())? {
+        Some(v) => {
+            Ok(u64::from_be_bytes(v.as_ref().try_into().map_err(|_| {
+                MetaError::Invalid("next_journal_seq".into())
+            })?))
+        }
+        None => Ok(1),
+    }
+}
+
 thread_local! {
     static PENDING_COMPLETION: std::cell::Cell<Option<Rid>> = const { std::cell::Cell::new(None) };
+    static PENDING_OP: std::cell::RefCell<Option<(Option<Rid>, crate::mutate::MutateOp)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Plan 30 §M3b: the op (and rid, if any) `mutate::execute` is running,
+/// for `store::local`'s `journal_tx` row. The same thread-local scoping
+/// as [`PendingCompletion`], for the same reason: the op's own
+/// transaction runs on this call stack, and nothing else can see it. A
+/// replay after a deposition re-executes exactly this op by this rid.
+pub(crate) struct PendingLocalOp;
+
+impl PendingLocalOp {
+    pub(crate) fn set(rid: Option<Rid>, op: &crate::mutate::MutateOp) -> PendingLocalOpGuard {
+        PENDING_OP.with(|c| *c.borrow_mut() = Some((rid, op.clone())));
+        PendingLocalOpGuard
+    }
+
+    /// Taken by the first journaled transaction that finishes while it is
+    /// set, so a second transaction in the same call (none today) could
+    /// not claim the same op.
+    pub(crate) fn take() -> Option<(Option<Rid>, crate::mutate::MutateOp)> {
+        PENDING_OP.with(|c| c.borrow_mut().take())
+    }
+}
+
+pub(crate) struct PendingLocalOpGuard;
+
+impl Drop for PendingLocalOpGuard {
+    fn drop(&mut self) {
+        PENDING_OP.with(|c| *c.borrow_mut() = None);
+    }
 }
 
 /// The rid `mutate::execute` is completing, visible only to the thread
@@ -128,13 +176,41 @@ fn decode_row(k: &[u8], v: &[u8]) -> Result<(u64, LogRecord), MetaError> {
     Ok((seq, LogRecord::from_postcard(v)?))
 }
 
+/// Plan 30 §M3b: every journal row at or below this is deleted (see
+/// `store::KV_JOURNAL_ACKED`). Scans start after it: the LSM keeps the
+/// shipped history's tombstones until compaction, and walking them from
+/// the start of the keyspace on every round cost time proportional to
+/// everything ever shipped, not to the backlog.
+pub(crate) fn acked_watermark(
+    r: &impl Readable,
+    local: &SingleWriterTxKeyspace,
+) -> Result<u64, MetaError> {
+    crate::store::counter_get(r, local, crate::store::KV_JOURNAL_ACKED)
+}
+
+fn note_acked_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    upto: u64,
+) -> Result<(), MetaError> {
+    // Never past the last seq handed out: an "ack everything" caller may
+    // pass `u64::MAX`, and a row appended later must still be above it.
+    let upto = upto.min(peek_next_seq(&*tx, local)?.saturating_sub(1));
+    if upto > acked_watermark(tx, local)? {
+        crate::store::counter_set_tx(tx, local, crate::store::KV_JOURNAL_ACKED, upto);
+    }
+    Ok(())
+}
+
 pub(crate) fn take(
     r: &impl Readable,
     journal: &SingleWriterTxKeyspace,
+    local: &SingleWriterTxKeyspace,
     max: usize,
 ) -> Result<Vec<(u64, LogRecord)>, MetaError> {
+    let from = acked_watermark(r, local)?.saturating_add(1);
     let mut out = Vec::new();
-    for guard in r.iter(journal) {
+    for guard in r.range(journal, seq_key(from)..) {
         if out.len() >= max {
             break;
         }
@@ -174,9 +250,16 @@ pub(crate) fn max_seq(
     }
 }
 
-pub(crate) fn len(r: &impl Readable, journal: &SingleWriterTxKeyspace) -> Result<u64, MetaError> {
+/// Rows still in the journal: proportional to the backlog (see
+/// [`acked_watermark`]).
+pub(crate) fn len(
+    r: &impl Readable,
+    journal: &SingleWriterTxKeyspace,
+    local: &SingleWriterTxKeyspace,
+) -> Result<u64, MetaError> {
+    let from = acked_watermark(r, local)?.saturating_add(1);
     let mut n = 0u64;
-    for guard in r.iter(journal) {
+    for guard in r.range(journal, seq_key(from)..) {
         guard.key()?;
         n += 1;
     }
@@ -186,18 +269,27 @@ pub(crate) fn len(r: &impl Readable, journal: &SingleWriterTxKeyspace) -> Result
 pub(crate) fn ack_upto(
     tx: &mut SingleWriterWriteTx,
     journal: &SingleWriterTxKeyspace,
+    local: &SingleWriterTxKeyspace,
     upto_seq: u64,
 ) -> Result<(), MetaError> {
+    let from = acked_watermark(tx, local)?.saturating_add(1);
     let keys: Vec<Vec<u8>> = tx
-        .range(journal, ..=seq_key(upto_seq))
+        .range(journal, seq_key(from)..=seq_key(upto_seq))
         .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
         .collect::<Result<_, _>>()?;
     for k in keys {
         tx.remove(journal, k);
     }
-    Ok(())
+    note_acked_tx(tx, local, upto_seq)
 }
 
+/// Remove the shipped rows `seqs` and record the segment they shipped in
+/// as applied. Plan 30 §M3b: the position advances even for an empty
+/// `seqs` — a takeover's epoch-marker segment carries no journal rows but
+/// is still this replica's own, applied segment.
+///
+/// `seqs` is always the journal's head (a shipped batch, or our own
+/// recovered segment), so its highest seq becomes the acked watermark.
 pub(crate) fn ack_rows_at(
     tx: &mut SingleWriterWriteTx,
     journal: &SingleWriterTxKeyspace,
@@ -205,11 +297,11 @@ pub(crate) fn ack_rows_at(
     seqs: &[u64],
     applied_seq: u64,
 ) -> Result<(), MetaError> {
-    if seqs.is_empty() {
-        return Ok(());
-    }
     for seq in seqs {
         tx.remove(journal, seq_key(*seq));
+    }
+    if let Some(&upto) = seqs.iter().max() {
+        note_acked_tx(tx, local, upto)?;
     }
     kv_set_tx(
         tx,
@@ -265,25 +357,6 @@ pub(crate) fn unmarked_parts(
 pub(crate) struct ReintegrationRow {
     pub disposition: String,
     pub detail: String,
-}
-
-pub(crate) fn mark_disposition_tx(
-    tx: &mut SingleWriterWriteTx,
-    reintegration: &SingleWriterTxKeyspace,
-    seq: u64,
-    disposition: &str,
-    detail: &str,
-) -> Result<(), MetaError> {
-    let key = seq_key(seq);
-    if tx.get(reintegration, key.clone())?.is_some() {
-        return Ok(());
-    }
-    let row = ReintegrationRow {
-        disposition: disposition.to_string(),
-        detail: detail.to_string(),
-    };
-    tx.insert(reintegration, key, postcard::to_allocvec(&row)?);
-    Ok(())
 }
 
 pub(crate) fn conflict_count(

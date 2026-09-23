@@ -1,9 +1,12 @@
 //! The `stateright::Model` implementation itself: state, actions,
 //! transitions and properties for the authority protocol variants of plan
-//! 30 (`Today` from §M1, `ExactlyOnce` from §M2, `Recovery` from §M3a). See the crate-level docs for the action → code mapping table
-//! and the list of deliberate simplifications.
+//! 30 (`Today` from §M1, `ExactlyOnce` from §M2, `Recovery` from §M3a
+//! and §M3b). See the crate-level docs for the action → code mapping
+//! table and the list of deliberate simplifications.
 
-use crate::namespace::{eval, force_apply, DirState, Errno, NamespaceSpec, NsOp, NsRet, Record};
+use crate::namespace::{
+    eval, force_apply, present, with_presence, DirState, Errno, NamespaceSpec, NsOp, NsRet, Record,
+};
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
 use stateright::{Model, Property};
 
@@ -37,6 +40,36 @@ pub struct Rid {
 /// completes). `Today` always sets this (rid allocation is unconditional,
 /// per `mutate_op_rebasable`), but only `ExactlyOnce` ever reads it back.
 pub type Logged = (Option<Rid>, Record);
+
+/// One unshipped journal row: the record a holder executed, plus what
+/// plan 30 §M3b's holder-side capture stores for it
+/// (`Meta::begin_local`/`finish_local`, a `spec` entry of kind
+/// `SpecKind::Local`).
+///
+/// `epoch` and `before` are only captured under `Protocol::Recovery`
+/// (both stay `0`/`false` under `Today`/`ExactlyOnce`, which have no
+/// holder-side capture, so their reachable state spaces are unchanged):
+/// - `epoch` is the tenure the entry executed under. A tailed segment at
+///   a higher epoch, or a `Renew` that finds the lease moved, proves that
+///   tenure is over (the entry is stranded: rolled back and queued for
+///   replay by rid).
+/// - `before` is the entry's before-image: whether `rec`'s one name was
+///   present in the node's replica view immediately before this entry
+///   applied (every modeled record touches exactly one name, so one bit
+///   is the whole `Option<value>` of the real `before: [(key,
+///   Option<value>)]`). Captured at execute time from `node_replica`, and
+///   re-captured (`recapture_before_images`) whenever something beneath
+///   the journal changes — a tailed segment, or a shadow retired or
+///   stranded — the model's form of the real rollback-apply-redo, which
+///   re-captures every redone entry's before-image. `Publish` substitutes
+///   the earliest one per name (`log_prefix_view`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JournalEntry {
+    pub rid: Option<Rid>,
+    pub rec: Record,
+    pub epoch: Epoch,
+    pub before: bool,
+}
 
 /// A shipped log segment: `seq -> (epoch, records)` in the crate doc's
 /// terms. Corresponds to the envelope `shipper.rs::encode`/`decode`
@@ -194,8 +227,9 @@ pub struct Node {
     pub held_epoch: Option<Epoch>,
     /// Highest log seq this node has tailed (`Meta::applied_seq`).
     pub applied_seq: Seq,
-    /// Unshipped local records, in order (the fjall journal).
-    pub journal: Vec<Logged>,
+    /// Unshipped local records, in order (the fjall journal), each with
+    /// its `Recovery` capture (see [`JournalEntry`]).
+    pub journal: Vec<JournalEntry>,
     /// Outstanding shadows (`forward.rs::apply_accepted`), oldest first.
     /// `Today`/`ExactlyOnce` never hold more than one at a time (one
     /// client op per node); `Recovery` can briefly hold a replayed op's
@@ -221,6 +255,8 @@ pub struct Node {
     /// re-executing. Volatile: lost on `Restart`, unlike the durable,
     /// log-derived `completed` table (see `rid_completed_record`). The
     /// epoch is the one the op executed under, answered back on a retry.
+    /// Under `Recovery` a Local entry rolled back on deposition takes its
+    /// `recent` outcome with it (`strand_local`).
     pub recent: Vec<(Rid, Record, Epoch)>,
 }
 
@@ -312,9 +348,42 @@ pub enum Action {
 ///     `ExactlyOnce` keep the looser "trust `held_epoch` until `Renew`"
 ///     abstraction M1 shipped with.
 ///
-///   The holder side (a holder's own unshipped journal as speculation,
-///   log-prefix publishing from a holder) is M3b; simplification 9 still
-///   gates `Publish` on an empty journal.
+///   M3b adds the holder side on the same variant:
+///   - holder-side capture: every journal entry records the epoch it
+///     executed under and its before-image ([`JournalEntry`]); an entry
+///     retires when it ships, and a tailed segment re-captures the
+///     before-images of the entries that survive it (rollback, apply,
+///     redo);
+///   - `Publish` is offered even while the journal is non-empty, and
+///     publishes the node's replica with every name an unshipped entry
+///     touches replaced by that name's earliest before-image
+///     (`log_prefix_view`), at `applied_seq`. Still not offered while a
+///     shadow is outstanding. `AuthorityModel::raw_holder_publish` is a
+///     non-vacuity knob that publishes the raw replica instead;
+///   - deposition rolls back, then replays by rid: a `Renew` that finds
+///     the lease moved, or a tailed (non-fenced) segment at a higher
+///     epoch than an entry's, removes those entries from the journal (and
+///     their `recent` outcomes) and queues their ops, in journal order, on
+///     the same `replays` queue stranded shadows use (`strand_local`). A
+///     tail that proves the node's own tenure over also clears
+///     `held_epoch`, as `recover_deposed` marks the lease lost;
+///   - the takeover epoch marker: a takeover `AcquireLease` ships an
+///     empty segment at its new epoch at the next log slot before the
+///     gate runs (`ship_epoch_marker`), fencing late segments of the old
+///     epoch and stranding third nodes' old-epoch shadows as soon as they
+///     tail it, even if the new holder's own op is refused and ships
+///     nothing. The gate also strands the node's own Local entries below
+///     the new epoch;
+///   - a forward reply at an epoch below the one this node holds is not
+///     installed as a shadow (`reply_superseded`); its op is queued for
+///     replay by rid, unless the applied log already completed it;
+///   - dedup (`rid_completed_record`) also consults the node's own
+///     unshipped journal, which writes `completed` in the op's own
+///     transaction in the real code (`holder_execute`'s
+///     `completed_position` check), so a deposed holder's replay of an op
+///     the new holder already re-executed is answered, not re-run.
+///
+///   The continuation-epoch path (`adopt_epoch_hold`) is not modeled.
 /// - `Positions`/`Backup`/`FlexEpochs`/`Delegation` (M6/M9/M10/M11) each
 ///   extend `State`/`Action` further; none are added speculatively here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -361,6 +430,14 @@ pub struct AuthorityModel {
     /// inside the test budget lowers this explicitly rather than relying
     /// on the generous default meant for the other two variants.
     pub max_next_id: MsgId,
+    /// `Recovery` only, a non-vacuity knob (default `false`): publish the
+    /// node's raw replica, speculative unshipped journal included, instead
+    /// of the before-image-substituted log-prefix view. With it on, a
+    /// holder that publishes between executing and shipping violates
+    /// `commits_are_log_prefixes`, which is how a test shows that property
+    /// actually constrains M3b's holder publish (it is not true merely by
+    /// construction).
+    pub raw_holder_publish: bool,
 }
 
 impl AuthorityModel {
@@ -380,6 +457,7 @@ impl AuthorityModel {
             initial_expiry: 0,
             workload: Vec::new(),
             max_next_id: 200,
+            raw_holder_publish: false,
         }
     }
 
@@ -443,6 +521,11 @@ impl AuthorityModel {
         self.max_next_id = n;
         self
     }
+
+    pub fn with_raw_holder_publish(mut self, b: bool) -> Self {
+        self.raw_holder_publish = b;
+        self
+    }
 }
 
 impl AuthorityModel {
@@ -467,16 +550,55 @@ impl AuthorityModel {
     /// refused — the real code materializes that refusal as a conflict
     /// copy; the model just drops it.
     fn replay_locally(&self, s: &mut State, id: NodeId, rid: Rid, op: NsOp) {
-        if rid_completed_record(s, id, rid).is_some() {
+        if rid_completed_record(s, id, rid, self.protocol).is_some() {
             return;
         }
         let base = node_replica(s, id);
         let (ret, _) = eval(base, op);
         if ret == NsRet::Ok {
             let epoch = s.nodes[id as usize].held_epoch.unwrap_or(0);
-            s.nodes[id as usize].journal.push((Some(rid), op));
+            self.journal_push(s, id, rid, op, epoch);
             s.nodes[id as usize].recent.push((rid, op, epoch));
         }
+    }
+
+    /// Journal one record `id` just executed under `epoch`. Under
+    /// `Recovery` this is also plan 30 §M3b's holder-side capture
+    /// (`Meta::begin_local`/`finish_local`): the entry's before-image is
+    /// read from the node's replica view as it stands immediately before
+    /// the entry applies, which already includes every earlier journal
+    /// entry. The other variants capture nothing (see [`JournalEntry`]).
+    fn journal_push(&self, s: &mut State, id: NodeId, rid: Rid, rec: Record, epoch: Epoch) {
+        let entry = if self.protocol == Protocol::Recovery {
+            let view = node_replica(s, id);
+            JournalEntry {
+                rid: Some(rid),
+                rec,
+                epoch,
+                before: present(view, rec.name()),
+            }
+        } else {
+            JournalEntry {
+                rid: Some(rid),
+                rec,
+                epoch: 0,
+                before: false,
+            }
+        };
+        s.nodes[id as usize].journal.push(entry);
+    }
+
+    /// Plan 30 §M3b, `Recovery` only: an `Accepted` reply executed under
+    /// an epoch lower than the one `id` holds (`held_epoch`, the model's
+    /// `Meta::holder_epoch`) is already stranded — a higher epoch exists,
+    /// this node's own — so `Meta::install_shadow` refuses it rather than
+    /// letting the new holder validate against an older epoch's effect
+    /// until the next drain tick strands it. The caller queues the op for
+    /// replay by rid instead. A stale `held_epoch` (deposition not yet
+    /// noticed) only ever errs towards replaying, which dedup makes safe.
+    fn reply_superseded(&self, s: &State, id: NodeId, epoch: Epoch) -> bool {
+        self.protocol == Protocol::Recovery
+            && s.nodes[id as usize].held_epoch.is_some_and(|h| h > epoch)
     }
 }
 
@@ -533,13 +655,38 @@ fn log_state_and_epoch(log: &[Option<Segment>], upto: Seq) -> (DirState, Epoch) 
 /// an identical outcome rather than deriving one afresh — and so a
 /// `Recovery` shadow installed from a dedup answer is never stranded by
 /// a segment that precedes the one completing it.
-fn rid_completed_record(state: &State, id: NodeId, rid: Rid) -> Option<(Record, Epoch)> {
+///
+/// Under `Recovery` (plan 30 §M3b) the node's own unshipped journal
+/// counts too: the real journal writes `completed` in the op's own
+/// transaction, so `holder_execute`'s `completed_position` check sees a
+/// rid this tenure executed through any path — not only the forwarded
+/// ones `recent` remembers, but also the holder's own client ops and the
+/// takeover path's re-execution. That is what keeps a deposed holder's
+/// replay of an op the new holder already re-executed (the M2 coverage
+/// gap: the old holder's journal was never visible to the new one) from
+/// running twice. A rolled-back entry leaves the journal, and with it
+/// this answer.
+fn rid_completed_record(
+    state: &State,
+    id: NodeId,
+    rid: Rid,
+    protocol: Protocol,
+) -> Option<(Record, Epoch)> {
     let node = &state.nodes[id as usize];
     let (_, _, completions) = log_fold(&state.log, node.applied_seq);
     completions
         .into_iter()
         .find(|(r, _, _)| *r == rid)
         .map(|(_, rec, epoch)| (rec, epoch))
+        .or_else(|| {
+            if protocol != Protocol::Recovery {
+                return None;
+            }
+            node.journal
+                .iter()
+                .find(|e| e.rid == Some(rid))
+                .map(|e| (e.rec, e.epoch))
+        })
         .or_else(|| {
             node.recent
                 .iter()
@@ -600,15 +747,94 @@ fn log_head(log: &[Option<Segment>]) -> Seq {
 /// and its own unshipped journal (a holder's local writes not yet
 /// shipped).
 fn node_replica(state: &State, id: NodeId) -> DirState {
+    let mut dir = replica_below_journal(state, id);
+    for e in &state.nodes[id as usize].journal {
+        dir = force_apply(dir, e.rec);
+    }
+    dir
+}
+
+/// `node_replica` without the node's own journal: the base its first
+/// journal entry applies on top of.
+fn replica_below_journal(state: &State, id: NodeId) -> DirState {
     let node = &state.nodes[id as usize];
     let (mut dir, _) = log_state_and_epoch(&state.log, node.applied_seq);
     for sh in &node.shadows {
         dir = force_apply(dir, sh.rec);
     }
-    for (_, r) in &node.journal {
-        dir = force_apply(dir, *r);
+    dir
+}
+
+/// Plan 30 §M3b's redo step, `Recovery` only: re-capture every journal
+/// entry's before-image against what now lies beneath it. The real code
+/// gets here by rolling the Local entries back, applying whatever changed
+/// beneath them (a tailed segment, a retired or stranded shadow) and
+/// redoing them, which captures each afresh; the model's replica is a
+/// fold computed on demand, so only the captured bits need refreshing.
+///
+/// Only called where the real code rolls back and redoes (`tail_one`,
+/// the takeover gate), never before `Publish`: a stale before-image at
+/// publish time is exactly what `commits_are_log_prefixes` would catch.
+/// The model folds shadows *beneath* the journal regardless of arrival
+/// order (the real `spec` log orders by `spec_seq`), so a shadow
+/// installed on top of Local entries leaves their bits describing a
+/// different base than `node_replica` folds; that is harmless because
+/// `Publish` is never offered while a shadow is outstanding, and every
+/// path that removes a shadow re-captures here.
+fn recapture_before_images(s: &mut State, id: NodeId) {
+    let mut view = replica_below_journal(s, id);
+    for e in &mut s.nodes[id as usize].journal {
+        e.before = present(view, e.rec.name());
+        view = force_apply(view, e.rec);
+    }
+}
+
+/// Plan 30 §M3b holder publish (`mtree_publish::plan_from_dirty` over
+/// `Meta::publish_basis_at`): the node's replica with every name an
+/// unshipped journal entry touches replaced by that name's *earliest*
+/// captured before-image. With no shadow outstanding (`Publish`'s
+/// precondition) that is exactly the log-prefix state at `applied_seq`
+/// — but it is computed here from what the replica shows plus the
+/// captured bits, never by folding the log, so `commits_are_log_prefixes`
+/// genuinely checks the capture and re-capture rules.
+fn log_prefix_view(state: &State, id: NodeId) -> DirState {
+    let mut dir = node_replica(state, id);
+    let mut substituted: DirState = 0;
+    for e in &state.nodes[id as usize].journal {
+        let n = e.rec.name();
+        if !present(substituted, n) {
+            substituted = with_presence(substituted, n, true);
+            dir = with_presence(dir, n, e.before);
+        }
     }
     dir
+}
+
+/// Plan 30 §M3b, `Recovery` only: roll back every journal (Local) entry
+/// whose epoch is below `below` — its tenure is over — and queue its op
+/// for replay by rid, in original journal order, behind whatever is
+/// already queued (`recovery::recover_deposed` → `Meta::strand_local`
+/// feeding `pending_replays`). Its `recent` outcome goes too: a retry
+/// must not be answered from an effect that no longer exists. Rolling
+/// back is simply removing the entry, since `node_replica` folds the
+/// journal live; the survivors (never an earlier entry: epochs along the
+/// journal are non-decreasing) are re-captured by the caller.
+fn strand_local(s: &mut State, id: NodeId, below: Epoch) {
+    let node = &mut s.nodes[id as usize];
+    let (stranded, kept): (Vec<JournalEntry>, Vec<JournalEntry>) =
+        node.journal.iter().partition(|e| e.epoch < below);
+    node.journal = kept;
+    for e in stranded {
+        if let Some(rid) = e.rid {
+            node.recent.retain(|(r, _, _)| *r != rid);
+            node.replays.push(ReplayEntry {
+                rid,
+                op: e.rec,
+                inflight: None,
+                attempts: 0,
+            });
+        }
+    }
 }
 
 /// Apply exactly the next log slot to `id`'s tailer state
@@ -618,9 +844,21 @@ fn node_replica(state: &State, id: NodeId) -> DirState {
 /// (the pre-M3a `shadow_retire_matching`); `Recovery` matches by rid and
 /// then strands every remaining shadow whose epoch this segment
 /// supersedes — rolled back (dropped from the overlay, which
-/// `node_replica` reads live) and queued for replay by rid. Panics if
-/// there is no next slot to apply; callers only invoke this when
-/// `log_head > applied_seq`.
+/// `node_replica` reads live) and queued for replay by rid.
+///
+/// Plan 30 §M3b adds the holder side under `Recovery`: every journal
+/// (Local) entry whose epoch the segment supersedes is stranded too
+/// (`strand_local`, queued behind the shadows stranded by the same
+/// segment, matching the model's shadows-beneath-journal fold order),
+/// a `held_epoch` below the segment's is dropped (the tenure is provably
+/// over: `recover_deposed` marks the lease lost), and the surviving
+/// entries' before-images are re-captured over the new base
+/// (`recapture_before_images`: the real code rolls the Local entries
+/// back, applies the segment, and redoes them, since a tailed segment
+/// always precedes the holder's unshipped work in log order).
+///
+/// Panics if there is no next slot to apply; callers only invoke this
+/// when `log_head > applied_seq`.
 fn tail_one(s: &mut State, id: NodeId, protocol: Protocol) {
     let node = &s.nodes[id as usize];
     let (_, max_before) = log_state_and_epoch(&s.log, node.applied_seq);
@@ -648,6 +886,11 @@ fn tail_one(s: &mut State, id: NodeId, protocol: Protocol) {
                 attempts: 0,
             });
         }
+        if node.held_epoch.is_some_and(|h| h < seg.epoch) {
+            node.held_epoch = None;
+        }
+        strand_local(s, id, seg.epoch);
+        recapture_before_images(s, id);
     } else {
         node.shadows
             .retain(|sh| !seg.records.iter().any(|(_, r)| *r == sh.rec));
@@ -674,7 +917,10 @@ fn try_ship_once(s: &mut State, id: NodeId, max_seq: Seq, protocol: Protocol) ->
         return false;
     };
     if s.log[target as usize].is_none() {
-        let records = std::mem::take(&mut s.nodes[id as usize].journal);
+        // Shipping retires every Local entry (plan 30 §M3b: "a local
+        // entry retires when its record ships"), before-images and all.
+        let journal = std::mem::take(&mut s.nodes[id as usize].journal);
+        let records = journal.iter().map(|e| (e.rid, e.rec)).collect();
         s.log[target as usize] = Some(Segment {
             node: id,
             epoch,
@@ -702,6 +948,44 @@ fn flush_for_handoff(s: &mut State, id: NodeId, max_seq: Seq, protocol: Protocol
             // keeping the lease ("declining is always safe").
             return false;
         }
+    }
+}
+
+/// Plan 30 §M3b takeover epoch marker, `Recovery` only
+/// (`Shipper::ship_epoch_marker`, called from `shipper::acquire_lease_for`
+/// before `recovery::takeover_gate`): an empty segment at the new epoch
+/// at the next free slot. If a late segment already took that slot, tail
+/// it and retry at the next one, as `ship_part`'s collision absorption
+/// does. Returns `false` if the log is full, in which case the takeover
+/// cannot complete (`actions()` never offers it then).
+///
+/// Everything downstream of the marker follows from the ordinary rules:
+/// `log_fold`'s fencing skips any later segment of an older epoch, and a
+/// third node tailing the marker strands its older-epoch shadows (and a
+/// deposed holder its Local entries) in `tail_one`, without waiting for
+/// the new holder to ship an op of its own.
+fn ship_epoch_marker(
+    s: &mut State,
+    id: NodeId,
+    epoch: Epoch,
+    max_seq: Seq,
+    protocol: Protocol,
+) -> bool {
+    loop {
+        let target = s.nodes[id as usize].applied_seq + 1;
+        if target > max_seq {
+            return false;
+        }
+        if s.log[target as usize].is_none() {
+            s.log[target as usize] = Some(Segment {
+                node: id,
+                epoch,
+                records: Vec::new(),
+            });
+            s.nodes[id as usize].applied_seq = target;
+            return true;
+        }
+        tail_one(s, id, protocol);
     }
 }
 
@@ -803,7 +1087,17 @@ impl Model for AuthorityModel {
                     Phase::NeedsLease => {
                         match claim_kind(state, id) {
                             Some(needs_tail) => {
-                                if !needs_tail || node.applied_seq == log_head(&state.log) {
+                                // Plan 30 §M3b: under `Recovery` a
+                                // takeover ships its epoch marker into
+                                // the next slot, so, like `Ship` at
+                                // capacity, it is not offered once the
+                                // log is full (`ship_epoch_marker`).
+                                let marker_fits = !needs_tail
+                                    || self.protocol != Protocol::Recovery
+                                    || log_head(&state.log) < self.max_seq;
+                                if (!needs_tail || node.applied_seq == log_head(&state.log))
+                                    && marker_fits
+                                {
                                     actions.push(Action::AcquireLease(id));
                                 }
                             }
@@ -885,9 +1179,16 @@ impl Model for AuthorityModel {
             // outstanding shadow does not publish (`TreePublisher::publish`
             // defers while `Meta::has_outstanding_speculation`). Queued
             // replays do not block it: stranded effects are already rolled
-            // back, so the replica is a log prefix plus live shadows.
+            // back, so the replica is a log prefix plus live shadows (and
+            // the node's own journal, substituted away at publish).
+            // Plan 30 §M3b, `Recovery` only: the empty-journal gate above
+            // (simplification 9) is gone — a node publishes while its
+            // journal is non-empty, substituting before-images for the
+            // unshipped entries (`log_prefix_view`, see `Publish`). The
+            // shadow deferral stays.
             let speculating = self.protocol == Protocol::Recovery && !node.shadows.is_empty();
-            if node.journal.is_empty() && !speculating {
+            let journal_gate = self.protocol != Protocol::Recovery && !node.journal.is_empty();
+            if !journal_gate && !speculating {
                 actions.push(Action::Publish(id));
             }
             if self.max_crashes > state.crashes_used {
@@ -940,14 +1241,14 @@ impl Model for AuthorityModel {
                     seq,
                 };
                 let held = authority(&s, id, self.protocol);
-                if held.is_some() {
+                if let Some(epoch) = held {
                     // Fast path: `fusefs.rs::mutate_op_rebasable`'s
                     // `view.open_for_new_mutation()` branch — a
                     // synchronous local `execute_mutate`, no yield point.
                     let base = node_replica(&s, id);
                     let (ret, _) = eval(base, op);
                     if ret == NsRet::Ok {
-                        s.nodes[id as usize].journal.push((Some(rid), op));
+                        self.journal_push(&mut s, id, rid, op, epoch);
                     }
                     s.history.push(HistEvt::Return(id, ret));
                 } else if let Some(h) = s.lease.holder {
@@ -1009,7 +1310,7 @@ impl Model for AuthorityModel {
                 // (dedup first), which only matters for a node that is no
                 // longer holder but still remembers the rid.
                 let cached = if dedup && (held.is_some() || self.protocol != Protocol::Recovery) {
-                    rid_completed_record(&s, to, rid)
+                    rid_completed_record(&s, to, rid, self.protocol)
                 } else {
                     None
                 };
@@ -1020,7 +1321,7 @@ impl Model for AuthorityModel {
                     let (ret, _) = eval(base, op);
                     match ret {
                         NsRet::Ok => {
-                            s.nodes[to as usize].journal.push((Some(rid), op));
+                            self.journal_push(&mut s, to, rid, op, epoch);
                             if dedup {
                                 s.nodes[to as usize].recent.push((rid, op, epoch));
                             }
@@ -1057,8 +1358,24 @@ impl Model for AuthorityModel {
                                 Outcome::Accepted(rec, epoch) => {
                                     // `forward.rs::apply_accepted`: shadow
                                     // insert + apply immediately, ahead of
-                                    // the log.
-                                    self.install_shadow(&mut s, to, cop.rid, epoch, rec);
+                                    // the log — unless (plan 30 §M3b) this
+                                    // node already holds a higher epoch,
+                                    // in which case the op goes straight
+                                    // to the replay queue (skipped if the
+                                    // applied log already completed it).
+                                    // The client was accepted either way.
+                                    if self.reply_superseded(&s, to, epoch) {
+                                        if !rid_in_applied_log(&s, to, cop.rid) {
+                                            s.nodes[to as usize].replays.push(ReplayEntry {
+                                                rid: cop.rid,
+                                                op: rec,
+                                                inflight: None,
+                                                attempts: 0,
+                                            });
+                                        }
+                                    } else {
+                                        self.install_shadow(&mut s, to, cop.rid, epoch, rec);
+                                    }
                                     completed = Some(NsRet::Ok);
                                 }
                                 Outcome::Errno(e) => completed = Some(NsRet::Err(e)),
@@ -1085,10 +1402,24 @@ impl Model for AuthorityModel {
                     let entry = s.nodes[to as usize].replays[i];
                     match outcome {
                         Outcome::Accepted(rec, epoch) => {
-                            // Replayed: a fresh shadow under the new
-                            // holder's epoch, retiring like any other.
-                            s.nodes[to as usize].replays.remove(i);
-                            self.install_shadow(&mut s, to, entry.rid, epoch, rec);
+                            if self.reply_superseded(&s, to, epoch) {
+                                // Plan 30 §M3b: answered under an epoch
+                                // this node has already superseded. Not
+                                // installed; the entry stays queued (in
+                                // place, keeping its order) for another
+                                // replay by rid, unless the applied log
+                                // already completed it.
+                                if rid_in_applied_log(&s, to, entry.rid) {
+                                    s.nodes[to as usize].replays.remove(i);
+                                } else {
+                                    s.nodes[to as usize].replays[i].inflight = None;
+                                }
+                            } else {
+                                // Replayed: a fresh shadow under the new
+                                // holder's epoch, retiring like any other.
+                                s.nodes[to as usize].replays.remove(i);
+                                self.install_shadow(&mut s, to, entry.rid, epoch, rec);
+                            }
                         }
                         Outcome::Errno(_) => {
                             // Refused: the real code materializes a
@@ -1220,9 +1551,23 @@ impl Model for AuthorityModel {
                     // `diagnose_lost_renew` -> `mark_lost`: deposition is
                     // terminal, the journal is stranded.
                     s.nodes[id as usize].held_epoch = None;
+                    if self.protocol == Protocol::Recovery {
+                        // Plan 30 §M3b (`recovery::recover_deposed`):
+                        // every Local entry belongs to the lost tenure, so
+                        // all of them roll back and queue for replay by
+                        // rid, in journal order. Nothing is left to
+                        // re-capture.
+                        strand_local(&mut s, id, Epoch::MAX);
+                    }
                 }
             }
             Action::AcquireLease(id) => {
+                // Plan 30 §M3b: a takeover (the model's `needs_tail`
+                // claim — the register last named another holder, or
+                // this node after releasing) ships an epoch marker under
+                // `Recovery`. Decided before the CAS below rewrites the
+                // register `claim_kind` reads.
+                let takeover = claim_kind(&s, id) == Some(true);
                 let new_epoch = match s.lease.holder {
                     None => 1,
                     Some(h) if h == id && !s.lease.released => s.lease.epoch.max(1),
@@ -1246,6 +1591,36 @@ impl Model for AuthorityModel {
                     // therefore never sees phantom state, and a stranded
                     // op lands before any op that arrives after the
                     // takeover.
+                    //
+                    // Plan 30 §M3b: a takeover first ships its epoch
+                    // marker (`ship_epoch_marker`), before the gate's
+                    // local replays and before anything else executes.
+                    // Modeled as part of this one atomic step rather than
+                    // as a separate action: in the real code the window
+                    // between the CAS and the marker landing has the view
+                    // still closed, so this node executes, ships and
+                    // answers nothing (a forwarded request arriving
+                    // meanwhile is refused or waits for the view, which
+                    // the model expresses by delivering it before or after
+                    // this step); in this model the old holder cannot ship
+                    // into the window either, because `authority` ends its
+                    // tenure at the expiry or release this CAS required;
+                    // and third nodes only observe the marker once it
+                    // exists. So no other node's action
+                    // could interleave with a distinguishable effect, and
+                    // a separate step would only add interleavings (and a
+                    // "marker pending" flag gating every action) without
+                    // new reachable outcomes. The retry loop for a slot a
+                    // late segment took is kept for fidelity, though
+                    // tail-to-head plus exclusive authority make it
+                    // unreachable here.
+                    if takeover
+                        && !ship_epoch_marker(&mut s, id, new_epoch, self.max_seq, self.protocol)
+                    {
+                        // Log full: the takeover cannot complete.
+                        // `actions()` never offers this, so unreachable.
+                        return None;
+                    }
                     let node = &mut s.nodes[id as usize];
                     let (stranded, kept): (Vec<ShadowEntry>, Vec<ShadowEntry>) =
                         node.shadows.iter().partition(|sh| sh.epoch < new_epoch);
@@ -1258,6 +1633,15 @@ impl Model for AuthorityModel {
                             attempts: 0,
                         });
                     }
+                    // Plan 30 §M3b: this node's own Local entries from an
+                    // earlier tenure are stranded the same way (behind
+                    // its shadows, as in `tail_one`), and whatever
+                    // survives is re-captured over the new base. Tail-to-
+                    // head over the previous holder's marker has normally
+                    // already done this; the gate keeps it unconditional,
+                    // as `takeover_gate` requires no stranded speculation.
+                    strand_local(&mut s, id, new_epoch);
+                    recapture_before_images(&mut s, id);
                     // In-flight ones too: their target's authority ended
                     // with this CAS, so it can only answer `NotHolder`,
                     // and that late answer then matches nothing.
@@ -1278,7 +1662,7 @@ impl Model for AuthorityModel {
                 if let Some(cop) = s.nodes[id as usize].client_op.clone() {
                     let dedup = self.protocol.dedups();
                     let cached = if dedup {
-                        rid_completed_record(&s, id, cop.rid)
+                        rid_completed_record(&s, id, cop.rid, self.protocol)
                     } else {
                         None
                     };
@@ -1288,7 +1672,7 @@ impl Model for AuthorityModel {
                         let base = node_replica(&s, id);
                         let (ret, _) = eval(base, cop.op);
                         if ret == NsRet::Ok {
-                            s.nodes[id as usize].journal.push((Some(cop.rid), cop.op));
+                            self.journal_push(&mut s, id, cop.rid, cop.op, new_epoch);
                         }
                         ret
                     };
@@ -1335,7 +1719,18 @@ impl Model for AuthorityModel {
                 // code; here, the full node_replica, which — faithfully —
                 // includes any lingering shadow, since mtree_publish has
                 // "no notion of shadows").
-                let dir = node_replica(&s, id);
+                //
+                // Plan 30 §M3b, `Recovery`: `plan_from_dirty` over
+                // `Meta::publish_basis_at` — the replica with every
+                // name an unshipped journal entry touches replaced by its
+                // earliest before-image (`log_prefix_view`), claimed at
+                // `applied_seq`. `raw_holder_publish` (a test-only knob)
+                // publishes the raw replica instead, journal included.
+                let dir = if self.protocol == Protocol::Recovery && !self.raw_holder_publish {
+                    log_prefix_view(&s, id)
+                } else {
+                    node_replica(&s, id)
+                };
                 let applied = s.nodes[id as usize].applied_seq;
                 s.commit = Some((dir, applied));
             }

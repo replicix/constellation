@@ -112,22 +112,36 @@ fn dispatch_mutate(
         // dropped.
         let executed = {
             let keepers = ctx.keepers.lock().await;
-            let (ship_epoch, is_lost) = keepers
+            let (ship_epoch, is_lost, fenced) = keepers
                 .get(&part)
-                .map(|keeper| (keeper.ship_epoch(), keeper.is_lost()))
-                .unwrap_or((None, false));
-            (ship_epoch.is_some() || is_lost).then(|| {
-                forward::holder_execute(
-                    &ctx.meta,
-                    ship_epoch,
-                    is_lost,
-                    ctx.node_id,
-                    &op,
-                    ship_floor,
-                    rid,
-                    Some(&*ctx.forward),
-                )
-            })
+                .map(|keeper| {
+                    (
+                        keeper.ship_epoch(),
+                        keeper.is_lost(),
+                        keeper.view().fenced(),
+                    )
+                })
+                .unwrap_or((None, false, false));
+            // Plan 30 §M3b: this node holds the lease but its takeover gate
+            // has not completed (or a release is in its final section):
+            // nothing new may execute yet, and the requester's same-rid
+            // retry will find the gate done.
+            if fenced {
+                Some(constellation_meta::MutateOutcome::Busy)
+            } else {
+                (ship_epoch.is_some() || is_lost).then(|| {
+                    forward::holder_execute(
+                        &ctx.meta,
+                        ship_epoch,
+                        is_lost,
+                        ctx.node_id,
+                        &op,
+                        ship_floor,
+                        rid,
+                        Some(&*ctx.forward),
+                    )
+                })
+            }
         };
         // Plan 30 §M2 GC: this requester tells us it has already
         // received replies for every seq of its current incarnation up
@@ -203,15 +217,15 @@ fn dispatch_mutate(
 /// M3a `kill9-remount` hang.
 ///
 /// The holder check is therefore [`lease::LeaseView::new_mutation_epoch`],
-/// the lock-free gate the FUSE fast path uses (`open_for_new_mutation`).
-/// It is closed by the handoff pause, which `run_sync_round` sets before
-/// its final flush, by `LeaseKeeper::release`'s view clear before the
-/// CAS, and until `commit_gated`'s takeover gate has run. So a local
-/// forward gets the same treatment as a local FUSE write in those
-/// windows. It is also atomic with respect to the round in a way a FUSE
-/// thread is not. The check and the fjall write below run with no await
-/// between them, on the same task as the round, so the round cannot move
-/// between the check and the write.
+/// the lock-free gate the FUSE fast path uses (`open_for_new_mutation`),
+/// behind the same admission ([`lease::LeaseView::admit`]). It is closed
+/// by the releasing flag every release/handoff holds across its final
+/// flush and CAS, by the handoff pause, by `LeaseKeeper::release`'s view
+/// clear, and from a won CAS until its takeover gate completes (plan 30
+/// §M3b). So a local forward gets the same treatment as a local FUSE
+/// write in those windows. The check and the fjall write below run with
+/// no await between them, on the same task as the round, so the round
+/// cannot move between the check and the write.
 ///
 /// The local-holder branch runs inline (a local fjall write) and replies
 /// before returning. The non-holder branch spawns the network round trip
@@ -224,13 +238,19 @@ fn dispatch_forward(
     rid: constellation_meta::Rid,
     reply: tokio::sync::oneshot::Sender<Result<constellation_meta::MutateOutcome, String>>,
 ) {
-    let local_epoch = ctx
-        .lease_views
-        .lock()
-        .unwrap()
-        .get(&part)
-        .and_then(|view| view.new_mutation_epoch(ctx.node_id));
-    if let Some(epoch) = local_epoch {
+    let view = ctx.lease_views.lock().unwrap().get(&part).cloned();
+    // Plan 30 §M3b: admitted (counted in flight) before the gate check,
+    // like the FUSE fast path — see `lease.rs`'s module doc, "The
+    // releasing flag". On this task the admission cannot overlap a round's
+    // quiescence wait anyway (no await between here and the write), but
+    // one admission rule for every local mutation is simpler to reason
+    // about than two.
+    let admitted = view.as_ref().and_then(|view| {
+        let guard = view.admit()?;
+        view.new_mutation_epoch(ctx.node_id)
+            .map(|epoch| (guard, epoch))
+    });
+    if let Some((_admitted, epoch)) = admitted {
         let outcome = match constellation_meta::execute_mutate(&ctx.meta, &op, Some(rid)) {
             Ok(records) => {
                 if let Some(view) = ctx.lease_views.lock().unwrap().get(&part) {
@@ -399,6 +419,7 @@ fn dispatch_forward(
                     }
                 }
             }
+            let mut queued_behind_takeover = false;
             if let constellation_meta::MutateOutcome::Accepted { epoch, ref records } = outcome {
                 // Installed ahead of the log for read-your-writes:
                 // the caller's next op on this entry resolves it here.
@@ -414,35 +435,36 @@ fn dispatch_forward(
                 // precisely needs the holder's journal position in
                 // replies and segments (tracked in PROGRESS.md, plan 29
                 // M6).
-                let apply_result = forward::apply_accepted(&ctx.meta, epoch, rid, &op, records);
-                if let Err(error) = apply_result {
-                    tracing::warn!(
-                        %error,
-                        part,
-                        "failed to apply accepted forwarded mutation"
-                    );
-                    let _ = reply.send(Err(error.to_string()));
-                    return;
-                }
-                // Plan 30 §M3a: a reply from an older epoch that lands
-                // after this node itself took the lease over missed the
-                // takeover gate, and as holder this node never tails a
-                // later-epoch segment that would strand it. Strand it
-                // here; the replay drain then executes it locally, by
-                // rid.
-                let view = ctx.lease_views.lock().unwrap().get(&part).cloned();
-                if let Some(view) = view {
-                    let lease = view.status();
-                    if lease.held && lease.holder == ctx.node_id && lease.epoch > epoch {
-                        if let Err(error) = ctx.meta.strand_below_epoch(lease.epoch) {
-                            tracing::warn!(
-                                %error,
-                                part,
-                                "failed to strand a reply that arrived after this node's takeover"
-                            );
-                        }
+                //
+                // Plan 30 §M3b: a reply from an older epoch that lands
+                // after this node itself took the lease over is not
+                // installed at all — `Meta::install_shadow` sees the higher
+                // holder epoch (recorded the instant the CAS won, before
+                // the takeover gate) and queues the op for replay instead,
+                // so the new holder never validates against it. The caller
+                // is answered `Busy` then: its lease path finds this node
+                // holding and executes the op here at once, by the same rid
+                // (the queued replay later finds it completed and drops
+                // it), so its read-your-writes does not wait for the drain.
+                match forward::apply_accepted(&ctx.meta, epoch, rid, &op, records) {
+                    Ok(installed) => {
+                        queued_behind_takeover = !installed
+                            && ctx.meta.holder_epoch() > epoch
+                            && matches!(ctx.meta.completed_position(rid), Ok(None));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            part,
+                            "failed to apply accepted forwarded mutation"
+                        );
+                        let _ = reply.send(Err(error.to_string()));
+                        return;
                     }
                 }
+            }
+            if queued_behind_takeover {
+                outcome = constellation_meta::MutateOutcome::Busy;
             }
             outcome
         } else {
@@ -1041,7 +1063,8 @@ impl NodeRuntime {
                 lease_mode,
             ),
             node_id,
-        );
+        )
+        .with_holder_epoch(meta.holder_epoch_cell());
         let lease_views = Arc::new(std::sync::Mutex::new({
             let mut m = HashMap::new();
             m.insert(
@@ -1768,10 +1791,11 @@ impl NodeRuntime {
                                 }
                             };
                             if deposed {
-                                let _ = reply.send(Err(
-                                    "this node was deposed; run reintegration before acquiring leases"
-                                        .into(),
-                                ));
+                                // Plan 30 §M3b: the next sync round rolls the
+                                // stranded journal back and clears this; the
+                                // caller's retry then proceeds.
+                                let _ = reply.send(Ok(fusefs::AcquireProgress::busy(0, 0)));
+                                pending = Some(fusefs::SyncRequest::Nudge);
                                 continue;
                             }
                             let mut ship = ship.lock().await;
@@ -1784,7 +1808,8 @@ impl NodeRuntime {
                                         lease_mode,
                                     ),
                                     node_id,
-                                );
+                                )
+                                .with_holder_epoch(meta.holder_epoch_cell());
                                 k.share_takeover_gate(epochs.blocks_takeover.clone());
                                 lease_views.lock().unwrap().insert(part.clone(), k.view());
                                 keepers.insert(part.clone(), k);
@@ -1809,8 +1834,13 @@ impl NodeRuntime {
                                 if keeper.holds_authority() {
                                     Ok(true)
                                 } else if peers.request_lease(&part, None).await.is_some() {
-                                    keeper.adopt_epoch_hold(keeper.authority_epoch());
-                                    Ok(true)
+                                    // Plan 30 §M3b: the continuation-epoch
+                                    // takeover runs the gate too.
+                                    let epoch = keeper.authority_epoch();
+                                    crate::recovery::adopt_epoch_hold_gated(
+                                        keeper, &meta, &spool, node_id, epoch,
+                                    );
+                                    Ok(keeper.pending_gate().is_none())
                                 } else {
                                     Ok(false)
                                 }
@@ -1943,6 +1973,12 @@ impl NodeRuntime {
                                         );
                                         None
                                     } else {
+                                        // Plan 30 §M3b: this node's own new
+                                        // mutations are fenced from here to
+                                        // the release CAS (peers' by the
+                                        // keepers lock held above).
+                                        let releasing = k.begin_releasing();
+                                        releasing.wait_quiescent().await;
                                         match ship.sync_one(&part, k).await {
                                             Ok(()) => match k.release().await {
                                                 Ok(etag) => Some(fusefs::HandoffResult {
@@ -2028,7 +2064,8 @@ impl NodeRuntime {
                                         lease_mode,
                                     ),
                                     node_id,
-                                );
+                                )
+                                .with_holder_epoch(meta.holder_epoch_cell());
                                 keeper.share_takeover_gate(epochs.blocks_takeover.clone());
                                 lease_views
                                     .lock()
@@ -2116,13 +2153,15 @@ impl NodeRuntime {
                                 ));
                                 continue;
                             }
+                            // Plan 30 §M3b: deposition recovery runs by
+                            // itself on the next sync round; this runs it
+                            // now, for an operator (or a test) that wants
+                            // to wait for it.
                             let mut ship = ship.lock().await;
                             let mut keepers = keepers.lock().await;
                             let r = reintegrate::run(
-                                &meta,
                                 &mut ship,
                                 &mut keepers,
-                                node_id,
                                 &state_dir_task,
                                 &reintegration,
                             )
@@ -2202,6 +2241,7 @@ impl NodeRuntime {
                                 &chunk_store,
                                 compression,
                                 &upload,
+                                &state_dir_task,
                             );
                             tokio::pin!(round);
                             let mut completed = false;
@@ -2862,10 +2902,18 @@ impl NodeRuntime {
             }
             let mut ship = self.ship.lock().await;
             let mut keepers = self.keepers.lock().await;
+            // Plan 30 §M3b: the final flush + release is a release like any
+            // other — nothing new executes locally from here on.
+            let releasing: Vec<lease::ReleasingGuard> =
+                keepers.values().map(|k| k.begin_releasing()).collect();
+            for guard in &releasing {
+                guard.wait_quiescent().await;
+            }
             let r = ship.shutdown_all(&mut keepers).await;
             for k in keepers.values_mut() {
                 k.release().await?;
             }
+            drop(releasing);
             r
         });
         flush.context("final log flush")?;
@@ -3740,11 +3788,63 @@ mod tests {
         assert!(!exists(&meta, "after-release"));
     }
 
-    /// Gate semantics, takeover gate: `commit_gated` runs plan 30 M3a's
-    /// gate after the CAS but before `set_held`. A local forward arriving
-    /// then must not execute ahead of the gate's replays. Dispatching from
-    /// inside the gate closure puts it exactly in that window. Once the
-    /// view opens, the next forward executes locally as usual.
+    /// Plan 30 §M3b: the releasing flag, held for a release/handoff's whole
+    /// final flush + CAS, closes local forwards for exactly as long as it
+    /// is held — no timer — and reopens when the guard drops (a round
+    /// cancelled mid-release).
+    #[tokio::test]
+    async fn dispatch_forward_does_not_execute_locally_while_releasing() {
+        let backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut keeper = lease::LeaseKeeper::new(
+            constellation_store_s3::LeaseStore::new(
+                backend.clone(),
+                "p0",
+                constellation_store_s3::LeaseMode::Cas,
+            ),
+            1,
+        );
+        assert!(keeper
+            .commit(lease::Plan::Create, None)
+            .await
+            .expect("create the lease"));
+        let views = Arc::new(Mutex::new(HashMap::from([(
+            "p0".to_string(),
+            keeper.view(),
+        )])));
+        let meta = Arc::new(Meta::open_in_memory().expect("in-memory meta"));
+        let ctx = test_dispatch_ctx(
+            backend,
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            views,
+            meta.clone(),
+        );
+
+        let releasing = keeper.begin_releasing();
+        releasing.wait_quiescent().await;
+        let during = forward_once(ctx.clone(), "while-releasing", 1).await;
+        assert!(
+            !matches!(during, constellation_meta::MutateOutcome::Accepted { .. }),
+            "a forward executed locally while the releasing flag was up: {during:?}"
+        );
+        assert!(!exists(&meta, "while-releasing"));
+        drop(releasing);
+
+        let after = forward_once(ctx, "after-releasing", 2).await;
+        assert!(
+            matches!(
+                after,
+                constellation_meta::MutateOutcome::Accepted { epoch: 1, .. }
+            ),
+            "dropping the guard reopens local execution: {after:?}"
+        );
+    }
+
+    /// Gate semantics, takeover gate: plan 30's gate runs after the CAS
+    /// (`commit_cas`, which does not open the view) and, if it fails, stays
+    /// pending after the view is armed (`open_won` with a `PendingGate`). A
+    /// local forward arriving in either window must not execute ahead of
+    /// the gate's replays. Once the gate completes, the next forward
+    /// executes locally as usual.
     #[tokio::test]
     async fn dispatch_forward_does_not_execute_locally_inside_the_takeover_gate() {
         let backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -3770,13 +3870,47 @@ mod tests {
 
         let (op, rid) = local_mkdir("inside-gate", 1);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let gate_ctx = ctx.clone();
-        assert!(keeper
-            .commit_gated(lease::Plan::Create, None, move |_epoch| {
-                dispatch_forward(gate_ctx, "p0".to_string(), op, rid, reply_tx);
-            })
+        let won = match keeper
+            .commit_cas(lease::Plan::Create, None)
             .await
-            .expect("create the lease"));
+            .expect("create the lease")
+        {
+            lease::CasOutcome::Won(won) => won,
+            _ => panic!("a fresh lease must be won"),
+        };
+        // Between the CAS and the gate, and with the gate pending after the
+        // view is armed: no local execution either way.
+        dispatch_forward(ctx.clone(), "p0".to_string(), op, rid, reply_tx);
+        keeper
+            .open_won(
+                won,
+                Some(lease::PendingGate {
+                    epoch: 1,
+                    takeover: false,
+                    marker_shipped: true,
+                }),
+            )
+            .await;
+        let (pending_op, pending_rid) = local_mkdir("gate-pending", 3);
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        dispatch_forward(
+            ctx.clone(),
+            "p0".to_string(),
+            pending_op,
+            pending_rid,
+            pending_tx,
+        );
+        let pending = tokio::time::timeout(DISPATCH_DEADLINE, pending_rx)
+            .await
+            .expect("dispatch_forward replies within the deadline")
+            .expect("dispatch_forward always replies")
+            .expect("no transport error");
+        assert!(
+            !matches!(pending, constellation_meta::MutateOutcome::Accepted { .. }),
+            "a forward executed locally with the takeover gate pending: {pending:?}"
+        );
+        assert!(!exists(&meta, "gate-pending"));
+        keeper.finish_gate();
         let inside = tokio::time::timeout(DISPATCH_DEADLINE, reply_rx)
             .await
             .expect("dispatch_forward replies within the deadline")

@@ -1303,8 +1303,12 @@ impl ConstellationFs {
             }
         }
         let part = "p0".to_string();
-        if let Some(view) = h.leases.lock().unwrap().get(&part) {
-            if view.open_for_new_mutation() {
+        let view = h.leases.lock().unwrap().get(&part).cloned();
+        if let Some(view) = &view {
+            // Plan 30 §M3b: admitted (counted in flight) atomically with
+            // respect to a release's final flush + CAS — see `lease.rs`'s
+            // module doc, "The releasing flag".
+            if let Some(_admitted) = view.admit() {
                 let result = constellation_meta::execute_mutate(&self.meta, op, Some(rid))
                     .map(|_| ())
                     .map_err(mutate_fail);
@@ -1361,8 +1365,24 @@ impl ConstellationFs {
                 Err(_) => return Err(MutateFail::Errno(libc::EIO)),
             }
         }
-        self.require_lease_for(part_hint_ino)
-            .map_err(MutateFail::Errno)?;
+        // Plan 30 §M3b: the lease path admits the op through the same gate
+        // as the fast path. `require_lease_for` returning is not enough on
+        // its own: a release can begin between it and the write, so the
+        // admission is re-checked, and a closed gate sends the op back
+        // through the lease path (whose own deadline bounds the loop).
+        let view = h.leases.lock().unwrap().get(&part).cloned();
+        let _admitted = loop {
+            self.require_lease_for(part_hint_ino)
+                .map_err(MutateFail::Errno)?;
+            match &view {
+                Some(view) => {
+                    if let Some(admitted) = view.admit() {
+                        break Some(admitted);
+                    }
+                }
+                None => break None,
+            }
+        };
         // Plan 30 §M2 in-doubt resolution, last resort: every forward
         // attempt above ended in doubt (never an explicit refusal — that
         // returns early above), so this op might already have taken
@@ -1882,19 +1902,22 @@ impl ConstellationFs {
         force_through: bool,
         epoch_active: bool,
     ) -> Result<(), i32> {
-        let holds_lease = self.sync.as_ref().is_none_or(|handle| {
-            let part = "p0".to_string();
-            handle
-                .leases
-                .lock()
-                .unwrap()
-                .get(&part)
-                .is_some_and(|view| view.open_for_new_mutation())
-        });
+        // Plan 30 §M3b: a local commit is admitted through the lease view
+        // (counted in flight until the commit returns) so a release's final
+        // flush cannot miss it — see `lease.rs`'s module doc, "The
+        // releasing flag". The guard is dropped right after the commit:
+        // the chunk drain below can take long and must not hold a release.
+        let view = self
+            .sync
+            .as_ref()
+            .and_then(|handle| handle.leases.lock().unwrap().get("p0").cloned());
+        let admitted = view.as_ref().and_then(|view| view.admit());
+        let holds_lease = self.sync.is_none() || admitted.is_some();
         if holds_lease {
-            if let Err(error) =
-                self.commit_manifest_local(ino, &ws, base, manifest_bytes, dirty_hashes)
-            {
+            let committed =
+                self.commit_manifest_local(ino, &ws, base, manifest_bytes, dirty_hashes);
+            drop(admitted);
+            if let Err(error) = committed {
                 writes.insert(ino, ws);
                 return Err(error);
             }
@@ -2120,6 +2143,17 @@ mod quota_tests {
     use constellation_fs_core::DEFAULT_CHUNK_SIZE;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
+
+    /// Plan 30 §M3b: `publish_now` refuses while the journal is non-empty
+    /// (`SPECULATION_OUTSTANDING`) so it never publishes speculation.
+    /// This test's bare `Meta` has no shipper acking it, so simulate one
+    /// ship of everything journaled so far under `segment`, exactly as
+    /// production does when a segment lands.
+    fn ship_all(meta: &Meta, segment: u64) {
+        let rows = meta.take_journal(usize::MAX).unwrap();
+        let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+        meta.ack_journal_rows_at(&seqs, segment).unwrap();
+    }
 
     fn test_fs(meta: Arc<Meta>) -> (ConstellationFs, TempDir) {
         let dir = TempDir::new().unwrap();
@@ -2399,6 +2433,7 @@ mod quota_tests {
         let (manager, _nodes) =
             crate::snapshot::test_manager(meta.clone(), store.clone(), DEFAULT_CHUNK_SIZE);
         let snapshots = Arc::new(manager);
+        ship_all(&meta, 1);
         // Create the snapshot on a throwaway runtime so the FUSE handle's
         // runtime is idle when view_usage later block_on's tree loads.
         {

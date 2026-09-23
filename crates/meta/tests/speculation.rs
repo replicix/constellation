@@ -2,14 +2,20 @@
 //!
 //! The unit tests pin down one rule each (retirement by rid, stranding,
 //! rollback + redo with overlapping keys, hints, the takeover gate). The
-//! property test drives a requester replica through random interleavings
-//! of shadows, hints, foreign segments, retirements, strandings and
-//! takeovers, and checks that its namespace always equals a reference
-//! rebuilt from scratch: the durable log plus the speculation that
-//! survived, in the order this replica applied them.
+//! property test drives a replica through random interleavings of
+//! shadows, hints, foreign segments, retirements, strandings and
+//! takeovers — and, plan 30 §M3b, of tenures as holder: local
+//! transactions, own ships, a late segment inserted before local work,
+//! and deposition — and checks that its namespace always equals a
+//! reference rebuilt from scratch (the durable log plus the speculation
+//! that survived, in the order this replica applied them), and that its
+//! publish view is always the log prefix when only local speculation is
+//! outstanding.
 
 use constellation_fs_core::types::ROOT_INO;
-use constellation_meta::{LogRecord, Meta, MetaStore, MutateOp, Rid, TouchSet};
+use constellation_meta::{
+    execute_mutate, LogRecord, Meta, MetaStore, MutateOp, PublishBasis, Rid, TouchSet,
+};
 
 const HOLDER: u64 = 7;
 
@@ -352,6 +358,13 @@ struct View {
 impl View {
     fn apply(&mut self, rec: &LogRecord) {
         match rec {
+            // Replay semantics: a create of a name another inode already
+            // holds evicts it and wins — the log has no other rule for two
+            // creates of the same name (`same_name_conflict_converges_
+            // last_wins`), and it applies here too: a late segment ordered
+            // before local work validated without it does not make the
+            // local create's name claim void, it just means the local
+            // create is (in real log position) the later of the two.
             LogRecord::Create { name, ino, .. } => {
                 let name: &'static str =
                     NAMES.iter().copied().find(|n| *n == name.as_str()).unwrap();
@@ -412,6 +425,8 @@ fn gen_op(
 enum Event {
     Segment(Vec<LogRecord>),
     Speculation(usize, Vec<LogRecord>),
+    /// Plan 30 §M3b: a transaction this replica executed as holder.
+    Local(usize, Vec<LogRecord>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -423,11 +438,19 @@ enum Fate {
 
 struct Spec {
     epoch: u64,
-    /// `Some` for a shadow, `None` for a hint.
+    /// `Some` for a shadow or a local transaction, `None` for a hint.
     rid: Option<Rid>,
     /// Hints only.
     floor: u64,
+    /// Local transactions only: how many journal rows it wrote.
+    local_rows: Option<usize>,
     fate: Fate,
+}
+
+impl Spec {
+    fn is_local(&self) -> bool {
+        self.local_rows.is_some()
+    }
 }
 
 /// One random run. Returns a description of the failure, if any.
@@ -438,6 +461,16 @@ struct Spec {
 /// `Exists` answers (hints), tails every shipped segment immediately, and
 /// sometimes takes the lease itself (the takeover gate). A takeover by
 /// anyone strands the old holder's unshipped journal.
+///
+/// Plan 30 §M3b: while the replica under test holds the lease, its own
+/// ops and every other requester's execute *on it* (`Local` speculation,
+/// captured through `execute_mutate`), it ships prefixes of its own
+/// journal (retiring them), and before its first ship of the tenure the
+/// previous holder's leftover journal may still land as a late, unfenced
+/// segment (applied *before* the local work — the insert-before rule).
+/// Another node taking over deposes it: the new holder's first segment
+/// (an empty epoch marker, as `shipper::acquire_lease_for` ships) strands
+/// every unshipped local transaction.
 ///
 /// Segments may carry any prefix of the journal — a split can separate
 /// an op's records from its `Completed` — except while a hint is
@@ -459,138 +492,297 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
     let mut next_rid = 1u64;
     let mut t = 1i64;
     let mut trace: Vec<String> = Vec::new();
+    // Plan 30 §M3b: whether the replica under test holds the lease, and
+    // whether it has shipped anything this tenure (after that, fencing
+    // forbids a late segment of the previous epoch).
+    let mut holding = false;
+    let mut shipped_this_tenure = false;
+    let mut leftover: Vec<LogRecord> = Vec::new();
+    let mut leftover_epoch = 0u64;
 
     for _ in 0..steps {
-        match rng.below(100) {
-            // This replica forwards an op; the holder accepts it.
-            0..=29 => {
-                let (rec, op) = gen_op(&mut rng, &mut holder, &mut next_ino, &mut t);
-                let r = rid(next_rid);
-                next_rid += 1;
-                let recs = vec![rec, completed(r)];
-                journal.extend(recs.iter().cloned());
-                let installed = meta.install_shadow(r, epoch, &op, &recs).unwrap();
-                assert!(installed, "a fresh rid is never already completed");
-                events.push(Event::Speculation(specs.len(), recs));
-                specs.push(Spec {
-                    epoch,
-                    rid: Some(r),
-                    floor: 0,
-                    fate: Fate::Outstanding,
-                });
-                trace.push(format!("shadow {r:?} epoch {epoch}"));
-            }
-            // Another requester's op lands in the holder's journal.
-            30..=44 => {
-                let (rec, _) = gen_op(&mut rng, &mut holder, &mut next_ino, &mut t);
-                journal.push(rec);
-                trace.push("foreign op".into());
-            }
-            // An `Exists` answer: an entry the holder has, installed early
-            // (always below the floor: this replica has applied every
-            // shipped segment).
-            45..=54 => {
-                let pick = rng.below(NAMES.len() as u64) as usize;
-                let Some((&name, &i)) = holder.entries.iter().nth(pick) else {
-                    continue;
-                };
-                let recs = vec![create(name, i, 0)];
-                meta.install_hint(&recs, next_seq, epoch).unwrap();
-                events.push(Event::Speculation(specs.len(), recs));
-                specs.push(Spec {
-                    epoch,
-                    rid: None,
-                    floor: next_seq,
-                    fate: Fate::Outstanding,
-                });
-                trace.push(format!("hint {name} floor {next_seq} epoch {epoch}"));
-            }
-            // The holder ships (a prefix of) its journal; this replica
-            // tails it.
-            55..=79 => {
-                if journal.is_empty() {
-                    continue;
-                }
-                let hint_outstanding = specs
-                    .iter()
-                    .any(|s| s.rid.is_none() && s.fate == Fate::Outstanding);
-                let take = if hint_outstanding {
-                    journal.len()
-                } else {
-                    1 + rng.below(journal.len() as u64) as usize
-                };
-                let recs: Vec<LogRecord> = journal.drain(..take).collect();
-                let seq = next_seq;
-                next_seq += 1;
-                let completes: Vec<Rid> = recs
-                    .iter()
-                    .filter_map(|r| match r {
-                        LogRecord::Completed { rid } => Some(*rid),
-                        _ => None,
-                    })
-                    .collect();
-                // The rules the replica must follow, mirrored: strand
-                // first, then retire.
-                for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
-                    let completed_here = s.rid.is_some_and(|r| completes.contains(&r));
-                    if s.epoch < epoch && !completed_here {
-                        s.fate = Fate::Stranded;
+        let roll = rng.below(100);
+        if holding {
+            match roll {
+                // An op executes on this replica as holder: its own, or a
+                // peer's forwarded one (only the rid's node differs).
+                0..=44 => {
+                    let (_, op) = gen_op(&mut rng, &mut holder, &mut next_ino, &mut t);
+                    let r = rid(next_rid);
+                    next_rid += 1;
+                    match execute_mutate(&meta, &op, Some(r)) {
+                        Ok(recs) => {
+                            events.push(Event::Local(specs.len(), recs.clone()));
+                            specs.push(Spec {
+                                epoch,
+                                rid: Some(r),
+                                floor: 0,
+                                local_rows: Some(recs.len()),
+                                fate: Fate::Outstanding,
+                            });
+                            trace.push(format!("local {r:?} epoch {epoch}: {op:?}"));
+                        }
+                        // A late segment redone under our work can make
+                        // the generator's view stale; a refused op simply
+                        // did not happen.
+                        Err(error) => {
+                            holder = durable.clone();
+                            trace.push(format!("local op refused ({error}): {op:?}"));
+                        }
                     }
                 }
-                for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
-                    let done = match s.rid {
-                        Some(r) => completes.contains(&r),
-                        None => seq >= s.floor,
+                // This replica ships a prefix (whole transactions) of its
+                // own journal.
+                45..=74 => {
+                    let want = 1 + rng.below(4) as usize;
+                    let Some((_, batch)) = meta.take_journal_grouped(want).unwrap().pop() else {
+                        continue;
                     };
-                    if done {
+                    let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+                    let mut rows = batch.len();
+                    meta.ack_journal_rows_at(&seqs, next_seq).unwrap();
+                    for s in specs
+                        .iter_mut()
+                        .filter(|s| s.is_local() && s.fate == Fate::Outstanding)
+                    {
+                        let n = s.local_rows.unwrap();
+                        if n > rows {
+                            break;
+                        }
+                        rows -= n;
                         s.fate = Fate::Retired;
                     }
-                }
-                meta.apply_segment(seq, epoch, &recs, &TouchSet::default())
-                    .unwrap();
-                for rec in &recs {
-                    durable.apply(rec);
-                }
-                trace.push(format!(
-                    "segment {seq} epoch {epoch}: {} of {} journal records",
-                    recs.len(),
-                    recs.len() + journal.len()
-                ));
-                events.push(Event::Segment(recs));
-            }
-            // Another node takes over: the holder's unshipped journal is
-            // stranded with it.
-            80..=91 => {
-                epoch += 1;
-                journal.clear();
-                holder = durable.clone();
-                trace.push(format!("another node takes over, epoch {epoch}"));
-            }
-            // This replica takes over (the takeover gate).
-            _ => {
-                epoch += 1;
-                journal.clear();
-                holder = durable.clone();
-                for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
-                    if s.epoch < epoch {
-                        s.fate = Fate::Stranded;
+                    for (_, rec) in &batch {
+                        durable.apply(rec);
                     }
+                    trace.push(format!(
+                        "own segment {next_seq} epoch {epoch}: {} records",
+                        batch.len()
+                    ));
+                    next_seq += 1;
+                    shipped_this_tenure = true;
                 }
-                meta.strand_below_epoch(epoch).unwrap();
-                trace.push(format!("this node takes over, epoch {epoch}"));
+                // The previous holder's leftover journal lands late,
+                // before this tenure's first segment.
+                75..=84 => {
+                    if shipped_this_tenure || leftover.is_empty() {
+                        continue;
+                    }
+                    let take = 1 + rng.below(leftover.len() as u64) as usize;
+                    let recs: Vec<LogRecord> = leftover.drain(..take).collect();
+                    let applied = meta
+                        .apply_segment(next_seq, leftover_epoch, &recs, &TouchSet::default())
+                        .unwrap();
+                    if applied.stranded.any() {
+                        return Err(format!(
+                            "seed {seed}: a late lower-epoch segment stranded something\n{}",
+                            trace.join("\n")
+                        ));
+                    }
+                    for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
+                        if s.rid.is_some_and(|r| {
+                            recs.iter()
+                                .any(|rec| matches!(rec, LogRecord::Completed { rid } if *rid == r))
+                        }) && !s.is_local()
+                        {
+                            s.fate = Fate::Retired;
+                        }
+                    }
+                    // Log order: the late segment precedes every local
+                    // transaction still unshipped.
+                    let at = events
+                        .iter()
+                        .position(|e| {
+                            matches!(e, Event::Local(i, _) if specs[*i].fate == Fate::Outstanding)
+                        })
+                        .unwrap_or(events.len());
+                    for rec in &recs {
+                        durable.apply(rec);
+                    }
+                    trace.push(format!(
+                        "late segment {next_seq} epoch {leftover_epoch}: {} records (inserted \
+                         before local work: {})",
+                        recs.len(),
+                        applied.inserted_before_local
+                    ));
+                    events.insert(at, Event::Segment(recs));
+                    next_seq += 1;
+                    holder = durable.clone();
+                }
+                // Another node takes over: this replica is deposed. The new
+                // holder's first segment is its (empty) epoch marker.
+                85..=94 => {
+                    epoch += 1;
+                    holding = false;
+                    meta.set_holder_epoch(0);
+                    leftover.clear();
+                    journal.clear();
+                    for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
+                        if s.epoch < epoch {
+                            s.fate = Fate::Stranded;
+                        }
+                    }
+                    let applied = meta
+                        .apply_segment(next_seq, epoch, &[], &TouchSet::default())
+                        .unwrap();
+                    trace.push(format!(
+                        "deposed: marker segment {next_seq} epoch {epoch} stranded {} local",
+                        applied.stranded.locals
+                    ));
+                    events.push(Event::Segment(Vec::new()));
+                    next_seq += 1;
+                    holder = durable.clone();
+                }
+                _ => {}
+            }
+        } else {
+            match roll {
+                // This replica forwards an op; the holder accepts it.
+                0..=29 => {
+                    let (rec, op) = gen_op(&mut rng, &mut holder, &mut next_ino, &mut t);
+                    let r = rid(next_rid);
+                    next_rid += 1;
+                    let recs = vec![rec, completed(r)];
+                    journal.extend(recs.iter().cloned());
+                    let installed = meta.install_shadow(r, epoch, &op, &recs).unwrap();
+                    assert!(installed, "a fresh rid is never already completed");
+                    events.push(Event::Speculation(specs.len(), recs));
+                    specs.push(Spec {
+                        epoch,
+                        rid: Some(r),
+                        floor: 0,
+                        local_rows: None,
+                        fate: Fate::Outstanding,
+                    });
+                    trace.push(format!("shadow {r:?} epoch {epoch}"));
+                }
+                // Another requester's op lands in the holder's journal.
+                30..=44 => {
+                    let (rec, _) = gen_op(&mut rng, &mut holder, &mut next_ino, &mut t);
+                    journal.push(rec);
+                    trace.push("foreign op".into());
+                }
+                // An `Exists` answer: an entry the holder has, installed early
+                // (always below the floor: this replica has applied every
+                // shipped segment).
+                45..=54 => {
+                    let pick = rng.below(NAMES.len() as u64) as usize;
+                    let Some((&name, &i)) = holder.entries.iter().nth(pick) else {
+                        continue;
+                    };
+                    let recs = vec![create(name, i, 0)];
+                    meta.install_hint(&recs, next_seq, epoch).unwrap();
+                    events.push(Event::Speculation(specs.len(), recs));
+                    specs.push(Spec {
+                        epoch,
+                        rid: None,
+                        floor: next_seq,
+                        local_rows: None,
+                        fate: Fate::Outstanding,
+                    });
+                    trace.push(format!("hint {name} floor {next_seq} epoch {epoch}"));
+                }
+                // The holder ships (a prefix of) its journal; this replica
+                // tails it.
+                55..=79 => {
+                    if journal.is_empty() {
+                        continue;
+                    }
+                    let hint_outstanding = specs
+                        .iter()
+                        .any(|s| s.rid.is_none() && s.fate == Fate::Outstanding);
+                    let take = if hint_outstanding {
+                        journal.len()
+                    } else {
+                        1 + rng.below(journal.len() as u64) as usize
+                    };
+                    let recs: Vec<LogRecord> = journal.drain(..take).collect();
+                    let seq = next_seq;
+                    next_seq += 1;
+                    let completes: Vec<Rid> = recs
+                        .iter()
+                        .filter_map(|r| match r {
+                            LogRecord::Completed { rid } => Some(*rid),
+                            _ => None,
+                        })
+                        .collect();
+                    // The rules the replica must follow, mirrored: strand
+                    // first, then retire.
+                    for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
+                        let completed_here = s.rid.is_some_and(|r| completes.contains(&r));
+                        if s.epoch < epoch && !completed_here {
+                            s.fate = Fate::Stranded;
+                        }
+                    }
+                    for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
+                        let done = match s.rid {
+                            Some(r) => completes.contains(&r),
+                            None => seq >= s.floor,
+                        };
+                        if done {
+                            s.fate = Fate::Retired;
+                        }
+                    }
+                    meta.apply_segment(seq, epoch, &recs, &TouchSet::default())
+                        .unwrap();
+                    for rec in &recs {
+                        durable.apply(rec);
+                    }
+                    trace.push(format!(
+                        "segment {seq} epoch {epoch}: {} of {} journal records",
+                        recs.len(),
+                        recs.len() + journal.len()
+                    ));
+                    events.push(Event::Segment(recs));
+                }
+                // Another node takes over: the holder's unshipped journal is
+                // stranded with it.
+                80..=91 => {
+                    epoch += 1;
+                    journal.clear();
+                    holder = durable.clone();
+                    trace.push(format!("another node takes over, epoch {epoch}"));
+                }
+                // This replica takes over (the takeover gate), and holds.
+                _ => {
+                    leftover_epoch = epoch;
+                    leftover = std::mem::take(&mut journal);
+                    epoch += 1;
+                    holder = durable.clone();
+                    for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
+                        if s.epoch < epoch {
+                            s.fate = Fate::Stranded;
+                        }
+                    }
+                    meta.set_holder_epoch(epoch);
+                    meta.strand_below_epoch(epoch).unwrap();
+                    holding = true;
+                    shipped_this_tenure = false;
+                    trace.push(format!("this node takes over, epoch {epoch}"));
+                }
             }
         }
 
-        let outstanding = specs.iter().filter(|s| s.fate == Fate::Outstanding).count() as u64;
-        let stranded_shadows = specs
+        let outstanding = specs
+            .iter()
+            .filter(|s| !s.is_local() && s.fate == Fate::Outstanding)
+            .count() as u64;
+        let local = specs
+            .iter()
+            .filter(|s| s.is_local() && s.fate == Fate::Outstanding)
+            .count() as u64;
+        let queued = specs
             .iter()
             .filter(|s| s.fate == Fate::Stranded && s.rid.is_some())
             .count() as u64;
         let counts = meta.speculation_counts().unwrap();
-        if counts.outstanding != outstanding || counts.pending_replay != stranded_shadows {
+        if counts.outstanding != outstanding
+            || counts.pending_replay != queued
+            || counts.local != local
+        {
             return Err(format!(
                 "seed {seed}: counts {counts:?}, expected outstanding {outstanding}, \
-                 queued {stranded_shadows}\n{}",
+                 local {local}, queued {queued}\n{}",
                 trace.join("\n")
             ));
         }
@@ -600,18 +792,54 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                 trace.join("\n")
             ));
         }
+        // Plan 30 §M3b: whenever only local speculation is outstanding,
+        // the publish view is exactly the log prefix — the durable events
+        // alone.
+        if outstanding == 0 {
+            let basis = meta
+                .read_consistent(|snap| meta.publish_basis_at(snap))
+                .unwrap();
+            let published = match &basis {
+                PublishBasis::Defer => {
+                    return Err(format!(
+                        "seed {seed}: a publish deferred with only local speculation\n{}",
+                        trace.join("\n")
+                    ))
+                }
+                other => published_names(&meta, other),
+            };
+            let expected: std::collections::BTreeMap<String, u64> = durable
+                .entries
+                .iter()
+                .map(|(n, i)| (n.to_string(), *i))
+                .collect();
+            if published != expected {
+                return Err(format!(
+                    "seed {seed}: publish view {published:?} is not the log prefix \
+                     {expected:?}\n{}",
+                    trace.join("\n")
+                ));
+            }
+        }
     }
 
     // The reference: the durable log plus the speculation that survived,
-    // in the order this replica applied them. Retired speculation is left
-    // out — the segment that retired it carries the same records — and so
-    // is stranded speculation.
+    // in the order this replica applied them (a late segment already moved
+    // before the local work it was inserted under). Retired requester
+    // speculation is left out — the segment that retired it carries the
+    // same records — and so is stranded speculation. A local transaction
+    // stays unless stranded: shipping it made it durable in place.
     let reference = Meta::open_in_memory().unwrap();
     for event in &events {
         match event {
             Event::Segment(recs) => reference.apply_records(recs).unwrap(),
             Event::Speculation(i, recs) => {
                 if specs[*i].fate == Fate::Outstanding {
+                    reference.apply_records(recs).unwrap();
+                }
+            }
+            Event::Local(i, recs) => {
+                if specs[*i].fate != Fate::Stranded {
                     reference.apply_records(recs).unwrap();
                 }
             }
@@ -627,6 +855,28 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The root directory's entries as a publish through `basis` would show
+/// them, name -> ino.
+fn published_names(meta: &Meta, basis: &PublishBasis) -> std::collections::BTreeMap<String, u64> {
+    let mut out = std::collections::BTreeMap::new();
+    for name in NAMES {
+        let key = constellation_mtree::keys::dentry(ROOT_INO, name.as_bytes());
+        let value = match basis {
+            PublishBasis::Substituted(view) => meta
+                .read_consistent(|snap| meta.ns_get_via_at(snap, view, &key))
+                .unwrap(),
+            _ => meta
+                .read_consistent(|snap| meta.ns_get_at(snap, &key))
+                .unwrap(),
+        };
+        if let Some(bytes) = value {
+            let (ino, _) = constellation_mtree::record::DentryRecord::ino_and_kind(&bytes).unwrap();
+            out.insert(name.to_string(), ino);
+        }
+    }
+    out
 }
 
 #[test]

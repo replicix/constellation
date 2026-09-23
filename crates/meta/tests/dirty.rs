@@ -234,10 +234,10 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
         meta.apply_records(&records).unwrap();
     });
 
-    step!(meta, "commit_reintegration_batch", {
+    step!(meta, "replace_ns_from_rebuilt", {
         let side = Meta::open_in_memory().unwrap();
         side.mkdir(ROOT_INO, "reconciled", 0o755, 0, 0).unwrap();
-        meta.commit_reintegration_batch(&side, &[], &[]).unwrap();
+        meta.replace_ns_from_rebuilt(&side).unwrap();
     });
 }
 

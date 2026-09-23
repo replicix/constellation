@@ -267,10 +267,13 @@ each handover and both nodes report zero conflicts) and `lease-fencing`
 (A holds the lease with unshipped records and is frozen with
 `SIGSTOP`; after the TTL expires B takes over — legally, only after
 tailing everything A had flushed — and writes; A is then resumed with
-`SIGCONT` and must discover via a failed renew CAS that it was
-deposed, report `lost` over the control API, keep its stranded journal
-rather than shipping or discarding it, and refuse further mutations;
-a third, fresh node bootstrapping from the shared log alone must see
+`SIGCONT` and must discover that it was deposed (a failed renew CAS, or
+B's epoch marker), never ship under its old epoch, and — plan 30 M3b —
+recover by itself: its stranded `mkdir` is rolled back and replayed by
+rid through B exactly once with no conflict copy (`speculation.
+depositions`/`local_rolled_back` rise, `lost` clears, the journal and
+replay queue drain), after which A writes through B like any node; a
+third, fresh node bootstrapping from the shared log alone must see
 exactly B's namespace). `Client::pause()`/`resume()` wrap
 `SIGSTOP`/`SIGCONT`; querying the control socket is done *before*
 pausing, since a stopped daemon cannot answer it.
@@ -285,17 +288,24 @@ stranded-branch recovery:
 - `epoch-member-lost` stops one promised member with `SIGSTOP`; the
   survivor must freeze and return `EROFS`, then resume cleanly when the
   member returns and converge after S3 heals.
-- `deposed-reintegration` creates both a clean stranded file and an
-  edit-vs-edit conflict on a deposed holder. On-demand reintegration must
-  retain B's winner, publish A's clean file, and materialize A's exact
-  bytes as `shared/.constellation-conflict/same@<node>-<ts>` on both
-  mounts. The scenario verifies state transitions rather than sleeping
-  across a race: B must hold an epoch newer than A's, resumed A must
-  report `lost`, and B must then idle-release before A reintegrates.
-  A focused shipper test also sets the durable `lease_lost` bit with no
-  in-memory keeper and proves ordinary sync cannot create one or ship
-  the stranded journal; the explicit reintegration sync path is the
-  only bypass.
+- `deposed-reintegration` (rewritten for plan 30 M3b) strands three
+  edits on holder A while its S3 path is cut: a new file
+  (`clean-from-a`), an overwrite of a baseline file B never touches
+  (`a-only`), and an overwrite of `same`, which B then overwrites too
+  after taking the expired lease. Recovery is automatic — no
+  `reintegrate` call: resumed A learns it was deposed (its renewal finds
+  B's lease, or it tails B's epoch marker), rolls its unshipped journal
+  back from before-images, and its replay drain re-executes each
+  transaction by rid through B. On both mounts `same` keeps B's winner,
+  `clean-from-a` and `a-only` carry A's content, and
+  `shared/.constellation-conflict` holds exactly one entry,
+  `same@<node>-<ts>`, with A's losing bytes: a conflict copy only for the
+  genuine overlap. Non-vacuity on A: `speculation.local > 0` before the
+  pause (holder capture), then `depositions >= 1`,
+  `local_rolled_back >= 1`, `replay_conflicts >= 1` (mirrored in
+  `reintegration.conflicts_materialized`), `lease.lost == false`, and an
+  empty replay queue. `lost` is never polled for `true`: the recovery
+  clears it within one sync round.
 
 Phase-4c scenarios prove permanent leave (and that unmount alone is
 not leave):
@@ -743,6 +753,50 @@ Bug B scenarios (plan 30 M3a regression tests, in `SCENARIOS`):
   anything, so C's `create_new("phantom")` must fail with `EEXIST` (the
   create B's application was told succeeded is durable), and B, C and a
   fresh D agree the name exists, as one inode.
+
+Plan 30 M3b scenarios (in `SCENARIOS`; `deposed-reintegration` above
+was rewritten for the same milestone):
+
+- **`takeover-marker-strands-promptly`** (the epoch marker). The bug-B
+  rig again, with C as the requester: C's forwarded
+  `create_new("phantom")` is acked by A from memory (A's S3 cut) and A is
+  killed. B then takes the expired lease through an op that is
+  *refused* — `rmdir` of a non-empty directory, `ENOTEMPTY` — so B's own
+  op ships nothing. (`mkdir` of an existing name is not used: the kernel
+  can answer `EEXIST` from its dentry cache without calling the daemon,
+  so it might never take the lease.) Within 5 s of B's `rmdir`
+  returning, C's `speculation.rolled_back` must rise; only B's epoch
+  marker can cause that. B's `speculation.epoch_markers >= 1`, and the
+  first log segment at an epoch newer than A's, read straight from the
+  bucket (`segment_header` decodes the envelope's `node`/`epoch`/record
+  count without the record types), must be B's, at B's epoch, with zero
+  records. The stranded create then replays by rid through B exactly
+  once: B, C and a fresh D (after C's clean unmount publishes) see
+  `phantom` as one inode, with no replay conflict. All three nodes run
+  with `CONSTELLATION_SYNC_IDLE_MAX_MS=1000`, so the 5 s bound does not
+  depend on the P2P push alone.
+- **`holder-publishes-log-prefix`** (holder publish). Holder A runs a
+  paced `mkdir` burst (~200/s, metadata only: no close nudges, no chunk
+  uploads) with `CONSTELLATION_SYNC_INTERVAL_MS=50` under 25 ms of
+  toxiproxy latency each way, so every ship round leaves fresh
+  transactions journaled behind it and the 32-segment publish cadence
+  fires every few seconds mid-burst. `CONSTELLATION_PUBLISH_IDLE_S` is
+  not set: the idle publish only runs on a round whose journal is
+  empty. Non-vacuity: a status sample (every 100 ms) must see a new
+  A-authored head commit (read from `commits/` directly, bypassing the
+  proxy) while A's `speculation.local > 0`. A is then SIGKILLed the
+  moment its next commit is visible in the bucket, before its round can
+  ship what was journaled meanwhile. B has tailed the log since the
+  start; a fresh D bootstraps from the head commit plus the log after it.
+  Once both have applied through the log head, B and D must list exactly
+  the same `burst/` entries, those must be a contiguous prefix of A's
+  mkdir sequence, and A must have acknowledged more mkdirs than that
+  (the kill caught an unshipped tail, which neither node shows). The
+  head commit's `applied` must not exceed the log head. The harness
+  cannot decode log records, so "commit == log prefix at `applied`" is
+  not checked in isolation; D == B is the observable form of it (a
+  commit that carried the dead holder's unshipped work would show up on
+  D only).
 
 All of them poll the control API and the mounted namespace with
 `eventually` rather than sleeping and hoping.

@@ -33,6 +33,33 @@ pub enum NsOp {
     Unlink(Name),
 }
 
+impl NsOp {
+    /// The one name this op (or the record it produces) touches. Every
+    /// modeled op touches exactly one name, which is what lets plan 30
+    /// §M3b's per-entry before-image be a single bit (see
+    /// `protocol::JournalEntry::before`).
+    pub fn name(self) -> Name {
+        match self {
+            NsOp::CreateExcl(n) | NsOp::Unlink(n) => n,
+        }
+    }
+}
+
+/// Whether `name` is present in `dir`.
+pub fn present(dir: DirState, name: Name) -> bool {
+    dir & (1 << name) != 0
+}
+
+/// `dir` with `name`'s presence set to `on`: restoring a captured
+/// before-image (plan 30 §M3b's before-image substitution).
+pub fn with_presence(dir: DirState, name: Name, on: bool) -> DirState {
+    if on {
+        dir | (1 << name)
+    } else {
+        dir & !(1 << name)
+    }
+}
+
 /// The POSIX errnos this model cares about, matching
 /// `crates/cli/src/forward.rs::meta_errno`'s `Exists`/`NoEnt` arms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

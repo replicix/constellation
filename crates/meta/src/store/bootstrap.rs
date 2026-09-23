@@ -1,7 +1,7 @@
 //! Plan 29 M2's ingestion-based bootstrap-from-commit loader
 //! (`ns_ingest_page`, `put_local_blob`, `apply_bootstrap_indexes`,
-//! `clear_all_dirty`) and reintegration's atomic namespace swap
-//! (`commit_reintegration_batch`).
+//! `clear_all_dirty`) and the fallback deposition's atomic namespace
+//! swap (`replace_ns_from_rebuilt`, plan 30 §M3b).
 //!
 //! Bootstrap no longer reconstructs `TreeInode` rows and re-derives
 //! `0x01`/`0x02` records through the ordinary write path: since M1,
@@ -21,8 +21,7 @@
 //! alone, not a rebuild.
 
 use crate::error::MetaError;
-use crate::record::LogRecord;
-use crate::store::{journal, misc, ns, Meta, KV_APPLIED_SEQ, KV_USAGE_BYTES, KV_USAGE_FILES};
+use crate::store::{misc, ns, Meta, KV_APPLIED_SEQ, KV_USAGE_BYTES, KV_USAGE_FILES};
 use constellation_fs_core::{ChunkHash, Ino};
 use constellation_mtree::keys;
 use constellation_mtree::record::{self, Attrs, BlobHash, InodeRecord, Kind, XattrPlacement};
@@ -282,37 +281,30 @@ impl Meta {
         Ok(())
     }
 
-    /// The crash-safety boundary for reintegration: after commit the
-    /// namespace and disposition ledger cannot disagree.
+    /// Plan 30 §M3b's fallback deposition (holder capture off): replace
+    /// this replica's namespace wholesale with `side`'s — a replica
+    /// bootstrapped from the shared log, i.e. exactly the log-prefix state
+    /// — and queue every outstanding shadow and every one of this node's
+    /// unshipped transactions for replay by rid, in one transaction.
     ///
-    /// Re-expressed from the old engine's `ATTACH DATABASE` + `INSERT
-    /// ... SELECT` (fjall has no cross-database transaction — the
-    /// reconciled state instead arrives as an already-open side `Meta`,
-    /// typically bootstrapped into its own directory/tempdir from the
-    /// shared log). One `write_tx` on `self`: wipe and bulk-copy `ns`
-    /// and `orphans` from a snapshot of `side`, rebuild the derived
-    /// `chunk_ref`/`xattr_by_name` indexes from the new `ns` (the old
-    /// engine's "namespace replaced wholesale, so every reverse-index
-    /// row is stale" reasoning still holds), adopt only `side`'s
-    /// `applied_seq`, then mark every reconciled journal row's
-    /// disposition and delete it, and journal the reconciliation's own
-    /// `output` records — all inside the one transaction, so the
-    /// namespace/disposition/journal surgery is one atomic unit exactly
-    /// as it was under SQLite.
-    pub fn commit_reintegration_batch(
-        &self,
-        side: &Meta,
-        dispositions: &[(u64, String, String)],
-        output: &[LogRecord],
-    ) -> Result<(), MetaError> {
+    /// Without before-images there is nothing to roll the deposed journal
+    /// back with, so this is the only way to a log-prefix replica; the
+    /// replays then re-execute the journal through the new holder exactly
+    /// as the capture path would (`store::spec::reset_for_rebuilt_ns_tx`).
+    /// Re-expressed from the old reintegration swap (fjall has no
+    /// cross-database transaction; the rebuilt state arrives as an
+    /// already-open side `Meta`): wipe and bulk-copy `ns`, `orphans` and
+    /// `atime` from a snapshot of `side`, copy its local blobs, rebuild the
+    /// derived `chunk_ref`/`xattr_by_name` indexes and the usage counters
+    /// from the new `ns`, and adopt `side`'s `applied_seq`.
+    pub fn replace_ns_from_rebuilt(&self, side: &Meta) -> Result<(), MetaError> {
         let side_snap = side.db.read_tx();
         let mut tx = self.db.write_tx();
-        // Reintegration replaces the whole namespace, so every key that
-        // was live before or is live after has to be treated as changed
-        // for the next publish's sake: dirty each existing key while
-        // clearing it, then dirty each key the copy-in inserts. A key
-        // the reconciliation left unchanged is simply dirtied twice,
-        // which costs an extra harmless entry, not correctness.
+        // The namespace is replaced wholesale, so every key that was live
+        // before or is live after has to be treated as changed for the
+        // next publish's sake: dirty each existing key while clearing it,
+        // then dirty each key the copy-in inserts. A key left unchanged is
+        // simply dirtied twice, which costs an extra harmless entry.
         let old_ns_keys: Vec<Vec<u8>> = tx
             .iter(&self.ns)
             .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
@@ -322,8 +314,16 @@ impl Meta {
         }
         clear_tx(&mut tx, &self.orphans)?;
         clear_tx(&mut tx, &self.atime)?;
+        let (mut usage_bytes, mut usage_files) = (0i64, 0i64);
         for guard in side_snap.iter(&side.ns) {
             let (k, v) = guard.into_inner()?;
+            if let Ok(keys::Key::Inode { .. }) = keys::Key::parse(&k) {
+                let rec = InodeRecord::decode(&v)?;
+                if rec.attrs.kind == Kind::File {
+                    usage_bytes += rec.attrs.size as i64;
+                    usage_files += 1;
+                }
+            }
             ns::ns_insert(
                 &mut tx,
                 &self.ns,
@@ -343,9 +343,7 @@ impl Meta {
         // `side`'s `ns` may reference `Payload::Spilled` bodies that only
         // exist in `side.blobs`; without this, resolving them against
         // `self.blobs` after the swap would silently come back empty.
-        // Content-addressed, so a plain union copy is safe — any body
-        // this replica no longer references becomes an ordinary orphan
-        // (no local blob GC yet, same as everywhere else in M1).
+        // Content-addressed, so a plain union copy is safe.
         for guard in side_snap.iter(&side.blobs) {
             let (k, v) = guard.into_inner()?;
             tx.insert(&self.blobs, k.to_vec(), v.to_vec());
@@ -358,31 +356,23 @@ impl Meta {
             &self.chunk_ref_by_ino,
             &self.xattr_by_name,
         )?;
-        // Plan 30 §M3a: the speculation log's before-images describe the
-        // namespace just replaced; queue its outstanding shadows for
-        // replay and drop the rest.
         crate::store::spec::reset_for_rebuilt_ns_tx(&mut tx, self)?;
         if let Some(v) = side_snap.get(&side.local, KV_APPLIED_SEQ.as_bytes())? {
             tx.insert(&self.local, KV_APPLIED_SEQ.as_bytes().to_vec(), v.to_vec());
         }
-        for (seq, disposition, detail) in dispositions {
-            journal::mark_disposition_tx(&mut tx, &self.reintegration, *seq, disposition, detail)?;
-            tx.remove(&self.journal_ks, seq.to_be_bytes().to_vec());
-        }
-        for record in output {
-            // `output` is already-decided reintegration merge output
-            // (verbatim stranded records, possibly including a
-            // `Completed` row from the branch's own original execution)
-            // — never a fresh op, so nothing is pending here.
-            journal::append_tx(
-                &mut tx,
-                &self.journal_ks,
-                &self.local,
-                &self.completed,
-                record,
-            )?;
-        }
+        tx.insert(
+            &self.local,
+            KV_USAGE_BYTES.as_bytes().to_vec(),
+            usage_bytes.to_string().into_bytes(),
+        );
+        tx.insert(
+            &self.local,
+            KV_USAGE_FILES.as_bytes().to_vec(),
+            usage_files.to_string().into_bytes(),
+        );
         tx.commit()?;
+        self.usage_tracker()
+            .reseat(usage_bytes.max(0) as u64, usage_files.max(0) as u64);
         Ok(())
     }
 }

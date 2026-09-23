@@ -170,6 +170,26 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.speculation.replay_conflicts
     );
     gauge!(
+        "constellation_speculation_local",
+        "This node's own unshipped transactions captured as speculation.",
+        status.speculation.local
+    );
+    gauge!(
+        "constellation_speculation_local_rolled_back_total",
+        "This node's own unshipped transactions rolled back after a deposition.",
+        status.speculation.local_rolled_back
+    );
+    gauge!(
+        "constellation_speculation_depositions_total",
+        "Deposition recoveries run.",
+        status.speculation.depositions
+    );
+    gauge!(
+        "constellation_speculation_epoch_markers_total",
+        "Epoch-marker segments shipped after a takeover.",
+        status.speculation.epoch_markers
+    );
+    gauge!(
         "constellation_cache_used_bytes",
         "Bytes resident in the local chunk cache.",
         status.cache.used_bytes

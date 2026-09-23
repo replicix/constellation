@@ -73,12 +73,19 @@ impl Meta {
         crate::store::journal::peek_after(&r, &self.journal_ks, after_seq)
     }
 
+    /// The journal rows `journal_seqs` shipped in the segment at
+    /// `applied_seq`: delete them, advance `applied_seq`, and retire the
+    /// transactions they complete (plan 30 §M3b: their `journal_tx` rows,
+    /// and their `Local` speculation — see `spec::retire_local_tx`).
     pub fn ack_journal_rows_at(
         &self,
         journal_seqs: &[u64],
         applied_seq: u64,
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        if let Some(&upto) = journal_seqs.iter().max() {
+            crate::store::spec::retire_local_tx(&mut tx, self, upto, applied_seq)?;
+        }
         crate::store::journal::ack_rows_at(
             &mut tx,
             &self.journal_ks,
@@ -94,11 +101,15 @@ impl Meta {
     /// implicit partition (`"p0"`) and this degenerates to `[("p0",
     /// batch)]` (or `[]` if the journal is empty) — kept for shipper
     /// call-site compatibility.
+    ///
+    /// Plan 30 §M3b: the batch always ends on a transaction boundary (it
+    /// may run past `max_per_part` to reach one), so a caller shipping it
+    /// whole never splits an op's records from its `Completed { rid }`.
     pub fn take_journal_grouped(
         &self,
         max_per_part: usize,
     ) -> Result<Vec<(String, crate::store::JournalBatch)>, MetaError> {
-        let batch = MetaStore::take_journal(self, max_per_part)?;
+        let batch = self.take_journal_whole_txs(max_per_part)?;
         if batch.is_empty() {
             Ok(Vec::new())
         } else {
@@ -118,6 +129,8 @@ impl Meta {
         gid: u32,
     ) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let t = now_ns();
         let attrs = Attrs {
             kind: Kind::Dir,
@@ -133,7 +146,7 @@ impl Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.atime,
             &self.blobs,
             parent,
@@ -158,6 +171,7 @@ impl Meta {
                 time_ns: t,
             },
         )?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         Ok(ns::attrs_to_fileattr(ino, &attrs, t))
     }
@@ -172,6 +186,8 @@ impl Meta {
         gid: u32,
     ) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let t = now_ns();
         let attrs = Attrs {
             kind: Kind::File,
@@ -187,7 +203,7 @@ impl Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.atime,
             &self.blobs,
             parent,
@@ -213,6 +229,7 @@ impl Meta {
             },
         )?;
         crate::store::adjust_usage_tx(&mut tx, &self.local, 0, 1)?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         self.usage_tracker().adjust(0, 1);
         Ok(ns::attrs_to_fileattr(ino, &attrs, t))
@@ -228,6 +245,8 @@ impl Meta {
         gid: u32,
     ) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let t = now_ns();
         let attrs = Attrs {
             kind: Kind::Symlink,
@@ -243,7 +262,7 @@ impl Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.atime,
             &self.blobs,
             parent,
@@ -268,6 +287,7 @@ impl Meta {
                 time_ns: t,
             },
         )?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         Ok(ns::attrs_to_fileattr(ino, &attrs, t))
     }
@@ -288,6 +308,8 @@ impl Meta {
             return Err(MetaError::Invalid("mknod kind".into()));
         }
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let t = now_ns();
         let attrs = Attrs {
             kind: ns::kind_to_mtree(kind),
@@ -303,7 +325,7 @@ impl Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.atime,
             &self.blobs,
             parent,
@@ -330,6 +352,7 @@ impl Meta {
                 time_ns: t,
             },
         )?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         Ok(ns::attrs_to_fileattr(ino, &attrs, t))
     }
@@ -422,10 +445,12 @@ impl Meta {
         dirty_hashes: &[constellation_fs_core::ChunkHash],
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let delta = Self::set_manifest_tx(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.blobs,
             &self.chunk_ref,
             &self.chunk_ref_by_ino,
@@ -443,6 +468,7 @@ impl Meta {
             tx.insert(&self.pending_upload, k, Vec::new());
         }
         crate::store::adjust_usage_tx(&mut tx, &self.local, delta, 0)?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         self.usage_tracker().adjust(delta, 0);
         Ok(())
@@ -456,10 +482,12 @@ impl Meta {
         size: u64,
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let delta = Self::set_manifest_tx(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.blobs,
             &self.chunk_ref,
             &self.chunk_ref_by_ino,
@@ -472,6 +500,7 @@ impl Meta {
             size,
         )?;
         crate::store::adjust_usage_tx(&mut tx, &self.local, delta, 0)?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         self.usage_tracker().adjust(delta, 0);
         Ok(())
@@ -494,6 +523,8 @@ impl Meta {
         xattrs: &[(String, Vec<u8>)],
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         ns::require_dir(&tx, &self.ns, parent)?;
         let mut delta_bytes: i64 = 0;
         let mut delta_files: i64 = 0;
@@ -513,16 +544,9 @@ impl Meta {
                 return Ok(());
             }
             let t = now_ns();
-            ns::remove_dentry(
-                &mut tx,
-                &self.ns,
-                self.dirty_for_ns(),
-                parent,
-                name,
-                old.ino,
-            )?;
+            ns::remove_dentry(&mut tx, &self.ns, dirty, parent, name, old.ino)?;
             if old_rec.attrs.nlink <= 1 {
-                ns::clear_spilled_xattrs(&mut tx, &self.ns, self.dirty_for_ns(), old.ino)?;
+                ns::clear_spilled_xattrs(&mut tx, &self.ns, dirty, old.ino)?;
                 let names: Vec<Vec<u8>> =
                     ns::all_xattrs(&tx, &self.ns, &self.blobs, &old_rec, old.ino)?
                         .into_iter()
@@ -546,13 +570,13 @@ impl Meta {
                     old.ino.to_be_bytes().to_vec(),
                     orphan_rec.encode(),
                 );
-                ns::ns_remove(&mut tx, &self.ns, self.dirty_for_ns(), keys::inode(old.ino))?;
+                ns::ns_remove(&mut tx, &self.ns, dirty, keys::inode(old.ino))?;
                 if old_rec.attrs.kind == Kind::File {
                     delta_bytes -= old_rec.attrs.size as i64;
                     delta_files -= 1;
                 }
             } else {
-                misc::bump_nlink_tx(&mut tx, &self.ns, self.dirty_for_ns(), old.ino, -1, t)?;
+                misc::bump_nlink_tx(&mut tx, &self.ns, dirty, old.ino, -1, t)?;
             }
             journal::append_tx(
                 &mut tx,
@@ -581,16 +605,8 @@ impl Meta {
             ctime_ns,
             rdev: 0,
         };
-        ns::put_dentry(
-            &mut tx,
-            &self.ns,
-            self.dirty_for_ns(),
-            parent,
-            name,
-            ino,
-            attrs,
-        )?;
-        misc::touch_times_tx(&mut tx, &self.ns, self.dirty_for_ns(), parent, ctime_ns)?;
+        ns::put_dentry(&mut tx, &self.ns, dirty, parent, name, ino, attrs)?;
+        misc::touch_times_tx(&mut tx, &self.ns, dirty, parent, ctime_ns)?;
         atime::set_atime_tx(&mut tx, &self.atime, ino, mtime_ns);
         let xattr_pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
             .iter()
@@ -599,7 +615,7 @@ impl Meta {
         ns::put_inode(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.blobs,
             ino,
             attrs,
@@ -661,6 +677,7 @@ impl Meta {
         delta_bytes += size as i64;
         delta_files += 1;
         crate::store::adjust_usage_tx(&mut tx, &self.local, delta_bytes, delta_files)?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         self.usage_tracker().adjust(delta_bytes, delta_files);
         Ok(())
@@ -920,6 +937,8 @@ impl MetaStore for Meta {
         gid: u32,
     ) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, parent)?;
         let t = now_ns();
         let attrs = Attrs {
@@ -936,7 +955,7 @@ impl MetaStore for Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.atime,
             &self.blobs,
             parent,
@@ -961,6 +980,7 @@ impl MetaStore for Meta {
                 time_ns: t,
             },
         )?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         Ok(ns::attrs_to_fileattr(ino, &attrs, t))
     }
@@ -974,6 +994,8 @@ impl MetaStore for Meta {
         gid: u32,
     ) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, parent)?;
         let t = now_ns();
         let attrs = Attrs {
@@ -990,7 +1012,7 @@ impl MetaStore for Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.atime,
             &self.blobs,
             parent,
@@ -1016,6 +1038,7 @@ impl MetaStore for Meta {
             },
         )?;
         crate::store::adjust_usage_tx(&mut tx, &self.local, 0, 1)?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         self.usage_tracker().adjust(0, 1);
         Ok(ns::attrs_to_fileattr(ino, &attrs, t))
@@ -1030,6 +1053,8 @@ impl MetaStore for Meta {
         gid: u32,
     ) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, parent)?;
         let t = now_ns();
         let attrs = Attrs {
@@ -1046,7 +1071,7 @@ impl MetaStore for Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.atime,
             &self.blobs,
             parent,
@@ -1071,6 +1096,7 @@ impl MetaStore for Meta {
                 time_ns: t,
             },
         )?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         Ok(ns::attrs_to_fileattr(ino, &attrs, t))
     }
@@ -1089,6 +1115,8 @@ impl MetaStore for Meta {
             return Err(MetaError::Invalid("mknod kind".into()));
         }
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let ino = alloc_ino_tx(&mut tx, &self.local, &self.ino_alloc, parent)?;
         let t = now_ns();
         let attrs = Attrs {
@@ -1105,7 +1133,7 @@ impl MetaStore for Meta {
         insert_new_node(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.atime,
             &self.blobs,
             parent,
@@ -1132,12 +1160,15 @@ impl MetaStore for Meta {
                 time_ns: t,
             },
         )?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         Ok(ns::attrs_to_fileattr(ino, &attrs, t))
     }
 
     fn link(&self, ino: Ino, parent: Ino, name: &str) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         ns::require_dir(&tx, &self.ns, parent)?;
         let Some(rec) = ns::get_inode_record(&tx, &self.ns, ino)? else {
             return Err(MetaError::NoEnt(ino));
@@ -1147,18 +1178,10 @@ impl MetaStore for Meta {
         }
         let t = now_ns();
         let at = atime::get_atime(&tx, &self.atime, ino)?;
-        let rec2 = misc::bump_nlink_tx(&mut tx, &self.ns, self.dirty_for_ns(), ino, 1, t)?
-            .expect("checked above");
-        ns::put_dentry(
-            &mut tx,
-            &self.ns,
-            self.dirty_for_ns(),
-            parent,
-            name,
-            ino,
-            rec2.attrs,
-        )?;
-        misc::touch_times_tx(&mut tx, &self.ns, self.dirty_for_ns(), parent, t)?;
+        let rec2 =
+            misc::bump_nlink_tx(&mut tx, &self.ns, dirty, ino, 1, t)?.expect("checked above");
+        ns::put_dentry(&mut tx, &self.ns, dirty, parent, name, ino, rec2.attrs)?;
+        misc::touch_times_tx(&mut tx, &self.ns, dirty, parent, t)?;
         journal::append_tx(
             &mut tx,
             &self.journal_ks,
@@ -1171,18 +1194,22 @@ impl MetaStore for Meta {
                 time_ns: t,
             },
         )?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         Ok(ns::attrs_to_fileattr(ino, &rec2.attrs, at))
     }
 
     fn unlink(&self, parent: Ino, name: &str) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let Some(d) = ns::get_dentry_record(&tx, &self.ns, parent, name)? else {
             return Err(MetaError::NoEntry);
         };
         let ino = d.ino;
         let Some(rec) = ns::get_inode_record(&tx, &self.ns, ino)? else {
-            ns::remove_dentry(&mut tx, &self.ns, self.dirty_for_ns(), parent, name, ino)?;
+            ns::remove_dentry(&mut tx, &self.ns, dirty, parent, name, ino)?;
+            self.finish_local(&mut tx, local)?;
             tx.commit()?;
             return Ok(());
         };
@@ -1190,7 +1217,7 @@ impl MetaStore for Meta {
             return Err(MetaError::IsDir);
         }
         let t = now_ns();
-        ns::remove_dentry(&mut tx, &self.ns, self.dirty_for_ns(), parent, name, ino)?;
+        ns::remove_dentry(&mut tx, &self.ns, dirty, parent, name, ino)?;
         let mut usage_delta = (0i64, 0i64);
         if rec.attrs.nlink <= 1 {
             let manifest_bytes = rec
@@ -1202,7 +1229,7 @@ impl MetaStore for Meta {
                 .into_iter()
                 .map(|(n, _)| n.into_bytes())
                 .collect();
-            ns::clear_spilled_xattrs(&mut tx, &self.ns, self.dirty_for_ns(), ino)?;
+            ns::clear_spilled_xattrs(&mut tx, &self.ns, dirty, ino)?;
             misc::xattr_by_name_del_all_tx(&mut tx, &self.xattr_by_name, ino, names);
             misc::track_manifest_transition_tx(
                 &mut tx,
@@ -1221,14 +1248,14 @@ impl MetaStore for Meta {
                 ino.to_be_bytes().to_vec(),
                 orphan_rec.encode(),
             );
-            ns::ns_remove(&mut tx, &self.ns, self.dirty_for_ns(), keys::inode(ino))?;
+            ns::ns_remove(&mut tx, &self.ns, dirty, keys::inode(ino))?;
             if rec.attrs.kind == Kind::File {
                 usage_delta = (-(rec.attrs.size as i64), -1);
             }
         } else {
-            misc::bump_nlink_tx(&mut tx, &self.ns, self.dirty_for_ns(), ino, -1, t)?;
+            misc::bump_nlink_tx(&mut tx, &self.ns, dirty, ino, -1, t)?;
         }
-        misc::touch_times_tx(&mut tx, &self.ns, self.dirty_for_ns(), parent, t)?;
+        misc::touch_times_tx(&mut tx, &self.ns, dirty, parent, t)?;
         journal::append_tx(
             &mut tx,
             &self.journal_ks,
@@ -1241,6 +1268,7 @@ impl MetaStore for Meta {
             },
         )?;
         crate::store::adjust_usage_tx(&mut tx, &self.local, usage_delta.0, usage_delta.1)?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         self.usage_tracker().adjust(usage_delta.0, usage_delta.1);
         Ok(())
@@ -1248,6 +1276,8 @@ impl MetaStore for Meta {
 
     fn rmdir(&self, parent: Ino, name: &str) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let Some(d) = ns::get_dentry_record(&tx, &self.ns, parent, name)? else {
             return Err(MetaError::NoEntry);
         };
@@ -1262,16 +1292,16 @@ impl MetaStore for Meta {
             return Err(MetaError::NotEmpty);
         }
         let t = now_ns();
-        ns::remove_dentry(&mut tx, &self.ns, self.dirty_for_ns(), parent, name, ino)?;
-        ns::ns_remove(&mut tx, &self.ns, self.dirty_for_ns(), keys::inode(ino))?;
+        ns::remove_dentry(&mut tx, &self.ns, dirty, parent, name, ino)?;
+        ns::ns_remove(&mut tx, &self.ns, dirty, keys::inode(ino))?;
         let names: Vec<Vec<u8>> = ns::all_xattrs(&tx, &self.ns, &self.blobs, &rec, ino)?
             .into_iter()
             .map(|(n, _)| n.into_bytes())
             .collect();
-        ns::clear_spilled_xattrs(&mut tx, &self.ns, self.dirty_for_ns(), ino)?;
+        ns::clear_spilled_xattrs(&mut tx, &self.ns, dirty, ino)?;
         misc::xattr_by_name_del_all_tx(&mut tx, &self.xattr_by_name, ino, names);
         atime::remove_atime_tx(&mut tx, &self.atime, ino);
-        misc::bump_nlink_tx(&mut tx, &self.ns, self.dirty_for_ns(), parent, -1, t)?;
+        misc::bump_nlink_tx(&mut tx, &self.ns, dirty, parent, -1, t)?;
         journal::append_tx(
             &mut tx,
             &self.journal_ks,
@@ -1283,6 +1313,7 @@ impl MetaStore for Meta {
                 time_ns: t,
             },
         )?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         Ok(())
     }
@@ -1295,10 +1326,12 @@ impl MetaStore for Meta {
         new_name: &str,
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let result = rename_in_tx(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.atime,
             &self.orphans,
             &self.xattr_by_name,
@@ -1326,6 +1359,7 @@ impl MetaStore for Meta {
             )?;
             crate::store::adjust_usage_tx(&mut tx, &self.local, db, df)?;
         }
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         if let Some((_, _, db, df)) = result {
             self.usage_tracker().adjust(db, df);
@@ -1344,6 +1378,8 @@ impl MetaStore for Meta {
         mtime_ns: Option<i64>,
     ) -> Result<FileAttr, MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let Some(mut rec) = ns::get_inode_record(&tx, &self.ns, ino)? else {
             return Err(MetaError::NoEnt(ino));
         };
@@ -1367,7 +1403,7 @@ impl MetaStore for Meta {
         }
         rec.attrs.ctime_ns = t;
         let attrs = rec.attrs;
-        ns::put_inode_record(&mut tx, &self.ns, self.dirty_for_ns(), ino, &rec)?;
+        ns::put_inode_record(&mut tx, &self.ns, dirty, ino, &rec)?;
         if let Some(a) = atime_ns {
             atime::set_atime_tx(&mut tx, &self.atime, ino, a);
         }
@@ -1388,20 +1424,29 @@ impl MetaStore for Meta {
                 time_ns: t,
             },
         )?;
+        // Persisted with the change like every other usage move (it used
+        // to be in-memory only), so a rollback of this transaction (plan
+        // 30 §M3b) restores the counter it moved.
+        let size_delta = if size.is_some() && attrs.kind == Kind::File {
+            attrs.size as i64 - old_size as i64
+        } else {
+            0
+        };
+        crate::store::adjust_usage_tx(&mut tx, &self.local, size_delta, 0)?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
-        if size.is_some() && attrs.kind == Kind::File {
-            self.usage_tracker()
-                .adjust(attrs.size as i64 - old_size as i64, 0);
-        }
+        self.usage_tracker().adjust(size_delta, 0);
         Ok(ns::attrs_to_fileattr(ino, &attrs, at))
     }
 
     fn set_manifest(&self, ino: Ino, manifest: &[u8], size: u64) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let delta = Self::set_manifest_tx(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.blobs,
             &self.chunk_ref,
             &self.chunk_ref_by_ino,
@@ -1414,6 +1459,7 @@ impl MetaStore for Meta {
             size,
         )?;
         crate::store::adjust_usage_tx(&mut tx, &self.local, delta, 0)?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         self.usage_tracker().adjust(delta, 0);
         Ok(())
@@ -1427,6 +1473,8 @@ impl MetaStore for Meta {
         mode: SetXattrMode,
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let Some(rec) = ns::get_inode_record(&tx, &self.ns, ino)? else {
             return Err(MetaError::NoEnt(ino));
         };
@@ -1462,7 +1510,7 @@ impl MetaStore for Meta {
         ns::put_inode(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.blobs,
             ino,
             attrs,
@@ -1483,12 +1531,15 @@ impl MetaStore for Meta {
                 time_ns: t,
             },
         )?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         Ok(())
     }
 
     fn remove_xattr(&self, ino: Ino, name: &str) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
         let Some(rec) = ns::get_inode_record(&tx, &self.ns, ino)? else {
             return Err(MetaError::NoEnt(ino));
         };
@@ -1518,7 +1569,7 @@ impl MetaStore for Meta {
         ns::put_inode(
             &mut tx,
             &self.ns,
-            self.dirty_for_ns(),
+            dirty,
             &self.blobs,
             ino,
             attrs,
@@ -1538,6 +1589,7 @@ impl MetaStore for Meta {
                 time_ns: t,
             },
         )?;
+        self.finish_local(&mut tx, local)?;
         tx.commit()?;
         Ok(())
     }
@@ -1580,19 +1632,21 @@ impl MetaStore for Meta {
 
     fn take_journal(&self, max: usize) -> Result<Vec<(u64, LogRecord)>, MetaError> {
         let r = self.db.read_tx();
-        journal::take(&r, &self.journal_ks, max)
+        journal::take(&r, &self.journal_ks, &self.local, max)
     }
 
     fn ack_journal(&self, upto_seq: u64) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
-        journal::ack_upto(&mut tx, &self.journal_ks, upto_seq)?;
+        let applied = crate::store::applied_seq_at(&tx, &self.local)?;
+        crate::store::spec::retire_local_tx(&mut tx, self, upto_seq, applied)?;
+        journal::ack_upto(&mut tx, &self.journal_ks, &self.local, upto_seq)?;
         tx.commit()?;
         Ok(())
     }
 
     fn journal_len(&self) -> Result<u64, MetaError> {
         let r = self.db.read_tx();
-        journal::len(&r, &self.journal_ks)
+        journal::len(&r, &self.journal_ks, &self.local)
     }
 
     fn apply_atime(&self, bumps: &[(Ino, i64, i64)]) -> Result<(u64, u64), MetaError> {

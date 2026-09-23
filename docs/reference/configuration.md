@@ -300,6 +300,7 @@ hinted), never "proven absent".
 | `CONSTELLATION_COMPACT_BYTES_PER_S` | `33554432` (32 MiB/s) | bytes per second; `0` unpaced | read budget for metadata pack deletion and compaction in a GC round |
 | `CONSTELLATION_GC_THREADS` | one per core | threads, positive | width of the metadata mark and pack rewrite pools |
 | `CONSTELLATION_COMPLETION_RETENTION_S` | `900` | seconds | plan 30 M2: how long the node-local `completed` keyspace is retained, and the floor log-segment retention respects regardless of `CONSTELLATION_LOG_RETENTION_SEGMENTS` |
+| `CONSTELLATION_HOLDER_CAPTURE` | on | `0`/`off`/`false` to disable | plan 30 M3b internal switch: capture a holder's own journaled writes as speculation (before-images). Off is the performance-gate fallback — a holder with an unshipped journal then defers publishing, and a deposed holder rebuilds its namespace from the shared log instead of rolling back. Not a tuning knob |
 
 Log retention is evaluated against the position a fresh replica resumes
 from: the head plan 28 commit's `applied` position. With no commit yet
