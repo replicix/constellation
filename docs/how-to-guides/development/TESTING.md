@@ -347,11 +347,13 @@ the idle window and that the epoch advanced. Observed: ~27–33 ms.
 
 Phase 5 scenarios exercise the cooperative cache (DESIGN.md §7). Each
 one uses a distinct `CONSTELLATION_NODE_KEY` and
-`CONSTELLATION_DIGEST_INTERVAL_S=1` so blooms propagate in the harness
-without waiting the 30 s production interval. Small caches fit in one
-hash-prefix bucket (the common harness case); a TiB-class cache rotates
-one bucket per interval rather than flooding a 1 MiB snapshot. S3 is
-toxiproxied to 200 ms so a peer hit is unambiguously cheaper than a GET.
+`CONSTELLATION_DIGEST_INTERVAL_S=1` so membership propagates in the
+harness without waiting the 30 s production interval. They run in the
+default `CONSTELLATION_COOP_DIGEST=exact` mode (plan 30 §M15): pushed
+deltas every 250 ms plus a 1 s summary heartbeat, reconciliation on any
+gap. See [Cooperative cache membership](../../reference/features/cooperative-cache.md).
+S3 is toxiproxied to 200 ms so a peer hit is unambiguously cheaper than
+a GET.
 
 - `coop-cache-hit`: A writes a multi-chunk file and ships it; B (cold
   cache) reads it. B's `status.coop.peer_hits` must exceed `s3_fetches`
@@ -373,6 +375,25 @@ toxiproxied to 200 ms so a peer hit is unambiguously cheaper than a GET.
 - `web-fleet`: one writer, two cold "web" readers each reading twice.
   Aggregate `s3_fetches` on the readers stays near the unique-chunk
   count; `peer_hits` covers the rest.
+- `coop-exact-churn` (plan 30 §M15): three nodes, each with a 24-chunk
+  cache, run eight seeded rounds. In each round every node writes a
+  fresh 4-chunk file and reads two recent files written by others, with
+  S3 100 ms away. Every node adds and evicts chunks while its peers look
+  them up. The scenario asserts:
+  - zero `peer_false_positives` fleet-wide (a holder answering `Absent`;
+    `RecentlyRemoved` propagation races are reported separately as
+    `peer_stale_misses` and allowed);
+  - `peer_hits > 0`;
+  - every cache stayed within budget;
+  - after quiescence, each node's `peer_set_entries` equals the sum of
+    its peers' `local_set_entries`, i.e. the mirrors are exact.
+- `coop-digest-compare`: the same churn workload run twice, first with
+  `CONSTELLATION_COOP_DIGEST=bloom`, then `exact`. It prints one line per
+  mode: peer hits and misses, false positives, stale misses, S3 fetches,
+  fleet digest bytes and bytes/s, messages, digest CPU, and
+  reconciliation rounds with µs per round. It asserts only the
+  exact-mode invariants; the printed numbers are the measurement behind
+  the default digest mode.
 
 Phase 5a/5b scenarios exercise the write path itself, so they assert on
 process and cache *ceilings* rather than only on content. `Client` grows

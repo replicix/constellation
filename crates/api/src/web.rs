@@ -216,8 +216,43 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     );
     gauge!(
         "constellation_coop_peer_misses_total",
-        "Cooperative-cache peer declines (bloom FP, busy, absent).",
+        "Cooperative-cache peer declines (busy, absent, recently removed).",
         status.coop.peer_misses
+    );
+    gauge!(
+        "constellation_coop_peer_false_positives_total",
+        "Peer fetches the holder answered Absent although our digest claimed it.",
+        status.coop.peer_false_positives
+    );
+    gauge!(
+        "constellation_coop_peer_stale_misses_total",
+        "Peer fetches of a chunk the holder had just dropped (propagation race).",
+        status.coop.peer_stale_misses
+    );
+    gauge!(
+        "constellation_coop_digest_bytes_sent_total",
+        "Cooperative-cache digest-plane bytes sent.",
+        status.coop.digest_bytes_sent
+    );
+    gauge!(
+        "constellation_coop_digest_bytes_received_total",
+        "Cooperative-cache digest-plane bytes received.",
+        status.coop.digest_bytes_received
+    );
+    gauge!(
+        "constellation_coop_digest_cpu_us_total",
+        "Microseconds spent building, applying and answering digests.",
+        status.coop.digest_cpu_us
+    );
+    gauge!(
+        "constellation_coop_reconcile_rounds_total",
+        "Exact-mode reconciliation rounds this node initiated.",
+        status.coop.reconcile_rounds
+    );
+    gauge!(
+        "constellation_coop_peer_set_entries",
+        "Entries held about peers' caches (mirror keys or bloom inserts).",
+        status.coop.peer_set_entries
     );
     gauge!(
         "constellation_coop_peer_errors_total",

@@ -87,7 +87,8 @@ concurrent edits — catastrophic around git workflows.
 Ten web servers serve static files from a bucket. With mountpoint-s3 each
 node pays S3's 30–100 ms time-to-first-byte once per file per node and caches
 duplicate copies. As Constellation read-only followers they share caches:
-bloom-filter digests gossip which chunks each node holds, and a miss is
+exact, incrementally reconciled chunk-location mirrors tell each node which
+chunks its peers hold, and a miss is
 fetched from a same-region peer in ~1 ms with automatic, latency-measured
 fallback to S3. Cold cost is paid roughly once per cluster, not once per node.
 

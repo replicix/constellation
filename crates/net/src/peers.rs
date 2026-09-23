@@ -248,6 +248,40 @@ impl Peers {
         v
     }
 
+    /// Is `peer` really this node? Either its node id is ours, or it was
+    /// enrolled under our own endpoint key (several mounts sharing one
+    /// node key, see the warning in [`Peers::refresh_registry`]). A dial
+    /// to it can only fail with "connecting to ourself", so nothing that
+    /// initiates traffic from the roster should pick it.
+    pub fn is_self(&self, peer: &Peer) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        peer.node_id == inner.node_id
+            || peer.addr.id.as_bytes() == inner.p2p.secret_key().public().as_bytes()
+    }
+
+    /// [`Peers::is_self`] by node id: our own id, or a roster entry that
+    /// shares our endpoint key.
+    pub fn is_self_node(&self, node_id: u64) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        if node_id == inner.node_id {
+            return true;
+        }
+        let peer = inner.peers.lock().unwrap().get(&node_id).cloned();
+        peer.is_some_and(|p| self.is_self(&p))
+    }
+
+    /// [`Peers::snapshot`] without entries that are really this node:
+    /// the roster to initiate traffic from.
+    pub fn remote_snapshot(&self) -> Vec<Peer> {
+        let mut v = self.snapshot();
+        v.retain(|p| !self.is_self(p));
+        v
+    }
+
     /// Best-effort gossip of an already-signed-capable payload (digests,
     /// segment hints). Failure is fine: peers will learn on the next
     /// snapshot or S3 poll.
@@ -265,7 +299,8 @@ impl Peers {
         &self,
         node_id: u64,
         hash: &[u8; 32],
-    ) -> Result<Option<crate::endpoint::ChunkFetch>> {
+    ) -> Result<std::result::Result<crate::endpoint::ChunkFetch, crate::message::ChunkDecline>>
+    {
         self.request_chunk_with_timeout(node_id, hash, CHUNK_REQUEST_TIMEOUT)
             .await
     }
@@ -275,7 +310,8 @@ impl Peers {
         node_id: u64,
         hash: &[u8; 32],
         timeout: Duration,
-    ) -> Result<Option<crate::endpoint::ChunkFetch>> {
+    ) -> Result<std::result::Result<crate::endpoint::ChunkFetch, crate::message::ChunkDecline>>
+    {
         let Some(inner) = self.inner.as_ref() else {
             anyhow::bail!("P2P disabled");
         };
@@ -287,18 +323,18 @@ impl Peers {
             .map(|p| p.addr.clone())
             .ok_or_else(|| anyhow::anyhow!("peer {node_id} has no endpoint"))?;
         match tokio::time::timeout(timeout, inner.p2p.request_chunk(addr.clone(), hash)).await {
-            Ok(Ok(Some(fetch))) => {
+            Ok(Ok(Ok(fetch))) => {
                 let rtt = fetch.rtt.unwrap_or(Duration::ZERO);
                 self.note_rtt(node_id, rtt, true, fetch.path);
-                Ok(Some(fetch))
+                Ok(Ok(fetch))
             }
-            Ok(Ok(None)) => {
+            Ok(Ok(Err(why))) => {
                 // Soft miss: path still observed if the connection is live.
                 let path = inner.p2p.path_kind(addr.id).await;
                 if path != PathKind::Unknown {
                     self.note_path(node_id, path);
                 }
-                Ok(None)
+                Ok(Err(why))
             }
             Ok(Err(e)) => {
                 self.note_rtt(node_id, Duration::ZERO, false, PathKind::Unknown);
@@ -494,6 +530,19 @@ impl Peers {
     /// [`Peers::request_lease`]. For requests that are not one of the
     /// built-in convenience methods (e.g. `DelegationRequest`).
     pub async fn request_raw(&self, addr: EndpointAddr, payload: &Payload) -> Result<Payload> {
+        self.request_raw_timeout(addr, payload, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// [`Peers::request_raw`] with a caller-chosen bound, for background
+    /// exchanges (cache reconciliation) that must tolerate a WAN round
+    /// trip plus a cold QUIC dial rather than the lease path's 500 ms.
+    pub async fn request_raw_timeout(
+        &self,
+        addr: EndpointAddr,
+        payload: &Payload,
+        timeout: Duration,
+    ) -> Result<Payload> {
         let Some(inner) = self.inner.as_ref() else {
             anyhow::bail!("P2P disabled");
         };
@@ -505,8 +554,7 @@ impl Peers {
             .find(|p| p.addr.id == addr.id)
             .map(|p| p.node_id);
         let started = Instant::now();
-        let result =
-            tokio::time::timeout(REQUEST_TIMEOUT, inner.p2p.request(addr.clone(), payload)).await;
+        let result = tokio::time::timeout(timeout, inner.p2p.request(addr.clone(), payload)).await;
         match result {
             Ok(Ok(reply)) => {
                 if let Some(id) = node_id {
@@ -539,6 +587,41 @@ impl Peers {
             .ok_or_else(|| anyhow::anyhow!("no address for node {node_id}"))?
             .addr;
         self.request_raw(addr, payload).await
+    }
+
+    /// [`Peers::request_to_node`] with a caller-chosen bound.
+    pub async fn request_to_node_timeout(
+        &self,
+        node_id: u64,
+        payload: &Payload,
+        timeout: Duration,
+    ) -> Result<Payload> {
+        let addr = self
+            .snapshot()
+            .into_iter()
+            .find(|p| p.node_id == node_id)
+            .ok_or_else(|| anyhow::anyhow!("no address for node {node_id}"))?
+            .addr;
+        self.request_raw_timeout(addr, payload, timeout).await
+    }
+
+    /// Registry node id enrolled under `pubkey_hex`, if any. Used to
+    /// refuse gossip that claims to speak for a different node.
+    pub fn node_id_for_key(&self, pubkey_hex: &str) -> Option<u64> {
+        let inner = self.inner.as_ref()?;
+        let peers = inner.peers.lock().unwrap();
+        if let Some(p) = peers
+            .values()
+            .find(|p| p.pubkey_hex.eq_ignore_ascii_case(pubkey_hex))
+        {
+            return Some(p.node_id);
+        }
+        drop(peers);
+        inner
+            .p2p
+            .pubkey_hex()
+            .eq_ignore_ascii_case(pubkey_hex)
+            .then_some(inner.node_id)
     }
 
     /// Liveness probe used by continuation epochs. Failure is a missing
@@ -777,6 +860,19 @@ pub async fn run_gossip<S: PeerService>(
                     buckets: *buckets,
                 });
             }
+            Payload::CacheSummary { node_id, summary } => {
+                // Exact mirrors are only worth anything if a summary
+                // speaks for its real author: an enrolled peer must not
+                // be able to rewrite another node's advertised set.
+                if peers.node_id_for_key(&hex).is_some_and(|id| id == *node_id) {
+                    service.cache_summary(*node_id, *summary);
+                }
+            }
+            Payload::CacheSetDelta { node_id, delta } => {
+                if peers.node_id_for_key(&hex).is_some_and(|id| id == *node_id) {
+                    service.cache_set_delta(*node_id, delta.clone());
+                }
+            }
             Payload::EpochActivate {
                 epoch_id,
                 members,
@@ -951,13 +1047,17 @@ async fn handle_stream<S: PeerService>(
                 accepted: true,
             })
         }
+        Payload::ReconcileRequest { queries } => Some(service.reconcile_requested(queries).await),
         Payload::ChunkRequest { hash } => {
-            let data = service.serve_chunk(hash, hex.to_string()).await;
-            let found = data.is_some();
-            let reply = Payload::ChunkResponse { hash, found };
+            let served = service.serve_chunk(hash, hex.to_string()).await;
+            let status = match &served {
+                Ok(_) => crate::message::ChunkStatus::Found,
+                Err(why) => crate::message::ChunkStatus::Declined(*why),
+            };
+            let reply = Payload::ChunkResponse { hash, status };
             let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
             write_frame(&mut send, &signed).await?;
-            if let Some(bytes) = data {
+            if let Ok(bytes) = served {
                 use tokio::io::AsyncWriteExt;
                 send.write_u64(bytes.len() as u64).await?;
                 send.write_all(&bytes).await?;
@@ -971,6 +1071,9 @@ async fn handle_stream<S: PeerService>(
         | Payload::EpochAck { .. }
         | Payload::CacheDigest { .. }
         | Payload::CacheDigestDelta { .. }
+        | Payload::CacheSummary { .. }
+        | Payload::CacheSetDelta { .. }
+        | Payload::ReconcileReply { .. }
         | Payload::ChunkResponse { .. }
         | Payload::MutateReply { .. } => None,
     };
@@ -1278,14 +1381,21 @@ mod tests {
             &self,
             _hash: [u8; 32],
             _from_hex: String,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<u8>, crate::message::ChunkDecline>>
+                    + Send
+                    + '_,
+            >,
+        > {
             Box::pin(async move {
                 let n = self.in_flight.fetch_add(1, AtomicOrder::SeqCst) + 1;
                 self.peak.fetch_max(n, AtomicOrder::SeqCst);
                 tokio::time::sleep(self.delay).await;
                 self.in_flight.fetch_sub(1, AtomicOrder::SeqCst);
-                self.data.clone()
+                self.data
+                    .clone()
+                    .ok_or(crate::message::ChunkDecline::Absent)
             })
         }
         fn node_id(&self) -> u64 {
@@ -1327,7 +1437,7 @@ mod tests {
         let asker = chunk_pair(service.clone()).await;
         let hash = a_hash();
         let (x, y) = tokio::join!(asker.request_chunk(1, &hash), asker.request_chunk(1, &hash));
-        assert!(x.unwrap().is_some() && y.unwrap().is_some());
+        assert!(x.unwrap().is_ok() && y.unwrap().is_ok());
         assert_eq!(
             service.peak.load(AtomicOrder::SeqCst),
             2,
@@ -1345,7 +1455,7 @@ mod tests {
         let first = inner.p2p.pooled_connection_id(peer).await.unwrap();
         let hash = a_hash();
         let (a, b) = tokio::join!(asker.request_chunk(1, &hash), asker.request_chunk(1, &hash));
-        assert!(a.unwrap().is_some() && b.unwrap().is_some());
+        assert!(a.unwrap().is_ok() && b.unwrap().is_ok());
         let after = inner.p2p.pooled_connection_id(peer).await.unwrap();
         assert_eq!(first, after, "all streams should share one QUIC connection");
     }
@@ -1456,7 +1566,13 @@ mod tests {
         for mut recv in pending {
             let (_, body) = read_frame(&mut recv).await.unwrap().verify().unwrap();
             assert!(
-                matches!(body, Payload::ChunkResponse { found: true, .. }),
+                matches!(
+                    body,
+                    Payload::ChunkResponse {
+                        status: crate::message::ChunkStatus::Found,
+                        ..
+                    }
+                ),
                 "unexpected reply {body:?}"
             );
         }
@@ -1475,9 +1591,114 @@ mod tests {
         let asker = chunk_pair(service).await;
         let got = asker.request_chunk(1, &a_hash()).await;
         assert!(
-            matches!(got, Ok(None)),
-            "expected a clean miss, got {got:?}"
+            matches!(got, Ok(Err(crate::message::ChunkDecline::Absent))),
+            "expected a clean miss with its reason, got {got:?}"
         );
+    }
+
+    /// Answers reconciliation rounds from a fixed owner set.
+    struct ReconServer {
+        set: crate::reconcile::KeySet,
+    }
+
+    impl PeerService for ReconServer {
+        fn segment_published(
+            &self,
+            _part: &str,
+            _seq: u64,
+            _epoch: u64,
+            _payload: Option<Vec<u8>>,
+        ) {
+        }
+        fn lease_requested(
+            &self,
+            part: String,
+            _requester: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+            Box::pin(async move {
+                Payload::LeaseHandoff {
+                    part,
+                    epoch: 0,
+                    released: false,
+                    etag: None,
+                    head_seq: None,
+                }
+            })
+        }
+        fn reconcile_requested(
+            &self,
+            queries: Vec<crate::reconcile::Query>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+            Box::pin(async move {
+                let summary = crate::reconcile::Summary {
+                    incarnation: 1,
+                    seq: 1,
+                    root: self.set.root_fingerprint(),
+                    count: self.set.len() as u64,
+                };
+                Payload::ReconcileReply {
+                    reply: crate::reconcile::respond(
+                        &self.set,
+                        summary,
+                        &queries,
+                        crate::reconcile::REPLY_BUDGET,
+                    ),
+                }
+            })
+        }
+        fn node_id(&self) -> u64 {
+            1
+        }
+    }
+
+    /// A multi-round session over real QUIC frames: the initial sync of
+    /// 50k keys pages through several MAX_FRAME-bounded replies and the
+    /// mirror comes out exact.
+    #[tokio::test]
+    async fn a_reconciliation_session_converges_over_quic() {
+        use crate::reconcile::{start_bits_for, KeySet, Session};
+        let owner =
+            KeySet::from_keys((0..50_000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+        let topic = crate::topic_for(Some(&[9u8; 32]), "fs");
+        let a = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let b = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let (a_key, b_key) = (a.pubkey_hex(), b.pubkey_hex());
+        let (a_addr, b_addr) = (a.addr(), b.addr());
+        let holder = Peers::new(a, 1);
+        let asker = Peers::new(b, 2);
+        let registry = vec![
+            (1, a_key.clone(), serde_json::to_value(&a_addr).unwrap()),
+            (2, b_key, serde_json::to_value(&b_addr).unwrap()),
+        ];
+        holder.refresh_registry(registry.clone());
+        asker.refresh_registry(registry);
+        assert_eq!(asker.node_id_for_key(&a_key), Some(1));
+        assert_eq!(asker.node_id_for_key(&"00".repeat(32)), None);
+        let service = Arc::new(ReconServer { set: owner.clone() });
+        tokio::spawn(async move { holder.serve(service).await });
+
+        let mut mirror = KeySet::new();
+        let mut session = Session::new(start_bits_for(owner.len()));
+        while let Some(queries) = session.next_request(&mirror) {
+            let reply = asker
+                .request_to_node_timeout(
+                    1,
+                    &Payload::ReconcileRequest { queries },
+                    Duration::from_secs(20),
+                )
+                .await
+                .expect("reconcile round failed");
+            let Payload::ReconcileReply { reply } = reply else {
+                panic!("unexpected reply {reply:?}");
+            };
+            session.apply(&mut mirror, &reply).unwrap();
+        }
+        assert!(session.rounds > 1, "50k keys cannot fit one frame");
+        assert!(mirror == owner);
     }
 
     /// TTFB is measured to the control reply, so it tracks how long the
@@ -1525,6 +1746,37 @@ mod tests {
             peers.request_lease("p0", None).await.is_none(),
             "nobody else to ask"
         );
+    }
+
+    /// A different node enrolled under *our* key (mounts sharing a node
+    /// key) stays in the roster, but it is really us: the initiating
+    /// paths must see it as self and leave it out.
+    #[tokio::test]
+    async fn a_peer_sharing_our_key_is_self_and_not_a_remote() {
+        let topic = crate::topic_for(Some(&[7u8; 32]), "fs");
+        let p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let other = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let (own_key, own_addr) = (p2p.pubkey_hex(), p2p.addr());
+        let (other_key, other_addr) = (other.pubkey_hex(), other.addr());
+        let peers = Peers::new(p2p, 1);
+        peers.refresh_registry(vec![
+            (1, own_key.clone(), serde_json::to_value(&own_addr).unwrap()),
+            (2, own_key, serde_json::to_value(&own_addr).unwrap()),
+            (3, other_key, serde_json::to_value(&other_addr).unwrap()),
+        ]);
+        let listed: Vec<u64> = peers.snapshot().iter().map(|p| p.node_id).collect();
+        assert_eq!(listed, vec![2, 3], "the shared-key node stays enrolled");
+        assert!(peers.is_self_node(1), "our own id");
+        assert!(peers.is_self_node(2), "a node sharing our endpoint key");
+        assert!(!peers.is_self_node(3));
+        assert!(!peers.is_self_node(99), "unknown ids are not self");
+        let remote: Vec<u64> = peers.remote_snapshot().iter().map(|p| p.node_id).collect();
+        assert_eq!(remote, vec![3]);
+        assert!(!Peers::disabled().is_self_node(1));
     }
 
     /// A registry record whose address will not parse must not drop the

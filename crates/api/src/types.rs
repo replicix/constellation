@@ -579,7 +579,8 @@ pub struct WritebackStatus {
 pub struct CoopStatus {
     #[serde(default)]
     pub peer_hits: u64,
-    /// Soft negatives: peer declined (bloom FP, busy, not present).
+    /// Soft negatives: every peer decline (busy, absent, recently
+    /// removed); see `peer_false_positives` / `peer_stale_misses`.
     #[serde(default)]
     pub peer_misses: u64,
     /// Hard negatives: transport / hash failures against a peer.
@@ -599,6 +600,42 @@ pub struct CoopStatus {
     pub digest_capacity_exceeded: bool,
     #[serde(default)]
     pub per_source: Vec<SourceStatus>,
+    /// Plan 30 §M15: `exact` (mirrors + reconciliation) or `bloom`.
+    #[serde(default)]
+    pub digest_mode: String,
+    /// Peer declined with `Absent` a chunk our digest said it held.
+    #[serde(default)]
+    pub peer_false_positives: u64,
+    /// Peer had dropped the chunk within its recent-removal window.
+    #[serde(default)]
+    pub peer_stale_misses: u64,
+    /// Digest-plane traffic (summaries, deltas, rounds, or blooms).
+    #[serde(default)]
+    pub digest_bytes_sent: u64,
+    #[serde(default)]
+    pub digest_bytes_received: u64,
+    #[serde(default)]
+    pub digest_messages: u64,
+    /// Microseconds spent building, applying and answering digests.
+    #[serde(default)]
+    pub digest_cpu_us: u64,
+    #[serde(default)]
+    pub reconcile_sessions: u64,
+    #[serde(default)]
+    pub reconcile_rounds: u64,
+    #[serde(default)]
+    pub reconcile_failures: u64,
+    /// Part of `digest_cpu_us` spent on reconciliation rounds.
+    #[serde(default)]
+    pub reconcile_cpu_us: u64,
+    /// Keys in this node's published servable set.
+    #[serde(default)]
+    pub local_set_entries: u64,
+    /// Entries held about peers' caches (mirror keys or bloom inserts).
+    #[serde(default)]
+    pub peer_set_entries: u64,
+    #[serde(default)]
+    pub peer_set_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

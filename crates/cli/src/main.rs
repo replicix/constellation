@@ -2306,11 +2306,33 @@ impl constellation_net::PeerService for P2pBridge {
         self.coop.apply_delta(delta);
     }
 
+    fn cache_summary(&self, node_id: u64, summary: constellation_net::reconcile::Summary) {
+        self.coop.apply_summary(node_id, summary);
+    }
+
+    fn cache_set_delta(&self, node_id: u64, delta: constellation_net::reconcile::Delta) {
+        self.coop.apply_set_delta(node_id, delta);
+    }
+
+    fn reconcile_requested(
+        &self,
+        queries: Vec<constellation_net::reconcile::Query>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move { self.coop.reconcile_reply(queries).await })
+    }
+
     fn serve_chunk(
         &self,
         hash: [u8; 32],
         from_hex: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Vec<u8>, constellation_net::ChunkDecline>>
+                + Send
+                + '_,
+        >,
+    > {
         Box::pin(async move { self.coop.serve_chunk(hash, &from_hex).await })
     }
 

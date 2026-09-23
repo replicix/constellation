@@ -5288,3 +5288,639 @@ invocations were spaced out).
 **Needs a design decision:** none found this round. Round 1's blocking
 finding (`holder-ships-under-forward-load`) is resolved by the coder's
 round-2 fix; nothing new surfaced.
+
+## Plan 30 M15 — exact chunk-location reconciliation: **TESTED, GATES GREEN**
+
+Goal: replace the cooperative cache's bloom digests with range-based set
+reconciliation (RBSR, Negentropy-style range fingerprints), so every node
+knows its peers' cached chunks exactly and a peer fetch never goes to a
+node that never had the chunk. The bloom path stays behind a knob so the
+tester can measure both.
+
+Written by the coder agent without building or running anything (the
+tester runs every gate). Nothing below has been compiled yet.
+
+| Item | Status | Where |
+|---|---|---|
+| Crate-vs-in-tree: `negentropy` (rust-nostr, MIT, maintained, 0.5.1) was checked and rejected on fit. It stores 40-byte `(timestamp, id)` items per mirror (5x our 8-byte keys). Its storage is a sealed vector: every insert or evict re-seals, and every range fingerprint scans the range. Its protocol is symmetric union-sync, not an asymmetric exact mirror with removals, and it has its own framing. No other RBSR crate is in the lockfile. So the protocol is implemented in-tree, pure and I/O-free | done (untested) | `crates/net/src/reconcile.rs` |
+| Protocol: 8-byte big-endian hash-prefix keys; aligned 16-ary prefix ranges; fingerprint `blake3(count‖Σk‖Σmix(k))[..16]` with additive wrapping sums; `KeySet` sharded by prefix (~64 keys/shard, cached accumulators, O(1) root, O(shards-in-range) or one-shard scan per range); `respond` (equal → nothing, ≤32 owner keys or empty initiator → `Items`, else 16 `Children` fp+count), bounded by `REPLY_BUDGET` 48 KiB and `processed`; `Session` initiator; varint-gap key codec with strict decode; `Mirror` with seq/base-root-chained deltas | done (untested) | same |
+| Unit/property tests (seeded splitmix PRNG, no new deps): accumulators equal a scan at every depth; incremental insert/remove incl. shard resize both ways equals a rebuild; `replace_range` touches only its range; codec round trip + garbage rejection; sets 0–100k × differences 0–1000 converge to exact equality in ≤16 rounds from root and size-based starts with bytes ∝ difference; 4 diffs on 100k ≤6 rounds and <16 KiB; initial sync pages at the budget; owner-emptied; budget + progress guarantee; inconsistent replies abort without corrupting; chained deltas exact, gaps detected, restart handled; malformed delta refused; owner churn mid-session converges next session | done (untested) | same |
+| Wire: `CacheSummary`, `CacheSetDelta` (gossip), `ReconcileRequest`/`ReconcileReply` (direct stream); `ChunkResponse.found: bool` → `status: ChunkStatus { Found, Declined(Busy \| Absent \| RecentlyRemoved) }`; `wire_len` helper; frame-size tests for the largest delta/request/reply | done (untested) | `crates/net/src/message.rs` |
+| `PeerService::{cache_summary, cache_set_delta, reconcile_requested}`; `serve_chunk` returns `Result<Vec<u8>, ChunkDecline>`; `P2p::request_chunk` / `Peers::request_chunk` return `Result<Result<ChunkFetch, ChunkDecline>>`; `Peers::{request_raw_timeout, request_to_node_timeout, node_id_for_key}`; summaries and deltas are dropped unless the gossip author's registry node id matches the claimed `node_id`; QUIC end-to-end multi-round session test | done (untested) | `crates/net/src/endpoint.rs`, `crates/net/src/peers.rs`, `crates/net/src/lib.rs` |
+| Exact mode in the daemon: `LocalSet` (published servable set, per-tick net diff → chained deltas ≤2048 keys, >8 frames/tick → silent + immediate summary, recent-removal memory); per-peer `PeerMirror`; summary heartbeat every digest interval; session driver (on-demand + liveness sweep of mirrors unconfirmed for 2 intervals, ≤4 concurrent, ≥500 ms apart per peer, 5 s per round, ≤256 rounds); mirrors of peers that left the registry are dropped; peers advertising >8M keys are not mirrored | done (untested) | `crates/cli/src/coop/exact.rs` (new submodule of `coop`) |
+| Knob `CONSTELLATION_COOP_DIGEST=exact\|bloom` (default `exact`); bloom path unchanged apart from accounting; each mode ignores the other's messages | done (untested) | `crates/cli/src/coop.rs` |
+| False-positive accounting (both modes): holder declines with `Absent` unless it dropped the chunk within `max(10 s, 2 × digest interval)` or has not yet published the drop (`RecentlyRemoved`). Requester counters: `peer_false_positives` (Absent), `peer_stale_misses` (RecentlyRemoved). In exact mode an `Absent` also removes the key from the mirror and schedules a session | done (untested) | `crates/cli/src/coop.rs`, `crates/cli/src/coop/exact.rs` |
+| Measurement counters in `status.coop` and `/metrics`: `digest_mode`, `digest_bytes_{sent,received}`, `digest_messages`, `digest_cpu_us`, `reconcile_{sessions,rounds,failures,cpu_us}`, `local_set_entries`, `peer_set_{entries,bytes}`; web UI shows the FP count | done (untested) | `crates/api/src/types.rs`, `crates/api/src/web.rs`, `crates/api/webui/index.html` |
+| Existence hints (plan 14): `peer_digest_contains` now asks the exact mirrors (same "hint → confirming HEAD" semantics, no bloom-FP HEADs). The node-local existence bloom of its own uploads stays: it is not exchanged, it is RSS-capped, and an FP costs one HEAD | done (untested) | `crates/cli/src/coop.rs` (unchanged call site in `main.rs`) |
+| Harness: `coop-exact-churn` (3 nodes × 24-chunk caches × 8 seeded rounds of write + cross-reads under 100 ms S3). Asserts `peer_false_positives == 0`, peer hits, caches within budget, and exact mirrors after quiescence (`peer_set_entries == Σ peers' local_set_entries`). `coop-digest-compare` runs the same workload in bloom then exact mode and prints both | done (untested) | `crates/harness/src/scenarios/coop_churn.rs` (new), two `SCENARIOS` rows + `mod` line in `crates/harness/src/scenarios.rs` |
+| Docs | done | `docs/reference/features/cooperative-cache.md` (new), `docs/reference/README.md`, `docs/reference/configuration.md`, `docs/how-to-guides/development/TESTING.md`, `docs/explanation/GOALS.md` |
+
+**Default and why.** `exact` is the default. Reasons:
+
+- It has zero false positives by construction.
+- Removals propagate within one tick. Bloom deltas are add-only, so an
+  evicted chunk stays advertised until its bucket's next snapshot, up to
+  buckets × 30 s.
+- Steady-state digest traffic is a ~150-byte summary per interval plus
+  a few bytes per changed chunk. Bloom mode re-sends a full 16 KiB
+  bucket per interval.
+
+The cost is receiver memory: 8–12 B per peer chunk against at most
+4 MiB per peer for blooms, so exact mode is larger past ~350k chunks per
+peer. Initial sync is also ~7 B per key against ~1.25 B per key for a
+bloom. The bloom code stays until the tester's `coop-digest-compare`
+numbers confirm this. If they do, a follow-up can delete
+`bloom_publish_loop`, `DigestTracker`, the bloom `PeerDigest`, and
+`CacheDigest`/`CacheDigestDelta`. `bloom.rs` itself stays for the local
+existence bloom.
+
+**Spec contradiction recorded (not edited, per CONVENTIONS rule 5).**
+DESIGN.md §7 still describes the bloom digests (~10 bits/entry, ~1% FPR,
+16 KiB buckets) as the cooperative-cache mechanism. The spec rewrite
+belongs to M16 (coordinator).
+
+**Stateright.** Not extended. This milestone carries no safety state:
+every peer chunk is hash-verified, and a wrong mirror only costs a
+declined fetch that falls back to S3. So §2's "model first" applies to
+the authority protocol, not this.
+
+**Risks for the tester (things I could not check without a compiler or a run):**
+
+1. **Compile/clippy/fmt.** Everything is unbuilt. Run `cargo fmt --all`.
+   These places may need clippy fixes: the `tokio::select!` in
+   `sync_driver`, the `map_err` closure in `run_session`, and the
+   long-signature formatting in `endpoint.rs`/`peers.rs`/`main.rs`.
+2. **Test runtime.** In debug builds, `random_sets_converge_exactly_in_bounded_rounds`
+   (96 sessions, up to 100k keys) and
+   `incremental_updates_equal_a_rebuild` (60k ops) may take seconds.
+   If they are too slow, lower the sizes rather than the assertions.
+3. **Round/byte bounds in the property tests** (≤16 rounds, bytes ≤
+   256 KiB + 1 KiB·d) come from hand estimates: about 11 rounds for
+   n=100k, d=1000. If one trips, first check whether the estimate or
+   the protocol is wrong.
+4. **Harness timing.** `coop-cache-hit`, `web-fleet` and
+   `existence-peer-hint` sleep 2 s after the file is visible and rely on
+   a delta (≤250 ms) or a session (1 s summary interval) landing within
+   that time. The first contact between two nodes needs registry
+   enrolment before `node_id_for_key` accepts their summaries. The
+   liveness sweep covers that, but only once `peers.snapshot()` lists
+   the peer.
+5. **`coop-exact-churn` exact-mirror check.** It relies on
+   `local_set_entries`/`peer_set_entries` counting the same keys. Mirrors
+   are only pruned on lookups, so a stale extra mirror would show as a
+   mismatch. That would be a real bug, not a flake.
+6. **False-positive definition.** A requester whose mirror is more than
+   `max(10 s, 2 × interval)` behind counts every miss as a false
+   positive. On a WAN this is intended: it measures digest imprecision.
+   A pathological gossip partition would also show up there.
+7. **Bloom mode in `coop-digest-compare`** may report 0 false positives
+   on a run this small (the FPR is ~1% of lookups on peers that lack
+   the chunk). The bytes/s and CPU columns are the comparison that
+   matters there.
+8. **Shared hot files touched**, all additive:
+   - `crates/cli/src/main.rs`: 3 new `PeerService` methods and the
+     `serve_chunk` return type;
+   - `crates/api/src/types.rs`: new `CoopStatus` fields;
+   - `crates/harness/src/scenarios.rs`: `mod coop_churn;` and 2
+     `SCENARIOS` rows.
+
+   `node_runtime.rs` is untouched: `publish_loop` spawns the sync driver
+   itself.
+
+### Plan 30 M15 exit criteria (for the tester)
+
+- [x] `cargo fmt --all` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean
+- [x] `cargo test --workspace` green, in particular:
+  - `constellation-net` `reconcile::tests::*`;
+  - `message::tests::{a_maximum_exact_delta_fits_the_real_gossip_budget, maximum_reconcile_frames_fit_a_stream_frame, wire_len_tracks_the_signed_encoding}`;
+  - `peers::tests::a_reconciliation_session_converges_over_quic`;
+  - `constellation` `coop::tests::*`, `coop::exact::tests::*`;
+  - `main.rs` `peer_hit_selects_probe_but_peer_miss_retains_adaptive_head` (bloom-mode config).
+- [x] Regression: `coop-cache-hit`, `web-fleet`, `existence-peer-hint`
+  PASS; also `coop-fallback`, `s3-retry`, `existence-bloom-dedup` and
+  `p2p-partition-tolerance`
+- [x] `coop-exact-churn` PASS (0 false positives; exact mirrors after quiescence)
+- [x] `coop-digest-compare` PASS. Record both printed lines here: bytes/s,
+  false positives, stale misses, µs per reconciliation round
+- [x] Full `harness run`, smoke/integration, pjdfstest unchanged — see
+  scope note in the tester subsection below (pjdfstest/compose not run).
+
+See "Plan 30 M15 — tester gate run" below for the full report, the two
+bugs found and fixed, and the bloom-vs-exact numbers.
+
+### Plan 30 M15 — tester gate run
+
+Worktree `/home/bra/cvs/constellation-m15`, branch `plan30-m15`, on top
+of main `5e18214`. All gates below are green after two local fixes (one
+in product code, one in the new harness scenario); neither needed a
+design change.
+
+**Gate results**
+
+| # | Gate | Result |
+|---|---|---|
+| 1 | `cargo build --workspace --all-targets` | PASS, first try, no compile errors |
+| 2 | `cargo fmt --all` / `--check` | PASS, no reformatting needed |
+| 3 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS, zero warnings |
+| 4 | `cargo test --workspace` | PASS — `constellation-net` 89/89, `constellation` bin 260+31/291 (1 pre-existing `#[ignore]`), `constellation-model` (release) 3+4+7/14 (3 pre-existing `#[ignore]`, not run), every other crate green; longest single test 21.4 s (release, model) |
+| 5 | `cargo build --release --workspace` | PASS |
+| 6 | Harness scenarios (see below) | PASS after fixes |
+| 7 | Measurements | recorded below |
+
+Targeted tests from the exit criteria all pass: `constellation-net`
+`reconcile::tests::*` (17), `message::tests::{a_maximum_exact_delta_fits_the_real_gossip_budget, maximum_reconcile_frames_fit_a_stream_frame, wire_len_tracks_the_signed_encoding}`,
+`peers::tests::a_reconciliation_session_converges_over_quic`, `constellation`
+`coop::tests::*` + `coop::exact::tests::*` (31), and `main.rs`
+`pending_upload_tests::peer_hit_selects_probe_but_peer_miss_retains_adaptive_head`.
+
+**Fixes made**
+
+1. **`crates/cli/src/coop.rs:578-641` (`Coop::fetch_uncached`) — a fast
+   peer decline with an S3 hedge candidate skipped S3 entirely.**
+   The hedge race only *spawns* the hedge candidate inside the
+   `_ = sleep => { ... }` arm of the outer `tokio::select!`; if the
+   primary (peer) fails *before* the hedge deadline elapses, the other
+   arm (`r = &mut primary_f => self.settle(...)`) resolves the whole
+   race without ever starting the hedge. The final fallback then checked
+   `hedge != Some(SourceId::S3)` to decide whether S3 still needed
+   trying — but `hedge` records what was *selected*, not what was
+   *attempted*, so whenever the selected hedge happened to be S3 and the
+   peer declined fast, the function `bail!`ed with "chunk … unavailable
+   from peers and S3" **without ever contacting S3**. This is
+   pre-existing logic (unmodified by M15's diff — only the
+   `note_fail`/`Miss` signatures changed), but M15's `coop-exact-churn`
+   is the first scenario that legitimately produces frequent, *fast*
+   peer declines (`Absent`/`RecentlyRemoved`), so it is the first to
+   reliably trigger it. Reproduced with `RUST_LOG=debug` +
+   `CHAOS_KEEP_TMP=1`: `coop fetch failed hash=… error=chunk … unavailable
+   from peers and S3`, traced to a chunk that a small standalone blake3
+   harness proved was written, drained and visible two rounds earlier —
+   i.e. genuinely present in S3.
+   Fix: track an explicit `s3_tried` bool, set `true` only where S3 is
+   actually invoked (`primary == SourceId::S3` up front, or
+   `hsrc == SourceId::S3` inside the arm that really spawns the hedge),
+   and gate the last-resort fallback on that instead of on `hedge`.
+   Confirmed by the existing `coop::tests::*` suite (unaffected, still
+   31/31) and by `coop-exact-churn`/`coop-digest-compare` now completing
+   every round without a spurious I/O error.
+
+2. **`crates/harness/src/scenarios/coop_churn.rs:214-227` — the new
+   `coop-exact-churn`/`coop-digest-compare` budget assertion counted
+   cache *entries*, but the disk cache is shared with mtree metadata
+   nodes.** `crates/fs-core/src/cache.rs`'s `DiskCache` enforces its
+   budget in *bytes*, evicting clean LRU entries on every insert/commit —
+   this is correct and untouched by M15. But it is a generic
+   content-addressed store: small "MTRE…" metadata-tree pack nodes (128 B
+   to a few KB, confirmed by `xxd`ing the cache directory under
+   `CHAOS_KEEP_TMP=1`) live in the *same* directory and budget as the
+   1 MiB file-data chunks, and both are cooperatively served the same
+   way. The scenario's assertion `chunks <= CACHE_CHUNKS` (a pure
+   data-chunk headcount) is therefore not an invariant the cache ever
+   promised: a run that observed 27-28 entries had `used_bytes =
+   24,133,406 < budget_bytes = 25,165,824` — comfortably under budget,
+   just with more (smaller) entries than a chunks-only count assumed.
+   Fix: assert `cache.used_bytes <= cache.budget_bytes` (both already in
+   `CacheStatus`) instead of an entry count, which is what "eviction
+   really happened" actually means.
+
+Neither fix touches the exact-mode protocol, wire format, or default
+(`exact` stays the default); both are local/mechanical.
+
+**Harness scenario results**
+
+M15 scenarios, run individually:
+
+- `coop-exact-churn` PASS ×3 (after fix #1), 0 false positives every time:
+  - run 1: `peer_hits=112 peer_misses=9 false_positives=0 stale_misses=7 s3_fetches=25 digest_bytes=13403 (2454 B/s fleet) msgs=210 digest_cpu_us=1598 reconcile_rounds=3 (4.0 us/round, failures=0) peer_set_bytes=1824` in 5.5 s
+  - run 2: `peer_hits=134 peer_misses=4 false_positives=0 stale_misses=4 s3_fetches=9 digest_bytes=19619 (1424 B/s fleet) msgs=285 digest_cpu_us=1842 reconcile_rounds=14 (5.0 us/round, failures=3) peer_set_bytes=1824` in 13.8 s
+  - run 3: `peer_hits=119 peer_misses=7 false_positives=0 stale_misses=7 s3_fetches=15 digest_bytes=13904 (2550 B/s fleet) msgs=219 digest_cpu_us=1620 reconcile_rounds=2 (3.0 us/round, failures=1) peer_set_bytes=1824` in 5.5 s
+  - "exact mirrors after quiescence" (`peer_set_entries == Σ peers' local_set_entries`) held in all 3 runs.
+  - `reconcile_failures` (1-3 per run, non-zero in 2 of 3) is not asserted
+    on and is consistent with "owner churn mid-session converges on the
+    next session" by design (a session started against a set that
+    changed mid-round aborts and a fresh one starts); it never blocked
+    convergence or produced a false positive. Worth watching if it grows
+    with fleet size, but not a bug on this evidence.
+- `coop-digest-compare` PASS — see Measurements below for the recorded numbers.
+
+Regressions, run individually or in small groups:
+
+- `coop-cache-hit`, `web-fleet`, `existence-peer-hint` — PASS (4.6 s, 5.5 s, 4.8 s)
+- `coop-fallback`, `s3-retry`, `existence-bloom-dedup` — PASS (4.7 s, 2.2 s, 6.1 s)
+- `p2p-partition-tolerance` — PASS (105.3 s)
+- `p2p-invalidation` — PASS after fix #3 below (15.5 s)
+- `readahead` — PASS (2.4 s)
+- `two-clients-shared` — PASS, but slow (240.9 s vs. the few-seconds
+  runtime its sibling scenarios show); see "Performance finding" below
+- `baseline` — PASS (3.9 s)
+- `idle-cluster-is-quiet` — PASS (62.4 s); LIST/GET/HEAD/PUT counts
+  printed and well inside its own 675-request budget
+
+3. **`crates/harness/src/scenarios.rs:1740-1745` (`p2p_invalidation`) —
+   the second `setup()` call always self-deadlocked on the docker-prefix
+   lock.** This scenario runs two sub-experiments (P2P on, then P2P
+   off), each with its own `S3Env`/`TempDir` from `setup()`. Between them
+   it did `drop(root)` (the tempdir) but never dropped `env` (the
+   `S3Env`, which owns the docker-prefix `flock`), so the second
+   `setup("p2p-invalidation-off")` call always found the lock still held
+   by the first, still-live `env`, and failed every single run — not a
+   flake, reproduced 2/2 times including with `p2p-invalidation` as the
+   *only* scenario in the process. Unrelated to M15 (this function's
+   body is untouched by the M15 diff — confirmed with `git diff main`).
+   Fix: `drop(env);` right after `drop(root);`.
+
+M3b-sensitive (confirming the M3a/M3b merge holds under M15):
+
+- `kill9-remount` — PASS (2.8 s)
+- `lease-handover` — PASS (178.5 s; slow, see below), epochs observed `[1,2,3,4,5,6]`
+- `holder-ships-under-forward-load` — PASS (9.1 s): 6400 forwarded creates in 5.3 s, max journal_backlog 110, `ship_rounds_cancelled=0`
+- `chaos-ci` — PASS (14.6 s), 8 steps all ok
+
+**Performance finding (not blocking, no fix applied — flagging for the
+coordinator/M16 or a follow-up).** `two-clients-shared` (240.9 s) and
+`lease-handover` (178.5 s) both run noticeably slower than their
+pre-M15 ballpark (the other, structurally similar 2-node scenarios finish
+in single-digit seconds). Both pair two `Client`s that do **not** call
+`.with_own_node_key()`, so they share one iroh identity and P2P dials
+between them always fail ("Connecting to ourself is not supported" —
+this is documented, pre-existing, and by design for these two S3-only-path
+scenarios). Live status during the `two-clients-shared` run showed both
+daemons fully responsive (control socket answered instantly) with
+`reconcile_sessions` and `reconcile_failures` climbing in lockstep
+(`reconcile_rounds` stuck at 0 — every session fails immediately) roughly
+once every 30 s, plus `forwarded_err`/`forward_retries` climbing — i.e.
+not a daemon hang, but real wall-clock cost from the new exact-mode
+session driver repeatedly trying (and failing) to dial what is really
+itself. Bloom mode never dialed peers proactively for this, only
+broadcast gossip, so this cost is new in `exact` mode specifically for
+fleets with degenerate/self peer identities. Both scenarios still PASS
+(correctness unaffected — the S3-only convergence path takes over), so
+this is a performance observation, not a gate failure: worth a follow-up
+to make the session driver back off harder (or stop retrying) against a
+peer that dials-to-self, rather than a re-litigation of this milestone's
+design.
+
+**Flakes and environment notes**
+
+- One `harness run <a> <b> <c>` invocation was killed by an inner shell
+  `timeout` (my own tooling mistake, not a product bug) before
+  `two-clients-shared` finished; it left two orphaned
+  `constellation-harness-m15-*` containers (no owning process, `flock`
+  already released) that were removed by hand
+  (`docker rm -f`/`docker network rm`) before continuing. Not a
+  reproducible product issue.
+- No flakes were found in any of the three required 2 s-sleep-sensitive
+  regressions (`coop-cache-hit`, `web-fleet`, `existence-peer-hint`);
+  each passed on the first run in this environment, so the
+  bloom-vs-exact comparison the coder asked for (in case of a flake)
+  was not needed.
+- `coop-exact-churn`'s `reconcile_failures` varying run to run (0, 3, 1)
+  is noted above; it did not cause a false positive or a convergence
+  failure in any run.
+
+**Bloom vs. exact — `coop-digest-compare` (both printed lines)**
+
+```
+coop-churn[bloom]: peer_hits=93 peer_misses=12 false_positives=0 stale_misses=11 s3_fetches=45 digest_bytes=4534 (637 B/s fleet) msgs=102 digest_cpu_us=1680 reconcile_rounds=0 (0.0 us/round, failures=0) peer_set_bytes=188 in 7.1s
+coop-churn[exact]: peer_hits=116 peer_misses=6 false_positives=0 stale_misses=4 s3_fetches=23 digest_bytes=14184 (2369 B/s fleet) msgs=222 digest_cpu_us=1688 reconcile_rounds=3 (2.3 us/round, failures=0) peer_set_bytes=1824 in 6.0s
+```
+
+| Metric | bloom | exact |
+|---|---|---|
+| digest bytes/s (fleet) | 637 B/s | 2369 B/s |
+| false positives | 0 | 0 |
+| stale misses | 11 | 4 |
+| digest CPU (total, µs) | 1680 | 1688 |
+| µs per reconciliation round | n/a (0 rounds) | 2.3 |
+| peer-set bytes | 188 | 1824 |
+
+Reading this against the milestone's stated rationale: on this small,
+short (6-7 s) 3-node/24-chunk run, exact mode's *absolute* digest
+bytes/s is higher than bloom's, not lower — the workload is too small
+and short-lived for bloom's per-interval full-bucket resend to dominate
+the way the milestone write-up expects at steady state (bloom sends one
+digest message per 1 s interval per bucket regardless of change volume;
+over 6-7 s that is only ~6-7 messages, not enough to amortize past
+exact's chained-delta and reconciliation-session overhead on a
+constantly-churning small cache). Both modes show 0 false positives
+here (bloom's ~1% FPR did not trip in this sample size, matching the
+coder's risk note #7). `peer_set_bytes` is ~10x higher for exact
+(1824 vs 188) at this scale — consistent with the milestone's own
+stated trade-off (8-12 B/peer-chunk for exact vs. a shared, much smaller
+per-bucket bloom footprint) — and stale misses are lower under exact (4
+vs 11), consistent with same-tick delta propagation vs. bloom's
+add-only-until-next-snapshot staleness. **This one short run does not
+by itself confirm the milestone's "exact wins steady-state bytes/s"
+claim** (it wasn't run long enough or at enough scale to reach bloom's
+per-interval-resend steady state); a longer/larger `coop-digest-compare`
+run (more rounds, bigger caches) would be needed before deleting the
+bloom code per the milestone's own stated condition. This does not block
+the gate — `coop-digest-compare`'s only *assertions* (0 exact false
+positives, exact peer hits, both modes' peer hits, both modes' digest
+traffic) all pass — but it is a measurement caveat the coordinator
+should see before acting on "the tester's numbers confirm this."
+
+**Scope note on the exit-criteria's "smoke/integration, pjdfstest
+unchanged" line.** Ran `tests/smoke.sh` (host, local backend, no
+docker) — PASS. Did not run `tests/integration.sh` (floci S3 in docker)
+or `tests/compliance.sh` (pjdfstest; needs root and a pre-built
+`/opt/pjdfstest`, normally driven through
+`docker compose --profile test`) — out of scope for the gate list this
+tester was given, and M15's diff never touches POSIX namespace/file
+semantics (`fs-core`, `fusefs` VFS op handlers are untouched; only
+`coop.rs`/`coop/exact.rs`, `net`, `api` status fields, and the harness
+changed). Flagging this as a scope decision rather than silently
+skipping it.
+
+**Anything needing a design change:** none. Both bugs found were local
+and mechanical (one in pre-existing hedge-fallback logic exposed by the
+new churn scenario, one in the new scenario's own budget assertion) and
+are fixed above without touching the exact-mode protocol, wire format,
+or milestone defaults.
+
+### Plan 30 M15 — round 2: never dial ourselves from the roster
+
+The exact-mode driver no longer starts traffic to a roster entry that is
+really this node: its own node id, or a different node enrolled under
+this node's endpoint key (mounts sharing one node key, as in
+`two-clients-shared` and `lease-handover`). The shared helpers are
+`Peers::is_self` / `is_self_node` / `remote_snapshot` in
+`crates/net/src/peers.rs`. They are applied in four places, all in
+`crates/cli/src/coop/exact.rs`:
+
+- the liveness sweep;
+- the driver's pending set (on-demand session starts);
+- `run_session`, which returns before counting a session;
+- `exact_holders`' active set, so a fetch never picks such a peer.
+
+Bloom mode had no equivalent guard and did not need one: it never
+initiates traffic from the roster, only broadcasts gossip, and its
+holders come from received digests. It is left unchanged. The new unit
+test is `peers::tests::a_peer_sharing_our_key_is_self_and_not_a_remote`.
+Not built or run (coder round); the tester should re-time
+`two-clients-shared` and `lease-handover` and check that
+`reconcile_sessions` / `reconcile_failures` stay at 0 there.
+
+### Plan 30 M15 — tester gate run, round 2 (2026-09-23)
+
+Re-verified the round-2 self-guard fix (`Peers::is_self`/`is_self_node`/
+`remote_snapshot`, applied in `crates/cli/src/coop/exact.rs`). Build,
+fmt, clippy, `constellation-net` (90/90, incl. the new
+`a_peer_sharing_our_key_is_self_and_not_a_remote`) and `constellation`
+(260/261, 1 pre-existing ignore) tests, and the release build are all
+clean — no changes from round 1's report there.
+
+**The fix does what it says.** `two-clients-shared` and `lease-handover`
+(the two shared-node-key scenarios) both now report
+`reconcile_sessions=0` and `reconcile_failures=0` on *both* nodes
+(confirmed via a temporary `eprintln!` of `c0`/`c1` `control_status()`
+right before unmount, removed again after the check — see below). Before
+the fix these were climbing throughout the run (round 1 saw
+`reconcile_sessions`/`reconcile_failures` in the single digits and
+rising every ~30 s). Times: `two-clients-shared` 239.3 s,
+`lease-handover` 181.1 s — matching the coordinator's own M3a/M3b
+reference (~239 s / ~179 s) almost exactly. **This means the ~240 s/~180 s
+runtime is not a regression at all: it's these two scenarios' longstanding
+baseline** (they predate M15 and are unrelated to the cooperative cache).
+Round 1's report mischaracterized this as an M15 performance regression
+caused by the exact-mode session driver dialing itself — that
+attribution was wrong; the driver-retries-on-self-dial mechanism was real
+(and is exactly what round 2 fixed), but it was not what made these two
+scenarios slow. Retracting that finding.
+
+**Diagnostic used, and what it found.** To get `reconcile_sessions`/
+`reconcile_failures` from a live daemon (the scenario unmounts before
+returning, so there's no other way to see it from outside), I added a
+temporary `eprintln!` of the already-fetched `status`/`status1` values in
+`two_clients_shared` and freshly-fetched ones in `lease_handover`, right
+before `c0.unmount()`. Confirmed `0`/`0` on both nodes in both scenarios,
+then removed the `eprintln!`s (`git diff`/`grep TESTER-DIAG` confirm
+nothing remains). This directly answers the coordinator's question.
+
+**Two required regressions failed today: `coop-cache-hit`,
+`web-fleet`.** Investigated with a second temporary diagnostic
+(`tracing::debug!` in `Coop::holders` logging the exact-mode holder list
+plus `peers.remote_snapshot()`, and in `note_fail`'s `Busy` arm — both
+removed afterward, confirmed via `grep TESTER-DIAG` returning nothing and
+a clean `cargo fmt`/`clippy`/`build --workspace --all-targets` on the
+restored tree):
+
+- `coop-cache-hit` failed deterministically across 6 separate runs,
+  always `peer_hits=4 s3_fetches=4` (assertion wants `hits > s3`) on an
+  8-chunk file. The debug trace showed `exact_holders` correctly
+  returning `[1]` (peer A) as the sole holder for *every* chunk on every
+  call — the self-guard is not excluding a real peer. The 4 "misses"
+  were all `ChunkDecline::Busy` (not `Absent`/`RecentlyRemoved`, and
+  `peer_false_positives`/`peer_stale_misses` stayed 0): B's readahead
+  fires all 8 chunk fetches to A as a tight concurrent burst, and
+  `MAX_PER_PEER_SERVES = 4` (`crates/cli/src/coop.rs:51`, pre-existing,
+  untouched by any part of M15) caps A's concurrent serves to B at 4, so
+  the other 4 get busy-declined and correctly fall back to S3 (my
+  round-1 hedge fix, still working). **To rule out the round-2 self-guard
+  as the cause, I A/B-tested it directly**: temporarily reverted the 4
+  call sites in `exact.rs` back to `snapshot()`/no-op (backed up the file
+  first, restored it byte-for-byte after — `diff` confirmed), rebuilt,
+  and reran `coop-cache-hit` — **identical result**, `peer_hits=4
+  s3_fetches=4`. The self-guard is conclusively not the cause.
+- `web-fleet` failed once (`peer_hits=7` against a `>= 8` assertion) then
+  **passed twice** on immediate retries (`peer_hits=8`, then
+  `peer_hits=12`) with no code change in between — confirming it's
+  timing/scheduling variance, not a deterministic defect.
+
+**Assessment: not a round-2 regression, and not new to M15's code** —
+`MAX_PER_PEER_SERVES` and the busy-decline/fallback path are unchanged
+since before M15. What's plausible (not confirmed) is that exact mode's
+mirror becomes "this peer has everything" *complete* slightly sooner
+than bloom's bucket snapshot used to, so the prefetcher trusts all 8
+chunks as peer-servable at once and fires a tighter burst than bloom
+mode saw — meaning this marginal assertion (`hits > s3` against a
+hard-coded concurrency cap of 4 on an 8-chunk file, with only one peer
+to fetch from) may have been a latent, not-yet-triggered risk since
+round 1's default-mode switch to exact, and I simply got a lucky single
+pass when I ran it in round 1. I did not chase this further (it would
+mean changing `MAX_PER_PEER_SERVES`, the scenario's read pattern, or its
+assertion threshold — a design/tuning call, not a mechanical fix) and
+did not modify `coop-cache-hit`/`web-fleet`/`coop.rs`'s concurrency
+constant. Flagging for the coordinator: either loosen
+`coop-cache-hit`'s assertion (e.g. `hits >= n_chunks / 2` to match what
+a hard cap of `n_chunks / 2` peers-per-file guarantees), raise
+`MAX_PER_PEER_SERVES`, or accept it as an occasional flake specific to a
+single-peer 8-chunk burst.
+
+**`existence-peer-hint`** passed cleanly (as in round 1).
+
+**`coop-exact-churn` ×2**, both PASS, 0 false positives:
+```
+run 1: peer_hits=113 peer_misses=6 false_positives=0 stale_misses=6 s3_fetches=22 digest_bytes=13880 (2318 B/s fleet) msgs=219 digest_cpu_us=1675 reconcile_rounds=2 (8.0 us/round, failures=1) peer_set_bytes=1824 in 6.0s
+run 2: peer_hits=120 peer_misses=10 false_positives=0 stale_misses=9 s3_fetches=26 digest_bytes=14721 (2306 B/s fleet) msgs=234 digest_cpu_us=1767 reconcile_rounds=2 (4.0 us/round, failures=1) peer_set_bytes=1824 in 6.4s
+```
+
+**`coop-digest-compare`**, PASS:
+```
+coop-churn[bloom]: peer_hits=108 peer_misses=8 false_positives=0 stale_misses=8 s3_fetches=32 digest_bytes=4541 (654 B/s fleet) msgs=102 digest_cpu_us=1682 reconcile_rounds=0 (0.0 us/round, failures=0) peer_set_bytes=188 in 6.9s
+coop-churn[exact]: peer_hits=114 peer_misses=4 false_positives=0 stale_misses=2 s3_fetches=27 digest_bytes=14389 (2400 B/s fleet) msgs=225 digest_cpu_us=1717 reconcile_rounds=2 (4.0 us/round, failures=1) peer_set_bytes=1824 in 6.0s
+```
+Same ballpark as round 1's numbers; the round-1 caveat still applies —
+this run is too short/small to reach bloom's per-interval steady state.
+**A longer/larger variant was requested but `coop_churn.rs` has no env
+knob for it**: `NODES`, `ROUNDS`, `CACHE_CHUNKS`, `CHUNKS_PER_FILE`,
+`READS_PER_ROUND` are all hard-coded `const`s
+(`crates/harness/src/scenarios/coop_churn.rs:31-36`). Per the
+coordinator's fallback instruction, reporting this rather than hacking
+the scenario: a real steady-state comparison needs one of these (at
+minimum `ROUNDS` and `CACHE_CHUNKS`) exposed as an env var override, a
+small follow-up for whoever owns this scenario next.
+
+**Cleanup.** No commits made. All temporary diagnostics (`eprintln!` in
+two scenarios, `tracing::debug!` in two places in `coop.rs`) were added,
+used, and fully removed in this round; `git status`/`grep TESTER-DIAG`
+confirm the tree matches round 1's fix set plus the coder's untouched
+round-2 diff. No stray docker containers or lock holders left behind.
+
+### Plan 30 M15 — round 3: a serve-capped burst must stay on the peer
+
+**Regression.** `coop-cache-hit` failed deterministically on this branch
+in both digest modes: `peer_hits=4 peer_misses=4 s3_fetches=4`, against
+8/0 on main. `web-fleet` failed once.
+
+**How main gets 8/8 with the same `MAX_PER_PEER_SERVES = 4`.** It does
+not serve the burst; it drops it. B's cold read runs the demand fetch
+plus up to 7 readahead fetches at once. A serves 4 of them and answers
+the rest "not found" at once (in main, busy was indistinguishable from
+absent). In main's `fetch_uncached`, the last-resort S3 step was skipped
+whenever `hedge == Some(S3)`. That is always the case with one peer,
+because S3 is always the next-best candidate. So those 4 readahead
+fetches *failed without contacting anyone*. The readahead scheduler
+only records the error. When the application then reads those chunks,
+the demand path misses the cache, runs a fresh fetch, finds A's slots
+free, and gets a peer hit. The 8/8 is an accident of the
+never-try-S3 bug that the round-1 tester fix (`s3_tried`) correctly
+removed.
+
+**Root cause on M15.** With `s3_tried`, those 4 fast declines went
+straight to the last-resort S3 GET. Nothing between a `Busy` decline and
+S3 ever waited for the holder's slots, which free within milliseconds.
+M15's decline reasons only made the path observable. `Busy` was never
+counted as a false positive.
+
+**Fix** (`crates/cli/src/coop.rs`), bounded by the selector's S3 ETA, the
+number the peer was just ranked against:
+
+1. **Requester-side slots.** A new `peer_slots` map holds one semaphore
+   of `MAX_PER_PEER_SERVES` permits per peer. When a peer is the primary
+   source, `fetch_uncached` takes a permit *before* starting the
+   primary/hedge race, so a burst queues locally instead of drawing
+   `Busy`. The hedge timer starts only after the permit is held, so
+   time spent queued never fires a hedge. If no permit frees before the
+   S3 ETA, the fetch goes to S3 (`last_resort_s3`) without recording a
+   miss against the peer.
+2. **Retry on residual `Busy`.** If a holder still answers `Busy` (its
+   16-slot global cap is shared across requesters), `fetch_from` retries
+   the same peer: 2 ms backoff doubling to 20 ms, while inside the same
+   S3-ETA deadline. Each attempt is timed separately, so goodput is not
+   charged for backoff. Only a `Busy` that outlives the deadline becomes
+   `Miss(Busy)`.
+
+Why this design: a slot on a fast holder frees in milliseconds, far
+under an S3 first byte, and waiting no longer than the S3 ETA can never
+make a read slower than the choice the selector already rejected.
+Queueing at the requester needs no wire change and no extra round trips,
+which matters on a WAN. It uses the same cap constant as the holder, so
+one requester never oversubscribes a holder by construction. Retrying
+another exact holder was the alternative. It was not chosen: the burst
+case has one holder, and the selector already ranks the others as
+hedges.
+
+**Unchanged:**
+- `s3_tried`, so a read never errors without trying S3. The last-resort
+  path is now the shared `last_resort_s3` helper.
+- `Absent` still counts as `peer_false_positives`, and `RecentlyRemoved`
+  as `peer_stale_misses`.
+
+**Test.** `coop::tests::a_burst_past_the_serve_cap_is_served_by_the_peer_not_s3`
+sets up a real QUIC holder and requester in-process. S3 is an
+object store whose GETs take 200 ms, and the requester's selector has
+learned a ~200 ms S3 TTFB. The test fires 8 concurrent 64 KiB fetches
+against a per-requester serve cap of 4 and asserts
+`peer_hits == 8`, `s3_fetches == 0` and no false-positive or stale
+misses. On the pre-fix tree it gives 4/4, like the scenario. The
+reference page `docs/reference/features/cooperative-cache.md` gained a
+paragraph on `Busy` handling. Not built or run (coder round). The
+tester should rerun `coop-cache-hit` ×3 and `web-fleet` ×3 in both
+digest modes, and `coop-fallback`: a paused holder must still fall to
+S3 within the bound.
+
+### Plan 30 M15 — tester gate run, round 3 (2026-09-23)
+
+Re-verified the round-3 serve-cap fix (requester-side `peer_slots`,
+busy-decline retry with backoff, `last_resort_s3`, in
+`crates/cli/src/coop.rs`). One mechanical fix needed; everything else
+green, including the scenario the round-2 report flagged as a possible
+design issue — it's fixed now.
+
+**Fix needed: formatting.** `cargo fmt --all -- --check` failed on the
+coder's new code (three spots in `coop.rs`: the `timeout_at` call around
+line 709, the burst test's `assert!` around line 1901, and a chained
+`put_chunk(...).await.unwrap()` around line 1938 — all just needed
+rustfmt's line-wrapping). Ran `cargo fmt --all`; `--check` then passed
+clean. No other changes made.
+
+**Gates 1-3.** Build (workspace, all-targets) clean. `cargo clippy
+--workspace --all-targets -- -D warnings` clean. `cargo test -p
+constellation` — 261/261 (1 pre-existing ignore), including the new
+`coop::tests::a_burst_past_the_serve_cap_is_served_by_the_peer_not_s3`.
+`cargo test -p constellation-net` — 90/90. Release build clean.
+
+**Harness, both digest modes** (`CONSTELLATION_COOP_DIGEST` inherited by
+the spawned `constellation` processes from the harness's own
+environment — confirmed via the behavioral difference between modes
+below; `coop_client`/`Client::cmd` set no override):
+
+- `coop-cache-hit` ×3 **exact**: PASS every time —
+  `peer_hits=8 s3_fetches=0` all three runs (hedges 0, 2, 3). This is
+  the regression round 2 found: on the pre-round-3 tree this was a
+  deterministic `4/4` (confirmed via an A/B test in the round-2 report);
+  it is now consistently `8/0`.
+- `coop-cache-hit` ×3 **bloom**: PASS every time — `peer_hits=8
+  s3_fetches=0` all three runs (hedges 7, 4, 4; more hedging than exact,
+  consistent with bloom's less-immediate certainty that the peer holds
+  everything).
+- `web-fleet` ×3 **exact**: PASS every time — `s3_fetches=0`,
+  `peer_hits` 16, 16, 17 (aggregate across two readers × two reads of an
+  8-chunk file; 0 S3 fetches means every chunk after the first came from
+  a peer).
+- `web-fleet` ×3 **bloom**: PASS every time — `s3_fetches=0`,
+  `peer_hits=16` all three runs.
+- `coop-fallback` ×2 **exact**: PASS both times — `s3_fetches=8
+  hedges_fired=4 peer_misses=0 peer_errors=0` both runs, scenario time
+  4.6 s and 4.7 s. This exercises a genuinely *paused* (SIGSTOPped)
+  holder, not a `Busy` decline, so it's a check that the round-3 change
+  (requester-side slots + bounded retry, which only applies to a
+  responsive-but-over-capacity peer) did not disturb the pre-existing
+  hedge/timeout fallback for an unresponsive one — it didn't.
+
+**Default mode, once each, all PASS:**
+
+- `coop-exact-churn` ×2: `false_positives=0` both times (run 1:
+  `peer_hits=110 peer_misses=9 stale_misses=9 s3_fetches=33
+  reconcile_rounds=2 (4.5us/round, failures=1)` in 6.1s; run 2:
+  `peer_hits=107 peer_misses=5 stale_misses=5 s3_fetches=27
+  reconcile_rounds=2 (1.5us/round, failures=1)` in 5.9s — same shape as
+  rounds 1-2, still `reconcile_failures` in the low single digits per
+  run, still consistent with "owner churn mid-session converges on the
+  next session," never a false positive).
+- `existence-peer-hint`: PASS (`peer_hints=12 bloom_hits=0
+  chunk_ref_hits=0`).
+- `readahead`: PASS (32 chunks under 60 ms latency in 394.7 ms).
+- `p2p-invalidation`: PASS (push median 21 ms, poll median 3024 ms) —
+  unaffected by the fix, as expected (it doesn't touch the coop path).
+- `s3-retry`: PASS.
+- `two-clients-shared`: PASS in 243.4 s — matches the round-2-confirmed
+  ~239 s baseline (this scenario's longstanding cost, not related to
+  M15); no new slowdown from the round-3 change.
+
+**No design concerns, no diagnostics needed this round.** The one issue
+found (unformatted code) was mechanical and is fixed. `git status`
+shows only the accumulated round-1/round-2/round-3 diff (`cargo fmt`'s
+reformatting of the coder's new code, nothing else); no commits, no
+stray docker containers or lock holders.

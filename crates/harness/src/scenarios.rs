@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod coop_churn;
+
 pub struct Scenario {
     pub name: &'static str,
     pub desc: &'static str,
@@ -190,6 +192,18 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "one writer, two cold readers: aggregate S3 GETs stay near the unique-chunk count",
         requires: &[],
         run: web_fleet,
+    },
+    Scenario {
+        name: "coop-exact-churn",
+        desc: "3 small-cache nodes add and evict chunks while reading each other: zero false-positive peer fetches, exact mirrors",
+        requires: &[],
+        run: coop_churn::coop_exact_churn,
+    },
+    Scenario {
+        name: "coop-digest-compare",
+        desc: "same churn in bloom and exact digest mode: prints digest bytes/s, false positives, CPU per round",
+        requires: &[],
+        run: coop_churn::coop_digest_compare,
     },
     Scenario {
         name: "web-ui-smoke",
@@ -1726,6 +1740,11 @@ fn p2p_invalidation(_seed: u64) -> Result<()> {
     c0.unmount()?;
     c1.unmount()?;
     drop(root);
+    // The first S3Env (with its docker-prefix lock) must go too: the
+    // second `setup()` below acquires the same prefix lock and would
+    // otherwise always fail with "another harness run is already using
+    // the docker prefix", not a flake but a guaranteed self-conflict.
+    drop(env);
 
     // --- P2P off: the old bound must still hold ---
     let (env2, root2) = setup("p2p-invalidation-off")?;

@@ -171,7 +171,28 @@ pub enum Payload {
     },
     ChunkResponse {
         hash: [u8; 32],
-        found: bool,
+        status: ChunkStatus,
+    },
+    /// Plan 30 §M15: exact cache-membership heartbeat, gossiped every
+    /// digest interval. A receiver whose mirror of `node_id` does not
+    /// match starts a reconciliation session with it.
+    CacheSummary {
+        node_id: u64,
+        summary: crate::reconcile::Summary,
+    },
+    /// Plan 30 §M15: one publish tick's exact adds and removes, chained
+    /// by `seq` and by before/after root fingerprints.
+    CacheSetDelta {
+        node_id: u64,
+        delta: crate::reconcile::Delta,
+    },
+    /// Plan 30 §M15: one reconciliation round, sent directly to the
+    /// owner of the set being mirrored.
+    ReconcileRequest {
+        queries: Vec<crate::reconcile::Query>,
+    },
+    ReconcileReply {
+        reply: crate::reconcile::Reply,
     },
     /// Non-holder asks the lease holder to validate and journal `op`
     /// (postcard-encoded `MutateOp` from constellation-meta).
@@ -214,6 +235,41 @@ pub enum Payload {
         part: String,
         epoch: u64,
     },
+}
+
+/// Why a holder did not serve a requested chunk. The requester needs
+/// the distinction to account precisely: `Absent` for a chunk it was
+/// told the holder has is a false-positive peer fetch; a chunk the
+/// holder dropped moments ago is only a propagation race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChunkDecline {
+    /// Serving budget exhausted, cooperative cache off, or a local read
+    /// error: nothing to learn about membership.
+    Busy,
+    /// The holder does not have it and has not dropped it recently.
+    Absent,
+    /// The holder dropped it (evicted, or it became dirty) within its
+    /// recent-removal window, so a requester's view may not have caught
+    /// up yet.
+    RecentlyRemoved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChunkStatus {
+    /// The chunk body follows on the stream.
+    Found,
+    Declined(ChunkDecline),
+}
+
+/// Bytes a [`Signed`] envelope adds around a payload's postcard body:
+/// author key, 64-byte signature and their length prefixes.
+pub const SIGNED_ENVELOPE: usize = 32 + 1 + 64 + 3;
+
+/// Approximate on-the-wire size of `payload` once signed, for the
+/// digest-plane byte counters. Exact postcard body plus the fixed
+/// envelope; gossip fan-out and QUIC framing are not included.
+pub fn wire_len(payload: &Payload) -> usize {
+    postcard::to_allocvec(payload).map(|v| v.len()).unwrap_or(0) + SIGNED_ENVELOPE
 }
 
 /// A payload plus its author and signature.
@@ -470,6 +526,119 @@ mod tests {
             n <= GOSSIP_CONTENT_LIMIT,
             "maximum delta is {n} bytes, content limit is {GOSSIP_CONTENT_LIMIT}"
         );
+    }
+
+    /// A delta of [`crate::reconcile::MAX_DELTA_KEYS`] worst-case keys
+    /// (10-byte varints) must fit one gossip frame.
+    #[test]
+    fn a_maximum_exact_delta_fits_the_real_gossip_budget() {
+        use crate::reconcile::{Delta, MAX_DELTA_KEYS};
+        // Real gaps between 2048 sorted random keys are ~8-byte varints;
+        // charge every key the 10-byte maximum.
+        let mut worst = Vec::with_capacity(MAX_DELTA_KEYS * 10);
+        for _ in 0..MAX_DELTA_KEYS {
+            worst.extend_from_slice(&[0xff; 9]);
+            worst.push(0x01);
+        }
+        let msg = Signed::new(
+            &key(),
+            &Payload::CacheSetDelta {
+                node_id: u64::MAX,
+                delta: Delta {
+                    incarnation: u64::MAX,
+                    seq: u64::MAX,
+                    base: [0xff; 16],
+                    root: [0xff; 16],
+                    adds: worst,
+                    removes: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        let n = msg.encode_bare().unwrap().len();
+        assert!(
+            n <= GOSSIP_CONTENT_LIMIT,
+            "maximum exact delta is {n} bytes, content limit is {GOSSIP_CONTENT_LIMIT}"
+        );
+    }
+
+    /// The largest request and reply a session can produce must fit a
+    /// direct-stream frame, or the round silently fails on the wire.
+    #[test]
+    fn maximum_reconcile_frames_fit_a_stream_frame() {
+        use crate::reconcile::{
+            respond, KeySet, Query, Range, Summary, MAX_QUERIES_PER_REQUEST, REPLY_BUDGET,
+        };
+        let queries: Vec<Query> = (0..MAX_QUERIES_PER_REQUEST as u64)
+            .map(|i| Query {
+                range: Range {
+                    bits: 60,
+                    path: (1u64 << 60) - 1 - i,
+                },
+                fp: [0xff; 16],
+                count: u64::MAX,
+            })
+            .collect();
+        let req = Signed::new(&key(), &Payload::ReconcileRequest { queries }).unwrap();
+        assert!(req.encode().is_ok(), "maximum request exceeds MAX_FRAME");
+
+        // A dense owner answering "send everything" pages at the budget.
+        let owner =
+            KeySet::from_keys((0..200_000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+        let empty = KeySet::new();
+        let queries: Vec<Query> = Range::level(8)
+            .into_iter()
+            .map(|r| {
+                let a = empty.acc(&r);
+                Query {
+                    range: r,
+                    fp: a.fingerprint(),
+                    count: 0,
+                }
+            })
+            .collect();
+        let summary = Summary {
+            incarnation: u64::MAX,
+            seq: u64::MAX,
+            root: owner.root_fingerprint(),
+            count: owner.len() as u64,
+        };
+        let reply = respond(&owner, summary, &queries, REPLY_BUDGET);
+        let msg = Signed::new(&key(), &Payload::ReconcileReply { reply }).unwrap();
+        let n = msg.encode().expect("maximum reply exceeds MAX_FRAME").len();
+        assert!(n <= MAX_FRAME, "{n}");
+
+        // And a reply made only of child splits.
+        let mirror = KeySet::from_keys((0..200_000u64).map(|i| i.wrapping_mul(31)));
+        let queries: Vec<Query> = Range::level(8)
+            .into_iter()
+            .map(|r| {
+                let a = mirror.acc(&r);
+                Query {
+                    range: r,
+                    fp: a.fingerprint(),
+                    count: a.count.max(1),
+                }
+            })
+            .collect();
+        let reply = respond(&owner, summary, &queries, REPLY_BUDGET);
+        let msg = Signed::new(&key(), &Payload::ReconcileReply { reply }).unwrap();
+        assert!(
+            msg.encode().is_ok(),
+            "children-only reply exceeds MAX_FRAME"
+        );
+    }
+
+    #[test]
+    fn wire_len_tracks_the_signed_encoding() {
+        let payload = Payload::Ping { node_id: 7 };
+        let real = Signed::new(&key(), &payload)
+            .unwrap()
+            .encode_bare()
+            .unwrap()
+            .len();
+        let est = wire_len(&payload);
+        assert!(est.abs_diff(real) <= 8, "estimate {est} vs real {real}");
     }
 
     /// The largest segment push [`SEGMENT_PUSH_ENVELOPE`] admits must

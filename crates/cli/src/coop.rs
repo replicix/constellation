@@ -1,15 +1,35 @@
 //! Cooperative cache: digest gossip, peer serving, source-selecting fetch
 //! (DESIGN.md §7, plan 06).
 //!
-//! A local miss consults in-memory peer blooms (zero extra messages),
-//! then the latency-adaptive selector in [`crate::sources`] ranks S3
-//! against the peers that claim the chunk. S3 remains the correctness
-//! anchor: a peer that declines, times out, or fails blake3 verification
-//! is recorded as an error and the fetch falls back.
+//! A local miss consults in-memory knowledge of peers' caches (zero
+//! extra messages), then the latency-adaptive selector in
+//! [`crate::sources`] ranks S3 against the peers that claim the chunk.
+//! S3 remains the correctness anchor: a peer that declines, times out,
+//! or fails blake3 verification is recorded and the fetch falls back.
+//!
+//! How peers learn each other's caches is `CONSTELLATION_COOP_DIGEST`:
+//!
+//! * `exact` (default, plan 30 §M15, [`exact`]): an exact mirror of each
+//!   peer's set, kept current by pushed deltas and range-based set
+//!   reconciliation. No false positives by construction.
+//! * `bloom` (plans 06/14): gossiped bloom snapshots per hash-prefix
+//!   bucket plus add-only deltas, ~1% false positives, removals stale
+//!   until the bucket's next snapshot. Kept so the two can be measured
+//!   side by side (`status.coop.digest_*`, `peer_false_positives`).
+//!
+//! All nodes of a fleet should run the same mode: an exact node ignores
+//! bloom digests and vice versa, so a mixed pair just falls back to S3.
+//!
+//! False-positive accounting is mode-independent: a holder declines a
+//! chunk it lacks with `Absent`, unless it dropped it within its
+//! recent-removal window (`RecentlyRemoved`, a propagation race). Only
+//! `Absent` counts as a false-positive peer fetch.
 //!
 //! Rendezvous hashing (an alternative to "whoever already has it") is
 //! intentionally not wired; the selector only ranks sources that already
 //! claim the chunk.
+
+mod exact;
 
 use crate::sources::{Selector, SourceId};
 use anyhow::{bail, Result};
@@ -18,7 +38,9 @@ use constellation_fs_core::ChunkHash;
 use constellation_net::bloom::{
     bucket_count_for, bucket_index, ENTRIES_PER_BUCKET, MAX_BITS_BYTES, MAX_BUCKETS,
 };
-use constellation_net::{Bloom, PathKind, Payload, Peers};
+use constellation_net::message::{wire_len, SIGNED_ENVELOPE};
+use constellation_net::reconcile::key_of;
+use constellation_net::{Bloom, ChunkDecline, PathKind, Payload, Peers};
 use constellation_store_s3::{ChunkStore, DecodePriority};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +52,14 @@ const MAX_PER_PEER_SERVES: u32 = 4;
 const S3_FETCH_ATTEMPTS: usize = 3;
 const S3_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_PENDING_ADDS: usize = 65_536;
+/// First and largest pause between retries of a peer that answered
+/// `Busy`. A serving slot frees when one transfer ends (milliseconds on
+/// a LAN); the whole wait is bounded by the S3 ETA, see `fetch_uncached`.
+const BUSY_RETRY_FIRST: Duration = Duration::from_millis(2);
+const BUSY_RETRY_MAX: Duration = Duration::from_millis(20);
+/// Ceiling on how long a fetch waits for a peer's serving slot,
+/// whatever the S3 ETA says (a peer chunk request is bounded at 5 s).
+const MAX_PEER_WAIT_MS: f64 = 5_000.0;
 
 fn exceeds_digest_capacity(entries: usize) -> bool {
     entries > (MAX_BUCKETS as usize).saturating_mul(ENTRIES_PER_BUCKET)
@@ -44,11 +74,56 @@ fn parse_enabled(value: Option<&str>) -> bool {
     })
 }
 
+/// Which peer-membership protocol this node speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DigestMode {
+    Exact,
+    Bloom,
+}
+
+impl DigestMode {
+    /// `CONSTELLATION_COOP_DIGEST`: `exact` (default) or `bloom`.
+    /// Anything else keeps the default and says so.
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("exact") | Some("rbsr") => Self::Exact,
+            Some("bloom") => Self::Bloom,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "unknown CONSTELLATION_COOP_DIGEST; using exact"
+                );
+                Self::Exact
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Bloom => "bloom",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CoopConfig {
     enabled: bool,
     digest_interval: Duration,
     digest_ttl: Duration,
+    mode: DigestMode,
+}
+
+impl CoopConfig {
+    /// How long a holder remembers a dropped chunk, so a requester whose
+    /// view has not caught up yet is charged a race, not a false
+    /// positive. Two digest intervals covers a missed heartbeat plus a
+    /// session; 10 s floors it for short harness intervals.
+    fn recent_grace(&self) -> Duration {
+        self.digest_interval
+            .saturating_mul(2)
+            .max(Duration::from_secs(10))
+    }
 }
 
 impl CoopConfig {
@@ -68,6 +143,7 @@ impl CoopConfig {
             enabled,
             digest_interval: Duration::from_secs(interval_s),
             digest_ttl: Duration::from_secs(ttl_s),
+            mode: DigestMode::parse(std::env::var("CONSTELLATION_COOP_DIGEST").ok().as_deref()),
         }
     }
 }
@@ -108,6 +184,22 @@ struct Counters {
     stale_digests_pruned: AtomicU64,
     digest_rebuilds: AtomicU64,
     digest_capacity_exceeded: AtomicU64,
+    /// Peer answered `Absent` for a chunk our digest/mirror said it had.
+    peer_false_positives: AtomicU64,
+    /// Peer answered `RecentlyRemoved`: a propagation race.
+    peer_stale_misses: AtomicU64,
+    /// Digest-plane wire bytes and messages (both modes: blooms, bloom
+    /// deltas, summaries, exact deltas, reconciliation rounds).
+    digest_bytes_sent: AtomicU64,
+    digest_bytes_received: AtomicU64,
+    digest_messages: AtomicU64,
+    /// Time spent in digest-plane code (building/applying/answering).
+    digest_cpu_us: AtomicU64,
+    reconcile_sessions: AtomicU64,
+    reconcile_rounds: AtomicU64,
+    reconcile_failures: AtomicU64,
+    /// Part of `digest_cpu_us` spent answering or applying rounds.
+    reconcile_cpu_us: AtomicU64,
 }
 
 pub struct Coop {
@@ -120,7 +212,20 @@ pub struct Coop {
     digests: Mutex<HashMap<u64, PeerDigest>>,
     counters: Counters,
     budget: Mutex<ServeBudget>,
+    /// Requester side of the holder's per-peer serving cap: at most
+    /// [`MAX_PER_PEER_SERVES`] of our fetches in flight to one peer, so a
+    /// burst (a demand read plus its readahead) queues here instead of
+    /// being declined `Busy` by the holder. See `fetch_uncached`.
+    peer_slots: Mutex<HashMap<u64, Arc<tokio::sync::Semaphore>>>,
     config: CoopConfig,
+    /// This node's published servable set and recent removals (both
+    /// modes; see [`exact::LocalSet`]).
+    local: Mutex<exact::LocalSet>,
+    /// Exact mode: one mirror per peer.
+    mirrors: Mutex<HashMap<u64, exact::PeerMirror>>,
+    /// Exact mode: peers that need a reconciliation session.
+    sync_tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    sync_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<u64>>>,
 }
 
 /// Global and per-peer serving concurrency, under one lock so the
@@ -146,7 +251,7 @@ enum FetchResult {
         ttfb_ms: f64,
         total_ms: f64,
     },
-    Miss,
+    Miss(ChunkDecline),
     Fail,
 }
 
@@ -189,6 +294,7 @@ impl Coop {
         chunk_size: u32,
         config: CoopConfig,
     ) -> Arc<Self> {
+        let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel();
         Arc::new(Self {
             cache,
             store,
@@ -199,6 +305,11 @@ impl Coop {
             digests: Mutex::new(HashMap::new()),
             counters: Counters::default(),
             budget: Mutex::new(ServeBudget::default()),
+            peer_slots: Mutex::new(HashMap::new()),
+            local: Mutex::new(exact::LocalSet::new(config.recent_grace())),
+            mirrors: Mutex::new(HashMap::new()),
+            sync_tx,
+            sync_rx: Mutex::new(Some(sync_rx)),
             config,
         })
     }
@@ -215,14 +326,39 @@ impl Coop {
                 enabled: true,
                 digest_interval: Duration::from_secs(1),
                 digest_ttl: Duration::from_secs(60),
+                // `main.rs`'s upload-hint test feeds a bloom snapshot.
+                mode: DigestMode::Bloom,
             },
         )
     }
 
     pub fn apply_digest(&self, d: constellation_net::DigestSnapshot) {
-        if d.node_id == self.node_id {
+        if d.node_id == self.node_id || self.config.mode != DigestMode::Bloom {
             return;
         }
+        self.note_bloom_rx(d.bits.len() + 48);
+        let started = Instant::now();
+        self.apply_digest_inner(d);
+        self.note_digest_cpu(started);
+    }
+
+    fn note_bloom_rx(&self, body: usize) {
+        self.counters
+            .digest_bytes_received
+            .fetch_add((body + SIGNED_ENVELOPE) as u64, Ordering::Relaxed);
+        self.counters
+            .digest_messages
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_digest_cpu(&self, started: Instant) {
+        self.counters.digest_cpu_us.fetch_add(
+            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn apply_digest_inner(&self, d: constellation_net::DigestSnapshot) {
         let buckets = d.buckets.clamp(1, MAX_BUCKETS);
         if d.bucket >= buckets {
             return;
@@ -259,9 +395,16 @@ impl Coop {
     }
 
     pub fn apply_delta(&self, d: constellation_net::DigestDelta) {
-        if d.node_id == self.node_id {
+        if d.node_id == self.node_id || self.config.mode != DigestMode::Bloom {
             return;
         }
+        self.note_bloom_rx(d.adds.len() * 33 + 24);
+        let started = Instant::now();
+        self.apply_delta_inner(d);
+        self.note_digest_cpu(started);
+    }
+
+    fn apply_delta_inner(&self, d: constellation_net::DigestDelta) {
         let buckets = d.buckets.clamp(1, MAX_BUCKETS);
         let mut map = self.digests.lock().unwrap();
         let Some(entry) = map.get_mut(&d.node_id) else {
@@ -281,30 +424,48 @@ impl Coop {
     }
 
     /// Serve one clean/pinned chunk, honoring the global and per-peer
-    /// concurrency caps. Excess demand is a miss (`found: false`).
+    /// concurrency caps. Excess demand is `Busy`; a chunk we do not hold
+    /// is `Absent` — or `RecentlyRemoved` if we dropped it inside the
+    /// recent-removal window, so the requester can tell a propagation
+    /// race from a false positive in what we advertised.
     ///
     /// The read itself goes to a blocking thread: it is a synchronous
     /// file read plus a blake3 verify of up to a whole chunk, and this
     /// runs inside the peer accept path on a runtime worker.
-    pub async fn serve_chunk(self: &Arc<Self>, hash: [u8; 32], from_hex: &str) -> Option<Vec<u8>> {
+    pub async fn serve_chunk(
+        self: &Arc<Self>,
+        hash: [u8; 32],
+        from_hex: &str,
+    ) -> Result<Vec<u8>, ChunkDecline> {
         if !self.config.enabled {
-            return None;
+            return Err(ChunkDecline::Busy);
         }
-        let _slot = self.try_serve_slot(from_hex)?;
+        let _slot = self.try_serve_slot(from_hex).ok_or(ChunkDecline::Busy)?;
         let this = self.clone();
-        let data = tokio::task::spawn_blocking(move || this.cache.get_servable(&ChunkHash(hash)))
+        let read = tokio::task::spawn_blocking(move || this.cache.get_servable(&ChunkHash(hash)))
             .await
-            .ok()?
-            .ok()
-            .flatten()?;
+            .map_err(|_| ChunkDecline::Busy)?
+            .map_err(|_| ChunkDecline::Busy)?;
+        let Some(data) = read else {
+            return Err(self.absence_reason(&hash));
+        };
         let data = self
             .store
             .protect_peer_chunk(&ChunkHash(hash), &data)
-            .ok()?;
+            .map_err(|_| ChunkDecline::Busy)?;
         self.counters
             .bytes_served
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        Some(data)
+        Ok(data)
+    }
+
+    fn absence_reason(&self, hash: &[u8; 32]) -> ChunkDecline {
+        let local = self.local.lock().unwrap();
+        if local.recently_held(key_of(hash), Instant::now()) {
+            ChunkDecline::RecentlyRemoved
+        } else {
+            ChunkDecline::Absent
+        }
     }
 
     fn try_serve_slot(&self, from_hex: &str) -> Option<ServeSlot<'_>> {
@@ -325,6 +486,13 @@ impl Coop {
     }
 
     fn holders(&self, hash: &ChunkHash) -> Vec<u64> {
+        match self.config.mode {
+            DigestMode::Exact => self.exact_holders(key_of(&hash.0)),
+            DigestMode::Bloom => self.bloom_holders(hash),
+        }
+    }
+
+    fn bloom_holders(&self, hash: &ChunkHash) -> Vec<u64> {
         let key = hash.0;
         let mut map = self.digests.lock().unwrap();
         let before = map.len();
@@ -411,17 +579,52 @@ impl Coop {
         };
         let cands = self.candidates(hash);
         let size = u64::from(self.chunk_size);
-        let (primary, hedge, deadline) = {
+        let (primary, hedge, deadline, s3_eta_ms) = {
             let mut sel = self.selector.lock().unwrap();
             self.sync_probe_rtts(&mut sel);
             let primary = sel.pick(&cands, size);
             let hedge = sel.next_best(&cands, primary, size);
             let deadline = sel.hedge_deadline_ms(primary, size);
+            let s3_eta_ms = sel.eta_ms(SourceId::S3, size);
             sel.begin(primary);
-            (primary, hedge, deadline)
+            (primary, hedge, deadline, s3_eta_ms)
+        };
+        // How long a peer may keep us waiting for a serving slot before S3
+        // would have been faster: the selector's own S3 ETA, the number it
+        // just ranked this peer against. Queueing that long on a holder
+        // that is streaming our other chunks still beats an S3 GET.
+        let wait_ms = if s3_eta_ms.is_finite() {
+            s3_eta_ms.clamp(1.0, MAX_PEER_WAIT_MS)
+        } else {
+            MAX_PEER_WAIT_MS
+        };
+        let peer_wait_until = Instant::now() + Duration::from_secs_f64(wait_ms / 1000.0);
+        let _peer_slot = match primary {
+            SourceId::Peer(id) => match self.peer_slot(id, peer_wait_until).await {
+                Some(permit) => Some(permit),
+                None => {
+                    // Our own fetches keep this holder's serving budget
+                    // full for longer than S3 would take: S3 now wins.
+                    // Not the peer's fault, so no miss is recorded.
+                    self.selector.lock().unwrap().end(primary);
+                    return self.last_resort_s3(hash, priority, read_back).await;
+                }
+            },
+            SourceId::S3 => None,
         };
 
-        let primary_f = self.fetch_from(primary, hash, priority);
+        // Whether S3 was actually contacted (not merely armed as a hedge
+        // candidate): a primary that fails before the hedge deadline
+        // elapses ends the race in the first `select!` arm below without
+        // ever spawning the hedge, so `hedge == Some(SourceId::S3)` alone
+        // does not mean S3 was tried. Gating the last-resort fallback on
+        // this instead of on `hedge` fixes a real gap where a fast peer
+        // decline (a normal event under exact-mode churn) with an S3
+        // hedge candidate skipped S3 entirely and the fetch failed even
+        // though S3 was never asked.
+        let mut s3_tried = primary == SourceId::S3;
+
+        let primary_f = self.fetch_from(primary, hash, priority, peer_wait_until);
         tokio::pin!(primary_f);
         let result = if let Some(hsrc) = hedge {
             let sleep = tokio::time::sleep(Duration::from_millis(deadline));
@@ -430,7 +633,8 @@ impl Coop {
                 _ = sleep => {
                     self.counters.hedges_fired.fetch_add(1, Ordering::Relaxed);
                     self.selector.lock().unwrap().begin(hsrc);
-                    let hedge_f = self.fetch_from(hsrc, hash, priority);
+                    s3_tried = s3_tried || hsrc == SourceId::S3;
+                    let hedge_f = self.fetch_from(hsrc, hash, priority, peer_wait_until);
                     tokio::pin!(hedge_f);
                     tokio::select! {
                         r = &mut primary_f => {
@@ -440,7 +644,7 @@ impl Coop {
                                     self.settle(hash, primary, result, read_back)
                                 }
                                 other => {
-                                    self.note_fail(primary, &other);
+                                    self.note_fail(hash, primary, &other);
                                     self.settle(hash, hsrc, hedge_f.await, read_back)
                                 }
                             }
@@ -453,7 +657,7 @@ impl Coop {
                                 }
                                 other => {
                                     self.selector.lock().unwrap().end(hsrc);
-                                    self.note_fail(hsrc, &other);
+                                    self.note_fail(hash, hsrc, &other);
                                     self.settle(hash, primary, primary_f.await, read_back)
                                 }
                             }
@@ -467,24 +671,51 @@ impl Coop {
 
         match result {
             Some(fetched) => Ok(fetched),
-            None => {
-                // Last resort: S3 if we have not already succeeded via it.
-                if primary != SourceId::S3 && hedge != Some(SourceId::S3) {
-                    self.selector.lock().unwrap().begin(SourceId::S3);
-                    match self.settle(
-                        hash,
-                        SourceId::S3,
-                        self.fetch_from(SourceId::S3, hash, priority).await,
-                        read_back,
-                    ) {
-                        Some(fetched) => Ok(fetched),
-                        None => bail!("chunk {} unavailable from peers and S3", hash.to_hex()),
-                    }
-                } else {
-                    bail!("chunk {} unavailable from peers and S3", hash.to_hex())
-                }
-            }
+            // Last resort: S3, unless it was already actually tried.
+            None if !s3_tried => self.last_resort_s3(hash, priority, read_back).await,
+            None => bail!("chunk {} unavailable from peers and S3", hash.to_hex()),
         }
+    }
+
+    /// S3 as the final source: a read never fails without asking it.
+    async fn last_resort_s3(
+        &self,
+        hash: &ChunkHash,
+        priority: DecodePriority,
+        read_back: bool,
+    ) -> Result<Fetched> {
+        self.selector.lock().unwrap().begin(SourceId::S3);
+        let r = self.fetch_s3_spilled(hash, priority).await;
+        match self.settle(hash, SourceId::S3, r, read_back) {
+            Some(fetched) => Ok(fetched),
+            None => bail!("chunk {} unavailable from peers and S3", hash.to_hex()),
+        }
+    }
+
+    fn peer_limiter(&self, node_id: u64) -> Arc<tokio::sync::Semaphore> {
+        self.peer_slots
+            .lock()
+            .unwrap()
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_PER_PEER_SERVES as usize)))
+            .clone()
+    }
+
+    /// One of our [`MAX_PER_PEER_SERVES`] request slots to `node_id`, or
+    /// `None` if none frees up before `until`.
+    async fn peer_slot(
+        &self,
+        node_id: u64,
+        until: Instant,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let limiter = self.peer_limiter(node_id);
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(until),
+            limiter.acquire_owned(),
+        )
+        .await
+        .ok()?
+        .ok()
     }
 
     fn settle(
@@ -552,19 +783,40 @@ impl Coop {
                 })
             }
             other => {
-                self.note_fail(src, &other);
+                self.note_fail(requested, src, &other);
                 None
             }
         }
     }
 
-    fn note_fail(&self, src: SourceId, r: &FetchResult) {
+    fn note_fail(&self, hash: &ChunkHash, src: SourceId, r: &FetchResult) {
         let mut sel = self.selector.lock().unwrap();
         match r {
-            FetchResult::Miss => {
+            FetchResult::Miss(why) => {
                 sel.record_miss(src);
-                if matches!(src, SourceId::Peer(_)) {
+                drop(sel);
+                if let SourceId::Peer(id) = src {
                     self.counters.peer_misses.fetch_add(1, Ordering::Relaxed);
+                    match why {
+                        ChunkDecline::Absent => {
+                            self.counters
+                                .peer_false_positives
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(
+                                peer = id,
+                                chunk = %hash.to_hex(),
+                                mode = self.config.mode.as_str(),
+                                "false-positive peer fetch"
+                            );
+                        }
+                        ChunkDecline::RecentlyRemoved => {
+                            self.counters
+                                .peer_stale_misses
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        ChunkDecline::Busy => {}
+                    }
+                    self.forget_peer_key(id, key_of(&hash.0), *why);
                 }
             }
             FetchResult::Fail => {
@@ -580,29 +832,40 @@ impl Coop {
     /// Both arms report first-byte and end-to-end separately, because
     /// the selector learns TTFB and goodput as independent terms — one
     /// combined duration would leave goodput frozen at its prior.
+    ///
+    /// A peer that answers `Busy` (its serving budget is full, e.g. other
+    /// requesters share its global cap) is retried with a short backoff
+    /// until `busy_until` — the S3 ETA the peer was ranked against. Busy
+    /// says nothing about membership, so it is never a false positive,
+    /// and waiting for a slot on a fast holder beats an S3 GET.
     async fn fetch_from(
         &self,
         src: SourceId,
         hash: &ChunkHash,
         priority: DecodePriority,
+        busy_until: Instant,
     ) -> FetchResult {
-        if src == SourceId::S3 {
+        let SourceId::Peer(id) = src else {
             return self.fetch_s3_spilled(hash, priority).await;
-        }
-        let t0 = Instant::now();
-        let (data, ttfb, rtt, path) = match src {
-            SourceId::S3 => unreachable!(),
-            SourceId::Peer(id) => match self.peers.request_chunk(id, &hash.0).await {
-                Ok(Some(fetch)) => {
-                    let Ok(data) = self.store.open_peer_chunk(hash, &fetch.data) else {
-                        return FetchResult::Fail;
-                    };
-                    (data, fetch.ttfb, fetch.rtt, fetch.path)
-                }
-                Ok(None) => return FetchResult::Miss,
-                Err(_) => return FetchResult::Fail,
-            },
         };
+        let mut backoff = BUSY_RETRY_FIRST;
+        let (t0, fetch) = loop {
+            // Per attempt, so goodput is not charged for time spent queued.
+            let t0 = Instant::now();
+            match self.peers.request_chunk(id, &hash.0).await {
+                Ok(Ok(fetch)) => break (t0, fetch),
+                Ok(Err(ChunkDecline::Busy)) if Instant::now() + backoff < busy_until => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(BUSY_RETRY_MAX);
+                }
+                Ok(Err(why)) => return FetchResult::Miss(why),
+                Err(_) => return FetchResult::Fail,
+            }
+        };
+        let Ok(data) = self.store.open_peer_chunk(hash, &fetch.data) else {
+            return FetchResult::Fail;
+        };
+        let (ttfb, rtt, path) = (fetch.ttfb, fetch.rtt, fetch.path);
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if self.store.hash(&data) != *hash {
             return FetchResult::Fail;
@@ -693,6 +956,7 @@ impl Coop {
             })
             .collect();
         drop(sel);
+        let (peer_set_entries, peer_set_bytes) = self.peer_set_footprint();
         constellation_api::CoopStatus {
             peer_hits: self.counters.peer_hits.load(Ordering::Relaxed),
             peer_misses: self.counters.peer_misses.load(Ordering::Relaxed),
@@ -708,19 +972,135 @@ impl Coop {
                 .load(Ordering::Relaxed)
                 != 0,
             per_source,
+            digest_mode: self.config.mode.as_str().into(),
+            peer_false_positives: self.counters.peer_false_positives.load(Ordering::Relaxed),
+            peer_stale_misses: self.counters.peer_stale_misses.load(Ordering::Relaxed),
+            digest_bytes_sent: self.counters.digest_bytes_sent.load(Ordering::Relaxed),
+            digest_bytes_received: self.counters.digest_bytes_received.load(Ordering::Relaxed),
+            digest_messages: self.counters.digest_messages.load(Ordering::Relaxed),
+            digest_cpu_us: self.counters.digest_cpu_us.load(Ordering::Relaxed),
+            reconcile_sessions: self.counters.reconcile_sessions.load(Ordering::Relaxed),
+            reconcile_rounds: self.counters.reconcile_rounds.load(Ordering::Relaxed),
+            reconcile_failures: self.counters.reconcile_failures.load(Ordering::Relaxed),
+            reconcile_cpu_us: self.counters.reconcile_cpu_us.load(Ordering::Relaxed),
+            local_set_entries: self.local.lock().unwrap().keys.len() as u64,
+            peer_set_entries,
+            peer_set_bytes,
+        }
+    }
+
+    /// Size of what this node holds about peers' caches: mirror keys
+    /// (exact) or inserted bloom entries (bloom), and resident bytes.
+    fn peer_set_footprint(&self) -> (u64, u64) {
+        match self.config.mode {
+            DigestMode::Exact => {
+                let map = self.mirrors.lock().unwrap();
+                map.values().fold((0, 0), |(n, b), pm| {
+                    (
+                        n + pm.mirror.keys.len() as u64,
+                        b + pm.mirror.keys.approx_bytes() as u64,
+                    )
+                })
+            }
+            DigestMode::Bloom => {
+                let map = self.digests.lock().unwrap();
+                map.values().fold((0, 0), |(n, b), d| {
+                    (
+                        n + d.blooms.values().map(|bl| bl.n).sum::<u64>(),
+                        b + d.byte_len() as u64,
+                    )
+                })
+            }
         }
     }
 
     /// Gossip local cache membership from the cache's digest journal —
-    /// never a full `servable_hashes()` scan on the 250 ms tick.
-    ///
-    /// One hash-prefix bucket per interval (a full snapshot of that
-    /// slice); add-only deltas for hashes in buckets already sent.
-    /// Each node chooses `buckets` from its own cache size.
+    /// never a full `servable_hashes()` scan on the 250 ms tick — in the
+    /// configured [`DigestMode`]. Exact mode also runs the
+    /// reconciliation driver that keeps this node's peer mirrors current.
     pub async fn publish_loop(self: Arc<Self>) {
         if !self.config.enabled || !self.peers.is_enabled() {
             return;
         }
+        match self.config.mode {
+            DigestMode::Exact => {
+                tokio::spawn(self.clone().sync_driver());
+                self.exact_publish_loop().await
+            }
+            DigestMode::Bloom => self.bloom_publish_loop().await,
+        }
+    }
+
+    /// Drain the journal into the published set; returns the batch for
+    /// the bloom tracker (the exact path consumes it here).
+    fn drain_digest_events(&self, emit: bool) -> (DigestBatch, exact::Absorbed) {
+        let batch = self.cache.take_digest_events();
+        if batch.rebuild {
+            self.counters
+                .digest_rebuilds
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let absorbed = self
+            .local
+            .lock()
+            .unwrap()
+            .absorb(&batch, Instant::now(), emit);
+        (batch, absorbed)
+    }
+
+    async fn gossip_digest(&self, payload: Payload) -> bool {
+        let bytes = wire_len(&payload) as u64;
+        let ok = self.peers.gossip(payload).await.is_ok();
+        if ok {
+            self.counters
+                .digest_bytes_sent
+                .fetch_add(bytes, Ordering::Relaxed);
+            self.counters
+                .digest_messages
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        ok
+    }
+
+    /// Exact mode: per-tick deltas, and a summary heartbeat every digest
+    /// interval (or at once after a change too large to push).
+    async fn exact_publish_loop(self: Arc<Self>) {
+        let mut last_summary: Option<Instant> = None;
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let started = Instant::now();
+            let (_, absorbed) = self.drain_digest_events(true);
+            self.note_digest_cpu(started);
+            for delta in absorbed.deltas {
+                // A lost delta is repaired by the next summary's session.
+                let _ = self
+                    .gossip_digest(Payload::CacheSetDelta {
+                        node_id: self.node_id,
+                        delta,
+                    })
+                    .await;
+            }
+            let due = last_summary.is_none_or(|t| t.elapsed() >= self.config.digest_interval);
+            if due || absorbed.silent {
+                let summary = self.local.lock().unwrap().summary();
+                if self
+                    .gossip_digest(Payload::CacheSummary {
+                        node_id: self.node_id,
+                        summary,
+                    })
+                    .await
+                {
+                    last_summary = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Bloom mode (plans 06/14). One hash-prefix bucket per interval (a
+    /// full snapshot of that slice); add-only deltas for hashes in
+    /// buckets already sent. Each node chooses `buckets` from its own
+    /// cache size.
+    async fn bloom_publish_loop(self: Arc<Self>) {
         let mut last_full = Instant::now()
             .checked_sub(Duration::from_secs(86_400))
             .unwrap_or_else(Instant::now);
@@ -730,12 +1110,8 @@ impl Coop {
         let mut tracker = DigestTracker::default();
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let batch = self.cache.take_digest_events();
-            if batch.rebuild {
-                self.counters
-                    .digest_rebuilds
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            let started = Instant::now();
+            let (batch, _) = self.drain_digest_events(false);
             tracker.apply(batch);
             let n = tracker.len() as u64;
             if exceeds_digest_capacity(tracker.len()) {
@@ -758,6 +1134,7 @@ impl Coop {
                 let bucket = tracker.next_snapshot_bucket(rotate);
                 let subset = tracker.bucket_members(bucket);
                 let bloom = Bloom::from_hashes(&subset);
+                self.note_digest_cpu(started);
                 let next_gen = generation.saturating_add(1);
                 let payload = Payload::CacheDigest {
                     node_id: self.node_id,
@@ -769,7 +1146,7 @@ impl Coop {
                     bucket,
                     buckets: nb,
                 };
-                if self.peers.gossip(payload).await.is_ok() {
+                if self.gossip_digest(payload).await {
                     generation = next_gen;
                     last_full = Instant::now();
                     last_n = n;
@@ -778,6 +1155,7 @@ impl Coop {
                 }
             } else {
                 let adds = tracker.take_delta(constellation_net::message::MAX_GOSSIP_DELTA_ADDS);
+                self.note_digest_cpu(started);
                 if adds.is_empty() {
                     continue;
                 }
@@ -788,7 +1166,7 @@ impl Coop {
                     adds: adds.clone(),
                     buckets: nb,
                 };
-                if self.peers.gossip(payload).await.is_ok() {
+                if self.gossip_digest(payload).await {
                     generation = next_gen;
                     last_n = n;
                 } else {
@@ -993,15 +1371,39 @@ mod tests {
         ChunkHash::of(&n.to_le_bytes()).0
     }
 
-    /// The `TempDir` is returned, not leaked: the cache directory must
-    /// outlive the `Coop` and nothing longer.
-    fn coop() -> (Arc<Coop>, tempfile::TempDir) {
+    fn test_config(mode: DigestMode) -> CoopConfig {
+        CoopConfig {
+            enabled: true,
+            digest_interval: Duration::from_secs(30),
+            digest_ttl: Duration::from_secs(120),
+            mode,
+        }
+    }
+
+    fn coop_with(mode: DigestMode) -> (Arc<Coop>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cache = Arc::new(DiskCache::open(dir.path(), 1 << 20).unwrap());
         let store = Arc::new(ChunkStore::new(Arc::new(
             object_store::memory::InMemory::new(),
         )));
-        (Coop::new(cache, store, Peers::disabled(), 1, 1 << 20), dir)
+        (
+            Coop::new_with_config(
+                cache,
+                store,
+                Peers::disabled(),
+                1,
+                1 << 20,
+                test_config(mode),
+            ),
+            dir,
+        )
+    }
+
+    /// Bloom-mode coop (the digest tests below feed bloom snapshots).
+    /// The `TempDir` is returned, not leaked: the cache directory must
+    /// outlive the `Coop` and nothing longer.
+    fn coop() -> (Arc<Coop>, tempfile::TempDir) {
+        coop_with(DigestMode::Bloom)
     }
 
     fn put_bucket(c: &Coop, node: u64, gen: u64, hashes: &[[u8; 32]], bucket: u32, buckets: u32) {
@@ -1170,7 +1572,10 @@ mod tests {
         let data = vec![3u8; 4096];
         let hash = ChunkHash::of(&data);
         c.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
-        assert!(c.serve_chunk(hash.0, "peer-a").await.is_none());
+        assert_eq!(
+            c.serve_chunk(hash.0, "peer-a").await,
+            Err(ChunkDecline::Absent)
+        );
         assert_eq!(
             c.budget.lock().unwrap().global,
             0,
@@ -1361,13 +1766,15 @@ mod tests {
             1 << 20,
             CoopConfig {
                 enabled: false,
-                digest_interval: Duration::from_secs(30),
-                digest_ttl: Duration::from_secs(120),
+                ..test_config(DigestMode::Bloom)
             },
         );
         put_bucket(&disabled, 2, 1, &[h(1)], 0, 1);
         assert_eq!(disabled.candidates(&ChunkHash(h(1))), vec![SourceId::S3]);
-        assert!(disabled.serve_chunk(h(1), "peer").await.is_none());
+        assert_eq!(
+            disabled.serve_chunk(h(1), "peer").await,
+            Err(ChunkDecline::Busy)
+        );
         drop(dir);
     }
 
@@ -1378,6 +1785,341 @@ mod tests {
         assert!(!parse_enabled(Some("off")));
         assert!(!parse_enabled(Some(" FALSE ")));
         assert!(!parse_enabled(Some("0")));
+    }
+
+    /// An object store whose reads arrive only after `delay`, like the
+    /// harness's toxiproxied 200 ms S3. Writes and listings pass through.
+    #[derive(Debug)]
+    struct DelayedGets {
+        inner: Arc<dyn object_store::ObjectStore>,
+        delay: Duration,
+    }
+
+    impl std::fmt::Display for DelayedGets {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "DelayedGets")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for DelayedGets {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The holder's side of the P2P service: chunk serving only.
+    struct ServeOnly(Arc<Coop>);
+
+    impl constellation_net::PeerService for ServeOnly {
+        fn segment_published(&self, _part: &str, _seq: u64, _epoch: u64, _p: Option<Vec<u8>>) {}
+        fn lease_requested(
+            &self,
+            part: String,
+            _requester: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+            Box::pin(async move {
+                Payload::LeaseHandoff {
+                    part,
+                    epoch: 0,
+                    released: false,
+                    etag: None,
+                    head_seq: None,
+                }
+            })
+        }
+        fn serve_chunk(
+            &self,
+            hash: [u8; 32],
+            from_hex: String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<u8>, ChunkDecline>> + Send + '_>,
+        > {
+            Box::pin(async move { self.0.serve_chunk(hash, &from_hex).await })
+        }
+        fn node_id(&self) -> u64 {
+            self.0.node_id
+        }
+    }
+
+    /// Plan 30 §M15 round 3: `coop-cache-hit`'s burst. A cold reader
+    /// asks one holder for 8 chunks at once (a demand read plus its
+    /// readahead) while S3 is 200 ms away. The holder serves at most
+    /// `MAX_PER_PEER_SERVES` (4) at a time per requester. Every chunk
+    /// must come from the peer and none from S3: the excess queues on the
+    /// requester's slots instead of being declined `Busy` and spilled to
+    /// S3 (which the pre-fix tree did for 4 of the 8).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_past_the_serve_cap_is_served_by_the_peer_not_s3() {
+        const CHUNK: usize = 64 * 1024;
+        const N: usize = 8;
+        assert!(
+            N as u32 > MAX_PER_PEER_SERVES,
+            "the burst must exceed the cap"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let topic = constellation_net::topic_for(Some(&[4u8; 32]), "coop-burst");
+        let (key_a, _) = constellation_net::load_or_create(&dir.path().join("a.key")).unwrap();
+        let (key_b, _) = constellation_net::load_or_create(&dir.path().join("b.key")).unwrap();
+        let pa = constellation_net::P2p::spawn(key_a, topic).await.unwrap();
+        let pb = constellation_net::P2p::spawn(key_b, topic).await.unwrap();
+        let registry = vec![
+            (
+                1u64,
+                pa.pubkey_hex(),
+                serde_json::to_value(pa.addr()).unwrap(),
+            ),
+            (
+                2u64,
+                pb.pubkey_hex(),
+                serde_json::to_value(pb.addr()).unwrap(),
+            ),
+        ];
+        let peers_a = Peers::new(pa, 1);
+        let peers_b = Peers::new(pb, 2);
+        peers_a.refresh_registry(registry.clone());
+        peers_b.refresh_registry(registry);
+
+        // S3 holds every chunk, 200 ms away: a fallback would succeed,
+        // just slowly — and would show up in `s3_fetches`.
+        let s3 = Arc::new(DelayedGets {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            delay: Duration::from_millis(200),
+        });
+        let store = Arc::new(ChunkStore::new(s3));
+        let chunks: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8 + 1; CHUNK]).collect();
+        let hashes: Vec<ChunkHash> = chunks.iter().map(|d| ChunkHash::of(d)).collect();
+
+        let cache_a = Arc::new(DiskCache::open(dir.path().join("a"), 4 << 20).unwrap());
+        let a = Coop::new_with_config(
+            cache_a.clone(),
+            store.clone(),
+            peers_a.clone(),
+            1,
+            CHUNK as u32,
+            test_config(DigestMode::Exact),
+        );
+        let _ = cache_a.take_digest_events();
+        for (h, data) in hashes.iter().zip(&chunks) {
+            store
+                .put_chunk(h, data, CompressionSetting::RAW)
+                .await
+                .unwrap();
+            cache_a.insert(h, data, ChunkState::Clean).unwrap();
+        }
+        let (_, published) = a.drain_digest_events(true);
+        let service = Arc::new(ServeOnly(a.clone()));
+        tokio::spawn(async move { peers_a.serve(service).await });
+
+        let cache_b = Arc::new(DiskCache::open(dir.path().join("b"), 4 << 20).unwrap());
+        let b = Coop::new_with_config(
+            cache_b,
+            store.clone(),
+            peers_b,
+            2,
+            CHUNK as u32,
+            test_config(DigestMode::Exact),
+        );
+        for d in published.deltas {
+            b.apply_set_delta(1, d);
+        }
+        // B has measured S3 at ~200 ms first byte, as the scenario's
+        // reader has by the time it reads.
+        {
+            let mut sel = b.selector.lock().unwrap();
+            for _ in 0..8 {
+                sel.record_ok(SourceId::S3, 200.0, CHUNK as u64, 205.0);
+            }
+        }
+        assert_eq!(b.holders(&hashes[0]), vec![1], "B's mirror names A");
+
+        let fetched = futures::future::join_all(hashes.iter().map(|h| b.fetch(h))).await;
+        for (got, want) in fetched.into_iter().zip(&chunks) {
+            assert_eq!(&got.expect("burst fetch failed"), want);
+        }
+        let status = b.report();
+        assert_eq!(
+            (status.peer_hits, status.s3_fetches),
+            (N as u64, 0),
+            "every chunk of the burst must come from the peer: {status:?}"
+        );
+        assert_eq!(status.peer_false_positives, 0);
+        assert_eq!(status.peer_stale_misses, 0);
+    }
+
+    #[test]
+    fn digest_mode_parsing_defaults_to_exact() {
+        assert_eq!(DigestMode::parse(None), DigestMode::Exact);
+        assert_eq!(DigestMode::parse(Some("exact")), DigestMode::Exact);
+        assert_eq!(DigestMode::parse(Some(" BLOOM ")), DigestMode::Bloom);
+        assert_eq!(DigestMode::parse(Some("nonsense")), DigestMode::Exact);
+    }
+
+    /// A chunk evicted moments ago is a race, not a false positive; one
+    /// we never held is `Absent` and is what the counter charges.
+    #[tokio::test]
+    async fn decline_reasons_separate_races_from_false_positives() {
+        let (c, _dir) = coop_with(DigestMode::Exact);
+        let _ = c.cache.take_digest_events();
+        let data = vec![5u8; 4096];
+        let hash = ChunkHash::of(&data);
+        c.cache.insert(&hash, &data, ChunkState::Clean).unwrap();
+        c.drain_digest_events(true);
+        assert!(c.serve_chunk(hash.0, "peer-a").await.is_ok());
+
+        // Evicted but not yet drained: still published, so a race.
+        c.cache.remove(&hash).unwrap();
+        assert_eq!(
+            c.serve_chunk(hash.0, "peer-a").await,
+            Err(ChunkDecline::RecentlyRemoved)
+        );
+        // Drained: remembered inside the grace window, still a race.
+        c.drain_digest_events(true);
+        assert_eq!(
+            c.serve_chunk(hash.0, "peer-a").await,
+            Err(ChunkDecline::RecentlyRemoved)
+        );
+        // Never held: a false positive on the requester's side.
+        assert_eq!(
+            c.serve_chunk(h(77), "peer-a").await,
+            Err(ChunkDecline::Absent)
+        );
+    }
+
+    /// Exact mode: a summary with a matching root confirms the mirror,
+    /// a chained delta keeps it exact, and lookups answer from it.
+    #[test]
+    fn exact_mirror_follows_summaries_and_deltas() {
+        let (owner, _d1) = coop_with(DigestMode::Exact);
+        let (reader, _d2) = coop_with(DigestMode::Exact);
+        let _ = owner.cache.take_digest_events();
+        let a = vec![1u8; 1024];
+        let b = vec![2u8; 1024];
+        let (ha, hb) = (ChunkHash::of(&a), ChunkHash::of(&b));
+        owner.cache.insert(&ha, &a, ChunkState::Clean).unwrap();
+        let (_, first) = owner.drain_digest_events(true);
+        assert_eq!(first.deltas.len(), 1);
+
+        // Peers::disabled() has no registry, so the reader keeps every
+        // mirror (no active-set pruning) — exactly what this needs.
+        reader.apply_summary(2, owner.local.lock().unwrap().summary());
+        assert!(
+            reader.holders(&ha).is_empty(),
+            "an unsynced mirror must not claim anything"
+        );
+        for d in first.deltas {
+            reader.apply_set_delta(2, d);
+        }
+        assert_eq!(reader.holders(&ha), vec![2]);
+        assert!(reader.peer_digest_contains(&ha));
+
+        owner.cache.insert(&hb, &b, ChunkState::Clean).unwrap();
+        owner.cache.remove(&ha).unwrap();
+        let (_, second) = owner.drain_digest_events(true);
+        for d in second.deltas {
+            reader.apply_set_delta(2, d);
+        }
+        assert!(reader.holders(&ha).is_empty(), "removal did not propagate");
+        assert_eq!(reader.holders(&hb), vec![2]);
+        let summary = owner.local.lock().unwrap().summary();
+        reader.apply_summary(2, summary);
+        let map = reader.mirrors.lock().unwrap();
+        assert!(map.get(&2).unwrap().mirror.keys == owner.local.lock().unwrap().keys);
+        assert!(map.get(&2).unwrap().fresh(Duration::from_secs(60)));
+    }
+
+    /// The responder answers rounds from the published set; driving a
+    /// session with it makes a lagging mirror exact.
+    #[tokio::test]
+    async fn exact_reconcile_reply_repairs_a_lagging_mirror() {
+        use constellation_net::reconcile::{KeySet, Session};
+        let (owner, _d) = coop_with(DigestMode::Exact);
+        let _ = owner.cache.take_digest_events();
+        for n in 0..300u64 {
+            let data = n.to_le_bytes().repeat(16);
+            owner
+                .cache
+                .insert(&ChunkHash::of(&data), &data, ChunkState::Clean)
+                .unwrap();
+        }
+        owner.drain_digest_events(true);
+        let mut mirror = KeySet::new();
+        let mut session = Session::new(0);
+        while let Some(queries) = session.next_request(&mirror) {
+            let Payload::ReconcileReply { reply } = owner.reconcile_reply(queries).await else {
+                panic!("wrong reply kind");
+            };
+            session.apply(&mut mirror, &reply).unwrap();
+        }
+        assert!(mirror == owner.local.lock().unwrap().keys);
+        let status = owner.report();
+        assert!(status.reconcile_cpu_us <= status.digest_cpu_us);
+        assert!(status.digest_bytes_sent > 0 && status.digest_bytes_received > 0);
+        assert_eq!(status.local_set_entries, 300);
+    }
+
+    /// A bloom-mode node declines rounds; an exact node ignores blooms.
+    #[tokio::test]
+    async fn modes_do_not_cross_talk() {
+        let (bloom, _d1) = coop_with(DigestMode::Bloom);
+        let Payload::ReconcileReply { reply } = bloom.reconcile_reply(Vec::new()).await else {
+            panic!("wrong reply kind");
+        };
+        assert_eq!(reply.processed, 0);
+        let (exact, _d2) = coop_with(DigestMode::Exact);
+        put_bucket(&exact, 2, 1, &[h(1)], 0, 1);
+        assert!(exact.holders(&ChunkHash(h(1))).is_empty());
     }
 
     #[test]

@@ -233,12 +233,18 @@ unmount or lease handoff. A dropped bump only costs freshness.
 | `CONSTELLATION_P2P_RELAY` | `off` | `off`, `default`/`public`/`n0`, or comma-separated relay URLs | iroh relay policy |
 | `CONSTELLATION_P2P_RELAY_TOKEN` | unset | string | optional bearer token for custom relays |
 | `CONSTELLATION_COOP` | `on` | boolean | cooperative cache |
-| `CONSTELLATION_DIGEST_INTERVAL_S` | `30` | seconds, minimum `1` | cooperative-cache digest gossip |
-| `CONSTELLATION_DIGEST_TTL_S` | `4 × DIGEST_INTERVAL_S` | seconds, at least `2 × DIGEST_INTERVAL_S` | how long a peer digest stays usable |
+| `CONSTELLATION_COOP_DIGEST` | `exact` | `exact` or `bloom` | how peers learn each other's cached chunks: exact mirrors kept by reconciliation, or bloom digests |
+| `CONSTELLATION_DIGEST_INTERVAL_S` | `30` | seconds, minimum `1` | exact: summary heartbeat and liveness sweep; bloom: snapshot rotation |
+| `CONSTELLATION_DIGEST_TTL_S` | `4 × DIGEST_INTERVAL_S` | seconds, at least `2 × DIGEST_INTERVAL_S` | how long an unconfirmed peer mirror or digest stays usable |
 
 `CONSTELLATION_P2P=off` disables forwarding, placement messages, segment
 push, handoff acceleration, and cooperative peer transfer. Correctness and
 eventual convergence continue through S3.
+
+All nodes of a fleet should use the same `CONSTELLATION_COOP_DIGEST`: a
+mixed pair does not use each other as chunk sources. See
+[Cooperative cache membership](features/cooperative-cache.md) for the
+protocol, message bounds and counters.
 
 ### Prefetch and scan-ahead
 
@@ -272,9 +278,9 @@ eventual convergence continue through S3.
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_EXISTENCE_BLOOM_BYTES` | `4194304` | bytes, minimum `8` | local S3 existence bloom RSS cap |
-| `CONSTELLATION_EXISTENCE_PEER_HINT` | `on` | boolean | use peer digests as existence hints; `CONSTELLATION_COOP=off` also disables this path |
+| `CONSTELLATION_EXISTENCE_PEER_HINT` | `on` | boolean | use peer cache membership (exact mirrors, or blooms in `bloom` mode) as existence hints; `CONSTELLATION_COOP=off` also disables this path |
 
-An upload consults, in order, the peer cache digests, this node's bloom
+An upload consults, in order, peer cache membership, this node's bloom
 of hashes it has itself uploaded, and the replica's `chunk_ref` table —
 which replay maintains from *foreign* records too, so content referenced
 anywhere in the cluster is a hit. A hit means "take a confirming HEAD

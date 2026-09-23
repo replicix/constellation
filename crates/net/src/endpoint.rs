@@ -12,7 +12,7 @@
 //! S3 polling path that phases 1–2 already rely on.
 
 use crate::allowlist::{Allowlist, Decision};
-use crate::message::{Payload, Signed, ALPN};
+use crate::message::{ChunkDecline, ChunkStatus, Payload, Signed, ALPN};
 use crate::relay::RelayPolicy;
 use anyhow::{Context, Result};
 use iroh::address_lookup::memory::MemoryLookup;
@@ -141,9 +141,36 @@ pub trait PeerService: Send + Sync + 'static {
     /// Cooperative-cache digest snapshot from a peer.
     fn cache_digest(&self, _digest: DigestSnapshot) {}
     fn cache_digest_delta(&self, _delta: DigestDelta) {}
-    /// Serve a clean/pinned chunk, or `None` to decline (busy, dirty,
-    /// missing, or cooperative cache disabled). `from_hex` is the
-    /// requester's node-key hex, used for the per-peer concurrency cap.
+    /// Plan 30 §M15: a peer's exact-membership heartbeat.
+    fn cache_summary(&self, _node_id: u64, _summary: crate::reconcile::Summary) {}
+    /// Plan 30 §M15: a peer's exact adds/removes for one publish tick.
+    fn cache_set_delta(&self, _node_id: u64, _delta: crate::reconcile::Delta) {}
+    /// Plan 30 §M15: answer one reconciliation round against this node's
+    /// published chunk set. The default declines (`processed: 0`), which
+    /// the initiator treats as "no progress" and abandons.
+    fn reconcile_requested(
+        &self,
+        _queries: Vec<crate::reconcile::Query>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::ReconcileReply {
+                reply: crate::reconcile::Reply {
+                    summary: crate::reconcile::Summary {
+                        incarnation: 0,
+                        seq: 0,
+                        root: [0; 16],
+                        count: 0,
+                    },
+                    processed: 0,
+                    answers: Vec::new(),
+                },
+            }
+        })
+    }
+    /// Serve a clean/pinned chunk, or decline with the reason (busy,
+    /// absent, or recently removed — see [`ChunkDecline`]). `from_hex`
+    /// is the requester's node-key hex, used for the per-peer
+    /// concurrency cap.
     ///
     /// Async for the same reason as `lease_requested`: answering means
     /// reading and verifying up to a whole chunk from disk, which must
@@ -152,8 +179,10 @@ pub trait PeerService: Send + Sync + 'static {
         &self,
         _hash: [u8; 32],
         _from_hex: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + '_>> {
-        Box::pin(async move { None })
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<u8>, ChunkDecline>> + Send + '_>,
+    > {
+        Box::pin(async move { Err(ChunkDecline::Busy) })
     }
     /// Non-holder asked us to journal `op`. Default declines with an
     /// empty outcome; callers treat that as `MutateOutcome::Busy`.
@@ -359,12 +388,13 @@ impl P2p {
     /// Fetch one chunk from `peer`. The control frames use the same
     /// signed postcard as everything else; the payload (up to the FS chunk
     /// size) follows as `u64be length + bytes` so we never shove 4 MiB
-    /// through [`crate::message::MAX_FRAME`].
+    /// through [`crate::message::MAX_FRAME`]. `Ok(Err(reason))` is a
+    /// clean decline, distinct from a transport failure.
     pub async fn request_chunk(
         &self,
         peer: EndpointAddr,
         hash: &[u8; 32],
-    ) -> Result<Option<ChunkFetch>> {
+    ) -> Result<std::result::Result<ChunkFetch, ChunkDecline>> {
         let expect = peer.id;
         let first = self.connection(&peer).await?;
         match self.request_chunk_on(&first, expect, hash).await {
@@ -397,7 +427,7 @@ impl P2p {
         conn: &iroh::endpoint::Connection,
         expect: iroh::EndpointId,
         hash: &[u8; 32],
-    ) -> Result<Option<ChunkFetch>> {
+    ) -> Result<std::result::Result<ChunkFetch, ChunkDecline>> {
         use tokio::io::AsyncReadExt;
         let started = std::time::Instant::now();
         let (mut send, mut recv) = conn.open_bi().await.context("opening a chunk stream")?;
@@ -414,8 +444,14 @@ impl P2p {
             "chunk reply signed by an unexpected key"
         );
         match body {
-            Payload::ChunkResponse { found: false, .. } => Ok(None),
-            Payload::ChunkResponse { found: true, .. } => {
+            Payload::ChunkResponse {
+                status: ChunkStatus::Declined(why),
+                ..
+            } => Ok(Err(why)),
+            Payload::ChunkResponse {
+                status: ChunkStatus::Found,
+                ..
+            } => {
                 let len = recv.read_u64().await.context("chunk length")?;
                 anyhow::ensure!(
                     len > 0 && len <= 64 * 1024 * 1024,
@@ -424,7 +460,7 @@ impl P2p {
                 let mut data = vec![0u8; len as usize];
                 recv.read_exact(&mut data).await?;
                 let (rtt, path) = transport_observation(conn);
-                Ok(Some(ChunkFetch {
+                Ok(Ok(ChunkFetch {
                     data,
                     ttfb,
                     rtt,
