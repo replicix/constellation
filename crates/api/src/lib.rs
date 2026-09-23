@@ -375,6 +375,8 @@ mod tests {
                     head_seq: 7,
                     conflicts: 0,
                     last_ship_error: None,
+                    ship_rounds_completed: 5,
+                    ship_rounds_cancelled: 1,
                 },
                 cache: CacheStatus {
                     used_bytes: 100,

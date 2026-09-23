@@ -52,6 +52,53 @@
 //! against AWS a stale `If-Match` takes 599 ms to come back rejected, four
 //! times a plain GET, server-side and not the client's retries — so the
 //! conflict paths retry on a later round rather than in a tight loop.
+//!
+//! ### Locking rules for the keepers map (plan 30 M2b)
+//!
+//! `node_runtime`/`main::run_sync_round` share one
+//! `tokio::sync::Mutex<HashMap<String, LeaseKeeper>>` ("the keepers
+//! lock") across the periodic sync task and every forwarded mutation's
+//! dispatch (`node_runtime::dispatch_mutate`/`dispatch_forward`, plan 30
+//! M2b item 1). What each side may assume:
+//!
+//! - **Renewal never needs exclusion.** A still-valid lease stays valid
+//!   for the whole time its renewal CAS is in flight, so a forwarded
+//!   execute may run concurrently with one. `run_sync_round` therefore
+//!   only takes the lock to call [`LeaseKeeper::prepare_renew`] (a
+//!   synchronous read that hands back an owned [`RenewAttempt`]), drops
+//!   it for [`RenewAttempt::run`] (the actual CAS, needing no
+//!   `LeaseKeeper` reference at all — see that type's doc for why reads
+//!   made during it are still safe), then re-takes it only to call
+//!   [`LeaseKeeper::apply_renew`]. A dispatch that reads
+//!   `ship_epoch()`/`is_lost()` while the CAS is in flight sees the old,
+//!   still-accurate state — exactly as if the round had not started
+//!   renewing yet.
+//! - **Ordinary shipping never needs exclusion either.** The segment PUT
+//!   only drains whatever was in the journal as of the moment it was
+//!   read; a mutation landing in the journal while the PUT is in flight
+//!   is simply picked up by a later round. `Shipper::run_ordinary_round`
+//!   (in `shipper.rs`) takes the lock only to snapshot which partitions
+//!   are held and at what epoch, then ships using that snapshot with the
+//!   lock released.
+//! - **Release and handoff are the one case that does need exclusion.**
+//!   Both end with a final flush (draining the journal to zero) followed
+//!   by a release CAS; if a forwarded execute landed in the gap between
+//!   those two steps, it would be journaled under an epoch this node is
+//!   about to give up, and nobody would ever ship it (the invariant this
+//!   whole scheme protects: "an accepted op never lands after the final
+//!   flush of a release/handoff"). `run_sync_round`'s release/handoff
+//!   pass therefore keeps holding the keepers lock across the entire
+//!   decision, the final flush (`Shipper::ship_atime_before_release`, or
+//!   the forced drain's own `sync_all`), and [`LeaseKeeper::release`]'s
+//!   CAS — unchanged from before this milestone. [`LeaseKeeper::release`]
+//!   also fences the view *before* its own CAS (see that method's doc),
+//!   which is what closes the FUSE-local fast path the instant a release
+//!   begins, independent of the keepers lock.
+//! - Every other keepers-lock user (`SyncRequest::Acquire`/`HandOff`/
+//!   `ClaimOffer`/`Leave`/`Reintegrate` in `node_runtime.rs`) still
+//!   cancels the in-flight round before running (plan 30 M2b item 1 only
+//!   exempts `Mutate`/`Forward`), so it never overlaps a round's own
+//!   locking at all and needs no new reasoning here.
 
 use anyhow::{bail, Result};
 use constellation_store_s3::lease::{lease_ttl_ms, now_unix_ms, LeaseMode};
@@ -553,6 +600,16 @@ impl LeaseKeeper {
     }
 
     /// Renew when past half-TTL. Detects deposition.
+    ///
+    /// `run_sync_round` no longer calls this directly (plan 30 M2b: it
+    /// calls the split [`Self::prepare_renew`]/[`RenewAttempt::run`]/
+    /// [`Self::apply_renew`] instead, so it can drop the keepers lock for
+    /// the CAS — see the module doc's "Locking rules"). Kept as a
+    /// production-shaped convenience: it is the concise way tests exercise
+    /// the due-check itself (`renew_if_due_skips_until_half_ttl_then_renews`),
+    /// and it documents the gate `prepare_renew` applies before handing
+    /// back a job.
+    #[allow(dead_code)]
     pub async fn renew_if_due(&mut self) -> Result<()> {
         if self.view.epoch_held.load(Ordering::Relaxed) {
             self.extend_local();
@@ -570,93 +627,113 @@ impl LeaseKeeper {
     /// Renew unconditionally (also the deposition probe: a CAS failure
     /// here is how a frozen-then-resumed holder learns it is out).
     ///
-    /// Cancellation-safe by construction: `self.held`/`self.view` are only
-    /// ever *read* before the first await below, never taken or cleared —
-    /// every mutation happens after its triggering await has resolved. The
-    /// caller (`node_runtime`'s sync task) races this future's completion
-    /// against incoming `SyncRequest`s in a `tokio::select!` and drops it
-    /// unfinished when one arrives (e.g. a P2P-pushed segment, which is
-    /// exactly what a takeover announces). A frozen-then-resumed holder's
-    /// renewal is the case most likely to lose that race — it wakes up
-    /// already past its TTL, right as the depositor's segment is arriving
-    /// — so dropping mid-CAS used to leave the keeper stuck permanently:
-    /// `self.held.take()` had already cleared the lease (so nothing ever
-    /// renews it again) while the CAS result that would have called
-    /// `mark_lost` never got to run (so `lease_lost` was never persisted
-    /// either). Peeking with `clone()` instead means a cancelled attempt
-    /// leaves the keeper exactly as it was, so the very next round's
-    /// `renew_if_due` simply retries it to completion.
+    /// A thin, `&mut self`-holding wrapper around the same three-phase
+    /// split `run_sync_round` uses to renew *without* holding the keepers
+    /// map's lock across the CAS (plan 30 M2b, see the module doc's
+    /// "Locking rules"): [`Self::prepare_renew_unconditional`] (sync),
+    /// [`RenewAttempt::run`] (the actual I/O, needs no `&LeaseKeeper` at
+    /// all), [`Self::apply_renew`] (sync bookkeeping). Calling all three
+    /// back-to-back here, under one borrow of `self`, reproduces the
+    /// original single-future `renew_now` exactly for the tests
+    /// (`lease.rs`, `shipper.rs`) that still call it directly on an
+    /// unshared keeper not behind any lock at all — `run_sync_round`
+    /// itself now calls the three steps separately (see above) rather
+    /// than through this wrapper, precisely so it can drop the lock
+    /// between them.
+    ///
+    /// Cancellation-safe by construction, same as before this split:
+    /// nothing about `self` is touched until `apply_renew` runs, which
+    /// only happens after `RenewAttempt::run`'s await has fully resolved.
+    /// `renew_now_is_cancellation_safe` exercises this directly: a caller
+    /// racing this whole method's completion against something else in a
+    /// `tokio::select!` and dropping it mid-CAS leaves the keeper exactly
+    /// as it was, so the next attempt simply retries to completion.
+    #[allow(dead_code)]
     pub async fn renew_now(&mut self) -> Result<()> {
-        let Some((lease, tag)) = self.held.clone() else {
+        let Some(attempt) = self.prepare_renew_unconditional() else {
             return Ok(());
         };
-        let renewed = lease.renewed(self.ttl_ms);
-        match self.store.try_swap(&renewed, &tag).await {
-            Ok(tag) => {
-                self.view.set_held(&renewed);
-                self.held = Some((renewed, tag));
+        let outcome = attempt.run().await;
+        self.apply_renew(outcome).await
+    }
+
+    /// Phase 1 (sync, no I/O) of the renewal split: due-check plus
+    /// [`Self::prepare_renew_unconditional`]. Called under the keepers
+    /// lock by `run_sync_round`; returns `None` (no lock needed further)
+    /// when nothing is due this round. The `epoch_held` (continuation
+    /// authority, no S3 object) case has no I/O to move off the lock, so
+    /// it is applied instantly here rather than through a `RenewAttempt`.
+    pub fn prepare_renew(&mut self) -> Option<RenewAttempt> {
+        if self.view.epoch_held.load(Ordering::Relaxed) {
+            self.extend_local();
+            return None;
+        }
+        let (lease, _) = self.held.as_ref()?;
+        if lease.expires_in_ms(now_unix_ms()) > (self.ttl_ms / 2) as i64 {
+            return None;
+        }
+        self.prepare_renew_unconditional()
+    }
+
+    /// [`Self::prepare_renew`] without the half-TTL due-check — the
+    /// unconditional renewal `renew_now`/[`Self::release`]'s sibling
+    /// paths need. `None` only when this node holds no S3-backed lease at
+    /// all (continuation-epoch or never-acquired).
+    fn prepare_renew_unconditional(&mut self) -> Option<RenewAttempt> {
+        if self.view.epoch_held.load(Ordering::Relaxed) {
+            self.extend_local();
+            return None;
+        }
+        let (lease, tag) = self.held.as_ref()?;
+        Some(RenewAttempt {
+            store: self.store.clone(),
+            node_id: self.node_id,
+            ttl_ms: self.ttl_ms,
+            mine: lease.clone(),
+            tag: tag.clone(),
+        })
+    }
+
+    /// Phase 3 (sync bookkeeping plus one best-effort read) of the
+    /// renewal split: apply a [`RenewAttempt::run`] result. Called under
+    /// the keepers lock by `run_sync_round`, after the lock-free CAS in
+    /// `RenewAttempt::run` has fully resolved. Mirrors exactly what the
+    /// original single-future `renew_now` did with each outcome.
+    pub async fn apply_renew(&mut self, outcome: RenewOutcome) -> Result<()> {
+        match outcome {
+            RenewOutcome::Renewed { lease, tag } => {
+                self.view.set_held(&lease);
+                self.wanted = lease.wanted_by.clone();
+                if self.wanted.is_empty() {
+                    self.wanted_since = None;
+                } else if self.wanted_since.is_none() {
+                    self.wanted_since = Some(Instant::now());
+                }
+                self.held = Some((lease, tag));
                 self.refresh_condemned().await;
                 Ok(())
             }
-            Err(StoreError::CasConflict) => {
-                // Not necessarily a deposition any more: a peer that wants
-                // this partition edits `wanted_by` in place, which changes
-                // the etag and so fails exactly this CAS. Re-read before
-                // concluding anything, and keep the view intact until we
-                // know — clearing it first would stall the FUSE threads on
-                // a lease we still hold.
-                //
-                // A read failure here is not evidence of anything, and
-                // `self.held` is untouched (see above), so propagating it
-                // cannot silently demote a holder that has not been
-                // deposed.
-                let current = self.store.get().await?;
-                if let Some((cur, fresh_tag)) = current {
-                    if cur.holder == self.node_id
-                        && cur.epoch == lease.epoch
-                        && !cur.released
-                        && !cur.is_expired(now_unix_ms())
-                    {
-                        self.wanted = cur.wanted_by.clone();
-                        if self.wanted.is_empty() {
-                            self.wanted_since = None;
-                        } else if self.wanted_since.is_none() {
-                            self.wanted_since = Some(Instant::now());
-                        }
-                        tracing::debug!(
-                            wanted_by = ?self.wanted,
-                            epoch = cur.epoch,
-                            "renew CAS lost to a handoff request, not a takeover"
-                        );
-                        let renewed = cur.renewed(self.ttl_ms);
-                        return match self.store.try_swap(&renewed, &fresh_tag).await {
-                            Ok(tag) => {
-                                self.view.set_held(&renewed);
-                                self.held = Some((renewed, tag));
-                                self.refresh_condemned().await;
-                                Ok(())
-                            }
-                            // Lost again: somebody is moving faster than we
-                            // can read. Fall back to the deposition probe,
-                            // which is authoritative.
-                            Err(StoreError::CasConflict) => {
-                                self.view.clear();
-                                self.diagnose_lost_renew(&lease).await
-                            }
-                            Err(e) => {
-                                self.held = Some((cur, fresh_tag));
-                                Err(e.into())
-                            }
-                        };
-                    }
-                }
-                self.view.clear();
-                self.diagnose_lost_renew(&lease).await
+            RenewOutcome::Lost {
+                holder,
+                epoch,
+                my_epoch,
+            } => {
+                self.mark_lost(holder, epoch, my_epoch);
+                Ok(())
             }
-            // Transient store failure: `self.held` is untouched, so the
-            // lease we still (believe we) have is simply retried next
-            // tick — it is still unexpired from our own point of view.
-            Err(e) => Err(e.into()),
+            RenewOutcome::Err {
+                error,
+                held_update,
+                view_cleared,
+            } => {
+                if view_cleared {
+                    self.view.clear();
+                }
+                if let Some((lease, tag)) = held_update {
+                    self.held = Some((lease, tag));
+                }
+                Err(error)
+            }
         }
     }
 
@@ -883,6 +960,173 @@ impl LeaseKeeper {
     }
 }
 
+/// Everything a renewal CAS needs, captured by
+/// [`LeaseKeeper::prepare_renew`]/[`LeaseKeeper::prepare_renew_unconditional`]
+/// under the keepers lock so [`Self::run`] can perform the actual S3
+/// round trip(s) without it. See `cli::lease`'s module doc, "Locking
+/// rules".
+///
+/// Deliberately holds no reference to the originating [`LeaseKeeper`]:
+/// `store` is an owned clone (cheap — see [`LeaseStore`]'s doc) and
+/// `mine`/`tag` are the exact lease/tag this node believes it holds,
+/// snapshotted at prepare time. Reads of the *original* keeper
+/// (`ship_epoch`/`is_lost`, via its still-untouched `view`/`held`) made
+/// while a `RenewAttempt` is in flight see that still-valid snapshot,
+/// which is safe precisely because nothing here mutates it — the old
+/// lease is genuinely still valid until [`LeaseKeeper::apply_renew`]
+/// says otherwise.
+pub struct RenewAttempt {
+    store: LeaseStore,
+    node_id: u64,
+    ttl_ms: u64,
+    mine: Lease,
+    tag: LeaseTag,
+}
+
+/// What [`RenewAttempt::run`] learned, for [`LeaseKeeper::apply_renew`]
+/// to fold back into the keeper. Mirrors, one for one, the outcomes the
+/// original single-future `renew_now` used to apply inline.
+pub enum RenewOutcome {
+    /// Renewed (same holder, possibly a fresher `wanted_by`) at either
+    /// the first attempt or the "lost the CAS to a `wanted_by` edit, not
+    /// a takeover" retry — `lease.wanted_by` already reflects whichever
+    /// path got here, so `apply_renew` does not need to know which.
+    Renewed { lease: Lease, tag: LeaseTag },
+    /// Deposed: re-reading after a lost CAS shows a different holder, or
+    /// no lease object at all (0/0).
+    Lost {
+        holder: u64,
+        epoch: u64,
+        my_epoch: u64,
+    },
+    /// Transient failure. `held_update` mirrors the one case where the
+    /// original code adopted a freshly re-read lease/tag despite the
+    /// renewal itself failing (a second CAS lost to something other than
+    /// a conflict); `view_cleared` mirrors the one case where the
+    /// original code had already cleared the view (fencing FUSE writes)
+    /// before hitting this error, and so must still apply that.
+    Err {
+        error: anyhow::Error,
+        held_update: Option<(Lease, LeaseTag)>,
+        view_cleared: bool,
+    },
+}
+
+impl RenewAttempt {
+    /// The lock-free phase: run the CAS (and, on a lost race against a
+    /// `wanted_by` edit, the follow-up read-and-retry `renew_now` always
+    /// did), producing a [`RenewOutcome`] for [`LeaseKeeper::apply_renew`]
+    /// to apply. Touches nothing but its own owned fields and `self.store`
+    /// — no `LeaseKeeper`, no keepers map, so no lock of any kind.
+    pub async fn run(self) -> RenewOutcome {
+        let Self {
+            store,
+            node_id,
+            ttl_ms,
+            mine,
+            tag,
+        } = self;
+        let renewed = mine.renewed(ttl_ms);
+        match store.try_swap(&renewed, &tag).await {
+            Ok(tag) => RenewOutcome::Renewed {
+                lease: renewed,
+                tag,
+            },
+            Err(StoreError::CasConflict) => {
+                // Not necessarily a deposition: a peer that wants this
+                // partition edits `wanted_by` in place, which changes the
+                // etag and so fails exactly this CAS. Re-read before
+                // concluding anything — a read failure here is not
+                // evidence of anything, so it propagates untouched
+                // (`view_cleared: false`, matching "the view is intact
+                // until we know").
+                let current = match store.get().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return RenewOutcome::Err {
+                            error: e.into(),
+                            held_update: None,
+                            view_cleared: false,
+                        }
+                    }
+                };
+                if let Some((cur, fresh_tag)) = current {
+                    if cur.holder == node_id
+                        && cur.epoch == mine.epoch
+                        && !cur.released
+                        && !cur.is_expired(now_unix_ms())
+                    {
+                        tracing::debug!(
+                            wanted_by = ?cur.wanted_by,
+                            epoch = cur.epoch,
+                            "renew CAS lost to a handoff request, not a takeover"
+                        );
+                        let renewed = cur.renewed(ttl_ms);
+                        return match store.try_swap(&renewed, &fresh_tag).await {
+                            Ok(tag) => RenewOutcome::Renewed {
+                                lease: renewed,
+                                tag,
+                            },
+                            // Lost again: somebody is moving faster than we
+                            // can read. Fall back to the deposition probe,
+                            // which is authoritative.
+                            Err(StoreError::CasConflict) => {
+                                Self::diagnose(&store, node_id, &mine).await
+                            }
+                            Err(e) => RenewOutcome::Err {
+                                error: e.into(),
+                                held_update: Some((cur, fresh_tag)),
+                                view_cleared: false,
+                            },
+                        };
+                    }
+                }
+                Self::diagnose(&store, node_id, &mine).await
+            }
+            // Transient store failure: nothing to apply — the lease we
+            // still (believe we) have is simply retried next tick, still
+            // unexpired from our own point of view.
+            Err(e) => RenewOutcome::Err {
+                error: e.into(),
+                held_update: None,
+                view_cleared: false,
+            },
+        }
+    }
+
+    /// The deposition probe: every path that reaches it has already lost
+    /// a renewal CAS with no better explanation, so `apply_renew` always
+    /// clears the view for it (`view_cleared: true`) regardless of what
+    /// this re-read finds.
+    async fn diagnose(store: &LeaseStore, node_id: u64, mine: &Lease) -> RenewOutcome {
+        match store.get().await {
+            Ok(Some((cur, tag))) if cur.holder == node_id && cur.epoch == mine.epoch => {
+                // Our own object, only the tag was stale (a retried PUT
+                // landing twice). Adopt the fresh tag and carry on.
+                RenewOutcome::Renewed { lease: cur, tag }
+            }
+            Ok(Some((cur, _))) => RenewOutcome::Lost {
+                holder: cur.holder,
+                epoch: cur.epoch,
+                my_epoch: mine.epoch,
+            },
+            // The lease object vanished (manual surgery / GC). Treat it as
+            // deposition: we cannot prove we still have authority, and
+            // something else clearly rewrote history.
+            Ok(None) => RenewOutcome::Lost {
+                holder: 0,
+                epoch: 0,
+                my_epoch: mine.epoch,
+            },
+            Err(e) => RenewOutcome::Err {
+                error: e.into(),
+                held_update: None,
+                view_cleared: true,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,6 +1324,47 @@ mod tests {
         ka.renew_now().await.unwrap();
         assert!(ka.held.is_none());
         assert!(ka.is_lost(), "a real takeover must be reported as loss");
+    }
+
+    /// `renew_if_due` is the due-check `renew_now` itself skips (tests
+    /// above call `renew_now` directly to bypass exactly this gate). Plan
+    /// 30 M2b moved `run_sync_round`'s own call to the split
+    /// `prepare_renew`/`apply_renew` pair, so this is the one direct
+    /// exercise of the due-check left — `prepare_renew` shares the same
+    /// gate (see its doc).
+    #[tokio::test]
+    async fn renew_if_due_skips_until_half_ttl_then_renews() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let a = LeaseStore::new(store, "p0", LeaseMode::Cas);
+        let mut keeper = LeaseKeeper::new(a, 1);
+        keeper.ttl_ms = 1_000; // half-TTL = 500ms
+        assert!(keeper.commit(Plan::Create, None).await.unwrap());
+        let expires_before = keeper.held.as_ref().unwrap().0.expires_unix_ms;
+
+        keeper.renew_if_due().await.unwrap();
+        assert_eq!(
+            keeper.held.as_ref().unwrap().0.expires_unix_ms,
+            expires_before,
+            "well within the first half of the TTL: renew_if_due must not touch the lease"
+        );
+
+        // Back-date our own view of the expiry past the half-TTL mark.
+        // `try_swap`'s CAS keys off the etag, not this field, so the
+        // in-memory store's real object is untouched and the renewal
+        // below still succeeds — this isolates the due-check itself from
+        // whether the lease has actually gone stale. The sleep guarantees
+        // the millisecond clock `renewed()` stamps the new expiry from
+        // has actually ticked forward from `expires_before`, so the
+        // comparison below cannot pass merely because both reads landed
+        // in the same millisecond.
+        keeper.held.as_mut().unwrap().0.expires_unix_ms -= keeper.ttl_ms as i64 / 2 + 1;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        keeper.renew_if_due().await.unwrap();
+        assert!(
+            keeper.held.as_ref().unwrap().0.expires_unix_ms > expires_before,
+            "past half-TTL: renew_if_due must renew and push expiry back out"
+        );
+        assert!(!keeper.is_lost());
     }
 
     /// Root-cause regression for plan 29 M3c's `create-storm-s3-only`

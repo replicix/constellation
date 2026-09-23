@@ -743,6 +743,15 @@ pub struct SpoolStatus {
     pub conflicts: u64,
     /// Last sync error, if the most recent round failed (S3 outage).
     pub last_ship_error: Option<String>,
+    /// `run_managed_sync_round` invocations that ran to completion (plan
+    /// 30 M2b measurement counter — see `shipper::SpoolInfo`'s doc).
+    #[serde(default)]
+    pub ship_rounds_completed: u64,
+    /// Rounds dropped mid-flight for a request that still cancels one
+    /// (plan 30 M2b: `Mutate`/`Forward` no longer do — see
+    /// `shipper::SpoolInfo`'s doc).
+    #[serde(default)]
+    pub ship_rounds_cancelled: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

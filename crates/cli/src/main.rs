@@ -2756,25 +2756,61 @@ async fn run_sync_round(
     >,
 ) -> Result<()> {
     let mut ship = ship.lock().await;
-    let mut keepers = keepers.lock().await;
-    let any_lost = keepers.values().any(|k| k.is_lost());
-    if any_lost
-        && keepers
-            .values()
-            .all(|k| k.is_lost() || k.ship_epoch().is_none())
+    // Recovery path (out of scope for plan 30 M2b's lock-scope fix — see
+    // `lease.rs`'s module doc): every partition is either lost or was
+    // never ours, so this node is purely tailing. Holds the keepers lock
+    // across `tail_to_head`'s I/O, same as before; nothing executes a
+    // local write for a lost partition via the fast path, so there is no
+    // forwarded-op latency to protect here.
     {
-        return ship.tail_to_head().await.map(|_| ());
-    }
-    for k in keepers.values_mut() {
-        if !k.is_lost() {
-            k.renew_if_due().await?;
+        let keepers = keepers.lock().await;
+        let any_lost = keepers.values().any(|k| k.is_lost());
+        if any_lost
+            && keepers
+                .values()
+                .all(|k| k.is_lost() || k.ship_epoch().is_none())
+        {
+            drop(keepers);
+            return ship.tail_to_head().await.map(|_| ());
         }
     }
-    ship.sync_all(&mut keepers).await?;
+    // Renewal (plan 30 M2b): read-decide under the lock, run the CAS
+    // without it, apply the result back under the lock. See `lease.rs`'s
+    // `RenewAttempt` and its module doc's "Locking rules" for why reads
+    // made by a forwarded mutation's dispatch while the CAS is in flight
+    // are still correct.
+    let parts: Vec<String> = keepers.lock().await.keys().cloned().collect();
+    for part in parts {
+        let attempt = {
+            let mut g = keepers.lock().await;
+            match g.get_mut(&part) {
+                Some(k) if !k.is_lost() => k.prepare_renew(),
+                _ => None,
+            }
+        };
+        let Some(attempt) = attempt else { continue };
+        let outcome = attempt.run().await;
+        let mut g = keepers.lock().await;
+        if let Some(k) = g.get_mut(&part) {
+            k.apply_renew(outcome).await?;
+        }
+    }
+    // Ordinary shipping (plan 30 M2b): `Shipper::run_ordinary_round` takes
+    // the keepers `Arc` itself and never holds it across the segment PUT
+    // — see its doc and `lease.rs`'s module doc for the reasoning.
+    ship.run_ordinary_round(keepers).await?;
+    // Release / handoff (unchanged by plan 30 M2b): holds the keepers
+    // lock across the *entire* decision, the final flush, and the
+    // release CAS for every partition below — see `lease.rs`'s module
+    // doc, "Locking rules", for why this is the one part of the round
+    // that must not be split the way renewal/shipping just were: a
+    // forwarded execute must never land between the final flush and the
+    // release actually taking effect.
+    let mut keepers = keepers.lock().await;
     // First pass: the ordinary case, where the backlog already reads
-    // zero (either genuinely idle, or this round's `sync_all` above
-    // just drained it) — release immediately, no need to touch the
-    // fast path at all.
+    // zero (either genuinely idle, or `run_ordinary_round` above just
+    // drained it) — release immediately, no need to touch the fast path
+    // at all.
     let mut stuck: Vec<String> = Vec::new();
     for (part, k) in keepers.iter_mut() {
         if k.is_lost() {
@@ -3608,6 +3644,8 @@ impl constellation_api::StatusSource for DaemonStatus {
                 head_seq: spool.head_seq,
                 conflicts: spool.conflicts,
                 last_ship_error: spool.last_error,
+                ship_rounds_completed: spool.ship_rounds_completed,
+                ship_rounds_cancelled: spool.ship_rounds_cancelled,
             },
             cache: constellation_api::CacheStatus {
                 used_bytes: usage.used,

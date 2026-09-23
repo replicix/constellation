@@ -191,6 +191,13 @@ pub enum LeaseMode {
 }
 
 /// Read/modify/write access to one partition's lease object.
+///
+/// `Clone` is cheap (an `Arc`, a `String`, a `Copy` enum) and is what lets
+/// a renewal CAS run without holding the `cli` crate's keepers-map lock
+/// (plan 30 M2b, see `cli::lease`'s module doc): the keeper clones its
+/// store into an owned renewal job before the lock is dropped for the
+/// CAS itself.
+#[derive(Clone)]
 pub struct LeaseStore {
     store: Arc<dyn ObjectStore>,
     partition: String,

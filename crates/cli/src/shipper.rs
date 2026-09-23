@@ -280,6 +280,20 @@ pub struct SpoolInfo {
     /// Segments skipped because their lease epoch was already superseded.
     pub fenced: u64,
     pub last_error: Option<String>,
+    /// `run_managed_sync_round` invocations that ran to completion (plan
+    /// 30 M2b measurement). Before that milestone, under forwarding load
+    /// almost every round was cancelled instead — see
+    /// `ship_rounds_cancelled`'s doc — so a healthy holder should show
+    /// this climbing steadily relative to it.
+    pub ship_rounds_completed: u64,
+    /// Rounds dropped mid-flight because a non-`Nudge`,
+    /// non-`Mutate`/`Forward` `SyncRequest` arrived first (plan 30 M2b:
+    /// `Mutate`/`Forward` no longer cancel a round at all — see
+    /// `node_runtime`'s sync task doc). Kept because it is still useful:
+    /// a node fielding a steady stream of `Acquire`/`HandOff` traffic
+    /// (frequent handoffs, or peers hammering a busy partition) will
+    /// still show real cancellations here even after this milestone.
+    pub ship_rounds_cancelled: u64,
 }
 
 impl Shipper {
@@ -546,6 +560,147 @@ impl Shipper {
                         self.ship_atime_if_stale(part, lease).await;
                     }
                 }
+                return Ok(());
+            }
+        }
+    }
+
+    /// The periodic sync task's ordinary round (`main::run_sync_round`,
+    /// plan 30 M2b). Same tail/deposition-check/ship shape as
+    /// [`Self::sync_all`], but takes the keepers mutex itself instead of
+    /// an already-held guard, so it can drop it around the one thing
+    /// that must not run locked: the segment PUT (see `lease.rs`'s
+    /// module doc, "Locking rules" — renewal is `run_sync_round`'s own
+    /// job, done before this is called, for the same reason).
+    ///
+    /// The lock is re-taken only for: the per-loop snapshot (which
+    /// partitions are held, and at what epoch — plain reads), the idle
+    /// branch's read-time-atime drain (needs a live `&LeaseKeeper`), and
+    /// the rare fallback where a partition has pending journal but no
+    /// local lease record at all yet (this process's first-ever write,
+    /// before any acquire) or has lost its epoch since the snapshot
+    /// (expired/deposed mid-round). That fallback still needs `&mut
+    /// HashMap` to acquire or reacquire, so it runs under the full lock
+    /// exactly like [`Self::ship_all`] always has — a once-ever (or
+    /// once-per-deposition) event, not the steady-state hot path this
+    /// milestone targets.
+    pub async fn run_ordinary_round(
+        &mut self,
+        keepers: &Arc<tokio::sync::Mutex<HashMap<String, LeaseKeeper>>>,
+    ) -> Result<()> {
+        loop {
+            let (held, epochs): (HashSet<String>, HashMap<String, u64>) = {
+                let g = keepers.lock().await;
+                let held = self.held_partitions(&g);
+                let epochs = g
+                    .iter()
+                    .filter_map(|(p, k)| k.ship_epoch().map(|e| (p.clone(), e)))
+                    .collect();
+                (held, epochs)
+            };
+            self.tail_all_except(&held).await?;
+            if matches!(self.meta.kv_get("lease_lost")?.as_deref(), Some("1")) {
+                tracing::debug!(
+                    "deposed node remains tail-only until reintegration; \
+                     refusing ordinary lease acquisition and journal shipping"
+                );
+                return Ok(());
+            }
+            let grouped = self.meta.take_journal_grouped(SEGMENT_BATCH)?;
+            if grouped.is_empty() {
+                if self.publish_idle_due() {
+                    self.publish().await?;
+                }
+                if !held.is_empty() {
+                    let g = keepers.lock().await;
+                    for part in &held {
+                        if let Some(lease) = g.get(part) {
+                            self.ship_atime_if_stale(part, lease).await;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let mut more = false;
+            // Partitions the snapshot above did not find a current epoch
+            // for: shipped below under the full lock, same as
+            // `ship_all`. `take_journal_grouped` only *peeks* the journal
+            // (a read transaction; `ack_journal_rows_at` is the only
+            // thing that ever removes rows), so a `batch` this pass ends
+            // up not shipping is simply re-read by the next round — never
+            // lost, whether that is because acquisition failed here or
+            // because this method returns before reaching it.
+            let mut fallback: Vec<(String, constellation_meta::JournalBatch)> = Vec::new();
+            for (part, batch) in grouped {
+                self.ensure_part(&part);
+                match epochs.get(&part) {
+                    Some(&epoch) => {
+                        if self.ship_part(&part, Some(epoch), batch).await? {
+                            more = true;
+                        }
+                    }
+                    None => fallback.push((part, batch)),
+                }
+            }
+            if !fallback.is_empty() {
+                let mut g = keepers.lock().await;
+                for (part, batch) in fallback {
+                    if !g.contains_key(&part) {
+                        let mut keeper = LeaseKeeper::new(
+                            LeaseStore::new(self.log.inner(), &part, self.lease_mode),
+                            self.node_id,
+                        );
+                        keeper.note_acquire_reason("ship-pending-journal");
+                        match acquire_lease_for(self, &mut keeper, &part).await {
+                            Ok(true) => {
+                                g.insert(part.clone(), keeper);
+                            }
+                            // A live foreign holder: leave `batch`
+                            // unshipped this round. The journal itself is
+                            // untouched (see the comment above this loop),
+                            // so the next round's `take_journal_grouped`
+                            // simply reads the same rows again — matching
+                            // `ship_all`'s existing (pre-M2b) behavior for
+                            // this same corner case.
+                            Ok(false) => continue,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    part,
+                                    "lease acquisition for pending journal failed"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    let needs_reacquire = g
+                        .get(&part)
+                        .is_some_and(|keeper| !keeper.is_lost() && keeper.ship_epoch().is_none());
+                    if needs_reacquire {
+                        let keeper = g.get_mut(&part).expect("checked above");
+                        keeper.note_acquire_reason("ship-reacquire");
+                        match acquire_lease_for(self, keeper, &part).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    part,
+                                    "lease reacquisition for pending journal failed"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    let Some(lease) = g.get(&part) else {
+                        continue;
+                    };
+                    if self.ship_part(&part, lease.ship_epoch(), batch).await? {
+                        more = true;
+                    }
+                }
+            }
+            if !more {
                 return Ok(());
             }
         }
@@ -899,7 +1054,7 @@ impl Shipper {
             let Some(lease) = leases.get(&part) else {
                 continue;
             };
-            if self.ship_part(&part, lease, batch).await? {
+            if self.ship_part(&part, lease.ship_epoch(), batch).await? {
                 more = true;
             }
         }
@@ -916,7 +1071,7 @@ impl Shipper {
             .find(|(p, _)| p == part)
             .map(|(_, batch)| batch)
             .unwrap_or_default();
-        self.ship_part(part, lease, batch).await
+        self.ship_part(part, lease.ship_epoch(), batch).await
     }
 
     /// Ship one journal batch for `part`. Returns true if another
@@ -935,16 +1090,23 @@ impl Shipper {
     /// one leaves a hole that stalls every tailer behind it until it is
     /// filled or the stream is repaired. The byte cap below is what an
     /// accumulating journal actually needs.
+    ///
+    /// Takes `epoch` as a plain value rather than `&LeaseKeeper` (plan 30
+    /// M2b): the PUT below is the one piece of the ordinary ship path
+    /// that must not run with the keepers map locked (see `lease.rs`'s
+    /// module doc, "Locking rules"), and this is the only thing it ever
+    /// read from the keeper — no `&LeaseKeeper` reference survives past
+    /// the caller's snapshot.
     async fn ship_part(
         &mut self,
         part: &str,
-        lease: &LeaseKeeper,
+        epoch: Option<u64>,
         batch: constellation_meta::JournalBatch,
     ) -> Result<bool> {
         if self.skip_ship.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(false);
         }
-        let Some(epoch) = lease.ship_epoch() else {
+        let Some(epoch) = epoch else {
             return Ok(false);
         };
         if batch.is_empty() {

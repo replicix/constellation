@@ -45,6 +45,385 @@ use crate::{
     coop, designation, epoch, forward, fusefs, lease, log_buffer, pin, placement, reintegrate,
     shipper, snapshot, staging, writeback,
 };
+use object_store::ObjectStore;
+
+/// State the sync task's `SyncRequest::Mutate`/`Forward` dispatch needs
+/// (plan 30 M2b item 1), bundled so [`dispatch_mutate`]/[`dispatch_forward`]
+/// can run identically from two call sites: the outer `match` (no round
+/// currently in flight — today's behaviour) and, new in this milestone,
+/// from *inside* the round-vs-`sync_rx` `select!` loop, so a forwarded
+/// mutation no longer has to cancel an in-flight `run_managed_sync_round`
+/// to be serviced (see that loop's doc below). Cloning it is cheap (every
+/// field is an `Arc` or a plain `Copy`/cheaply-`Clone` value).
+#[derive(Clone)]
+struct SyncDispatchCtx {
+    node_id: u64,
+    lease_mode: constellation_store_s3::LeaseMode,
+    spool: Arc<Mutex<shipper::SpoolInfo>>,
+    keepers: Arc<tokio::sync::Mutex<HashMap<String, lease::LeaseKeeper>>>,
+    forward: Arc<forward::ForwardState>,
+    store_inner: Arc<dyn ObjectStore>,
+    meta: Arc<Meta>,
+    lease_views: Arc<Mutex<HashMap<String, Arc<lease::LeaseView>>>>,
+    placement: Arc<placement::Placement>,
+    sync_tx: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
+    peers: constellation_net::Peers,
+}
+
+/// `SyncRequest::Mutate` dispatch: a peer forwarded a mutation to this
+/// node as (believed) holder. Symmetric with [`dispatch_forward`] (plan
+/// 29 M5): a peer's incoming forwarded mutation needs no ordering gate
+/// here (each remote requester already serializes its own overlapping
+/// ops before sending; fjall's single-writer tx serializes concurrent
+/// `holder_execute` calls regardless of arrival order, which is all
+/// correctness requires on this side), but it still deserves to run off
+/// whatever loop dispatches it: under real concurrent load from several
+/// peers, funnelling every request through one synchronous arm
+/// serializes their per-message scheduling/wake overhead even though
+/// each `holder_execute` itself is fast, and — on a cold cache — this
+/// arm's holder lookup can hit an S3 `GET`.
+///
+/// Always spawns and never awaits anything itself, so this is safe to
+/// call from inside the round's `select!` loop (plan 30 M2b item 1)
+/// without ever delaying the next poll of the in-flight round: the call
+/// returns as soon as the task is spawned, exactly like calling it from
+/// the outer `match` always has.
+fn dispatch_mutate(
+    ctx: SyncDispatchCtx,
+    part: String,
+    requester: u64,
+    op: Vec<u8>,
+    rid: constellation_meta::Rid,
+    acked_through: u64,
+    reply: tokio::sync::oneshot::Sender<constellation_meta::MutateOutcome>,
+) {
+    let ship_floor = ctx.spool.lock().unwrap().head_seq.saturating_add(1);
+    tokio::spawn(async move {
+        // Check the lease and execute under one keeper-lock hold:
+        // handoff/release take the same lock around their final flush +
+        // release CAS, so an accepted op can never land after that flush
+        // under an epoch the requester is about to supersede (see
+        // `lease.rs`'s module doc, "Locking rules"). `holder_execute` is
+        // a local fjall write, so the hold is short; the not-holder
+        // lookup below (may GET the lease from S3) runs after it is
+        // dropped.
+        let executed = {
+            let keepers = ctx.keepers.lock().await;
+            let (ship_epoch, is_lost) = keepers
+                .get(&part)
+                .map(|keeper| (keeper.ship_epoch(), keeper.is_lost()))
+                .unwrap_or((None, false));
+            (ship_epoch.is_some() || is_lost).then(|| {
+                forward::holder_execute(
+                    &ctx.meta,
+                    ship_epoch,
+                    is_lost,
+                    ctx.node_id,
+                    &op,
+                    ship_floor,
+                    rid,
+                    Some(&*ctx.forward),
+                )
+            })
+        };
+        // Plan 30 §M2 GC: this requester tells us it has already
+        // received replies for every seq of its current incarnation up
+        // to `acked_through`, so our `recent` cache for those rids only
+        // wastes memory now. Done here, inside the spawned task, not
+        // inline on the main sync loop: that arm exists specifically so
+        // one slow/contended step in servicing a forward never delays
+        // the *next* request's own dispatch — an inline call here
+        // reintroduced exactly that funnel and was the dominant cost
+        // behind the meta-bench regression M2's coordinator review
+        // caught (confirmed: holder_execute/append_tx themselves cost
+        // tens of microseconds; the regression was hundreds).
+        ctx.meta
+            .forget_acked_through(rid.node, rid.incarnation, acked_through);
+        let outcome = if let Some(outcome) = executed {
+            outcome
+        } else {
+            let known_holder = if let Some(holder) = ctx.forward.cached_holder(&part) {
+                holder
+            } else {
+                constellation_store_s3::LeaseStore::new(
+                    ctx.store_inner.clone(),
+                    &part,
+                    ctx.lease_mode,
+                )
+                .get()
+                .await
+                .ok()
+                .flatten()
+                .map(|(lease, _)| lease.holder)
+                .unwrap_or(0)
+            };
+            forward::holder_execute(
+                &ctx.meta,
+                None,
+                false,
+                known_holder,
+                &op,
+                ship_floor,
+                rid,
+                Some(&*ctx.forward),
+            )
+        };
+        if matches!(outcome, constellation_meta::MutateOutcome::Accepted { .. }) {
+            if let Some(view) = ctx.lease_views.lock().unwrap().get(&part) {
+                view.touch();
+            }
+            ctx.placement.note_forwarded(requester);
+            let _ = ctx.sync_tx.send(fusefs::SyncRequest::Nudge);
+        }
+        // Fault injection only (plan 30 M0): the op above already
+        // executed and the keepers lock is already released, so this
+        // only delays the reply the requester is waiting on — see
+        // `fault_forward_reply_delay_ms`'s doc.
+        let fault_delay_ms = fault_forward_reply_delay_ms();
+        if fault_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(fault_delay_ms)).await;
+        }
+        let _ = reply.send(outcome);
+    });
+}
+
+/// `SyncRequest::Forward` dispatch: this node's own FUSE thread needs a
+/// mutation applied and may or may not be the current holder.
+///
+/// The local-holder branch below runs inline (a local fjall write, not a
+/// network round trip) and returns once it has replied — safe to call
+/// from inside the round's `select!` loop (plan 30 M2b item 1) because
+/// its only await, the initial `keepers.lock()`, resolves quickly: the
+/// ordinary ship path never holds that lock across S3 I/O any more (see
+/// `lease.rs`'s module doc, "Locking rules", and
+/// `Shipper::run_ordinary_round`), so this never ends up queued behind a
+/// PUT or a renewal CAS.
+///
+/// The non-holder branch spawns the actual network round trip (plan 29
+/// M4/M5: awaiting it inline would serialize every FUSE thread's forward
+/// behind whichever one is currently in flight), so this function's own
+/// await is always brief either way.
+async fn dispatch_forward(
+    ctx: SyncDispatchCtx,
+    part: String,
+    op: constellation_meta::MutateOp,
+    rid: constellation_meta::Rid,
+    reply: tokio::sync::oneshot::Sender<Result<constellation_meta::MutateOutcome, String>>,
+) {
+    let local_epoch = {
+        let keepers = ctx.keepers.lock().await;
+        keepers.get(&part).and_then(|keeper| keeper.ship_epoch())
+    };
+    if let Some(epoch) = local_epoch {
+        let outcome = match constellation_meta::execute_mutate(&ctx.meta, &op, Some(rid)) {
+            Ok(records) => {
+                if let Some(view) = ctx.lease_views.lock().unwrap().get(&part) {
+                    view.touch();
+                }
+                ctx.placement.note_local(ctx.node_id);
+                constellation_meta::MutateOutcome::Accepted { epoch, records }
+            }
+            Err(constellation_meta::MetaError::Conflict) => {
+                // We are the holder, so our own replica is
+                // authoritative; the requester rebases from it.
+                constellation_meta::MutateOutcome::Conflict { manifest: None }
+            }
+            Err(error) => constellation_meta::MutateOutcome::Errno(forward::meta_errno(&error)),
+        };
+        if matches!(outcome, constellation_meta::MutateOutcome::Accepted { .. }) {
+            // Ask for a prompt round the same way any spawned completion
+            // does (`dispatch_mutate`, the network branch below): the
+            // outer loop's own `pending` variable is not reachable from
+            // here, and this also has to work when called from inside
+            // the round-vs-`sync_rx` `select!` loop, where there is no
+            // `pending` slot to set at all.
+            let _ = ctx.sync_tx.send(fusefs::SyncRequest::Nudge);
+        }
+        let _ = reply.send(Ok(outcome));
+        return;
+    }
+    // Not the holder: forwarding this op means a network round trip
+    // (plus, on success, the local shadow+apply). Plan 29 M4 found that
+    // awaiting this inline serializes every FUSE thread's forward behind
+    // whichever one is currently in flight, well past the point where
+    // the round trip itself completes. Spawn it instead so the caller
+    // returns immediately; the requester-side ordering gate (plan 29 M5,
+    // `crate::keygate`) keeps ops that touch a common inode from landing
+    // (and being applied here) out of the order this node issued them
+    // in, and the semaphore bounds how many such round trips run at
+    // once.
+    tokio::spawn(async move {
+        // Gate first: a forward queued behind an overlapping one must
+        // not sit on an in-flight permit that a disjoint forward could
+        // use.
+        let keys = forward::conflict_keys(&op, &ctx.meta);
+        let _gate = ctx.forward.gate.acquire(keys).await;
+        let _permit = ctx.forward.inflight.clone().acquire_owned().await;
+        let mut holder = ctx.forward.cached_holder(&part);
+        if holder.is_none() {
+            let store = constellation_store_s3::LeaseStore::new(
+                ctx.store_inner.clone(),
+                &part,
+                ctx.lease_mode,
+            );
+            holder = store
+                .get()
+                .await
+                .ok()
+                .flatten()
+                .map(|(lease, _)| lease.holder)
+                .filter(|holder| *holder != 0);
+            if let Some(holder) = holder {
+                ctx.forward.note_holder(&part, holder);
+            }
+        }
+        let outcome = if let Some(mut holder) = holder {
+            let mut outcome = forward::request_mutate(
+                &ctx.peers,
+                &ctx.forward,
+                &part,
+                ctx.node_id,
+                holder,
+                &op,
+                rid,
+                ctx.forward.acked_through(),
+            )
+            .await;
+            // Plan 30 §M2: a timeout/transport error/Busy leaves this op
+            // in doubt, not refused — retry the *same rid* a few times
+            // (a slow holder is more common than a dead one) before
+            // falling through to the lease-acquisition path below. Each
+            // attempt re-reads the cached holder, which is also how this
+            // loop covers "then a redirected holder": a `NotHolder`
+            // reply updates the cache (`request_mutate_with`'s
+            // `note_holder`) before the next attempt reads it.
+            let mut attempt = 0u32;
+            while matches!(outcome, constellation_meta::MutateOutcome::Busy)
+                && attempt < forward::MAX_FORWARD_RETRY_ATTEMPTS
+            {
+                attempt += 1;
+                ctx.forward.retries.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(forward::forward_retry_backoff(attempt)).await;
+                holder = ctx.forward.cached_holder(&part).unwrap_or(holder);
+                outcome = forward::request_mutate(
+                    &ctx.peers,
+                    &ctx.forward,
+                    &part,
+                    ctx.node_id,
+                    holder,
+                    &op,
+                    rid,
+                    ctx.forward.acked_through(),
+                )
+                .await;
+            }
+            if let constellation_meta::MutateOutcome::NotHolder { holder: next } = outcome {
+                if next != 0 && next != holder {
+                    holder = next;
+                    outcome = forward::request_mutate(
+                        &ctx.peers,
+                        &ctx.forward,
+                        &part,
+                        ctx.node_id,
+                        holder,
+                        &op,
+                        rid,
+                        ctx.forward.acked_through(),
+                    )
+                    .await;
+                }
+            }
+            if let constellation_meta::MutateOutcome::Exists {
+                ref records,
+                ship_floor,
+            } = outcome
+            {
+                // The entry the holder refused us comes back with the
+                // refusal: install it so the caller's next lookup of
+                // that name succeeds here too. Not shadowed — these are
+                // the holder's own records, and its segment re-applies
+                // them idempotently (`replay::insert_node`). Only below
+                // the holder's ship floor, though
+                // (`forward::safe_to_install_early`); above it the
+                // bounded wait below takes over, which only ever
+                // observes.
+                if forward::safe_to_install_early(&ctx.meta, ship_floor) {
+                    if let Err(error) = ctx.meta.apply_records(records) {
+                        tracing::warn!(
+                            %error,
+                            part,
+                            "failed to apply the entry behind an EEXIST refusal"
+                        );
+                    }
+                }
+            }
+            if let constellation_meta::MutateOutcome::Accepted { epoch, ref records } = outcome {
+                // Installed ahead of the log for read-your-writes:
+                // the caller's next op on this entry resolves it here.
+                // Unlike `Exists`, this is not skipped above the ship
+                // floor: skipping would leave the caller's own op
+                // invisible until its segment lands, and its next write
+                // would then run against a stale base
+                // (`disjoint-write-4` fails with EIO). The window where
+                // a *later* record for the same entry reaches this
+                // replica before this reply is applied needs that
+                // record executed, made durable in S3 and pushed back
+                // within the reply's own 1–3 ms round trip; closing it
+                // precisely needs the holder's journal position in
+                // replies and segments (tracked in PROGRESS.md, plan 29
+                // M6).
+                let apply_result = forward::apply_accepted(&ctx.meta, &part, epoch, records);
+                if let Err(error) = apply_result {
+                    tracing::warn!(
+                        %error,
+                        part,
+                        "failed to apply accepted forwarded mutation"
+                    );
+                    let _ = reply.send(Err(error.to_string()));
+                    return;
+                }
+            }
+            outcome
+        } else {
+            ctx.forward.clear_holder(&part);
+            constellation_meta::MutateOutcome::Busy
+        };
+        // The gate/permit guards are still held here (dropped at the end
+        // of this scope, after the apply above completed), so the next
+        // overlapping forward cannot even start its own request until
+        // this one's apply has landed.
+        // Read-your-refusals: the errno is about an entry the holder has
+        // and this replica may not (yet), so wait for the holder's
+        // segment before the caller acts on it. Still under the gate, so
+        // overlapping forwards stay ordered behind it.
+        if let Some((parent, name, exists)) = forward::causal_wait_target(&op, &outcome) {
+            let deadline = tokio::time::Instant::now() + forward::CAUSAL_WAIT;
+            use constellation_meta::MetaStore as _;
+            while ctx.meta.lookup(parent, &name).ok().flatten().is_some() != exists
+                && tokio::time::Instant::now() < deadline
+            {
+                let _ = ctx.sync_tx.send(fusefs::SyncRequest::Nudge);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        if matches!(outcome, constellation_meta::MutateOutcome::Accepted { .. }) {
+            // The sync loop's own state (`pending`) is not reachable
+            // from this spawned task; ask it for a prompt round the
+            // same way any other caller does.
+            let _ = ctx.sync_tx.send(fusefs::SyncRequest::Nudge);
+        }
+        // Plan 30 §M2 GC: marking this rid's seq "acked" (so a later
+        // request can tell the holder to drop it from `recent`) is
+        // centralized in `fusefs::mutate_op_rebasable`, which sees every
+        // completion path an op can take (this forward reply, but also
+        // the local-holder fast path, a refusal before ever forwarding,
+        // and the lease-path fallback) — not just this one. Marking it
+        // here too, for only the forward-reply path, previously left
+        // every other path's rid unmarked forever, permanently stalling
+        // the contiguous `acked_through` floor.
+        let _ = reply.send(Ok(outcome));
+    });
+}
 
 /// Detach a stale FUSE mount left behind by a previous daemon that exited
 /// without unmounting (crash, `kill`, or an orphaned view). Such a
@@ -1142,6 +1521,24 @@ impl NodeRuntime {
                 sync_tx.clone(),
             );
             let last_sync_ms = last_sync_ms.clone();
+            // Plan 30 M2b: built once, cloned (cheap — every field is an
+            // `Arc` or `Copy`) at each `Mutate`/`Forward` dispatch site,
+            // of which there are now two: the outer `match` below (no
+            // round in flight) and, new in this milestone, inside the
+            // round-vs-`sync_rx` `select!` loop.
+            let dispatch_ctx = SyncDispatchCtx {
+                node_id,
+                lease_mode,
+                spool: spool.clone(),
+                keepers: keepers.clone(),
+                forward: forward.clone(),
+                store_inner: store_inner.clone(),
+                meta: meta.clone(),
+                lease_views: lease_views.clone(),
+                placement: placement.clone(),
+                sync_tx: sync_tx.clone(),
+                peers: peers.clone(),
+            };
             rt.spawn(async move {
                 let mut pending: Option<fusefs::SyncRequest> = None;
                 // The periodic poll is a *persistent* deadline, not a fresh
@@ -1423,409 +1820,18 @@ impl NodeRuntime {
                             acked_through,
                             reply,
                         }) => {
-                            // Symmetric with the `Forward` arm above (plan
-                            // 29 M5): a peer's incoming forwarded mutation
-                            // needs no ordering gate here (each remote
-                            // requester already serializes its own
-                            // overlapping ops before sending; fjall's
-                            // single-writer tx serializes concurrent
-                            // `holder_execute` calls regardless of arrival
-                            // order, which is all correctness requires on
-                            // this side), but it still deserves to run off
-                            // this loop: under real concurrent load from
-                            // several peers, funnelling every request
-                            // through one synchronous arm serializes their
-                            // per-message scheduling/wake overhead even
-                            // though each `holder_execute` itself is fast,
-                            // and — on a cold cache — this arm's holder
-                            // lookup can hit an S3 `GET`.
-                            let ship_floor =
-                                spool.lock().unwrap().head_seq.saturating_add(1);
-                            let (keepers, forward, store_inner, meta, lease_views, placement, sync_tx) = (
-                                keepers.clone(),
-                                forward.clone(),
-                                store_inner.clone(),
-                                meta.clone(),
-                                lease_views.clone(),
-                                placement.clone(),
-                                sync_tx.clone(),
+                            dispatch_mutate(
+                                dispatch_ctx.clone(),
+                                part,
+                                requester,
+                                op,
+                                rid,
+                                acked_through,
+                                reply,
                             );
-                            tokio::spawn(async move {
-                                // Check the lease and execute under one keeper-lock
-                                // hold: handoff/release take the same lock around
-                                // their final flush + release CAS, so an accepted
-                                // op can never land after that flush under an
-                                // epoch the requester is about to supersede.
-                                // `holder_execute` is a local fjall write, so the
-                                // hold is short; the not-holder lookup below (may
-                                // GET the lease from S3) runs after it is dropped.
-                                let executed = {
-                                    let keepers = keepers.lock().await;
-                                    let (ship_epoch, is_lost) = keepers
-                                        .get(&part)
-                                        .map(|keeper| (keeper.ship_epoch(), keeper.is_lost()))
-                                        .unwrap_or((None, false));
-                                    (ship_epoch.is_some() || is_lost).then(|| {
-                                        forward::holder_execute(
-                                            &meta,
-                                            ship_epoch,
-                                            is_lost,
-                                            node_id,
-                                            &op,
-                                            ship_floor,
-                                            rid,
-                                            Some(&*forward),
-                                        )
-                                    })
-                                };
-                                // Plan 30 §M2 GC: this requester tells us
-                                // it has already received replies for
-                                // every seq of its current incarnation up
-                                // to `acked_through`, so our `recent`
-                                // cache for those rids only wastes memory
-                                // now. Done here, inside the spawned
-                                // task, not inline on the main sync loop:
-                                // that arm exists specifically so one
-                                // slow/contended step in servicing a
-                                // forward never delays the *next*
-                                // request's own dispatch (see the comment
-                                // above `tokio::spawn`) — an inline call
-                                // here reintroduced exactly that funnel
-                                // and was the dominant cost behind the
-                                // meta-bench regression this milestone's
-                                // coordinator review caught (confirmed:
-                                // holder_execute/append_tx themselves
-                                // cost tens of microseconds; the
-                                // regression was hundreds).
-                                meta.forget_acked_through(rid.node, rid.incarnation, acked_through);
-                                let outcome = if let Some(outcome) = executed {
-                                    outcome
-                                } else {
-                                let known_holder = if let Some(holder) = forward.cached_holder(&part) {
-                                    holder
-                                } else {
-                                    constellation_store_s3::LeaseStore::new(
-                                        store_inner.clone(),
-                                        &part,
-                                        lease_mode,
-                                    )
-                                    .get()
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .map(|(lease, _)| lease.holder)
-                                    .unwrap_or(0)
-                                };
-                                forward::holder_execute(
-                                    &meta,
-                                    None,
-                                    false,
-                                    known_holder,
-                                    &op,
-                                    ship_floor,
-                                    rid,
-                                    Some(&*forward),
-                                )
-                                };
-                                if matches!(
-                                    outcome,
-                                    constellation_meta::MutateOutcome::Accepted { .. }
-                                ) {
-                                    if let Some(view) = lease_views.lock().unwrap().get(&part) {
-                                        view.touch();
-                                    }
-                                    placement.note_forwarded(requester);
-                                    let _ = sync_tx.send(fusefs::SyncRequest::Nudge);
-                                }
-                                // Fault injection only (plan 30 M0): the op
-                                // above already executed and the keepers
-                                // lock is already released, so this only
-                                // delays the reply the requester is
-                                // waiting on — see
-                                // `fault_forward_reply_delay_ms`'s doc.
-                                let fault_delay_ms = fault_forward_reply_delay_ms();
-                                if fault_delay_ms > 0 {
-                                    tokio::time::sleep(std::time::Duration::from_millis(
-                                        fault_delay_ms,
-                                    ))
-                                    .await;
-                                }
-                                let _ = reply.send(outcome);
-                            });
                         }
                         Some(fusefs::SyncRequest::Forward { part, op, rid, reply }) => {
-                            let local_epoch = {
-                                let keepers = keepers.lock().await;
-                                keepers.get(&part).and_then(|keeper| keeper.ship_epoch())
-                            };
-                            if let Some(epoch) = local_epoch {
-                                // We hold the lease: this is a local fjall
-                                // write, not a network round trip, so it
-                                // stays inline (plan 29 M5 only targets the
-                                // network-bound non-holder path below).
-                                let outcome =
-                                    match constellation_meta::execute_mutate(&meta, &op, Some(rid))
-                                {
-                                    Ok(records) => {
-                                        if let Some(view) = lease_views.lock().unwrap().get(&part) {
-                                            view.touch();
-                                        }
-                                        placement.note_local(node_id);
-                                        constellation_meta::MutateOutcome::Accepted { epoch, records }
-                                    }
-                                    Err(constellation_meta::MetaError::Conflict) => {
-                                        // We are the holder, so our own replica is
-                                        // authoritative; the requester rebases from it.
-                                        constellation_meta::MutateOutcome::Conflict {
-                                            manifest: None,
-                                        }
-                                    }
-                                    Err(error) => {
-                                        constellation_meta::MutateOutcome::Errno(
-                                            forward::meta_errno(&error),
-                                        )
-                                    }
-                                };
-                                if matches!(
-                                    outcome,
-                                    constellation_meta::MutateOutcome::Accepted { .. }
-                                ) {
-                                    pending = Some(fusefs::SyncRequest::Nudge);
-                                }
-                                let _ = reply.send(Ok(outcome));
-                                continue;
-                            }
-                            // Not the holder: forwarding this op means a
-                            // network round trip (plus, on success, the
-                            // local shadow+apply). Plan 29 M4 found that
-                            // awaiting this inline serializes every FUSE
-                            // thread's forward behind whichever one is
-                            // currently in flight, well past the point
-                            // where the round trip itself completes.
-                            // Spawn it instead so this loop returns to
-                            // `sync_rx.recv()` immediately; the requester-
-                            // side ordering gate (plan 29 M5,
-                            // `crate::keygate`) keeps ops that touch a
-                            // common inode from landing (and being
-                            // applied here) out of the order this node
-                            // issued them in, and the semaphore bounds how
-                            // many such round trips run at once.
-                            let (peers, forward, meta, store_inner, sync_tx) = (
-                                peers.clone(),
-                                forward.clone(),
-                                meta.clone(),
-                                store_inner.clone(),
-                                sync_tx.clone(),
-                            );
-                            tokio::spawn(async move {
-                                // Gate first: a forward queued behind an
-                                // overlapping one must not sit on an in-flight
-                                // permit that a disjoint forward could use.
-                                let keys = forward::conflict_keys(&op, &meta);
-                                let _gate = forward.gate.acquire(keys).await;
-                                let _permit = forward.inflight.clone().acquire_owned().await;
-                                let mut holder = forward.cached_holder(&part);
-                                if holder.is_none() {
-                                    let store = constellation_store_s3::LeaseStore::new(
-                                        store_inner.clone(),
-                                        &part,
-                                        lease_mode,
-                                    );
-                                    holder = store
-                                        .get()
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                        .map(|(lease, _)| lease.holder)
-                                        .filter(|holder| *holder != 0);
-                                    if let Some(holder) = holder {
-                                        forward.note_holder(&part, holder);
-                                    }
-                                }
-                                let outcome = if let Some(mut holder) = holder {
-                                    let mut outcome = forward::request_mutate(
-                                        &peers,
-                                        &forward,
-                                        &part,
-                                        node_id,
-                                        holder,
-                                        &op,
-                                        rid,
-                                        forward.acked_through(),
-                                    )
-                                    .await;
-                                    // Plan 30 §M2: a timeout/transport
-                                    // error/Busy leaves this op in doubt,
-                                    // not refused — retry the *same rid*
-                                    // a few times (a slow holder is more
-                                    // common than a dead one) before
-                                    // falling through to the
-                                    // lease-acquisition path below. Each
-                                    // attempt re-reads the cached holder,
-                                    // which is also how this loop covers
-                                    // "then a redirected holder": a
-                                    // `NotHolder` reply updates the cache
-                                    // (`request_mutate_with`'s
-                                    // `note_holder`) before the next
-                                    // attempt reads it.
-                                    let mut attempt = 0u32;
-                                    while matches!(outcome, constellation_meta::MutateOutcome::Busy)
-                                        && attempt < forward::MAX_FORWARD_RETRY_ATTEMPTS
-                                    {
-                                        attempt += 1;
-                                        forward.retries.fetch_add(1, Ordering::Relaxed);
-                                        tokio::time::sleep(forward::forward_retry_backoff(attempt))
-                                            .await;
-                                        holder = forward.cached_holder(&part).unwrap_or(holder);
-                                        outcome = forward::request_mutate(
-                                            &peers,
-                                            &forward,
-                                            &part,
-                                            node_id,
-                                            holder,
-                                            &op,
-                                            rid,
-                                            forward.acked_through(),
-                                        )
-                                        .await;
-                                    }
-                                    if let constellation_meta::MutateOutcome::NotHolder {
-                                        holder: next,
-                                    } = outcome
-                                    {
-                                        if next != 0 && next != holder {
-                                            holder = next;
-                                            outcome = forward::request_mutate(
-                                                &peers,
-                                                &forward,
-                                                &part,
-                                                node_id,
-                                                holder,
-                                                &op,
-                                                rid,
-                                                forward.acked_through(),
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                    if let constellation_meta::MutateOutcome::Exists {
-                                        ref records,
-                                        ship_floor,
-                                    } = outcome
-                                    {
-                                        // The entry the holder refused us comes
-                                        // back with the refusal: install it so
-                                        // the caller's next lookup of that name
-                                        // succeeds here too. Not shadowed —
-                                        // these are the holder's own records,
-                                        // and its segment re-applies them
-                                        // idempotently
-                                        // (`replay::insert_node`). Only below
-                                        // the holder's ship floor, though
-                                        // (`forward::safe_to_install_early`);
-                                        // above it the bounded wait below takes
-                                        // over, which only ever observes.
-                                        if forward::safe_to_install_early(&meta, ship_floor) {
-                                            if let Err(error) = meta.apply_records(records) {
-                                                tracing::warn!(
-                                                    %error,
-                                                    part,
-                                                    "failed to apply the entry behind an EEXIST refusal"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    if let constellation_meta::MutateOutcome::Accepted {
-                                        epoch,
-                                        ref records,
-                                    } = outcome
-                                    {
-                                        // Installed ahead of the log for
-                                        // read-your-writes: the caller's next op
-                                        // on this entry resolves it here. Unlike
-                                        // `Exists`, this is not skipped above
-                                        // the ship floor: skipping would leave
-                                        // the caller's own op invisible until
-                                        // its segment lands, and its next write
-                                        // would then run against a stale base
-                                        // (`disjoint-write-4` fails with EIO).
-                                        // The window where a *later* record for
-                                        // the same entry reaches this replica
-                                        // before this reply is applied needs that
-                                        // record executed, made durable in S3 and
-                                        // pushed back within the reply's own
-                                        // 1–3 ms round trip; closing it
-                                        // precisely needs the holder's journal
-                                        // position in replies and segments
-                                        // (tracked in PROGRESS.md, plan 29 M6).
-                                        let apply_result =
-                                            forward::apply_accepted(&meta, &part, epoch, records);
-                                        if let Err(error) = apply_result {
-                                            tracing::warn!(
-                                                %error,
-                                                part,
-                                                "failed to apply accepted forwarded mutation"
-                                            );
-                                            let _ = reply.send(Err(error.to_string()));
-                                            return;
-                                        }
-                                    }
-                                    outcome
-                                } else {
-                                    forward.clear_holder(&part);
-                                    constellation_meta::MutateOutcome::Busy
-                                };
-                                // The gate/permit guards are still held here
-                                // (dropped at the end of this scope, after
-                                // the apply above completed), so the next
-                                // overlapping forward cannot even start its
-                                // own request until this one's apply has
-                                // landed.
-                                // Read-your-refusals: the errno is about an
-                                // entry the holder has and this replica may
-                                // not (yet), so wait for the holder's segment
-                                // before the caller acts on it. Still under
-                                // the gate, so overlapping forwards stay
-                                // ordered behind it.
-                                if let Some((parent, name, exists)) =
-                                    forward::causal_wait_target(&op, &outcome)
-                                {
-                                    let deadline = tokio::time::Instant::now() + forward::CAUSAL_WAIT;
-                                    use constellation_meta::MetaStore as _;
-                                    while meta.lookup(parent, &name).ok().flatten().is_some() != exists
-                                        && tokio::time::Instant::now() < deadline
-                                    {
-                                        let _ = sync_tx.send(fusefs::SyncRequest::Nudge);
-                                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                                    }
-                                }
-                                if matches!(
-                                    outcome,
-                                    constellation_meta::MutateOutcome::Accepted { .. }
-                                ) {
-                                    // The sync loop's own state (`pending`)
-                                    // is not reachable from this spawned
-                                    // task; ask it for a prompt round the
-                                    // same way any other caller does.
-                                    let _ = sync_tx.send(fusefs::SyncRequest::Nudge);
-                                }
-                                // Plan 30 §M2 GC: marking this rid's seq
-                                // "acked" (so a later request can tell
-                                // the holder to drop it from `recent`)
-                                // is centralized in
-                                // `fusefs::mutate_op_rebasable`, which
-                                // sees every completion path an op can
-                                // take (this forward reply, but also the
-                                // local-holder fast path, a refusal
-                                // before ever forwarding, and the
-                                // lease-path fallback) — not just this
-                                // one. Marking it here too, for only the
-                                // forward-reply path, previously left
-                                // every other path's rid unmarked
-                                // forever, permanently stalling the
-                                // contiguous `acked_through` floor.
-                                let _ = reply.send(Ok(outcome));
-                            });
+                            dispatch_forward(dispatch_ctx.clone(), part, op, rid, reply).await;
                         }
                         Some(fusefs::SyncRequest::ApplyPushed {
                             part,
@@ -2046,12 +2052,18 @@ impl NodeRuntime {
                                     biased;
                                     r = &mut round => {
                                         completed = true;
+                                        {
+                                            let mut spool = spool.lock().unwrap();
+                                            spool.ship_rounds_completed += 1;
+                                            if let Err(e) = &r {
+                                                spool.last_error = Some(format!("{e:#}"));
+                                            }
+                                        }
                                         if let Err(e) = r {
                                             tracing::warn!(
                                                 error = %e,
                                                 "metadata sync failed; will retry"
                                             );
-                                            spool.lock().unwrap().last_error = Some(format!("{e:#}"));
                                         } else {
                                             pins.refresh_all().await;
                                         }
@@ -2065,9 +2077,45 @@ impl NodeRuntime {
                                             // not an idle round whatever it finds.
                                             nudged = true;
                                         }
+                                        // Plan 30 M2b item 1: these two spawn (or,
+                                        // for a local `Forward`, run one quick
+                                        // fjall write) and never need to interrupt
+                                        // an in-flight round to be serviced — see
+                                        // `dispatch_mutate`/`dispatch_forward`'s
+                                        // docs. Dispatching them here, instead of
+                                        // falling through to `pending`/`break`
+                                        // below, is the fix for the ship-round
+                                        // starvation plan 30 M2 measured: every
+                                        // forwarded op used to cancel and restart
+                                        // the round in progress.
+                                        Some(fusefs::SyncRequest::Mutate {
+                                            part,
+                                            requester,
+                                            op,
+                                            rid,
+                                            acked_through,
+                                            reply,
+                                        }) => {
+                                            dispatch_mutate(
+                                                dispatch_ctx.clone(),
+                                                part,
+                                                requester,
+                                                op,
+                                                rid,
+                                                acked_through,
+                                                reply,
+                                            );
+                                        }
+                                        Some(fusefs::SyncRequest::Forward { part, op, rid, reply }) => {
+                                            dispatch_forward(dispatch_ctx.clone(), part, op, rid, reply)
+                                                .await;
+                                        }
                                         Some(request) => {
                                             // Explicit operations retain their old
-                                            // prompt-response behavior.
+                                            // prompt-response behavior: cancel the
+                                            // in-flight round and service this one
+                                            // from the outer `match` instead.
+                                            spool.lock().unwrap().ship_rounds_cancelled += 1;
                                             pending = Some(request);
                                             break;
                                         }
@@ -2096,8 +2144,9 @@ impl NodeRuntime {
                                 // The sync round is the *only* thing that
                                 // renews a lease or notices a `wanted_by`
                                 // handoff request: `run_sync_round` is the
-                                // sole caller of `renew_if_due` and
-                                // `idle_release_due`. Backing off past the
+                                // sole caller of `LeaseKeeper::prepare_renew`
+                                // (plan 30 M2b; previously `renew_if_due`)
+                                // and `idle_release_due`. Backing off past the
                                 // renewal cadence therefore does not merely
                                 // delay a read, it starves lease maintenance
                                 // — with `idle_max_ms` above TTL/2 a
@@ -2818,8 +2867,9 @@ mod tests {
 
     /// A lease holder may not back off past its own renewal cadence.
     ///
-    /// `run_sync_round` is the only caller of `renew_if_due` and
-    /// `idle_release_due`, so the poll deadline *is* the lease-maintenance
+    /// `run_sync_round` is the only caller of `LeaseKeeper::prepare_renew`
+    /// (plan 30 M2b; previously `renew_if_due`) and `idle_release_due`, so
+    /// the poll deadline *is* the lease-maintenance
     /// deadline. Left unclamped, a 30 s ceiling over a 5 s TTL lets the
     /// lease expire while the node still believes it holds it — which is
     /// how `node-leave` came to fail with EIO — and stretches plan 26
@@ -3024,5 +3074,192 @@ mod tests {
 
         node_a.remove_mount(a_root_id).expect("unmount a root");
         node_b.remove_mount(b_id).expect("unmount b root");
+    }
+
+    /// An `ObjectStore` decorator that sleeps for a fixed delay before
+    /// every PUT, so a test can hold the release CAS open for a known
+    /// window instead of racing real S3 latency. Everything else
+    /// delegates straight through — same minimal-override shape as
+    /// `lease::tests::HangingStore`, whose full-hang version this
+    /// generalizes to a bounded one.
+    #[derive(Debug)]
+    struct DelayedStore(object_store::memory::InMemory, std::time::Duration);
+
+    impl std::fmt::Display for DelayedStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "DelayedStore({})", self.0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for DelayedStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            tokio::time::sleep(self.1).await;
+            self.0.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.0.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.0.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.0.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.0.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.0.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.0.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Plan 30 M2b: proves the invariant the release/handoff path's
+    /// "keep holding the keepers lock across the final flush and the
+    /// release CAS" is *for* — a forwarded execute must never land in the
+    /// gap between the two. `dispatch_mutate` (item 1) no longer cancels
+    /// an in-flight round to run, so it is now, for the first time,
+    /// something that can genuinely race a release rather than always
+    /// being serialized behind it by the round-drop that used to happen
+    /// first; this test is the regression guard for that new race.
+    ///
+    /// Simulates `run_sync_round`'s release pass directly (lock, call
+    /// `LeaseKeeper::release`, still holding the lock) racing a
+    /// `dispatch_mutate` call for the same partition, with the release's
+    /// CAS stretched out by [`DelayedStore`] so the race is deterministic
+    /// rather than depending on real scheduling luck.
+    #[tokio::test]
+    async fn forwarded_mutate_cannot_land_between_release_flush_and_cas() {
+        use constellation_fs_core::types::ROOT_INO;
+
+        let delay = std::time::Duration::from_millis(150);
+        let backend: Arc<dyn ObjectStore> =
+            Arc::new(DelayedStore(object_store::memory::InMemory::new(), delay));
+        let lease_store = constellation_store_s3::LeaseStore::new(
+            backend.clone(),
+            "p0",
+            constellation_store_s3::LeaseMode::Cas,
+        );
+        let mut keeper = lease::LeaseKeeper::new(lease_store, 1);
+        assert!(keeper
+            .commit(lease::Plan::Create, None)
+            .await
+            .expect("create the lease"));
+        assert!(keeper.ship_epoch().is_some(), "must hold after Create");
+
+        let keepers: Arc<tokio::sync::Mutex<HashMap<String, lease::LeaseKeeper>>> = Arc::new(
+            tokio::sync::Mutex::new(HashMap::from([("p0".to_string(), keeper)])),
+        );
+        let meta = Arc::new(Meta::open_in_memory().expect("in-memory meta"));
+        let (sync_tx, _sync_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = SyncDispatchCtx {
+            node_id: 1,
+            lease_mode: constellation_store_s3::LeaseMode::Cas,
+            spool: Arc::new(Mutex::new(shipper::SpoolInfo::default())),
+            keepers: keepers.clone(),
+            forward: forward::ForwardState::new(),
+            store_inner: backend,
+            meta: meta.clone(),
+            lease_views: Arc::new(Mutex::new(HashMap::new())),
+            placement: Arc::new(placement::Placement::new()),
+            sync_tx,
+            peers: constellation_net::Peers::disabled(),
+        };
+
+        // Task A: `run_sync_round`'s release pass, exactly as written
+        // there — take the lock, release (final flush is a no-op here;
+        // nothing was ever journaled), keep the lock the whole time.
+        // `DelayedStore` stretches the CAS inside `release()` to `delay`.
+        let release_task = tokio::spawn({
+            let keepers = keepers.clone();
+            async move {
+                let mut g = keepers.lock().await;
+                let k = g.get_mut("p0").expect("partition present");
+                k.release().await.expect("release succeeds");
+            }
+        });
+        // Give the release enough of a head start to have entered
+        // `release()` and be blocked inside the (delayed) CAS — not just
+        // queued behind the same lock `dispatch_mutate` will also want.
+        tokio::time::sleep(delay / 3).await;
+
+        // Task B: a peer's forwarded mutation arriving for this partition
+        // while the release above is still in flight — precisely the
+        // request `dispatch_mutate` now services without cancelling
+        // whatever sync round is running, per plan 30 M2b item 1.
+        let op = constellation_meta::MutateOp::Mkdir {
+            parent: ROOT_INO,
+            name: "race".into(),
+            ino: (1 << 40) | 1,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        }
+        .to_postcard()
+        .expect("encode op");
+        let rid = constellation_meta::Rid {
+            node: 9,
+            incarnation: 1,
+            seq: 1,
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        dispatch_mutate(ctx, "p0".to_string(), 9, op, rid, 0, reply_tx);
+        let outcome = reply_rx.await.expect("dispatch_mutate always replies");
+        release_task.await.expect("release task");
+
+        assert!(
+            !matches!(outcome, constellation_meta::MutateOutcome::Accepted { .. }),
+            "a forwarded execute landed between the release's final flush \
+             and its CAS: {outcome:?}"
+        );
+        // The op must not be visible either — belt and suspenders on top
+        // of the outcome check, in case some future refactor of
+        // `dispatch_mutate` executed the op but mislabeled the outcome.
+        use constellation_meta::MetaStore as _;
+        assert!(
+            meta.lookup(ROOT_INO, "race").ok().flatten().is_none(),
+            "a forwarded op must not be applied once this node has released the lease"
+        );
     }
 }

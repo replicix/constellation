@@ -491,6 +491,12 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         run: forward_timeout_reexec,
     },
+    Scenario {
+        name: "holder-ships-under-forward-load",
+        desc: "plan 30 M2b: a sustained forwarded-create burst from 2 non-holders must not starve the holder's own ship rounds; journal backlog stays bounded and followers converge within 2s of the burst ending",
+        requires: &[],
+        run: holder_ships_under_forward_load,
+    },
 ];
 
 /// Plan 30 M0: scenarios that reproduce a known, not-yet-fixed bug
@@ -6290,6 +6296,215 @@ fn dedup_evidence(clients: &[&Client]) -> Result<u64> {
         total += status["forward_indoubt_resolved"].as_u64().unwrap_or(0);
     }
     Ok(total)
+}
+
+/// Plan 30 M2b's own motivating measurement, as a regression scenario.
+///
+/// Before this milestone, `node_runtime`'s sync task dropped its
+/// in-flight `run_managed_sync_round` for *every* `SyncRequest` other
+/// than `Nudge` — including the holder's own `SyncRequest::Mutate` for
+/// each forwarded mutation. Under a sustained forwarding burst (a
+/// request every ~0.7ms, a round taking ~2ms — one S3 PUT) the holder
+/// almost never finished a round: the coordinator's own instrumented run
+/// entered ~1,200 rounds and only 5 ran `sync_all` to completion, with
+/// the journal backlog sitting at 1,000-1,600 records throughout.
+///
+/// This reproduces that load shape directly against the real sync task
+/// — no fault injection needed, since the starvation is structural
+/// (every forward cancels the round), not S3-latency-dependent — and
+/// checks the fix's two externally observable effects:
+/// - the holder's own `journal_backlog` stays small *throughout* the
+///   burst (bounded batching/shipping, not unbounded accumulation from
+///   starved rounds) — sampled continuously, not just checked at the
+///   end, since a round that starves for the whole burst and then
+///   catches up right at the end would otherwise pass a single
+///   end-of-burst check while still exhibiting exactly the bug;
+/// - the non-holders converge on every created file within 2s of the
+///   burst ending (bounded end-to-end latency from a holder that is
+///   actually shipping, not just "eventually" via the idle-poll
+///   fallback).
+///
+/// The backlog bound (`MAX_BACKLOG_DURING_BURST`) is chosen from measured
+/// pre-fix vs. post-fix behavior on this exact load shape, on this host
+/// (see the M2b PROGRESS.md entry): the pre-M2b binary (post-M2) reaches
+/// 12,799 — the same "thousands" shape the coordinator's own
+/// instrumentation found — while the post-M2b binary stays at 186-226
+/// across repeated runs. 500 sits comfortably above that measured
+/// post-fix range (room for host jitter) while remaining more than 25x
+/// tighter than the pre-fix failure mode, so a regression back to
+/// round-cancelling starvation still fails this scenario immediately
+/// rather than needing to reach four digits first.
+fn holder_ships_under_forward_load(_seed: u64) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    const MAX_BACKLOG_DURING_BURST: u64 = 500;
+    const CREATES_PER_THREAD: u64 = 800;
+    const THREADS_PER_NODE: usize = 4;
+
+    let (env, root) = setup("holder-ships-under-forward-load")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/holder-ships-{}", ts());
+    let mut holder =
+        Client::new(root.path(), "holder", &env.endpoint, &backend)?.with_own_node_key();
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?.with_own_node_key();
+    let mut c2 = Client::new(root.path(), "c2", &env.endpoint, &backend)?.with_own_node_key();
+    holder.fs_create()?;
+    holder.mount()?;
+    c1.mount()?;
+    c2.mount()?;
+    wait_for_p2p(&[&holder, &c1, &c2])?;
+
+    let dir = "burst";
+    std::fs::create_dir_all(holder.mnt.join(dir))?;
+    eventually(
+        "shared burst dir visible on all mounts",
+        Duration::from_secs(20),
+        || {
+            anyhow::ensure!(c1.mnt.join(dir).is_dir());
+            anyhow::ensure!(c2.mnt.join(dir).is_dir());
+            Ok(())
+        },
+    )?;
+
+    // Establish `holder` as the lease holder *before* the burst starts,
+    // so every forwarded create below has a fixed target — the property
+    // under test is what a forwarding-heavy holder does, not who ends up
+    // holding the lease.
+    std::fs::write(holder.mnt.join(dir).join(".establish-holder"), b"x")
+        .context("establishing the holder")?;
+    eventually("holder holds the lease", Duration::from_secs(20), || {
+        let lease = lease_of(&holder)?;
+        anyhow::ensure!(lease["held"] == true, "holder not holding: {lease}");
+        Ok(())
+    })?;
+
+    // Sample the holder's own `journal_backlog` throughout the burst on a
+    // dedicated thread — tight enough (5ms) to catch a starved holder's
+    // backlog sitting in the thousands for the burst's whole duration,
+    // the shape plan 30 M2's own measurement found.
+    let sampling = std::sync::atomic::AtomicBool::new(true);
+    let max_backlog = AtomicU64::new(0);
+    let last_sample_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    std::thread::scope(|scope| -> Result<()> {
+        let sampler = scope.spawn(|| {
+            while sampling.load(Ordering::Relaxed) {
+                match holder.control_status() {
+                    Ok(status) => {
+                        let backlog = status["spool"]["journal_backlog"].as_u64().unwrap_or(0);
+                        max_backlog.fetch_max(backlog, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        *last_sample_error.lock().unwrap() = Some(e.to_string());
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        // The sustained forwarded-create burst: several threads on each
+        // of the two non-holder nodes, all creating into the holder's
+        // shared directory — every single create is a forward (plan 29
+        // ADR-14), which is exactly the load shape that used to cancel
+        // the holder's round on every op.
+        let t0 = Instant::now();
+        let mut handles = Vec::new();
+        for (node_idx, client) in [&c1, &c2].into_iter().enumerate() {
+            for tid in 0..THREADS_PER_NODE {
+                let mnt = client.mnt.clone();
+                let dir = dir.to_string();
+                handles.push(scope.spawn(move || -> Result<u64> {
+                    for n in 0..CREATES_PER_THREAD {
+                        let path = mnt.join(&dir).join(format!("n{node_idx}-t{tid}-{n}"));
+                        std::fs::File::create(&path)
+                            .with_context(|| format!("creating {path:?}"))?;
+                    }
+                    Ok(CREATES_PER_THREAD)
+                }));
+            }
+        }
+        let mut created = 0u64;
+        for h in handles {
+            created += h
+                .join()
+                .map_err(|_| anyhow::anyhow!("burst worker thread panicked"))??;
+        }
+        let burst_elapsed = t0.elapsed();
+
+        sampling.store(false, Ordering::Relaxed);
+        sampler
+            .join()
+            .map_err(|_| anyhow::anyhow!("sampler thread panicked"))?;
+
+        eprintln!(
+            "holder-ships-under-forward-load: {created} forwarded creates in {burst_elapsed:?}, \
+             max journal_backlog observed = {}",
+            max_backlog.load(Ordering::Relaxed)
+        );
+        // Plan 30 M2b measurement: completed vs. cancelled sync rounds on
+        // the holder for this exact run (`shipper::SpoolInfo`'s doc has
+        // the full explanation) — printed so a coordinator comparing
+        // before/after binaries can read it straight from the scenario's
+        // own output rather than a separate ad hoc script.
+        if let Ok(status) = holder.control_status() {
+            eprintln!(
+                "holder-ships-under-forward-load: holder ship_rounds_completed={} \
+                 ship_rounds_cancelled={}",
+                status["spool"]["ship_rounds_completed"]
+                    .as_u64()
+                    .unwrap_or(0),
+                status["spool"]["ship_rounds_cancelled"]
+                    .as_u64()
+                    .unwrap_or(0),
+            );
+        }
+        if let Some(e) = last_sample_error.lock().unwrap().take() {
+            eprintln!("holder-ships-under-forward-load: a status sample failed: {e}");
+        }
+        anyhow::ensure!(
+            created == THREADS_PER_NODE as u64 * CREATES_PER_THREAD * 2,
+            "not every create completed: {created}"
+        );
+        anyhow::ensure!(
+            max_backlog.load(Ordering::Relaxed) <= MAX_BACKLOG_DURING_BURST,
+            "holder's journal_backlog reached {} during the burst (bound {}): the round-\
+             cancelling starvation plan 30 M2b fixes appears to be back",
+            max_backlog.load(Ordering::Relaxed),
+            MAX_BACKLOG_DURING_BURST
+        );
+        Ok(())
+    })?;
+
+    // Convergence within 2s of the burst ending: every created file must
+    // be visible (and readable) from *both* non-holder mounts — the
+    // requesters of the very forwards the burst above generated.
+    let expect_names: Vec<String> = (0..THREADS_PER_NODE)
+        .flat_map(|tid| (0..CREATES_PER_THREAD).map(move |n| (tid, n)))
+        .flat_map(|(tid, n)| [format!("n0-t{tid}-{n}"), format!("n1-t{tid}-{n}")])
+        .collect();
+    eventually(
+        "followers see every forwarded create within 2s of the burst ending",
+        Duration::from_secs(2),
+        || {
+            for mnt in [&holder.mnt, &c1.mnt, &c2.mnt] {
+                for name in &expect_names {
+                    anyhow::ensure!(
+                        mnt.join(dir).join(name).exists(),
+                        "{}: {name} not visible yet",
+                        mnt.display()
+                    );
+                }
+            }
+            Ok(())
+        },
+    )?;
+    ensure_no_conflicts(&[&holder, &c1, &c2])?;
+
+    holder.unmount()?;
+    c1.unmount()?;
+    c2.unmount()?;
+    Ok(())
 }
 
 /// Bug A (`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md`

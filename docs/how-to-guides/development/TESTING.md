@@ -662,6 +662,42 @@ which ordinary same-name-conflict replay resolves silently. `ino_agrees`
 compares the kernel inode number of the resulting name across both
 nodes, catching that even when no errno reaches the caller.
 
+### `holder-ships-under-forward-load` (plan 30 M2b, ship-round starvation)
+
+Three nodes (own P2P node keys), one established as the lease holder for
+a shared directory before the burst starts. The other two then hammer
+that directory with `O_CREAT` from 4 threads each (6,400 creates total)
+— every single one a forward (ADR-14) to the holder. A background thread
+polls the holder's `control_status()["spool"]["journal_backlog"]` every
+5ms throughout the burst.
+
+Before plan 30 M2b, `node_runtime`'s sync task dropped its in-flight
+`run_managed_sync_round` for every `SyncRequest` other than `Nudge`,
+including the holder's own `SyncRequest::Mutate` for each forwarded
+mutation. Under this load shape a request arrives roughly every 0.7ms
+while a round takes ~2ms (one S3 PUT), so the holder almost never
+finished a round — measured (on this host, against the pre-M2b, post-M2
+binary) at a peak `journal_backlog` of 12,799 during the burst, matching
+the "thousands, for the whole burst" shape the coordinator's own
+instrumentation found while measuring M2. With M2b's fix (`Mutate`/
+`Forward` dispatched from inside the round's own `select!` loop instead
+of cancelling it — see `crates/cli/src/node_runtime.rs`'s module doc and
+`crates/cli/src/lease.rs`'s "Locking rules" section), the same load
+measures 186-266 on this host across repeated runs.
+
+Two checks:
+
+- `journal_backlog` never exceeds 500 *at any sampled point* during the
+  burst — chosen with over 2x headroom above the measured post-fix range
+  and more than 25x tighter than the pre-fix failure mode, so a
+  regression back to round-cancelling starvation fails immediately
+  rather than needing to reach four digits first. Sampled continuously
+  (not just checked once at the end) because a holder that starves for
+  the whole burst and only catches up right at the end would otherwise
+  pass an end-of-burst-only check while still exhibiting the bug.
+- Every one of the 6,400 created files is visible from both non-holder
+  mounts within 2 seconds of the burst ending.
+
 ### Known-bug reproductions (plan 30 M0/M1, bug B pending M3)
 
 `harness list` prints a second catalog after the ordinary scenario list,
