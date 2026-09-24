@@ -19,3 +19,6 @@ tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `fjall_drop_deadlock` installs a `log` logger to widen fjall's shutdown
+# race window (the version fjall itself already pulls in).
+log = "0.4"

@@ -32,7 +32,7 @@ default-members = [
     "crates/upload-concurrency",
     "crates/model",
 ]
-exclude = ["bench/dbbench", "bench/prollybench", "bench/enginebench"]
+exclude = ["bench/dbbench", "bench/prollybench", "bench/enginebench", "vendor/fjall"]
 
 [workspace.package]
 version = "1.0.0"
@@ -82,6 +82,14 @@ memmap2 = "0.9"
 # topic for push invalidation and lease handoff.
 iroh = "1"
 iroh-gossip = "0.101"
+
+# Vendored fjall 3.1.10 with a one-function fix for a shutdown deadlock in
+# `DatabaseInner::drop`; see vendor/fjall/CONSTELLATION-PATCH.md for what
+# it changes and how to drop it again once upstream ships a fix. Excluded
+# from the workspace above so it is built as a plain dependency (not
+# linted or tested as a member).
+[patch.crates-io]
+fjall = { path = "vendor/fjall" }
 
 [profile.release]
 lto = "thin"
