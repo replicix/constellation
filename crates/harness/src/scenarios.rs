@@ -175,6 +175,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: p2p_partition_tolerance,
     },
     Scenario {
+        name: "p2p-same-identity-restart",
+        desc: "SIGKILL the lease holder of three and remount it with the same state and node key: the others see it connected again and forward to it over P2P within seconds, not after the dead connection's QUIC idle timeout",
+        requires: &[],
+        run: p2p_same_identity_restart,
+    },
+    Scenario {
         name: "coop-cache-hit",
         desc: "cold reader fetches most chunks from a warm peer while S3 is delayed 200ms",
         requires: &[],
@@ -4409,6 +4415,166 @@ fn forwarded_mutations(_seed: u64) -> Result<()> {
     ensure_no_conflicts(&[&c0, &c1])?;
     c0.unmount()?;
     c1.unmount()?;
+    Ok(())
+}
+
+/// A node SIGKILLed and remounted with the same state dir keeps its node
+/// key, so its new incarnation has the same iroh `EndpointId`. The nodes
+/// that knew it still hold connections to the dead incarnation, and
+/// iroh keeps routing new dials to its old address while any of them is
+/// open (see `constellation_net::endpoint::Pool`). Before the fix they
+/// could not reach it for 30 s or more: pings failed, `connected` stayed
+/// false, and forwards to it hung on the dead connection.
+///
+/// Three nodes; c2 holds the lease so c0 and c1 have warm, pooled P2P
+/// connections to it (their forwards). Crash c2, wait until both see it
+/// down, remount it from the same state, and require (1) both report it
+/// `connected` again within [`RESTART_REACH_BOUND`] of the remount, and
+/// (2) once it holds the lease again, a write on each of c0 and c1 is
+/// forwarded to it over P2P (not the S3 inbox), promptly.
+fn p2p_same_identity_restart(_seed: u64) -> Result<()> {
+    const RESTART_REACH_BOUND: Duration = Duration::from_secs(5);
+    const FORWARD_BOUND: Duration = Duration::from_secs(5);
+    let (env, root) = setup("p2p-same-identity-restart")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/p2p-restart-{}", ts());
+    // c2 creates the filesystem and writes first, so it takes the lease
+    // and keeps it (a sticky holder the others forward to).
+    let tune = |c: Client| {
+        c.with_own_node_key()
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "60000")
+    };
+    let mut c0 = tune(Client::new(root.path(), "c0", &env.endpoint, &backend)?);
+    let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
+    let mut c2 = tune(Client::new(root.path(), "c2", &env.endpoint, &backend)?);
+    c2.fs_create()?;
+    c2.mount()?;
+    std::fs::write(c2.mnt.join("c2-created"), b"c2")?;
+    c0.mount()?;
+    c1.mount()?;
+    wait_for_peers(&[&c0, &c1, &c2])?;
+    let victim = c2.control_status()?["node_id"]
+        .as_u64()
+        .context("c2 reports no node id")?;
+    let sees = |c: &Client, want: bool| -> Result<()> {
+        let p = p2p_of(c)?;
+        let up = p["peers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|peer| peer["node_id"] == victim && peer["connected"] == true);
+        anyhow::ensure!(
+            up == want,
+            "{} sees c2 connected={up}, want {want}: {p}",
+            c.name
+        );
+        Ok(())
+    };
+    let mut model = Model::default();
+    model.write_file(std::path::Path::new("c2-created"), b"c2".to_vec());
+    let mut write = |c: &Client, name: &str| -> Result<()> {
+        let data = format!("{name} via {}", c.name).into_bytes();
+        std::fs::write(c.mnt.join(name), &data)?;
+        model.write_file(std::path::Path::new(name), data);
+        Ok(())
+    };
+    // One write from `c`, which must reach the holder as a P2P forward.
+    let forward = |c: &Client, name: &str, write: &mut dyn FnMut(&Client, &str) -> Result<()>| {
+        let ok = c.control_status()?["forwarded_ok"].as_u64().unwrap_or(0);
+        let inbox = inbox_counter(c, "inbox_ops")?;
+        let started = std::time::Instant::now();
+        write(c, name)?;
+        let took = started.elapsed();
+        let ok_after = c.control_status()?["forwarded_ok"].as_u64().unwrap_or(0);
+        let inbox_after = inbox_counter(c, "inbox_ops")?;
+        anyhow::Ok((ok_after > ok && inbox_after == inbox, took))
+    };
+    let c2_holds = |c2: &Client, what: &str, write: &mut dyn FnMut(&Client, &str) -> Result<()>| {
+        write(c2, what)?;
+        eventually(
+            &format!("c2 holds the lease ({what})"),
+            Duration::from_secs(30),
+            || {
+                let lease = lease_of(c2)?;
+                anyhow::ensure!(lease["held"] == true, "c2 does not hold the lease: {lease}");
+                Ok(())
+            },
+        )
+    };
+
+    c2_holds(&c2, "c2-first", &mut write)?;
+    for c in [&c0, &c1] {
+        // A cold start may still have c2 refusing a node it has not read
+        // from the registry yet (its allowlist refresh is rate-limited),
+        // so the warm-up retries until a forward goes over P2P.
+        let mut attempt = 0;
+        eventually(
+            &format!("{}'s warm-up write is a P2P forward", c.name),
+            Duration::from_secs(30),
+            || {
+                attempt += 1;
+                let (p2p, took) = forward(c, &format!("warm-{}-{attempt}", c.name), &mut write)?;
+                anyhow::ensure!(p2p, "not a P2P forward ({took:?})");
+                Ok(())
+            },
+        )?;
+        eventually(
+            &format!("{} sees c2 connected", c.name),
+            Duration::from_secs(20),
+            || sees(c, true),
+        )?;
+    }
+
+    c2.kill9()?;
+    for c in [&c0, &c1] {
+        // The registry tick's probe (every 5 s) notices.
+        eventually(
+            &format!("{} sees c2 down", c.name),
+            Duration::from_secs(20),
+            || sees(c, false),
+        )?;
+    }
+    c2.mount().context("remounting c2 with the same state")?;
+    let remounted = std::time::Instant::now();
+    for c in [&c0, &c1] {
+        let left = RESTART_REACH_BOUND.saturating_sub(remounted.elapsed());
+        eventually(
+            &format!("{} sees the restarted c2 connected", c.name),
+            left,
+            || sees(c, true),
+        )
+        .with_context(|| format!("c2's log: {}", c2.tail_log()))?;
+    }
+    eprintln!(
+        "    p2p-same-identity-restart: c0 and c1 see c2 connected {} ms after its remount",
+        remounted.elapsed().as_millis()
+    );
+
+    c2_holds(&c2, "c2-again", &mut write)?;
+    for c in [&c0, &c1] {
+        let (p2p, took) = forward(c, &format!("after-{}", c.name), &mut write)?;
+        eprintln!(
+            "    p2p-same-identity-restart: {}'s forward to the restarted holder: p2p={p2p} in {} ms",
+            c.name,
+            took.as_millis()
+        );
+        anyhow::ensure!(
+            p2p && took <= FORWARD_BOUND,
+            "{}'s write to the restarted holder was not a prompt P2P forward \
+             (p2p={p2p}, {took:?}, bound {FORWARD_BOUND:?})",
+            c.name
+        );
+    }
+    eventually("all three converge", Duration::from_secs(30), || {
+        model.verify(&c0.mnt).context("via c0")?;
+        model.verify(&c1.mnt).context("via c1")?;
+        model.verify(&c2.mnt).context("via c2")?;
+        Ok(())
+    })?;
+    ensure_no_conflicts(&[&c0, &c1, &c2])?;
+    c0.unmount()?;
+    c1.unmount()?;
+    c2.unmount()?;
     Ok(())
 }
 

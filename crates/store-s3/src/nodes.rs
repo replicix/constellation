@@ -175,14 +175,17 @@ pub async fn get_node(
     store: Arc<dyn ObjectStore>,
     node_id: u64,
 ) -> Result<Option<NodeInfo>, StoreError> {
-    match store.get(&node_key(node_id)).await {
-        Ok(r) => {
-            let bytes = r.bytes().await?;
-            Ok(Some(serde_json::from_slice(&bytes)?))
-        }
-        Err(object_store::Error::NotFound { .. }) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    Ok(read_record(store.as_ref(), &node_key(node_id))
+        .await?
+        .map(|(info, _)| info))
+}
+
+/// One registry record, re-reading a torn body (`crate::control`).
+async fn read_record(
+    store: &dyn ObjectStore,
+    key: &object_store::path::Path,
+) -> Result<Option<(NodeInfo, object_store::ObjectMeta)>, StoreError> {
+    crate::control::get_json::<NodeInfo>(store, key).await
 }
 
 /// Permanently retire `node_id` from the write-eligible roster.
@@ -194,15 +197,7 @@ pub async fn get_node(
 /// success keeps admin leave safe to retry).
 pub async fn leave_node(store: Arc<dyn ObjectStore>, node_id: u64) -> Result<(), StoreError> {
     let key = node_key(node_id);
-    let existing = match store.get(&key).await {
-        Ok(r) => {
-            let bytes = r.bytes().await?;
-            Some(serde_json::from_slice::<NodeInfo>(&bytes)?)
-        }
-        Err(object_store::Error::NotFound { .. }) => None,
-        Err(e) => return Err(e.into()),
-    };
-    let Some(existing) = existing else {
+    let Some((existing, _)) = read_record(store.as_ref(), &key).await? else {
         return Ok(());
     };
     if existing.retired {
@@ -250,14 +245,24 @@ pub async fn write_eligible_roster(store: Arc<dyn ObjectStore>) -> Result<Vec<u6
         if !is_node_record {
             continue;
         }
-        let bytes = store.get(&m.location).await?.bytes().await?;
-        let info: NodeInfo = serde_json::from_slice(&bytes).map_err(|e| {
-            StoreError::Registry(format!(
-                "unparseable node record {}: {e}; refusing to derive a \
-                 write-eligible roster from an incomplete registry",
-                m.location
-            ))
-        })?;
+        let info = match read_record(store.as_ref(), &m.location).await {
+            Ok(Some((info, _))) => info,
+            Ok(None) => {
+                return Err(StoreError::Registry(format!(
+                    "node record {} vanished while listing; refusing to derive a \
+                     write-eligible roster from an incomplete registry",
+                    m.location
+                )))
+            }
+            Err(StoreError::Json(e)) => {
+                return Err(StoreError::Registry(format!(
+                    "unparseable node record {}: {e}; refusing to derive a \
+                     write-eligible roster from an incomplete registry",
+                    m.location
+                )))
+            }
+            Err(e) => return Err(e),
+        };
         if info.is_write_eligible() {
             out.push(info.node_id);
         }
@@ -278,15 +283,11 @@ pub async fn list_nodes(store: Arc<dyn ObjectStore>) -> Result<Vec<NodeInfo>, St
     let metas = store.list(Some(&prefix)).try_collect::<Vec<_>>().await?;
     let mut out = Vec::new();
     for m in metas {
-        let Ok(res) = store.get(&m.location).await else {
-            continue;
-        };
-        let Ok(bytes) = res.bytes().await else {
-            continue;
-        };
-        match serde_json::from_slice::<NodeInfo>(&bytes) {
-            Ok(info) if info.is_live() => out.push(info),
-            Ok(_) => {} // retired tombstone: not a peer
+        // A torn read is re-read (`crate::control`) rather than dropping
+        // a live peer from the directory until the next refresh.
+        match read_record(store.as_ref(), &m.location).await {
+            Ok(Some((info, _))) if info.is_live() => out.push(info),
+            Ok(_) => {} // retired tombstone (not a peer), or gone
             // A corrupt or future-format record must not hide every
             // other peer; the caller degrades to the S3 path for it.
             Err(_) => continue,
@@ -316,18 +317,11 @@ pub async fn publish_p2p(
     version: &str,
 ) -> Result<(), StoreError> {
     let key = node_key(node_id);
-    let existing: NodeInfo = match store.get(&key).await {
-        Ok(r) => {
-            let bytes = r.bytes().await?;
-            serde_json::from_slice(&bytes)?
-        }
-        Err(object_store::Error::NotFound { .. }) => {
-            return Err(StoreError::Registry(format!(
-                "node {node_id} has no registry record; remount with a fresh \
-                 state dir (or --rejoin) rather than reclaiming a deleted id"
-            )));
-        }
-        Err(e) => return Err(e.into()),
+    let Some((existing, _)) = read_record(store.as_ref(), &key).await? else {
+        return Err(StoreError::Registry(format!(
+            "node {node_id} has no registry record; remount with a fresh \
+             state dir (or --rejoin) rather than reclaiming a deleted id"
+        )));
     };
     if existing.retired {
         return Err(StoreError::Registry(format!(
@@ -362,14 +356,13 @@ pub async fn publish_ro(
     ro: bool,
 ) -> Result<(), StoreError> {
     let key = node_key(node_id);
-    let existing: Option<NodeInfo> = match store.get(&key).await {
-        Ok(r) => r
-            .bytes()
-            .await
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok()),
-        Err(object_store::Error::NotFound { .. }) => None,
-        Err(e) => return Err(e.into()),
+    // A torn read is re-read (`crate::control`): taking it for "no
+    // record" would rewrite ours without its P2P identity and claim. A
+    // record that stays unparseable is replaced, as before.
+    let existing: Option<NodeInfo> = match read_record(store.as_ref(), &key).await {
+        Ok(found) => found.map(|(info, _)| info),
+        Err(StoreError::Json(_)) => None,
+        Err(e) => return Err(e),
     };
     if existing.as_ref().is_some_and(|i| i.retired) {
         return Err(StoreError::Registry(format!(
@@ -439,6 +432,46 @@ mod tests {
             Err(StoreError::ObjectStore(_))
         ));
         assert_eq!(list_node_ids(store).await.unwrap(), vec![1, 2]);
+    }
+
+    /// A torn registry GET (see `crate::control`) is re-read: it must not
+    /// drop a live peer from `list_nodes`, fail the fail-closed roster,
+    /// or make `publish_p2p` refuse.
+    #[tokio::test]
+    async fn torn_registry_reads_are_re_read() {
+        use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
+        let faulty = FaultyStore::new();
+        let store: Arc<dyn ObjectStore> = faulty.clone();
+        let id = claim_node_id(store.clone()).await.unwrap();
+        let addr = serde_json::json!({"id": "abc", "addrs": []});
+        faulty.script(OpKind::Get, "nodes/", Calls::Nth(1), Fault::Truncated(30));
+        publish_p2p(store.clone(), id, "aa".repeat(32).as_str(), addr, "t")
+            .await
+            .expect("a torn read of our own record must not fail the publish");
+        faulty.clear();
+        faulty.script(OpKind::Get, "nodes/", Calls::Nth(1), Fault::Truncated(30));
+        let listed = list_nodes(store.clone()).await.unwrap();
+        assert_eq!(listed.len(), 1, "a torn read hid a live peer");
+        assert!(listed[0].pubkey.is_some());
+        faulty.clear();
+        faulty.script(OpKind::Get, "nodes/", Calls::Nth(1), Fault::Truncated(30));
+        assert_eq!(
+            write_eligible_roster(store.clone()).await.unwrap(),
+            vec![id]
+        );
+        faulty.clear();
+        faulty.script(OpKind::Get, "nodes/", Calls::Nth(1), Fault::Truncated(30));
+        assert_eq!(
+            get_node(store.clone(), id).await.unwrap().unwrap().node_id,
+            id
+        );
+        // Still fails closed on a record that never parses.
+        faulty.clear();
+        faulty.script(OpKind::Get, "nodes/", Calls::Every, Fault::Truncated(30));
+        assert!(matches!(
+            write_eligible_roster(store).await,
+            Err(StoreError::Registry(_))
+        ));
     }
 
     #[tokio::test]

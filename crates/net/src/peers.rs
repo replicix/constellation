@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 /// short enough that it never dominates the idle-release window.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long after closing every connection to a dead peer incarnation
+/// to send the gossip `Join` (see [`Peers::new`]).
+const GOSSIP_REJOIN_DELAY: Duration = Duration::from_millis(300);
+
 /// A holder agreed to hand `part` over — see [`Peers::request_lease`].
 #[derive(Debug, Clone, Copy)]
 pub struct HandoffAccepted {
@@ -120,15 +124,52 @@ impl Peers {
     }
 
     pub fn new(p2p: P2p, node_id: u64) -> Self {
-        Self {
-            inner: Some(Arc::new(Inner {
-                p2p,
-                node_id,
-                peers: Mutex::new(HashMap::new()),
-                refresher: Mutex::new(None),
-                warned_shared_key: std::sync::atomic::AtomicBool::new(false),
-            })),
-        }
+        let inner = Arc::new(Inner {
+            p2p,
+            node_id,
+            peers: Mutex::new(HashMap::new()),
+            refresher: Mutex::new(None),
+            warned_shared_key: std::sync::atomic::AtomicBool::new(false),
+        });
+        // A dead pooled connection was just evicted (the peer crashed,
+        // or restarted under the same key) and every connection to it
+        // closed: the peer is down *on those connections*, so say so,
+        // then re-dial at once. A restarted peer is back to `connected`
+        // within one round trip instead of waiting for the next
+        // registry-tick probe (or a gossip neighbor-up, which a restart
+        // under the same key does not produce); a dead one costs one
+        // failed dial. Gossip is re-formed with a `Join` once its actor
+        // has seen the closes (a `Join` queued before that would go out
+        // on a closing connection and be lost).
+        let weak = Arc::downgrade(&inner);
+        inner.p2p.set_evict_hook(Arc::new(move |endpoint| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let node = {
+                let mut map = inner.peers.lock().unwrap();
+                map.values_mut().find(|p| p.addr.id == endpoint).map(|p| {
+                    p.connected = false;
+                    p.node_id
+                })
+            };
+            if let (Some(node), Ok(rt)) = (node, tokio::runtime::Handle::try_current()) {
+                let peers = Peers { inner: Some(inner) };
+                let rejoin = peers.clone();
+                rt.spawn(async move {
+                    let _ = peers.ping_node(node).await;
+                });
+                rt.spawn(async move {
+                    tokio::time::sleep(GOSSIP_REJOIN_DELAY).await;
+                    if let Some(inner) = rejoin.inner.as_ref() {
+                        if let Err(error) = inner.p2p.rejoin(endpoint).await {
+                            tracing::debug!(%error, node, "gossip rejoin failed");
+                        }
+                    }
+                });
+            }
+        }));
+        Self { inner: Some(inner) }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -206,6 +247,17 @@ impl Peers {
                 // from bare endpoint ids, can dial this peer at all.
                 inner.p2p.learn_addr(addr.clone());
                 let prev = inner.peers.lock().unwrap().get(&rec.node_id).cloned();
+                // The peer re-published its record: a new mount (a
+                // restart, possibly under the same key after a crash).
+                // Any connection we pool to it may lead to the dead
+                // previous incarnation; have it probed now.
+                if let Some(prev) = prev.as_ref() {
+                    if prev.addr.id == addr.id
+                        && (prev.addr != addr || prev.p2p_updated_unix != rec.p2p_updated_unix)
+                    {
+                        inner.p2p.suspect_restart(addr.id);
+                    }
+                }
                 peers.insert(
                     rec.node_id,
                     Peer {
@@ -1497,6 +1549,53 @@ mod tests {
             first, replacement,
             "a closed pooled connection must be replaced"
         );
+    }
+
+    /// A pooled connection that was closed (by the peer, or the idle
+    /// timeout) must not be handed out again: the pool's own strong
+    /// handle kept `weak_handle().upgrade()` succeeding, so the next
+    /// request (which, unlike a chunk fetch, does not retry) failed.
+    #[tokio::test]
+    async fn a_closed_pooled_connection_is_not_reused_by_a_request() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::ZERO);
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        let peer = inner.peers.lock().unwrap().get(&1).unwrap().addr.id;
+        assert!(asker.ping_node(1).await);
+        let first = inner.p2p.pooled_connection_id(peer).await.unwrap();
+        inner.p2p.close_pooled_connection(peer).await;
+        assert!(
+            asker.ping_node(1).await,
+            "the first request after a close must redial, not fail"
+        );
+        assert_ne!(Some(first), inner.p2p.pooled_connection_id(peer).await);
+    }
+
+    /// Plan 30 §M13's "slow is not gone": requests to a peer that is
+    /// merely slow to answer time out at the application level, and the
+    /// liveness probe they trigger must find its QUIC stack answering —
+    /// the pooled connection stays, and `connection_alive` stays true.
+    #[tokio::test]
+    async fn a_slow_peer_keeps_its_pooled_connection() {
+        let service = ChunkServer::new(Some(vec![1u8; 4096]), Duration::from_secs(5));
+        let asker = chunk_pair(service).await;
+        let inner = asker.inner.as_ref().unwrap();
+        let peer = inner.peers.lock().unwrap().get(&1).unwrap().addr.id;
+        assert!(asker.ping_node(1).await);
+        let first = inner.p2p.pooled_connection_id(peer).await.unwrap();
+        let started = Instant::now();
+        while started.elapsed() < crate::endpoint::PROBE_WINDOW + Duration::from_secs(1) {
+            let got = asker
+                .request_chunk_with_timeout(1, &a_hash(), Duration::from_millis(200))
+                .await;
+            assert!(got.is_err(), "the slow serve should have timed out");
+        }
+        assert_eq!(
+            inner.p2p.pooled_connection_id(peer).await,
+            Some(first),
+            "a slow but live peer's connection was evicted"
+        );
+        assert!(asker.connection_alive(1).await);
     }
 
     #[tokio::test]

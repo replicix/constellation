@@ -73,6 +73,10 @@ pub enum Fault {
     AppliedThen(u16),
     /// The operation takes effect, then the caller sees a timeout.
     AppliedThenTimeout,
+    /// GET only: the first `n` bytes of the object, as a complete
+    /// response — the torn read an emulator serving a file mid-overwrite
+    /// produces (real S3 GETs are atomic). No effect on a PUT.
+    Truncated(usize),
 }
 
 struct Rule {
@@ -269,7 +273,7 @@ impl ObjectStore for FaultyStore {
     ) -> object_store::Result<PutResult> {
         let mode = opts.mode.clone();
         match self.fault_for(OpKind::Put, location) {
-            None => self.inner.put_opts(location, payload, opts).await,
+            None | Some(Fault::Truncated(_)) => self.inner.put_opts(location, payload, opts).await,
             Some(Fault::Status(status)) => Err(s3_error(location.as_ref(), status, &mode)),
             Some(Fault::Timeout) => Err(timeout_error()),
             Some(Fault::AppliedThen(status)) => {
@@ -308,6 +312,22 @@ impl ObjectStore for FaultyStore {
                 Err(s3_error(location.as_ref(), status, &PutMode::Overwrite))
             }
             Some(Fault::Timeout) => Err(timeout_error()),
+            Some(Fault::Truncated(n)) => {
+                let full = self.inner.get_opts(location, options).await?;
+                let (mut meta, attributes) = (full.meta.clone(), full.attributes.clone());
+                let mut bytes = full.bytes().await?;
+                bytes.truncate(n);
+                meta.size = bytes.len() as u64;
+                Ok(GetResult {
+                    range: 0..meta.size,
+                    payload: object_store::GetResultPayload::Stream(Box::pin(
+                        futures::stream::once(async move { Ok(bytes) }),
+                    )),
+                    meta,
+                    attributes,
+                    extensions: Default::default(),
+                })
+            }
         }
     }
 

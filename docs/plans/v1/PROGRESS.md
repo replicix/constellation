@@ -11830,3 +11830,231 @@ changes.
 - No commits made; `git status` on `/home/bra/cvs/constellation-m6` is
   unchanged from what the coder handed off (same modified/untracked file
   list as the "rebase onto M5" section above).
+
+## Fix: P2P same-identity restart; torn control-object reads
+
+Branch `fix-p2p-remount` (off `617499b`). Two base-layer bugs: the one
+the plan 30 M9 coder hit in `backup-failover` (and worked around with
+four nodes), and a torn lease GET seen once on floci.
+
+### Bug 1 — a peer restarted under the same node key stayed unreachable
+
+**Symptom.** A node SIGKILLed and remounted from the same state dir
+(same node key, so the same iroh `EndpointId`) could not be reached by
+the nodes that knew it, for 30 s or more: their pings to it failed,
+`status.p2p.peers[..].connected` stayed false, their forwards to it
+hung, and they logged `noq_proto: failed closing path err=LastOpenPath`.
+Its own outbound P2P and S3 worked, so it converged.
+
+**Root cause** — three layers, each of which alone keeps the peer
+unreachable:
+
+1. *Our pool never evicted the dead connection.* A pooled connection to
+   a SIGKILLed peer stays open on our side: nothing tells QUIC the other
+   end is gone, and the new incarnation cannot close it for us (it has
+   no state for it, and usually a new port). Every caller bounds a
+   request with `tokio::time::timeout`, which *drops* the request
+   future, so the "transport error → `invalidate_connection`" branch in
+   `P2p::request` never ran; requests kept going to the dead connection
+   and timing out. The steady stream of new requests also kept the
+   connection from ever idling out (in the in-process reproducer it was
+   still pooled after 45 s). And `P2p::connection`'s liveness check,
+   `weak_handle().upgrade().is_some()`, is always true while the pool
+   itself holds a strong handle, so even a *closed* pooled connection
+   was handed out again (the first request after a close always
+   failed). `connection_alive` (pooled and `close_reason()` none) kept
+   reporting the dead peer reachable, so plan 30 M13's inbox rule never
+   saw an outage either.
+2. *iroh kept dialing the dead incarnation's address.* iroh 1.1's
+   per-remote state (`RemoteStateActor`) holds one *selected path* per
+   `EndpointId` and sends every new handshake's Initial packets to that
+   path **only**, while any connection to the remote exists. The dead
+   incarnation's connections (gossip's, the ones it had dialed to us,
+   ours) still carry its old address with a frozen low RTT, so the
+   selector never moves to the new incarnation's address — not even
+   after the new incarnation connects to us, and not after the old
+   connections finally time out either (`handle_connection_close` does
+   not re-run selection; it clears it only when *no* connection is
+   left, and the new incarnation's own inbound connections keep the set
+   non-empty). So even with our pooled connection evicted, every
+   re-dial went to a port nobody listened on (seen in iroh's debug log:
+   `connecting ... ip_addresses=[<new port>]`, with `remote_candidates`
+   and the selected path still on the old port, never completing). The
+   `LastOpenPath` warning is noq failing to abandon that dead last path
+   on its 15 s path-idle timer. Same in iroh 1.2.0.
+3. *Gossip did not re-form.* The new incarnation's `Join` reaches us
+   while it is still in our HyParView active view, so no `NeighborUp`
+   fires; and iroh-gossip leaks `pending_neighbor_requests` entries (a
+   crossed `Neighbor` exchange at the first join leaves one behind), in
+   which case our `Neighbor` reply is suppressed and the new incarnation
+   never gets us into its active view — its broadcasts reached nobody
+   (3 of 10 in-process runs never recovered gossip within 45 s).
+
+**Fix** (`crates/net/src/endpoint.rs`, `crates/net/src/peers.rs`):
+
+- `P2p::connection` treats `close_reason().is_some()` as dead and
+  re-dials (no more `weak_handle` check).
+- A transport-level **liveness probe** (`Pool::probe`/`alive`): send a
+  `Ping` on a fresh stream of the pooled connection and watch its
+  receive counter (`stats().udp_rx.datagrams`). *Any* datagram — an
+  ACK from the peer's QUIC stack, the `Pong`, anything — within the
+  window means alive; nothing means dead. A peer that is merely slow
+  to answer still ACKs within milliseconds, so it keeps its connection
+  (and `connection_alive` stays true); a dead incarnation cannot
+  produce a single datagram on it. Single-flight per peer.
+- What triggers a probe:
+  - **an unanswered request** — an `InFlight` drop guard in
+    `P2p::request` / `request_chunk` fires when the request future is
+    dropped before completing (the only trace a caller's timeout
+    leaves); window 3 s;
+  - **the peer dialing us afresh** — an iroh `EndpointHooks`
+    (`InboundWatch::after_handshake`) sees every inbound handshake, on
+    any ALPN (gossip included): a new incarnation announces itself by
+    joining gossip at mount; window 2 s;
+  - **the peer's registry record changing** (`p2p_updated_unix` or its
+    address; `publish_p2p` runs once per mount) in
+    `Peers::refresh_registry` — the registry-carried incarnation;
+    window 2 s.
+- When a probe proves the connection dead, `Pool::evict` drops it from
+  the pool and **closes every connection to that remote**, whoever
+  dialed it and whatever its ALPN (the hook tracks them all as weak
+  handles). That empties iroh's per-remote connection set, which clears
+  its stale selected path, so the re-dial sends its Initials to every
+  known address (the registry's current one included) and reaches the
+  new incarnation. A connection found merely *closed* is only unpooled
+  (no close-all), so a peer's clean close cannot ping-pong between two
+  nodes.
+- The evict hook in `Peers::new` marks the peer `connected = false`,
+  re-dials at once with a ping (so `connected` flips back within one
+  round trip instead of waiting for the next registry tick), and after
+  300 ms (once gossip's actor has seen the closes) sends a gossip
+  `Join` to it (`P2p::rejoin` → `GossipSender::join_peers`). The closes
+  cleared gossip's stale neighbor and pending-request state on our
+  side, so the join forms a fresh neighbor link both ways.
+
+**Slow is still not gone (M13).** `connection_alive` keeps its meaning:
+a slow peer's connection answers the probe and stays pooled — only a
+connection that receives *nothing* for the whole window is evicted. What
+changes is that a dead or restarted peer is now recognized: its
+connection is evicted ~3.5 s after the first unanswered request (500 ms
+timeout + 3 s window) instead of lingering indefinitely, so
+`connection_alive` turns false and the M13 inbox rule sees a real
+outage. A SIGSTOPped peer is indistinguishable from a dead one and is
+treated the same way (after SIGCONT it re-dials; its closed connections
+are replaced on demand). Cost: one small `Ping` stream per unanswered
+request at most (single-flight), plus one per inbound handshake.
+
+**Known limit.** The probe needs a pooled connection to the peer. A node
+that has never sent a direct request to the restarted peer (so only
+gossip connections to its old incarnation exist) would still hit
+iroh's stale path until those idle out. Daemons always have one: the
+5 s registry tick pings every peer. A proper fix belongs in iroh
+(re-select in `handle_connection_close` when the selected path is no
+longer on any live connection).
+
+**Reproducers.**
+
+- `crates/net/tests/same_identity_restart.rs` (new). The victim runs in
+  a child process (the test binary re-run with an env var), so a real
+  SIGKILL takes it down; the observer is a daemon-like `Peers` in the
+  test process.
+  - `a_peer_restarted_with_the_same_key_is_reachable_again_promptly`:
+    kill -9, 2 s of failing pings, restart with the same key (new
+    port; the registry update is handed over at once), then time
+    ping / `connected` / gossip from the new incarnation. **Before:**
+    ping and `connected` never recovered within 45 s in 3 of 4 runs
+    (35.8 s in the 4th), gossip within 0.2 s or never; **after:** ping
+    and `connected` 1.5–1.65 s, gossip 0.2–2.0 s, in every run (16)
+    since the gossip rejoin went in.
+  - `a_crashed_peer_stops_counting_as_reachable_promptly`: kill -9, no
+    restart, one ping: **before** `connection_alive` stayed true for
+    30.0 s; **after** 4.0 s.
+- `crates/net/src/peers.rs` unit tests:
+  `a_closed_pooled_connection_is_not_reused_by_a_request` (fails with
+  the old `weak_handle` check) and `a_slow_peer_keeps_its_pooled_connection`
+  (a 5 s-slow server, 200 ms request timeouts for 4 s: the pooled
+  connection and `connection_alive` survive the probes).
+- Harness scenario **`p2p-same-identity-restart`** (new): three nodes
+  with their own node keys; c2 creates the filesystem and holds the
+  lease, c0 and c1 forward to it over P2P; kill -9 c2, wait until both
+  see it down, remount it from the same state dir; require both to
+  report it `connected` within 5 s of the remount, and — once it holds
+  the lease again — a write on each of c0 and c1 to be a P2P forward
+  (`forwarded_ok` +1, `inbox_ops` +0) within 5 s. **Before** (base
+  binary): fails, c0 still sees c2 disconnected at 5 s; with the bound
+  relaxed it took **32.0 s**. **After:** `connected` 3.0 s after the
+  remount returns (the 2 s probe plus mount), forwards 6–207 ms over
+  P2P.
+
+### Bug 2 — torn control-object reads (floci)
+
+A takeover's lease GET once failed with `json: EOF while parsing an
+object at line 1 column 187` while another node's CAS PUT of the lease
+was in flight: floci's GET is not atomic against a concurrent PUT (real
+S3's is).
+
+- New `crates/store-s3/src/control.rs`: `get_json` GETs and parses a
+  small JSON control object; a body that does not parse (or a body
+  stream that breaks off) is a transient read error, re-read up to 4
+  times with 20/40/80 ms backoff, then reported as the `Json` error it
+  always was. Not-found and store errors are not retried here.
+- Routed through it: the lease (`LeaseStore::get`), registry records
+  (`get_node`, `list_nodes` — a torn read no longer drops a live peer
+  from the directory for a tick —, `write_eligible_roster` — still fails
+  closed, now only on a record that stays unparseable —, `publish_p2p`
+  — no longer refuses on a torn read of our own record —, `publish_ro`
+  — no longer rewrites our record without its P2P identity and claim
+  on a torn read —, `leave_node`), and designations (`get`, and
+  `list_all`, where a skipped torn claim would have let an overlapping
+  designation be created).
+- The M4 CAS helper had the same exposure in its read-back: after a
+  412/404 it compares the object with our body, and a torn read of our
+  own landed write (e.g. a 5xx-retried attempt that had applied) would
+  have been reported as a lost race. `cas::read_back` now re-reads a
+  body that is a strict prefix of ours (same budget); anything else —
+  a complete object, or a torn one that already differs — decides at
+  once.
+- Tests with the M4 fault store, which gains `Fault::Truncated(n)` (a
+  GET answered with the object's first `n` bytes as a complete
+  response): `control::tests` (one torn read → retried, 2 GETs; always
+  torn → `Json` error after 4 GETs, in well under a second; 404 → none,
+  500 → not retried), `lease::a_torn_lease_read_is_retried_promptly`,
+  `nodes::torn_registry_reads_are_re_read`,
+  `designation::torn_designation_reads_are_re_read`,
+  `cas::a_torn_read_back_of_our_own_write_is_still_a_win`,
+  `cas::a_torn_foreign_object_is_a_lost_race_without_re_reads`.
+
+### Verification
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`: clean. `cargo test --workspace`: all green (net 93
+  unit + 3 new integration, store-s3 181, cli 191, …).
+- Harness, release build, `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-fixnet`,
+  all **PASSED**: `p2p-handover` (3.2 s), `p2p-invalidation` (22.7 s),
+  `p2p-partition-tolerance` (9.7 s), `kill9-remount` (4.0 s),
+  `two-clients-shared` (12.3 s), `forwarded-mutations` (2.0 s),
+  `coop-cache-hit` (4.1 s), `web-fleet` (4.3 s); and, because the
+  probe changes when a peer counts as gone, `forward-timeout-reexec`
+  (the 1.5 s-slow holder: slow must not become an outage; 26.9 s),
+  `takeover-marker-strands-promptly` (10.6 s), `lease-fencing`
+  (SIGSTOPped holder; 13.0 s), `epoch-member-lost` (4.4 s),
+  `coop-fallback` (paused warm peer; 4.4 s).
+- `p2p-same-identity-restart`: on the final harness, 6 of 6 PASSED
+  (seeds 1–5 and 13), `connected` 3.0 s after the remount every time,
+  forwards to the restarted holder over P2P in 3–209 ms. Before the
+  warm-up change below, 12 more runs: every one that got past the
+  warm-up passed (10, `connected` at 2.8–3.0 s); 2 failed *before* the
+  crash, in the warm-up, with c2 still refusing c1 on its rate-limited
+  cold-start allowlist refresh — a pre-existing cold-start race
+  (`wait_for_peers` counts the S3 row as a peer, so it can pass before
+  c2 has read c1's record). The warm-up now retries until a forward
+  goes over P2P.
+
+### Files
+
+`crates/net/src/endpoint.rs`, `crates/net/src/peers.rs`,
+`crates/net/tests/same_identity_restart.rs` (new),
+`crates/net/Cargo.toml` (dev-dep `tracing-subscriber`, for `RUST_LOG`
+in the new test), `crates/store-s3/src/control.rs` (new),
+`crates/store-s3/src/{lib,lease,nodes,designation,cas,faulty}.rs`,
+`crates/harness/src/scenarios.rs`, this section.

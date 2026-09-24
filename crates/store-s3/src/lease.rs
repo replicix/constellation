@@ -227,17 +227,21 @@ impl LeaseStore {
 
     /// Current lease plus the token needed to swap it; `None` when no
     /// node has ever claimed the partition.
+    ///
+    /// A body that does not parse is re-read promptly a few times before
+    /// it is an error (`crate::control`: an emulator's GET can be torn by
+    /// a concurrent CAS PUT; real S3's cannot).
     pub async fn get(&self) -> Result<Option<(Lease, LeaseTag)>, StoreError> {
-        let res = match self.store.get(&layout::lease(&self.partition)).await {
-            Ok(r) => r,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let path = layout::lease(&self.partition);
+        let Some((lease, meta)) =
+            crate::control::get_json::<Lease>(self.store.as_ref(), &path).await?
+        else {
+            return Ok(None);
         };
         let tag = LeaseTag(UpdateVersion {
-            e_tag: res.meta.e_tag.clone(),
-            version: res.meta.version.clone(),
+            e_tag: meta.e_tag,
+            version: meta.version,
         });
-        let lease: Lease = serde_json::from_slice(&res.bytes().await?)?;
         Ok(Some((lease, tag)))
     }
 
@@ -326,6 +330,23 @@ mod tests {
 
     fn ls(mode: LeaseMode) -> LeaseStore {
         LeaseStore::new(Arc::new(InMemory::new()), P, mode)
+    }
+
+    /// The torn lease GET seen on floci while another node's CAS PUT
+    /// was in flight (`json: EOF while parsing an object`): re-read at
+    /// once, not reported.
+    #[tokio::test]
+    async fn a_torn_lease_read_is_retried_promptly() {
+        let faulty = FaultyStore::new();
+        let s = LeaseStore::new(faulty.clone(), P, LeaseMode::Cas);
+        let tag = s.try_create(&Lease::granted(P, 7, 1, TTL)).await.unwrap();
+        faulty.script(OpKind::Get, "leases", Calls::Nth(1), Fault::Truncated(40));
+        let started = std::time::Instant::now();
+        let (lease, read_tag) = s.get().await.unwrap().unwrap();
+        assert_eq!((lease.holder, lease.epoch), (7, 1));
+        assert_eq!(read_tag, tag);
+        assert_eq!(faulty.calls(OpKind::Get, "leases"), 2);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[tokio::test]

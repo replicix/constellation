@@ -244,10 +244,8 @@ pub async fn put_conditional_with(
                 if verify == Verify::Caller {
                     return Ok(lost);
                 }
-                match store.get(path).await {
-                    Ok(res) => {
-                        let meta = res.meta.clone();
-                        let current = res.bytes().await?;
+                match read_back(store, path, &body).await {
+                    Ok((meta, current)) => {
                         if current == body {
                             tracing::info!(
                                 %path,
@@ -282,6 +280,41 @@ pub async fn put_conditional_with(
         tracing::debug!(%path, attempt, "conditional PUT answered 409; retrying the same attempt");
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BUSY_BACKOFF_MAX);
+    }
+}
+
+/// [`put_conditional`]'s read-back. A GET that returns a strict prefix
+/// of `ours` may be a torn read of our own landed write (an emulator's
+/// GET is not atomic against a concurrent PUT of the key; real S3's is):
+/// taken at face value it would report our win as a lost race. So such a
+/// body is re-read a few times, promptly (`crate::control`'s budget)
+/// before the last one is returned. Any other body — a complete object,
+/// or a torn one that already differs from ours — decides at once:
+/// whatever it becomes, it is not our write.
+async fn read_back(
+    store: &dyn ObjectStore,
+    path: &Path,
+    ours: &Bytes,
+) -> Result<(object_store::ObjectMeta, Bytes), object_store::Error> {
+    let mut backoff = crate::control::TORN_READ_BACKOFF;
+    let mut attempt = 1u32;
+    loop {
+        let res = store.get(path).await?;
+        let meta = res.meta.clone();
+        let current = res.bytes().await?;
+        let maybe_torn = current.len() < ours.len() && ours.starts_with(&current);
+        if !maybe_torn || attempt >= crate::control::TORN_READ_ATTEMPTS {
+            return Ok((meta, current));
+        }
+        tracing::debug!(
+            %path,
+            attempt,
+            bytes = current.len(),
+            "CAS read-back is a prefix of our body (a torn read?); re-reading"
+        );
+        attempt += 1;
+        tokio::time::sleep(backoff).await;
+        backoff *= 2;
     }
 }
 
@@ -396,6 +429,56 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(out, CasPut::Won(_)));
+    }
+
+    /// A torn read-back (an emulator's GET racing a PUT of the key) must
+    /// not turn our own landed write into a lost race.
+    #[tokio::test]
+    async fn a_torn_read_back_of_our_own_write_is_still_a_win() {
+        let store = FaultyStore::new();
+        store.script(OpKind::Put, "k", Calls::Nth(1), Fault::AppliedThen(412));
+        store.script(OpKind::Get, "k", Calls::Nth(1), Fault::Truncated(5));
+        let out = put_conditional(
+            store.as_ref(),
+            &p("k"),
+            Bytes::from_static(b"{\"holder\":7,\"epoch\":3}"),
+            PutMode::Create,
+            Verify::Body,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out, CasPut::Won(_)), "{out:?}");
+        assert_eq!(
+            store.calls(OpKind::Get, "k"),
+            2,
+            "the torn body was re-read"
+        );
+    }
+
+    /// A read-back that already differs from our body decides at once.
+    #[tokio::test]
+    async fn a_torn_foreign_object_is_a_lost_race_without_re_reads() {
+        let store = FaultyStore::new();
+        store
+            .inner()
+            .put(
+                &p("k"),
+                PutPayload::from_static(b"{\"holder\":8,\"epoch\":4}"),
+            )
+            .await
+            .unwrap();
+        store.script(OpKind::Get, "k", Calls::Every, Fault::Truncated(12));
+        let out = put_conditional(
+            store.as_ref(),
+            &p("k"),
+            Bytes::from_static(b"{\"holder\":7,\"epoch\":3}"),
+            PutMode::Create,
+            Verify::Body,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, CasPut::Lost);
+        assert_eq!(store.calls(OpKind::Get, "k"), 1);
     }
 
     #[tokio::test]

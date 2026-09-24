@@ -9,6 +9,7 @@ pub mod cas;
 pub mod codec;
 pub mod commits;
 pub mod compact;
+pub mod control;
 pub mod decode_gate;
 pub mod designation;
 pub mod e2e;

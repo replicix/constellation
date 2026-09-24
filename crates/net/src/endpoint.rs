@@ -20,11 +20,320 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 type ConnectionSlot = Arc<tokio::sync::Mutex<Option<iroh::endpoint::Connection>>>;
-type ConnectionPool = Arc<Mutex<HashMap<iroh::EndpointId, ConnectionSlot>>>;
+/// Called with a peer's endpoint id after its pooled connection was
+/// found dead and evicted (see [`Pool::probe`]).
+pub type EvictHook = Arc<dyn Fn(iroh::EndpointId) + Send + Sync>;
+
+/// How long a probe of a pooled connection waits for any sign of life
+/// after a request on it went unanswered. Only the peer's QUIC stack has
+/// to answer (an ACK, or anything else), never its application, so a
+/// peer that is merely slow to reply keeps its connection; a crashed or
+/// restarted one cannot produce a single datagram on it.
+pub(crate) const PROBE_WINDOW: Duration = Duration::from_secs(3);
+/// The same when the peer itself just told us it may have restarted: it
+/// dialed us afresh, or re-published its registry record. It is
+/// provably up right now, so its QUIC stack answers on a live old
+/// connection well within this.
+const RESTART_PROBE_WINDOW: Duration = Duration::from_secs(2);
+/// Poll interval for a probe's receive counter.
+const PROBE_TICK: Duration = Duration::from_millis(25);
+
+/// Why a pooled connection is being probed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Suspicion {
+    /// A request on it was dropped unanswered (timed out or abandoned).
+    Unanswered,
+    /// The peer showed signs of a new incarnation: it opened a new
+    /// connection to us, or re-published its registry record.
+    Restarted,
+}
+
+/// The outbound connection pool, and what keeps it honest.
+///
+/// A pooled connection to a peer that was SIGKILLed stays "open" on our
+/// side: nothing tells QUIC the other end is gone, and the peer's next
+/// incarnation (same node key, so the same `EndpointId`) cannot close it
+/// for us either — it has no state for that connection and usually a
+/// new port. Requests over it simply never get an answer, and since the
+/// callers bound them with timeouts that drop the request future, no
+/// transport error ever evicted it. Left alone it lingers until the QUIC
+/// idle timeout at best (and with the steady stream of new requests
+/// keeping it busy, in practice much longer).
+///
+/// So anything suspicious — an unanswered request, the peer dialing in
+/// afresh, its registry record changing — triggers a [`Pool::probe`]:
+/// did the connection receive *anything* within a short window after we
+/// sent it a ping? A live peer's QUIC stack ACKs within milliseconds
+/// however busy its application is; a dead incarnation cannot. Only a
+/// connection that stays silent is evicted, so a slow peer keeps its
+/// connection (and `connection_alive` keeps reporting it reachable).
+///
+/// Evicting our own pooled connection is not enough, because of how
+/// iroh routes a new dial. Its per-remote state keeps one *selected
+/// path* (remote socket address) for the `EndpointId`, and sends every
+/// new handshake's Initial packets to that path alone while any
+/// connection to the remote is open. The dead incarnation's connections
+/// (gossip's, and the ones it dialed to us) still carry its old address
+/// with a frozen, flattering RTT, so the selection never moves to the
+/// new incarnation's address, even once the new one has connected to
+/// us — our re-dials go to a port nobody listens on. iroh re-selects
+/// only on a new connection or path event, and clears the selection
+/// only when the remote has no connection at all. So once the probe
+/// proves the peer's old incarnation dead, *every* connection to it is
+/// closed, whoever dialed it and whatever its ALPN (see [`Pool::tracked`]):
+/// the selection resets, the re-dial sends its Initials to every known
+/// address (the registry's current one included) and lands on the new
+/// incarnation. The new incarnation's own fresh connections are closed
+/// too — it re-dials on demand, and gossip re-forms its neighbor link.
+struct Pool {
+    connections: Mutex<HashMap<iroh::EndpointId, ConnectionSlot>>,
+    /// Every connection the endpoint completed a handshake for, either
+    /// side, any ALPN, by remote — weak handles, so this never keeps one
+    /// alive. What [`Pool::evict`] closes.
+    tracked: Mutex<HashMap<iroh::EndpointId, Vec<iroh::endpoint::WeakConnectionHandle>>>,
+    /// Peers with a probe in flight. Single-flight per peer: a slow peer
+    /// times out many requests at once, and one probe answers for all
+    /// of them (a probe of a live connection ends at its first received
+    /// datagram, so a slow peer costs at most one extra ping per
+    /// unanswered request, never a pile of them).
+    probing: Mutex<HashSet<iroh::EndpointId>>,
+    key: SecretKey,
+    on_evict: Mutex<Option<EvictHook>>,
+}
+
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Pool")
+    }
+}
+
+impl Pool {
+    fn new(key: SecretKey) -> Self {
+        Self {
+            connections: Mutex::new(HashMap::new()),
+            tracked: Mutex::new(HashMap::new()),
+            probing: Mutex::new(HashSet::new()),
+            key,
+            on_evict: Mutex::new(None),
+        }
+    }
+
+    fn gate(&self, id: &iroh::EndpointId) -> Option<ConnectionSlot> {
+        self.connections.lock().unwrap().get(id).cloned()
+    }
+
+    /// Probe the connection pooled for `id`, if any, in the background.
+    /// At most one probe per peer runs at a time.
+    fn suspect(self: &Arc<Self>, id: iroh::EndpointId, why: Suspicion) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.gate(&id).is_none() {
+            return;
+        }
+        if !self.probing.lock().unwrap().insert(id) {
+            return;
+        }
+        let pool = self.clone();
+        rt.spawn(async move {
+            pool.probe(id, why).await;
+            pool.probing.lock().unwrap().remove(&id);
+        });
+    }
+
+    async fn probe(&self, id: iroh::EndpointId, why: Suspicion) {
+        let Some(gate) = self.gate(&id) else {
+            return;
+        };
+        // Clone out rather than hold the slot: a probe must never block
+        // a request's dial.
+        let Some(conn) = gate.lock().await.clone() else {
+            return;
+        };
+        let stable = conn.stable_id();
+        if conn.close_reason().is_some() {
+            // Closed cleanly (by the peer, or by us): nothing is stale
+            // about the peer's address, so just stop handing it out.
+            self.unpool(&gate, stable).await;
+            return;
+        }
+        let window = match why {
+            Suspicion::Unanswered => PROBE_WINDOW,
+            Suspicion::Restarted => RESTART_PROBE_WINDOW,
+        };
+        if self.alive(&conn, id, window).await {
+            tracing::debug!(peer = %id.fmt_short(), ?why, "pooled connection answered its probe");
+        } else {
+            tracing::info!(
+                peer = %id.fmt_short(),
+                ?why,
+                window_ms = window.as_millis() as u64,
+                "pooled P2P connection is dead (peer restarted or gone); evicting it"
+            );
+            self.evict(id, stable, "unresponsive").await;
+        }
+    }
+
+    /// Did `conn` show any sign of life within `window`? A `Ping` goes
+    /// out on a fresh stream (its STREAM frame is ACK-eliciting); the
+    /// answer is yes as soon as the connection receives any datagram at
+    /// all, or the `Pong`.
+    async fn alive(
+        &self,
+        conn: &iroh::endpoint::Connection,
+        expect: iroh::EndpointId,
+        window: Duration,
+    ) -> bool {
+        let received = || conn.stats().udp_rx.datagrams;
+        let before = received();
+        let deadline = tokio::time::Instant::now() + window;
+        let ping = async {
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let msg = Signed::new(&self.key, &Payload::Ping { node_id: 0 })?;
+            crate::message::write_frame(&mut send, &msg).await?;
+            send.finish().ok();
+            let reply = crate::message::read_frame(&mut recv).await?;
+            let (author, body) = reply.verify()?;
+            anyhow::ensure!(
+                author.as_bytes() == expect.as_bytes(),
+                "pong from another key"
+            );
+            anyhow::ensure!(matches!(body, Payload::Pong { .. }), "not a pong");
+            anyhow::Ok(())
+        };
+        tokio::pin!(ping);
+        let mut ping_done = false;
+        loop {
+            if conn.close_reason().is_some() {
+                return false;
+            }
+            if received() > before {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::select! {
+                res = &mut ping, if !ping_done => {
+                    if res.is_ok() {
+                        return true;
+                    }
+                    // A failed ping alone proves nothing (the stream may
+                    // have been refused); keep watching the counter.
+                    ping_done = true;
+                }
+                _ = tokio::time::sleep(PROBE_TICK) => {}
+            }
+        }
+    }
+
+    /// Take `stable`'s connection out of `gate` if it is still the one
+    /// pooled there.
+    async fn unpool(
+        &self,
+        gate: &ConnectionSlot,
+        stable: usize,
+    ) -> Option<iroh::endpoint::Connection> {
+        let mut slot = gate.lock().await;
+        match slot.as_ref() {
+            Some(conn) if conn.stable_id() == stable => slot.take(),
+            _ => None,
+        }
+    }
+
+    fn track(&self, conn: &iroh::endpoint::Connection) {
+        let mut tracked = self.tracked.lock().unwrap();
+        let list = tracked.entry(conn.remote_id()).or_default();
+        list.retain(|weak| {
+            weak.upgrade()
+                .is_some_and(|conn| conn.close_reason().is_none())
+        });
+        list.push(conn.weak_handle());
+    }
+
+    /// Drop `stable`'s connection from the pool (if it is still the one
+    /// pooled for `id`) and close it, so requests still waiting on it
+    /// fail now instead of at their own timeouts; then close every other
+    /// connection to `id` (see [`Pool`] for why).
+    async fn evict(&self, id: iroh::EndpointId, stable: usize, why: &'static str) {
+        let Some(gate) = self.gate(&id) else {
+            return;
+        };
+        let Some(conn) = self.unpool(&gate, stable).await else {
+            return;
+        };
+        conn.close(iroh::endpoint::VarInt::from_u32(0), why.as_bytes());
+        let others = self.tracked.lock().unwrap().remove(&id).unwrap_or_default();
+        let mut closed = 0usize;
+        for other in others.iter().filter_map(|weak| weak.upgrade()) {
+            if other.close_reason().is_none() {
+                other.close(
+                    iroh::endpoint::VarInt::from_u32(0),
+                    b"peer incarnation is dead; resetting",
+                );
+                closed += 1;
+            }
+        }
+        tracing::debug!(peer = %id.fmt_short(), closed, "closed every connection to the peer");
+        let hook = self.on_evict.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(id);
+        }
+    }
+}
+
+/// Watches every completed handshake: tracks the connection (for
+/// [`Pool::evict`]), and on an inbound one — a peer dialing us afresh
+/// may be a new incarnation behind a connection we still pool — has the
+/// pooled connection probed.
+#[derive(Debug)]
+struct InboundWatch(Weak<Pool>);
+
+impl iroh::endpoint::EndpointHooks for InboundWatch {
+    fn after_handshake<'a>(
+        &'a self,
+        conn: &'a iroh::endpoint::Connection,
+    ) -> impl std::future::Future<Output = iroh::endpoint::AfterHandshakeOutcome> + Send + 'a {
+        if let Some(pool) = self.0.upgrade() {
+            pool.track(conn);
+            if conn.side() == iroh::endpoint::Side::Server {
+                pool.suspect(conn.remote_id(), Suspicion::Restarted);
+            }
+        }
+        async { iroh::endpoint::AfterHandshakeOutcome::accept() }
+    }
+}
+
+/// Probes the pooled connection if the request it guards is dropped
+/// before it completes — the only trace a caller's timeout leaves.
+struct InFlight {
+    pool: Arc<Pool>,
+    id: iroh::EndpointId,
+    done: bool,
+}
+
+impl InFlight {
+    fn new(pool: &Arc<Pool>, id: iroh::EndpointId) -> Self {
+        Self {
+            pool: pool.clone(),
+            id,
+            done: false,
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if !self.done {
+            self.pool.suspect(self.id, Suspicion::Unanswered);
+        }
+    }
+}
 
 /// One hash-prefix bucket of a peer's cache bloom, as gossiped.
 pub struct DigestSnapshot {
@@ -230,8 +539,8 @@ pub struct P2p {
     sender: Arc<tokio::sync::Mutex<Option<iroh_gossip::api::GossipSender>>>,
     /// One gate per remote prevents dial storms while allowing unrelated
     /// peers to connect concurrently. QUIC streams multiplex over the
-    /// retained connection.
-    connections: ConnectionPool,
+    /// retained connection. See [`Pool`] for how dead ones are evicted.
+    pool: Arc<Pool>,
     /// Active relay policy label (`disabled` / `default` / URL…).
     relay: String,
 }
@@ -261,6 +570,7 @@ impl P2p {
 
     pub async fn spawn_with(key: SecretKey, topic: TopicId, relay: RelayPolicy) -> Result<Self> {
         let lookup = MemoryLookup::new();
+        let pool = Arc::new(Pool::new(key.clone()));
         let relay_mode = relay.to_iroh()?;
         let relay_label = relay.label();
         let endpoint = Endpoint::builder(presets::Minimal)
@@ -271,6 +581,7 @@ impl P2p {
             .secret_key(key.clone())
             .address_lookup(lookup.clone())
             .alpns(vec![ALPN.to_vec(), iroh_gossip::ALPN.to_vec()])
+            .hooks(InboundWatch(Arc::downgrade(&pool)))
             .bind()
             .await
             .context("binding the iroh endpoint")?;
@@ -285,7 +596,7 @@ impl P2p {
             allow: Arc::new(Mutex::new(Allowlist::new())),
             lookup,
             sender: Arc::new(tokio::sync::Mutex::new(None)),
-            connections: Arc::new(Mutex::new(HashMap::new())),
+            pool,
             relay: relay_label,
         })
     }
@@ -360,6 +671,21 @@ impl P2p {
         Ok(())
     }
 
+    /// Ask `peer` to (re)join our gossip topic neighborhood — a `Join`,
+    /// as at bootstrap. Used after a peer's dead incarnation was evicted
+    /// and every connection to it closed: that drops it from the active
+    /// view, and neither side would otherwise re-form the link (the new
+    /// incarnation's own `Join` may already have been swallowed while
+    /// the stale neighbor state still stood).
+    pub async fn rejoin(&self, peer: iroh::EndpointId) -> Result<()> {
+        let guard = self.sender.lock().await;
+        let Some(tx) = guard.as_ref() else {
+            anyhow::bail!("gossip topic not joined yet");
+        };
+        tx.join_peers(vec![peer]).await?;
+        Ok(())
+    }
+
     /// Send `payload` to one peer and wait for a single reply.
     ///
     /// `peer` is the full [`EndpointAddr`] from the registry, not just a
@@ -368,6 +694,7 @@ impl P2p {
     pub async fn request(&self, peer: EndpointAddr, payload: &Payload) -> Result<Payload> {
         let expect = peer.id;
         let conn = self.connection(&peer).await?;
+        let mut in_flight = InFlight::new(&self.pool, expect);
         let result = async {
             let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
             let msg = Signed::new(&self.key, payload)?;
@@ -382,6 +709,7 @@ impl P2p {
             Ok(body)
         }
         .await;
+        in_flight.done = true;
         if result.is_err() {
             self.invalidate_connection(expect, conn.stable_id()).await;
         }
@@ -400,7 +728,8 @@ impl P2p {
     ) -> Result<std::result::Result<ChunkFetch, ChunkDecline>> {
         let expect = peer.id;
         let first = self.connection(&peer).await?;
-        match self.request_chunk_on(&first, expect, hash).await {
+        let mut in_flight = InFlight::new(&self.pool, expect);
+        let result = match self.request_chunk_on(&first, expect, hash).await {
             Ok(value) => Ok(value),
             Err(first_error) => {
                 self.invalidate_connection(expect, first.stable_id()).await;
@@ -409,28 +738,44 @@ impl P2p {
                     .await
                     .with_context(|| format!("chunk stream failed after redial: {first_error:#}"))
             }
-        }
+        };
+        in_flight.done = true;
+        result
+    }
+
+    /// Install the callback run after a dead pooled connection is
+    /// evicted (the peer directory marks the peer down and re-dials).
+    pub fn set_evict_hook(&self, hook: EvictHook) {
+        *self.pool.on_evict.lock().unwrap() = Some(hook);
+    }
+
+    /// The peer `id` may have restarted (its registry record changed):
+    /// probe the connection pooled for it and evict it if it is dead.
+    pub fn suspect_restart(&self, id: iroh::EndpointId) {
+        self.pool.suspect(id, Suspicion::Restarted);
     }
 
     /// Plan 30 §M4: every open path of the pooled connection to `id`,
     /// without waiting (`None` if none is pooled, or one is being dialed
     /// right now). For `status`, which must not block.
     pub fn path_summary_now(&self, id: iroh::EndpointId) -> Option<crate::paths::PathSummary> {
-        let gate = self.connections.lock().unwrap().get(&id).cloned()?;
+        let gate = self.pool.gate(&id)?;
         let slot = gate.try_lock().ok()?;
         slot.as_ref().map(crate::paths::PathSummary::of)
     }
 
     /// Whether a pooled, still-open QUIC connection to `id` exists right
     /// now. A request that timed out at the application level leaves
-    /// the connection in the pool (only a transport error invalidates
-    /// it), so this distinguishes "slow to answer" from "cannot be
-    /// reached": a dial failure never pools anything, a transport error
-    /// evicts it, and a peer that went away closes it (or the idle
-    /// timeout does). Plan 30 §M13 uses it to start a P2P outage only
+    /// the connection in the pool as long as the peer's transport still
+    /// answers (see [`Pool`]: the timeout only triggers a probe, which
+    /// evicts nothing that receives so much as an ACK), so this
+    /// distinguishes "slow to answer" from "cannot be reached": a dial
+    /// failure never pools anything, a transport error evicts it, a
+    /// peer that closed it closed it, and a peer that died or restarted
+    /// fails the probe. Plan 30 §M13 uses it to start a P2P outage only
     /// from the latter.
     pub async fn connection_alive(&self, id: iroh::EndpointId) -> bool {
-        let gate = self.connections.lock().unwrap().get(&id).cloned();
+        let gate = self.pool.gate(&id);
         let Some(gate) = gate else {
             return false;
         };
@@ -441,7 +786,7 @@ impl P2p {
 
     /// Selected-path kind for a pooled connection, if any.
     pub async fn path_kind(&self, id: iroh::EndpointId) -> PathKind {
-        let gate = self.connections.lock().unwrap().get(&id).cloned();
+        let gate = self.pool.gate(&id);
         let Some(gate) = gate else {
             return PathKind::Unknown;
         };
@@ -503,6 +848,7 @@ impl P2p {
 
     async fn connection(&self, peer: &EndpointAddr) -> Result<iroh::endpoint::Connection> {
         let gate = self
+            .pool
             .connections
             .lock()
             .unwrap()
@@ -511,7 +857,10 @@ impl P2p {
             .clone();
         let mut slot = gate.lock().await;
         if let Some(conn) = slot.as_ref() {
-            if conn.weak_handle().upgrade().is_some() {
+            // Not `weak_handle().upgrade()`: the pool's own strong handle
+            // makes that always succeed, so a connection closed by the
+            // peer or the idle timeout used to be handed out again.
+            if conn.close_reason().is_none() {
                 return Ok(conn.clone());
             }
             *slot = None;
@@ -526,7 +875,7 @@ impl P2p {
     }
 
     async fn invalidate_connection(&self, peer: iroh::EndpointId, stable_id: usize) {
-        let gate = self.connections.lock().unwrap().get(&peer).cloned();
+        let gate = self.pool.gate(&peer);
         if let Some(gate) = gate {
             let mut slot = gate.lock().await;
             if slot
@@ -540,14 +889,14 @@ impl P2p {
 
     #[cfg(test)]
     pub(crate) async fn pooled_connection_id(&self, peer: iroh::EndpointId) -> Option<usize> {
-        let gate = self.connections.lock().unwrap().get(&peer).cloned()?;
+        let gate = self.pool.gate(&peer)?;
         let id = gate.lock().await.as_ref().map(|conn| conn.stable_id());
         id
     }
 
     #[cfg(test)]
     pub(crate) async fn close_pooled_connection(&self, peer: iroh::EndpointId) {
-        let gate = self.connections.lock().unwrap().get(&peer).cloned();
+        let gate = self.pool.gate(&peer);
         if let Some(gate) = gate {
             if let Some(conn) = gate.lock().await.as_ref() {
                 conn.close(iroh::endpoint::VarInt::from_u32(0), b"test close");

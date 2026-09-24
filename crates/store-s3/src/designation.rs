@@ -23,7 +23,7 @@
 use crate::error::StoreError;
 use crate::layout;
 use futures::TryStreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
+use object_store::{ObjectStore, PutMode, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -136,16 +136,17 @@ impl DesignationStore {
         &self,
         hash: &str,
     ) -> Result<Option<(Designation, DesignationTag)>, StoreError> {
-        let res = match self.store.get(&layout::designation(hash)).await {
-            Ok(r) => r,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e.into()),
+        // Torn bodies are re-read (`crate::control`).
+        let path = layout::designation(hash);
+        let Some((d, meta)) =
+            crate::control::get_json::<Designation>(self.store.as_ref(), &path).await?
+        else {
+            return Ok(None);
         };
         let tag = DesignationTag(UpdateVersion {
-            e_tag: res.meta.e_tag.clone(),
-            version: res.meta.version.clone(),
+            e_tag: meta.e_tag,
+            version: meta.version,
         });
-        let d: Designation = serde_json::from_slice(&res.bytes().await?)?;
         Ok(Some((d, tag)))
     }
 
@@ -160,13 +161,12 @@ impl DesignationStore {
             .await?;
         let mut out = Vec::new();
         for m in metas {
-            let Ok(res) = self.store.get(&m.location).await else {
-                continue;
-            };
-            let Ok(bytes) = res.bytes().await else {
-                continue;
-            };
-            if let Ok(d) = serde_json::from_slice::<Designation>(&bytes) {
+            // A torn read must not make a live claim invisible to the
+            // overlap check: re-read it (`crate::control`); only an
+            // object that stays unreadable is skipped, as before.
+            if let Ok(Some((d, _))) =
+                crate::control::get_json::<Designation>(self.store.as_ref(), &m.location).await
+            {
                 out.push(d);
             }
         }
@@ -296,6 +296,38 @@ mod tests {
             "must not match by prefix string"
         );
         assert!(!path_covers("/site/sub", "/site"));
+    }
+
+    /// A torn designation GET (see `crate::control`) is re-read, in the
+    /// direct read and in the listing the overlap check relies on (a
+    /// skipped live claim there would let an overlapping one be created).
+    #[tokio::test]
+    async fn torn_designation_reads_are_re_read() {
+        let faulty = FaultyStore::new();
+        let s = DesignationStore::new(faulty.clone(), DesignationMode::Cas);
+        s.create(&Designation::new("/site", 1, false))
+            .await
+            .unwrap();
+        faulty.script(
+            OpKind::Get,
+            "designations",
+            Calls::Nth(1),
+            Fault::Truncated(25),
+        );
+        assert_eq!(s.get("/site").await.unwrap().unwrap().0.designee, 1);
+        faulty.clear();
+        faulty.script(
+            OpKind::Get,
+            "designations",
+            Calls::Nth(1),
+            Fault::Truncated(25),
+        );
+        assert!(
+            s.create(&Designation::new("/site/sub", 2, false))
+                .await
+                .is_err(),
+            "a torn read hid the live overlapping claim"
+        );
     }
 
     #[tokio::test]
