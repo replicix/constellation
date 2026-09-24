@@ -44,6 +44,13 @@ pub struct FsMeta {
     /// journal on first mount; live changes do not rewrite `meta.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_logical_bytes: Option<u64>,
+    /// Plan 30 §M9: the filesystem's acknowledgement policy, "local"
+    /// (the default: a backup within the RTT budget when there is one,
+    /// else today's behaviour) or "s3" (`ack=s3`: every mutation is
+    /// acknowledged only once its records are in the shared log). A
+    /// mount's `--ack` overrides it for that mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_policy: Option<String>,
 }
 
 impl FsMeta {
@@ -61,6 +68,7 @@ impl FsMeta {
             gossip_secret: Some(random_hex32()),
             keyring: None,
             max_logical_bytes: None,
+            ack_policy: None,
         }
     }
 

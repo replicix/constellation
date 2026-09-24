@@ -266,6 +266,25 @@ fn replay_seed() {
             p2p_drop: 0.03,
             ..strict_config()
         },
+        // Plan 30 §M9.
+        Ok("backup") => backup_config(),
+        Ok("acks3") => ack_s3_config(),
+        Ok("backup-far") => far_config(),
+        Ok("backup-strict") => backup_strict_config(),
+        Ok("backup-crash") => backup_crash_config(),
+        Ok("backup-crash-slow") => SimConfig {
+            s3_latency: (60, 200),
+            ..backup_crash_config()
+        },
+        Ok("acks3-crash") => ack_s3_crash_config(),
+        Ok("backup-departs") => backup_departs_config(),
+        Ok("backup-partition") => backup_partition_config(),
+        Ok("long-backup") => long_backup_config(),
+        // `long_backup`'s odd seeds: the same, under `ack=s3`.
+        Ok("long-acks3") => SimConfig {
+            core: std::sync::Arc::new(sim::run::ack_s3_core_config),
+            ..long_backup_config()
+        },
         // Plan 30 §M7.
         Ok("streams-off") => streams_off_config(),
         Ok("stream-faults") => stream_faults_config(),
@@ -748,7 +767,11 @@ fn regression_resubmitted_rid_withdraws_its_batch() {
 fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     let report = run_seed(10247, long_config()).unwrap_or_else(|e| panic!("seed 10247: {e}"));
     assert!(report.converged_checked, "seed 10247 did not converge");
-    for seed in [10981, 11066] {
+    // Re-pinned after plan 30 M9's rebase (the holder journals refusals
+    // now, which shifts every schedule): `find_multi_batch_withdraw_seeds`
+    // over 10000–11999 found 13 seeds on this tree; these two reach it
+    // twice each.
+    for seed in [10729, 11608] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats
@@ -1078,5 +1101,464 @@ fn long_strict() {
         }
     }
     eprintln!("long_strict: {totals:?}");
+    assert!(failures.is_empty(), "failing seeds: {failures:?}");
+}
+
+// ---- plan 30 §M9: backups, seal-based failover, `ack=s3` ----
+
+/// Plan 30 §M9's counters summed over a run's nodes.
+#[derive(Debug, Default, Clone)]
+struct M9Totals {
+    backups_added: u64,
+    backups_removed: u64,
+    reconfig_cas: u64,
+    appends: u64,
+    acks: u64,
+    ack_timeouts: u64,
+    acks_waited: u64,
+    ack_wait_ms: u64,
+    acks_aborted: u64,
+    streamed_ahead: u64,
+    streamed_installed: u64,
+    streamed_dropped: u64,
+    seals: u64,
+    backup_takeovers: u64,
+    tail_applied: u64,
+    s3_fast_takeovers: u64,
+    ack_floor_waits: u64,
+    stale_refusals: u64,
+    takeovers: u64,
+    acked_rolled_back: usize,
+    failovers: Vec<u64>,
+}
+
+impl M9Totals {
+    fn add(&mut self, r: &Report) {
+        for s in r.stats.values() {
+            self.backups_added += s.backups_added;
+            self.backups_removed += s.backups_removed;
+            self.reconfig_cas += s.reconfig_cas;
+            self.appends += s.backup_appends;
+            self.acks += s.backup_acks;
+            self.ack_timeouts += s.backup_ack_timeouts;
+            self.acks_waited += s.acks_waited;
+            self.ack_wait_ms += s.ack_wait_ms_total;
+            self.acks_aborted += s.acks_aborted;
+            self.streamed_ahead += s.streamed_ahead;
+            self.streamed_installed += s.streamed_installed;
+            self.streamed_dropped += s.streamed_dropped;
+            self.seals += s.seals;
+            self.backup_takeovers += s.backup_takeovers;
+            self.tail_applied += s.backup_tail_applied;
+            self.s3_fast_takeovers += s.s3_fast_takeovers;
+            self.ack_floor_waits += s.ack_floor_waits;
+            self.stale_refusals += s.stale_liveness_refusals;
+            self.takeovers += s.takeovers;
+        }
+        self.acked_rolled_back += r.acked_rolled_back;
+        self.failovers.extend(r.failover_ms.iter().copied());
+    }
+
+    fn failover_dist(&self) -> String {
+        if self.failovers.is_empty() {
+            return "none".into();
+        }
+        let mut v = self.failovers.clone();
+        v.sort_unstable();
+        let p = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+        format!(
+            "n={} p50={}ms p90={}ms max={}ms",
+            v.len(),
+            p(0.5),
+            p(0.9),
+            v[v.len() - 1]
+        )
+    }
+}
+
+fn backup_config() -> SimConfig {
+    SimConfig {
+        read_ratio: 0.3,
+        strict_durability: true,
+        core: std::sync::Arc::new(sim::run::backup_core_config),
+        ..SimConfig::default()
+    }
+}
+
+fn ack_s3_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::ack_s3_core_config),
+        ..backup_config()
+    }
+}
+
+/// Every pair's RTT is above the budget: no backup, today's behaviour.
+fn far_config() -> SimConfig {
+    SimConfig {
+        rtts: vec![((1, 2), 120), ((1, 3), 120), ((2, 3), 120)],
+        strict_durability: false,
+        ..backup_config()
+    }
+}
+
+/// A holder crash mid-burst with the backup configuration: the backup
+/// seals and takes over.
+fn backup_crash_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 8,
+        random_faults: 1,
+        faults: vec![
+            // The holder loses S3 first: what it acknowledges through its
+            // backup from here on is exactly the tail the backup must
+            // re-ship after the crash.
+            ScheduledFault {
+                at_ms: 1_100,
+                kind: FaultKind::CutS3Holder { for_ms: 2_000 },
+            },
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::CrashHolder {
+                    restart_ms: Some(7_000),
+                    keep_journal: true,
+                },
+            },
+        ],
+        ..backup_config()
+    }
+}
+
+fn ack_s3_crash_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::ack_s3_core_config),
+        ..backup_crash_config()
+    }
+}
+
+fn backup_departs_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 8,
+        random_faults: 0,
+        faults: vec![ScheduledFault {
+            at_ms: 1_800,
+            kind: FaultKind::CrashBackup {
+                restart_ms: Some(4_000),
+            },
+        }],
+        ..backup_config()
+    }
+}
+
+fn backup_partition_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 8,
+        random_faults: 0,
+        faults: vec![ScheduledFault {
+            at_ms: 1_800,
+            kind: FaultKind::PartitionBackup { for_ms: 2_500 },
+        }],
+        ..backup_config()
+    }
+}
+
+fn backup_strict_config() -> SimConfig {
+    SimConfig {
+        read_ratio: 0.6,
+        strict: true,
+        ..backup_crash_config()
+    }
+}
+
+fn run_m9(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M9Totals {
+    let mut totals = M9Totals::default();
+    for seed in seeds {
+        let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+            panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+        });
+        totals.add(&report);
+    }
+    eprintln!("{label}: {totals:?}; failover {}", totals.failover_dist());
+    totals
+}
+
+/// Plan 30 §M9: three LAN nodes under the backup configuration with the
+/// CI faults: a backup is chosen and the lease says so; every
+/// acknowledgement is durable, so no acknowledged op is ever rolled back
+/// and no refusal ever observed a tentative effect (`strict_durability`
+/// makes both hard failures); linearizable; converged.
+#[test]
+fn backup_no_acked_op_lost() {
+    let t = run_m9("backup", backup_config(), 700..760);
+    assert!(t.backups_added >= 40, "backups rarely chosen: {t:?}");
+    assert!(t.acks_waited > 100, "acknowledgements never waited: {t:?}");
+    // `acked_rolled_back` counts *transient* rollbacks too: a requester's
+    // shadow is stranded by the successor's marker and completed again by
+    // the re-shipped tail moments later (plan 30 §M3's rule; reads of the
+    // keys wait meanwhile). What must hold — and `strict_durability`
+    // checks — is that every acknowledged op is in the log once, in
+    // acknowledgement order.
+}
+
+/// Plan 30 §M9: the holder is killed mid-burst; the backup seals its
+/// epoch, takes the lease over before the TTL, re-ships the tail it held,
+/// and every acknowledged op is in the log exactly once.
+#[test]
+fn backup_failover_reships_the_tail() {
+    let t = run_m9("backup-crash", backup_crash_config(), 800..840);
+    assert!(t.seals >= 20, "the backup rarely sealed: {t:?}");
+    assert!(
+        t.backup_takeovers >= 20,
+        "the backup rarely took over: {t:?}"
+    );
+    assert!(t.tail_applied >= 10, "no tail was ever re-shipped: {t:?}");
+    let ttl = sim::run::backup_core_config(1, 1).ttl_ms;
+    let fast = t.failovers.iter().filter(|ms| **ms < ttl).count();
+    assert!(
+        fast * 2 > t.failovers.len(),
+        "failover mostly waited for the TTL: {}",
+        t.failover_dist()
+    );
+}
+
+/// Plan 30 §M9: `ack=s3` — no backups, acknowledgements wait for the
+/// segment, and a peer takes an unexpired lease over on holder silence;
+/// the log-slot CAS is the only fence.
+#[test]
+fn ack_s3_no_acked_op_lost() {
+    let t = run_m9("acks3-crash", ack_s3_crash_config(), 900..940);
+    assert_eq!(t.backups_added, 0, "ack=s3 uses no backups: {t:?}");
+    assert!(t.acks_waited > 100, "acknowledgements never waited: {t:?}");
+    assert!(
+        t.s3_fast_takeovers >= 20,
+        "fast takeover rarely happened: {t:?}"
+    );
+    // (`acked_rolled_back` may be non-zero even here: a dead holder's
+    // stale journal copy of a row that had landed in S3 is rolled back at
+    // its restart and its replay dedups — the log-level checks are what
+    // says nothing was lost.)
+    run_m9("acks3", ack_s3_config(), 940..970);
+}
+
+/// Plan 30 §M9: no peer within the RTT budget means today's behaviour —
+/// no backup, no appends, TTL failover (and acknowledged ops may be
+/// rolled back, as today).
+#[test]
+fn no_peer_in_budget_is_todays_behaviour() {
+    let cfg = SimConfig {
+        faults: backup_crash_config().faults,
+        ops_per_client: 8,
+        random_faults: 0,
+        ..far_config()
+    };
+    let t = run_m9("backup-far", cfg, 1000..1020);
+    assert_eq!(t.backups_added, 0, "{t:?}");
+    assert_eq!(t.appends, 0, "{t:?}");
+    assert_eq!(t.seals, 0, "{t:?}");
+    assert_eq!(t.acks_waited, 0, "{t:?}");
+    // A reply already on its way when the holder died counts as an
+    // acknowledgement after the crash; the rest wait for the TTL.
+    let ttl = sim::run::backup_core_config(1, 1).ttl_ms;
+    let slow = t.failovers.iter().filter(|ms| **ms >= ttl / 2).count();
+    assert!(
+        slow * 10 >= t.failovers.len() * 9,
+        "failovers happened before the TTL: {}",
+        t.failover_dist()
+    );
+}
+
+/// Plan 30 §M9: the backup unmounts (dies); the holder removes it by a
+/// lease CAS and writes continue; when it returns it is brought back.
+#[test]
+fn backup_departs_reconfigures() {
+    let t = run_m9("backup-departs", backup_departs_config(), 1100..1130);
+    assert!(
+        t.backups_removed >= 20,
+        "the backup was rarely removed: {t:?}"
+    );
+    assert!(t.backups_added > t.backups_removed, "never re-added: {t:?}");
+}
+
+/// Plan 30 §M9: the holder is partitioned from its backup (both keep S3).
+/// Either the holder removes it (an ack timeout, then a CAS) or the backup
+/// seals and takes over — never both acknowledging; the checks (strict
+/// durability, linearizability, convergence) say so.
+#[test]
+fn backup_partition_reconfigures_or_seals() {
+    let t = run_m9("backup-partition", backup_partition_config(), 1200..1230);
+    assert!(
+        t.backups_removed + t.backup_takeovers >= 20,
+        "the partition was rarely resolved either way: {t:?}"
+    );
+}
+
+/// Plan 30 §M9 + §M8: `cto=strict` readers hold delegations when the
+/// holder dies and its backup takes the lease over before the old lease
+/// expired. The successor waits the predecessor's grant horizon out
+/// before acknowledging mutations (`ack_floor_waits`), and close-to-open
+/// holds (enforced).
+#[test]
+fn fast_failover_with_delegations_keeps_close_to_open() {
+    let t = run_m9("backup-strict", backup_strict_config(), 1300..1330);
+    assert!(t.backup_takeovers >= 15, "{t:?}");
+    assert!(t.ack_floor_waits >= 10, "the successor never waited: {t:?}");
+}
+
+/// Plan 30 §M9: backup-acked transactions reach subscribers ahead of S3
+/// and are retired by the segments that carry them (or stranded by a
+/// takeover); slow S3 makes the window visible.
+#[test]
+fn pre_s3_streaming_installs_and_retires() {
+    let cfg = SimConfig {
+        s3_latency: (60, 200),
+        ..backup_crash_config()
+    };
+    let t = run_m9("backup-crash-slow", cfg, 1400..1420);
+    assert!(t.streamed_ahead > 20, "{t:?}");
+    assert!(t.streamed_installed > 20, "{t:?}");
+}
+
+/// Plan 30 §M9's checks are not vacuous: today's `Local` policy with a
+/// holder crash does roll acknowledged ops back (plan 30 §1.2's L2
+/// window), and the strict-durability check catches it.
+#[test]
+fn local_policy_rollbacks_are_found() {
+    let cfg = SimConfig {
+        strict_durability: true,
+        ..bug_b_config()
+    };
+    let mut found = None;
+    for seed in 200..260 {
+        if let Err(e) = run_seed(seed, cfg.clone()) {
+            found = Some((seed, e));
+            break;
+        }
+    }
+    let (seed, e) = found.expect("no seed rolled an acknowledged op back under Local");
+    eprintln!(
+        "local_policy_rollbacks_are_found: seed {seed}: {}",
+        e.lines().next().unwrap_or("")
+    );
+}
+
+fn long_backup_config() -> SimConfig {
+    SimConfig {
+        strict_durability: true,
+        core: std::sync::Arc::new(sim::run::backup_core_config),
+        ..long_config()
+    }
+}
+
+/// Plan 30 §M9 rebase: a forwarded op refused by the holder (ENOENT /
+/// EEXIST) was executed a *second* time — by the deposed requester's
+/// replay by rid (50126) or by a later holder draining an inbox batch
+/// (50064) — and succeeded, after its client had been told the refusal
+/// (the strict acknowledgement-order check found both). The holder now
+/// journals definitive refusals as outcomes (`Refused { rid, errno }`),
+/// so every later execution of the rid dedups to the same errno.
+#[test]
+fn regression_refused_forward_is_not_re_executed() {
+    let acks3 = || SimConfig {
+        core: std::sync::Arc::new(sim::run::ack_s3_core_config),
+        ..long_backup_config()
+    };
+    // 50277 (`ack=s3`): the holder's *own* client refused from a stale
+    // replica after a fast takeover, because a refusal with nothing
+    // unshipped left at once; the local path journals refusals too.
+    // 753 (`backup`): the requester's own op arrived on the holder's
+    // pre-S3 stream before its reply; the reply's shadow re-applied it
+    // over a later streamed create. 1328 (`backup-strict`): the sealed
+    // successor's takeover gate waited the delegation horizon out
+    // without shipping the re-applied tail, and crashed inside it.
+    // 1122 (`backup-departs`), 1407 (`backup-crash-slow`): the
+    // requester's own op streamed ahead must count as installed, or the
+    // reply sends it down the lease path a second time.
+    // Round 2: 50064 stopped journaling a refusal once the holder
+    // streamed holes and resent once (the schedule moved); it stays for
+    // its strict checks, and 50068 pins the refusal-journaling path.
+    for (seed, cfg, alias) in [
+        (50064u64, long_backup_config(), "long-backup"),
+        (50068, long_backup_config(), "long-backup"),
+        (50126, long_backup_config(), "long-backup"),
+        (50277, acks3(), "long-acks3"),
+        (753, backup_config(), "backup"),
+        (1328, backup_strict_config(), "backup-strict"),
+        (1122, backup_departs_config(), "backup-departs"),
+        (
+            1407,
+            SimConfig {
+                s3_latency: (60, 200),
+                ..backup_crash_config()
+            },
+            "backup-crash-slow",
+        ),
+        // 1402: the mirror case — the reply's shadow arrived first, and
+        // the stream's copy must turn it into a streamed entry (retired
+        // by the segment's skip), not be dropped.
+        (
+            1402,
+            SimConfig {
+                s3_latency: (60, 200),
+                ..backup_crash_config()
+            },
+            "backup-crash-slow",
+        ),
+        // 50412: a streamed `Refused` / `InboxAck` must still be written
+        // (completed row, inbox watermark) when its segment lands, or
+        // the next holder's inbox drain re-executes the refused op.
+        (50412, long_backup_config(), "long-backup"),
+    ] {
+        let report = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={alias}")
+        });
+        assert!(report.converged_checked, "seed {seed} did not converge");
+        let journaled: u64 = report.stats.values().map(|s| s.refusals_journaled).sum();
+        // (The refusal-journaling seeds; the others pin different paths.)
+        assert!(
+            journaled >= 1 || !matches!(seed, 50068 | 50126 | 50277),
+            "seed {seed} no longer refuses a forward ({journaled})"
+        );
+    }
+}
+
+/// Plan 30 §M9: the long configuration with backups (and, every other
+/// seed, `ack=s3`): `cargo test -p constellation-authority --release
+/// --test sim -- --ignored long_backup` (`AUTHORITY_SIM_SEEDS`,
+/// `AUTHORITY_SIM_START`; replay with `AUTHORITY_SIM_CONFIG=long-backup`).
+#[test]
+#[ignore]
+fn long_backup() {
+    let seeds: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000);
+    let start: u64 = std::env::var("AUTHORITY_SIM_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000);
+    let mut failures = Vec::new();
+    let mut totals = M9Totals::default();
+    for seed in start..start + seeds {
+        let (cfg, alias) = if seed % 2 == 0 {
+            (long_backup_config(), "long-backup")
+        } else {
+            (
+                SimConfig {
+                    core: std::sync::Arc::new(sim::run::ack_s3_core_config),
+                    ..long_backup_config()
+                },
+                "long-acks3",
+            )
+        };
+        match run_seed(seed, cfg) {
+            Ok(report) => totals.add(&report),
+            Err(e) => {
+                eprintln!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={alias}");
+                failures.push(seed);
+            }
+        }
+    }
+    eprintln!(
+        "long_backup: {totals:?}; failover {}",
+        totals.failover_dist()
+    );
     assert!(failures.is_empty(), "failing seeds: {failures:?}");
 }

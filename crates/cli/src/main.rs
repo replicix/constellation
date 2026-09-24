@@ -112,6 +112,15 @@ enum Command {
         /// delegation). `CONSTELLATION_CTO` supplies the default.
         #[arg(long)]
         cto: Option<String>,
+        /// Acknowledgement policy (plan 30 §M9): "local" (a mutation is
+        /// acknowledged once journaled here; a backup peer within the
+        /// RTT budget, when there is one, holds it too) or "s3" (every
+        /// acknowledgement waits for the record to land in the shared
+        /// log; a silent holder is taken over fast). Omitted: the
+        /// filesystem's `ack_policy` (`fs create --ack-policy`), else
+        /// local. `CONSTELLATION_ACK` supplies the default.
+        #[arg(long)]
+        ack: Option<String>,
         /// Chunk close policy: "through" waits for S3; "back" returns
         /// after the local durable queue is journaled.
         #[arg(long)]
@@ -523,6 +532,11 @@ enum FsCommand {
         /// Optional logical size cap (e.g. 10G). Unbounded when omitted.
         #[arg(long, value_parser = parse_byte_size)]
         max_size: Option<u64>,
+        /// Acknowledgement policy for every mount of this filesystem
+        /// (plan 30 §M9): "local" (default) or "s3". A mount's `--ack`
+        /// overrides it.
+        #[arg(long)]
+        ack_policy: Option<String>,
     },
     /// Change an E2E filesystem's passphrase without re-encrypting data.
     Passwd {
@@ -693,6 +707,7 @@ fn main() -> Result<()> {
         fs_name,
         fsync_mode,
         cto,
+        ack,
         write_mode,
         read_only_member,
         atime,
@@ -715,6 +730,7 @@ fn main() -> Result<()> {
                 fs_name,
                 fsync_mode,
                 cto,
+                ack,
                 write_mode,
                 read_only_member,
                 atime,
@@ -743,9 +759,15 @@ fn main() -> Result<()> {
                     compression,
                     e2e,
                     max_size,
+                    ack_policy,
                 },
         } => {
             constellation_fs_core::validate_chunk_size(chunk_size)?;
+            let ack_policy = match ack_policy.as_deref().map(|p| p.trim().to_ascii_lowercase()) {
+                None => None,
+                Some(p) if p == "local" || p == "s3" => Some(p),
+                Some(other) => bail!("invalid --ack-policy {other:?} (expected local or s3)"),
+            };
             let setting: CompressionSetting =
                 compression.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
             let backend = rt
@@ -767,6 +789,7 @@ fn main() -> Result<()> {
                 meta.gossip_secret = None;
             }
             meta.max_logical_bytes = max_size.filter(|&n| n > 0);
+            meta.ack_policy = ack_policy;
             // Collect the passphrase before writing anything: an abort at
             // the prompt (Ctrl-C, empty input) must leave no orphan
             // `meta.json` behind. The keyring block is built into `meta`,
@@ -797,6 +820,9 @@ fn main() -> Result<()> {
             println!("  e2e:         {e2e}");
             if let Some(cap) = meta.max_logical_bytes {
                 println!("  max_size:    {cap}");
+            }
+            if let Some(p) = &meta.ack_policy {
+                println!("  ack_policy:  {p}");
             }
             Ok(())
         }
@@ -1191,6 +1217,7 @@ struct MountArgs {
     fs_name: Option<String>,
     fsync_mode: Option<String>,
     cto: Option<String>,
+    ack: Option<String>,
     write_mode: Option<String>,
     read_only_member: bool,
     atime: Option<String>,
@@ -1285,6 +1312,7 @@ fn cmd_mount(
         fs_name,
         fsync_mode,
         cto,
+        ack,
         write_mode,
         read_only_member,
         atime,
@@ -1294,6 +1322,7 @@ fn cmd_mount(
         web_ui,
     } = args;
     let cto_strict = crate::cto::strict_from(cto.as_deref())?;
+    let ack = crate::authority_driver::ack_flag(ack.as_deref())?;
     // Resolve once: env CONSTELLATION_ATIME overrides the --atime flag.
     let atime_mode =
         crate::atime::AtimeMode::resolve(atime.as_deref().and_then(crate::atime::AtimeMode::parse));
@@ -1500,6 +1529,7 @@ fn cmd_mount(
             node_cache_size,
             fsync_s3,
             cto_strict,
+            ack,
             initial_write_mode,
             read_only_member,
             atime_mode,
@@ -1517,6 +1547,7 @@ fn cmd_mount(
                 node_cache_size,
                 fsync_s3,
                 cto_strict,
+                ack,
                 initial_write_mode,
                 read_only_member,
                 atime_mode,
@@ -1592,6 +1623,7 @@ fn cmd_mount_body(
     cache_size: u64,
     fsync_s3: bool,
     cto_strict: bool,
+    ack: Option<bool>,
     initial_write_mode: writeback::WriteMode,
     read_only_member: bool,
     atime_mode: crate::atime::AtimeMode,
@@ -1670,6 +1702,7 @@ fn cmd_mount_body(
                     cache_size,
                     fsync_s3,
                     cto_strict,
+                    ack,
                     initial_write_mode,
                     read_only_member,
                     web_ui,
@@ -2458,6 +2491,7 @@ impl constellation_net::PeerService for P2pBridge {
             };
             let (reply, receive) = tokio::sync::oneshot::channel();
             let started = std::time::Instant::now();
+            tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate request queued");
             let (outcome, base, position) = if self
                 .nudge
                 .send(fusefs::SyncRequest::Mutate {
@@ -2481,6 +2515,7 @@ impl constellation_net::PeerService for P2pBridge {
                     constellation_meta::Position::ZERO,
                 )
             };
+            tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate reply taken");
             tracing::trace!(
                 requester,
                 service_us = started.elapsed().as_micros() as u64,
@@ -2541,6 +2576,81 @@ impl constellation_net::PeerService for P2pBridge {
                 grant,
             }
         })
+    }
+
+    fn backup_append_requested(
+        &self,
+        holder: u64,
+        req_id: u64,
+        epoch: u64,
+        config_version: u64,
+        from: u64,
+        txs: Vec<u8>,
+        through: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            // `sealed` is the safe refusal: the holder never counts this
+            // node again until a reconfiguration (a node that cannot
+            // persist the append must not be credited).
+            let refuse = constellation_net::Payload::BackupAck {
+                req_id,
+                epoch,
+                acked: 0,
+                sealed: true,
+            };
+            if crate::fault::p2p_denied(holder) {
+                // Fault injection: the link is cut; no answer.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return refuse;
+            }
+            let Ok(txs) = postcard::from_bytes::<Vec<constellation_meta::BackupTx>>(&txs) else {
+                return refuse;
+            };
+            tracing::trace!(target: "constellation::fwd", from, "append queued");
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            if self
+                .nudge
+                .send(fusefs::SyncRequest::PeerBackupAppend {
+                    holder,
+                    epoch,
+                    config_version,
+                    from,
+                    txs,
+                    through,
+                    reply,
+                })
+                .is_err()
+            {
+                return refuse;
+            }
+            let out = match receive.await {
+                Ok((acked, sealed)) => constellation_net::Payload::BackupAck {
+                    req_id,
+                    epoch,
+                    acked,
+                    sealed,
+                },
+                Err(_) => refuse,
+            };
+            tracing::trace!(target: "constellation::fwd", from, "append reply taken");
+            out
+        })
+    }
+
+    fn stream_ahead(&self, from: u64, epoch: u64, base: u64, txs: Vec<u8>) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let Ok(txs) = postcard::from_bytes::<Vec<constellation_meta::BackupTx>>(&txs) else {
+            return;
+        };
+        let _ = self.nudge.send(fusefs::SyncRequest::PeerStreamAhead {
+            from,
+            epoch,
+            base,
+            txs,
+        });
     }
 
     fn read_recall_requested(
@@ -3446,6 +3556,7 @@ async fn adopt_root(
             op,
             rid: forward.next_system_rid(node_id),
             policy: constellation_authority::Policy::System,
+            in_doubt: false,
             reply,
         })
         .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
@@ -3740,6 +3851,47 @@ impl constellation_api::StatusSource for DaemonStatus {
                     waits_ms: s.waits_ms.to_vec(),
                     wait_ms_total: s.wait_ms_total,
                     raised: s.raised,
+                }
+            },
+            ack: {
+                let a = &core.ack;
+                let s = self.meta.session().stats();
+                constellation_api::AckStatus {
+                    ack_s3: core.ack_s3,
+                    policy: a.policy.to_string(),
+                    backups: a.backups.clone(),
+                    candidate: a.candidate,
+                    config_version: a.config_version,
+                    durable: a.durable,
+                    parked_acks: a.parked_acks as u64,
+                    gated: self.lease.ack_gated(),
+                    backing_holder: a.backing_holder,
+                    backing_epoch: a.backing_epoch,
+                    backing_acked: a.backing_acked,
+                    sealed_epoch: a.sealed_epoch,
+                    backups_added: stats.backups_added,
+                    backups_removed: stats.backups_removed,
+                    reconfig_cas: stats.reconfig_cas,
+                    backup_appends: stats.backup_appends,
+                    backup_acks: stats.backup_acks,
+                    backup_ack_timeouts: stats.backup_ack_timeouts,
+                    acks_waited: stats.acks_waited,
+                    ack_wait_ms_total: stats.ack_wait_ms_total,
+                    acks_aborted: stats.acks_aborted,
+                    streamed_ahead: stats.streamed_ahead,
+                    streamed_installed: stats.streamed_installed,
+                    streamed_dropped: stats.streamed_dropped,
+                    backup_persisted: stats.backup_persisted,
+                    seals: stats.seals,
+                    backup_takeovers: stats.backup_takeovers,
+                    backup_tail_applied: stats.backup_tail_applied,
+                    s3_fast_takeovers: stats.s3_fast_takeovers,
+                    ack_floor_waits: stats.ack_floor_waits,
+                    stale_liveness_refusals: stats.stale_liveness_refusals,
+                    epoch_carry_refused: stats.epoch_carry_refused,
+                    refusals_journaled: stats.refusals_journaled,
+                    unacked_replays_refused: stats.unacked_replays_refused,
+                    reads_durability_blocked: s.durability_blocked,
                 }
             },
             cto: {
@@ -5409,6 +5561,7 @@ mod umount_tests {
                 cache_size: 16 * 1024 * 1024,
                 fsync_s3: false,
                 cto_strict: false,
+                ack: None,
                 initial_write_mode: writeback::WriteMode::Through,
                 read_only_member: false,
                 web_ui: 0,

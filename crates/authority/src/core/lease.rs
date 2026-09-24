@@ -10,7 +10,7 @@
 use super::Config;
 use crate::ids::{Epoch, Ms, NodeId};
 use constellation_store_s3::lease::LEASE_VERSION;
-use constellation_store_s3::{Lease, LeaseTag};
+use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 
 /// Plan 30 §M3b: a won lease whose takeover gate has not completed. While
 /// pending the view is closed to every new mutation and nothing ships.
@@ -25,6 +25,23 @@ pub struct PendingGate {
     /// M13: every older epoch's inbox batch has been executed and deleted
     /// (or the inbox is off).
     pub drained: bool,
+    /// Plan 30 §M9: the lease this one took over had not expired (a
+    /// sealed backup's or an `ack=s3` fast takeover): its expiry and
+    /// whether that tenure served strict reads, for the successor's
+    /// acknowledgement floor (see `core::backup`).
+    pub fast_prev: Option<(i64, bool)>,
+    /// Plan 30 §M9: this node backed the predecessor at this epoch and
+    /// must apply what is left of its backup tail before its view opens
+    /// (`None` once applied, or when it backed nobody).
+    pub backup_tail_epoch: Option<Epoch>,
+    /// Plan 30 §M9: the gate's journal work is done — the marker landed,
+    /// the backup tail and the stranded replays are journaled — and only
+    /// the read-delegation quarantine or the kernel drain keeps the view
+    /// closed. What is journaled ships meanwhile (`ship_epoch`): the
+    /// re-shipped tail is what makes the predecessor's acknowledgements
+    /// durable again, and a successor that crashed during a multi-second
+    /// horizon wait lost it (backup-strict seed 1328).
+    pub shippable: bool,
 }
 
 /// What the lease object allows this node to do (`LeaseKeeper::classify`).
@@ -86,6 +103,12 @@ pub struct LeaseState {
     /// object, writes journal locally, nothing ships until the epoch
     /// closes.
     epoch_hold: Option<Epoch>,
+    /// Plan 30 §M9: this node may take over the live lease `(epoch,
+    /// holder)` before it expires — it sealed that epoch as a listed
+    /// backup, or the tenure's `ack_policy` is `S3` and the holder has
+    /// gone silent. Checked against the lease object at classification
+    /// (the object is the truth; this is only the permit to try).
+    pub takeover_permit: Option<(Epoch, NodeId)>,
 }
 
 impl LeaseState {
@@ -173,6 +196,17 @@ impl LeaseState {
         self.usable(now, cfg).then(|| self.epoch()).flatten()
     }
 
+    /// Plan 30 §M9: `ship_epoch` for the shipper alone — also while a
+    /// gate whose journal work is done waits out the read-delegation
+    /// quarantine (`PendingGate::shippable`). Nothing else (forwards,
+    /// handoffs, the inbox, backups, streams) opens before the gate.
+    pub fn journal_ship_epoch(&self, now: Ms, cfg: &Config) -> Option<Epoch> {
+        if self.lost || self.gate.as_ref().is_some_and(|g| !g.shippable) {
+            return None;
+        }
+        self.usable(now, cfg).then(|| self.epoch()).flatten()
+    }
+
     pub fn is_paused_for_handoff(&self, now: Ms) -> bool {
         self.pause_until > now
     }
@@ -207,8 +241,39 @@ impl LeaseState {
             && self.wants_handoff(now, cfg)
     }
 
+    /// Plan 30 §M9: whether the permit lets this node claim `prev` now.
+    /// A sealed backup may claim the epoch it sealed while it is still
+    /// listed; under `ack_policy = S3` any peer may claim once the holder
+    /// has not renewed for `backup_takeover_ms` (a renewal within that
+    /// window is proof of S3 liveness, and a merely P2P-partitioned
+    /// holder keeps its lease).
+    fn permit_allows(&self, now: Ms, cfg: &Config, prev: &Lease, sealed_epoch: Epoch) -> bool {
+        let Some((epoch, holder)) = self.takeover_permit else {
+            return false;
+        };
+        if prev.epoch != epoch || prev.holder != holder || holder == cfg.node_id {
+            return false;
+        }
+        match prev.ack_policy {
+            AckPolicy::Backup => prev.backups.contains(&cfg.node_id) && sealed_epoch >= prev.epoch,
+            AckPolicy::S3 => {
+                let renewed_at = prev.expires_unix_ms - cfg.ttl_ms as i64;
+                now.0 - renewed_at >= cfg.backup_takeover_ms as i64
+            }
+            AckPolicy::Local => false,
+        }
+    }
+
     /// `LeaseKeeper::classify` over an already-read lease object.
-    pub fn classify(&self, now: Ms, cfg: &Config, object: Option<(Lease, LeaseTag)>) -> Plan {
+    /// `sealed_epoch`: the highest epoch this node sealed as a backup
+    /// (plan 30 §M9), 0 when none.
+    pub fn classify(
+        &self,
+        now: Ms,
+        cfg: &Config,
+        object: Option<(Lease, LeaseTag)>,
+        sealed_epoch: Epoch,
+    ) -> Plan {
         if self.lost {
             return Plan::Refused("deposed; refusing to reacquire before recovery");
         }
@@ -228,7 +293,7 @@ impl LeaseState {
                 marker: true,
             };
         }
-        if !prev.is_claimable(now.0) {
+        if !prev.is_claimable(now.0) && !self.permit_allows(now, cfg, &prev, sealed_epoch) {
             return Plan::Busy {
                 holder: prev.holder,
                 epoch: prev.epoch,
@@ -251,7 +316,9 @@ impl LeaseState {
 
     /// The lease object a `Plan::Create`/`Plan::Claim` CAS writes
     /// (`LeaseKeeper::commit_cas`'s epoch rule: same holder re-adopting
-    /// keeps the epoch, a real handover bumps it).
+    /// keeps the epoch, a real handover bumps it). Plan 30 §M9: a new
+    /// tenure starts with no backups (`Local`, or `S3` when this mount
+    /// asks for `ack=s3`) and a `config_version` above the predecessor's.
     pub fn granted_lease(&self, now: Ms, cfg: &Config, prev: Option<&Lease>) -> Lease {
         let epoch = match prev {
             None => 1,
@@ -266,6 +333,35 @@ impl LeaseState {
             expires_unix_ms: now.plus(cfg.ttl_ms).0,
             released: false,
             wanted_by: Vec::new(),
+            backups: Vec::new(),
+            config_version: prev.map(|p| p.config_version + 1).unwrap_or(1),
+            ack_policy: if cfg.ack_s3 {
+                AckPolicy::S3
+            } else {
+                AckPolicy::Local
+            },
+            granted_delegations: cfg.strict_mounts,
+        }
+    }
+
+    /// Plan 30 §M9: the acknowledgement policy of the lease this node
+    /// holds (`Local` when it holds none, or holds through a continuation
+    /// epoch: nothing ships, nothing is backed).
+    pub fn ack_policy(&self) -> AckPolicy {
+        match &self.held {
+            Some((lease, _)) if !self.lost && self.epoch_hold.is_none() => lease.ack_policy,
+            _ => AckPolicy::Local,
+        }
+    }
+
+    /// Plan 30 §M9: the committed backup set (empty unless holding under
+    /// `Backup`).
+    pub fn backups(&self) -> &[NodeId] {
+        match &self.held {
+            Some((lease, _)) if !self.lost && lease.ack_policy == AckPolicy::Backup => {
+                &lease.backups
+            }
+            _ => &[],
         }
     }
 
@@ -407,11 +503,11 @@ mod tests {
         let cfg = cfg();
         let st = LeaseState::default();
         let now = Ms(1_000_000);
-        assert_eq!(st.classify(now, &cfg, None), Plan::Create);
+        assert_eq!(st.classify(now, &cfg, None, 0), Plan::Create);
         // A live foreign holder is busy.
         let mut foreign = st.granted_lease(now, &cfg, None);
         foreign.holder = 3;
-        match st.classify(now, &cfg, Some((foreign.clone(), tag()))) {
+        match st.classify(now, &cfg, Some((foreign.clone(), tag())), 0) {
             Plan::Busy { holder: 3, .. } => {}
             other => panic!("{other:?}"),
         }
@@ -420,7 +516,7 @@ mod tests {
             expires_unix_ms: now.0 - 1,
             ..foreign.clone()
         };
-        match st.classify(now, &cfg, Some((expired, tag()))) {
+        match st.classify(now, &cfg, Some((expired, tag())), 0) {
             Plan::Claim {
                 takeover: true,
                 marker: true,
@@ -430,7 +526,7 @@ mod tests {
         }
         // Released: a takeover without a marker.
         let released = foreign.released();
-        match st.classify(now, &cfg, Some((released, tag()))) {
+        match st.classify(now, &cfg, Some((released, tag())), 0) {
             Plan::Claim {
                 takeover: true,
                 marker: false,
@@ -441,7 +537,7 @@ mod tests {
         // Our own live lease we do not track: re-adopted through the gate
         // (M4); tracked: held.
         let mine = st.granted_lease(now, &cfg, None);
-        match st.classify(now, &cfg, Some((mine.clone(), tag()))) {
+        match st.classify(now, &cfg, Some((mine.clone(), tag())), 0) {
             Plan::Claim {
                 takeover: true,
                 marker: true,
@@ -451,11 +547,17 @@ mod tests {
         }
         let mut holding = st.clone();
         holding.adopt(now, mine.clone(), tag(), None);
-        assert_eq!(holding.classify(now, &cfg, Some((mine, tag()))), Plan::Held);
+        assert_eq!(
+            holding.classify(now, &cfg, Some((mine, tag())), 0),
+            Plan::Held
+        );
         // Deposed: refused until recovered.
         let mut lost = st.clone();
         lost.mark_lost(3, 5, 4);
-        assert!(matches!(lost.classify(now, &cfg, None), Plan::Refused(_)));
+        assert!(matches!(
+            lost.classify(now, &cfg, None, 0),
+            Plan::Refused(_)
+        ));
         assert_eq!(lost.lost_floor, 5);
     }
 
@@ -475,6 +577,9 @@ mod tests {
                 takeover: true,
                 marker_shipped: false,
                 drained: true,
+                fast_prev: None,
+                backup_tail_epoch: None,
+                shippable: false,
             }),
         );
         // Gate pending: closed to everything, nothing ships.

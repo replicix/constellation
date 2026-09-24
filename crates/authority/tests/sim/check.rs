@@ -89,7 +89,7 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
                     completed_at.entry(*rid).or_insert((*seq, i));
                 }
             }
-            Replica::apply_segment(&meta, *seq, seg.epoch, seg.through, &seg.records)
+            Replica::apply_segment(&meta, *seq, seg.epoch, seg.through, &seg.rows, &seg.records)
                 .expect("apply");
             max_epoch = max_epoch.max(seg.epoch);
         }

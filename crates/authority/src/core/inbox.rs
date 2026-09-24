@@ -1104,6 +1104,12 @@ impl Core {
                 self.stats.inbox_deduped_ops += 1;
                 continue;
             }
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                completed = ?replica.completed_outcome(rid),
+                "inbox: executing a batch op"
+            );
             if admitted && self.lease.new_mutation_epoch(now, &self.cfg).is_none() {
                 return Err(Halt::Fenced);
             }

@@ -265,6 +265,16 @@ impl Core {
         self.submit(now, rid, op, policy, Origin::Client, replica, out);
     }
 
+    /// Plan 30 §M9 (`Control::InDoubt`): the next `submit` of `rid`
+    /// starts in doubt (see `in_doubt_rids`).
+    pub(crate) fn note_in_doubt(&mut self, rid: Rid) {
+        self.in_doubt_rids.insert(rid);
+        while self.in_doubt_rids.len() > MAX_IN_DOUBT_RIDS {
+            let first = *self.in_doubt_rids.iter().next().expect("non-empty");
+            self.in_doubt_rids.remove(&first);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn submit(
         &mut self,
@@ -750,7 +760,13 @@ impl Core {
     /// Plan 30 §M2: a timeout, transport failure or `Busy` leaves the op
     /// in doubt; retry the same rid a few times before the lease path
     /// (a system op gets no retries; a best-effort one is dropped).
-    fn retry_or_lease(&mut self, now: Ms, rid: Rid, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn retry_or_lease(
+        &mut self,
+        now: Ms,
+        rid: Rid,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -990,6 +1006,19 @@ impl Core {
         if in_doubt {
             if let Some(outcome) = completed_as_outcome(replica, rid, epoch) {
                 self.stats.forward_indoubt_resolved += 1;
+                // Plan 30 §M9: a completion found in this node's own
+                // unshipped journal is not durable yet under a
+                // `Backup`/`S3` policy; the answer waits like a fresh
+                // execution's would.
+                let position = Position {
+                    seq: self.ship.head_seq,
+                    pending: replica.journal_position(epoch),
+                };
+                if let Some(need) = self.ack_need(&position) {
+                    self.rd
+                        .parked_local
+                        .insert(rid, (Default::default(), Some(need)));
+                }
                 return outcome;
             }
         }
@@ -1011,7 +1040,7 @@ impl Core {
             // the outcome goes to `finish`, which drops it.
             return MutateOutcome::Errno(libc::EIO);
         };
-        match replica.execute(&op, Some(rid)) {
+        let outcome = match replica.execute(&op, Some(rid)) {
             Ok(records) => {
                 if policy == Policy::Client {
                     self.lease.touch(now);
@@ -1020,14 +1049,41 @@ impl Core {
                 // Plan 30 §M8: the sequencer's own writes recall read
                 // delegations too; `finish` parks the reply until done.
                 let inos = constellation_meta::recall_inos(&records);
-                if let Some(wait) = self.recall_needed(now, &inos, None, replica, out) {
-                    self.rd.parked_local.insert(rid, wait);
-                }
-                MutateOutcome::Accepted { epoch, records }
+                let wait = self.recall_needed(now, &inos, None, replica, out);
+                (MutateOutcome::Accepted { epoch, records }, wait)
             }
-            Err(MetaError::Conflict) => MutateOutcome::Conflict { manifest: None },
-            Err(error) => MutateOutcome::Errno(meta_errno(&error)),
+            Err(MetaError::Conflict) => (MutateOutcome::Conflict { manifest: None }, None),
+            Err(error) => {
+                // Plan 30 §M9: a definitive refusal is journaled as an
+                // outcome (`record_refusal`), for the same reason as a
+                // forwarded op's — and so that the refusal's position is
+                // never "nothing unshipped": under `Backup`/`S3` the
+                // answer then waits for that row to reach the backup /
+                // the log, which is what proves this node still holds.
+                // Without it a holder taken over fast (`ack=s3`, a seal)
+                // could answer a refusal from its stale replica at once
+                // (long-acks3 seed 50277: EEXIST for a name a newer
+                // holder had already renamed away).
+                let errno = meta_errno(&error);
+                self.record_refusal(rid, errno, replica);
+                (MutateOutcome::Errno(errno), None)
+            }
+        };
+        // Plan 30 §M9: accepted or refused, the reply observed the
+        // journal as it stands; under a `Backup`/`S3` policy it leaves
+        // only once that is durable.
+        let position = Position {
+            seq: self.ship.head_seq,
+            pending: replica.journal_position(epoch),
+        };
+        let durable = self.ack_need(&position);
+        let (outcome, wait) = outcome;
+        if wait.is_some() || durable.is_some() {
+            self.rd
+                .parked_local
+                .insert(rid, (wait.unwrap_or_default(), durable));
         }
+        outcome
     }
 
     // ---- finishing ----
@@ -1090,13 +1146,27 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        let Some(c) = self.clients.get(&rid) else {
+            return;
+        };
+        if c.phase == Phase::Recalling {
+            // Executed; only the acknowledgement waits. A recall ends by
+            // the grant's TTL: not in doubt. A durability wait (plan 30
+            // §M9) can outlast anything (S3 away under `ack=s3`): the
+            // client hears in doubt and retries by rid, which `completed`
+            // answers once the row is durable.
+            if !self.abort_durable_park_of(rid, out) {
+                return;
+            }
+            self.stats.acks_aborted += 1;
+        }
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
         if c.phase == Phase::Recalling {
-            // Executed; only the acknowledgement waits, and a recall ends
-            // by the grant's TTL: not in doubt.
-            return;
+            // Executed here, never acknowledged: the resubmission is in
+            // doubt (it must find the completion, not run again).
+            c.forwarded = true;
         }
         if let Phase::Forwarded { req, .. } = c.phase {
             self.by_req.remove(&req);
@@ -1163,9 +1233,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if let Some(wait) = self.rd.parked_local.remove(&rid) {
+        if let Some((wait, durable)) = self.rd.parked_local.remove(&rid) {
             if self.clients.contains_key(&rid) {
-                self.park_finish(now, rid, wait, outcome);
+                self.park_finish(now, rid, wait, durable, outcome);
                 return;
             }
         }

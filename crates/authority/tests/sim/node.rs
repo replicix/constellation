@@ -72,6 +72,8 @@ pub struct CoreView {
     pub applied_seq: Seq,
     pub journal_len: u64,
     pub speculation: constellation_meta::SpeculationCounts,
+    /// Plan 30 §M9.
+    pub ack: constellation_authority::core::AckView,
 }
 
 pub struct Shared {
@@ -175,6 +177,7 @@ impl NodeHandle {
             shared: shared.clone(),
             rolled_back_seen: (0, 0),
             timers: HashSet::new(),
+            timer_kinds: HashMap::new(),
             bootstrap: None,
             deferred: Vec::new(),
             events_handled: 0,
@@ -260,6 +263,9 @@ struct Driver {
     shared: Arc<Shared>,
     rolled_back_seen: (u64, u64),
     timers: HashSet<constellation_authority::TimerId>,
+    /// What each pending timer is for (the watchdog's histogram names
+    /// the kind, not just "Timer").
+    timer_kinds: HashMap<constellation_authority::TimerId, constellation_authority::TimerKind>,
     /// Mount-time bootstrap (`shipper::bootstrap`): the replica tails to
     /// head before any client op is admitted. Submits arriving meanwhile
     /// wait here.
@@ -293,7 +299,11 @@ impl Driver {
         {
             let (tx, bus, id) = (self.tx.clone(), self.bus.clone(), self.id);
             let p2p = self.core.config().p2p;
+            let clock = self.clock;
             tokio::spawn(async move {
+                // Plan 30 §M9: since when each link has been up without a
+                // break (the directory's `since`).
+                let mut up_since: HashMap<NodeId, constellation_authority::Ms> = HashMap::new();
                 loop {
                     let nodes = bus.nodes();
                     if tx
@@ -304,14 +314,26 @@ impl Driver {
                     {
                         return;
                     }
+                    let now = clock.now();
                     // With P2P off the directory is empty (`Peers::disabled`).
                     let links: Vec<PeerLink> = nodes
                         .into_iter()
                         .filter(|n| *n != id && p2p)
-                        .map(|n| PeerLink {
-                            node: n,
-                            connected: bus.linked(id, n),
-                            last_seen: None,
+                        .map(|n| {
+                            let connected = bus.linked(id, n);
+                            let since = if connected {
+                                Some(*up_since.entry(n).or_insert(now))
+                            } else {
+                                up_since.remove(&n);
+                                None
+                            };
+                            PeerLink {
+                                node: n,
+                                connected,
+                                last_seen: None,
+                                rtt_ms: connected.then(|| bus.rtt(id, n)),
+                                since,
+                            }
                         })
                         .collect();
                     if tx.send(Event::Peers { links }).is_err() {
@@ -346,11 +368,14 @@ impl Driver {
                 + self.core.stats.hints_installed;
             if std::env::var_os("AUTHORITY_SIM_WATCHDOG").is_some() {
                 let text = format!("{event:?}");
-                let kind = text
-                    .split(|c: char| !c.is_alphanumeric())
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .join(":");
+                let kind = match &event {
+                    Event::Timer { id } => format!("Timer:{:?}", self.timer_kinds.get(id).copied()),
+                    _ => text
+                        .split(|c: char| !c.is_alphanumeric())
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join(":"),
+                };
                 let mut h = EVENT_HISTOGRAM.lock().unwrap();
                 let (clock, hist) = h.get_or_insert_with(|| (0, BTreeMap::new()));
                 *clock = now.0 as u64;
@@ -367,6 +392,23 @@ impl Driver {
             let actions = self.core.handle(now, event, &*self.meta);
             if std::env::var_os("AUTHORITY_SIM_WATCHDOG").is_some() {
                 *IN_FLIGHT.lock().unwrap() = None;
+                let clients: Vec<String> = self
+                    .core
+                    .clients()
+                    .map(|(rid, phase)| {
+                        format!("{}.{}.{}:{phase:?}", rid.node, rid.incarnation, rid.seq)
+                    })
+                    .collect();
+                note_waiting(
+                    &format!("node {}", self.id),
+                    format!(
+                        "job={:?} lease={:?} gate={} ack={:?} clients={clients:?}",
+                        self.core.job(),
+                        self.core.lease().epoch(),
+                        self.core.lease().gate.is_some(),
+                        self.core.ack_view(),
+                    ),
+                );
             }
             let marks_after = self.core.stats.takeovers
                 + self.core.stats.segments_applied
@@ -417,6 +459,7 @@ impl Driver {
         view.applied_seq = Replica::applied_seq(&*self.meta).unwrap_or(0);
         view.journal_len = Replica::journal_len(&*self.meta).unwrap_or(0);
         view.speculation = self.meta.speculation_counts().unwrap_or_default();
+        view.ack = self.core.ack_view();
     }
 
     /// Whenever the core rolled something back, the replay queue names
@@ -446,8 +489,9 @@ impl Driver {
                 }
                 Action::Send { to, msg } => self.bus.send(self.id, to, msg),
                 Action::S3 { op, req } => self.spawn_s3(op, req),
-                Action::SetTimer { id, at, .. } => {
+                Action::SetTimer { id, at, kind } => {
                     self.timers.insert(id);
+                    self.timer_kinds.insert(id, kind);
                     let tx = self.tx.clone();
                     let when = self.clock.at(at);
                     tokio::spawn(async move {
@@ -457,6 +501,7 @@ impl Driver {
                 }
                 Action::CancelTimer { id } => {
                     self.timers.remove(&id);
+                    self.timer_kinds.remove(&id);
                 }
                 Action::UploadDirtyChunks { op, .. } => {
                     // No chunks in this simulation: every upload pass is

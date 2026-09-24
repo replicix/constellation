@@ -1030,8 +1030,14 @@ async fn handle_conn<S: PeerService>(
         let inner = inner.clone();
         let service = service.clone();
         let hex = hex.clone();
+        let accepted = std::time::Instant::now();
         tokio::spawn(async move {
             let _permit = permit;
+            tracing::trace!(
+                target: "constellation_net::serve",
+                spawn_us = accepted.elapsed().as_micros() as u64,
+                "stream accepted"
+            );
             let r = handle_stream(&inner, service.as_ref(), &remote_key, &hex, send, recv).await;
             if let Err(e) = r {
                 tracing::debug!(peer = %hex, error = %e, "peer stream ended with an error");
@@ -1052,7 +1058,9 @@ async fn handle_stream<S: PeerService>(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
+    let t0 = std::time::Instant::now();
     let req = read_frame(&mut recv).await?;
+    let read_us = t0.elapsed().as_micros() as u64;
     let (author, payload) = req.verify()?;
     // The signer must be the peer we authorized, so an allowed peer
     // cannot relay a third party's request through its connection.
@@ -1060,6 +1068,12 @@ async fn handle_stream<S: PeerService>(
         tracing::warn!(peer = %hex, "dropping frame signed by a different key");
         return Ok(());
     }
+    let kind = match &payload {
+        Payload::MutateRequest { .. } => "mutate",
+        Payload::BackupAppend { .. } => "append",
+        Payload::StreamAhead { .. } => "ahead",
+        _ => "other",
+    };
     let reply = match payload {
         Payload::SegmentPublished { part, seq, epoch } => {
             service.segment_published(&part, seq, epoch);
@@ -1120,6 +1134,28 @@ async fn handle_stream<S: PeerService>(
         Payload::PeerRtts { node_id, rtts } => {
             service.peer_rtts(node_id, rtts);
             None
+        }
+        Payload::BackupAppend {
+            holder,
+            req_id,
+            epoch,
+            config_version,
+            from,
+            txs,
+            through,
+        } => Some(
+            service
+                .backup_append_requested(holder, req_id, epoch, config_version, from, txs, through)
+                .await,
+        ),
+        Payload::StreamAhead {
+            from,
+            epoch,
+            base,
+            txs,
+        } => {
+            service.stream_ahead(from, epoch, base, txs);
+            Some(Payload::Ok { req_id: 0 })
         }
         Payload::DelegationRequest { path, requester } => {
             Some(service.delegation_requested(path, requester).await)
@@ -1191,13 +1227,24 @@ async fn handle_stream<S: PeerService>(
         | Payload::LogEnd { .. }
         | Payload::MutateReply { .. }
         | Payload::ReadIndexReply { .. }
-        | Payload::ReadRecalled { .. } => None,
+        | Payload::ReadRecalled { .. }
+        | Payload::BackupAck { .. }
+        | Payload::Ok { .. } => None,
     };
+    let served_us = t0.elapsed().as_micros() as u64;
     if let Some(reply) = reply {
         let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
         write_frame(&mut send, &signed).await?;
     }
     let _ = send.finish();
+    tracing::trace!(
+        target: "constellation_net::serve",
+        kind,
+        read_us,
+        served_us,
+        total_us = t0.elapsed().as_micros() as u64,
+        "stream served"
+    );
     Ok(())
 }
 

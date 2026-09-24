@@ -44,6 +44,8 @@ impl Harness {
                         node,
                         connected: false,
                         last_seen: None,
+                        rtt_ms: None,
+                        since: None,
                     })
                     .collect(),
             },
@@ -90,6 +92,13 @@ impl Harness {
             expires_unix_ms: self.now.plus(10_000).0,
             released: false,
             wanted_by: Vec::new(),
+            backups: Vec::new(),
+            config_version: 1,
+            ack_policy: constellation_store_s3::AckPolicy::Local,
+            // A tenure that serves strict reads (plan 30 §M9: the flag is
+            // set by one CAS before the first answer; `a_tenure_marks_
+            // itself_before_its_first_strict_answer` covers that).
+            granted_delegations: true,
         };
         self.core.lease.adopt(self.now, lease, tag(), gate);
         self.meta.set_holder_epoch(epoch);
@@ -226,7 +235,7 @@ fn the_lease_path_resolves_an_in_doubt_rid_from_the_log() {
     let holder = Meta::open_in_memory().unwrap();
     holder.set_node_prefix(2).unwrap();
     let records = constellation_meta::execute_mutate(&holder, &op, Some(rid)).unwrap();
-    crate::replica::Replica::apply_segment(&h.meta, 1, 1, 0, &records).unwrap();
+    crate::replica::Replica::apply_segment(&h.meta, 1, 1, 0, &[], &records).unwrap();
     // The reply never comes; the retries run out; the lease path starts
     // and this node wins the lease outright (no object yet).
     let mut t = timeout;
@@ -286,6 +295,9 @@ fn a_peers_forward_is_busy_while_fenced_and_executes_once_the_gate_opens() {
             takeover: true,
             marker_shipped: true,
             drained: true,
+            fast_prev: None,
+            backup_tail_epoch: None,
+            shippable: false,
         }),
     );
     let rid = Rid {
@@ -534,6 +546,10 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
         expires_unix_ms: h.now.plus(10_000).0,
         released: false,
         wanted_by: Vec::new(),
+        backups: Vec::new(),
+        config_version: 2,
+        ack_policy: constellation_store_s3::AckPolicy::Local,
+        granted_delegations: false,
     };
     let out = h.step(Event::S3 {
         op: reread,
@@ -989,6 +1005,8 @@ fn pair() -> (Harness, Harness) {
                 node,
                 connected: true,
                 last_seen: None,
+                rtt_ms: Some(1),
+                since: Some(Ms(0)),
             })
             .collect(),
     });
@@ -1098,7 +1116,7 @@ fn a_refusal_raises_observed_until_the_segment_lands() {
     let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
     let through = holder.meta.journal_through_after(&seqs).unwrap();
     let records: Vec<_> = batch.into_iter().map(|(_, r)| r).collect();
-    crate::replica::Replica::apply_segment(&requester.meta, 1, 1, through, &records).unwrap();
+    crate::replica::Replica::apply_segment(&requester.meta, 1, 1, through, &[], &records).unwrap();
     for keys in [
         vec![ReadKey::Dentry(ROOT_INO, "a".into())],
         vec![ReadKey::Dir(ROOT_INO)],
@@ -1214,7 +1232,7 @@ fn holder_segment(holder: &mut Harness, name: &str, seq: Seq) -> Vec<u8> {
     Replica::ack_journal(&holder.meta, &seqs, seq, None).unwrap();
     holder.core.ship.next_seq = seq + 1;
     holder.core.ship.head_seq = seq;
-    crate::segment::encode(1, 1, 0, &records).unwrap()
+    crate::segment::encode(1, 1, 0, &[], &records).unwrap()
 }
 
 fn stream_frames(actions: &[Action]) -> Vec<PeerMsg> {
@@ -1935,5 +1953,497 @@ mod cto {
         r.advance(2_000);
         let out = r.step(Event::Timer { id: deadline });
         assert_eq!(answer(&out, 60), ReadAnswer::Degraded);
+    }
+}
+
+/// Plan 30 §M9 + §M10: the claim rule for continuation epochs and the
+/// member backup's watch.
+mod epoch_rules {
+    use super::*;
+    use constellation_store_s3::AckPolicy;
+
+    fn epoch(open: bool, active: bool, members: Vec<NodeId>) -> Event {
+        Event::Control {
+            op: OpId(900),
+            req: Control::Epoch {
+                open,
+                active,
+                frozen: false,
+                flushing: false,
+                base: 0,
+                members,
+            },
+        }
+    }
+
+    fn holder_with(policy: AckPolicy, backups: Vec<NodeId>) -> Harness {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let lease = &mut h.core.lease.held.as_mut().expect("held").0;
+        lease.ack_policy = policy;
+        lease.backups = backups;
+        h
+    }
+
+    /// (a) An `ack=s3` lease is never carried: the epoch activates
+    /// without this node's authority, and the S3 lease stays what it
+    /// was (its acknowledgements wait for S3).
+    #[test]
+    fn an_ack_s3_lease_is_not_carried_into_an_epoch() {
+        let mut h = holder_with(AckPolicy::S3, Vec::new());
+        h.step(epoch(true, true, vec![1, 2]));
+        assert!(!h.core.lease.epoch_held(), "an S3-policy lease was carried");
+        assert!(h.core.lease.held.is_some(), "the S3 lease itself is kept");
+        assert_eq!(h.core.stats.epoch_carry_refused, 1);
+        assert_eq!(
+            h.core.lease.ack_policy(),
+            AckPolicy::S3,
+            "still acknowledging on S3"
+        );
+    }
+
+    /// (a) A `Backup` lease is carried only with every listed backup a
+    /// member; `Local` always.
+    #[test]
+    fn a_backup_lease_is_carried_only_with_every_backup_a_member() {
+        let mut h = holder_with(AckPolicy::Backup, vec![3]);
+        h.step(epoch(true, true, vec![1, 2]));
+        assert!(!h.core.lease.epoch_held(), "backup 3 is outside the epoch");
+        assert_eq!(h.core.stats.epoch_carry_refused, 1);
+        h.step(epoch(false, false, Vec::new()));
+
+        let mut h = holder_with(AckPolicy::Backup, vec![3]);
+        h.step(epoch(true, true, vec![1, 2, 3]));
+        assert!(h.core.lease.epoch_held(), "every backup is a member");
+        assert_eq!(
+            h.core.lease.ack_policy(),
+            AckPolicy::Local,
+            "an epoch acknowledges locally"
+        );
+
+        let mut h = holder_with(AckPolicy::Local, Vec::new());
+        h.step(epoch(true, true, vec![1, 2]));
+        assert!(h.core.lease.epoch_held());
+    }
+
+    /// (a) With a reconfiguration CAS in flight (its outcome unknown) the
+    /// lease is not carried either.
+    #[test]
+    fn a_lease_with_a_reconfiguration_in_flight_is_not_carried() {
+        let mut h = holder_with(AckPolicy::Backup, vec![2]);
+        h.core.ack.reconfig_wanted = Some(vec![2, 3]);
+        h.step(epoch(true, true, vec![1, 2, 3]));
+        assert!(!h.core.lease.epoch_held());
+    }
+
+    /// (b) A member backup runs no seal watch while its epoch is open:
+    /// the holder's silence past `backup_takeover_ms` neither seals nor
+    /// reads the lease. Once the epoch closes the watch resumes with a
+    /// fresh window, and silence then seals.
+    #[test]
+    fn a_member_backup_does_not_seal_while_its_epoch_is_open() {
+        let mut h = Harness::new(2);
+        // Node 1 streams a heartbeat: this node backs it at epoch 1.
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(7),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                from: 1,
+                txs: Vec::new(),
+                through: 0,
+            },
+        });
+        assert!(matches!(
+            sends(&out).as_slice(),
+            [(1, PeerMsg::BackupAck { sealed: false, .. })]
+        ));
+        let watch = timers(&out, TimerKind::BackupWatch);
+        assert_eq!(watch.len(), 1, "the watch is armed: {out:?}");
+        // The epoch opens; the holder falls silent.
+        h.step(epoch(true, true, vec![1, 2]));
+        h.advance(5_000);
+        let out = h.step(Event::Timer { id: watch[0] });
+        assert_eq!(h.core.bk.sealed, 0, "sealed inside an open epoch");
+        assert!(
+            s3_ops(&out).is_empty(),
+            "read the lease inside an open epoch: {out:?}"
+        );
+        assert!(timers(&out, TimerKind::BackupWatch).is_empty());
+        // The epoch closes: the watch resumes with a full window.
+        let out = h.step(epoch(false, false, Vec::new()));
+        let watch = timers(&out, TimerKind::BackupWatch);
+        assert_eq!(watch.len(), 1, "the watch resumes: {out:?}");
+        let out = h.step(Event::Timer { id: watch[0] });
+        assert_eq!(h.core.bk.sealed, 0, "sealed before a full window passed");
+        let watch = timers(&out, TimerKind::BackupWatch);
+        assert_eq!(watch.len(), 1);
+        h.advance(2_000);
+        let out = h.step(Event::Timer { id: watch[0] });
+        assert_eq!(h.core.bk.sealed, 1, "silence after the close seals");
+        assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
+    }
+}
+
+/// Plan 30 §M9: a definitive refusal of a forwarded op is an outcome.
+mod refusal_outcomes {
+    use super::*;
+
+    fn forward(h: &mut Harness, from: NodeId, req: u64, seq: u64, op: MutateOp) -> Vec<Action> {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: Rid {
+                    node: from,
+                    incarnation: 1,
+                    seq,
+                },
+                op,
+                acked_through: 0,
+            },
+        })
+    }
+
+    fn outcome_of(out: &[Action], req: u64) -> MutateOutcome {
+        out.iter()
+            .find_map(|a| match a {
+                Action::Send {
+                    msg:
+                        PeerMsg::MutateReply {
+                            req: r, outcome, ..
+                        },
+                    ..
+                } if *r == OpId(req) => Some(outcome.clone()),
+                _ => None,
+            })
+            .expect("a reply")
+    }
+
+    /// Node 2's unlink of a name that does not exist is refused ENOENT
+    /// and the refusal journaled; the name is then created; a retry of
+    /// the same rid (a lost reply, a replay by rid, an inbox drain)
+    /// answers ENOENT again instead of unlinking the new file.
+    #[test]
+    fn a_refused_forward_is_journaled_and_a_retry_dedups_to_the_same_errno() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let unlink = MutateOp::Unlink {
+            parent: ROOT_INO,
+            name: "f".into(),
+        };
+        let out = forward(&mut h, 2, 1, 1, unlink.clone());
+        assert_eq!(outcome_of(&out, 1), MutateOutcome::Errno(libc::ENOENT));
+        assert_eq!(h.core.stats.refusals_journaled, 1);
+        assert!(
+            matches!(
+                h.meta.completed_outcome(Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 1,
+                }),
+                Ok(Some(constellation_meta::CompletedOutcome::Refused {
+                    errno: libc::ENOENT
+                }))
+            ),
+            "the refusal is a completion"
+        );
+        // The state changes: `f` now exists.
+        let create = h.create("f");
+        let out = forward(&mut h, 3, 2, 1, create);
+        assert!(matches!(
+            outcome_of(&out, 2),
+            MutateOutcome::Accepted { .. }
+        ));
+        // The same rid again: the recorded outcome, not a fresh unlink.
+        let out = forward(&mut h, 2, 3, 1, unlink);
+        assert_eq!(outcome_of(&out, 3), MutateOutcome::Errno(libc::ENOENT));
+        assert_eq!(h.core.stats.forward_dedup_hits, 1);
+        assert!(
+            h.meta.lookup(ROOT_INO, "f").unwrap().is_some(),
+            "the retry unlinked the new file"
+        );
+    }
+}
+
+/// Plan 30 §M9 round 2: pipelined appends and contiguous acknowledgements.
+mod pipelined_appends {
+    use super::*;
+
+    fn appends(out: &[Action]) -> Vec<(OpId, u64, usize)> {
+        out.iter()
+            .filter_map(|a| match a {
+                Action::Send {
+                    to: 2,
+                    msg: PeerMsg::BackupAppend { req, from, txs, .. },
+                } => Some((*req, *from, txs.len())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A holder with node 2 as its candidate backup.
+    fn holder_with_candidate() -> Harness {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        h.core.ack.candidate = Some(2);
+        h.core.ack.peers.insert(
+            2,
+            crate::core::backup::BackupPeer {
+                acked: 0,
+                sent_through: 0,
+                inflight: Default::default(),
+                last_sent: Ms(0),
+                last_progress: h.now,
+                committed: false,
+            },
+        );
+        h
+    }
+
+    fn journal(h: &Harness, name: &str, seq: u64) -> u64 {
+        constellation_meta::execute_mutate(&h.meta, &h.create(name), Some(h.rid(seq))).unwrap();
+        h.meta.journal_tip().unwrap()
+    }
+
+    fn journaled(h: &mut Harness, op: u64) -> Vec<Action> {
+        h.step(Event::Control {
+            op: OpId(op),
+            req: Control::Journaled,
+        })
+    }
+
+    fn ack(h: &mut Harness, req: OpId, acked: u64) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::BackupAck {
+                req,
+                epoch: 1,
+                acked,
+                sealed: false,
+            },
+        })
+    }
+
+    /// Rows journaled while an append is in flight go out at once in a
+    /// second append (up to the pipeline depth), and a cumulative ack
+    /// for the second retires both.
+    #[test]
+    fn appends_pipeline_and_acks_are_cumulative() {
+        let mut h = holder_with_candidate();
+        let tip1 = journal(&h, "a", 1);
+        let out = journaled(&mut h, 900);
+        let first = appends(&out);
+        assert_eq!(first.len(), 1, "{out:?}");
+        assert_eq!(first[0].1, 1);
+        let tip2 = journal(&h, "b", 2);
+        let out = journaled(&mut h, 901);
+        let second = appends(&out);
+        assert_eq!(
+            second.len(),
+            1,
+            "a second append while the first is in flight: {out:?}"
+        );
+        assert_eq!(second[0].1, tip1 + 1);
+        assert_eq!(h.core.ack.peers[&2].inflight.len(), 2);
+        // The second batch's ack covers both.
+        ack(&mut h, second[0].0, tip2);
+        let p = &h.core.ack.peers[&2];
+        assert_eq!(p.acked, tip2);
+        assert!(p.inflight.is_empty(), "{:?}", p.inflight);
+        // The late first ack changes nothing.
+        ack(&mut h, first[0].0, tip1);
+        assert_eq!(h.core.ack.peers[&2].acked, tip2);
+    }
+
+    /// The oldest append answered short (its rows did not land): the
+    /// holder resends from what the backup holds.
+    #[test]
+    fn a_short_ack_for_the_oldest_append_resends_from_the_hold() {
+        let mut h = holder_with_candidate();
+        journal(&h, "a", 1);
+        let first = appends(&journaled(&mut h, 900));
+        let tip2 = journal(&h, "b", 2);
+        let second = appends(&journaled(&mut h, 901));
+        // The second batch arrived first at the backup: acked 0.
+        ack(&mut h, second[0].0, 0);
+        assert_eq!(h.core.ack.peers[&2].inflight.len(), 1);
+        // The first batch was lost on the wire.
+        let out = h.step(Event::PeerFailed {
+            req: first[0].0,
+            to: 2,
+            outage: false,
+        });
+        let resend = appends(&out);
+        assert_eq!(resend.len(), 1, "{out:?}");
+        assert_eq!(resend[0].1, 1, "resent from the backup's hold");
+        assert_eq!(resend[0].2, 2, "both transactions again");
+        ack(&mut h, resend[0].0, tip2);
+        assert_eq!(h.core.ack.peers[&2].acked, tip2);
+    }
+
+    /// Round 2: rows shipped and dropped out of order behind a held-back
+    /// transaction leave holes in the journal; the holder streams them
+    /// as empty transactions up to the tip, the backup's hold steps over
+    /// them, and the candidate counts as caught up.
+    #[test]
+    fn holes_in_the_journal_stream_as_empty_transactions_up_to_the_tip() {
+        let mut h = holder_with_candidate();
+        journal(&h, "a", 1);
+        journal(&h, "b", 2);
+        let tip = journal(&h, "c", 3);
+        let txs = h.meta.journal_txs_from(1, 1000).unwrap();
+        assert_eq!(txs.len(), 3);
+        // The second and third transactions shipped out of order (the
+        // first is held back): their rows are gone, the tip stays.
+        let rows: Vec<u64> = (txs[1].first..=txs[2].last).collect();
+        h.meta.ack_journal_rows_at(&rows, 1).unwrap();
+        assert_eq!(h.meta.journal_tip().unwrap(), tip);
+        let out = journaled(&mut h, 900);
+        let sent = appends(&out);
+        assert_eq!(sent.len(), 1, "{out:?}");
+        let batch = out
+            .iter()
+            .find_map(|a| match a {
+                Action::Send {
+                    to: 2,
+                    msg: PeerMsg::BackupAppend { txs, .. },
+                } => Some(txs.clone()),
+                _ => None,
+            })
+            .expect("the append");
+        assert_eq!(batch.len(), 2, "{batch:?}");
+        assert_eq!(batch[0], txs[0]);
+        assert_eq!((batch[1].first, batch[1].last), (txs[1].first, tip));
+        assert!(batch[1].records.is_empty(), "a hole to the tip");
+        // The backup persists the hole and acknowledges through the tip.
+        let mut b = Harness::new(2);
+        let out = b.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(7),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                from: 1,
+                txs: batch,
+                through: 0,
+            },
+        });
+        let acked = out
+            .iter()
+            .find_map(|a| match a {
+                Action::Send {
+                    msg: PeerMsg::BackupAck { acked, .. },
+                    ..
+                } => Some(*acked),
+                _ => None,
+            })
+            .expect("an ack");
+        assert_eq!(acked, tip);
+        assert_eq!(b.meta.backup_acked(1).unwrap(), tip);
+        // Its ack makes the candidate caught up: the holder wants it
+        // listed.
+        ack(&mut h, sent[0].0, tip);
+        h.step(Event::Timer {
+            id: h.core.ack.tick_timer.expect("a backup tick armed"),
+        });
+        assert!(
+            h.core.ack.reconfig.is_some() || h.core.ack.reconfig_wanted == Some(vec![2]),
+            "caught up: the reconfiguration is wanted or in flight"
+        );
+    }
+
+    /// Round 2: a backup answering short for the same rows over and over
+    /// makes no progress; the holder resends once per short answer (not
+    /// once per append in flight) and the timeout rule drops it.
+    #[test]
+    fn a_stuck_backup_is_resent_to_once_and_then_dropped() {
+        let mut h = holder_with_candidate();
+        journal(&h, "a", 1);
+        let first = appends(&journaled(&mut h, 900));
+        journal(&h, "b", 2);
+        let second = appends(&journaled(&mut h, 901));
+        assert_eq!(h.core.ack.peers[&2].inflight.len(), 2);
+        // The oldest comes back short: one resend, the other in-flight
+        // append forgotten (its short ack would resend the same rows).
+        let out = ack(&mut h, first[0].0, 0);
+        let resend = appends(&out);
+        assert_eq!(resend.len(), 1, "{out:?}");
+        assert_eq!(resend[0].1, 1);
+        assert_eq!(h.core.ack.peers[&2].inflight.len(), 1);
+        assert!(appends(&ack(&mut h, second[0].0, 0)).is_empty());
+        // Short answers are not progress: the candidate times out.
+        let started = h.now;
+        let timeout = h.core.cfg.backup_ack_timeout_ms as i64;
+        let mut req = resend[0].0;
+        while h.core.ack.candidate.is_some() && h.now.since(started) < 4 * timeout {
+            h.advance(50);
+            let out = ack(&mut h, req, 0);
+            if let Some(r) = appends(&out).first() {
+                req = r.0;
+            }
+            if let Some(id) = h.core.ack.tick_timer {
+                h.step(Event::Timer { id });
+            }
+        }
+        assert!(h.core.ack.candidate.is_none(), "dropped");
+        assert!(h.core.stats.backup_ack_timeouts >= 1);
+    }
+
+    /// The backup side: a batch that overtook an earlier one is
+    /// persisted but acknowledged only once the gap closes, and the ack
+    /// then names the whole contiguous hold.
+    #[test]
+    fn a_backup_acknowledges_its_contiguous_hold() {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        journal(&holder, "a", 1);
+        journal(&holder, "b", 2);
+        let txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+        assert_eq!(txs.len(), 2);
+        let mut b = Harness::new(2);
+        let append = |b: &mut Harness, req: u64, tx: &constellation_meta::BackupTx| {
+            let out = b.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::BackupAppend {
+                    req: OpId(req),
+                    epoch: 1,
+                    holder: 1,
+                    config_version: 2,
+                    from: tx.first,
+                    txs: vec![tx.clone()],
+                    through: 0,
+                },
+            });
+            out.iter()
+                .find_map(|a| match a {
+                    Action::Send {
+                        msg:
+                            PeerMsg::BackupAck {
+                                req: r,
+                                acked,
+                                sealed,
+                                ..
+                            },
+                        ..
+                    } if *r == OpId(req) => Some((*acked, *sealed)),
+                    _ => None,
+                })
+                .expect("an ack")
+        };
+        assert_eq!(
+            append(&mut b, 1, &txs[1]),
+            (0, false),
+            "ahead of a gap: not acknowledged"
+        );
+        assert_eq!(
+            append(&mut b, 2, &txs[0]),
+            (txs[1].last, false),
+            "the gap closed: both"
+        );
+        assert_eq!(b.meta.backup_acked(1).unwrap(), txs[1].last);
     }
 }

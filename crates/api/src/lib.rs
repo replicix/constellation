@@ -10,15 +10,15 @@ pub mod types;
 pub mod web;
 
 pub use types::{
+    AckStatus, CasProbeStatus, CtoStatus, HeldInodeStatus, HeldStatus, LogStreamStatus,
+    PeerPathsStatus, SessionStatus,
+};
+pub use types::{
     AtimeStatus, CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry,
     DoctorStatus, DownloadSession, EpochStatus, InboxStatus, InspectStatus, LeaseStatus,
     ManifestStatus, MountInfo, MountViewOpts, P2pStatus, PeerStatus, PinStatus, PrefetchStatus,
     PruneRootStatus, PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response,
     SnapshotStatus, SourceStatus, SpeculationStatus, SpoolStatus, StatusReport, WritebackStatus,
-};
-pub use types::{
-    CasProbeStatus, CtoStatus, HeldInodeStatus, HeldStatus, LogStreamStatus, PeerPathsStatus,
-    SessionStatus,
 };
 
 use anyhow::{Context, Result};
@@ -413,6 +413,7 @@ mod tests {
                 held: HeldStatus::default(),
                 session: SessionStatus::default(),
                 cto: crate::CtoStatus::default(),
+                ack: crate::AckStatus::default(),
                 coop: CoopStatus::default(),
                 prefetch: PrefetchStatus::default(),
                 writeback: WritebackStatus::default(),

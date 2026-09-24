@@ -15,8 +15,9 @@
 use crate::ids::{Epoch, Seq};
 use constellation_fs_core::Ino;
 use constellation_meta::{
-    execute_mutate, CompletedOutcome, InboxAck, JournalBatch, JournalPos, KeySet, LogRecord, Meta,
-    MetaError, MetaStore, MutateOp, Position, ReadDelegations, Rid, Stranded, StrandedOp, TouchSet,
+    execute_mutate, BackupRole, BackupTx, CompletedOutcome, InboxAck, JournalBatch, JournalPos,
+    KeySet, LogRecord, Meta, MetaError, MetaStore, MutateOp, Position, ReadDelegations, Rid,
+    Stranded, StrandedOp, TouchSet,
 };
 
 /// What applying a foreign segment did (`Meta::apply_segment`).
@@ -73,6 +74,10 @@ pub trait Replica {
     ) -> Result<Vec<LogRecord>, MetaError>;
     /// Journal a refusal (`Refused { rid, errno }`) with its position.
     fn journal_inbox_refusal(&self, rid: Rid, errno: i32, ack: InboxAck) -> Result<(), MetaError>;
+    /// Plan 30 §M9: journal a forwarded op's definitive refusal by rid
+    /// (`Meta::journal_refusal`), so every later execution of the rid
+    /// dedups to the same errno.
+    fn journal_refusal(&self, rid: Rid, errno: i32) -> Result<(), MetaError>;
     /// The journal seq the next row lands at, and the highest shipped.
     fn journal_next_seq(&self) -> Result<u64, MetaError>;
     fn journal_acked_seq(&self) -> Result<u64, MetaError>;
@@ -102,6 +107,9 @@ pub trait Replica {
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError>;
     fn forget_replay(&self, queue_seq: u64) -> Result<(), MetaError>;
     fn mark_replay_refused(&self, queue_seq: u64, reason: String) -> Result<(), MetaError>;
+    /// Plan 30 §M9: a queued replay of an op this node executed but never
+    /// acknowledged: refused, it is forgotten, not copied.
+    fn mark_replay_unacked(&self, queue_seq: u64) -> Result<(), MetaError>;
     /// Whether the holder captures before-images (a deposition then
     /// rolls back from them; without them the namespace is rebuilt).
     fn holder_capture(&self) -> bool;
@@ -129,12 +137,14 @@ pub trait Replica {
     /// segment's `(epoch, through)`), retire their speculation.
     fn ack_journal(&self, seqs: &[u64], at: Seq, pos: Option<JournalPos>) -> Result<(), MetaError>;
     /// Apply a foreign segment: strand what its epoch supersedes, apply,
-    /// retire, advance the applied position (to `(epoch, through)` too).
+    /// retire (plan 30 §M9: the streamed transactions `rows` confirm
+    /// too), advance the applied position (to `(epoch, through)` too).
     fn apply_segment(
         &self,
         seq: Seq,
         epoch: Epoch,
         through: u64,
+        rows: &[u64],
         records: &[LogRecord],
     ) -> Result<Applied, MetaError>;
     /// A fenced segment (older epoch): advance the position past it
@@ -187,6 +197,50 @@ pub trait Replica {
         dir: bool,
         child: Option<(&str, Option<Ino>)>,
     ) -> bool;
+
+    // ---- plan 30 §M9: backups, streaming, the durability gate ----
+
+    /// The holder's journal transactions from journal seq `from` on
+    /// (whole transactions, at most `max_rows` rows), for a backup append
+    /// or a pre-S3 stream batch.
+    fn journal_txs_from(&self, from: u64, max_rows: usize) -> Vec<BackupTx>;
+    /// The highest journal seq allocated (0: none).
+    fn journal_tip(&self) -> u64;
+    /// Backup side: persist the holder's transactions (`true` when
+    /// committed — the acknowledgement's meaning).
+    fn backup_append(&self, epoch: Epoch, txs: &[BackupTx]) -> bool;
+    fn backup_acked(&self, epoch: Epoch) -> u64;
+    fn backup_tail(&self, epoch: Epoch) -> Vec<BackupTx>;
+    /// A segment of `epoch` shipped through `through` with journal
+    /// `rows`: trim what it confirms (and every older epoch).
+    fn backup_trim(&self, epoch: Epoch, through: u64, rows: &[u64]);
+    fn backup_clear(&self);
+    fn backup_role(&self) -> Option<BackupRole>;
+    fn set_backup_role(&self, role: BackupRole);
+    /// Persist the seal (`true` when durable — only then is a takeover
+    /// attempted).
+    fn backup_seal(&self, epoch: Epoch) -> bool;
+    fn backup_sealed_epoch(&self) -> Epoch;
+    /// A takeover re-applies one of the predecessor's transactions into
+    /// this node's own journal (plan 30 §M3b's replay-from-records path),
+    /// completing `rid` once.
+    fn apply_records_journaled(
+        &self,
+        records: &[LogRecord],
+        rid: Option<Rid>,
+    ) -> Result<(), MetaError>;
+    /// Install a streamed transaction ahead of the log
+    /// (`SpecKind::Streamed`).
+    fn install_streamed(
+        &self,
+        epoch: Epoch,
+        first: u64,
+        last: u64,
+        records: &[LogRecord],
+    ) -> Result<(), MetaError>;
+    /// The holder's durability watermark for its own reads
+    /// (`Meta::durability_pending`).
+    fn set_durable(&self, gate: bool, jseq: u64, lost: bool);
 
     // ---- holder state ----
 
@@ -276,6 +330,10 @@ impl Replica for Meta {
         Meta::journal_inbox_refusal(self, rid, errno, ack)
     }
 
+    fn journal_refusal(&self, rid: Rid, errno: i32) -> Result<(), MetaError> {
+        Meta::journal_refusal(self, rid, errno)
+    }
+
     fn journal_next_seq(&self) -> Result<u64, MetaError> {
         Meta::journal_next_seq(self)
     }
@@ -317,6 +375,10 @@ impl Replica for Meta {
 
     fn forget_replay(&self, queue_seq: u64) -> Result<(), MetaError> {
         Meta::forget_replay(self, queue_seq)
+    }
+
+    fn mark_replay_unacked(&self, queue_seq: u64) -> Result<(), MetaError> {
+        Meta::mark_replay_unacked(self, queue_seq)
     }
 
     fn mark_replay_refused(&self, queue_seq: u64, reason: String) -> Result<(), MetaError> {
@@ -373,10 +435,11 @@ impl Replica for Meta {
         seq: Seq,
         epoch: Epoch,
         through: u64,
+        rows: &[u64],
         records: &[LogRecord],
     ) -> Result<Applied, MetaError> {
         let pending: TouchSet = Meta::pending_touches(self)?;
-        let applied = Meta::apply_segment(self, seq, epoch, records, &pending)?;
+        let applied = Meta::apply_segment_rows(self, seq, epoch, through, rows, records, &pending)?;
         self.note_foreign_applied(records);
         // Plan 30 §M8: a newer epoch voids the delegations an older
         // holder granted (each was capped by that holder's lease, which is
@@ -464,6 +527,78 @@ impl Replica for Meta {
         child: Option<(&str, Option<Ino>)>,
     ) -> bool {
         Meta::unshipped_touches_read(self, ino, dir, child)
+    }
+
+    fn journal_txs_from(&self, from: u64, max_rows: usize) -> Vec<BackupTx> {
+        Meta::journal_txs_from(self, from, max_rows).unwrap_or_default()
+    }
+
+    fn journal_tip(&self) -> u64 {
+        Meta::journal_tip(self).unwrap_or(0)
+    }
+
+    fn backup_append(&self, epoch: Epoch, txs: &[BackupTx]) -> bool {
+        match Meta::backup_append(self, epoch, txs) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "persisting a backup append failed; not acknowledging");
+                false
+            }
+        }
+    }
+
+    fn backup_acked(&self, epoch: Epoch) -> u64 {
+        Meta::backup_acked(self, epoch).unwrap_or(0)
+    }
+
+    fn backup_tail(&self, epoch: Epoch) -> Vec<BackupTx> {
+        Meta::backup_tail(self, epoch).unwrap_or_default()
+    }
+
+    fn backup_trim(&self, epoch: Epoch, through: u64, rows: &[u64]) {
+        let _ = Meta::backup_trim(self, epoch, through, rows);
+    }
+
+    fn backup_clear(&self) {
+        let _ = Meta::backup_clear(self);
+    }
+
+    fn backup_role(&self) -> Option<BackupRole> {
+        Meta::backup_role(self).ok().flatten()
+    }
+
+    fn set_backup_role(&self, role: BackupRole) {
+        let _ = Meta::set_backup_role(self, role);
+    }
+
+    fn backup_seal(&self, epoch: Epoch) -> bool {
+        Meta::backup_seal(self, epoch).is_ok()
+    }
+
+    fn backup_sealed_epoch(&self) -> Epoch {
+        Meta::backup_sealed_epoch(self).unwrap_or(0)
+    }
+
+    fn apply_records_journaled(
+        &self,
+        records: &[LogRecord],
+        rid: Option<Rid>,
+    ) -> Result<(), MetaError> {
+        Meta::apply_records_journaled_completing(self, records, rid)
+    }
+
+    fn install_streamed(
+        &self,
+        epoch: Epoch,
+        first: u64,
+        last: u64,
+        records: &[LogRecord],
+    ) -> Result<(), MetaError> {
+        Meta::install_streamed(self, epoch, first, last, records)
+    }
+
+    fn set_durable(&self, gate: bool, jseq: u64, lost: bool) {
+        self.session().set_durable(gate, jseq, lost)
     }
 
     fn set_holder_epoch(&self, epoch: Epoch) {

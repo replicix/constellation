@@ -72,6 +72,13 @@
 //! `with_stale_base_shadows(true)`), and `tests/positions.rs` keeps those
 //! counterexamples.
 //!
+//! Plan 30 §M9 (module [`backup`]) is a third focused model: the
+//! synchronous backup, the seal, reconfiguration by CAS and `ack=s3`,
+//! with "no acknowledged write is lost under a single failure" and the
+//! acknowledgement order against the log; and [`cto`] gains the fast
+//! takeover (a seal, or `ack=s3`) with the successor's delegation
+//! horizon and the old holder's liveness probe.
+//!
 //! Plan 30 §M8 (module [`cto`]) is a second, focused model: `cto=strict`
 //! reads (ReadIndex, read delegations with recall, lease-capped grants,
 //! recall before release) over per-node clocks with bounded drift, and
@@ -304,6 +311,7 @@
 //!     hint is a latency optimization of the same rule. Reads record no
 //!     history events and are not linearizability-checked.
 
+pub mod backup;
 pub mod cto;
 pub mod inbox;
 pub mod namespace;

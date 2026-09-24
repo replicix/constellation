@@ -424,6 +424,9 @@ pub struct StatusReport {
     /// Plan 30 §M8: `cto=strict` and read delegations.
     #[serde(default)]
     pub cto: CtoStatus,
+    /// Plan 30 §M9: acknowledgement policy, backups, seals.
+    #[serde(default)]
+    pub ack: AckStatus,
     /// Cooperative cache (phase 5, DESIGN.md §7).
     #[serde(default)]
     pub coop: CoopStatus,
@@ -1182,6 +1185,97 @@ pub struct HeldInodeStatus {
     /// Held transactions whose manifest names them.
     #[serde(default)]
     pub seeds: u64,
+}
+
+/// Plan 30 §M9: the acknowledgement policy, backups and seals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AckStatus {
+    /// This mount asks for `ack=s3`.
+    #[serde(default)]
+    pub ack_s3: bool,
+    /// The policy of the lease this node holds: "local", "backup", "s3",
+    /// or "-" when it holds none.
+    #[serde(default)]
+    pub policy: String,
+    #[serde(default)]
+    pub backups: Vec<u64>,
+    #[serde(default)]
+    pub candidate: Option<u64>,
+    #[serde(default)]
+    pub config_version: u64,
+    /// The durable journal seq (min over the backups' acks, or the
+    /// shipped-through seq under `s3`); `u64::MAX` when nothing gates.
+    #[serde(default)]
+    pub durable: u64,
+    /// Acknowledgements parked for durability right now.
+    #[serde(default)]
+    pub parked_acks: u64,
+    /// The fast path is closed (local writes go through the core).
+    #[serde(default)]
+    pub gated: bool,
+    // ---- this node as a backup ----
+    #[serde(default)]
+    pub backing_holder: u64,
+    #[serde(default)]
+    pub backing_epoch: u64,
+    #[serde(default)]
+    pub backing_acked: u64,
+    #[serde(default)]
+    pub sealed_epoch: u64,
+    // ---- counters ----
+    #[serde(default)]
+    pub backups_added: u64,
+    #[serde(default)]
+    pub backups_removed: u64,
+    #[serde(default)]
+    pub reconfig_cas: u64,
+    #[serde(default)]
+    pub backup_appends: u64,
+    #[serde(default)]
+    pub backup_acks: u64,
+    #[serde(default)]
+    pub backup_ack_timeouts: u64,
+    #[serde(default)]
+    pub acks_waited: u64,
+    #[serde(default)]
+    pub ack_wait_ms_total: u64,
+    #[serde(default)]
+    pub acks_aborted: u64,
+    #[serde(default)]
+    pub streamed_ahead: u64,
+    #[serde(default)]
+    pub streamed_installed: u64,
+    #[serde(default)]
+    pub streamed_dropped: u64,
+    #[serde(default)]
+    pub backup_persisted: u64,
+    #[serde(default)]
+    pub seals: u64,
+    #[serde(default)]
+    pub backup_takeovers: u64,
+    #[serde(default)]
+    pub backup_tail_applied: u64,
+    #[serde(default)]
+    pub s3_fast_takeovers: u64,
+    #[serde(default)]
+    pub ack_floor_waits: u64,
+    #[serde(default)]
+    pub stale_liveness_refusals: u64,
+    /// Plan 30 §M10's claim rule: continuation-epoch activations that
+    /// did not carry this node's lease (an `ack=s3` lease, or a backup
+    /// outside the epoch).
+    #[serde(default)]
+    pub epoch_carry_refused: u64,
+    /// Plan 30 §M9: definitive refusals of forwarded ops journaled as
+    /// outcomes, and refused replays of never-acknowledged ops.
+    #[serde(default)]
+    pub refusals_journaled: u64,
+    #[serde(default)]
+    pub unacked_replays_refused: u64,
+    /// Holder-local reads that waited for durability of the unshipped
+    /// rows they would have observed.
+    #[serde(default)]
+    pub reads_durability_blocked: u64,
 }
 
 /// Partition lease state (DESIGN.md §4). `held` is this node's own

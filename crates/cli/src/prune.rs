@@ -743,6 +743,7 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
             op,
             rid,
             policy: constellation_authority::Policy::System,
+            in_doubt: false,
             reply,
         })
         .is_err()

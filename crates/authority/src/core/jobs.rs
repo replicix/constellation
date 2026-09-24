@@ -408,6 +408,8 @@ impl Core {
             };
             replica.ack_journal(&seqs, seq, Some(seg.journal_pos()))?;
             self.stats.own_recovered += 1;
+            // Plan 30 §M9: durable in the log, whichever way we learned it.
+            self.note_shipped(&seqs, seg.through);
             tracing::info!(
                 node = self.cfg.node_id,
                 seq,
@@ -434,7 +436,8 @@ impl Core {
             );
             replica.skip_segment(seq)?;
         } else {
-            let applied = replica.apply_segment(seq, seg.epoch, seg.through, &seg.records)?;
+            let applied =
+                replica.apply_segment(seq, seg.epoch, seg.through, &seg.rows, &seg.records)?;
             tracing::debug!(
                 node = self.cfg.node_id,
                 seq,
@@ -451,16 +454,25 @@ impl Core {
                     (applied.stranded.shadows + applied.stranded.hints) as u64;
                 self.stats.local_rolled_back += applied.stranded.locals as u64;
             }
-            // A segment above the epoch we hold is a deposition we have
-            // not been told about: probe it at the next round.
+            // A segment above the epoch we hold is a deposition: only a
+            // lease CAS winner can have written it. Plan 30 §M9: give the
+            // lease up at once (a fast takeover's fence), not at the next
+            // renewal — a deposed holder must stop answering strict reads
+            // as soon as it can know.
             if let Some(mine) = self.lease.epoch() {
                 if seg.epoch > mine && !self.lease.lost && !self.lease.epoch_held() {
                     self.ship.renew_now = true;
+                    if self.lease.held.is_some() {
+                        self.deposed(now, seg.node, seg.epoch, mine, replica, out);
+                    }
                 }
             }
             if seg.node != 0 && seg.epoch >= self.ship.max_epoch {
                 self.lease.cached_holder = Some(seg.node);
             }
+            // Plan 30 §M9: a backup's tail is trimmed by the log itself;
+            // the pre-S3 stream cursor follows the log.
+            self.backup_note_segment(seg.epoch, seg.through, &seg.rows, replica);
         }
         self.ship.max_epoch = self.ship.max_epoch.max(seg.epoch);
         self.ship.next_seq = seq + 1;
@@ -485,13 +497,21 @@ impl Core {
         if self.skip_ship {
             return Ok(false);
         }
-        let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) else {
+        let Some(epoch) = self.lease.journal_ship_epoch(now, &self.cfg) else {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                held = self.lease.held.is_some(),
+                lost = self.lease.lost,
+                gate = self.lease.gate.is_some(),
+                "not shipping: no ship epoch"
+            );
             return Ok(false);
         };
         let batch = replica
             .take_journal(self.cfg.segment_batch)
             .map_err(|e| e.to_string())?;
         if batch.is_empty() {
+            tracing::trace!(node = self.cfg.node_id, "not shipping: empty batch");
             return Ok(false);
         }
         let mut records: Vec<LogRecord> = batch.iter().map(|(_, r)| r.clone()).collect();
@@ -534,7 +554,7 @@ impl Core {
         let through = replica
             .journal_through_after(&seqs)
             .map_err(|e| e.to_string())?;
-        let payload = segment::encode(self.cfg.node_id, epoch, through, &records)
+        let payload = segment::encode(self.cfg.node_id, epoch, through, &seqs, &records)
             .map_err(|e| e.to_string())?;
         let seq = self.ship.next_seq;
         let op = self.issue_s3(
@@ -597,7 +617,7 @@ impl Core {
             })
             .collect();
         let through = replica.journal_acked_seq().unwrap_or(0);
-        let Ok(payload) = segment::encode(self.cfg.node_id, epoch, through, &records) else {
+        let Ok(payload) = segment::encode(self.cfg.node_id, epoch, through, &[], &records) else {
             return false;
         };
         let atime_inos: Vec<Ino> = rows.iter().map(|(ino, _, _)| *ino).collect();
@@ -686,6 +706,9 @@ impl Core {
         }
         self.stats.segments_shipped += 1;
         self.note_shipped_touches(seq, &payload);
+        // Plan 30 §M9: these rows are durable in the log (`ack=s3`'s
+        // acknowledgements, and a backup's, wait for exactly this).
+        self.note_shipped(seqs, through);
         tracing::debug!(
             target: "constellation_authority::stream",
             node = self.cfg.node_id,
@@ -736,8 +759,8 @@ impl Core {
         // Plan 30 §M6: the new tenure's journal position starts here, above
         // every position of the tenure it ends.
         let through = replica.journal_acked_seq().unwrap_or(0);
-        let payload =
-            segment::encode(self.cfg.node_id, gate.epoch, through, &[]).expect("empty segment");
+        let payload = segment::encode(self.cfg.node_id, gate.epoch, through, &[], &[])
+            .expect("empty segment");
         let seq = self.ship.next_seq;
         let op = self.issue_s3(S3Op::SegmentPut { seq, payload }, S3For::Job, out);
         self.set_phase(Phase::Marker { attempts }, Some(op));
@@ -787,8 +810,24 @@ impl Core {
                 Err(e) => return GateStep::Failed(e.to_string()),
             }
         }
+        // Plan 30 §M9: what this node held as the predecessor's backup
+        // goes into its own journal now, in journal order — before the
+        // replay of anything stranded, so the replay finds it completed.
+        if let Some(prev_epoch) = gate.backup_tail_epoch {
+            if let Err(e) = self.apply_backup_tail(prev_epoch, replica) {
+                return GateStep::Failed(e);
+            }
+            if let Some(g) = self.lease.gate.as_mut() {
+                g.backup_tail_epoch = None;
+            }
+        }
         if let Err(e) = self.replay_queue_locally(now, replica, out) {
             return GateStep::Failed(e.to_string());
+        }
+        // Plan 30 §M9: the journal work is done; what waits now (the
+        // quarantine, the drain) keeps the view closed, not the shipper.
+        if let Some(g) = self.lease.gate.as_mut() {
+            g.shippable = true;
         }
         if !gate.drained {
             if replica.read_delegations().quarantine_until() > now.0 {
@@ -831,7 +870,7 @@ impl Core {
         self.ship.max_epoch = self.ship.max_epoch.max(epoch);
         self.stats.epoch_markers += 1;
         let payload =
-            segment::encode(self.cfg.node_id, epoch, through, &[]).expect("empty segment");
+            segment::encode(self.cfg.node_id, epoch, through, &[], &[]).expect("empty segment");
         self.stream_passed(now, seq, epoch, &payload, out);
         out.push(Action::Announce {
             seq,
@@ -844,11 +883,24 @@ impl Core {
             epoch,
             "shipped the takeover's epoch marker"
         );
+        // Plan 30 §M9: a fast takeover's acknowledgement floor counts
+        // from here.
+        self.note_marker_landed(now, replica, out);
         Ok(())
     }
 
     /// `LeaseKeeper::mark_lost` plus what the keeper's callers do next.
-    fn deposed(&mut self, holder: NodeId, epoch: Epoch, my_epoch: Epoch, replica: &dyn Replica) {
+    /// Plan 30 §M9: every acknowledgement parked for durability is
+    /// answered as not given (the requester retries by rid).
+    pub(crate) fn deposed(
+        &mut self,
+        now: Ms,
+        holder: NodeId,
+        epoch: Epoch,
+        my_epoch: Epoch,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         tracing::error!(
             node = self.cfg.node_id,
             new_holder = holder,
@@ -860,6 +912,24 @@ impl Core {
         replica.set_holder_epoch(0);
         let _ = replica.persist_lost(true);
         self.inbox.holder = None;
+        self.ack_abort_parked(now, replica, out);
+    }
+
+    /// Plan 30 §M9: whether the job in the slot has a lease CAS (or its
+    /// re-read) in flight — a reconfiguration waits for it rather than
+    /// racing our own renewal or release on the object's version.
+    pub(crate) fn lease_cas_in_flight(&self) -> bool {
+        match &self.job {
+            None => false,
+            Some(job) => matches!(
+                job.phase,
+                Phase::Renew { .. }
+                    | Phase::RenewReread { .. }
+                    | Phase::Release
+                    | Phase::ReleaseReread
+                    | Phase::Cas { .. }
+            ),
+        }
     }
 
     /// `recovery::recover_deposed` after the tail to head: roll back from
@@ -908,6 +978,7 @@ impl Core {
         replica.persist_lost(false).map_err(|e| e.to_string())?;
         self.stats.depositions += 1;
         self.stats.local_rolled_back += rolled;
+        self.mark_unacked_replays(replica);
         let queued = replica.pending_replays().map(|q| q.len()).unwrap_or(0);
         let summary = format!(
             "deposition recovered: {rolled} unshipped transaction(s) {how}; \
@@ -962,6 +1033,12 @@ impl Core {
         if self.lease.ship_epoch(now, &self.cfg).is_none() || self.lease.epoch_held() {
             return false;
         }
+        if self.ship.probe_now {
+            // Plan 30 §M9: a strict read waits for proof of S3 liveness.
+            self.ship.probe_now = false;
+            self.ship.held_tail_at = Some(now);
+            return false;
+        }
         match self.ship.held_tail_at {
             Some(at) if now.since(at) < self.cfg.held_tail_staleness_ms as i64 => true,
             Some(_) => {
@@ -985,6 +1062,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.nudged = false;
+        tracing::trace!(node = self.cfg.node_id, poll_triggered, "round begins");
         self.job = Some(Job {
             what: What::Round {
                 poll_triggered,
@@ -1537,7 +1615,7 @@ impl Core {
         if let Some((lease, _)) = &object {
             self.lease.note_object(now, lease);
         }
-        let plan = self.lease.classify(now, &self.cfg, object);
+        let plan = self.lease.classify(now, &self.cfg, object, self.bk.sealed);
         match plan {
             Plan::Held => {
                 self.acquire_gate(now, replica, out);
@@ -1583,7 +1661,12 @@ impl Core {
                     } => (*ask_handoff, *attempts),
                     _ => (false, 0),
                 };
-                if ask && self.cfg.p2p && attempts == 0 && holder != self.cfg.node_id {
+                // (Not while a takeover permit names this holder: it is
+                // known silent, and the permit's own rule decides when
+                // the lease is claimable.)
+                let permitted = self.lease.takeover_permit == Some((epoch, holder));
+                if ask && self.cfg.p2p && attempts == 0 && holder != self.cfg.node_id && !permitted
+                {
                     let req = self.op_id();
                     self.set_phase(
                         Phase::LeaseRequest {
@@ -1663,9 +1746,34 @@ impl Core {
             epoch,
             takeover,
             marker,
+            policy = ?lease.ack_policy,
             "acquired the lease"
         );
         replica.set_holder_epoch(epoch);
+        // Plan 30 §M9: a takeover of an unexpired lease (a seal, or
+        // `ack=s3`) is what the permit allowed; the predecessor's
+        // strict-read horizon becomes this tenure's acknowledgement floor
+        // once the marker lands, and a backup's tail is re-applied inside
+        // the gate.
+        self.lease.takeover_permit = None;
+        let fast_prev = prev
+            .as_ref()
+            .filter(|p| {
+                takeover && !p.released && !p.is_expired(now.0) && p.holder != self.cfg.node_id
+            })
+            .map(|p| (p.expires_unix_ms, p.granted_delegations));
+        if let Some(p) = prev.as_ref().filter(|_| fast_prev.is_some()) {
+            self.note_fast_takeover(p);
+        }
+        let backup_tail_epoch = prev
+            .as_ref()
+            .filter(|p| takeover && p.holder != self.cfg.node_id)
+            .and_then(|p| {
+                self.bk
+                    .role
+                    .filter(|r| r.epoch == p.epoch && r.holder == p.holder)
+            })
+            .map(|r| r.epoch);
         // Plan 30 §M3 takeover gate; M13: every acquisition drains the
         // older epochs' inbox before its view opens.
         let gate = PendingGate {
@@ -1673,6 +1781,9 @@ impl Core {
             takeover,
             marker_shipped: !marker,
             drained: !self.cfg.inbox,
+            fast_prev,
+            backup_tail_epoch,
+            shippable: false,
         };
         if takeover {
             self.stats.takeovers += 1;
@@ -1967,7 +2078,10 @@ impl Core {
             }
             // ---- renewal ----
             (Phase::Renew { .. }, S3Result::LeasePut(Ok(tag))) => {
-                let (mine, _) = self.lease.held.clone().expect("held");
+                let Some((mine, _)) = self.lease.held.clone() else {
+                    self.lease_gone_mid_job(now, kind, replica, out);
+                    return;
+                };
                 let renewed = self.lease.renewed_lease(now, &self.cfg, &mine);
                 self.lease.renewed(now, renewed, tag);
                 self.ship.renew_now = false;
@@ -1989,7 +2103,10 @@ impl Core {
                 );
             }
             (Phase::RenewReread { final_probe }, S3Result::LeaseGet(Ok(current))) => {
-                let (mine, _) = self.lease.held.clone().expect("held");
+                let Some((mine, _)) = self.lease.held.clone() else {
+                    self.lease_gone_mid_job(now, kind, replica, out);
+                    return;
+                };
                 match current {
                     Some((cur, tag))
                         if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
@@ -2016,7 +2133,7 @@ impl Core {
                         }
                     }
                     Some((cur, _)) => {
-                        self.deposed(cur.holder, cur.epoch, mine.epoch, replica);
+                        self.deposed(now, cur.holder, cur.epoch, mine.epoch, replica, out);
                         self.set_phase(
                             Phase::Tail {
                                 then: TailThen::Recover,
@@ -2026,7 +2143,7 @@ impl Core {
                         self.issue_tail(out);
                     }
                     None => {
-                        self.deposed(0, 0, mine.epoch, replica);
+                        self.deposed(now, 0, 0, mine.epoch, replica, out);
                         self.set_phase(
                             Phase::Tail {
                                 then: TailThen::Recover,
@@ -2232,15 +2349,21 @@ impl Core {
                 }
             }
             (Phase::ReleaseReread, S3Result::LeaseGet(result)) => {
-                let (mine, _) = self.lease.held.clone().expect("held");
+                let Some((mine, _)) = self.lease.held.clone() else {
+                    self.lease.releasing = false;
+                    self.lease_gone_mid_job(now, kind, replica, out);
+                    return;
+                };
                 match result {
                     Ok(Some((cur, tag)))
                         if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
                     {
                         self.lease.renewed(now, cur, tag);
                     }
-                    Ok(Some((cur, _))) => self.deposed(cur.holder, cur.epoch, mine.epoch, replica),
-                    Ok(None) => self.deposed(0, 0, mine.epoch, replica),
+                    Ok(Some((cur, _))) => {
+                        self.deposed(now, cur.holder, cur.epoch, mine.epoch, replica, out)
+                    }
+                    Ok(None) => self.deposed(now, 0, 0, mine.epoch, replica, out),
                     Err(e) => {
                         tracing::warn!(node = self.cfg.node_id, error = %e.0, "lease re-read failed")
                     }
@@ -2298,7 +2421,12 @@ impl Core {
                 // S3 is reachable. The current epoch holder publishes
                 // first; a previous holder keeps its promise open until it
                 // has tailed that publication.
-                let holds = self.lease.epoch_held();
+                // Plan 30 §M10's claim rule: an S3 holder whose lease the
+                // epoch could not carry is the authority too, and closes
+                // the epoch the same way (nobody else can: the epoch has
+                // no holder to ship past `base`).
+                let holds =
+                    self.lease.epoch_held() || (self.lease.held.is_some() && !self.lease.lost);
                 if !holds && self.ship.head_seq <= self.epoch.base {
                     self.finish_round(now, None, replica, out);
                     return;
@@ -2379,6 +2507,40 @@ impl Core {
         }
     }
 
+    /// Plan 30 §M9: the lease went away while a renewal or release had
+    /// an S3 request in flight — `apply_incoming` deposes the holder at
+    /// once on a higher epoch's segment (a fast takeover's fence), which
+    /// before M9 only the CAS path itself could do. A deposed node runs
+    /// the recovery from here (the round's `Recover` tail, as the CAS
+    /// path would); otherwise the job just ends.
+    fn lease_gone_mid_job(
+        &mut self,
+        now: Ms,
+        kind: JobKind,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        tracing::debug!(
+            node = self.cfg.node_id,
+            lost = self.lease.lost,
+            "lease gone while its renewal or release was in flight"
+        );
+        if self.lease.lost && kind == JobKind::Round {
+            self.set_phase(
+                Phase::Tail {
+                    then: TailThen::Recover,
+                },
+                None,
+            );
+            self.issue_tail(out);
+            return;
+        }
+        match kind {
+            JobKind::Round => self.finish_round(now, None, replica, out),
+            _ => self.finish_flush_job(now, false, replica, out),
+        }
+    }
+
     fn job_failed(&mut self, now: Ms, error: String, replica: &dyn Replica, out: &mut Vec<Action>) {
         match self.job.as_ref().map(|j| j.kind()) {
             Some(JobKind::Round) => self.finish_round(now, Some(error), replica, out),
@@ -2447,6 +2609,9 @@ impl Core {
                 takeover: false,
                 marker_shipped: true,
                 drained: true,
+                fast_prev: None,
+                backup_tail_epoch: None,
+                shippable: false,
             });
             self.acquire_gate(now, replica, out);
             return;
@@ -2471,6 +2636,32 @@ impl Core {
             None,
         );
         self.issue_tail(out);
+    }
+
+    /// Plan 30 §M9: a takeover permit arrived (a sealed backup's, or the
+    /// `ack=s3` silence rule's) while an acquisition waits for the silent
+    /// holder's handoff answer — a wait of `handoff_request_timeout_ms`
+    /// that would otherwise delay the takeover by that much. Stop waiting
+    /// and re-classify now: with the permit the unexpired lease is
+    /// claimable. A late answer or the request's timer find the phase
+    /// gone and are ignored.
+    pub(crate) fn permit_interrupts_handoff_wait(&mut self, out: &mut Vec<Action>) {
+        let Some(job) = self.job.as_ref() else {
+            return;
+        };
+        if job.kind() != JobKind::Acquire
+            || !matches!(
+                job.phase,
+                Phase::LeaseRequest {
+                    epoch_mode: false,
+                    ..
+                }
+            )
+        {
+            return;
+        }
+        let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
+        self.set_phase(Phase::Get, Some(op));
     }
 
     pub(crate) fn on_job_peer_failed(

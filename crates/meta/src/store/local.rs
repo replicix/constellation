@@ -445,7 +445,32 @@ impl Meta {
     /// own (`MutateOp::Records`): apply its records through the replay path
     /// — the same skip-on-conflict rules every tailing replica uses — and
     /// journal what applied, in one transaction.
-    pub(crate) fn apply_records_journaled(&self, records: &[LogRecord]) -> Result<(), MetaError> {
+    pub fn apply_records_journaled(&self, records: &[LogRecord]) -> Result<(), MetaError> {
+        self.apply_records_journaled_completing(records, None)
+    }
+
+    /// [`Self::apply_records_journaled`] that also journals `Completed {
+    /// rid }` for `rid` (and records the completion), as `execute` does
+    /// for an op: plan 30 §M9's takeover re-applies the predecessor's
+    /// backup tail this way, so the log carries every acknowledged op's
+    /// completion exactly once and every requester's dedup finds it.
+    pub fn apply_records_journaled_completing(
+        &self,
+        records: &[LogRecord],
+        rid: Option<crate::Rid>,
+    ) -> Result<(), MetaError> {
+        // With a rid, the transaction is that op's (plan 30 §M9): a
+        // stranding replays it *by rid* — where `completed` dedups —
+        // never as anonymous records under a derived rid, which would
+        // re-apply a stale effect out of order.
+        let _op = rid.map(|rid| {
+            journal::PendingLocalOp::set(
+                Some(rid),
+                &crate::mutate::MutateOp::Records {
+                    records: records.to_vec(),
+                },
+            )
+        });
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
         let staged = UsageTracker::staging();
@@ -464,22 +489,51 @@ impl Meta {
                 true,
             )?
         };
-        for rec in applied.iter().filter(|rec| {
-            !matches!(
-                rec,
-                LogRecord::Completed { .. }
-                    | LogRecord::Atime { .. }
-                    | LogRecord::Refused { .. }
-                    | LogRecord::InboxAck { .. }
-            )
-        }) {
+        let rows: Vec<&LogRecord> = applied
+            .iter()
+            .filter(|rec| {
+                !matches!(
+                    rec,
+                    LogRecord::Completed { .. }
+                        | LogRecord::Atime { .. }
+                        | LogRecord::Refused { .. }
+                        | LogRecord::InboxAck { .. }
+                )
+            })
+            .collect();
+        let n = rows.len();
+        for (i, rec) in rows.into_iter().enumerate() {
+            // With a rid of its own, the completion rides the last row
+            // (as in `execute`); without one, whatever `execute` armed for
+            // the calling op is left alone.
+            let _armed =
+                (rid.is_some() && i + 1 == n).then(|| journal::PendingCompletion::set(rid));
             journal::append_tx(&mut tx, &self.journal_ks, &self.local, &self.completed, rec)?;
+        }
+        if n == 0 {
+            if let Some(rid) = rid {
+                // Nothing of it applied (every record lost to a newer
+                // state), but the op completed here: the log must still
+                // say so, once.
+                journal::append_completion_tx(
+                    &mut tx,
+                    &self.journal_ks,
+                    &self.local,
+                    &self.completed,
+                    rid,
+                )?;
+            }
         }
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
         staged.drain_into(self.usage_tracker());
+        // The rows journaled here are unshipped work of this tenure, like
+        // `mutate::execute`'s: plan 30 §M5's forward-reply `base`, §M8's
+        // ReadIndex positions and §M9's holder-read durability wait all
+        // ask what the unshipped journal touched.
+        self.note_unshipped(&applied);
         Ok(())
     }
 }

@@ -248,7 +248,11 @@ pub fn execute(
 }
 
 fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError> {
-    let before = meta.max_journal_seq()?;
+    // The last seq handed out (a point read of the counter), not the
+    // highest live row: the op's rows land above it either way, and the
+    // counter costs nothing when the journal is empty (see
+    // `journal::max_seq`).
+    let before = meta.journal_tip()?;
     match op {
         MutateOp::Mkdir {
             parent,

@@ -65,7 +65,7 @@ fn insert_new_node(
 impl Meta {
     pub fn max_journal_seq(&self) -> Result<u64, MetaError> {
         let r = self.db.read_tx();
-        crate::store::journal::max_seq(&r, &self.journal_ks)
+        crate::store::journal::max_seq(&r, &self.journal_ks, &self.local)
     }
 
     pub fn peek_journal_after(&self, after_seq: u64) -> Result<Vec<(u64, LogRecord)>, MetaError> {

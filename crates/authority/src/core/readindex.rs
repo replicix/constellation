@@ -132,9 +132,15 @@ enum ParkedWhat {
 struct Parked {
     waiting: BTreeSet<u64>,
     quarantine: Option<Ms>,
+    /// Plan 30 §M9: the journal seq that must be durable (on every
+    /// backup, or shipped) before this acknowledgement leaves.
+    durable: Option<u64>,
     since: Ms,
     what: ParkedWhat,
 }
+
+/// What a parked acknowledgement waits for besides durability.
+pub(crate) type RecallWait = (BTreeSet<u64>, Option<Ms>);
 
 #[derive(Debug, Default)]
 pub(crate) struct ReadState {
@@ -145,8 +151,9 @@ pub(crate) struct ReadState {
     parked: BTreeMap<u64, Parked>,
     next_park: u64,
     parked_rids: BTreeMap<Rid, u64>,
-    /// `execute_local` found recalls needed; `finish` parks.
-    pub(crate) parked_local: BTreeMap<Rid, (BTreeSet<u64>, Option<Ms>)>,
+    /// `execute_local` found recalls (or a durability wait) needed;
+    /// `finish` parks.
+    pub(crate) parked_local: BTreeMap<Rid, (RecallWait, Option<u64>)>,
     /// Inodes an inbox op waits to execute on: no new grants until then.
     blocked: BTreeMap<Ino, Ms>,
     /// Strict reads answered by a tail to head (no live sequencer, or no
@@ -242,6 +249,13 @@ impl Core {
                 .unwrap_or(0);
             ReadIndexOutcome::NotHolder { holder }
         } else if self.lease.fenced() {
+            self.stats.read_index_refused += 1;
+            ReadIndexOutcome::Busy
+        } else if !self.strict_answer_allowed(now, out) || !self.ensure_granting_marked(out) {
+            // Plan 30 §M9: a tenure that may be taken over before its
+            // lease expires answers strict reads only with fresh S3
+            // liveness, and only once the lease says it does (its
+            // successor then waits the horizon out).
             self.stats.read_index_refused += 1;
             ReadIndexOutcome::Busy
         } else {
@@ -384,20 +398,140 @@ impl Core {
         Some((waiting, quarantine))
     }
 
-    fn park(&mut self, now: Ms, wait: (BTreeSet<u64>, Option<Ms>), what: ParkedWhat) -> u64 {
+    fn park(&mut self, now: Ms, wait: RecallWait, durable: Option<u64>, what: ParkedWhat) -> u64 {
         self.rd.next_park += 1;
         let id = self.rd.next_park;
-        self.stats.recall_waits += 1;
+        if !wait.0.is_empty() || wait.1.is_some() {
+            self.stats.recall_waits += 1;
+        }
+        if durable.is_some() {
+            self.stats.acks_waited += 1;
+        }
         self.rd.parked.insert(
             id,
             Parked {
                 waiting: wait.0,
                 quarantine: wait.1,
+                durable,
                 since: now,
                 what,
             },
         );
         id
+    }
+
+    /// Acknowledgements parked for durability (plan 30 §M9, `status`).
+    pub(crate) fn parked_durable_count(&self) -> usize {
+        self.rd
+            .parked
+            .values()
+            .filter(|p| p.durable.is_some())
+            .count()
+    }
+
+    /// Arm the quarantine timer at `at` (plan 30 §M9's successor floor
+    /// joins M8's restart quarantine).
+    pub(crate) fn arm_grant_quarantine(&mut self, at: Ms, out: &mut Vec<Action>) {
+        if self.rd.quarantine_timer.is_none() {
+            let id = self.set_timer(at, Timer::GrantQuarantine, out);
+            self.rd.quarantine_timer = Some(id);
+        }
+    }
+
+    /// Plan 30 §M9: a local op parked for durability reached its deadline:
+    /// answer it in doubt (its row is journaled here and ships when it
+    /// can; the client's retry by rid finds it completed). `false` when
+    /// `rid` is not parked for durability (a recall park: bounded by the
+    /// grant's TTL, so the deadline lets it be).
+    pub(crate) fn abort_durable_park_of(&mut self, rid: Rid, out: &mut Vec<Action>) -> bool {
+        let id = self
+            .rd
+            .parked
+            .iter()
+            .find(|(_, p)| {
+                p.durable.is_some()
+                    && matches!(p.what, ParkedWhat::Finish { rid: r, .. } if r == rid)
+            })
+            .map(|(id, _)| *id);
+        let Some(id) = id else {
+            return false;
+        };
+        self.rd.parked.remove(&id);
+        let _ = out;
+        true
+    }
+
+    /// Plan 30 §M9: the lease is gone; every acknowledgement parked for
+    /// durability is answered as not given (see `backup.rs`). Returns how
+    /// many.
+    pub(crate) fn abort_durable_parks(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> u64 {
+        let ids: Vec<u64> = self
+            .rd
+            .parked
+            .iter()
+            .filter(|(_, p)| p.durable.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        let mut n = 0;
+        for id in ids {
+            // Re-entrancy tolerance as `complete_ready` (M5's rule).
+            let Some(p) = self.rd.parked.remove(&id) else {
+                continue;
+            };
+            n += 1;
+            match p.what {
+                ParkedWhat::Reply {
+                    to,
+                    req,
+                    rid,
+                    held_timer,
+                    ..
+                } => {
+                    self.rd.parked_rids.remove(&rid);
+                    if let Some(t) = held_timer {
+                        self.cancel_timer(t, out);
+                    }
+                    if let Some(req) = req {
+                        out.push(Action::Send {
+                            to,
+                            msg: PeerMsg::MutateReply {
+                                req,
+                                outcome: MutateOutcome::Busy,
+                                base: None,
+                                position: Position::ZERO,
+                            },
+                        });
+                    }
+                }
+                ParkedWhat::Finish { rid, .. } => {
+                    // Executed here but never acknowledged: in doubt, and
+                    // retried by the same rid (the row is stranded and
+                    // replayed by the recovery; `completed` dedups — a
+                    // refusal too, since the holder journals refusals —
+                    // and the replay entry is marked unacked so that a
+                    // refusal of it is this client's answer, not a
+                    // conflict copy).
+                    self.replay.unacked.insert(rid);
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.forwarded = true;
+                        c.phase = ClientPhase::WaitingLease;
+                    }
+                    self.retry_or_lease(now, rid, replica, out);
+                }
+                ParkedWhat::Control { op } => out.push(Action::ControlDone {
+                    op,
+                    result: Err("the lease was lost before the write was durable".into()),
+                }),
+                ParkedWhat::Release => {}
+                ParkedWhat::InboxRepoll { .. } => {}
+            }
+        }
+        n
     }
 
     /// A forwarded op's reply must wait: park it, and answer `Held` if it
@@ -406,7 +540,8 @@ impl Core {
     pub(crate) fn park_reply(
         &mut self,
         now: Ms,
-        wait: (BTreeSet<u64>, Option<Ms>),
+        wait: RecallWait,
+        durable: Option<u64>,
         to: NodeId,
         req: OpId,
         rid: Rid,
@@ -418,6 +553,7 @@ impl Core {
         let id = self.park(
             now,
             wait,
+            durable,
             ParkedWhat::Reply {
                 to,
                 req: Some(req),
@@ -476,7 +612,6 @@ impl Core {
     }
 
     pub(crate) fn on_held_reply_timer(&mut self, id: u64, out: &mut Vec<Action>) {
-        let retry_ms = self.cfg.held_retry_ms;
         let Some(Parked {
             what:
                 ParkedWhat::Reply {
@@ -485,10 +620,19 @@ impl Core {
                     held_timer,
                     ..
                 },
+            durable,
             ..
         }) = self.rd.parked.get_mut(&id)
         else {
             return;
+        };
+        // A durability wait (an S3 round trip) is longer than a LAN
+        // recall: the retry comes back at the hold interval, not every
+        // few ms.
+        let retry_ms = if durable.is_some() {
+            self.cfg.recall_hold_ms
+        } else {
+            self.cfg.held_retry_ms
         };
         *held_timer = None;
         if let Some(req) = req.take() {
@@ -520,7 +664,7 @@ impl Core {
                 result: Ok(ControlOk::Done),
             }),
             Some(wait) => {
-                self.park(now, wait, ParkedWhat::Control { op });
+                self.park(now, wait, None, ParkedWhat::Control { op });
             }
         }
     }
@@ -550,7 +694,7 @@ impl Core {
                     grants = wait.0.len(),
                     "release waits for read delegations to be recalled"
                 );
-                self.park(now, wait, ParkedWhat::Release);
+                self.park(now, wait, None, ParkedWhat::Release);
                 true
             }
         }
@@ -573,7 +717,7 @@ impl Core {
         for ino in inos {
             self.rd.blocked.insert(*ino, until);
         }
-        self.park(now, wait, ParkedWhat::InboxRepoll { node });
+        self.park(now, wait, None, ParkedWhat::InboxRepoll { node });
         true
     }
 
@@ -648,12 +792,16 @@ impl Core {
         self.complete_ready(now, replica, out);
     }
 
-    fn complete_ready(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn complete_ready(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
         let ready: Vec<u64> = self
             .rd
             .parked
             .iter()
-            .filter(|(_, p)| p.waiting.is_empty() && p.quarantine.is_none_or(|q| q <= now))
+            .filter(|(_, p)| {
+                p.waiting.is_empty()
+                    && p.quarantine.is_none_or(|q| q <= now)
+                    && p.durable.is_none_or(|j| self.durable_covers(j))
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in ready {
@@ -664,7 +812,25 @@ impl Core {
             let Some(p) = self.rd.parked.remove(&id) else {
                 continue;
             };
-            self.stats.recall_wait_ms_total += now.since(p.since).max(0) as u64;
+            let waited = now.since(p.since).max(0) as u64;
+            if p.durable.is_some() {
+                self.stats.ack_wait_ms_total += waited;
+                let req = match &p.what {
+                    ParkedWhat::Reply { req, .. } => req.map(|r| r.0),
+                    _ => None,
+                };
+                tracing::trace!(
+                    target: "constellation_authority::ack_wait",
+                    node = self.cfg.node_id,
+                    waited_ms = waited,
+                    need = p.durable,
+                    durable = self.durable_jseq(),
+                    req,
+                    "parked acknowledgement released"
+                );
+            } else {
+                self.stats.recall_wait_ms_total += waited;
+            }
             match p.what {
                 ParkedWhat::Reply {
                     to,
@@ -704,18 +870,20 @@ impl Core {
         }
     }
 
-    /// `finish` found this op's local execution needs recalls first.
+    /// `finish` found this op's local execution needs recalls (or
+    /// durability) first.
     pub(crate) fn park_finish(
         &mut self,
         now: Ms,
         rid: Rid,
-        wait: (BTreeSet<u64>, Option<Ms>),
+        wait: RecallWait,
+        durable: Option<u64>,
         outcome: MutateOutcome,
     ) {
         if let Some(c) = self.clients.get_mut(&rid) {
             c.phase = ClientPhase::Recalling;
         }
-        self.park(now, wait, ParkedWhat::Finish { rid, outcome });
+        self.park(now, wait, durable, ParkedWhat::Finish { rid, outcome });
     }
 
     // ------------------------------------------------------------ delegate
@@ -750,7 +918,15 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         if self.lease.usable(now, &self.cfg) && !self.lease.fenced() {
-            self.read_answer(op, ReadAnswer::Holder, out);
+            // Plan 30 §M9: a holder of a tenure that may be taken over
+            // before its lease expires reads its own replica only with
+            // fresh S3 liveness; otherwise this read probes first (a tail
+            // to head reveals a deposition), then reads.
+            if self.strict_answer_allowed(now, out) {
+                self.read_answer(op, ReadAnswer::Holder, out);
+            } else {
+                self.read_tail(now, op, replica, out);
+            }
             return;
         }
         if !self.cfg.p2p {
@@ -1002,7 +1178,11 @@ impl Core {
                 return;
             };
             self.cancel_timer(r.deadline, out);
-            self.read_answer(op, ReadAnswer::Holder, out);
+            if self.strict_answer_allowed(now, out) {
+                self.read_answer(op, ReadAnswer::Holder, out);
+            } else {
+                self.read_tail(now, op, replica, out);
+            }
             return;
         }
         self.read_route(now, op, replica, out);

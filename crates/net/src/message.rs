@@ -302,6 +302,43 @@ pub enum Payload {
     ReadRecalled {
         req_id: u64,
     },
+    /// Plan 30 §M9: the holder streams whole journal transactions to a
+    /// backup (`constellation_authority`'s `PeerMsg::BackupAppend`).
+    /// `txs` is postcard of `Vec<constellation_meta::BackupTx>`; `from`
+    /// is the journal seq the batch starts at (the seq after what the
+    /// backup last acknowledged), `through` the holder's shipped-through
+    /// seq. Answered by [`Payload::BackupAck`].
+    BackupAppend {
+        holder: u64,
+        req_id: u64,
+        epoch: u64,
+        config_version: u64,
+        from: u64,
+        txs: Vec<u8>,
+        through: u64,
+    },
+    /// Plan 30 §M9: the backup holds every row through `acked`, or has
+    /// `sealed` the epoch (it will never acknowledge it again).
+    BackupAck {
+        req_id: u64,
+        epoch: u64,
+        acked: u64,
+        sealed: bool,
+    },
+    /// Plan 30 §M9: pre-S3 streaming — backup-acked transactions
+    /// (postcard of `Vec<BackupTx>`) evaluated against the log through
+    /// `base`, for a subscriber to install ahead of the log. Answered
+    /// with [`Payload::Ok`] (nothing to say).
+    StreamAhead {
+        from: u64,
+        epoch: u64,
+        base: u64,
+        txs: Vec<u8>,
+    },
+    /// A reply with nothing to say.
+    Ok {
+        req_id: u64,
+    },
     /// Gossiped RTT vector for holder-driven lease placement.
     PeerRtts {
         node_id: u64,

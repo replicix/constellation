@@ -23,11 +23,12 @@ pub use record::{CloneNode, LogRecord};
 pub use reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 pub use replay::TouchSet;
 pub use rid::Rid;
-pub use session::{JournalPos, KeySet, Position, ReadKey, SessionStats, SessionWait};
+pub use session::{DurableWait, JournalPos, KeySet, Position, ReadKey, SessionStats, SessionWait};
+pub use store::backup::{BackupRole, BackupTx};
 pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};
 pub use store::spec::{
-    Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp,
+    Refusal, SegmentApplied, ShippedRows, SpecKind, SpeculationCounts, Stranded, StrandedOp,
     LOCAL_REPLAY_INCARNATION,
 };
 pub use store::{

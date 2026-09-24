@@ -87,6 +87,7 @@
 //!   arbitrarily large manifests.
 
 pub(crate) mod atime;
+pub mod backup;
 mod bootstrap;
 pub mod held;
 pub mod inbox;
@@ -493,6 +494,9 @@ pub struct Meta {
     /// durable log (`LogRecord::Completed`), so it survives a
     /// re-bootstrap the same way `ns` itself does.
     pub(crate) completed: SingleWriterTxKeyspace,
+    /// Plan 30 §M9: the journal transactions this node holds as a
+    /// synchronous backup for the holder it backs (`store::backup`).
+    pub(crate) backup_tail: SingleWriterTxKeyspace,
     /// Plan 30 §M2 holder dedup: the in-memory "recent outcomes" map for
     /// ops this node executed as holder but has not yet shipped.
     /// Deliberately not a keyspace — it is volatile by design (lost on
@@ -543,6 +547,12 @@ pub struct Meta {
     /// the journal ships out completely. Conservative when it is stale
     /// (a key stays until the next full ship), never permissive.
     pub(crate) unshipped: std::sync::Mutex<crate::replay::TouchSet>,
+    /// Plan 30 §M9 round 2: a lower bound on every live `backup_tail`
+    /// key, `(epoch, first)`, so a trim scans the live tail and not the
+    /// tombstones of everything trimmed before it (`Meta::backup_trim`).
+    /// `None`: unknown (fresh open, or cleared), the next trim scans
+    /// from the start and establishes it.
+    pub(crate) backup_tail_floor: std::sync::Mutex<Option<(u64, u64)>>,
     /// How many times a ship plan, a retirement or an ack took a held-set
     /// path (plan 30 §M4 round 2). Only ever moves while something is
     /// poisoned or held; the cost tests in `store::local` pin that it stays
@@ -640,6 +650,7 @@ impl Meta {
         let blobs = db.keyspace("blobs", KeyspaceCreateOptions::default)?;
         let ino_alloc = db.keyspace("ino_alloc", KeyspaceCreateOptions::default)?;
         let completed = db.keyspace("completed", KeyspaceCreateOptions::default)?;
+        let backup_tail = db.keyspace("backup_tail", KeyspaceCreateOptions::default)?;
 
         let meta = Meta {
             db,
@@ -665,12 +676,14 @@ impl Meta {
             blobs,
             ino_alloc,
             completed,
+            backup_tail,
             recent: std::sync::Mutex::new(std::collections::HashMap::new()),
             holder_epoch: Arc::new(AtomicU64::new(0)),
             holder_capture: AtomicBool::new(holder_capture_default()),
             held: std::sync::Mutex::new(held::HeldSummary::default()),
             held_any: AtomicBool::new(false),
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
+            backup_tail_floor: std::sync::Mutex::new(None),
             held_work: AtomicU64::new(0),
             session: crate::session::SessionState::default(),
             read_delegations: crate::readdeleg::ReadDelegations::default(),
@@ -822,6 +835,26 @@ impl Meta {
         let mine = self.unshipped.lock().unwrap();
         keys.dentries.iter().any(|d| mine.dentries.contains(d))
             || keys.inos.iter().any(|i| mine.inos.contains(i))
+    }
+
+    /// Plan 30 §M9: whether the unshipped journal touched what a read of
+    /// `keys` reads (a holder under a non-`Local` acknowledgement policy
+    /// answers such a read only once those rows are durable). A `Dir`
+    /// key is touched by any unshipped dentry under it.
+    pub fn unshipped_touches_keys(&self, keys: &[crate::session::ReadKey]) -> bool {
+        let mine = self.unshipped.lock().unwrap();
+        if mine.dentries.is_empty() && mine.inos.is_empty() {
+            return false;
+        }
+        keys.iter().any(|k| match k {
+            crate::session::ReadKey::Dentry(parent, name) => {
+                mine.dentries.contains(&(*parent, name.clone()))
+            }
+            crate::session::ReadKey::Ino(ino) => mine.inos.contains(ino),
+            crate::session::ReadKey::Dir(dir) => {
+                mine.inos.contains(dir) || mine.dentries.iter().any(|(p, _)| p == dir)
+            }
+        })
     }
 
     /// Records just journaled: their keys join the unshipped set.

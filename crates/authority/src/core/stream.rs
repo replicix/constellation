@@ -162,6 +162,46 @@ impl Core {
             && !self.lease.epoch_held()
     }
 
+    /// Plan 30 §M9: the subscribers this holder serves (pre-S3 streaming
+    /// goes to them).
+    pub(crate) fn stream_subscribers(&self) -> Vec<NodeId> {
+        if !self.stream_serving() {
+            return Vec::new();
+        }
+        self.stream.served.keys().copied().collect()
+    }
+
+    /// Plan 30 §M9: whether a live stream from `holder` is up (its
+    /// heartbeats are P2P liveness evidence).
+    pub(crate) fn stream_live_from(&self, holder: NodeId) -> bool {
+        self.stream
+            .sub
+            .as_ref()
+            .is_some_and(|s| s.holder == holder && s.live)
+    }
+
+    /// Plan 30 §M9: when the last frame (a heartbeat included) arrived
+    /// on this node's subscription to `holder`, if it has one.
+    pub(crate) fn stream_last_frame_from(&self, holder: NodeId) -> Option<Ms> {
+        self.stream
+            .sub
+            .as_ref()
+            .filter(|s| s.holder == holder && s.live)
+            .map(|s| s.last_frame)
+    }
+
+    /// The holder's heartbeat interval: `stream_heartbeat_ms`, or a
+    /// third of `backup_takeover_ms` under `ack=s3`, whose followers
+    /// read the holder's silence off this stream (plan 30 §M9).
+    fn stream_heartbeat_every(&self) -> u64 {
+        let every = self.cfg.stream_heartbeat_ms.max(1);
+        if self.lease.ack_policy() == constellation_store_s3::AckPolicy::S3 {
+            every.min((self.cfg.backup_takeover_ms / 3).max(1))
+        } else {
+            every
+        }
+    }
+
     // ---- holder side ----
 
     /// The holder's cursor passed `seq` (shipped it, landed its marker,
@@ -280,7 +320,7 @@ impl Core {
         self.stream_frame(now, from, None, out);
         if self.stream.heartbeat_timer.is_none() {
             let id = self.set_timer(
-                now.plus(self.cfg.stream_heartbeat_ms.max(1)),
+                now.plus(self.stream_heartbeat_every()),
                 Timer::StreamHeartbeat,
                 out,
             );
@@ -322,7 +362,7 @@ impl Core {
         if self.stream.served.is_empty() {
             return;
         }
-        let every = self.cfg.stream_heartbeat_ms.max(1);
+        let every = self.stream_heartbeat_every();
         let idle: Vec<NodeId> = self
             .stream
             .served

@@ -13333,3 +13333,1371 @@ pjdfstest 8798/8798 in both default and `--cto strict` mounts, and perf
 consistent with the milestone's write-path addition being a single
 uncontended lock check). No mechanical fixes were needed — the tree was
 already clean. Nothing is sent back to the coder.
+
+## Plan 30 M9 — backup peer, seal-based failover, `ack=s3`, pre-S3 streaming: **WRITTEN, CODER-TESTED** (pipelined on the M8 WIP base 8d688dc; all M9 work is uncommitted on top of it — `git diff 8d688dc` plus the new, untracked files listed under "Files")
+
+| Item | State | Where |
+|---|---|---|
+| Model first: a Stateright model of the acknowledgement policies (`Local`, `Backup`, `S3`), backups, seals, takeovers by a listed sealed backup / by anyone on a dead holder / fast under `S3`, reconfiguration by CAS (add, remove), crashes; properties `acked_never_lost`, `ack_order_is_log_order` | done, 7 tests + 1 `#[ignore]` | `crates/model/src/backup.rs`, `crates/model/tests/backup.rs` (new) |
+| M8's `cto` model extended: fast takeover of an unexpired lease, the delegation horizon (`horizon_wait`), the holder's probe freshness (`probe_freshness`), the `marked` register; 5 new tests (counterexamples without the horizon or the probe, clean with both, under drift) | done | `crates/model/src/cto.rs`, `crates/model/tests/cto.rs` |
+| Lease format: `backups`, `config_version`, `ack_policy: {local,backup,s3}`, `granted_delegations`; `Lease::reconfigured`; `FsMeta.ack_policy` | done | `crates/store-s3/src/{lease,store,lib}.rs` |
+| Backup selection by RTT budget and link stability; at most `CONSTELLATION_BACKUPS`; no candidate → `backups = []`, `Local` (today) | done | `crates/authority/src/core/backup.rs` (new) |
+| Append path: whole journal transactions streamed, one append in flight per backup (group commit), write-all acks; the `backup_tail` keyspace and persisted role/seal on the backup | done | `core/backup.rs`, `crates/meta/src/store/backup.rs` (new), `store/mod.rs` |
+| The acknowledgement gate: accepted *and refused* replies wait for durability (parked continuations); the FUSE fast path closed under a non-`Local` policy; the holder's own reads wait for durability of what they would observe | done | `core/{backup,readindex,client,holder}.rs`, `crates/meta/src/session.rs`, `crates/cli/src/lease.rs` |
+| Reconfiguration by CAS: add after catch-up, remove on ack timeout / link down / seal, never removing a backup that alone holds an acknowledged row, one CAS per change, rate-limited re-adds | done | `core/backup.rs` |
+| Seal-based failover: watch timer → seal (persisted) → lease read → takeover permit → acquisition; the tail applied through the gate with completions by rid; the deposed holder replays by rid | done | `core/{backup,jobs,lease}.rs`, `crates/meta/src/store/local.rs` |
+| `ack=s3`: `--ack local\|s3` (`CONSTELLATION_ACK`), `fs create --ack-policy`; acknowledgements on the segment landing; fast takeover of a holder silent for `CONSTELLATION_BACKUP_TAKEOVER_MS` | done | `crates/cli/src/{main,node_runtime,authority_driver}.rs`, `core/backup.rs` |
+| Pre-S3 streaming: backup-acked transactions to M7 subscribers as `SpecKind::Streamed` speculation, retired by the segment rows (`rows` in the v3 envelope) or stranded | done | `core/{backup,stream}.rs`, `crates/meta/src/store/spec.rs`, `crates/authority/src/segment.rs` |
+| Delegation horizon across a fast failover: `granted_delegations` marked by CAS before the first strict answer; the successor's quarantine floor; the holder's strict answers and its own strict reads need fresh S3 liveness | done | `core/{backup,readindex,jobs}.rs`, `crates/cli/src/{lease,fusefs}.rs` |
+| Wire: `Payload::{BackupAppend, BackupAck, StreamAhead, Ok}`, `PeerService::{backup_append_requested, stream_ahead}`; driver `send`/`on_request` arms; peer links carry RTT and `since` | done | `crates/net/src/{message,endpoint,peers}.rs`, `crates/cli/src/{authority_driver,fusefs,main}.rs` |
+| `status.ack` block (`AckStatus`) | done | `crates/api/src/{types,lib}.rs`, `crates/cli/src/main.rs` |
+| Sim: `strict_durability` (rollbacks and tentative observers are hard failures), RTTs on links, `CrashBackup` / `PartitionBackup` / `CutS3Holder`, failover samples, `M9Totals`; 9 tests + `long_backup` (`#[ignore]`) | done | `crates/authority/tests/sim/{bus,node,run,session,check}.rs`, `tests/sim.rs` |
+| Harness: `backup-failover`, `backup-departs`, `no-peer-in-budget`, `ack-s3-failover`, `single-node-unchanged`, `backup-failover-with-delegation`, `backup-partition`; `fault::p2p_denied` (`CONSTELLATION_FAULT_P2P_DENY_FILE`) | done, each run (below) | `crates/harness/src/scenarios/m9.rs` (new), `scenarios.rs`, `crates/cli/src/fault.rs`, TESTING.md |
+
+### Design, as built
+
+**What an acknowledgement means.** The lease object carries `ack_policy`,
+`backups` and `config_version`. A holder answers a mutation — accepted
+*or refused*, since a refusal was evaluated against the same unshipped
+state — only once the journal position it was evaluated at is durable
+under the policy: `Local` at once (today); `Backup` once every backup in
+the *committed* lease object has persisted the journal through it; `S3`
+once the segment carrying it landed. The wait is M8's parked
+continuation with a durability condition (`Parked.durable`,
+`durable_jseq()` / `durable_covers()`): the op has executed, its rows
+ship like any other, only the reply waits (`acks_waited`,
+`ack_wait_ms_total`). Under a non-`Local` policy the FUSE fast path is
+closed (`LeaseView::admit` → `None` when `ack_gated`), so every local
+mutation goes through the core and parks the same way — which is also
+what lets a deposition turn a waiting op into an in-doubt retry by rid
+(`ack_abort_parked`, `acks_aborted`) instead of an acknowledgement
+nobody can honour. Replays are in doubt from submission (a gate may
+have completed them).
+
+**The append path.** The holder streams whole journal transactions
+(`BackupTx {first, last, records}`, read from the `journal_tx` heads)
+to each backup, one `BackupAppend` in flight per backup, batches of
+`backup_batch_rows`; every row journaled during a round trip rides the
+next append (the group commit), so a LAN backup adds one round trip per
+acknowledgement and the batch amortises under load. The batch starts
+past `max(acked, shipped_through)`: rows through the holder's
+shipped-through seq are in the log (and trimmed from the journal), so a
+backup — a fresh candidate above all — needs nothing below them, and
+the backup accepts such a skip only when the message's `through` covers
+it. Heartbeats are empty appends every `backup_heartbeat_ms`; any
+answer is progress. The backup persists the transactions in its
+`backup_tail` keyspace (`(epoch, first)` keys; committed before the
+ack), remembers `BackupRole {holder, epoch, config_version}` and the
+sealed epoch in persisted kv, and trims its tail by the segments it
+applies (the v3 envelope's `rows`, the journal seqs each segment
+carries) and by the holder's `through`.
+
+**Selection (never assume a LAN).** Candidates are write-eligible peers
+whose measured RTT (`Peer.rtt_ms`, from the P2P ping) is within
+`CONSTELLATION_BACKUP_RTT_BUDGET_MS` (default 5; 0 = never) and whose
+link has been up for `backup_stable_ms` (2 s); the longest-connected
+first; at most `CONSTELLATION_BACKUPS` (default 1). No candidate:
+`backups = []`, `Local`, today's behaviour — a cluster of far nodes
+never pays a synchronous round trip. A candidate is streamed the
+journal first and CASed into the lease once caught up
+(`backup_promote`); while a candidate is being brought up, or an
+eligible peer exists, nothing is acknowledged under `Local` (it would
+rest on this node's disk alone while a takeover-capable peer is about
+to be listed; the wait ends with the CAS, or when no peer is in budget
+after all). A backup that stops answering for
+`CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` (1 s), whose link goes down, or
+that answers `sealed`, is removed by a lease CAS (`Lease::reconfigured`:
+`config_version + 1`, `Local` when the set empties); the removed node is
+not re-added within `backup_reconfig_min_ms` (3 s). One node: nothing
+here ever runs.
+
+**Failover.** A backup that hears nothing for
+`CONSTELLATION_BACKUP_TAKEOVER_MS` (1.5 s) *seals* its epoch (persisted
+first; from then on every append of that epoch is answered `sealed`),
+reads the lease (`TakeoverGet`) and, if it is still listed for that
+holder and epoch, sets a takeover permit and runs the ordinary
+acquisition: the M3b tail to head, the marker at the next slot by
+create-if-absent, the gate. The gate applies the backup tail through
+`apply_records_journaled_completing(records, rid)` — each transaction's
+rows journaled with a `Completed{rid}` and the rid armed as a
+`PendingLocalOp`, so a later stranding replays it by rid, and a
+transaction whose rid the log already completed is skipped. An
+acquisition waiting for the silent holder's handoff answer is cut short
+by the permit (`permit_interrupts_handoff_wait`). Under `S3` any peer
+that sees the holder silent on P2P for `backup_takeover_ms` (and the
+lease not renewed within that) takes over the same way (`s3_fast_takeovers`);
+its fence is the log slot alone. The deposed holder learns from the
+marker (or its next CAS), deposes itself at once on applying a higher
+epoch, strands and replays by rid.
+
+**Pre-S3 streaming.** Under `Backup`, the rows that just became durable
+are pushed to the M7 subscribers as `StreamAhead {epoch, base, txs}`
+and installed as `SpecKind::Streamed {epoch, first, last}` speculation
+(`streamed_installed`), contiguous with what the log and earlier
+batches gave; the segment that carries them (its `rows`) retires them —
+`apply_segment_rows` skips the confirmed rows and converts the entry to
+`Foreign` — and a takeover strands them (a *foreign* replay by rid:
+reads block, refusals make no conflict copy). Positions stay monotone:
+a streamed row is applied at its journal seq once.
+
+### Safety arguments
+
+*Safety never depends on failure detection.* Every timeout above is
+liveness only (when to seal, when to reconfigure, when to try a
+takeover). What makes each transition safe:
+
+- **The seal.** The old holder needs a write-all ack from the committed
+  set for anything it acknowledges. A backup that has sealed epoch `e`
+  never acks epoch `e` again, whether the holder is dead, slow, or
+  merely partitioned from it. So after the seal the holder can
+  acknowledge nothing new; what it acknowledged before is in the
+  backup's tail (or in the log), and the sealed backup re-ships that
+  tail. The takeover CAS and the holder's removal CAS are on the same
+  object version: exactly one wins. Holder wins: the backup re-reads,
+  finds itself unlisted, discards its tail (nothing acknowledged rested
+  on it alone — see the removal rule). Backup wins: the holder's re-read
+  shows a new holder, a deposition with M3b's stranding and replay.
+- **Fencing.** The successor's marker is a create-if-absent at the next
+  slot; anything the old holder ships after it collides, and what it
+  shipped before it the successor adopted in its tail to head. Under
+  `S3` this is the only fence needed: every acknowledged record is in a
+  slot below the marker.
+- **The committed set.** Acknowledgements need the backups in the lease
+  *object*, never a candidate (the model's `unlisted` counterexample: a
+  candidate that took over would lack what rested on the listed one).
+  A removal CAS is issued only once every seq an acknowledgement may
+  have rested on (`acked_hwm`) is in the log or on every backup that
+  stays (`removal_safe`; the model's `RemoveCas` is enabled under the
+  same rule) — otherwise an ack given on the strength of the removed
+  backup would come to rest on the holder's disk alone (the model found
+  exactly this path before the rule).
+- **The delegation horizon** (extra requirement 1; chosen: a
+  conservative global horizon, not grant replication). M8 caps a
+  delegation by the granting holder's lease expiry; a takeover before
+  it breaks the cap. Two rules close it, both reducing to the lease's
+  own `M > 2D`: (a) a tenure that serves strict reads marks the lease
+  first (`granted_delegations`, one CAS before the first strict answer;
+  a `cto=strict` mount marks at acquisition); (b) a holder under a
+  non-`Local` policy or with a listed backup answers strict reads —
+  positions, grants, and its *own* strict reads (`LeaseView::reads_locally`)
+  — only while an S3 request it *sent* within the last
+  `backup_takeover_ms` succeeded without revealing a deposition
+  (`last_s3_fresh`; otherwise `Busy` / a probe, `stale_liveness_refusals`),
+  and deposes itself at once on applying a higher epoch. So every strict
+  answer the old holder gives is sent within `backup_takeover_ms + 2D`
+  of the last moment before the successor's marker existed, and every
+  grant it gave expires within `read_delegation_ttl` of that. The
+  successor of an *unexpired* marked lease acknowledges no mutation
+  until `min(old expiry, T_marker + backup_takeover_ms + read_delegation_ttl + 2M)`
+  (`ack_floor_waits`, through the M8 quarantine every acknowledgement
+  already waits on). A tenure that never served a strict read costs its
+  successor nothing. Modelled (`cto.rs`: `fast_takeover`, `horizon_wait`,
+  `probe_freshness`; the counterexamples without either rule are
+  asserted found), simulated (`backup-strict`, close-to-open enforced),
+  and run in the harness (`backup-failover-with-delegation`).
+- **Tentative observers** (extra requirement 2). Under `Backup` and
+  `S3` the holder's own reads wait for durability of the unshipped rows
+  they would observe (`Meta::durability_pending`, the session gate's
+  `durable_jseq`; `reads_durability_blocked`), forwarded and local
+  refusals are parked like acceptances, and the FUSE fast path is
+  closed; so no client of any node ever observes an effect a failover
+  could roll back. The sim's `observed_tentative` and `acked_rolled_back`
+  are hard failures under these policies (`strict_durability`); the
+  non-vacuity seed shows today's `Local` policy failing both.
+- **M6/M7 interplay** (extra requirement 3): streamed speculation
+  retires by the segment rows or strands by the takeover (foreign
+  replay); positions are journal seqs applied once; the marker changes
+  the epoch and M7 subscribers re-subscribe to the new holder
+  (`stream_live_from` gates the silence rule so a live stream counts as
+  liveness). **M13** (4): with P2P off no backup is ever selected
+  (`Local`), `S3` is honoured (the inbox holder's acknowledgements park
+  the same way), and pre-S3 streaming is off.
+
+### The model
+
+`crates/model/src/backup.rs`: `n` nodes with `w` writes each, a
+register (holder, epoch, backups, config_version, policy, version), a
+log of slots (markers and writes), per-node journal / backup tail /
+replay set / seal, messages (forward, append, acks) delivered in any
+order, crashes, ticks; the actions above. `acked_never_lost`: every
+*durable* acknowledgement (under `S3`, or with a non-empty backup set)
+is in the log, in a live node's journal or replay set, or in a live
+*listed* backup's tail for the current tenure. Results (release, each
+under the 30M-state / 55 s budget, ≤ 2 GB):
+
+| Test | States | Result |
+|---|---|---|
+| `local_policy_loses_an_acked_write_on_a_crash` (`check_all_acks`) | 4k | counterexample found (plan 30 §1.2's L2) |
+| `ack_s3_before_landing_loses_an_acked_write` | 111k | counterexample found |
+| `acking_before_the_removal_cas_lands_loses_an_acked_write` | 2.1M | counterexample found |
+| `an_unlisted_backup_taking_over_loses_an_acked_write` (removed backup that has not re-read the register; listing check off) | 30M | counterexample found |
+| `backup_with_a_crash_is_clean` (2 nodes, crash, seal takeover, tail re-shipped, removal) | 920k | clean, all witnesses |
+| `backup_three_nodes_is_clean` (forwarded writes, seal takeover) | 1.3M | clean |
+| `ack_s3_with_a_crash_and_fast_takeover_is_clean` (3 nodes) | 25.5M, 19 s | clean |
+| `backup_three_nodes_with_reconfiguration_is_clean` | `#[ignore]` (over budget) | — |
+
+Two design bugs the model found before the code did: the takeover
+policy (a `Backup` tenure with no backups yet acknowledged non-durably
+but the register said durable), and the removal rule above (removing a
+backup that alone held acknowledged unshipped rows). `cto.rs` (18 tests,
+19 s): `fast_takeover_without_the_horizon_violates`,
+`fast_takeover_without_the_probe_violates`,
+`fast_takeover_with_horizon_and_probe_is_clean`,
+`fast_takeover_is_clean_under_drift_within_the_margin`,
+`an_unmarked_tenure_sets_no_floor` — the clean runs found, on the way,
+that the holder's *own* local strict read must be gated by the probe
+too (a deposed-but-unaware holder reading "as the usable holder"), which
+is why `reads_locally` checks liveness.
+
+### Simulation
+
+`AUTHORITY_SIM_CONFIG=backup | acks3 | backup-far | backup-strict |
+backup-crash | backup-crash-slow | acks3-crash | backup-departs |
+backup-partition | long-backup`. Totals from one run of the suite
+(`cargo test -p constellation-authority --release --test sim`, 4–5 s for
+the M9 tests):
+
+- `backup` (60 seeds, CI faults): backups added 79 / removed 7,
+  reconfiguration CAS 98, appends 2944, acks waited 780 (12 s total),
+  seals 39, takeovers 30, streamed ahead 440 / installed 1102 /
+  dropped 40; **acked rolled back 0**, tentative observers 0.
+- `backup-crash` (S3 cut from the holder, then the holder crashes,
+  40 seeds): seals 42, backup takeovers 40, tail rows applied 111;
+  failover n=41 p50=1179 ms p90=3159 ms (TTL 5 s in the sim; a
+  takeover past the TTL is a seed where the crash landed inside the
+  gate).
+- `acks3-crash` (40 seeds): fast takeovers 76, acks waited 462;
+  failover p50=2426 ms p90=2559 ms; backups 0, appends 0.
+- `backup-far` (RTTs over budget, 20 seeds): backups 0, appends 0,
+  seals 0, acks waited 0; failover p50=5087 ms (the TTL) — today.
+- `backup-strict` (30 seeds): backup takeovers 44, floor waits 24,
+  stale-liveness refusals 1; close-to-open enforced, 0 violations.
+- `backup-crash-slow` (S3 60–200 ms): streamed ahead 301, installed
+  513, dropped 194 (stranded by the takeover or superseded).
+- `backup-departs` / `backup-partition`: removed ≥ 20 / resolved either
+  way ≥ 20 over 30 seeds each.
+- `local_policy_rollbacks_are_found`: today's policy rolls an
+  acknowledged op back under the holder crash and `strict_durability`
+  reports it (non-vacuity).
+
+### Measurements (this host, release build, single runs; other sessions were running)
+
+All on one host (three daemons on loopback, floci S3 behind toxiproxy,
+a `cargo test` compile running alongside), 20 s lease TTL, sync interval
+200 ms. Open+write+close of a small file on the holder:
+
+| Policy | Latency (n) | Where |
+|---|---|---|
+| one node, `local` (M9 a no-op: fast path open) | p50 1.9 ms, p90 2.2 ms, p99 7.9 ms (200) | `single-node-unchanged` |
+| three nodes, no peer in budget, `local` | p50 1.5 ms, p90 1.9 ms (50) | `no-peer-in-budget` |
+| three nodes, one LAN backup (`backup`; the fast path closed, one append round trip per ack, group-committed) | p50 3.9 ms, p90 4.7 ms (20); p50 3.3 ms, p90 11.3 ms, p99 16.4 ms (90, across three tenures, including each tenure's first writes while its backup was being brought up) | `backup-departs`, `backup-failover` |
+| the same, during a backup's removal + replacement | p50 7.8 ms, p90 8.3 ms, p99 44 ms (21) | `backup-departs` |
+| three nodes, `ack=s3` (each ack waits for the segment; the 200 ms ship round batches them) | p50 5.1 ms, p90 5.7 ms (30) | `ack-s3-failover` |
+| forwarded writes from the third node while the holder and its backup are partitioned (removal + replacement in between) | p50 5.4 ms, p90 9.1 ms, p99 168 ms (108) | `backup-partition` |
+
+So a LAN backup costs ~2 ms per acknowledgement here (one loopback
+round trip plus the backup's fjall commit), and `ack=s3` against a local
+floci ~3 ms on top of local — against real S3 it is the segment PUT
+(tens of ms) amortised over the round.
+
+S3 requests per reconfiguration (`backup-departs`, the holder behind a
+counting proxy): a backup's departure cost **2 lease PUTs** (one CAS
+removing it, one adding the replacement; `reconfig_cas` 2) among 104
+requests in the 1.2 s until the replacement was listed (the rest are the
+writes' own segments and reads). A single node makes 0 lease PUTs beyond
+its renewals over 200 writes.
+
+Failover time (kill → the successor holds; TTL 20 s):
+
+| Scenario | Samples |
+|---|---|
+| `backup-failover`, seal-based (holder SIGKILLed) | 1.504 s, 1.508 s, 1.518 s (three rounds: `backup_takeover_ms` 1.5 s of silence, then the seal, the lease read, the CAS, the tail and the marker within ~10 ms) |
+| `backup-failover-with-delegation` | 1.41 s to hold; the first write of the delegated file acknowledged 6.66 s later (8.07 s after the reader's last grant: `T_marker + 1.5 s + 3 s TTL + 2 × 1 s margin`), 0 stale reads of 17 sampled after the ack, 0 degraded strict reads |
+| `ack-s3-failover`, holder frozen (SIGSTOP) | the peer's write returned 6.8 s after the freeze (1.5 s silence on the stream + watch granularity + a floci torn-read retry, below); an earlier run without the stream-based silence rule took 10–11 s |
+| `no-peer-in-budget` (today: TTL expiry) | 20.2 s |
+| sim (`backup-crash`, TTL 5 s) | p50 1.18 s, p90 3.2 s over 41 crashes; `acks3-crash` p50 2.4 s |
+
+### Harness scenarios run (prefix `constellation-harness-m9fable`, release build)
+
+- `single-node-unchanged`: PASSED (2 s). `policy local`, no backup or
+  candidate, fast path open, every M9 counter 0.
+- `no-peer-in-budget`: PASSED (26 s). Budget 0: local, nothing waited;
+  after the kill the second node's write returned after 20.2 s with
+  `backup_takeovers 0`, `seals 0`, `s3_fast_takeovers 0`.
+- `backup-departs`: PASSED (8 s). Replacement listed 1.2 s after the
+  departure, `backups_removed 1`, `backups_added 2`, `reconfig_cas 3`
+  over the run (initial add, removal, replacement), writes completed
+  throughout; the departed node remounted and converged.
+- `backup-failover-with-delegation`: PASSED (20 s). See the table above:
+  `ack_floor_waits 1`, no stale read after the acknowledgement, no
+  degraded strict read (`read_index 6`, `delegation_local 242`).
+- `backup-partition`: PASSED (19 s). The holder timed its backup out
+  (`backup_ack_timeouts 1`), removed it and listed the third node
+  (`backups_removed 1`, `backups_added 2`); the partitioned backup
+  sealed (`seals 1`) and, unlisted, did not take over; the third node's
+  108 writes all completed; after the heal every file was everywhere,
+  one holder, no conflicts.
+- `backup-failover`: PASSED (17.5 s; four nodes, three rounds). Each
+  round: the backup sealed and held 1.50–1.52 s after the kill
+  (`seals`, `backup_takeovers`), the 30 files acknowledged before the
+  kill were on it at once (60 tail rows persisted per round, applied
+  through the gate), the killed node remounted and every node converged
+  on all files; no conflicts.
+- `ack-s3-failover`: PASSED (9 s). `policy s3`, fast path gated,
+  `acks_waited 63` for 30 files (each waited for its segment; p50 6.7 ms
+  in this run, 5.1 ms in another), every file visible on the third node
+  through S3 alone; after the freeze `s3_fast_takeovers 1` on the peer,
+  the write returned 6.8 s later, every file on the new holder; the
+  thawed holder was deposed (`acks_aborted 1`: its in-flight
+  acknowledgement turned into an in-doubt retry), no conflicts.
+
+Two things the harness found that the sim had not (both fixed here):
+the append protocol started a candidate at journal seq 1, which a holder
+whose journal was trimmed by shipping could not serve (an append loop
+at ~3000/s until the harness gave up; now the batch starts past the
+shipped-through seq and the backup accepts the log-covered skip); and
+`ack=s3`'s silence detection read the QUIC/gossip `connected` flag and
+the stream's 3.5 s timeout, so a frozen holder was taken over ~10 s
+later rather than 1.5 s (now the follower reads silence off the
+holder's log stream, which the holder heartbeats every 500 ms under
+`S3`; without a subscription the link flag remains the fallback), and
+an acquisition waiting on the frozen holder's handoff answer (5 s) is
+now cut short by the takeover permit.
+
+### Found, not fixed here
+
+- **P2P after a same-identity restart** (base, not M9): a node killed
+  (SIGKILL) and remounted with the same state directory and node key is
+  unreachable over P2P by the nodes that knew it, for at least 30 s
+  (their pings to it fail, `status.p2p.peers[..].connected` stays false,
+  it never rejoins gossip on their side; `noq_proto: failed closing path
+  err=LastOpenPath` on their side). Its own outbound P2P and S3 work, so
+  it converges. For M9 this means a restarted node is not a backup
+  candidate until the link recovers (the append to it times out and it
+  is dropped; `backup-failover` runs four nodes for that reason).
+- **A torn lease read from floci**: `ack-s3-failover` once saw the
+  takeover's `LeaseGet` fail with `json: EOF while parsing an object at
+  line 1 column 187` while another node's CAS was in flight; the
+  acquisition retried 3.4 s later and won. Real S3 GETs are atomic;
+  floci's may not be. The scenario's 6.8 s failover is 1.5 s silence
+  + up to 1.5 s watch granularity + that retry.
+- A takeover under `no-peer-in-budget` (and any TTL failover) makes the
+  requester's first write wait the whole TTL plus the acquire's own
+  round (20.2 s at a 20 s TTL) — today's behaviour, unchanged.
+- The base issues listed for M8 (mount-time acquire failure unmounts;
+  forward throughput; sim `long_random` seed 10476; the fjall drop
+  deadlock; `takeover-marker-strands-promptly` flakes) are untouched.
+- `journal_txs_from` skips a transaction head whose rows are gone (a
+  rolled-back transaction); a head written before its rows in a
+  separate write batch would look the same — the meta store writes both
+  in one batch today, and the backup protocol's skip rule only ever
+  skips rows the log covers.
+
+### Files
+
+New: `crates/authority/src/core/backup.rs`, `crates/meta/src/store/backup.rs`,
+`crates/model/src/backup.rs`, `crates/model/tests/backup.rs`,
+`crates/harness/src/scenarios/m9.rs` (untracked: `git add -N` them to
+see them in `git diff 8d688dc`).
+Changed: `crates/store-s3/src/{lease,store,lib}.rs`;
+`crates/authority/src/{action,event,replica,segment}.rs`,
+`core/{mod,lease,jobs,client,holder,readindex,replay,stream,inbox,tests}.rs`,
+`tests/sim.rs`, `tests/sim/{bus,node,run,session,check}.rs`, `tests/meta_repro.rs`;
+`crates/meta/src/{lib,session}.rs`, `store/{mod,spec,local,journal}.rs`;
+`crates/model/src/{cto,lib}.rs`, `tests/cto.rs`;
+`crates/net/src/{message,endpoint,peers}.rs`;
+`crates/api/src/{types,lib}.rs`;
+`crates/cli/src/{authority_driver,fusefs,lease,main,node_runtime,fault}.rs`;
+`crates/harness/src/scenarios.rs`, `scenarios/m8.rs`;
+`docs/how-to-guides/development/TESTING.md`, this file.
+
+### What the tester must run
+
+- `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`.
+- `cargo test -p constellation-model --release` (`--test backup` 20 s
+  and `--test cto` 19 s, each ≤ 2 GB with its tests in parallel);
+  optionally `--ignored backup_three_nodes_with_reconfiguration_is_clean`
+  (over the 30M budget: raise `CAP` to see it through).
+- `cargo test -p constellation-authority --release` (the fjall-drop hang
+  may stall it: rerun), and
+  `AUTHORITY_SIM_SEEDS=300 cargo test -p constellation-authority --release --test sim -- --ignored long_backup`;
+  `long_strict` and `long_random` as before.
+- `cargo test -p constellation-meta -p constellation-store-s3 -p constellation-net -p constellation-api -p constellation -p constellation-harness -p constellation-chaos`.
+- Release build, then
+  `harness run single-node-unchanged no-peer-in-budget backup-failover backup-departs backup-partition ack-s3-failover backup-failover-with-delegation`,
+  the M8 `cto-*` scenarios and `chaos-ci-strict` (the holder's strict
+  reads now probe when its S3 liveness is stale on a tenure with a
+  backup), the M7 visibility scenarios (the v3 envelope), the M5/M13
+  forwarding, handoff and inbox scenarios, `chaos-ci`, then the full
+  suite. This is a phase boundary: the full gate list.
+- pjdfstest (single node: M9 is a no-op there — `single-node-unchanged`
+  says so, and the fast path is untouched under `Local`).
+- `meta-bench` before/after on one node (unchanged path) and, if the
+  bench has a two-node mode, with a LAN backup (one round trip per
+  acknowledgement, batched under load).
+- M16: on EC2 with a same-region pair and a far node: the far node is
+  never a backup (`status.ack.backups`), the pair's acknowledgement
+  latency, and a failover with the far node as the third replica.
+
+## Plan 30 M9 — rebase onto M5–M8, and the epoch rules: **GREEN** (coder, 2026-09-24; uncommitted on `plan30-m9` = main 92c4078 + the WIP bases fd94c96 (M7 on M6) and 3c50ef4 (M8 on M7); the pre-rebase state is `stash@{0}`, untouched)
+
+**Conflicts resolved.**
+- `core/client.rs` (2): `submit` keeps M5's `inbox_keys` (the
+  multi-batch withdraw) and its `Origin::Replay`-in-doubt comment; M9's
+  duplicate of the same rule is dropped. `execute_local` keeps M8's
+  rebase fix — the recall set is `constellation_meta::recall_inos`
+  (parents included) — inside M9's `(outcome, wait)` shape, so the
+  recall wait and the durability wait park together.
+- `core/jobs.rs` `ship_landed`: both kept, in this order — M5's
+  `note_shipped_touches` (the forward-reply `base` window), then M9's
+  `note_shipped` (the durable seq and shipped rows the acknowledgement
+  gate waits on).
+- `core/readindex.rs` `complete_ready`: M5's re-entrancy tolerance
+  (`let Some(p) = remove(..) else continue`) plus M9's split of the wait
+  time into `ack_wait_ms_total` / `recall_wait_ms_total`. M9's own
+  `abort_durable_parks` had the same bare `expect("present")`; it is
+  tolerant now too.
+- `PROGRESS.md`: every section in order (M5, M6, M6 rebase, M7, M7
+  rebase, M8, M8 rebase), then M9's, then this.
+
+**Semantic interactions checked in the files that applied cleanly.**
+1. *M9's acknowledgement gate vs M8's parked recall continuations, with
+   M5's `get`-based tolerance.* One park per reply (`Parked {waiting,
+   quarantine, durable}`), released by `complete_ready` when all three
+   are satisfied; the loop is now the tolerant one everywhere it
+   removes. `execute_local` looks the op up with `get` (a nested
+   `release_gated` may have finished it) before executing, unchanged
+   from M5, and the durability need is computed after the execution
+   from the replica's journal position — no bare index on the way.
+2. *Pre-S3 streaming vs M7's streams as rebased.* `stream_ahead` sends to
+   `stream_subscribers()` (M7's `served` map, only while this node
+   serves — holds — the stream) and the subscriber installs at
+   `(epoch, jseq)` contiguity with the segments it applied through
+   `apply_incoming`. M7's rebase changed nothing there: streamed and
+   tailed segments both go through `Replica::apply_segment`, which is
+   where the `rows` retire `Streamed` speculation. The `ack=s3` silence
+   rule reads the subscription's `last_frame` (M7's field, unchanged).
+3. *The delegation horizon vs M8's `recall_inos` and the
+   `set_manifest_dirty` recall.* The horizon concerns grants outstanding
+   at a takeover and is independent of the recall set; what changed
+   under it is the sequencer's own manifest commit. Under a non-`Local`
+   policy `LeaseView::admit()` returns `None`, so the FUSE close takes
+   `commit_manifest_forwarded` → `Submit` → `execute_local`, which
+   recalls with `recall_inos(&records)` (parents included) and parks for
+   durability; under `Local` the fast path's `set_manifest_dirty` +
+   `Control::Recall` is M8's rebased one. Both feed M5's unshipped key
+   set.
+4. *The backup append of journal transactions vs M5's `shipped_touches`
+   and M4's held rows.* The append reads `journal_tx` heads and their
+   rows; a batch starts past `max(acked, shipped_through)`, and the
+   ship's `through` never passes an M4 held row (`journal_acked_seq`
+   stops below the first held transaction), so held rows are always
+   appended, never skipped. `shipped_touches` is the holder's own ship
+   history and is fed by `ship_landed` only — the append neither reads
+   nor bypasses it. **One gap found and fixed:** the successor's
+   `apply_records_journaled_completing` (the backup tail, journaled with
+   completions by rid) did not add its rows to M5's unshipped key set
+   (`Meta::note_unshipped`), so until the next ship a forward reply's
+   `base`, a ReadIndex position and M9's own holder-read wait could miss
+   that those keys had unshipped work. It does now.
+
+**The two safety rules from the M10 model** (`/home/bra/cvs/constellation-m10`,
+`crates/model/src/flex.rs`; PROGRESS.md "Plan 30 M10 — phase 1",
+"Plan 30 §M9's seal-based fast takeover against epochs", and the
+coordinator decisions). Both live where continuation epochs are decided
+in the core (`on_epoch_state`, from `Control::Epoch`, which now carries
+the epoch's `members`; the driver's `report_epoch` fills them from
+`EpochManager::status()`):
+- (a) **The claim rule.** `Core::epoch_may_carry(members)`: an activation
+  carries this node's lease into the epoch (`adopt_epoch_hold`) only if
+  the lease's policy is `Local`, or `Backup` with every listed backup a
+  member and no reconfiguration CAS pending or wanted (its outcome could
+  list a backup this node believes removed); never `S3`. A lease not
+  carried stays an S3 lease: the holder keeps acknowledging under its
+  own policy — under `ack=s3` its writes wait for S3, which is the
+  promise `ack=s3` makes — and the epoch holds no authority (members'
+  forwards get no in-epoch handoff and wait). When the probe finds S3
+  back, an S3 holder whose lease was not carried closes the epoch like
+  an epoch holder would (`TailThen::EpochProbe`: `holds` includes
+  `held.is_some() && !lost`), otherwise nobody could — the epoch has no
+  holder to ship past `base`. Counted as `epoch_carry_refused`
+  (`status.ack`).
+- (b) **No seal watch inside an open epoch.** `arm_backup_watch` arms
+  nothing and `on_backup_watch` seals nothing while `epoch.open`; the
+  `ack=s3` silence rule already returned under `epoch.open`. When the
+  epoch closes, `backup_watch_after_epoch` resets `last_heard` and
+  re-arms, so the holder's re-acquisition after the close (which keeps
+  the epoch) gets a full silence window rather than an immediate seal of
+  the epoch it is about to re-adopt (M10's liveness note).
+
+Model: the M10 model's runs are the check —
+`m9_seal_takeover_against_an_unguarded_epoch_splits_brain` and
+`m9_ack_s3_fast_takeover_against_an_unguarded_epoch_splits_brain` are
+M9 as it was (a `Backup` lease carried with its backup outside, and an
+`S3` lease carried), and `m9_seal_takeover_with_the_claim_rule_is_clean`
+/ `m9_ack_s3_with_the_claim_rule_is_clean` are the rule as now built,
+with fast takeovers enabled (`single_authority`, `linearizable`,
+`converged_at_quiescence`). M9's own `backup` model has no epochs (its
+takeovers are by listed sealed backups, TTL expiry or `S3` silence — all
+S3 acquisitions, which members of an open epoch never do), so it is
+unchanged. Unit tests, `core/tests.rs` `mod epoch_rules`:
+`an_ack_s3_lease_is_not_carried_into_an_epoch`,
+`a_backup_lease_is_carried_only_with_every_backup_a_member`,
+`a_lease_with_a_reconfiguration_in_flight_is_not_carried` (rule a) and
+`a_member_backup_does_not_seal_while_its_epoch_is_open` (rule b: the
+watch fires inside the open epoch and seals nothing, reads no lease,
+re-arms nothing; after the close it resumes with a full window and then
+seals). The sim has no continuation epochs (M5's simplification), so
+there is no sim test.
+
+**Found by the sweeps, fixed here: a refused forward executed twice.**
+The first `long_backup` sweep (300 seeds) failed two seeds, 50064 and
+50126, on the strict acknowledgement-order check ("rid A returned
+before rid B was invoked but follows it in the log"). Both are the same
+shape, and neither is M9's design: a forwarded op the holder *refused*
+(ENOENT on an unlink, EEXIST on a create) was executed a second time —
+by the deposed requester's replay by rid in 50126 (its own reply had
+been parked for durability at the deposition, so the client copy was
+re-driven in doubt *and* the recovery replayed the stranded row), by
+the next holder draining an inbox batch in 50064 — and the second
+execution *succeeded* against a state that had changed meanwhile, after
+the client had been told the refusal. Accepted ops never do this (their
+`Completed` row dedups every later execution); refusals of forwarded
+ops were not recorded anywhere, so exactly-once did not cover them.
+Before M9 the same race needed a lost reply and was exempt in the sim
+as a "tentative" op; M9's strict durability check makes it count. Fix:
+- the holder journals a *definitive* refusal of an op executed by rid
+  as `Refused { rid, errno }` (`Meta::journal_refusal`, the inbox's
+  row without the `InboxAck`; `Core::record_refusal` in
+  `holder_execute`; `refusals_journaled` in `status.ack`) — a
+  transient one (`Conflict`/EAGAIN, a stale manifest base) is not an
+  outcome and is not recorded. Every dedup site already asks
+  `completed_outcome` for both executed and refused rids, so the
+  requester's retry, the replay by rid and an inbox drain all answer
+  the same errno; once the row ships, every later holder does too. The
+  row is unshipped journal work like any other: under `Backup`/`S3`
+  the refusal's acknowledgement waits for it.
+- a replay entry of an op this node executed but never acknowledged
+  (its reply parked at the deposition) is marked unacked
+  (`Replica::mark_replay_unacked`, persisted on the queued row as
+  `foreign`; `ReplayState::unacked`, filled by `abort_durable_parks`,
+  applied in `finish_recovery`): a refusal of its replay is the
+  client's answer, not an effect to preserve as a conflict copy
+  (`unacked_replays_refused`).
+- the second sweep found the local path's sibling (long-acks3 seed
+  50277, `AUTHORITY_SIM_CONFIG=long-acks3` replays the odd seeds): a
+  holder taken over fast under `ack=s3` answered its *own* client's
+  create with EEXIST from its stale replica — a name the new holder had
+  already renamed away — because a refusal evaluated on a fully
+  shipped state had "nothing unshipped" to wait for and left at once.
+  `execute_local` now records definitive refusals too, so a refusal's
+  position always names a journal row and under `Backup`/`S3` the
+  answer waits for that row to reach the backup or the log — which is
+  what proves the node still holds (the fenced ship deposes it, the
+  parked answer becomes an in-doubt retry to the new holder).
+- and a bare `expect("held")` in the renewal / release re-read phases
+  (`backup` seed 739): M9's immediate deposition on a higher epoch's
+  segment can clear the lease while a renewal or release has its S3
+  request in flight, which before M9 only the CAS path itself could
+  do. `lease_gone_mid_job` ends the phase and, when deposed, runs the
+  recovery tail as the CAS path would.
+- the schedules the refusal rows shifted then exposed two latent M9
+  bugs in the CI configurations (both passed by luck of timing before):
+  - **`backup` seed 753 — a shadow over a streamed install.** Under
+    pre-S3 streaming the requester is a subscriber too, so its own
+    forwarded op can arrive on the holder's stream (installed as
+    `Streamed`) before its reply does; the reply then installed a
+    `Shadow` for the same op and re-applied it on top of what had been
+    streamed *after* it — an unlink that removed the name a later
+    streamed create had put back — and the segment, skipping the
+    confirmed streamed rows, never put it back: node 2 diverged from
+    the log. `install_shadow` now *adopts* a live `Streamed` entry that
+    completes the rid: the entry stays streamed (the segment's skip is
+    the only retirement that converges for streamed rows) but carries
+    the op as this node's own (`SpecKind::Streamed::own`), so a takeover
+    that strands it replays it by rid as this node's op, with a conflict
+    copy on refusal, like a shadow; the reply counts as installed.
+    The mirror case — the reply's shadow arrived first — turns the
+    shadow into the streamed entry when the stream's copy arrives
+    (`install_streamed`, without applying anything): the segment then
+    retires it by skipping its rows like every streamed transaction's,
+    which is what keeps the streamed rows installed *after* it right.
+    Three wrong cuts on the way, each caught by the CI sim: answering
+    "not installed" sends the op down the lease path a second time
+    (`backup-departs` seed 1122, `backup-crash-slow` seed 1407);
+    re-kinding a streamed entry to a shadow re-applies its unlink over
+    the later streamed create when the segment lands (seed 753 again);
+    and simply dropping the stream's copy of a shadowed op lets the
+    segment apply that op's rows the ordinary way, over the later
+    streamed rows (`backup-crash-slow` seed 1402). All pinned.
+  - **`backup-strict` seed 1328 — the horizon wait blocked the tail's
+    shipping.** M8's takeover gate waits out the read-delegation
+    quarantine (`GateStep::Wait`) with the view closed *and nothing
+    shipping* (`ship_epoch` is `None` under a pending gate). M9's
+    delegation horizon reuses that quarantine, so a sealed backup that
+    took an unexpired strict tenure over sat for the whole horizon
+    (3.8 s here) with the predecessor's acknowledged tail re-applied in
+    its journal but unshipped; it crashed inside the wait (the seed's
+    second holder crash), and the acked write reached the log only as
+    a conflict copy after the restarted client had re-created the
+    name. `PendingGate.shippable` is set once the gate's journal work
+    is done (marker, backup tail, replays); the journal shipper alone
+    (`LeaseState::journal_ship_epoch`) then ships while the quarantine
+    or the kernel drain still keeps the view closed — forwards,
+    handoffs, the inbox, backups and streams still wait for the gate.
+    The horizon delays acknowledgements, as designed — not durability.
+- an extra `long_backup` range (50300–50599, beyond the required 300)
+  found one more, in the streamed-row skip itself (`long-backup` seed
+  50412): a subscriber that had installed a holder's `Refused` +
+  `InboxAck` transaction ahead of the log skipped those rows when the
+  segment landed — correct for namespace records, but the streamed
+  install is not durable and writes neither the refused `completed`
+  row nor the inbox watermark, so the subscriber never learned the
+  refusal; taking over next, its inbox drain executed the refused
+  create. The skip now exempts every outcome row (`Completed`,
+  `Refused`, `InboxAck`), whose durable application is exactly those
+  idempotent bookkeeping writes.
+Pinned: `regression_refused_forward_is_not_re_executed` (all nine
+seeds under their configurations; the refusal seeds assert a refusal
+was journaled)
+and the unit test `a_refused_forward_is_journaled_and_a_retry_dedups_to_the_same_errno`.
+`regression_every_inbox_batch_of_a_rid_is_withdrawn` is re-pinned to
+10729 and 11608 (`find_multi_batch_withdraw_seeds` over 10000–11999
+found 13 seeds on this tree; the refusal rows shift every schedule).
+
+**Gates (this host).**
+All on the final tree (seven full chains were run along the way; the
+numbers below are the last one's):
+- `cargo fmt --all -- --check`: clean. `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test -p constellation-authority --release`: 45 unit (the 4
+  `epoch_rules` and 1 `refusal_outcomes` tests included), 3
+  `meta_repro`, 42 sim (4 ignored) — every pinned seed of M5–M9
+  including the ten pinned here; 29 s. The M9 sim set
+  (`backup ack_s3 no_peer pre_s3 local_policy regression_refused`) run
+  three times in a row: 9/9 each time.
+- `cargo test --workspace --exclude constellation-model`: 0 failures
+  (the CLI's 194, the net crate's 173, meta, store-s3, api, harness,
+  chaos, the debug sim shard's 42 in 73 s).
+- `cargo test -p constellation-model --release`: 0 failures (`backup`
+  7 + 1 ignored, 19.5 s; `cto` 18 + 1 ignored, 19.9 s; the rest as
+  before).
+- Sweeps: `long_random` 1,000 seeds (10000–10999) ok, 59 s;
+  `long_strict` 500 seeds ok, 31 s; `long_backup` 600 seeds
+  (50000–50599: the required 300 plus the range that found 50412) ok,
+  35 s — 592 backups added / 256 removed, 527 seals, 195 backup
+  takeovers, 429 `ack=s3` fast takeovers, 22,241 acknowledgements
+  waited, strict durability enforced throughout.
+
+**Harness** (prefix `constellation-harness-m9fable`, release build):
+all eight PASSED, one run each, alongside the test chain:
+- `single-node-unchanged` (2.7 s): local, no backup, fast path open,
+  every M9 counter 0; 200 writes p50 3.6 ms (the host was compiling
+  and testing alongside; 1.9 ms on a quiet host).
+- `no-peer-in-budget` (28 s): local, nothing waited; the successor's
+  first write 20.3 s after the kill (TTL expiry, as today).
+- `backup-departs` (12 s): replacement listed 1.6 s after the departure,
+  2 lease PUTs for the removal and the replacement, writes completed
+  throughout.
+- `backup-partition` (20 s): the holder timed the partitioned backup out
+  and replaced it; the sealed, unlisted backup did not take over; 108
+  writes from the third node, one holder after the heal, no conflicts.
+- `backup-failover` (18 s, four nodes, three rounds): seal-based
+  failover 1.508 / 1.51 / 1.52 s at a 20 s TTL; every acknowledged file
+  on the successor at once; backup-policy write latency p50 3.4 ms,
+  p90 4.1 ms (90 writes).
+- `ack-s3-failover` (9 s): acknowledgements waited for the segment (p50
+  5.5 ms against local floci); the frozen holder taken over, the peer's
+  write returned 6.6 s after the freeze; the thawed holder deposed, no
+  conflicts.
+- `backup-failover-with-delegation` (20 s, strict): the backup held
+  after 1.41 s; its first write of the delegated file returned 6.65 s
+  later (8.06 s after the reader's last grant, past the horizon); 0
+  stale of 25 reads sampled after the acknowledgement; 0 degraded.
+- `cto-strict` (8.5 s): 80 reads right after a close elsewhere, 0
+  stale; reader p50 1.1 ms, writer close p50 3.4 ms.
+
+## Plan 30 M9 — tester gate run (phase-4 boundary)
+
+Tester (Sonnet), 2026-09-24, worktree `/home/bra/cvs/constellation-m9`
+(branch `plan30-m9`, base main `e0437df` + M9's uncommitted work as
+handed off). Baseline: a detached worktree of main `e0437df` built
+fresh in the scratchpad (release `constellation` + `harness`), removed
+at the end. Host shared with several other concurrent milestone
+sessions throughout (uptime load average ranged ~3 to ~30); gates other
+than perf were run regardless, perf was run once load first dropped
+under ~8.
+
+### Gate 1 — fmt, clippy, workspace tests
+
+- `cargo fmt --all -- --check`: clean. `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --exclude constellation-model` (debug; the
+  model crate is reported separately in release, below, per its own
+  ≤60 s/≤2 GB-per-test budget): **850 passed, 0 failed, 13 ignored**
+  across 39 test binaries.
+  - One flake along the way: `constellation-meta`'s
+    `completion_marker_never_attaches_to_a_concurrent_writer`
+    (`crates/meta/tests/completion_ownership.rs`) failed once under
+    this host's heavy concurrent load. Reproduced under
+    `stress-ng --cpu 28` at 11/20 on this M9 tree and **10/20 on the
+    main baseline build**, same failure shape — a pre-existing
+    scheduling-sensitivity in the test (not in the M9 diff: the file is
+    unmodified from main), unrelated to M9. A quiet re-run of the full
+    `--exclude constellation-model` suite (below) was clean, 0 failures.
+- `cargo test -p constellation-model --release` (each test binary, its
+  own process): `backup.rs` **7 passed, 1 ignored (`backup_three_nodes_with_reconfiguration_is_clean`,
+  over the 30 M-state budget by design), 28.13 s wall, 7.69 GB peak RSS**;
+  `cto.rs` **18 passed, 1 ignored, 32.43 s wall, 14.9 GB peak RSS**
+  (both measured with `/usr/bin/time -v`, default test-thread
+  parallelism, which is why the aggregate RSS is well over the
+  CONVENTIONS 2 GB-per-test figure — several of the heavier individual
+  cases, e.g. the 30 M-state and 25.5 M-state searches, run
+  concurrently within one process; not a regression, just parallel
+  aggregation). Full `cargo test -p constellation-model --release`
+  (all files, one shared process): **57 passed, 0 failed, 5 ignored**.
+
+### Gate 2 — authority + sweeps
+
+- `cargo test -p constellation-authority --release`: **45 unit + 3
+  `meta_repro` + 42 sim (4 ignored) passed, 0 failed, 22.69 s.**
+- `AUTHORITY_SIM_SEEDS=2000 cargo test -p constellation-authority --release --test sim -- --ignored long_random`
+  (seeds 10000–11999): **PASSED, 140.88 s, 0 failing seeds.**
+- `cargo test -p constellation-authority --release --test sim -- --ignored long_strict`
+  (default 1000 seeds, 40000–40999): **PASSED, 56.97 s, 0 failing
+  seeds.** Totals: `CtoTotals { reads: 53392, constrained: 50400,
+  degraded: 473, tentative: 0, stale: 0, grants: 9247, recalls_sent:
+  8619, recalls_acked: 8215, recalls_expired: 404, ... }`.
+- `AUTHORITY_SIM_SEEDS=600 cargo test -p constellation-authority --release --test sim -- --ignored long_backup`
+  (seeds 50000–50599): **PASSED, 52.66 s, 0 failing seeds.** Totals:
+  `M9Totals { backups_added: 592, backups_removed: 256, reconfig_cas:
+  931, appends: 27738, acks_waited: 22241, seals: 527,
+  backup_takeovers: 195, s3_fast_takeovers: 429, acked_rolled_back: 0
+  (of the durability check; the `acked_rolled_back` field printed by
+  the report is a raw event counter across mixed configurations, not
+  itself a failure — the test's own `assert!(failures.is_empty())`
+  covers strict durability and passed) }`; failover samples n=477,
+  **p50=1213 ms, p90=3738 ms, max=11428 ms.**
+- No failing seed found anywhere in this run; nothing to replay.
+
+### Gate 3 — release build
+
+`cargo build --release --workspace`: clean.
+
+### Gate 4 — smoke, integration, pjdfstest
+
+- `tests/smoke.sh` (local file backend): **PASSED.** The "etag CAS
+  (If-Match) ... unavailable" line is the known `object_store`
+  `LocalFileSystem` CAS gap the `doctor` probe correctly reports (same
+  as every prior milestone's tester notes) — not an M9 issue.
+- `tests/integration.sh` equivalent: host port 4566 was held by the
+  independent, long-running `constellation-floci-1` container (as in
+  every prior milestone's tester run on this host), so ran the same
+  workaround as M4/M7/M8/M13: a standalone `floci` container on port
+  14566, `AWS_ENDPOINT=http://localhost:14566`, then
+  `bash tests/smoke.sh "s3://constellation-ci/<prefix>"` — **PASSED**,
+  full CAS probe report `ok` across the board (`create over an existing
+  key`, `If-Match` current/stale/missing, concurrent creates, concurrent
+  swaps).
+- pjdfstest, default mount: built the compliance image fresh
+  (`docker compose -p constellation-m9 build compliance`), ran with
+  `docker compose -p constellation-m9 -f docker-compose.yml -f
+  <scratchpad>/floci-no-port.yml --profile test run --rm compliance`
+  (drops floci's host port publish only; `compliance` reaches it by
+  in-network DNS regardless — same workaround M8's tester used). Result:
+  **8798 passed, 0 failed, empty baseline.**
+- pjdfstest with `CONSTELLATION_ACK=s3` (`docker compose ... run --rm -e
+  CONSTELLATION_ACK=s3 compliance`, same override): **8798 passed, 0
+  failed, empty baseline** — identical to the default-mount run (single
+  node: M9's design says `ack=s3` still runs through the lone-sequencer
+  fast path's ack gate, adding a segment-landing wait per write but no
+  new POSIX-visible behavior).
+- Both compliance runs torn down (`down -v`) immediately after; verified
+  `constellation-floci-1` and other worktrees' containers were untouched
+  throughout.
+
+### Gate 5 — the full harness run
+
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m9
+CONSTELLATION_BIN=.../target/release/constellation timeout 2400
+./target/release/harness run` (every scenario, one process, ~43
+minutes): **104 PASSED, 8 FAILED, 2 SKIPPED** (`fio-latency`,
+`fio-blips` — no `fio` on this host, acceptable per CONVENTIONS).
+
+All seven M9 scenarios **PASSED**:
+- `single-node-unchanged` (1.9 s): local, no backup, every M9 counter 0.
+- `no-peer-in-budget` (21.7 s): local throughout; B's first write after
+  A's death returned after 15.55 s (TTL expiry, today's behavior).
+- `backup-failover` (16.6 s, three rounds): seal-based failover
+  **1.504389338 s, 1.504931189 s, 1.506948227 s** (round 0/1/2) — see
+  the failover table below.
+- `backup-departs` (8.2 s): replacement listed 1.235 s after the
+  departure; **115 S3 requests during the reconfiguration window**
+  (lease PUTs 2, GET 34, PUT 72, LIST 0); reconfiguration CAS 2
+  (removed 1, added 1); write latency before n=20 p50=3.04 ms, during
+  the reconfiguration n=22 p50=7.82 ms.
+- `ack-s3-failover` (8.6 s): `acks_waited 63`, holder write latency
+  under `ack=s3` p50=4.91 ms; B's write returned 6.22 s after A froze
+  (SIGSTOP); the thawed A deposed (`aborted 1`).
+- `backup-failover-with-delegation` (19.1 s, strict): X's write of the
+  delegated file returned 6.65 s later (8.05 s after R's last grant,
+  past the horizon); `floor_waits 1`; R sampled the file 123 times, 24
+  after the ack, **0 stale**.
+- `backup-partition` (18.6 s): the holder timed the partitioned backup
+  out and replaced it (`removed 1`, `added 2`, `reconfig_cas 3`); the
+  sealed, unlisted backup did not take over; converged after the heal.
+
+Also PASSED: every `cto-*` (`cto-strict`, `cto-bounded`,
+`cto-delegation-recall`, `cto-recall-unreachable`, `cto-latency`,
+`cto-second-node-joins`), every `session-*`, `visibility-after-burst`
+in some runs (see below), `p2p-same-identity-restart` (10.5 s — confirms
+the base-layer fix from `c876080` carries cleanly into M9),
+`kill9-remount`, `lease-handover`, `epoch-member-lost`,
+`continuation-epoch`, `inbox-create-storm-p2p-off`,
+`inbox-requester-crash-mid-batch`, `inbox-holder-takeover-pending-batch`,
+and (after the mechanical fix below) `chaos-ci`, `chaos-ci-strict`,
+`chaos-soak-4`.
+
+**The 8 failures, triaged:**
+
+1. **Mechanical, fixed here (3 of the 8): `chaos-ci`, `chaos-ci-strict`,
+   `chaos-soak-4`** all failed identically:
+   `unexpected segment envelope version 3`. Root cause: M9 bumped
+   `SEGMENT_VERSION` 2→3 in `crates/authority/src/segment.rs` (the
+   `rows` field for pre-S3 streaming), but two harness-only verification
+   helpers that hand-decode the envelope's first four fields
+   (`crates/harness/src/scenarios/m4.rs`'s completion-log reader, used
+   by `m4::after_chaos`; `crates/harness/src/scenarios.rs`'s
+   `segment_header`, used by `takeover-marker-strands-promptly`) still
+   hardcoded `v == 2`. Confirmed this is M9-introduced, not pre-existing:
+   the main baseline's `segment.rs` still has `SEGMENT_VERSION = 2`, so
+   main's identical checker code never hits it. The envelope's on-wire
+   shape is unaffected for the fields these helpers read (new fields are
+   appended with `#[serde(default)]`, and the module's own comment notes
+   the prefix decode "still reads the envelope" across additions) — only
+   the expected-version constant was stale. Fixed by bumping both to
+   `v == 3` with a short comment. Rebuilt `constellation-harness`;
+   `cargo fmt`/`clippy -p constellation-harness` clean; re-ran all
+   three: **`chaos-ci` PASSED (12.2 s), `chaos-ci-strict` PASSED (4.2 s),
+   `chaos-soak-4` PASSED (309.0 s).**
+2. **Pre-existing, documented: `takeover-marker-strands-promptly`**
+   FAILED once in the full run (`C must hold the accepted create as an
+   outstanding shadow`). Reruns: **1/3 failed on M9, 0/3 failed on
+   main** (small sample; a known intermittent race). This scenario is
+   the one PROGRESS.md's M5–M8 "Found, not fixed" lists have carried
+   forward unchanged as "`takeover-marker-strands-promptly` flakes" —
+   consistent with what was found here, not a new M9 issue.
+3. **Genuine M9 regression: `holder-publishes-log-prefix`** — FAILED
+   **3/3** on M9 (`A acknowledged N mkdirs and all N are visible: the
+   kill caught no unshipped tail, so nothing here tested a commit
+   published over one`), **PASSED 3/3 on main** (~11.1–11.3 s each,
+   vs. 8.9–9.3 s on M9). The scenario's premise needs the kill to land
+   while A's journal still holds unshipped work (it paces mkdirs at
+   ~200/s against a 50 ms sync interval and kills on the *next* new
+   commit after first observing `speculation.local > 0`); on M9 the
+   race window that used to catch an unshipped tail no longer does —
+   every acknowledged mkdir was already shipped by the time A died, in
+   all 3 runs. Replay: `CONSTELLATION_HARNESS_DOCKER_PREFIX=<own>
+   CONSTELLATION_BIN=<m9 release bin> harness run holder-publishes-log-prefix`.
+   Not fixed here (a real timing-window question, not a fixture bug).
+4. **Genuine M9 regression: `visibility-after-burst`** — FAILED **2/3**
+   on M9 (`streams on: b/c still issued 17 S3 tail GETs during the
+   markers`, the same count both times), **PASSED 3/3 on main**
+   (~28.9 s each, vs. 32.0–32.2 s on M9). The scenario's whole point
+   under "streams on" is that log-stream subscribers need ~0 S3 tail
+   GETs during the marker phase; M9's pre-S3 streaming shares the M7
+   stream-subscription machinery, and something in that path now falls
+   back to tailing S3 17 times per follower in 2 of 3 runs. Not fixed
+   here. Replay: `harness run visibility-after-burst` (repeat a few
+   times; it did not reproduce on the third M9 run).
+5. **Inconclusive, likely host-load flake: `inbox-sporadic-write-p2p-off`**
+   — FAILED once during the crowded full run (`the lease moved for
+   sporadic writes (epoch 1 -> 1)`; decoding the assertion, the epoch
+   didn't move — `lease_of(&holder)?["held"]` read `false` once,
+   transiently, which the message's wording doesn't distinguish).
+   **3/3 passed on isolated M9 reruns** (62.8–62.9 s each) and **2/2 on
+   main** (63.2, 62.9 s). Reported for completeness; not reproduced
+   outside the heavily loaded full run, so not counted as a confirmed
+   regression.
+
+### Perf (interleaved main vs. M9, load 3–6 throughout this block)
+
+`meta-bench` via a `mb.sh`-style driver in the scratchpad
+(`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m9`,
+`CONSTELLATION_METABENCH_ONLY=<label>`), 3 interleaved main→M9 pairs per
+config:
+
+| Config | Round | main agg ops/s | M9 agg ops/s | main p50 ms | M9 p50 ms |
+|---|---|---|---|---|---|
+| `1node-create-lat0` | 1 | 9372 | 7701 | 0.10 | 0.12 |
+| `1node-create-lat0` | 2 | 7370 | 8418 | 0.12 | 0.11 |
+| `1node-create-lat0` | 3 | 8149 | 8240 | 0.11 | 0.11 |
+| `1node-write4k-lat0` | 1 | 3234 | 3234 | 0.30 | 0.30 |
+| `1node-write4k-lat0` | 2 | 3085 | 3012 | 0.30 | 0.31 |
+| `1node-write4k-lat0` | 3 | 3019 | 2974 | 0.32 | 0.31 |
+| `3node-p2pon-shared-create-lat0` | 1 | 2868 | 564 | 0.63 | 2.46 |
+| `3node-p2pon-shared-create-lat0` | 2 | 2888 | 576 | 0.63 | 2.62 |
+| `3node-p2pon-shared-create-lat0` | 3 | 3339 | 570 | 0.61 | 2.43 |
+
+The two single-node configs are M9 within ~5% of main, as required
+under real `ack=local`. The 3-node config is **not** a regression: with
+`CHAOS_KEEP_TMP=1` and default `RUST_LOG`, node 0's `mount.log` shows
+`bringing up a backup node=1 candidate=2` then `backup set reconfigured
+node=1 backups=[2] policy=Backup config_version=2` about 5 s after
+mount — M9's backup-selection logic (design, PROGRESS's M9 section:
+"never assume a LAN"; `CONSTELLATION_BACKUP_RTT_BUDGET_MS` default 5,
+trivially met on loopback) auto-promotes *any* multi-node LAN mount out
+of `Local` once a candidate is stable, by design, not by request. So
+this config is no longer running under `ack=local` after ~5 s, and its
+~5× lower throughput / ~4× higher p50 **is** the "added ack latency on
+a LAN with a backup in budget" the plan separately asks the tester to
+record — consistent with PROGRESS's own qualitative M9 section figures
+("a LAN backup costs ~2 ms per acknowledgement here"). Flagged for the
+coordinator only because it means every realistic multi-node same-DC
+deployment silently leaves `Local` within seconds; not something a
+tester fixes, and not a violation of the "within 5% under `ack=local`"
+bar since the bar's own precondition (`ack=local` staying in effect)
+does not hold for this config once a backup is selected.
+
+**Failover-time distribution** (kill → successor holds; 20 s TTL
+throughout):
+
+| Scenario | Samples |
+|---|---|
+| `backup-failover` (seal-based, 3 rounds) | 1.504 s, 1.505 s, 1.507 s |
+| `ack-s3-failover` (holder frozen, SIGSTOP) | 6.22 s (full run); a separate isolated run of the same scenario returned 6.8 s |
+| sim `long_backup` (600 seeds, TTL varies per seed) | n=477, p50=1213 ms, p90=3738 ms, max=11428 ms |
+
+**S3 requests per reconfiguration** (`backup-departs`, holder behind the
+harness's own counting proxy): **115 requests** in the 1.235 s window
+until the replacement backup was listed — **2 lease PUTs** (the removal
+CAS and the addition CAS), 34 GET, 72 PUT (the writes' own segments/
+chunks continuing throughout), 0 LIST; matches the M9 coder's own
+measurement ("2 lease PUTs... among 104 requests") to within the load
+this run carried.
+
+### Mechanical fixes made
+
+- `crates/harness/src/scenarios/m4.rs` and `crates/harness/src/scenarios.rs`:
+  bumped two hardcoded segment-envelope version checks from `v == 2` to
+  `v == 3` to match M9's own `SEGMENT_VERSION` bump (a stale test
+  fixture, not a product bug — see Gate 5, item 1). No other files
+  touched.
+
+### Not fixed here (for the coder/coordinator)
+
+- `holder-publishes-log-prefix`: a timing-window regression — M9 now
+  reliably ships every acknowledged write before the scenario's kill
+  can land inside an unshipped tail, so the "publish over an unshipped
+  commit" path this scenario exists to exercise goes untested. 3/3 on
+  M9 vs. 3/3 on main.
+- `visibility-after-burst`: with log streams on, followers issued 17 S3
+  tail GETs during the marker phase in 2/3 M9 runs (expected ~0), vs.
+  0/3 on main. Likely an interaction between M9's pre-S3 streaming and
+  M7's stream-subscription liveness/gap-detection path.
+- The 3-node `meta-bench` LAN-backup auto-promotion above (design
+  question, not a bug): whether every same-DC multi-node deployment
+  silently paying the backup round trip within ~5 s of mount is the
+  intended default, or whether `CONSTELLATION_BACKUP_RTT_BUDGET_MS`'s
+  default should be reconsidered for the common LAN case.
+- `takeover-marker-strands-promptly` and the base issues listed under
+  M5–M8's own "Found, not fixed" sections remain untouched and are not
+  M9's responsibility.
+
+### Round 2 re-verify (tester, 2026-09-24; coordinator-requested targeted
+re-run after the coder's round 2 — see "Plan 30 M9 — round 2" below for
+what changed: `journal::max_seq`/`execute_inner`'s `next_journal_seq`
+bound, `backup_tail_floor`, holes in `journal_txs_from`, the no-peer
+`backup_stream` skip, and `holder-publishes-log-prefix` pinning
+`CONSTELLATION_BACKUP_RTT_BUDGET_MS=0` plus its new `-backup` variant)
+
+Baseline: a fresh detached worktree of main `e0437df` built in the
+scratchpad (release `constellation` + `harness`), removed afterwards.
+Host shared with other sessions throughout (load average 4–10).
+
+**Gates 1–3.**
+- `cargo fmt --all -- --check`: clean. `cargo clippy --workspace --all-targets -- -D warnings`: clean. `cargo clippy --workspace --all-targets --release -- -D warnings`: clean.
+- `cargo test --workspace --exclude constellation-model --no-fail-fast`:
+  **858 passed, 0 failed, 13 ignored** (up from round 1's 850 — the
+  coder's new tests). `cargo test -p constellation-model --release`:
+  **57 passed, 0 failed, 5 ignored.**
+- `cargo test -p constellation-authority --release`: **50 + 3 + 42
+  passed, 0 failed, 4 ignored, 21.7 s** (50 unit, up from 45 — the
+  coder's new `pipelined_appends` tests).
+- Sweeps: `long_random` 1000 seeds (10000–10999): **PASSED, 71.45 s.**
+  `long_strict` 500 seeds (40000–40499): **PASSED, 28.73 s.**
+  `long_backup` 600 seeds (50000–50599): **PASSED, 32.82 s**
+  (`M9Totals`: backups added 498 / removed 113, appends 20251, seals
+  353, backup takeovers 241, s3 fast takeovers 429). Zero failing seeds
+  anywhere.
+- Release build: clean. `tests/smoke.sh`: **PASSED.** pjdfstest,
+  default mount (same `floci-no-port.yml` / separate project-name
+  workaround as the phase-4 run): **8798 passed, 0 failed, empty
+  baseline.**
+
+**Harness** (prefix `constellation-harness-m9`, foreground, each
+scenario or small group its own invocation): **every scenario the
+coordinator asked for PASSED — zero failures, no reruns needed.**
+- The seven M9 scenarios, `holder-ships-under-forward-load`,
+  `forwarded-mutations`, `poison-record-isolation`, `kill9-remount`,
+  `fresh-node-bootstrap` (63.4 s), `stale-base-rename-divergence`,
+  `inbox-create-storm-p2p-off`, `inbox-sporadic-write-p2p-off` (63.6 s
+  — did not flake this time), `session-ryw-after-holder-kill`,
+  `cto-strict`: **16/16 PASSED** in one batch run.
+- `chaos-ci`, `chaos-ci-strict`, `chaos-soak-4`: **PASSED** (3.6 s,
+  3.1 s, 306.3 s) — confirms round 1's mechanical `SEGMENT_VERSION`
+  fixture fix still holds against the coder's round-2 code.
+- `holder-publishes-log-prefix` ×3: **3/3 PASSED** (11.3–11.5 s each)
+  — confirms the fix (pinning `CONSTELLATION_BACKUP_RTT_BUDGET_MS=0`
+  restores the scenario's original precondition).
+- `holder-publishes-log-prefix-backup` ×3 (new scenario): **3/3
+  PASSED** (15.1–15.4 s each).
+- `visibility-after-burst` ×3: **3/3 PASSED** (29.0–31.6 s each).
+  Tail-GET counts recorded directly from the scenario's own output:
+
+  | Run | streams off (b / c) | streams on (b / c) |
+  |---|---|---|
+  | 1 | 1564 / 1564 | 1 / 0 |
+  | 2 | 1520 / 1518 | 1 / 0 |
+  | 3 | 1718 / 1676 | 1 / 0 |
+
+  Matches the coder's round-2 claim exactly (streams-on tail GETs at
+  1/0, down from round 1's 17/17 with streams on and the
+  never-completed 23 000+ with streams off before the holes fix).
+- `takeover-marker-strands-promptly` ×3: **3/3 PASSED** (10.1–10.6 s
+  each) — the phase-4 run's 1/3 flake did not recur; still treated as
+  the known low-probability pre-existing race (unrelated to M9), not
+  re-litigated further here.
+
+**Perf** (interleaved main vs. M9, 3 pairs each, load 4.4–8.1
+throughout — reported per the `uptime` at the start and end of the
+block: `4.43 7.79 9.34` → `5.90 7.37 8.96`):
+
+| Config | main round 1/2/3 ops/s | M9 round 1/2/3 ops/s | mean M9/main | main p50 ms | M9 p50 ms |
+|---|---|---|---|---|---|
+| `1node-create-lat0` | 6284 / 6749 / 7742 | 7998 / 8411 / 9416 | **1.25** | 0.12/0.13/0.12 | 0.12/0.11/0.10 |
+| `1node-write4k-lat0` | 3271 / 2957 / 3052 | 2990 / 2874 / 2828 | **0.94** | 0.30/0.31/0.32 | 0.31/0.32/0.33 |
+| `3node-p2pon-shared-create-lat0` | 3074 / 2822 / 3060 | 2344 / 2233 / 2571 | **0.80** | 0.63/0.64/0.64 | 1.08/1.10/1.01 |
+
+- `1node-create-lat0`: M9 **25% ahead** of main — comfortably within
+  the 5% bar (and consistent with round 2's no-peer `backup_stream`
+  read skip, which brought the lone-node fast path level with or ahead
+  of main).
+- `1node-write4k-lat0`: M9 at **94% of main** (6% below) — just outside
+  a strict 5% reading; all three individual-round ratios were
+  91–97%, i.e. inside ordinary run-to-run noise on a host whose load
+  moved from ~4 to ~9 during the block, not a step-function regression
+  like round 1 saw elsewhere. Flagged for the record, not rerun further
+  (three pairs were already run, as asked).
+- `3node-p2pon-shared-create-lat0`: M9 at **80% of main**, p50 = main +
+  ~0.4–0.45 ms — inside the ~25% target and matching the coder's own
+  quiet-host figure (74–82%) and explanation (one loopback QUIC round
+  trip to the auto-selected backup). Round 1's pre-fix number on this
+  same config was ~20% of main (5×  slower); this is the throughput fix
+  confirmed independently.
+
+**Verdict:** every item the coordinator asked to re-check is clean.
+No new failures, no reruns triggered, no A/B against main needed beyond
+the perf interleaving itself. Baseline worktree removed
+(`git worktree remove --force`) and the compliance compose project torn
+down (`down -v`) after use; no processes or containers left behind
+(confirmed against `/proc/<pid>/exe` and `docker ps -a` before treating
+anything as stale).
+
+## Plan 30 M9 — round 2 (coder, 2026-09-24; uncommitted on `plan30-m9` = main e0437df + M9 + the tester's two `SEGMENT_VERSION` fixture bumps)
+
+The tester's phase-4 run left three items. All three are fixed; the
+first two turned out to be one root cause each, the third was two.
+
+### 1. Default-backup throughput (blocking) — fixed
+
+**What was slow.** Not the round trips. With a backup, the holder's
+forwarded-op handling (`core step event="Peer(MutateRequest)"`) cost
+4.5–9 ms p90/p99 while every other event took microseconds, and the
+backup's own `Peer(BackupAppend)` handling cost 350 µs and grew. Both
+were the same fjall pathology, found with per-phase `Instant` probes
+(removed again):
+
+- **Holder: `Meta::max_journal_seq` (`journal::max_seq`) — 3.4 ms mean,
+  p90 5.4 ms, 949 of 2 400 forwarded ops.** `execute_inner` reads the
+  journal's highest seq before every op via `last_key_value`, which
+  walks backwards through every *tombstone* in the memtable before it
+  finds a live row — or finds none. A holder that ships promptly (a
+  backup, a stream-ahead every few ms, S3 at 0 ms) keeps its journal
+  empty most of the time, so nearly every op paid the whole walk; on
+  main (no backup) a backlog usually existed and the walk stopped at
+  once (53 slow calls vs 1 135). Fix: `max_seq` starts its reverse
+  range at the acked watermark + 1 (rows at or below it are deleted),
+  and `execute_inner` takes `before` from the `next_journal_seq`
+  counter (`journal_tip`, a point read) — the op's rows land above it
+  either way. `journal_position` uses the bounded scan too.
+- **Backup: `Meta::backup_trim` — every append trimmed by scanning
+  `backup_tail` from key `(0, 0)`**, i.e. through the tombstones of
+  everything trimmed before it, and committed a write transaction even
+  with nothing to remove; the same scan ran on every applied log-stream
+  segment (`backup_note_segment`), which is why the backup's
+  `Peer(LogStream)` handling cost 480 µs vs 85 µs on the other
+  follower. Fix: a `backup_tail_floor` hint (`Meta`, in memory: a lower
+  bound on every live tail key; `None` = unknown, full scan once) that
+  a trim starts from and re-establishes (the lowest survivor, or
+  `(epoch, through + 1)`); an append lowers it when a resend lands
+  below; `backup_clear` forgets it. The scan also stops at the first
+  transaction that begins above everything the caller can trim (a
+  transaction's `last` ≥ its `first`), and a trim with nothing doomed
+  rolls back instead of committing. `a_trim_scans_from_the_floor_and_a_resend_lowers_it`
+  pins the floor's moves.
+
+- **Lone node: a journal read per event.** `backup_stream` read the
+  journal tip (`journal_tip`, a snapshot and a point get) on every core
+  event before finding it had no peer to stream to — 4 000 reads per
+  4 000 fast-path ops on a single node, enough to keep the fast path
+  out of its 0.12–0.17 ms p50 mode (main's `Control(Nudge)` handling
+  is 0 µs; M9's was 5 µs p50, 14 p90, with the FUSE op's wall time
+  417 µs p50 vs 177). It returns before the read now when there is no
+  peer; the `1node-*` labels are level with main since (tables below).
+
+**What did not help** (measured, kept or reverted as noted): appends
+were already pipelined (up to `backup_max_inflight = 8`, cumulative
+acks, one transaction per append at this load, ~2.3 in flight) and the
+parked acknowledgements were released 12 µs p50 after the covering
+ack; the stream-ahead hold-off, the housekeeping cadence and the open
+fast path (all kept, from round 1) moved throughput by a few percent.
+The remaining gap to main is one backup round trip per acknowledged
+op: QUIC request/response on loopback here is ~350–420 µs p50, the
+backup's own service time 22 µs.
+
+**After** (same host, quiet, interleaved single runs of
+`3node-p2pon-shared-create-lat0`): main **3 092 ops/s, p50 0.63 ms**;
+M9 **2 512 / 2 549 / 2 524 / 2 294 ops/s, p50 1.02–1.07 ms** — 74–82 %
+of main's throughput, p50 = main + ~0.4 ms (one loopback QUIC round
+trip). Before the fix M9 was 521–630 ops/s, p50 2.1 ms.
+
+### 2. `holder-publishes-log-prefix` — (a), a legitimate precondition change
+
+With a backup in budget (any LAN peer, by default), an acknowledged
+mkdir is no longer "unshipped work the kill catches": the sealed
+backup re-ships it, and every acknowledged mkdir reaches the log —
+which is M9's promise, not a bug. The scenario now pins
+`CONSTELLATION_BACKUP_RTT_BUDGET_MS=0` (the M7 precondition, stated in
+its registry description) and passes 3/3 (1 022 / 1 050 / 1 033
+acked, 7 / 7 / 6 never visible). A new companion,
+**`holder-publishes-log-prefix-backup`** (budget 5 ms), runs the same
+burst and kill with B as A's backup: B must seal and take over, the
+log must hold at least every acknowledged mkdir (the one in flight at
+the kill may be on B only), D == B as before; 3/3 (928 / 937 / 934
+acked, 0 never visible, 6 tail rows re-applied each). TESTING.md
+documents both.
+
+### 3. `visibility-after-burst` — two real bugs, fixed
+
+Reproduced 2/4 here at first (17 S3 tail GETs with streams on; a
+streams-*off* run with p99 31 s and 23 000 tail GETs, i.e. the
+followers spinning on S3 while nothing arrived), then with backup
+tracing kept:
+
+- **The candidate backup never caught up, so the holder's fast path
+  waited the whole 30 s durability budget out.** After the burst, A's
+  journal had a held-back manifest row (its chunk still uploading)
+  with rows shipped and deleted *above* it — a hole. `journal_txs_from`
+  iterated `journal_tx` heads, so the batch it streamed from `through
+  + 1` began past the hole; the backup's contiguous fold needs the
+  next seq, held the batch "ahead of a gap" and acknowledged the same
+  `acked` forever; the holder took the short ack as "resend from the
+  hold" and resent — **271 175 appends in 30 s** (the log-stream
+  followers saw the same rows go by as tail GETs). Meanwhile the
+  candidate was neither listed nor dropped ("any answer is progress"),
+  and `durable_jseq` is `MAX` while a candidate is being brought up,
+  so every fsync'd marker waited `DURABLE_WAIT_BUDGET` (30 s) and went
+  in doubt. Fix, three parts:
+  1. `journal_txs_from` walks the journal *rows* from the boundary
+     (a head at the row's seq gives the transaction's extent; a row
+     outside any head is a transaction of its own) and emits **holes**
+     — a `BackupTx` with no records spanning rows the journal no
+     longer has (shipped out of order, or rolled back) — so what a
+     backup or a stream-ahead subscriber receives is contiguous from
+     the seq it asked for. The holder appends a trailing hole up to
+     the tip when the batch was not capped, so the hold reaches the
+     tip and the candidate counts as caught up. Holes are persisted
+     and acknowledged like any transaction, skipped by the takeover's
+     tail re-apply, and step a subscriber's `ahead_next` cursor (the
+     rows are in the log at or below `base`, which it has applied).
+  2. **Progress is the hold advancing** (or an append answered in
+     full, heartbeats included), not any answer: a backup stuck on the
+     same rows now times out (`backup_ack_timeout_ms`, 1 s) and is
+     dropped — a candidate silently, a listed backup by
+     reconfiguration — instead of holding the fast path for 30 s.
+  3. **A short ack resends once**: the later appends in flight are
+     forgotten (their acks are ignored like any unknown request's)
+     rather than each triggering the same resend.
+- The other follower's "17 tail GETs" were the same hole seen from the
+  pre-S3 stream: a `StreamAhead` batch whose first transaction did not
+  start at `ahead_next` was dropped, the cursor reset, and the
+  follower tailed S3 until the next segment re-synced it. Holes fix
+  that path too (`on_stream_ahead` steps over them).
+
+Tests: `a_holder_streams_holes_and_headless_rows_contiguously` (meta),
+`holes_in_the_journal_stream_as_empty_transactions_up_to_the_tip` and
+`a_stuck_backup_is_resent_to_once_and_then_dropped` (core). Now
+`visibility-after-burst` passes 3/3 with streams on 1 / 0 tail GETs
+(b / c) and streams off back at 1 900–2 050, p99 0.36–0.39 s in both
+modes.
+
+### Also found
+
+- `backup-failover` failed 1/6 with "b did not take over as a backup"
+  while b's status still showed it *backing* epoch 1: the harness read
+  `backup_takeovers` right after `wait_holds`, and the lease is held
+  before the takeover gate re-applies the tail (the gate runs in the
+  rounds after the claim). The scenario now waits up to 10 s for the
+  counters (`m9.rs`); 8/8 since.
+- `regression_refused_forward_is_not_re_executed`: long-backup seed
+  50064 stopped journaling a refusal once the holder streamed holes
+  and resent once (the schedule moved); it stays for its strict
+  checks and seed 50068 (8 refusals journaled) pins the path.
+- **Not M9, environmental, for the coordinator:** a 3-node `meta-bench`
+  config with P2P off drives ~25 000 short-lived TCP connections to
+  the S3 proxy in ~6 s (each tail-probe GET on a fresh connection —
+  `TIME-WAIT` on host→toxiproxy and host→docker-proxy) and exhausts
+  the ephemeral port range; S3 then refuses connections for ~20 s,
+  a create can fail with `EIO`, and the *next* config's preflight
+  fails ("error sending request"). Measured identically on main
+  (24 847 `TIME-WAIT`) and M9 (25 730); it hit M9's rounds more often
+  by luck of ordering. The p2poff labels below are from the one round
+  that completed on both builds; rounds 2–3 ran the `1node` and
+  `p2pon` labels only. Worth its own look (`object_store` connection
+  reuse against floci/toxiproxy, or a narrower default `tail_width`
+  when the stream covers the tail).
+- The driver's `Action::CancelTimer` is a no-op, so the `HeldReply`
+  timers a released park leaves behind still fire (~100–400 no-op
+  `Timer` events/s on a busy holder). Harmless (microseconds each),
+  not changed here.
+
+### Gates
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets --release -- -D warnings` clean.
+- `cargo test --workspace --release`: all green (authority 50 + 3 +
+  sim 42/4 ignored, meta 67 + …, model, cli, harness).
+- Sweeps: `long_random` 1 000 seeds, `long_strict` 500, `long_backup`
+  300 — all pass (`long_backup` M9Totals: backups added 247 / removed
+  57, appends 10 305, acks 7 660, ack timeouts 155, seals 181, backup
+  takeovers 127, s3 fast takeovers 212, acked rolled back 50, 0
+  failing seeds).
+- Harness (prefix `constellation-harness-m9fable`, foreground): the
+  seven M9 scenarios `backup-failover` (6/6 after the harness fix,
+  1/1 flake before it), `backup-departs`, `no-peer-in-budget`,
+  `ack-s3-failover`, `single-node-unchanged`,
+  `backup-failover-with-delegation`, `backup-partition` — PASSED;
+  `cto-strict` PASSED; `chaos-ci` PASSED (21 s);
+  `holder-publishes-log-prefix` 3/3, `holder-publishes-log-prefix-backup`
+  3/3, `visibility-after-burst` 3/3.
+
+### Meta-bench, interleaved against main e0437df (built in a scratch detached worktree, removed afterwards)
+
+Three interleaved rounds (main, M9, main, M9, …; rounds 2–3 without the p2poff labels, see "Also found"). Host load 3–5 from other sessions throughout; main's round 2 ran on a briefly quiet host (its outliers are visible). Throughput in ops/s, p50 in ms, per round r1/r2/r3:
+
+| label | main ops/s | M9 ops/s | M9/main (mean) | main p50 | M9 p50 |
+|---|---|---|---|---|---|
+| `1node-create-lat0` | 2492/5306/3264 | 2622/2671/2750 | 0.73 | 0.34/0.15/0.25 | 0.31/0.30/0.28 |
+| `3node-p2pon-shared-create-lat0` | 1569/1597/1662 | 1311/963/1331 | 0.75 | 0.92/0.81/0.79 | 1.34/2.26/1.35 |
+| `3node-p2pon-disjoint-create-lat0` | 1388/3347/1494 | 1374/1318/1409 | 0.66 | 1.00/0.62/0.98 | 1.23/1.08/1.08 |
+| `1node-write4k-lat0` | 1312/3175/1194 | 1321/1114/1302 | 0.66 | 0.62/0.30/0.61 | 0.57/0.81/0.58 |
+| `3node-p2pon-shared-write4k-lat0` | 163/272/178 | 434/423/400 | 2.05 | 12.53/8.37/10.64 | 3.89/3.55/4.29 |
+| `3node-p2pon-disjoint-write4k-lat0` | 161/280/171 | 451/440/482 | 2.24 | 12.95/8.19/10.70 | 3.52/4.04/3.53 |
+| `1node-create-lat20` | 1960/9345/2430 | 2695/2868/2372 | 0.58 | 0.54/0.10/0.37 | 0.32/0.23/0.38 |
+| `3node-p2pon-shared-create-lat20` | 1194/3828/1024 | 877/712/925 | 0.42 | 1.09/0.63/1.88 | 2.44/3.19/2.20 |
+| `3node-p2pon-disjoint-create-lat20` | 1686/3894/1432 | 826/855/818 | 0.36 | 0.68/0.63/0.87 | 2.74/2.48/2.60 |
+| `1node-write4k-lat20` | 1368/3529/954 | 943/827/910 | 0.46 | 0.39/0.24/1.03 | 1.01/1.22/0.96 |
+| `3node-p2pon-shared-write4k-lat20` | 34/36/38 | 50/33/36 | 1.10 | 83.62/79.38/1.89 | 3.95/83.06/4.84 |
+| `3node-p2pon-disjoint-write4k-lat20` | 32/41/35 | 33/33/33 | 0.92 | 83.45/0.43/83.50 | 88.43/83.62/86.89 |
+| `1node-create-concurrent4-lat0` | 3195/8301/2984 | 3896/3958/3806 | 0.81 | 1.02/0.45/1.24 | 0.72/0.51/0.77 |
+| `3node-p2pon-shared-create-concurrent4-lat0` | 2157/3435/2250 | 1829/1266/1394 | 0.57 | 3.11/2.51/2.76 | 4.86/4.29/5.46 |
+| `3node-p2pon-disjoint-create-concurrent4-lat0` | 5455/8430/5922 | 4477/4044/3740 | 0.62 | 1.04/0.86/1.02 | 1.83/1.66/2.35 |
+
+p2poff labels (round 1 only, both builds; no backups with P2P off, so M9 is a no-op there):
+
+| label | main ops/s | M9 ops/s | main p50 | M9 p50 |
+|---|---|---|---|---|
+| `3node-p2poff-shared-create-lat0` | 80 | 40 | 0.51 | 0.49 |
+| `3node-p2poff-disjoint-create-lat0` | 60 | 51 | 0.34 | 0.26 |
+| `3node-p2poff-shared-write4k-lat0` | 84 | 83 | 0.53 | 0.75 |
+| `3node-p2poff-disjoint-write4k-lat0` | 50 | 69 | 0.78 | 0.69 |
+| `3node-p2poff-shared-create-lat20` | 69 | 70 | 0.12 | 0.37 |
+| `3node-p2poff-disjoint-create-lat20` | 70 | 69 | 0.34 | 0.48 |
+| `3node-p2poff-shared-write4k-lat20` | 68 | 68 | 0.77 | 0.96 |
+| `3node-p2poff-disjoint-write4k-lat20` | 68 | 67 | 1.04 | 0.87 |
+
+Focused back-to-back A/B on the labels that matter (each row alternates main, M9, main, M9, …; `ab_1node2` is after the last change, the no-peer journal-read skip):
+
+*3node-p2pon-shared-create-lat0 with the 1node labels, 3 rounds (before the no-peer skip; host load 3–5)*
+
+| label | main ops/s (p50 ms) | M9 ops/s (p50 ms) | M9/main (mean ops/s) |
+|---|---|---|---|
+| `3node-p2pon-shared-create-lat0` | 1582 (0.85) / 1735 (0.81) / 2071 (0.73) | 1580 (1.10) / 1492 (1.36) / 1268 (1.32) | 0.81 |
+| `1node-create-lat0` | 2490 (0.36) / 2628 (0.30) / 4719 (0.13) | 2882 (0.28) / 2902 (0.27) / 2726 (0.29) | 0.86 |
+| `1node-create-lat20` | 4248 (0.12) / 2667 (0.33) / 2504 (0.39) | 2027 (0.50) / 2066 (0.49) / 2064 (0.49) | 0.65 |
+| `1node-create-concurrent4-lat0` | 2915 (1.18) / 2709 (1.30) / 3610 (0.58) | 2653 (1.42) / 2656 (1.41) / 2236 (1.76) | 0.82 |
+
+(This is the run that showed the lone-node cost — main's 0.12–0.13 ms
+"fast mode" never appeared on M9 — and led to the no-peer journal-read
+skip below; after it the 1node labels are level or ahead, next table.)
+
+*1node-create lat0/lat20, 5 rounds (after the no-peer skip; host load 5–10)*
+
+| label | main ops/s (p50 ms) | M9 ops/s (p50 ms) | M9/main (mean ops/s) |
+|---|---|---|---|
+| `1node-create-lat0` | 2606 (0.32) / 2957 (0.25) / 2435 (0.33) / 3862 (0.17) / 3256 (0.23) | 3675 (0.17) / 3437 (0.18) / 2704 (0.31) / 3298 (0.19) / 3069 (0.23) | 1.07 |
+| `1node-create-lat20` | 2042 (0.48) / 2714 (0.34) / 2225 (0.46) / 2598 (0.36) / 2454 (0.38) | 3498 (0.12) / 2316 (0.41) / 3433 (0.13) / 2075 (0.49) / 2701 (0.31) | 1.17 |
+
+
+*Final build, 3node-p2pon-shared-create-lat0, 2 rounds (host load 5–6)*
+
+| main ops/s (p50 ms) | M9 ops/s (p50 ms) |
+|---|---|
+| 1492 (0.89) / 2046 (0.71) | 1604 (1.10) / 1970 (0.77) |
+
+*Quiet host, single runs, same label (the numbers in section 1)*: main
+3 092 ops/s p50 0.63 ms; M9 2 512 / 2 549 / 2 524 / 2 294 ops/s p50
+1.02–1.07 ms (p99 2.2–3.7 ms vs main's 6.9 ms).
+
+**Reading.** With a backup, `3node-p2pon-*-create-*` runs at 0.75–0.85
+of main's throughput on a loaded host (0.74–0.82 on a quiet one) with
+p50 = main + 0.3–0.5 ms — one loopback QUIC round trip to the backup,
+which the durability promise cannot hide; at 20 ms S3 latency the
+ratio is worse (0.4–0.7; p50 + ~1.3 ms — the S3-slow holder streams
+ahead to the non-backup subscriber on every durable advance, a second
+QUIC request per hold-off window, not measured further here). The
+`write4k` 3-node rows are *faster* on M9 (2×; main's 8–13 ms p50 is
+the write-back path waiting for a ship round, M9's fast path is open
+under the gate). The `1node-*` rows are level (the last-change tables:
+1.07–1.17). Every number here moves ±30 % run to run with the other
+sessions on the host; the tester's own interleaved rounds are the
+better source for the "within 25 %" verdict, and the reason it may
+still miss it is the round trip itself, not something left on the
+holder.
+
+### Files (round 2, on top of round 1's list)
+
+- `crates/meta/src/store/journal.rs`: `max_seq` bounded by the acked
+  watermark (takes `local`); `decode_row` crate-visible.
+- `crates/meta/src/store/writes.rs`, `session.rs`: callers of the
+  bounded `max_seq`. `crates/meta/src/mutate.rs`: `before` from
+  `journal_tip`.
+- `crates/meta/src/store/mod.rs`: `Meta::backup_tail_floor`.
+- `crates/meta/src/store/backup.rs`: `journal_txs_from` by rows with
+  holes; `backup_append` lowers the floor; `backup_trim` bounded,
+  early-stopping, commit-free when idle; `backup_clear` forgets the
+  floor; two tests.
+- `crates/authority/src/core/backup.rs`: no journal read without a
+  peer, trailing hole in `backup_stream`; progress rule and resend-once in `on_backup_ack`;
+  holes in `apply_backup_tail` and `on_stream_ahead`; `Reconfig` /
+  `AckState::reconfig` crate-visible (tests).
+- `crates/authority/src/core/holder.rs`, `core/mod.rs`,
+  `core/client.rs`: probes removed again; the `too_many_arguments`
+  allow back on `submit`.
+- `crates/authority/src/core/tests.rs`: two `pipelined_appends` tests.
+- `crates/authority/tests/sim.rs`: seed 50068.
+- `crates/harness/src/scenarios/m9.rs`: `backup-failover` waits for
+  the takeover gate's counters. `crates/harness/src/scenarios.rs`:
+  `holder-publishes-log-prefix` pins the budget; `-backup` variant
+  (round 1's change, documented now).
+- `docs/how-to-guides/development/TESTING.md`: the two log-prefix
+  scenarios, seed 50068.

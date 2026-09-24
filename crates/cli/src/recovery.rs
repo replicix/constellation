@@ -36,6 +36,7 @@ async fn submit(
             op,
             rid,
             policy: Policy::System,
+            in_doubt: false,
             reply,
         })
         .ok()?;

@@ -24,6 +24,8 @@ mod m6;
 mod m7;
 /// Plan 30 §M8: `--cto strict`, read delegations and recalls.
 mod m8;
+/// Plan 30 §M9: backup peers, seal-based failover, `ack=s3`.
+mod m9;
 
 pub struct Scenario {
     pub name: &'static str,
@@ -546,9 +548,15 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "holder-publishes-log-prefix",
-        desc: "plan 30 M3b: a holder publishes while its journal is non-empty; every commit equals the log prefix, so after a mid-burst kill a fresh node matches the log-tailing follower exactly",
+        desc: "plan 30 M3b: a holder publishes while its journal is non-empty; every commit equals the log prefix, so after a mid-burst kill a fresh node matches the log-tailing follower exactly (CONSTELLATION_BACKUP_RTT_BUDGET_MS=0: today's ack=local, where the kill catches an unshipped tail)",
         requires: &[],
         run: holder_publishes_log_prefix,
+    },
+    Scenario {
+        name: "holder-publishes-log-prefix-backup",
+        desc: "plan 30 M9: the same burst with B as A's backup; A's acknowledged tail is re-shipped by B after it seals and takes over, so every acknowledged mkdir reaches the log and the fresh node still matches the follower exactly",
+        requires: &[],
+        run: holder_publishes_log_prefix_backup,
     },
     Scenario {
         name: "poison-record-isolation",
@@ -651,6 +659,48 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M8: a lone strict node keeps a kernel cache (free on a single node); a second node joins and writes, and the first node's very next open sees it (the latch turns the cache off and drains it before acking the newcomer)",
         requires: &[],
         run: m8::cto_second_node_joins,
+    },
+    Scenario {
+        name: "backup-failover",
+        desc: "plan 30 M9: 3 nodes, 20 s lease TTL; three rounds of: 30 files written on the holder, the holder killed, its backup peer seals and holds within seconds (never the TTL), every acknowledged file is on it, the dead node remounts and converges; prints the failover-time distribution and the backup-policy write latency",
+        requires: &[],
+        run: m9::backup_failover,
+    },
+    Scenario {
+        name: "backup-departs",
+        desc: "plan 30 M9: the backup unmounts; the holder reconfigures it out and the third node in while writes keep completing; prints the S3 requests (lease PUTs) the reconfiguration cost and the write latency during it",
+        requires: &[],
+        run: m9::backup_departs,
+    },
+    Scenario {
+        name: "no-peer-in-budget",
+        desc: "plan 30 M9: CONSTELLATION_BACKUP_RTT_BUDGET_MS=0: no backup, local acknowledgements, the fast path open; a dead holder is replaced only when its lease expires (no seal, no fast takeover)",
+        requires: &[],
+        run: m9::no_peer_in_budget,
+    },
+    Scenario {
+        name: "ack-s3-failover",
+        desc: "plan 30 M9: CONSTELLATION_ACK=s3 on every mount: every acknowledgement waits for the log (a follower through S3 alone sees each acknowledged file); the holder is frozen and a peer takes over well inside the 20 s lease; the thawed holder is deposed without conflicts",
+        requires: &[],
+        run: m9::ack_s3_failover,
+    },
+    Scenario {
+        name: "single-node-unchanged",
+        desc: "plan 30 M9: one node, default knobs: local policy, no backup or candidate, the fast path open, nothing waited, no reconfiguration CAS; prints the write latency and the S3 requests of 200 writes",
+        requires: &[],
+        run: m9::single_node_unchanged,
+    },
+    Scenario {
+        name: "backup-failover-with-delegation",
+        desc: "plan 30 M9 (strict): a reader holds a read delegation from the holder, which dies; the backup takes over inside the lease and its first write of that file is acknowledged only past the delegation horizon: no read the reader starts after the acknowledgement is stale, and no strict read degrades",
+        requires: &[],
+        run: m9::backup_failover_with_delegation,
+    },
+    Scenario {
+        name: "backup-partition",
+        desc: "plan 30 M9: the holder and its backup are partitioned from each other (both keep S3 and the third node, which writes throughout): the holder reconfigures the backup out or the sealed backup takes over, never two holders; every acknowledged write is kept and the cluster converges after the heal",
+        requires: &[],
+        run: m9::backup_partition,
     },
     Scenario {
         name: "inbox-create-storm-p2p-off",
@@ -7641,7 +7691,10 @@ fn segment_header(endpoint: &str, prefix: &str, part: &str, seq: u64) -> Result<
     let ((v, node, epoch, records), _) =
         postcard::take_from_bytes::<(u32, u64, u64, u64)>(&payload)
             .with_context(|| format!("decoding {key}'s envelope"))?;
-    anyhow::ensure!(v == 2, "{key}: unexpected segment envelope version {v}");
+    // Plan 30 §M7 bumped the wire envelope to v3 (`through`) and §M9
+    // added `rows`; both are appended fields this prefix decode never
+    // reads, so only the version constant itself needed updating.
+    anyhow::ensure!(v == 3, "{key}: unexpected segment envelope version {v}");
     Ok((node, epoch, records))
 }
 
@@ -7883,20 +7936,44 @@ fn burst_listing(mnt: &std::path::Path) -> Result<Vec<String>> {
 /// log after `applied` on top of the commit. The two differ observably
 /// only when the commit holds something the log never received — exactly
 /// the crash case above, which D == B catches.
-fn holder_publishes_log_prefix(_seed: u64) -> Result<()> {
+fn holder_publishes_log_prefix(seed: u64) -> Result<()> {
+    holder_publishes_log_prefix_mode(seed, false)
+}
+
+/// Plan 30 §M9: the same burst with B as A's backup. A's acknowledged
+/// tail is on B when A dies, so B (sealing, taking over) re-ships it:
+/// *every* acknowledged mkdir reaches the log, and a fresh node still
+/// matches the follower exactly.
+fn holder_publishes_log_prefix_backup(seed: u64) -> Result<()> {
+    holder_publishes_log_prefix_mode(seed, true)
+}
+
+fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Instant;
     /// Pause between the writer's mkdirs: ~200/s, a few dozen per ship
     /// round (sync interval plus one PUT under the injected latency).
     const PACE: Duration = Duration::from_millis(5);
-    let (env, root) = setup("holder-publishes-log-prefix")?;
+    let name = if backup {
+        "holder-publishes-log-prefix-backup"
+    } else {
+        "holder-publishes-log-prefix"
+    };
+    let (env, root) = setup(name)?;
     let proxy = env.s3_proxy()?;
     let prefix = format!("log-prefix-{}", ts());
     let backend = format!("s3://{BUCKET}/{prefix}");
     // A 1 s idle poll ceiling so B and D reach the final head promptly.
+    // Plan 30 §M9: without a backup (today's `ack=local`, the scenario's
+    // original premise: an acknowledged tail can die with the holder),
+    // or with B as A's backup on this LAN.
     let tune = |c: Client| {
         c.with_own_node_key()
             .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")
+            .with_env(
+                "CONSTELLATION_BACKUP_RTT_BUDGET_MS",
+                if backup { "5" } else { "0" },
+            )
     };
     let mut a = tune(Client::new(root.path(), "a", &env.endpoint, &backend)?)
         .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "50");
@@ -7908,6 +7985,17 @@ fn holder_publishes_log_prefix(_seed: u64) -> Result<()> {
     let a_node = a.control_status()?["node_id"]
         .as_u64()
         .context("a reports no node_id")?;
+    if backup {
+        eventually("A lists B as its backup", Duration::from_secs(30), || {
+            let ack = a.control_status()?["ack"].clone();
+            anyhow::ensure!(
+                ack["policy"] == "backup"
+                    && ack["backups"].as_array().is_some_and(|b| !b.is_empty()),
+                "A has no backup yet: {ack}"
+            );
+            Ok(())
+        })?;
+    }
     std::fs::create_dir(a.mnt.join("burst"))?;
     eventually("burst/ visible on B", Duration::from_secs(20), || {
         anyhow::ensure!(b.mnt.join("burst").is_dir(), "burst/ missing on B");
@@ -8041,11 +8129,34 @@ fn holder_publishes_log_prefix(_seed: u64) -> Result<()> {
             );
         }
         anyhow::ensure!(shipped > 0, "none of A's burst reached the log");
-        anyhow::ensure!(
-            shipped < acked_n,
-            "A acknowledged {acked_n} mkdirs and all {shipped} are visible: the kill caught no \
-             unshipped tail, so nothing here tested a commit published over one"
-        );
+        if backup {
+            // Plan 30 §M9: an acknowledgement rested on B's copy; B
+            // re-shipped A's tail after sealing and taking over.
+            // (`>=`: the mkdir in flight at the kill may be on B — journaled
+            // and backup-acked — without its return having reached the
+            // writer.)
+            anyhow::ensure!(
+                shipped >= acked_n,
+                "A acknowledged {acked_n} mkdirs but only {shipped} are visible: the backup \
+                 lost an acknowledged mkdir"
+            );
+            let b_ack = b.control_status()?["ack"].clone();
+            anyhow::ensure!(
+                b_ack["backup_takeovers"].as_u64().unwrap_or(0) >= 1
+                    && b_ack["seals"].as_u64().unwrap_or(0) >= 1,
+                "B did not seal and take over as A's backup: {b_ack}"
+            );
+            eprintln!(
+                "    {name}: B sealed and took over; tail rows re-applied {}",
+                b_ack["backup_tail_applied"]
+            );
+        } else {
+            anyhow::ensure!(
+                shipped < acked_n,
+                "A acknowledged {acked_n} mkdirs and all {shipped} are visible: the kill caught no \
+                 unshipped tail, so nothing here tested a commit published over one"
+            );
+        }
         let head_key = commit_keys(&env.direct_endpoint, &prefix)?
             .pop()
             .context("no commit was ever published")?;
@@ -8060,11 +8171,10 @@ fn holder_publishes_log_prefix(_seed: u64) -> Result<()> {
             "head commit {head_key} claims log position {applied}, past the log head {log_head}"
         );
         eprintln!(
-            "    holder-publishes-log-prefix: {hits}/{samples} samples saw a new commit over \
-             unshipped work (max local {max_local}); A acked {acked_n} mkdirs, {shipped} \
-             reached the log, {} unshipped tail never visible; head commit applied {applied}, \
-             log head {log_head}",
-            acked_n - shipped
+            "    {name}: {hits}/{samples} samples saw a new commit over unshipped work (max \
+             local {max_local}); A acked {acked_n} mkdirs, {shipped} reached the log, {} \
+             unshipped tail never visible; head commit applied {applied}, log head {log_head}",
+            acked_n.saturating_sub(shipped)
         );
         Ok(())
     })();

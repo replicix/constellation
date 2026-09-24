@@ -37,6 +37,13 @@ pub(crate) struct ReplayState {
     copy_in_flight: Option<u64>,
     /// When a stalled copy last asked for the lease.
     copy_lease_asked_at: Option<Ms>,
+    /// Plan 30 §M9: rids executed here whose reply was still waiting for
+    /// durability when the tenure ended (`abort_durable_parks`). The
+    /// recovery that follows queues their rows for replay by rid; those
+    /// entries are marked unacked (`Replica::mark_replay_unacked`) — a
+    /// refused replay of one is an outcome for its client, not an effect
+    /// to preserve as a conflict copy.
+    pub unacked: std::collections::BTreeSet<Rid>,
 }
 
 impl ReplayState {
@@ -139,9 +146,14 @@ impl Core {
                     MutateOutcome::Accepted { .. } => {
                         let _ = replica.forget_replay(head.queue_seq);
                     }
-                    // Refused through an inbox before this node saw it:
-                    // an outcome, not a re-evaluation.
-                    MutateOutcome::Errno(errno) if refusal_is_satisfied(&head.op, errno) => {
+                    // Refused through an inbox (or, plan 30 §M9, by a
+                    // holder that journals refusals) before this node saw
+                    // it: an outcome, not a re-evaluation. An unacked
+                    // entry's refusal is its client's answer.
+                    MutateOutcome::Errno(errno)
+                        if head.foreign || refusal_is_satisfied(&head.op, errno) =>
+                    {
+                        self.note_unacked_refused(head);
                         self.stats.stranded_replayed += 1;
                         let _ = replica.forget_replay(head.queue_seq);
                     }
@@ -199,6 +211,35 @@ impl Core {
     }
 
     /// A refused replay: record the refusal and start its conflict copy.
+    /// Plan 30 §M9: bookkeeping for a refused replay of a never
+    /// acknowledged op (an unacked entry is `foreign`-marked).
+    fn note_unacked_refused(&mut self, queued: &StrandedOp) {
+        if self.replay.unacked.remove(&queued.rid) {
+            self.stats.unacked_replays_refused += 1;
+        }
+    }
+
+    /// Plan 30 §M9: after a deposition recovery queued the stranded rows
+    /// for replay by rid, the entries of ops whose reply never left
+    /// (`abort_durable_parks`) are marked unacked, persistently.
+    pub(crate) fn mark_unacked_replays(&mut self, replica: &dyn Replica) {
+        if self.replay.unacked.is_empty() {
+            return;
+        }
+        let Ok(queued) = replica.pending_replays() else {
+            return;
+        };
+        let queued_rids: std::collections::BTreeSet<Rid> = queued.iter().map(|q| q.rid).collect();
+        for q in &queued {
+            if self.replay.unacked.contains(&q.rid) && !q.foreign {
+                let _ = replica.mark_replay_unacked(q.queue_seq);
+            }
+        }
+        // Rids the recovery did not queue (rows already shipped, or
+        // nothing of the op journaled) need no marker.
+        self.replay.unacked.retain(|rid| queued_rids.contains(rid));
+    }
+
     fn refuse_replay(
         &mut self,
         now: Ms,
@@ -331,6 +372,25 @@ impl Core {
         let Some(queued) = queued else {
             return;
         };
+        // Plan 30 §M9: a foreign entry (another node's op, stranded here
+        // as streamed speculation) only ever waits for the successor's
+        // verdict; refused, it is simply forgotten — its own requester
+        // makes any conflict copy.
+        if queued.foreign
+            && matches!(
+                outcome,
+                Some(
+                    MutateOutcome::Errno(_)
+                        | MutateOutcome::Exists { .. }
+                        | MutateOutcome::Conflict { .. }
+                )
+            )
+        {
+            self.note_unacked_refused(&queued);
+            let _ = replica.forget_replay(queue_seq);
+            self.replay.stuck_since = None;
+            return;
+        }
         let reason = match outcome {
             Some(MutateOutcome::Accepted { .. }) => {
                 tracing::info!(node = self.cfg.node_id, ?rid, "stranded op replayed by rid");
@@ -391,7 +451,10 @@ impl Core {
                 MutateOutcome::Accepted { .. } => {
                     replica.forget_replay(queued.queue_seq)?;
                 }
-                MutateOutcome::Errno(errno) if refusal_is_satisfied(&queued.op, errno) => {
+                MutateOutcome::Errno(errno)
+                    if queued.foreign || refusal_is_satisfied(&queued.op, errno) =>
+                {
+                    self.note_unacked_refused(queued);
                     self.stats.stranded_replayed += 1;
                     replica.forget_replay(queued.queue_seq)?;
                 }
@@ -414,7 +477,8 @@ impl Core {
             }
             Err(error) => {
                 let errno = meta_errno(&error);
-                if refusal_is_satisfied(&queued.op, errno) {
+                if queued.foreign || refusal_is_satisfied(&queued.op, errno) {
+                    self.note_unacked_refused(queued);
                     self.stats.stranded_replayed += 1;
                     replica.forget_replay(queued.queue_seq)?;
                 } else {

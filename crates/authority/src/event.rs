@@ -13,7 +13,7 @@
 
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 use constellation_fs_core::Ino;
-use constellation_meta::{LogRecord, MutateOp, MutateOutcome, Position, Rid};
+use constellation_meta::{BackupTx, LogRecord, MutateOp, MutateOutcome, Position, Rid};
 use constellation_store_s3::inbox::InboxBatch;
 use constellation_store_s3::{Lease, LeaseTag};
 
@@ -120,6 +120,13 @@ pub struct PeerLink {
     pub connected: bool,
     /// When it was last heard from (any successful exchange).
     pub last_seen: Option<Ms>,
+    /// Plan 30 §M9: the measured round trip to it, when known. Backup
+    /// candidates are chosen by this against the RTT budget, never by
+    /// assuming a LAN.
+    pub rtt_ms: Option<u64>,
+    /// Plan 30 §M9: since when the link has been up without a break
+    /// (the plan prefers the peer connected the longest).
+    pub since: Option<Ms>,
 }
 
 /// Control-plane requests (`SyncRequest`'s non-mutation arms).
@@ -127,6 +134,15 @@ pub struct PeerLink {
 pub enum Control {
     /// Run a round soon (`SyncRequest::Nudge`).
     Nudge,
+    /// Plan 30 §M9: the FUSE fast path journaled a row under a
+    /// durability gate; the holder's backups get their append now (the
+    /// event itself is a no-op: every event ends in
+    /// `backup_after_event`).
+    Journaled,
+    /// Plan 30 §M9: the next `Submit` of `rid` is a resubmission of an
+    /// op this node executed but never acknowledged (its fast-path wait
+    /// ended with the lease lost): the client machine starts it in doubt.
+    InDoubt { rid: Rid },
     /// `--fsync-mode s3` barrier: ship this node's journal, then answer.
     Barrier { ino: Option<Ino> },
     /// Ship everything and publish a commit now (snapshots).
@@ -170,6 +186,9 @@ pub enum Control {
         frozen: bool,
         flushing: bool,
         base: Seq,
+        /// Plan 30 §M10's claim rule (enforced since M9): the epoch's
+        /// members, for whether a lease may be carried into it.
+        members: Vec<NodeId>,
     },
 }
 
@@ -300,19 +319,41 @@ pub enum PeerMsg {
     DelegationRecalled {
         req: OpId,
     },
-    /// M9: the holder streams a journal batch to its backups; a backup
-    /// acks it; a backup seals an epoch before taking over.
+    /// Plan 30 §M9: the holder streams its journal to a backup: whole
+    /// transactions from journal seq `from` (the seq after what the
+    /// backup last acknowledged), or none (a heartbeat). `through` is the
+    /// holder's shipped-through journal seq (the backup may trim below
+    /// it). `config_version` is the lease's as the holder knows it, so a
+    /// backup can tell a stale holder's appends from the current one's.
     BackupAppend {
+        req: OpId,
         epoch: Epoch,
-        first_journal_seq: u64,
-        records: Vec<LogRecord>,
+        holder: NodeId,
+        config_version: u64,
+        from: u64,
+        txs: Vec<BackupTx>,
+        through: u64,
     },
+    /// Plan 30 §M9: the backup holds every row through `acked`
+    /// (durably), or has `sealed` the epoch and will never acknowledge
+    /// it again (the holder must reconfigure it out before it can
+    /// acknowledge anything further — or is being taken over).
     BackupAck {
+        req: OpId,
         epoch: Epoch,
-        journal_seq: u64,
+        acked: u64,
+        sealed: bool,
     },
-    Sealed {
+    /// Plan 30 §M9: pre-S3 streaming. The holder's backups hold `txs`
+    /// (journal transactions of its tenure at `epoch`), evaluated against
+    /// the log through `base`; a subscriber that has applied `base` may
+    /// install them ahead of the log as `Streamed` speculation, which the
+    /// segment carrying their rows retires. One-way; the log itself
+    /// still arrives on the stream (`LogStream`) or from S3.
+    StreamAhead {
         epoch: Epoch,
+        base: Seq,
+        txs: Vec<BackupTx>,
     },
     /// M11: a delegate's ordered record stream to the root (`deps` is the
     /// highest position the delegate's requester observed).
@@ -341,6 +382,7 @@ impl PeerMsg {
             | PeerMsg::LeaseHandoff { req, .. }
             | PeerMsg::ReadIndexReply { req, .. }
             | PeerMsg::DelegationRecalled { req }
+            | PeerMsg::BackupAck { req, .. }
             | PeerMsg::Recalled { req } => Some(*req),
             _ => None,
         }
@@ -355,6 +397,7 @@ impl PeerMsg {
             | PeerMsg::LogSubscribe { req, .. }
             | PeerMsg::ReadIndex { req, .. }
             | PeerMsg::DelegationRecall { req, .. }
+            | PeerMsg::BackupAppend { req, .. }
             | PeerMsg::Recall { req, .. } => Some(*req),
             _ => None,
         }

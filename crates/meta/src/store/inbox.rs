@@ -192,9 +192,23 @@ impl Meta {
         errno: i32,
         ack: InboxAck,
     ) -> Result<(), MetaError> {
+        let _pending = PendingInboxAck::set(ack);
+        self.journal_refusal(rid, errno)
+    }
+
+    /// Plan 30 §M9: the holder refused a *forwarded* op by rid: the same
+    /// `Refused { rid, errno }` row and `completed` entry, without an
+    /// `InboxAck`. A refusal is an outcome: whoever executes this rid
+    /// again — the requester's retry, the deposed holder's replay by
+    /// rid, an inbox batch drained later — finds it in `completed` (here
+    /// at once, everywhere once the row ships) and answers the same
+    /// errno instead of re-evaluating the op against a state that may
+    /// have changed (the long-backup seeds 50064 and 50126: a refused
+    /// unlink / create executed a second time and succeeded, after its
+    /// client had been told ENOENT / EEXIST).
+    pub fn journal_refusal(&self, rid: Rid, errno: i32) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
-        let _pending = PendingInboxAck::set(ack);
         let position = journal::append_tx(
             &mut tx,
             &self.journal_ks,

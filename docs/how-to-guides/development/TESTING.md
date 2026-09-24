@@ -851,7 +851,17 @@ was rewritten for the same milestone):
   cannot decode log records, so "commit == log prefix at `applied`" is
   not checked in isolation; D == B is the observable form of it (a
   commit that carried the dead holder's unshipped work would show up on
-  D only).
+  D only). Plan 30 M9 round 2: the scenario pins
+  `CONSTELLATION_BACKUP_RTT_BUDGET_MS=0` — with a backup in budget (any
+  LAN peer, by default) the acknowledged tail is no longer "unshipped
+  work the kill catches": the sealed backup re-ships it, and every
+  acknowledged mkdir reaches the log. That is the companion
+  **`holder-publishes-log-prefix-backup`** (budget 5 ms): the same
+  burst and kill with B listed as A's backup; B must seal and take
+  over (`backup_takeovers >= 1`, `seals >= 1`), the log must hold at
+  least every acknowledged mkdir (the one in flight at the kill may be
+  on B only), and D == B as before. It prints the tail rows B
+  re-applied.
 
 - **`poison-record-isolation`** (plan 30 M4, L7). Deterministic through
   two test-only fault points on holder A (write-back):
@@ -982,6 +992,61 @@ relay of its own so requests can be attributed per role):
   - `cto-second-node-joins`: a lone strict node keeps a kernel cache
     (TTL half the lease margin); a second node mounts and writes, and the
     first node's very next open must see it (the latch).
+- **Plan 30 M9 scenarios** (each prints the nodes' `status.ack` block:
+  the lease's acknowledgement policy, backups and candidate, the durable
+  journal seq, parked acknowledgements, whether the fast path is gated;
+  this node as a backup — whom it backs, through what, what it sealed —
+  and the counters: backups added / removed, reconfiguration CAS,
+  appends and acks, ack timeouts, acknowledgements that waited and for
+  how long, aborted, streamed ahead / installed / dropped, seals,
+  takeovers, tail rows applied, `ack=s3` fast takeovers, floor waits,
+  stale-liveness refusals, reads blocked on durability). Every mount has
+  a 20 s lease TTL and idle release off, so a takeover within seconds
+  can only be seal-based (or `ack=s3`'s fast path), never expiry:
+  - `backup-failover`: four nodes; three rounds of "30 files written on
+    the holder (backup-policy write latency), the holder killed, its
+    backup seals and holds within a few seconds, every acknowledged
+    file is on it at once, the dead node remounts and converges (its
+    stranded journal replays by rid: already completed)". Four nodes so
+    that each round's backup is a never-restarted node (a node remounted
+    with the same identity is unreachable over P2P by its peers for a
+    long while — a P2P-layer matter; the remounted nodes converge over
+    S3). Prints the failover-time distribution.
+  - `backup-departs`: the backup unmounts; the holder (behind a counting
+    proxy) reconfigures it out and the third node in, at most 4 lease
+    CAS, while writes keep completing. Prints the S3 requests of the
+    reconfiguration (lease PUTs beyond the renewals) and the write
+    latency before and during it.
+  - `no-peer-in-budget`: `CONSTELLATION_BACKUP_RTT_BUDGET_MS=0`: the
+    local policy, no backup or candidate, the fast path open, nothing
+    waited; the holder killed, the second node's write waits for the
+    lease to expire (seconds; no seal, no fast takeover).
+  - `ack-s3-failover`: `CONSTELLATION_ACK=s3` on every mount: the fast
+    path is gated and every acknowledgement waited for the log (a
+    follower through S3 alone sees each acknowledged file); the holder
+    frozen (SIGSTOP), a peer's write takes the lease over well inside
+    the TTL (`s3_fast_takeovers`); the thawed holder is deposed with no
+    conflict.
+  - `single-node-unchanged`: one node with default knobs (behind a
+    counting proxy): local policy, no backup, the fast path open, every
+    M9 counter zero over 200 writes; prints their latency and S3
+    requests (M9 is a no-op on one node).
+  - `backup-failover-with-delegation` (strict; `CONSTELLATION_CTO=strict`,
+    `CONSTELLATION_READ_DELEGATION_TTL_MS=3000`,
+    `CONSTELLATION_READ_INDEX_BUDGET_MS=20000`): the reader holds a
+    delegation on `f` from the holder, which is killed; the backup takes
+    over inside the lease and writes `f`: its acknowledgement returns
+    only past the delegation horizon (`ack_floor_waits`, at least the
+    delegation TTL after the reader's last grant), and of the reader's
+    continuous samples of `f`, none started after the acknowledgement
+    is stale; the reader never degraded a strict read.
+  - `backup-partition`: the holder and its backup lose each other's P2P
+    (`CONSTELLATION_FAULT_P2P_DENY_FILE`: each node's file lists the
+    peer it cannot reach) while both keep S3 and the third node, which
+    writes throughout; within 12 s the holder has reconfigured the
+    backup out or the sealed backup has taken over — never two holders
+    — and after the heal every file is everywhere with no conflict and
+    exactly one holder.
 - **`sticky-lease-handoff-over-s3`** runs with `CONSTELLATION_INBOX=off`
   since M5 phase 2: it tests the S3-only cooperative handoff, and with
   M13's inbox on a lone blocked write is answered through the holder's
@@ -1230,6 +1295,54 @@ and the non-vacuity seeds `bounded_mode_reads_stale` and
 false`). `long_strict` (`#[ignore]`) is the long configuration in strict
 mode with skew and loss. `AUTHORITY_SIM_CONFIG=strict | strict-skew |
 long-strict` replays them.
+
+Plan 30 M9: `SimConfig::strict_durability` makes two things hard
+failures that the checks otherwise only report — an acknowledged op
+rolled back (`acked_rolled_back`), and a refusal that observed a
+tentative (acknowledged-but-unsealed) effect (`observed_tentative`);
+`SimConfig::rtts` gives each link an RTT (the backup selection's budget)
+and the links a `since`. `run::backup_core_config` / `ack_s3_core_config`
+set the M9 knobs (short takeover and ack timeouts, `ack_s3`), and the
+faults `CrashBackup`, `PartitionBackup` (the holder and its backup lose
+each other; both keep S3) and `CutS3Holder` join the CI set. The run
+report carries `M9Totals` (backups added / removed, appends, acks
+waited, seals, takeovers, tail rows applied, `ack=s3` fast takeovers,
+floor waits, streamed ahead / installed) and the failover-time samples
+(holder crash → successor holds). Tests, each 20–60 seeds:
+`backup_no_acked_op_lost` (three LAN nodes, CI faults: a backup is
+chosen, acknowledgements wait, nothing acknowledged is lost),
+`backup_failover_reships_the_tail` (holder crashes mid-burst after S3 is
+cut from it: the backup seals, takes over before the TTL, re-ships its
+tail), `ack_s3_no_acked_op_lost` (`ack=s3`: no backups, fast takeover on
+holder silence, the log slot the only fence), `no_peer_in_budget_is_todays_behaviour`
+(far peers: no backup, no appends, no seal, TTL failover),
+`backup_departs_reconfigures`, `backup_partition_reconfigures_or_seals`,
+`fast_failover_with_delegations_keeps_close_to_open` (strict readers
+hold delegations when the holder dies inside its lease: the successor
+waits the grant horizon out — `ack_floor_waits` — and close-to-open is
+enforced), `pre_s3_streaming_installs_and_retires` (slow S3 makes the
+stream-ahead window visible), and the non-vacuity seed
+`local_policy_rollbacks_are_found` (today's `Local` policy under the
+holder crash does roll an acknowledged op back, and strict durability
+catches it), and `regression_refused_forward_is_not_re_executed`
+(long-backup seeds 50064, 50068 and 50126, long-acks3 seed 50277: an op the
+holder refused must not be executed a second time by a replay by rid
+or an inbox drain, and a refusal must not leave a fast-taken-over
+holder from its stale replica — the holder journals definitive
+refusals as outcomes, and the answer waits for the row like any other;
+backup seed 753, backup-departs seed 1122, backup-crash-slow seeds
+1407 and 1402: a requester's own op that travels both on the holder's
+pre-S3 stream and in its reply is one entry, whichever arrives first —
+neither re-applied by a shadow, nor sent down the lease path again, nor
+re-applied by the segment over later streamed rows; backup-strict seed 1328: a takeover gate waiting
+out the delegation horizon ships the re-applied backup tail meanwhile;
+long-backup seed 50412: a streamed refusal's `completed` row and inbox
+watermark are written when its segment lands). `long_backup` (`#[ignore]`) is the long
+configuration with backups, crashes and partitions (odd seeds under
+`ack=s3`). `AUTHORITY_SIM_CONFIG=backup | acks3 | backup-far |
+backup-strict | backup-crash | backup-crash-slow | acks3-crash |
+backup-departs | backup-partition | long-backup | long-acks3` replays
+them.
 
 The checker design, settled in phase 2: the exact log-witnessed
 linearizability check runs on every seed; Stateright's

@@ -44,6 +44,10 @@ pub struct Bus {
     pub stream_frames: Mutex<u64>,
     segment_frames: Mutex<u64>,
     pub stream_faults_injected: Mutex<u64>,
+    /// Plan 30 §M9: the measured RTT the directory reports per pair (a
+    /// "far" pair is out of the backup budget); default twice the max
+    /// delay.
+    rtts: Mutex<HashMap<(NodeId, NodeId), u64>>,
 }
 
 /// M7: the stream faults (probabilities per frame).
@@ -74,7 +78,25 @@ impl Bus {
             stream_frames: Mutex::new(0),
             segment_frames: Mutex::new(0),
             stream_faults_injected: Mutex::new(0),
+            rtts: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Plan 30 §M9: what the directory reports as the RTT from `a` to
+    /// `b` (both directions).
+    pub fn set_rtt(&self, a: NodeId, b: NodeId, rtt_ms: u64) {
+        let mut r = self.rtts.lock().unwrap();
+        r.insert((a, b), rtt_ms);
+        r.insert((b, a), rtt_ms);
+    }
+
+    pub fn rtt(&self, a: NodeId, b: NodeId) -> u64 {
+        self.rtts
+            .lock()
+            .unwrap()
+            .get(&(a, b))
+            .copied()
+            .unwrap_or(2 * self.delay.1.max(1))
     }
 
     pub fn set_stream_faults(&self, faults: StreamFaults) {

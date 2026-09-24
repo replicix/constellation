@@ -209,7 +209,31 @@ pub(crate) fn append_tx(
     Ok(seq)
 }
 
-fn decode_row(k: &[u8], v: &[u8]) -> Result<(u64, LogRecord), MetaError> {
+/// Plan 30 §M9: a `Completed { rid }` row on its own (a re-applied
+/// transaction none of whose records took effect any more).
+pub(crate) fn append_completion_tx(
+    tx: &mut SingleWriterWriteTx,
+    journal: &SingleWriterTxKeyspace,
+    local: &SingleWriterTxKeyspace,
+    completed: &SingleWriterTxKeyspace,
+    rid: Rid,
+) -> Result<u64, MetaError> {
+    let cseq = next_seq_tx(tx, local)?;
+    tx.insert(
+        journal,
+        seq_key(cseq),
+        LogRecord::Completed { rid }.to_postcard()?,
+    );
+    let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
+    tx.insert(
+        completed,
+        rid.to_key(),
+        Meta::encode_completed_row(cseq, now_ms),
+    );
+    Ok(cseq)
+}
+
+pub(crate) fn decode_row(k: &[u8], v: &[u8]) -> Result<(u64, LogRecord), MetaError> {
     let seq = u64::from_be_bytes(
         k.try_into()
             .map_err(|_| MetaError::Invalid("journal key".into()))?,
@@ -274,11 +298,23 @@ pub(crate) fn peek_after(
     Ok(out)
 }
 
+/// The highest row still in the journal (0 when it is empty).
+///
+/// Bounded below by the acked watermark: an unbounded `last_key_value`
+/// walks backwards through every tombstone an acked row left in the
+/// memtable before it finds a live row — or finds none, once everything
+/// shipped. A holder that ships promptly (plan 30 §M9: a backup, a
+/// stream-ahead every few milliseconds) keeps its journal empty most of
+/// the time, and paid 3–6 ms per forwarded op for that walk (round 2).
+/// Rows at or below the watermark are deleted, so the reverse walk
+/// starts above it and crosses only a stranding's tombstones.
 pub(crate) fn max_seq(
     r: &impl Readable,
     journal: &SingleWriterTxKeyspace,
+    local: &SingleWriterTxKeyspace,
 ) -> Result<u64, MetaError> {
-    match r.last_key_value(journal) {
+    let from = acked_watermark(r, local)?.saturating_add(1);
+    match r.range(journal, seq_key(from)..).next_back() {
         Some(guard) => {
             let k = guard.key()?;
             Ok(u64::from_be_bytes(

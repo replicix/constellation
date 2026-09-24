@@ -68,7 +68,7 @@ fn pct(sorted: &[Duration], p: f64) -> Duration {
     sorted[i.min(sorted.len() - 1)]
 }
 
-fn dist(mut v: Vec<Duration>) -> String {
+pub(super) fn dist(mut v: Vec<Duration>) -> String {
     v.sort();
     format!(
         "n={} p50={:?} p90={:?} p99={:?} max={:?}",
@@ -135,14 +135,14 @@ fn unmount_all(clients: &mut [Client]) {
 }
 
 /// Write `content` to `path` (open, write, close) and time it.
-fn write_timed(path: &Path, content: &[u8]) -> Result<Duration> {
+pub(super) fn write_timed(path: &Path, content: &[u8]) -> Result<Duration> {
     let t = Instant::now();
     std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
     Ok(t.elapsed())
 }
 
 /// Open and read `path`, and time it.
-fn read_timed(path: &Path) -> (std::io::Result<Vec<u8>>, Duration) {
+pub(super) fn read_timed(path: &Path) -> (std::io::Result<Vec<u8>>, Duration) {
     let t = Instant::now();
     let r = std::fs::read(path);
     (r, t.elapsed())

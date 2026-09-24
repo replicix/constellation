@@ -49,3 +49,24 @@ pub fn sync_held() -> bool {
     let _ = std::fs::write(PathBuf::from(marker), b"held");
     true
 }
+
+/// `CONSTELLATION_FAULT_P2P_DENY_FILE=<path>`: while that file exists,
+/// every backup append and pre-S3 stream batch to or from the node ids
+/// it lists (one per line) is dropped on this node — a partition between
+/// a holder and its backup that leaves S3 reachable to both (plan 30
+/// §M9's `backup-partition` scenario). Read on every use so the harness
+/// can start and end the partition mid-run.
+pub fn p2p_denied(peer: u64) -> bool {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var_os("CONSTELLATION_FAULT_P2P_DENY_FILE").map(PathBuf::from))
+    else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .any(|id| id == peer)
+}

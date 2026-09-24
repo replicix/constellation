@@ -560,6 +560,32 @@ pub trait PeerService: Send + Sync + 'static {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move { Payload::ReadRecalled { req_id } })
     }
+    /// Plan 30 §M9: the holder streams journal transactions to this node
+    /// as its backup. Default: this node backs nobody (`sealed`, so the
+    /// holder never counts it).
+    #[allow(clippy::too_many_arguments)]
+    fn backup_append_requested(
+        &self,
+        _holder: u64,
+        req_id: u64,
+        epoch: u64,
+        _config_version: u64,
+        _from: u64,
+        _txs: Vec<u8>,
+        _through: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::BackupAck {
+                req_id,
+                epoch,
+                acked: 0,
+                sealed: true,
+            }
+        })
+    }
+    /// Plan 30 §M9: backup-acked transactions streamed ahead of S3.
+    /// Default ignores them.
+    fn stream_ahead(&self, _from: u64, _epoch: u64, _base: u64, _txs: Vec<u8>) {}
     /// Holder offered us this lease (placement). Default ignores it.
     fn lease_offered(&self, _part: String, _epoch: u64) {}
     /// A peer gossiped its RTT vector. Default ignores it.

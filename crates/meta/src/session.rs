@@ -254,6 +254,17 @@ pub struct SessionStats {
     /// Times `observed` was raised (a reply whose effects were not
     /// installed here).
     pub raised: u64,
+    /// Plan 30 §M9: reads on a holder under a `Backup`/`S3` acknowledgement
+    /// policy whose wait began because the unshipped journal touched their
+    /// keys and was not yet durable (on every backup, or in the log).
+    #[serde(default)]
+    pub durability_blocked: u64,
+    /// Plan 30 §M9: fast-path acknowledgements that waited for
+    /// durability, their total wait, and those left in doubt (the lease
+    /// was lost meanwhile; resubmitted by rid).
+    pub fast_acks_waited: u64,
+    pub fast_ack_wait_us_total: u64,
+    pub fast_acks_in_doubt: u64,
 }
 
 struct Inner {
@@ -278,12 +289,35 @@ impl Inner {
 }
 
 /// The session state `Meta` carries.
+/// Plan 30 §M9: the outcome of [`SessionState::wait_durable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableWait {
+    /// The watermark covers the row (how long it took).
+    Durable(Duration),
+    /// The gate is off and the lease is still this node's.
+    Ungated,
+    /// The gate is off because the lease was lost.
+    Lost,
+    TimedOut,
+}
+
 pub struct SessionState {
     inner: Mutex<Inner>,
     cv: Condvar,
     budget_ms: AtomicU64,
     warned: AtomicBool,
     stats: Mutex<SessionStats>,
+    /// Plan 30 §M9: this node holds under a `Backup`/`S3` acknowledgement
+    /// policy, so its own reads must not observe unshipped journal rows
+    /// that are not yet durable (the "observers of tentative effects"
+    /// rule applied to the holder's own clients).
+    durable_gate: AtomicBool,
+    /// Plan 30 §M9: the gate went off because the lease was lost (a
+    /// deposition), not because the policy went back to `Local`: a
+    /// mutation waiting on it is in doubt.
+    durable_lost: AtomicBool,
+    /// The highest journal seq that is durable under that policy.
+    durable_jseq: AtomicU64,
 }
 
 fn budget_default() -> u64 {
@@ -306,6 +340,9 @@ impl Default for SessionState {
             budget_ms: AtomicU64::new(budget_default()),
             warned: AtomicBool::new(false),
             stats: Mutex::new(SessionStats::default()),
+            durable_gate: AtomicBool::new(false),
+            durable_lost: AtomicBool::new(false),
+            durable_jseq: AtomicU64::new(0),
         }
     }
 }
@@ -329,6 +366,16 @@ impl SessionState {
 
     pub fn stats(&self) -> SessionStats {
         *self.stats.lock().unwrap()
+    }
+
+    pub fn count_fast_ack(&self, waited: Duration) {
+        let mut s = self.stats.lock().unwrap();
+        s.fast_acks_waited += 1;
+        s.fast_ack_wait_us_total += waited.as_micros() as u64;
+    }
+
+    pub fn count_fast_ack_in_doubt(&self) {
+        self.stats.lock().unwrap().fast_acks_in_doubt += 1;
     }
 
     pub fn observed(&self) -> Position {
@@ -378,6 +425,57 @@ impl SessionState {
     /// Wake waiters (a replay resolved).
     pub fn notify(&self) {
         self.cv.notify_all();
+    }
+
+    /// Plan 30 §M9: the core's durability watermark for this holder's
+    /// journal (`gate`: a non-`Local` policy is in force). Every advance
+    /// wakes the waiters.
+    pub fn set_durable(&self, gate: bool, jseq: u64, lost: bool) {
+        self.durable_lost.store(lost, Ordering::Relaxed);
+        self.durable_gate.store(gate, Ordering::Relaxed);
+        let before = self.durable_jseq.swap(jseq, Ordering::Relaxed);
+        if !gate || jseq > before {
+            self.cv.notify_all();
+        }
+    }
+
+    /// Plan 30 §M9: the FUSE fast path's acknowledgement wait under a
+    /// durability gate. The op is journaled at or below `jseq`; return
+    /// once the core's durable watermark covers it, or once the gate is
+    /// off — because the policy is `Local` again (`Ungated`: the row is
+    /// this node's, acknowledged as under `Local`), or because the lease
+    /// was lost (`Lost`: in doubt, resubmitted by rid).
+    pub fn wait_durable(&self, jseq: u64, budget: Duration) -> DurableWait {
+        let started = Instant::now();
+        loop {
+            if !self.durable_gate.load(Ordering::Relaxed) {
+                return if self.durable_lost.load(Ordering::Relaxed) {
+                    DurableWait::Lost
+                } else {
+                    DurableWait::Ungated
+                };
+            }
+            if self.durable_jseq.load(Ordering::Relaxed) >= jseq {
+                return DurableWait::Durable(started.elapsed());
+            }
+            let waited = started.elapsed();
+            if waited >= budget {
+                return DurableWait::TimedOut;
+            }
+            let slice = (budget - waited).min(Duration::from_millis(20));
+            let g = self.inner.lock().unwrap();
+            let _ = self.cv.wait_timeout(g, slice).unwrap();
+        }
+    }
+
+    /// Whether the durability gate is on (one atomic load: the fast
+    /// path's only cost when it is off).
+    pub fn durable_gated(&self) -> bool {
+        self.durable_gate.load(Ordering::Relaxed)
+    }
+
+    pub fn durable_jseq(&self) -> u64 {
+        self.durable_jseq.load(Ordering::Relaxed)
     }
 
     /// A new FUSE session (restart): forget what the last one observed.
@@ -443,7 +541,7 @@ impl SessionState {
         &self,
         keys: &[ReadKey],
         floor: &Position,
-        mut refresh: impl FnMut() -> (u64, bool),
+        mut refresh: impl FnMut() -> (u64, bool, bool),
         held: impl Fn() -> bool,
     ) -> SessionWait {
         let budget = self.budget();
@@ -452,10 +550,13 @@ impl SessionState {
         }
         let started = Instant::now();
         let mut replay_blocked = false;
+        let mut durability_blocked = false;
         let mut slept = false;
         let result = loop {
-            let (seq, replay_touches) = refresh();
+            let (seq, replay_touches, durability_pending) = refresh();
             replay_blocked |= replay_touches;
+            durability_blocked |= durability_pending;
+            let replay_touches = replay_touches || durability_pending;
             {
                 let mut g = self.inner.lock().unwrap();
                 if seq > g.applied_seq {
@@ -482,6 +583,9 @@ impl SessionState {
         s.reads += 1;
         if replay_blocked {
             s.replay_blocked += 1;
+        }
+        if durability_blocked {
+            s.durability_blocked += 1;
         }
         match result {
             SessionWait::Fast => s.fast += 1,
@@ -540,10 +644,28 @@ impl crate::store::Meta {
             floor,
             || {
                 let seq = self.applied_seq().unwrap_or(0);
-                (seq, self.replay_touches(keys))
+                (
+                    seq,
+                    self.replay_touches(keys),
+                    self.durability_pending(keys),
+                )
             },
             || self.held_any.load(Ordering::Relaxed),
         )
+    }
+
+    /// Plan 30 §M9: this holder acknowledges only what is durable on its
+    /// backups (or in the log), and its own reads observe nothing less:
+    /// `true` while the unshipped journal touched `keys` and reaches past
+    /// the durable watermark. One atomic load when the gate is off.
+    pub fn durability_pending(&self, keys: &[ReadKey]) -> bool {
+        if !self.session.durable_gated() {
+            return false;
+        }
+        if !self.unshipped_touches_keys(keys) {
+            return false;
+        }
+        self.journal_tip().unwrap_or(0) > self.session.durable_jseq()
     }
 
     /// [`SessionState::ready`] against this store: whether a read of
@@ -555,8 +677,12 @@ impl crate::store::Meta {
     /// [`Self::session_ready`] with a per-read position floor.
     pub fn session_ready_at(&self, keys: &[ReadKey], floor: &Position) -> bool {
         let seq = self.applied_seq().unwrap_or(0);
-        self.session
-            .ready(keys, seq, self.replay_touches(keys), floor)
+        self.session.ready(
+            keys,
+            seq,
+            self.replay_touches(keys) || self.durability_pending(keys),
+            floor,
+        )
     }
 
     /// Whether a queued replay (a stranded op rolled back until it lands)
@@ -600,9 +726,13 @@ impl crate::store::Meta {
     /// now: its shipped-through log sequence is the caller's, this is the
     /// unshipped part (`None` when every row has shipped).
     pub fn journal_position(&self, epoch: u64) -> Option<JournalPos> {
-        let next = self.journal_next_seq().ok()?;
+        // The highest row still in the journal, not `next − 1`: a
+        // stranding deletes rows without moving the acked watermark, and
+        // a position past every remaining row would wait for a ship that
+        // has nothing to ship (plan 30 §M9's durability parks found it).
+        let r = self.db.read_tx();
+        let last = crate::store::journal::max_seq(&r, &self.journal_ks, &self.local).ok()?;
         let acked = self.journal_acked_seq().ok()?;
-        let last = next.saturating_sub(1);
         (last > acked).then_some(JournalPos { epoch, jseq: last })
     }
 }
@@ -649,7 +779,7 @@ mod tests {
         s.set_budget_ms(30);
         let k = [ReadKey::Dentry(1, "a".into())];
         assert_eq!(
-            s.wait(&k, &Position::ZERO, || (0, false), || false),
+            s.wait(&k, &Position::ZERO, || (0, false, false), || false),
             SessionWait::Fast
         );
         let obs = Position {
@@ -669,24 +799,34 @@ mod tests {
             },
         );
         assert_eq!(
-            s.wait(&k, &Position::ZERO, || (3, false), || false),
+            s.wait(&k, &Position::ZERO, || (3, false, false), || false),
             SessionWait::Covered
         );
         // The directory is not covered: it waits, then times out.
         assert!(matches!(
-            s.wait(&[ReadKey::Dir(1)], &Position::ZERO, || (3, false), || true),
+            s.wait(
+                &[ReadKey::Dir(1)],
+                &Position::ZERO,
+                || (3, false, false),
+                || true
+            ),
             SessionWait::TimedOut(_)
         ));
         assert_eq!(s.stats().degraded_held, 1);
         // Applying the segment shipped through the position releases it.
         s.advance(4, jp(1, 9));
         assert_eq!(
-            s.wait(&[ReadKey::Dir(1)], &Position::ZERO, || (4, false), || false),
+            s.wait(
+                &[ReadKey::Dir(1)],
+                &Position::ZERO,
+                || (4, false, false),
+                || false
+            ),
             SessionWait::Fast
         );
         // A queued replay touching the key blocks even the fast path.
         assert!(matches!(
-            s.wait(&k, &Position::ZERO, || (4, true), || false),
+            s.wait(&k, &Position::ZERO, || (4, true, false), || false),
             SessionWait::TimedOut(_)
         ));
     }
@@ -704,7 +844,7 @@ mod tests {
             s2.wait(
                 &[ReadKey::Ino(1)],
                 &Position::ZERO,
-                || (s2.applied().seq, false),
+                || (s2.applied().seq, false, false),
                 || false,
             )
         });

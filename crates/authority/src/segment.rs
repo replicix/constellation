@@ -7,7 +7,7 @@
 use constellation_meta::LogRecord;
 use serde::{Deserialize, Serialize};
 
-const SEGMENT_VERSION: u32 = 2;
+const SEGMENT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct SegmentEnvelope {
@@ -22,6 +22,13 @@ struct SegmentEnvelope {
     /// checks) still reads the envelope.
     #[serde(default)]
     through: u64,
+    /// Plan 30 §M9: the shipping holder's journal seq of every journal
+    /// row in `records` (atime ride-along rows have none), in record
+    /// order. A backup trims its `backup_tail` by them, and a subscriber
+    /// retires the pre-S3 streamed speculation they confirm — exactly,
+    /// even when M4/M7 ship transactions out of journal order.
+    #[serde(default)]
+    rows: Vec<u64>,
 }
 
 /// A decoded segment.
@@ -34,6 +41,8 @@ pub struct Segment {
     /// this segment has the shipping tenure's journal through
     /// `(epoch, through)`.
     pub through: u64,
+    /// Plan 30 §M9: see `SegmentEnvelope::rows`.
+    pub rows: Vec<u64>,
 }
 
 impl Segment {
@@ -58,6 +67,7 @@ pub fn encode(
     node: u64,
     epoch: u64,
     through: u64,
+    rows: &[u64],
     records: &[LogRecord],
 ) -> Result<Vec<u8>, SegmentError> {
     Ok(postcard::to_allocvec(&SegmentEnvelope {
@@ -66,6 +76,7 @@ pub fn encode(
         epoch,
         records: records.to_vec(),
         through,
+        rows: rows.to_vec(),
     })?)
 }
 
@@ -79,6 +90,7 @@ pub fn decode(payload: &[u8]) -> Result<Segment, SegmentError> {
         epoch: env.epoch,
         records: env.records,
         through: env.through,
+        rows: env.rows,
     })
 }
 
@@ -103,17 +115,18 @@ mod tests {
                 },
             },
         ];
-        let bytes = encode(5, 3, 17, &records).unwrap();
-        // `v=2, node=5, epoch=3` then the record vector, all postcard
+        let bytes = encode(5, 3, 17, &[16, 17], &records).unwrap();
+        // `v=3, node=5, epoch=3` then the record vector, all postcard
         // varints: the prefix the shipper writes for the same envelope.
-        assert_eq!(&bytes[..3], &[2, 5, 3]);
+        assert_eq!(&bytes[..3], &[3, 5, 3]);
         let seg = decode(&bytes).unwrap();
         assert_eq!(seg.node, 5);
         assert_eq!(seg.epoch, 3);
         assert_eq!(seg.records, records);
         assert_eq!(seg.through, 17);
+        assert_eq!(seg.rows, vec![16, 17]);
         assert!(matches!(
-            decode(&[1, 0, 0, 0, 0]),
+            decode(&[1, 0, 0, 0, 0, 0]),
             Err(SegmentError::Version(1))
         ));
     }

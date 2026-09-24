@@ -96,6 +96,52 @@ pub struct Lease {
     /// for compatibility with older objects: see [`LEASE_VERSION`].
     #[serde(default)]
     pub wanted_by: Vec<u64>,
+    /// Plan 30 §M9: the holder's synchronous backups (node ids). Every
+    /// acknowledgement the holder gives while `ack_policy` is `Backup`
+    /// is held by each of them, so any one of them may seal the epoch
+    /// and take the lease over without waiting for the TTL. Empty means
+    /// no backup (today's behaviour). Changed only by the holder, by a
+    /// CAS that bumps `config_version`.
+    #[serde(default)]
+    pub backups: Vec<u64>,
+    /// Plan 30 §M9: bumped by every change of `backups`/`ack_policy`
+    /// (and by `granted_delegations`), so two readers can tell which of
+    /// two objects with the same holder and epoch is newer.
+    #[serde(default)]
+    pub config_version: u64,
+    /// Plan 30 §M9: what an acknowledgement means under this tenure —
+    /// see [`AckPolicy`]. A taker may claim an `S3` lease before it
+    /// expires (the log-slot CAS fences the old holder), and a listed
+    /// backup may claim a `Backup` one after sealing it.
+    #[serde(default)]
+    pub ack_policy: AckPolicy,
+    /// Plan 30 §M9: set (by one CAS, before the tenure's first read
+    /// delegation) once this tenure may have granted read delegations. A
+    /// successor that takes the lease over *before* it expired must then
+    /// wait out the previous tenure's grant horizon before it acknowledges
+    /// any mutation (`crate::lease`'s M9 section in the design notes);
+    /// with it clear there is nothing to wait for.
+    #[serde(default)]
+    pub granted_delegations: bool,
+}
+
+/// Plan 30 §M9: what an acknowledgement means under a tenure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AckPolicy {
+    /// Acked once journaled on the holder (today: Layer A only —
+    /// requesters keep what they were acked and replay it by rid after a
+    /// takeover). Takeover waits for the TTL.
+    #[default]
+    Local,
+    /// Acked once every node in `backups` holds the batch (Layer B). A
+    /// listed backup seals the epoch and takes over on heartbeat
+    /// silence; the old holder cannot collect a write-all ack after the
+    /// seal, so it cannot ack anything more.
+    Backup,
+    /// Acked once the record's segment is CAS-created in the log (Layer
+    /// C, `ack=s3`). Any peer may take over on heartbeat silence: the
+    /// next slot's CAS fences the old holder.
+    S3,
 }
 
 fn default_version() -> u32 {
@@ -113,6 +159,35 @@ impl Lease {
             expires_unix_ms: now_unix_ms() + ttl_ms as i64,
             released: false,
             wanted_by: Vec::new(),
+            backups: Vec::new(),
+            config_version: 0,
+            ack_policy: AckPolicy::Local,
+            granted_delegations: false,
+        }
+    }
+
+    /// Plan 30 §M9: this lease with a new backup set and acknowledgement
+    /// policy, `config_version` bumped. Everything else is copied: a
+    /// reconfiguration moves neither the holder nor the expiry.
+    pub fn reconfigured(&self, backups: Vec<u64>, ack_policy: AckPolicy) -> Self {
+        let mut backups = backups;
+        backups.sort_unstable();
+        backups.dedup();
+        Self {
+            backups,
+            ack_policy,
+            config_version: self.config_version + 1,
+            ..self.clone()
+        }
+    }
+
+    /// Plan 30 §M9: this lease marked as a tenure that grants read
+    /// delegations (`config_version` bumped).
+    pub fn with_granted_delegations(&self) -> Self {
+        Self {
+            granted_delegations: true,
+            config_version: self.config_version + 1,
+            ..self.clone()
         }
     }
 

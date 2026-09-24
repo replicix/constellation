@@ -46,6 +46,7 @@
 //! fast path's `LeaseView::admit`) is fenced by the driver re-checking
 //! the journal under the mirrored releasing flag before the release CAS.
 
+mod backup;
 mod client;
 mod holder;
 mod inbox;
@@ -65,6 +66,7 @@ use constellation_meta::Rid;
 use constellation_store_s3::inbox::InboxKey;
 use std::collections::{BTreeMap, VecDeque};
 
+pub use backup::AckView;
 pub use client::{meta_errno, ClientPhase};
 pub use inbox::InboxView;
 pub use jobs::JobKind;
@@ -196,6 +198,54 @@ pub struct Config {
     /// off to show the close-to-open check finds what it prevents (as
     /// `speculate_on_stale_base` does for M5's rule).
     pub recall_before_ack: bool,
+    // ---- plan 30 §M9: backups, seal-based failover, `ack=s3` ----
+    /// This mount asks for `ack=s3` (`--ack s3`, `CONSTELLATION_ACK`, or
+    /// the filesystem's policy): every acknowledgement waits for the
+    /// record's segment to land in S3; no backups are used.
+    pub ack_s3: bool,
+    /// `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (default 5): a peer is a
+    /// backup candidate only while its measured RTT is within this. 0
+    /// means no backup ever (today's behaviour).
+    pub backup_rtt_budget_ms: u64,
+    /// `CONSTELLATION_BACKUPS` (default 1): at most this many backups.
+    pub backups_max: usize,
+    /// Appends in flight per backup (pipelined; acknowledged
+    /// cumulatively by journal position). Rows journaled while every
+    /// slot is taken ride the next append: the group commit.
+    pub backup_max_inflight: usize,
+    /// Pre-S3 stream-ahead sends to a subscriber are at least this far
+    /// apart; the rows that become durable meanwhile go in one batch.
+    pub stream_ahead_holdoff_ms: u64,
+    /// `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` (default 1000): a backup
+    /// that makes no acknowledgement progress for this long is removed by
+    /// a lease CAS before the holder acknowledges anything further.
+    pub backup_ack_timeout_ms: u64,
+    /// `CONSTELLATION_BACKUP_TAKEOVER_MS` (default 1500): a backup that
+    /// has not heard from its holder for this long seals the epoch and
+    /// takes the lease over; under `ack=s3`, any peer does. Liveness
+    /// only: safety comes from the seal and the log-slot CAS.
+    pub backup_takeover_ms: u64,
+    /// How often the holder sends a heartbeat append to an idle backup
+    /// (well inside `backup_takeover_ms`).
+    pub backup_heartbeat_ms: u64,
+    /// A candidate must have been connected this long before it is added
+    /// (a flapping peer is never made a backup).
+    pub backup_stable_ms: u64,
+    /// Minimum interval between two reconfigurations of the backup set.
+    pub backup_reconfig_min_ms: u64,
+    /// Rows per `BackupAppend`.
+    pub backup_batch_rows: usize,
+    /// Plan 30 §M9: stream backup-acked transactions to log-stream
+    /// subscribers ahead of S3 (`CONSTELLATION_PRE_S3_STREAMING`, default
+    /// on).
+    pub pre_s3_streaming: bool,
+    /// Take an `ack=s3` lease over on holder silence (default on; the
+    /// simulation turns it off to show TTL failover).
+    pub fast_takeover: bool,
+    /// This node has `cto=strict` mounts: its tenure serves strict reads
+    /// from the start, so its lease says so at acquisition (a successor
+    /// then waits the horizon out).
+    pub strict_mounts: bool,
 }
 
 impl Config {
@@ -269,6 +319,20 @@ impl Config {
             read_index_deadline_ms: 2_000,
             recall_before_ack: true,
             kernel_cache_ttl_ms: 0,
+            ack_s3: false,
+            backup_rtt_budget_ms: 5,
+            backups_max: 1,
+            backup_max_inflight: 8,
+            stream_ahead_holdoff_ms: 5,
+            backup_ack_timeout_ms: 1_000,
+            backup_takeover_ms: 1_500,
+            backup_heartbeat_ms: 300,
+            backup_stable_ms: 2_000,
+            backup_reconfig_min_ms: 3_000,
+            backup_batch_rows: 2_000,
+            pre_s3_streaming: true,
+            fast_takeover: true,
+            strict_mounts: false,
         }
     }
 }
@@ -394,6 +458,52 @@ pub struct Stats {
     pub read_index_answered: u64,
     pub read_index_degraded: u64,
     pub read_index_tailed: u64,
+    // ---- M9: backups, seals, `ack=s3` ----
+    /// Holder: backups added to / removed from the lease, and the lease
+    /// CASes spent on it (a reconfiguration is one CAS when it lands).
+    pub backups_added: u64,
+    pub backups_removed: u64,
+    pub reconfig_cas: u64,
+    /// Holder: appends sent, acks received, backups that timed out.
+    pub backup_appends: u64,
+    pub backup_acks: u64,
+    pub backup_ack_timeouts: u64,
+    /// Holder: acknowledgements that waited for durability (a backup's
+    /// ack, or the segment landing), and the total wait.
+    pub acks_waited: u64,
+    pub ack_wait_ms_total: u64,
+    /// Holder: acknowledgements abandoned by a deposition (answered in
+    /// doubt / busy; retried by rid).
+    pub acks_aborted: u64,
+    /// Holder: transactions streamed ahead of S3 to subscribers.
+    pub streamed_ahead: u64,
+    /// Subscriber: streamed transactions installed / dropped (not on an
+    /// applied base, or out of order).
+    pub streamed_installed: u64,
+    pub streamed_dropped: u64,
+    /// Backup: appends persisted, epochs sealed, takeovers completed by
+    /// seal, and how many transactions a takeover re-applied.
+    pub backup_persisted: u64,
+    pub seals: u64,
+    pub backup_takeovers: u64,
+    pub backup_tail_applied: u64,
+    /// Any peer: fast takeovers of an `ack=s3` lease.
+    pub s3_fast_takeovers: u64,
+    /// Successor: takeovers that had to wait out the predecessor's
+    /// delegation horizon before acknowledging mutations.
+    pub ack_floor_waits: u64,
+    /// Holder: ReadIndex answers and grants refused for stale S3
+    /// liveness (a probe was started instead).
+    pub stale_liveness_refusals: u64,
+    /// Plan 30 §M10's claim rule: activations that did not carry this
+    /// node's lease into the epoch.
+    pub epoch_carry_refused: u64,
+    /// Plan 30 §M9: definitive refusals of forwarded ops journaled as
+    /// outcomes (`Refused { rid, errno }`), and replays of never
+    /// acknowledged ops whose refusal was an outcome rather than a
+    /// conflict copy.
+    pub refusals_journaled: u64,
+    pub unacked_replays_refused: u64,
 }
 
 /// The log cursor and ship bookkeeping (`Shipper::PartState` + `SpoolInfo`).
@@ -417,6 +527,9 @@ pub struct ShipState {
     pub last_ship_epoch: Epoch,
     /// The last round's error, if it failed (`SpoolInfo::last_error`).
     pub last_error: Option<String>,
+    /// Plan 30 §M9: the next round must read this holder's own stream
+    /// (a strict read was refused for stale S3 liveness).
+    pub probe_now: bool,
 }
 
 impl Default for ShipState {
@@ -432,6 +545,7 @@ impl Default for ShipState {
             renew_now: false,
             last_ship_epoch: 0,
             last_error: None,
+            probe_now: false,
         }
     }
 }
@@ -473,6 +587,17 @@ pub(crate) enum S3For {
     InboxWithdraw(Rid),
     /// M8: a strict read learning who holds the lease.
     ReadHolder(OpId),
+    /// M9: the holder's backup-set reconfiguration CAS, and its re-read
+    /// after a conflict.
+    Reconfig,
+    ReconfigReread,
+    /// M9: a sealed backup (or a peer of an `ack=s3` holder) reading the
+    /// lease before it tries to take over.
+    TakeoverGet,
+    /// M9: the holder marking its tenure as one that serves strict reads
+    /// (`Lease::granted_delegations`), and its re-read after a conflict.
+    MarkGranting,
+    MarkGrantingReread,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,6 +622,11 @@ enum Timer {
     ReadIndexTimeout(OpId),
     ReadIndexRetry(OpId),
     ReadIndexDeadline(OpId),
+    BackupTick,
+    BackupWatch,
+    /// Plan 30 §M9 round 2: the pre-S3 stream-ahead hold-off (batches
+    /// the rows that became durable meanwhile into one send).
+    StreamAhead,
 }
 
 impl Timer {
@@ -521,6 +651,9 @@ impl Timer {
             Timer::ReadIndexTimeout(_) => TimerKind::ReadIndexTimeout,
             Timer::ReadIndexRetry(_) => TimerKind::ReadIndexRetry,
             Timer::ReadIndexDeadline(_) => TimerKind::ReadIndexDeadline,
+            Timer::BackupTick => TimerKind::BackupTick,
+            Timer::BackupWatch => TimerKind::BackupWatch,
+            Timer::StreamAhead => TimerKind::BackupTick,
         }
     }
 }
@@ -596,6 +729,12 @@ pub struct Core {
     stream: stream::StreamState,
     /// M8: ReadIndex requests, grants being recalled, parked acks.
     pub(crate) rd: readindex::ReadState,
+    /// M9: the holder's backups and acknowledgement gate.
+    pub(crate) ack: backup::AckState,
+    /// M9: this node as a backup, and as a pre-S3 stream subscriber.
+    pub(crate) bk: backup::BackupState,
+    /// The `now` of the event being handled (for `issue_s3`'s send time).
+    last_now: Ms,
     stopped: bool,
     pub stats: Stats,
 }
@@ -641,6 +780,9 @@ impl Core {
             inbox: inbox::InboxState::default(),
             stream: stream::StreamState::default(),
             rd: readindex::ReadState::default(),
+            ack: backup::AckState::default(),
+            bk: backup::BackupState::default(),
+            last_now: Ms(0),
             stopped: false,
             stats: Stats::default(),
             cfg,
@@ -678,6 +820,11 @@ impl Core {
         self.clients.iter().map(|(rid, op)| (*rid, op.phase_kind()))
     }
 
+    /// M9: the acknowledgement gate's observable state, for `status`.
+    pub fn ack_view(&self) -> AckView {
+        self.backup_view()
+    }
+
     /// M13: the inbox's observable state, for `status`.
     pub fn inbox_view(&self, now: Ms) -> InboxView {
         self.inbox.view(now, &self.cfg, &self.roster)
@@ -699,6 +846,7 @@ impl Core {
     /// the replay drain start; the replica's persisted deposition flag
     /// is honoured (`recover_deposed` at mount).
     pub fn start(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        self.last_now = now;
         replica.set_holder_epoch(0);
         self.ship.last_publish = now;
         let applied = replica.applied_seq().unwrap_or(0);
@@ -710,6 +858,7 @@ impl Core {
         self.arm_poll(now, 0, out);
         self.arm_drain(now, out);
         self.read_start(now, replica, out);
+        self.backup_start(now, replica, out);
     }
 
     /// Handle one event. Every action returned must be carried out by the
@@ -719,6 +868,7 @@ impl Core {
         if self.stopped {
             return out;
         }
+        self.last_now = now;
         match event {
             Event::Submit { rid, op, policy } => {
                 self.on_submit(now, rid, op, policy, replica, &mut out)
@@ -779,6 +929,7 @@ impl Core {
         }
         self.inbox_after_event(now, &mut out);
         self.stream_after_event(now, &mut out);
+        self.backup_after_event(now, replica, &mut out);
         out
     }
 
@@ -849,6 +1000,34 @@ impl Core {
             PeerMsg::DelegationRecalled { req } => {
                 self.on_delegation_recalled(now, req, replica, out)
             }
+            PeerMsg::BackupAppend {
+                req,
+                epoch,
+                holder,
+                config_version,
+                from: from_jseq,
+                txs,
+                through,
+            } => self.on_backup_append(
+                now,
+                from,
+                req,
+                (epoch, holder, config_version),
+                from_jseq,
+                txs,
+                through,
+                replica,
+                out,
+            ),
+            PeerMsg::BackupAck {
+                req,
+                epoch,
+                acked,
+                sealed,
+            } => self.on_backup_ack(now, from, req, epoch, acked, sealed, replica, out),
+            PeerMsg::StreamAhead { epoch, base, txs } => {
+                self.on_stream_ahead(now, from, epoch, base, txs, replica, out)
+            }
             // Later milestones' messages: acknowledged by the interface,
             // answered by nothing until they are implemented.
             other => {
@@ -877,6 +1056,9 @@ impl Core {
         if self.on_read_request_failed(now, req, to, outage, out) {
             return;
         }
+        if self.on_backup_request_failed(now, req, to) {
+            return;
+        }
         if let Some(rid) = self.by_req.remove(&req) {
             self.stats.forwards_err += 1;
             self.note_p2p_result(now, to, !outage);
@@ -898,6 +1080,7 @@ impl Core {
             tracing::debug!(node = self.cfg.node_id, ?op, "stale S3 result dropped");
             return;
         };
+        self.note_s3_liveness(op, &result);
         match purpose {
             S3For::Job => self.on_job_s3(now, op, result, replica, out),
             S3For::LearnHolder(rid) => self.on_holder_learned(now, rid, result, replica, out),
@@ -914,6 +1097,11 @@ impl Core {
             S3For::InboxGc(key) => self.on_inbox_gc(now, key, result),
             S3For::InboxWithdraw(rid) => self.on_inbox_withdrawn(now, rid, result, replica, out),
             S3For::ReadHolder(op) => self.on_read_holder_learned(now, op, result, replica, out),
+            S3For::Reconfig => self.on_reconfig_put(now, result, replica, out),
+            S3For::ReconfigReread => self.on_reconfig_reread(now, result, replica, out),
+            S3For::TakeoverGet => self.on_takeover_get(now, result, replica, out),
+            S3For::MarkGranting => self.on_mark_granting_put(now, result, replica, out),
+            S3For::MarkGrantingReread => self.on_mark_granting_reread(now, result, replica, out),
         }
     }
 
@@ -962,6 +1150,17 @@ impl Core {
             Timer::ReadIndexTimeout(req) => self.on_read_index_timeout(now, req, out),
             Timer::ReadIndexRetry(op) => self.on_read_index_retry(now, op, replica, out),
             Timer::ReadIndexDeadline(op) => self.on_read_index_deadline(op, replica, out),
+            Timer::BackupTick => {
+                self.ack.tick_timer = None;
+                self.backup_tick(now, replica, out);
+            }
+            Timer::StreamAhead => {
+                self.on_stream_ahead_timer(now, replica, out);
+            }
+            Timer::BackupWatch => {
+                self.bk.watch_timer = None;
+                self.on_backup_watch(now, replica, out);
+            }
         }
     }
 
@@ -976,6 +1175,19 @@ impl Core {
         match req {
             Control::Nudge => {
                 self.nudge(now, out);
+                out.push(Action::ControlDone {
+                    op,
+                    result: Ok(ControlOk::Done),
+                });
+            }
+            Control::Journaled => {
+                out.push(Action::ControlDone {
+                    op,
+                    result: Ok(ControlOk::Done),
+                });
+            }
+            Control::InDoubt { rid } => {
+                self.note_in_doubt(rid);
                 out.push(Action::ControlDone {
                     op,
                     result: Ok(ControlOk::Done),
@@ -1062,6 +1274,7 @@ impl Core {
                 frozen,
                 flushing,
                 base,
+                members,
             } => {
                 self.on_epoch_state(
                     now,
@@ -1072,6 +1285,7 @@ impl Core {
                         flushing,
                         base,
                     },
+                    &members,
                     replica,
                     out,
                 );
@@ -1088,10 +1302,20 @@ impl Core {
     /// hold and stops shipping; closing lets the hold go and resumes
     /// shipping (the epoch's journal then reaches S3 through an ordinary
     /// acquisition).
+    ///
+    /// Plan 30 §M10's claim rule, enforced here since M9: the epoch
+    /// carries this node's lease only if the lease's acknowledgement
+    /// policy cannot be taken over from outside the epoch
+    /// (`epoch_may_carry`). A lease not carried stays an S3 lease: its
+    /// holder keeps acknowledging under its own policy (which, with S3
+    /// unreachable, means `ack=s3` writes stall — the promise `ack=s3`
+    /// makes), the epoch holds no authority, and on the probe that finds
+    /// S3 back the S3 holder closes the epoch like an epoch holder would.
     fn on_epoch_state(
         &mut self,
         now: Ms,
         state: EpochState,
+        members: &[NodeId],
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1099,17 +1323,27 @@ impl Core {
         self.epoch = state;
         if state.active && !before.active {
             self.skip_ship = true;
-            if self.lease.usable(now, &self.cfg) {
+            if self.lease.usable(now, &self.cfg) && self.epoch_may_carry(members) {
                 let epoch = self.lease.epoch().unwrap_or(1);
                 self.lease.adopt_epoch_hold(now, epoch);
                 replica.set_holder_epoch(0);
             }
-        } else if state.active && self.lease.usable(now, &self.cfg) && !self.lease.epoch_held() {
+        } else if state.active
+            && self.lease.usable(now, &self.cfg)
+            && !self.lease.epoch_held()
+            && self.epoch_may_carry(members)
+        {
             // Re-affirming (a holder carrying S3 authority through an
             // epoch that was already active when it acquired).
             let epoch = self.lease.epoch().unwrap_or(1);
             self.lease.adopt_epoch_hold(now, epoch);
             replica.set_holder_epoch(0);
+        }
+        if !state.open && before.open {
+            // Plan 30 §M9/§M10 rule (b): a member backup ran no seal
+            // watch while its epoch was open; it resumes now, with a
+            // fresh silence window for the holder's re-acquisition.
+            self.backup_watch_after_epoch(now, out);
         }
         if !state.active && before.active && !state.frozen {
             self.skip_ship = false;
@@ -1161,6 +1395,9 @@ impl Core {
     ) -> OpId {
         let op = self.op_id();
         self.s3.insert(op, purpose);
+        // Plan 30 §M9: the *send* time bounds the S3 liveness a
+        // successful result proves (see `backup::note_s3_liveness`).
+        self.ack.s3_sent.insert(op, self.last_now);
         out.push(Action::S3 { op, req });
         op
     }

@@ -47,6 +47,16 @@ pub enum FaultKind {
     JoinFresh,
     /// Scripted S3 error codes from now on (M4's `faulty.rs` idea).
     S3Rule(Rule),
+    /// Plan 30 §M9: kill the holder's first listed backup (as the lease
+    /// object names it); restart it after `restart_ms`.
+    CrashBackup { restart_ms: Option<u64> },
+    /// Plan 30 §M9: cut P2P between the holder and its first listed
+    /// backup (S3 stays reachable to both) for `for_ms`.
+    PartitionBackup { for_ms: u64 },
+    /// Plan 30 §M9: cut the current holder's path to S3 for `for_ms` (it
+    /// keeps acknowledging through its backup; what it journals meanwhile
+    /// is the backup's tail).
+    CutS3Holder { for_ms: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +101,14 @@ pub struct SimConfig {
     /// Plan 30 §M8: each node's clock is off by a seeded constant within
     /// `±clock_skew_ms` (leases and delegations are judged on it).
     pub clock_skew_ms: i64,
+    /// Plan 30 §M9: the run's acknowledgements are durable (a backup
+    /// within budget, or `ack=s3`): an acknowledged op is never
+    /// tentative — its rollback is a failure, not an exemption — and a
+    /// refusal explained only by a tentative effect is a failure.
+    pub strict_durability: bool,
+    /// Plan 30 §M9: pairs whose reported RTT is `ms` (out of budget when
+    /// above it).
+    pub rtts: Vec<((NodeId, NodeId), u64)>,
 }
 
 /// Core tunables scaled down for simulation (seconds, not minutes).
@@ -146,6 +164,29 @@ pub fn inbox_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c
 }
 
+/// Plan 30 §M9: the backup configuration. The bus's default RTT (twice
+/// the max delay: 30 ms) is within the budget, so a LAN backup is chosen;
+/// the seal/takeover, ack-timeout and heartbeat clocks are scaled like
+/// the rest (the lease TTL is 6 s here).
+pub fn backup_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let mut c = sim_core_config(node_id, incarnation);
+    c.backup_rtt_budget_ms = 50;
+    c.backup_takeover_ms = 1_000;
+    c.backup_ack_timeout_ms = 600;
+    c.backup_heartbeat_ms = 200;
+    c.backup_stable_ms = 200;
+    c.backup_reconfig_min_ms = 500;
+    c
+}
+
+/// Plan 30 §M9: `ack=s3` — no backups, every acknowledgement waits for
+/// the segment, fast takeover on holder silence.
+pub fn ack_s3_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let mut c = backup_core_config(node_id, incarnation);
+    c.ack_s3 = true;
+    c
+}
+
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
@@ -167,6 +208,8 @@ impl Default for SimConfig {
             stream_faults: StreamFaults::default(),
             strict: false,
             clock_skew_ms: 0,
+            strict_durability: false,
+            rtts: Vec::new(),
         }
     }
 }
@@ -195,11 +238,20 @@ pub struct Report {
     pub stats: BTreeMap<NodeId, Stats>,
     pub faults: Vec<String>,
     pub simulated_ms: u64,
+    /// Plan 30 §M9: acknowledged ops that were rolled back at some point
+    /// (exempted as tentative unless `strict_durability`).
+    pub acked_rolled_back: usize,
+    /// Plan 30 §M9: per holder crash, simulated ms from the crash to the
+    /// first mutation any node acknowledged afterwards.
+    pub failover_ms: Vec<u64>,
 }
 
 pub struct Cluster {
     pub nodes: Mutex<BTreeMap<NodeId, Arc<NodeHandle>>>,
     pub env: NodeEnv,
+    /// Plan 30 §M9: holder crashes (simulated ms) and, once known, the
+    /// first acknowledgement after each.
+    pub failovers: Mutex<Vec<(u64, Option<u64>)>>,
 }
 
 impl Cluster {
@@ -220,6 +272,16 @@ impl Cluster {
         let node = self.get(id);
         node.crash(&self.env.bus);
         node.meta.clone()
+    }
+
+    /// A mutation was acknowledged now: the open failover, if any, ends.
+    fn note_ack(&self) {
+        let now = self.env.clock.elapsed_ms();
+        if let Some(f) = self.failovers.lock().unwrap().last_mut() {
+            if f.1.is_none() {
+                f.1 = Some(now.saturating_sub(f.0));
+            }
+        }
     }
 }
 
@@ -386,6 +448,16 @@ async fn client_read(
         .ok()
         .flatten()
         .is_some();
+    tracing::debug!(
+        node = handle.id,
+        now = handle.clock.now().0,
+        name,
+        present,
+        timed_out,
+        replays = handle.meta.pending_replays().map(|q| q.len()).unwrap_or(0),
+        speculation = ?handle.meta.speculation_counts().ok(),
+        "client read"
+    );
     history.read(super::history::ReadEvt {
         node: handle.id,
         incarnation: handle
@@ -466,6 +538,9 @@ async fn client_thread(
             match answer {
                 Ok(ClientReply::Outcome(outcome)) => match ns_ret(&outcome) {
                     Ok(ret) => {
+                        if ret == NsRet::Ok {
+                            cluster.note_ack();
+                        }
                         history.ret(thread, rid, ret);
                     }
                     Err(e) => failures.lock().unwrap().push(e),
@@ -635,6 +710,11 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} crash holder {holder} (restart {restart_ms:?}, keep_journal {keep_journal})",
                 fault.at_ms
             ));
+            cluster
+                .failovers
+                .lock()
+                .unwrap()
+                .push((cluster.env.clock.elapsed_ms(), None));
             let meta = cluster.crash(holder);
             if let Some(after) = restart_ms {
                 tokio::time::sleep(Duration::from_millis(after)).await;
@@ -708,6 +788,60 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             let id = cluster.ids().into_iter().max().unwrap_or(0) + 1;
             note(format!("t={} fresh node {id} joins", fault.at_ms));
             cluster.restart(id, None);
+        }
+        FaultKind::CrashBackup { restart_ms } => {
+            let Some(lease) = read_lease(&cluster.env.bucket).await else {
+                note(format!("t={} crash-backup: no lease yet", fault.at_ms));
+                return;
+            };
+            let Some(&backup) = lease.backups.first() else {
+                note(format!("t={} crash-backup: no backup listed", fault.at_ms));
+                return;
+            };
+            if !cluster.ids().contains(&backup) || !cluster.get(backup).alive() {
+                return;
+            }
+            note(format!(
+                "t={} crash backup {backup} of holder {} (restart {restart_ms:?})",
+                fault.at_ms, lease.holder
+            ));
+            let meta = cluster.crash(backup);
+            if let Some(after) = restart_ms {
+                tokio::time::sleep(Duration::from_millis(after)).await;
+                cluster.restart(backup, Some(meta));
+            }
+        }
+        FaultKind::CutS3Holder { for_ms } => {
+            let Some(lease) = read_lease(&cluster.env.bucket).await else {
+                return;
+            };
+            note(format!(
+                "t={} cut S3 for holder {} for {for_ms}ms",
+                fault.at_ms, lease.holder
+            ));
+            cluster.env.bucket.set_cut(lease.holder, true);
+            tokio::time::sleep(Duration::from_millis(for_ms)).await;
+            cluster.env.bucket.set_cut(lease.holder, false);
+        }
+        FaultKind::PartitionBackup { for_ms } => {
+            let Some(lease) = read_lease(&cluster.env.bucket).await else {
+                note(format!("t={} partition-backup: no lease yet", fault.at_ms));
+                return;
+            };
+            let Some(&backup) = lease.backups.first() else {
+                note(format!(
+                    "t={} partition-backup: no backup listed",
+                    fault.at_ms
+                ));
+                return;
+            };
+            note(format!(
+                "t={} partition holder {} <-> backup {backup} for {for_ms}ms",
+                fault.at_ms, lease.holder
+            ));
+            cluster.env.bus.set_partition(lease.holder, backup, true);
+            tokio::time::sleep(Duration::from_millis(for_ms)).await;
+            cluster.env.bus.set_partition(lease.holder, backup, false);
         }
     }
 }
@@ -788,7 +922,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let cluster = Arc::new(Cluster {
         nodes: Mutex::new(BTreeMap::new()),
         env,
+        failovers: Mutex::new(Vec::new()),
     });
+    for ((a, b), ms) in &cfg.rtts {
+        bus.set_rtt(*a, *b, *ms);
+    }
     for id in 1..=cfg.nodes {
         cluster.restart(id, None);
     }
@@ -974,12 +1112,33 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     if let Some(f) = failures.lock().unwrap().first() {
         return Err(format!("{f}\n  faults: {:?}", report.faults));
     }
+    // Plan 30 §M9: under a durable acknowledgement policy an acknowledged
+    // op is never exempt — a rollback of one is exactly what the backup
+    // (or `ack=s3`) exists to make impossible, so only ops the client
+    // abandoned (its process died with the call in flight) are tentative.
     let mut tentative: HashSet<Rid> = abandoned.lock().unwrap().clone();
+    let acked: HashSet<Rid> = history.returned().into_iter().map(|(rid, _)| rid).collect();
+    let mut rolled_back_acked = 0usize;
     for id in cluster.ids() {
         let n = cluster.get(id);
-        tentative.extend(n.shared.tentative.lock().unwrap().iter().copied());
+        for rid in n.shared.tentative.lock().unwrap().iter() {
+            if acked.contains(rid) {
+                rolled_back_acked += 1;
+            }
+            if !cfg.strict_durability {
+                tentative.insert(*rid);
+            }
+        }
         report.stats.insert(id, n.view().stats);
     }
+    report.acked_rolled_back = rolled_back_acked;
+    report.failover_ms = cluster
+        .failovers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(_, d)| *d)
+        .collect();
     let commit_list = commits.lock().unwrap().clone();
     let snapshots: BTreeSet<u64> = commit_list.iter().map(|c| c.applied).collect();
     let oracle = check::replay_log(bucket.raw(), &snapshots).await;
@@ -1025,6 +1184,12 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let witness = check_linearizable_witnessed(&events, &tentative, &oracle.completed_at)
         .map_err(lin_context)?;
     report.observed_tentative = witness.observed_tentative;
+    if cfg.strict_durability && witness.observed_tentative > 0 {
+        return Err(lin_context(format!(
+            "{} refusal(s) observed an acknowledged effect that was later rolled back              (impossible under a durable acknowledgement policy)",
+            witness.observed_tentative
+        )));
+    }
     if events.len() <= STATERIGHT_EVENT_BOUND && tentative.len() <= STATERIGHT_TENTATIVE_BOUND {
         check_linearizable(&events, &tentative).map_err(lin_context)?;
         report.stateright_checked = true;
@@ -1079,10 +1244,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     );
     if cfg.session_wait {
         if let Some((checker, what)) = report.sessions.violations.first() {
-            return Err(format!(
-                "session guarantee violated ({checker}): {what}\n  faults: {:?}",
-                report.faults
-            ));
+            return Err(lin_context(format!(
+                "session guarantee violated ({checker}): {what}"
+            )));
         }
     }
     // Plan 30 §M8: close-to-open across nodes (see `cto.rs`); enforced

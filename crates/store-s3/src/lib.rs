@@ -52,7 +52,7 @@ pub use inbox::{
     gc_keep_newest, InboxBatch, InboxKey, InboxOp, InboxPoller, InboxRid, InboxStore,
     InboxSubmitter, PollBackoff, PutBatch, INBOX_VERSION,
 };
-pub use lease::{live_leases_held_by, Lease, LeaseMode, LeaseStore, LeaseTag};
+pub use lease::{live_leases_held_by, AckPolicy, Lease, LeaseMode, LeaseStore, LeaseTag};
 pub use log::LogStore;
 pub use mark::{live_set, mark, CatalogPack, LiveSet, Mark, PackCatalog};
 pub use node_cache::{NodeCache, NodeCacheStats, NodeLocation, PeerNodeSource};

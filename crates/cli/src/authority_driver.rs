@@ -72,6 +72,9 @@ pub struct CoreStatus {
     /// Plan 30 §M8.
     pub read: constellation_authority::core::ReadView,
     pub read_delegations: bool,
+    /// Plan 30 §M9.
+    pub ack: constellation_authority::core::AckView,
+    pub ack_s3: bool,
 }
 
 /// Short names for the trace line around every core step.
@@ -99,6 +102,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::SubscriberGone { .. } => "SubscriberGone",
         Event::Control { req, .. } => match req {
             Control::Nudge => "Control(Nudge)",
+            Control::Journaled => "Control(Journaled)",
             Control::PublishNow => "Control(PublishNow)",
             Control::Barrier { .. } => "Control(Barrier)",
             Control::TailToHead => "Control(TailToHead)",
@@ -406,7 +410,67 @@ pub fn load_config(
     c.read_delegation_ttl_ms = crate::cto::read_delegation_ttl_ms();
     c.recall_hold_ms = (c.forward_timeout_ms / 2).max(1);
     c.read_index_deadline_ms = crate::cto::read_index_budget_ms();
+    // Plan 30 §M9: backups (peers within the RTT budget; `0` backups or
+    // no peer in budget is today's behaviour), the ack timeout that
+    // reconfigures a silent backup out, the silence after which a backup
+    // seals and takes over, and pre-S3 streaming to followers.
+    // (`0` is meaningful here — no peer is ever in budget — so not
+    // `env_ms`, which treats 0 as unset.)
+    c.backup_rtt_budget_ms = std::env::var("CONSTELLATION_BACKUP_RTT_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(c.backup_rtt_budget_ms);
+    c.backups_max = std::env::var("CONSTELLATION_BACKUPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(c.backups_max);
+    c.backup_ack_timeout_ms = env_ms(
+        "CONSTELLATION_BACKUP_ACK_TIMEOUT_MS",
+        c.backup_ack_timeout_ms,
+    )
+    .max(1);
+    c.backup_takeover_ms = env_ms("CONSTELLATION_BACKUP_TAKEOVER_MS", c.backup_takeover_ms).max(1);
+    c.backup_heartbeat_ms = env_ms("CONSTELLATION_BACKUP_HEARTBEAT_MS", c.backup_heartbeat_ms)
+        .max(1)
+        .min(c.backup_takeover_ms / 3)
+        .max(1);
+    c.pre_s3_streaming = p2p
+        && !matches!(
+            std::env::var("CONSTELLATION_PRE_S3_STREAMING")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "off" | "false"
+        );
     c
+}
+
+/// Plan 30 §M9: the `--ack` mount flag (`local` or `s3`), or
+/// `CONSTELLATION_ACK`; `None` leaves the choice to the filesystem's
+/// `ack_policy` (`fs create --ack-policy`).
+pub fn ack_flag(flag: Option<&str>) -> anyhow::Result<Option<bool>> {
+    let env = std::env::var("CONSTELLATION_ACK").ok();
+    let Some(raw) = flag.or(env.as_deref()) else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "local" => Ok(Some(false)),
+        "s3" => Ok(Some(true)),
+        other => anyhow::bail!("invalid --ack {other:?} (expected local or s3)"),
+    }
+}
+
+/// Plan 30 §M9: whether this mount acknowledges on the shared log
+/// (`ack=s3`): the flag, else the filesystem's policy, else `local`.
+pub fn ack_s3_resolved(flag: Option<bool>, fs_policy: Option<&str>) -> bool {
+    match flag {
+        Some(v) => v,
+        None => fs_policy
+            .map(|p| p.trim().eq_ignore_ascii_case("s3"))
+            .unwrap_or(false),
+    }
 }
 
 fn now() -> Ms {
@@ -441,6 +505,9 @@ pub struct Driver {
     /// driver minted for the core.
     read_index_replies: HashMap<OpId, oneshot::Sender<ReadIndexOutcome>>,
     recall_replies: HashMap<OpId, oneshot::Sender<()>>,
+    /// Plan 30 §M9: the holder's `BackupAppend` requests this node is
+    /// answering, by the core's op id.
+    backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
     controls: HashMap<OpId, ControlReply>,
     next_control: u64,
     /// Whether this node holds (from the last refresh), for the tickers.
@@ -487,6 +554,7 @@ impl Driver {
             handoff_replies: HashMap::new(),
             read_index_replies: HashMap::new(),
             recall_replies: HashMap::new(),
+            backup_replies: HashMap::new(),
             controls: HashMap::new(),
             next_control: 1 << 48,
             last_epoch_reported: None,
@@ -516,16 +584,30 @@ impl Driver {
             let tx = self.event_tx();
             let peers = self.deps.peers.clone();
             tokio::spawn(async move {
+                // Plan 30 §M9: when each peer's link came up, for the
+                // backup selection's stability requirement.
+                let mut since: HashMap<u64, Ms> = HashMap::new();
                 loop {
+                    let now = Ms(now_unix_ms());
                     let links: Vec<PeerLink> = peers
                         .snapshot()
                         .into_iter()
-                        .map(|p| PeerLink {
-                            node: p.node_id,
-                            connected: p.connected,
-                            last_seen: p
-                                .last_seen
-                                .map(|at| Ms(now_unix_ms() - at.elapsed().as_millis() as i64)),
+                        .map(|p| {
+                            let since = if p.connected {
+                                Some(*since.entry(p.node_id).or_insert(now))
+                            } else {
+                                since.remove(&p.node_id);
+                                None
+                            };
+                            PeerLink {
+                                node: p.node_id,
+                                connected: p.connected,
+                                last_seen: p
+                                    .last_seen
+                                    .map(|at| Ms(now_unix_ms() - at.elapsed().as_millis() as i64)),
+                                rtt_ms: p.rtt_ms,
+                                since,
+                            }
                         })
                         .collect();
                     if tx.send(Internal::Event(Event::Peers { links })).is_err() {
@@ -535,6 +617,7 @@ impl Driver {
                 }
             });
         }
+        let mut step_end = std::time::Instant::now();
         loop {
             let internal = tokio::select! {
                 biased;
@@ -550,6 +633,7 @@ impl Driver {
                     None => break,
                 },
             };
+            let waited_us = step_end.elapsed().as_micros() as u64;
             let event = match internal {
                 Internal::Event(event) => event,
                 Internal::Control { req, reply } => {
@@ -563,21 +647,30 @@ impl Driver {
                 .store(crate::prune::now_unix_ms(), Ordering::Relaxed);
             let kind = event_kind(&event);
             let started = std::time::Instant::now();
+            let int_pending = self.int_rx.len();
+            let sync_pending = self.sync_rx.len();
             let actions = self.core.handle(now(), event, &*self.deps.meta);
             let handled_us = started.elapsed().as_micros() as u64;
             // The mirror first: a FUSE thread must see the releasing flag
             // before the release's IO starts.
             self.refresh();
             let refreshed_us = started.elapsed().as_micros() as u64 - handled_us;
+            let action_kinds: Vec<&'static str> = actions.iter().map(action_kind).collect();
+            self.dispatch(actions);
+            let dispatched_us = started.elapsed().as_micros() as u64 - handled_us - refreshed_us;
             tracing::trace!(
                 event = kind,
-                actions = ?actions.iter().map(action_kind).collect::<Vec<_>>(),
+                actions = ?action_kinds,
                 job = ?self.core.job(),
                 handled_us,
                 refreshed_us,
+                dispatched_us,
+                int_pending,
+                sync_pending,
+                waited_us,
                 "core step"
             );
-            self.dispatch(actions);
+            step_end = std::time::Instant::now();
             if self.core.stopped() {
                 break;
             }
@@ -596,7 +689,12 @@ impl Driver {
         let now = now();
         let cfg = self.core.config();
         let lease = self.core.lease();
-        self.deps.view.mirror(lease, now, cfg);
+        self.deps
+            .view
+            .mirror(lease, now, cfg, self.core.ack_gated());
+        self.deps
+            .view
+            .set_liveness(self.core.fast_tenure(), self.core.last_s3_fresh().0);
         let mut status = self.deps.status.lock().unwrap();
         status.stats = self.core.stats;
         status.ship = Some(self.core.ship().clone());
@@ -613,6 +711,8 @@ impl Driver {
         status.stream_enabled = cfg.log_streams && cfg.p2p;
         status.read = self.core.read_view();
         status.read_delegations = cfg.read_delegations;
+        status.ack = self.core.ack_view();
+        status.ack_s3 = cfg.ack_s3;
     }
 
     /// Tell the core the epoch machine's state when it changed (or
@@ -635,6 +735,7 @@ impl Driver {
             return;
         }
         self.last_epoch_reported = Some(state);
+        let members = e.status().members;
         let _ = self.int_tx.send(Internal::Control {
             req: Control::Epoch {
                 open: state.open,
@@ -642,6 +743,7 @@ impl Driver {
                 frozen: state.frozen,
                 flushing: state.flushing,
                 base: state.base,
+                members,
             },
             reply: ControlReply::None,
         });
@@ -657,6 +759,7 @@ impl Driver {
         let control = |req: Control, reply: ControlReply| Some(Internal::Control { req, reply });
         match req {
             SyncRequest::Nudge => control(Control::Nudge, ControlReply::None),
+            SyncRequest::Journaled => control(Control::Journaled, ControlReply::None),
             SyncRequest::Roster(roster) => Some(Internal::Event(Event::Roster {
                 write_eligible: roster,
             })),
@@ -725,6 +828,13 @@ impl Driver {
                     }
                 };
                 let req = self.control_id();
+                tracing::trace!(
+                    target: "constellation::fwd",
+                    rid = rid.seq,
+                    rnode = rid.node,
+                    req = req.0,
+                    "mutate request received"
+                );
                 self.mutate_replies.insert(req, reply);
                 Some(Internal::Event(Event::Peer {
                     from: requester,
@@ -740,9 +850,16 @@ impl Driver {
                 op,
                 rid,
                 policy,
+                in_doubt,
                 reply,
             } => {
                 self.replies.insert(rid, reply);
+                if in_doubt {
+                    let _ = self.int_tx.send(Internal::Control {
+                        req: Control::InDoubt { rid },
+                        reply: ControlReply::None,
+                    });
+                }
                 let acked = self.drain_acks();
                 if !acked.is_empty() {
                     let _ = self.int_tx.send(Internal::Event(Event::Activity {
@@ -796,6 +913,40 @@ impl Driver {
                     msg: PeerMsg::DelegationRecall { req, ino, grant },
                 }))
             }
+            SyncRequest::PeerBackupAppend {
+                holder,
+                epoch,
+                config_version,
+                from,
+                txs,
+                through,
+                reply,
+            } => {
+                let req = self.control_id();
+                tracing::trace!(target: "constellation::fwd", from, req = req.0, "append received");
+                self.backup_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from: holder,
+                    msg: PeerMsg::BackupAppend {
+                        req,
+                        epoch,
+                        holder,
+                        config_version,
+                        from,
+                        txs,
+                        through,
+                    },
+                }))
+            }
+            SyncRequest::PeerStreamAhead {
+                from,
+                epoch,
+                base,
+                txs,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::StreamAhead { epoch, base, txs },
+            })),
             SyncRequest::SegmentHint { seq, epoch } => Some(Internal::Event(Event::Peer {
                 from: 0,
                 msg: PeerMsg::SegmentPublished { seq, epoch },
@@ -1141,6 +1292,7 @@ impl Driver {
                 base,
                 position,
             } => {
+                tracing::trace!(target: "constellation::fwd", req = req.0, "mutate reply sent");
                 if let Some(tx) = self.mutate_replies.remove(&req) {
                     if matches!(outcome, MutateOutcome::Accepted { .. }) {
                         self.deps.placement.note_forwarded(to);
@@ -1317,6 +1469,12 @@ impl Driver {
                     let started = std::time::Instant::now();
                     let reply =
                         tokio::time::timeout(timeout, peers.request_to_node(to, &payload)).await;
+                    tracing::trace!(
+                        target: "constellation::fwd_rtt",
+                        to,
+                        us = started.elapsed().as_micros() as u64,
+                        "forward round trip"
+                    );
                     match reply {
                         Ok(Ok(Payload::MutateReply {
                             req_id,
@@ -1451,6 +1609,126 @@ impl Driver {
                     // A refusal the handler has not got a sink for (it
                     // raced a replacement): nothing to write to.
                 }
+            }
+            PeerMsg::BackupAck {
+                req,
+                epoch,
+                acked,
+                sealed,
+            } => {
+                let _ = epoch;
+                tracing::trace!(target: "constellation::fwd", req = req.0, "append reply sent");
+                if let Some(tx) = self.backup_replies.remove(&req) {
+                    let _ = tx.send((acked, sealed));
+                }
+            }
+            PeerMsg::BackupAppend {
+                req,
+                epoch,
+                holder,
+                config_version,
+                from,
+                txs,
+                through,
+            } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let timeout = Duration::from_millis(self.core.config().backup_ack_timeout_ms);
+                let denied = crate::fault::p2p_denied(to);
+                let txs = match postcard::to_allocvec(&txs) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "encoding a backup append; dropped");
+                        let _ = tx.send(Internal::Event(Event::PeerFailed {
+                            req,
+                            to,
+                            outage: false,
+                        }));
+                        return;
+                    }
+                };
+                tokio::spawn(async move {
+                    if denied {
+                        // Fault injection: the link to this peer is cut.
+                        tokio::time::sleep(timeout).await;
+                        let _ = tx.send(Internal::Event(Event::PeerFailed {
+                            req,
+                            to,
+                            outage: true,
+                        }));
+                        return;
+                    }
+                    let payload = Payload::BackupAppend {
+                        holder,
+                        req_id: req.0,
+                        epoch,
+                        config_version,
+                        from,
+                        txs,
+                        through,
+                    };
+                    let started = std::time::Instant::now();
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    tracing::trace!(
+                        target: "constellation::backup_rtt",
+                        to,
+                        from,
+                        us = started.elapsed().as_micros() as u64,
+                        "backup append round trip"
+                    );
+                    match reply {
+                        Ok(Ok(Payload::BackupAck {
+                            req_id,
+                            epoch,
+                            acked,
+                            sealed,
+                        })) if req_id == req.0 => {
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::BackupAck {
+                                    req,
+                                    epoch,
+                                    acked,
+                                    sealed,
+                                },
+                            }));
+                        }
+                        _ => {
+                            let outage = !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
+            }
+            PeerMsg::StreamAhead { epoch, base, txs } => {
+                let peers = self.deps.peers.clone();
+                let from = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().backup_ack_timeout_ms);
+                if crate::fault::p2p_denied(to) {
+                    return;
+                }
+                let Ok(txs) = postcard::to_allocvec(&txs) else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let payload = Payload::StreamAhead {
+                        from,
+                        epoch,
+                        base,
+                        txs,
+                    };
+                    // Fire and forget: a follower that misses a batch
+                    // gets the rows from the segment.
+                    let _ = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                });
             }
             PeerMsg::LogSubscribe { req, from } => self.spawn_subscription(to, req, from),
             PeerMsg::LogUnsubscribe { req } => {

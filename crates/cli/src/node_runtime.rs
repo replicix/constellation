@@ -134,6 +134,9 @@ pub struct NodeConfig {
     pub fsync_s3: bool,
     /// Plan 30 §M8: `--cto strict`.
     pub cto_strict: bool,
+    /// Plan 30 §M9: `--ack s3` (`Some(true)`), `--ack local`
+    /// (`Some(false)`), or the filesystem's policy (`None`).
+    pub ack: Option<bool>,
     pub initial_write_mode: writeback::WriteMode,
     pub read_only_member: bool,
     pub web_ui: u16,
@@ -284,6 +287,7 @@ impl NodeRuntime {
             cache_size,
             fsync_s3,
             cto_strict,
+            ack,
             initial_write_mode,
             read_only_member,
             web_ui,
@@ -734,6 +738,15 @@ impl NodeRuntime {
         // acknowledging anything another node started.
         if cto_strict {
             core_config.kernel_cache_ttl_ms = crate::cto::lone_kernel_drain_ms();
+        }
+        // Plan 30 §M9: `ack=s3` from the flag, else the filesystem's
+        // policy; a strict mount marks its tenures as serving strict
+        // reads (a fast successor then waits the delegation horizon).
+        core_config.ack_s3 =
+            crate::authority_driver::ack_s3_resolved(ack, fsmeta.ack_policy.as_deref());
+        core_config.strict_mounts = cto_strict;
+        if core_config.ack_s3 {
+            tracing::info!("acknowledgement policy: s3 (every acknowledgement waits for the log)");
         }
         // Plan 28 §11: publish the §P6 tree on the publish cadence.
         // A read-only member publishes nothing: it ships no segments, so
@@ -1714,6 +1727,7 @@ async fn atime_flush_once(
                 op,
                 rid: forward.next_system_rid(node_id),
                 policy: constellation_authority::Policy::BestEffort,
+                in_doubt: false,
                 reply,
             })
             .is_err()
@@ -1752,6 +1766,7 @@ mod tests {
                 cache_size: 16 * 1024 * 1024,
                 fsync_s3: false,
                 cto_strict: false,
+                ack: None,
                 initial_write_mode: writeback::WriteMode::Through,
                 read_only_member: false,
                 web_ui: 0,

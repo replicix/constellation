@@ -145,6 +145,28 @@ pub enum SpecKind {
     /// The `Exists` early install: retires once the applied position
     /// reaches `floor`, strands if a segment above `epoch` arrives first.
     Hint { floor: u64, epoch: u64 },
+    /// Plan 30 §M9: one of the holder's journal transactions (rows
+    /// `first..=last` of its tenure at `epoch`), streamed to this
+    /// subscriber once its backups held it, ahead of the log. Retires
+    /// when a segment of `epoch` carries row `last` (or ships through
+    /// it); strands if a segment above `epoch` arrives first — the
+    /// tenure ended without shipping it, and its successor re-ships
+    /// what its backup held.
+    Streamed {
+        epoch: u64,
+        first: u64,
+        last: u64,
+        /// Plan 30 §M9: this node's own op. A requester subscribed to the
+        /// holder's stream sees its op twice — on the stream and in its
+        /// reply — and keeps *one* entry, this kind, whichever arrived
+        /// first (`install_shadow` adopts a streamed entry; a shadow that
+        /// was first becomes streamed in `install_streamed`). Retired by
+        /// the segment's row skip like any streamed transaction, which
+        /// is what keeps later streamed rows right; stranded, it replays
+        /// by rid as this node's op — a conflict copy on refusal — rather
+        /// than as a foreign row.
+        own: Option<(Rid, MutateOp)>,
+    },
     /// A tailed segment applied while older speculation was outstanding
     /// (or a `Local` transaction that shipped while it was).
     Foreign { segment_seq: u64 },
@@ -179,6 +201,7 @@ struct SpecRow {
 enum LiveEntry {
     Shadow { rid: Rid, epoch: u64 },
     Hint { floor: u64, epoch: u64 },
+    Streamed { epoch: u64, last: u64 },
     Local { first: u64, epoch: u64 },
 }
 
@@ -187,6 +210,7 @@ impl LiveEntry {
         match self {
             LiveEntry::Shadow { epoch, .. }
             | LiveEntry::Hint { epoch, .. }
+            | LiveEntry::Streamed { epoch, .. }
             | LiveEntry::Local { epoch, .. } => *epoch,
         }
     }
@@ -217,6 +241,12 @@ struct QueuedReplay {
     rid: Rid,
     op: MutateOp,
     refused: Option<Refusal>,
+    /// Plan 30 §M9: another node's op, stranded here as pre-S3 streamed
+    /// speculation. Queued so reads of its keys wait until the successor
+    /// (which re-ships it, or dedups its replay) settles it; a refusal
+    /// makes no conflict copy (the op's own requester replays it).
+    #[serde(default)]
+    foreign: bool,
 }
 
 /// A stranded op waiting to be replayed by rid (plan 30 §M3a recovery
@@ -228,6 +258,8 @@ pub struct StrandedOp {
     pub rid: Rid,
     pub op: MutateOp,
     pub refused: Option<Refusal>,
+    /// Plan 30 §M9: see `QueuedReplay::foreign`.
+    pub foreign: bool,
 }
 
 /// What a stranding pass rolled back.
@@ -378,6 +410,52 @@ fn read_live(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, Me
     Ok(out)
 }
 
+/// Plan 30 §M9: the live `Streamed` entry whose records complete `rid`,
+/// if any.
+fn streamed_entry_completing(
+    r: &impl Readable,
+    meta: &Meta,
+    rid: Rid,
+) -> Result<Option<u64>, MetaError> {
+    for (seq, entry) in read_live(r, meta)? {
+        if !matches!(entry, LiveEntry::Streamed { .. }) {
+            continue;
+        }
+        if let Some(v) = r.get(&meta.spec, seq_key(seq))? {
+            let row: SpecRow = postcard::from_bytes(&v)?;
+            if row
+                .records
+                .iter()
+                .any(|rec| matches!(rec, LogRecord::Completed { rid: c } if *c == rid))
+            {
+                return Ok(Some(seq));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Plan 30 §M9: the live `Shadow` for `rid`, if any: its spec seq, epoch
+/// and op.
+fn shadow_row_for(
+    r: &impl Readable,
+    meta: &Meta,
+    rid: Rid,
+) -> Result<Option<(u64, u64, MutateOp)>, MetaError> {
+    for (seq, entry) in read_live(r, meta)? {
+        if !matches!(entry, LiveEntry::Shadow { rid: r2, .. } if r2 == rid) {
+            continue;
+        }
+        if let Some(v) = r.get(&meta.spec, seq_key(seq))? {
+            let row: SpecRow = postcard::from_bytes(&v)?;
+            if let SpecKind::Shadow { epoch, op, .. } = row.kind {
+                return Ok(Some((seq, epoch, op)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn read_rows_from(
     r: &impl Readable,
     spec: &SingleWriterTxKeyspace,
@@ -420,6 +498,10 @@ fn record_tx(
         SpecKind::Hint { floor, epoch } => Some(LiveEntry::Hint {
             floor: *floor,
             epoch: *epoch,
+        }),
+        SpecKind::Streamed { epoch, last, .. } => Some(LiveEntry::Streamed {
+            epoch: *epoch,
+            last: *last,
         }),
         SpecKind::Foreign { .. } | SpecKind::Local { .. } => None,
     };
@@ -470,10 +552,22 @@ fn enqueue_replay_tx(
     rid: Rid,
     op: MutateOp,
 ) -> Result<(), MetaError> {
+    enqueue_replay_as_tx(tx, meta, key, rid, op, false)
+}
+
+fn enqueue_replay_as_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    key: u64,
+    rid: Rid,
+    op: MutateOp,
+    foreign: bool,
+) -> Result<(), MetaError> {
     let row = QueuedReplay {
         rid,
         op,
         refused: None,
+        foreign,
     };
     if tx.get(&meta.pending_replay, seq_key(key))?.is_none() {
         counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, 1)?;
@@ -798,7 +892,10 @@ fn redo_row_tx(
 ) -> Result<(), MetaError> {
     if stranded.contains(&seq) {
         tx.remove(&meta.spec, seq_key(seq));
-        if matches!(row.kind, SpecKind::Shadow { .. } | SpecKind::Hint { .. }) {
+        if matches!(
+            row.kind,
+            SpecKind::Shadow { .. } | SpecKind::Hint { .. } | SpecKind::Streamed { .. }
+        ) {
             tx.remove(&meta.spec_live, seq_key(seq));
             counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)?;
         }
@@ -810,6 +907,30 @@ fn redo_row_tx(
             SpecKind::Local { first, .. } => {
                 strand_local_tx(tx, meta, first, row.origin)?;
                 out.locals += 1;
+            }
+            SpecKind::Streamed { own, .. } => {
+                // Plan 30 §M9: the tenure ended without shipping it; its
+                // successor re-ships what its backup held (or the op's
+                // requester replays it). Until then reads of its keys
+                // must not see the rolled-back state as final. This
+                // node's own op (adopted by `install_shadow`) replays as
+                // a shadow's would.
+                if let Some((rid, op)) = own {
+                    enqueue_replay_tx(tx, meta, row.origin, rid, op)?;
+                    out.shadows += 1;
+                } else {
+                    let rid = row.records.iter().find_map(|r| match r {
+                        LogRecord::Completed { rid } => Some(*rid),
+                        _ => None,
+                    });
+                    if let Some(rid) = rid {
+                        let op = MutateOp::Records {
+                            records: row.records.clone(),
+                        };
+                        enqueue_replay_as_tx(tx, meta, row.origin, rid, op, true)?;
+                    }
+                    out.hints += 1;
+                }
             }
             SpecKind::Hint { .. } | SpecKind::Foreign { .. } => out.hints += 1,
         }
@@ -904,13 +1025,25 @@ fn strand_tx(
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, None)?.0)
 }
 
-/// Retire every outstanding shadow whose rid `completes` names, and every
-/// hint whose floor `applied_seq` has reached.
+/// Plan 30 §M9: what a segment says about the shipping tenure's journal,
+/// for retiring `Streamed` entries: its epoch, the journal seq it ships
+/// through, and the journal seqs of its rows.
+#[derive(Clone, Copy, Debug)]
+pub struct ShippedRows<'a> {
+    pub epoch: u64,
+    pub through: u64,
+    pub rows: &'a [u64],
+}
+
+/// Retire every outstanding shadow whose rid `completes` names, every
+/// hint whose floor `applied_seq` has reached, and every streamed
+/// transaction `shipped` confirms.
 fn retire_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     completes: &HashSet<Rid>,
     applied_seq: u64,
+    shipped: Option<ShippedRows<'_>>,
 ) -> Result<usize, MetaError> {
     let mut retired = 0;
     if counter_get(tx, &meta.local, KV_SPEC_LIVE_COUNT)? == 0 {
@@ -929,6 +1062,11 @@ fn retire_tx(
         let done = match entry {
             LiveEntry::Shadow { rid, .. } => completes.contains(&rid),
             LiveEntry::Hint { floor, .. } => applied_seq >= floor,
+            // Rows-confirmed entries are converted by `apply_segment_rows`
+            // (their records were skipped); one confirmed by `through`
+            // alone shipped in a segment that did not name its rows.
+            LiveEntry::Streamed { epoch, last } => shipped
+                .is_some_and(|s| s.epoch == epoch && s.through >= last && !s.rows.contains(&last)),
             LiveEntry::Local { .. } => false,
         };
         if done {
@@ -1176,7 +1314,9 @@ pub(crate) fn local_before_images_from(
                     return Ok(None);
                 }
             }
-            SpecKind::Shadow { .. } | SpecKind::Hint { .. } => return Ok(None),
+            SpecKind::Shadow { .. } | SpecKind::Hint { .. } | SpecKind::Streamed { .. } => {
+                return Ok(None)
+            }
         }
     }
     Ok(Some(view))
@@ -1204,7 +1344,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
             }
             tx.remove(&meta.spec_live, seq_key(*seq));
         }
-        if let LiveEntry::Hint { .. } = entry {
+        if let LiveEntry::Hint { .. } | LiveEntry::Streamed { .. } = entry {
             tx.remove(&meta.spec_live, seq_key(*seq));
         }
     }
@@ -1296,6 +1436,7 @@ pub(crate) fn refuse_queued_tx(
         rid,
         op,
         refused: Some(refusal),
+        foreign: false,
     };
     tx.insert(
         &meta.pending_replay,
@@ -1338,6 +1479,7 @@ pub(crate) fn read_pending_replays(
             rid: row.rid,
             op: row.op,
             refused: row.refused,
+            foreign: row.foreign,
         });
     }
     Ok(out)
@@ -1370,6 +1512,29 @@ impl Meta {
         let mut tx = self.db.write_tx();
         if tx.get(&self.completed, rid.to_key())?.is_some() {
             return Ok(false);
+        }
+        // Plan 30 §M9: the holder's pre-S3 stream may have carried this
+        // very op here before its reply (the requester is a subscriber
+        // too): it is installed already, as `Streamed`. Applying the
+        // records again on top of whatever was streamed *after* it would
+        // not converge (backup seed 753: the shadow's unlink removed the
+        // name a later streamed create had put back). The streamed entry
+        // stays what it is — the segment's skip is the retirement that
+        // converges for streamed rows — but adopts the op as this node's
+        // own: stranded by a takeover, it replays by rid as a shadow
+        // would (a conflict copy on refusal). The reply counts as
+        // installed (backup seeds 1122 and 1407: "not installed" sent
+        // the op down the lease path a second time).
+        if let Some(spec_seq) = streamed_entry_completing(&tx, self, rid)? {
+            if let Some(v) = tx.get(&self.spec, seq_key(spec_seq))? {
+                let mut row: SpecRow = postcard::from_bytes(&v)?;
+                if let SpecKind::Streamed { own, .. } = &mut row.kind {
+                    *own = Some((rid, op.clone()));
+                }
+                put_row(&mut tx, &self.spec, spec_seq, &row)?;
+            }
+            tx.commit()?;
+            return Ok(true);
         }
         if self.holder_epoch() > epoch {
             let key = next_spec_seq_tx(&mut tx, &self.local)?;
@@ -1406,6 +1571,62 @@ impl Meta {
     ) -> Result<(), MetaError> {
         let tx = self.db.write_tx();
         self.install_speculative_tx(tx, SpecKind::Hint { floor, epoch }, records)
+    }
+
+    /// Plan 30 §M9: install one of the holder's backup-acked journal
+    /// transactions (rows `first..=last` of its tenure at `epoch`) ahead
+    /// of the log, as a `Streamed` entry (see [`SpecKind::Streamed`]).
+    pub fn install_streamed(
+        &self,
+        epoch: u64,
+        first: u64,
+        last: u64,
+        records: &[LogRecord],
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        // The mirror of `install_shadow`'s rule: this node's own op,
+        // whose reply installed a shadow first, is not applied a second
+        // time from the stream. The shadow *becomes* the streamed entry
+        // (its effect is in place already): the segment then retires it
+        // by skipping its rows like any streamed transaction's — which
+        // is what keeps later streamed rows on top of it right (seed
+        // 1402: a shadow retired the ordinary way had the segment's
+        // unlink re-applied over a later streamed create) — and a
+        // takeover strands it as this node's own op.
+        for rec in records {
+            if let LogRecord::Completed { rid } = rec {
+                if let Some((seq, own_epoch, op)) = shadow_row_for(&tx, self, *rid)? {
+                    if let Some(v) = tx.get(&self.spec, seq_key(seq))? {
+                        let mut row: SpecRow = postcard::from_bytes(&v)?;
+                        row.kind = SpecKind::Streamed {
+                            epoch,
+                            first,
+                            last,
+                            own: Some((*rid, op)),
+                        };
+                        put_row(&mut tx, &self.spec, seq, &row)?;
+                    }
+                    let _ = own_epoch;
+                    tx.insert(
+                        &self.spec_live,
+                        seq_key(seq),
+                        postcard::to_allocvec(&LiveEntry::Streamed { epoch, last })?,
+                    );
+                    tx.commit()?;
+                    return Ok(());
+                }
+            }
+        }
+        self.install_speculative_tx(
+            tx,
+            SpecKind::Streamed {
+                epoch,
+                first,
+                last,
+                own: None,
+            },
+            records,
+        )
     }
 
     fn install_speculative_tx(
@@ -1463,6 +1684,22 @@ impl Meta {
         records: &[LogRecord],
         pending: &TouchSet,
     ) -> Result<SegmentApplied, MetaError> {
+        self.apply_segment_rows(seq, epoch, 0, &[], records, pending)
+    }
+
+    /// [`Self::apply_segment`] with the segment's journal bookkeeping
+    /// (plan 30 §M9): the shipping tenure's `through` and the journal
+    /// seqs of its rows, which retire the `Streamed` entries they
+    /// confirm (step 3).
+    pub fn apply_segment_rows(
+        &self,
+        seq: u64,
+        epoch: u64,
+        through: u64,
+        rows: &[u64],
+        records: &[LogRecord],
+        pending: &TouchSet,
+    ) -> Result<SegmentApplied, MetaError> {
         let completes: HashSet<Rid> = records
             .iter()
             .filter_map(|rec| match rec {
@@ -1477,6 +1714,60 @@ impl Meta {
                 && !matches!(entry, LiveEntry::Shadow { rid, .. } if completes.contains(rid))
         })?;
         let live: HashMap<u64, LiveEntry> = read_live(&tx, self)?.into_iter().collect();
+        // Plan 30 §M9: the streamed transactions this segment carries are
+        // applied already. Re-applying their records would not converge
+        // (a `Create` re-runs once a later speculation renamed the name
+        // away: two dentries on one inode), so their rows are skipped —
+        // the outcome rows excepted: `Completed`, `Refused` and
+        // `InboxAck` touch no namespace key, and the streamed install
+        // (not durable) recorded none of them — the `completed` row and
+        // the inbox watermark only exist once the segment writes them.
+        // (Long-backup seed 50412: a skipped `Refused` left the next
+        // holder unaware of the refusal, and its inbox drain executed
+        // the refused op.) The entry becomes a durable `Foreign` row
+        // below: a later redo still carries its effect.
+        let mut confirmed: Vec<(u64, u64, u64)> = Vec::new();
+        for (spec_seq, entry) in &live {
+            let LiveEntry::Streamed { epoch: e, last } = entry else {
+                continue;
+            };
+            if *e != epoch || !rows.contains(last) {
+                continue;
+            }
+            if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
+                if let SpecKind::Streamed { first, .. } = postcard::from_bytes::<SpecRow>(&v)?.kind
+                {
+                    confirmed.push((*spec_seq, first, *last));
+                }
+            }
+        }
+        let skipped_rows: HashSet<u64> = confirmed
+            .iter()
+            .flat_map(|(_, first, last)| *first..=*last)
+            .collect();
+        let filtered: Vec<LogRecord>;
+        let records: &[LogRecord] = if skipped_rows.is_empty() {
+            records
+        } else {
+            let mut jseqs = rows.iter();
+            filtered = records
+                .iter()
+                .filter(|rec| {
+                    if matches!(rec, LogRecord::Atime { .. }) {
+                        return true;
+                    }
+                    let jseq = jseqs.next().copied();
+                    matches!(
+                        rec,
+                        LogRecord::Completed { .. }
+                            | LogRecord::Refused { .. }
+                            | LogRecord::InboxAck { .. }
+                    ) || !jseq.is_some_and(|j| skipped_rows.contains(&j))
+                })
+                .cloned()
+                .collect();
+            &filtered
+        };
         let first_local = live
             .iter()
             .filter(|(_, entry)| matches!(entry, LiveEntry::Local { .. }))
@@ -1527,7 +1818,29 @@ impl Meta {
             };
             apply_batch_tx(&mut tx, self, cx, records, pending, &staged, false)?.0
         };
-        let retired = retire_tx(&mut tx, self, &completes, seq)?;
+        let mut retired = retire_tx(
+            &mut tx,
+            self,
+            &completes,
+            seq,
+            Some(ShippedRows {
+                epoch,
+                through,
+                rows,
+            }),
+        )?;
+        for (spec_seq, _, _) in &confirmed {
+            if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
+                let mut row: SpecRow = postcard::from_bytes(&v)?;
+                row.kind = SpecKind::Foreign { segment_seq: seq };
+                put_row(&mut tx, &self.spec, *spec_seq, &row)?;
+            }
+            if tx.get(&self.spec_live, seq_key(*spec_seq))?.is_some() {
+                tx.remove(&self.spec_live, seq_key(*spec_seq));
+                counter_add_tx(&mut tx, &self.local, KV_SPEC_LIVE_COUNT, -1)?;
+                retired += 1;
+            }
+        }
         let from = journal_from(&tx, self)?;
         compact_tx(&mut tx, self, from)?;
         kv_set_tx(&mut tx, &self.local, KV_APPLIED_SEQ, &seq.to_string());
@@ -1629,6 +1942,29 @@ impl Meta {
         };
         let mut row: QueuedReplay = postcard::from_bytes(&v)?;
         row.refused = Some(refusal);
+        tx.insert(
+            &self.pending_replay,
+            seq_key(queue_seq),
+            postcard::to_allocvec(&row)?,
+        );
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Plan 30 §M9: mark `queue_seq` foreign-like — its op was executed
+    /// here but never acknowledged (its reply waited for durability when
+    /// the tenure ended), so a refusal of its replay is an outcome for
+    /// its client, not an effect to preserve as a conflict copy.
+    pub fn mark_replay_unacked(&self, queue_seq: u64) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        let Some(v) = tx.get(&self.pending_replay, seq_key(queue_seq))? else {
+            return Ok(());
+        };
+        let mut row: QueuedReplay = postcard::from_bytes(&v)?;
+        if row.foreign {
+            return Ok(());
+        }
+        row.foreign = true;
         tx.insert(
             &self.pending_replay,
             seq_key(queue_seq),

@@ -208,6 +208,11 @@ pub enum TimerKind {
     ReadIndexTimeout,
     ReadIndexRetry,
     ReadIndexDeadline,
+    /// M9: the holder's append/heartbeat tick to its backups.
+    BackupTick,
+    /// M9: a backup's check that its holder is still heard from (silence
+    /// past `backup_takeover_ms` seals the epoch and takes the lease).
+    BackupWatch,
 }
 
 /// Successful control-plane results.

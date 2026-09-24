@@ -288,3 +288,91 @@ fn deep_drift_takeover_release() {
     let checker = run("deep", &m);
     assert!(checker.discovery("close_to_open").is_none());
 }
+
+// ---- plan 30 §M9: a takeover before the lease expires ----
+
+/// A `fast` tenure (a sealed backup / `ack=s3`): the successor takes the
+/// live lease over while the reader still holds the old holder's
+/// delegation and does not wait the horizon out — the reader's next open
+/// is local and stale.
+#[test]
+fn fast_takeover_without_the_horizon_violates() {
+    let m = CtoModel {
+        horizon_wait: false,
+        max_tick: 6,
+        ..CtoModel::strict_fast(vec![vec![R, R], vec![W], vec![W]])
+    };
+    assert_violates("fast-no-horizon", &m);
+}
+
+/// With the horizon but without the old holder's liveness probe: the
+/// deposed holder keeps answering strict reads past the window the
+/// successor waited for.
+#[test]
+fn fast_takeover_without_the_probe_violates() {
+    let m = CtoModel {
+        probe_freshness: false,
+        max_tick: 8,
+        deleg_ttl: 2,
+        lease_ttl: 12,
+        max_drops: 0,
+        ..CtoModel::strict_fast(vec![vec![R, R], vec![W], vec![W]])
+    };
+    assert_violates("fast-no-probe", &m);
+}
+
+/// Both rules: a fast takeover with a delegation outstanding is clean,
+/// the successor's floor and the fast takeover both witnessed.
+#[test]
+fn fast_takeover_with_horizon_and_probe_is_clean() {
+    let m = CtoModel {
+        max_tick: 6,
+        max_drops: 0,
+        ..CtoModel::strict_fast(vec![vec![R, R], vec![W], vec![W]])
+    };
+    assert_clean(
+        "fast-both",
+        &m,
+        &["fast_takeover", "floor_waited", "read_under_delegation"],
+    );
+}
+
+/// The same under clocks off by ±1 that step once each, with margins of
+/// 3 (> 2D): still clean.
+#[test]
+fn fast_takeover_is_clean_under_drift_within_the_margin() {
+    let m = CtoModel {
+        max_offset: 1,
+        max_jumps: 1,
+        seq_margin: 3,
+        deleg_margin: 3,
+        lease_margin: 3,
+        lease_ttl: 12,
+        deleg_ttl: 4,
+        takeover_window: 2,
+        max_tick: 6,
+        max_drops: 0,
+        ..CtoModel::strict_fast(vec![vec![R, R], vec![W], vec![W]])
+    };
+    assert_clean("fast-drift", &m, &["fast_takeover", "floor_waited"]);
+}
+
+/// A tenure without strict mounts and no strict reader costs its
+/// successor nothing: no floor is set, and bounded-mode writes stay
+/// clean (bounded reads make no promise).
+#[test]
+fn an_unmarked_tenure_sets_no_floor() {
+    let m = CtoModel {
+        max_tick: 6,
+        fast_takeover: true,
+        ..CtoModel::bounded(vec![vec![W], vec![W]])
+    };
+    let checker = run("fast-unmarked", &m);
+    assert!(checker.is_done());
+    assert!(checker.discovery("close_to_open").is_none());
+    assert!(checker.discovery("fast_takeover").is_some());
+    assert!(
+        checker.discovery("floor_waited").is_none(),
+        "a floor was set although nobody served a strict read"
+    );
+}

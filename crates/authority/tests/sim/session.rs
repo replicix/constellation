@@ -217,6 +217,12 @@ pub fn check_sessions(
                 .cloned();
             let floor = binding.as_ref().map(|b| b.2).unwrap_or(0);
             match first_at_or_after(&r.name, floor, r.present) {
+                // A degraded read (its session wait timed out: the state
+                // it was owed never arrived, plan 30 §M6) is answered from
+                // whatever the replica has; it binds no later read — it
+                // would otherwise be "explained" by a far-future state and
+                // make the next, fresh read look non-monotonic.
+                Some(_) if r.timed_out => {}
                 Some(k) => list.push((
                     r.ret,
                     r.name.clone(),
@@ -242,15 +248,23 @@ pub fn check_sessions(
                         }
                         continue;
                     };
+                    let chain: Vec<String> = list
+                        .iter()
+                        .filter(|(_, n, ..)| *n == r.name)
+                        .map(|(t, _, k, kind, by)| format!("[tick {t} index {k} {kind:?}: {by}]"))
+                        .collect();
                     let what = format!(
                         "node {} (incarnation {}) t{} read {} as {} at tick {}, but it had \
-                         already observed a later state (log index {floor}, set by {by})",
+                         already observed a later state (log index {floor}, set by {by}); \
+                         observations of {}: {}",
                         r.node,
                         r.incarnation,
                         r.thread,
                         r.name,
                         if r.present { "present" } else { "absent" },
                         r.inv,
+                        r.name,
+                        chain.join(" "),
                     );
                     if tentative_name {
                         report.tentative += 1;

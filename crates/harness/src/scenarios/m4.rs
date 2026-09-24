@@ -94,7 +94,10 @@ fn logged_completions(
             zstd::decode_all(&compressed[..]).with_context(|| format!("decompressing {key}"))?;
         let (v, node, epoch, records): (u32, u64, u64, Vec<constellation_meta::LogRecord>) =
             postcard::from_bytes(&payload).with_context(|| format!("decoding {key}"))?;
-        anyhow::ensure!(v == 2, "{key}: unexpected segment envelope version {v}");
+        // Plan 30 §M7 bumped the wire envelope to v3 (`through`) and §M9
+        // added `rows`; both are appended fields this prefix decode never
+        // reads, so only the version constant itself needed updating.
+        anyhow::ensure!(v == 3, "{key}: unexpected segment envelope version {v}");
         for (index, rec) in records.iter().enumerate() {
             // Plan 30 §M13: a `Refused` (an inbox refusal the holder
             // shipped) is an outcome too.

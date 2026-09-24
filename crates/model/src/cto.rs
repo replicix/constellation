@@ -129,6 +129,38 @@
 //! margin at all), and that the cap, the recall before a release, the
 //! recall before an ack and the overtaken-grant rule each are
 //! (`tests/cto.rs`).
+//!
+//! # Plan 30 §M9: a takeover before the lease expires
+//!
+//! A sealed backup, or any peer of an `ack=s3` holder, takes the lease
+//! over while it is still live (`CtoModel::fast_takeover`, on a register
+//! marked `fast`), which breaks the epoch-change argument above: the old
+//! holder's grants are capped by a lease that has *not* ended, and the
+//! old holder keeps answering strict reads (positions and grants) until
+//! it notices. Two rules restore it, both in `Reg`'s clock discipline:
+//! - **Liveness probe** (`probe_freshness`): a holder of a `fast`
+//!   register answers a ReadIndex only if it probed the register (an S3
+//!   request that would reveal a deposition: `Probe(h)`) within
+//!   `takeover_window` by its clock; a probe that finds another holder
+//!   deposes it at once. So every answer it gives was sent within
+//!   `takeover_window + 2D` of the last moment before the successor's
+//!   marker existed (the code: `note_s3_liveness`, and the immediate
+//!   deposition on applying a higher epoch).
+//! - **Acknowledgement floor** (`horizon_wait`): a successor of an
+//!   unexpired lease whose tenure served strict reads (`Reg::marked`,
+//!   the `granted_delegations` flag set by a CAS before the first answer)
+//!   acknowledges no write until its clock reaches `min(old expiry,
+//!   marker time + takeover_window + deleg_ttl + 2·seq_margin)`
+//!   (`FloorPassed`). The delegate honours a grant made at `G` until
+//!   `G + ttl − deleg_margin`; with `G < marker + takeover_window + 2D`
+//!   the floor covers it iff `seq_margin + deleg_margin > 4D` — the
+//!   lease's `M > 2D` again. A tenure that never served a strict read
+//!   (`marked == false`) costs its successor nothing.
+//!
+//! `tests/cto.rs` shows each rule is load-bearing (a fast takeover
+//! without the floor, and with the floor but without the probe, both
+//! violate close-to-open) and that with both the design is clean,
+//! including under drift within the margin.
 
 use stateright::{Model, Property};
 
@@ -182,6 +214,17 @@ pub struct CtoModel {
     pub explore_offsets: bool,
     /// The initial offsets when not exploring them (default all zero).
     pub init_offsets: Option<Vec<i16>>,
+    // ---- plan 30 §M9 ----
+    /// The register is a `fast` tenure (a sealed backup / `ack=s3`): a
+    /// takeover may happen before the lease expires.
+    pub fast_takeover: bool,
+    /// The successor waits the predecessor's strict-read horizon out
+    /// before acknowledging writes.
+    pub horizon_wait: bool,
+    /// A `fast` holder answers strict reads only with a fresh probe.
+    pub probe_freshness: bool,
+    /// The takeover detection window (`backup_takeover_ms`), in ticks.
+    pub takeover_window: i16,
 }
 
 impl CtoModel {
@@ -212,6 +255,19 @@ impl CtoModel {
             initial_holder: 0,
             explore_offsets: false,
             init_offsets: None,
+            fast_takeover: false,
+            horizon_wait: true,
+            probe_freshness: true,
+            takeover_window: 2,
+        }
+    }
+
+    /// Plan 30 §M9: strict mode on a `fast` tenure (takeovers before
+    /// expiry), with both rules on.
+    pub fn strict_fast(scripts: Vec<Vec<Op>>) -> Self {
+        CtoModel {
+            fast_takeover: true,
+            ..Self::strict(scripts)
         }
     }
 
@@ -235,6 +291,9 @@ pub struct Reg {
     pub epoch: u8,
     pub expires: i16,
     pub released: bool,
+    /// Plan 30 §M9: this tenure has served a strict read (the
+    /// `granted_delegations` flag, set by one CAS before the first).
+    pub marked: bool,
 }
 
 /// Holder side: a grant it must recall or outwait.
@@ -301,6 +360,13 @@ pub struct Node {
     /// only if no recall arrived meanwhile — a recall can overtake the
     /// reply that carries the very grant it recalls.
     pub recall_gen: u8,
+    /// Plan 30 §M9: the holder's clock at its last probe of the register
+    /// (a takeover or renewal counts).
+    pub last_probe: i16,
+    /// Plan 30 §M9: the successor's acknowledgement floor (its clock),
+    /// and the writes held until it passes.
+    pub ack_floor: Option<i16>,
+    pub floor_held: Vec<(u8, u8)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -343,6 +409,8 @@ pub const SAW_RECALL_ACK: u8 = 2;
 pub const SAW_RECALL_EXPIRED: u8 = 4;
 pub const SAW_TAKEOVER: u8 = 8;
 pub const SAW_READINDEX_READ: u8 = 16;
+pub const SAW_FAST_TAKEOVER: u8 = 32;
+pub const SAW_FLOOR_WAIT: u8 = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -439,6 +507,11 @@ impl State {
             Vec::new()
         };
         if waiting.is_empty() {
+            // Plan 30 §M9: the successor's floor holds the acknowledgement.
+            if self.nodes[h].ack_floor.is_some_and(|f| now < f) {
+                self.nodes[h].floor_held.push((writer as u8, version));
+                return;
+            }
             self.ack_write(h, writer, version);
             return;
         }
@@ -480,8 +553,13 @@ impl State {
             }
         }
         self.nodes[h].held.retain(|x| !x.waiting.is_empty());
+        let now = self.local(h);
         for (writer, version) in done {
-            self.ack_write(h, writer as usize, version);
+            if self.nodes[h].ack_floor.is_some_and(|f| now < f) {
+                self.nodes[h].floor_held.push((writer, version));
+            } else {
+                self.ack_write(h, writer as usize, version);
+            }
         }
     }
 
@@ -524,6 +602,12 @@ pub enum Action {
     /// Holder `h` drops its expired grants (by its clock).
     Expire(u8),
     Deliver(usize),
+    /// Plan 30 §M9: holder `h` probes the register (an S3 request): a
+    /// foreign holder there deposes it; otherwise its liveness is fresh.
+    Probe(u8),
+    /// Plan 30 §M9: successor `h`'s acknowledgement floor passed (by its
+    /// clock): the writes held for it are acknowledged.
+    FloorPassed(u8),
 }
 
 impl Model for CtoModel {
@@ -559,6 +643,9 @@ impl Model for CtoModel {
                         grants: Vec::new(),
                         held: Vec::new(),
                         recall_gen: 0,
+                        last_probe: 0,
+                        ack_floor: None,
+                        floor_held: Vec::new(),
                     })
                     .collect();
                 let mut reg = Reg {
@@ -566,6 +653,7 @@ impl Model for CtoModel {
                     epoch: 0,
                     expires: 0,
                     released: false,
+                    marked: false,
                 };
                 let mut log = Vec::new();
                 if self.initial_holder != NONE {
@@ -576,12 +664,17 @@ impl Model for CtoModel {
                         epoch: 1,
                         expires,
                         released: false,
+                        // A tenure with strict mounts serves strict reads
+                        // from the start (the code marks the lease at
+                        // acquisition when this node has `cto=strict`).
+                        marked: self.strict,
                     };
                     log.push(1);
                     for node in nodes.iter_mut() {
                         node.applied = 1;
                     }
                     nodes[h].lease = Some((1, expires));
+                    nodes[h].last_probe = off[h];
                 }
                 State {
                     t: 0,
@@ -640,13 +733,27 @@ impl Model for CtoModel {
                 actions.push(Action::Renew(iu));
             }
             let claimable = s.reg.holder == NONE || s.reg.released || s.local(i) >= s.reg.expires;
+            // Plan 30 §M9: on a `fast` tenure the detection of the
+            // holder's silence is nondeterministic (safety must hold for
+            // any timing), so a live lease is claimable by a peer at any
+            // moment.
+            let fast = self.fast_takeover && s.reg.holder != NONE && s.reg.holder != iu;
             // Takeover is offered only to a node with a write to do: that
             // is what makes a node acquire.
             let wants = node.op == NodeOp::Writing
                 || (node.op == NodeOp::Idle
                     && self.scripts[i].get(node.pc as usize) == Some(&Op::Write));
-            if claimable && wants && s.reg.epoch < self.max_epoch {
+            if (claimable || fast) && wants && s.reg.epoch < self.max_epoch {
                 actions.push(Action::Takeover(iu));
+            }
+            if node.lease.is_some() && self.fast_takeover {
+                actions.push(Action::Probe(iu));
+            }
+            if node
+                .ack_floor
+                .is_some_and(|f| s.local(i) >= f && !node.floor_held.is_empty())
+            {
+                actions.push(Action::FloorPassed(iu));
             }
             if self.allow_release && s.may_execute(self, i) && node.held.is_empty() {
                 let now = s.local(i);
@@ -661,6 +768,12 @@ impl Model for CtoModel {
                     actions.push(Action::Expire(iu));
                 }
             }
+            // Plan 30 §M9: on a `fast` tenure a holder serves even its own
+            // strict reads locally only with a fresh probe (a deposed
+            // holder that has not noticed would read stale state).
+            let fresh = !self.fast_takeover
+                || !self.probe_freshness
+                || s.local(i) - node.last_probe < self.takeover_window;
             match node.op {
                 NodeOp::Idle => {
                     if (node.pc as usize) < self.scripts[i].len() {
@@ -681,8 +794,13 @@ impl Model for CtoModel {
                 }
                 NodeOp::ReadStart { .. } => {
                     // Bounded, or the usable holder: its own replica.
-                    if !self.strict || s.usable(self, i).is_some() {
+                    if !self.strict {
                         actions.push(Action::ReadLocal(iu));
+                    } else if s.usable(self, i).is_some() {
+                        if fresh {
+                            actions.push(Action::ReadLocal(iu));
+                        }
+                        // Else: `Probe(i)` first (offered above).
                     } else if self.delegations && node.deleg.is_some_and(|d| s.local(i) < d.until) {
                         actions.push(Action::ReadUnderDelegation(iu));
                     } else if s.reg.holder == NONE || s.reg.released || s.local(i) >= s.reg.expires
@@ -732,16 +850,20 @@ impl Model for CtoModel {
                 s.reg.expires = expires;
                 let epoch = s.reg.epoch;
                 s.nodes[i].lease = Some((epoch, expires));
+                s.nodes[i].last_probe = s.local(i);
             }
             Action::Takeover(i) => {
                 let i = i as usize;
                 let epoch = s.reg.epoch + 1;
-                let expires = s.local(i) + self.lease_ttl;
+                let now = s.local(i);
+                let expires = now + self.lease_ttl;
+                let prev = s.reg;
                 s.reg = Reg {
                     holder: i as u8,
                     epoch,
                     expires,
                     released: false,
+                    marked: self.strict,
                 };
                 // Tail to head, then the marker.
                 while (s.nodes[i].applied as usize) < s.log.len() {
@@ -750,10 +872,46 @@ impl Model for CtoModel {
                 s.log.push(epoch);
                 s.nodes[i].applied = s.log.len() as u8;
                 s.nodes[i].lease = Some((epoch, expires));
+                s.nodes[i].last_probe = now;
                 // A new tenure's table is empty.
                 s.nodes[i].grants.clear();
                 s.nodes[i].held.clear();
                 s.saw |= SAW_TAKEOVER;
+                // Plan 30 §M9: an unexpired predecessor that served strict
+                // reads: hold every acknowledgement until its horizon.
+                let unexpired = prev.holder != NONE && !prev.released && now < prev.expires;
+                if unexpired {
+                    s.saw |= SAW_FAST_TAKEOVER;
+                }
+                s.nodes[i].ack_floor = None;
+                if self.horizon_wait && unexpired && prev.marked {
+                    let bound = now + self.takeover_window + self.deleg_ttl + 2 * self.seq_margin;
+                    let floor = prev.expires.min(bound);
+                    if floor > now {
+                        s.nodes[i].ack_floor = Some(floor);
+                        s.saw |= SAW_FLOOR_WAIT;
+                    }
+                }
+            }
+            Action::Probe(i) => {
+                let i = i as usize;
+                let (mine, _) = s.nodes[i].lease?;
+                if s.reg.holder != i as u8 || s.reg.epoch != mine {
+                    // Deposed: stop everything at once.
+                    s.nodes[i].lease = None;
+                    s.nodes[i].grants.clear();
+                    s.nodes[i].held.clear();
+                } else {
+                    s.nodes[i].last_probe = s.local(i);
+                }
+            }
+            Action::FloorPassed(i) => {
+                let i = i as usize;
+                let held = std::mem::take(&mut s.nodes[i].floor_held);
+                s.nodes[i].ack_floor = None;
+                for (writer, version) in held {
+                    s.ack_write(i, writer as usize, version);
+                }
             }
             Action::Release(i) => {
                 let i = i as usize;
@@ -863,6 +1021,10 @@ impl Model for CtoModel {
                 s.saw & SAW_DELEG_READ != 0
             }),
             Property::sometimes("recall_acked", |_, s: &State| s.saw & SAW_RECALL_ACK != 0),
+            Property::sometimes("fast_takeover", |_, s: &State| {
+                s.saw & SAW_FAST_TAKEOVER != 0
+            }),
+            Property::sometimes("floor_waited", |_, s: &State| s.saw & SAW_FLOOR_WAIT != 0),
         ]
     }
 
@@ -930,7 +1092,13 @@ fn deliver(cfg: &CtoModel, s: &mut State, m: Msg) {
         }
         Msg::ReadIndex { from, to } => {
             let h = to as usize;
-            let Some(epoch) = s.usable(cfg, h) else {
+            let now = s.local(h);
+            // Plan 30 §M9: on a `fast` tenure, only with a fresh probe.
+            let stale = cfg.fast_takeover
+                && cfg.probe_freshness
+                && now - s.nodes[h].last_probe >= cfg.takeover_window;
+            let usable = s.usable(cfg, h).filter(|_| !stale);
+            let Some(epoch) = usable else {
                 s.send(Msg::ReadIndexReply {
                     to: from,
                     ok: false,
@@ -939,8 +1107,24 @@ fn deliver(cfg: &CtoModel, s: &mut State, m: Msg) {
                 });
                 return;
             };
+            // The tenure serves strict reads: say so in the register
+            // first (one CAS; a stale holder's CAS fails and deposes it —
+            // here the register comparison stands in for the CAS).
+            if s.reg.holder == h as u8 && s.reg.epoch == epoch {
+                s.reg.marked = true;
+            } else {
+                s.nodes[h].lease = None;
+                s.nodes[h].grants.clear();
+                s.nodes[h].held.clear();
+                s.send(Msg::ReadIndexReply {
+                    to: from,
+                    ok: false,
+                    pos: 0,
+                    grant: None,
+                });
+                return;
+            }
             let pos = s.nodes[h].applied;
-            let now = s.local(h);
             let mut grant = None;
             if cfg.delegations {
                 let mut ttl = cfg.deleg_ttl;

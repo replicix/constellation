@@ -133,11 +133,28 @@ impl Core {
         // leave only once no other node still honours a read delegation
         // on what it touched. The requester's own delegation is not
         // recalled: its reads of its own write are read-your-writes (M6).
-        if let Some(inos) = fresh {
-            if let Some(wait) = self.recall_needed(now, &inos, Some(from), replica, out) {
-                self.park_reply(now, wait, from, req, rid, outcome, base, position, out);
-                return;
-            }
+        // Plan 30 §M9: and, accepted or refused, only once the journal
+        // position it was evaluated at is durable under the lease's
+        // acknowledgement policy.
+        let wait = match fresh {
+            Some(inos) => self.recall_needed(now, &inos, Some(from), replica, out),
+            None => None,
+        };
+        let durable = self.ack_need(&position);
+        if wait.is_some() || durable.is_some() {
+            self.park_reply(
+                now,
+                wait.unwrap_or_default(),
+                durable,
+                from,
+                req,
+                rid,
+                outcome,
+                base,
+                position,
+                out,
+            );
+            return;
         }
         out.push(Action::Send {
             to: from,
@@ -215,6 +232,12 @@ impl Core {
             }
             None => {}
         }
+        tracing::debug!(
+            node = self.cfg.node_id,
+            ?rid,
+            rseq = rid.seq,
+            "holder: executing a forwarded op"
+        );
         let outcome = match replica.execute(op, Some(rid)) {
             Ok(records) => {
                 replica.remember_outcome(rid, &records);
@@ -229,19 +252,45 @@ impl Core {
                 },
                 _ => MutateOutcome::Errno(libc::EAGAIN),
             },
-            Err(MetaError::Exists) => match named_child(op) {
-                Some((parent, name)) => match replica.entry_as_record(parent, name) {
-                    Some(record) => MutateOutcome::Exists {
-                        records: vec![record],
-                        epoch,
+            Err(MetaError::Exists) => {
+                self.record_refusal(rid, libc::EEXIST, replica);
+                match named_child(op) {
+                    Some((parent, name)) => match replica.entry_as_record(parent, name) {
+                        Some(record) => MutateOutcome::Exists {
+                            records: vec![record],
+                            epoch,
+                        },
+                        None => MutateOutcome::Errno(libc::EEXIST),
                     },
                     None => MutateOutcome::Errno(libc::EEXIST),
-                },
-                None => MutateOutcome::Errno(libc::EEXIST),
-            },
-            Err(e) => MutateOutcome::Errno(meta_errno(&e)),
+                }
+            }
+            Err(e) => {
+                let errno = meta_errno(&e);
+                self.record_refusal(rid, errno, replica);
+                MutateOutcome::Errno(errno)
+            }
         };
         (outcome, None)
+    }
+
+    /// Plan 30 §M9: a definitive refusal of an op executed by rid is an
+    /// outcome, journaled as `Refused { rid, errno }` so that any second
+    /// execution of the rid — the requester's retry after a `Busy` or a
+    /// lost reply, the deposed holder's replay by rid, an inbox batch
+    /// drained later — dedups to the same errno rather than re-evaluating
+    /// the op against a state that may have changed meanwhile. (A
+    /// transient refusal — `Conflict`/`EAGAIN`, a stale manifest base —
+    /// is not an outcome: the requester rebases and retries.) The row is
+    /// unshipped journal work like any other: the reply's position
+    /// carries it, and under `Backup`/`S3` the acknowledgement waits for
+    /// it.
+    pub(crate) fn record_refusal(&mut self, rid: Rid, errno: i32, replica: &dyn Replica) {
+        if let Err(error) = replica.journal_refusal(rid, errno) {
+            tracing::warn!(node = self.cfg.node_id, ?rid, errno, %error, "could not journal a refusal");
+            return;
+        }
+        self.stats.refusals_journaled += 1;
     }
 
     /// `SyncRequest::HandOff`: a peer wants the lease. If this node holds

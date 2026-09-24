@@ -84,6 +84,18 @@ pub struct LeaseView {
     gate_pending: AtomicBool,
     /// Mutations admitted by [`Self::admit`] and still executing.
     inflight: AtomicU32,
+    /// Plan 30 §M9: acknowledgements are gated by durability (a backup,
+    /// `ack=s3`, or a backup being brought up): a fast-path mutation is
+    /// acknowledged only once the core's durable watermark covers its
+    /// journal row.
+    ack_gated: AtomicBool,
+    /// Plan 30 §M9: the tenure may be taken over before its lease
+    /// expires, and the send time (unix ms) of the latest S3 request that
+    /// proved this node still holds; a strict read on this node is local
+    /// only while that is within `fresh_window_ms`.
+    fast_tenure: AtomicBool,
+    last_s3_fresh_ms: AtomicI64,
+    fresh_window_ms: AtomicI64,
 }
 
 /// A new mutation admitted through [`LeaseView::admit`]: counted in
@@ -99,7 +111,11 @@ impl Drop for AdmitGuard<'_> {
 
 impl LeaseView {
     /// Copy the core's lease state in (the driver, after every event).
-    pub fn mirror(&self, lease: &LeaseState, now: Ms, cfg: &Config) {
+    /// `ack_gated`: plan 30 §M9's durability gate is in force.
+    pub fn mirror(&self, lease: &LeaseState, now: Ms, cfg: &Config, ack_gated: bool) {
+        self.ack_gated.store(ack_gated, Ordering::Relaxed);
+        self.fresh_window_ms
+            .store(cfg.backup_takeover_ms as i64, Ordering::Relaxed);
         self.lost.store(lease.lost, Ordering::Relaxed);
         self.gate_pending
             .store(lease.gate.is_some(), Ordering::SeqCst);
@@ -152,11 +168,28 @@ impl LeaseView {
     /// lease, no takeover gate, no release in progress — so its replica
     /// is authoritative and a `cto=strict` read needs no ReadIndex. The
     /// handoff pause does not matter (it closes this node's own new
-    /// writes, not its authority).
+    /// writes, not its authority). Plan 30 §M9: on a tenure that may be
+    /// taken over before its lease expires, only with fresh S3 liveness;
+    /// otherwise the read goes through the core, which probes first.
     pub fn reads_locally(&self) -> bool {
-        !self.releasing.load(Ordering::SeqCst)
-            && !self.gate_pending.load(Ordering::SeqCst)
-            && self.usable()
+        if self.releasing.load(Ordering::SeqCst)
+            || self.gate_pending.load(Ordering::SeqCst)
+            || !self.usable()
+        {
+            return false;
+        }
+        if !self.fast_tenure.load(Ordering::Relaxed) {
+            return true;
+        }
+        now_unix_ms() - self.last_s3_fresh_ms.load(Ordering::Relaxed)
+            < self.fresh_window_ms.load(Ordering::Relaxed)
+    }
+
+    /// Plan 30 §M9: the driver mirrors the core's liveness bookkeeping.
+    pub fn set_liveness(&self, fast_tenure: bool, last_s3_fresh_ms: i64) {
+        self.fast_tenure.store(fast_tenure, Ordering::Relaxed);
+        self.last_s3_fresh_ms
+            .store(last_s3_fresh_ms, Ordering::Relaxed);
     }
 
     /// As [`Self::usable`], but also closed by the releasing flag, a
@@ -179,6 +212,9 @@ impl LeaseView {
     /// closed. Hold the guard across the mutation's metadata write, and
     /// no longer.
     pub fn admit(&self) -> Option<AdmitGuard<'_>> {
+        // Plan 30 §M9: under a durability gate the fast path still
+        // executes here; its acknowledgement then waits for the core's
+        // durable watermark (`ConstellationFs::ack_when_durable`).
         self.inflight.fetch_add(1, Ordering::SeqCst);
         if self.open_for_new_mutation() {
             Some(AdmitGuard(self))
@@ -203,6 +239,12 @@ impl LeaseView {
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
+    }
+
+    /// Plan 30 §M9: whether a fast-path acknowledgement waits for
+    /// durability.
+    pub fn ack_gated(&self) -> bool {
+        self.ack_gated.load(Ordering::Relaxed)
     }
 
     /// Whether the takeover gate is still pending (`status`).
@@ -272,25 +314,25 @@ mod tests {
         let now = Ms(now_unix_ms());
         let view = LeaseView::default();
         let mut state = LeaseState::default();
-        view.mirror(&state, now, &cfg);
+        view.mirror(&state, now, &cfg, false);
         assert!(!view.usable());
         assert!(view.admit().is_none());
 
         let lease = state.granted_lease(now, &cfg, None);
         state.adopt(now, lease, tag(), None);
-        view.mirror(&state, now, &cfg);
+        view.mirror(&state, now, &cfg, false);
         assert!(view.usable());
         assert!(view.open_for_new_mutation());
         assert_eq!(view.status().holder, 7);
 
         state.releasing = true;
-        view.mirror(&state, now, &cfg);
+        view.mirror(&state, now, &cfg, false);
         assert!(view.usable());
         assert!(view.admit().is_none(), "releasing closes new mutations");
         state.releasing = false;
 
         state.begin_handoff_pause(now, &cfg);
-        view.mirror(&state, now, &cfg);
+        view.mirror(&state, now, &cfg, false);
         assert!(view.usable());
         assert!(!view.open_for_new_mutation(), "paused for a handoff");
         state.pause_until = Ms(0);
@@ -300,15 +342,18 @@ mod tests {
             takeover: true,
             marker_shipped: false,
             drained: true,
+            fast_prev: None,
+            backup_tail_epoch: None,
+            shippable: false,
         });
-        view.mirror(&state, now, &cfg);
+        view.mirror(&state, now, &cfg, false);
         assert!(view.gate_pending());
         assert!(view.admit().is_none());
         state.gate = None;
 
         state.released();
         state.adopt_epoch_hold(now, 3);
-        view.mirror(&state, now, &cfg);
+        view.mirror(&state, now, &cfg, false);
         assert!(view.usable() && view.open_for_new_mutation());
         assert_eq!(view.status().epoch, 3);
     }
@@ -323,7 +368,7 @@ mod tests {
         let mut state = LeaseState::default();
         let lease = state.granted_lease(now, &cfg, None);
         state.adopt(now, lease, tag(), None);
-        view.mirror(&state, now, &cfg);
+        view.mirror(&state, now, &cfg, false);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_time()

@@ -166,6 +166,12 @@ pub struct HandoffResult {
     pub head_seq: Option<u64>,
 }
 
+/// Plan 30 §M9: how long a fast-path acknowledgement waits for
+/// durability before the op is treated as in doubt (a backup that stops
+/// answering is reconfigured out within `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS`;
+/// a lost lease ends the wait at once).
+const DURABLE_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A request to the daemon's sync task — the authority core's driver
 /// (`crate::authority_driver`), which turns each into a core event.
 pub enum SyncRequest {
@@ -242,8 +248,16 @@ pub enum SyncRequest {
         /// retry this op goes through.
         rid: constellation_meta::Rid,
         policy: constellation_authority::Policy,
+        /// Plan 30 §M9: a resubmission of an op the fast path executed
+        /// here but could not acknowledge (the lease was lost while its
+        /// acknowledgement waited for durability): in doubt from the
+        /// start, resolved against `completed` by rid.
+        in_doubt: bool,
         reply: tokio::sync::oneshot::Sender<constellation_authority::ClientReply>,
     },
+    /// Plan 30 §M9: the fast path journaled a row under a durability
+    /// gate; the core appends it to the backups now.
+    Journaled,
     /// Plan 30 §M8: a strict open or lookup on this node needs to know
     /// how it may read (`constellation_authority::ReadAnswer`).
     ReadIndex {
@@ -274,6 +288,25 @@ pub enum SyncRequest {
         ino: Ino,
         grant: u64,
         reply: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Plan 30 §M9: the holder streams journal transactions to this
+    /// node as its backup; answered with `(acked through, sealed)`.
+    PeerBackupAppend {
+        holder: u64,
+        epoch: u64,
+        config_version: u64,
+        from: u64,
+        txs: Vec<constellation_meta::BackupTx>,
+        through: u64,
+        reply: tokio::sync::oneshot::Sender<(u64, bool)>,
+    },
+    /// Plan 30 §M9: backup-acked transactions streamed ahead of S3 by
+    /// the holder this node follows.
+    PeerStreamAhead {
+        from: u64,
+        epoch: u64,
+        base: u64,
+        txs: Vec<constellation_meta::BackupTx>,
     },
     /// A peer's gossip says segment `seq` landed (plan 30 §M7: a hint
     /// with no payload). The core tails now unless its log stream from
@@ -1526,12 +1559,25 @@ impl ConstellationFs {
         // `lease.rs`'s module doc, "The releasing flag".
         if let Some(admitted) = h.lease.admit() {
             let result = constellation_meta::execute_mutate(&self.meta, op, Some(rid));
+            // Plan 30 §M9: under a durability gate, the row this op
+            // journaled (at or below the tip now) must reach the backups
+            // or the log before the acknowledgement.
+            let jseq = if h.lease.ack_gated() && result.is_ok() {
+                Some(self.meta.journal_tip().unwrap_or(u64::MAX))
+            } else {
+                None
+            };
             // The row is journaled: a release's quiescence wait need not
             // wait on the recall below (it recalls every grant itself).
             drop(admitted);
             return match result {
                 Ok(records) => {
                     h.lease.touch();
+                    if let Some(jseq) = jseq {
+                        if let Some(outcome) = self.ack_when_durable(h, rid, op, jseq) {
+                            return outcome;
+                        }
+                    }
                     self.recall_after_local_write(h, &records);
                     Ok(())
                 }
@@ -1547,12 +1593,52 @@ impl ConstellationFs {
         // refusal, which is an outcome too), the causal wait, the
         // deadline — is the authority core's client machine. One channel
         // round trip; the reply is the op's outcome or "in doubt".
+        self.submit_to_core(h, op, rid, false)
+    }
+
+    /// Plan 30 §M9: the fast path's acknowledgement wait under a
+    /// durability gate. `Some(outcome)` ends the op with it; `None`
+    /// means acknowledged as usual (durable, or the gate went off with
+    /// the lease still this node's — `Local` again). A lost lease
+    /// leaves the op in doubt: resubmitted by rid through the core,
+    /// which resolves it against `completed` (the stranded row is
+    /// replayed by rid).
+    fn ack_when_durable(
+        &self,
+        h: &SyncHandle,
+        rid: constellation_meta::Rid,
+        op: &constellation_meta::MutateOp,
+        jseq: u64,
+    ) -> Option<Result<(), MutateFail>> {
+        let _ = h.tx.send(SyncRequest::Journaled);
+        let session = self.meta.session();
+        match session.wait_durable(jseq, DURABLE_WAIT_BUDGET) {
+            constellation_meta::DurableWait::Durable(waited) => {
+                session.count_fast_ack(waited);
+                None
+            }
+            constellation_meta::DurableWait::Ungated => None,
+            constellation_meta::DurableWait::Lost | constellation_meta::DurableWait::TimedOut => {
+                session.count_fast_ack_in_doubt();
+                Some(self.submit_to_core(h, op, rid, true))
+            }
+        }
+    }
+
+    fn submit_to_core(
+        &self,
+        h: &SyncHandle,
+        op: &constellation_meta::MutateOp,
+        rid: constellation_meta::Rid,
+        in_doubt: bool,
+    ) -> Result<(), MutateFail> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if h.tx
             .send(SyncRequest::Submit {
                 op: op.clone(),
                 rid,
                 policy: constellation_authority::Policy::Client,
+                in_doubt,
                 reply: tx,
             })
             .is_err()
