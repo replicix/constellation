@@ -3,12 +3,33 @@
 //! Wraps [`constellation_net::EpochMachine`] with SQLite persistence and
 //! the P2P propose/ack/activate exchange. FUSE threads only read the
 //! three atomics (`active`, `frozen`, `blocks_takeover`).
+//!
+//! Plan 30 §M10 (flexible quorums): with `epoch_slack = f`, an epoch
+//! needs `N − f` members of the write-eligible roster
+//! ([`constellation_net::component_quorum`]; all of it at `f = 0`), and a
+//! node proposes or joins only once its own last issued heartbeat promise
+//! has expired — checked and gated in one replica transaction
+//! (`Meta::promise_join_begin`), so no promise can be issued between the
+//! check and the join. Each ack carries the member's lease claim and the
+//! highest epoch it knows of; the proposer resolves them
+//! ([`constellation_authority::resolve_epoch_claims`]) into the lease the epoch
+//! carries and the epoch below which a member's claim is stale, and the
+//! activation carries both to every member's core. With `f > 0` a node
+//! forms or joins only after a heartbeat advertising `f` has landed
+//! (a taker honours the largest slack advertised). When the carrier's
+//! node is retired (admin `leave --node-id`, which fences its lease), the
+//! members that do not own the hold abandon the epoch: the flush it was
+//! waiting for will never come.
 
 use anyhow::Result;
+use constellation_authority::EpochClaimView;
 use constellation_meta::Meta;
-use constellation_net::{component_covers_roster, EpochMachine, EpochPromise, Payload};
+use constellation_net::{
+    component_quorum, EpochActivation, EpochCarrier, EpochClaim, EpochMachine, EpochPromise,
+    Payload,
+};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn now_ms() -> i64 {
@@ -17,6 +38,9 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+/// `local` key of the current (or last) epoch's resolution.
+const CARRIER_KEY: &str = "epoch_carrier";
 
 pub struct EpochManager {
     node_id: u64,
@@ -33,6 +57,12 @@ pub struct EpochManager {
     pub frozen: Arc<AtomicBool>,
     pub blocks_takeover: Arc<AtomicBool>,
     flushing: AtomicBool,
+    /// Plan 30 §M10: `f`.
+    slack: AtomicU32,
+    /// The core's claim, mirrored by the driver after every step.
+    claim: Mutex<EpochClaimView>,
+    /// The current (or last) epoch's `(carrier, stale_below)`.
+    carrier: Mutex<(Option<EpochCarrier>, u64)>,
 }
 
 impl EpochManager {
@@ -52,6 +82,12 @@ impl EpochManager {
                 p
             });
         let machine = loaded.map(EpochMachine::from_promise).unwrap_or_default();
+        let carrier = meta
+            .kv_get(CARRIER_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| decode_carrier(&v))
+            .unwrap_or((None, 0));
         let mgr = Self {
             node_id,
             meta,
@@ -64,6 +100,9 @@ impl EpochManager {
             frozen: Arc::new(AtomicBool::new(false)),
             blocks_takeover: Arc::new(AtomicBool::new(false)),
             flushing: AtomicBool::new(false),
+            slack: AtomicU32::new(0),
+            claim: Mutex::new(EpochClaimView::default()),
+            carrier: Mutex::new(carrier),
         };
         mgr.sync_flags();
         mgr
@@ -86,6 +125,71 @@ impl EpochManager {
                 .meta
                 .persist_epoch(&p.epoch_id, &p.members, &p.base, p.promised_at, state);
         }
+        if !m.is_open() {
+            // Plan 30 §M10: in no open epoch, promises may be issued again.
+            let _ = self.meta.promise_join_end();
+        }
+    }
+
+    /// Plan 30 §M10: `meta.json`'s `epoch_slack`.
+    pub fn set_slack(&self, epoch_slack: u32) {
+        self.slack.store(epoch_slack, Ordering::Relaxed);
+    }
+
+    pub fn slack(&self) -> u32 {
+        self.slack.load(Ordering::Relaxed)
+    }
+
+    /// The driver mirrors the core's claim here after every step.
+    pub fn set_claim_view(&self, view: EpochClaimView) {
+        *self.claim.lock().unwrap() = view;
+    }
+
+    /// The current (or last) epoch's carried lease and stale floor.
+    pub fn carrier(&self) -> (Option<EpochCarrier>, u64) {
+        *self.carrier.lock().unwrap()
+    }
+
+    fn set_carrier(&self, carrier: Option<EpochCarrier>, stale_below: u64) {
+        *self.carrier.lock().unwrap() = (carrier, stale_below);
+        let _ = self
+            .meta
+            .kv_set(CARRIER_KEY, &encode_carrier(carrier, stale_below));
+    }
+
+    /// This node's ack for an epoch of `members`: `(claim, known)`.
+    fn my_claim(&self, members: &[u64]) -> (Option<EpochClaim>, u64) {
+        let view = self.claim.lock().unwrap();
+        tracing::debug!(node = self.node_id, ?view, "epoch claim");
+        let claim = view
+            .claim(members)
+            .map(|(epoch, expires_unix_ms, may_carry)| EpochClaim {
+                epoch,
+                expires_unix_ms,
+                may_carry,
+            });
+        (claim, view.known)
+    }
+
+    /// Whether this node may take part in an epoch under its own slack:
+    /// `members` is at least `N − f` of the roster and contains this
+    /// node, and with `f > 0` a heartbeat advertising `f` has landed.
+    fn quorum_ok(&self, members: &[u64]) -> bool {
+        let roster = self.roster();
+        let f = self.slack();
+        if roster.is_empty() || !members.contains(&self.node_id) {
+            return false;
+        }
+        if !members.iter().all(|m| roster.contains(m)) {
+            return false;
+        }
+        let Some(quorum) = constellation_store_s3::heartbeat::epoch_quorum(roster.len(), f) else {
+            return false;
+        };
+        if members.len() < quorum {
+            return false;
+        }
+        f == 0 || self.claim.lock().unwrap().advertised_slack == Some(f)
     }
 
     pub fn status(&self) -> constellation_api::EpochStatus {
@@ -95,6 +199,10 @@ impl EpochManager {
             active,
             epoch_id,
             members,
+            epoch_slack: self.slack(),
+            carrier: self.carrier().0.map(|c| c.node),
+            promise_until_ms: self.meta.promise_issued().unwrap_or(0),
+            ..Default::default()
         }
     }
 
@@ -132,6 +240,7 @@ impl EpochManager {
     }
 
     pub fn set_roster(&self, ids: Vec<u64>) {
+        self.abandon_if_carrier_retired(&ids);
         *self.roster.lock().unwrap() = ids;
     }
 
@@ -139,32 +248,88 @@ impl EpochManager {
         self.roster.lock().unwrap().clone()
     }
 
-    /// Persist a promise (BEFORE any ack is sent) then reply.
+    /// Persist a promise (BEFORE any ack is sent) then reply. Plan 30
+    /// §M10: only under this node's own quorum rule, and only once its
+    /// own last issued heartbeat promise has expired (the join gate).
     pub fn handle_propose(
         &self,
         epoch_id: String,
         members: Vec<u64>,
         base: Vec<(String, u64)>,
-        _proposer: u64,
+        proposer: u64,
+        proposer_slack: u32,
     ) -> Payload {
+        let refuse = |why: &str| {
+            tracing::info!(
+                epoch_id,
+                proposer,
+                proposer_slack,
+                why,
+                "declined an epoch proposal"
+            );
+            Payload::EpochAck {
+                epoch_id: epoch_id.clone(),
+                member: self.node_id,
+                accepted: false,
+                claim: None,
+                known: 0,
+            }
+        };
+        // The proposer applied the quorum rule to its roster. Re-check it
+        // here only when the proposer runs with a larger slack than this
+        // node does (a change of `f` in flight): then this node's stricter
+        // rule decides. Otherwise the proposer's view — as fresh as ours,
+        // or fresher (a leave this node has not read yet) — stands, as it
+        // always did.
+        let own = self.slack();
+        if proposer_slack > own && !self.quorum_ok(&members) {
+            return refuse("not a quorum under this node's slack");
+        }
+        if !members.contains(&self.node_id) {
+            return refuse("not a member");
+        }
+        if own > 0 && self.claim.lock().unwrap().advertised_slack != Some(own) {
+            return refuse("this node's slack is not advertised yet");
+        }
+        match self.meta.promise_join_begin(now_ms()) {
+            Ok(true) => {}
+            Ok(false) => return refuse("this node's own promise has not expired"),
+            Err(_) => return refuse("join gate failed"),
+        }
         let base: BTreeMap<String, u64> = base.into_iter().collect();
-        let p = EpochPromise::new(epoch_id.clone(), members, base, now_ms());
+        let p = EpochPromise::new(epoch_id.clone(), members.clone(), base, now_ms());
         let accepted = {
             let mut m = self.machine.lock().unwrap();
             m.persist_promise(p).is_ok()
         };
         self.sync_flags();
+        let (claim, known) = self.my_claim(&members);
         Payload::EpochAck {
             epoch_id,
             member: self.node_id,
             accepted,
+            claim: accepted.then_some(claim).flatten(),
+            known,
         }
     }
 
-    pub fn handle_activate(&self, epoch_id: String, _members: Vec<u64>, _base: Vec<(String, u64)>) {
-        let _ = self.machine.lock().unwrap().activate(&epoch_id);
+    pub fn handle_activate(&self, activation: EpochActivation) {
+        let ok = self
+            .machine
+            .lock()
+            .unwrap()
+            .activate(&activation.epoch_id)
+            .is_ok();
+        if ok {
+            self.set_carrier(activation.carrier, activation.stale_below);
+        }
         self.sync_flags();
-        tracing::info!(epoch_id, "continuation epoch activated");
+        tracing::info!(
+            epoch_id = activation.epoch_id,
+            carrier = ?activation.carrier,
+            stale_below = activation.stale_below,
+            "continuation epoch activated"
+        );
     }
 
     pub async fn check_liveness(&self) {
@@ -222,56 +387,152 @@ impl EpochManager {
         // deliberately insufficient for this safety decision.
         let mut live = vec![self.node_id];
         if roster.len() > 1 {
-            for id in roster.iter().copied().filter(|id| *id != self.node_id) {
-                if self.peers.ping_node(id).await {
-                    live.push(id);
-                }
-            }
+            // Plan 30 §M10: in parallel — a missing node's ping runs to its
+            // timeout, and with `f > 0` the epoch must still form while
+            // the holder's lease is usable.
+            let others: Vec<u64> = roster
+                .iter()
+                .copied()
+                .filter(|id| *id != self.node_id)
+                .collect();
+            let answers =
+                futures::future::join_all(others.iter().map(|id| self.peers.ping_node(*id))).await;
+            live.extend(
+                others
+                    .iter()
+                    .zip(answers)
+                    .filter(|(_, up)| *up)
+                    .map(|(id, _)| *id),
+            );
         }
-        if !component_covers_roster(self.node_id, &live, &roster) {
+        let f = self.slack();
+        let Some(members) = component_quorum(self.node_id, &live, &roster, f) else {
+            return Ok(false);
+        };
+        if !self.quorum_ok(&members) {
+            return Ok(false);
+        }
+        if !self
+            .meta
+            .promise_join_begin(now_ms())
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
+            tracing::debug!("not proposing an epoch: this node's promise has not expired");
             return Ok(false);
         }
         let epoch_id = format!("{}-{}", self.node_id, now_ms());
-        let p = EpochPromise::new(epoch_id.clone(), roster.clone(), base.clone(), now_ms());
+        let p = EpochPromise::new(epoch_id.clone(), members.clone(), base.clone(), now_ms());
         {
             let mut m = self.machine.lock().unwrap();
             m.persist_promise(p).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         self.sync_flags();
         let base_vec: Vec<(String, u64)> = base.into_iter().collect();
-        let mut acked = vec![self.node_id];
-        for id in roster.iter().copied().filter(|id| *id != self.node_id) {
+        let (claim, known) = self.my_claim(&members);
+        let mut acks = vec![(self.node_id, claim, known)];
+        for id in members.iter().copied().filter(|id| *id != self.node_id) {
             let payload = Payload::EpochPropose {
                 epoch_id: epoch_id.clone(),
-                members: roster.clone(),
+                members: members.clone(),
                 base: base_vec.clone(),
                 proposer: self.node_id,
+                epoch_slack: f,
             };
             match self.peers.request_to_node(id, &payload).await {
                 Ok(Payload::EpochAck {
                     accepted: true,
                     member,
+                    claim,
+                    known,
                     ..
-                }) => acked.push(member),
+                }) if member == id => acks.push((member, claim, known)),
                 other => {
                     tracing::warn!(peer = id, ?other, "epoch propose not acked");
                     return Ok(false);
                 }
             }
         }
-        if !roster.iter().all(|m| acked.contains(m)) {
-            return Ok(false);
-        }
+        let resolved: Vec<_> = acks
+            .iter()
+            .map(|(node, claim, known)| {
+                (
+                    *node,
+                    claim.map(|c| (c.epoch, c.expires_unix_ms, c.may_carry)),
+                    *known,
+                )
+            })
+            .collect();
+        let (carrier, stale_below) = constellation_authority::resolve_epoch_claims(&resolved);
+        let carrier = carrier.map(|c| EpochCarrier {
+            node: c.node,
+            epoch: c.epoch,
+            expires_unix_ms: c.expires_unix_ms,
+        });
+        self.set_carrier(carrier, stale_below);
         {
             let mut m = self.machine.lock().unwrap();
             m.activate(&epoch_id).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         self.sync_flags();
-        self.peers
-            .announce_epoch_activate(&epoch_id, &roster, &base_vec)
-            .await;
-        tracing::info!(epoch_id, members = ?roster, "continuation epoch active");
+        let activation = EpochActivation {
+            epoch_id: epoch_id.clone(),
+            members: members.clone(),
+            base: base_vec,
+            carrier,
+            stale_below,
+        };
+        self.peers.announce_epoch_activate(&activation).await;
+        tracing::info!(
+            epoch_id,
+            ?members,
+            slack = f,
+            ?acks,
+            ?carrier,
+            stale_below,
+            "continuation epoch active"
+        );
         Ok(true)
+    }
+
+    /// Plan 30 §M10: the epoch's carrier was retired (admin `leave
+    /// --node-id`, which fenced its lease): a member that does not own
+    /// the hold abandons the epoch — the flush it waits for will never
+    /// come, and the fence makes the carried lease unclaimable by anyone
+    /// still holding it. The hold's owner (a handoff successor) keeps its
+    /// epoch until its own flush, whose re-claim CAS the fence fails.
+    /// Returns whether it abandoned.
+    pub fn abandon_if_carrier_retired(&self, roster: &[u64]) -> bool {
+        if roster.is_empty() || !self.is_open() {
+            return false;
+        }
+        let (carrier, _) = self.carrier();
+        let Some(carrier) = carrier else {
+            return false;
+        };
+        if roster.contains(&carrier.node) || carrier.node == self.node_id {
+            return false;
+        }
+        if self.claim.lock().unwrap().epoch_held {
+            return false;
+        }
+        let id = {
+            self.machine
+                .lock()
+                .unwrap()
+                .current()
+                .map(|p| p.epoch_id.clone())
+        };
+        if let Some(id) = id {
+            self.machine.lock().unwrap().close();
+            let _ = self.meta.set_epoch_state(&id, "closed");
+        }
+        self.sync_flags();
+        tracing::warn!(
+            carrier = carrier.node,
+            "continuation epoch abandoned: its carrier was retired (admin leave); \
+             its unflushed journal is lost"
+        );
+        true
     }
 
     pub fn close(&self) {
@@ -292,5 +553,205 @@ impl EpochManager {
         self.flushing.store(true, Ordering::Relaxed);
         self.sync_flags();
         tracing::info!("continuation epoch closed");
+    }
+}
+
+/// Refresh the epoch coordinator's write-eligible roster from the
+/// registry; the roster read on success.
+///
+/// Fail-closed where it matters: a registry that answers but cannot be
+/// fully parsed clears the roster (an empty roster never satisfies a
+/// quorum, so no epoch activates on a registry we could not fully read).
+/// Plan 30 §M10: an S3 *outage* (the read fails at the transport) keeps
+/// the last complete roster instead — clearing it there made every
+/// continuation epoch race the next 5 s refresh after the outage began,
+/// since the outage is exactly when an epoch forms. The kept roster is
+/// as stale as it would be between two refreshes; a node enrolled during
+/// the outage is plan 30 §M10's known gap (see PROGRESS.md).
+pub async fn refresh_roster(
+    epochs: &EpochManager,
+    store: Arc<dyn object_store::ObjectStore>,
+) -> Option<Vec<u64>> {
+    match constellation_store_s3::write_eligible_roster(store).await {
+        Ok(roster) => {
+            epochs.set_roster(roster.clone());
+            Some(roster)
+        }
+        Err(e @ constellation_store_s3::StoreError::Registry(_)) => {
+            tracing::error!(
+                error = %e,
+                "cannot determine the write-eligible roster; continuation epochs stay unavailable"
+            );
+            epochs.set_roster(Vec::new());
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "registry unreachable; keeping the last complete write-eligible roster"
+            );
+            None
+        }
+    }
+}
+
+fn encode_carrier(carrier: Option<EpochCarrier>, stale_below: u64) -> String {
+    match carrier {
+        Some(c) => format!("{}:{}:{}:{stale_below}", c.node, c.epoch, c.expires_unix_ms),
+        None => format!("-:-:-:{stale_below}"),
+    }
+}
+
+fn decode_carrier(v: &str) -> Option<(Option<EpochCarrier>, u64)> {
+    let parts: Vec<&str> = v.split(':').collect();
+    let [node, epoch, expires, stale] = parts.as_slice() else {
+        return None;
+    };
+    let stale_below = stale.parse().ok()?;
+    if *node == "-" {
+        return Some((None, stale_below));
+    }
+    Some((
+        Some(EpochCarrier {
+            node: node.parse().ok()?,
+            epoch: epoch.parse().ok()?,
+            expires_unix_ms: expires.parse().ok()?,
+        }),
+        stale_below,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager(node: u64, slack: u32) -> (EpochManager, Arc<Meta>) {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let m = EpochManager::new(node, meta.clone(), constellation_net::Peers::disabled());
+        m.set_roster(vec![1, 2, 3]);
+        m.set_slack(slack);
+        m.set_claim_view(EpochClaimView {
+            advertised_slack: (slack > 0).then_some(slack),
+            known: 1,
+            ..Default::default()
+        });
+        (m, meta)
+    }
+
+    fn accepted(p: &Payload) -> bool {
+        matches!(p, Payload::EpochAck { accepted: true, .. })
+    }
+
+    /// Plan 30 §M10: a member acks an epoch of `N − f` under its own
+    /// slack, only once its own promise has expired, and holds the join
+    /// gate (no promise is issued) while the epoch is open.
+    #[test]
+    fn a_member_joins_a_flexible_quorum_only_past_its_own_promise() {
+        // A proposer running a larger slack than this node's f = 0: two
+        // of three is not a quorum here.
+        let (m, _) = manager(1, 0);
+        assert!(!accepted(&m.handle_propose(
+            "e".into(),
+            vec![1, 2],
+            vec![],
+            2,
+            1
+        )));
+        // f = 1 but this node's promise is still out.
+        let (m, meta) = manager(1, 1);
+        assert!(meta.promise_issue(now_ms() + 60_000).unwrap());
+        assert!(!accepted(&m.handle_propose(
+            "e".into(),
+            vec![1, 2],
+            vec![],
+            2,
+            1
+        )));
+        // Expired: joins, and no promise can be issued while open.
+        let (m, meta) = manager(1, 1);
+        assert!(meta.promise_issue(now_ms() - 1).unwrap());
+        assert!(accepted(&m.handle_propose(
+            "e".into(),
+            vec![1, 2],
+            vec![],
+            2,
+            1
+        )));
+        assert!(m.is_open());
+        assert!(!meta.promise_issue(now_ms() + 60_000).unwrap(), "gated");
+        // Not advertised yet: refused.
+        let (m, _) = manager(1, 1);
+        m.set_claim_view(EpochClaimView::default());
+        assert!(!accepted(&m.handle_propose(
+            "e".into(),
+            vec![1, 2],
+            vec![],
+            2,
+            1
+        )));
+    }
+
+    /// Plan 30 §M10: the members of an epoch whose carrier was retired
+    /// (admin leave fenced its lease) abandon it — unless they own the
+    /// hold, which flushes (its re-claim fails on the fence) — and may
+    /// promise again.
+    #[test]
+    fn members_abandon_an_epoch_whose_carrier_was_retired() {
+        let (m, meta) = manager(1, 1);
+        assert!(accepted(&m.handle_propose(
+            "e".into(),
+            vec![1, 2],
+            vec![],
+            2,
+            1
+        )));
+        m.handle_activate(EpochActivation {
+            epoch_id: "e".into(),
+            members: vec![1, 2],
+            base: vec![],
+            carrier: Some(EpochCarrier {
+                node: 2,
+                epoch: 1,
+                expires_unix_ms: 5,
+            }),
+            stale_below: 1,
+        });
+        assert!(m.is_active());
+        assert_eq!(m.carrier().0.map(|c| c.node), Some(2));
+        // The carrier stays in the roster: nothing happens.
+        m.set_roster(vec![1, 2, 3]);
+        assert!(m.is_open());
+        // A hold owner does not abandon.
+        m.set_claim_view(EpochClaimView {
+            epoch_held: true,
+            ..Default::default()
+        });
+        m.set_roster(vec![1, 3]);
+        assert!(m.is_open());
+        m.set_claim_view(EpochClaimView::default());
+        m.set_roster(vec![1, 3]);
+        assert!(!m.is_open(), "abandoned");
+        assert!(
+            meta.promise_issue(now_ms() + 1_000).unwrap(),
+            "promises again"
+        );
+        // The carrier survives a restart of the coordinator.
+        let again = EpochManager::new(1, meta, constellation_net::Peers::disabled());
+        assert_eq!(again.carrier().0.map(|c| c.node), Some(2));
+    }
+
+    #[test]
+    fn carrier_roundtrips_through_the_kv_encoding() {
+        let c = EpochCarrier {
+            node: 3,
+            epoch: 7,
+            expires_unix_ms: -5,
+        };
+        assert_eq!(
+            decode_carrier(&encode_carrier(Some(c), 9)),
+            Some((Some(c), 9))
+        );
+        assert_eq!(decode_carrier(&encode_carrier(None, 2)), Some((None, 2)));
+        assert_eq!(decode_carrier("garbage"), None);
     }
 }

@@ -95,9 +95,20 @@ pub async fn admin_leave(
             });
         }
     }
-    constellation_store_s3::leave_node(store, target)
+    constellation_store_s3::leave_node(store.clone(), target)
         .await
         .map_err(|e| LeaveError::Other(format!("retiring node {target}: {e}")))?;
+    // Plan 30 §M10: fence every lease that still names the retired node
+    // (epoch bump, expired, its id in `retired`), so it can never renew,
+    // flush-re-claim or re-acquire one again — even before it sees its
+    // tombstone — and a continuation epoch it carried is abandoned by
+    // its members (the flush they wait for will never come).
+    let fenced = constellation_store_s3::fence_retired(store, target)
+        .await
+        .map_err(|e| LeaveError::Other(format!("fencing node {target}'s leases: {e}")))?;
+    if !fenced.is_empty() {
+        tracing::warn!(node = target, ?fenced, "fenced the retired node's leases");
+    }
     Ok(())
 }
 
@@ -235,6 +246,82 @@ mod tests {
             .await
             .unwrap();
         assert!(get_node(store, b).await.unwrap().unwrap().retired);
+    }
+
+    /// Plan 30 §M10: an admin leave fences the retired node's lease — the
+    /// epoch bumps, it expires, the node joins `retired` — so the retired
+    /// node's own renewal (a CAS on the old tag) loses, and its claim of
+    /// the fenced object is refused however it reads it; another node's
+    /// claim is an ordinary takeover with an epoch marker.
+    #[tokio::test]
+    async fn admin_leave_fences_the_retired_nodes_lease() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let a = claim_node_id(store.clone()).await.unwrap();
+        let b = claim_node_id(store.clone()).await.unwrap();
+        let ls = LeaseStore::new(store.clone(), "p0", LeaseMode::Cas);
+        let tag_b = ls
+            .try_create(&Lease::granted("p0", b, 3, 60_000))
+            .await
+            .unwrap();
+        let meta = open_meta();
+        let designations = DesignationManager::new(
+            DesignationStore::new(store.clone(), DesignationMode::Cas),
+            meta,
+            Peers::disabled(),
+            a,
+        );
+        admin_leave(store.clone(), &designations, a, b, true)
+            .await
+            .unwrap();
+        let (fenced, tag) = ls.get().await.unwrap().unwrap();
+        assert_eq!(fenced.holder, b);
+        assert_eq!(fenced.epoch, 4, "the epoch bumps");
+        assert!(
+            !fenced.released,
+            "not released: the next taker ships a marker"
+        );
+        assert!(fenced.is_expired(constellation_store_s3::lease::now_unix_ms()));
+        assert_eq!(fenced.retired, vec![b]);
+        // The retired node's renewal on its old tag loses.
+        let renewed = Lease::granted("p0", b, 3, 60_000);
+        assert!(ls.try_swap(&renewed, &tag_b).await.is_err());
+        // Its core refuses the fenced object; another node's classifies
+        // it as a takeover with a marker.
+        let now = constellation_authority::Ms(constellation_store_s3::lease::now_unix_ms());
+        let as_b = constellation_authority::Config::defaults(b, 1);
+        let plan = constellation_authority::core::LeaseState::default().classify(
+            now,
+            &as_b,
+            Some((fenced.clone(), tag.clone())),
+            0,
+        );
+        assert!(
+            matches!(plan, constellation_authority::core::Plan::Refused(_)),
+            "{plan:?}"
+        );
+        let as_a = constellation_authority::Config::defaults(a, 1);
+        let plan = constellation_authority::core::LeaseState::default().classify(
+            now,
+            &as_a,
+            Some((fenced, tag)),
+            0,
+        );
+        assert!(
+            matches!(
+                plan,
+                constellation_authority::core::Plan::Claim {
+                    takeover: true,
+                    marker: true,
+                    ..
+                }
+            ),
+            "{plan:?}"
+        );
+        // A second leave is a no-op on the lease.
+        admin_leave(store.clone(), &designations, a, b, true)
+            .await
+            .unwrap();
+        assert_eq!(ls.get().await.unwrap().unwrap().0.epoch, 4);
     }
 
     #[tokio::test]

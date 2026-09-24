@@ -323,6 +323,28 @@ impl Core {
             return;
         }
         if self.epoch.active && !self.epoch.frozen && self.lease.epoch_held() {
+            // Plan 30 §M10 (found by the M10 simulation's first epoch
+            // runs, pre-M10 behaviour): a hold with an unshipped journal is
+            // not handed over. Nothing ships during an epoch, so the
+            // successor would execute on a replica missing this journal,
+            // and the two journals would ship in either order after the
+            // epoch (acknowledged effects re-evaluated and reordered). The
+            // requester forwards to this node instead; its file writes'
+            // manifests go forwarded too, their chunks uploaded when S3
+            // returns (`fusefs::commit_manifest_forwarded`).
+            if replica.journal_len().unwrap_or(1) > 0 {
+                self.stats.handoffs_declined += 1;
+                out.push(Action::Send {
+                    to: from,
+                    msg: PeerMsg::LeaseHandoff {
+                        req,
+                        released: false,
+                        epoch: self.lease.epoch().unwrap_or(0),
+                        head_seq: None,
+                    },
+                });
+                return;
+            }
             let epoch = self.lease.epoch().unwrap_or(1);
             self.lease.release_local();
             replica.set_holder_epoch(0);

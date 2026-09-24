@@ -52,6 +52,7 @@ mod holder;
 mod inbox;
 mod jobs;
 mod lease;
+mod promise;
 mod readindex;
 mod replay;
 mod stream;
@@ -71,6 +72,7 @@ pub use client::{meta_errno, ClientPhase};
 pub use inbox::InboxView;
 pub use jobs::JobKind;
 pub use lease::{LeaseState, PendingGate, Plan};
+pub use promise::{lease_may_carry, resolve_epoch_claims, EpochClaimView};
 pub use readindex::ReadView;
 pub use stream::StreamView;
 
@@ -246,6 +248,24 @@ pub struct Config {
     /// from the start, so its lease says so at acquisition (a successor
     /// then waits the horizon out).
     pub strict_mounts: bool,
+    // ---- plan 30 §M10: flexible-quorum continuation epochs ----
+    /// `meta.json`'s `epoch_slack` (`f`): a continuation epoch may form
+    /// with up to `f` write-eligible nodes missing. 0: today's rule.
+    pub epoch_slack: u32,
+    /// `CONSTELLATION_PROMISE_TTL_S` (default 15 s = lease TTL / 4): how
+    /// long a heartbeat promise binds its writer.
+    pub promise_ttl_ms: u64,
+    /// How long a TTL takeover waits for its promise requests' replies
+    /// before it decides on what it has.
+    pub promise_wait_ms: u64,
+    /// With P2P unavailable, a node with `f > 0` re-reads the lease this
+    /// often to notice an unrenewed expiry and promise on its own (a
+    /// would-be taker cannot ask it).
+    pub promise_watch_ms: u64,
+    /// The TTL takeover's promise check. Always on in production; the
+    /// simulation turns it off to show its single-authority check finds
+    /// what it prevents (as `speculate_on_stale_base` does for M5).
+    pub takeover_promise_check: bool,
 }
 
 impl Config {
@@ -333,6 +353,11 @@ impl Config {
             pre_s3_streaming: true,
             fast_takeover: true,
             strict_mounts: false,
+            epoch_slack: 0,
+            promise_ttl_ms: 15_000,
+            promise_wait_ms: 1_000,
+            promise_watch_ms: 5_000,
+            takeover_promise_check: true,
         }
     }
 }
@@ -504,6 +529,24 @@ pub struct Stats {
     /// conflict copy.
     pub refusals_journaled: u64,
     pub unacked_replays_refused: u64,
+    // ---- M10: heartbeat promises ----
+    /// Promises persisted and PUT (on an observed unrenewed expiry, on a
+    /// peer's request, or to advertise a changed slack).
+    pub promise_puts: u64,
+    /// Promise requests this node answered with a promise, and refused
+    /// (in an open epoch, or retired).
+    pub promise_requests_answered: u64,
+    pub promise_requests_refused: u64,
+    /// Would-be taker: promise checks run, promise requests sent, TTL
+    /// takeovers refused for too few promises, and takeovers exempt as
+    /// the flush re-claim of the carried lease.
+    pub promise_checks: u64,
+    pub promise_requests_sent: u64,
+    pub takeovers_refused_promises: u64,
+    pub promise_flush_exempt: u64,
+    /// Activations that found this node's lease claim stale (a member
+    /// knew a later epoch): deposed.
+    pub epoch_stale_claims: u64,
 }
 
 /// The log cursor and ship bookkeeping (`Shipper::PartState` + `SpoolInfo`).
@@ -598,6 +641,12 @@ pub(crate) enum S3For {
     /// (`Lease::granted_delegations`), and its re-read after a conflict.
     MarkGranting,
     MarkGrantingReread,
+    /// M10: a takeover's heartbeat read, and a promise PUT (the slack it
+    /// advertises).
+    Heartbeats,
+    HeartbeatPut(u32),
+    /// M10: the idle promise watch's lease read.
+    PromiseWatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,6 +676,8 @@ enum Timer {
     /// Plan 30 §M9 round 2: the pre-S3 stream-ahead hold-off (batches
     /// the rows that became durable meanwhile into one send).
     StreamAhead,
+    PromiseWait,
+    PromiseWatch,
 }
 
 impl Timer {
@@ -654,6 +705,8 @@ impl Timer {
             Timer::BackupTick => TimerKind::BackupTick,
             Timer::BackupWatch => TimerKind::BackupWatch,
             Timer::StreamAhead => TimerKind::BackupTick,
+            Timer::PromiseWait => TimerKind::PromiseWait,
+            Timer::PromiseWatch => TimerKind::PromiseWatch,
         }
     }
 }
@@ -733,6 +786,8 @@ pub struct Core {
     pub(crate) ack: backup::AckState,
     /// M9: this node as a backup, and as a pre-S3 stream subscriber.
     pub(crate) bk: backup::BackupState,
+    /// M10: heartbeat promises, the takeover check, the carried lease.
+    pub(crate) pr: promise::PromiseState,
     /// The `now` of the event being handled (for `issue_s3`'s send time).
     last_now: Ms,
     stopped: bool,
@@ -782,6 +837,7 @@ impl Core {
             rd: readindex::ReadState::default(),
             ack: backup::AckState::default(),
             bk: backup::BackupState::default(),
+            pr: promise::PromiseState::default(),
             last_now: Ms(0),
             stopped: false,
             stats: Stats::default(),
@@ -859,6 +915,7 @@ impl Core {
         self.arm_drain(now, out);
         self.read_start(now, replica, out);
         self.backup_start(now, replica, out);
+        self.promise_start(now, replica, out);
     }
 
     /// Handle one event. Every action returned must be carried out by the
@@ -925,11 +982,13 @@ impl Core {
                 }
             }
             Event::SubscriberGone { node, req } => self.on_subscriber_gone(node, req),
+            Event::Slack { epoch_slack } => self.on_slack(now, epoch_slack, replica, &mut out),
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),
         }
         self.inbox_after_event(now, &mut out);
         self.stream_after_event(now, &mut out);
         self.backup_after_event(now, replica, &mut out);
+        self.promise_after_event(now, replica, &mut out);
         out
     }
 
@@ -1028,6 +1087,15 @@ impl Core {
             PeerMsg::StreamAhead { epoch, base, txs } => {
                 self.on_stream_ahead(now, from, epoch, base, txs, replica, out)
             }
+            PeerMsg::PromiseRequest {
+                req,
+                expires_unix_ms,
+            } => self.on_promise_request(now, from, req, expires_unix_ms, replica, out),
+            PeerMsg::PromiseReply {
+                req,
+                until,
+                epoch_slack,
+            } => self.on_promise_reply(now, from, req, until, epoch_slack, replica, out),
             // Later milestones' messages: acknowledged by the interface,
             // answered by nothing until they are implemented.
             other => {
@@ -1057,6 +1125,9 @@ impl Core {
             return;
         }
         if self.on_backup_request_failed(now, req, to) {
+            return;
+        }
+        if self.on_promise_request_failed(now, req, replica, out) {
             return;
         }
         if let Some(rid) = self.by_req.remove(&req) {
@@ -1102,6 +1173,13 @@ impl Core {
             S3For::TakeoverGet => self.on_takeover_get(now, result, replica, out),
             S3For::MarkGranting => self.on_mark_granting_put(now, result, replica, out),
             S3For::MarkGrantingReread => self.on_mark_granting_reread(now, result, replica, out),
+            S3For::Heartbeats => self.on_heartbeats(now, result, replica, out),
+            S3For::HeartbeatPut(slack) => self.on_heartbeat_put(slack, result),
+            S3For::PromiseWatch => {
+                if let S3Result::LeaseGet(Ok(Some((lease, _)))) = result {
+                    self.lease.note_object(now, &lease);
+                }
+            }
         }
     }
 
@@ -1160,6 +1238,11 @@ impl Core {
             Timer::BackupWatch => {
                 self.bk.watch_timer = None;
                 self.on_backup_watch(now, replica, out);
+            }
+            Timer::PromiseWait => self.on_promise_wait(now, replica, out),
+            Timer::PromiseWatch => {
+                self.pr.watch_timer = None;
+                self.on_promise_watch(now, out);
             }
         }
     }
@@ -1275,7 +1358,10 @@ impl Core {
                 flushing,
                 base,
                 members,
+                carrier,
+                stale_below,
             } => {
+                self.pr.carried = carrier;
                 self.on_epoch_state(
                     now,
                     EpochState {
@@ -1286,9 +1372,17 @@ impl Core {
                         base,
                     },
                     &members,
+                    stale_below,
                     replica,
                     out,
                 );
+                out.push(Action::ControlDone {
+                    op,
+                    result: Ok(ControlOk::Done),
+                });
+            }
+            Control::Retire => {
+                self.on_retire(now, replica, out);
                 out.push(Action::ControlDone {
                     op,
                     result: Ok(ControlOk::Done),
@@ -1316,6 +1410,7 @@ impl Core {
         now: Ms,
         state: EpochState,
         members: &[NodeId],
+        stale_below: Epoch,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1323,7 +1418,17 @@ impl Core {
         self.epoch = state;
         if state.active && !before.active {
             self.skip_ship = true;
-            if self.lease.usable(now, &self.cfg) && self.epoch_may_carry(members) {
+            // Plan 30 §M10's claim resolution: a member whose lease claim
+            // is below an epoch another member knows of was taken over
+            // and has not heard yet — deposed, not carried.
+            if !self.lease.epoch_held() && self.epoch_claim_stale(stale_below) {
+                self.stats.epoch_stale_claims += 1;
+                let mine = self.lease.epoch().unwrap_or(0);
+                self.deposed(now, 0, stale_below, mine, replica, out);
+            } else if self.lease.usable(now, &self.cfg)
+                && self.carries_mine()
+                && self.epoch_may_carry(members)
+            {
                 let epoch = self.lease.epoch().unwrap_or(1);
                 self.lease.adopt_epoch_hold(now, epoch);
                 replica.set_holder_epoch(0);
@@ -1331,6 +1436,7 @@ impl Core {
         } else if state.active
             && self.lease.usable(now, &self.cfg)
             && !self.lease.epoch_held()
+            && self.carries_mine()
             && self.epoch_may_carry(members)
         {
             // Re-affirming (a holder carrying S3 authority through an
@@ -1339,6 +1445,7 @@ impl Core {
             self.lease.adopt_epoch_hold(now, epoch);
             replica.set_holder_epoch(0);
         }
+        self.restore_epoch_hold(now, replica);
         if !state.open && before.open {
             // Plan 30 §M9/§M10 rule (b): a member backup ran no seal
             // watch while its epoch was open; it resumes now, with a

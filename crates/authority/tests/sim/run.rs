@@ -57,6 +57,12 @@ pub enum FaultKind {
     /// keeps acknowledging through its backup; what it journals meanwhile
     /// is the backup's tail).
     CutS3Holder { for_ms: u64 },
+    /// Plan 30 §M10: an S3 outage for the current holder and `members −
+    /// 1` other nodes (the lowest ids), which are also cut from every
+    /// other node over P2P; the others keep S3. The sim's epoch
+    /// coordinator (`epochs.rs`) forms a continuation epoch among the cut
+    /// nodes when the flexible-quorum rule allows. Healed after `for_ms`.
+    EpochOutage { members: usize, for_ms: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +115,13 @@ pub struct SimConfig {
     /// Plan 30 §M9: pairs whose reported RTT is `ms` (out of budget when
     /// above it).
     pub rtts: Vec<((NodeId, NodeId), u64)>,
+    /// Plan 30 §M10: the slack the sim's epoch coordinator forms epochs
+    /// under (the cores' `Config::epoch_slack` must agree).
+    pub epoch_slack: u32,
+    /// Random faults may include `JoinFresh`. Off for the M10 configs: a
+    /// node enrolled during an epoch is plan 30 §M10's documented gap
+    /// (`flex_node_enrolled_during_an_epoch_is_the_known_gap`).
+    pub join_fresh: bool,
 }
 
 /// Core tunables scaled down for simulation (seconds, not minutes).
@@ -187,6 +200,40 @@ pub fn ack_s3_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c
 }
 
+/// Plan 30 §M10: flexible-quorum continuation epochs with `f = 1`
+/// (the promise TTL a quarter of the 6 s lease; P2P requests for
+/// promises answered within 400 ms).
+pub fn flex_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let mut c = sim_core_config(node_id, incarnation);
+    c.epoch_slack = 1;
+    c.promise_ttl_ms = c.ttl_ms / 4;
+    c.promise_wait_ms = 400;
+    c.promise_watch_ms = 1_000;
+    c
+}
+
+/// Plan 30 §M10 with M9's backups in budget: the claim rule decides
+/// whether the epoch carries the holder's `Backup` lease (its backup a
+/// member), and an epoch hold acknowledges locally.
+pub fn flex_backup_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let b = backup_core_config(node_id, incarnation);
+    let mut c = flex_core_config(node_id, incarnation);
+    c.backup_rtt_budget_ms = b.backup_rtt_budget_ms;
+    c.backup_takeover_ms = b.backup_takeover_ms;
+    c.backup_ack_timeout_ms = b.backup_ack_timeout_ms;
+    c.backup_heartbeat_ms = b.backup_heartbeat_ms;
+    c.backup_stable_ms = b.backup_stable_ms;
+    c.backup_reconfig_min_ms = b.backup_reconfig_min_ms;
+    c
+}
+
+/// The same with the takeover's promise check off (the non-vacuity knob).
+pub fn flex_unchecked_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let mut c = flex_core_config(node_id, incarnation);
+    c.takeover_promise_check = false;
+    c
+}
+
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
@@ -210,6 +257,8 @@ impl Default for SimConfig {
             clock_skew_ms: 0,
             strict_durability: false,
             rtts: Vec::new(),
+            epoch_slack: 0,
+            join_fresh: true,
         }
     }
 }
@@ -244,11 +293,21 @@ pub struct Report {
     /// Plan 30 §M9: per holder crash, simulated ms from the crash to the
     /// first mutation any node acknowledged afterwards.
     pub failover_ms: Vec<u64>,
+    /// Plan 30 §M10: continuation epochs formed (and with a roster node
+    /// missing), and the authority samples taken.
+    pub epochs_formed: usize,
+    pub epochs_missing_node: usize,
+    pub authority_samples: u64,
 }
 
 pub struct Cluster {
     pub nodes: Mutex<BTreeMap<NodeId, Arc<NodeHandle>>>,
     pub env: NodeEnv,
+    /// Plan 30 §M10: epochs formed (members), and single-authority
+    /// violations seen by the sampler.
+    pub epochs: Mutex<Vec<Vec<NodeId>>>,
+    pub split_brains: Mutex<Vec<String>>,
+    pub slack: u32,
     /// Plan 30 §M9: holder crashes (simulated ms) and, once known, the
     /// first acknowledgement after each.
     pub failovers: Mutex<Vec<(u64, Option<u64>)>>,
@@ -264,7 +323,12 @@ impl Cluster {
     }
 
     pub fn restart(&self, id: NodeId, meta: Option<Arc<Meta>>) {
-        let handle = NodeHandle::start(&self.env, id, meta);
+        // Plan 30 §M10: the epoch state is persisted with the journal.
+        let epoch = match (&meta, self.nodes.lock().unwrap().get(&id)) {
+            (Some(_), Some(old)) => old.shared.epoch.lock().unwrap().clone(),
+            _ => Default::default(),
+        };
+        let handle = NodeHandle::start_with(&self.env, id, meta, epoch);
         self.nodes.lock().unwrap().insert(id, Arc::new(handle));
     }
 
@@ -536,6 +600,18 @@ async fn client_thread(
             let answer = handle.submit(rid, mop.clone()).await;
             super::node::note_waiting(&format!("client t{thread}"), "answered".into());
             match answer {
+                // Plan 30 §M10: a frozen continuation epoch refuses writes
+                // with `EROFS` before executing them; the FUSE caller
+                // retries (here: the same rid, like an in-doubt answer).
+                Ok(ClientReply::Outcome(MutateOutcome::Errno(e))) if e == libc::EROFS => {
+                    attempts += 1;
+                    if attempts > MAX_RESUBMITS {
+                        abandoned.lock().unwrap().insert(rid);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
                 Ok(ClientReply::Outcome(outcome)) => match ns_ret(&outcome) {
                     Ok(ret) => {
                         if ret == NsRet::Ok {
@@ -627,7 +703,7 @@ fn gen_faults(rng: &mut StdRng, cfg: &SimConfig, horizon_ms: u64) -> Vec<Schedul
                 keep_journal: true,
             },
             2 => {
-                if rng.random_bool(0.3) {
+                if rng.random_bool(0.3) && cfg.join_fresh {
                     FaultKind::JoinFresh
                 } else {
                     FaultKind::CrashNode {
@@ -823,6 +899,10 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             tokio::time::sleep(Duration::from_millis(for_ms)).await;
             cluster.env.bucket.set_cut(lease.holder, false);
         }
+        FaultKind::EpochOutage { members, for_ms } => {
+            super::epochs::epoch_outage(cluster.clone(), fault.at_ms, members, for_ms, log.clone())
+                .await;
+        }
         FaultKind::PartitionBackup { for_ms } => {
             let Some(lease) = read_lease(&cluster.env.bucket).await else {
                 note(format!("t={} partition-backup: no lease yet", fault.at_ms));
@@ -923,6 +1003,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         nodes: Mutex::new(BTreeMap::new()),
         env,
         failovers: Mutex::new(Vec::new()),
+        epochs: Mutex::new(Vec::new()),
+        split_brains: Mutex::new(Vec::new()),
+        slack: cfg.epoch_slack,
     });
     for ((a, b), ms) in &cfg.rtts {
         bus.set_rtt(*a, *b, *ms);
@@ -964,6 +1047,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let mut faults = cfg.faults.clone();
     faults.extend(gen_faults(&mut rng, &cfg, horizon));
     let mut fault_tasks = Vec::new();
+    // Plan 30 §M10: the single-authority sampler.
+    let sampler = tokio::spawn(super::epochs::sample_authority(cluster.clone()));
     for f in faults {
         fault_tasks.push(tokio::spawn(run_fault(
             cluster.clone(),
@@ -1102,11 +1187,27 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         }
     }
 
+    sampler.abort();
     // Checks.
     let mut report = Report {
         seed,
         ..Default::default()
     };
+    {
+        let formed = cluster.epochs.lock().unwrap();
+        report.epochs_formed = formed.len();
+        report.epochs_missing_node = formed
+            .iter()
+            .filter(|m| m.len() < cfg.nodes as usize)
+            .count();
+    }
+    report.authority_samples = super::epochs::SAMPLES.with(|s| s.get());
+    if let Some(what) = cluster.split_brains.lock().unwrap().first() {
+        return Err(format!(
+            "two authorities at once (plan 30 §M10): {what}\n  faults: {:?}",
+            fault_log.lock().unwrap()
+        ));
+    }
     report.faults = fault_log.lock().unwrap().clone();
     report.simulated_ms = clock.elapsed_ms();
     if let Some(f) = failures.lock().unwrap().first() {

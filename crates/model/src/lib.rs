@@ -86,6 +86,16 @@
 //! it is about and what this model deliberately leaves out; see its
 //! module doc for the abstraction and the drift-margin argument.
 //!
+//! Plan 30 §M10 (module [`flex`], [`flex::FlexEpochs`]) is a focused
+//! model of its own, like M8's and M9's: continuation epochs that may
+//! form with up to `f` roster nodes missing, `heartbeat/<node>` promises
+//! read across clocks with bounded drift, the S3 takeover's promise
+//! check, and the interaction with M9's fast takeovers. Its property is
+//! `single_authority` (never an epoch and an S3 holder, or two of either,
+//! able to acknowledge at once), next to `linearizable` and
+//! `converged_at_quiescence`; `tests/flex_epochs.rs` has the naive
+//! variants' counterexamples and the full rule clean.
+//!
 //! # What is modeled
 //!
 //! - **Actors.** `N` `Node`s (2–3 across the tests) plus one implicit
@@ -313,6 +323,7 @@
 
 pub mod backup;
 pub mod cto;
+pub mod flex;
 pub mod inbox;
 pub mod namespace;
 pub mod positions;

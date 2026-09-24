@@ -97,6 +97,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::ConflictCopyDone { .. } => "ConflictCopyDone",
         Event::RebuildDone { .. } => "RebuildDone",
         Event::Roster { .. } => "Roster",
+        Event::Slack { .. } => "Slack",
         Event::Peers { .. } => "Peers",
         Event::Activity { .. } => "Activity",
         Event::SubscriberGone { .. } => "SubscriberGone",
@@ -150,6 +151,8 @@ fn s3_kind(op: &S3Op) -> &'static str {
         S3Op::InboxDrain { .. } => "InboxDrain",
         S3Op::InboxDelete { .. } => "InboxDelete",
         S3Op::InboxLastN { .. } => "InboxLastN",
+        S3Op::HeartbeatRead => "HeartbeatRead",
+        S3Op::HeartbeatPut { .. } => "HeartbeatPut",
     }
 }
 
@@ -505,6 +508,8 @@ pub struct Driver {
     /// driver minted for the core.
     read_index_replies: HashMap<OpId, oneshot::Sender<ReadIndexOutcome>>,
     recall_replies: HashMap<OpId, oneshot::Sender<()>>,
+    /// Plan 30 §M10: peers' promise requests this node is answering.
+    promise_replies: HashMap<OpId, oneshot::Sender<(Option<i64>, u32)>>,
     /// Plan 30 §M9: the holder's `BackupAppend` requests this node is
     /// answering, by the core's op id.
     backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
@@ -554,6 +559,7 @@ impl Driver {
             handoff_replies: HashMap::new(),
             read_index_replies: HashMap::new(),
             recall_replies: HashMap::new(),
+            promise_replies: HashMap::new(),
             backup_replies: HashMap::new(),
             controls: HashMap::new(),
             next_control: 1 << 48,
@@ -713,6 +719,10 @@ impl Driver {
         status.read_delegations = cfg.read_delegations;
         status.ack = self.core.ack_view();
         status.ack_s3 = cfg.ack_s3;
+        drop(status);
+        self.deps
+            .epochs
+            .set_claim_view(self.core.epoch_claim_view(now));
     }
 
     /// Tell the core the epoch machine's state when it changed (or
@@ -736,6 +746,7 @@ impl Driver {
         }
         self.last_epoch_reported = Some(state);
         let members = e.status().members;
+        let (carrier, stale_below) = e.carrier();
         let _ = self.int_tx.send(Internal::Control {
             req: Control::Epoch {
                 open: state.open,
@@ -744,6 +755,12 @@ impl Driver {
                 flushing: state.flushing,
                 base: state.base,
                 members,
+                carrier: carrier.map(|c| constellation_authority::Carrier {
+                    node: c.node,
+                    epoch: c.epoch,
+                    expires_unix_ms: c.expires_unix_ms,
+                }),
+                stale_below,
             },
             reply: ControlReply::None,
         });
@@ -947,6 +964,26 @@ impl Driver {
                 from,
                 msg: PeerMsg::StreamAhead { epoch, base, txs },
             })),
+            SyncRequest::PeerPromiseRequest {
+                requester,
+                expires_unix_ms,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.promise_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from: requester,
+                    msg: PeerMsg::PromiseRequest {
+                        req,
+                        expires_unix_ms,
+                    },
+                }))
+            }
+            SyncRequest::Slack(epoch_slack) => {
+                self.deps.epochs.set_slack(epoch_slack);
+                Some(Internal::Event(Event::Slack { epoch_slack }))
+            }
+            SyncRequest::Retired => control(Control::Retire, ControlReply::None),
             SyncRequest::SegmentHint { seq, epoch } => Some(Internal::Event(Event::Peer {
                 from: 0,
                 msg: PeerMsg::SegmentPublished { seq, epoch },
@@ -1085,6 +1122,10 @@ impl Driver {
                     let sync_tx = self.sync_tx.clone();
                     let bulk = self.bulk_pass.clone();
                     let wait = self.round_upload_wait;
+                    // Plan 30 §M10: a frozen epoch's hold owner still
+                    // flushes once S3 is back (the core only runs the
+                    // upload for it after its probe found S3).
+                    let holds = self.core.lease().epoch_held();
                     tokio::spawn(async move {
                         if round && crate::fault::sync_held() {
                             let _ = tx.send(Internal::Event(Event::UploadsDone {
@@ -1096,7 +1137,7 @@ impl Driver {
                         if round && epochs.is_open() {
                             epochs.check_liveness().await;
                             let _ = sync_tx.send(SyncRequest::EpochChanged);
-                            if epochs.is_frozen() {
+                            if epochs.is_frozen() && !holds {
                                 let _ = tx.send(Internal::Event(Event::UploadsDone {
                                     op,
                                     result: UploadResult::Skip,
@@ -1730,6 +1771,64 @@ impl Driver {
                     .await;
                 });
             }
+            PeerMsg::PromiseReply {
+                req,
+                until,
+                epoch_slack,
+            } => {
+                if let Some(tx) = self.promise_replies.remove(&req) {
+                    let _ = tx.send((until, epoch_slack));
+                }
+            }
+            PeerMsg::PromiseRequest {
+                req,
+                expires_unix_ms,
+            } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let requester = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().promise_wait_ms);
+                if crate::fault::p2p_denied(to) {
+                    let _ = tx.send(Internal::Event(Event::PeerFailed {
+                        req,
+                        to,
+                        outage: true,
+                    }));
+                    return;
+                }
+                tokio::spawn(async move {
+                    let payload = Payload::PromiseRequest {
+                        requester,
+                        req_id: req.0,
+                        expires_unix_ms,
+                    };
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::PromiseReply {
+                            req_id,
+                            until,
+                            epoch_slack,
+                        })) if req_id == req.0 => {
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::PromiseReply {
+                                    req,
+                                    until,
+                                    epoch_slack,
+                                },
+                            }));
+                        }
+                        _ => {
+                            let outage = !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
+            }
             PeerMsg::LogSubscribe { req, from } => self.spawn_subscription(to, req, from),
             PeerMsg::LogUnsubscribe { req } => {
                 // Dropping our end of the stream is the unsubscription:
@@ -1880,6 +1979,7 @@ impl Driver {
         let inbox = self.inbox.clone();
         let view = self.deps.view.clone();
         let meta = self.deps.meta.clone();
+        let heartbeats = constellation_store_s3::HeartbeatStore::new(self.deps.store_inner.clone());
         tokio::spawn(async move {
             let result = match req {
                 S3Op::LeaseGet => S3Result::LeaseGet(leases.get().await.map_err(s3_failure)),
@@ -1937,6 +2037,12 @@ impl Driver {
                 }
                 S3Op::InboxLastN { epoch, node } => {
                     S3Result::InboxLastN(inbox.last_n(epoch, node).await.map_err(s3_failure))
+                }
+                S3Op::HeartbeatRead => {
+                    S3Result::Heartbeats(heartbeats.read_all().await.map_err(s3_failure))
+                }
+                S3Op::HeartbeatPut { promise } => {
+                    S3Result::HeartbeatPut(heartbeats.put(&promise).await.map_err(s3_failure))
                 }
             };
             tracing::trace!(
@@ -2331,6 +2437,8 @@ impl Standalone {
             S3Op::InboxDrain { .. } => S3Result::InboxDrain(Ok(Vec::new())),
             S3Op::InboxDelete { .. } => S3Result::InboxDelete(Ok(())),
             S3Op::InboxLastN { .. } => S3Result::InboxLastN(Ok(None)),
+            S3Op::HeartbeatRead => S3Result::Heartbeats(Ok(Vec::new())),
+            S3Op::HeartbeatPut { .. } => S3Result::HeartbeatPut(Ok(())),
         }
     }
 

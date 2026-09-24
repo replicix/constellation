@@ -13,11 +13,12 @@ use super::clock::Clock;
 use super::store::Bucket;
 use constellation_authority::action::ControlOk;
 use constellation_authority::{
-    Action, CasFailure, ClientReply, Config, Control, Core, Event, NodeId, OpId, PeerLink, PeerMsg,
-    Policy, Replica, S3Failure, S3Op, S3Result, Seq, Stats, UploadResult,
+    Action, Carrier, CasFailure, ClientReply, Config, Control, Core, EpochClaimView, Event, NodeId,
+    OpId, PeerLink, PeerMsg, Policy, Replica, S3Failure, S3Op, S3Result, Seq, Stats, UploadResult,
 };
 use constellation_meta::{Meta, MutateOp, PublishBasis, Rid};
 use constellation_store_s3::commits::{CommitChain, CommitPayload};
+use constellation_store_s3::heartbeat::HeartbeatStore;
 use constellation_store_s3::inbox::InboxStore;
 use constellation_store_s3::{LeaseMode, LeaseStore, LogStore, StoreError};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -74,6 +75,42 @@ pub struct CoreView {
     pub speculation: constellation_meta::SpeculationCounts,
     /// Plan 30 §M9.
     pub ack: constellation_authority::core::AckView,
+    /// Plan 30 §M10: what this node would claim in an epoch proposal, and
+    /// the authority it has: a continuation-epoch hold, or an S3 lease
+    /// (epoch, expiry) it believes it holds and has not lost.
+    pub claim: EpochClaimView,
+    pub epoch_held: bool,
+    pub s3_held: Option<(u64, i64)>,
+}
+
+/// Plan 30 §M10: a node's continuation-epoch state, as the sim's epoch
+/// coordinator (`epochs.rs`) and the node's own `EpochClose` /
+/// `EpochFlushed` actions move it (the daemon's `EpochManager`).
+#[derive(Debug, Clone, Default)]
+pub struct SimEpoch {
+    pub open: bool,
+    pub active: bool,
+    pub frozen: bool,
+    pub flushing: bool,
+    pub base: Seq,
+    pub members: Vec<NodeId>,
+    pub carrier: Option<Carrier>,
+    pub stale_below: u64,
+}
+
+impl SimEpoch {
+    pub fn control(&self) -> Control {
+        Control::Epoch {
+            open: self.open,
+            active: self.active,
+            frozen: self.frozen,
+            flushing: self.flushing,
+            base: self.base,
+            members: self.members.clone(),
+            carrier: self.carrier,
+            stale_below: self.stale_below,
+        }
+    }
 }
 
 pub struct Shared {
@@ -91,6 +128,8 @@ pub struct Shared {
     /// rollback counters move.
     pub tentative: Mutex<BTreeSet<Rid>>,
     pub commits: Arc<Mutex<Vec<CommitRecord>>>,
+    /// Plan 30 §M10.
+    pub epoch: Mutex<SimEpoch>,
 }
 
 pub struct NodeHandle {
@@ -136,7 +175,14 @@ impl NodeHandle {
     /// Start (or restart) node `id` over `meta`. A fresh `Meta` is a node
     /// with no durable state (a new mount); an existing one is a restart
     /// with its journal intact.
-    pub fn start(env: &NodeEnv, id: NodeId, meta: Option<Arc<Meta>>) -> NodeHandle {
+    /// Plan 30 §M10: a restart keeps the node's persisted epoch state
+    /// (the daemon's `EpochManager` reloads it from the replica).
+    pub fn start_with(
+        env: &NodeEnv,
+        id: NodeId,
+        meta: Option<Arc<Meta>>,
+        epoch: SimEpoch,
+    ) -> NodeHandle {
         let meta = match meta {
             Some(m) => m,
             None => {
@@ -162,6 +208,7 @@ impl NodeHandle {
             conflict_copies: AtomicU64::new(0),
             tentative: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
+            epoch: Mutex::new(epoch),
         });
         env.bus.attach(id, tx.clone());
         let cfg = (env.config)(id, incarnation);
@@ -234,6 +281,12 @@ impl NodeHandle {
         self.shared.view.lock().unwrap().clone()
     }
 
+    /// Plan 30 §M10: report the node's epoch state to its core.
+    pub fn report_epoch(&self) {
+        let req = self.shared.epoch.lock().unwrap().control();
+        drop(self.control(req));
+    }
+
     /// Fail-stop. In-flight S3 requests still land (their tasks hold the
     /// store), exactly like a killed process's outstanding PUTs.
     pub fn crash(&self, bus: &Bus) {
@@ -293,6 +346,19 @@ impl Driver {
             &*self.meta,
         );
         self.dispatch(out);
+        // Plan 30 §M10: a restarted member reports its persisted epoch.
+        let epoch = self.shared.epoch.lock().unwrap().clone();
+        if epoch.open || epoch.flushing {
+            let out = self.core.handle(
+                now,
+                Event::Control {
+                    op: OpId(self.shared.next_control.fetch_add(1, Ordering::SeqCst)),
+                    req: epoch.control(),
+                },
+                &*self.meta,
+            );
+            self.dispatch(out);
+        }
         self.refresh_view();
         // The driver's directory: the roster and the peer links, refreshed
         // on a ticker like the daemon's registry poll and `probe_all`.
@@ -460,6 +526,15 @@ impl Driver {
         view.journal_len = Replica::journal_len(&*self.meta).unwrap_or(0);
         view.speculation = self.meta.speculation_counts().unwrap_or_default();
         view.ack = self.core.ack_view();
+        let now = self.clock.now();
+        view.claim = self.core.epoch_claim_view(now);
+        view.epoch_held = lease.epoch_held();
+        view.s3_held = match &lease.held {
+            Some((l, _)) if !lease.lost && !lease.epoch_held() && l.holder == self.id => {
+                Some((l.epoch, l.expires_unix_ms))
+            }
+            _ => None,
+        };
     }
 
     /// Whenever the core rolled something back, the replay queue names
@@ -519,7 +594,28 @@ impl Driver {
                     // Holder capture is on in the simulation: never asked.
                     let _ = self.tx.send(Event::RebuildDone { op, ok: false });
                 }
-                Action::RoundDone { .. } | Action::EpochClose | Action::EpochFlushed => {}
+                Action::RoundDone { .. } => {}
+                Action::EpochClose | Action::EpochFlushed => {
+                    // `EpochManager::close` / `finish_flushing`.
+                    let req = {
+                        let mut e = self.shared.epoch.lock().unwrap();
+                        if matches!(action, Action::EpochClose) {
+                            if !e.open {
+                                continue;
+                            }
+                            e.open = false;
+                            e.active = false;
+                            e.frozen = false;
+                            e.flushing = true;
+                        } else {
+                            e.flushing = false;
+                        }
+                        e.control()
+                    };
+                    let _ = self.meta.promise_join_end();
+                    let op = OpId(self.shared.next_control.fetch_add(1, Ordering::SeqCst));
+                    let _ = self.tx.send(Event::Control { op, req });
+                }
                 Action::RefreshRoster => {
                     let _ = self.tx.send(Event::Roster {
                         write_eligible: self.bus.nodes(),
@@ -632,6 +728,18 @@ impl Driver {
                 S3Op::InboxLastN { epoch, node } => S3Result::InboxLastN(
                     InboxStore::new(store.clone())
                         .last_n(epoch, node)
+                        .await
+                        .map_err(|e| S3Failure(e.to_string())),
+                ),
+                S3Op::HeartbeatRead => S3Result::Heartbeats(
+                    HeartbeatStore::new(store.clone())
+                        .read_all()
+                        .await
+                        .map_err(|e| S3Failure(e.to_string())),
+                ),
+                S3Op::HeartbeatPut { promise } => S3Result::HeartbeatPut(
+                    HeartbeatStore::new(store.clone())
+                        .put(&promise)
                         .await
                         .map_err(|e| S3Failure(e.to_string())),
                 ),

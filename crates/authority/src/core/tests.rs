@@ -99,6 +99,7 @@ impl Harness {
             // set by one CAS before the first answer; `a_tenure_marks_
             // itself_before_its_first_strict_answer` covers that).
             granted_delegations: true,
+            retired: Vec::new(),
         };
         self.core.lease.adopt(self.now, lease, tag(), gate);
         self.meta.set_holder_epoch(epoch);
@@ -550,6 +551,7 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
         config_version: 2,
         ack_policy: constellation_store_s3::AckPolicy::Local,
         granted_delegations: false,
+        retired: Vec::new(),
     };
     let out = h.step(Event::S3 {
         op: reread,
@@ -1971,6 +1973,14 @@ mod epoch_rules {
                 frozen: false,
                 flushing: false,
                 base: 0,
+                // Node 1's lease as `Harness::hold(1, ..)` makes it at
+                // the harness's start time.
+                carrier: (active && !members.is_empty()).then_some(crate::event::Carrier {
+                    node: 1,
+                    epoch: 1,
+                    expires_unix_ms: 1_010_000,
+                }),
+                stale_below: 0,
                 members,
             },
         }
@@ -2019,6 +2029,29 @@ mod epoch_rules {
             h.core.lease.ack_policy(),
             AckPolicy::Local,
             "an epoch acknowledges locally"
+        );
+        // Plan 30 §M10 (rebase onto M9 round 2): and nothing gates it — not
+        // the held lease's backups, nor a candidate being brought up.
+        h.core.ack.candidate = Some(3);
+        assert!(h.core.lease.backups().is_empty());
+        assert_eq!(h.core.durable_jseq(), u64::MAX);
+        assert!(
+            !h.core.ack_gated(),
+            "the FUSE fast path is open in an epoch"
+        );
+        let rid = h.rid(1);
+        let op = h.create("in-epoch");
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+        });
+        assert!(
+            matches!(
+                replies(&out).as_slice(),
+                [(_, ClientReply::Outcome(MutateOutcome::Accepted { .. }))]
+            ),
+            "acknowledged at once: {out:?}"
         );
 
         let mut h = holder_with(AckPolicy::Local, Vec::new());
@@ -2445,5 +2478,468 @@ mod pipelined_appends {
             "the gap closed: both"
         );
         assert_eq!(b.meta.backup_acked(1).unwrap(), txs[1].last);
+    }
+}
+
+/// Plan 30 §M10: heartbeat promises, the TTL takeover's promise check,
+/// claim resolution at activation, the flush exemption, retirement.
+mod m10 {
+    use super::*;
+    use crate::event::Carrier;
+    use constellation_store_s3::heartbeat::Promise;
+
+    fn lease_of(holder: NodeId, epoch: Epoch, expires: i64) -> Lease {
+        Lease {
+            v: 1,
+            partition: "p0".into(),
+            holder,
+            epoch,
+            expires_unix_ms: expires,
+            released: false,
+            wanted_by: Vec::new(),
+            backups: Vec::new(),
+            config_version: 1,
+            ack_policy: constellation_store_s3::AckPolicy::Local,
+            granted_delegations: false,
+            retired: Vec::new(),
+        }
+    }
+
+    fn flex(slack: u32) -> Harness {
+        let mut h = Harness::new(1);
+        h.core.cfg.epoch_slack = slack;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        h
+    }
+
+    /// Acquire, and answer the lease read with `lease`.
+    fn acquire_against(h: &mut Harness, lease: Lease) -> Vec<Action> {
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        let (get, req) = s3_ops(&out)[0];
+        assert!(matches!(req, S3Op::LeaseGet), "{out:?}");
+        h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease, tag())))),
+        })
+    }
+
+    fn heartbeat_read(out: &[Action]) -> OpId {
+        s3_ops(out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::HeartbeatRead))
+            .map(|(op, _)| op)
+            .unwrap_or_else(|| panic!("no heartbeat read: {out:?}"))
+    }
+
+    fn promise_requests(out: &[Action]) -> Vec<(NodeId, OpId)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::PromiseRequest { req, .. } => Some((to, *req)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tails(out: &[Action]) -> usize {
+        s3_ops(out)
+            .iter()
+            .filter(|(_, r)| matches!(r, S3Op::SegmentRun { .. }))
+            .count()
+    }
+
+    #[test]
+    fn a_ttl_takeover_proceeds_once_f_others_promise_past_the_expiry() {
+        let mut h = flex(1);
+        let expires = h.now.0 - 1_000;
+        let out = acquire_against(&mut h, lease_of(2, 3, expires));
+        let hb = heartbeat_read(&out);
+        let asked = promise_requests(&out);
+        assert_eq!(
+            asked.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![2, 3],
+            "every other roster node is asked"
+        );
+        assert_eq!(tails(&out), 0, "no tail before the check: {out:?}");
+        // Node 3 promises past the expiry; the heartbeat read must still
+        // land first (a larger advertised slack would show there).
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::PromiseReply {
+                req: asked[1].1,
+                until: Some(h.now.0 + 15_000),
+                epoch_slack: 1,
+            },
+        });
+        assert_eq!(tails(&out), 0);
+        let out = h.step(Event::S3 {
+            op: hb,
+            result: S3Result::Heartbeats(Ok(Vec::new())),
+        });
+        assert_eq!(tails(&out), 1, "the takeover proceeds: {out:?}");
+        assert_eq!(h.core.stats.promise_checks, 1);
+        assert_eq!(h.core.stats.takeovers_refused_promises, 0);
+    }
+
+    #[test]
+    fn a_ttl_takeover_without_enough_promises_is_refused() {
+        let mut h = flex(1);
+        let expires = h.now.0 - 1_000;
+        let out = acquire_against(&mut h, lease_of(2, 3, expires));
+        let hb = heartbeat_read(&out);
+        let asked = promise_requests(&out);
+        // A heartbeat that does not outlast the expiry does not count.
+        h.step(Event::S3 {
+            op: hb,
+            result: S3Result::Heartbeats(Ok(vec![(3, Promise::new(3, expires, 1, 0))])),
+        });
+        // Node 2 is in an open epoch (refuses); node 3 is unreachable.
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::PromiseReply {
+                req: asked[0].1,
+                until: None,
+                epoch_slack: 1,
+            },
+        });
+        let out = h.step(Event::PeerFailed {
+            req: asked[1].1,
+            to: 3,
+            outage: true,
+        });
+        assert_eq!(tails(&out), 0, "{out:?}");
+        assert_eq!(h.core.stats.takeovers_refused_promises, 1);
+        assert!(h.core.job().is_none(), "the acquisition finished");
+    }
+
+    #[test]
+    fn a_larger_advertised_slack_is_honoured_at_f_0() {
+        let mut h = flex(0);
+        let expires = h.now.0 - 1_000;
+        let out = acquire_against(&mut h, lease_of(2, 3, expires));
+        let hb = heartbeat_read(&out);
+        assert!(
+            promise_requests(&out).is_empty(),
+            "f = 0 asks nobody up front"
+        );
+        // Node 3 still runs with f = 1 (it has not seen it lowered), and
+        // its promise ran out: the taker asks now, gets nothing, refuses.
+        let out = h.step(Event::S3 {
+            op: hb,
+            result: S3Result::Heartbeats(Ok(vec![(3, Promise::new(3, 0, 1, 0))])),
+        });
+        let asked = promise_requests(&out);
+        assert_eq!(asked.len(), 2, "{out:?}");
+        let mut last = Vec::new();
+        for (to, req) in asked {
+            last = h.step(Event::PeerFailed {
+                req,
+                to,
+                outage: true,
+            });
+        }
+        assert_eq!(tails(&last), 0);
+        assert_eq!(h.core.stats.takeovers_refused_promises, 1);
+
+        // Nobody advertises a slack: today's takeover (one LIST more).
+        let mut h = flex(0);
+        let out = acquire_against(&mut h, lease_of(2, 3, expires));
+        let hb = heartbeat_read(&out);
+        let out = h.step(Event::S3 {
+            op: hb,
+            result: S3Result::Heartbeats(Ok(Vec::new())),
+        });
+        assert_eq!(tails(&out), 1, "{out:?}");
+    }
+
+    #[test]
+    fn a_promise_request_persists_then_publishes_then_answers() {
+        let mut h = flex(1);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::PromiseRequest {
+                req: OpId(5),
+                expires_unix_ms: h.now.0 - 10,
+            },
+        });
+        let until = h.now.0 + 15_000;
+        assert_eq!(h.meta.promise_issued().unwrap(), until, "persisted first");
+        assert!(
+            s3_ops(&out).iter().any(|(_, r)| matches!(
+                r,
+                S3Op::HeartbeatPut { promise } if promise.no_epoch_until_unix_ms == until
+            )),
+            "{out:?}"
+        );
+        assert!(matches!(
+            sends(&out).as_slice(),
+            [(2, PeerMsg::PromiseReply { until: Some(u), epoch_slack: 1, .. })] if *u == until
+        ));
+        // A join holds the gate: no promise is issued, the answer refuses.
+        h.advance(20_000);
+        assert!(h.meta.promise_join_begin(h.now.0).unwrap());
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::PromiseRequest {
+                req: OpId(6),
+                expires_unix_ms: h.now.0 - 10,
+            },
+        });
+        assert!(matches!(
+            sends(&out).as_slice(),
+            [(2, PeerMsg::PromiseReply { until: None, .. })]
+        ));
+        assert!(!s3_ops(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::HeartbeatPut { .. })));
+        assert_eq!(h.meta.promise_issued().unwrap(), until);
+    }
+
+    #[test]
+    fn a_member_of_an_open_epoch_promises_nothing() {
+        let mut h = flex(1);
+        h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Epoch {
+                open: true,
+                active: true,
+                frozen: false,
+                flushing: false,
+                base: 0,
+                members: vec![1, 2],
+                carrier: None,
+                stale_below: 0,
+            },
+        });
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::PromiseRequest {
+                req: OpId(5),
+                expires_unix_ms: 0,
+            },
+        });
+        assert!(matches!(
+            sends(&out).as_slice(),
+            [(3, PeerMsg::PromiseReply { until: None, .. })]
+        ));
+        assert_eq!(h.meta.promise_issued().unwrap(), 0);
+        // An observed expiry does not make it promise either.
+        h.core
+            .lease
+            .note_object(h.now, &lease_of(2, 3, h.now.0 - 1));
+        let out = h.step(Event::Peers { links: Vec::new() });
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn an_observed_unrenewed_expiry_is_promised_on_once() {
+        // P2P down (the harness's peers are all unconnected): nobody can
+        // ask, so the node promises on what it observes.
+        let mut h = flex(1);
+        h.core
+            .lease
+            .note_object(h.now, &lease_of(2, 3, h.now.0 - 1));
+        let out = h.step(Event::Peers { links: Vec::new() });
+        let puts = s3_ops(&out)
+            .iter()
+            .filter(|(_, r)| matches!(r, S3Op::HeartbeatPut { .. }))
+            .count();
+        assert_eq!(puts, 1, "{out:?}");
+        let out = h.step(Event::Peers { links: Vec::new() });
+        assert!(
+            !s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::HeartbeatPut { .. })),
+            "covered already"
+        );
+        // P2P up: takers ask; an observed expiry alone promises nothing.
+        let mut h = flex(1);
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: None,
+                rtt_ms: None,
+                since: None,
+            }],
+        });
+        h.core
+            .lease
+            .note_object(h.now, &lease_of(2, 3, h.now.0 - 1));
+        let out = h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 2,
+                connected: true,
+                last_seen: None,
+                rtt_ms: None,
+                since: None,
+            }],
+        });
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+        // f = 0: never on its own.
+        let mut h = flex(0);
+        h.core
+            .lease
+            .note_object(h.now, &lease_of(2, 3, h.now.0 - 1));
+        let out = h.step(Event::Peers { links: Vec::new() });
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn the_flush_reclaim_of_the_carried_lease_needs_no_promises() {
+        let mut h = flex(1);
+        let carried = lease_of(2, 3, h.now.0 - 1_000);
+        h.core.pr.carried = Some(Carrier {
+            node: 2,
+            epoch: 3,
+            expires_unix_ms: carried.expires_unix_ms,
+        });
+        let out = acquire_against(&mut h, carried.clone());
+        assert_eq!(tails(&out), 1, "straight to the takeover tail: {out:?}");
+        assert_eq!(h.core.stats.promise_flush_exempt, 1);
+        assert_eq!(h.core.stats.promise_checks, 0);
+        // A renewed object (another expiry) is not the carried one.
+        let mut h = flex(1);
+        h.core.pr.carried = Some(Carrier {
+            node: 2,
+            epoch: 3,
+            expires_unix_ms: carried.expires_unix_ms - 5,
+        });
+        let out = acquire_against(&mut h, carried);
+        assert_eq!(tails(&out), 0);
+        assert_eq!(h.core.stats.promise_checks, 1);
+    }
+
+    fn activate(h: &mut Harness, carrier: Option<Carrier>, stale_below: Epoch) {
+        h.step(Event::Control {
+            op: OpId(901),
+            req: Control::Epoch {
+                open: true,
+                active: true,
+                frozen: false,
+                flushing: false,
+                base: 0,
+                members: vec![1, 2],
+                carrier,
+                stale_below,
+            },
+        });
+    }
+
+    #[test]
+    fn a_stale_claim_is_deposed_at_activation_and_a_foreign_carrier_not_adopted() {
+        // A member knows epoch 2 exists (it sealed ours, or took over):
+        // our epoch-1 claim is stale.
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        activate(&mut h, None, 2);
+        assert!(!h.core.lease.epoch_held());
+        assert!(h.core.lease.lost, "deposed");
+        assert_eq!(h.core.stats.epoch_stale_claims, 1);
+
+        // The carrier is another member's lease: ours is not carried.
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let expires = h.core.lease.held.as_ref().unwrap().0.expires_unix_ms;
+        activate(
+            &mut h,
+            Some(Carrier {
+                node: 2,
+                epoch: 1,
+                expires_unix_ms: expires,
+            }),
+            1,
+        );
+        assert!(!h.core.lease.epoch_held());
+
+        // Exactly ours: carried.
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let expires = h.core.lease.held.as_ref().unwrap().0.expires_unix_ms;
+        activate(
+            &mut h,
+            Some(Carrier {
+                node: 1,
+                epoch: 1,
+                expires_unix_ms: expires,
+            }),
+            1,
+        );
+        assert!(h.core.lease.epoch_held());
+        assert!(!h.core.lease.lost);
+    }
+
+    #[test]
+    fn the_claim_view_reports_the_held_lease_and_the_known_epoch() {
+        let mut h = Harness::new(1);
+        h.hold(4, None);
+        h.core.bk.sealed = 6;
+        let view = h.core.epoch_claim_view(h.now);
+        assert_eq!(view.held.as_ref().map(|l| l.epoch), Some(4));
+        assert_eq!(view.known, 7, "the successor of the epoch it sealed");
+        assert_eq!(view.claim(&[1, 2]).map(|c| c.2), Some(true));
+    }
+
+    #[test]
+    fn a_retired_node_acquires_nothing() {
+        let mut h = flex(1);
+        h.hold(2, None);
+        h.step(Event::Control {
+            op: OpId(902),
+            req: Control::Retire,
+        });
+        assert!(h.core.lease.lost, "its tenure ends");
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::PromiseRequest {
+                req: OpId(5),
+                expires_unix_ms: 0,
+            },
+        });
+        assert!(matches!(
+            sends(&out).as_slice(),
+            [(2, PeerMsg::PromiseReply { until: None, .. })]
+        ));
+    }
+}
+
+mod claim_resolution {
+    use crate::core::resolve_epoch_claims;
+
+    #[test]
+    fn the_highest_claim_wins_unless_a_member_knows_later() {
+        // Node 1 claims epoch 1, node 3 epoch 2 (it took over by seal).
+        let (carrier, stale) =
+            resolve_epoch_claims(&[(1, Some((1, 10, true)), 1), (3, Some((2, 20, true)), 2)]);
+        assert_eq!(
+            carrier.map(|c| (c.node, c.epoch, c.expires_unix_ms)),
+            Some((3, 2, 20))
+        );
+        assert_eq!(stale, 2, "node 1's claim is stale");
+        // Node 3 restarted without its lease, but knows epoch 2 exists:
+        // node 1's claim is stale and nothing is carried.
+        let (carrier, stale) = resolve_epoch_claims(&[(1, Some((1, 10, true)), 1), (3, None, 2)]);
+        assert_eq!(carrier, None);
+        assert_eq!(stale, 2);
+        // The claim rule refuses the top claim: carried by nobody, and it
+        // is not stale (its holder keeps its S3 lease).
+        let (carrier, stale) = resolve_epoch_claims(&[(1, Some((4, 10, false)), 4), (2, None, 3)]);
+        assert_eq!(carrier, None);
+        assert_eq!(stale, 4);
+        // Nobody claims.
+        assert_eq!(
+            resolve_epoch_claims(&[(1, None, 0), (2, None, 0)]),
+            (None, 0)
+        );
     }
 }

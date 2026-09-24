@@ -18,6 +18,7 @@ pub mod error;
 pub(crate) mod faulty;
 pub mod format;
 pub mod gc;
+pub mod heartbeat;
 pub mod inbox;
 pub mod layout;
 pub mod lease;
@@ -48,11 +49,14 @@ pub use gc::{
     publish_condemned_packs, read_condemned, read_condemned_blobs, read_condemned_packs,
     CondemnedList, GcJournalEntry,
 };
+pub use heartbeat::{HeartbeatStore, Promise, PromiseConfig, TakeoverCheck};
 pub use inbox::{
     gc_keep_newest, InboxBatch, InboxKey, InboxOp, InboxPoller, InboxRid, InboxStore,
     InboxSubmitter, PollBackoff, PutBatch, INBOX_VERSION,
 };
-pub use lease::{live_leases_held_by, AckPolicy, Lease, LeaseMode, LeaseStore, LeaseTag};
+pub use lease::{
+    fence_retired, live_leases_held_by, AckPolicy, Lease, LeaseMode, LeaseStore, LeaseTag,
+};
 pub use log::LogStore;
 pub use mark::{live_set, mark, CatalogPack, LiveSet, Mark, PackCatalog};
 pub use node_cache::{NodeCache, NodeCacheStats, NodeLocation, PeerNodeSource};

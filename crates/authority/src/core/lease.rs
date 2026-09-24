@@ -117,6 +117,11 @@ impl LeaseState {
             .or_else(|| self.held.as_ref().map(|(l, _)| l.epoch))
     }
 
+    /// The continuation-epoch hold's epoch, if one is in force.
+    pub fn epoch_hold(&self) -> Option<Epoch> {
+        self.epoch_hold
+    }
+
     /// Continuation-epoch local authority is in force.
     pub fn epoch_held(&self) -> bool {
         self.epoch_hold.is_some()
@@ -280,6 +285,11 @@ impl LeaseState {
         let Some((prev, tag)) = object else {
             return Plan::Create;
         };
+        if prev.retired.contains(&cfg.node_id) {
+            // Plan 30 §M10: an admin `leave --node-id` fenced this lease
+            // against this node; it never holds it again.
+            return Plan::Refused("retired by an admin leave (the lease is fenced against us)");
+        }
         if prev.holder == cfg.node_id && !prev.released && !prev.is_expired(now.0) {
             if self.held.is_some() {
                 return Plan::Held;
@@ -341,6 +351,7 @@ impl LeaseState {
                 AckPolicy::Local
             },
             granted_delegations: cfg.strict_mounts,
+            retired: prev.map(|p| p.retired.clone()).unwrap_or_default(),
         }
     }
 
@@ -358,7 +369,13 @@ impl LeaseState {
     /// `Backup`).
     pub fn backups(&self) -> &[NodeId] {
         match &self.held {
-            Some((lease, _)) if !self.lost && lease.ack_policy == AckPolicy::Backup => {
+            // Plan 30 §M10: a continuation epoch's hold backs nothing (it
+            // acknowledges locally; see `ack_policy`).
+            Some((lease, _))
+                if !self.lost
+                    && self.epoch_hold.is_none()
+                    && lease.ack_policy == AckPolicy::Backup =>
+            {
                 &lease.backups
             }
             _ => &[],

@@ -20,6 +20,7 @@ use crate::event::PeerMsg;
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 use constellation_fs_core::Ino;
 use constellation_meta::{MutateOp, MutateOutcome, Rid};
+use constellation_store_s3::heartbeat::Promise;
 use constellation_store_s3::inbox::{InboxBatch, InboxKey};
 use constellation_store_s3::{Lease, LeaseTag};
 
@@ -161,6 +162,11 @@ pub enum S3Op {
     InboxDelete { key: InboxKey },
     /// M13: LIST-last this node's batch numbering under `epoch`.
     InboxLastN { epoch: Epoch, node: NodeId },
+    /// Plan 30 §M10: LIST `heartbeat/` and GET every promise object.
+    HeartbeatRead,
+    /// Plan 30 §M10: PUT this node's promise object (the core persisted
+    /// the promise through the replica first).
+    HeartbeatPut { promise: Promise },
 }
 
 /// What a timer is for (for the driver's logs; the core keeps its own
@@ -213,6 +219,11 @@ pub enum TimerKind {
     /// M9: a backup's check that its holder is still heard from (silence
     /// past `backup_takeover_ms` seals the epoch and takes the lease).
     BackupWatch,
+    /// M10: a takeover's wait for promise replies.
+    PromiseWait,
+    /// M10: the idle promise watch (a lease re-read while P2P is
+    /// unavailable).
+    PromiseWatch,
 }
 
 /// Successful control-plane results.

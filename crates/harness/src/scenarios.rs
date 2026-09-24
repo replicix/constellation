@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod coop_churn;
+/// Plan 30 §M10: flexible-quorum continuation epochs.
+mod m10;
 /// Plan 30 §M4's scenarios and the chaos runs' whole-cluster checks.
 mod m4;
 /// Plan 30 §M5 phase 2: the stale-base rule on the wire.
@@ -701,6 +703,24 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M9: the holder and its backup are partitioned from each other (both keep S3 and the third node, which writes throughout): the holder reconfigures the backup out or the sealed backup takes over, never two holders; every acknowledged write is kept and the cluster converges after the heal",
         requires: &[],
         run: m9::backup_partition,
+    },
+    Scenario {
+        name: "epoch-missing-node",
+        desc: "plan 30 M10: 3 nodes, epoch_slack 1; C unmounts, A and B lose S3 and form an epoch of 2/3 that keeps writing; C returns with S3 but no P2P: its takeover of the expired lease is refused (no promise outlasts it), then S3 returns, the epoch flushes and everyone converges with no conflict",
+        requires: &[],
+        run: m10::epoch_missing_node,
+    },
+    Scenario {
+        name: "epoch-holder-retired",
+        desc: "plan 30 M10: f = 1; A and B form an epoch carrying A's lease, A writes and is killed; B's frozen epoch keeps everyone out until the operator retires A (leave --node-id: the lease is fenced), B abandons the epoch, writes resume through a takeover with a promise, and A's state dir can never mount again",
+        requires: &[],
+        run: m10::epoch_holder_retired,
+    },
+    Scenario {
+        name: "epoch-slack-zero-unchanged",
+        desc: "plan 30 M10: epoch_slack 0 (the default) never touches heartbeat/; with epoch_slack 1 the steady state publishes only the mount's slack advertisement (promises are on demand); prints heartbeat PUTs per node per day",
+        requires: &[],
+        run: m10::epoch_slack_zero_unchanged,
     },
     Scenario {
         name: "inbox-create-storm-p2p-off",
@@ -3291,8 +3311,8 @@ fn node_leave(_seed: u64) -> Result<()> {
         )?;
     }
 
-    std::fs::create_dir(c0.mnt.join("a"))?;
-    std::fs::create_dir(c1.mnt.join("b"))?;
+    std::fs::create_dir(c0.mnt.join("a")).context("A mkdir a")?;
+    std::fs::create_dir(c1.mnt.join("b")).context("B mkdir b")?;
     eventually("dirs visible on C", Duration::from_secs(20), || {
         anyhow::ensure!(c2.mnt.join("a").is_dir());
         anyhow::ensure!(c2.mnt.join("b").is_dir());
@@ -3344,8 +3364,10 @@ fn node_leave(_seed: u64) -> Result<()> {
 
     proxy.cut()?;
     wait_for_epoch([&c0, &c1])?;
-    std::fs::write(c0.mnt.join("a/after-leave"), b"ok")?;
-    std::fs::write(c1.mnt.join("b/after-leave"), b"ok")?;
+    std::fs::write(c0.mnt.join("a/after-leave"), b"ok")
+        .context("A writes a/after-leave in the post-leave epoch")?;
+    std::fs::write(c1.mnt.join("b/after-leave"), b"ok")
+        .context("B writes b/after-leave in the post-leave epoch")?;
     proxy.heal()?;
     eventually(
         "post-leave epoch writes converge",

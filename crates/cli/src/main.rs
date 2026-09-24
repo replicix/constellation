@@ -537,6 +537,17 @@ enum FsCommand {
         /// overrides it.
         #[arg(long)]
         ack_policy: Option<String>,
+        /// Plan 30 §M10: how many write-eligible nodes a continuation
+        /// epoch may form without (`f`, default 0: every node must be a
+        /// member). With f > 0 an S3 takeover needs f other nodes'
+        /// heartbeat promises.
+        #[arg(long, default_value_t = 0)]
+        epoch_slack: u32,
+    },
+    /// Change a filesystem setting stored in `meta.json`.
+    Set {
+        #[command(subcommand)]
+        setting: FsSetting,
     },
     /// Change an E2E filesystem's passphrase without re-encrypting data.
     Passwd {
@@ -546,6 +557,22 @@ enum FsCommand {
     },
     /// List every registered filesystem and its views.
     List,
+}
+
+#[derive(Subcommand)]
+enum FsSetting {
+    /// Plan 30 §M10: set `epoch_slack` (`f`). Refused when `f` is at
+    /// least the write-eligible roster size; warns when `f > N − 2` (a
+    /// single crashed holder then blocks TTL failover until it returns).
+    /// Mounted nodes pick it up within a minute; a node still on the old
+    /// value keeps advertising it in its heartbeat, and a taker honours
+    /// the largest advertised.
+    EpochSlack {
+        target: String,
+        slack: u32,
+        #[arg(long)]
+        s3: Option<String>,
+    },
 }
 
 /// Shared boilerplate for the many control commands that take
@@ -760,6 +787,7 @@ fn main() -> Result<()> {
                     e2e,
                     max_size,
                     ack_policy,
+                    epoch_slack,
                 },
         } => {
             constellation_fs_core::validate_chunk_size(chunk_size)?;
@@ -790,6 +818,13 @@ fn main() -> Result<()> {
             }
             meta.max_logical_bytes = max_size.filter(|&n| n > 0);
             meta.ack_policy = ack_policy;
+            meta.epoch_slack = (epoch_slack > 0).then_some(epoch_slack);
+            if epoch_slack > 0 {
+                let ttl = crate::lease::lease_ttl_ms();
+                constellation_store_s3::PromiseConfig::from_env(ttl)
+                    .validate(ttl)
+                    .map_err(|why| anyhow::anyhow!("--epoch-slack {epoch_slack}: {why}"))?;
+            }
             // Collect the passphrase before writing anything: an abort at
             // the prompt (Ctrl-C, empty input) must leave no orphan
             // `meta.json` behind. The keyring block is built into `meta`,
@@ -823,6 +858,62 @@ fn main() -> Result<()> {
             }
             if let Some(p) = &meta.ack_policy {
                 println!("  ack_policy:  {p}");
+            }
+            if epoch_slack > 0 {
+                println!("  epoch_slack: {epoch_slack}");
+            }
+            Ok(())
+        }
+        Command::Fs {
+            command:
+                FsCommand::Set {
+                    setting: FsSetting::EpochSlack { target, slack, s3 },
+                },
+        } => {
+            let reg = registry::Registry::load()?;
+            let t = target::resolve(&target, &reg);
+            let s3 = target::s3_url(s3, &t)?;
+            let backend = rt
+                .block_on(backend::open_backend(&s3))
+                .context("opening backend")?;
+            let store = ChunkStore::new(backend.clone());
+            if slack > 0 {
+                let ttl = crate::lease::lease_ttl_ms();
+                constellation_store_s3::PromiseConfig::from_env(ttl)
+                    .validate(ttl)
+                    .map_err(|why| anyhow::anyhow!("epoch-slack {slack}: {why}"))?;
+            }
+            let roster = rt
+                .block_on(constellation_store_s3::write_eligible_roster(
+                    backend.clone(),
+                ))
+                .context("reading the write-eligible roster")?;
+            use constellation_store_s3::heartbeat::{check_epoch_slack, SlackFit};
+            match check_epoch_slack(slack, roster.len()) {
+                // No node enrolled yet (set before the first mount): the
+                // roster decides nothing (formation applies the quorum).
+                _ if roster.is_empty() => {}
+                SlackFit::Invalid => bail!(
+                    "epoch-slack {slack} leaves no member out of a {}-node write-eligible roster",
+                    roster.len()
+                ),
+                SlackFit::NoTtlFailover => eprintln!(
+                    "warning: epoch-slack {slack} > N - 2 (N = {}): an S3 takeover needs {slack} \
+                     other live nodes' promises, so one crashed holder blocks TTL failover \
+                     until it returns (seal-based and ack=s3 failover are unaffected)",
+                    roster.len()
+                ),
+                SlackFit::Ok => {}
+            }
+            let previous = rt
+                .block_on(store.set_epoch_slack(slack))
+                .context("updating meta.json")?;
+            println!("epoch_slack: {previous} -> {slack}");
+            if slack < previous {
+                println!(
+                    "  nodes still on {previous} keep advertising it until they adopt {slack}; \
+                     takeovers honour the largest advertised meanwhile"
+                );
             }
             Ok(())
         }
@@ -2414,18 +2505,60 @@ impl constellation_net::PeerService for P2pBridge {
         members: Vec<u64>,
         base: Vec<(String, u64)>,
         proposer: u64,
+        epoch_slack: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
             self.epochs
-                .handle_propose(epoch_id, members, base, proposer)
+                .handle_propose(epoch_id, members, base, proposer, epoch_slack)
         })
     }
 
-    fn epoch_activated(&self, epoch_id: String, members: Vec<u64>, base: Vec<(String, u64)>) {
-        self.epochs.handle_activate(epoch_id, members, base);
+    fn epoch_activated(&self, activation: constellation_net::EpochActivation) {
+        self.epochs.handle_activate(activation);
         let _ = self.nudge.send(fusefs::SyncRequest::EpochChanged);
         let _ = self.nudge.send(fusefs::SyncRequest::Nudge);
+    }
+
+    fn promise_requested(
+        &self,
+        requester: u64,
+        req_id: u64,
+        expires_unix_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let refuse = constellation_net::Payload::PromiseReply {
+                req_id,
+                until: None,
+                epoch_slack: 0,
+            };
+            if crate::fault::p2p_denied(requester) {
+                // Fault injection: the link is cut; no answer.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return refuse;
+            }
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            if self
+                .nudge
+                .send(fusefs::SyncRequest::PeerPromiseRequest {
+                    requester,
+                    expires_unix_ms,
+                    reply,
+                })
+                .is_err()
+            {
+                return refuse;
+            }
+            match receive.await {
+                Ok((until, epoch_slack)) => constellation_net::Payload::PromiseReply {
+                    req_id,
+                    until,
+                    epoch_slack,
+                },
+                Err(_) => refuse,
+            }
+        })
     }
 
     fn cache_digest(&self, digest: constellation_net::DigestSnapshot) {
@@ -2782,22 +2915,9 @@ async fn refresh_peers(
     }
     // The peer directory is tolerant of unreadable records (a peer we
     // cannot dial only loses its fast path); the epoch roster is not,
-    // so it gets its own fail-closed read. On failure the roster is
-    // cleared rather than left stale: an empty roster can never satisfy
-    // `component_covers_roster`, so no epoch activates on a registry we
-    // could not fully read.
+    // so it gets its own fail-closed read (`crate::epoch::refresh_roster`).
     if let Some(epochs) = epochs {
-        match constellation_store_s3::write_eligible_roster(store.clone()).await {
-            Ok(roster) => epochs.set_roster(roster),
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "cannot determine the write-eligible roster; \
-                     continuation epochs stay unavailable"
-                );
-                epochs.set_roster(Vec::new());
-            }
-        }
+        crate::epoch::refresh_roster(epochs, store.clone()).await;
     }
     match constellation_store_s3::list_nodes(store).await {
         Ok(nodes) => {
@@ -3705,7 +3825,14 @@ impl constellation_api::StatusSource for DaemonStatus {
         let usage = self.cache.usage();
         let p0_lease = self.lease.status();
         let designations = self.list_designations();
-        let epoch = self.epochs.status();
+        let mut epoch = self.epochs.status();
+        epoch.promise_puts = stats.promise_puts;
+        epoch.promise_requests_answered = stats.promise_requests_answered;
+        epoch.promise_requests_refused = stats.promise_requests_refused;
+        epoch.promise_checks = stats.promise_checks;
+        epoch.takeovers_refused_promises = stats.takeovers_refused_promises;
+        epoch.promise_flush_exempt = stats.promise_flush_exempt;
+        epoch.stale_claims = stats.epoch_stale_claims;
         let coop = self.coop.report();
         let s3_coop = coop.per_source.iter().find(|s| s.id == "s3").cloned();
         let peer_snap = self.peers.snapshot();

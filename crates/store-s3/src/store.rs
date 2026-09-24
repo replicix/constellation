@@ -51,6 +51,12 @@ pub struct FsMeta {
     /// mount's `--ack` overrides it for that mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_policy: Option<String>,
+    /// Plan 30 §M10: `f`, how many write-eligible nodes a continuation
+    /// epoch may form without (`fs create --epoch-slack`, `fs set
+    /// epoch-slack`). Absent means 0: every roster node must be a member
+    /// (today's rule), and no heartbeat promises are published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch_slack: Option<u32>,
 }
 
 impl FsMeta {
@@ -69,7 +75,13 @@ impl FsMeta {
             keyring: None,
             max_logical_bytes: None,
             ack_policy: None,
+            epoch_slack: None,
         }
+    }
+
+    /// `f` (0 when unset).
+    pub fn epoch_slack(&self) -> u32 {
+        self.epoch_slack.unwrap_or(0)
     }
 
     /// Unwrap the E2E keys from this filesystem's keyring block with the
@@ -319,6 +331,41 @@ impl ChunkStore {
             )
             .await?;
         Ok(())
+    }
+
+    /// Plan 30 §M10: set `epoch_slack` in `meta.json` with a CAS update
+    /// (a lost race re-reads and retries, a few times). `0` removes the
+    /// field. Returns the previous value. The caller validates `f`
+    /// against the roster (`heartbeat::check_epoch_slack`); mounted nodes
+    /// pick the new value up on their next `meta.json` read.
+    pub async fn set_epoch_slack(&self, epoch_slack: u32) -> Result<u32, StoreError> {
+        let key = layout::meta_json();
+        for _ in 0..5 {
+            let object = self.store.get(&key).await.map_err(|e| match e {
+                object_store::Error::NotFound { .. } => StoreError::NotFound,
+                e => e.into(),
+            })?;
+            let version = UpdateVersion {
+                e_tag: object.meta.e_tag.clone(),
+                version: object.meta.version.clone(),
+            };
+            let mut meta: FsMeta = serde_json::from_slice(&object.bytes().await?)?;
+            let previous = meta.epoch_slack();
+            meta.epoch_slack = (epoch_slack > 0).then_some(epoch_slack);
+            match crate::cas::put_conditional(
+                self.store.as_ref(),
+                &key,
+                serde_json::to_vec_pretty(&meta)?.into(),
+                PutMode::Update(version),
+                crate::cas::Verify::Body,
+            )
+            .await?
+            {
+                crate::cas::CasPut::Won(_) => return Ok(previous),
+                crate::cas::CasPut::Lost | crate::cas::CasPut::Missing => continue,
+            }
+        }
+        Err(StoreError::CasConflict)
     }
 
     /// Store a chunk under its content address. Skips the upload when the
@@ -1044,6 +1091,34 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
         assert!(leftover.is_empty(), "preflight left scratch objects behind");
+    }
+
+    #[tokio::test]
+    async fn epoch_slack_is_absent_by_default_and_set_by_cas() {
+        let s = store();
+        let meta = FsMeta::default();
+        assert_eq!(meta.epoch_slack(), 0);
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            !json.contains("epoch_slack"),
+            "f = 0 stays out of meta.json"
+        );
+        assert!(matches!(
+            s.set_epoch_slack(1).await,
+            Err(StoreError::NotFound)
+        ));
+        s.create_fs(&meta).await.unwrap();
+        assert_eq!(s.set_epoch_slack(1).await.unwrap(), 0);
+        let loaded = s.load_fs().await.unwrap();
+        assert_eq!(loaded.epoch_slack(), 1);
+        assert_eq!(loaded.uuid, meta.uuid);
+        assert_eq!(s.set_epoch_slack(0).await.unwrap(), 1);
+        assert_eq!(s.load_fs().await.unwrap().epoch_slack, None);
+        // A meta.json written before the field existed decodes as 0.
+        let old = r#"{"uuid":"00000000-0000-0000-0000-000000000000","format_version":1,
+            "chunk_size":1048576,"compression":"raw","e2e":false,"created_unix":0}"#;
+        let parsed: FsMeta = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.epoch_slack(), 0);
     }
 
     #[tokio::test]

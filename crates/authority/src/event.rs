@@ -14,6 +14,7 @@
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 use constellation_fs_core::Ino;
 use constellation_meta::{BackupTx, LogRecord, MutateOp, MutateOutcome, Position, Rid};
+use constellation_store_s3::heartbeat::Promise;
 use constellation_store_s3::inbox::InboxBatch;
 use constellation_store_s3::{Lease, LeaseTag};
 
@@ -58,6 +59,9 @@ pub enum Event {
     /// The membership poll read the write-eligible roster (M13's inbox
     /// polls it; M9 picks backups from it).
     Roster { write_eligible: Vec<NodeId> },
+    /// Plan 30 §M10: the filesystem's `epoch_slack` as `meta.json` now
+    /// says (the driver re-reads it with the roster).
+    Slack { epoch_slack: u32 },
     /// The P2P directory's view of the peers (M13's reachability rule,
     /// the holder's inbox poll set, M9's backup liveness). Sent whole,
     /// whenever the driver refreshes it.
@@ -189,7 +193,30 @@ pub enum Control {
         /// Plan 30 §M10's claim rule (enforced since M9): the epoch's
         /// members, for whether a lease may be carried into it.
         members: Vec<NodeId>,
+        /// Plan 30 §M10's claim resolution: the lease the epoch carries —
+        /// the members' claim at the highest lease epoch, provided no
+        /// member knows a later one and its policy may be carried — or
+        /// none. Kept after the epoch closes (the flush re-claim of
+        /// exactly this lease object needs no promise check).
+        carrier: Option<Carrier>,
+        /// Any member's lease claim below this epoch is stale: that
+        /// member was taken over (it has not heard yet) and is deposed at
+        /// activation.
+        stale_below: Epoch,
     },
+    /// Plan 30 §M10: this node's registry record is retired (admin
+    /// `leave --node-id`): it never acquires, promises or acknowledges
+    /// again.
+    Retire,
+}
+
+/// Plan 30 §M10: the lease a continuation epoch carries, exactly as the
+/// lease object read when the member claimed it (holder, epoch, expiry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Carrier {
+    pub node: NodeId,
+    pub epoch: Epoch,
+    pub expires_unix_ms: i64,
 }
 
 /// Messages between cores. The driver maps these to and from
@@ -355,6 +382,21 @@ pub enum PeerMsg {
         base: Seq,
         txs: Vec<BackupTx>,
     },
+    /// Plan 30 §M10: a would-be taker of the expired lease that expires
+    /// at `expires_unix_ms` asks for a promise ("join no continuation
+    /// epoch before …"). The peer persists one and publishes it (unless
+    /// it is in an open epoch), and answers with it.
+    PromiseRequest {
+        req: OpId,
+        expires_unix_ms: i64,
+    },
+    /// Plan 30 §M10: the persisted promise (`None`: refused — this node
+    /// is in an open epoch, or retired), and the epoch slack it runs with.
+    PromiseReply {
+        req: OpId,
+        until: Option<i64>,
+        epoch_slack: u32,
+    },
     /// M11: a delegate's ordered record stream to the root (`deps` is the
     /// highest position the delegate's requester observed).
     DelegateStream {
@@ -383,6 +425,7 @@ impl PeerMsg {
             | PeerMsg::ReadIndexReply { req, .. }
             | PeerMsg::DelegationRecalled { req }
             | PeerMsg::BackupAck { req, .. }
+            | PeerMsg::PromiseReply { req, .. }
             | PeerMsg::Recalled { req } => Some(*req),
             _ => None,
         }
@@ -398,6 +441,7 @@ impl PeerMsg {
             | PeerMsg::ReadIndex { req, .. }
             | PeerMsg::DelegationRecall { req, .. }
             | PeerMsg::BackupAppend { req, .. }
+            | PeerMsg::PromiseRequest { req, .. }
             | PeerMsg::Recall { req, .. } => Some(*req),
             _ => None,
         }
@@ -454,6 +498,11 @@ pub enum S3Result {
     /// `S3Op::InboxLastN`: the highest batch number this node wrote
     /// under the epoch, if any (a previous incarnation's).
     InboxLastN(Result<Option<u64>, S3Failure>),
+    /// Plan 30 §M10: `S3Op::HeartbeatRead` — every decodable heartbeat
+    /// object, keyed by the node its key names.
+    Heartbeats(Result<Vec<(NodeId, Promise)>, S3Failure>),
+    /// Plan 30 §M10: `S3Op::HeartbeatPut`.
+    HeartbeatPut(Result<(), S3Failure>),
 }
 
 /// Why a conditional PUT did not land. `Conflict` is a lost race (412,

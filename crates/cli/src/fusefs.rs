@@ -308,6 +308,18 @@ pub enum SyncRequest {
         base: u64,
         txs: Vec<constellation_meta::BackupTx>,
     },
+    /// Plan 30 §M10: a would-be taker asks this node for a heartbeat
+    /// promise; answered with `(until, epoch_slack)` (`until: None`:
+    /// refused).
+    PeerPromiseRequest {
+        requester: u64,
+        expires_unix_ms: i64,
+        reply: tokio::sync::oneshot::Sender<(Option<i64>, u32)>,
+    },
+    /// Plan 30 §M10: `meta.json`'s `epoch_slack` as last read.
+    Slack(u32),
+    /// Plan 30 §M10: this node's registry record is retired.
+    Retired,
     /// A peer's gossip says segment `seq` landed (plan 30 §M7: a hint
     /// with no payload). The core tails now unless its log stream from
     /// the holder delivers it.
@@ -2281,7 +2293,23 @@ impl ConstellationFs {
                         .add_pending_upload(hash, ino)
                         .map_err(mutate_fail)?;
                 }
-                self.drain_inode(ino).map_err(MutateFail::Errno)?;
+                // Plan 30 §M10: in an active continuation epoch S3 is away,
+                // and the epoch's hold owner journals the manifest locally
+                // like its own writes; the chunks stay enrolled here and
+                // go up with this node's first round once S3 returns (a
+                // reader before then fetches them from this node over
+                // P2P). The epoch's writes are as durable as their nodes,
+                // as the holder's own are. (A handoff of the hold would
+                // carry the chunks' manifest to this node instead, but a
+                // hold with an unshipped journal is no longer handed over.)
+                let epoch_active = self.sync.as_ref().is_some_and(|h| {
+                    h.epoch_active
+                        .as_ref()
+                        .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+                });
+                if !epoch_active {
+                    self.drain_inode(ino).map_err(MutateFail::Errno)?;
+                }
                 self.mutate_op_rebasable(
                     ino,
                     constellation_meta::MutateOp::SetManifest {

@@ -123,6 +123,14 @@ pub struct Lease {
     /// with it clear there is nothing to wait for.
     #[serde(default)]
     pub granted_delegations: bool,
+    /// Plan 30 §M10: node ids retired by an admin `leave --node-id`
+    /// while this lease named them ([`fence_retired`]). Such a node never
+    /// claims this lease again (`classify` refuses), whatever it believes
+    /// it holds: the fence reaches a retired node the moment it reads the
+    /// object, before any CAS, even if it has not yet seen its registry
+    /// tombstone. Carried by every tenure that follows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<u64>,
 }
 
 /// Plan 30 §M9: what an acknowledgement means under a tenure.
@@ -163,6 +171,32 @@ impl Lease {
             config_version: 0,
             ack_policy: AckPolicy::Local,
             granted_delegations: false,
+            retired: Vec::new(),
+        }
+    }
+
+    /// Plan 30 §M10: the fence an admin `leave --node-id` writes over a
+    /// lease naming the retired `node`: the epoch bumps (every segment,
+    /// renewal and flush re-claim of the old tenure is now stale), the
+    /// lease expires at once and is not released (so the next taker ships
+    /// an epoch marker, fencing the old tenure's late segments in the
+    /// log), the backup set clears (no seal permit names the old
+    /// tenure), and `node` joins [`Lease::retired`].
+    pub fn fenced_for_retirement(&self, node: u64, now_ms: i64) -> Self {
+        let mut retired = self.retired.clone();
+        retired.push(node);
+        retired.sort_unstable();
+        retired.dedup();
+        Self {
+            epoch: self.epoch + 1,
+            expires_unix_ms: now_ms.min(self.expires_unix_ms),
+            released: false,
+            wanted_by: Vec::new(),
+            backups: Vec::new(),
+            config_version: self.config_version + 1,
+            ack_policy: AckPolicy::Local,
+            retired,
+            ..self.clone()
         }
     }
 
@@ -366,6 +400,51 @@ impl LeaseStore {
 /// Partition ids whose lease is currently held by `node_id` (not
 /// released, not expired). Used by admin `leave --node-id` to refuse
 /// retiring a node that still appears to own write authority.
+/// Plan 30 §M10: fence every lease that names `node` (admin `leave
+/// --node-id`): CAS it to [`Lease::fenced_for_retirement`]. Returns the
+/// partitions fenced. A lost race re-reads and retries; a released lease
+/// is fenced too (its `retired` list is what stops the node re-claiming
+/// it).
+pub async fn fence_retired(
+    store: Arc<dyn ObjectStore>,
+    node: u64,
+) -> Result<Vec<String>, StoreError> {
+    use futures::TryStreamExt;
+    let prefix = object_store::path::Path::from("leases");
+    let metas = store.list(Some(&prefix)).try_collect::<Vec<_>>().await?;
+    let mut out = Vec::new();
+    for m in metas {
+        let Some(partition) = m
+            .location
+            .filename()
+            .and_then(|f| f.strip_suffix(".json"))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let leases = LeaseStore::new(store.clone(), &partition, LeaseMode::Cas);
+        for _ in 0..5 {
+            let Some((lease, tag)) = leases.get().await? else {
+                break;
+            };
+            if lease.holder != node || lease.retired.contains(&node) {
+                break;
+            }
+            let fenced = lease.fenced_for_retirement(node, now_unix_ms());
+            match leases.try_swap(&fenced, &tag).await {
+                Ok(_) => {
+                    out.push(partition.clone());
+                    break;
+                }
+                Err(StoreError::CasConflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 pub async fn live_leases_held_by(
     store: Arc<dyn ObjectStore>,
     node_id: u64,

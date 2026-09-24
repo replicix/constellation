@@ -87,7 +87,15 @@ enum Phase {
     Tail { then: TailThen },
     /// `LeaseSwap(renewed)` outstanding (`retry`: after a `wanted_by`
     /// edit was re-read).
-    Renew { retry: bool },
+    Renew {
+        retry: bool,
+        /// Plan 30 §M10: the object the swap writes. On success the held
+        /// lease becomes exactly it (it used to be recomputed at the
+        /// result's time, an expiry later than the object's by the
+        /// round trip — which also broke the carried-lease match of an
+        /// epoch's flush re-claim).
+        sent: Box<Lease>,
+    },
     /// `LeaseGet` after a lost renewal CAS (`final_probe`: the second
     /// swap lost too, so this read is the deposition probe).
     RenewReread { final_probe: bool },
@@ -121,11 +129,15 @@ enum Phase {
     Recover { op: OpId },
     /// Acquire: `LeaseGet` outstanding.
     Get,
-    /// Acquire: the CAS outstanding.
-    Cas { plan: Plan },
+    /// Acquire: the CAS outstanding, and the object it writes (adopted
+    /// exactly on success — see `Renew::sent`).
+    Cas { plan: Plan, sent: Box<Lease> },
     /// Acquire: `LeaseRequest` sent to `holder`; waiting for its answer.
     /// `epoch_mode`: a continuation epoch's P2P-only handoff.
     LeaseRequest { req: OpId, epoch_mode: bool },
+    /// Plan 30 §M10: a TTL takeover's promise check (`promise.rs`); the
+    /// plan waits in `pending_plan`.
+    PromiseCheck,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +173,12 @@ enum What {
         epoch_flush_release: bool,
         /// Deposition recovery: transactions rolled back so far.
         recover_rolled: u64,
+        /// Plan 30 §M10 (found by the `epoch-missing-node` scenario): this
+        /// round's epoch probe found S3 reachable. Only such a round may
+        /// close an open epoch — a round that started before the epoch
+        /// opened reaches its upload pass with S3 still down, and closing
+        /// there tore the epoch down the instant it activated.
+        epoch_probed: bool,
     },
     Acquire {
         reason: &'static str,
@@ -1071,6 +1089,7 @@ impl Core {
                 epoch_closed: false,
                 epoch_flush_release: false,
                 recover_rolled: 0,
+                epoch_probed: false,
             },
             phase: Phase::Upload,
             op: None,
@@ -1078,8 +1097,14 @@ impl Core {
         });
         if self.epoch.open {
             // A continuation epoch is open: writes are local, nothing
-            // ships; the round only probes whether S3 is back.
-            if self.epoch.frozen {
+            // ships; the round only probes whether S3 is back. Frozen (a
+            // member is missing), only the hold's owner probes: when S3
+            // is back it flushes and closes like an active epoch's holder
+            // would (plan 30 §M10 — a member that never returns must not
+            // keep the journal out of S3 forever; the flush's re-claim
+            // CAS is the arbiter, and it fails if an admin leave fenced
+            // the lease).
+            if self.epoch.frozen && !self.lease.epoch_held() {
                 self.finish_round(now, None, replica, out);
                 return;
             }
@@ -1124,10 +1149,28 @@ impl Core {
         match job.what {
             What::Round { .. } => match result {
                 UploadResult::Done { .. } => {
+                    let probed = matches!(
+                        self.job.as_ref().map(|j| &j.what),
+                        Some(What::Round {
+                            epoch_probed: true,
+                            ..
+                        })
+                    );
+                    if self.epoch.open && !probed {
+                        // Started before the epoch opened: S3 is not
+                        // known to be back. Nothing ships; the next round
+                        // probes.
+                        self.finish_round(now, None, replica, out);
+                        return;
+                    }
                     if self.epoch.open {
                         // S3 is back and this node may ship: close the
                         // epoch; the journal ships under an ordinary S3
                         // lease from here.
+                        if self.lease.epoch_held() {
+                            // Plan 30 §M10: silent until the journal is in.
+                            self.pr.flush_pending = true;
+                        }
                         out.push(Action::EpochClose);
                         self.skip_ship = false;
                         self.lease.release_local();
@@ -1189,13 +1232,19 @@ impl Core {
             let renewed = self.lease.renewed_lease(now, &self.cfg, &mine);
             let op = self.issue_s3(
                 S3Op::LeaseSwap {
-                    lease: renewed,
+                    lease: renewed.clone(),
                     tag,
                 },
                 S3For::Job,
                 out,
             );
-            self.set_phase(Phase::Renew { retry: false }, Some(op));
+            self.set_phase(
+                Phase::Renew {
+                    retry: false,
+                    sent: Box::new(renewed),
+                },
+                Some(op),
+            );
             return;
         }
         self.round_gate(now, replica, out);
@@ -1542,6 +1591,11 @@ impl Core {
             op: None,
             width: 0,
         });
+        if self.retired() {
+            // Plan 30 §M10: admin `leave --node-id` retired this node.
+            self.finish_acquire(now, false, replica, out);
+            return;
+        }
         if self.lease.lost || replica.lost_persisted() {
             // Recovered by the next round; the callers retry.
             self.nudged = true;
@@ -1626,8 +1680,20 @@ impl Core {
             }
             Plan::Create => {
                 let lease = self.lease.granted_lease(now, &self.cfg, None);
-                let op = self.issue_s3(S3Op::LeaseCreate { lease }, S3For::Job, out);
-                self.set_phase(Phase::Cas { plan: Plan::Create }, Some(op));
+                let op = self.issue_s3(
+                    S3Op::LeaseCreate {
+                        lease: lease.clone(),
+                    },
+                    S3For::Job,
+                    out,
+                );
+                self.set_phase(
+                    Phase::Cas {
+                        plan: Plan::Create,
+                        sent: Box::new(lease),
+                    },
+                    Some(op),
+                );
             }
             Plan::Busy {
                 holder,
@@ -1690,6 +1756,15 @@ impl Core {
             }
             Plan::Claim { takeover, .. } => {
                 if takeover {
+                    if let Plan::Claim { prev, .. } = &plan {
+                        if self.promise_check_needed(now, prev) {
+                            let prev = prev.clone();
+                            self.set_phase(Phase::PromiseCheck, None);
+                            self.pending_plan = Some(plan);
+                            self.promise_check_begin(now, &prev, out);
+                            return;
+                        }
+                    }
                     self.set_phase(
                         Phase::Tail {
                             then: TailThen::Takeover,
@@ -1706,6 +1781,37 @@ impl Core {
         }
     }
 
+    /// Plan 30 §M10: the promise check decided. Allowed: the takeover
+    /// proceeds exactly as without it (tail to head, then the CAS naming
+    /// the lease object read). Refused: the acquisition fails; the client
+    /// op retries on its backoff and asks again.
+    pub(crate) fn promise_check_resolved(
+        &mut self,
+        now: Ms,
+        allowed: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !self
+            .job
+            .as_ref()
+            .is_some_and(|j| matches!(j.phase, Phase::PromiseCheck))
+        {
+            return;
+        }
+        if !allowed {
+            self.finish_acquire(now, false, replica, out);
+            return;
+        }
+        self.set_phase(
+            Phase::Tail {
+                then: TailThen::Takeover,
+            },
+            None,
+        );
+        self.issue_tail(out);
+    }
+
     fn acquire_cas(&mut self, now: Ms, plan: Plan, out: &mut Vec<Action>) {
         let Plan::Claim { prev, tag, .. } = &plan else {
             return;
@@ -1713,19 +1819,26 @@ impl Core {
         let lease = self.lease.granted_lease(now, &self.cfg, Some(prev));
         let op = self.issue_s3(
             S3Op::LeaseSwap {
-                lease,
+                lease: lease.clone(),
                 tag: tag.clone(),
             },
             S3For::Job,
             out,
         );
-        self.set_phase(Phase::Cas { plan }, Some(op));
+        self.set_phase(
+            Phase::Cas {
+                plan,
+                sent: Box::new(lease),
+            },
+            Some(op),
+        );
     }
 
     fn acquire_won(
         &mut self,
         now: Ms,
         plan: Plan,
+        sent: Lease,
         tag: LeaseTag,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1739,7 +1852,7 @@ impl Core {
             } => (Some(prev), takeover, marker),
             _ => (None, false, false),
         };
-        let lease = self.lease.granted_lease(now, &self.cfg, prev.as_ref());
+        let lease = sent;
         let epoch = lease.epoch;
         tracing::info!(
             node = self.cfg.node_id,
@@ -1822,6 +1935,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.pending_plan = None;
+        self.promise_check_abandon(out);
         let Some(job) = self.job.take() else {
             return;
         };
@@ -2077,17 +2191,17 @@ impl Core {
                 self.job_failed(now, format!("tailing: {}", e.0), replica, out)
             }
             // ---- renewal ----
-            (Phase::Renew { .. }, S3Result::LeasePut(Ok(tag))) => {
-                let Some((mine, _)) = self.lease.held.clone() else {
+            (Phase::Renew { ref sent, .. }, S3Result::LeasePut(Ok(tag))) => {
+                if self.lease.held.is_none() {
                     self.lease_gone_mid_job(now, kind, replica, out);
                     return;
-                };
-                let renewed = self.lease.renewed_lease(now, &self.cfg, &mine);
+                }
+                let renewed = (**sent).clone();
                 self.lease.renewed(now, renewed, tag);
                 self.ship.renew_now = false;
                 self.round_gate(now, replica, out);
             }
-            (Phase::Renew { retry }, S3Result::LeasePut(Err(CasFailure::Conflict))) => {
+            (Phase::Renew { retry, .. }, S3Result::LeasePut(Err(CasFailure::Conflict))) => {
                 let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
                 self.set_phase(Phase::RenewReread { final_probe: retry }, Some(op));
             }
@@ -2123,13 +2237,19 @@ impl Core {
                             self.lease.renewed(now, cur, tag.clone());
                             let op = self.issue_s3(
                                 S3Op::LeaseSwap {
-                                    lease: renewed,
+                                    lease: renewed.clone(),
                                     tag,
                                 },
                                 S3For::Job,
                                 out,
                             );
-                            self.set_phase(Phase::Renew { retry: true }, Some(op));
+                            self.set_phase(
+                                Phase::Renew {
+                                    retry: true,
+                                    sent: Box::new(renewed),
+                                },
+                                Some(op),
+                            );
                         }
                     }
                     Some((cur, _)) => {
@@ -2382,8 +2502,8 @@ impl Core {
                 tracing::warn!(node = self.cfg.node_id, error = %e.0, "lease read failed");
                 self.finish_acquire(now, false, replica, out);
             }
-            (Phase::Cas { plan }, S3Result::LeasePut(Ok(tag))) => {
-                self.acquire_won(now, plan, tag, replica, out)
+            (Phase::Cas { plan, sent }, S3Result::LeasePut(Ok(tag))) => {
+                self.acquire_won(now, plan, *sent, tag, replica, out)
             }
             (Phase::Cas { .. }, S3Result::LeasePut(Err(CasFailure::Conflict))) => {
                 self.finish_acquire(now, false, replica, out)
@@ -2430,6 +2550,13 @@ impl Core {
                 if !holds && self.ship.head_seq <= self.epoch.base {
                     self.finish_round(now, None, replica, out);
                     return;
+                }
+                if let Some(Job {
+                    what: What::Round { epoch_probed, .. },
+                    ..
+                }) = self.job.as_mut()
+                {
+                    *epoch_probed = true;
                 }
                 let op = self.op_id();
                 self.set_phase(Phase::Upload, Some(op));
@@ -2600,7 +2727,9 @@ impl Core {
         }
         if epoch_mode {
             // A continuation epoch's P2P-only handoff: local authority,
-            // gated like a takeover (no marker: nothing ships).
+            // gated like a takeover (no marker: nothing ships). Plan 30
+            // §M10: the predecessor hands over only with an empty journal
+            // (`on_lease_request`).
             let mine = self.lease.epoch().unwrap_or(epoch).max(1);
             self.lease.adopt_epoch_hold(now, mine);
             replica.set_holder_epoch(0);

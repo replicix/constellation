@@ -2,7 +2,7 @@
 //! `pins`, `epochs` and the prune-policy root-discovery helpers.
 
 use crate::error::MetaError;
-use crate::store::{ns, EpochRow, Meta};
+use crate::store::{kv_get_tx, kv_set_tx, ns, EpochRow, Meta};
 use constellation_fs_core::{ChunkHash, Ino};
 use constellation_mtree::record::{InodeRecord, Payload};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
@@ -384,6 +384,9 @@ impl Meta {
 
 // -------------------------------------------------------------- epochs
 
+const PROMISE_ISSUED: &str = "epoch_promise_issued_ms";
+const PROMISE_JOINING: &str = "epoch_promise_joining";
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EpochRowEnc {
     members: Vec<u64>,
@@ -445,6 +448,75 @@ impl Meta {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    // ------------------------------------------- plan 30 §M10: promises
+
+    /// The last heartbeat promise this node *issued*
+    /// (`no_epoch_until_unix_ms`, persisted before its PUT; 0: none).
+    pub fn promise_issued(&self) -> Result<i64, MetaError> {
+        Ok(self
+            .kv_get(PROMISE_ISSUED)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Persist a new promise before publishing it. Refused (`Ok(false)`,
+    /// nothing written) while a continuation-epoch join holds the gate
+    /// ([`Meta::promise_join_begin`]): a member publishes no promise. The
+    /// check and the write are one write transaction, and the join gate
+    /// takes the same (single) writer lock, so a promise can never be
+    /// issued between a join's check and its gate.
+    pub fn promise_issue(&self, until_unix_ms: i64) -> Result<bool, MetaError> {
+        let mut tx = self.db.write_tx();
+        if kv_get_tx(&tx, &self.local, PROMISE_JOINING)?.as_deref() == Some("1") {
+            return Ok(false);
+        }
+        let issued: i64 = kv_get_tx(&tx, &self.local, PROMISE_ISSUED)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if until_unix_ms > issued {
+            kv_set_tx(
+                &mut tx,
+                &self.local,
+                PROMISE_ISSUED,
+                &until_unix_ms.to_string(),
+            );
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// A continuation-epoch join: allowed only once the last issued
+    /// promise has expired in this node's clock (`now_ms`), and from then
+    /// on no promise is issued until [`Meta::promise_join_end`].
+    /// Idempotent while the gate is held.
+    pub fn promise_join_begin(&self, now_ms: i64) -> Result<bool, MetaError> {
+        let mut tx = self.db.write_tx();
+        if kv_get_tx(&tx, &self.local, PROMISE_JOINING)?.as_deref() == Some("1") {
+            return Ok(true);
+        }
+        let issued: i64 = kv_get_tx(&tx, &self.local, PROMISE_ISSUED)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if now_ms < issued {
+            return Ok(false);
+        }
+        kv_set_tx(&mut tx, &self.local, PROMISE_JOINING, "1");
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The node is in no open epoch any more: promises may be issued.
+    pub fn promise_join_end(&self) -> Result<(), MetaError> {
+        if self.promise_joining()? {
+            self.kv_set(PROMISE_JOINING, "0")?;
+        }
+        Ok(())
+    }
+
+    pub fn promise_joining(&self) -> Result<bool, MetaError> {
+        Ok(self.kv_get(PROMISE_JOINING)?.as_deref() == Some("1"))
     }
 
     // ---------------------------------------------------------- reintegration

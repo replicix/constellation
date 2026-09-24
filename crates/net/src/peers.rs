@@ -734,19 +734,16 @@ impl Peers {
         )
     }
 
-    pub async fn announce_epoch_activate(
-        &self,
-        epoch_id: &str,
-        members: &[u64],
-        base: &[(String, u64)],
-    ) {
+    pub async fn announce_epoch_activate(&self, activation: &crate::EpochActivation) {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
         let payload = Payload::EpochActivate {
-            epoch_id: epoch_id.to_string(),
-            members: members.to_vec(),
-            base: base.to_vec(),
+            epoch_id: activation.epoch_id.clone(),
+            members: activation.members.clone(),
+            base: activation.base.clone(),
+            carrier: activation.carrier,
+            stale_below: activation.stale_below,
         };
         let _ = inner.p2p.broadcast(&payload).await;
         for p in self.snapshot() {
@@ -963,8 +960,16 @@ pub async fn run_gossip<S: PeerService>(
                 epoch_id,
                 members,
                 base,
+                carrier,
+                stale_below,
             } => {
-                service.epoch_activated(epoch_id.clone(), members.clone(), base.clone());
+                service.epoch_activated(crate::EpochActivation {
+                    epoch_id: epoch_id.clone(),
+                    members: members.clone(),
+                    base: base.clone(),
+                    carrier: *carrier,
+                    stale_below: *stale_below,
+                });
             }
             _ => {}
         }
@@ -1178,23 +1183,43 @@ async fn handle_stream<S: PeerService>(
             members,
             base,
             proposer,
+            epoch_slack,
         } => Some(
             service
-                .epoch_proposed(epoch_id, members, base, proposer)
+                .epoch_proposed(epoch_id, members, base, proposer, epoch_slack)
                 .await,
         ),
         Payload::EpochActivate {
             epoch_id,
             members,
             base,
+            carrier,
+            stale_below,
         } => {
-            service.epoch_activated(epoch_id.clone(), members, base);
+            service.epoch_activated(crate::EpochActivation {
+                epoch_id: epoch_id.clone(),
+                members,
+                base,
+                carrier,
+                stale_below,
+            });
             Some(Payload::EpochAck {
                 epoch_id,
                 member: service.node_id(),
                 accepted: true,
+                claim: None,
+                known: 0,
             })
         }
+        Payload::PromiseRequest {
+            requester,
+            req_id,
+            expires_unix_ms,
+        } => Some(
+            service
+                .promise_requested(requester, req_id, expires_unix_ms)
+                .await,
+        ),
         Payload::ReconcileRequest { queries } => Some(service.reconcile_requested(queries).await),
         Payload::ChunkRequest { hash } => {
             let served = service.serve_chunk(hash, hex.to_string()).await;
@@ -1229,6 +1254,7 @@ async fn handle_stream<S: PeerService>(
         | Payload::ReadIndexReply { .. }
         | Payload::ReadRecalled { .. }
         | Payload::BackupAck { .. }
+        | Payload::PromiseReply { .. }
         | Payload::Ok { .. } => None,
     };
     let served_us = t0.elapsed().as_micros() as u64;

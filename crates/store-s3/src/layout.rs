@@ -170,6 +170,28 @@ pub fn inbox_requester_prefix(epoch: u64, node: u64) -> Path {
     Path::from(format!("inbox/{epoch:016x}/{node:016x}"))
 }
 
+/// `heartbeat/<node:016x>.json`: a node's epoch promise (plan 30 §M10,
+/// `crate::heartbeat`). Hex like the other per-node keys, zero-padded so
+/// a LIST comes back in node order.
+pub fn heartbeat(node: u64) -> Path {
+    Path::from(format!("heartbeat/{node:016x}.json"))
+}
+
+pub fn heartbeat_prefix() -> Path {
+    Path::from("heartbeat")
+}
+
+/// The node a [`heartbeat`] key names; `None` for anything else under
+/// the prefix.
+pub fn heartbeat_node(path: &Path) -> Option<u64> {
+    let rest = path.as_ref().strip_prefix("heartbeat/")?;
+    let hex = rest.strip_suffix(".json")?;
+    if hex.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +236,29 @@ mod tests {
         assert!(inbox_epoch_prefix(3)
             .to_string()
             .starts_with(&inbox_prefix().to_string()));
+    }
+
+    #[test]
+    fn heartbeat_keys_roundtrip_and_sort_by_node() {
+        assert_eq!(
+            heartbeat(0xab).to_string(),
+            "heartbeat/00000000000000ab.json"
+        );
+        assert_eq!(heartbeat_node(&heartbeat(0xab)), Some(0xab));
+        assert_eq!(heartbeat_node(&heartbeat(u64::MAX)), Some(u64::MAX));
+        assert!(heartbeat(9).to_string() < heartbeat(10).to_string());
+        assert!(heartbeat(3)
+            .to_string()
+            .starts_with(&heartbeat_prefix().to_string()));
+        assert_eq!(heartbeat_node(&Path::from("heartbeat/ab.json")), None);
+        assert_eq!(
+            heartbeat_node(&Path::from("heartbeat/00000000000000ab")),
+            None
+        );
+        assert_eq!(
+            heartbeat_node(&Path::from("nodes/00000000000000ab.json")),
+            None
+        );
     }
 
     #[test]

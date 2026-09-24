@@ -745,6 +745,26 @@ impl NodeRuntime {
         core_config.ack_s3 =
             crate::authority_driver::ack_s3_resolved(ack, fsmeta.ack_policy.as_deref());
         core_config.strict_mounts = cto_strict;
+        // Plan 30 §M10: flexible-quorum continuation epochs.
+        core_config.epoch_slack = fsmeta.epoch_slack();
+        {
+            let promise = constellation_store_s3::PromiseConfig::from_env(core_config.ttl_ms);
+            if let Err(why) = promise.validate(core_config.ttl_ms) {
+                if core_config.epoch_slack > 0 {
+                    anyhow::bail!("epoch_slack {}: {why}", core_config.epoch_slack);
+                }
+                tracing::warn!(%why, "promise TTL invalid (unused while epoch_slack is 0)");
+            }
+            core_config.promise_ttl_ms = promise.ttl_ms;
+        }
+        epochs.set_slack(core_config.epoch_slack);
+        if core_config.epoch_slack > 0 {
+            tracing::info!(
+                epoch_slack = core_config.epoch_slack,
+                promise_ttl_ms = core_config.promise_ttl_ms,
+                "flexible-quorum continuation epochs"
+            );
+        }
         if core_config.ack_s3 {
             tracing::info!("acknowledgement policy: s3 (every acknowledgement waits for the log)");
         }
@@ -924,11 +944,16 @@ impl NodeRuntime {
                     sync_tx.clone(),
                 );
                 rt.spawn(async move {
+                    let mut tick: u64 = 0;
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         crate::refresh_peers(&peers, store_inner.clone(), Some(&epochs)).await;
                         let _ = sync_tx.send(fusefs::SyncRequest::Roster(epochs.roster()));
                         peers.probe_all().await;
+                        tick += 1;
+                        if tick.is_multiple_of(SLACK_REREAD_TICKS) {
+                            reread_slack(&store_inner, &sync_tx).await;
+                        }
                         match constellation_store_s3::get_node(store_inner.clone(), node_id).await {
                             Ok(None) => {
                                 tracing::error!(
@@ -946,6 +971,7 @@ impl NodeRuntime {
                                 );
                                 departed.store(true, Ordering::Relaxed);
                                 let _ = meta.kv_set("left", "1");
+                                let _ = sync_tx.send(fusefs::SyncRequest::Retired);
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -966,26 +992,20 @@ impl NodeRuntime {
             );
             let sync_tx_roster = sync_tx.clone();
             rt.spawn(async move {
+                let mut tick: u64 = 0;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    match constellation_store_s3::write_eligible_roster(store_inner.clone()).await {
-                        Ok(roster) => {
-                            // A requester this holder has not polled yet
-                            // (a node that mounted after our last read):
-                            // the core polls it at once (plan 30 M13
-                            // round 2).
-                            let _ =
-                                sync_tx_roster.send(fusefs::SyncRequest::Roster(roster.clone()));
-                            epochs.set_roster(roster)
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "cannot determine the write-eligible roster; \
-                                 continuation epochs stay unavailable"
-                            );
-                            epochs.set_roster(Vec::new());
-                        }
+                    tick += 1;
+                    if tick.is_multiple_of(SLACK_REREAD_TICKS) {
+                        reread_slack(&store_inner, &sync_tx_roster).await;
+                    }
+                    if let Some(roster) =
+                        crate::epoch::refresh_roster(&epochs, store_inner.clone()).await
+                    {
+                        // A requester this holder has not polled yet (a
+                        // node that mounted after our last read): the core
+                        // polls it at once (plan 30 M13 round 2).
+                        let _ = sync_tx_roster.send(fusefs::SyncRequest::Roster(roster));
                     }
                     match constellation_store_s3::get_node(store_inner.clone(), node_id).await {
                         Ok(None) => {
@@ -1003,6 +1023,7 @@ impl NodeRuntime {
                             );
                             departed.store(true, Ordering::Relaxed);
                             let _ = meta.kv_set("left", "1");
+                            let _ = sync_tx_roster.send(fusefs::SyncRequest::Retired);
                         }
                         _ => {}
                     }
@@ -1747,6 +1768,24 @@ async fn atime_flush_once(
                 stats.forward_err.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+/// Plan 30 §M10: re-read `meta.json`'s `epoch_slack` every this many
+/// registry-poll ticks (5 s each): one GET a minute per node.
+const SLACK_REREAD_TICKS: u64 = 12;
+
+/// Plan 30 §M10: `fs set epoch-slack` changed `meta.json`: tell the core
+/// (which re-advertises it in its heartbeat) and the epoch coordinator.
+async fn reread_slack(
+    store: &Arc<dyn object_store::ObjectStore>,
+    sync_tx: &tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
+) {
+    match ChunkStore::new(store.clone()).load_fs().await {
+        Ok(meta) => {
+            let _ = sync_tx.send(fusefs::SyncRequest::Slack(meta.epoch_slack()));
+        }
+        Err(e) => tracing::debug!(error = %e, "re-reading meta.json for epoch_slack failed"),
     }
 }
 

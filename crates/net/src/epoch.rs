@@ -201,6 +201,43 @@ pub fn component_covers_roster(self_id: u64, connected_peer_ids: &[u64], roster:
         .all(|&id| id == self_id || connected_peer_ids.contains(&id))
 }
 
+/// Plan 30 §M10: an [`crate::Payload::EpochActivate`] as a service sees
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activation {
+    pub epoch_id: String,
+    pub members: Vec<u64>,
+    pub base: Vec<(String, u64)>,
+    pub carrier: Option<crate::message::EpochCarrier>,
+    pub stale_below: u64,
+}
+
+/// Plan 30 §M10: the members a flexible-quorum epoch would have — every
+/// roster node in the live component (self plus connected peers) — if
+/// they are at least `N − epoch_slack` and include this node. With
+/// `epoch_slack = 0` this is [`component_covers_roster`]. The quorum is
+/// only half of the rule: each member also joins only once its own last
+/// issued heartbeat promise has expired (`store_s3::heartbeat`).
+pub fn component_quorum(
+    self_id: u64,
+    connected_peer_ids: &[u64],
+    roster: &[u64],
+    epoch_slack: u32,
+) -> Option<Vec<u64>> {
+    if !roster.contains(&self_id) {
+        return None;
+    }
+    let mut members: Vec<u64> = roster
+        .iter()
+        .copied()
+        .filter(|id| *id == self_id || connected_peer_ids.contains(id))
+        .collect();
+    members.sort_unstable();
+    members.dedup();
+    let quorum = roster.len().checked_sub(epoch_slack as usize)?.max(1);
+    (members.len() >= quorum).then_some(members)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +318,25 @@ mod tests {
         assert!(!component_covers_roster(1, &[2], &[1, 2, 3]));
         assert!(component_covers_roster(1, &[], &[1]));
         assert!(!component_covers_roster(1, &[], &[1, 2]));
+    }
+
+    #[test]
+    fn flexible_quorum_takes_n_minus_f_roster_members() {
+        // f = 0 is `component_covers_roster`.
+        assert_eq!(
+            component_quorum(1, &[2, 3], &[1, 2, 3], 0),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(component_quorum(1, &[2], &[1, 2, 3], 0), None);
+        // f = 1: two of three.
+        assert_eq!(component_quorum(1, &[2], &[1, 2, 3], 1), Some(vec![1, 2]));
+        assert_eq!(component_quorum(1, &[], &[1, 2, 3], 1), None);
+        // Connected peers outside the roster (read-only, retired) do not
+        // count; this node must be in the roster.
+        assert_eq!(component_quorum(1, &[7, 8], &[1, 2, 3], 1), None);
+        assert_eq!(component_quorum(9, &[1, 2], &[1, 2, 3], 1), None);
+        // Never an epoch of nobody.
+        assert_eq!(component_quorum(1, &[], &[1], 5), None);
+        assert_eq!(component_quorum(1, &[], &[1], 0), Some(vec![1]));
     }
 }

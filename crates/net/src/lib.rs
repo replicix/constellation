@@ -49,11 +49,12 @@ pub use endpoint::{
     topic_for, ChunkFetch, DigestDelta, DigestSnapshot, LogEvent, P2p, PathKind, PeerService,
 };
 pub use epoch::{
-    component_covers_roster, EpochState, Machine as EpochMachine, Promise as EpochPromise,
+    component_covers_roster, component_quorum, Activation as EpochActivation, EpochState,
+    Machine as EpochMachine, Promise as EpochPromise,
 };
 pub use handoff::{handle_request, interpret_reply, Handoff, RequestOutcome};
 pub use identity::{load_or_create, parse_pubkey, pubkey_hex};
-pub use message::{ChunkDecline, ChunkStatus, Payload, Signed, ALPN};
+pub use message::{ChunkDecline, ChunkStatus, EpochCarrier, EpochClaim, Payload, Signed, ALPN};
 pub use paths::PathSummary;
 pub use peers::{run_gossip, Peer, PeerEnrollment, Peers, Refresher};
 pub use relay::RelayPolicy;

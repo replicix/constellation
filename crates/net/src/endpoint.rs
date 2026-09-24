@@ -449,17 +449,36 @@ pub trait PeerService: Send + Sync + 'static {
         _members: Vec<u64>,
         _base: Vec<(String, u64)>,
         _proposer: u64,
+        _epoch_slack: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::EpochAck {
                 epoch_id: String::new(),
                 member: 0,
                 accepted: false,
+                claim: None,
+                known: 0,
             }
         })
     }
     /// A peer redistributed activation. Default is a no-op.
-    fn epoch_activated(&self, _epoch_id: String, _members: Vec<u64>, _base: Vec<(String, u64)>) {}
+    fn epoch_activated(&self, _activation: crate::EpochActivation) {}
+    /// Plan 30 §M10: a would-be taker asks for a heartbeat promise.
+    /// Default refuses (P2P-disabled / tests).
+    fn promise_requested(
+        &self,
+        _requester: u64,
+        req_id: u64,
+        _expires_unix_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::PromiseReply {
+                req_id,
+                until: None,
+                epoch_slack: 0,
+            }
+        })
+    }
     /// Cooperative-cache digest snapshot from a peer.
     fn cache_digest(&self, _digest: DigestSnapshot) {}
     fn cache_digest_delta(&self, _delta: DigestDelta) {}

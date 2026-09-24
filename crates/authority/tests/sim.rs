@@ -13,6 +13,7 @@ mod sim {
     pub mod check;
     pub mod clock;
     pub mod cto;
+    pub mod epochs;
     pub mod history;
     pub mod node;
     pub mod run;
@@ -285,6 +286,13 @@ fn replay_seed() {
             core: std::sync::Arc::new(sim::run::ack_s3_core_config),
             ..long_backup_config()
         },
+        // Plan 30 §M10.
+        Ok("flex") => flex_config(),
+        Ok("flex-unchecked") => flex_unchecked_config(),
+        Ok("flex-crash") => flex_crash_config(),
+        Ok("flex-long") => flex_config(),
+        Ok("flex-backup") => flex_backup_config(),
+        Ok("flex-zero") => flex_zero_config(),
         // Plan 30 §M7.
         Ok("streams-off") => streams_off_config(),
         Ok("stream-faults") => stream_faults_config(),
@@ -1561,4 +1569,223 @@ fn long_backup() {
         totals.failover_dist()
     );
     assert!(failures.is_empty(), "failing seeds: {failures:?}");
+}
+
+// ---- plan 30 §M10: flexible-quorum continuation epochs ----
+
+/// Three nodes, `f = 1`: the holder and one other lose S3 (and P2P to
+/// the third) for 5 s mid-workload; they form an epoch of 2/3 and keep
+/// writing, while the third keeps S3 and keeps trying to write — its
+/// takeover of the expired lease must be refused (no promise outlasts
+/// the expiry: the members are silent). Then S3 returns, the epoch
+/// flushes, everyone converges.
+fn flex_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 8,
+        random_faults: 0,
+        epoch_slack: 1,
+        core: std::sync::Arc::new(sim::run::flex_core_config),
+        faults: vec![ScheduledFault {
+            at_ms: 1_200,
+            kind: FaultKind::EpochOutage {
+                members: 2,
+                for_ms: 5_000,
+            },
+        }],
+        ..SimConfig::default()
+    }
+}
+
+/// The same with the promise check off: the third node takes the lease
+/// the epoch carries, and the sampler sees two authorities.
+fn flex_unchecked_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::flex_unchecked_core_config),
+        ..flex_config()
+    }
+}
+
+/// The outage plus a crash of a random node with restart, and the CI's
+/// random faults on top.
+fn flex_crash_config() -> SimConfig {
+    SimConfig {
+        random_faults: 2,
+        read_ratio: 0.3,
+        join_fresh: false,
+        ..flex_config()
+    }
+}
+
+/// `f = 0` under the same outage: two of three is not a quorum, no epoch
+/// forms, the cut nodes stall and the third takes over as today.
+fn flex_zero_config() -> SimConfig {
+    SimConfig {
+        epoch_slack: 0,
+        core: std::sync::Arc::new(sim::run::sim_core_config),
+        ..flex_config()
+    }
+}
+
+#[derive(Debug, Default)]
+struct FlexTotals {
+    seeds: u64,
+    epochs: usize,
+    missing_node: usize,
+    refused: u64,
+    promise_checks: u64,
+    promise_puts: u64,
+    promise_answers: u64,
+    flush_exempt: u64,
+    samples: u64,
+}
+
+fn run_flex(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> FlexTotals {
+    let mut t = FlexTotals::default();
+    for seed in seeds {
+        let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+            panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+        });
+        t.seeds += 1;
+        t.epochs += report.epochs_formed;
+        t.missing_node += report.epochs_missing_node;
+        t.samples += report.authority_samples;
+        for s in report.stats.values() {
+            t.refused += s.takeovers_refused_promises;
+            t.promise_checks += s.promise_checks;
+            t.promise_puts += s.promise_puts;
+            t.promise_answers += s.promise_requests_answered;
+            t.flush_exempt += s.promise_flush_exempt;
+        }
+    }
+    eprintln!("{label}: {t:?}");
+    t
+}
+
+/// Plan 30 §M10: the epoch of 2/3 forms and writes, the third node's
+/// takeover is refused, nobody ever sees two authorities, the history is
+/// linearizable and the replicas converge.
+#[test]
+fn flex_epoch_with_a_missing_node_is_single_authority() {
+    let t = run_flex("flex", flex_config(), 1000..1040);
+    assert!(t.epochs >= 30, "epochs rarely formed: {t:?}");
+    assert_eq!(t.missing_node, t.epochs, "every epoch had a node missing");
+    assert!(
+        t.refused > 0,
+        "the third node never tried a takeover: {t:?}"
+    );
+    assert!(t.samples > 0);
+}
+
+/// Non-vacuity: without the promise check the sampler finds the third
+/// node's S3 lease alongside the epoch's hold.
+#[test]
+fn flex_without_the_promise_check_is_found() {
+    // Either the sampler sees both authorities, or — when the split brain
+    // shows in the history first — the log-witnessed linearizability
+    // check does (the third node's writes and the epoch's collide).
+    let (mut sampled, mut history) = (0, 0);
+    for seed in 1000..1040 {
+        match run_seed(seed, flex_unchecked_config()) {
+            Err(e) if e.contains("two authorities at once") => sampled += 1,
+            Err(e) if e.contains("quiescence") => {
+                panic!("flex-unchecked seed {seed} failed otherwise: {e}")
+            }
+            Err(_) => history += 1,
+            Ok(_) => {}
+        }
+    }
+    eprintln!(
+        "flex-unchecked: {sampled}/40 seeds sampled two authorities, {history}/40 more \
+         broke linearizability first"
+    );
+    assert!(sampled > 0, "the sampler never saw the split brain");
+}
+
+/// Plan 30 §M10 with crashes, reads and the random CI faults.
+#[test]
+fn flex_epochs_survive_crashes_and_faults() {
+    let t = run_flex("flex-crash", flex_crash_config(), 1100..1160);
+    assert!(t.epochs > 0, "{t:?}");
+}
+
+/// Plan 30 §M10's documented gap: a node enrolled *during* an epoch is
+/// outside the roster the epoch formed under, so its promise counts for a
+/// taker although the epoch's members never saw it — the intersection
+/// needs `f + 1` promisers from the formation roster. Here node 4 enrolls
+/// during the outage, the epoch's hold owner dies, node 3 counts node 4's
+/// promise, takes the lease over, and the hold owner comes back. Kept as
+/// a repro (`#[ignore]`): it is expected to FAIL until the gap is closed.
+#[test]
+#[ignore]
+fn flex_node_enrolled_during_an_epoch_is_the_known_gap() {
+    let cfg = SimConfig {
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::EpochOutage {
+                    members: 2,
+                    for_ms: 5_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 3_500,
+                kind: FaultKind::JoinFresh,
+            },
+            ScheduledFault {
+                at_ms: 4_800,
+                kind: FaultKind::CrashHolder {
+                    restart_ms: Some(6_000),
+                    keep_journal: true,
+                },
+            },
+        ],
+        ..flex_config()
+    };
+    let mut found = 0;
+    for seed in 30_000..30_040 {
+        if let Err(e) = run_seed(seed, cfg.clone()) {
+            eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
+            found += 1;
+        }
+    }
+    eprintln!("enrolled-during-epoch: {found}/40 seeds failed");
+    assert!(found > 0, "the known gap did not show");
+}
+
+/// Plan 30 §M10 × M9: backups in budget during the outage.
+fn flex_backup_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::flex_backup_core_config),
+        read_ratio: 0.3,
+        ..flex_config()
+    }
+}
+
+/// The outage with M9's backups in budget: the epoch carries the holder's
+/// `Backup` lease only when its backup is the other member, and then
+/// acknowledges locally (an epoch hold is never gated on the backups —
+/// found by `node-leave` after M9's round 2).
+#[test]
+fn flex_epochs_with_backups() {
+    let t = run_flex("flex-backup", flex_backup_config(), 1200..1240);
+    assert!(t.epochs > 0, "{t:?}");
+}
+
+/// `f = 0` is today's rule: two of three never form an epoch.
+#[test]
+fn flex_zero_forms_no_partial_epoch() {
+    let t = run_flex("flex-zero", flex_zero_config(), 1000..1020);
+    assert_eq!(t.epochs, 0, "{t:?}");
+}
+
+/// Plan 30 §M10: many more seeds of the epoch configurations.
+#[test]
+#[ignore]
+fn long_flex() {
+    let n: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+    run_flex("flex", flex_config(), 20_000..20_000 + n);
+    run_flex("flex-crash", flex_crash_config(), 30_000..30_000 + n);
 }

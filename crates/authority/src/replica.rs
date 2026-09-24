@@ -250,6 +250,18 @@ pub trait Replica {
     /// The persisted deposition flag (`local["lease_lost"]`).
     fn lost_persisted(&self) -> bool;
     fn persist_lost(&self, lost: bool) -> Result<(), MetaError>;
+
+    // ---- plan 30 §M10: heartbeat promises ----
+
+    /// The last promise this node issued (`Meta::promise_issued`).
+    fn promise_issued(&self) -> i64;
+    /// Persist a promise before its PUT (`Meta::promise_issue`): `false`
+    /// while a continuation-epoch join holds the gate (nothing written).
+    fn issue_promise(&self, until_unix_ms: i64) -> Result<bool, MetaError>;
+    /// The continuation-epoch hold this node owns (`local["epoch_hold"]`),
+    /// so a restarted hold owner re-adopts it and can flush its journal.
+    fn epoch_hold_persisted(&self) -> Option<Epoch>;
+    fn persist_epoch_hold(&self, hold: Option<Epoch>) -> Result<(), MetaError>;
 }
 
 impl Replica for Meta {
@@ -614,5 +626,25 @@ impl Replica for Meta {
 
     fn persist_lost(&self, lost: bool) -> Result<(), MetaError> {
         Meta::kv_set(self, "lease_lost", if lost { "1" } else { "0" })
+    }
+
+    fn promise_issued(&self) -> i64 {
+        Meta::promise_issued(self).unwrap_or(0)
+    }
+
+    fn issue_promise(&self, until_unix_ms: i64) -> Result<bool, MetaError> {
+        Meta::promise_issue(self, until_unix_ms)
+    }
+
+    fn epoch_hold_persisted(&self) -> Option<Epoch> {
+        Meta::kv_get(self, "epoch_hold")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .filter(|e| *e > 0)
+    }
+
+    fn persist_epoch_hold(&self, hold: Option<Epoch>) -> Result<(), MetaError> {
+        Meta::kv_set(self, "epoch_hold", &hold.unwrap_or(0).to_string())
     }
 }

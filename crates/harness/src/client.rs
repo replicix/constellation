@@ -179,6 +179,29 @@ impl Client {
         Ok(())
     }
 
+    /// Plan 30 §M10: `fs set epoch-slack` on this client's backend.
+    pub fn fs_set_epoch_slack(&self, slack: u32) -> Result<()> {
+        let slack = slack.to_string();
+        let out = self
+            .cmd(&[
+                "fs",
+                "set",
+                "epoch-slack",
+                "harness",
+                &slack,
+                "--s3",
+                &self.backend,
+            ])
+            .output()?;
+        if !out.status.success() {
+            bail!(
+                "fs set epoch-slack failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
+    }
+
     /// Change the E2E passphrase via `fs passwd`, without touching any
     /// mounted node. The target positional is a throwaway — `--s3` selects
     /// the backend directly (as everywhere else in the harness).

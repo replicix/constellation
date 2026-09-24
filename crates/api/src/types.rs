@@ -722,6 +722,35 @@ pub struct EpochStatus {
     pub epoch_id: Option<String>,
     #[serde(default)]
     pub members: Vec<u64>,
+    /// Plan 30 §M10: `f` (the filesystem's `epoch_slack`).
+    #[serde(default)]
+    pub epoch_slack: u32,
+    /// Plan 30 §M10: the node whose lease the current (or last) epoch
+    /// carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<u64>,
+    /// Plan 30 §M10: this node's last issued heartbeat promise (unix ms;
+    /// 0: none).
+    #[serde(default)]
+    pub promise_until_ms: i64,
+    /// Plan 30 §M10 counters (the core's): promises persisted and PUT;
+    /// promise requests answered and refused; TTL-takeover promise checks
+    /// run, takeovers refused for too few promises, flush re-claims
+    /// exempt; activations that found this node's claim stale.
+    #[serde(default)]
+    pub promise_puts: u64,
+    #[serde(default)]
+    pub promise_requests_answered: u64,
+    #[serde(default)]
+    pub promise_requests_refused: u64,
+    #[serde(default)]
+    pub promise_checks: u64,
+    #[serde(default)]
+    pub takeovers_refused_promises: u64,
+    #[serde(default)]
+    pub promise_flush_exempt: u64,
+    #[serde(default)]
+    pub stale_claims: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

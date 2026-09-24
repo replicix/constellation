@@ -326,6 +326,18 @@ impl Core {
     /// The durable journal seq under the current policy: `u64::MAX` when
     /// nothing gates acknowledgements.
     pub(crate) fn durable_jseq(&self) -> u64 {
+        if self.lease.epoch_held() {
+            // Plan 30 §M10 (found by `node-leave` on M9's round 2): a
+            // continuation epoch's hold acknowledges locally — nothing
+            // ships and nothing is backed during an epoch, and the claim
+            // rule carried the lease in only with every backup a member
+            // (which takes nothing over while the epoch is open). Gating
+            // here on the held lease's backups, a candidate or the
+            // shipped watermark parked every acknowledgement for the
+            // epoch's lifetime: the FUSE caller timed out, retried, and
+            // met its own first attempt (`EEXIST`).
+            return u64::MAX;
+        }
         match self.lease.ack_policy() {
             AckPolicy::S3 => self.ack.shipped_through,
             AckPolicy::Local | AckPolicy::Backup => {
@@ -364,7 +376,9 @@ impl Core {
     /// The journal seq an acknowledgement evaluated at `position` must
     /// wait for, or `None` when it may be given now.
     pub(crate) fn ack_need(&self, position: &constellation_meta::Position) -> Option<u64> {
-        if self.lease.ack_policy() == AckPolicy::Local && self.ack.candidate.is_none() {
+        if self.lease.epoch_held()
+            || (self.lease.ack_policy() == AckPolicy::Local && self.ack.candidate.is_none())
+        {
             return None;
         }
         let jseq = position.pending.map(|p| p.jseq)?;
@@ -1402,6 +1416,11 @@ impl Core {
     /// durability promise even with nobody outside. And not while a
     /// reconfiguration CAS's outcome is unknown (it could list a backup
     /// this node believes removed).
+    /// A backup-set reconfiguration CAS is in flight or wanted.
+    pub(crate) fn reconfig_busy(&self) -> bool {
+        self.ack.reconfig.is_some() || self.ack.reconfig_wanted.is_some()
+    }
+
     pub(crate) fn epoch_may_carry(&mut self, members: &[NodeId]) -> bool {
         let Some((lease, _)) = self.lease.held.clone() else {
             return false;
@@ -1409,15 +1428,7 @@ impl Core {
         if self.lease.lost {
             return false;
         }
-        let ok = match lease.ack_policy {
-            AckPolicy::Local => true,
-            AckPolicy::Backup => {
-                lease.backups.iter().all(|b| members.contains(b))
-                    && self.ack.reconfig.is_none()
-                    && self.ack.reconfig_wanted.is_none()
-            }
-            AckPolicy::S3 => false,
-        };
+        let ok = super::promise::lease_may_carry(&lease, members, self.reconfig_busy());
         if !ok {
             self.stats.epoch_carry_refused += 1;
             tracing::warn!(

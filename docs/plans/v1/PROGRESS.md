@@ -14701,3 +14701,1134 @@ holder.
   (round 1's change, documented now).
 - `docs/how-to-guides/development/TESTING.md`: the two log-prefix
   scenarios, seed 50068.
+
+## Plan 30 M10 — phase 1 (coder, 2026-09-24): the `FlexEpochs` model, the design, pure helpers
+
+Phase 1 depends on nothing unmerged. It adds the Stateright model, the
+store-level helpers (the heartbeat object, `meta.json`'s
+`epoch_slack`, validation), and this design for phase 2. It changes no
+file in `crates/authority/**`,
+`crates/cli/src/{authority_driver,node_runtime,main,lease}.rs` or
+`crates/meta/src/store/**`. M9 is read from `/home/bra/cvs/constellation-m9`
+and is not merged.
+
+| Item | State | Where |
+|---|---|---|
+| `FlexEpochs` model: heartbeat promises (persisted, then an in-flight PUT), joining after one's own promise expires, silent members, formation with `N − f`, the claim rule, the TTL takeover's heartbeat read and CAS as separate steps, epoch close by flush, crashes and restarts, drift (`M > 2D`), and M9's seal and `ack=s3` fast takeovers. Properties: `single_authority`, `linearizable`, `converged_at_quiescence`, plus witnesses | done | `crates/model/src/flex.rs` (new), `crates/model/src/lib.rs` |
+| Counterexamples for the naive variants: the plan's three, four more rules the model shows are needed, and three M9 interactions. The full rule is clean with honest clocks, under drift, with four nodes, and with `f = 0` | done: 18 CI tests (39–48 s serial depending on host load, 669 MB peak RSS) and 2 `#[ignore]` tests | `crates/model/tests/flex_epochs.rs` (new) |
+| `heartbeat/<node:016x>.json` layout, `Promise` encode/decode, `PromiseConfig` (refresh/TTL, env, validation TTL ≤ lease TTL / 4), `may_join_epoch`, `epoch_quorum`, `check_epoch_slack`, `effective_slack`, `takeover_check`, `HeartbeatStore` (PUT, LIST+GET) | done, 9 unit tests | `crates/store-s3/src/heartbeat.rs` (new), `layout.rs`, `lib.rs` |
+| `FsMeta.epoch_slack` (absent = 0) and `ChunkStore::set_epoch_slack` (a CAS update of `meta.json`) | done, 1 unit test | `crates/store-s3/src/store.rs` |
+| `component_quorum` (the live component's roster members, if at least `N − f`) | done, 1 unit test | `crates/net/src/epoch.rs`, `lib.rs` |
+| CLI, core, driver, persistence, harness | phase 2 (checklist below) | — |
+
+Rebase note: `FsMeta` gains `epoch_slack` right after
+`max_logical_bytes`. M9 adds `ack_policy` at the same spot, so expect a
+trivial conflict in `crates/store-s3/src/store.rs`. Nothing else overlaps
+with the M6–M9 diffs.
+
+### The model (`constellation_model::flex::FlexEpochs`)
+
+This is a focused model, like M8's `cto` and M9's `backup`. The authority
+model has no continuation epochs (its simplification 14) and no clocks,
+and its state space is already large. The state has:
+- the lease register: holder, epoch, expiry in the holder's clock, a CAS
+  version and the M9 policy (`Local`, `Backup(b)` or `S3`);
+- the log, with epoch markers;
+- per-node clocks `t + off[i]`, with `|off| ≤ D` chosen at start;
+- one `heartbeat/<node>` value per node;
+- per node: the persisted promise, a PUT in flight, epoch membership, a
+  heartbeat snapshot, the M9 seal, `known` (the highest lease epoch it
+  knows exists) and the epoch holder's journal;
+- the epoch records;
+- a two-op `create_excl` workload.
+
+Partitions are not a separate mechanism. Every S3 or P2P step is an
+action that may never fire, so "A and B lose S3", "C is offline" and "C
+has S3 but no P2P to them" are all schedules. The module doc maps each
+action to its phase-2 code path and lists the simplifications (one
+lease, no in-epoch handoff, only epochs that claim something are formed,
+one PUT in flight per node).
+
+`single_authority` means at most one live node could acknowledge a write
+now:
+- an epoch holder always could;
+- an S3 holder could while its lease is usable in its own clock
+  (`local < expires − M`), and in addition:
+  - under `Backup(b)`, while `b` is alive and has not sealed its epoch
+    (M9's write-all acknowledgement);
+  - under `S3`, while no newer marker is in the log (the slot fence).
+
+`linearizable` replays the atomic op history through `NamespaceSpec`.
+`converged_at_quiescence` says that once no epoch is open, every
+acknowledged op is in the log.
+
+Results. Release build, one checker thread, run serially:
+
+| Test | Result | States (unique) | Depth | Time |
+|---|---|---|---|---|
+| `naive_no_takeover_check_splits_brain` (f = 1, no promise check) | `single_authority` found | 10,240 (4,773) | 7 | 5 ms |
+| `naive_join_before_own_promise_expired_splits_brain` | found | 102,738 (38,756) | 9 | 44 ms |
+| `naive_fewer_than_n_minus_f_splits_brain` (epoch of 1 of 3) | found | 73,204 (26,989) | 9 | 29 ms |
+| `naive_persist_after_publish_splits_brain` | found | 93,482 (38,333) | 9 | 41 ms |
+| `naive_heartbeat_read_before_expiry_splits_brain` | found | 30,464 (11,776) | 8 | 12 ms |
+| `naive_member_keeps_promising_splits_brain` | found | 109,323 (40,244) | 9 | 45 ms |
+| `margin_below_twice_the_drift_splits_brain` (D = 1, M = 1) | found | 8,915 (4,705) | 4 | 5 ms |
+| `m9_seal_takeover_against_an_unguarded_epoch_splits_brain` | found | 10,283 (4,531) | 7 | 4 ms |
+| `m9_ack_s3_fast_takeover_against_an_unguarded_epoch_splits_brain` | found | 10,887 (4,831) | 6 | 5 ms |
+| `m9_stale_claim_without_epoch_resolution_breaks` | `linearizable` found | 20,040 (8,392) | 7 | 9 ms |
+| `expiry_based_check_still_needs_the_join_rule` | found | 113,263 (41,848) | 9 | 52 ms |
+| **`full_rule_is_clean`** (N = 3, f = 1, a crash with restart, PUTs in flight) | clean, all 4 witnesses | 4,972,474 (1,029,072) | 25 | 2.5 s |
+| **`full_rule_is_clean_under_drift`** (D = 1, M = 3, every offset, PUTs land at once) | clean | 19,240,016 (4,683,686) | 22 | 11.5 s |
+| `m9_seal_takeover_with_the_claim_rule_is_clean` (`Backup(C)`, seal takeovers) | clean, seal witnessed | 8,819,821 (1,785,686) | 25 | 4.4 s |
+| `m9_ack_s3_with_the_claim_rule_is_clean` (`S3`, fast takeovers) | clean | 12,383,939 (2,482,690) | 25 | 6.3 s |
+| `expiry_based_check_is_clean` / `_under_drift` (the simpler check below) | clean | 4,986,870 (1,031,544) / 20,317,043 (4,927,568) | 25 / 22 | 2.3 s / 11.4 s |
+| `slack_zero_is_todays_rule_and_clean` (f = 0) | clean | 14,363 (4,956) | 16 | 9 ms |
+| `#[ignore]` `full_rule_is_clean_under_drift_with_inflight_puts` (±D offsets, PUTs in flight, crash) | clean | 215,538,507 (43,132,858) | 29 | 135 s, 6.4 GB RSS |
+| `#[ignore]` `full_rule_four_nodes` (N = 4, f = 1) | clean | 114,472,868 (19,099,508) | 29 | 62 s, 3.5 GB RSS |
+
+The whole CI suite runs in 39–48 s serially, depending on host load,
+with a peak RSS of 669 MB (the drift tests). Every test is well inside the 60 s / 2 GB budget. The state space
+is kept small by normalizing it:
+- values every clock has passed collapse to `PAST`, and values beyond
+  the horizon collapse to `FAR`;
+- register versions are ranked;
+- a node that holds nothing is at the log head;
+- clock offsets are considered only up to a common shift.
+
+The counterexamples use honest clocks unless noted. Node 0 (A) holds a
+lease expiring at 3, and the promise TTL is 2 (lease TTL 8, so
+TTL/4 holds).
+
+- **No takeover check.** `{A,B}` form at t=2 while A's lease is usable.
+  At t=3 C takes the expired lease. There are now two authorities.
+- **Joining before one's own promise expired.** A publishes a promise
+  until 4 at t=2 and joins `{A,C}` at once. B, after the expiry, counts
+  A's promise and takes over. The unexpired promise was the epoch
+  holder's own.
+- **Fewer than N − f.** `{A}` forms alone. B counts C's live promise and
+  takes over.
+- **Persisting after the PUT.** A issues a promise PUT (until 4) and
+  joins at t=2 while the PUT is in flight: its persisted promise, 2, has
+  expired. The PUT lands after the join, and B counts it.
+  "Persist before publish" means the join must wait for the last
+  *issued* promise, not the last acknowledged one.
+- **Reading the heartbeats early.** C reads at t=1 while the lease is
+  valid and sees A's and B's promises unexpired. `{A,B}` form at t=2. C
+  CASes after the expiry using the stale read.
+- **A member that keeps promising.** `{A,C}` form, then A publishes a
+  promise, and B counts it.
+- **Margin below 2D.** Offsets are A −1, C +1, with M = 1. C's clock
+  passes the expiry while A's still reads before `expires − M`. This is
+  the lease's own margin rule: the promise check needs no margin of its
+  own (see the takeover-check section below).
+
+The full rule is clean in every configuration above, and every
+`sometimes` witness is reached, so no run is vacuous:
+- an epoch formed with a roster node missing that holds the lease;
+- a TTL takeover that passed the promise check;
+- an epoch that flushed its journal;
+- all ops done;
+- the fast takeovers.
+
+### Plan 30 §M9's seal-based fast takeover against epochs
+
+A promise check cannot gate a fast takeover. A seal takeover, or any
+`ack=s3` takeover, happens *before* the lease expires. An epoch can
+still form after the taker's heartbeat read, with the holder's lease
+usable, from members whose promises expire after that read. So the
+epoch and the fast taker would both claim authority, and no promise
+arithmetic prevents it. Fast takeovers must instead be kept away from
+epochs on the formation side. The model shows both halves.
+
+1. **M9 as built breaks under M10.** `LeaseState::ack_policy()` returns
+   `Local` under `epoch_hold` ("nothing ships, nothing is backed"). Two
+   cases follow:
+   - Under `Backup(C)` with C the missing node, `{A,B}` carry A's lease.
+     C's watch timer fires (A cannot reach it), and C seals and takes
+     over through its permit, with no TTL and no promise check. Both A
+     and C acknowledge (`m9_seal_takeover_against_an_unguarded_epoch_splits_brain`).
+   - Under `S3`, any non-member takes the lease over once the holder has
+     not renewed for `backup_takeover_ms`, and an epoch holder never
+     renews (`m9_ack_s3_…`).
+
+   With f = 0 no outside taker exists, since every roster node is a
+   member and members do no S3 acquisition. But an epoch that carries an
+   `S3`-policy lease still acknowledges `Local`, which breaks `ack=s3`'s
+   durability promise even today. M9's review should know this.
+2. **The claim rule (clean).** Activation carries a lease into the epoch
+   only if its policy is `Local`, or `Backup` with every listed backup a
+   member. An `S3`-policy lease is never carried: an `ack=s3` filesystem
+   gets no continuation-epoch writes, which is what `ack=s3` promises
+   anyway. A member backup does no S3 acquisition while its epoch is
+   open (today's `epoch.open && !epoch.active` refusal, and the
+   `epoch.active` P2P-only branch), so it cannot seal-take the lease
+   out from under the epoch. A non-member cannot seal, because it is
+   not listed.
+3. **Claim resolution (found by the model).** Two members can both
+   believe they hold the lease: A, whose backup C sealed and took over
+   (A has not heard), and C. An epoch that takes the first claim it sees
+   carries A's stale lease, and A executes on a replica that lacks C's
+   writes (`m9_stale_claim_without_epoch_resolution_breaks`: two `Ok`
+   creates). C does not even need to be the one claiming. After C
+   crashes and restarts without S3, it has no lease belief at all, yet
+   its persisted state (the takeover marker it applied, its seal) still
+   proves A's claim stale. The rule is:
+   - the epoch takes the claim at the highest lease epoch among the
+     members;
+   - that claim is valid only if no member *knows* of a later epoch:
+     one it took, a marker it tailed (`ship.max_epoch`), or the
+     successor of an epoch it sealed (`bk.sealed`).
+
+   The proposal and each ack must carry that information; today's
+   `EpochPropose` carries only `base` (partition → seq).
+
+Not modeled, for phase 2:
+- a holder must not claim while a reconfiguration CAS's outcome is
+  unknown (it could list a backup it believes removed);
+- a member backup should not run M9's watch or seal while its epoch is
+  open. The seal would be persisted, and the flush re-claim keeps the
+  same epoch (`granted_lease`: the same holder re-adopting keeps the
+  epoch), so the backup would answer `sealed` to that holder until the
+  epoch changes. That is liveness, not safety.
+- A backup's persisted seal of an epoch whose takeover CAS it knows
+  failed should not veto. When in doubt, the veto only costs
+  availability.
+
+Read delegations need nothing new: M9's `readindex.rs` grants none
+under `epoch_held`, and the claim rule leaves no fast taker outside the
+epoch.
+
+### Where continuation epochs live today (after M5)
+
+- **Pure state machine**, `crates/net/src/epoch.rs`: `Machine` has the
+  states Promised, Active, Frozen and Closed. It persists a promise
+  before activating, refuses a second distinct open epoch, freezes when
+  a member is lost, and implements `blocks_s3_takeover` and
+  `component_covers_roster`.
+- **Driver-side coordinator**, `crates/cli/src/epoch.rs`
+  (`EpochManager`):
+  - persistence through `Meta::persist_epoch`, `load_open_epoch` and
+    `set_epoch_state` in `crates/meta/src/store/misc.rs`;
+  - `maybe_propose`: the S3-failure grace, current pings, and today's
+    all-roster coverage. It sends `Payload::EpochPropose`, requires
+    every ack, then sends `EpochActivate`;
+  - `handle_propose` / `handle_activate`, `check_liveness` (the freeze)
+    and `close()`.
+- **Driver wiring**, `crates/cli/src/authority_driver.rs`:
+  - `report_epoch` → `Control::Epoch(EpochState)`;
+  - `Action::RoundDone` runs `check_liveness` while an epoch is open,
+    and `maybe_propose` with `base = {p0: applied_seq}` when the round
+    failed;
+  - `Action::EpochClose` → `epochs.close()`;
+  - `Action::EpochFlushed` → `finish_flushing()`;
+  - the roster refresh (`write_eligible_roster`, fail-closed) →
+    `Event::Roster`;
+  - `node_runtime.rs` builds the manager and sets the propose grace to
+    one sync interval.
+- **Decisions, in the core** (`crates/authority/src/core`):
+  - `mod.rs`: `EpochState {open, active, frozen, flushing, base}`.
+    `on_epoch_state` turns a usable S3 lease into
+    `LeaseState::adopt_epoch_hold` (and re-affirms it), and closing
+    calls `release_local`.
+  - `lease.rs`: `epoch_hold`; `usable()` is always true under a hold.
+  - `jobs.rs`:
+    - a round with the epoch open runs only `TailThen::EpochProbe`
+      (frozen: nothing);
+    - the probe (S3 back) lets the hold's owner go first: `EpochClose`
+      and `release_local`, then the journal ships under an ordinary S3
+      acquisition;
+    - a non-holder closes after the head passes `epoch.base`;
+    - `round_release` releases the flush lease and emits
+      `EpochFlushed`;
+    - `acquire`: `epoch.active` means a P2P-only handoff, and
+      `epoch.open && !active` means no S3 acquisition at all.
+  - `holder.rs:231` is the in-epoch handoff. Under M9, `ack_policy()` is
+    `Local` under a hold, and `readindex` grants nothing under a hold.
+
+So the M10 decisions split as follows:
+- the quorum and the own-promise check at propose and ack time go in the
+  driver's `EpochManager`, through the pure helpers;
+- the claim rule and claim resolution go in the core, at
+  `on_epoch_state`, from facts the ack carries;
+- the takeover check goes in the core's acquisition path;
+- the promise timer and PUT go in the driver.
+
+### The `heartbeat/<node>` object, refresh, and S3 cost
+
+- The key is `heartbeat/<node:016x>.json` (`layout::heartbeat`). The body
+  is JSON: `{v: 1, node, no_epoch_until_unix_ms, epoch_slack,
+  written_unix_ms}` (`heartbeat::Promise`). It is plaintext on E2E
+  filesystems, like leases.
+- **Refresh.** Every `CONSTELLATION_PROMISE_REFRESH_S` (default 5), while
+  `f > 0` and the node is in no open epoch (Promised, Active, Frozen, or
+  Closed but not yet past the base, all count as open). The node:
+  1. computes `u = now + ttl`;
+  2. persists `u` as its last *issued* promise;
+  3. issues a plain PUT.
+
+  `CONSTELLATION_PROMISE_TTL_S` defaults to three refreshes, 15 s. That
+  equals the default lease TTL (60 s) / 4, the most the validation
+  allows (`PromiseConfig::validate`: TTL ≤ lease TTL / 4, and TTL ≥ two
+  refreshes). A node joins only when `now ≥ last issued`
+  (`may_join_epoch`).
+- **Withdrawal.** A node whose `f` drops to 0 writes one last
+  `{no_epoch_until: 0, epoch_slack: 0}`. With f = 0 no heartbeat is
+  ever written: today's behaviour and cost.
+- **Cost with f = 1:**
+  - 86,400 / 5 = **17,280 PUTs per node per day** (the
+    `puts_per_day()` unit test). At $0.005 per 1,000 PUTs that is about
+    $0.086 per node per day, about $2.6 per node per month;
+  - a TTL takeover by a non-holder adds 1 LIST of `heartbeat/` plus one
+    GET per object, which is rare;
+  - nothing else changes.
+- **Optional cheaper variant** (a decision for the coordinator). Safety
+  never depends on the refresh cadence: the model's `Issue` is fully
+  nondeterministic. So a node could publish a promise only when it sees
+  a lease expire unrenewed (it already polls the lease), instead of
+  every 5 s. Steady-state cost drops to 0 PUTs, plus 1 per node per
+  observed expiry. A takeover then waits one PUT round trip for the
+  survivors' promises. This needs the expiry-based check below, since
+  the survivors' promises are younger than the expiry by construction.
+
+### The takeover check: rule and placement
+
+**Rule.** A TTL takeover by a node that is not the lease's holder, when
+`f > 0`, needs at least `f` *other* write-eligible nodes whose heartbeat
+promise **outlasts the lease's recorded `expires_unix_ms`**
+(`heartbeat::takeover_check`). This is a strictly simpler form of the
+plan's rule ("unexpired promises read after the expiry plus a margin").
+If `read ≥ expires` and `u > read`, then `u > expires`, so the plan's
+rule implies it. It is equally safe, and the model shows it clean with
+the heartbeats read at any time, even before the expiry
+(`expiry_based_check_is_clean[_under_drift]`).
+
+The proof uses only two clocks at the same instant. The epoch formed at
+`j` with a member `h` holding the lease usably, `h(j) < expires − M`. A
+counted member `x` joined only once `x(j) ≥ u` (its last issued promise)
+and published nothing newer. So `u > expires` gives `x(j) − h(j) > M ≥
+2D`, which drift forbids. No taker clock appears in the argument, so
+"read after the expiry" and a promise-side margin are both unnecessary.
+The lease's own `M > 2D` is the only margin. The naive early-read
+counterexample breaks the plan's form only because it compares against
+the reader's clock at the read.
+
+Exemptions:
+- the lease names the taker (`TakeoverCheck::OwnLease`): a restart, a
+  lapsed renewal, or an epoch holder's flush re-claim. No epoch without
+  the taker can hold it, and the model's `Close` relies on this;
+- `f = 0`;
+- M9's permit paths (seal, `ack=s3`), which are kept apart by the claim
+  rule instead.
+
+A released lease is not "held validly", so no epoch can carry it and it
+needs no check.
+
+**Placement.** The check goes in `crates/authority/src/core/jobs.rs`,
+`acquire_classified`, on the `Plan::Claim { takeover: true, .. }` branch,
+*before* `TailThen::Takeover`. It is not used when the claim came from
+M9's `takeover_permit` (`LeaseState::permit_allows`) or when
+`prev.holder == node_id`. The core issues a new
+`S3Op::HeartbeatRead` (`HeartbeatStore::read_all`) and parks in a new
+`Phase::PromiseCheck { plan }`. On `S3Result::Heartbeats(v)` it runs
+`takeover_check(effective_slack(cfg.epoch_slack, roster, &v), node_id,
+roster, prev.holder, prev.expires_unix_ms, &v)`:
+- allowed: continue exactly as today (tail, then `acquire_cas` naming
+  `prev`'s tag);
+- refused: `finish_acquire(false)` with a new
+  `stats.takeovers_refused_promises` counter, and retry after one promise
+  refresh period.
+
+`roster` is the core's `Event::Roster` list. In M9 terms this sits next
+to `permit_allows`: `classify` decides *whether* the lease is claimable,
+and the new phase decides whether an expired, *unpermitted* claim may
+proceed.
+
+### `fs create --epoch-slack` / `fs set epoch-slack`, and `meta.json`
+
+- `meta.json` gains `epoch_slack: Option<u32>`. It is absent, and
+  serialized as absent, for 0, so f = 0 filesystems are byte-identical
+  (`FsMeta::epoch_slack()`). `ChunkStore::set_epoch_slack(f)` is a CAS
+  update of `meta.json`: a lost race re-reads and retries (5 attempts).
+  The field lives in `FsMeta` rather than as a raw JSON key, because
+  `change_passphrase` re-serializes `FsMeta`, which would drop unknown
+  keys.
+- `fs create … --epoch-slack N` sets it at creation. The roster is still
+  empty then, so the only checks are `N` within reason and the promise
+  config against the lease TTL.
+- `constellation fs set epoch-slack <TARGET> <N> [--s3 URL]` (new
+  `FsCommand::Set`):
+  - reads the roster (`write_eligible_roster`, fail-closed);
+  - refuses `SlackFit::Invalid` (f ≥ N);
+  - warns on `SlackFit::NoTtlFailover` (f > N − 2: a single crashed
+    holder then blocks TTL failover until it returns, because the taker
+    needs f *other* live promisers besides the dead holder);
+  - writes by CAS and prints the old and new values.
+- Nodes read `f` from `meta.json` at mount and on each roster refresh.
+- **Changing `f` safely.** Each heartbeat carries the writer's
+  `epoch_slack`, and a taker honours `effective_slack` = the largest
+  among its own and every roster node's heartbeat:
+  - *Lowering* (1 → 0): a node still on 1 keeps advertising 1 until it
+    has adopted 0 and written its withdrawal. Until then, any epoch it
+    might form (with only `N − 1` members) stays protected.
+  - *Raising* (0 → 1): a node that has adopted 1 advertises it before
+    it may form any epoch under it. Rule: a node forms under `f` only
+    after a heartbeat carrying `f` has landed. Takers on 0 therefore see
+    1 in the heartbeats they read.
+
+  Consequently every non-own TTL takeover reads `heartbeat/`, even at
+  f = 0: one LIST per takeover, and the LIST of an empty prefix costs
+  nothing more. Not modeled; argued here.
+
+### Harness scenarios (phase 2, `crates/harness/src/scenarios/m10.rs`)
+
+- **`epoch-missing-node`**: three nodes, f = 1.
+  1. C is killed (or unmounted) after its promise lapses.
+  2. A and B's S3 proxy is cut, and they form an epoch of 2/3 and keep
+     writing (journaled).
+  3. C remounts through its own healthy S3 proxy, with P2P to A and B
+     denied (M9's `CONSTELLATION_FAULT_P2P_DENY_FILE`).
+  4. After A's lease expires, C tries to write. Its takeover must be
+     refused: `takeovers_refused_promises > 0`, the lease object still
+     names A, and no epoch marker from C appears in the log. Its writes
+     block or fail cleanly.
+  5. Heal A and B's S3. A flushes, B closes and resumes promises. C then
+     writes through the holder, and all trees converge with zero
+     conflict copies.
+
+  This needs one S3 proxy per client (the harness `s3_proxy()` today is
+  shared by a scenario's clients) and M9's P2P-deny fault.
+- **`epoch-slack-zero-unchanged`**: f unset.
+  - no `heartbeat/` object is ever written (count it via
+    `CountingProxy`);
+  - the per-op S3 request counts equal `continuation-epoch`'s baseline;
+  - `continuation-epoch`, `epoch-member-lost` and `node-leave` pass
+    unchanged.
+- Also: `continuation-epoch` and `epoch-member-lost` rerun with f = 1
+  and all nodes present. Behaviour is the same, plus heartbeat PUTs.
+
+### Phase-2 checklist
+
+1. **Persistence** (`crates/meta/src/store/misc.rs`, after the rebases):
+   - `Meta::persist_promise_issued(u)` and `last_promise_issued()`;
+   - the epoch row gains the carried claim `(holder, lease_epoch,
+     config_version, ack_policy)`.
+2. **Promise task** (driver; a `Timer::PromiseRefresh` in the core is an
+   alternative): while `f > 0` and the epoch machine is not open,
+   persist `u = now + ttl`, then `HeartbeatStore::put`. Validate
+   `PromiseConfig::from_env()` against `lease_ttl_ms()` at mount and
+   refuse to mount if it is invalid. Status gets `promise_until` and
+   `puts`.
+3. **Formation**:
+   - `EpochManager::maybe_propose` uses `component_quorum(self, live,
+     roster, f)` instead of `component_covers_roster`, with members = the
+     returned set;
+   - a proposer and every acker check `may_join_epoch(last_issued, now)`
+     and ack `accepted = false` otherwise;
+   - acks carry `(lease holder, lease epoch, ack_policy, backups, known =
+     max(ship.max_epoch, bk.sealed + 1, own tenure))`;
+   - the machine's promise persists the members and the claim;
+   - stop the promise task *before* persisting the epoch promise.
+     Stopping afterwards is fine for safety (an issued-but-unlanded PUT
+     is covered by the persisted `u`), but stopping first avoids useless
+     PUTs;
+   - `Payload::EpochPropose`/`EpochAck` get the new fields (`crates/net`).
+4. **Claim rule and resolution** (core, `on_epoch_state`):
+   - adopt the hold only if this node's claim is the highest-epoch claim
+     in the activation, no member's `known` exceeds it, and the policy is
+     `Local`, or `Backup` with `backups ⊆ members`;
+   - otherwise mark the node deposed for that lease (strand and replay
+     by rid, M3b);
+   - never adopt while a reconfiguration CAS is in flight;
+   - M9: suppress the backup watch and seal while `epoch.open`.
+5. **Takeover check** (core, `jobs.rs`): `Phase::PromiseCheck`,
+   `S3Op::HeartbeatRead` / `S3Result::Heartbeats`, `effective_slack`,
+   `takeover_check`, and the counter. The flush re-claim after
+   `EpochClose` must be recognized as own-lease or epoch-held. If the
+   hold was handed off inside the epoch, the register names another
+   member, so the exemption must be "the register names a member of the
+   epoch whose hold I carry, at the formation-time version". Carry that
+   version through the handoff.
+6. **Close and resume**: a member resumes promises only once its
+   machine is Closed and past `base` (today's non-holder close
+   condition). A frozen member stays silent.
+7. **CLI** (`main.rs`): `fs create --epoch-slack N`; `fs set epoch-slack`
+   with `check_epoch_slack` against the fail-closed roster;
+   `ChunkStore::set_epoch_slack`; `status.epoch` shows f, the quorum and
+   the promise.
+8. **Sim** (`crates/authority/tests/sim`): an `epoch_slack` config, a
+   `CutS3` of a subset, and a `SilentMember`, with the single-authority
+   checker. Seeds must not find two acknowledgers.
+9. **Harness**: `epoch-missing-node`, `epoch-slack-zero-unchanged`, and
+   per-client S3 proxies.
+10. **Measure**: heartbeat PUTs per node per day with f = 1 (expect
+    17,280 at the defaults), and takeover latency with the check (one
+    LIST plus N GETs).
+
+### Open questions
+
+- **Roster growth during an epoch.** A node enrolled after the members
+  last cached the roster is outside the formation roster `R_E`, and for
+  it the intersection needs `f + 1` promisers from `R_E`. Today's f = 0
+  rule has the same hole: a newly enrolled node is not a member and may
+  take expired leases. Candidate fixes:
+  - a node requires `f + 1` promisers until it has seen every lease it
+    wants renewed once since its enrollment;
+  - members persist and advertise `R_E` (for example in the lease
+    object at the flush) and takers count against it.
+
+  Model a `Join` action before choosing.
+- **An epoch whose holder never returns.** The members stay silent
+  forever, so with f = 1 nobody outside can take over (today: both sides
+  freeze). `constellation leave` of the dead holder does not unfreeze
+  the members' open epoch. An operator "abandon epoch" command is
+  needed, one that accepts losing the dead holder's journal.
+- **Freeze on member loss.** It stays, since the plan does not change
+  it. A silent departed member is harmless to safety, so an epoch that
+  still has its holder and `≥ N − f` members could keep writing. That
+  would be a later availability improvement.
+- The cheaper on-demand promise variant, above: the coordinator's call.
+
+### Commands run (phase 1)
+
+- `cargo test -p constellation-model --release --test flex_epochs --
+  --test-threads=1`: 18 passed, 2 ignored, 38.7 s (47.6 s on a
+  busier host, 669 MB peak RSS). Both ignored tests
+  were run separately with `--ignored` (numbers above).
+- `cargo test -p constellation-store-s3`: 183 passed.
+  `cargo test -p constellation-net --lib epoch`: passed.
+- `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean.
+
+### Plan 30 M10 — coordinator decisions on phase 1's open questions
+
+- **Promise cadence:** on demand. A node publishes (persists, then
+  PUTs) a promise when it sees a lease expire unrenewed, or when a peer
+  asks for one; there is no steady 5 s refresh. Hard constraint 6
+  (minimize S3 requests) outweighs one extra PUT round trip on a rare
+  takeover. Safety does not depend on the cadence (phase 1's argument).
+  Phase 2 implements it and measures steady-state heartbeat PUTs, which
+  should be about 0.
+- **Changing f:** honour the largest `epoch_slack` seen in any heartbeat,
+  as designed.
+- **An epoch whose holder never returns:** resolved through the existing
+  permanent-departure path (`constellation leave --node-id`, plan 05),
+  not a new command. Retiring the lost holder removes it from the
+  write-eligible roster, so the remaining nodes can form or close the
+  epoch. Phase 2 designs the fencing (the retired node must never ack
+  again: registry tombstone plus lease epoch bump) and tests it.
+- **Nodes that enroll during an epoch:** a known gap, documented (same
+  as today with f = 0). Not addressed in M10.
+- **M9 interaction:** fixed in M9 itself during its rebase. An epoch
+  carries a lease only if its policy is `Local`, or `Backup` with every
+  listed backup a member. It never carries an `ack=s3` lease (with
+  `ack=s3`, writes stall while S3 is unreachable). Member backups do not
+  run the seal watch while an epoch is open. Phase 2 builds on M9 with
+  these rules in place and keeps the claim-resolution rule (highest
+  lease epoch; refuse claims below any epoch a member knows exists).
+
+## Plan 30 M10 — phase 2 (coder, 2026-09-24): flexible-quorum continuation epochs, implemented
+
+**State: WRITTEN, CODER-TESTED, uncommitted.** Pipelined on `plan30-m10`:
+main 0f9583d (M5, M6, M7, the P2P restart fix) + WIP base c2463af (M8) +
+WIP base 22d633b (M9). Phase 1 was 3-way applied on top of them, and its
+conflicts in `crates/model/src/lib.rs`, `crates/store-s3/src/store.rs`
+(`FsMeta.epoch_slack` next to M9's `ack_policy`) and this file were
+resolved by keeping both sides. Nothing is committed.
+
+### The coordinator's decisions, as implemented
+
+- **Promise cadence: on demand.** There is no steady refresh. A node
+  persists a promise (`Meta::promise_issue`) and then PUTs it
+  (`heartbeat/<node:016x>.json`) in three cases:
+  - a would-be taker asks over P2P (`PeerMsg::PromiseRequest` →
+    `PromiseReply`);
+  - P2P is unavailable, so nobody can ask, and the node observes the
+    lease expire unrenewed. The idle watch re-reads the lease every
+    `promise_watch_ms` (5 s; GETs only), so an expiry it shows is a real
+    one;
+  - it advertises a changed slack (once per mount at `f > 0`).
+
+  A taker with too few promises in the heartbeats does not just wait: it
+  asks every roster peer and counts the replies too. Both a reply and a
+  heartbeat are a promise its writer persisted first. Measured steady
+  state: **0 heartbeat PUTs per node per day** at `f = 1` (60 s of writes
+  from two nodes, then idle: 0 PUTs and 0 heartbeat requests), plus one
+  advertisement PUT per mount. At `f = 0` nothing ever touches
+  `heartbeat/`.
+- **Changing f: the largest seen is honoured.** Every heartbeat carries
+  its writer's `epoch_slack`. A taker uses `effective_slack` = the largest
+  of its own `f` and every roster heartbeat's. At `f = 0` the check is
+  one heartbeat LIST per TTL takeover, and the taker asks for promises
+  only if the heartbeats show a larger slack. A node forms or joins under
+  `f > 0` only after a heartbeat advertising that `f` has landed
+  (`EpochClaimView::advertised_slack`). `meta.json` is re-read every 60 s
+  (`reread_slack`, one GET a minute) → `Event::Slack`.
+- **An epoch whose holder never returns is resolved by `constellation
+  leave --node-id`.** `admin_leave` now fences every lease that names the
+  retired node (`store_s3::fence_retired`, `Lease::fenced_for_retirement`):
+  - the epoch is bumped, so every renewal, flush re-claim or
+    carried-lease match of the old tenure is stale;
+  - the lease expires at once and is not released, so the next taker
+    ships an epoch marker that fences late segments;
+  - the backups are cleared, so no seal permit names the old tenure;
+  - the node joins the new `Lease::retired` list. `classify` refuses a
+    claim by a node on that list (`Plan::Refused`) whatever it believes,
+    even before it has seen its registry tombstone.
+
+  The retired daemon, once it reads its tombstone, gets `Control::Retire`
+  (it never acquires or promises again, and its tenure is deposed), and
+  it can never mount again (the existing registry check). Members whose
+  epoch's carrier is retired abandon the epoch
+  (`EpochManager::abandon_if_carrier_retired`: close without flush, and
+  promise again). A hold owner does not abandon: it flushes, and its
+  re-claim CAS fails on the fence. Tested end to end by the
+  `epoch-holder-retired` scenario.
+- **Nodes that enroll during an epoch: a known gap, documented** (see
+  "Known gaps"). It is also kept as an `#[ignore]` sim repro.
+- **The claim-resolution rule is kept.** `EpochAck` carries `claim:
+  Option<EpochClaim {epoch, expires_unix_ms, may_carry}>` and `known`.
+  The proposer runs `resolve_epoch_claims` and sends `EpochActivate {
+  carrier, stale_below }`:
+  - the epoch carries the claim at the highest lease epoch, provided no
+    member knows a later epoch and the claim rule allows it;
+  - a member whose claim is below `stale_below` is deposed at activation;
+  - a member adopts the hold only if the carrier is its lease *exactly*
+    (holder, epoch, expiry: `carries_mine`).
+- **The flush re-claim exemption.** A TTL takeover skips the promise
+  check when the lease object is exactly the carrier recorded at
+  activation (`promise_check_needed`). That is the register unchanged
+  since formation, so no other epoch can hold it, and the members stay
+  silent until the flush.
+
+### Files
+
+- **Core, sans-IO** (`crates/authority`):
+  - `core/promise.rs` (new):
+    - promise issuance and the responder;
+    - the P2P-down idle watch;
+    - the takeover check phase (`Phase::PromiseCheck`: heartbeat read
+      plus requests, `effective_slack`, `takeover_check`);
+    - `EpochClaimView`, `lease_may_carry`, `resolve_epoch_claims`;
+    - `carries_mine`, stale claims, `Control::Retire`;
+    - persisting and restoring the epoch hold; `flush_pending`.
+  - `core/jobs.rs`:
+    - the check wired into `acquire_classified`, and `promise_check_resolved`;
+    - retired nodes do not acquire;
+    - a frozen epoch's hold owner still probes and flushes;
+    - only a probed round closes an epoch;
+    - `Renew`/`Cas` adopt exactly the object they wrote.
+  - `core/holder.rs`: an in-epoch handoff is declined while the journal
+    is non-empty.
+  - `core/mod.rs`: config, stats, dispatch, the `on_epoch_state` carrier
+    and stale handling.
+  - `core/lease.rs`: `epoch_hold()`; `classify` refuses retired nodes.
+  - `core/backup.rs`: the claim rule goes through `lease_may_carry`.
+  - `event.rs`, `action.rs`:
+    - `Event::Slack`;
+    - `Control::{Epoch { carrier, stale_below }, Retire}`;
+    - `Carrier`;
+    - `PeerMsg::{PromiseRequest, PromiseReply}`;
+    - `S3Op::{HeartbeatRead, HeartbeatPut}` and `S3Result::{Heartbeats,
+      HeartbeatPut}`;
+    - `TimerKind::{PromiseWait, PromiseWatch}`.
+  - `replica.rs`: `promise_issued`, `issue_promise`,
+    `epoch_hold_persisted`, `persist_epoch_hold`.
+  - `lib.rs`.
+  - Tests:
+    - `core/tests.rs`: `mod m10` (10 tests) and `mod claim_resolution`;
+    - the simulation: `tests/sim/epochs.rs` (new: the epoch coordinator,
+      `FaultKind::EpochOutage`, the single-authority sampler),
+      `tests/sim/{node,run}.rs` and `tests/sim.rs`.
+- **Meta**: `crates/meta/src/store/misc.rs`: `promise_issued`,
+  `promise_issue` and `promise_join_begin`/`end`. The join gate and the
+  issue are one write transaction each, under fjall's single writer, so
+  no promise can be issued between a join's check and its gate.
+- **Net**: `message.rs`, `epoch.rs`, `endpoint.rs`, `peers.rs`, `lib.rs`:
+  - the `EpochPropose`/`EpochAck`/`EpochActivate` fields;
+  - `EpochClaim` and `EpochCarrier`;
+  - `PromiseRequest`/`PromiseReply`;
+  - `component_quorum` and `EpochActivation`;
+  - `PeerService::promise_requested`.
+- **Store**:
+  - `crates/store-s3/src/heartbeat.rs`: `PromiseConfig` is now TTL only
+    (default lease TTL / 4, validated);
+  - `lease.rs`: `Lease::retired`, `fenced_for_retirement`,
+    `fence_retired`;
+  - `store.rs`, `layout.rs`, `lib.rs`.
+- **CLI**:
+  - `epoch.rs`:
+    - the flexible quorum, the join gate and claims, the carrier
+      (persisted in `local["epoch_carrier"]`);
+    - abandonment when the carrier is retired;
+    - parallel pings;
+    - `refresh_roster`, which keeps the last complete roster when S3 is
+      unreachable (see "Bugs found");
+  - `authority_driver.rs`: heartbeat ops, promise messages, the claim
+    view mirror, the carrier in `Control::Epoch`, `Slack`/`Retired`
+    requests, and the frozen hold owner's upload;
+  - `node_runtime.rs`: `epoch_slack` and the promise TTL from `meta.json`
+    and the environment (mount refuses an invalid TTL at `f > 0`), the
+    60 s slack re-read, and `Retired` on the tombstone;
+  - `main.rs`: `fs create --epoch-slack`, `fs set epoch-slack` (roster
+    fit check: `f ≥ N` refused, `f > N − 2` warned, no check before the
+    first mount), the promise service, status counters, and the roster
+    refresh through `epoch::refresh_roster`;
+  - `leave.rs`: fencing in `admin_leave`, plus a test;
+  - `fusefs.rs`: a member's forwarded manifest skips the chunk drain in
+    an active epoch.
+- **API**: `EpochStatus` gains `epoch_slack`, `carrier`,
+  `promise_until_ms` and the M10 counters.
+- **Model**: `crates/model/src/flex.rs` gains `on_demand` (with stale
+  observations, `Action::Observe`); `tests/flex_epochs.rs` gains 3 tests
+  plus 1 `#[ignore]`.
+- **Harness**:
+  - `crates/harness/src/scenarios/m10.rs` (new): `epoch-missing-node`,
+    `epoch-slack-zero-unchanged`, `epoch-holder-retired`;
+  - `scenarios.rs`;
+  - `client.rs`: `fs_set_epoch_slack`.
+
+### Bugs found and fixed along the way (the sim's and harness's first epoch runs)
+
+1. **An epoch closed the instant it activated.** A sync round that
+   started before the epoch opened reached `on_uploads_done` after
+   activation, with S3 still down, and emitted `EpochClose`. Only a round
+   whose epoch probe found S3 may close now (`What::Round::epoch_probed`).
+   Found by `epoch-missing-node`.
+2. **A roster refresh during an outage cleared the roster.** Every epoch
+   then raced the next 5 s refresh, because the outage is exactly when an
+   epoch forms. A transport failure now keeps the last complete roster; a
+   registry that answers but does not parse still clears it
+   (`epoch::refresh_roster`).
+3. **The held lease was not the object in S3.** Both `Renew` and `Cas`
+   recomputed the lease at the *result's* time, so the held expiry ran
+   later than the stored one by the S3 round trip (27 ms observed). Both
+   now adopt exactly the object they wrote. This also broke the flush
+   exemption's exact match. Found by sim flex-crash seed 30002.
+4. **A hold owner answered promises between its close and its flush,**
+   which let a taker in first (flex-crash 30002). It is now silent until
+   its journal is in (`PromiseState::flush_pending`).
+5. **A restarted hold owner lost its hold.** Its epoch-journaled writes
+   then never flushed (flex-crash 1100: no quiescence). The hold is now
+   persisted (`local["epoch_hold"]`) and re-adopted when the epoch is
+   reported open.
+6. **An in-epoch handoff lost or reordered the journal** (pre-M10,
+   flex-crash 1104). The hold moved without the unshipped journal, so the
+   successor executed on a replica missing it, and both journals shipped
+   in either order: a linearizability failure and duplicate records. The
+   handoff is now declined while the journal is non-empty, and requesters
+   forward instead. That broke one thing: other members' *file* writes
+   drained their chunks to S3 before forwarding the manifest, which fails
+   during an outage. So in an active epoch a forwarded manifest no longer
+   drains: the chunks stay enrolled on the writer and upload when S3
+   returns, and a reader meanwhile fetches them from it over P2P. Those
+   writes are as durable as the writer node, as the hold owner's own are.
+   I also tried carrying the journal inside the handoff, but that was
+   unsafe when the handoff reply was lost and was reverted (see "Known
+   gaps").
+7. **An acker's stale roster refused valid epochs** (`node-leave`,
+   3 runs out of 4, after a leave it had not read yet). An acker now
+   re-checks the quorum only when the proposer runs a larger slack than
+   its own.
+
+### Results
+
+**Model** (release, serial; 21 CI tests pass in 49.5 s with a peak of
+652 MB; 3 ignored). The phase-1 results are unchanged. New:
+
+| Test | Result | States (unique) | Time |
+|---|---|---|---|
+| `on_demand_promises_are_clean` (honest clocks, crash, PUTs in flight, expiry-based check, stale observations) | clean, all witnesses | 9,635,255 (1,779,366) | 4.6 s |
+| `on_demand_promises_are_clean_under_drift` (D = 1, M = 3, clocks at ±D, no crash) | clean | 11,220,993 (2,333,883) | 6.1 s |
+| `on_demand_promises_still_need_the_join_rule` (a stale observation lets a promise outlast the current expiry) | `single_authority` found | 724,926 (237,531) | 0.3 s |
+| `#[ignore]` `on_demand_promises_are_clean_under_every_drift` (±D, PUTs in flight) | clean | 177,011,847 (31,414,257) | 98.9 s, 5.7 GB |
+
+On-demand publishing keeps the expiry-based check safe, as expected:
+safety never depended on the cadence. With fresh observations only, the
+join rule is even redundant in the model. A stale observation (the node
+last read the lease before a renewal) brings the need back, so the join
+rule stays.
+
+**Simulation** (`cargo test -p constellation-authority --release`: 46
+sim tests pass in 23–30 s, 6 ignored). The new configs (3 nodes,
+`f = 1`, the holder plus one other node cut from S3 and P2P for 5 s):
+
+| Test | Seeds | Result |
+|---|---|---|
+| `flex_epoch_with_a_missing_node_is_single_authority` | 40 | 40 epochs formed, all with a node missing; 26 takeovers refused; 0 two-authority samples in 13,315 |
+| `flex_epochs_survive_crashes_and_faults` (reads 0.3, 2 random faults) | 60 | 54 epochs; 93 refused, 8 checked takeovers passed on P2P promises; linearizable, converged |
+| `flex_zero_forms_no_partial_epoch` (f = 0) | 20 | 0 epochs, 0 promise PUTs |
+| `flex_without_the_promise_check_is_found` (non-vacuity) | 40 | 15 seeds sampled two authorities; 4 more broke linearizability first |
+| `#[ignore] long_flex` (`AUTHORITY_SIM_SEEDS`, default 500 each) | 500 + 500 | clean: flex 500/500 epochs, flex-crash 435 epochs, 1,661 checks, 223,784 samples, 54 s |
+| `#[ignore] flex_node_enrolled_during_an_epoch_is_the_known_gap` | 40 | fails as expected: two authorities after the dead hold owner returns |
+
+**Harness** (release binary, prefix `constellation-harness-m10opus`):
+
+| Scenario | Result |
+|---|---|
+| `epoch-missing-node` | PASSED in 76 s: epoch of 2/3 formed 11.3 s after the cut; C's takeover refused twice; converged; 0 conflicts |
+| `epoch-slack-zero-unchanged` | PASSED in 87–90 s: f = 0 made 0 heartbeat requests; f = 1 made 1 advertisement PUT per mount, then **0 PUTs over 60 s of steady writes** |
+| `epoch-holder-retired` | PASSED in 42 s: fence logged, epoch abandoned, writes resumed through a checked takeover, the retired A's remount refused ("node 1 is retired in the registry") |
+| `continuation-epoch`, `epoch-member-lost`, `node-leave` (×3), `lease-fencing`, `baseline`, `kill9-remount`, `backup-failover`, `no-peer-in-budget`, `single-node-unchanged` | PASSED |
+
+Other test runs:
+- `cargo test -p constellation-store-s3 -p constellation-net
+  -p constellation-api -p constellation-meta`: pass;
+- `cargo test -p constellation --bin constellation`: 198 passed;
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean;
+- `cargo fmt --all`: clean.
+
+### Measurements
+
+- **Heartbeat PUTs per node per day with f = 1:** 0 in steady state, plus
+  1 per mount (the slack advertisement), plus 1 per node per observed
+  real expiry while P2P is down. A TTL takeover costs 1 LIST, plus 1 GET
+  per heartbeat object, plus one P2P request per roster peer. At f = 0 it
+  costs only the LIST.
+- **Epoch formation in the harness took 11 s after the cut.** Most of it
+  is S3 failure detection (2 retries of about 250 ms per request, over
+  several rounds) and the grace. The lease must still be usable then, so
+  scenarios with f > 0 use a 20 s TTL (production uses 60 s).
+
+### What the tester must run
+
+1. `cargo test -p constellation-model --release --test flex_epochs --
+   --test-threads=1` (about 50 s). The 3 `#[ignore]` tests need up to
+   6.4 GB and 2.5 min each.
+2. `cargo test -p constellation-authority --release`, then `cargo test -p
+   constellation-authority --release --test sim long_flex -- --ignored`.
+3. Harness with `CONSTELLATION_HARNESS_DOCKER_PREFIX=<own>` and
+   `CONSTELLATION_BIN=target/release/constellation`:
+   - `epoch-missing-node`, `epoch-slack-zero-unchanged`,
+     `epoch-holder-retired`;
+   - the pre-existing epoch scenarios `continuation-epoch`,
+     `epoch-member-lost`, `node-leave` (run it several times: it was
+     flaky before fix 7);
+   - M9's `backup-failover`, `no-peer-in-budget`, `ack-s3-failover`, and
+     `lease-fencing` (every TTL takeover now reads `heartbeat/`).
+4. Real S3: `epoch-missing-node` with a production lease TTL (60 s), and
+   heartbeat PUT counts on an idle two-node `f = 1` cluster over an hour
+   (expected: the mount advertisements only).
+
+### Known gaps
+
+- **A node enrolled during an epoch.** It is outside the roster the epoch
+  formed under, so its promise counts for a taker although no member can
+  have waited it out; the intersection then needs `f + 1` promisers from
+  the formation roster. f = 0 has the same hole: a new node is not a
+  member and may take expired leases. The repro is
+  `flex_node_enrolled_during_an_epoch_is_the_known_gap` (fails, 40 of 40
+  seeds). The CI configs disable `JoinFresh` (`SimConfig::join_fresh`).
+  Candidate fixes (model a `Join` action first):
+  - a node counts only promisers enrolled before it;
+  - it requires `f + 1` until it has seen the lease renewed once since
+    its own enrollment;
+  - members write the formation roster into the lease object at the
+    flush.
+- **In-epoch handoff with a journal is declined, not carried.** Carrying
+  the journal (the successor re-journals it with
+  `apply_records_journaled`, the predecessor drops its rows) was
+  implemented, and then reverted: when the handoff reply is lost (the
+  requester crashes or times out), the predecessor has already dropped
+  the rows, and acknowledged writes are lost (long seed 30077). Doing it
+  right needs a two-phase transfer. With the decline, members write
+  through the hold owner; only the epoch's first writer holds.
+- **A dead hold owner with no leave.** Its epoch's members stay silent,
+  so TTL takeovers are refused until it returns or is retired. This is by
+  design: its acknowledged journal would otherwise be lost silently.
+- **An asymmetric P2P partition.** An epoch holder that can reach its
+  members while they cannot reach it keeps acknowledging while they
+  freeze. Admin-retiring it then lets a taker in. `leave --node-id`
+  asserts the node is dead or permanently cut off, as it always has.
+
+## Plan 30 M10 — rebase onto M9 (coder, 2026-09-24)
+
+**State: rebased, CODER-TESTED, uncommitted.** Branch `plan30-m10` = main
+0e1017b (M9 committed; phase 4 closed) + the whole M10 diff, 3-way
+applied by the coordinator. The pre-rebase state is `stash@{0}`
+("m10-on-wip-m9 (backup)"), kept for reference and not popped.
+
+### Conflicts resolved (keeping both sides)
+
+- `crates/authority/src/core/mod.rs`: `Timer` now has M9 round 2's
+  `StreamAhead` and M10's `PromiseWait`/`PromiseWatch`, and `Timer::kind`
+  maps all three.
+- `crates/authority/src/core/tests.rs`: M9's `mod pipelined_appends`,
+  then M10's `mod m10` and `mod claim_resolution`.
+- This file: every section in order, then M10's phase 1 and phase 2.
+
+### Semantic check against M9 round 2
+
+- **Fix 6 (declining an in-epoch hold handoff while the journal is
+  non-empty)** tests `Replica::journal_len`. That counts journal *rows*
+  above the acked watermark (`journal::len`, which round 2 also made
+  start from the watermark). Holes are gaps in the sequence, not rows, so
+  they cannot make it non-zero. The rule is unchanged: a hold with
+  unshipped rows stays where it is. M10 no longer calls
+  `journal_txs_from` (the journal-carrying handoff was reverted in
+  phase 2), so the new empty-hole `BackupTx`s do not reach it. The
+  counter-based `next_journal_seq` and `backup_tail_floor` do not touch
+  M10 paths.
+- **Renew/Cas adopt exactly the object they wrote** (M10 phase 2, fix 3).
+  Round 2 did not change those arms; the diff against main contains only
+  M10's changes there.
+- **New interaction found: an epoch hold's acknowledgements were gated
+  on M9's durability rule.**
+  - **Symptom:** `node-leave` failed 4 of 4 runs with `B writes
+    b/after-leave in the post-leave epoch: File exists (os error 17)`.
+    Plain main 0e1017b fails it the same way (2 of 2), so this is not an
+    M10 regression.
+  - **Cause:** under an epoch hold, `LeaseState::ack_policy()` is
+    `Local`, but `backups()` still returned the held lease's backups, and
+    `durable_jseq` still waited for a candidate or the shipped watermark.
+    The epoch holder therefore parked every acknowledgement for the
+    epoch's lifetime, with its FUSE fast path closed (`ack_gated`). The
+    caller timed out, retried, and met its own first attempt (`EEXIST`).
+  - **Fix:** `backups()` is empty under an epoch hold,
+    `Core::durable_jseq` returns `u64::MAX` while `epoch_held()`, and
+    `ack_need` returns `None`. An epoch acknowledges locally, as the
+    claim rule assumes: the lease is carried only when every listed
+    backup is a member, and a member takes nothing over while its epoch
+    is open.
+  - **Tests:** a unit test (in `epoch_rules::a_backup_lease_is_carried_only_with_every_backup_a_member`:
+    under the hold, with a candidate set, nothing is gated and a submit
+    is acknowledged at once); `node-leave` 3 of 3 after the fix.
+  - **Sim:** a new config, `flex-backup` (`flex_epochs_with_backups`,
+    40 seeds, clean). It does *not* catch the bug without the fix: the
+    sim's in-doubt resubmission by rid absorbs the parked replies. The
+    unit test and the harness are the regression tests.
+- The `node-leave` scenario's filesystem steps now carry `.context(..)`,
+  so a failure names the step.
+
+### Results (final tree)
+
+- `cargo fmt --all -- --check`: clean. `cargo clippy --workspace
+  --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --release --exclude constellation-model`, and
+  the same in debug: every test result 0 failed. The authority unit tests
+  (61) and the sim (47 passed, 6 ignored) are included.
+- `cargo test -p constellation-model --release -- --test-threads=1`: all
+  model test binaries pass. `flex_epochs`: 21 passed, 3 ignored, 46 s.
+- Long runs (release, `AUTHORITY_SIM_SEEDS`):
+  - `long_flex` 500 + 500: clean (flex 500 epochs, flex-crash 435
+    epochs and 1,661 promise checks);
+  - `long_backup` 300: clean;
+  - `long_random` 1000 (seeds 10000–10999): clean.
+
+  The pinned seeds are in the CI tests, all passing.
+- Harness (prefix `constellation-harness-m10opus`, release binary of this
+  tree), all PASSED:
+
+  | Scenario | Time | Notes |
+  |---|---|---|
+  | `epoch-missing-node` | 76 s | epoch formed 10.8 s after the cut |
+  | `epoch-slack-zero-unchanged` | 91 s | f = 1 steady state: 0 heartbeat PUTs over 63 s |
+  | `epoch-holder-retired` | 58 s | |
+  | `continuation-epoch` | 15.5 s | |
+  | `epoch-member-lost` | 6.3 s | |
+  | `node-leave` ×3 | 43–44 s | |
+  | `backup-failover` | 19 s | failover p50 1.50 s |
+  | `ack-s3-failover` | 9.7 s | |
+  | `lease-fencing` | 12.4 s | |
+
+### What the tester must run
+
+Section "Plan 30 M10 — phase 2", "What the tester must run", plus
+`node-leave` several times on this tree and, for comparison, on main
+0e1017b (where it fails with `EEXIST` for the reason above).
+
+## Plan 30 M10 — tester gate run
+
+Tester (Sonnet), 2026-09-24, worktree `/home/bra/cvs/constellation-m10`
+(branch `plan30-m10`, uncommitted M10 work on main `0e1017b`).
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m10`,
+`CONSTELLATION_BIN=/home/bra/cvs/constellation-m10/target/release/constellation`.
+Host shared with other concurrent sessions throughout (uptime load average
+ranged ~5 to ~17). No mechanical fixes were needed anywhere — every gate
+passed on the first attempt.
+
+### Gate 1 — fmt, clippy, workspace tests
+
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --exclude constellation-model --no-fail-fast`
+  (debug): **889 passed, 0 failed, 0 unexpected** across 29 test
+  binaries (the model crate is reported separately in release, below,
+  per its own budget).
+- `cargo test -p constellation-model --release --test flex_epochs --
+  --test-threads=1`: **21 passed, 3 ignored, 46.87 s** — matches the
+  coder's own figures exactly (the 3 `#[ignore]` tests were not run,
+  per the tiering rule).
+- The rest of the model crate, each test binary its own process
+  (release): `backup.rs` 7 passed/1 ignored (20.72 s), `cto.rs` 18
+  passed/1 ignored (18.15 s), `holder_side.rs` 4 passed/2 ignored
+  (6.88 s), `inbox.rs` 9 passed/2 ignored (2.42 s), `positions.rs` 9
+  passed/1 ignored (22.78 s), `today_bugs.rs` 7 passed/1 ignored
+  (25.84 s). All clean, 0 failures.
+
+### Gate 2 — authority + sweeps
+
+- `cargo test -p constellation-authority --release`: **61 unit + 3
+  `meta_repro` + 47 sim (6 ignored) passed, 0 failed, 20.44 s.**
+- `AUTHORITY_SIM_SEEDS=500 cargo test -p constellation-authority
+  --release --test sim -- --ignored long_flex`: **PASSED, 48.82 s.**
+- `AUTHORITY_SIM_SEEDS=300 cargo test -p constellation-authority
+  --release --test sim -- --ignored long_backup`: **PASSED, 16.37 s.**
+- `AUTHORITY_SIM_SEEDS=1000 cargo test -p constellation-authority
+  --release --test sim -- --ignored long_random`: **PASSED, 57.28 s.**
+- No failing seed anywhere; nothing to replay.
+
+### Gate 3 — release build
+
+`cargo build --release --workspace`: clean, 38.65 s.
+
+### Gate 4 — harness
+
+All scenarios run in the foreground with explicit timeouts, one
+`harness run` invocation per batch.
+
+**Batch A (single run each), all 13 PASSED:**
+
+| Scenario | Time | Notes |
+|---|---|---|
+| `epoch-slack-zero-unchanged` | 91.3 s | f=0: 0 heartbeat requests over 20s on A/B; f=1 C/D: 1 PUT at mount (advertisement), then 0 PUTs / 0 requests over 64s steady state — matches the coder's "0/day" claim |
+| `backup-failover` | 18.9 s | failover p50 1.504723542 s (n=3: 1.503–1.505 s) — matches M9's 1.504–1.507 s almost exactly |
+| `ack-s3-failover` | 9.8 s | |
+| `no-peer-in-budget` | 22.0 s | |
+| `lease-fencing` | 12.5 s | |
+| `lease-handover` | 37.5 s | |
+| `kill9-remount` | 2.8 s | |
+| `single-node-unchanged` | 2.4 s | |
+| `baseline` | 3.0 s | |
+| `chaos-ci` | 3.1 s | |
+| `forwarded-mutations` | 1.9 s | |
+| `inbox-create-storm-p2p-off` | 38.2 s | 1671.6 ops/s (floor 41 ops/s) |
+| `p2p-same-identity-restart` | 10.8 s | reconnected 501 ms after remount |
+
+**Batch B (M10-specific, run the required number of times), all 11
+runs PASSED, no failures, no reruns needed beyond the required
+counts:**
+
+| Scenario | Runs | Times |
+|---|---|---|
+| `epoch-missing-node` | ×2 | 77.1 s, 77.2 s — epoch of 2/3 formed 11.5 s after the cut both times, matching the coder's 10.8–11.3 s |
+| `epoch-holder-retired` | ×2 | 62.8 s, 59.4 s |
+| `continuation-epoch` | ×2 | 16.3 s, 15.7 s |
+| `epoch-member-lost` | ×2 | 6.3 s, 7.1 s |
+| `node-leave` | ×3 | 43.4 s, 43.3 s, 44.6 s — all 3 PASSED |
+
+**`node-leave` on main, for comparison** (rebuilt main `0e1017b`
+release binaries in the pre-existing `/home/bra/cvs/constellation`
+worktree, since it needed rebuilding anyway for the perf A/B below):
+**FAILED in 56.7 s**, `B writes b/after-leave in the post-leave epoch:
+File exists (os error 17)` — the exact error the coder's "rebase onto
+M9" section documents for main. This confirms the M9-interaction fix
+(epoch acknowledgements no longer gated on M9's durability rule) is
+real, not a coincidental pass.
+
+No docker containers or `/tmp/harness-*` mount directories were left
+behind; two stray unmounted `/tmp/harness-node-leave-*` directories
+from Batch B were found afterwards (unmounted, not held open by any
+process) and removed.
+
+### Gate 5 — smoke
+
+`tests/smoke.sh` (local file backend, `CONSTELLATION_BIN` = this
+tree's release binary): **PASSED.** The "etag CAS (If-Match) ...
+unavailable" / "UNKNOWN" lines are the known `object_store`
+`LocalFileSystem` CAS gap every prior milestone's tester has reported;
+not an M10 issue.
+
+### Gate 6 — perf
+
+**Failover timings (every takeover now reads `heartbeat/`):**
+- `lease-handover`: 37.5 s (Batch A) — in line with M8's `lease-handover`
+  figures (36.7–38.0 s across M6–M9's tester sections); no regression
+  from adding the heartbeat read.
+- `backup-failover`: p50 1.505 s (n=3, Batch A) — matches M9's own
+  1.504–1.507 s to the millisecond; the heartbeat read adds no visible
+  cost to a seal-based failover.
+
+**meta-bench, `1node-create-lat0` (f=0 default path) and
+`3node-p2pon-shared-create-lat0`, 2 runs each, initial pass (this
+tree only, prefix `constellation-harness-m10`):**
+
+| Config | Run 1 | Run 2 |
+|---|---|---|
+| `1node-create-lat0` | 5642 ops/s | 4085 ops/s |
+| `3node-p2pon-shared-create-lat0` | 1151 ops/s | 1296 ops/s |
+
+The `1node-create-lat0` pair (4085–5642 ops/s) looked low against the
+M9 tester's own range for the same config (6284–9416 ops/s across two
+of its runs), so per the "unless something looks off" instruction this
+was not left at a PROGRESS.md-only comparison. Three more isolated
+runs on this tree alone (2858–4182 ops/s, host load 8–9 at the time)
+did not resolve whether this was noise or a regression, so a same-host
+interleaved A/B against main was run instead of trusting either
+history or an un-interleaved run:
+
+- Rebuilt main `0e1017b`'s release `constellation`/`harness` binaries
+  in the pre-existing `/home/bra/cvs/constellation` worktree (stale
+  since 2026-09-22, predating this main tip) rather than a new
+  worktree, since one already existed and just needed a rebuild — no
+  extra worktree was created or needed deleting.
+- Interleaved main → M10, 3 rounds, same prefix
+  (`constellation-harness-m10ab`), `1node-create-lat0`:
+
+  | Round | main ops/s | M10 ops/s | M10/main |
+  |---|---|---|---|
+  | 1 | 4586 | 3392 | 0.74 |
+  | 2 | 4060 | 8969 | 2.21 |
+  | 3 | 7860 | 7999 | 1.02 |
+
+  (uptime load average 17.4 → 10.2 over this block). The swing runs in
+  both directions and matches the scale of noise M9's and M13's tester
+  sections already documented for this same saturating micro-benchmark
+  (up to 23% from noise alone on a quiet load average; this host's load
+  average was far higher). Mean M10/main ratio **1.32** — M10 net
+  *ahead*, not behind. **No regression.**
+
+- Same interleaving, `3node-p2pon-shared-create-lat0`, 3 rounds:
+
+  | Round | main ops/s | M10 ops/s | M10/main |
+  |---|---|---|---|
+  | 1 | 2168 | 1218 | 0.56 |
+  | 2 | 1579 | 2124 | 1.35 |
+  | 3 | 2246 | 1999 | 0.89 |
+
+  Mean ratio **0.93**, and every individual round's ratio brackets 1 —
+  no consistent regression, and this is already at least as good as
+  M9's own documented 0.80 ratio against main for this identical
+  config (which M9 attributed to its backup-selection LAN
+  auto-promotion out of `ack=local`, by design, not to a defect).
+
+**Verdict: no evidence of an M10 perf regression on the default (f=0)
+path or on the 3-node p2p-on path.** The initial low-looking numbers
+were host-load noise, confirmed by interleaving against a same-host,
+same-prefix main build rather than trusting either the isolated runs
+or the PROGRESS.md history alone.
+
+### Mechanical fixes made
+
+None. Every gate passed on the first attempt; nothing in the tree
+needed a mechanical correction.
+
+### Cleanup
+
+- The main-build rebuild happened in the pre-existing
+  `/home/bra/cvs/constellation` worktree (not a new one), so nothing
+  was created there to remove.
+- `docker ps -a` showed no leftover harness containers under either
+  `constellation-harness-m10` or `constellation-harness-m10ab` after
+  the run.
+- Two stray unmounted `/tmp/harness-node-leave-*` directories (from
+  Batch B's `node-leave` runs) and one more from the main-comparison
+  `node-leave` run were removed after confirming they were unmounted
+  and not held open by any process.
+- No stray `constellation` or `harness` processes remained (checked
+  against `/proc/<pid>/exe` before treating anything as stale; none
+  needed killing).
+
+### Not fixed here
+
+Nothing — no non-mechanical issue was found. All required scenarios,
+sweeps, and perf checks are clean.

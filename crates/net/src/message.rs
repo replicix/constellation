@@ -147,6 +147,9 @@ pub enum Payload {
         /// Applied-seq vector at proposal time (`part` → seq).
         base: Vec<(String, u64)>,
         proposer: u64,
+        /// Plan 30 §M10: the proposer's `epoch_slack`; `members` is at
+        /// least `N − f` of the write-eligible roster (all of it at 0).
+        epoch_slack: u32,
     },
     /// Signed ack of an [`Payload::EpochPropose`]. The ack is only sent
     /// after the promise is durable on the member's local disk.
@@ -154,6 +157,12 @@ pub enum Payload {
         epoch_id: String,
         member: u64,
         accepted: bool,
+        /// Plan 30 §M10's claim resolution: the lease this member holds
+        /// usably (epoch, expiry, whether the claim rule lets an epoch of
+        /// these members carry it), and the highest lease epoch it knows
+        /// exists.
+        claim: Option<EpochClaim>,
+        known: u64,
     },
     /// All members have acked: the epoch is now the authority root.
     /// Redistributed by the proposer; also gossiped so a late joiner of
@@ -162,6 +171,25 @@ pub enum Payload {
         epoch_id: String,
         members: Vec<u64>,
         base: Vec<(String, u64)>,
+        /// Plan 30 §M10: the lease the epoch carries (`None`: none), and
+        /// the epoch below which a member's claim is stale.
+        carrier: Option<EpochCarrier>,
+        stale_below: u64,
+    },
+    /// Plan 30 §M10: a would-be taker of the expired lease asks for a
+    /// heartbeat promise past `expires_unix_ms`. Answered by
+    /// [`Payload::PromiseReply`].
+    PromiseRequest {
+        requester: u64,
+        req_id: u64,
+        expires_unix_ms: i64,
+    },
+    /// Plan 30 §M10: the persisted promise (`None`: refused — in an open
+    /// continuation epoch, or retired), and the answerer's slack.
+    PromiseReply {
+        req_id: u64,
+        until: Option<i64>,
+        epoch_slack: u32,
     },
     /// Gossiped bloom of one hash-prefix bucket of this node's
     /// clean/pinned chunk cache (DESIGN.md §7). Recipients consult it
@@ -350,6 +378,23 @@ pub enum Payload {
         part: String,
         epoch: u64,
     },
+}
+
+/// Plan 30 §M10: a member's lease claim in an [`Payload::EpochAck`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochClaim {
+    pub epoch: u64,
+    pub expires_unix_ms: i64,
+    pub may_carry: bool,
+}
+
+/// Plan 30 §M10: the lease a continuation epoch carries, as its holder
+/// read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochCarrier {
+    pub node: u64,
+    pub epoch: u64,
+    pub expires_unix_ms: i64,
 }
 
 /// Why a holder did not serve a requested chunk. The requester needs
