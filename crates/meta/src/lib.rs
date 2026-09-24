@@ -26,7 +26,8 @@ pub use store::spec::{
     LOCAL_REPLAY_INCARNATION,
 };
 pub use store::{
-    BootstrapIndexBuilder, JournalBatch, LogPrefixView, Meta, PublishBasis, SCRATCH_XATTR,
+    BootstrapIndexBuilder, ForeignApplyHook, JournalBatch, LogPrefixView, Meta, PublishBasis,
+    SCRATCH_XATTR,
 };
 
 use constellation_fs_core::{FileAttr, Ino};

@@ -259,6 +259,11 @@ impl Core {
     }
 
     fn start_next_job(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        // M7: streamed segments that arrived while the job owned the
+        // cursor go in first.
+        if self.job.is_none() {
+            self.stream_drain(now, replica, out);
+        }
         while self.job.is_none() {
             let Some(req) = self.queued_jobs.pop_front() else {
                 if self.nudged {
@@ -292,6 +297,19 @@ impl Core {
         }
     }
 
+    /// Plan 30 §M7: whether a streamed segment may be applied now. A job
+    /// that captured a sequence (a ship or marker PUT in flight, an
+    /// acquisition's CAS or gate) owns the cursor; one that is only
+    /// uploading or tailing does not — applying the next sequence during a
+    /// tail is what the tail itself would do (`apply_incoming` skips a
+    /// run's segments below the cursor).
+    pub(crate) fn cursor_free(&self) -> bool {
+        match &self.job {
+            None => true,
+            Some(job) => matches!(job.phase, Phase::Upload | Phase::Tail { .. }),
+        }
+    }
+
     fn set_phase(&mut self, phase: Phase, op: Option<OpId>) {
         if let Some(job) = self.job.as_mut() {
             job.phase = phase;
@@ -314,6 +332,10 @@ impl Core {
 
     fn issue_tail(&mut self, out: &mut Vec<Action>) {
         let width = self.cfg.tail_width.max(1);
+        self.issue_tail_width(width, out);
+    }
+
+    fn issue_tail_width(&mut self, width: usize, out: &mut Vec<Action>) {
         let from = self.ship.next_seq;
         let op = self.issue_s3(S3Op::SegmentRun { from, width }, S3For::Job, out);
         if let Some(job) = self.job.as_mut() {
@@ -354,7 +376,6 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> anyhow::Result<()> {
-        let _ = (out, now);
         if seq < self.ship.next_seq {
             return Ok(());
         }
@@ -432,6 +453,10 @@ impl Core {
         self.ship.next_seq = seq + 1;
         self.ship.head_seq = self.ship.head_seq.max(seq);
         self.ship.last_error = None;
+        // M7: a holder streams what its cursor passes, read back from S3
+        // included (its own unacked segments), so subscribers never miss
+        // a sequence it knows.
+        self.stream_passed(now, seq, seg.epoch, payload, out);
         Ok(())
     }
 
@@ -648,7 +673,15 @@ impl Core {
         }
         self.stats.segments_shipped += 1;
         self.note_shipped_touches(seq, &payload);
-        tracing::debug!(node = self.cfg.node_id, seq, epoch, "shipped log segment");
+        tracing::debug!(
+            target: "constellation_authority::stream",
+            node = self.cfg.node_id,
+            seq,
+            epoch,
+            records = seqs.len(),
+            "ship"
+        );
+        self.stream_passed(now, seq, epoch, &payload, out);
         out.push(Action::Announce {
             seq,
             epoch,
@@ -753,6 +786,7 @@ impl Core {
 
     fn marker_landed(
         &mut self,
+        now: Ms,
         seq: Seq,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -782,6 +816,7 @@ impl Core {
         self.stats.epoch_markers += 1;
         let payload =
             segment::encode(self.cfg.node_id, epoch, through, &[]).expect("empty segment");
+        self.stream_passed(now, seq, epoch, &payload, out);
         out.push(Action::Announce {
             seq,
             epoch,
@@ -969,6 +1004,7 @@ impl Core {
             op,
             ino: None,
             round: true,
+            complete: !self.round_waiters.is_empty() || self.publish_forced,
         });
     }
 
@@ -1096,13 +1132,21 @@ impl Core {
             self.round_ship(now, 0, replica, out);
             return;
         }
+        // M7: the holder's stream has delivered everything it reported;
+        // S3 has nothing a round could find sooner.
+        if self.stream_covers_tail(now) {
+            self.stats.stream_tail_skips += 1;
+            self.round_ship(now, 0, replica, out);
+            return;
+        }
         self.set_phase(
             Phase::Tail {
                 then: TailThen::Round,
             },
             None,
         );
-        self.issue_tail(out);
+        let width = self.stream_tail_width(now);
+        self.issue_tail_width(width, out);
     }
 
     fn round_ship(&mut self, now: Ms, attempts: u32, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -1680,6 +1724,7 @@ impl Core {
             op,
             ino: None,
             round: false,
+            complete: true,
         });
     }
 
@@ -1699,6 +1744,7 @@ impl Core {
             op,
             ino: None,
             round: false,
+            complete: true,
         });
     }
 
@@ -1935,7 +1981,7 @@ impl Core {
             // ---- the gate's marker ----
             (Phase::Marker { .. }, S3Result::SegmentPut(Ok(()))) => {
                 let seq = self.ship.next_seq;
-                if let Err(error) = self.marker_landed(seq, replica, out) {
+                if let Err(error) = self.marker_landed(now, seq, replica, out) {
                     self.job_failed(now, error, replica, out);
                     return;
                 }
@@ -2196,6 +2242,7 @@ impl Core {
                     op,
                     ino: None,
                     round: true,
+                    complete: true,
                 });
             }
             TailThen::Marker => {

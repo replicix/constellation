@@ -34,11 +34,6 @@ pub fn publish_idle_interval() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
-/// The node that wrote `payload`, for a gossip push that did not say.
-pub fn segment_node(payload: &[u8]) -> Option<u64> {
-    decode(payload).ok().map(|segment| segment.node)
-}
-
 /// Plan 28 S6: rebuild the replica from the commit chain's head, then
 /// tail the log from the commit's `applied` position. `false` when the
 /// chain is empty (a fresh filesystem with no commit yet), so the caller

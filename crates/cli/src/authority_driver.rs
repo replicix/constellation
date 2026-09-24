@@ -36,7 +36,7 @@ use constellation_authority::{
 };
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::{JournalPos, LogRecord, Meta, MutateOp, MutateOutcome, Position, Rid};
-use constellation_net::Payload;
+use constellation_net::{LogEvent, Payload};
 use constellation_store_s3::inbox::InboxStore;
 use constellation_store_s3::lease::now_unix_ms;
 use constellation_store_s3::log::PARTITION;
@@ -66,6 +66,9 @@ pub struct CoreStatus {
     pub rounds_completed: u64,
     pub last_error: Option<String>,
     pub epoch: EpochState,
+    /// Plan 30 §M7.
+    pub stream: constellation_authority::core::StreamView,
+    pub stream_enabled: bool,
 }
 
 /// Short names for the trace line around every core step.
@@ -76,6 +79,9 @@ fn event_kind(event: &Event) -> &'static str {
             PeerMsg::MutateRequest { .. } => "Peer(MutateRequest)",
             PeerMsg::MutateReply { .. } => "Peer(MutateReply)",
             PeerMsg::SegmentPublished { .. } => "Peer(SegmentPublished)",
+            PeerMsg::LogSubscribe { .. } => "Peer(LogSubscribe)",
+            PeerMsg::LogStream { .. } => "Peer(LogStream)",
+            PeerMsg::LogStreamEnd { .. } => "Peer(LogStreamEnd)",
             _ => "Peer",
         },
         Event::PeerFailed { .. } => "PeerFailed",
@@ -87,6 +93,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::Roster { .. } => "Roster",
         Event::Peers { .. } => "Peers",
         Event::Activity { .. } => "Activity",
+        Event::SubscriberGone { .. } => "SubscriberGone",
         Event::Control { req, .. } => match req {
             Control::Nudge => "Control(Nudge)",
             Control::PublishNow => "Control(PublishNow)",
@@ -172,6 +179,130 @@ pub struct DriverDeps {
     pub fault_reply_delay_ms: u64,
 }
 
+/// Plan 30 §M7: frames queued for one log-stream subscriber, at most
+/// `CONSTELLATION_LOG_STREAM_QUEUE` (default 1024) of them.
+pub fn log_stream_queue() -> usize {
+    std::env::var("CONSTELLATION_LOG_STREAM_QUEUE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1024)
+}
+
+/// Plan 30 §M7: bytes queued for one log-stream subscriber before the
+/// holder drops it back to S3 tailing
+/// (`CONSTELLATION_LOG_STREAM_BUFFER_BYTES`, default 32 MiB). This is what
+/// keeps a slow WAN subscriber from slowing the holder: the holder never
+/// waits on a subscriber, it only ever enqueues or drops.
+fn log_stream_buffer_bytes() -> usize {
+    std::env::var("CONSTELLATION_LOG_STREAM_BUFFER_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(32 << 20)
+}
+
+fn env_ms(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+/// One subscriber of this holder's log stream: the frames queued for its
+/// stream writer (the P2P handler), and how many bytes of segment payload
+/// sit in that queue.
+struct SubscriberSink {
+    req: OpId,
+    tx: mpsc::Sender<LogEvent>,
+    queued_bytes: Arc<AtomicU64>,
+}
+
+/// Plan 30 §M7: how long a sync round waits for the upload pass before
+/// shipping what is already shippable (`CONSTELLATION_ROUND_UPLOAD_WAIT_MS`,
+/// default 250). The ship defers every transaction whose manifest still
+/// names a pending chunk (`Meta::take_journal_grouped`), so a round no
+/// longer has to wait for a whole write-back backlog before anything else
+/// can ship.
+fn round_upload_wait() -> Duration {
+    Duration::from_millis(env_ms("CONSTELLATION_ROUND_UPLOAD_WAIT_MS", 250))
+}
+
+/// Plan 30 §M7: the one full upload pass (every pending chunk) in flight,
+/// shared by the rounds that wait on it. A round joins the running pass
+/// (or starts one) and waits at most the round budget; the pass keeps
+/// going in the background and nudges a round when it finishes, so the
+/// transactions it unblocked ship at once.
+#[derive(Clone, Default)]
+struct BulkPass {
+    running: Arc<Mutex<Option<PassDone>>>,
+}
+
+/// A bulk pass's outcome, `None` while it runs.
+type PassDone = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
+
+impl BulkPass {
+    /// The running pass, or a new one.
+    fn join(
+        &self,
+        upload: Uploader,
+        tx: mpsc::UnboundedSender<Internal>,
+        budget: Duration,
+    ) -> PassDone {
+        let mut running = self.running.lock().unwrap();
+        if let Some(rx) = running.as_ref() {
+            if rx.borrow().is_none() {
+                return rx.clone();
+            }
+        }
+        let (done_tx, done_rx) = tokio::sync::watch::channel(None);
+        *running = Some(done_rx.clone());
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = upload.run(None).await.map_err(|e| format!("{e:#}"));
+            let _ = done_tx.send(Some(result));
+            if started.elapsed() >= budget {
+                // A round already moved on without this pass: ship what
+                // it unblocked now, not at the next poll.
+                let _ = tx.send(Internal::Control {
+                    req: Control::Nudge,
+                    reply: ControlReply::None,
+                });
+            }
+        });
+        done_rx
+    }
+
+    /// One round's (or flush's) upload step. `complete`: every chunk
+    /// pending now must be up before it returns — the running pass is
+    /// waited for, then a fresh full pass runs (it picks up what arrived
+    /// after the running one took its snapshot).
+    async fn run(
+        &self,
+        upload: Uploader,
+        tx: mpsc::UnboundedSender<Internal>,
+        complete: bool,
+        budget: Duration,
+    ) -> Result<(), String> {
+        let mut rx = self.join(upload.clone(), tx, budget);
+        if complete {
+            let _ = rx.wait_for(|r| r.is_some()).await;
+            return upload.run(None).await.map_err(|e| format!("{e:#}"));
+        }
+        let finished = tokio::time::timeout(budget, rx.wait_for(|r| r.is_some()))
+            .await
+            .ok()
+            .and_then(|r| r.ok().map(|r| r.clone()));
+        match finished {
+            Some(Some(result)) => result,
+            // Still uploading (or the pass went away): ship what is
+            // already shippable.
+            _ => Ok(()),
+        }
+    }
+}
+
 /// What a control-plane request is waiting for.
 enum ControlReply {
     None,
@@ -236,6 +367,23 @@ pub fn load_config(
     c.escalate_ops = knobs.escalate_ops;
     c.escalate_wait_ms = knobs.escalate_wait_ms;
     c.escalate_retry_ms = knobs.escalate_retry_ms;
+    // Plan 30 §M7: direct log streams (on unless
+    // `CONSTELLATION_LOG_STREAMS` is 0/off/false; P2P off disables them
+    // too).
+    c.log_streams = !matches!(
+        std::env::var("CONSTELLATION_LOG_STREAMS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "off" | "false"
+    );
+    c.stream_heartbeat_ms = env_ms(
+        "CONSTELLATION_LOG_STREAM_HEARTBEAT_MS",
+        c.stream_heartbeat_ms,
+    );
+    c.stream_timeout_ms = env_ms("CONSTELLATION_LOG_STREAM_TIMEOUT_MS", c.stream_timeout_ms);
+    c.stream_backstop_ms = env_ms("CONSTELLATION_LOG_STREAM_BACKSTOP_MS", c.stream_backstop_ms);
     c
 }
 
@@ -271,6 +419,15 @@ pub struct Driver {
     next_control: u64,
     /// Whether this node holds (from the last refresh), for the tickers.
     last_epoch_reported: Option<EpochState>,
+    /// Plan 30 §M7, holder side: the subscribers of this node's log
+    /// stream, by node.
+    subscribers: HashMap<NodeId, SubscriberSink>,
+    /// Plan 30 §M7, subscriber side: the task reading each subscription.
+    subscriptions: HashMap<OpId, tokio::task::AbortHandle>,
+    stream_buffer_bytes: u64,
+    /// Plan 30 §M7: the background upload pass rounds share.
+    bulk_pass: BulkPass,
+    round_upload_wait: Duration,
 }
 
 impl Driver {
@@ -305,6 +462,11 @@ impl Driver {
             controls: HashMap::new(),
             next_control: 1 << 48,
             last_epoch_reported: None,
+            subscribers: HashMap::new(),
+            subscriptions: HashMap::new(),
+            stream_buffer_bytes: log_stream_buffer_bytes() as u64,
+            bulk_pass: BulkPass::default(),
+            round_upload_wait: round_upload_wait(),
         }
     }
 
@@ -419,6 +581,8 @@ impl Driver {
         status.rounds_completed = self.core.stats.rounds_completed;
         status.last_error = self.core.ship().last_error.clone();
         status.epoch = self.core.epoch_state();
+        status.stream = self.core.stream_view();
+        status.stream_enabled = cfg.log_streams && cfg.p2p;
     }
 
     /// Tell the core the epoch machine's state when it changed (or
@@ -558,34 +722,31 @@ impl Driver {
                 }
                 Some(Internal::Event(Event::Submit { rid, op, policy }))
             }
-            SyncRequest::ApplyPushed {
-                seq,
-                epoch,
-                holder_node,
-                payload,
+            SyncRequest::SegmentHint { seq, epoch } => Some(Internal::Event(Event::Peer {
+                from: 0,
+                msg: PeerMsg::SegmentPublished { seq, epoch },
+            })),
+            SyncRequest::LogSubscribe {
+                requester,
+                req,
+                from,
+                sink,
+                queued_bytes,
             } => {
-                // E2E pushes carry the sealed segment; open it with the
-                // partition DEK, or fall back to the ordinary tail.
-                let payload = if self.deps.log.is_e2e() {
-                    match self.deps.log.open_segment(seq, &payload) {
-                        Ok(p) => p,
-                        Err(_) => return control(Control::Nudge, ControlReply::None),
-                    }
-                } else {
-                    payload
-                };
-                let from = if holder_node != 0 {
-                    holder_node
-                } else {
-                    crate::shipper::segment_node(&payload).unwrap_or(0)
-                };
-                Some(Internal::Event(Event::Peer {
-                    from,
-                    msg: PeerMsg::SegmentPublished {
-                        seq,
-                        epoch,
-                        payload: Some(payload),
+                let req = OpId(req);
+                // A newer subscription from the same node replaces the
+                // old one; dropping the old sink ends its stream.
+                self.subscribers.insert(
+                    requester,
+                    SubscriberSink {
+                        req,
+                        tx: sink,
+                        queued_bytes,
                     },
+                );
+                Some(Internal::Event(Event::Peer {
+                    from: requester,
+                    msg: PeerMsg::LogSubscribe { req, from },
                 }))
             }
             SyncRequest::ClaimOffer { epoch } => {
@@ -679,7 +840,12 @@ impl Driver {
                     });
                 }
                 Action::CancelTimer { .. } => {}
-                Action::UploadDirtyChunks { op, ino, round } => {
+                Action::UploadDirtyChunks {
+                    op,
+                    ino,
+                    round,
+                    complete,
+                } => {
                     let tx = self.int_tx.clone();
                     let upload = self.uploader();
                     let epochs = self.deps.epochs.clone();
@@ -692,6 +858,8 @@ impl Driver {
                         }));
                     }
                     let sync_tx = self.sync_tx.clone();
+                    let bulk = self.bulk_pass.clone();
+                    let wait = self.round_upload_wait;
                     tokio::spawn(async move {
                         if round && crate::fault::sync_held() {
                             let _ = tx.send(Internal::Event(Event::UploadsDone {
@@ -711,9 +879,14 @@ impl Driver {
                                 return;
                             }
                         }
-                        let result = match upload.run(ino).await {
-                            Ok(_) => UploadResult::Done { held: 0 },
-                            Err(e) => UploadResult::Failed(format!("{e:#}")),
+                        let result = if ino.is_none() {
+                            bulk.run(upload, tx.clone(), complete, wait).await
+                        } else {
+                            upload.run(ino).await.map_err(|e| format!("{e:#}"))
+                        };
+                        let result = match result {
+                            Ok(()) => UploadResult::Done { held: 0 },
+                            Err(e) => UploadResult::Failed(e),
                         };
                         let _ = tx.send(Internal::Event(Event::UploadsDone { op, result }));
                     });
@@ -762,18 +935,16 @@ impl Driver {
                     payload,
                 } => {
                     let peers = self.deps.peers.clone();
-                    let log = self.deps.log.clone();
                     let designations = self.deps.designations.clone();
                     let meta = self.deps.meta.clone();
                     tokio::spawn(async move {
-                        // In E2E mode the pushed body is the sealed segment
-                        // (identical to the S3 object), never plaintext.
-                        let pushed = if log.is_e2e() {
-                            log.seal_segment(seq, &payload).ok()
-                        } else {
-                            Some(payload.clone())
-                        };
-                        peers.announce_segment(PARTITION, seq, epoch, pushed).await;
+                        // Plan 30 §M7: a hint only. The segment reaches the
+                        // holder's subscribers on their log streams (over
+                        // QUIC between enrolled members, which hold the
+                        // E2E key anyway), so gossip — relayed by third
+                        // parties — never carries log content, sealed or
+                        // not.
+                        peers.announce_segment(PARTITION, seq, epoch).await;
                         if let Ok(seg) = constellation_authority::segment::decode(&payload) {
                             verify_flush_acks(&designations, &meta, seq, &seg.records).await;
                         }
@@ -1071,10 +1242,175 @@ impl Driver {
                     }
                 });
             }
+            PeerMsg::LogStream {
+                req,
+                n,
+                epoch,
+                head,
+                segment,
+            } => {
+                let seq = segment.as_ref().map(|(seq, _)| *seq);
+                let bytes = segment.as_ref().map(|(_, p)| p.len() as u64).unwrap_or(0);
+                self.stream_to(
+                    to,
+                    req,
+                    LogEvent::Frame {
+                        n,
+                        epoch,
+                        head,
+                        segment,
+                    },
+                    bytes,
+                    seq,
+                );
+            }
+            PeerMsg::LogStreamEnd { req, refused } => {
+                if self.subscribers.get(&to).is_some_and(|s| s.req == req) {
+                    let sink = self.subscribers.remove(&to).expect("present");
+                    let _ = sink.tx.try_send(LogEvent::End { refused });
+                } else if refused {
+                    // A refusal the handler has not got a sink for (it
+                    // raced a replacement): nothing to write to.
+                }
+            }
+            PeerMsg::LogSubscribe { req, from } => self.spawn_subscription(to, req, from),
+            PeerMsg::LogUnsubscribe { req } => {
+                // Dropping our end of the stream is the unsubscription:
+                // the holder's writer fails and its driver drops us.
+                if let Some(handle) = self.subscriptions.remove(&req) {
+                    handle.abort();
+                }
+            }
             other => {
                 tracing::debug!(to, ?other, "unsupported peer message; dropped");
             }
         }
+    }
+
+    /// Plan 30 §M7, holder side: queue one frame for subscriber `to`. The
+    /// holder never waits on a subscriber: a full queue, or one holding
+    /// more than the byte budget, drops the subscriber (it falls back to
+    /// S3 and resubscribes), and the core is told.
+    fn stream_to(&mut self, to: NodeId, req: OpId, event: LogEvent, bytes: u64, seq: Option<u64>) {
+        let Some(sink) = self.subscribers.get(&to) else {
+            let _ = self
+                .int_tx
+                .send(Internal::Event(Event::SubscriberGone { node: to, req }));
+            return;
+        };
+        if sink.req != req {
+            return;
+        }
+        let over_budget = sink.queued_bytes.load(Ordering::Relaxed) + bytes
+            > self.stream_buffer_bytes
+            && bytes > 0;
+        let sent = if over_budget {
+            Err("byte budget")
+        } else {
+            sink.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+            match sink.tx.try_send(event) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => Err("queue full"),
+                Err(mpsc::error::TrySendError::Closed(_)) => Err("gone"),
+            }
+        };
+        match sent {
+            Ok(()) => {
+                if let Some(seq) = seq {
+                    tracing::debug!(
+                        target: "constellation::log_stream",
+                        to,
+                        seq,
+                        bytes,
+                        "stream send queued"
+                    );
+                }
+            }
+            Err(why) => {
+                tracing::info!(
+                    target: "constellation::log_stream",
+                    subscriber = to,
+                    why,
+                    "dropping a log-stream subscriber; it falls back to S3"
+                );
+                self.subscribers.remove(&to);
+                let _ = self
+                    .int_tx
+                    .send(Internal::Event(Event::SubscriberGone { node: to, req }));
+            }
+        }
+    }
+
+    /// Plan 30 §M7, subscriber side: open the stream and turn what it
+    /// carries into core events; its end (without the holder's `End`) is
+    /// the subscription's `PeerFailed`.
+    fn spawn_subscription(&mut self, to: NodeId, req: OpId, from: u64) {
+        self.subscriptions.retain(|_, h| !h.is_finished());
+        let tx = self.int_tx.clone();
+        let peers = self.deps.peers.clone();
+        let handle = tokio::spawn(async move {
+            let mut rx = match peers.subscribe_log(to, req.0, from).await {
+                Ok(rx) => rx,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "constellation::log_stream",
+                        holder = to,
+                        %error,
+                        "could not open the holder's log stream"
+                    );
+                    let outage = !peers.connection_alive(to).await;
+                    let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                    return;
+                }
+            };
+            let mut ended = false;
+            while let Some(event) = rx.recv().await {
+                let msg = match event {
+                    LogEvent::Frame {
+                        n,
+                        epoch,
+                        head,
+                        segment,
+                    } => {
+                        if let Some((seq, bytes)) = &segment {
+                            tracing::debug!(
+                                target: "constellation::log_stream",
+                                holder = to,
+                                seq,
+                                n,
+                                bytes = bytes.len(),
+                                "stream receive"
+                            );
+                        }
+                        PeerMsg::LogStream {
+                            req,
+                            n,
+                            epoch,
+                            head,
+                            segment,
+                        }
+                    }
+                    LogEvent::End { refused } => {
+                        ended = true;
+                        PeerMsg::LogStreamEnd { req, refused }
+                    }
+                };
+                if tx
+                    .send(Internal::Event(Event::Peer { from: to, msg }))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if !ended {
+                let _ = tx.send(Internal::Event(Event::PeerFailed {
+                    req,
+                    to,
+                    outage: false,
+                }));
+            }
+        });
+        self.subscriptions.insert(req, handle.abort_handle());
     }
 
     fn spawn_s3(&mut self, op: OpId, req: S3Op) {

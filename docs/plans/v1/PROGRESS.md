@@ -12058,3 +12058,558 @@ S3's is).
 in the new test), `crates/store-s3/src/control.rs` (new),
 `crates/store-s3/src/{lib,lease,nodes,designation,cas,faulty}.rs`,
 `crates/harness/src/scenarios.rs`, this section.
+
+## Plan 30 M7 — direct log streams and visibility: **WRITTEN, CODER-TESTED** (pipelined on the M6 WIP base 642bf70; all M7 work is `git diff 642bf70`, uncommitted)
+
+| Item | State | Where |
+|---|---|---|
+| `PeerMsg::{LogSubscribe, LogUnsubscribe, LogStream { req, n, epoch, head, segment }, LogStreamEnd}`, `Event::SubscriberGone`; `SegmentPublished` loses its payload (a hint) | done | `crates/authority/src/event.rs` |
+| Core: holder serves while it holds (ring of recent segments, per-subscriber frame numbers, heartbeats), subscriber applies through `apply_incoming` (fencing included), reorder buffer, gap/timeout/overflow handling, backoff with parking, round skips the S3 tail while the stream covers it (width-1 backstop probe), hint-sized probes | done | `crates/authority/src/core/stream.rs` (new), `core/{mod,jobs,holder}.rs` |
+| Core unit tests: streamed apply + duplicate, frame gap, segment ahead of the cursor, tail skip + backstop width, serving follows the lease, lone node | done | `core/tests.rs` |
+| Net: `Payload::{LogSubscribe, LogFrame, LogEnd}` (signed frame + raw segment bytes with a signed blake3, like chunk bodies), `P2p::open_log_stream`, `Peers::subscribe_log`, `serve_log_stream` (10 s per-frame write timeout), `PeerService::log_subscribe`; gossip `SegmentPublished` without payload | done | `crates/net/src/{message,endpoint,peers,lib}.rs` |
+| Driver: subscriber task per subscription (frames → events, stream end → `PeerFailed`), per-subscriber bounded sink (1024 frames, 32 MiB of segments; overflow drops the subscriber → `SubscriberGone`), `SegmentHint`, knobs, `status.log_stream` | done | `crates/cli/src/{authority_driver,main,fusefs}.rs`, `crates/api/src/types.rs` |
+| Sim: FIFO stream lanes per (holder, subscriber), `StreamFaults { drop_p, reorder_p, cut_p, drop_segment_frames }`, `SubscriberGone` on a dead subscriber; tests `streams_carry_the_log_and_save_tail_gets`, `stream_faults_are_survived`, `regression_stream_gap_detected` | done | `crates/authority/tests/sim/{bus,run,node}.rs`, `tests/sim.rs` |
+| Tracing at ship → stream send → receive → apply (`constellation_authority::stream`, `constellation::log_stream`, debug) | done | core + driver |
+| Visibility root cause and fixes (below): bounded round upload wait + deferral of transactions behind still-uploading chunks; priority upload lane for small `fsync` drains; kernel cache invalidation on foreign applies | done | `crates/meta/src/store/held.rs`, `crates/cli/src/authority_driver.rs` (`BulkPass`), `crates/upload-concurrency/src/gate.rs`, `crates/cli/src/main.rs`, `crates/cli/src/kernel_inval.rs` (new), `crates/meta/src/store/mod.rs`, `crates/authority/src/replica.rs`, `crates/cli/src/node_runtime.rs` |
+| Meta tests for deferral; net QUIC round-trip and refusal tests; gate priority test; invalidation mapping tests | done | `crates/meta/tests/held.rs`, `crates/net/src/peers.rs`, `crates/upload-concurrency/src/gate.rs`, `crates/cli/src/kernel_inval.rs` |
+| Harness scenario `visibility-after-burst` | done, passing | `crates/harness/src/scenarios/m7.rs` (new), TESTING.md |
+| Model | no change, argued below | — |
+
+### The stream, as built
+
+- **Who serves.** The holder, while `held` (not deposed, not in a
+  continuation epoch), and only then; losing, releasing or handing off the
+  lease sends `LogStreamEnd` to every subscriber. A node subscribes to
+  `lease.cached_holder` when it is not holding, P2P and
+  `CONSTELLATION_LOG_STREAMS` are on, and no continuation epoch is open —
+  so one node, or P2P off, never streams (`a_lone_node_never_subscribes`,
+  `single_node_is_clean` asserts zero P2P messages).
+- **What is streamed.** Every segment the holder's log cursor passes while
+  it serves: what it ships (after the create-if-absent PUT landed), its
+  takeover marker, and what it reads back from S3 (its own unacked
+  segments, a fenced one). Each frame carries the holder's `head` and a
+  per-subscription frame number `n`. The holder keeps the last 64
+  segments (16 MiB) so a subscriber that subscribes from a sequence a
+  little behind (it tailed to head a moment ago) is served without S3.
+  E2E: frames carry the opened segment over QUIC between enrolled members
+  (who hold the key); gossip, which third parties relay, carries no log
+  content at all.
+- **Applying.** Exactly the tail path: `Core::apply_incoming(seq,
+  payload)` — own-segment recovery, epoch fencing, `apply_segment`, the
+  M6 applied position and condvar, `answer_awaiting_log`. Only
+  `next_seq` is applied; later segments wait in a reorder buffer (256
+  segments / 64 MiB; overflow drops the stream). A streamed segment is
+  applied only while no job owns the cursor (`Core::cursor_free`: no
+  job, or one uploading or tailing — a run applied after a streamed apply
+  skips what is below the cursor); otherwise it waits for the job's end.
+- **Never skipping a sequence.** Frame numbers out of order break the
+  stream at once (a QUIC stream never does it; the sim's bus does); a
+  cursor at or below the last reported `head` after draining means the
+  holder will not send what is missing, and a round tails S3 (full
+  width) for it. A round skips its S3 tail only while the stream is live,
+  the buffer empty and the cursor past `head`; even then it probes S3 one
+  GET wide every `CONSTELLATION_LOG_STREAM_BACKSTOP_MS` (10 s).
+  Heartbeats every `CONSTELLATION_LOG_STREAM_HEARTBEAT_MS` (1 s) keep
+  `head` current; a stream silent for `CONSTELLATION_LOG_STREAM_TIMEOUT_MS`
+  (3.5 s) is dropped.
+- **Epoch changes.** A subscriber drops and resubscribes when it learns
+  of a different holder (a newer segment, a lease read, a redirect, a
+  frame) or takes the lease itself. A new holder's first streamed frame
+  is its marker. A deposed holder that has not noticed yet only streams
+  segments that are in S3 at those sequences; the subscriber's fencing
+  treats them exactly as a tail would, and its cached holder moves to the
+  new one as soon as it applies the new epoch's marker. A holder that
+  refused or ended a subscription is *parked*: not asked again until the
+  log has moved past the head seen then (an idle cluster whose holder let
+  the lease go asks nobody).
+- **Positions (M6).** Nothing new: a streamed apply advances
+  `applied_seq` and the applied journal position through
+  `Replica::apply_segment`, like a tail, and wakes the session condvar —
+  reads waiting on `observed` just wake sooner, and `AwaitingLog`
+  forwards are answered from the streamed segment.
+- **Slow subscribers.** The holder never waits on a subscriber: the
+  driver enqueues each frame into that subscriber's bounded sink
+  (`CONSTELLATION_LOG_STREAM_QUEUE`, default 1024 frames;
+  `CONSTELLATION_LOG_STREAM_BUFFER_BYTES`, default 32 MiB of segments)
+  with `try_send`; a full sink drops the subscriber (`SubscriberGone`),
+  which falls back to S3 and resubscribes. The P2P writer additionally
+  gives a frame 10 s to be taken before resetting the stream. QUIC flow
+  control is per stream, so a slow WAN subscriber stalls only its own
+  sink.
+
+### Relay: not now
+
+The holder serves every subscriber directly. Cost: one copy of each
+segment per subscriber of the holder's uplink — segments are what the
+holder already PUTs to S3 once, so N−1 extra copies for N nodes; with
+today's write-eligible clusters (a handful of nodes) that is small next
+to the chunk traffic. A relay tree by RTT would save WAN bytes only when
+several subscribers share a distant continent, would add a hop of
+latency and a relay-failure path to every far subscriber, and — because
+frames are signed by their sender — would need the holder's signature
+carried end to end so a relay cannot alter a segment. None of that is
+needed for the constraints: a far subscriber gets the log one WAN RTT
+after the ship (an S3 GET from there costs at least that), and a slow one
+cannot slow the holder (bounded sink, drop to S3). The protocol is
+relay-ready: a relay is a subscriber that also serves `LogSubscribe` from
+its own ring, with the same `from`/`head`/`n` rules. Revisit when a
+deployment has three or more nodes on another continent and log bandwidth
+shows up next to chunk bandwidth.
+
+### Model: no change needed
+
+A streamed delivery is a refinement of the model's `Tail(n)`
+(`crates/model/src/protocol.rs`): `Tail(n)` is enabled whenever the log
+has a slot past `n`'s applied position and applies exactly that slot
+through `tail_one`. A stream only ever delivers a slot that exists in the
+log (the holder streams after its create-if-absent PUT landed, or what it
+read from S3), and the subscriber applies it only at its next slot,
+through the same apply as a tail — so every state a streamed apply
+reaches, `Tail(n)` reaches in the same step. Skipping an S3 tail is an
+execution with fewer `Tail` actions, which the model already explores
+(no action is ever forced). Nothing safety-relevant changes, so no
+`StreamDeliver` action was added; M9's pre-S3 streaming (speculative
+records not yet in S3) is where the model must grow. The simulation runs
+the real stream code under loss, reorder and subscriber drops with every
+check on (linearizability, convergence, commit-prefix, exactly-once, M6
+sessions). The deferral of transactions behind uploading chunks
+(visibility fix 1) reorders shipping exactly as M4's held planner does
+for lost chunks — same planner, same commutation rule (disjoint key sets,
+transitive taint, uncaptured transactions hold everything after them) —
+so M4's argument and meta tests carry over; two meta tests pin the new
+class.
+
+### Visibility: root cause
+
+1. **EC2 row 6 was mostly the benchmark.** `bench/remote/phase_a.py`
+   runs the writer to completion, fetches its event list, `scp`s it to
+   the pollers and waits an 8 s barrier before the pollers *start*; each
+   marker's "latency" is then (poller start − write time). Re-reading the
+   saved raw data (`bench/remote/results/run1/row6_visibility_n4.json`):
+   every poller's *first* observation came 7.83 s after the writer's
+   *last* marker, and the latencies fall linearly from 21.3 s (marker 0)
+   to 9.8–12.9 s (marker 209) — the 13.5 s writer run plus the barrier.
+   The real visibility was at most 7.8 s and was not measured. M16 must
+   re-run row 6 with pollers running concurrently with the writer, as
+   `visibility-after-burst` does.
+2. **On floci, a burst did make visibility slow** (with 10 ms S3 latency
+   on every path; base binary 642bf70, `VIS_RUNS=off`): p99 1.9–2.05 s,
+   max 2.0–2.14 s (one of two runs over the 2 s bound); with a 384 MiB
+   burst p99 1.35 s and 3.67 s, max 3.8 s. Traced to three causes:
+   - **Head-of-line blocking behind the write-back backlog.** A round
+     uploaded *every* pending chunk before shipping anything, and the
+     journal shipped in order, so a marker journaled behind the burst's
+     manifests waited for the whole upload pass (3.4 s for 384 MiB).
+     It also left a window: a manifest journaled after the pass took its
+     snapshot of the pending rows shipped in the same round, before its
+     chunk was uploaded.
+   - **Priority inversion on `fsync`.** A marker's `fsync` drains its
+     inode through the same upload gate as the pass; the pass queues up
+     to 128 uploads on it and every release wakes every waiter, so the
+     one-chunk drain waited 2.5 s of a 3.4 s pass.
+   - **The kernel's 1 s TTL.** With the first two fixed, a marker whose
+     create shipped in one segment and its data in the next was listed,
+     read back empty, and stayed empty on the other node for a whole
+     attribute TTL: a 1.1 s tail on a third of the markers written during
+     the pass.
+3. **Fixes.**
+   - The round waits for the upload pass at most
+     `CONSTELLATION_ROUND_UPLOAD_WAIT_MS` (250 ms; one shared background
+     pass, which nudges a round when it finishes), and the ship
+     *defers* every transaction whose manifest names a still-pending
+     chunk, and whatever depends on one, through M4's planner
+     (`store::held`, "Deferred"): everything else ships. Deferred is not
+     held — it is not reported as `held`, needs no repair, and ships by
+     itself once the pass acks the chunks (`status.held` gains
+     `deferred`; `held_any` now also covers deferral, so `through` never
+     claims a skipped row). Barriers, forced publishes, flushes and
+     handoffs still wait for a complete pass (`UploadDirtyChunks {
+     complete }`).
+   - Small inode drains (≤ 4 chunks: `fsync`, write-through closes of
+     small files) take a priority permit — up to 4 slots above the
+     adaptive target, never used by ordinary uploads
+     (`ConcurrencyGate::acquire_priority`).
+   - Every foreign segment the replica applies is turned into
+     `FUSE_NOTIFY_INVAL_ENTRY`/`INVAL_INODE` for what it touched (names,
+     parents, changed inodes and their pages), sent from one dedicated
+     thread nothing waits on, per mounted view (subtree roots
+     renumbered, snapshot views skipped); `CONSTELLATION_KERNEL_INVALIDATE=0`
+     turns it off. Cross-node visibility is no longer bounded below by
+     the TTL (this also helps M8).
+   - Streams remove the remaining ship → S3 → tail hop.
+
+### Measurements (floci, this host, while other sessions ran)
+
+`visibility-after-burst` (192 MiB write-back burst, 10 ms latency on
+every S3 path, 60 fsync'd markers at 10/s, pollers B and C; the writer is
+the holder, so the M5 base's forwarding slowdown is not in play):
+
+| Build / mode | p50 | p90 | p99 | max | S3 tail GETs per poller during the markers |
+|---|---|---|---|---|---|
+| base 642bf70 (gossip pushes carry payloads) | 97 ms | 333–372 ms | 1.91–2.05 s | 2.01–2.14 s | 944–960 |
+| M7, streams off (`CONSTELLATION_LOG_STREAMS=0`) | 122–137 ms | 286–345 ms | 0.37–0.50 s | 0.40–0.56 s | 2,070–2,700 |
+| M7, streams on | 98 ms | 211–335 ms | 0.29–0.45 s | 0.30–0.53 s | **0–1** |
+
+(ranges over 3–5 runs.) 384 MiB variant (`VIS_BURST_FILES=48`): base p99
+1.35 s / 3.67 s; M7 p99 0.36–0.43 s in both modes. With streams off the
+followers issue *more* tail GETs than the base because gossip hints no
+longer carry the segment (each hint costs a probe; hint-sized probes —
+one GET per hinted segment plus one — keep that bounded); with streams
+up they issue essentially none.
+
+`idle-cluster-is-quiet` (3 nodes, 60 s idle, budget 675): base 562
+requests (followers 165/176 GETs); M7 **411–423** over three runs
+(followers 95 GETs each, of which 2 are `log/` — the rest is
+membership); the holder unchanged (161).
+
+Simulation (`cargo test -p constellation-authority --release`, 16 s):
+60 fault-free seeds, streams on vs off: S3 GETs 2,859 vs 16,366 (−83 %),
+2,146 of 2,255 segment applies from streams, 456 rounds skipped their
+tail. 150 seeds with stream faults (4 % loss, 4 % reorder, 2 % cuts on
+top of the CI faults): 292 gaps detected, 788 subscriptions lost, 129
+subscribers dropped by the holder, every check green. The 1,000 CI seeds
+and every regression green; `long_random` 400 seeds green (21 s).
+
+### Harness scenarios run (prefix `constellation-harness-m7opus`, release build, each once unless noted)
+
+PASSED: `visibility-after-burst` (×6 after the final fixes),
+`idle-cluster-is-quiet` (×3), `p2p-invalidation` (×2, push median 8 ms),
+`poison-record-isolation`, `holder-publishes-log-prefix`,
+`takeover-marker-strands-promptly`, `e2e-two-nodes`,
+`forwarded-mutations`, `lease-handover`, `session-exists-observed`,
+`session-forwarded-ryw`, `session-ryw-after-holder-kill`,
+`session-idle-latency`, `writeback-fsync`, `writeback-drain`,
+`writeback-backpressure`, `chaos-ci`, `p2p-handover`, `lease-fencing`,
+`continuation-epoch`, `epoch-member-lost`, `deposed-reintegration`,
+`holder-crash-phantom-shadow`, `holder-crash-phantom-new-holder`,
+`inbox-sporadic-write-p2p-off`, `two-clients-shared`, `kill9-remount`,
+`e2e-basic`, `stale-base-rename-divergence`, `session-wait-degrades`,
+`session-stale-base-rename`, `writeback-latency`, `big-file-write`,
+`create-storm-s3-only`, `snapshot-lifecycle`, `p2p-partition-tolerance`,
+`node-leave`, `baseline`. None failed. Not run: the full suite, pjdfstest,
+`chaos-soak-4`, meta-bench.
+
+### Found in M5/M6 (not fixed here)
+
+1. **The simulation binary hangs intermittently — on the base too.** The
+   sim test binary built from 642bf70 hung in 2 of 16 runs (mine in 3 of
+   ~40): several tests at once (`seeds_shard_*`,
+   `session_guarantees_hold`, …) stop with no CPU use. Backtrace (a
+   symbolized build): `sim::node::Driver` drop → `Arc<Meta>` drop →
+   `fjall::db::DatabaseInner::drop` (fjall 3.1.10 `src/db.rs:76`) →
+   `flume::Sender::send` blocked. That drop loops sending
+   `WorkerMessage::Close` into the worker pool's `bounded(1000)` channel
+   while `active_thread_counter > 0`; once nobody consumes, the channel
+   fills and `send` blocks for ever. Any `Meta` drop can hit it — a
+   crashed/restarted sim node, and probably a daemon's shutdown.
+2. `regression_inbox_batch_withdrawn_before_p2p_forward` pinned seed 794
+   of the default configuration; stream traffic moved that interleaving
+   off the withdrawal path (every check still passes), so it now runs
+   794 and the following seeds until one withdraws a batch (798 today).
+3. M6's `status.session.degraded_held` now also counts read timeouts
+   while rows are *deferred* behind uploading chunks (`held_any` covers
+   both, because both keep `through` below a skipped row).
+
+### What the tester must run
+
+- `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`.
+- `cargo test -p constellation-authority --release` (watch for the
+  fjall-drop hang above: a run that stalls past a minute is that, not an
+  M7 failure — rerun), and
+  `AUTHORITY_SIM_SEEDS=2000 cargo test -p constellation-authority --release --test sim -- --ignored long_random`.
+- `cargo test -p constellation-meta -p constellation-net -p constellation-api -p constellation-upload-concurrency -p constellation -p constellation-harness`.
+- Release build, then `harness run visibility-after-burst` (three times;
+  prints both modes' distributions and GET counts), `idle-cluster-is-quiet`,
+  `p2p-invalidation`, the `session-*` scenarios, `poison-record-isolation`,
+  `holder-publishes-log-prefix`, the writeback scenarios, `e2e-two-nodes`,
+  `continuation-epoch`, `epoch-member-lost`, `chaos-ci`, then the full
+  suite (`fresh-node-bootstrap`, `snapshot-mount` and
+  `holder-ships-under-forward-load` fail on the M5 base already).
+- Before/after: `VIS_RUNS=off CONSTELLATION_BIN=<a 642bf70 build> harness run visibility-after-burst`.
+- pjdfstest (single node: no streams, no foreign applies, so no
+  invalidations — but the upload gate and the ship planner changed).
+- M16: re-run EC2 row 6 with concurrent pollers.
+
+### Bisect: sim `long_random` seed 10476 (coordinator request, 2026-09-24)
+
+Replayed with `AUTHORITY_SIM_SEED=10476 AUTHORITY_SIM_CONFIG=long ... replay_seed`:
+236c39a (M5) passes, 642bf70 (+M6) passes, this tree (+M7) failed —
+`rid (2,1,8) returned before rid (3,2,13) was invoked but follows it in
+the log`. The failing code is M5's, though (the M13 inbox as moved into
+the core). The M5 coder's current tree has the same code; the seed
+passes there only because its timing differs. M7's stream timing
+reached it.
+
+**Mechanism.** Node 2's `create f1` (rid 2,1,8) went to holder 3's
+inbox under epoch 2 as batch n=0. Its inbox deadline passed ("in doubt,
+takes the lease path"), the acquisition lost to the live holder, and
+`on_acquire_retry` routed it back through the inbox as batch n=1, then
+n=2. `ClientOp::inbox_key` was a single `Option<InboxKey>`, overwritten
+by each submission, so only the latest batch was remembered. When P2P
+came back, `send_forward` withdrew that one batch and forwarded; holder
+3 answered `Exists`, and the client returned `EEXIST`. At node 2's
+takeover (epoch 3) the gate drained the forgotten batch: a refusal
+leaves no `completed` witness, so it executed `Create f1` and journaled
+`Completed(2,1,8)` at seq 34 — after the client had been told the file
+existed. The replay shows it: node 2 withdrew 2 batches and drained 3
+ops.
+
+**Fix (small, separate).** `ClientOp::inbox_keys: Vec<InboxKey>` (every
+batch the rid was submitted in; `in_doubt_batches` carries the vector
+to a resubmission). `send_forward` withdraws them one at a time before
+it forwards; `on_inbox_withdrawn` pops each one and calls `send_forward`
+again. The "stranded under an older epoch" path removes only the batch
+it deletes. After the fix, seed 10476 withdraws 4 batches and drains 1
+op, and passes. It is pinned as
+`regression_every_inbox_batch_of_a_rid_is_withdrawn`.
+
+Files: `crates/authority/src/core/{client,inbox,mod}.rs`, and the test
+in `crates/authority/tests/sim.rs`.
+
+Verified: the sim suite, 24 tests green; `long_random` seeds
+10000–11999 green (one chunk stalled on the fjall drop hang at seed
+10647 and passed on rerun).
+
+## Plan 30 M7 — rebase onto M5+M6: **GREEN** (coder, 2026-09-24; uncommitted on `plan30-m7` = main 617499b + the M6 WIP base 96149bb; the pre-rebase state is `stash@{0}`, untouched)
+
+**Conflicts resolved.**
+- `core/client.rs`: `ClientOp::inbox_keys` docs, `in_doubt` for
+  `Origin::Replay`, and the `inbox_multi_batch_withdrawals` counter all
+  taken from M5. M7's own multi-batch fix (the bisect section above) is
+  superseded by M5's equivalent and dropped.
+- `core/mod.rs`: M5's `shipped_touches`/`shipped_floor` kept.
+- `core/jobs.rs` `ship_landed`: both kept, in this order —
+  `note_shipped_touches` (M5), then M7's ship trace and
+  `stream_passed`.
+- `tests/sim.rs`: M5's long-config doc and M7's stream configs and tests
+  both kept. M7's duplicate `regression_every_inbox_batch_of_a_rid_is_withdrawn`
+  is dropped: M5's test of the same name covers more, and M5 pins seed
+  10476 in its convergence list.
+- `PROGRESS.md`: every section kept (M5, M6, M6 rebase, then M7).
+- One compile fix after the merge: `authority_driver::event_kind`, a
+  match M5 added, now names `SubscriberGone` and the stream messages.
+
+**Semantic checks.**
+- *Streamed applies vs M6's positions.* A streamed segment goes through
+  `apply_incoming` → `Replica::apply_segment(seq, epoch, through,
+  records)`, exactly as a tailed one does. The applied position, the
+  session condvar and `answer_awaiting_log` therefore see no difference.
+  The kernel-invalidation hook sits in `Replica::apply_segment`, so it
+  covers both paths.
+- *Streamed applies vs M5's `shipped_touches`.* That window is the
+  holder's own ship history, used for forward replies' `base`. It is fed
+  by `ship_landed` and reset when a tenure starts. Subscribers are never
+  holders (a node drops its stream when it holds), and the holder never
+  applies a streamed segment. So streams neither feed nor bypass it;
+  tailed segments do not feed it either.
+- *Round upload deferral vs M5's route rule.* Deferred rows are
+  unshipped journal rows. They only occur on a holder: the fast path
+  and holder execution journal only under the lease. A holder never
+  lets the lease go with rows deferred:
+  - idle release and wanted-handoff both require `backlog == 0`, and a
+    backlog starts a handoff pause instead;
+  - handoff, flush, barrier and forced-publish jobs run a complete
+    upload pass (`UploadDirtyChunks { complete: true }`).
+  The route rule (a node with an unshipped journal takes the lease path)
+  can therefore only meet deferred rows on a deposed node. That is the
+  case the rule exists for: its recovery strands them like any
+  unshipped rows.
+- *Sim seed pins.* Streams shift every schedule, so the seeds M6
+  re-pinned for the multi-batch withdraw no longer reach it here. M5's
+  `find_multi_batch_withdraw_seeds` over 10000–11999 found 13 seeds on
+  this tree, and the test now pins 10981 and 11066. 10247 stays as a
+  convergence seed, and 2267/2277/10476 as convergence seeds.
+  `regression_inbox_batch_withdrawn_before_p2p_forward` keeps M7's
+  search from seed 794.
+
+**Gates (this host).**
+- `cargo fmt --all`: clean. `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace` (model excluded): 0 failures.
+  `cargo test -p constellation-model --release`: green.
+- `cargo test -p constellation-authority --release`: 28 unit, 3
+  meta_repro and 26 sim tests (2 ignored), 19 s. That includes M5's
+  pinned seeds (bug A/B, scripted S3, inbox, 11932, the multi-batch
+  withdraw), M6's session seeds, and M7's `regression_stream_gap_detected`,
+  `stream_faults_are_survived` and `streams_carry_the_log_and_save_tail_gets`.
+- `long_random`: 10000–11999 with reads (the default) and without
+  (`AUTHORITY_SIM_READS=0`) — 4,000 seed runs, all green, no stalls.
+  This build includes the vendored fjall fix.
+- Harness, prefix `constellation-harness-m7opus`, all PASSED:
+  - `visibility-after-burst` ×2: streams on p99 340–346 ms, S3 tail
+    GETs 0–1; streams off p99 391–424 ms, GETs 1,850–1,986.
+  - `idle-cluster-is-quiet`: 409 requests (budget 675).
+  - `p2p-invalidation`: push median 8 ms.
+  - Also `session-forwarded-ryw`, `session-ryw-after-holder-kill`,
+    `forwarded-mutations`, `takeover-marker-strands-promptly`,
+    `poison-record-isolation`.
+
+## Plan 30 M7 — tester gate run (2026-09-24)
+
+Worktree `/home/bra/cvs/constellation-m7`, branch `plan30-m7`, uncommitted
+on top of main 92c4078 (post M5+M6 rebase). Baseline: a detached worktree
+at main 92c4078 built once (`target/release/{constellation,harness}`),
+used for every A/B below, removed with `git worktree remove --force` at
+the end. Harness prefix `constellation-harness-m7`. Every gate below
+**PASSED**; no design-level issues found; nothing sent back to the coder.
+
+### Gate 1 — fmt, clippy, workspace tests
+
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --exclude constellation-model`: **0 failures**
+  across every crate (net 92, store-s3 175, meta/held, api, chaos,
+  upload-concurrency, cli, harness, mtree doc-test, etc.).
+- `cargo test -p constellation-model --release`: **0 failures**, 5
+  ignored (the `_deep` cases); longest test `exactly_once_is_linearizable`
+  at 37.2 s / well under the 60 s·2 GB model-test budget.
+
+### Gate 2 — authority + simulation
+
+- `cargo test -p constellation-authority --release`: 28 unit + 3
+  meta_repro + 26 sim tests green (2 ignored: `find_multi_batch_withdraw_seeds`,
+  `long_random`), 24.3 s. Includes `a_lone_node_never_subscribes`,
+  `a_frame_gap_breaks_the_stream`, `a_caught_up_stream_skips_the_tail_until_the_backstop`,
+  `a_segment_ahead_of_the_cursor_waits_for_it`, `a_streamed_segment_is_applied_through_the_tail_path`,
+  `regression_stream_gap_detected`, `streams_carry_the_log_and_save_tail_gets`,
+  `stream_faults_are_survived`, `regression_every_inbox_batch_of_a_rid_is_withdrawn`
+  — all pass.
+- `AUTHORITY_SIM_SEEDS=2000 cargo test -p constellation-authority --release --test sim -- --ignored long_random` (reads on, seeds 10000–11999): **ok, 0 failed**, 130.0 s. No fjall-drop hang (the pre-existing M5/M6 intermittent issue, see below) hit in this run.
+- `AUTHORITY_SIM_SEEDS=1000 AUTHORITY_SIM_READS=0 cargo test -p constellation-authority --release --test sim -- --ignored long_random` (seeds 10000–10999): **ok, 0 failed**, 53.4 s.
+- No failing seed to report; no replay command needed.
+
+### Gate 3 — release build
+
+`cargo build --release --workspace`: clean, 41.8 s.
+
+### Gate 4 — harness
+
+Binaries: `CONSTELLATION_BIN=/home/bra/cvs/constellation-m7/target/release/constellation`,
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m7`. Every
+scenario below **PASSED on the first attempt** — no reruns or main-build
+A/B were needed since nothing failed.
+
+- `visibility-after-burst` ×3: p99 344–446 ms (well under the 2 s bound)
+  in both stream modes across all 3 runs; S3 tail GETs per poller during
+  the fsync'd markers with streams on: **0–1** each run (vs. 1,788–2,072
+  with streams off in the same runs). Burst 24×8 MiB.
+- `idle-cluster-is-quiet` ×2: 650 and 410 total S3 requests over 60 s / 3
+  nodes (budget 675); holder unchanged, followers 95–125 requests each.
+- `p2p-invalidation` (push median 8 ms), `p2p-handover` (221 ms first
+  write under a live holder), `p2p-partition-tolerance`, `coop-cache-hit`
+  (0 S3 fetches, 8 peer hits), `web-fleet` (0 S3 fetches, 16 peer hits for
+  8 unique chunks) — all PASSED.
+- All six `session-*`: `session-exists-observed`, `session-forwarded-ryw`,
+  `session-stale-base-rename`, `session-ryw-after-holder-kill`,
+  `session-wait-degrades`, `session-idle-latency` — all PASSED, no
+  unexpected waits/timeouts.
+- `chaos-ci` ×2 (2.6–2.7 s each, 13 outcomes each rid once, no
+  cycle/violation), `chaos-soak-4` (311.0 s, ~1,660 steps, 1,664
+  `exactly_once_log` outcomes each rid once, converged, no checker false
+  positive).
+- `holder-ships-under-forward-load` (6,400 forwarded creates, max journal
+  backlog 126, `ship_rounds_cancelled=0`), `forwarded-mutations`,
+  `takeover-marker-strands-promptly`, `poison-record-isolation` (1 held
+  tx → conflict copy, 1 dependent rolled back and replayed) — all PASSED.
+- `writeback-drain`, `writeback-fsync`, `writeback-backpressure`,
+  `unmount-drain`, `staging-crash` — all PASSED.
+- `big-file-write` (peak RSS 99 MiB, cache budget 64 MiB, flat — not
+  tracking bytes written), `kill9-remount`, `fresh-node-bootstrap`,
+  `snapshot-mount`, `two-clients-shared` — all PASSED. (`fresh-node-bootstrap`
+  and `snapshot-mount` had been noted as failing on the pre-rebase M5 base;
+  both pass cleanly here after the M5+M6 rebase.)
+- `inbox-create-storm-p2p-off` (1,758.7 ops/s, ping-pong floor 41 ops/s),
+  `inbox-sporadic-write-p2p-off` (p50 563 ms, p99 1.08 s), `stale-base-rename-divergence`,
+  `baseline`, `git-workflow` — all PASSED.
+
+### Gate 5 — smoke and pjdfstest
+
+- `tests/smoke.sh`: **PASSED** against the local file backend (the
+  "If-Match ... unavailable" lines are the known LocalFileSystem CAS gap,
+  not an M7 regression — the doctor probe correctly reports it).
+- pjdfstest: port 4566 was held by `constellation-floci-1` (a live,
+  independent container), so used the same workaround as M4/M13's tester
+  runs — `docker compose -p constellation-m7 -f docker-compose.yml -f
+  <scratchpad>/floci-no-port.yml --profile test run --rm compliance`
+  (drops floci's host port publish; `compliance` reaches it by in-network
+  DNS name regardless, so nothing about what's tested changes). Built the
+  M7 image fresh (`cargo build --release -p constellation -p
+  constellation-harness` inside the image, 58.7 s). Result: **8798
+  passed, 0 failed, empty baseline.** Torn down immediately (`down -v`,
+  project `constellation-m7`); `constellation-floci-1` and other
+  worktrees' containers untouched.
+
+### Gate 6 — perf (main 92c4078 vs. this tree, interleaved)
+
+Host load was elevated and highly variable throughout this run (other
+concurrent worktree sessions — observed a live `constellation-m9` harness
+chain during this gate): 1-minute load ranged from ~4 to ~32 over the
+perf window. Rounds were interleaved (main, M7, main, M7, ...) so any
+transient spike hits both sides; a few outlier single-run numbers below
+are host noise (noted inline), not a systematic direction. Where the
+first pass was too noisy to call, extra pairs were run once the load
+settled (~4–8) to confirm.
+
+**`meta-bench`** (`CONSTELLATION_METABENCH_ONLY=<label>`, via
+`<scratchpad>/mb.sh`, 1 run per side per round):
+
+| Config | Round | main agg ops/s | M7 agg ops/s | main p99 ms | M7 p99 ms | Load (1-min) at measurement |
+|---|---|---|---|---|---|---|
+| `1node-create-lat0` | 1 | 2984 (cold-start outlier) | 7894 | 2.92 | 0.26 | ~6 |
+| `1node-create-lat0` | 2 | 7484 | 8035 | 0.48 | 0.24 | ~6 |
+| `1node-create-lat0` | 3 | 8112 | 7690 | 0.25 | 0.27 | ~6 |
+| `1node-write4k-lat0` | 6 (calm) | 3068 | 3321 | 0.78 | 0.57 | ~4 |
+| `1node-write4k-lat0` | 7 (calm) | 2844 | 3310 | 1.06 | 0.63 | ~4 |
+| `1node-write4k-lat0` | 8 (calm) | 3201 | 2881 | 0.65 | 0.74 | ~4–5 |
+| `3node-p2pon-shared-create-lat0` | 1 | 2226 | 2979 | 9.91 | 6.91 | ~4–5 |
+| `3node-p2pon-shared-create-lat0` | 2 | 1905 | 3168 | 9.77 | 6.90 | ~5 |
+| `3node-p2pon-shared-create-lat0` | 3 | 2273 | 2848 | 8.83 | 6.86 | ~5 |
+
+(An initial 5-round pass at `1node-write4k-lat0` under load spiking to
+16–32 produced a wild outlier — M7 1724 vs. main 2931 in one round, M7
+2980 vs. main 2565 in the very next — confirming that swing was host
+noise, not a regression; the 3 "calm" rounds above at load ~4 are the
+ones to trust.)
+
+Aggregates: `1node-create-lat0` excluding main's cold-start round —
+main ≈7,798, M7 ≈7,862.5 (**M7 +0.8%**, within noise).
+`1node-write4k-lat0` (calm rounds) — main avg 3,038, M7 avg 3,171 (**M7
++4.4%**, within the 5% bound). `3node-p2pon-shared-create-lat0` — main
+avg 2,135, M7 avg 2,998 (**M7 +40.5%, clearly faster**, consistent with
+M7's design: followers' forwarded creates no longer wait on an S3 tail
+hop once the log stream is up).
+
+**`harness bench`** (`--files 5000 --json`, reduced from the 20,000-file
+default for tractability under this host's shared load; same params both
+sides, 3 interleaved pairs):
+
+| Metric (files/s unless noted) | main avg (3 runs) | M7 avg (3 runs) | Δ |
+|---|---|---|---|
+| `import_files_per_sec` | 73.3 | 90.8 | **+24%** |
+| `durable_import_files_per_sec` | 72.9 | 90.2 | **+23%** |
+| `writeback_import_files_per_sec` | 1,320 | 1,208 | −8.5% |
+| `metadata_walk_files_per_sec` | 224,656 | 217,599 | −3.1% |
+| `cold_read_files_per_sec` | 55,004 | 52,919 | −3.8% |
+| `sequential_cold_read_mib_per_sec` | 347.9 | 312.7 | −10.1% |
+
+Per-round spread on `main` alone was 62–80 files/s for import and
+313–377 MiB/s for sequential cold read (a 20–25% swing run-to-run on the
+*same* binary), i.e. comparable to or larger than the deltas above under
+this host's load — so the writeback/cold-read/sequential-read deltas are
+not distinguishable from noise at 3 pairs. The one clearly-signal number
+is `import_files_per_sec`/`durable_import_files_per_sec`: M7 is
+consistently and substantially faster on every round (99.1>79.95,
+77.3>62.4, 95.9>77.5), matching the round-upload-wait/deferral and
+priority-fsync-lane changes in M7's design. **No metric shows M7
+regressing beyond what the host's own noise floor explains; the
+metric most directly targeted by this milestone (import throughput) is
+clearly faster, not slower.**
+
+### Summary
+
+All required gates green: fmt/clippy/workspace/model tests, authority +
+3,000 combined `long_random` seeds, release build, the full listed
+harness matrix (all scenarios passed on the first try, no A/B needed),
+smoke, pjdfstest 8798/8798, and perf (no regression found; import
+throughput measurably improved, consistent with the milestone's design).
+No mechanical fixes were needed — the tree was already clean. Nothing is
+sent back to the coder.

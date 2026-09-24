@@ -20,6 +20,8 @@ mod m4;
 /// Plan 30 §M5 phase 2: the stale-base rule on the wire.
 mod m5;
 mod m6;
+/// Plan 30 §M7: log streams and cross-node visibility.
+mod m7;
 
 pub struct Scenario {
     pub name: &'static str,
@@ -599,6 +601,12 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M6: after a 3-node write burst, a read-only phase never waits (status.session.waited flat); a single node never waits at all; prints the wait histograms",
         requires: &[],
         run: m6::session_idle_latency,
+    },
+    Scenario {
+        name: "visibility-after-burst",
+        desc: "plan 30 M7: 3 nodes; A writes a large write-back burst, then a paced series of fsync'd markers while B and C poll for each; cross-node visibility p99 < 2 s with log streams off and on, and with streams on the pollers issue ~0 S3 tail GETs during the markers",
+        requires: &[],
+        run: m7::visibility_after_burst,
     },
     Scenario {
         name: "inbox-create-storm-p2p-off",

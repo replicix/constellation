@@ -244,11 +244,25 @@ pub enum SyncRequest {
         policy: constellation_authority::Policy,
         reply: tokio::sync::oneshot::Sender<constellation_authority::ClientReply>,
     },
-    ApplyPushed {
+    /// A peer's gossip says segment `seq` landed (plan 30 §M7: a hint
+    /// with no payload). The core tails now unless its log stream from
+    /// the holder delivers it.
+    SegmentHint {
         seq: u64,
         epoch: u64,
-        holder_node: u64,
-        payload: Vec<u8>,
+    },
+    /// Plan 30 §M7: a peer subscribes to this node's log stream. The
+    /// driver hands it to the core and writes whatever the core streams
+    /// to `requester` into `sink` (bounded: a subscriber that falls
+    /// behind is dropped back to S3 tailing).
+    LogSubscribe {
+        requester: u64,
+        req: u64,
+        from: u64,
+        sink: tokio::sync::mpsc::Sender<constellation_net::LogEvent>,
+        /// Segment bytes queued in `sink` and not yet taken by the stream
+        /// writer (the driver adds, the writer's relay subtracts).
+        queued_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     },
     ClaimOffer {
         epoch: u64,
@@ -667,6 +681,12 @@ impl ConstellationFs {
         self.view_root = self.intern_synthetic(format!("mount:{path}@{name}"), node);
         *self.usage_cache.lock().unwrap() = None;
         Ok(())
+    }
+
+    /// The replica inode this view shows as its root (plan 30 §M7's
+    /// kernel invalidation renumbers it).
+    pub fn view_root(&self) -> Ino {
+        self.view_root
     }
 
     pub(crate) fn real_ino(&self, ino: Ino) -> Ino {

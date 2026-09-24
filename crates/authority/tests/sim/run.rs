@@ -2,7 +2,7 @@
 //! time, a seeded workload, a seeded fault plan, then quiescence and the
 //! checks.
 
-use super::bus::Bus;
+use super::bus::{Bus, StreamFaults};
 use super::check;
 use super::clock::Clock;
 use super::history::{check_linearizable, check_linearizable_witnessed, History, NsOp, NsRet};
@@ -81,6 +81,9 @@ pub struct SimConfig {
     /// `false` is the non-vacuity knob: reads never wait.
     pub session_wait: bool,
     pub session_wait_ms: u64,
+    /// Plan 30 §M7: faults on log-stream frames (loss, reorder, the
+    /// holder dropping a subscriber).
+    pub stream_faults: StreamFaults,
 }
 
 /// Core tunables scaled down for simulation (seconds, not minutes).
@@ -118,6 +121,13 @@ pub fn sim_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.escalate_ops = 8;
     c.escalate_wait_ms = 1_500;
     c.escalate_retry_ms = 800;
+    c.stream_heartbeat_ms = 300;
+    c.stream_timeout_ms = 1_000;
+    c.stream_backstop_ms = 2_000;
+    c.stream_ring_segments = 16;
+    c.stream_buffer_segments = 32;
+    c.stream_retry_min_ms = 150;
+    c.stream_retry_max_ms = 2_000;
     c
 }
 
@@ -147,6 +157,7 @@ impl Default for SimConfig {
             read_ratio: 0.0,
             session_wait: true,
             session_wait_ms: 2_000,
+            stream_faults: StreamFaults::default(),
         }
     }
 }
@@ -715,6 +726,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let clock = Clock::start();
     let bucket = Bucket::new(seed, cfg.s3_latency);
     let bus = Bus::new(seed, cfg.p2p_delay, cfg.p2p_drop);
+    bus.set_stream_faults(cfg.stream_faults.clone());
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let env = NodeEnv {
         bucket: bucket.clone(),

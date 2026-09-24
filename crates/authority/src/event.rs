@@ -62,6 +62,11 @@ pub enum Event {
     /// the holder's inbox poll set, M9's backup liveness). Sent whole,
     /// whenever the driver refreshes it.
     Peers { links: Vec<PeerLink> },
+    /// M7: the driver dropped a subscriber of this holder's log stream
+    /// (its bounded send buffer overflowed, or its connection went away):
+    /// stop streaming to it. The subscriber falls back to S3 and
+    /// resubscribes on its own.
+    SubscriberGone { node: NodeId, req: OpId },
     /// Local writes the driver's fast path executed without the core
     /// (the FUSE lease view's `admit`): the time of the last one, for the
     /// idle-release clock, and their rid seqs, for the ack tracker
@@ -213,23 +218,48 @@ pub enum PeerMsg {
         epoch: Epoch,
         head_seq: Option<Seq>,
     },
-    /// Gossip push of a shipped segment (`Payload::SegmentPublished`).
+    /// Gossip hint that a segment landed (`Payload::SegmentPublished`).
+    /// Plan 30 §M7: a hint only — the log itself travels on direct
+    /// streams ([`PeerMsg::LogStream`]) or through S3; gossip carries
+    /// membership and digests.
     SegmentPublished {
         seq: Seq,
         epoch: Epoch,
-        payload: Option<Vec<u8>>,
     },
-    /// M7: subscribe to the holder's shipped-segment stream from `from`.
+    /// M7: subscribe to the holder's log stream from `from` (the
+    /// subscriber's next expected sequence). `req` names the subscription
+    /// in every frame of it; the driver reports `Event::PeerFailed` with
+    /// it when the stream cannot be opened or breaks.
     LogSubscribe {
         req: OpId,
         from: Seq,
     },
-    /// M7: one streamed segment (applied through the tail path, fencing
-    /// included).
+    /// M7: the subscriber lets subscription `req` go (it switched holders,
+    /// took the lease itself, or found a gap).
+    LogUnsubscribe {
+        req: OpId,
+    },
+    /// M7: frame `n` (0, 1, 2, … per subscription) of subscription `req`:
+    /// one segment the holder's cursor passed over — shipped by it, or
+    /// read back from S3 — exactly the bytes of `log/<seq>` in S3, or a
+    /// heartbeat (`segment: None`). `head` is the holder's highest
+    /// applied-or-shipped sequence when it sent the frame, and `epoch` the
+    /// epoch it holds. A subscriber applies segments through the tail
+    /// path (`Core::apply_incoming`, fencing included) and never skips a
+    /// sequence: a frame out of order breaks the stream, and a missing
+    /// sequence is read from S3.
     LogStream {
-        seq: Seq,
+        req: OpId,
+        n: u64,
         epoch: Epoch,
-        payload: Vec<u8>,
+        head: Seq,
+        segment: Option<(Seq, Vec<u8>)>,
+    },
+    /// M7: the holder ends subscription `req`: it stopped holding
+    /// (`refused: false`), or was never the holder (`refused: true`).
+    LogStreamEnd {
+        req: OpId,
+        refused: bool,
     },
     /// M8: `cto=strict` open(): ask the owning sequencer for the current
     /// position and inode record, and possibly a read delegation.

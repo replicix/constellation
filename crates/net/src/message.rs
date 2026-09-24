@@ -32,11 +32,10 @@ pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 32 * 1024;
 /// envelope. `Signed::encode_bare` enforces this before enqueue, because
 /// the gossip sender otherwise reports an oversized frame asynchronously.
 pub const GOSSIP_CONTENT_LIMIT: usize = GOSSIP_MAX_MESSAGE_SIZE - 1024;
-/// Headroom a `SegmentPublished` push needs on top of its zstd payload
-/// and partition id: enum/option tags, seq + epoch varints, postcard
-/// length prefixes, the author pubkey, and the signature. Measured well
-/// under 200 bytes; 512 keeps a safety margin.
-pub const SEGMENT_PUSH_ENVELOPE: usize = 512;
+/// Largest log segment a stream frame may carry (plan 30 §M7). A shipped
+/// segment is capped at 4 MiB of records; this leaves room for the
+/// envelope and stops a peer from making us allocate.
+pub const MAX_LOG_SEGMENT: u64 = 64 * 1024 * 1024;
 /// Conservative delta batch under [`GOSSIP_CONTENT_LIMIT`]. Raw hashes
 /// cost 32 bytes each; the remaining headroom covers payload/envelope
 /// tags, counters, author, and signature.
@@ -46,15 +45,44 @@ pub const MAX_GOSSIP_DELTA_ADDS: usize = 900;
 /// chunk serving over the same ALPN.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Payload {
-    /// Gossiped after a segment PUT succeeds: recipients tail
-    /// immediately instead of waiting for their next poll.
-    /// `payload` is the zstd segment bytes when small enough to fit
-    /// the gossip budget; recipients may apply it directly.
+    /// Gossiped after a segment PUT succeeds: recipients that do not
+    /// follow the holder's log stream tail immediately instead of waiting
+    /// for their next poll. Plan 30 §M7: a hint only — the log itself
+    /// travels on direct log streams ([`Payload::LogSubscribe`]) or through
+    /// S3; gossip carries membership and digests.
     SegmentPublished {
         part: String,
         seq: u64,
         epoch: u64,
-        payload: Option<Vec<u8>>,
+    },
+    /// Plan 30 §M7: subscribe to the holder's log stream from `from`.
+    /// Sent directly to the holder, on a bidirectional stream that stays
+    /// open: the holder answers with [`Payload::LogFrame`]s (each followed
+    /// by its segment bytes) until one side lets go, or with one
+    /// [`Payload::LogEnd`].
+    LogSubscribe {
+        part: String,
+        requester: u64,
+        req_id: u64,
+        from: u64,
+    },
+    /// Plan 30 §M7: frame `n` of subscription `req_id`. `segment` names
+    /// the log sequence whose S3 object bytes (`len` of them, `blake3`
+    /// hash `hash`) follow the frame on the stream; `None` is a
+    /// heartbeat. `head` is the holder's highest applied-or-shipped
+    /// sequence, `epoch` the epoch it holds.
+    LogFrame {
+        req_id: u64,
+        n: u64,
+        epoch: u64,
+        head: u64,
+        segment: Option<(u64, u64, [u8; 32])>,
+    },
+    /// Plan 30 §M7: the holder ends subscription `req_id` (it stopped
+    /// holding, or `refused`: it never held).
+    LogEnd {
+        req_id: u64,
+        refused: bool,
     },
     /// GC has CAS-published `gc/condemned.json`. Writers still re-read S3;
     /// this is only a freshness nudge, never the authority.
@@ -399,7 +427,6 @@ mod tests {
             part: "p0".into(),
             seq: 7,
             epoch: 3,
-            payload: None,
         };
         let signed = Signed::new(&k, &payload).unwrap();
         let (author, got) = signed.verify().unwrap();
@@ -465,7 +492,6 @@ mod tests {
             part: "p0".into(),
             seq: 3,
             epoch: 1,
-            payload: None,
         };
         let signed = Signed::new(&k, &payload).unwrap();
         let bare = signed.encode_bare().unwrap();
@@ -494,7 +520,6 @@ mod tests {
                 part: "p".repeat(MAX_FRAME),
                 seq: 1,
                 epoch: 1,
-                payload: None,
             },
         )
         .unwrap();
@@ -655,30 +680,5 @@ mod tests {
             .len();
         let est = wire_len(&payload);
         assert!(est.abs_diff(real) <= 8, "estimate {est} vs real {real}");
-    }
-
-    /// The largest segment push [`SEGMENT_PUSH_ENVELOPE`] admits must
-    /// really encode within the gossip budget, or `announce_segment`'s
-    /// size gate would wave through frames the sender then rejects —
-    /// re-disabling push invalidation under load, silently.
-    #[test]
-    fn a_maximum_segment_push_fits_the_real_gossip_budget() {
-        let part = "p1_20";
-        let payload = vec![0xAB; GOSSIP_CONTENT_LIMIT - SEGMENT_PUSH_ENVELOPE - part.len()];
-        let msg = Signed::new(
-            &key(),
-            &Payload::SegmentPublished {
-                part: part.to_string(),
-                seq: u64::MAX,
-                epoch: u64::MAX,
-                payload: Some(payload),
-            },
-        )
-        .unwrap();
-        let n = msg.encode_bare().unwrap().len();
-        assert!(
-            n <= GOSSIP_CONTENT_LIMIT,
-            "maximum segment push is {n} bytes, content limit is {GOSSIP_CONTENT_LIMIT}"
-        );
     }
 }

@@ -436,8 +436,10 @@ pub struct StatusReport {
     pub forwarded_err: u64,
     #[serde(default)]
     pub forward_p50_ms: Option<u64>,
+    /// Plan 30 §M7: the direct log stream (this node's subscription to
+    /// the holder, or the subscribers it serves as the holder).
     #[serde(default)]
-    pub pushed_segments_applied: u64,
+    pub log_stream: LogStreamStatus,
     /// Plan 30 §M2: forwarded requests the holder answered from
     /// `recent`/`completed` instead of re-executing (a retried rid).
     #[serde(default)]
@@ -1002,6 +1004,61 @@ pub struct SessionStatus {
     pub raised: u64,
 }
 
+/// Plan 30 §M7: the direct log stream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LogStreamStatus {
+    /// `CONSTELLATION_LOG_STREAMS` (and P2P) on.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The holder this node is subscribed to (0: none), whether a frame
+    /// has arrived on the subscription, and segments waiting in its
+    /// reorder buffer for a sequence S3 must supply.
+    #[serde(default)]
+    pub upstream: u64,
+    #[serde(default)]
+    pub live: bool,
+    #[serde(default)]
+    pub buffered: u64,
+    /// Segments applied from the stream (no S3 GET), and rounds that
+    /// skipped their S3 tail because the stream covered it.
+    #[serde(default)]
+    pub applied: u64,
+    #[serde(default)]
+    pub tail_skips: u64,
+    /// Subscriptions made, and how they ended: refused (not the holder),
+    /// ended by the holder (it let the lease go), a frame gap, lost at the
+    /// transport, silent past the timeout, or a full reorder buffer.
+    #[serde(default)]
+    pub subscribes: u64,
+    #[serde(default)]
+    pub refused: u64,
+    #[serde(default)]
+    pub ended: u64,
+    #[serde(default)]
+    pub gaps: u64,
+    #[serde(default)]
+    pub lost: u64,
+    #[serde(default)]
+    pub timeouts: u64,
+    #[serde(default)]
+    pub overflows: u64,
+    #[serde(default)]
+    pub duplicates: u64,
+    /// As the holder: subscribers served now, subscriptions accepted and
+    /// declined, frames sent, and subscribers dropped for falling behind
+    /// (their bounded buffer overflowed) or going away.
+    #[serde(default)]
+    pub serving: u64,
+    #[serde(default)]
+    pub served: u64,
+    #[serde(default)]
+    pub declined: u64,
+    #[serde(default)]
+    pub frames_sent: u64,
+    #[serde(default)]
+    pub subscribers_dropped: u64,
+}
+
 /// Plan 30 §M4: records held back behind unrecoverable pending chunks.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HeldStatus {
@@ -1018,6 +1075,10 @@ pub struct HeldStatus {
     /// transaction after it is held too.
     #[serde(default)]
     pub opaque: bool,
+    /// Plan 30 §M7: transactions deferred (not held) because a chunk their
+    /// manifest names is still uploading; they ship once it is up.
+    #[serde(default)]
+    pub deferred: u64,
     /// Each inode with unrecoverable chunks: `constellation repair
     /// drop-held <ino>` discards its held records.
     #[serde(default)]

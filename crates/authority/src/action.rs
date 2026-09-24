@@ -53,6 +53,12 @@ pub enum Action {
         op: OpId,
         ino: Option<Ino>,
         round: bool,
+        /// Plan 30 §M7: a round's pass may report done before every
+        /// pending chunk is up — the ship defers what still needs its
+        /// chunks (`Meta::take_journal_grouped`) — unless `complete`: the
+        /// round answers a barrier or a forced publish, which need the
+        /// whole journal shipped.
+        complete: bool,
     },
     /// Publish a metadata commit from the replica's log-prefix state
     /// (`TreePublisher::publish` with `Meta::publish_basis_at`) and report
@@ -63,8 +69,10 @@ pub enum Action {
     /// dirty keys the head commit already covers
     /// (`TreePublisher::follow_head`) — and report `Event::PublishDone`.
     FollowHead { op: OpId },
-    /// Gossip a shipped segment (`Shipper`'s `announce_segment`), and run
-    /// the offline-designation flush-ack check for the records it
+    /// Gossip a hint that segment `seq` landed (`Peers::announce_segment`;
+    /// plan 30 §M7: the hint carries no payload — subscribers get the
+    /// segment on their log stream, everyone else tails it), and run the
+    /// offline-designation flush-ack check for the records `payload`
     /// carries. Best effort; peers converge by tailing regardless.
     Announce {
         seq: Seq,
@@ -183,6 +191,10 @@ pub enum TimerKind {
     InboxSubmitRetry,
     /// M13 round 3b: the escalator's tick while demand is sustained.
     EscalateTick,
+    /// M7: the holder's heartbeat to idle log-stream subscribers.
+    StreamHeartbeat,
+    /// M7: a subscriber's check that its log stream is still alive.
+    StreamWatchdog,
 }
 
 /// Successful control-plane results.

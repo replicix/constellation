@@ -408,32 +408,17 @@ impl Peers {
     }
 
     /// Tell peers a segment is durable so they tail now instead of at
-    /// their next poll. Failure is fine: the poll still happens.
-    /// `payload` is the zstd segment bytes when they fit the gossip budget.
-    pub async fn announce_segment(
-        &self,
-        part: &str,
-        seq: u64,
-        epoch: u64,
-        payload: Option<Vec<u8>>,
-    ) {
+    /// their next poll. Failure is fine: the poll still happens. Plan 30
+    /// §M7: a hint only; the segment itself reaches the holder's
+    /// subscribers on their log streams.
+    pub async fn announce_segment(&self, part: &str, seq: u64, epoch: u64) {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
-        // The payload rides along only when it fits the gossip frame; an
-        // oversized segment must still produce the *hint*. Failing the
-        // whole broadcast here used to silently disable push invalidation
-        // exactly under write bursts — the big batched segments are the
-        // ones whose readers lag the most on their own poll schedule.
-        let payload = payload.filter(|p| {
-            p.len() + part.len() + crate::message::SEGMENT_PUSH_ENVELOPE
-                <= crate::message::GOSSIP_CONTENT_LIMIT
-        });
         let payload = Payload::SegmentPublished {
             part: part.to_string(),
             seq,
             epoch,
-            payload,
         };
         match inner.p2p.broadcast(&payload).await {
             Ok(()) => tracing::debug!(part, seq, epoch, "announced segment to peers"),
@@ -441,6 +426,38 @@ impl Peers {
                 tracing::debug!(error = %e, part, seq, "segment announce failed; peers will poll")
             }
         }
+    }
+
+    /// Plan 30 §M7: subscribe to `node_id`'s log stream from `from` (see
+    /// [`crate::P2p::open_log_stream`]).
+    pub async fn subscribe_log(
+        &self,
+        node_id: u64,
+        req_id: u64,
+        from: u64,
+    ) -> Result<tokio::sync::mpsc::Receiver<crate::endpoint::LogEvent>> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("P2P is off"))?;
+        let addr = self
+            .snapshot()
+            .into_iter()
+            .find(|p| p.node_id == node_id)
+            .ok_or_else(|| anyhow::anyhow!("no address for node {node_id}"))?
+            .addr;
+        let started = std::time::Instant::now();
+        let payload = Payload::LogSubscribe {
+            part: "p0".to_string(),
+            requester: inner.node_id,
+            req_id,
+            from,
+        };
+        let id = addr.id;
+        let result = inner.p2p.open_log_stream(addr, &payload).await;
+        let path = inner.p2p.path_kind(id).await;
+        self.note_rtt(node_id, started.elapsed(), result.is_ok(), path);
+        result
     }
 
     pub async fn announce_condemned(&self, epoch: u64) {
@@ -862,13 +879,8 @@ pub async fn run_gossip<S: PeerService>(
             continue;
         }
         match &payload {
-            Payload::SegmentPublished {
-                part,
-                seq,
-                epoch,
-                payload: body,
-            } => {
-                service.segment_published(part, *seq, *epoch, body.clone());
+            Payload::SegmentPublished { part, seq, epoch } => {
+                service.segment_published(part, *seq, *epoch);
             }
             Payload::MutateRequest {
                 part,
@@ -1049,14 +1061,19 @@ async fn handle_stream<S: PeerService>(
         return Ok(());
     }
     let reply = match payload {
-        Payload::SegmentPublished {
-            part,
-            seq,
-            epoch,
-            payload,
-        } => {
-            service.segment_published(&part, seq, epoch, payload);
+        Payload::SegmentPublished { part, seq, epoch } => {
+            service.segment_published(&part, seq, epoch);
             None
+        }
+        Payload::LogSubscribe {
+            requester,
+            req_id,
+            from,
+            ..
+        } => {
+            serve_log_stream(inner, service, hex, requester, req_id, from, &mut send).await?;
+            let _ = send.finish();
+            return Ok(());
         }
         Payload::CondemnedPublished { .. } => None,
         Payload::LeaseRequest { part, requester } => {
@@ -1149,6 +1166,8 @@ async fn handle_stream<S: PeerService>(
         | Payload::CacheSetDelta { .. }
         | Payload::ReconcileReply { .. }
         | Payload::ChunkResponse { .. }
+        | Payload::LogFrame { .. }
+        | Payload::LogEnd { .. }
         | Payload::MutateReply { .. } => None,
     };
     if let Some(reply) = reply {
@@ -1156,6 +1175,91 @@ async fn handle_stream<S: PeerService>(
         write_frame(&mut send, &signed).await?;
     }
     let _ = send.finish();
+    Ok(())
+}
+
+/// Plan 30 §M7: write `requester`'s log stream until the service closes
+/// it, the subscriber goes away, or a frame is not taken within
+/// [`crate::endpoint::LOG_FRAME_WRITE_TIMEOUT`]. Every frame is a signed
+/// [`Payload::LogFrame`] followed by the raw segment bytes, like a chunk
+/// body; the subscriber checks the bytes against the signed hash.
+#[allow(clippy::too_many_arguments)]
+async fn serve_log_stream<S: PeerService>(
+    inner: &Arc<Inner>,
+    service: &S,
+    hex: &str,
+    requester: u64,
+    req_id: u64,
+    from: u64,
+    send: &mut iroh::endpoint::SendStream,
+) -> Result<()> {
+    use crate::endpoint::{LogEvent, LOG_FRAME_WRITE_TIMEOUT};
+    use tokio::io::AsyncWriteExt;
+    let Some(mut rx) = service.log_subscribe(requester, req_id, from) else {
+        let end = Signed::new(
+            inner.p2p.secret_key(),
+            &Payload::LogEnd {
+                req_id,
+                refused: true,
+            },
+        )?;
+        write_frame(send, &end).await?;
+        return Ok(());
+    };
+    while let Some(event) = rx.recv().await {
+        let (payload, body) = match event {
+            LogEvent::Frame {
+                n,
+                epoch,
+                head,
+                segment,
+            } => {
+                let (meta, body) = match segment {
+                    Some((seq, bytes)) => {
+                        let hash = *blake3::hash(&bytes).as_bytes();
+                        (Some((seq, bytes.len() as u64, hash)), Some(bytes))
+                    }
+                    None => (None, None),
+                };
+                (
+                    Payload::LogFrame {
+                        req_id,
+                        n,
+                        epoch,
+                        head,
+                        segment: meta,
+                    },
+                    body,
+                )
+            }
+            LogEvent::End { refused } => (Payload::LogEnd { req_id, refused }, None),
+        };
+        let end = matches!(payload, Payload::LogEnd { .. });
+        let signed = Signed::new(inner.p2p.secret_key(), &payload)?;
+        let write = async {
+            write_frame(send, &signed).await?;
+            if let Some(body) = &body {
+                send.write_all(body).await?;
+                send.flush().await?;
+            }
+            anyhow::Ok(())
+        };
+        match tokio::time::timeout(LOG_FRAME_WRITE_TIMEOUT, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(peer = %hex, error = %e, "log stream subscriber went away");
+                return Ok(());
+            }
+            Err(_) => {
+                tracing::debug!(peer = %hex, "log stream subscriber too slow; dropping it");
+                let _ = send.reset(0u32.into());
+                return Ok(());
+            }
+        }
+        if end {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -1173,10 +1277,12 @@ mod tests {
         digests: Mutex<Vec<crate::endpoint::DigestSnapshot>>,
         /// What to answer a lease request with.
         release: bool,
+        /// Plan 30 §M7: subscriptions seen, as `(requester, req_id, from)`.
+        log_subs: Mutex<Vec<(u64, u64, u64)>>,
     }
 
     impl PeerService for Recorder {
-        fn segment_published(&self, part: &str, seq: u64, epoch: u64, _payload: Option<Vec<u8>>) {
+        fn segment_published(&self, part: &str, seq: u64, epoch: u64) {
             self.segments
                 .lock()
                 .unwrap()
@@ -1207,6 +1313,45 @@ mod tests {
         }
         fn node_id(&self) -> u64 {
             7
+        }
+        /// Serves (when `release`) a heartbeat, one segment larger than
+        /// a control frame may be, and an end; refuses otherwise.
+        fn log_subscribe(
+            &self,
+            requester: u64,
+            req_id: u64,
+            from: u64,
+        ) -> Option<tokio::sync::mpsc::Receiver<crate::endpoint::LogEvent>> {
+            use crate::endpoint::LogEvent;
+            self.log_subs
+                .lock()
+                .unwrap()
+                .push((requester, req_id, from));
+            if !self.release {
+                return None;
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move {
+                let big = vec![0x5a; 3 * crate::message::MAX_FRAME];
+                for event in [
+                    LogEvent::Frame {
+                        n: 0,
+                        epoch: 4,
+                        head: 9,
+                        segment: None,
+                    },
+                    LogEvent::Frame {
+                        n: 1,
+                        epoch: 4,
+                        head: 10,
+                        segment: Some((10, big)),
+                    },
+                    LogEvent::End { refused: false },
+                ] {
+                    let _ = tx.send(event).await;
+                }
+            });
+            Some(rx)
         }
     }
 
@@ -1241,6 +1386,55 @@ mod tests {
         (holder, asker, service)
     }
 
+    /// Plan 30 §M7: a log stream over real QUIC: frames arrive in order,
+    /// a segment bigger than any control frame comes through whole (and
+    /// hash-checked), and the holder's end closes it.
+    #[tokio::test]
+    async fn a_log_stream_crosses_quic_in_order() {
+        use crate::endpoint::LogEvent;
+        let (_holder, asker, service) = pair(true).await;
+        let mut rx = asker.subscribe_log(1, 42, 9).await.unwrap();
+        let mut got = Vec::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("log stream stalled")
+        {
+            got.push(event);
+        }
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(matches!(
+            got[0],
+            LogEvent::Frame {
+                n: 0,
+                head: 9,
+                segment: None,
+                ..
+            }
+        ));
+        match &got[1] {
+            LogEvent::Frame {
+                n: 1,
+                segment: Some((10, bytes)),
+                ..
+            } => assert_eq!(bytes.len(), 3 * crate::message::MAX_FRAME),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(got[2], LogEvent::End { refused: false });
+        assert_eq!(service.log_subs.lock().unwrap().as_slice(), [(2, 42, 9)]);
+    }
+
+    /// A node with no log to serve refuses at once.
+    #[tokio::test]
+    async fn a_refused_log_stream_says_so() {
+        use crate::endpoint::LogEvent;
+        let (_holder, asker, _service) = pair(false).await;
+        let mut rx = asker.subscribe_log(1, 1, 1).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no answer");
+        assert_eq!(first, Some(LogEvent::End { refused: true }));
+    }
+
     /// The disabled handle must be safe to call everywhere, so the
     /// daemon needs no `if p2p` branches and `CONSTELLATION_P2P=off`
     /// cannot change behaviour beyond losing the speedup.
@@ -1252,7 +1446,7 @@ mod tests {
         assert!(p.pubkey_hex().is_none());
         assert!(p.snapshot().is_empty());
         p.refresh_registry(vec![(1, "aa".into(), serde_json::json!({}))]);
-        p.announce_segment("p0", 1, 1, None).await;
+        p.announce_segment("p0", 1, 1).await;
         assert!(
             p.request_lease("p0", None).await.is_none(),
             "no fast path means the caller must use S3"
@@ -1342,7 +1536,6 @@ mod tests {
                 part: "after-digest".into(),
                 seq: 1,
                 epoch: 1,
-                payload: None,
             })
             .await
             .unwrap();
@@ -1428,14 +1621,7 @@ mod tests {
     }
 
     impl PeerService for ChunkServer {
-        fn segment_published(
-            &self,
-            _part: &str,
-            _seq: u64,
-            _epoch: u64,
-            _payload: Option<Vec<u8>>,
-        ) {
-        }
+        fn segment_published(&self, _part: &str, _seq: u64, _epoch: u64) {}
         fn lease_requested(
             &self,
             part: String,
@@ -1723,14 +1909,7 @@ mod tests {
     }
 
     impl PeerService for ReconServer {
-        fn segment_published(
-            &self,
-            _part: &str,
-            _seq: u64,
-            _epoch: u64,
-            _payload: Option<Vec<u8>>,
-        ) {
-        }
+        fn segment_published(&self, _part: &str, _seq: u64, _epoch: u64) {}
         fn lease_requested(
             &self,
             part: String,

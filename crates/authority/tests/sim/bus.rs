@@ -4,6 +4,17 @@
 //! the way a failed dial or a lost connection does through
 //! `Peers::request_to_node`; a reply or a gossip push that is lost is just
 //! lost — the core's own timers cover it.
+//!
+//! Plan 30 §M7: log-stream frames (`LogStream`, `LogStreamEnd`) travel in
+//! FIFO lanes per (holder, subscriber) pair, as on a QUIC stream, and the
+//! stream faults break exactly what a stream promises: `stream_drop_p`
+//! loses one frame (the subscriber must see the gap in the frame numbers),
+//! `stream_reorder_p` delivers one frame late, past its successors, and
+//! `stream_cut_p` drops the subscriber on the holder's side
+//! (`Event::SubscriberGone`, the driver's overflow drop) while the
+//! subscriber's end reports the broken stream (`Event::PeerFailed` for
+//! its subscription). A frame to a dead node is the holder's write error:
+//! `SubscriberGone`.
 
 use constellation_authority::{Event, NodeId, OpId, PeerMsg};
 use rand::rngs::StdRng;
@@ -27,6 +38,23 @@ pub struct Bus {
     reply_delay: Mutex<HashMap<NodeId, u64>>,
     pub sent: Mutex<u64>,
     pub dropped: Mutex<u64>,
+    /// M7: per (from, to) lane, when its last frame is delivered.
+    lanes: Mutex<HashMap<(NodeId, NodeId), tokio::time::Instant>>,
+    stream_faults: Mutex<StreamFaults>,
+    pub stream_frames: Mutex<u64>,
+    segment_frames: Mutex<u64>,
+    pub stream_faults_injected: Mutex<u64>,
+}
+
+/// M7: the stream faults (probabilities per frame).
+#[derive(Debug, Clone, Default)]
+pub struct StreamFaults {
+    pub drop_p: f64,
+    pub reorder_p: f64,
+    pub cut_p: f64,
+    /// Scripted loss: drop these segment-carrying frames (0-based, in the
+    /// order the bus saw them, over every lane).
+    pub drop_segment_frames: Vec<u64>,
 }
 
 impl Bus {
@@ -41,7 +69,20 @@ impl Bus {
             reply_delay: Mutex::new(HashMap::new()),
             sent: Mutex::new(0),
             dropped: Mutex::new(0),
+            lanes: Mutex::new(HashMap::new()),
+            stream_faults: Mutex::new(StreamFaults::default()),
+            stream_frames: Mutex::new(0),
+            segment_frames: Mutex::new(0),
+            stream_faults_injected: Mutex::new(0),
         })
+    }
+
+    pub fn set_stream_faults(&self, faults: StreamFaults) {
+        *self.stream_faults.lock().unwrap() = faults;
+    }
+
+    fn roll(&self, p: f64) -> bool {
+        p > 0.0 && self.rng.lock().unwrap().random_bool(p.min(1.0))
     }
 
     pub fn attach(&self, node: NodeId, tx: mpsc::UnboundedSender<Event>) {
@@ -114,6 +155,13 @@ impl Bus {
     }
 
     pub fn send(self: &Arc<Self>, from: NodeId, to: NodeId, msg: PeerMsg) {
+        if matches!(
+            msg,
+            PeerMsg::LogStream { .. } | PeerMsg::LogStreamEnd { .. }
+        ) {
+            self.send_frame(from, to, msg);
+            return;
+        }
         *self.sent.lock().unwrap() += 1;
         let mut delay = self.delay();
         if matches!(msg, PeerMsg::MutateReply { .. }) {
@@ -143,6 +191,105 @@ impl Bus {
                         outage: true,
                     });
                 }
+            }
+        });
+    }
+
+    /// M7: one log-stream frame, in its lane.
+    fn send_frame(self: &Arc<Self>, from: NodeId, to: NodeId, msg: PeerMsg) {
+        *self.sent.lock().unwrap() += 1;
+        *self.stream_frames.lock().unwrap() += 1;
+        let req = match &msg {
+            PeerMsg::LogStream { req, .. } | PeerMsg::LogStreamEnd { req, .. } => *req,
+            _ => unreachable!(),
+        };
+        if self.dead.lock().unwrap().contains(&to) {
+            // The holder's write fails: its driver drops the subscriber.
+            self.deliver_later(
+                from,
+                Duration::ZERO,
+                Event::SubscriberGone { node: to, req },
+            );
+            return;
+        }
+        let faults = self.stream_faults.lock().unwrap().clone();
+        let is_frame = matches!(msg, PeerMsg::LogStream { .. });
+        if matches!(
+            msg,
+            PeerMsg::LogStream {
+                segment: Some(_),
+                ..
+            }
+        ) {
+            let mut n = self.segment_frames.lock().unwrap();
+            let index = *n;
+            *n += 1;
+            if faults.drop_segment_frames.contains(&index) {
+                *self.stream_faults_injected.lock().unwrap() += 1;
+                *self.dropped.lock().unwrap() += 1;
+                return;
+            }
+        }
+        if is_frame && self.roll(faults.cut_p) {
+            *self.stream_faults_injected.lock().unwrap() += 1;
+            self.deliver_later(
+                from,
+                Duration::ZERO,
+                Event::SubscriberGone { node: to, req },
+            );
+            self.deliver_later(
+                to,
+                self.delay(),
+                Event::PeerFailed {
+                    req,
+                    to: from,
+                    outage: false,
+                },
+            );
+            return;
+        }
+        if is_frame && self.roll(faults.drop_p) {
+            *self.stream_faults_injected.lock().unwrap() += 1;
+            *self.dropped.lock().unwrap() += 1;
+            return;
+        }
+        if !self.deliverable(from, to) {
+            *self.dropped.lock().unwrap() += 1;
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        let mut at = now + self.delay();
+        if is_frame && self.roll(faults.reorder_p) {
+            // Late, past the frames sent after it; the lane does not move.
+            *self.stream_faults_injected.lock().unwrap() += 1;
+            let last = self.lanes.lock().unwrap().get(&(from, to)).copied();
+            at = at.max(last.unwrap_or(now)) + Duration::from_millis(30);
+        } else {
+            let mut lanes = self.lanes.lock().unwrap();
+            let lane = lanes.entry((from, to)).or_insert(now);
+            at = at.max(*lane + Duration::from_millis(1));
+            *lane = at;
+        }
+        let bus = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(at).await;
+            let tx = bus.senders.lock().unwrap().get(&to).cloned();
+            match tx {
+                Some(tx) => {
+                    let _ = tx.send(Event::Peer { from, msg });
+                }
+                None => *bus.dropped.lock().unwrap() += 1,
+            }
+        });
+    }
+
+    fn deliver_later(self: &Arc<Self>, to: NodeId, delay: Duration, event: Event) {
+        let bus = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let tx = bus.senders.lock().unwrap().get(&to).cloned();
+            if let Some(tx) = tx {
+                let _ = tx.send(event);
             }
         });
     }

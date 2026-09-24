@@ -267,43 +267,24 @@ impl Core {
         );
     }
 
-    /// `SyncRequest::ApplyPushed`: a gossiped segment. Applied at once when
-    /// it is exactly the next one and carries its payload; otherwise a
-    /// round is nudged to tail it.
-    #[allow(clippy::too_many_arguments)]
+    /// A gossiped "segment `seq` landed" hint (plan 30 §M7: hints carry
+    /// no payload). The stream this node follows delivers it; otherwise
+    /// a round tails it now rather than at the next poll.
     pub(crate) fn on_segment_pushed(
         &mut self,
         now: Ms,
         from: NodeId,
         seq: Seq,
         epoch: Epoch,
-        payload: Option<Vec<u8>>,
-        replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         if from != 0 && epoch >= self.ship.max_epoch {
             self.lease.cached_holder = Some(from);
         }
-        if seq < self.ship.next_seq {
+        if seq < self.ship.next_seq || self.stream_delivers_from(from) {
             return;
         }
-        // A job mid-tail or mid-ship owns the cursor; let it find the
-        // segment (its next probe or its CAS collision will).
-        if seq == self.ship.next_seq && self.job.is_none() {
-            if let Some(payload) = payload {
-                match self.apply_incoming(now, seq, &payload, replica, out) {
-                    Ok(()) => {
-                        self.stats.segments_applied += 1;
-                        self.stats.pushed_applied += 1;
-                        self.answer_awaiting_log(now, replica, out);
-                        return;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, node = self.cfg.node_id, seq, "pushed segment not applied")
-                    }
-                }
-            }
-        }
+        self.stream_note_hint(seq);
         self.nudge(now, out);
     }
 }

@@ -464,15 +464,11 @@ impl Driver {
                     payload,
                 } => {
                     // `Peers::announce_segment` is a no-op with P2P off.
+                    // Plan 30 §M7: a hint only; the log travels on streams.
+                    let _ = payload;
                     if self.core.config().p2p {
-                        self.bus.broadcast(
-                            self.id,
-                            PeerMsg::SegmentPublished {
-                                seq,
-                                epoch,
-                                payload: Some(payload),
-                            },
-                        )
+                        self.bus
+                            .broadcast(self.id, PeerMsg::SegmentPublished { seq, epoch })
                     }
                 }
                 Action::ConflictCopy {

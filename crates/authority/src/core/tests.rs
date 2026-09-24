@@ -17,9 +17,16 @@ struct Harness {
 
 impl Harness {
     fn new(node_id: NodeId) -> Self {
+        Self::with(node_id, false)
+    }
+
+    /// Plan 30 §M7: `streams` turns log streams on (the other tests pin
+    /// the forwarding and lease machinery's own sends).
+    fn with(node_id: NodeId, streams: bool) -> Self {
         let meta = Meta::open_in_memory().unwrap();
         meta.set_node_prefix(node_id).unwrap();
         let mut cfg = Config::defaults(node_id, 1);
+        cfg.log_streams = streams;
         cfg.ttl_ms = 10_000;
         cfg.forward_timeout_ms = 500;
         cfg.forward_backoff_ms = 100;
@@ -1142,4 +1149,293 @@ fn a_queued_replay_blocks_reads_of_its_keys() {
         SessionWait::Fast
     );
     assert_eq!(requester.meta.session().stats().replay_blocked, 2);
+}
+
+// ---- plan 30 §M7: log streams ----
+
+/// A holder (node 1, streams on, holding epoch 1) and a subscriber
+/// (node 2) that knows it as the holder and has subscribed; returns the
+/// subscription's `req` after node 1 accepted it and node 2 applied the
+/// first frame (a heartbeat).
+fn stream_pair() -> (Harness, Harness, OpId) {
+    let mut holder = Harness::with(1, true);
+    holder.hold(1, None);
+    let mut sub = Harness::with(2, true);
+    sub.core.lease.cached_holder = Some(1);
+    let out = sub.step(Event::Peers { links: Vec::new() });
+    let sent = sends(&out);
+    let [(1, PeerMsg::LogSubscribe { req, from })] = sent.as_slice() else {
+        panic!("expected one subscription to node 1: {sent:?}")
+    };
+    assert_eq!(*from, 1, "subscribes from its next sequence");
+    let req = *req;
+    let served = holder.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::LogSubscribe { req, from: 1 },
+    });
+    let frames = sends(&served);
+    let [(
+        2,
+        PeerMsg::LogStream {
+            n: 0,
+            segment: None,
+            ..
+        },
+    )] = frames.as_slice()
+    else {
+        panic!("expected the opening heartbeat: {frames:?}")
+    };
+    let first = frames[0].1.clone();
+    sub.step(Event::Peer {
+        from: 1,
+        msg: first,
+    });
+    assert!(sub.core.stream_view().live);
+    (holder, sub, req)
+}
+
+/// The holder executes a create and "ships" it as segment `seq`: the
+/// encoded payload, as the S3 object would hold it.
+fn holder_segment(holder: &mut Harness, name: &str, seq: Seq) -> Vec<u8> {
+    let rid = holder.rid(seq);
+    let op = holder.create(name);
+    let out = holder.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    assert!(matches!(
+        replies(&out)[0].1,
+        ClientReply::Outcome(MutateOutcome::Accepted { .. })
+    ));
+    let batch = Replica::take_journal(&holder.meta, 100).unwrap();
+    let records: Vec<_> = batch.iter().map(|(_, r)| r.clone()).collect();
+    let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+    Replica::ack_journal(&holder.meta, &seqs, seq, None).unwrap();
+    holder.core.ship.next_seq = seq + 1;
+    holder.core.ship.head_seq = seq;
+    crate::segment::encode(1, 1, 0, &records).unwrap()
+}
+
+fn stream_frames(actions: &[Action]) -> Vec<PeerMsg> {
+    sends(actions)
+        .into_iter()
+        .filter(|(_, m)| matches!(m, PeerMsg::LogStream { .. }))
+        .map(|(_, m)| m.clone())
+        .collect()
+}
+
+#[test]
+fn a_streamed_segment_is_applied_through_the_tail_path() {
+    use constellation_meta::MetaStore;
+    let (mut holder, mut sub, _) = stream_pair();
+    let payload = holder_segment(&mut holder, "a", 1);
+    let mut out = Vec::new();
+    holder
+        .core
+        .stream_passed(holder.now, 1, 1, &payload, &mut out);
+    let frames = stream_frames(&out);
+    assert_eq!(frames.len(), 1);
+    assert!(matches!(
+        &frames[0],
+        PeerMsg::LogStream {
+            n: 1,
+            head: 1,
+            segment: Some((1, _)),
+            ..
+        }
+    ));
+    sub.step(Event::Peer {
+        from: 1,
+        msg: frames[0].clone(),
+    });
+    assert_eq!(Replica::applied_seq(&sub.meta).unwrap(), 1);
+    assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "a")
+        .unwrap()
+        .is_some());
+    assert_eq!(sub.core.stats.stream_applied, 1);
+    assert_eq!(sub.core.ship().next_seq, 2);
+    // A duplicate (a resubscription replaying the ring) is ignored.
+    let again = PeerMsg::LogStream {
+        req: match &frames[0] {
+            PeerMsg::LogStream { req, .. } => *req,
+            _ => unreachable!(),
+        },
+        n: 2,
+        epoch: 1,
+        head: 1,
+        segment: Some((1, payload)),
+    };
+    sub.step(Event::Peer {
+        from: 1,
+        msg: again,
+    });
+    assert_eq!(sub.core.stats.stream_duplicates, 1);
+    assert_eq!(Replica::applied_seq(&sub.meta).unwrap(), 1);
+}
+
+/// A lost frame (the numbering jumps) breaks the stream: the subscriber
+/// unsubscribes, counts the gap, and a round runs at once to read the log
+/// from S3.
+#[test]
+fn a_frame_gap_breaks_the_stream() {
+    let (_holder, mut sub, req) = stream_pair();
+    let out = sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::LogStream {
+            req,
+            n: 2,
+            epoch: 1,
+            head: 3,
+            segment: None,
+        },
+    });
+    assert_eq!(sub.core.stats.stream_gaps, 1);
+    assert!(sends(&out)
+        .iter()
+        .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::LogUnsubscribe { req: r } if *r == req)));
+    assert!(!timers(&out, TimerKind::Poll).is_empty(), "no round nudged");
+    assert_eq!(sub.core.stream_view().upstream, 0);
+}
+
+/// A segment ahead of the cursor waits in the buffer (and a round is
+/// nudged to read the missing one); once the missing sequence arrives,
+/// both apply in order.
+#[test]
+fn a_segment_ahead_of_the_cursor_waits_for_it() {
+    let (mut holder, mut sub, req) = stream_pair();
+    let p1 = holder_segment(&mut holder, "a", 1);
+    let p2 = holder_segment(&mut holder, "b", 2);
+    let out = sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::LogStream {
+            req,
+            n: 1,
+            epoch: 1,
+            head: 2,
+            segment: Some((2, p2)),
+        },
+    });
+    assert_eq!(Replica::applied_seq(&sub.meta).unwrap(), 0);
+    assert_eq!(sub.core.stream_view().buffered, 1);
+    assert!(
+        !timers(&out, TimerKind::Poll).is_empty(),
+        "the gap must nudge a round"
+    );
+    sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::LogStream {
+            req,
+            n: 2,
+            epoch: 1,
+            head: 2,
+            segment: Some((1, p1)),
+        },
+    });
+    assert_eq!(Replica::applied_seq(&sub.meta).unwrap(), 2);
+    assert_eq!(sub.core.stats.stream_applied, 2);
+}
+
+/// The round a caught-up subscriber runs skips its S3 tail; once the
+/// backstop period has passed it probes S3 once, one GET wide.
+#[test]
+fn a_caught_up_stream_skips_the_tail_until_the_backstop() {
+    let (_holder, mut sub, req) = stream_pair();
+    let run_round = |sub: &mut Harness| -> Vec<Action> {
+        sub.core.nudge(sub.now, &mut Vec::new());
+        let mut all = Vec::new();
+        let poll = sub
+            .core
+            .timers
+            .iter()
+            .find(|(_, (t, _))| matches!(t, Timer::Poll))
+            .map(|(id, _)| *id)
+            .expect("poll timer");
+        let out = sub.step(Event::Timer { id: poll });
+        let upload = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        });
+        all.extend(out);
+        if let Some(op) = upload {
+            all.extend(sub.step(Event::UploadsDone {
+                op,
+                result: UploadResult::Done { held: 0 },
+            }));
+        }
+        all
+    };
+    // The first round's tail is the backstop's first probe (no S3 tail
+    // yet): one GET.
+    let out = run_round(&mut sub);
+    let runs: Vec<_> = s3_ops(&out)
+        .into_iter()
+        .filter_map(|(op, r)| match r {
+            S3Op::SegmentRun { width, .. } => Some((op, *width)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].1, 1,
+        "a caught-up stream's backstop probe is one GET"
+    );
+    sub.step(Event::S3 {
+        op: runs[0].0,
+        result: S3Result::SegmentRun(Ok(Vec::new())),
+    });
+    // Within the backstop period: no S3 tail at all.
+    sub.advance(1_000);
+    sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::LogStream {
+            req,
+            n: 1,
+            epoch: 1,
+            head: 0,
+            segment: None,
+        },
+    });
+    let out = run_round(&mut sub);
+    assert!(
+        !s3_ops(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::SegmentRun { .. })),
+        "a round tailed S3 while the stream covered it: {out:?}"
+    );
+    assert_eq!(sub.core.stats.stream_tail_skips, 1);
+}
+
+/// A holder that lets the lease go ends every subscription; a node that
+/// does not hold refuses one.
+#[test]
+fn serving_follows_the_lease() {
+    let (mut holder, _sub, req) = stream_pair();
+    holder.core.lease.released();
+    let out = holder.step(Event::Peers { links: Vec::new() });
+    assert!(sends(&out).iter().any(|(to, m)| *to == 2
+        && matches!(m, PeerMsg::LogStreamEnd { req: r, refused: false } if *r == req)));
+    let out = holder.step(Event::Peer {
+        from: 3,
+        msg: PeerMsg::LogSubscribe {
+            req: OpId(9),
+            from: 1,
+        },
+    });
+    assert!(sends(&out)
+        .iter()
+        .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::LogStreamEnd { refused: true, .. })));
+}
+
+/// With one node there is nobody to stream from or to.
+#[test]
+fn a_lone_node_never_subscribes() {
+    let mut solo = Harness::with(1, true);
+    solo.hold(1, None);
+    let out = solo.step(Event::Peers { links: Vec::new() });
+    assert!(sends(&out).is_empty());
+    solo.core.lease.released();
+    solo.core.lease.cached_holder = Some(1);
+    let out = solo.step(Event::Peers { links: Vec::new() });
+    assert!(sends(&out).is_empty(), "subscribed to itself: {out:?}");
 }

@@ -16,6 +16,7 @@ mod fusefs;
 mod gc;
 mod held;
 mod inbox;
+mod kernel_inval;
 mod lease;
 mod leave;
 mod log_buffer;
@@ -2224,18 +2225,53 @@ struct P2pBridge {
 }
 
 impl constellation_net::PeerService for P2pBridge {
-    fn segment_published(&self, part: &str, seq: u64, epoch: u64, payload: Option<Vec<u8>>) {
-        tracing::debug!(part, seq, epoch, "peer published a segment; syncing now");
-        let request = match payload {
-            Some(payload) => fusefs::SyncRequest::ApplyPushed {
-                seq,
-                epoch,
-                holder_node: 0,
-                payload,
-            },
-            None => fusefs::SyncRequest::Nudge,
-        };
-        let _ = self.nudge.send(request);
+    fn segment_published(&self, part: &str, seq: u64, epoch: u64) {
+        tracing::debug!(part, seq, epoch, "peer published a segment");
+        // The core decides: a node following the holder's log stream has
+        // it (or will) and ignores the hint; any other node tails now.
+        let _ = self
+            .nudge
+            .send(fusefs::SyncRequest::SegmentHint { seq, epoch });
+    }
+
+    fn log_subscribe(
+        &self,
+        requester: u64,
+        req_id: u64,
+        from: u64,
+    ) -> Option<tokio::sync::mpsc::Receiver<constellation_net::LogEvent>> {
+        // The driver queues into `sink` (bounded in frames and in bytes)
+        // and never waits; this relay hands frames to the stream writer
+        // one at a time, so `queued_bytes` counts exactly what is waiting
+        // for the subscriber.
+        let (sink, mut queue) = tokio::sync::mpsc::channel(authority_driver::log_stream_queue());
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(1);
+        let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        self.nudge
+            .send(fusefs::SyncRequest::LogSubscribe {
+                requester,
+                req: req_id,
+                from,
+                sink,
+                queued_bytes: queued_bytes.clone(),
+            })
+            .ok()?;
+        tokio::spawn(async move {
+            while let Some(event) = queue.recv().await {
+                if let constellation_net::LogEvent::Frame {
+                    segment: Some((_, bytes)),
+                    ..
+                } = &event
+                {
+                    queued_bytes
+                        .fetch_sub(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                if writer_tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Some(writer_rx)
     }
 
     fn lease_requested(
@@ -2850,6 +2886,14 @@ use constellation_upload_concurrency::{AdaptiveConcurrency, ConcurrencyGate, Con
 /// pending-upload memory: at most this many chunk buffers are ever held
 /// at once regardless of how many rows `pending_upload` has queued.
 const UPLOAD_CONCURRENCY_HARD_MAX: usize = 128;
+/// Plan 30 §M7: upload slots above the adaptive target that small inode
+/// drains may use, and what counts as small. Without them an `fsync` of a
+/// one-chunk marker file written during a write-back burst waited for
+/// most of the burst's upload backlog (2.5 s of a 3.4 s pass on floci):
+/// the pass queues up to the hard maximum of uploads on the gate, and a
+/// release wakes every waiter at once.
+const PRIORITY_UPLOAD_RESERVE: usize = 4;
+const PRIORITY_DRAIN_CHUNKS: u64 = 4;
 
 /// See docs/explanation/DESIGN.md §5b step 2 / `docs/plans/v1/done/08-p5b-streaming-writeback.md`.
 /// A durable pending-upload queue in SQLite is drained by a bounded pool;
@@ -2937,6 +2981,13 @@ impl UploadRuntime {
 
     async fn permit(&self) -> ConcurrencyPermit<'_> {
         self.gate.acquire().await
+    }
+
+    /// Plan 30 §M7: a permit for a small inode drain (an `fsync` or a
+    /// write-through close of a small file) that must not wait behind the
+    /// round's bulk upload pass — see `ConcurrencyGate::acquire_priority`.
+    async fn permit_priority(&self) -> ConcurrencyPermit<'_> {
+        self.gate.acquire_priority(PRIORITY_UPLOAD_RESERVE).await
     }
 
     fn record_success(&self, bytes: u64, latency: std::time::Duration, now: std::time::Instant) {
@@ -3091,6 +3142,7 @@ pub(crate) async fn upload_dirty_chunks_report(
         grouped.entry(hash).or_default().push(ino);
     }
     let total = grouped.len() as u64;
+    let priority = only_ino.is_some() && total <= PRIORITY_DRAIN_CHUNKS;
     if total > 0 {
         tracing::debug!(
             pending_chunks = total,
@@ -3121,7 +3173,11 @@ pub(crate) async fn upload_dirty_chunks_report(
         let missing_sample = missing_sample.clone();
         let missing_rows = missing_rows.clone();
         async move {
-            let _permit = upload.permit().await;
+            let _permit = if priority {
+                upload.permit_priority().await
+            } else {
+                upload.permit().await
+            };
             if fault::lose_chunk(&hash) {
                 tracing::warn!(%hash, "fault injection: dropping a pending chunk from the cache");
                 let _ = cache.remove(&hash);
@@ -3614,7 +3670,30 @@ impl constellation_api::StatusSource for DaemonStatus {
             forwarded_ok: self.forward.ok.load(std::sync::atomic::Ordering::Relaxed),
             forwarded_err: self.forward.err.load(std::sync::atomic::Ordering::Relaxed),
             forward_p50_ms: self.forward.p50_ms(),
-            pushed_segments_applied: stats.pushed_applied,
+            log_stream: {
+                let v = core.stream;
+                constellation_api::LogStreamStatus {
+                    enabled: core.stream_enabled,
+                    upstream: v.upstream,
+                    live: v.live,
+                    buffered: v.buffered,
+                    applied: stats.stream_applied,
+                    tail_skips: stats.stream_tail_skips,
+                    subscribes: stats.stream_subscribes,
+                    refused: stats.stream_refused,
+                    ended: stats.stream_ended,
+                    gaps: stats.stream_gaps,
+                    lost: stats.stream_lost,
+                    timeouts: stats.stream_timeouts,
+                    overflows: stats.stream_overflows,
+                    duplicates: stats.stream_duplicates,
+                    serving: v.serving,
+                    served: stats.stream_served,
+                    declined: stats.stream_declined,
+                    frames_sent: stats.stream_frames_sent,
+                    subscribers_dropped: stats.stream_subscribers_dropped,
+                }
+            },
             forward_dedup_hits: stats.forward_dedup_hits,
             forward_retries: stats.forward_retries,
             forward_indoubt_resolved: stats.forward_indoubt_resolved,

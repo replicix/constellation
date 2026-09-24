@@ -355,6 +355,7 @@ impl Replica for Meta {
     ) -> Result<Applied, MetaError> {
         let pending: TouchSet = Meta::pending_touches(self)?;
         let applied = Meta::apply_segment(self, seq, epoch, records, &pending)?;
+        self.note_foreign_applied(records);
         self.session().advance(
             seq,
             Some(JournalPos {

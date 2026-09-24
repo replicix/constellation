@@ -258,6 +258,10 @@ pub struct NodeRuntime {
     /// `remove_mount`'s attempt to join it.
     threads: Mutex<HashMap<MountId, std::thread::JoinHandle<()>>>,
     next_mount_id: AtomicU64,
+    /// Plan 30 §M7: drops the kernel's cached view of what another node's
+    /// writes changed (`kernel_inval`); `None` when
+    /// `CONSTELLATION_KERNEL_INVALIDATE=0`.
+    kernel_inval: Option<crate::kernel_inval::KernelInvalidator>,
     shutdown_started: AtomicBool,
 }
 
@@ -1112,7 +1116,13 @@ impl NodeRuntime {
                 .context("automatic reintegration after mount")?;
         }
 
+        let kernel_inval = crate::kernel_inval::enabled().then(|| {
+            let k = crate::kernel_inval::KernelInvalidator::start();
+            meta.set_foreign_apply_hook(k.hook());
+            k
+        });
         let node = Arc::new(NodeRuntime {
+            kernel_inval,
             node_id,
             incarnation,
             next_rid_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1421,11 +1431,16 @@ impl NodeRuntime {
         // from inside this process (via SessionUnmounter). Plain
         // `fuser::mount` has no hook for that; without it, an external
         // kill leaves a dead mountpoint that needs `fusermount3 -u`.
+        let view_root = fs.view_root();
+        let frozen_view = selector.is_some() && !rw_snapshot;
         let mut session =
             fuser::Session::new(fs, &mountpoint, &fuse_config).context("FUSE mount")?;
         let unmounter = session.unmount_callable();
 
         let id = MountId(self.next_mount_id.fetch_add(1, Ordering::Relaxed));
+        if let (Some(k), false) = (&self.kernel_inval, frozen_view) {
+            k.register(id.0, session.notifier(), view_root);
+        }
         let subtree = inner_path.clone();
         self.mounts.lock().unwrap().insert(
             id,
@@ -1442,6 +1457,9 @@ impl NodeRuntime {
         let thread = std::thread::spawn(move || {
             if let Err(e) = session.run() {
                 tracing::warn!(error = %e, "FUSE session ended with an error");
+            }
+            if let Some(k) = &node.kernel_inval {
+                k.unregister(id.0);
             }
             tracing::info!("FUSE detached");
             if let Some(path) = ephemeral_clone {

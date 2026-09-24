@@ -19,15 +19,53 @@ mod sim {
     pub mod store;
 }
 
-use sim::run::{run_seed, FaultKind, ScheduledFault, SimConfig};
+use sim::bus::StreamFaults;
+use sim::run::{run_seed, FaultKind, Report, ScheduledFault, SimConfig};
 use sim::store::{Fault, OpKind, Rule, When};
 
 /// Seeds per CI shard; four shards run in parallel under `cargo test`.
 const CI_SEEDS_PER_SHARD: u64 = 250;
 
+/// Plan 30 §M7: the log-stream counters summed over a run's nodes.
+#[derive(Debug, Default, Clone, Copy)]
+struct StreamTotals {
+    applied: u64,
+    segments_applied: u64,
+    tail_skips: u64,
+    subscribes: u64,
+    gaps: u64,
+    lost: u64,
+    timeouts: u64,
+    ended: u64,
+    refused: u64,
+    served: u64,
+    dropped_subscribers: u64,
+    s3_gets: u64,
+}
+
+impl StreamTotals {
+    fn add(&mut self, r: &Report) {
+        for s in r.stats.values() {
+            self.applied += s.stream_applied;
+            self.segments_applied += s.segments_applied;
+            self.tail_skips += s.stream_tail_skips;
+            self.subscribes += s.stream_subscribes;
+            self.gaps += s.stream_gaps;
+            self.lost += s.stream_lost;
+            self.timeouts += s.stream_timeouts;
+            self.ended += s.stream_ended;
+            self.refused += s.stream_refused;
+            self.served += s.stream_served;
+            self.dropped_subscribers += s.stream_subscribers_dropped;
+        }
+        self.s3_gets += r.s3_gets;
+    }
+}
+
 fn run_shard(shard: u64) {
     let mut failures = Vec::new();
     let mut summary = (0usize, 0usize, 0usize, 0usize);
+    let mut streams = StreamTotals::default();
     for seed in (shard * CI_SEEDS_PER_SHARD)..((shard + 1) * CI_SEEDS_PER_SHARD) {
         // Plan 30 §M6: the CI seeds read too (session checks enforced).
         let cfg = SimConfig {
@@ -41,13 +79,14 @@ fn run_shard(shard: u64) {
                 summary.1 += report.segments;
                 summary.2 += usize::from(report.converged_checked);
                 summary.3 += usize::from(report.stateright_checked);
+                streams.add(&report);
             }
             Err(e) => failures.push(format!("seed {seed}: {e}")),
         }
     }
     eprintln!(
         "shard {shard}: {} seeds, {} ops returned, {} segments, {} converged-checked runs, \
-         {} also checked with Stateright's tester",
+         {} also checked with Stateright's tester; streams: {streams:?}",
         CI_SEEDS_PER_SHARD, summary.0, summary.1, summary.2, summary.3
     );
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
@@ -218,6 +257,10 @@ fn replay_seed() {
             ..SimConfig::default()
         },
         Ok("plain") => SimConfig::default(),
+        // Plan 30 §M7.
+        Ok("streams-off") => streams_off_config(),
+        Ok("stream-faults") => stream_faults_config(),
+        Ok("stream-gap") => stream_gap_config(),
         // The CI shards' configuration (reads included since M6).
         _ => SimConfig {
             read_ratio: 0.3,
@@ -441,13 +484,32 @@ fn regression_inbox_p2p_off() {
 /// restarted holder re-acquired its own epoch (no takeover, no drain),
 /// answered the forward with EEXIST (no `completed` witness), and the
 /// next takeover's drain executed the stale batch a second time.
+///
+/// Plan 30 M7: log streams moved seed 794's interleaving off the path
+/// (the fix is structural, the seed only reached it), so the test now
+/// runs 794 and the seeds after it until one withdraws a batch — every
+/// run passes every check either way.
 #[test]
 fn regression_inbox_batch_withdrawn_before_p2p_forward() {
-    let report = run_seed(794, SimConfig::default()).unwrap_or_else(|e| panic!("seed 794: {e}"));
-    let withdrawn: u64 = report.stats.values().map(|s| s.inbox_withdrawn_ops).sum();
+    let mut withdrawn = 0;
+    let mut seed = 794;
+    while withdrawn == 0 && seed < 794 + 200 {
+        let report =
+            run_seed(seed, SimConfig::default()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        withdrawn += report
+            .stats
+            .values()
+            .map(|s| s.inbox_withdrawn_ops)
+            .sum::<u64>();
+        seed += 1;
+    }
+    eprintln!(
+        "seed {}: an inbox batch withdrawn before a P2P forward",
+        seed - 1
+    );
     assert!(
         withdrawn > 0,
-        "seed 794 no longer withdraws a batch before forwarding"
+        "no seed in 794..994 withdraws a batch before forwarding"
     );
 }
 
@@ -493,11 +555,14 @@ fn regression_resubmitted_rid_withdraws_its_batch() {
 /// core changes (no causal-wait timers) shift every schedule, and on this
 /// tree 10507 and 10396 reach it (`find_multi_batch_withdraw_seeds`
 /// re-pins). 10247 stays as a convergence seed; 10476 is pinned above.
+/// Plan 30 M7: log streams shift every schedule again; on this tree
+/// 10981 and 11066 reach the multi-batch withdraw (re-pinned with the
+/// helper over 10000–11999).
 #[test]
 fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     let report = run_seed(10247, long_config()).unwrap_or_else(|e| panic!("seed 10247: {e}"));
     assert!(report.converged_checked, "seed 10247 did not converge");
-    for seed in [10396, 10507] {
+    for seed in [10981, 11066] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats
@@ -593,6 +658,139 @@ fn single_node_is_clean() {
         assert_eq!(report.p2p_sent, 0, "a lone node sent P2P messages");
         assert!(report.converged_checked);
     }
+}
+
+// ---- plan 30 §M7: log streams ----
+
+fn streams_off_config() -> SimConfig {
+    SimConfig {
+        read_ratio: 0.3,
+        core: std::sync::Arc::new(|node, inc| {
+            let mut c = sim::run::sim_core_config(node, inc);
+            c.log_streams = false;
+            c
+        }),
+        ..SimConfig::default()
+    }
+}
+
+fn stream_faults_config() -> SimConfig {
+    SimConfig {
+        read_ratio: 0.3,
+        stream_faults: StreamFaults {
+            drop_p: 0.04,
+            reorder_p: 0.04,
+            cut_p: 0.02,
+            drop_segment_frames: Vec::new(),
+        },
+        ..SimConfig::default()
+    }
+}
+
+/// Two nodes, no random faults, and the stream loses segment-carrying
+/// frames 2 and 5: the subscriber must notice each loss at the next
+/// frame, read the missing sequence from S3, resubscribe, and converge.
+fn stream_gap_config() -> SimConfig {
+    SimConfig {
+        nodes: 2,
+        clients_per_node: 2,
+        ops_per_client: 10,
+        random_faults: 0,
+        read_ratio: 0.3,
+        stream_faults: StreamFaults {
+            drop_segment_frames: vec![2, 5],
+            ..StreamFaults::default()
+        },
+        ..SimConfig::default()
+    }
+}
+
+/// Streams carry the log: subscribers apply most segments from the
+/// holder's stream, rounds skip the S3 tail, and the same seeds with
+/// streams off need more S3 GETs. Every run passes every check either
+/// way (the streams change latency and traffic, never what is applied).
+#[test]
+fn streams_carry_the_log_and_save_tail_gets() {
+    let mut on = StreamTotals::default();
+    let mut off = StreamTotals::default();
+    for seed in 500..560 {
+        let cfg = SimConfig {
+            read_ratio: 0.3,
+            random_faults: 0,
+            ..SimConfig::default()
+        };
+        let r = run_seed(seed, cfg).unwrap_or_else(|e| panic!("seed {seed} (streams on): {e}"));
+        assert!(r.converged_checked, "seed {seed} did not converge");
+        on.add(&r);
+        let cfg = SimConfig {
+            random_faults: 0,
+            ..streams_off_config()
+        };
+        let r = run_seed(seed, cfg).unwrap_or_else(|e| panic!("seed {seed} (streams off): {e}"));
+        off.add(&r);
+    }
+    eprintln!("streams on:  {on:?}\nstreams off: {off:?}");
+    assert!(
+        on.applied > 0 && on.tail_skips > 0,
+        "no segment came over a stream: {on:?}"
+    );
+    assert_eq!(
+        off.applied + off.subscribes + off.served,
+        0,
+        "streams off still streamed"
+    );
+    assert!(
+        on.s3_gets < off.s3_gets,
+        "streams did not reduce S3 GETs: on {} vs off {}",
+        on.s3_gets,
+        off.s3_gets
+    );
+}
+
+/// Lost, reordered and cut stream frames on top of the CI seeds' random
+/// faults: every check still holds, and each fault was actually met.
+#[test]
+fn stream_faults_are_survived() {
+    let mut totals = StreamTotals::default();
+    for seed in 600..750 {
+        let r =
+            run_seed(seed, stream_faults_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        totals.add(&r);
+    }
+    eprintln!("stream faults: {totals:?}");
+    assert!(
+        totals.gaps > 0,
+        "no frame gap was ever detected: {totals:?}"
+    );
+    assert!(totals.lost > 0, "no stream was ever cut: {totals:?}");
+    assert!(
+        totals.dropped_subscribers > 0,
+        "no subscriber was dropped: {totals:?}"
+    );
+    assert!(totals.applied > 0, "nothing streamed: {totals:?}");
+}
+
+/// Regression for gap detection: a lost segment frame is noticed at the
+/// next frame (`stream_gaps`), the missing sequence comes from S3, the
+/// subscriber resubscribes and keeps streaming, and every replica
+/// converges to the log — no sequence skipped, none applied twice.
+#[test]
+fn regression_stream_gap_detected() {
+    let mut detected = 0;
+    for seed in 800..820 {
+        let r = run_seed(seed, stream_gap_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert!(r.converged_checked, "seed {seed} did not converge");
+        let mut t = StreamTotals::default();
+        t.add(&r);
+        if t.gaps > 0 {
+            detected += 1;
+            assert!(
+                t.subscribes >= 2,
+                "seed {seed}: no resubscription after the gap: {t:?}"
+            );
+        }
+    }
+    assert!(detected >= 10, "only {detected}/20 seeds met a gap");
 }
 
 /// The long configuration M5's pinned regression seeds were found and

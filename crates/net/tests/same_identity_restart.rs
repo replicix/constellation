@@ -35,7 +35,7 @@ struct Recorder {
 }
 
 impl PeerService for Recorder {
-    fn segment_published(&self, part: &str, _seq: u64, _epoch: u64, _payload: Option<Vec<u8>>) {
+    fn segment_published(&self, part: &str, _seq: u64, _epoch: u64) {
         self.segments
             .lock()
             .unwrap()
@@ -150,7 +150,6 @@ async fn restart_victim_child() {
                 part: format!("inc-{incarnation}"),
                 seq,
                 epoch: 1,
-                payload: None,
             })
             .await;
         tokio::time::sleep(Duration::from_millis(200)).await;

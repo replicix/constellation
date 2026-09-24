@@ -323,3 +323,95 @@ fn uncaptured_transactions_after_a_held_one_are_held() {
         "uncaptured transactions cannot be rolled back"
     );
 }
+
+// ---- plan 30 §M7: deferral behind chunks still uploading ----
+
+/// A write-back burst's manifest names a chunk that is still uploading:
+/// it is *deferred* — not held (nothing is lost, no repair is needed) —
+/// while the unrelated marker created after it ships at once; once the
+/// chunk is acked the manifest ships too. The segment's `through` never
+/// claims the deferred row.
+#[test]
+fn a_manifest_whose_chunk_is_uploading_is_deferred_and_others_ship() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let pending = ChunkHash::of(b"a burst's chunk, still uploading");
+    let big = meta.create(ROOT_INO, "big", 0o644, 0, 0).unwrap().ino;
+    meta.set_manifest_dirty(big, None, &manifest_naming(pending, 33), 33, &[pending])
+        .unwrap();
+    let marker = meta.create(ROOT_INO, "marker", 0o644, 0, 0).unwrap().ino;
+    let rows = batch(&meta);
+    let recs = records(&rows);
+    assert!(
+        !recs
+            .iter()
+            .any(|r| matches!(r, LogRecord::WriteManifest { ino, .. } if *ino == big)),
+        "the manifest waits for its chunk: {recs:?}"
+    );
+    assert!(
+        recs.iter()
+            .any(|r| matches!(r, LogRecord::Create { ino, .. } if *ino == marker)),
+        "the marker ships ahead of it: {recs:?}"
+    );
+    let held = meta.held_summary();
+    assert_eq!(held.transactions, 0, "deferred work is not held: {held:?}");
+    assert_eq!(held.deferred, 1, "{held:?}");
+    let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+    let through = meta.journal_through_after(&seqs).unwrap();
+    assert!(
+        through < *seqs.iter().max().unwrap(),
+        "`through` {through} claims the deferred row shipped ({seqs:?})"
+    );
+    ship(&meta, &rows, 1);
+    assert!(batch(&meta).is_empty(), "nothing else is shippable yet");
+
+    meta.ack_upload(&pending, big).unwrap();
+    let rest = batch(&meta);
+    assert!(
+        records(&rest)
+            .iter()
+            .any(|r| matches!(r, LogRecord::WriteManifest { ino, .. } if *ino == big)),
+        "the manifest ships once its chunk is up: {rest:?}"
+    );
+    ship(&meta, &rest, 2);
+    assert_eq!(meta.journal_len().unwrap(), 0);
+}
+
+/// A later change to the deferred file depends on its manifest and waits
+/// with it; nothing is skipped out of dependency order.
+#[test]
+fn a_dependent_of_a_deferred_manifest_waits_with_it() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let pending = ChunkHash::of(b"still uploading");
+    let big = meta.create(ROOT_INO, "big", 0o644, 0, 0).unwrap().ino;
+    meta.set_manifest_dirty(big, None, &manifest_naming(pending, 15), 15, &[pending])
+        .unwrap();
+    meta.setattr(big, Some(0o600), None, None, None, None, None)
+        .unwrap();
+    let rows = batch(&meta);
+    assert!(
+        records(&rows).iter().all(|r| !matches!(
+            r,
+            LogRecord::WriteManifest { .. } | LogRecord::Setattr { .. }
+        )),
+        "{rows:?}"
+    );
+    assert_eq!(meta.held_summary().deferred, 2);
+    ship(&meta, &rows, 1);
+    meta.ack_upload(&pending, big).unwrap();
+    let rest = records(&batch(&meta));
+    let manifest_at = rest
+        .iter()
+        .position(|r| matches!(r, LogRecord::WriteManifest { .. }))
+        .expect("manifest");
+    let chmod_at = rest
+        .iter()
+        .position(|r| matches!(r, LogRecord::Setattr { .. }))
+        .expect("chmod");
+    assert!(
+        manifest_at < chmod_at,
+        "journal order within the deferred work"
+    );
+    assert_eq!(mode_of(&meta, big), 0o600);
+}

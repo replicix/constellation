@@ -16,7 +16,9 @@ pub use types::{
     PruneRootStatus, PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response,
     SnapshotStatus, SourceStatus, SpeculationStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
-pub use types::{CasProbeStatus, HeldInodeStatus, HeldStatus, PeerPathsStatus, SessionStatus};
+pub use types::{
+    CasProbeStatus, HeldInodeStatus, HeldStatus, LogStreamStatus, PeerPathsStatus, SessionStatus,
+};
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -415,7 +417,7 @@ mod tests {
                 forwarded_ok: 0,
                 forwarded_err: 0,
                 forward_p50_ms: None,
-                pushed_segments_applied: 0,
+                log_stream: LogStreamStatus::default(),
                 forward_dedup_hits: 0,
                 forward_retries: 0,
                 forward_indoubt_resolved: 0,

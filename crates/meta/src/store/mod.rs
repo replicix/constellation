@@ -551,12 +551,34 @@ pub struct Meta {
     /// Plan 30 §M6: positions, the `observed` watermark and the read
     /// wait (`crate::session`).
     pub(crate) session: crate::session::SessionState,
+    /// Plan 30 §M7: told the records of every foreign segment this replica
+    /// applied (the daemon invalidates the kernel's FUSE caches for what
+    /// they touched, so another node's write is visible without waiting
+    /// out the attribute/entry TTL).
+    foreign_apply_hook: std::sync::OnceLock<ForeignApplyHook>,
     usage: UsageTracker,
     #[allow(dead_code)]
     path: Option<PathBuf>,
 }
 
+/// See [`Meta::set_foreign_apply_hook`].
+pub type ForeignApplyHook = Box<dyn Fn(&[crate::record::LogRecord]) + Send + Sync>;
+
 impl Meta {
+    /// Plan 30 §M7: call `hook` with the records of every foreign segment
+    /// applied from now on ([`Meta::note_foreign_applied`]). Set once; a
+    /// second call is ignored.
+    pub fn set_foreign_apply_hook(&self, hook: ForeignApplyHook) {
+        let _ = self.foreign_apply_hook.set(hook);
+    }
+
+    /// A foreign segment carrying `records` was applied to this replica.
+    pub fn note_foreign_applied(&self, records: &[crate::record::LogRecord]) {
+        if let Some(hook) = self.foreign_apply_hook.get() {
+            hook(records);
+        }
+    }
+
     /// Force every committed write to stable storage.
     ///
     /// Commits use `PersistMode::Buffer`: they reach the OS on commit, so
@@ -649,6 +671,7 @@ impl Meta {
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
             held_work: AtomicU64::new(0),
             session: crate::session::SessionState::default(),
+            foreign_apply_hook: std::sync::OnceLock::new(),
             usage: UsageTracker::new(0, 0),
             path,
         };

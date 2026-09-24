@@ -69,6 +69,24 @@
 //! unrecoverable chunks as holes — the replay drain materializes under
 //! `.constellation-conflict/`. The unrecoverable pending rows go with it.
 //!
+//! # Deferred: chunks still uploading (plan 30 §M7)
+//!
+//! The same planner defers a transaction whose manifest names a chunk
+//! that is merely *pending* — not uploaded yet, not lost. Before M7 a
+//! round uploaded every pending chunk before shipping anything, so after
+//! a write-back burst the whole journal, however unrelated, waited for
+//! the burst's upload backlog: a one-byte marker file written next to a
+//! 384 MiB burst became visible on other nodes only once the whole burst
+//! was in S3 (`visibility-after-burst`). Now a round waits for the
+//! upload pass only briefly, and the ship plans around what is still
+//! pending exactly as it plans around what is lost: pending seeds and
+//! their dependents wait (a *deferred* transaction), everything else
+//! ships. Deferred work is not held work — it is not reported under
+//! `held` and needs no repair; it ships by itself once the pass acks its
+//! chunks. It also closes a window the round's ordering left open: a
+//! manifest journaled after the pass took its snapshot of the pending
+//! rows used to ship with its chunks still unuploaded.
+//!
 //! # Cost
 //!
 //! Nothing when no chunk is poisoned: one counter read
@@ -142,6 +160,23 @@ fn read_poisoned(r: &impl Readable, meta: &Meta) -> Result<PoisonMap, MetaError>
     Ok(out)
 }
 
+/// Every pending (not yet uploaded) chunk per inode: the deferral seeds
+/// (plan 30 §M7). One seek when nothing is pending — the ship path's cost
+/// in write-through steady state.
+fn read_pending(r: &impl Readable, meta: &Meta) -> Result<PoisonMap, MetaError> {
+    let mut out = PoisonMap::new();
+    for guard in r.iter(&meta.pending_upload) {
+        let (k, _) = guard.into_inner()?;
+        if k.len() != 40 {
+            return Err(MetaError::Invalid("pending_upload key length".into()));
+        }
+        let hash = ChunkHash(k[..32].try_into().expect("32 bytes"));
+        let ino = u64::from_be_bytes(k[32..].try_into().expect("8 bytes"));
+        out.entry(ino).or_default().insert(hash);
+    }
+    Ok(out)
+}
+
 /// What the last ship plan held back (`Meta::held_summary`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeldSummary {
@@ -154,6 +189,9 @@ pub struct HeldSummary {
     pub inodes: BTreeMap<Ino, HeldInode>,
     /// An uncaptured transaction was held, so everything after it is too.
     pub opaque: bool,
+    /// Plan 30 §M7: transactions deferred (not held) because a chunk
+    /// their manifest names is still uploading.
+    pub deferred: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -244,20 +282,34 @@ fn seed_inos(tx: &Tx, poisoned: &PoisonMap) -> Vec<Ino> {
 /// seed for (empty for a dependent), and its key set (`None`: uncaptured).
 type Held = (Tx, Vec<Ino>, Option<Vec<Vec<u8>>>);
 
-/// A ship plan: the transactions to ship (in order) and those held back.
+/// A ship plan: the transactions to ship (in order), those held back
+/// behind lost chunks, and those deferred behind chunks still uploading.
 struct Plan {
     ship: Vec<Tx>,
     held: Vec<Held>,
+    deferred: Vec<Tx>,
     opaque: bool,
 }
 
-/// See the module doc's "What is held".
-fn plan(r: &impl Readable, meta: &Meta, poisoned: &PoisonMap) -> Result<Plan, MetaError> {
+/// See the module doc's "What is held" and "Deferred". A transaction is
+/// *held* if it is a poisoned seed or depends on a held one; otherwise
+/// *deferred* if it is a pending seed or depends on anything held or
+/// deferred; otherwise it ships. Taint accumulates per kind, so a
+/// transaction behind both is reported as held.
+fn plan(
+    r: &impl Readable,
+    meta: &Meta,
+    poisoned: &PoisonMap,
+    pending: &PoisonMap,
+) -> Result<Plan, MetaError> {
     let mut tainted: HashSet<Vec<u8>> = HashSet::new();
+    let mut deferred_keys: HashSet<Vec<u8>> = HashSet::new();
     let mut opaque = false;
+    let mut opaque_deferred = false;
     let mut out = Plan {
         ship: Vec::new(),
         held: Vec::new(),
+        deferred: Vec::new(),
         opaque: false,
     };
     for tx in transactions(r, meta)? {
@@ -273,15 +325,29 @@ fn plan(r: &impl Readable, meta: &Meta, poisoned: &PoisonMap) -> Result<Plan, Me
                 // Unknown keys: held once anything is.
                 None => !out.held.is_empty(),
             };
-        if !held {
-            out.ship.push(tx);
+        if held {
+            match &keys {
+                Some(keys) => tainted.extend(keys.iter().cloned()),
+                None => opaque = true,
+            }
+            out.held.push((tx, seeds, keys));
             continue;
         }
-        match &keys {
-            Some(keys) => tainted.extend(keys.iter().cloned()),
-            None => opaque = true,
+        let deferred = opaque_deferred
+            || !seed_inos(&tx, pending).is_empty()
+            || match &keys {
+                Some(keys) => keys.iter().any(|k| deferred_keys.contains(k)),
+                None => !out.deferred.is_empty(),
+            };
+        if deferred {
+            match &keys {
+                Some(keys) => deferred_keys.extend(keys.iter().cloned()),
+                None => opaque_deferred = true,
+            }
+            out.deferred.push(tx);
+            continue;
         }
-        out.held.push((tx, seeds, keys));
+        out.ship.push(tx);
     }
     out.opaque = opaque;
     Ok(out)
@@ -313,6 +379,7 @@ fn summarize(plan: &Plan, poisoned: &PoisonMap) -> HeldSummary {
         oldest_seq: plan.held.first().map(|(t, _, _)| t.first),
         inodes,
         opaque: plan.opaque,
+        deferred: plan.deferred.len() as u64,
     }
 }
 
@@ -413,16 +480,22 @@ impl Meta {
     pub(crate) fn take_shippable(&self, max: usize) -> Result<Vec<(u64, LogRecord)>, MetaError> {
         let r = self.db.read_tx();
         let poisoned = read_poisoned(&r, self)?;
-        if poisoned.is_empty() {
+        let pending = read_pending(&r, self)?;
+        if poisoned.is_empty() && pending.is_empty() {
             drop(r);
             if self.held_any.swap(false, Ordering::Relaxed) {
                 *self.held.lock().unwrap() = HeldSummary::default();
             }
             return self.take_journal_whole_txs(max);
         }
-        self.held_any.store(true, Ordering::Relaxed);
         self.held_work.fetch_add(1, Ordering::Relaxed);
-        let plan = plan(&r, self, &poisoned)?;
+        let plan = plan(&r, self, &poisoned, &pending)?;
+        // Whether rows may be skipped: `journal_through_after` must not
+        // claim a skipped row shipped.
+        self.held_any.store(
+            !poisoned.is_empty() || !plan.held.is_empty() || !plan.deferred.is_empty(),
+            Ordering::Relaxed,
+        );
         *self.held.lock().unwrap() = summarize(&plan, &poisoned);
         let mut batch = Vec::new();
         for tx in plan.ship {
@@ -479,7 +552,7 @@ impl Meta {
                  for it"
             )));
         };
-        let held = plan(&tx, self, &poisoned)?;
+        let held = plan(&tx, self, &poisoned, &PoisonMap::new())?;
         // The inode's seeds, and every held transaction that depends on
         // them (key overlap, transitively, in journal order).
         let mut tainted: HashSet<Vec<u8>> = HashSet::new();

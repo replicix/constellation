@@ -46,7 +46,7 @@ pub use allowlist::{Allowlist, Decision};
 pub use bloom::Bloom;
 pub use delegation::{DelegationGranter, DelegationHolder, DEFAULT_DELEGATION_TTL_MS};
 pub use endpoint::{
-    topic_for, ChunkFetch, DigestDelta, DigestSnapshot, P2p, PathKind, PeerService,
+    topic_for, ChunkFetch, DigestDelta, DigestSnapshot, LogEvent, P2p, PathKind, PeerService,
 };
 pub use epoch::{
     component_covers_roster, EpochState, Machine as EpochMachine, Promise as EpochPromise,

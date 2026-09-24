@@ -1863,7 +1863,7 @@ mod tests {
     struct ServeOnly(Arc<Coop>);
 
     impl constellation_net::PeerService for ServeOnly {
-        fn segment_published(&self, _part: &str, _seq: u64, _epoch: u64, _p: Option<Vec<u8>>) {}
+        fn segment_published(&self, _part: &str, _seq: u64, _epoch: u64) {}
         fn lease_requested(
             &self,
             part: String,

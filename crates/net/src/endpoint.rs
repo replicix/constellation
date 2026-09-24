@@ -392,9 +392,22 @@ impl PathKind {
 /// doing that on a blocking call inside the accept task would stall a
 /// runtime worker.
 pub trait PeerService: Send + Sync + 'static {
-    /// A peer published a segment: tail now instead of at the next poll.
-    /// `payload` is the zstd segment body when it fit the gossip budget.
-    fn segment_published(&self, part: &str, seq: u64, epoch: u64, payload: Option<Vec<u8>>);
+    /// A peer published a segment: tail now instead of at the next poll
+    /// (unless this node follows the holder's log stream, which carries
+    /// it). Plan 30 §M7: a hint, never the segment itself.
+    fn segment_published(&self, part: &str, seq: u64, epoch: u64);
+    /// Plan 30 §M7: `requester` subscribes to this node's log stream from
+    /// sequence `from`. The returned receiver yields what to write on the
+    /// stream, in order; the stream ends when it closes (or after an
+    /// [`LogEvent::End`]). `None` refuses at once (no log to serve).
+    fn log_subscribe(
+        &self,
+        _requester: u64,
+        _req_id: u64,
+        _from: u64,
+    ) -> Option<tokio::sync::mpsc::Receiver<LogEvent>> {
+        None
+    }
     /// A peer wants `part`'s lease. Returns the reply to send.
     fn lease_requested(
         &self,
@@ -525,6 +538,25 @@ pub trait PeerService: Send + Sync + 'static {
 }
 
 /// A live P2P endpoint.
+/// Plan 30 §M7: one event on a log stream, as the holder writes it and
+/// the subscriber reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogEvent {
+    /// Frame `n`: a segment (`(seq, S3 object bytes)`) or a heartbeat.
+    Frame {
+        n: u64,
+        epoch: u64,
+        head: u64,
+        segment: Option<(u64, Vec<u8>)>,
+    },
+    /// The holder ended the subscription (`refused`: it never held).
+    End { refused: bool },
+}
+
+/// How long a holder waits for one log-stream frame to be taken by a
+/// subscriber before giving that subscriber up (it falls back to S3).
+pub const LOG_FRAME_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct P2p {
     endpoint: Endpoint,
     gossip: Gossip,
@@ -753,6 +785,99 @@ impl P2p {
     /// probe the connection pooled for it and evict it if it is dead.
     pub fn suspect_restart(&self, id: iroh::EndpointId) {
         self.pool.suspect(id, Suspicion::Restarted);
+    }
+
+    /// Plan 30 §M7: open a log stream to `peer` (the holder) and return
+    /// the events read from it. The subscription frame goes out on a new
+    /// bidirectional stream of the pooled connection; a reader task then
+    /// verifies each frame's author, reads the segment bytes that follow
+    /// it and checks their hash, and forwards them in order. The channel
+    /// closes when the stream ends or breaks — the caller's cue to fall
+    /// back to S3 — and dropping the receiver ends the stream from this
+    /// side.
+    pub async fn open_log_stream(
+        &self,
+        peer: EndpointAddr,
+        payload: &Payload,
+    ) -> Result<tokio::sync::mpsc::Receiver<LogEvent>> {
+        let expect = peer.id;
+        let conn = self.connection(&peer).await?;
+        let opened = async {
+            let (mut send, recv) = conn.open_bi().await.context("opening a log stream")?;
+            let msg = Signed::new(&self.key, payload)?;
+            crate::message::write_frame(&mut send, &msg).await?;
+            send.finish().ok();
+            anyhow::Ok(recv)
+        }
+        .await;
+        let mut recv = match opened {
+            Ok(recv) => recv,
+            Err(e) => {
+                self.invalidate_connection(expect, conn.stable_id()).await;
+                return Err(e);
+            }
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            loop {
+                let frame = match crate::message::read_frame(&mut recv).await {
+                    Ok(frame) => frame,
+                    Err(_) => return,
+                };
+                let Ok((author, body)) = frame.verify() else {
+                    return;
+                };
+                if author.as_bytes() != expect.as_bytes() {
+                    tracing::warn!("log stream frame signed by an unexpected key; closing");
+                    return;
+                }
+                let event = match body {
+                    Payload::LogFrame {
+                        n,
+                        epoch,
+                        head,
+                        segment,
+                        ..
+                    } => {
+                        let segment = match segment {
+                            None => None,
+                            Some((seq, len, hash)) => {
+                                if len > crate::message::MAX_LOG_SEGMENT {
+                                    return;
+                                }
+                                let mut bytes = vec![0u8; len as usize];
+                                if recv.read_exact(&mut bytes).await.is_err() {
+                                    return;
+                                }
+                                if *blake3::hash(&bytes).as_bytes() != hash {
+                                    tracing::warn!(
+                                        seq,
+                                        "log stream segment hash mismatch; closing"
+                                    );
+                                    return;
+                                }
+                                Some((seq, bytes))
+                            }
+                        };
+                        LogEvent::Frame {
+                            n,
+                            epoch,
+                            head,
+                            segment,
+                        }
+                    }
+                    Payload::LogEnd { refused, .. } => {
+                        let _ = tx.send(LogEvent::End { refused }).await;
+                        return;
+                    }
+                    _ => return,
+                };
+                if tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(rx)
     }
 
     /// Plan 30 §M4: every open path of the pooled connection to `id`,

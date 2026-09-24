@@ -914,6 +914,23 @@ relay of its own so requests can be attributed per role):
     ships;
   - `session-idle-latency`: after a 3-node write burst an idle read
     phase never waits; a single node never waits.
+- **`visibility-after-burst`** (plan 30 M7; the local form of the EC2
+  bench's row 6). Three nodes, every S3 path behind a 10 ms toxiproxy
+  latency and a `CountingProxy`. A writes a 192 MiB write-back burst
+  (24 × 8 MiB, incompressible), then 60 fsync'd marker files at 10/s
+  while B and C poll `vis/` every 10 ms (`readdir`, then the marker's
+  content); a marker's latency runs from A's `open` to the first poll
+  that reads it back. Runs twice on fresh filesystems — log streams off
+  (`CONSTELLATION_LOG_STREAMS=0`: gossip hints plus the S3 GET-next
+  tailer) and on (after both pollers report `status.log_stream.live`) —
+  and asserts, for every poller, cross-node visibility p99 < 2 s, no
+  marker missed, and with streams on at most 4 S3 tail GETs (`GET` of a
+  `log/` key) during the markers; prints both runs' GET counts.
+  Diagnosis knobs (harness environment): `VIS_BURST_FILES`,
+  `VIS_LATENCY_MS`, `VIS_DEBUG=1` (per-marker write times and
+  latencies), `VIS_RUST_LOG=info,constellation_authority::stream=debug,constellation::log_stream=debug`
+  (every segment's ship → stream send → receive → apply, with
+  `CHAOS_KEEP_TMP=1`).
 - **`sticky-lease-handoff-over-s3`** runs with `CONSTELLATION_INBOX=off`
   since M5 phase 2: it tests the S3-only cooperative handoff, and with
   M13's inbox on a lone blocked write is answered through the holder's
@@ -1123,6 +1140,25 @@ monotonic reads against the log's version order (`tests/sim/session.rs`;
 violations on names a tentative op touched are counted, not failed).
 `session_wait_off_is_found` is the non-vacuity seed: with the wait off
 the checker must find a violation.
+
+Plan 30 M7: with P2P on (every configuration but the inbox ones), the
+holder serves log streams and followers apply streamed segments through
+the tail path; gossip hints carry no payload. The bus carries stream
+frames in FIFO lanes per (holder, subscriber), like a QUIC stream, and
+`SimConfig::stream_faults` breaks them: `drop_p` (a lost frame),
+`reorder_p` (a frame delivered past its successors), `cut_p` (the holder
+drops the subscriber — `Event::SubscriberGone` — while the subscriber's
+end breaks), and `drop_segment_frames` (scripted loss by index). A frame
+to a dead node is the holder's write error (`SubscriberGone`). Tests:
+`streams_carry_the_log_and_save_tail_gets` (60 seeds with streams on and
+off: streamed applies and tail skips happen, S3 GETs drop),
+`stream_faults_are_survived` (150 seeds of the CI configuration plus
+stream loss, reorder and cuts: every check holds, and each fault kind
+was met), `regression_stream_gap_detected` (scripted loss of two
+segment frames: the gap is noticed at the next frame, the sequence comes
+from S3, the subscriber resubscribes, every replica converges).
+`AUTHORITY_SIM_CONFIG=streams-off | stream-faults | stream-gap` replays
+them; the shard summary prints the stream counters.
 
 The checker design, settled in phase 2: the exact log-witnessed
 linearizability check runs on every seed; Stateright's

@@ -52,6 +52,7 @@ mod inbox;
 mod jobs;
 mod lease;
 mod replay;
+mod stream;
 #[cfg(test)]
 mod tests;
 
@@ -67,6 +68,7 @@ pub use client::{meta_errno, ClientPhase};
 pub use inbox::InboxView;
 pub use jobs::JobKind;
 pub use lease::{LeaseState, PendingGate, Plan};
+pub use stream::StreamView;
 
 /// Tunables, all read from `CONSTELLATION_*` by the production driver and
 /// set directly by the simulation.
@@ -145,6 +147,27 @@ pub struct Config {
     pub escalate_ops: u64,
     pub escalate_wait_ms: u64,
     pub escalate_retry_ms: u64,
+    // ---- plan 30 §M7: direct log streams ----
+    /// `CONSTELLATION_LOG_STREAMS` (default on): subscribe to the
+    /// holder's log stream, and serve one while holding. Off, or with P2P
+    /// off, every node tails S3 exactly as before M7.
+    pub log_streams: bool,
+    /// The holder sends a heartbeat frame to a subscriber it has sent
+    /// nothing for this long.
+    pub stream_heartbeat_ms: u64,
+    /// A subscription with no frame for this long is dead.
+    pub stream_timeout_ms: u64,
+    /// A caught-up subscriber still probes S3 (one GET) this often.
+    pub stream_backstop_ms: u64,
+    /// The holder's ring of recent segments served to new subscribers.
+    pub stream_ring_segments: usize,
+    pub stream_ring_bytes: usize,
+    /// A subscriber's reorder buffer (segments ahead of its cursor).
+    pub stream_buffer_segments: usize,
+    pub stream_buffer_bytes: usize,
+    /// Backoff between subscription attempts (doubling to the max).
+    pub stream_retry_min_ms: u64,
+    pub stream_retry_max_ms: u64,
 }
 
 impl Config {
@@ -201,6 +224,16 @@ impl Config {
             escalate_ops: 20,
             escalate_wait_ms: 3_000,
             escalate_retry_ms: 2_000,
+            log_streams: true,
+            stream_heartbeat_ms: 1_000,
+            stream_timeout_ms: 3_500,
+            stream_backstop_ms: 10_000,
+            stream_ring_segments: 64,
+            stream_ring_bytes: 16 << 20,
+            stream_buffer_segments: 256,
+            stream_buffer_bytes: 64 << 20,
+            stream_retry_min_ms: 500,
+            stream_retry_max_ms: 5_000,
         }
     }
 }
@@ -244,8 +277,33 @@ pub struct Stats {
     /// transport or timed out (`ForwardState::ok`/`err`).
     pub forwards_ok: u64,
     pub forwards_err: u64,
-    /// Gossip-pushed segments applied without a GET.
-    pub pushed_applied: u64,
+    // ---- M7: log streams ----
+    /// Subscriber: segments applied from the holder's stream (no GET).
+    pub stream_applied: u64,
+    /// Subscriber: subscriptions sent.
+    pub stream_subscribes: u64,
+    /// Subscriber: streamed segments already applied (dropped).
+    pub stream_duplicates: u64,
+    /// Subscriber: frames out of order (the stream was dropped).
+    pub stream_gaps: u64,
+    /// Subscriber: subscriptions refused (not the holder) or ended by the
+    /// holder (it stopped holding).
+    pub stream_refused: u64,
+    pub stream_ended: u64,
+    /// Subscriber: subscriptions lost at the transport, silent past the
+    /// timeout, or dropped for a full reorder buffer.
+    pub stream_lost: u64,
+    pub stream_timeouts: u64,
+    pub stream_overflows: u64,
+    /// Subscriber: rounds that skipped the S3 tail because the stream
+    /// covered it.
+    pub stream_tail_skips: u64,
+    /// Holder: subscriptions served and declined, frames sent, and
+    /// subscribers the driver dropped (slow or gone).
+    pub stream_served: u64,
+    pub stream_declined: u64,
+    pub stream_frames_sent: u64,
+    pub stream_subscribers_dropped: u64,
     // ---- M13 ----
     pub inbox_submitted_batches: u64,
     pub inbox_submitted_ops: u64,
@@ -368,6 +426,8 @@ enum Timer {
     InboxRecheck,
     InboxSubmitRetry,
     EscalateTick,
+    StreamHeartbeat,
+    StreamWatchdog,
 }
 
 impl Timer {
@@ -384,6 +444,8 @@ impl Timer {
             Timer::InboxRecheck => TimerKind::InboxRecheck,
             Timer::InboxSubmitRetry => TimerKind::InboxSubmitRetry,
             Timer::EscalateTick => TimerKind::EscalateTick,
+            Timer::StreamHeartbeat => TimerKind::StreamHeartbeat,
+            Timer::StreamWatchdog => TimerKind::StreamWatchdog,
         }
     }
 }
@@ -456,6 +518,7 @@ pub struct Core {
     roster: Vec<NodeId>,
     links: BTreeMap<NodeId, PeerLink>,
     pub(crate) inbox: inbox::InboxState,
+    stream: stream::StreamState,
     stopped: bool,
     pub stats: Stats,
 }
@@ -499,6 +562,7 @@ impl Core {
             roster: Vec::new(),
             links: BTreeMap::new(),
             inbox: inbox::InboxState::default(),
+            stream: stream::StreamState::default(),
             stopped: false,
             stats: Stats::default(),
             cfg,
@@ -612,6 +676,7 @@ impl Core {
             }
             Event::Peers { links } => {
                 self.links = links.into_iter().map(|l| (l.node, l)).collect();
+                self.stream_on_peers(now);
             }
             Event::Activity {
                 last_write,
@@ -624,9 +689,11 @@ impl Core {
                     self.acked.mark_done(seq);
                 }
             }
+            Event::SubscriberGone { node, req } => self.on_subscriber_gone(node, req),
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),
         }
         self.inbox_after_event(now, &mut out);
+        self.stream_after_event(now, &mut out);
         out
     }
 
@@ -665,11 +732,23 @@ impl Core {
                 epoch,
                 head_seq,
             } => self.on_lease_handoff(now, from, req, released, epoch, head_seq, replica, out),
-            PeerMsg::SegmentPublished {
-                seq,
+            PeerMsg::SegmentPublished { seq, epoch } => {
+                self.on_segment_pushed(now, from, seq, epoch, out)
+            }
+            PeerMsg::LogSubscribe { req, from: seq } => {
+                self.on_log_subscribe(now, from, req, seq, out)
+            }
+            PeerMsg::LogUnsubscribe { req } => self.on_log_unsubscribe(from, req, out),
+            PeerMsg::LogStream {
+                req,
+                n,
                 epoch,
-                payload,
-            } => self.on_segment_pushed(now, from, seq, epoch, payload, replica, out),
+                head,
+                segment,
+            } => self.on_log_stream(now, from, req, n, epoch, head, segment, replica, out),
+            PeerMsg::LogStreamEnd { req, refused } => {
+                self.on_log_stream_end(now, from, req, refused, out)
+            }
             // Later milestones' messages: acknowledged by the interface,
             // answered by nothing until they are implemented.
             other => {
@@ -692,6 +771,9 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if self.on_stream_failed(now, req, out) {
+            return;
+        }
         if let Some(rid) = self.by_req.remove(&req) {
             self.stats.forwards_err += 1;
             self.note_p2p_result(now, to, !outage);
@@ -768,6 +850,8 @@ impl Core {
                 self.inbox.escalate_timer = None;
                 self.on_escalate_tick(now, replica, out);
             }
+            Timer::StreamHeartbeat => self.on_stream_heartbeat(now, out),
+            Timer::StreamWatchdog => self.on_stream_watchdog(now, out),
         }
     }
 

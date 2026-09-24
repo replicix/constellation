@@ -58,6 +58,33 @@ impl ConcurrencyGate {
         }
     }
 
+    /// A permit for latency-sensitive work (plan 30 §M7: a small
+    /// `fsync`/write-through inode drain) that must not queue behind a
+    /// bulk backlog. It is granted while fewer than `target + reserve`
+    /// permits are out, so it only ever competes with other priority
+    /// work: ordinary waiters stop at `target`, and `notify_waiters` wakes
+    /// every waiter at once, so an ordinary `acquire` behind a backlog of
+    /// hundreds of queued uploads would win a slot about as often as each
+    /// of them does. The overshoot is bounded by `reserve`.
+    pub async fn acquire_priority(&self, reserve: usize) -> ConcurrencyPermit<'_> {
+        loop {
+            let notified = self.notify.notified();
+            let limit = self.target().max(1) + reserve;
+            let cur = self.in_flight.load(Ordering::Acquire);
+            if cur < limit {
+                if self
+                    .in_flight
+                    .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return ConcurrencyPermit { gate: self };
+                }
+                continue;
+            }
+            notified.await;
+        }
+    }
+
     /// Acquire a permit that can be moved into a spawned task.
     pub async fn acquire_owned(self: &Arc<Self>) -> OwnedConcurrencyPermit {
         loop {
@@ -126,6 +153,34 @@ mod tests {
         drop(p1);
         waiter.await.unwrap();
         drop(p2);
+    }
+
+    /// Plan 30 §M7: with every ordinary slot taken (and ordinary waiters
+    /// queued), a priority acquire still gets one of the reserve slots at
+    /// once; ordinary waiters never use the reserve.
+    #[tokio::test]
+    async fn a_priority_acquire_skips_the_ordinary_queue() {
+        let gate = Arc::new(ConcurrencyGate::new(2));
+        let _a = gate.acquire().await;
+        let _b = gate.acquire().await;
+        let gate2 = gate.clone();
+        let ordinary = tokio::spawn(async move {
+            let _c = gate2.acquire().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let prio = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            gate.acquire_priority(1),
+        )
+        .await
+        .expect("a priority acquire waited behind the ordinary queue");
+        assert_eq!(gate.in_flight(), 3);
+        assert!(
+            !ordinary.is_finished(),
+            "ordinary work must not use the reserve"
+        );
+        drop(prio);
+        ordinary.abort();
     }
 
     #[tokio::test]

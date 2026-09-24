@@ -25,6 +25,7 @@ pub fn status(meta: &Meta) -> constellation_api::HeldStatus {
         records: summary.records,
         oldest_seq: summary.oldest_seq,
         opaque: summary.opaque,
+        deferred: summary.deferred,
         inodes: inodes
             .into_iter()
             .map(|(ino, held)| constellation_api::HeldInodeStatus {
