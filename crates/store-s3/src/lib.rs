@@ -29,6 +29,7 @@ pub mod nodes;
 pub mod packs;
 pub mod parallel;
 pub mod probe;
+pub(crate) mod run;
 pub mod snapshot;
 pub mod store;
 

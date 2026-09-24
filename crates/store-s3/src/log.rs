@@ -175,35 +175,19 @@ impl LogStore {
     /// against OVH Milan) and costs ~1/12.5 of a LIST request. A LIST page
     /// still wins when genuinely far behind — 1000 keys in one round trip
     /// — so the tailer keeps it for catch-up and uses this for the poll.
+    ///
+    /// The GETs past the gap are left to finish in the background rather
+    /// than cancelled, so their connections go back to the pool; see
+    /// [`crate::run`].
     pub async fn get_run(&self, from: u64, k: usize) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
-        use futures::StreamExt;
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-        let store = &self.store;
-        let partition = self.partition.as_str();
-        let mut fetched = futures::stream::iter((0..k as u64).map(|i| {
-            let seq = from.saturating_add(i);
-            async move {
-                let key = layout::log_segment(partition, seq);
-                match store.get(&key).await {
-                    Ok(res) => (seq, res.bytes().await),
-                    Err(e) => (seq, Err(e)),
-                }
-            }
-        }))
-        .buffered(k);
-        let mut run = Vec::new();
-        // `buffered` yields in issue order, so the first miss is the end of
-        // the run and every later reply is simply never consumed.
-        while let Some((seq, body)) = fetched.next().await {
-            match body {
-                Ok(body) => run.push((seq, self.open_segment(seq, &body)?)),
-                Err(object_store::Error::NotFound { .. }) => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(run)
+        let keys =
+            (0..k as u64).map(|i| layout::log_segment(&self.partition, from.saturating_add(i)));
+        crate::run::get_run(&self.store, keys)
+            .await?
+            .into_iter()
+            .zip(from..)
+            .map(|(body, seq)| Ok((seq, self.open_segment(seq, &body)?)))
+            .collect()
     }
 
     /// All segment sequence numbers, ascending.

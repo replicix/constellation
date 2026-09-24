@@ -368,26 +368,29 @@ impl CommitChain {
     pub async fn get(&self, seq: u64) -> Result<Option<Commit>, StoreError> {
         let key = layout::commit(seq);
         match self.store.get(&key).await {
-            Ok(res) => {
-                let stored = res.bytes().await?;
-                let body = match self.seal.as_deref() {
-                    Some(seal) => {
-                        crate::e2e::decrypt_object(&seal.commits, key.as_ref().as_bytes(), &stored)?
-                    }
-                    None => stored.to_vec(),
-                };
-                let commit: Commit = serde_json::from_slice(&body)?;
-                if commit.v != COMMIT_VERSION {
-                    return Err(StoreError::CorruptObject(format!(
-                        "commit {seq} is version {}, this build reads {COMMIT_VERSION}",
-                        commit.v
-                    )));
-                }
-                Ok(Some(commit))
-            }
+            Ok(res) => Ok(Some(self.open(seq, &res.bytes().await?)?)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Decode (and unseal) the stored body of commit `seq`.
+    fn open(&self, seq: u64, stored: &[u8]) -> Result<Commit, StoreError> {
+        let key = layout::commit(seq);
+        let body = match self.seal.as_deref() {
+            Some(seal) => {
+                crate::e2e::decrypt_object(&seal.commits, key.as_ref().as_bytes(), stored)?
+            }
+            None => stored.to_vec(),
+        };
+        let commit: Commit = serde_json::from_slice(&body)?;
+        if commit.v != COMMIT_VERSION {
+            return Err(StoreError::CorruptObject(format!(
+                "commit {seq} is version {}, this build reads {COMMIT_VERSION}",
+                commit.v
+            )));
+        }
+        Ok(commit)
     }
 
     /// Commits `from, from+1, …` fetched concurrently, truncated at the
@@ -396,21 +399,13 @@ impl CommitChain {
     /// gives: a 404 is as cheap as an empty LIST and a twelfth of the
     /// request cost.
     pub async fn get_run(&self, from: u64, k: usize) -> Result<Vec<Commit>, StoreError> {
-        use futures::StreamExt;
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-        let mut fetched =
-            futures::stream::iter((0..k as u64).map(|i| self.get(from.saturating_add(i))))
-                .buffered(k);
-        let mut run = Vec::new();
-        while let Some(commit) = fetched.next().await {
-            match commit? {
-                Some(commit) => run.push(commit),
-                None => break,
-            }
-        }
-        Ok(run)
+        let keys = (0..k as u64).map(|i| layout::commit(from.saturating_add(i)));
+        crate::run::get_run(&self.store, keys)
+            .await?
+            .into_iter()
+            .zip(from..)
+            .map(|(body, seq)| self.open(seq, &body))
+            .collect()
     }
 
     /// Sequence numbers present, ascending, at or above `from`. The

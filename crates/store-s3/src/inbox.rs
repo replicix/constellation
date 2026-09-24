@@ -343,15 +343,21 @@ impl InboxStore {
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let body = res.bytes().await?;
-        let batch = InboxBatch::decode(&self.open(&path, &body)?)?;
+        Ok(Some(self.open_batch(key, &res.bytes().await?)?))
+    }
+
+    /// Decode the stored body of the batch at `key`, refusing one that
+    /// names a different key.
+    fn open_batch(&self, key: InboxKey, body: &[u8]) -> Result<InboxBatch, StoreError> {
+        let path = key.path();
+        let batch = InboxBatch::decode(&self.open(&path, body)?)?;
         if batch.key() != key {
             return Err(StoreError::CorruptObject(format!(
                 "inbox batch at {path} names {:?}",
                 batch.key()
             )));
         }
-        Ok(Some(batch))
+        Ok(batch)
     }
 
     /// GET-next: batches `from, from+1, …` of one requester under one
@@ -366,23 +372,16 @@ impl InboxStore {
         from: u64,
         k: usize,
     ) -> Result<Vec<InboxBatch>, StoreError> {
-        use futures::StreamExt;
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-        let mut fetched = futures::stream::iter((0..k as u64).map(|i| {
-            let n = from.saturating_add(i);
-            async move { (n, self.get_batch(InboxKey { epoch, node, n }).await) }
-        }))
-        .buffered(k);
-        let mut run = Vec::new();
-        while let Some((_, got)) = fetched.next().await {
-            match got? {
-                Some(batch) => run.push(batch),
-                None => break,
-            }
-        }
-        Ok(run)
+        let keys = (0..k as u64).map(|i| InboxKey {
+            epoch,
+            node,
+            n: from.saturating_add(i),
+        });
+        let run = crate::run::get_run(&self.store, keys.clone().map(|key| key.path())).await?;
+        run.iter()
+            .zip(keys)
+            .map(|(body, key)| self.open_batch(key, body))
+            .collect()
     }
 
     /// Every batch key under `prefix`, ascending. Stray objects (keys
