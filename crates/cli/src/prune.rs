@@ -69,10 +69,6 @@ pub fn scan_budget() -> Duration {
     Duration::from_millis(env_u64("CONSTELLATION_PRUNE_SCAN_BUDGET_MS", 5000))
 }
 
-pub fn forward_timeout() -> Duration {
-    Duration::from_millis(env_u64("CONSTELLATION_PRUNE_FORWARD_TIMEOUT_MS", 2000))
-}
-
 // --- observability ---
 
 /// Prune counters, surfaced on `StatusReport` and in `/metrics`. A
@@ -147,9 +143,9 @@ pub struct PruneDeps {
     pub store: Arc<dyn ObjectStore>,
     pub meta: Arc<Meta>,
     pub sync_tx: tokio::sync::mpsc::UnboundedSender<crate::fusefs::SyncRequest>,
-    pub keepers: Arc<tokio::sync::Mutex<HashMap<String, crate::lease::LeaseKeeper>>>,
+    /// The core's lease view (the fast path's admission gate).
+    pub lease: Arc<crate::lease::LeaseView>,
     pub forward: Arc<crate::forward::ForwardState>,
-    pub peers: constellation_net::Peers,
     pub node_id: u64,
     pub lease_mode: LeaseMode,
     pub read_only_member: bool,
@@ -709,7 +705,6 @@ async fn execute_unlink_no_policy(deps: &PruneDeps, _now_ns: i64, v: &VictimRef)
 }
 
 async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult {
-    let part = "p0".to_string();
     let op = MutateOp::Unlink {
         parent: v.parent,
         name: v.name.clone(),
@@ -726,55 +721,28 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
     // Held locally with a usable, non-lost shipping lease → execute
     // directly (no `touch()`, so a pure prune never pins the lease).
     // Plan 30 §M3b: admitted through the lease view like every other
-    // local mutation, so a release's final flush cannot miss it (see
-    // `lease.rs`'s module doc, "The releasing flag").
-    let held_view = {
-        let keepers = deps.keepers.lock().await;
-        keepers
-            .get(&part)
-            .filter(|k| !k.is_lost() && k.ship_epoch().is_some())
-            .map(|k| k.view())
-    };
-    if let Some(view) = held_view {
-        if let Some(_admitted) = view.admit() {
-            match constellation_meta::execute_mutate(&deps.meta, &op, Some(rid)) {
-                Ok(_) => {
-                    let _ = deps.sync_tx.send(crate::fusefs::SyncRequest::Nudge);
-                    return UnlinkResult::Done { freed };
-                }
-                Err(_) => return UnlinkResult::SkippedForward,
+    // local mutation, so a release's final flush cannot miss it.
+    if let Some(_admitted) = deps.lease.admit() {
+        match constellation_meta::execute_mutate(&deps.meta, &op, Some(rid)) {
+            Ok(_) => {
+                let _ = deps.sync_tx.send(crate::fusefs::SyncRequest::Nudge);
+                return UnlinkResult::Done { freed };
             }
+            Err(_) => return UnlinkResult::SkippedForward,
         }
     }
 
-    // Non-holder with a cached holder → one best-effort forward.
-    if let Some(holder) = deps.forward.cached_holder(&part) {
-        let outcome = crate::forward::request_mutate_with(
-            &deps.peers,
-            &deps.forward,
-            &part,
-            deps.node_id,
-            holder,
-            &op,
-            rid,
-            deps.forward.acked_through(),
-            forward_timeout(),
-        )
-        .await;
-        // Busy/NotHolder/timeout: fall through to try acquiring.
-        if let MutateOutcome::Accepted { .. } = outcome {
-            return UnlinkResult::Done { freed };
-        }
-    }
-
-    // Nobody holds it → acquire the lease ourselves (Step 4c), never
-    // preempting a live holder. `Acquire` returns false when a foreign
-    // holder still owns it.
+    // Non-holder: the core forwards once to the known holder, else takes
+    // the lease if it is free — never preempting a live holder
+    // (`Policy::System`) — and, having held, resolves the rid against
+    // `completed` before executing (plan 30 §M2's in-doubt rule).
     let (reply, rx) = tokio::sync::oneshot::channel();
     if deps
         .sync_tx
-        .send(crate::fusefs::SyncRequest::Acquire {
-            part: part.clone(),
+        .send(crate::fusefs::SyncRequest::Submit {
+            op,
+            rid,
+            policy: constellation_authority::Policy::System,
             reply,
         })
         .is_err()
@@ -782,23 +750,11 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
         return UnlinkResult::SkippedForward;
     }
     match rx.await {
-        Ok(Ok(progress)) if progress.acquired => {
-            inc(&deps.stats.leases_acquired, 1);
-            // Plan 30 §M2 in-doubt resolution: the forward above may
-            // already have taken effect on the node that used to hold
-            // (see `fusefs.rs::mutate_op_rebasable`'s identical check).
-            if matches!(deps.meta.completed_position(rid), Ok(Some(_))) {
-                return UnlinkResult::Done { freed };
-            }
-            match constellation_meta::execute_mutate(&deps.meta, &op, Some(rid)) {
-                Ok(_) => {
-                    let _ = deps.sync_tx.send(crate::fusefs::SyncRequest::Nudge);
-                    UnlinkResult::Done { freed }
-                }
-                Err(_) => UnlinkResult::SkippedForward,
-            }
+        Ok(constellation_authority::ClientReply::Outcome(MutateOutcome::Accepted { .. })) => {
+            UnlinkResult::Done { freed }
         }
-        // Foreign holder or acquisition failure: skip, next run retries.
+        // Refused, in doubt, foreign holder or acquisition failure:
+        // skip, next run retries.
         _ => UnlinkResult::SkippedForward,
     }
 }

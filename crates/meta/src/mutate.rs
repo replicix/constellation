@@ -239,7 +239,9 @@ pub fn execute(
     // in its `journal_tx` row (`store::local`), so a deposition can replay
     // it by rid.
     let _op = crate::store::journal::PendingLocalOp::set(rid, op);
-    execute_inner(meta, op)
+    let records = execute_inner(meta, op)?;
+    meta.note_unshipped(&records);
+    Ok(records)
 }
 
 fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError> {

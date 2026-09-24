@@ -234,6 +234,7 @@ impl SnapshotManager {
             .as_ref()
             .context("this mount cannot publish a metadata commit, so it cannot take snapshots")?;
         let (seq, root) = publish().await?;
+        tracing::debug!(%path, name, seq, root = %root.to_hex(), ino, "snapshot: publish returned");
         // The commit must actually hold the directory: a path created
         // after the last shipped segment would otherwise freeze nothing.
         let kind = self
@@ -338,6 +339,7 @@ impl SnapshotManager {
     /// A frozen directory's children, in name order.
     pub async fn list_frozen(&self, dir: &FrozenObject) -> Result<FrozenDir> {
         let FrozenObject { root, ino } = *dir;
+        tracing::debug!(root = %root.to_hex(), ino, "snapshot: listing a frozen directory");
         self.tree()?
             .read(root, move |reader, resolver| {
                 let xattrs = reader
@@ -369,6 +371,11 @@ impl SnapshotManager {
                         xattrs: row.xattrs,
                     });
                 }
+                tracing::debug!(
+                    ino,
+                    entries = ?entries.iter().map(|e| (e.name.as_str(), e.kind)).collect::<Vec<_>>(),
+                    "snapshot: frozen directory listed"
+                );
                 Ok(FrozenDir { entries, xattrs })
             })
             .await

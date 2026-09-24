@@ -201,6 +201,7 @@ pub trait PeerService: Send + Sync + 'static {
             Payload::MutateReply {
                 req_id,
                 outcome: Vec::new(),
+                base: None,
             }
         })
     }

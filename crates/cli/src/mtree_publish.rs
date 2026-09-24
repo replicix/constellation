@@ -534,12 +534,23 @@ impl TreePublisher {
                 let view = match meta.publish_basis_at(snap)? {
                     PublishBasis::Defer => return Ok(Planned::Speculating),
                     PublishBasis::AsIs => LogPrefixView::default(),
-                    PublishBasis::Substituted(view) => view,
+                    PublishBasis::Substituted(view) => {
+                        tracing::debug!(
+                            substituted = view.len(),
+                            "metadata publish: log-prefix substitution"
+                        );
+                        view
+                    }
                 };
                 let dirty = meta.dirty_snapshot(snap)?;
                 if dirty.is_empty() {
                     return Ok(Planned::Empty);
                 }
+                tracing::debug!(
+                    dirty = dirty.len(),
+                    applied = meta.applied_seq_at(snap).unwrap_or(0),
+                    "metadata publish: planning"
+                );
                 let plan = plan_from_dirty(&meta, snap, &view, &blobs, &dirty)?;
                 // A substituted key was published at its log-prefix value,
                 // not its current one: it stays dirty for the publish after

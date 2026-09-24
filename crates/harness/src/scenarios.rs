@@ -17,6 +17,8 @@ use std::time::Duration;
 mod coop_churn;
 /// Plan 30 §M4's scenarios and the chaos runs' whole-cluster checks.
 mod m4;
+/// Plan 30 §M5 phase 2: the stale-base rule on the wire.
+mod m5;
 
 pub struct Scenario {
     pub name: &'static str,
@@ -548,6 +550,12 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M4: S3 requests per node by area on an idle and a busy 3-node cluster; only the lease holder PUTs commits or reads condemned lists",
         requires: &[],
         run: m4::publish_only_holder,
+    },
+    Scenario {
+        name: "stale-base-rename-divergence",
+        desc: "plan 30 M5: a holder's accepted reply names the unshipped base it was evaluated on; the requester waits for the log instead of installing a rename-over-existing-name as a shadow that the holder's unshipped unlink then removes, so A, B and C agree `f2` is the renamed `f1`",
+        requires: &[],
+        run: m5::stale_base_rename_divergence,
     },
     Scenario {
         name: "inbox-create-storm-p2p-off",
@@ -5956,29 +5964,58 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
 /// ListObjectsV2. One page (1000 keys); every caller here stays well
 /// under that.
 fn raw_objects(endpoint: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
-    let mut body = String::new();
-    ureq::get(&format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}"))
-        .call()
-        .with_context(|| format!("listing {prefix}"))?
-        .into_reader()
-        .read_to_string(&mut body)?;
+    // Every page: a listing is capped at 1000 keys per response, and a
+    // busy writer's log passes that within a minute (plan 30 M5).
     let mut out = Vec::new();
-    let mut rest = body.as_str();
-    while let Some(start) = rest.find("<Contents>") {
-        rest = &rest[start..];
-        let Some(end) = rest.find("</Contents>") else {
-            break;
-        };
-        let entry = &rest[..end];
-        if let (Some(key), Some(size)) = (
-            xml_field(entry, "Key"),
-            xml_field(entry, "Size").and_then(|s| s.parse().ok()),
-        ) {
-            out.push((key.to_string(), size));
+    let mut token: Option<String> = None;
+    loop {
+        let mut url = format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}");
+        if let Some(t) = &token {
+            url.push_str("&continuation-token=");
+            url.push_str(&url_encode(t));
         }
-        rest = &rest[end..];
+        let mut body = String::new();
+        ureq::get(&url)
+            .call()
+            .with_context(|| format!("listing {prefix}"))?
+            .into_reader()
+            .read_to_string(&mut body)?;
+        let mut rest = body.as_str();
+        while let Some(start) = rest.find("<Contents>") {
+            rest = &rest[start..];
+            let Some(end) = rest.find("</Contents>") else {
+                break;
+            };
+            let entry = &rest[..end];
+            if let (Some(key), Some(size)) = (
+                xml_field(entry, "Key"),
+                xml_field(entry, "Size").and_then(|s| s.parse().ok()),
+            ) {
+                out.push((key.to_string(), size));
+            }
+            rest = &rest[end..];
+        }
+        let truncated = xml_field(&body, "IsTruncated") == Some("true");
+        token = xml_field(&body, "NextContinuationToken").map(|t| t.to_string());
+        if !truncated || token.is_none() {
+            break;
+        }
     }
     Ok(out)
+}
+
+/// Percent-encode a continuation token for a query string.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn xml_field<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
@@ -6419,6 +6456,10 @@ fn sticky_lease_handoff_over_s3(_seed: u64) -> Result<()> {
     let mk = |name: &str| -> Result<Client> {
         Ok(Client::new(root.path(), name, &env.endpoint, &backend)?
             .with_env("CONSTELLATION_P2P", "off")
+            // Plan 30 M13's inbox answers a lone write through the holder
+            // without any handoff; this scenario is about the S3-only
+            // lease handoff itself, so it runs with the inbox off.
+            .with_env("CONSTELLATION_INBOX", "off")
             .with_env("CONSTELLATION_LEASE_TTL_MS", &TTL_MS.to_string())
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "1000"))
     };

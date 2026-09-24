@@ -535,6 +535,14 @@ pub struct Meta {
     /// Whether `held` may be non-default, so a ship with nothing poisoned
     /// does not take its lock (plan 30 §M4 round 2).
     pub(crate) held_any: AtomicBool,
+    /// Plan 30 §M5: the dentries and inodes this node's *unshipped*
+    /// journal touched, kept in memory so a forward reply can say whether
+    /// the holder evaluated the op behind unshipped work on the same keys
+    /// (`Meta::unshipped_overlaps`). Fed by `mutate::execute` — every
+    /// journaled op, the FUSE fast path included — and cleared the moment
+    /// the journal ships out completely. Conservative when it is stale
+    /// (a key stays until the next full ship), never permissive.
+    pub(crate) unshipped: std::sync::Mutex<crate::replay::TouchSet>,
     /// How many times a ship plan, a retirement or an ack took a held-set
     /// path (plan 30 §M4 round 2). Only ever moves while something is
     /// poisoned or held; the cost tests in `store::local` pin that it stays
@@ -635,6 +643,7 @@ impl Meta {
             holder_capture: AtomicBool::new(holder_capture_default()),
             held: std::sync::Mutex::new(held::HeldSummary::default()),
             held_any: AtomicBool::new(false),
+            unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
             held_work: AtomicU64::new(0),
             usage: UsageTracker::new(0, 0),
             path,
@@ -774,6 +783,29 @@ impl Meta {
     /// to write (`LeaseKeeper::share_holder_epoch`).
     pub fn holder_epoch_cell(&self) -> Arc<AtomicU64> {
         self.holder_epoch.clone()
+    }
+
+    /// Plan 30 §M5: whether the unshipped journal touched any key `keys`
+    /// names — the base a forward reply reports to its requester (see
+    /// `constellation_authority`'s `PeerMsg::MutateReply::base`).
+    pub fn unshipped_overlaps(&self, keys: &crate::replay::TouchSet) -> bool {
+        let mine = self.unshipped.lock().unwrap();
+        keys.dentries.iter().any(|d| mine.dentries.contains(d))
+            || keys.inos.iter().any(|i| mine.inos.contains(i))
+    }
+
+    /// Records just journaled: their keys join the unshipped set.
+    pub(crate) fn note_unshipped(&self, records: &[crate::record::LogRecord]) {
+        let mut mine = self.unshipped.lock().unwrap();
+        for rec in records {
+            mine.add(rec);
+        }
+    }
+
+    /// The journal shipped out completely: nothing unshipped touches
+    /// anything any more.
+    pub(crate) fn clear_unshipped(&self) {
+        *self.unshipped.lock().unwrap() = crate::replay::TouchSet::default();
     }
 
     /// The epoch this node executes under as holder, 0 when it holds none.

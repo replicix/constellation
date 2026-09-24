@@ -896,3 +896,72 @@ mod tests {
         assert_eq!(meta.speculation_counts().unwrap().local, 2);
     }
 }
+
+#[cfg(test)]
+mod root_substitution_tests {
+    use super::*;
+    use crate::mutate::{execute, MutateOp};
+    use crate::rid::Rid;
+    use crate::MetaStore;
+    use constellation_fs_core::types::ROOT_INO;
+
+    /// Plan 30 M5 round 3: a substituted (log-prefix) publish with the
+    /// root directory behind an unshipped local transaction must publish
+    /// the root as it was *shipped* — owner included — never the genesis
+    /// root. A fresh node bootstrapping from such a commit otherwise
+    /// comes up with a `0:0` root and refuses its own user's writes
+    /// (`fresh-node-bootstrap`).
+    #[test]
+    fn a_substituted_publish_keeps_the_shipped_root_owner() {
+        let meta = Meta::open_in_memory().unwrap();
+        meta.set_holder_epoch(1);
+        meta.setattr(ROOT_INO, None, Some(1000), Some(1000), None, None, None)
+            .unwrap();
+        let seqs: Vec<u64> = meta
+            .take_journal(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        // An unshipped create in the root (its mtime moves): captured.
+        execute(
+            &meta,
+            &MutateOp::Create {
+                parent: ROOT_INO,
+                name: "f".into(),
+                ino: (3 << 40) | 1,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            },
+            Some(Rid {
+                node: 3,
+                incarnation: 1,
+                seq: 1,
+            }),
+        )
+        .unwrap();
+        let (basis, root) = meta
+            .read_consistent(|snap| -> Result<_, MetaError> {
+                let basis = meta.publish_basis_at(snap)?;
+                let view = match &basis {
+                    PublishBasis::Substituted(view) => view.clone(),
+                    _ => LogPrefixView::default(),
+                };
+                let root = meta.tree_inode_via_at(snap, &view, ROOT_INO)?;
+                Ok((basis, root))
+            })
+            .unwrap();
+        assert!(
+            matches!(basis, PublishBasis::Substituted(_)),
+            "the create is unshipped and captured: {basis:?}"
+        );
+        let root = root.expect("the root is in the published tree");
+        assert_eq!(
+            (root.attr.uid, root.attr.gid),
+            (1000, 1000),
+            "the log-prefix root carries the shipped owner"
+        );
+    }
+}

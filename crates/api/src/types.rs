@@ -829,6 +829,12 @@ pub struct InboxStatus {
     pub gc_deleted: u64,
     #[serde(default)]
     pub tracked_requesters: u64,
+    /// The write-eligible roster this node's authority core last read
+    /// (the registry, refreshed periodically and at a holder's inbox
+    /// tenure start): who a holder polls with P2P off. A bench waits for
+    /// it to name every node before timing.
+    #[serde(default)]
+    pub roster: Vec<u64>,
     /// Round-2 instrumentation, requester side: mean time from queueing
     /// an op to its batch being durable, from durable to its outcome
     /// applied from the log, and their sum.

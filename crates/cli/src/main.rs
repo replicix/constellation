@@ -1,6 +1,7 @@
 //! Constellation entry point: CLI, daemon, and FUSE mount in one binary.
 
 mod atime;
+mod authority_driver;
 mod backend;
 mod coop;
 mod daemonize;
@@ -15,7 +16,6 @@ mod fusefs;
 mod gc;
 mod held;
 mod inbox;
-mod keygate;
 mod lease;
 mod leave;
 mod log_buffer;
@@ -2220,7 +2220,6 @@ struct P2pBridge {
     meta: std::sync::Arc<Meta>,
     epochs: std::sync::Arc<epoch::EpochManager>,
     coop: std::sync::Arc<crate::coop::Coop>,
-    forward: std::sync::Arc<forward::ForwardState>,
     placement: std::sync::Arc<placement::Placement>,
 }
 
@@ -2229,7 +2228,6 @@ impl constellation_net::PeerService for P2pBridge {
         tracing::debug!(part, seq, epoch, "peer published a segment; syncing now");
         let request = match payload {
             Some(payload) => fusefs::SyncRequest::ApplyPushed {
-                part: part.to_string(),
                 seq,
                 epoch,
                 holder_node: 0,
@@ -2258,7 +2256,7 @@ impl constellation_net::PeerService for P2pBridge {
             if self
                 .nudge
                 .send(fusefs::SyncRequest::HandOff {
-                    part: part.clone(),
+                    requester,
                     reply: tx,
                 })
                 .is_err()
@@ -2339,6 +2337,7 @@ impl constellation_net::PeerService for P2pBridge {
 
     fn epoch_activated(&self, epoch_id: String, members: Vec<u64>, base: Vec<(String, u64)>) {
         self.epochs.handle_activate(epoch_id, members, base);
+        let _ = self.nudge.send(fusefs::SyncRequest::EpochChanged);
         let _ = self.nudge.send(fusefs::SyncRequest::Nudge);
     }
 
@@ -2397,17 +2396,17 @@ impl constellation_net::PeerService for P2pBridge {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
-            self.forward.note_holder(&part, self.node_id);
+            let _ = part;
             let rid = constellation_meta::Rid {
                 node: rid.0,
                 incarnation: rid.1,
                 seq: rid.2,
             };
             let (reply, receive) = tokio::sync::oneshot::channel();
-            let outcome = if self
+            let started = std::time::Instant::now();
+            let (outcome, base) = if self
                 .nudge
                 .send(fusefs::SyncRequest::Mutate {
-                    part,
                     requester,
                     op,
                     rid,
@@ -2418,21 +2417,25 @@ impl constellation_net::PeerService for P2pBridge {
             {
                 receive
                     .await
-                    .unwrap_or(constellation_meta::MutateOutcome::Busy)
+                    .unwrap_or((constellation_meta::MutateOutcome::Busy, None))
             } else {
-                constellation_meta::MutateOutcome::Busy
+                (constellation_meta::MutateOutcome::Busy, None)
             };
+            tracing::trace!(
+                requester,
+                service_us = started.elapsed().as_micros() as u64,
+                "forwarded mutate served"
+            );
             constellation_net::Payload::MutateReply {
                 req_id,
                 outcome: outcome.to_postcard().unwrap_or_default(),
+                base,
             }
         })
     }
 
-    fn lease_offered(&self, part: String, epoch: u64) {
-        let _ = self
-            .nudge
-            .send(fusefs::SyncRequest::ClaimOffer { part, epoch });
+    fn lease_offered(&self, _part: String, epoch: u64) {
+        let _ = self.nudge.send(fusefs::SyncRequest::ClaimOffer { epoch });
     }
 
     fn peer_rtts(&self, node_id: u64, rtts: Vec<(u64, u16)>) {
@@ -2819,224 +2822,6 @@ async fn control_call(state_dir: &std::path::Path, req: constellation_api::Reque
     }
 }
 
-/// Plan 30 §M3b: run the deposition recovery for every keeper that is
-/// lost (a renewal found another holder, or a deposition persisted across
-/// a restart). Holds the keepers lock and the shipper across the
-/// recovery's tail — a recovery path, like the acquisition path, not the
-/// ordinary one (see `lease.rs`'s module doc). A recovery that fails leaves
-/// the keeper lost (tail-only) for the next round to retry.
-async fn recover_deposed_keepers(
-    ship: &mut shipper::Shipper,
-    keepers: &std::sync::Arc<
-        tokio::sync::Mutex<std::collections::HashMap<String, lease::LeaseKeeper>>,
-    >,
-    state_dir: &std::path::Path,
-) {
-    let mut keepers = keepers.lock().await;
-    for (part, keeper) in keepers.iter_mut() {
-        if !keeper.is_lost() {
-            continue;
-        }
-        if let Err(error) = recovery::recover_deposed(ship, keeper, Some(state_dir)).await {
-            tracing::warn!(
-                part,
-                error = %format!("{error:#}"),
-                "deposition recovery failed; staying tail-only and retrying next round"
-            );
-        }
-    }
-}
-
-async fn run_sync_round(
-    ship: &std::sync::Arc<tokio::sync::Mutex<shipper::Shipper>>,
-    keepers: &std::sync::Arc<
-        tokio::sync::Mutex<std::collections::HashMap<String, lease::LeaseKeeper>>,
-    >,
-    state_dir: &std::path::Path,
-) -> Result<()> {
-    let mut ship = ship.lock().await;
-    // Plan 30 §M3b: a deposition learned last round is recovered first —
-    // the stranded journal rolled back, its ops queued for replay by rid
-    // — which clears it, so the rest of this round runs as a non-holder.
-    recover_deposed_keepers(&mut ship, keepers, state_dir).await;
-    // Still deposed (the recovery failed): every partition is either lost
-    // or was never ours, so this node is purely tailing. Holds the keepers
-    // lock across `tail_to_head`'s I/O, same as before; nothing executes a
-    // local write for a lost partition via the fast path, so there is no
-    // forwarded-op latency to protect here.
-    {
-        let keepers = keepers.lock().await;
-        let any_lost = keepers.values().any(|k| k.is_lost());
-        if any_lost
-            && keepers
-                .values()
-                .all(|k| k.is_lost() || k.ship_epoch().is_none())
-        {
-            drop(keepers);
-            return ship.tail_to_head().await.map(|_| ());
-        }
-    }
-    // Renewal (plan 30 M2b): read-decide under the lock, run the CAS
-    // without it, apply the result back under the lock. See `lease.rs`'s
-    // `RenewAttempt` and its module doc's "Locking rules" for why reads
-    // made by a forwarded mutation's dispatch while the CAS is in flight
-    // are still correct.
-    //
-    // Plan 30 §M3b: a keeper that believes it holds an epoch below one this
-    // node has already tailed (another node's epoch marker, typically) was
-    // deposed; renew it now rather than at half-TTL, so the renewal's
-    // deposition probe notices at once.
-    let parts: Vec<String> = keepers.lock().await.keys().cloned().collect();
-    for part in parts {
-        let tailed_epoch = ship.max_epoch(&part);
-        let attempt = {
-            let mut g = keepers.lock().await;
-            match g.get_mut(&part) {
-                Some(k) if !k.is_lost() => {
-                    if k.ship_epoch().is_some_and(|mine| tailed_epoch > mine) {
-                        k.prepare_renew_now()
-                    } else {
-                        k.prepare_renew()
-                    }
-                }
-                _ => None,
-            }
-        };
-        let Some(attempt) = attempt else { continue };
-        let outcome = attempt.run().await;
-        let mut g = keepers.lock().await;
-        if let Some(k) = g.get_mut(&part) {
-            k.apply_renew(outcome).await?;
-        }
-    }
-    // A deposition the renewal just found is recovered in the same round.
-    recover_deposed_keepers(&mut ship, keepers, state_dir).await;
-    // Plan 30 §M3b: a won lease whose takeover gate failed (its epoch
-    // marker or a local replay) keeps new mutations closed until the gate
-    // completes; retry it every round (`shipper::complete_gate`).
-    {
-        let mut g = keepers.lock().await;
-        for (part, k) in g.iter_mut() {
-            if k.pending_gate().is_some() && !k.is_lost() {
-                shipper::complete_gate(&mut ship, k, part).await;
-            }
-        }
-    }
-    // Plan 30 §M13: the holder's inbox — GC what shipped, GET-next every
-    // due requester, execute what it finds — under the lease view, never
-    // under the keepers lock across S3 I/O (`inbox::holder_round`).
-    if let Some(inbox) = ship.inbox().cloned() {
-        if let Err(error) = inbox::holder_round(&inbox, ship.meta(), keepers).await {
-            tracing::warn!(error = %error, "inbox poll failed; will retry next round");
-        }
-    }
-    // Ordinary shipping (plan 30 M2b): `Shipper::run_ordinary_round` takes
-    // the keepers `Arc` itself and never holds it across the segment PUT
-    // — see its doc and `lease.rs`'s module doc for the reasoning.
-    ship.run_ordinary_round(keepers).await?;
-    // Release / handoff: holds the keepers lock across the *entire*
-    // decision, the final flush, and the release CAS for every partition
-    // below — see `lease.rs`'s module doc, "Locking rules", for why this is
-    // the one part of the round that must not be split the way
-    // renewal/shipping just were: a forwarded execute must never land
-    // between the final flush and the release actually taking effect.
-    // Plan 30 §M3b: this node's *own* new mutations are fenced the same
-    // way by the releasing flag, raised (and drained of admitted writes)
-    // before the backlog is read and held through the CAS.
-    let mut keepers = keepers.lock().await;
-    // First pass: the ordinary case, where the backlog already reads
-    // zero (either genuinely idle, or `run_ordinary_round` above just
-    // drained it) — release immediately, no need to touch the fast path
-    // at all.
-    let mut stuck: Vec<String> = Vec::new();
-    for (part, k) in keepers.iter_mut() {
-        if k.is_lost() || !k.wants_handoff() {
-            continue;
-        }
-        let releasing = k.begin_releasing();
-        releasing.wait_quiescent().await;
-        let backlog = ship.journal_backlog_of(part);
-        if k.idle_release_due(backlog) {
-            tracing::info!(part, "idle-releasing partition lease");
-            // Close our own fast path past the release too (plan 29 M3c):
-            // `idle_release_due` only fires with a registered waiter, and
-            // without this our own next local write — already queued on
-            // the same `Acquire` path, released to retry the instant the
-            // CAS lands — tends to win the reclaim race against that
-            // waiter's independently-scheduled retry.
-            k.begin_handoff_pause();
-            // Ship-then-release (plan 20): flush any pending read-time
-            // atime for this partition before the lease is gone, so a
-            // read-heavy holder's bumps reach the cluster rather than
-            // being stranded in a partition we will no longer ship.
-            ship.ship_atime_before_release(part, k).await;
-            k.release().await?;
-        } else if backlog > 0 {
-            stuck.push(part.clone());
-        }
-        drop(releasing);
-    }
-    // Second pass (plan 29 M3c): a busy local workload can keep
-    // `journal_backlog` above zero indefinitely, which used to mean a
-    // registered waiter never saw the round above release anything —
-    // sustained local traffic on the holder's own node starved every
-    // other node past the FUSE acquire deadline. Dwell/wanted already
-    // justify a handoff (`wants_handoff`); force it by briefly closing
-    // this node's own fast path (`begin_handoff_pause`) so no *new*
-    // local mutation can extend the backlog, then try once more to
-    // drain it.
-    //
-    // One attempt per round, not a busy-loop here: a record can be
-    // waiting on this round's own `upload_dirty_chunks` (called by our
-    // caller, `run_managed_sync_round`, *before* `run_sync_round`, not
-    // by `sync_all` itself), so spinning inside this function cannot
-    // make it ship any sooner — it would only burn the handoff-pause
-    // budget without giving the next round's upload a chance to run.
-    // The pause is self-expiring and outlives a single round
-    // (`HANDOFF_PAUSE_MS`), so a registered waiter still gets several
-    // of these attempts, each preceded by a fresh chunk-upload pass,
-    // before it lapses; if the backlog is still stuck by then the next
-    // round's `wants_handoff` check simply re-arms it.
-    for part in stuck {
-        if let Some(k) = keepers.get_mut(&part) {
-            k.begin_handoff_pause();
-        }
-        ship.sync_all(&mut keepers).await?;
-        if ship.journal_backlog_of(&part) > 0 {
-            tracing::debug!(
-                part,
-                "handoff pause set; backlog still non-zero, will retry next round"
-            );
-            continue;
-        }
-        let Some(k) = keepers.get_mut(&part) else {
-            continue;
-        };
-        if k.is_lost() {
-            continue;
-        }
-        // Plan 30 §M3b: the releasing flag from here to the CAS, and a
-        // re-check once the writes admitted before it have landed — the
-        // pause alone is time-bounded and not atomic with a FUSE thread's
-        // check-then-write.
-        let releasing = k.begin_releasing();
-        releasing.wait_quiescent().await;
-        if ship.journal_backlog_of(&part) > 0 {
-            tracing::debug!(part, "a write landed before the releasing flag; retrying");
-            continue;
-        }
-        tracing::info!(
-            part,
-            "idle-releasing partition lease (forced drain under sustained local traffic)"
-        );
-        k.begin_handoff_pause();
-        ship.ship_atime_before_release(&part, k).await;
-        k.release().await?;
-        drop(releasing);
-    }
-    Ok(())
-}
-
 /// Drain `Meta::pending_uploads()` — the durable not-yet-uploaded
 /// set (plan 07 step 1) — rather than `DiskCache::dirty_chunks()`,
 /// which cannot survive a crash (`DiskCache::rescan` legitimately marks
@@ -3272,7 +3057,7 @@ struct UploadReport {
 /// holds back just the records that need it and everything else ships.
 /// Any other failure (S3 unreachable, a PUT that keeps failing) is still
 /// an error for the round.
-async fn upload_dirty_chunks_report(
+pub(crate) async fn upload_dirty_chunks_report(
     cache: &DiskCache,
     meta: &Meta,
     store: &ChunkStore,
@@ -3451,204 +3236,16 @@ async fn upload_dirty_chunks_report(
 /// The continuation-epoch machinery (`constellation_net::EpochPromise`)
 /// still speaks in per-partition vectors; with plan 29 M0a's single
 /// stream that is always a one-entry map keyed by `p0`.
-fn epoch_base(meta: &Meta) -> Result<std::collections::BTreeMap<String, u64>> {
-    Ok(std::collections::BTreeMap::from([(
-        constellation_store_s3::log::PARTITION.to_string(),
-        meta.applied_seq()?,
-    )]))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_managed_sync_round(
-    ship: &std::sync::Arc<tokio::sync::Mutex<shipper::Shipper>>,
-    keepers: &std::sync::Arc<
-        tokio::sync::Mutex<std::collections::HashMap<String, lease::LeaseKeeper>>,
-    >,
-    epochs: &epoch::EpochManager,
-    meta: &Meta,
-    cache: &DiskCache,
-    store: &ChunkStore,
-    compression: CompressionSetting,
-    upload: &UploadRuntime,
-    state_dir: &std::path::Path,
-) -> Result<()> {
-    // Test-only fault point (`fault::sync_held`, plan 30 §M4 round 2).
-    if fault::sync_held() {
-        return Ok(());
-    }
-    let (spool, node_id) = {
-        let ship = ship.lock().await;
-        (ship.spool.clone(), ship.node_id())
-    };
-    if epochs.is_open() {
-        {
-            let mut keepers = keepers.lock().await;
-            for keeper in keepers.values_mut().filter(|k| k.holds_authority()) {
-                reaffirm_epoch_authority(keeper, meta, &spool, node_id);
-            }
-        }
-        epochs.check_liveness().await;
-        if epochs.is_frozen() {
-            return Ok(());
-        }
-        let s3_back = {
-            let mut ship = ship.lock().await;
-            ship.tail_to_head().await.is_ok()
-        };
-        if !s3_back {
-            return Ok(());
-        }
-        let holds_epoch_lease = keepers
-            .lock()
-            .await
-            .values()
-            .any(|keeper| keeper.holds_authority());
-        if !holds_epoch_lease && !epochs.shared_log_advanced(&epoch_base(meta)?) {
-            // The current epoch holder must publish first. A previous
-            // holder keeps its promise open until it has tailed that
-            // publication, then follows with its older local journal.
-            return Ok(());
-        }
-        // Plan 30 §M4: an unrecoverable chunk holds back only what needs
-        // it (`upload_dirty_chunks_report`); the rest of the journal ships.
-        upload_dirty_chunks_report(cache, meta, store, compression, upload, None, None).await?;
-        {
-            let ship = ship.lock().await;
-            ship.set_skip_ship(false);
-        }
-        epochs.close();
-        {
-            let mut keepers = keepers.lock().await;
-            for keeper in keepers.values_mut() {
-                keeper.release_local();
-            }
-        }
-        let result = run_sync_round(ship, keepers, state_dir).await;
-        if result.is_ok() {
-            let ship = ship.lock().await;
-            let mut keepers = keepers.lock().await;
-            let mut drained = true;
-            for (part, keeper) in keepers.iter_mut() {
-                // Plan 30 §M3b: fence this node's own new mutations for the
-                // drained check and the release CAS.
-                let releasing = keeper.begin_releasing();
-                releasing.wait_quiescent().await;
-                if ship.journal_backlog_of(part) == 0 {
-                    keeper.release().await?;
-                } else {
-                    drained = false;
-                }
-                drop(releasing);
-            }
-            if drained {
-                epochs.finish_flushing();
-            }
-            // Keep the guard alive only long enough to read backlog;
-            // release above is S3-only and does not call into shipper.
-            drop(ship);
-        }
-        return result;
-    }
-
-    // Plan 30 §M4 item 2: a chunk missing from the local cache no longer
-    // fails the round — the ship plan holds back only the records that
-    // need it (`constellation_meta::store::held`), and every other inode
-    // keeps publishing. Only a real upload failure fails the round.
-    if let Err(error) =
-        upload_dirty_chunks_report(cache, meta, store, compression, upload, None, None).await
-    {
-        let base = epoch_base(meta)?;
-        if epochs.maybe_propose(base).await? {
-            let ship = ship.lock().await;
-            ship.set_skip_ship(true);
-            drop(ship);
-            let mut keepers = keepers.lock().await;
-            for keeper in keepers.values_mut().filter(|k| k.holds_authority()) {
-                reaffirm_epoch_authority(keeper, meta, &spool, node_id);
-            }
-        }
-        return Err(error);
-    }
-
-    let result = run_sync_round(ship, keepers, state_dir).await;
-    if result.is_ok() {
-        epochs.note_s3_success();
-    }
-    if keepers.lock().await.values().any(|k| k.is_lost()) {
-        meta.kv_set("lease_lost", "1")?;
-    }
-    if result.is_ok() && epochs.is_flushing() {
-        let ship = ship.lock().await;
-        // One lock hold for both the drained check and the release, with
-        // no await between them. `dispatch_forward` runs on this same task
-        // and only gets in at this future's await points. A second
-        // `keepers.lock().await` here used to be such a point: a local
-        // forward could run in it, find the view still open and journal
-        // an op after the drained check but before `release` cleared the
-        // view.
-        let mut keepers = keepers.lock().await;
-        // Plan 30 §M3b: this node's own new mutations are fenced (and the
-        // ones already admitted drained) before the drained check, through
-        // every release below.
-        let releasing: Vec<lease::ReleasingGuard> =
-            keepers.values().map(|k| k.begin_releasing()).collect();
-        for guard in &releasing {
-            guard.wait_quiescent().await;
-        }
-        let drained = keepers
-            .keys()
-            .all(|part| ship.journal_backlog_of(part) == 0);
-        if drained {
-            for keeper in keepers.values_mut() {
-                keeper.release().await?;
-            }
-            epochs.finish_flushing();
-        }
-    }
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let base = epoch_base(meta)?;
-            if epochs.maybe_propose(base).await? {
-                let ship = ship.lock().await;
-                ship.set_skip_ship(true);
-                drop(ship);
-                let mut keepers = keepers.lock().await;
-                for keeper in keepers.values_mut().filter(|k| k.holds_authority()) {
-                    reaffirm_epoch_authority(keeper, meta, &spool, node_id);
-                }
-            }
-            Err(error)
-        }
-    }
-}
-
-/// A holder carrying its S3 authority into (or through) a continuation
-/// epoch: same node, same epoch, so nothing strands and no gate runs —
-/// unless one is still pending from a failed attempt (plan 30 §M3b), which
-/// is retried here.
-fn reaffirm_epoch_authority(
-    keeper: &mut lease::LeaseKeeper,
-    meta: &Meta,
-    spool: &std::sync::Mutex<shipper::SpoolInfo>,
-    node_id: u64,
-) {
-    let epoch = keeper.authority_epoch();
-    if keeper.pending_gate().is_some() {
-        recovery::adopt_epoch_hold_gated(keeper, meta, spool, node_id, epoch);
-    } else {
-        keeper.adopt_epoch_hold(epoch);
-    }
-}
-
 /// Give the root directory to the mounting user on a freshly created
 /// filesystem. Skipped entirely unless the root is still 0:0, so this
 /// costs nothing (and needs no lease) on every subsequent mount; when it
-/// does apply, it takes the lease like any other mutation.
+/// does apply, it takes the lease like any other mutation (through the
+/// authority core).
 async fn adopt_root(
     meta: &std::sync::Arc<Meta>,
-    ship: &mut shipper::Shipper,
-    keeper: &mut lease::LeaseKeeper,
+    sync_tx: &tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
+    forward: &forward::ForwardState,
+    node_id: u64,
 ) -> Result<()> {
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
@@ -3656,30 +3253,53 @@ async fn adopt_root(
         return Ok(());
     }
     // Another node may already have done it; make sure we have its log.
-    ship.tail_to_head().await?;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    sync_tx
+        .send(fusefs::SyncRequest::TailToHead { reply })
+        .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
+    rx.await
+        .map_err(|_| anyhow::anyhow!("sync task stopped"))?
+        .map_err(anyhow::Error::msg)?;
     let root =
         constellation_meta::MetaStore::getattr(&**meta, constellation_fs_core::types::ROOT_INO)?;
+    tracing::debug!(
+        uid = root.as_ref().map(|a| a.uid),
+        gid = root.as_ref().map(|a| a.gid),
+        applied = meta.applied_seq().unwrap_or(0),
+        "root adoption check"
+    );
     if !matches!(root, Some(a) if a.uid == 0) {
         return Ok(());
     }
-    if !shipper::acquire_lease(ship, keeper).await? {
+    let op = constellation_meta::MutateOp::Setattr {
+        ino: constellation_fs_core::types::ROOT_INO,
+        mode: None,
+        uid: Some(euid),
+        gid: Some(egid),
+        size: None,
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    sync_tx
+        .send(fusefs::SyncRequest::Submit {
+            op,
+            rid: forward.next_system_rid(node_id),
+            policy: constellation_authority::Policy::System,
+            reply,
+        })
+        .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
+    match rx.await {
+        Ok(constellation_authority::ClientReply::Outcome(
+            constellation_meta::MutateOutcome::Accepted { .. },
+        )) => Ok(()),
         // Another node holds authority; it either already adopted the
         // root or will, and its record reaches us by tailing.
-        tracing::info!("root adoption deferred: partition lease held elsewhere");
-        return Ok(());
+        _ => {
+            tracing::info!("root adoption deferred: partition lease held elsewhere");
+            Ok(())
+        }
     }
-    constellation_meta::MetaStore::setattr(
-        &**meta,
-        constellation_fs_core::types::ROOT_INO,
-        None,
-        Some(euid),
-        Some(egid),
-        None,
-        None,
-        None,
-    )?;
-    ship.sync(keeper).await?;
-    Ok(())
 }
 
 /// Format dial addresses for status/UI output.
@@ -3692,10 +3312,9 @@ struct DaemonStatus {
     meta: std::sync::Arc<Meta>,
     cache: std::sync::Arc<DiskCache>,
     staging_budget: std::sync::Arc<staging::StagingBudget>,
-    spool: std::sync::Arc<std::sync::Mutex<shipper::SpoolInfo>>,
-    leases: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<lease::LeaseView>>>,
-    >,
+    /// The authority core's observable state (`authority_driver`).
+    core: std::sync::Arc<std::sync::Mutex<authority_driver::CoreStatus>>,
+    lease: std::sync::Arc<lease::LeaseView>,
     fs_uuid: String,
     backend: String,
     /// Back-reference for the mount-management verbs (`MountAdd`,
@@ -3724,8 +3343,6 @@ struct DaemonStatus {
     placement: std::sync::Arc<placement::Placement>,
     atime: std::sync::Arc<crate::atime::AtimeAccumulator>,
     prune_stats: std::sync::Arc<crate::prune::PruneStats>,
-    keepers:
-        std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, lease::LeaseKeeper>>>,
     lease_mode: constellation_store_s3::LeaseMode,
     read_only_member: bool,
     last_sync_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -3761,9 +3378,10 @@ impl DaemonStatus {
             .map_err(|error| error.to_string())?
             .unwrap_or(constellation_fs_core::types::ROOT_INO);
         let part = "p0".to_string();
+        let _ = part;
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sync_tx
-            .send(fusefs::SyncRequest::Acquire { part, reply })
+            .send(fusefs::SyncRequest::Acquire { reply })
             .map_err(|_| "sync task is not running".to_string())?;
         let progress = tokio::task::block_in_place(|| self.rt.block_on(receive))
             .map_err(|_| "lease acquisition stopped".to_string())??;
@@ -3790,9 +3408,8 @@ impl DaemonStatus {
             store: self.store.clone(),
             meta: self.meta.clone(),
             sync_tx: self.sync_tx.clone(),
-            keepers: self.keepers.clone(),
+            lease: self.lease.clone(),
             forward: self.forward.clone(),
-            peers: self.peers.clone(),
             node_id: self.node_id,
             lease_mode: self.lease_mode,
             read_only_member: self.read_only_member,
@@ -3806,26 +3423,16 @@ impl DaemonStatus {
 
 impl constellation_api::StatusSource for DaemonStatus {
     fn status(&self) -> constellation_api::StatusReport {
-        let spool = self.spool.lock().unwrap().clone();
+        let core = self.core.lock().unwrap().clone();
+        let stats = core.stats;
         let speculation = (
-            spool.speculation_rolled_back,
-            spool.stranded_replayed,
-            spool.replay_conflicts,
+            stats.speculation_rolled_back,
+            stats.stranded_replayed,
+            stats.replay_conflicts,
         );
-        let gate_pending = self
-            .leases
-            .lock()
-            .unwrap()
-            .get(constellation_store_s3::log::PARTITION)
-            .is_some_and(|v| v.gate_pending());
+        let gate_pending = self.lease.gate_pending();
         let usage = self.cache.usage();
-        let p0_lease = self
-            .leases
-            .lock()
-            .unwrap()
-            .get(constellation_store_s3::log::PARTITION)
-            .map(|v| v.status())
-            .unwrap_or_default();
+        let p0_lease = self.lease.status();
         let designations = self.list_designations();
         let epoch = self.epochs.status();
         let coop = self.coop.report();
@@ -3909,11 +3516,13 @@ impl constellation_api::StatusSource for DaemonStatus {
             spool: constellation_api::SpoolStatus {
                 journal_backlog: constellation_meta::MetaStore::journal_len(&*self.meta)
                     .unwrap_or(0),
-                head_seq: spool.head_seq,
-                conflicts: spool.conflicts,
-                last_ship_error: spool.last_error,
-                ship_rounds_completed: spool.ship_rounds_completed,
-                ship_rounds_cancelled: spool.ship_rounds_cancelled,
+                head_seq: core.ship.as_ref().map(|s| s.head_seq).unwrap_or(0),
+                conflicts: stats.conflicts,
+                last_ship_error: core.last_error.clone(),
+                ship_rounds_completed: stats.rounds_completed,
+                // Plan 30 M5: a round is never cancelled by a request any
+                // more (requests are events the round interleaves with).
+                ship_rounds_cancelled: 0,
             },
             cache: constellation_api::CacheStatus {
                 used_bytes: usage.used,
@@ -3948,12 +3557,12 @@ impl constellation_api::StatusSource for DaemonStatus {
                     stranded_replayed: speculation.1,
                     replay_conflicts: speculation.2,
                     local: counts.local,
-                    local_rolled_back: spool.local_rolled_back,
-                    depositions: spool.depositions,
-                    epoch_markers: spool.epoch_markers,
+                    local_rolled_back: stats.local_rolled_back,
+                    depositions: stats.depositions,
+                    epoch_markers: stats.epoch_markers,
                     gate_pending,
-                    copies_pending: spool.replay_copies_pending,
-                    copies_stalled: spool.replay_copies_stalled,
+                    copies_pending: core.copies.0,
+                    copies_stalled: core.copies.1,
                 }
             },
             held: held::status(&self.meta),
@@ -3981,33 +3590,16 @@ impl constellation_api::StatusSource for DaemonStatus {
             forwarded_ok: self.forward.ok.load(std::sync::atomic::Ordering::Relaxed),
             forwarded_err: self.forward.err.load(std::sync::atomic::Ordering::Relaxed),
             forward_p50_ms: self.forward.p50_ms(),
-            pushed_segments_applied: self
-                .forward
-                .pushed_applied
-                .load(std::sync::atomic::Ordering::Relaxed),
-            forward_dedup_hits: self
-                .forward
-                .dedup_hits
-                .load(std::sync::atomic::Ordering::Relaxed),
-            forward_retries: self
-                .forward
-                .retries
-                .load(std::sync::atomic::Ordering::Relaxed),
-            forward_indoubt_resolved: self
-                .node
-                .indoubt_resolved
-                .load(std::sync::atomic::Ordering::Relaxed),
-            inbox: {
-                let mut inbox = self.node.inbox().status();
-                inbox.local_ops = self
-                    .leases
-                    .lock()
-                    .unwrap()
-                    .get(constellation_store_s3::log::PARTITION)
-                    .map(|v| v.touches())
-                    .unwrap_or(0);
-                inbox
-            },
+            pushed_segments_applied: stats.pushed_applied,
+            forward_dedup_hits: stats.forward_dedup_hits,
+            forward_retries: stats.forward_retries,
+            forward_indoubt_resolved: stats.forward_indoubt_resolved,
+            inbox: crate::inbox::status(
+                crate::inbox::inbox_enabled(),
+                &stats,
+                &core.inbox,
+                self.lease.touches(),
+            ),
             placement_reason: self.placement.last_reason.lock().unwrap().clone(),
             atime: {
                 use std::sync::atomic::Ordering::Relaxed;
@@ -4434,9 +4026,11 @@ impl constellation_api::StatusSource for DaemonStatus {
 
     fn force_release(&self, part: &str) -> std::result::Result<String, String> {
         let (reply, receive) = tokio::sync::oneshot::channel();
+        // A cooperative release asked for by the operator: the core's
+        // handoff job, addressed as if this node itself asked.
         self.sync_tx
             .send(fusefs::SyncRequest::HandOff {
-                part: part.to_string(),
+                requester: self.node_id,
                 reply,
             })
             .map_err(|_| "sync task is not running".to_string())?;

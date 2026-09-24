@@ -1025,6 +1025,7 @@ dependencies = [
  "async-trait",
  "clap",
  "constellation-api",
+ "constellation-authority",
  "constellation-fs-core",
  "constellation-meta",
  "constellation-mtree",
@@ -1064,6 +1065,32 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "constellation-authority"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "constellation-fs-core",
+ "constellation-meta",
+ "constellation-mtree",
+ "constellation-store-s3",
+ "futures",
+ "libc",
+ "object_store",
+ "postcard",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "stateright",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

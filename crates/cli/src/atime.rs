@@ -109,11 +109,6 @@ pub fn ship_max_delay() -> Duration {
     Duration::from_secs(env_u64("CONSTELLATION_ATIME_SHIP_MAX_DELAY_S", 300))
 }
 
-/// Batched-forward timeout (shorter than the 500 ms mutation forward).
-pub fn forward_timeout() -> Duration {
-    Duration::from_millis(env_u64("CONSTELLATION_ATIME_FORWARD_TIMEOUT_MS", 200))
-}
-
 /// Whether a read-only member may forward atime batches. Atime carries
 /// no authority, so this is the one record class a RO member may
 /// publish — opt-in, and it gates only `AtimeBatch`.

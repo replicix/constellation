@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// rid from ever being reused after a crash: `seq` itself resets to 0 on
 /// every mount (the in-memory counter does not survive a crash), but the
 /// incarnation bump means the *pair* never repeats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Rid {
     pub node: u64,
     pub incarnation: u32,

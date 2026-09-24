@@ -149,13 +149,6 @@ pub struct AcquireProgress {
 }
 
 impl AcquireProgress {
-    pub fn acquired() -> Self {
-        Self {
-            acquired: true,
-            ..Default::default()
-        }
-    }
-
     pub fn busy(holder: u64, epoch: u64) -> Self {
         Self {
             acquired: false,
@@ -173,17 +166,25 @@ pub struct HandoffResult {
     pub head_seq: Option<u64>,
 }
 
-/// A request to the daemon's sync task.
+/// A request to the daemon's sync task — the authority core's driver
+/// (`crate::authority_driver`), which turns each into a core event.
 pub enum SyncRequest {
     /// Run a sync round soon; the sender does not wait.
     Nudge,
+    /// The write-eligible roster from the registry poll (M13: who the
+    /// holder polls).
+    Roster(Vec<u64>),
+    /// The continuation-epoch machine changed state (the driver
+    /// re-reports it to the core).
+    EpochChanged,
     /// Ship everything this node can, then publish a plan 28 metadata
     /// commit and reply with `(seq, root)` — the tree a snapshot taken
     /// now retains.
     Publish {
         reply: tokio::sync::oneshot::Sender<Result<(u64, constellation_mtree::NodeHash), String>>,
     },
-    /// Run a sync round and report its outcome (fsync barrier).
+    /// Upload `ino`'s chunks, run a sync round and report its outcome
+    /// (fsync barrier).
     Barrier {
         ino: Ino,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -192,67 +193,64 @@ pub enum SyncRequest {
         ino: Ino,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
-    /// Tail every known partition to the log head without shipping or
-    /// publishing anything (plan 29 M3a: in-daemon GC's liveness-freshness
-    /// gate). Unlike `Publish`/`Barrier`, this never touches a lease —
-    /// it only applies foreign segments this replica has not seen yet —
-    /// so it is safe to run from a read-only member or mid-reintegration.
+    /// Tail to the log head without shipping or publishing anything
+    /// (plan 29 M3a: in-daemon GC's liveness-freshness gate). Never
+    /// touches a lease, so it is safe from a read-only member.
     TailToHead {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
-    /// Take the lease for `part` if it is free. `acquired: false` means a
-    /// live foreign holder still owns it — `holder`/`epoch` are a
-    /// best-effort snapshot of that holder (0/0 when unknown), letting a
-    /// retrying caller tell forward progress (the lease changing hands,
-    /// even to someone else) from a genuinely stuck wait (plan 29 M3c).
+    /// Take the lease if it is free. `acquired: false` means a live
+    /// foreign holder still owns it — `holder`/`epoch` are a best-effort
+    /// snapshot of that holder (0/0 when unknown), letting a retrying
+    /// caller tell forward progress from a genuinely stuck wait (plan 29
+    /// M3c).
     Acquire {
-        part: String,
         reply: tokio::sync::oneshot::Sender<Result<AcquireProgress, String>>,
     },
-    /// A peer asked us to hand `part`'s lease over (M3.3 fast path):
-    /// flush that partition's journal to S3 and release the lease.
-    /// Replies with the epoch, etag, and last shipped seq we held, or
-    /// `None` if we do not hold it or the flush failed — in which case
-    /// the requester falls back to waiting the lease out through S3,
-    /// which is always correct.
+    /// A peer asked us to hand the lease over (M3.3 fast path): flush the
+    /// journal to S3 and release. Replies with the epoch and last shipped
+    /// seq we held, or `None` if we do not hold it or the flush failed —
+    /// the requester then waits the lease out through S3.
     HandOff {
-        part: String,
+        requester: u64,
         reply: tokio::sync::oneshot::Sender<Option<HandoffResult>>,
     },
+    /// A peer forwarded a mutation to this node as (believed) holder.
+    /// The reply carries plan 30 §M6's `base` (see
+    /// `constellation_authority::PeerMsg::MutateReply`).
     Mutate {
-        part: String,
         requester: u64,
         op: Vec<u8>,
         /// Plan 30 §M2: the op's exactly-once identity, for holder-side
-        /// dedup (`forward::holder_execute`).
+        /// dedup.
         rid: constellation_meta::Rid,
         /// Plan 30 §M2 GC: prune `recent` outcomes for `requester`'s
         /// current incarnation up to this seq.
         acked_through: u64,
-        reply: tokio::sync::oneshot::Sender<constellation_meta::MutateOutcome>,
+        reply: tokio::sync::oneshot::Sender<(constellation_meta::MutateOutcome, Option<u64>)>,
     },
-    Forward {
-        part: String,
+    /// This node's own mutation, when the FUSE fast path could not
+    /// execute it locally: the core forwards it, submits it through the
+    /// holder's inbox, or takes the lease, per `policy`.
+    Submit {
         op: constellation_meta::MutateOp,
-        /// Plan 30 §M2: allocated once in `mutate_op_rebasable` and kept
-        /// across every retry this op goes through (forward, redirected
-        /// forward, or the lease path).
+        /// Plan 30 §M2: allocated once by the caller and kept across every
+        /// retry this op goes through.
         rid: constellation_meta::Rid,
-        reply: tokio::sync::oneshot::Sender<Result<constellation_meta::MutateOutcome, String>>,
+        policy: constellation_authority::Policy,
+        reply: tokio::sync::oneshot::Sender<constellation_authority::ClientReply>,
     },
     ApplyPushed {
-        part: String,
         seq: u64,
         epoch: u64,
         holder_node: u64,
         payload: Vec<u8>,
     },
     ClaimOffer {
-        part: String,
         epoch: u64,
     },
-    /// Reintegrate a stranded branch, either from the control API or
-    /// automatically after mounting a persisted deposed state dir.
+    /// Run the deposition recovery now (the control API, or automatically
+    /// after mounting a persisted deposed state dir).
     Reintegrate(tokio::sync::oneshot::Sender<Result<String, String>>),
     /// Permanently leave the cluster (self). Flushes, tombstones the
     /// registry record, marks the state dir spent, then the caller
@@ -261,6 +259,10 @@ pub enum SyncRequest {
         force: bool,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
+    /// Final flush + release on unmount; the core stops afterwards.
+    Shutdown {
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// FUSE-side handle to the metadata sync task.
@@ -268,10 +270,9 @@ pub struct SyncHandle {
     pub tx: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
     /// `--fsync-mode s3`: fsync() returns only once the journal is in S3.
     pub fsync_s3: bool,
-    /// Lock-free lease state keyed by partition; the write gate reads
-    /// the relevant view per mutating op.
-    pub leases:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<crate::lease::LeaseView>>>>,
+    /// Lock-free lease view (the core's state, mirrored by the driver);
+    /// the write gate reads it per mutating op.
+    pub lease: Arc<crate::lease::LeaseView>,
     /// Bound on how long a mutation waits for a foreign holder.
     pub acquire_deadline: Duration,
     /// Offline designation (DESIGN.md §5.2). `None` when no designations
@@ -295,20 +296,11 @@ pub struct SyncHandle {
     pub node_id: u64,
     pub incarnation: u32,
     pub next_rid_seq: Arc<std::sync::atomic::AtomicU64>,
-    /// Plan 30 §M2: incremented when the lease-path, last-resort check
-    /// (`self.meta.completed_position(rid)`) finds an op already
-    /// completed and returns success without executing it again — the
-    /// in-doubt case the coverage rule resolves. Distinct from
-    /// `ForwardState::dedup_hits` (the holder-side, network-visible
-    /// dedup), since this happens purely locally after a takeover.
-    pub indoubt_resolved: Arc<std::sync::atomic::AtomicU64>,
-    /// Plan 30 §M2 GC: the *same* tracker `h.forward`'s `ForwardState`
-    /// uses (shared via `Arc`, see `ForwardState::acked`'s doc) — every
-    /// completion path in `mutate_op_rebasable` marks this op's rid done
-    /// here exactly once, whether or not it ever went through a forward
-    /// at all, so `acked_through` has no gaps for the holder to stall
-    /// behind.
-    pub acked: Arc<std::sync::Mutex<crate::forward::AckTracker>>,
+    /// Plan 30 §M2 GC: rid seqs whose op completed here (every path of
+    /// `mutate_op_rebasable`, the fast path included), drained by the
+    /// driver into the core's ack tracker so `acked_through` has no gaps
+    /// for the holder to stall behind.
+    pub acked: Arc<std::sync::Mutex<Vec<u64>>>,
 }
 
 /// Everything [`ConstellationFs::new`] needs besides the two filesystem
@@ -1011,15 +1003,33 @@ impl ConstellationFs {
         let manifest = self
             .rt
             .block_on(self.snapshots.load_manifest(&manifest_hash))
-            .map_err(|_| libc::EIO)?;
+            .map_err(|error| {
+                tracing::debug!(%error, ino, "frozen read: manifest load failed");
+                libc::EIO
+            })?;
         let hashes = self.chunk_list(&manifest)?;
+        tracing::debug!(
+            ino,
+            file_len = manifest.file_len,
+            chunks = hashes.len(),
+            "frozen read: manifest loaded"
+        );
         if offset >= manifest.file_len {
             return Ok(Vec::new());
         }
         let len = size.min(manifest.file_len - offset);
         let mut out = Vec::with_capacity(len as usize);
         for slice in manifest.layout.slices(offset, len) {
-            let chunk = self.read_committed_chunk(ino, &hashes, slice.index)?;
+            let chunk = self
+                .read_committed_chunk(ino, &hashes, slice.index)
+                .inspect_err(|errno| {
+                    tracing::debug!(
+                        ino,
+                        index = slice.index,
+                        errno,
+                        "frozen read: chunk read failed"
+                    )
+                })?;
             let start = slice.offset as usize;
             let end = (slice.offset + slice.len) as usize;
             if chunk.len() < end {
@@ -1089,33 +1099,23 @@ impl ConstellationFs {
         if h.epoch_active
             .as_ref()
             .is_some_and(|active| active.load(std::sync::atomic::Ordering::Relaxed))
+            && h.lease.usable()
         {
-            let part = "p0".to_string();
-            let map = h.leases.lock().unwrap();
-            if let Some(view) = map.get(&part) {
-                if view.usable() {
-                    view.touch();
-                    return Ok(());
-                }
-            }
-            // The sync task performs a P2P-only handoff in epoch mode.
+            h.lease.touch();
+            return Ok(());
+            // Otherwise the core performs a P2P-only handoff in epoch mode.
         }
-        let part = "p0".to_string();
-        {
-            let map = h.leases.lock().unwrap();
-            if let Some(view) = map.get(&part) {
-                if view.open_for_new_mutation() {
-                    view.touch();
-                    return Ok(());
-                }
-                if view.is_lost() {
-                    tracing::error!(
-                        part,
-                        "refusing mutation: this node lost the partition lease"
-                    );
-                    return Err(libc::EIO);
-                }
-            }
+        let part = "p0";
+        if h.lease.open_for_new_mutation() {
+            h.lease.touch();
+            return Ok(());
+        }
+        if h.lease.is_lost() {
+            tracing::error!(
+                part,
+                "refusing mutation: this node lost the partition lease"
+            );
+            return Err(libc::EIO);
         }
         let start = std::time::Instant::now();
         // Each retry is a classify GET (and, the first time round, a CAS
@@ -1140,20 +1140,12 @@ impl ConstellationFs {
         let mut no_progress_since = start;
         loop {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if h.tx
-                .send(SyncRequest::Acquire {
-                    part: part.clone(),
-                    reply: tx,
-                })
-                .is_err()
-            {
+            if h.tx.send(SyncRequest::Acquire { reply: tx }).is_err() {
                 return Err(libc::EIO);
             }
             match rx.blocking_recv() {
                 Ok(Ok(progress)) if progress.acquired => {
-                    if let Some(view) = h.leases.lock().unwrap().get(&part) {
-                        view.touch();
-                    }
+                    h.lease.touch();
                     return Ok(());
                 }
                 Ok(Ok(progress)) => {
@@ -1259,7 +1251,7 @@ impl ConstellationFs {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
         let result = self.mutate_op_rebasable_with_rid(h, part_hint_ino, &op, rid);
-        h.acked.lock().unwrap().mark_done(rid.seq);
+        h.acked.lock().unwrap().push(rid.seq);
         result
     }
 
@@ -1302,128 +1294,62 @@ impl ConstellationFs {
                 }
             }
         }
-        let part = "p0".to_string();
-        let view = h.leases.lock().unwrap().get(&part).cloned();
-        if let Some(view) = &view {
-            // Plan 30 §M3b: admitted (counted in flight) atomically with
-            // respect to a release's final flush + CAS — see `lease.rs`'s
-            // module doc, "The releasing flag".
-            if let Some(_admitted) = view.admit() {
-                let result = constellation_meta::execute_mutate(&self.meta, op, Some(rid))
-                    .map(|_| ())
-                    .map_err(mutate_fail);
-                if result.is_ok() {
-                    view.touch();
-                }
-                return result;
+        // Plan 30 §M3b: the fast path admits the op (counted in flight)
+        // atomically with respect to a release's final flush + CAS — see
+        // `lease.rs`'s module doc, "The releasing flag".
+        if let Some(_admitted) = h.lease.admit() {
+            let result = constellation_meta::execute_mutate(&self.meta, op, Some(rid))
+                .map(|_| ())
+                .map_err(mutate_fail);
+            if result.is_ok() {
+                h.lease.touch();
             }
-            if view.is_lost() {
-                return Err(MutateFail::Errno(libc::EIO));
-            }
+            return result;
         }
+        if h.lease.is_lost() {
+            return Err(MutateFail::Errno(libc::EIO));
+        }
+        // Plan 30 M5: everything else — forwarding with its same-rid
+        // retries, the inbox when there is no P2P path, the lease path
+        // with its in-doubt resolution against `completed` (and an inbox
+        // refusal, which is an outcome too), the causal wait, the
+        // deadline — is the authority core's client machine. One channel
+        // round trip; the reply is the op's outcome or "in doubt".
         let (tx, rx) = tokio::sync::oneshot::channel();
-        // Plan 30 §M2: set only once this op is actually handed to the
-        // sync task for forwarding — the in-doubt check below is only
-        // ever worth paying for an op that really might already have
-        // executed somewhere else. A fresh op that was never forwarded
-        // at all (forwarding disabled, or no channel to send on) cannot
-        // possibly be in `completed`, so it skips straight to executing,
-        // exactly as before M2.
-        let mut attempted_forward = false;
-        if crate::forward::forwarding_enabled()
-            && h.tx
-                .send(SyncRequest::Forward {
-                    part: part.clone(),
-                    op: op.clone(),
-                    rid,
-                    reply: tx,
-                })
-                .is_ok()
+        if h.tx
+            .send(SyncRequest::Submit {
+                op: op.clone(),
+                rid,
+                policy: constellation_authority::Policy::Client,
+                reply: tx,
+            })
+            .is_err()
         {
-            attempted_forward = true;
-            match rx.blocking_recv() {
-                Ok(Ok(constellation_meta::MutateOutcome::Accepted { .. })) => return Ok(()),
-                Ok(Ok(constellation_meta::MutateOutcome::Errno(e))) => {
-                    return Err(MutateFail::Errno(e))
-                }
-                // The name exists on the holder; the sync task has just
-                // installed the entry it sent with the refusal, so the
-                // caller's next lookup resolves here too.
-                Ok(Ok(constellation_meta::MutateOutcome::Exists { .. })) => {
-                    return Err(MutateFail::Errno(libc::EEXIST))
-                }
-                Ok(Ok(constellation_meta::MutateOutcome::Conflict { manifest })) => {
-                    return Err(MutateFail::Conflict { manifest })
-                }
-                Ok(Ok(
-                    constellation_meta::MutateOutcome::Busy
-                    | constellation_meta::MutateOutcome::NotHolder { .. },
-                )) => {}
-                Ok(Err(error)) => {
-                    tracing::debug!(%error, part, "forwarded mutation failed; acquiring lease");
-                }
-                Err(_) => return Err(MutateFail::Errno(libc::EIO)),
-            }
+            return Err(MutateFail::Errno(libc::EIO));
         }
-        // Plan 30 §M3b: the lease path admits the op through the same gate
-        // as the fast path. `require_lease_for` returning is not enough on
-        // its own: a release can begin between it and the write, so the
-        // admission is re-checked, and a closed gate sends the op back
-        // through the lease path (whose own deadline bounds the loop).
-        let view = h.leases.lock().unwrap().get(&part).cloned();
-        let _admitted = loop {
-            self.require_lease_for(part_hint_ino)
-                .map_err(MutateFail::Errno)?;
-            match &view {
-                Some(view) => {
-                    if let Some(admitted) = view.admit() {
-                        break Some(admitted);
-                    }
+        match rx.blocking_recv() {
+            Ok(constellation_authority::ClientReply::Outcome(outcome)) => match outcome {
+                constellation_meta::MutateOutcome::Accepted { .. } => Ok(()),
+                constellation_meta::MutateOutcome::Errno(e) => Err(MutateFail::Errno(e)),
+                // The name exists on the holder; the core installed the
+                // entry it sent with the refusal, so the caller's next
+                // lookup resolves here too.
+                constellation_meta::MutateOutcome::Exists { .. } => {
+                    Err(MutateFail::Errno(libc::EEXIST))
                 }
-                None => break None,
-            }
-        };
-        // Plan 30 §M2 in-doubt resolution, last resort: every forward
-        // attempt above ended in doubt (never an explicit refusal — that
-        // returns early above), so this op might already have taken
-        // effect on the node that used to hold. Only worth checking when
-        // a forward genuinely left the op in doubt — a fresh op that was
-        // never forwarded at all cannot possibly be in `completed` yet.
-        //
-        // Unlike the first cut of this check, there is no polling here:
-        // `require_lease_for`'s success is now an *exact* coverage
-        // witness, not a heuristic. A genuine S3-CAS takeover already
-        // tails to head as part of committing the claim
-        // (`shipper::acquire_lease_for`'s `needs_tail` /
-        // `TailedToHead`). A P2P handoff additionally waits, inside the
-        // `SyncRequest::Acquire` arm itself (before ever reporting
-        // "acquired"), until this replica's own tail reaches the
-        // departing holder's reported `head_seq` — see that arm's
-        // `pending_catchup` handling. So by the time this line runs,
-        // `completed`'s answer is final: found means the op already
-        // happened, absent means it never happened anywhere this
-        // replica could not have seen.
-        if attempted_forward && matches!(self.meta.completed_position(rid), Ok(Some(_))) {
-            h.indoubt_resolved
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(());
+                constellation_meta::MutateOutcome::Conflict { manifest } => {
+                    Err(MutateFail::Conflict { manifest })
+                }
+                constellation_meta::MutateOutcome::Busy
+                | constellation_meta::MutateOutcome::NotHolder { .. } => {
+                    Err(MutateFail::Errno(libc::EIO))
+                }
+            },
+            // Neither executed here nor answered by a holder within the
+            // deadline: `EIO`, and the op stays retryable.
+            Ok(constellation_authority::ClientReply::InDoubt) => Err(MutateFail::Errno(libc::EIO)),
+            Err(_) => Err(MutateFail::Errno(libc::EIO)),
         }
-        // Plan 30 §M13: an inbox refusal is an outcome too — the holder
-        // that refused it may be gone, but the refusal it shipped stands.
-        if attempted_forward {
-            if let Ok(Some(errno)) = self.meta.refused_errno(rid) {
-                h.indoubt_resolved
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(if errno == libc::ESTALE {
-                    MutateFail::Conflict { manifest: None }
-                } else {
-                    MutateFail::Errno(errno)
-                });
-            }
-        }
-        constellation_meta::execute_mutate(&self.meta, op, Some(rid))
-            .map(|_| ())
-            .map_err(mutate_fail)
     }
 
     /// fsync() barrier. In `--fsync-mode s3`, block until the journal
@@ -1920,10 +1846,7 @@ impl ConstellationFs {
         // flush cannot miss it — see `lease.rs`'s module doc, "The
         // releasing flag". The guard is dropped right after the commit:
         // the chunk drain below can take long and must not hold a release.
-        let view = self
-            .sync
-            .as_ref()
-            .and_then(|handle| handle.leases.lock().unwrap().get("p0").cloned());
+        let view = self.sync.as_ref().map(|handle| handle.lease.clone());
         let admitted = view.as_ref().and_then(|view| view.admit());
         let holds_lease = self.sync.is_none() || admitted.is_some();
         if holds_lease {

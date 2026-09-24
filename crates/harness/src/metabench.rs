@@ -228,6 +228,24 @@ pub fn run_one(
         .with_context(|| format!("directories visible on {}", c.name))?;
     }
 
+    // Every node's authority core must know the whole roster before the
+    // clock starts: with P2P off a holder polls the inboxes of the
+    // requesters its last registry read named, and a node that mounted
+    // after that read is discovered at the next periodic refresh (5 s)
+    // — a mount-order artifact this bench does not measure.
+    if cfg.nodes > 1 {
+        let want = cfg.nodes;
+        eventually(Duration::from_secs(30), || {
+            clients.iter().all(|c| {
+                c.control_status()
+                    .ok()
+                    .and_then(|s| s["inbox"]["roster"].as_array().map(|r| r.len()))
+                    .is_some_and(|n| n >= want)
+            })
+        })
+        .context("every node's roster names every node")?;
+    }
+
     let mut base_fwd_ok = vec![0u64; cfg.nodes];
     let mut base_fwd_err = vec![0u64; cfg.nodes];
     // Max across nodes, not node 0 alone: a node idles once its own

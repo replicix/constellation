@@ -439,6 +439,14 @@ pub(crate) fn load_tree(
     // (`Meta::apply_bootstrap_indexes`) never re-reads or re-decodes a
     // single `0x01` value.
     let mut derived = constellation_meta::BootstrapIndexBuilder::new();
+    // The root inode's row, re-written through an ordinary write after
+    // the ingestion (plan 30 M5 round 3): `Meta::open` has already
+    // inserted a genesis root (`0:0`) into the memtable, and an ingested
+    // segment sits *below* the memtable, so the loaded root record would
+    // otherwise stay shadowed by genesis until some later write rewrote
+    // it — a fresh node bootstrapping from a head commit with no log
+    // tail came up with a `0:0` root (`fresh-node-bootstrap`).
+    let mut root_row: Option<(Vec<u8>, Vec<u8>)> = None;
 
     let flush = |page: &mut Vec<Pair>, force: bool| -> Result<()> {
         if page.len() >= LOAD_PAGE || (force && !page.is_empty()) {
@@ -490,6 +498,9 @@ pub(crate) fn load_tree(
                 }
                 derived.observe(ino, &rec.attrs, manifest.as_deref(), &xattrs);
                 let local = meta.encode_local_inode(rec.attrs, manifest, target, &xattrs)?;
+                if ino == constellation_fs_core::types::ROOT_INO {
+                    root_row = Some((key.to_vec(), local.record.clone()));
+                }
                 main.push((key.to_vec(), local.record));
                 for (name, value) in local.xattrs {
                     local_xattrs.push((keys::xattr(ino, &name), value));
@@ -512,6 +523,9 @@ pub(crate) fn load_tree(
     }
     flush(&mut main, true)?;
     flush(&mut local_xattrs, true)?;
+    if let Some((key, value)) = root_row {
+        meta.ns_overwrite_after_ingest(&key, &value)?;
+    }
 
     meta.apply_bootstrap_indexes(derived)?;
     // Everything just loaded already equals the published tree; retract

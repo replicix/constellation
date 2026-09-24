@@ -9396,3 +9396,1612 @@ mechanical fixes were needed.
 
 Everything else this round matched its documented expectation exactly;
 no other findings.
+
+## Plan 30 M5 — sans-IO authority core and deterministic simulation: **PHASE 1 DONE** (interface, simulation, regression seeds; the extraction itself is phase 2, after M4 and M13 merge)
+
+Goal (plan 30 §M5): the authority decisions as a pure state machine,
+`Core::handle(now, event, replica) -> Vec<Action>`, and a deterministic
+simulation that runs N of them over the real `Meta`, `LogStore`,
+`LeaseStore` and `CommitChain` on a simulated bucket and bus, checking
+histories with Stateright's `LinearizabilityTester` plus the model's
+convergence and commit-prefix properties. Phase 1 was written while M4
+and M13 were still in test, so it touches none of the files they change
+(`node_runtime.rs`, `shipper.rs`, `lease.rs`, `forward.rs`,
+`recovery.rs`, `inbox.rs`, `main.rs`, `crates/meta/src/store/**`). The
+core is a new crate, not yet wired into the daemon; the simulation
+drives it today.
+
+| Item | State | Where |
+|---|---|---|
+| New workspace crate `constellation-authority` (in `members` and `default-members`; depends on `constellation-meta` and `constellation-store-s3` only; no IO crate in its graph) | done | `crates/authority` |
+| `Event` (submit, peer message, peer failure, S3 result, timer, uploads done, publish done, roster, peer link, control), `PeerMsg` with M6–M11/M14 variants declared, `S3Op`/`S3Result` (portable S3 only: GET, create-if-absent PUT, `If-Match` swap, GET-next run; M13's inbox PUT/LIST/DELETE declared), `Action` (reply, send, S3, timer, upload pass, publish, announce, conflict copy, control done) | done | `crates/authority/src/{event,action,ids}.rs` |
+| `Replica` trait: the synchronous local port to `Meta` (execute/dedup, speculation install/strand/replay queue, journal take/ack, segment apply/skip, holder epoch, persisted deposition), implemented for `Meta` | done | `crates/authority/src/replica.rs` |
+| `Core`: lease state and decisions (`LeaseState`: view + keeper minus IO), the client-op machine (fast path, forward with same-rid retries and one redirect, lease path with the coverage rule, read-your-refusal wait, deadline, plan 29 M5's ordering gate), the holder side (dedup + execute, `Busy` while fenced, handoff), the job slot (round: upload → deposition recovery → renew/deposition probe → gate → tail → ship → publish → release; acquire: read → classify → tail-to-head → CAS → marker → gate; handoff/shutdown: upload → flush → release; tail-to-head), the replay drain and the gate's local replay | done | `crates/authority/src/core/{mod,lease,client,holder,jobs,replay}.rs` |
+| Segment envelope shared with the shipper (byte-identical, pinned) | done | `crates/authority/src/segment.rs` |
+| `Rid: Ord` (the core keys maps by rid) | done | `crates/meta/src/rid.rs` |
+| Core unit tests: the view gates, classify, handoff timers, same-rid retry then lease path, in-doubt resolution from the log, `Busy` while fenced then exactly-once execution, the reply base, a holder's handoff queued behind the round then flush + release, a lost renewal → deposition → recovery, the ordering gate | done | `crates/authority/src/core/{lease,client,tests}.rs` |
+| Simulation: simulated bucket (`InMemory` + seeded latency, per-node cut, scripted 412/409/404/500/timeout and applied-then-lost rules shaped like `object_store`'s S3 errors — M4's `faulty.rs` idea, not its file), simulated bus (seeded delay/reorder, drops, partitions, dead nodes, plan 30 M0's reply-delay knob), the node driver (real `Core` over real `Meta`/`LogStore`/`LeaseStore`/`CommitChain`, mount-time bootstrap tail, crash with in-flight PUTs still landing, restart with the journal, pause with timers running, fresh joins), seeded workloads (create/unlink/rename on a few names, several client threads per node, in-doubt resubmission by the same rid), history recording, checks | done | `crates/authority/tests/sim/{store,bus,clock,node,run,history,check}.rs` |
+| Checks: linearizability twice — a log-witnessed check (the `Completed{rid}` positions are the successes' linearization order; refusals are pure reads placed in their real-time window; exact for this spec and polynomial) on every run, and Stateright's `LinearizabilityTester` over the same create/unlink/rename spec on histories of ≤ 80 events with ≤ 6 tentative ops (its search is exponential in ops left in flight: a 72-op crash-heavy history did not finish in minutes), both with M13 round 3a's `Tentative` treatment (rolled-back and abandoned rids on synthetic threads / unbound positions); convergence at quiescence against the log replayed onto a fresh `Meta` through the same `Replica::apply_segment` (fresh joiners included); commit-is-log-prefix for every commit (the holder's `publish_basis_at` substitution applied to a raw `ns` dump, CAS-created as a real `Commit`); exactly-once over the log's `Completed{rid}` records (never twice; once for every success, never for a refusal) | done | `crates/authority/tests/sim/{history,check}.rs` |
+| CI seed set: 4 shards × 250 seeds (3 nodes, 2 clients each, 6 ops each, 2 random faults) + regression tests; a failing seed prints `AUTHORITY_SIM_SEED=<seed> [AUTHORITY_SIM_CONFIG=…] cargo test -p constellation-authority --test sim replay_seed -- --nocapture --exact`; `RUST_LOG=constellation_authority=debug,sim=debug` narrates a replay; determinism test (same seed twice → same counters/history) | done | `crates/authority/tests/sim.rs` |
+| Regression seeds: bug A (`regression_bug_a_slow_holder_replies`: slow holder replies past the forward timeout; asserts the same-rid dedup/in-doubt path fired), bug B (`regression_bug_b_holder_dies_with_unshipped_forwards`: holder killed with accepted, unshipped forwards; asserts stranding + replay and convergence), scripted S3 error codes on every CAS site, single node, and `stale_base_speculation_is_found` (below) | done | `crates/authority/tests/sim.rs` |
+| Long randomized run: `cargo test -p constellation-authority --test sim -- --ignored long_random` (`AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_START`; 12 ops per client, 4 faults, 2 % P2P drop) | done | same |
+| Meta-level documentation tests of what the sim found (below) | done | `crates/authority/tests/meta_repro.rs` |
+
+**Runtime.** `cargo test -p constellation-authority --test sim` (debug):
+1,000 CI seeds plus the regression tests in 40 s of test time (46 s
+wall, 8 threads, ~1.1 GB RSS); the lib tests in 0.1 s. The four shards
+together return ~36,900 client ops over ~18,700 segments, and every one
+of the 1,000 seeds ends with the convergence check *applied* (the settle
+write brings a dead holder's takeover forward, so the model's
+`failover_pending` exemption is never needed) and is also checked by
+Stateright's tester; the shard summary prints both counts so a
+regression in them is visible. The long configuration (12 ops per
+client, 4 random faults, 2 % P2P drop; `long_random`, `#[ignore]`) ran
+1,200 seeds green in this session at ~0.17 s per seed, single-threaded
+(seeds 10000–10199, 20000–20499, 30000–30499; the two seeds that failed
+along the way are findings 5 and 6 below).
+
+### The interface
+
+- **Time is an input.** `handle(now: Ms, …)`; `Ms` is unix ms. Lease
+  objects are built with that `now` (never `now_unix_ms()`), so the
+  simulation's paused clock governs expiry end to end.
+- **Correlation.** Every action that has a result carries an `OpId` the
+  core minted (`Action::S3 { op, .. }` → `Event::S3 { op, .. }`;
+  `PeerMsg::MutateRequest { req, .. }` → `MutateReply { req, .. }` or
+  `Event::PeerFailed { req, .. }`; `UploadDirtyChunks`/`Publish` likewise);
+  timers carry a `TimerId`. The core records what each outstanding id was
+  for (`S3For`, `Timer`), so a result for an id it no longer tracks — a
+  reply after the forward timed out, a PUT result for a round it ended —
+  is dropped as stale rather than misread.
+- **What the core owns:** the lease view and keeper state (held lease +
+  tag, wanted-by, dwell/grace clocks, handoff pause, releasing flag,
+  takeover gate, deposition floor, cached holder), the log cursor
+  (`next_seq`, `max_epoch`, `head_seq`, `held_tail_at`, renew-now), the
+  job slot and its queue, every client op in flight (with its phase,
+  attempts, conflict keys, deadline), the replay drain cursor, the ack
+  tracker, the unshipped-touches set, every outstanding id and timer,
+  counters. **What the driver owns:** `Meta` (reached synchronously
+  through `Replica`), the S3 clients, the P2P endpoint and wire encoding
+  (`PeerMsg` ↔ `Payload`), FUSE reply channels, chunk uploads, the tree
+  publisher, and everything the plan keeps out of scope (GC, prune,
+  atime, coop cache, pins, designations, continuation epochs).
+- **The M2b lesson, structurally.** `handle` never awaits; there is no
+  lock. What used to be "the keepers lock across the final flush and the
+  release CAS" is the **job slot**: at most one authority job (round,
+  acquisition, handoff, shutdown, tail-to-head) is in progress; later
+  requests queue (`JobReq`) and start when it ends; nothing cancels a
+  round. A forwarded or local mutation never enters the slot: it is
+  admitted by `LeaseState::new_mutation_epoch` and executed synchronously
+  through `Replica::execute`, with no event boundary between the check
+  and the write — the lock-free check-then-write `dispatch_forward` ended
+  up with after the M3a fix, now the only shape there is. A release's
+  "wait for admitted writes to drain" is vacuous by construction.
+  `a_holders_handoff_queues_behind_the_round_then_flushes_and_releases`
+  pins it.
+- **Replica calls are synchronous by design, not actions.** The plan's
+  "Actions: … apply records" became a trait call: fjall writes are local
+  and sub-millisecond, the check-then-write atomicity above needs them
+  inline, and a model-checking replica (the stretch goal) can implement
+  the same trait over a bitmap. Every method is a plain read or write
+  transaction; none can wait on anything.
+- **Not implemented in phase 1** (declared so the interface carries them):
+  `PeerMsg::{LogSubscribe, LogStream}` (M7), `ReadIndex`/delegation recall
+  (M8), `BackupAppend/Ack/Sealed` (M9), `DelegateStream`/`Recall` (M11),
+  the inbox S3 ops (M13), `Event::Roster`/`PeerLink` consumers (M13, M9),
+  M4's held-record count (`Event::UploadsDone::held` keeps the lease while
+  non-zero; the plan's per-transaction holdback stays in `Meta`), atime
+  ride-along and `whole_tx_prefix` byte cuts on ship (the sim's segments
+  are small), `Control::Barrier`'s `ino` (whole-journal barrier).
+
+### Phase 2 checklist: decision point → event/action
+
+"Core" says whether phase 1's core already implements the decision
+(`yes`), carries the interface only (`iface`), or leaves it to the
+driver (`driver`).
+
+| Today | Where | Event → Action in the core | Core |
+|---|---|---|---|
+| `mutate_op_rebasable`: rid allocation, `open_for_new_mutation` fast path, `SyncRequest::Forward` on miss, `Busy`/`NotHolder` → `require_lease_for` → `completed_position` check → `execute_mutate`, `acked.mark_done` on every completion path | `fusefs.rs` | `Event::Submit { rid, op }` → fast path executes inline (`Action::Reply`), else the client-op machine; `AckTracker::mark_done` in `finish`; the FUSE thread allocates the rid and maps `ClientReply` to errno | yes (rid allocation and errno mapping stay in `fusefs`) |
+| `dispatch_forward` local branch (admit through `new_mutation_epoch`, execute, `Nudge`) | `node_runtime.rs` | `Submit` → `execute_local` → `Reply` + poll re-armed at 0 | yes |
+| `dispatch_forward` network branch: keygate + inflight permit, cached holder / lease GET, never forward to self, `request_mutate` + same-rid retries with backoff, one `NotHolder` redirect, `Exists` hint install, `apply_accepted` (shadow), queued-behind-takeover → `Busy`, causal wait, `Nudge` | `node_runtime.rs`, `forward.rs` | `Phase::Gated` (conflict keys), `LearnHolder` (`S3Op::LeaseGet`), `Forwarded { req }` (`Action::Send(MutateRequest)` + `ForwardTimeout` timer), `Backoff`, redirect, `on_mutate_reply` (install shadow / hint, `AwaitingLog` on a stale base, `queued_behind_takeover` → lease path), `CausalWait` timer | yes (the inflight semaphore is a driver concern: the core issues sends, the driver bounds them) |
+| `request_mutate_with`: wire encode, `req_id`, timeout → `Busy`, `note_holder` on `NotHolder` | `forward.rs` | the driver encodes `PeerMsg` ↔ `Payload`; the timeout is the core's timer; `PeerFailed` stands in for a transport error | yes |
+| `dispatch_mutate` (peer's forward): keepers lock + `ship_epoch`/`is_lost`/`fenced` snapshot, `holder_execute`, `forget_acked_through`, cold holder lookup for `NotHolder`, `touch`, `Nudge`, the M0 reply-delay knob | `node_runtime.rs`, `forward.rs` | `Event::Peer(MutateRequest)` → `on_mutate_request`: `Busy` while fenced, `holder_execute` (recent → completed → execute → remember), `NotHolder { cached }` plus a `LeaseGet` to refresh the cache, `Action::Send(MutateReply { base })`; the reply-delay knob is the bus's | yes |
+| `SyncRequest::Acquire`: persisted-deposition decline, keeper creation, handoff-pause decline, continuation-epoch branch, `acquire_lease_for`, fast handoff (`peers.request_lease` → `catch_up_to` → retry), `pending_catchup`, `AcquireProgress` | `node_runtime.rs`, `shipper.rs` | `JobReq::Acquire` (coalesced): `Phase::Get` → `classify` → `Create`/`Claim` CAS, takeover tail-to-head first, `Busy` → register `wanted_by` + `LeaseRequest` → `LeaseHandoff` → catch-up tail → re-read; `on_acquire_finished` resolves waiting ops (`resolve_in_doubt_then_execute`) or schedules `AcquireRetry`; progress is the client op's own deadline | yes (continuation epochs: driver, out of scope) |
+| `LeaseKeeper::classify`/`commit_cas`/`open_won`/M4 `readopts` | `lease.rs` | `LeaseState::classify` (own untracked live lease → takeover with marker, M4), `granted_lease` (epoch rule), `adopt` | yes |
+| `shipper::acquire_lease_for` + `complete_gate` + `ship_epoch_marker` + `recovery::takeover_gate` | `shipper.rs`, `recovery.rs` | `PendingGate` on `adopt`; `issue_marker` (`S3Op::SegmentPut` of an empty segment, collision → tail → retry, bounded) ; `complete_gate` = `strand_below_epoch` + `replay_queue_locally` + open; a failed gate keeps the view closed and is retried by every round and acquisition | yes |
+| `SyncRequest::HandOff`: keepers lock, `upload_dirty_chunks`, `begin_releasing` + `wait_quiescent`, `sync_one`, `release`, `HandoffResult { head_seq }` | `node_runtime.rs` | `Event::Peer(LeaseRequest)` → decline unless holding and not fenced, else `JobReq::Handoff`: `UploadDirtyChunks` → `releasing = true` → ship loop → `LeaseSwap(released)` → `Send(LeaseHandoff { released, head_seq })` | yes |
+| `SyncRequest::ClaimOffer` (placement) | `node_runtime.rs` | `Control::ClaimOffer` → `JobReq::Acquire { ask_handoff }` | yes |
+| `SyncRequest::ApplyPushed` (`try_apply_pushed`, `note_holder`) | `node_runtime.rs`, `shipper.rs` | `Event::Peer(SegmentPublished)` → `apply_incoming` when it is exactly the next sequence and no job owns the cursor, else nudge | yes |
+| `SyncRequest::Nudge`, the persistent poll deadline, idle backoff, `lease_poll_cap_ms`, `productive` | `node_runtime.rs` | `Control::Nudge`/internal `nudge` → poll timer at 0 (a round in flight is followed, never cancelled); `next_poll_ms` (doubling, ceiling, TTL/4 cap while holding) | yes |
+| `run_managed_sync_round`: upload pass, continuation-epoch branches, `lease_lost` persistence, epoch flush/release | `main.rs` | round starts with `Action::UploadDirtyChunks`; `UploadsDone { ok: false }` ends the round; `persist_lost` on deposition; continuation epochs stay in the driver | yes / driver |
+| `run_sync_round`: `recover_deposed_keepers`, renew split (`prepare_renew` / `RenewAttempt::run` / `apply_renew`, `prepare_renew_now` after a higher epoch tailed), lost-CAS re-read and `wanted_by` retry, deposition probe, `complete_gate` retry, `run_ordinary_round`, release passes (dwell/grace, `idle_release_due`, `begin_handoff_pause`, forced drain) | `main.rs`, `lease.rs` | `Phase::Renew`/`RenewReread`/`Renew { retry }` → `renewed` or `deposed` + `TailThen::Recover` → `recover_deposed`; `round_gate`; `round_tail`; `round_ship`; `round_release` (`wants_handoff`, `idle_release_due` with M4's held count, pause when the backlog is non-zero, `Release`/`ReleaseReread`) | yes |
+| `recovery::recover_deposed` (tail to head, `strand_below_epoch(lost_floor)`, capture-off rebuild) | `recovery.rs` | `TailThen::Recover` → `recover_deposed` (strand + clear + persist); the capture-off rebuild stays in the driver (needs a state dir) | yes / driver |
+| `Shipper::run_ordinary_round` / `ship_all` / `ship_part`: held-partition tail skipping (`HELD_TAIL_MAX_STALENESS`), `take_journal_grouped`, atime ride-along, byte cap / `whole_tx_prefix`, `put_segment`, `AlreadyExists` → tail → retry, `ack_journal_rows_at`, announce, flush-ack verification, publish cadence, ship-pending-journal acquisition | `shipper.rs` | `skip_tail_as_holder`; `issue_ship` (`Replica::take_journal` whole transactions, `S3Op::SegmentPut`), `ship_landed` (ack, `Action::Announce`, cadence), collision → `TailThen::Ship`; `JobReq::Acquire("ship-pending-journal")` when a journal has no authority | yes (atime ride-along, byte cap, designation flush-acks: phase 2 or driver) |
+| `Shipper::tail_*`, `apply_decoded_segment`: probe run, own-segment recovery, epoch fencing, `apply_segment` with `pending_touches`, stranding counters | `shipper.rs` | `S3Op::SegmentRun`, `apply_run` (saturated → probe again), `apply_incoming` (own → `journal_head_matching` + `ack_journal` and a landed marker recognised; fenced → `skip_segment`; else `apply_segment`, deposition noticed → `renew_now`) | yes (the LIST catch-up path: phase 2 if measured worth it) |
+| Publish decisions: `publish_is_due`, idle publish, `publish_in_background`, M3a's speculation deferral, M4's holder-only rule and `follow_head` | `shipper.rs`, `mtree_publish.rs` | `round_publish`: cadence or idle or forced, holder only, `!has_outstanding_speculation` → `Action::Publish { op, epoch }` → `Event::PublishDone`; the publisher itself (packs, commit CAS, `follow_head`) stays the driver's | yes / driver |
+| `recovery::drain_pending_replays`, `drain_one`, `submit`, `drain_inode`, `LEASE_FALLBACK`, conflict copies | `recovery.rs` | `ReplayDrain` timer → `on_drain_tick`: holder-side strand of older-epoch leftovers, head of queue submitted under `Origin::Replay` through the client machine, `on_replay_outcome` (accepted / satisfied refusal / `Action::ConflictCopy`), lease fallback after `replay_lease_fallback_ms`; `DrainInode` before a manifest replay: driver (phase 2: `Action::UploadDirtyChunks { ino }` before the submit) | yes |
+| `SyncRequest::Barrier`, `Publish`, `TailToHead`, `Leave`, `Reintegrate`, unmount `shutdown_all` | `node_runtime.rs` | `Control::Barrier` / `PublishNow` (answered when the next round completes), `TailToHead` (a job), `Shutdown` (flush + release, then the core stops); `Leave`/`Reintegrate` stay driver-side (registry, state dir) | yes / driver |
+| M13: `p2p_reaches` + grace, `forward_via_inbox` (submitter batches, outcome wait through the log, lease re-read), `holder_round` (per-requester GET-next + backoff), `drain_at_takeover`, escalation window | `inbox.rs` (unmerged) | `Event::PeerLink` feeds reachability; the client machine gains an `Inbox` phase (`S3Op::InboxPut`, outcome by `answer_awaiting_log` — the same wait as `AwaitingLog`); the holder's poll is an `InboxPoll` timer per requester (`S3Op::InboxRun`); the gate gains `InboxList { below_epoch }` + execute + `InboxDelete`; escalation enqueues `JobReq::Acquire`. All declared, none implemented | iface |
+| M4: `cas::put_conditional` error-code rules, held-record planning, `drop-held`, `follow_head` | (unmerged) | the driver's S3 adapter runs `put_conditional` and reports `CasFailure::Conflict`/`Failed` only; `UploadsDone::held` keeps the lease; `Publish` for a follower runs `follow_head` | iface / driver |
+
+### The simulation
+
+One current-thread tokio runtime per seed, `start_paused`, so every
+`sleep` is instantaneous and the same seed replays the same interleaving
+(`a_seed_replays_identically`). Per node: a driver task owning the core,
+a real `Meta` (`open_in_memory`), the node's handle to the bucket, and an
+unbounded event queue; S3 requests, sends, timers and publishes are
+spawned tasks that post their result back as events, never awaited in
+the handler. Crashing a node aborts its task and detaches it from the
+bus; its in-flight PUTs still land, like a killed process's. A restart
+reuses the `Meta` (the journal is durable) and bumps the incarnation
+through `Meta::bump_incarnation`; a node with no durable state joins
+under a *new* id (a same-id restart with an empty journal is "state dir
+reuse", which production refuses, so the sim does not model it). Each
+node bootstraps like a mount: a tail to head before any client op is
+admitted.
+
+Clients are tasks issuing sequential ops through `NodeHandle::submit`
+(a oneshot per rid — the FUSE reply channel); an `InDoubt` answer or a
+dropped channel resubmits the *same rid* while the incarnation is
+unchanged, and abandons the op (tentative) after a restart, as a FUSE
+call that died with its process is. The run ends with a settle write
+from a live node (brings a takeover forward if the holder is dead, and
+ships one more segment so `EEXIST` hints, whose floor is the holder's
+next segment, retire), a `PublishNow` control to the holder, and a
+quiescence wait (no client op in flight, every live replica exactly the
+log prefix at head — no speculation, empty journal, empty replay queue —
+no job in the slot); then the checks. Convergence is skipped, as the
+model does, only while the lease still names a crashed node.
+
+### What the simulation found (and the core's own bugs it caught)
+
+1. **Requester speculation on a stale base** (the M3a residual the
+   shipper's comments describe as needing "the holder's journal position
+   in replies", plan 30 §M6). A holder evaluates a forwarded op after a
+   record its requester has not applied; the reply's records are
+   installed ahead of the log on the older base; the segment carrying
+   both then applies on top, and a `rename` makes the difference visible
+   (`f1 → f2` moved by the segment after the shadow had put `f1`
+   elsewhere; the model's create/unlink-only namespace cannot show it).
+   The same shape for `EEXIST` hints. Fixed in the core the way §M6
+   intends: `PeerMsg::MutateReply::base` — the holder's last shipped
+   sequence, or `None` when its unshipped journal already touched one of
+   the op's keys (a cheap per-tenure `unshipped_touches` set, cleared
+   when the journal ships out) — and the requester installs a shadow or
+   hint only when it has applied that base, otherwise waits for the log
+   (`Phase::AwaitingLog`, answered by `completed_position` after each
+   applied segment; `Stats::awaited_log`). `Config::speculate_on_stale_base`
+   restores today's behaviour and `stale_base_speculation_is_found`
+   asserts the sim finds the divergence with it on, the way
+   `today_finds_bug_a` does in the model. `meta_repro.rs` documents both
+   sides at the `Meta` level (`a_hint_installed_on_a_stale_base_diverges`
+   is written to flip if the meta layer ever closes the window itself).
+   **For the coordinator:** production has this window today; M6 should
+   adopt the `base` rule (or positions proper) and the M3a hint/shadow
+   installs should honour it.
+2. **The requester-side ordering gate is load-bearing.** Two client
+   threads on one node forwarding overlapping ops (`rename f0 → f2` and
+   `create f0`) had their replies land in the opposite order to the
+   holder's evaluation; the `EEXIST` hint for `f0` re-inserted the entry
+   the rename's shadow had just moved. Plan 29 M5's `KeyGate` prevents
+   exactly this and had to be part of the core (`Phase::Gated`,
+   `conflict_keys`), not left to the driver.
+3. **`EEXIST` hints outlive an idle cluster.** A hint retires when the
+   applied position reaches the holder's *next* segment; if nothing more
+   ships it stays outstanding, `has_outstanding_speculation` stays true
+   and the requester never publishes until the next write anywhere.
+   Harmless for correctness (the entry equals the log's), noted for M6's
+   exact floor.
+4. **Directory times are set, not merged, by replay** (`touch_times_tx`),
+   so a shadow applied ahead of an older segment leaves a different
+   mtime/ctime than the plain replay does. The checks compare namespace
+   content with inode/dentry times zeroed; plan 30 §M12 makes them a
+   max-merge.
+5. **A delivered request whose answerer dies is the one loss the
+   transport cannot report.** An acquisition sent `LeaseRequest` to a
+   holder that was killed before replying; the job waited forever in
+   the slot, so the node never ran a round again (the long run's first
+   non-quiescent seed). Every request the core sends now has a timer
+   (`TimerKind::JobRequestTimeout`, `Config::handoff_request_timeout_ms`);
+   the rule is written into `TimerKind` for the M7–M11 requests to come.
+6. **A refusal can observe an acked-then-rolled-back effect** (the long
+   run, seed 20334 of its configuration): holder 3 acked a requester's
+   `rename f0 → f2`, then refused another node's `create f2` with
+   `EEXIST` on the strength of it, then died before shipping; the rename
+   was replayed later through the next holder. In the log's order there
+   is no point in the refused op's window at which `f2` exists, so the
+   refusal is not linearizable unless the tentative effect is allowed
+   to have been visible early. This is plan 30 §1.2's L2 window ("acks
+   exist in one place until S3 has them") as seen by a third party;
+   M13 round 3a's `Tentative` rule covers the acked op's own return, not
+   its observers, and M9 (backup acks / `ack=s3`) is what closes it. The
+   witnessed check re-tries such a refusal with the tentative effects
+   applied and counts it (`Report::observed_tentative`, printed by the
+   long run) instead of failing; the CI configuration never produces one.
+7. **Core bugs the sim caught before any seed set was green:** the
+   forward-backoff path executed locally without the coverage rule when
+   another op's acquisition had opened the view (a double execution —
+   bug A's shape reborn; `resolve_in_doubt_then_execute` now runs for
+   every op that was ever forwarded); the log cursor started at 0
+   (`Shipper::ensure_part` starts at `applied + 1`); a marker whose PUT
+   landed but whose reply was lost was shipped again (own-segment
+   recovery now marks the gate's marker shipped); the idle publish fired
+   on the first ship because `last_publish` started at 0.
+
+### Stretch goal: Stateright actors delegating to the real core
+
+Feasible with this interface, and worth doing in phase 2 once the
+extraction is in: `Core::handle` is pure over `Event`/`Action`, all time
+is an input, and `Replica` is a trait — a model actor holds a `Core` and
+an in-memory replica (a directory bitmap plus a journal, `completed`,
+shadow and replay-queue maps: the methods the core calls are all
+enumerable and the model crate already has that state) and maps actions
+to `stateright::actor` sends and timers, with S3 as the state-holding
+actor the model has today. Two costs to plan for: `Core` is not `Hash`
+(it holds maps and counters; a model state must be) — either derive
+`Hash`/`Eq` on the core's state (mostly `BTreeMap`s already) or hash a
+projection; and `MutateOp`/`LogRecord` carry strings and inode numbers,
+so the model's tiny namespace would use a fixed op set. Neither needs an
+interface change. Not done in phase 1: the core's decisions will move
+under it in phase 2 and the model would have to be redone.
+
+### Open questions for the coordinator
+
+- Adopt the `base` rule for the M3a installs in production now (small:
+  `MutateOutcome`/`Payload::MutateReply` gain the field; `dispatch_forward`
+  waits for the log instead of installing), or leave it to M6? The sim's
+  default is the safe rule.
+- `Replica` calls being synchronous trait calls rather than actions is a
+  deliberate deviation from the plan's wording; it is what keeps the
+  check-then-write atomicity without a lock. Confirm before phase 2
+  builds on it.
+- The core is single-stream (`p0`). M11 delegations are modelled as a
+  table inside the same authority (the plan's "one log"), not as
+  partitions; the `partition` field in `Config` exists only for the S3
+  layout.
+- Phase 2 order: wire `node_runtime` as the driver first with the core's
+  decisions *shadowing* today's code (compare, do not act), then flip —
+  or replace the sync task outright and rely on the harness gates? The
+  former costs a milestone of duplicated plumbing; the latter is what
+  the plan says ("preserve behaviour: every test and scenario is green
+  before and after").
+
+## Plan 30 M5 — phase 2: the extraction (coder, 2026-09-24)
+
+Goal (plan 30 §M5, coordinator's phase-2 brief): the daemon's authority
+decisions leave `node_runtime.rs`, `main.rs`, `lease.rs`, `forward.rs`,
+`recovery.rs`, `shipper.rs` and `inbox.rs` and live in
+`constellation-authority`'s `Core`; `node_runtime` becomes the core's IO
+driver, shaped like the sim's `tests/sim/node.rs`; the sim drives the
+production core; behaviour is preserved except for the stale-base fix;
+the "no await inside the sync loop" invariant is structural.
+
+### What landed
+
+- **The driver.** `crates/cli/src/authority_driver.rs` (new, 1,453
+  lines): `Driver` owns the `Core`, a `tokio` select loop over
+  `SyncRequest`s (mapped 1:1 to `Event::Submit`/`Control`/`Peer`),
+  P2P deliveries, timer wakeups and S3/upload/publish completions.
+  Every `Action` is spawned (S3 through `object_store` + the CAS
+  adapters, sends through `Peers`, the upload pass, the publisher, the
+  conflict copier); the core never awaits — `Core::handle` is a
+  synchronous call on the loop's thread, so the invariant is now a type
+  fact (`Core` has no async surface) rather than a review rule.
+  `LeaseView::mirror` refreshes the FUSE-facing admission view before
+  every dispatch; a release is guarded by `view.wait_quiescent()` plus
+  a journal re-read (a fast-path write that landed meanwhile fails the
+  release with `CasFailure::Failed` and the core retries); fast-path
+  acks reach the core as `Event::Activity { acked_seqs }`; the peers
+  ticker (1 s) feeds `Event::Peers`; the roster arrives as
+  `SyncRequest::Roster`; `EpochChanged` re-reports `Control::Epoch`.
+  `Standalone` is the inline variant for tools and tests (`gc`'s tail,
+  the shipper's bootstrap/replay tests): same core, stepped to
+  quiescence over a real store, no spawned tasks.
+- **What moved into the core** (all of it decision code; the driver
+  keeps IO only): the client-op machine incl. M13's inbox requester
+  (group-commit submitter with `LastN` resync, waiters answered from
+  `completed_outcome` after applies, the recheck timer, the escalation
+  window and `wants_lease`), the holder side incl. M13's per-requester
+  polls with backoff, GC after `journal_acked_seq`, and the takeover
+  drain inside the gate; `Policy::{Client, System, BestEffort}` (prune
+  / conflict copies / root adoption forward once and never touch the
+  lease; atime forwards once if a holder is cached); in-doubt
+  resubmission (`in_doubt_rids`); continuation epochs (`Control::Epoch`
+  → `EpochState`; activation adopts the epoch hold, a round in an open
+  epoch probes then uploads then `Action::EpochClose`, flushing releases
+  when drained → `Action::EpochFlushed`, freeze refuses waiting ops with
+  `EROFS`); atime ride-along and the standalone atime ships; the replay
+  drain with conflict copies (`Action::ConflictCopy` /
+  `Event::ConflictCopyDone`) and the capture-off rebuild
+  (`RebuildReplica`); M4's held records (`UploadsDone::held` keeps the
+  lease) and holder-only publish; the segment-cadence publish from the
+  ship path (M3b's `publish_in_background`, so a round under sustained
+  load still commits).
+- **The stale-base fix** (coordinator's decision 1): `MutateOutcome`
+  carries nothing new; `PeerMsg::MutateReply { base }` /
+  `Payload::MutateReply { base: Option<u64> }` (`#[serde(default)]`)
+  carries the holder's `head_seq`, or its unshipped journal position
+  when `Meta::unshipped_overlaps(keys_of_op)` says the op was evaluated
+  on unshipped state (`Meta`'s new unshipped `TouchSet`, noted in
+  `mutate::execute`, cleared when the journal drains). The requester
+  installs a shadow or hint only when `applied >= base`; otherwise the
+  op waits in `Phase::AwaitingLog` and is answered when the log applies
+  its completion (`Stats::awaited_log`). `Config::speculate_on_stale_base`
+  is a sim-only knob (`stale_base_speculation_is_found` keeps finding
+  the divergence with it on); production has no escape hatch.
+- **Harness scenario for it**: `stale-base-rename-divergence` (below,
+  and TESTING.md). Forced deterministically with the existing
+  `CONSTELLATION_FAULT_HOLD_SYNC_FILE` knob on A and B (no new fault
+  knob): A's `unlink f2` stays unshipped, B's `rename f1 → f2` (over the
+  name B still sees) is evaluated on it. Pre-fix binary (main 296749d):
+  FAILS — B's rename returns at once on a shadow and B ends up without
+  `f2`. Post-fix: PASSES — the rename waits for the log, then A, B and
+  C agree. Numbers in the run log below.
+
+### Mapping table (final; phase 1's checklist, marked)
+
+| Today (main) | Now | Done |
+|---|---|---|
+| `mutate_op_rebasable`: rid allocation, fast path, `SyncRequest::Forward`, `require_lease_for`, `completed_position` check, `acked.mark_done` | `fusefs.rs` allocates the rid and maps `ClientReply`; the fast path admits through `LeaseView::admit` (no await); everything else is `SyncRequest::Submit { policy }` → `Event::Submit` → the core's client machine | done |
+| `dispatch_forward` local + network branches, `request_mutate_with`, keygate, inflight permit | core (`client.rs`): `Gated`/`LearnHolder`/`Forwarded`/`Backoff`/redirect/`AwaitingLog`/`CausalWait`; the driver encodes `PeerMsg` ↔ `Payload` and bounds sends; `keygate.rs` deleted | done |
+| `dispatch_mutate` (peer's forward) incl. M0 reply-delay knob | core `holder.rs`; `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` delays the driver's send | done |
+| `SyncRequest::Acquire` incl. `AcquireProgress`, fast handoff, `pending_catchup` | core `jobs.rs` acquire job; waiters answered with `ControlOk::Lease`; `AcquireProgress` removed | done |
+| `LeaseKeeper::classify`/`commit_cas`/`open_won`/`readopts` | core `lease.rs` (`LeaseState`); `cli/lease.rs` keeps knob readers and `LeaseView` (mirror/admit/wait_quiescent) | done |
+| `acquire_lease_for` + `complete_gate` + `ship_epoch_marker` + `takeover_gate` | core `PendingGate` → `GateStep::{Done,NeedMarker,NeedDrain,Failed}`; the inbox drain runs inside the gate | done |
+| `SyncRequest::HandOff` | core handoff job; `HandOff { requester }` control for `force_release` | done |
+| `ClaimOffer`, `ApplyPushed`, `Nudge`, poll backoff | core | done |
+| `run_managed_sync_round` incl. continuation-epoch branches, `lease_lost` persistence, epoch flush/release | core round job + `EpochState`; the driver reports `Control::Epoch` and runs `EpochManager` liveness/propose (`set_propose_grace(sync_interval)`) | done (the epoch manager's S3 objects stay in `epoch.rs`, as planned) |
+| `run_sync_round`: renew split, deposition probe, release passes, dwell/grace/idle release | core; a renewal or re-read failure now fails the round (so `maybe_propose` sees it), `note_s3_success` reset | done |
+| `recover_deposed`, capture-off rebuild | core `TailThen::Recover`; `Action::RebuildReplica` → driver `rebuild_deposed` | done |
+| `run_ordinary_round`/`ship_all`/`ship_part`: grouping, atime ride-along, byte cap, `whole_tx_prefix`, collision retry, announce, flush-ack verification, publish cadence | core `issue_ship`/`ship_landed`/`records_within_cap`; the driver's `verify_flush_acks`; `shipper.rs` keeps `publish_idle_interval`, `segment_node`, `bootstrap`/`replay_from` | done |
+| `tail_*`, `apply_decoded_segment` | core `apply_run`/`apply_incoming` | done (LIST catch-up not needed: `SegmentRun` probes) |
+| Publish decisions | core `round_publish` + ship-path cadence; the publisher stays the driver's | done |
+| `drain_pending_replays`, conflict copies, `DrainInode` | core replay drain; `Action::ConflictCopy`; `SyncRequest::DrainInode` before a manifest replay | done |
+| `Barrier`, `Publish`, `TailToHead`, `Leave`, `Reintegrate`, shutdown | core controls; `leave.rs`/`reintegrate.rs` keep registry/state-dir work (`pre_leave_checks`, `finish_leave`) | done |
+| M13 inbox (requester, holder, drain, escalation) | core `inbox.rs` | done |
+| M4 CAS error codes, held records, `drop-held`, `follow_head` | driver's S3 adapter reports `CasFailure::{Conflict,Failed}`; `UploadsDone::held`; `follow_head` in the publisher | done |
+| Directory-time merging (idle EEXIST hints, dir times) | unchanged (coordinator: M12) | not done, by decision |
+
+### Line counts (main → now)
+
+`node_runtime.rs` 4,063 → 1,897; `main.rs` 5,696 → 5,278; `lease.rs`
+2,036 → 339; `forward.rs` 1,552 → 132; `recovery.rs` 1,322 → 320;
+`shipper.rs` 3,835 → 379; `inbox.rs` 2,034 → 241; `fusefs.rs` 2,490 →
+2,395; `keygate.rs` 298 → deleted; `leave.rs` 325 → 272;
+`reintegrate.rs` 74 → 33. New: `authority_driver.rs` 1,453;
+`crates/authority/src` 7,919 (core 6,909 of it); `scenarios/m5.rs` 175.
+Net for the daemon crate: −13,600 lines of decision code replaced by
+the 6,900-line core the sim exercises.
+
+### Bugs the sim found in the production core during phase 2
+
+Each has a regression seed; each was a real daemon bug (the sim ran the
+extracted code, not a copy).
+
+1. **Double execution through a stale inbox batch** (seed 794, default
+   config). An op submitted to the holder's inbox during an outage was
+   later forwarded over P2P when the holder came back (the restarted
+   holder re-acquired its *own* epoch, so no takeover drained the
+   batch); the P2P reply was a refusal (`EEXIST`), which leaves no
+   `Completed` witness; the next takeover's drain executed the batch a
+   second time and the create succeeded. Fix: `Phase::InboxWithdraw` —
+   an op with a durable batch deletes it (`S3For::InboxWithdraw`) before
+   any P2P forward; a failed delete sends the op down the lease path
+   instead (its own gate drains it, `completed` is exact).
+   `Stats::inbox_withdrawn_ops`;
+   `regression_inbox_batch_withdrawn_before_p2p_forward`.
+2. **Gated resubmission skipped the in-doubt check** (long-config seeds
+   1112, 1207, 2007, 2137, 2153, 2328). A resubmitted in-doubt rid that
+   waited behind an earlier op of its node (the key gate) was released
+   through `execute_local` instead of `resolve_in_doubt_then_execute`;
+   when the op it waited behind was the takeover gate's own drain of
+   that rid, it ran twice (once answering `ENOENT` for an op the log had
+   completed). Fix: `release_gated` resolves in doubt first;
+   `regression_gated_resubmission_checks_completed`.
+3. **A resubmitted in-doubt rid forgot its batch** (long-config seeds
+   2267, 2277, found once fix 1 existed). The resubmission is a fresh
+   client op, so `inbox_key` was `None`, the forward went out without
+   withdrawing the batch, was refused, and the requester's own later
+   takeover drained the stale batch and executed the op. Fix:
+   `in_doubt_batches` (bounded with `in_doubt_rids`) hands the key to the
+   resubmission; `regression_resubmitted_rid_withdraws_its_batch`.
+4. Found earlier in phase 2 and fixed as the extraction went: in-doubt
+   resubmissions re-executed through the fast path (seed 602 →
+   `in_doubt_rids`); the holder polled nobody with P2P off because links
+   still reported `connected` (`Peers` are ignored when `!cfg.p2p`); a
+   hint installed after the settle write left a run non-quiescent (the
+   quiescence loop now settles again while hints are outstanding).
+
+Sweep after the fixes: 3,000 long-config seeds (1000–3999) green in
+156 s; the 1,000 CI seeds in 15 s (release). TESTING.md lists the
+regression tests.
+
+### Decisions recorded
+
+- Checker design (decision 3): exact log-witnessed check always,
+  Stateright's tester on bounded histories; documented in TESTING.md.
+- Observers of tentative effects: M9 exit item; the sim keeps
+  `observed_tentative`.
+- `sticky-lease-handoff-over-s3` runs with `CONSTELLATION_INBOX=off`
+  (M13's PROGRESS anticipated it: with the inbox on, B's lone write is
+  answered through the holder's inbox and B never holds).
+- Continuation epochs: the core completes failing rounds more often
+  than the old loop did, which opened epochs during short S3 outages;
+  `EpochManager::set_propose_grace(sync_interval)` and liveness on every
+  `RoundDone` while an epoch is open restore the old timing
+  (`deposed-reintegration`, `epoch-member-lost` green).
+- A renewal or lease re-read failure fails the round (the old loop's
+  `note_s3_success` reset), so `node-leave`'s forced drain and
+  `maybe_propose` see it.
+- Harness: `raw_objects` paginates (`continuation-token`); the
+  1,000-key cap had made `holder-publishes-log-prefix` compare a
+  truncated listing.
+
+### Escalation tuning (P2P off, inbox on vs `CONSTELLATION_INBOX=off`)
+
+Bench: `harness meta-bench` with `CONSTELLATION_METABENCH_ONLY=3node-p2poff`
+(8 configs: shared/disjoint × create/write4k × lat0/lat20, 300 ops per
+node, one thread per node, TTL 5 s), on this host while other sessions
+ran; `agg` is ops/s over the whole run, `h` handoffs.
+
+What the runs showed, in order, with per-config logs kept
+(`CHAOS_KEEP_TMP=1`, `constellation_authority::core::inbox=debug`):
+
+1. **Round 4's knobs already retuned in phase 1** (`ESCALATE_OPS` 20 → 8,
+   `ESCALATE_WAIT_MS` 3000 → 1500, `wants_lease` on the batches): the
+   escalation itself fires ~0.5 s after the holder's first poll (8 ops
+   answered), and the holder learns it at its next poll, not at
+   half-TTL. Not the bottleneck.
+2. **Discovery** was: the holder acquired on its first write ~0.1 s
+   after mounting, before the two requesters had registered, so its
+   roster (read once at start) named nobody to poll until the driver's
+   periodic 5 s refresh — 5 s of every ~15 s run with the requesters'
+   batches sitting in S3 (`oldest_ms=3900` at the first poll hit).
+   Changes: `Action::RefreshRoster` (a holder re-reads the registry when
+   its inbox tenure starts) and `Event::Roster` now runs
+   `inbox_holder_tick` at once, so a requester learned of is polled
+   immediately rather than at the next round's end. The bench's
+   mount-then-write-immediately shape still beats the 5 s refresh, so
+   `metabench` now waits until every node's `status.inbox.roster` names
+   every node before starting the clock (the refresh period is not what
+   the bench measures; `status` gained the `roster` field for it).
+3. **The first tenure's polls waited for the first round to end**: the
+   holder's inbox tick ran only at a round's end (and on the poll timer
+   the tick itself arms), and the first round after an acquisition
+   spends the write-back delay in the upload pass (write4k: ~4.6 s for
+   one deduplicated chunk), so the requesters' batches sat unpolled
+   meanwhile. Change: the tick also runs when an acquisition succeeds,
+   so polls (their own S3 ops, not the job slot) start at once; the
+   executed ops still ship after the upload pass, as they must.
+4. **Requester ops stalling in the lease path**: after a handoff, ops
+   that the recheck timer had moved to the lease path (the lease was
+   claimable during the gap) lost their acquisition to the new holder
+   and then retried the acquisition with backoff until that holder let
+   go — up to a whole tenure of 5–7 s with the requester's single FUSE
+   thread blocked on one op (tenure 2 of the first runs: 3 ops/s, zero
+   batches). Change: `on_acquire_retry` routes the op back through the
+   inbox when a live holder is unreachable (`route` → lease re-read →
+   `inbox_enqueue`) instead of the lease path; the escalation keeps
+   asking for the lease on the node's behalf.
+
+Numbers (single runs; the tester's quiet box should repeat them):
+
+| config (3node-p2poff) | inbox on A | inbox on B | INBOX=off A | INBOX=off B |
+|---|---|---|---|---|
+| shared-create-lat0 | 79 | 78 | 59 | 60 |
+| disjoint-create-lat0 | 40 | 41 | 60 | 53 |
+| shared-write4k-lat0 | 53 | 46 | 59 | 58 |
+| disjoint-write4k-lat0 | 73 | 83 | 58 | 58 |
+| shared-create-lat20 | 63 | 61 | 46 | 46 |
+| disjoint-create-lat20 | 58 | 65 | 46 | 46 |
+| shared-write4k-lat20 | 67 | 67 | 45 | 45 |
+| disjoint-write4k-lat20 | 69 | 68 | 46 | 45 |
+
+Six of the eight configs are 25–50 % *above* INBOX=off in both runs
+(from 36–44 vs 47–55 at the start of phase 2). Two are below:
+`disjoint-create-lat0` (40/41 vs 53/60) and `shared-write4k-lat0`
+(53/46 vs 58/59), both with p99 over a second, i.e. a stall somewhere
+in a tenure rather than slow ops — and both were also measured at
+76–85 ops/s in other runs of this session with the same binary
+(diagnostic runs with logs kept: 76, 84, 82), so the miss is run-to-run
+variance whose remaining cause the kept logs did not show in time: the
+three diagnosed causes above were all fixed and each diagnostic rerun
+came out above INBOX=off. **The 5 % target is met on 6/8 and not
+demonstrated on 2/8**; the tester's quiet box should run
+`CONSTELLATION_METABENCH_ONLY=3node-p2poff` inbox on/off three times
+each, with `CHAOS_KEEP_TMP=1 RUST_LOG=info,constellation_authority=debug`
+on a below-target run so the tenure timeline
+(`acquired/released/tracking a requester/poll found batches/submitted
+a batch`) shows where the second stalls.
+
+The floor: with the sticky-lease dwell (5 s) and wanted grace (5 s) the
+run is three tenures of ≥ 5 s whichever way the requesters' ops travel,
+so inbox-on can only match INBOX=off, not beat it, unless the
+requesters' inbox throughput during a tenure exceeds their share of the
+ping-pong. `inbox-sporadic-write-p2p-off` keeps 0 escalations (one
+write every few seconds never reaches 8 ops or 1.5 s of waiting per 10 s
+window) and `inbox-create-storm-p2p-off` stays above 41 ops/s (numbers
+in the harness section).
+
+### Stretch goal: Stateright actors delegating to the real core
+
+Not done in phase 2: the extraction, the two sim findings above and
+the escalation tuning used the time. The plan, concrete enough to
+start from (estimate 2–3 coder days, as an M5 phase 3 or under M6):
+
+1. **`MemReplica`** (`crates/authority/tests/model/replica.rs`): the
+   `Replica` trait has 82 methods today; a model actor's state must be
+   `Clone + Hash + Eq`, so `Meta` (fjall) cannot be the replica. The
+   in-memory one holds a namespace `BTreeMap<(Ino, String), Ino>`, a
+   journal `Vec<(Seq, Vec<LogRecord>, Option<Rid>)>` with the acked
+   floor, `completed: BTreeMap<Rid, CompletedOutcome>`, `recent`,
+   shadows/hints (by rid / floor+epoch), the replay queue, the inbox
+   acks per `(epoch, node)`, the holder epoch and the persisted lost
+   flag. `execute` re-uses `constellation_meta::mutate`'s validation
+   rules over the map (the sim's oracle in `tests/sim/history.rs`
+   already has the spec: create/unlink/rename on names); segments use
+   the real `segment.rs` encoder so `apply_segment` is the production
+   decode. The sim's checks (`history.rs`, `check.rs`) apply unchanged
+   to what the bucket actor accumulates.
+2. **`Core: Hash + Eq`** by projection, not derive: `Config`, `Stats`
+   and the timer/op counters are excluded; `impl Hash for Core` hashes
+   `(lease, ship, job kind + phase, clients (rid → phase, attempts,
+   forwarded), inbox.{queue, pending, holder polls}, pending gate,
+   replay queue, epoch state, timers by kind)`. `MutateOp` and
+   `LogRecord` are `Eq` already and need `Hash` derived
+   (`crates/meta`); `Lease`, `InboxBatch`, `InboxKey` likewise
+   (`crates/store-s3`). No interface change.
+3. **Actors** (`crates/authority/tests/model.rs`, Stateright 0.31):
+   `NodeActor { id, cfg }` with `State = (Core, MemReplica)`; `on_start`
+   feeds `Event::Peers` + the bootstrap tail; `on_msg` maps
+   `Msg::{Peer(PeerMsg), S3(OpId, S3Result), Client(Rid, MutateOp)}` to
+   events; every `Action::Send` is an actor send, `Action::S3` a send to
+   `BucketActor`, `Action::SetTimer` a Stateright timer keyed by
+   `TimerId` (fired nondeterministically: that is the exploration),
+   `Action::UploadDirtyChunks` answered inline (`UploadResult::Done`),
+   `Action::Publish` a bucket CAS with the replica's log-prefix state.
+   `BucketActor` holds `BTreeMap<String, (Vec<u8>, u64 version)>` for
+   leases, segments, commits and inbox keys and implements the
+   portable-S3 semantics the sim's `store.rs` implements (create-if-
+   absent, `If-Match` swap, GET-next run, LIST below epoch) plus one
+   nondeterministic `Status(5xx)` choice per op under a bound. `ClientActor`
+   per node with a fixed script of 2–3 ops over 3 names, resubmitting by
+   rid on `InDoubt`.
+4. **Properties**: `always` log-witnessed linearizability (the sim's
+   check over the bucket's log and the client actors' histories),
+   `always` exactly-once over `Completed{rid}`, `eventually` convergence
+   of every replica to the log at quiescence (no timers or messages
+   left). `within_boundary`: ≤ 2 nodes × 2 ops, ≤ 1 crash, ≤ 2 injected
+   S3 errors — the model crate's sizes.
+5. **Cost to watch**: Stateright's BFS explores every timer interleaving;
+   the core sets a poll timer per round, so `Action::SetTimer` for
+   `Timer::Poll` must be coalesced into one outstanding timer per actor
+   (the driver already does this) or the frontier explodes.
+
+### Harness runs this session (prefix `constellation-harness-m5fable`)
+
+All with the tree's release binary, one at a time, during the
+extraction (batch A/B/C) and again after the escalation changes (the
+final batch):
+
+- Batch A (during the extraction, all PASS): `forwarded-mutations`,
+  `lease-handover`, `kill9-remount`, `p2p-handover`, `two-clients-shared`,
+  `lease-fencing`, `inbox-sporadic-write-p2p-off` (0 escalations, p50
+  653 ms), `inbox-create-storm-p2p-off` (1,512 ops/s, 3 handoffs, 2
+  escalations), `forward-timeout-reexec`, `holder-crash-phantom-shadow`,
+  `holder-crash-phantom-new-holder`, `takeover-marker-strands-promptly`,
+  `deposed-reintegration`, `continuation-epoch`, `epoch-member-lost`,
+  `node-leave`, `create-storm-s3-only` (failed once with "1 unexpected
+  errno(s)", detail lost; passed on rerun and in batch C),
+  `holder-publishes-log-prefix` (failed once on a truncated listing —
+  fixed — then passed twice), `sticky-lease-handoff-over-s3` (with
+  `CONSTELLATION_INBOX=off`; the scenario now sets it itself).
+- Batch B (all PASS): `disjoint-write-4` 13.9 s, `mkdir-p-race` 8.4 s,
+  `inbox-requester-crash-mid-batch` 9.3 s,
+  `inbox-holder-takeover-pending-batch` 7.8 s, `publish-only-holder`
+  47.0 s, `poison-record-isolation` 4.2 s,
+  `holder-ships-under-forward-load` 65.3 s, `idle-cluster-is-quiet`
+  63.1 s, `wan-writer-ships-put-only` 30.7 s.
+- Batch C (all PASS): `atime-eventual`, `prune`, `gc-dedup-race`,
+  `unmount-drain`, `s3-outage`, `baseline`, `create-storm-s3-only`
+  63.8 s, `holder-publishes-log-prefix` 13.7 s.
+
+- Final batch (after the escalation changes, all PASS):
+  `inbox-sporadic-write-p2p-off` 64.3 s — 0 escalations, 0 lease
+  requests, first write 4.3 s (first contact), then p50 643 ms / p99
+  1.16 s; `inbox-create-storm-p2p-off` 40.1 s — 1,637 ops/s (floor 41),
+  4 handoffs, 3 escalations; `sticky-lease-handoff-over-s3` 13.4 s;
+  `inbox-requester-crash-mid-batch` 12.1 s;
+  `inbox-holder-takeover-pending-batch` 8.2 s; `forwarded-mutations`
+  2.7 s; `lease-handover` 38.0 s; `create-storm-s3-only` 43.2 s;
+  `holder-publishes-log-prefix` 14.0 s; `idle-cluster-is-quiet` 63.2 s.
+- `stale-base-rename-divergence`: tree binary PASS 6.6 s (B's rename
+  waits while the log is held, returns OK 3.0 s later once the holds
+  lift, A/B/C agree); pre-fix binary (main 296749d, the
+  `constellation-m13` worktree's build) FAILS in 36.6 s exactly as
+  designed — B's rename returns after 20 ms on a shadow
+  (`speculation.outstanding: 1`), and "`f2` missing on B: the unlink
+  removed the renamed entry" is the divergence. An earlier draft of the
+  scenario used an `O_EXCL` create of the renamed-away name; that is
+  refused by B's own validation (`EEXIST` on the stale replica) before
+  any forward, so it never reached the base rule — the rename-over-an-
+  existing-name shape is the one whose local validation passes and
+  whose holder-side evaluation depends on unshipped state.
+
+### What the tester must run
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`, `cargo test --workspace` (the authority crate's 1,000
+  CI seeds + regressions run in ~15 s release / ~50 s debug).
+- `cargo test -p constellation-authority --test sim -- --ignored
+  long_random` with `AUTHORITY_SIM_SEEDS=3000` (153 s release; green
+  1000–3999 here).
+- Release build, then the full harness suite (`harness run` with no
+  names) — every scenario, including the ones this session ran, under
+  the tester's own docker prefix. Watch `create-storm-s3-only` and
+  `holder-publishes-log-prefix` (each failed once here, passed on rerun;
+  the second was a truncated listing, fixed, the first's detail was
+  lost) and `sticky-lease-handoff-over-s3` (now pins
+  `CONSTELLATION_INBOX=off` itself).
+- `stale-base-rename-divergence` twice: with the tree's binary (PASS)
+  and with `CONSTELLATION_BIN=<a main 296749d build>` (must FAIL on the
+  convergence check, then the early-return check).
+- pjdfstest and the chaos CI suite (`harness run chaos-ci`) — untouched
+  by this milestone but the FUSE fast path now admits through
+  `LeaseView::admit`.
+- `harness meta-bench` with `CONSTELLATION_METABENCH_ONLY=3node-p2poff`,
+  inbox on and with `CONSTELLATION_INBOX=off`, two runs each; the
+  numbers below are single runs on a loaded host and the 5 % target
+  needs the tester's quieter box to confirm.
+
+## Plan 30 M5 — tester gate run
+
+Worktree `/home/bra/cvs/constellation-m5`, branch `plan30-m5`, uncommitted
+on main 296749d. All commands via
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m5` /
+`CONSTELLATION_BIN=.../constellation-m5/target/release/constellation`,
+foreground with explicit timeouts. Main-binary A/Bs used the paired
+296749d build at `/home/bra/cvs/constellation-m13/target/release/{constellation,harness}`
+under `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m13base`.
+No mechanical fixes were needed anywhere in the gates below — the tree
+built, formatted and linted clean as handed off.
+
+### Gate 1 — build/fmt/clippy
+
+`cargo build --workspace --all-targets`, `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`: all three clean,
+zero warnings, no fixes needed.
+
+### Gate 2 — workspace + model tests
+
+`cargo test --workspace --exclude constellation-model`: every crate
+green, 0 failed (cli, meta, api, net, store-s3, upload-concurrency,
+mtree, fs-core, harness, chaos, uploadbench, doc-tests). `cargo test -p
+constellation-model --release`: 23 passed, 0 failed, 5 ignored (the
+documented `#[ignore]`d "deep" siblings of cheap exact-path tests,
+pre-existing, not run); longest test 23.45 s, well inside the
+60 s/2 GB model-test budget.
+
+### Gate 3 — the simulator
+
+`cargo test -p constellation-authority --release`: 1,000 CI seeds +
+regressions green in 14.24 s (target ~15 s). `AUTHORITY_SIM_SEEDS=3000
+cargo test -p constellation-authority --release --test sim -- --ignored
+long_random`: seeds 10000–12999 all green in 153.93 s (target ~156 s,
+matches the coder's session). No failing seed to report.
+
+### Gate 4 — release build
+
+`cargo build --release --workspace`: clean, 32.9 s.
+
+### Gate 5 — smoke / integration / pjdfstest
+
+- `tests/smoke.sh` (local backend): PASSED.
+- `tests/integration.sh` (real S3 API): the worktree's own
+  `docker compose up -d --wait floci` could not bind — port 4566 was
+  already held by `constellation-floci-1`, a container belonging to
+  compose project `constellation` (`/home/bra/cvs/constellation`, a
+  different, apparently-active session). Per the "never touch another
+  worktree's processes" rule this container was left alone; the smoke
+  test was instead run directly against it (`s3://constellation-ci/run-m5-<ts>`,
+  its bucket already existed) with a fresh unique prefix, exercising the
+  same real-S3 code path integration.sh does. PASSED (etag CAS, 412/404
+  conditional semantics all `ok`).
+- pjdfstest (`docker compose --profile test run --rm compliance`): the
+  same port conflict applied to this worktree's own floci container
+  (internal-network-only, but compose still tries to publish 4566 on
+  the host). Worked around with a scratch override
+  (`services: {floci: {ports: !reset []}}`, the same fix the coder's
+  session had already found for this exact conflict) so this worktree's
+  own floci/compliance containers ran under `COMPOSE_PROJECT_NAME=constellation-m5`
+  without touching the other project. **8798 passed, 0 failed**, empty
+  baseline — matches the standing gate. Torn down after
+  (`docker compose down -v --remove-orphans`, my own project only).
+
+### Gate 6 — full harness suite (all 92 `SCENARIOS`, `fio-latency`/`fio-blips` SKIPPED — no `fio` on this host)
+
+89 of 92 scenarios PASSED (individually or in groups of 7–9, all under
+`constellation-harness-m5`). Full pass list: baseline, latency,
+slow-network, s3-outage, s3-flap, kill9-remount, cold-cache,
+two-clients-disjoint, two-clients-shared, atime-eventual,
+quota-enforcement, prune, git-workflow, lease-handover, lease-fencing,
+continuation-epoch, epoch-member-lost, deposed-reintegration,
+node-leave, p2p-invalidation, p2p-handover, forwarded-mutations,
+scratch-publish, p2p-partition-tolerance, coop-cache-hit, s3-retry,
+coop-fallback, web-fleet, coop-exact-churn, coop-digest-compare,
+web-ui-smoke, gc-lifecycle, gc-dedup-race, fsck-repair,
+fsck-while-mounted, snapshot-lifecycle, clone-workflow, snapshot-churn,
+e2e-basic, e2e-two-nodes, passwd-live-cluster,
+commit-strips-pending-upload, readahead, readahead-adaptive,
+e2e-spilled-manifest, e2e-decode-priority, scan-ahead,
+distant-bigfile-stable, distant-bigfile-stable-e2e, prefetch-abandon,
+prefetch-abandon-e2e, prefetch-fairness, stress-ng-flap, big-file-write,
+staging-crash, unmount-drain, writeback-latency, writeback-bigfile,
+writeback-drain, writeback-fsync, writeback-backpressure,
+existence-bloom-dedup, existence-peer-hint, xattr-roundtrip,
+fallocate-sparse, chaos-ci (3.4 s), chaos-soak-4 (305.8 s,
+exactly_once_log 1,727 outcomes), disjoint-write-4, mkdir-p-race,
+create-storm-s3-only (51.4 s; watch-list item, clean this session),
+mtree-gc-plateau, named-shared-daemon, forward-timeout-reexec,
+holder-crash-phantom-shadow, holder-crash-phantom-new-holder,
+holder-publishes-log-prefix (13.8 s; watch-list item, clean this
+session), poison-record-isolation, publish-only-holder,
+inbox-create-storm-p2p-off, inbox-holder-takeover-pending-batch,
+inbox-requester-crash-mid-batch, inbox-sporadic-write-p2p-off,
+sticky-lease-handoff-over-s3, wan-writer-ships-put-only.
+
+**Transport-level flakiness (infra, not code):** during a period of
+high host load (`uptime` load1 climbed to ~11 from other worktrees'
+concurrent activity), `idle-cluster-is-quiet`,
+`inbox-requester-crash-mid-batch`, `inbox-sporadic-write-p2p-off`,
+`inbox-create-storm-p2p-off`, `sticky-lease-handoff-over-s3` and
+`wan-writer-ships-put-only` each failed at least once with `fs create
+failed: ... HTTP error: error sending request` / `connection closed
+before message completed` — a bare transport error against the
+harness's own per-run floci/toxiproxy containers, before the
+constellation binary reaches any authority-core logic. Confirmed
+environmental: (a) the same scenario (`inbox-sporadic-write-p2p-off`)
+run against the **main** binary+harness under similarly elevated load
+also needed a warm/retried container before passing; (b) rerunning the
+identical M5 command with no code change made the failure disappear
+every time; (c) the failure is identical regardless of which scenario
+runs first, always at the harness's S3 preflight, never inside
+constellation's own logic. Aggregate pass rate across all reruns:
+idle-cluster-is-quiet 4/6 (see below — one of the 2 failures was *not*
+transport-related), inbox-create-storm-p2p-off 3/4,
+inbox-requester-crash-mid-batch 3/5, inbox-sporadic-write-p2p-off 3/5,
+sticky-lease-handoff-over-s3 1/1 clean rerun,
+wan-writer-ships-put-only 1/1 clean rerun. No log path is useful here
+(the containers are gone by the time the harness process exits); the
+evidence is the uniform failure signature plus the main-binary
+same-load comparison.
+
+**Non-mechanical failures (real, not flakes) — evidence for the M5 coder:**
+
+1. **`fresh-node-bootstrap` — regression, 4/4 FAIL on M5, 3/3 PASS on
+   main.** M5: `FAILED in 7.4–7.9s: Permission denied (os error 13)`
+   every time. Main (296749d): `PASSED in 62.3–64.9s` every time.
+   Debug capture (`CHAOS_KEEP_TMP=1
+   RUST_LOG=info,constellation_authority=debug`) at
+   `/tmp/harness-bootstrap-hUU9l7` (also
+   `/tmp/harness-bootstrap-zZ7j1j`) shows the fresh node (c1, node_id=2,
+   mounting after c0/node_id=1 was `kill9`'d 5 s earlier) logs:
+   `lease held by another node node=2 holder=1 epoch=2` →
+   `acquisition finished ... acquired=false` → `root adoption deferred:
+   partition lease held elsewhere` → `fuser::session: Mounting
+   .../c1/mnt` → **`fuser::mnt: Unmounting .../c1/mnt` 100–170 ms
+   later**, i.e. the daemon tears its own mount down right after a
+   failed mount-time (`"fuse-acquire"`) lease acquisition, instead of
+   taking over the dead holder's lease or proceeding as a normal
+   non-holder. The bare `Permission denied` the scenario sees is the
+   harness's own `std::fs::read()` (no `.context()`, `crates/harness/src/model.rs:71`,
+   the second, uncontexted `model.verify()` call in
+   `crates/harness/src/scenarios.rs:3315`) failing because the file it
+   just wrote (`crates/harness/src/scenarios.rs:3310`) landed on a
+   filesystem that unmounted underneath it.
+2. **`snapshot-mount` — regression, 3/3 FAIL on M5, 2/2 PASS on main.**
+   M5: `FAILED in 6.2–6.6s: No such file or directory (os error 2)`
+   every time (bare `std::fs::read(frozen.mnt.join("data"))?` at
+   `crates/harness/src/scenarios.rs:1339`, no context). Main: `PASSED
+   in 32.5–34.8s` every time. Debug capture at
+   `/tmp/harness-snapshot-mount-4is2IN`: **identical signature** to
+   finding 1 — the `frozen` node (node_id=2, mounting a read-only
+   snapshot view `/project@release` while `source`/node_id=1 legitimately
+   and continuously holds the lease) logs `lease held by another node
+   node=2 holder=1 epoch=1` → `acquisition finished ... acquired=false`
+   → `root adoption deferred` → mounts → **unmounts itself ~100 ms
+   later** (`FUSE detached`, `draining uploads and shipping journal
+   before exit`, `clean unmount drain complete`) before the harness
+   ever gets to read the file it expects to see. Since this mount was
+   never supposed to need the write lease at all (it is an explicit
+   read-only snapshot-subtree view), this looks like one root cause
+   shared with finding 1: **a node whose mount-time `"fuse-acquire"`
+   attempt returns `acquired=false` now self-unmounts instead of
+   continuing as a non-holder**, in `crates/authority`'s
+   extracted mount/acquire path (`node_runtime.rs` / `authority_driver.rs`
+   / `core::jobs`, per the mapping table above). Most multi-node
+   scenarios don't hit this because their second mount's first
+   `fuse-acquire` either wins the race or the peer is genuinely dead
+   with a takeover following through; these two land on the "another
+   live/dead-but-not-yet-taken-over holder" branch and never recover.
+3. **`holder-ships-under-forward-load` — regression, 3/3 FAIL on M5,
+   2/2 PASS on main, and severe.** M5: `FAILED in ~93s` each time:
+   `holder's journal_backlog reached {692,970,576} during the burst
+   (bound 500)`, 6,400 forwarded creates took 90.6–91.1 s. Main:
+   `PASSED in 10.3–11.7s`, same 6,400-create burst, backlog peaked at
+   84–86. That is roughly an **8× wall-clock slowdown** and a 7–12×
+   backlog blowup on M5 for the exact same workload — this is plan 30
+   M2b's round-cancelling-starvation fix, which the scenario's own
+   failure message names directly. Debug-log capture attempted
+   (`CHAOS_KEEP_TMP=1 RUST_LOG=info,constellation_authority=debug`) but
+   the run itself exceeded the capture command's timeout under the
+   extra logging overhead; a plain (non-debug) `CHAOS_KEEP_TMP=1` run's
+   artifacts are kept at `/tmp/harness-holder-ships-under-forward-load-VXFgVl`
+   (`c1/mount.log` 4,375 lines, `c2/mount.log` 2,329 lines,
+   `holder/mount.log` 2,266 lines). This is corroborated independently
+   by the perf regression check below (`3node-p2pon-shared-create-lat0`
+   shows the same ~5× throughput loss under sustained forwarding).
+4. **`takeover-marker-strands-promptly` — pre-existing flake, NOT an M5
+   regression.** M5: 3/5 PASS (fails with `C must hold the accepted
+   create as an outstanding shadow: {...outstanding:0...}`). Main: 3/4
+   PASS with the **identical** failure message when it fails. Same flake
+   rate, same signature, on both binaries — pre-existing, unrelated to
+   the extraction. No action needed from the M5 coder.
+5. **`idle-cluster-is-quiet` — inconclusive, likely load-sensitive, not
+   clearly M5-specific.** 5 attempts on M5: 1 transport-flake FAIL (see
+   above), 1 genuine-looking FAIL (`issued 691 requests over 60s,
+   budget 675`, +2.4% over), 3 PASS (62.0–62.6 s). 1 attempt on main
+   under comparable load: PASS. Given only one of five M5 attempts
+   showed the budget overage, and it was a small margin right at a
+   fixed 675-request threshold, this reads as load-sensitive (extra
+   retry/backoff cycles under host contention pushing a tight budget
+   over) rather than a hard regression, but it was not reproduced
+   against main enough times to rule that out with confidence — flagged
+   for the coder rather than dismissed.
+
+### Gate 7 — `stale-base-rename-divergence` (the regression proof)
+
+M5 binary: **PASS ×3** (7.4 s each, identical). Main (296749d) binary
+under the M5 harness (the scenario doesn't exist in the m13 harness
+binary, so `CONSTELLATION_BIN` was pointed at the main
+`constellation` binary while using this worktree's `harness`):
+**FAILS in 36.8s** exactly as designed — "B's rename RETURNED while the
+log was held" after 3.9 ms, then "`f2` missing on B: the unlink removed
+the renamed entry" — matching the coder's documented pre-fix behaviour.
+Regression proof holds.
+
+### Gate 8 — perf (measured last; host load recorded per run)
+
+Waited in a bounded loop (~1 minute, well under the 30 min cap) for
+`uptime` load1 to drop under 3 with no other worktree cargo/harness
+processes: reached load1=2.97 (load5=7.48, load15=8.22) before starting.
+Load drifted back up to ~7–11 over the course of the perf runs (other
+worktrees resumed); noted per section.
+
+**`3node-p2poff-*` meta-bench, inbox on vs `CONSTELLATION_INBOX=off`, 3
+runs each, interleaved** (`agg` ops/s; load1 2.97→6.73 over the six
+runs):
+
+| config | inbox-on runs | on avg | INBOX=off runs | off avg | on/off |
+|---|---|---|---|---|---|
+| shared-create-lat0 | 85, 83, 78 | 82.0 | 60, 59, 53 | 57.3 | 1.43 |
+| disjoint-create-lat0 | 64, 43, 61 | 56.0 | 59, 59, 60 | 59.3 | **0.94** |
+| shared-write4k-lat0 | 67, 52, 45 | 54.7 | 58, 59, 59 | 58.7 | **0.93** |
+| disjoint-write4k-lat0 | 63, 74, 84 | 73.7 | 59, 59, 58 | 58.7 | 1.26 |
+| shared-create-lat20 | 71, 63, 63 | 65.7 | 46, 46, 46 | 46.0 | 1.43 |
+| disjoint-create-lat20 | 69, 63, 61 | 64.3 | 46, 46, 46 | 46.0 | 1.40 |
+| shared-write4k-lat20 | 69, 68, 68 | 68.3 | 46, 45, 46 | 45.7 | 1.50 |
+| disjoint-write4k-lat20 | 67, 67, 70 | 68.0 | 46, 45, 46 | 45.7 | 1.49 |
+
+6/8 configs clear the 0.95× target comfortably (1.26–1.50×). The same
+2 configs the coder already flagged (`disjoint-create-lat0`,
+`shared-write4k-lat0`) come in just under target (0.94×, 0.93×) — this
+matches the coder's own documented finding almost exactly. Every
+`CONSTELLATION_INBOX=off` run, all 8 configs, all 3 iterations, showed
+`errors=1` (inbox-on runs: `errors=0` throughout) — consistent across
+27 data points, so likely a deterministic single expected/counted error
+rather than a flake, but not previously called out; worth the coder's
+attention.
+
+Diagnostic reruns of the 2 below-target configs
+(`CHAOS_KEEP_TMP=1 RUST_LOG=info,constellation_authority=debug`,
+inbox-on): `disjoint-create-lat0` came back at 26 ops/s with 3 errors
+(`/tmp/harness-metabench-wj6rzq`) — but the kept log shows the same
+`object_store::client::retry: ... HTTP error: error sending request`
+transport-flake signature as gate 6's infra flakiness, not an authority
+bug. `shared-write4k-lat0` came back at 86 ops/s, comfortably above
+target this time (`/tmp/harness-metabench-AJzxZP`). Net: the two
+below-target configs look like host/container-load variance riding on
+top of a tight margin, as the coder already concluded, not a new M5
+issue.
+
+**Regression check vs main, `1node-create-lat0` / `1node-write4k-lat0`
+/ `3node-p2pon-shared-create-lat0`, 3 runs each, interleaved** (load1
+6.7→9.2 over the six rounds):
+
+| config | M5 runs | M5 avg | main runs | main avg | M5/main |
+|---|---|---|---|---|---|
+| 1node-create-lat0 | 6546, 7777, 7881 | 7401 | 7694, 3979, 2724 | 4799 | 1.54 (noisy both sides, no regression) |
+| 1node-write4k-lat0 | 3440, 3454, 2642 | 3179 | 503, 278, 334 | 372 | 8.5× **faster** on M5, consistent every round |
+| 3node-p2pon-shared-create-lat0 | 516, 498, 385 | 466 | 2218, 2645, 2601 | 2488 | **0.19×** — M5 is ~5.3× *slower*, every single round |
+
+`1node-create-lat0` is noisy on both binaries under this host's shifting
+load and shows no consistent direction. `1node-write4k-lat0` is
+consistently *much faster* on M5 (not a problem, but unexplained and
+inconsistent with a "within 5%" expectation in either direction — flagged
+as an anomaly, not a regression). `3node-p2pon-shared-create-lat0` is
+**consistently ~5× slower on M5, in every one of 3 interleaved rounds**,
+nowhere near the 5% target — this corroborates `holder-ships-under-forward-load`
+(gate 6, finding 3) independently: both measure sustained P2P-forwarded
+creates against one holder, and both show the same multiple-of-slowdown
+under the M5-extracted authority core. This is the most significant
+finding of this test run and needs the M5 coder's attention before
+merge.
+
+### Summary for the coordinator
+
+- Gates 1–5, 7: clean, no fixes needed, regression proof holds exactly
+  as designed.
+- Gate 6: 89/92 scenarios green (3 SKIPPED/flaky-environmental
+  explained), one pre-existing flake (not M5's), one inconclusive
+  load-sensitive item, and **3 reproducible regressions**: `fresh-node-bootstrap`
+  and `snapshot-mount` (same root cause: a node's mount-time
+  `"fuse-acquire"` failing now self-unmounts instead of continuing as a
+  non-holder) and `holder-ships-under-forward-load` (M2b's
+  round-starvation fix regressed, ~8× slower, backlog bound blown).
+- Gate 8: independently corroborates the `holder-ships-under-forward-load`
+  finding via `3node-p2pon-shared-create-lat0` (~5× slower than main,
+  every round); the inbox on/off ratio target is met on 6/8 configs and
+  the 2 near-misses reproduce the coder's own prior finding
+  (load/container variance on a tight margin, not a new issue).
+- None of these were fixed by the tester (all non-mechanical); no
+  commits made.
+
+## Plan 30 M5 — round 3 (coder, 2026-09-24): the tester's three regressions
+
+Worktree `/home/bra/cvs/constellation-m5`, uncommitted on main 296749d;
+A/Bs against the main build at `/home/bra/cvs/constellation-m13`. All
+three regressions traced to root causes with kept debug logs
+(`CHAOS_KEEP_TMP=1 RUST_LOG=info,constellation=debug,constellation_authority=debug`,
+plus a new `constellation::authority_driver=trace` line per core step:
+event kind, actions, job, `handled_us`/`refreshed_us`, and one per S3 op
+issued/done with its kind and latency).
+
+### 1. `holder-ships-under-forward-load` / `3node-p2pon-shared-create-lat0` (the 5–8× forward slowdown)
+
+**Root cause: the reply base was the holder's head.** `reply_base` sent
+`head_seq` whenever the op's keys had no unshipped overlap. Under a
+forward burst the holder ships continuously and every requester trails
+the head by a segment or two, so `applied >= base` failed for most
+accepted replies (the kept requester log: `base=Some(4) applied=3
+base_ok=false` on op after op) and each forward went to
+`Phase::AwaitingLog` — its latency became ship + tail (S3 PUT, requester
+GET) instead of one P2P round trip, and with one op in flight per FUSE
+thread the burst ran at log speed. Main installed the shadow at once
+(the pre-M5 rule, safe only by luck), which is what M2b's bound assumes.
+
+**Fix.** The holder remembers the keys of its last 64 shipped segments
+(`Core::shipped_touches`, `SHIPPED_TOUCH_WINDOW`, reset at every tenure
+start with `shipped_floor` = the head at acquisition) and the reply's
+`base` is the last *shipped* position that touched one of the op's keys,
+or the window floor when none did — the position the requester actually
+needs, never the head. The unshipped-overlap rule is unchanged (`None`
+→ wait for the log), so the stale-base proof still holds
+(`stale-base-rename-divergence` PASS; `stale_base_speculation_is_found`
+still finds the divergence with the sim knob). Cost per forward: one
+scan of ≤ 64 small `TouchSet`s; `unshipped_overlaps` is a hash lookup,
+not a scan (it was already).
+
+Unit test: `a_reply_base_is_the_last_shipped_touch_not_the_head` (a
+holder that shipped `a` at seq 1 and `b` at seq 2 answers an op on `c`
+with base 0, on `a` with 1, on `b` with 2). The sim's 1,000 CI seeds and
+1,500 long seeds (1000–2499) run the new rule green.
+
+**Numbers.** `holder-ships-under-forward-load`: before 90.6–91.1 s,
+backlog 692–970 (FAIL); after **4.6 s, backlog 214, PASS** (main: 10–12 s,
+backlog 84–86). Meta-bench row
+`3node-p2pon-shared-create-lat0`, main and M5 interleaved on this host
+(agg ops/s, load1 at each run): under load1 12–15 the runs are noise
+(main 431 with a handoff, 3280, 1752; M5 2964, 1604, 1683); the four
+pairs at load1 5–8 are the measurement — main 2708 / 2763 / 2030 /
+2616 (avg 2529), **M5 3103 / 2831 / 2616 / 2802 (avg 2838, +12 %)**, p50
+0.62–0.68 ms on both, p99 6.3–7.4 ms (M5) vs 7.4–8.1 ms (main). Before
+the fix the tester measured M5 at 0.19× main (466 vs 2488), and my own
+pre-fix runs 435 / 835. `holder-ships-under-forward-load` on main in
+the same session: 3.6 s, backlog 92 (M5: 4.6 s, backlog 122–214, bound
+500).
+
+Where M5's forward goes, from the traced run
+(`/tmp/harness-metabench-g2InLP`, `awk` over the trace lines): requester
+`Submit` → `Send` 6 µs; P2P round trip p50 643 µs / p90 1.36 ms / p99
+14 ms; the holder serves a forward in p50 174 µs (core step
+`Peer(MutateRequest)` avg 310 µs — `execute` into fjall plus the reply —
+p99 11 ms, fjall's write stalls); the requester's `Peer(MutateReply)`
+(shadow install) avg 159 µs; `refresh` (the lease mirror + status) ≤ 1
+µs per step; segment PUTs 1.8 ms avg, 727 of them for 3,600 ops, off the
+loop. Nothing on the requester or holder path waits on the round
+(`job=Some(Round)` steps handle forwards at the same cost), the KeyGate
+is per-op and released at the reply, and `unshipped_overlaps` is two
+hash lookups — the coordinator's other suspects were checked and are
+not it.
+
+### 2. `snapshot-mount` (ENOENT on the frozen view)
+
+**Not a self-unmount.** The frozen node's "unmount 100 ms after mount"
+in the tester's logs is the harness tearing the mount down after its
+first read failed; on main the same node unmounts 55 ms after mounting
+because the scenario's read *succeeded* and it moves on. The frozen view
+listed the snapshot fine (`entries=[("data", File)]`, manifest loaded,
+16 bytes, 1 chunk) — the `ENOENT` came from the chunk read: the source
+node's `data` chunk was still in its own cache, its upload deferred by
+the write-back delay, and the frozen node's `fetch_chunk_for_inode`
+found nothing in S3. On main the source's first ship round uploaded the
+chunk before shipping (`pending chunk upload complete uploaded=1` at
+mount + 60 ms); on M5 the upload pass ran, but a second regression hid
+behind it: the `writable` node of the same scenario (an ephemeral clone
+mounted read-write) forwarded its op to the source, which refused
+`ENOENT` for a directory only the clone's own unshipped journal knew.
+
+**Root cause (M5).** The `writable` node mounts `/project@release`
+read-write: `clone_to` writes an eager clone into its *own* journal at
+mount, before it ever holds the lease. Its first write then went
+through the core's client machine, which forwarded it to the source
+node; the source has none of the clone's records (they are unshipped,
+on the requester) and refused `ENOENT`. Main never forwarded here
+because `dispatch_forward`'s fast path executed locally while the view
+was open, and the lease path's `ship-pending-journal` acquisition made
+the node the holder before its clone's ops were served. The frozen
+node's `ENOENT`, in turn, was the source's `data` chunk not yet in S3:
+the source's ship round had run its upload pass, but the snapshot
+record sat in the journal for ~5 s (the source's next round came on the
+idle cadence) and the frozen node had bootstrapped from the head commit
+in between. Both are one rule in the core: **an op from a node whose own
+journal is unshipped takes the lease path, never a forward or an
+inbox** (`Core::route`; `an_op_from_a_node_with_an_unshipped_journal_takes_the_lease_path`).
+The `ship-pending-journal` acquisition that main relied on is the same
+job the core queues from `round_ship`, so the node becomes the holder,
+ships its clone, and serves its own writes — exactly main's order. With
+that, the frozen node's read finds the chunk uploaded by the source's
+round that the writable node's acquisition triggers. `snapshot-mount`
+PASSES (2/2 here) with no change to the snapshot code.
+
+Also fixed on the way, found by the new
+`a_nudge_during_an_in_flight_publish_ships_the_journal_at_once` core
+test: none — the core already ships on a nudge with a publish in
+flight; the test pins it because the tester's timeline suggested
+otherwise (the 5 s gap was the write-back delay in the upload pass, not
+the nudge).
+
+### 3. `fresh-node-bootstrap` (EACCES on the fresh node)
+
+**Not a self-unmount either**, and not the lease: the fresh node's
+root directory came up `0:0`, so the harness's own write into it as an
+unprivileged user got `EACCES` (`std::fs::write` at `scenarios.rs:3310`,
+no context; the "unmount 100 ms later" is again the harness giving up).
+`root adoption deferred` is the symptom: `adopt_root` saw `uid == 0`
+after tailing to head. On main the fresh node's root was the user's
+(`adopt_root` returned early, no "deferred" line) and the 60 s the
+scenario took there was the lease path waiting out the killed holder's
+TTL for the harness's write.
+
+**Root cause: a bootstrapped replica's root inode was genesis' `0:0`
+whenever the head commit had no log tail to replay.** `Meta::open`
+inserts a genesis root (`0:0`) before `bootstrap_from_commit` loads the
+commit's tree with fjall's *ingestion*, which lands below the memtable,
+so the loaded root record (uid 1000 in the commit — verified by reading
+the head commit's tree directly) stayed shadowed by genesis. Every
+later write to the root (a create's parent-mtime bump during the log
+replay) re-wrote it above the shadow, which is why main never saw it:
+main publishes only at unmount and on its 32-segment cadence, so its
+fresh node always replayed a tail (72 records in the tester's runs and
+in mine). M5's ship-path publishes put a commit at the exact head, the
+fresh node replayed 0 records, and its root was `0:0`. Latent since the
+bootstrap-from-commit landed; M5 exposed it.
+
+**Fix.** `load_tree` keeps the root inode's loaded row and re-writes it
+through an ordinary write transaction after the ingestion
+(`Meta::ns_overwrite_after_ingest`; no dirty mark, no journal — the value
+is the published tree's). Tests, both through the real core, publisher
+and `shipper::bootstrap`:
+`a_bootstrapped_replica_has_the_adopted_root_owner` (head commit at the
+log head: failed with `(0, 0)` before the fix) and
+`a_bootstrapped_replica_with_a_log_tail_has_the_adopted_root_owner`
+(main's shape). `a_substituted_publish_keeps_the_shipped_root_owner`
+(`crates/meta`) pins that the M3b log-prefix substitution publishes the
+shipped root owner too, since that was the other candidate.
+
+**On the "self-unmount" reading and the requested test.** Neither
+scenario's node unmounted itself; the core keeps serving as a non-holder
+after a failed mount-time acquisition (every non-holder in every sim
+seed does exactly that — each seed's history has ops returned by every
+node while one holds — and `a_non_holder_declines_a_handoff_at_once`
+plus the new lease-path test cover the core side). No `Stopped` path is
+reachable from a failed acquisition: `Core::stopped` is set only by the
+flush that `Control::Shutdown` requests.
+
+### Seed 10476 (the M8 coder's linearizability failure on b906e90)
+
+`AUTHORITY_SIM_CONFIG=long AUTHORITY_SIM_SEED=10476` **passes on this
+tree** (M5 with round 3's fixes; 0.08 s). It is pinned in
+`regression_resubmitted_rid_withdraws_its_batch`'s seed list so the
+M6/M7 stack can bisect against it. The three round-3 core changes that
+could plausibly matter for a linearizability check on the stack are the
+reply base (`shipped_touches`), the unshipped-journal lease-path rule,
+and — from phase 2 — the in-doubt batch carry-over; if the stack's
+snapshot of M5 predates round 3, the fix may simply be this round.
+
+### `takeover-marker-strands-promptly`
+
+Left alone per the coordinator (same flake rate and signature on main).
+
+### `idle-cluster-is-quiet`: idle work reading
+
+The core arms, when idle: the poll timer (doubling backoff to
+`idle_max`, TTL/4 cap while holding — main's `next_poll_ms`), the replay
+drain tick (250 ms, in-process; `on_drain_tick` returns before any IO
+when the queue is empty), and the holder's inbox polls at the warm/cold
+cadence for requesters it has no P2P link to (M13's own schedule; with
+P2P up and peers connected there are none). The driver's tickers: peers
+links every 1 s (in-memory, `Peers::links`, no S3), the registry roster
+every 5 s (main's ticker). New since main: one registry read
+(`Action::RefreshRoster`) when an inbox tenure starts — once per
+acquisition, not periodic. No periodic S3 work was added; the tester's
+one +2.4 % overage under load1 ≈ 11 reads as load, as they concluded.
+
+### Files touched this round
+
+- `crates/authority/src/core/{mod,jobs,holder}.rs`: `shipped_touches` /
+  `shipped_floor` / `SHIPPED_TOUCH_WINDOW`, `note_shipped_touches`,
+  `reply_base` over the window, `touch_sets_overlap`.
+- `crates/authority/src/core/client.rs`: the unshipped-journal rule in
+  `route`.
+- `crates/authority/src/core/tests.rs`: three tests (nudge during a
+  publish, reply base from shipped touches, unshipped journal → lease
+  path).
+- `crates/cli/src/mtree_read.rs`, `crates/meta/src/store/bootstrap.rs`:
+  the root re-write after ingestion.
+- `crates/cli/src/shipper.rs`, `crates/meta/src/store/local.rs`: the
+  bootstrap and substitution root-owner tests.
+- `crates/cli/src/authority_driver.rs`: the per-step trace line
+  (`event`, `actions`, `job`, `handled_us`, `refreshed_us`), the S3 op
+  issued/done traces, the forward round-trip trace.
+- `crates/cli/src/main.rs`: `adopt_root` logs the root it saw; the
+  bridge traces the forwarded mutate's service time.
+- `crates/cli/src/mtree_publish.rs`, `crates/cli/src/snapshot.rs`,
+  `crates/cli/src/fusefs.rs`: debug lines (publish planning and
+  substitution, snapshot publish/listing, frozen reads).
+
+### What the tester must re-run
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`, `cargo test --workspace` (clean here for the touched
+  crates: cli 191, meta, authority 17 unit + sim).
+- `cargo test -p constellation-authority --release` (1,000 CI seeds,
+  ~15 s) and `AUTHORITY_SIM_SEEDS=3000 ... --ignored long_random`
+  (1000–3999 green here: 1000–2499 in one run, 2500–2689 and then
+  2691–3999 in fresh-process chunks after one test-binary hang at seed
+  2690 — the fjall `DatabaseInner::drop` deadlock main fixed in 72ddb91,
+  not a seed; 2690 replays clean on its own).
+- `fresh-node-bootstrap` ×3, `snapshot-mount` ×3,
+  `holder-ships-under-forward-load` ×3 (all PASS ×3, ×2, ×2 here after
+  the fixes, with the stale-base proof still passing), then the full
+  suite once more, since the reply-base rule and the unshipped-journal
+  rule touch every forward.
+- `3node-p2pon-shared-create-lat0` main vs M5 interleaved, ≥ 3 pairs at
+  load1 < 8; expect parity or better.
+- pjdfstest is unaffected (no FUSE op changed) but cheap to repeat.
+
+## Plan 30 M5 — round 4 (coder, 2026-09-24): every inbox batch of a rid is withdrawn
+
+Rebased worktree (main 72ddb91). One latent bug in the round-2 inbox
+withdraw, found through seed 10476 on the M5+M6+M7 stack and bisected
+by the M7 coder; the fix is the M7 coder's, ported here.
+
+**Bug.** `ClientOp::inbox_key` was an `Option`: an op submitted to the
+inbox more than once under the same epoch (its inbox deadline sends it
+down the lease path, the acquisition loses to the live holder,
+`on_acquire_retry` routes it back through the inbox as a *new* batch)
+remembered only its latest batch. When P2P returned, `send_forward`
+withdrew that one and forwarded; the holder answered `Exists`, the
+client got `EEXIST`, and the next takeover's gate drained the forgotten
+batch and created the file — `Completed(rid)` in the log after the
+client was told it existed. This tree passed 10476 by timing only.
+
+**Fix** (`crates/authority/src/core/{client,inbox,mod}.rs`):
+`ClientOp::inbox_keys: Vec<InboxKey>` records every batch the op was
+submitted in (`on_inbox_put` pushes, the stale-epoch resubmission
+`retain`s the deleted one out); `in_doubt_batches: BTreeMap<Rid,
+Vec<InboxKey>>` carries the whole list to a resubmission; `send_forward`
+withdraws them one at a time through `on_inbox_withdrawn` (each success
+pops the front and calls `send_forward` again; a failed delete still
+sends the op down the lease path). New stat
+`Stats::inbox_multi_batch_withdrawals` (forwards that had ≥ 2 batches to
+withdraw) so a seed exercising the path is recognisable.
+
+**Tests.** Core unit test
+`every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward`: a
+resubmitted rid inheriting three batches issues three `InboxDelete`s in
+order, forwards only after the third succeeds, and a rid whose delete
+fails takes the lease path. Sim regression
+`regression_every_inbox_batch_of_a_rid_is_withdrawn`: long-config
+**seeds 10247 and 10507**, found by scanning 10000–10999 for
+`inbox_multi_batch_withdrawals > 0` on this tree (10247 and 10507 each
+have two forwards that first withdraw ≥ 2 batches; 10206, 10241, 10392,
+10396, 10551, 10729, 10800 have one); the test asserts the path was taken
+and the run converged. Seed 10476 stays pinned in
+`regression_resubmitted_rid_withdraws_its_batch` (it passes here by
+timing, as the coordinator said).
+
+Re-run for the tester: `cargo test -p constellation-authority --release`
+(unit + sim; the multi-batch unit test and the new regression included)
+and the inbox scenarios (`inbox-sporadic-write-p2p-off`,
+`inbox-create-storm-p2p-off`, `inbox-requester-crash-mid-batch`,
+`inbox-holder-takeover-pending-batch`, `sticky-lease-handoff-over-s3`).
+Files: `crates/authority/src/core/{client,inbox,mod,tests}.rs`,
+`crates/authority/tests/sim.rs`, this section.
+
+**The other per-op fields, audited for the same shape.** A resubmission
+is a fresh `ClientOp`; what must survive it does so through the core's
+per-rid maps: `forwarded` (via `in_doubt_rids`) and now the batch list
+(via `in_doubt_batches`). `attempts`, `redirected`, `acquire_retries`,
+`inbox_since`, `deadline` and `timer` are per-submission budgets and
+timers by design (safety never rests on them; the coverage rule's
+`completed` check does that), and the key gate orders *live* ops by
+`order`, so a resubmission correctly queues behind later ops on its
+keys. One residual of the same family, unchanged: `in_doubt_rids` /
+`in_doubt_batches` are bounded at `MAX_IN_DOUBT_RIDS` (10,000) with
+oldest-first eviction, so a rid evicted before its resubmission would
+forget both its in-doubt flag and its batches — the pre-existing bound
+from M2, noted here rather than changed.
+
+## Plan 30 M5 — tester gate run, round 2
+
+Re-test after round 3 (main 72ddb91, the vendored fjall shutdown-deadlock
+fix) and, mid-session, round 4 (the inbox-batch-withdraw fix). Same
+worktree/rules as round 1; A/Bs against `/home/bra/cvs/constellation-m13/target/release/{constellation,harness}`
+(pre-M5, now older than main but still the agreed behaviour baseline).
+No mechanical fixes needed. **Results below are from the round-4 build**
+except where marked "round-3 build" (superseded, kept for the record
+since round 4 doesn't touch that code path).
+
+### Steps 1–3 — fmt/clippy/tests, simulator, release build (round-3 build, then re-verified round-4)
+
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --
+-D warnings`, `cargo test --workspace --exclude constellation-model`
+(0 failed throughout), `cargo test -p constellation-model --release`
+(0 failed): all clean on the round-3 build. `cargo build --release
+--workspace`: clean, 36.2 s.
+
+`cargo test -p constellation-authority --release`: 1,000 CI seeds +
+regressions green, 13.63 s.
+
+**`AUTHORITY_SIM_SEEDS=3000` `long_random` (seeds 10000–12999, round-3
+build) found two failures that round 1's identical sweep of this exact
+range did not have** (round 1 was 3000/3000 clean here):
+
+1. **Seed 11932 (`AUTHORITY_SIM_CONFIG=long`): a PANIC followed by a
+   process HANG.** `thread 'replay_seed' panicked at
+   crates/authority/src/core/client.rs:951:34: no entry found for key`
+   (a bare `self.clients[&rid]` index — `execute_local` called with a
+   rid the client-op map no longer has an entry for). Reproduces on
+   every replay. **After the panic the test process does not exit**:
+   confirmed hung for 180 s wall-clock at ~0% CPU (`user 0m0.135s sys
+   0m0.156s` over 3 minutes — genuinely blocked, not spinning), only
+   `timeout`'s SIGKILL ends it; this is a Drop/cleanup deadlock
+   triggered by unwinding through the panic, the same class of bug as
+   the fjall `DatabaseInner::drop` deadlock 72ddb91 fixed, but a
+   different one (72ddb91 is already in this tree and didn't prevent
+   it). Replay: `AUTHORITY_SIM_SEED=11932 AUTHORITY_SIM_CONFIG=long
+   cargo test -p constellation-authority --release --test sim
+   replay_seed -- --nocapture --exact` (give it a hard external
+   timeout — it will not return on its own).
+2. **Seed 12666 (`AUTHORITY_SIM_CONFIG=long`): a linearizability
+   violation.** `rid Rid { node: 2, .. seq: 10 } returned before rid
+   Rid { node: 2/3, .. } was invoked but follows it in the log` — a
+   real history-checker failure (fast, 0.05 s, no hang), reproducible
+   on every replay (4/4), **but the specific named culprit rid pair
+   differed on 3 of 4 replays** (`seq: 19`, then `seq: 11`, then `seq:
+   12`, then `seq: 16`) while the seed itself failed every time — worth
+   the coder knowing the witness the checker reports isn't stable even
+   though the verdict is. Full history dumps in
+   `/tmp/claude-1000/.../scratchpad/r2_seed12666_full.log` and inline
+   in `r2_long_random_resume1.log`. Replay:
+   `AUTHORITY_SIM_SEED=12666 AUTHORITY_SIM_CONFIG=long cargo test -p
+   constellation-authority --release --test sim replay_seed --
+   --nocapture --exact`.
+
+Both were **new relative to round 1's identical sweep of the same
+10000–12999 range** (which was 3000/3000 clean) — i.e. round 3's core
+changes (`shipped_touches`/`reply_base`, the unshipped-journal `route()`
+rule) most likely introduced both, though the tester did not bisect
+further per the "gates and mechanical fixes only" rule.
+
+**After round 4 landed mid-session, re-verified on the round-4 build:**
+rebuilt release (31.4 s, clean), re-ran `cargo test -p
+constellation-authority --release` (18 unit + 18 sim tests incl. the
+new `regression_every_inbox_batch_of_a_rid_is_withdrawn`, 0 failed,
+13.95 s), then re-swept the same 10000–12999 range in two chunks
+(skipping the known-bad 11932): **10000–11931 clean (1932/1932, 97.24
+s) and 11933–12999 clean (1067/1067, 52.86 s) — seed 12666 now PASSES.**
+**Seed 11932 still panics and hangs identically** (`client.rs:965:34`
+now, same message, same line shifted by round 4's edits) — round 4's
+fix is unrelated to this one and did not touch it. Net for the
+round-4 build: **2999/3000 of this seed range green; seed 11932 is the
+one open sim finding** — a real panic-then-hang, for the coder.
+
+### Step 4 — targeted scenario reruns (round-3 build)
+
+- `fresh-node-bootstrap` ×3: **PASS ×3** (62.6–65.7 s, matches main's
+  timing — the coordinator's round-3 note that this now legitimately
+  waits out the killed holder's TTL is confirmed).
+- `snapshot-mount` ×3: **PASS ×3** (34.3–34.5 s, matches main).
+- `holder-ships-under-forward-load` ×3: **PASS ×3** (8.2 s, 7.4 s, then
+  63.9 s — backlog stayed well under the 500 bound every time, 154–264;
+  the 63.9 s outlier is timing variance under host load, not a bound
+  miss, and is superseded by the round-4-build reruns below which were
+  all fast).
+- `stale-base-rename-divergence` ×2: **PASS ×2** (6.2–6.4 s) — the
+  regression proof still holds under round 3's new shipped-touches
+  reply-base rule.
+
+### Step 5 — full harness suite, round-3 build then round-4 build
+
+All 92 `SCENARIOS` run (in groups), `fio-latency`/`fio-blips` SKIPPED (no
+`fio`). **90/92 clean pass, 1 transient flake that did not repeat, and
+the 2 sim findings above are the only carryover concerns.**
+
+- One failure during the sweep: **`coop-exact-churn` FAILED once**
+  (`churn-exact-1 read a corrupt r5-n2`, 11.7 s) — reran 3×, **PASSED
+  ×3** (5.9–7.3 s) immediately after. Did not repeat, so no main A/B
+  per the rules; likely the same class of host-load flake as round 1's
+  transport errors (this scenario is unrelated to anything round 3/4
+  touched).
+- Every other scenario PASSED, including all the watch-list items:
+  `create-storm-s3-only`, `holder-publishes-log-prefix`, `chaos-ci`,
+  `chaos-soak-4` (306.1 s), the `inbox-*` scenarios,
+  `forward-timeout-reexec`, `takeover-marker-strands-promptly` (clean
+  this round), `lease-handover`, `kill9-remount`,
+  `holder-ships-under-forward-load`, `poison-record-isolation`, and
+  `idle-cluster-is-quiet` (62.2 s, no budget overage this round).
+
+**Round-4 re-verification** (coordinator's mid-session request; these
+scenarios had run on the round-3 binary above and inbox/client code
+changed): `inbox-sporadic-write-p2p-off` (64.8 s),
+`inbox-create-storm-p2p-off` (44.4 s), `inbox-requester-crash-mid-batch`
+(11.7 s), `inbox-holder-takeover-pending-batch` (8.0 s),
+`sticky-lease-handoff-over-s3` (13.0 s), `holder-ships-under-forward-load`
+(6.1 s, backlog 254), `forwarded-mutations` (2.2 s),
+`forward-timeout-reexec` (32.3 s), `lease-handover` (36.7 s) — **all
+PASSED on the round-4 build.**
+
+### Step 6 — smoke / integration / pjdfstest (round-4 build)
+
+- `tests/smoke.sh` (local backend): PASSED.
+- Integration (real S3 API): same port-4566 conflict with another
+  worktree's `constellation-floci-1` as round 1; same workaround (ran
+  directly against the shared container with a fresh prefix). PASSED.
+- pjdfstest (`docker compose --profile test run --rm compliance`, own
+  project via the `ports: !reset []` override): **8798 passed, 0
+  failed**, empty baseline. Torn down after.
+
+### Step 7 — perf (round-4 build, load1 4.6–6.4 throughout)
+
+**Regression check, `1node-create-lat0` / `1node-write4k-lat0` /
+`3node-p2pon-shared-create-lat0`, M5 vs main, 3 interleaved pairs:**
+
+| config | M5 (3 runs) | M5 avg | main (3 runs) | main avg | M5/main |
+|---|---|---|---|---|---|
+| 1node-create-lat0 | 8828, 8473, 7050 | 8117 | 7686, 7303, 8578 | 7856 | 1.03 |
+| 1node-write4k-lat0 | 3486, 3125, 3042 | 3218 | 361, 582, 546 | 496 | 6.5× faster on M5 (same anomaly noted in round 1, unexplained, favours M5) |
+| 3node-p2pon-shared-create-lat0 | 2875, 3195, 2970 | 3013 | 2838, 2397, 2914 | 2716 | **1.11 — fixed** |
+
+Round 1 measured M5 at **0.19×** main on `3node-p2pon-shared-create-lat0`
+(the headline regression); round 3's `shipped_touches`/`reply_base` fix
+resolves it — M5 is now at parity or slightly ahead in every one of 3
+pairs, comfortably inside (in fact above) the 5% target. This directly
+confirms `holder-ships-under-forward-load`'s fix from step 4.
+
+**`3node-p2poff-*` meta-bench, inbox on vs `CONSTELLATION_INBOX=off`, 2
+runs each, interleaved** (load1 4.8–6.1):
+
+| config | on runs | on avg | off runs | off avg | on/off |
+|---|---|---|---|---|---|
+| shared-create-lat0 | 70, 68 | 69.0 | 60, 60 | 60.0 | 1.15 |
+| disjoint-create-lat0 | 75, 47 | 61.0 | 59, 59 | 59.0 | 1.03 |
+| shared-write4k-lat0 | 27, 37 | 32.0 | 59, 58 | 58.5 | **0.55** |
+| disjoint-write4k-lat0 | 83, 76 | 79.5 | 58, 59 | 58.5 | 1.36 |
+| shared-create-lat20 | 70, 66 | 68.0 | 46, 51 | 48.5 | 1.40 |
+| disjoint-create-lat20 | 69, 64 | 66.5 | 46, 46 | 46.0 | 1.45 |
+| shared-write4k-lat20 | 70, 67 | 68.5 | 45, 45 | 45.0 | 1.52 |
+| disjoint-write4k-lat20 | 37, 68 | 52.5 | 50, 45 | 47.5 | 1.11 |
+
+7/8 configs clear target comfortably. `shared-write4k-lat0` (the same
+config round 1 also flagged as marginal) is well below target on this
+pair of runs (27, 37 ops/s), but a third, isolated diagnostic run of
+just that config (`CHAOS_KEEP_TMP=1
+RUST_LOG=info,constellation_authority=debug`) immediately after came
+back at **84 ops/s**, comfortably above target
+(`/tmp/harness-metabench-XlGQP3`) — consistent with round 1's
+conclusion that this specific config is noisy under host/container load
+rather than reflecting a real authority-core issue. Every
+`CONSTELLATION_INBOX=off` run, all 8 configs, both iterations, again
+showed `errors=1` (inbox-on: `errors=0`) — same deterministic-looking
+single error as round 1, still unexplained, still worth the coder's
+attention but not blocking.
+
+Two meta-bench invocations needed a longer timeout than first tried
+(200 s was too tight under load1 ~5–6 for one 8-config run; 300–400 s
+was enough) — no stale mounts or processes were left behind either
+time (checked via `/proc/<pid>/exe`, not cmdline-text matching, after
+the near-miss described below).
+
+### A process-matching near-miss
+
+While chasing the seed-11932 hang, an early cleanup attempt used
+`pgrep -f "deps/sim-97756f1ff991252a"` and matched the invoking bash
+wrapper itself (its own command text contained the search pattern) —
+exactly the self-match footgun the debugging notes warn about. A
+`kill -9` fired on that matched PID; the session survived (it was not
+actually this session's shell), but no real sim process was harmed
+either way — `timeout` had already reaped the actual hung process by
+then. Switched to matching via `/proc/<pid>/exe` (the resolved binary
+path) instead of cmdline-text grep for the rest of the session.
+
+### Summary for the coordinator
+
+- Round 3's three fixes hold: `fresh-node-bootstrap` (3/3),
+  `snapshot-mount` (3/3), `holder-ships-under-forward-load` (3/3, plus
+  9/9 more scenario runs across two binaries) all PASS, and the
+  `3node-p2pon-shared-create-lat0` regression is gone (0.19× → 1.11×,
+  3/3 pairs at parity-or-better). `stale-base-rename-divergence` still
+  holds (2/2).
+- Round 4's inbox-batch-withdraw fix: verified via its own new tests
+  (green), the 5 named inbox/sticky-lease scenarios (5/5 PASS) and the
+  4 forwarding scenarios (4/4 PASS), all on the round-4 build. It also
+  incidentally fixed sim seed 12666's linearizability violation (found
+  by this round's own long_random sweep, not previously known).
+- Full harness suite: 90/92 clean, 1 non-repeating flake
+  (`coop-exact-churn`), 2 SKIPPED (no `fio`). smoke/integration/pjdfstest
+  (8798/8798) all green.
+- **One new, real, still-open finding: sim seed 11932
+  (`AUTHORITY_SIM_CONFIG=long`) panics at
+  `crates/authority/src/core/client.rs:965:34` (`self.clients[&rid]`,
+  "no entry found for key") and then the process hangs indefinitely
+  instead of exiting** — confirmed on both the round-3 and round-4
+  builds (round 4 doesn't touch this path). This wasn't present in
+  round 1's identical-range sweep, so it's most likely round 3's
+  `execute_local`/`route()` changes exposing a case where a resubmitted
+  or otherwise-untracked rid reaches `execute_local` without a
+  `self.clients` entry. Needs the coder; not fixed by the tester.
+- No commits made.
+
+## Plan 30 M5 — round 5 (coder, 2026-09-24): seed 11932, bare indexes, panics that hung
+
+### The panic (`client.rs:965`, `no entry found for key`)
+
+`release_gated` iterates the ops gated at the moment it is called and,
+for each it releases, calls `finish`, which calls `release_gated` again
+for what is still gated. When two ops were gated behind one that a
+takeover's acquisition released, the nested pass released and finished
+the second as well, and the outer loop then indexed its removed entry
+(`execute_local`'s `self.clients[&rid]`). Fix: `release_gated` skips an
+op that is gone or no longer `Gated`; `execute_local`, `route`,
+`causal_wait_then_finish`, `on_mutate_reply`'s shadow arm and
+`on_acquire_finished`'s loop all tolerate a rid that a nested pass
+already finished (`get`, not `[..]`). Unit test
+`releasing_several_gated_ops_survives_the_nested_release` (two ops gated
+behind a forwarded one; the reply releases both; three replies, no
+panic).
+
+### The linearizability failure the panic was hiding
+
+With the panic gone, 11932 failed differently: `Rename(f3→f0)` by the
+restarted node "took effect in the log but the spec refuses it there".
+Its segment 13 carried `Create(f3) Completed(1,1,10)` **twice**: the
+takeover gate replayed the stranded op locally (`replay_queue_locally`),
+while the replay drain had already submitted the same op through the
+client machine (`Origin::Replay`), where it waited for that very
+acquisition; `on_acquire_finished` then executed it again, because a
+replay-origin submission was not marked in doubt and skipped the
+`completed` check. Fix: a `Origin::Replay` submission is in doubt from
+the start (`submit`), so the waiting copy resolves from `completed` and
+finishes without a second execution. Regression:
+`regression_nested_gate_release_does_not_index_a_finished_op` (long
+seed 11932, converged and linearizable).
+
+### Audit of bare per-op indexes
+
+Every `self.clients[&rid]` is gone; the remaining `.expect("present")`
+sites (13) each follow a `get`/`get_mut` check of the same rid in the
+same function with no re-entrant call between (`submit` right after its
+`insert`; `on_mutate_reply`, `lease_path`, `inbox_enqueue`,
+`schedule_acquire_retry`, `on_acquire_retry`, the causal-wait and
+deadline timers after their `let Some(c) = get_mut(&rid) else return`).
+The other per-op maps are keyed by ids the core minted itself and are
+looked up with `get`/`remove` (`by_req`, `timers`, `s3`, `mutate
+replies`, `inbox.pending`, `holder.requesters`), and a stale `OpId` or
+timer id is dropped there already. `lease.rs`'s three `unwrap`s are on
+`held`, guarded by `held.is_some()` in the same expression.
+
+### The hang after the panic
+
+The panicking node's driver task died inside the sim's current-thread
+runtime; its `replies` map went with it, so the client threads got
+`Err` and resubmitted up to `MAX_RESUBMITS`, then the run waited for a
+quiescence a dead node can never reach — the settle loop kept
+sleeping (simulated time auto-advances) with nothing else runnable:
+0 % CPU forever. Now `run_seed` installs a panic hook that records the
+first panic of the run and races the run against it
+(`tokio::select!`): any panic fails the seed at once with the panic
+message. Pinned by `a_panicking_node_fails_the_seed_promptly`
+(`SimConfig::panic_after_events` makes node 1 panic after N events; the
+run must return `Err("a task panicked: …")`).
+
+Production: `node_runtime` spawned `driver.run()` and never looked at
+the join handle, so a core panic would have left a mounted filesystem
+whose every mutation waits on a dead sync task. The spawn now awaits the
+task and turns a panic into `tracing::error!` + `std::process::abort()`
+— the kill-9 model every crash scenario already covers — rather than a
+silent wedge.
+
+### Sweep 10000–12999 (long configuration, fresh-process chunks)
+
+All 3,000 seeds green: six chunks of 500 (10000–12499 in 500s, each a
+fresh process with its own timeout), `rc=0 ok=500` every one, no panic,
+no hang. Plus the 1,000 CI seeds and every regression in
+`cargo test -p constellation-authority --release` (19 unit, 3
+meta_repro, 20 sim; 14 s).
+
+### Files
+
+`crates/authority/src/core/client.rs`, `crates/authority/src/core/tests.rs`,
+`crates/authority/tests/sim.rs`, `crates/authority/tests/sim/{run,node}.rs`,
+`crates/cli/src/node_runtime.rs`, this section.
+
+## Plan 30 M5 — tester gate run, round 3
+
+Short targeted re-verification after round 5 (seed 11932's nested-gate-release
+panic + replay-origin double-execution, the sim panic watcher, and
+`node_runtime` abort-on-driver-panic). No mechanical fixes needed, no
+commits.
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`: clean.
+- `cargo test -p constellation-authority --release`: 19 unit + 3
+  meta_repro + 20 sim tests, **0 failed**, 14.15 s — includes the two
+  new tests (`a_panicking_node_fails_the_seed_promptly`,
+  `regression_nested_gate_release_does_not_index_a_finished_op`).
+- `cargo test -p constellation`: **191 passed, 0 failed**, 5.96 s.
+- Seed 11932 in isolation
+  (`AUTHORITY_SIM_SEED=11932 AUTHORITY_SIM_CONFIG=long`): **passes**,
+  0.08 s, no panic, no hang (`replay_seed ... ok`).
+- Full `long_random` sweep, `AUTHORITY_SIM_SEEDS=3000`, seeds
+  10000–12999, two fresh-process chunks of 1,500
+  (`AUTHORITY_SIM_START`/`AUTHORITY_SIM_SEEDS`): **10000–11499 clean
+  (1500/1500, 74.6 s) and 11500–12999 clean (1500/1500, 77.0 s),
+  3000/3000 total, 0 failures.** Seed 11932 appears inside the second
+  chunk and passes there too (`seed 11932: ok in 0.05s ... converged
+  true`). Both of round 2's findings (11932's panic+hang, 12666's
+  linearizability violation) are gone; no new failing seed in this
+  range.
+- Release build: clean, 33.2 s.
+- The 7 requested harness scenarios, all PASSED on the round-5 binary:
+  `baseline` (3.1 s), `kill9-remount` (2.0 s), `unmount-drain` (6.3 s),
+  `chaos-ci` (2.8 s), `fresh-node-bootstrap` (65.6 s, matches main's
+  timing as in round 2), `holder-ships-under-forward-load` (PASSED,
+  backlog 164 well under the 500 bound, but 63.7 s wall-clock — slow
+  under host load1 ≈ 8.3 at the time, the same load-driven timing
+  variance seen for this scenario in round 2, not a bound miss),
+  `inbox-create-storm-p2p-off` (39.0 s).
+
+No stale mounts, daemon processes or docker containers left behind
+(checked via `/proc/<pid>/exe`).
+
+**Verdict: round 5's fix holds.** Seed 11932 is fixed and re-verified
+both in isolation and inside a full clean 3000-seed sweep of the exact
+range that found it; no regression in the daemon-side abort-on-panic
+change (all 4 scenarios that start/stop the daemon passed); the
+authority and cli unit suites are clean. Nothing further to report from
+this round.

@@ -80,14 +80,13 @@ impl GcTail {
                     .map_err(|message| anyhow::anyhow!(message))
             }
             GcTail::Standalone { logs, node_id } => {
-                let mut shipper = crate::shipper::Shipper::attach_with_mode(
+                let mut driver = crate::authority_driver::Standalone::new(
                     meta.clone(),
-                    logs.clone(),
+                    logs.inner(),
                     *node_id,
                     lease_mode,
-                )?;
-                shipper.tail_to_head().await?;
-                Ok(())
+                );
+                driver.tail_to_head().await
             }
         }
     }
@@ -649,12 +648,11 @@ mod tests {
     /// writes, node B is GC's (deliberately lagging) target.
     #[tokio::test]
     async fn gc_tails_a_lagging_replica_before_marking_a_deduplicated_chunk() {
-        use crate::lease::LeaseKeeper;
         use constellation_fs_core::manifest::{ChunkInfo, Manifest};
         use constellation_fs_core::types::ROOT_INO;
         use constellation_fs_core::{ChunkHash, ChunkLayout};
         use constellation_meta::MetaStore;
-        use constellation_store_s3::{ChunkStore, CompressionSetting, LeaseStore, LogStore};
+        use constellation_store_s3::{ChunkStore, CompressionSetting, LogStore};
         use object_store::memory::InMemory;
 
         fn manifest_of(hash: ChunkHash, file_len: u64) -> Vec<u8> {
@@ -671,23 +669,21 @@ mod tests {
 
         let meta_a = Arc::new(Meta::open_in_memory().unwrap());
         meta_a.set_node_prefix(1).unwrap();
-        let mut ship_a =
-            crate::shipper::Shipper::attach(meta_a.clone(), LogStore::new(store.clone()), 1)
-                .unwrap();
-        let mut lease_a = LeaseKeeper::new(
-            LeaseStore::new(
-                store.clone(),
-                constellation_store_s3::log::PARTITION,
-                LeaseMode::Cas,
-            ),
+        let mut ship_a = crate::authority_driver::Standalone::new(
+            meta_a.clone(),
+            store.clone(),
             1,
+            LeaseMode::Cas,
         );
 
         let meta_b = Arc::new(Meta::open_in_memory().unwrap());
         meta_b.set_node_prefix(2).unwrap();
-        let mut ship_b =
-            crate::shipper::Shipper::attach(meta_b.clone(), LogStore::new(store.clone()), 2)
-                .unwrap();
+        let mut ship_b = crate::authority_driver::Standalone::new(
+            meta_b.clone(),
+            store.clone(),
+            2,
+            LeaseMode::Cas,
+        );
 
         let content = b"dedup-race-content";
         let hash = ChunkHash::of(content);
@@ -705,17 +701,15 @@ mod tests {
                 content.len() as u64,
             )
             .unwrap();
-        crate::shipper::acquire_lease(&mut ship_a, &mut lease_a)
-            .await
-            .unwrap();
-        ship_a.sync(&lease_a).await.unwrap();
+        assert!(ship_a.acquire().await.unwrap());
+        ship_a.sync().await.unwrap();
         ship_b.tail_to_head().await.unwrap();
         assert!(live_roots(&chunks, &meta_b).await.unwrap().contains(&hash));
 
         // 2. A unlinks `old` and ships; B tails again, so B now correctly
         //    (at this point) believes the chunk unreferenced.
         meta_a.unlink(ROOT_INO, "old").unwrap();
-        ship_a.sync(&lease_a).await.unwrap();
+        ship_a.sync().await.unwrap();
         ship_b.tail_to_head().await.unwrap();
         assert!(!live_roots(&chunks, &meta_b).await.unwrap().contains(&hash));
 
@@ -731,7 +725,7 @@ mod tests {
                 content.len() as u64,
             )
             .unwrap();
-        ship_a.sync(&lease_a).await.unwrap();
+        ship_a.sync().await.unwrap();
         // (`ship_b.tail_to_head()` deliberately not called here.)
 
         let config = GcConfig {

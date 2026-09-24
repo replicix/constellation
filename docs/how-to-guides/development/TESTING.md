@@ -872,6 +872,30 @@ Plan 30 M13 scenarios (the S3 inbox; all three run with
 `CONSTELLATION_P2P=off`, the holder and each requester on a counting
 relay of its own so requests can be attributed per role):
 
+- **`stale-base-rename-divergence`** (plan 30 M5 phase 2, the
+  `MutateReply::base` rule on the wire). Three nodes with own P2P keys;
+  A's and B's sync rounds are held with
+  `CONSTELLATION_FAULT_HOLD_SYNC_FILE=<root>/hold-{a,b}` (each daemon
+  writes `<hold>.held` from the first round that sees the file, so the
+  scenario knows no round is still shipping). `f1` and `f2` exist
+  everywhere. A (holder) unlinks `f2`, which stays in its journal; B,
+  still seeing both, renames `f1` over `f2` — a shape B's own
+  validation accepts (an `O_EXCL` create of a name B still sees would be
+  refused locally and never forwarded). A executes it and replies with
+  `base` = its unshipped position (the unlink overlaps the rename's
+  keys). Post-fix B waits in `AwaitingLog` — the scenario checks the
+  rename has *not* returned 3 s later — then the holds lift, A ships
+  both records, the rename returns OK, and A, B and C must agree `f2`
+  is `f1`'s inode with `f1`'s content and `f1` is gone. Against a
+  pre-fix build (main before M5 phase 2: `CONSTELLATION_BIN=<main
+  build>`), B installs the rename as a shadow onto the stale replica and
+  returns at once; the arriving `Unlink(f2)` then removes the renamed
+  entry and the rename record finds no `f1`, so B has no `f2` at all
+  (the convergence check fails first, the early-return check second).
+- **`sticky-lease-handoff-over-s3`** runs with `CONSTELLATION_INBOX=off`
+  since M5 phase 2: it tests the S3-only cooperative handoff, and with
+  M13's inbox on a lone blocked write is answered through the holder's
+  inbox instead (no handoff, which is the point of the inbox).
 - **`inbox-create-storm-p2p-off`** (the hybrid on a storm, measured).
   Three nodes, the holder established first with a 20 s TTL and idle
   release off. Two requesters run `create-storm-s3-only`'s
@@ -900,6 +924,16 @@ relay of its own so requests can be attributed per role):
   2 s) and p99 within it plus a second. Today's path for the same write
   registers `wanted_by`, waits up to TTL/4 for the holder's lease round,
   and moves the lease twice.
+- **The meta-bench's roster barrier** (plan 30 M5 phase 2). Multi-node
+  `harness meta-bench` configs wait, before starting the clock, until
+  every node's `status.inbox.roster` names every node: with P2P off a
+  holder polls the inboxes of the requesters its last registry read
+  named, and the bench's mount-then-write-immediately shape had the
+  holder acquiring before the other two nodes registered, so it polled
+  nobody until the driver's 5 s registry refresh — a mount-order
+  artifact, not what the bench measures (`inbox-sporadic-write-p2p-off`
+  measures that "first-contact tax" on purpose and prints it
+  separately).
 - **`inbox-requester-crash-mid-batch`**. The holder's S3 is cut (it can
   neither poll nor renew), `r1` submits a create (its FUSE thread blocks
   on the outcome), the batch is seen in the bucket, `r1` is SIGKILLed,
@@ -1017,6 +1051,65 @@ one `node_id`. It then exercises `umount myfs:/sub` (root view keeps
 serving, daemon stays up) followed by `umount myfs` (last view: the
 daemon runs its clean-shutdown sequence, exits, and removes its own PID
 file).
+
+## The authority simulation (plan 30 M5)
+
+`crates/authority` holds the sans-IO authority core and, under
+`tests/sim.rs`, a deterministic simulation that runs several real cores
+over real `Meta`, `LogStore`, `LeaseStore` and `CommitChain` instances on
+a simulated bucket (seeded latency, per-node cuts, scripted 412/409/404/
+500/timeout and applied-then-lost answers) and a simulated P2P bus
+(seeded delay, drops, partitions, pauses, crashes and restarts, fresh
+joins), with seeded workloads. Histories are checked with Stateright's
+`LinearizabilityTester`; every run also checks convergence at quiescence
+against the log replayed onto a fresh replica, that every commit is the
+log prefix at its claimed position, and exactly-once over the log's
+`Completed { rid }` records.
+
+Since plan 30 M5 phase 2 the core under the simulation *is* the
+daemon's decision code: `crates/cli/src/authority_driver.rs` drives the
+same `Core` from the sync loop (S3, P2P, timers and the upload pass are
+its actions), so a seed that fails here is a daemon bug, not a model
+bug.
+
+```bash
+cargo test -p constellation-authority                 # 1,000 CI seeds + regressions, ~15 s release / ~50 s debug
+AUTHORITY_SIM_SEED=152 cargo test -p constellation-authority --test sim replay_seed -- --nocapture --exact
+AUTHORITY_SIM_SEED=200 AUTHORITY_SIM_CONFIG=bugb ...  # buga | bugb | s3:<rule index> | single | long | inbox
+RUST_LOG=constellation_authority=debug,sim=debug ...  # narrate a replay
+cargo test -p constellation-authority --test sim -- --ignored long_random   # AUTHORITY_SIM_SEEDS, AUTHORITY_SIM_START
+```
+
+A failing seed prints its replay command. The regression tests
+(`regression_bug_a_slow_holder_replies`,
+`regression_bug_b_holder_dies_with_unshipped_forwards`,
+`regression_scripted_s3_error_codes`, `stale_base_speculation_is_found`,
+`regression_inbox_p2p_off` — M13's inbox with P2P off: ops answered
+through the log, sustained demand escalating to a lease request —
+`regression_inbox_batch_withdrawn_before_p2p_forward`,
+`regression_gated_resubmission_checks_completed` and
+`regression_resubmitted_rid_withdraws_its_batch`, all found by the
+long configuration against the production core in phase 2) are the
+simulation's counterparts of the model crate's `today_finds_bug_*`
+tests; see PROGRESS.md's "Plan 30 M5" sections for what each covers.
+
+The checker design, settled in phase 2: the exact log-witnessed
+linearizability check runs on every seed; Stateright's
+`LinearizabilityTester` additionally checks the bounded histories (≤ 80
+events, ≤ 6 tentative ops) where its search finishes. A run's summary
+prints both counts.
+
+Round 3 added, after the tester's gate run: `RUST_LOG=constellation::authority_driver=trace`
+prints one line per core step (`event`, `actions`, `job`, `handled_us`,
+`refreshed_us`), one per S3 op issued and done (kind, latency), and the
+forward round trip on the requester; `constellation=trace` adds the
+holder's forwarded-mutate service time. The per-second `awk` over a kept
+`mount.log` in PROGRESS.md's round-3 section is the intended use.
+
+Tools and tests that need the authority without a daemon (`gc`'s
+standalone tail, the shipper's bootstrap/replay tests) use
+`authority_driver::Standalone`: the same `Core`, stepped inline over a
+real store with no spawned tasks.
 
 ## CI notes
 

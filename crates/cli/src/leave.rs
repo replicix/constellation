@@ -8,11 +8,8 @@
 
 use crate::designation::DesignationManager;
 use crate::epoch::EpochManager;
-use crate::lease::LeaseKeeper;
-use crate::shipper::Shipper;
 use constellation_meta::Meta;
 use object_store::ObjectStore;
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -104,16 +101,13 @@ pub async fn admin_leave(
     Ok(())
 }
 
-/// Self-leave: flush, release leases, tombstone, mark the state dir spent.
-///
-/// Callers must already have refused an open epoch. `--force` skips only
-/// the designation courtesy check — an open epoch and a stranded journal
-/// still refuse.
-pub async fn self_leave(
-    store: Arc<dyn ObjectStore>,
+/// Self-leave, first half: the guards. Callers must already have refused
+/// an open epoch. `--force` skips only the designation courtesy check —
+/// an open epoch and a stranded journal still refuse. The flush and the
+/// release run in the authority core (`Control::Flush`); [`finish_leave`]
+/// then retires the record.
+pub fn pre_leave_checks(
     meta: &Meta,
-    ship: &mut Shipper,
-    keepers: &mut HashMap<String, LeaseKeeper>,
     designations: &DesignationManager,
     node_id: u64,
     force: bool,
@@ -135,25 +129,16 @@ pub async fn self_leave(
             return Err(LeaveError::LiveDesignation { node_id, path });
         }
     }
-    // Plan 30 §M3b: this node's own new mutations are fenced (and those
-    // already admitted drained) from before the final flush through the
-    // release CAS.
-    let releasing: Vec<crate::lease::ReleasingGuard> =
-        keepers.values().map(|k| k.begin_releasing()).collect();
-    for guard in &releasing {
-        guard.wait_quiescent().await;
-    }
-    ship.shutdown_all(keepers).await.map_err(|e| {
-        LeaveError::Other(format!(
-            "cannot flush before leave (is S3 reachable?): {e:#}"
-        ))
-    })?;
-    for k in keepers.values_mut() {
-        k.release()
-            .await
-            .map_err(|e| LeaveError::Other(format!("releasing lease: {e:#}")))?;
-    }
-    drop(releasing);
+    Ok(())
+}
+
+/// Self-leave, second half (after the core flushed and released):
+/// tombstone the registry record and mark the state dir spent.
+pub async fn finish_leave(
+    store: Arc<dyn ObjectStore>,
+    meta: &Meta,
+    node_id: u64,
+) -> Result<(), LeaveError> {
     constellation_store_s3::leave_node(store, node_id)
         .await
         .map_err(|e| LeaveError::Other(format!("retiring node {node_id}: {e}")))?;
@@ -178,7 +163,7 @@ mod tests {
     use constellation_net::Peers;
     use constellation_store_s3::designation::{DesignationMode, DesignationStore};
     use constellation_store_s3::{
-        claim_node_id, get_node, write_eligible_roster, Lease, LeaseMode, LeaseStore, LogStore,
+        claim_node_id, get_node, write_eligible_roster, Lease, LeaseMode, LeaseStore,
     };
     use object_store::memory::InMemory;
 
@@ -195,31 +180,14 @@ mod tests {
 
         let meta = open_meta();
         meta.set_node_prefix(b).unwrap();
-        let log = LogStore::new(store.clone());
-        let mut ship = Shipper::attach_with_mode(meta.clone(), log, b, LeaseMode::Cas).unwrap();
-        let mut keepers = HashMap::new();
-        keepers.insert(
-            "p0".into(),
-            LeaseKeeper::new(LeaseStore::new(store.clone(), "p0", LeaseMode::Cas), b),
-        );
         let designations = DesignationManager::new(
             DesignationStore::new(store.clone(), DesignationMode::Cas),
             meta.clone(),
             Peers::disabled(),
             b,
         );
-
-        self_leave(
-            store.clone(),
-            &meta,
-            &mut ship,
-            &mut keepers,
-            &designations,
-            b,
-            false,
-        )
-        .await
-        .unwrap();
+        pre_leave_checks(&meta, &designations, b, false).unwrap();
+        finish_leave(store.clone(), &meta, b).await.unwrap();
 
         assert_eq!(write_eligible_roster(store.clone()).await.unwrap(), [a]);
         assert!(get_node(store, b).await.unwrap().unwrap().retired);
@@ -285,30 +253,13 @@ mod tests {
             0,
         )
         .unwrap();
-        let log = LogStore::new(store.clone());
-        let mut ship = Shipper::attach_with_mode(meta.clone(), log, id, LeaseMode::Cas).unwrap();
-        let mut keepers = HashMap::new();
-        keepers.insert(
-            "p0".into(),
-            LeaseKeeper::new(LeaseStore::new(store.clone(), "p0", LeaseMode::Cas), id),
-        );
         let designations = DesignationManager::new(
             DesignationStore::new(store.clone(), DesignationMode::Cas),
             meta.clone(),
             Peers::disabled(),
             id,
         );
-        let err = self_leave(
-            store,
-            &meta,
-            &mut ship,
-            &mut keepers,
-            &designations,
-            id,
-            true,
-        )
-        .await
-        .unwrap_err();
+        let err = pre_leave_checks(&meta, &designations, id, true).unwrap_err();
         assert!(matches!(err, LeaveError::StrandedJournal), "{err}");
     }
 
@@ -316,10 +267,6 @@ mod tests {
     fn open_epoch_is_not_forceable() {
         let meta = open_meta();
         let epochs = EpochManager::new(1, meta, Peers::disabled());
-        // Simulate an open promise via the public activate path's local
-        // state: set_roster + manually flipping is enough for is_open
-        // only after a real propose/activate. Instead, assert the helper
-        // maps is_open correctly when closed.
         refuse_open_epoch(&epochs).unwrap();
     }
 }

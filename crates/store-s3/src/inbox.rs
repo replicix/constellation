@@ -91,7 +91,7 @@ use std::sync::Arc;
 /// Current batch encoding version. A reader refuses any other
 /// ([`StoreError::InboxVersion`]): plan 30 waives compatibility, and a
 /// batch is a short-lived object that never outlives an upgrade window.
-pub const INBOX_VERSION: u32 = 1;
+pub const INBOX_VERSION: u32 = 2;
 
 /// The magic the version tag follows: a batch object is self-describing
 /// enough that a stray object under the prefix is rejected as corrupt
@@ -147,6 +147,13 @@ pub struct InboxBatch {
     /// Nothing decides anything from it (clock skew must not matter).
     pub submitted_unix_ms: i64,
     pub ops: Vec<InboxOp>,
+    /// Plan 30 §M5: the requester's inbox demand is sustained and it is
+    /// asking for the lease. The holder treats it as the requester having
+    /// written itself into `wanted_by` — it learns at its next poll of
+    /// this requester rather than at its half-TTL renewal, with no extra
+    /// S3 request on either side.
+    #[serde(default)]
+    pub wants_lease: bool,
 }
 
 impl InboxBatch {
@@ -567,6 +574,7 @@ impl InboxSubmitter {
             n: self.next_n,
             submitted_unix_ms: now_unix_ms,
             ops,
+            wants_lease: false,
         };
         for _ in 0..MAX_RESYNC_ATTEMPTS {
             match self.store.put_batch(&batch).await {
@@ -954,6 +962,7 @@ mod tests {
             n,
             submitted_unix_ms: 1_000,
             ops,
+            wants_lease: false,
         }
     }
 

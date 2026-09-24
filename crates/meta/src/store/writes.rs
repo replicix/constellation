@@ -113,7 +113,13 @@ impl Meta {
             applied_seq,
             held_below,
         )?;
+        // Plan 30 §M5: with nothing left unshipped, no key is behind an
+        // unshipped record any more (`Meta::unshipped_overlaps`).
+        let empty = crate::store::journal::len(&tx, &self.journal_ks, &self.local)? == 0;
         tx.commit()?;
+        if empty {
+            self.clear_unshipped();
+        }
         // Plan 30 §M13: what shipped is in `completed`; `recent` need not
         // remember it any more (see `Meta::prune_recent_shipped`).
         if let Some(&upto) = journal_seqs.iter().max() {

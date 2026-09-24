@@ -833,6 +833,16 @@ any single failure, and the model stays linearizable and converged.
 - `single-node-unchanged`: P2P off, one node; no behavioural or performance
   change.
 
+**Also close (found by the M5 simulator).** A third node can observe an
+effect that was acknowledged but later rolled back. Example: a holder acks
+`rename f0→f2`, refuses another node's `create f2` with `EEXIST`, and dies
+before shipping. The rename is rolled back, but the refusal was based on it.
+M13's `Tentative` rule covers only the acked op's own return, not
+observers. With `ack=s3` (or a sealed backup) the holder must not answer an
+op from state that includes unsealed acked effects of *other* clients. Turn
+the sim's `observed_tentative` counter into a hard failure in the `ack=s3`
+configurations.
+
 **Measure.** Added ack latency on a LAN, S3 requests per reconfiguration,
 and the failover-time distribution.
 

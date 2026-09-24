@@ -179,6 +179,20 @@ impl Meta {
         Ok(())
     }
 
+    /// Re-write one ingested `ns` row through an ordinary write, so it
+    /// sits above whatever the memtable already held for that key. A
+    /// bootstrap needs it for exactly one key: the root inode, which
+    /// `Meta::open` inserts as genesis (`0:0`) before the tree is loaded,
+    /// and which an ingested segment (below the memtable) cannot
+    /// override. Neither dirties nor journals: the value *is* the
+    /// published tree's.
+    pub fn ns_overwrite_after_ingest(&self, key: &[u8], value: &[u8]) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        tx.insert(&self.ns, key.to_vec(), value.to_vec());
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Store `body` under its local (plain blake3) hash, for a bootstrap
     /// converting a published `Payload::Spilled` reference (fetched from
     /// the bucket's `blobs/`, under whatever hash the filesystem's E2E

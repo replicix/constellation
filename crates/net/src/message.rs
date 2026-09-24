@@ -223,6 +223,14 @@ pub enum Payload {
         req_id: u64,
         /// Postcard bytes of `constellation_meta::MutateOutcome`.
         outcome: Vec<u8>,
+        /// Plan 30 M5 (§M6's first form): the log position the requester
+        /// must have applied before it may install the reply's records
+        /// ahead of the log — the holder's last shipped sequence when it
+        /// evaluated the op — or `None` when the holder's unshipped
+        /// journal already touched one of the op's keys (then only the
+        /// log delivers the records, in their order).
+        #[serde(default)]
+        base: Option<u64>,
     },
     /// Gossiped RTT vector for holder-driven lease placement.
     PeerRtts {

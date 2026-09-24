@@ -1,0 +1,33 @@
+[package]
+name = "constellation-authority"
+description = "Sans-IO authority core (plan 30 M5): lease, forwarding, speculation and ship/tail/publish decisions as a pure state machine, plus the deterministic simulation that drives it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+constellation-fs-core.workspace = true
+constellation-meta.workspace = true
+constellation-store-s3.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The simulation (tests/sim.rs) only: real stores over a simulated bucket
+# and bus, seeded workloads, Stateright's linearizability checker used as
+# a library. None of this reaches the product build.
+async-trait = "0.1"
+blake3.workspace = true
+constellation-mtree.workspace = true
+bytes.workspace = true
+futures.workspace = true
+object_store.workspace = true
+rand = { version = "0.9", features = ["std_rng"] }
+serde_json.workspace = true
+stateright = "0.31"
+tracing-subscriber.workspace = true
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "test-util"] }

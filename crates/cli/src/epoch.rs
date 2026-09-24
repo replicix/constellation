@@ -25,6 +25,10 @@ pub struct EpochManager {
     machine: Mutex<EpochMachine>,
     roster: Mutex<Vec<u64>>,
     s3_failure_since: Mutex<Option<std::time::Instant>>,
+    /// How long S3 must have been failing before a proposal (the sync
+    /// interval at least: one full round's worth of failures, not a
+    /// blip inside one).
+    propose_grace: Mutex<std::time::Duration>,
     pub active: Arc<AtomicBool>,
     pub frozen: Arc<AtomicBool>,
     pub blocks_takeover: Arc<AtomicBool>,
@@ -55,6 +59,7 @@ impl EpochManager {
             machine: Mutex::new(machine),
             roster: Mutex::new(Vec::new()),
             s3_failure_since: Mutex::new(None),
+            propose_grace: Mutex::new(std::time::Duration::from_millis(500)),
             active: Arc::new(AtomicBool::new(false)),
             frozen: Arc::new(AtomicBool::new(false)),
             blocks_takeover: Arc::new(AtomicBool::new(false)),
@@ -121,25 +126,17 @@ impl EpochManager {
         *self.s3_failure_since.lock().unwrap() = None;
     }
 
+    /// See `propose_grace`: never below 500 ms.
+    pub fn set_propose_grace(&self, grace: std::time::Duration) {
+        *self.propose_grace.lock().unwrap() = grace.max(std::time::Duration::from_millis(500));
+    }
+
     pub fn set_roster(&self, ids: Vec<u64>) {
         *self.roster.lock().unwrap() = ids;
     }
 
     pub fn roster(&self) -> Vec<u64> {
         self.roster.lock().unwrap().clone()
-    }
-
-    pub fn shared_log_advanced(&self, applied: &BTreeMap<String, u64>) -> bool {
-        self.machine
-            .lock()
-            .unwrap()
-            .current()
-            .is_some_and(|promise| {
-                promise
-                    .base
-                    .iter()
-                    .any(|(part, base)| applied.get(part).copied().unwrap_or(0) > *base)
-            })
     }
 
     /// Persist a promise (BEFORE any ack is sent) then reply.
@@ -210,9 +207,7 @@ impl EpochManager {
                     *since = Some(now);
                     return Ok(false);
                 }
-                Some(first)
-                    if now.duration_since(first) < std::time::Duration::from_millis(500) =>
-                {
+                Some(first) if now.duration_since(first) < *self.propose_grace.lock().unwrap() => {
                     return Ok(false);
                 }
                 Some(_) => {}

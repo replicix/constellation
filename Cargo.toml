@@ -12,6 +12,7 @@ members = [
     "crates/chaos",
     "crates/upload-concurrency",
     "crates/model",
+    "crates/authority",
     "bench/uploadbench",
 ]
 # Bare `cargo build`/`cargo test` at the root only touch the product
@@ -31,6 +32,7 @@ default-members = [
     "crates/chaos",
     "crates/upload-concurrency",
     "crates/model",
+    "crates/authority",
 ]
 exclude = ["bench/dbbench", "bench/prollybench", "bench/enginebench", "vendor/fjall"]
 
@@ -49,6 +51,7 @@ constellation-net = { path = "crates/net" }
 constellation-api = { path = "crates/api" }
 constellation-upload-concurrency = { path = "crates/upload-concurrency" }
 constellation-chaos = { path = "crates/chaos" }
+constellation-authority = { path = "crates/authority" }
 
 anyhow = "1"
 thiserror = "2"
