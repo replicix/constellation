@@ -26,7 +26,7 @@ use fuser::{
     LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyLseek, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::{Read, Seek};
 use std::os::unix::ffi::OsStrExt;
@@ -98,6 +98,11 @@ struct WriteState {
     file_len: u64,
     base: Option<Manifest>,
     sealed: HashMap<u64, ChunkHash>,
+    /// The sealed indices whose seal enrolled a pending-upload claim
+    /// (`seal_crossed_chunks` skips the claim for content already known
+    /// durable). Unsealing withdraws exactly that claim and no other:
+    /// see [`ConstellationFs::unseal`].
+    enrolled: HashSet<u64>,
     holes: crate::staging::DirtyRuns,
     seal_buffer: Vec<u8>,
     high_water: u64,
@@ -1867,6 +1872,7 @@ impl ConstellationFs {
                 file_len: manifest.file_len,
                 base: Some(manifest.clone()),
                 sealed: HashMap::new(),
+                enrolled: HashSet::new(),
                 holes: crate::staging::DirtyRuns::default(),
                 seal_buffer: Vec::new(),
                 high_water: manifest.file_len,
@@ -1933,6 +1939,7 @@ impl ConstellationFs {
                 self.meta
                     .add_pending_upload(&hash, ino)
                     .map_err(|error| errno(&error))?;
+                ws.enrolled.insert(idx);
             }
             ws.staging.release_chunk(idx, self.chunk_size);
             ws.sealed.insert(idx, hash);
@@ -1944,6 +1951,24 @@ impl ConstellationFs {
             self.nudge_sync();
         }
         Ok(())
+    }
+
+    /// Drop sealed chunk `idx` from the write session (it is being
+    /// overwritten or punched) and withdraw the one pending-upload claim
+    /// its seal enrolled, if it enrolled one. Other claims on the same
+    /// content — another index with identical bytes, an earlier manifest
+    /// of this inode not yet uploaded — are untouched, so that content
+    /// still uploads (`Meta::cancel_pending_upload`).
+    fn unseal(&self, ws: &mut WriteState, ino: Ino, idx: u64) -> Result<Option<ChunkHash>, i32> {
+        let hash = ws.sealed.remove(&idx);
+        if let Some(hash) = &hash {
+            if ws.enrolled.remove(&idx) {
+                self.meta
+                    .cancel_pending_upload(hash, ino)
+                    .map_err(|error| errno(&error))?;
+            }
+        }
+        Ok(hash)
     }
 
     /// Insert content as Dirty unless the local durable-set rung proves
@@ -2763,5 +2788,229 @@ mod quota_tests {
         assert_eq!(fs.view_usage(), (1042, 2));
         fs.set_snapshot_root("/source", "snap").unwrap();
         assert_eq!(fs.view_usage(), (42, 1));
+    }
+}
+
+/// Pending-upload claims under duplicate content (the data-loss path the
+/// storm-hang fix found while reading the write path): rewriting one of
+/// two identical sealed chunks must not cancel the claim the other one
+/// still needs.
+#[cfg(test)]
+mod pending_row_tests {
+    use super::*;
+    use constellation_fs_core::types::ROOT_INO;
+    use object_store::memory::InMemory;
+    use tempfile::TempDir;
+
+    const CHUNK: u32 = 1024 * 1024;
+
+    struct Env {
+        fs: ConstellationFs,
+        meta: Arc<Meta>,
+        cache: Arc<DiskCache>,
+        store: Arc<ChunkStore>,
+        rt: tokio::runtime::Runtime,
+        _dir: TempDir,
+    }
+
+    fn env() -> Env {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap());
+        let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
+        let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
+            meta.clone(),
+            store.clone(),
+            CHUNK,
+            1,
+        ));
+        let fs_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fs = ConstellationFs::new(
+            FsDependencies {
+                meta: meta.clone(),
+                store: store.clone(),
+                cache: cache.clone(),
+                rt: fs_rt.handle().clone(),
+                sync: None,
+                coop: None,
+                staging_dir: dir.path().join("staging"),
+                staging_budget: StagingBudget::new(1 << 30),
+                snapshots,
+                atime: Arc::new(crate::atime::AtimeAccumulator::new(
+                    crate::atime::AtimeMode::Off,
+                    crate::atime::AtimeStats::new(),
+                )),
+                prune_stats: crate::prune::PruneStats::new(),
+            },
+            CHUNK,
+            CompressionSetting::RAW,
+        );
+        std::mem::forget(fs_rt);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        Env {
+            fs,
+            meta,
+            cache,
+            store,
+            rt,
+            _dir: dir,
+        }
+    }
+
+    fn chunk(fill: u8) -> Vec<u8> {
+        vec![fill; CHUNK as usize]
+    }
+
+    impl Env {
+        fn upload_round(&self) {
+            self.rt
+                .block_on(crate::upload_dirty_chunks(
+                    &self.cache,
+                    &self.meta,
+                    &self.store,
+                    CompressionSetting::RAW,
+                    &crate::UploadRuntime::for_test(true),
+                    None,
+                    None,
+                ))
+                .expect("every pending chunk uploads");
+        }
+
+        fn in_s3(&self, hash: &ChunkHash) -> bool {
+            self.rt.block_on(self.store.chunk_durable(hash)).unwrap()
+        }
+
+        /// The invariant that matters: every chunk a committed manifest
+        /// names is in S3 already or still has a pending row that will
+        /// put it there (and is in the cache to be uploaded from).
+        fn assert_manifest_backed(&self, ino: Ino) {
+            let manifest = self.fs.load_manifest(ino).unwrap();
+            for (idx, hash) in self.fs.chunk_list(&manifest).unwrap() {
+                let pending = self.meta.pending_upload_claims(&hash, ino).unwrap() > 0;
+                assert!(
+                    self.in_s3(&hash) || (pending && self.cache.contains(&hash)),
+                    "ino {ino} chunk {idx} ({hash}) is in neither S3 nor the upload queue"
+                );
+            }
+        }
+
+        fn assert_manifest_in_s3(&self, ino: Ino) {
+            let manifest = self.fs.load_manifest(ino).unwrap();
+            for (idx, hash) in self.fs.chunk_list(&manifest).unwrap() {
+                assert!(
+                    self.in_s3(&hash),
+                    "ino {ino} chunk {idx} ({hash}) never reached S3"
+                );
+            }
+        }
+    }
+
+    /// One file, identical content at chunk positions 0 and 2 (both sealed
+    /// once the writer crosses them), then position 0 rewritten: the chunk
+    /// position 2 still names must stay enrolled and upload.
+    #[test]
+    fn rewriting_one_of_two_identical_sealed_chunks_keeps_the_other_enrolled() {
+        let e = env();
+        let file = e.meta.create(ROOT_INO, "dup", 0o644, 0, 0).unwrap();
+        let same = chunk(b'A');
+        let same_hash = ChunkHash::of(&same);
+        e.fs.do_write(file.ino, 0, &same).unwrap();
+        e.fs.do_write(file.ino, u64::from(CHUNK), &chunk(b'B'))
+            .unwrap();
+        e.fs.do_write(file.ino, 2 * u64::from(CHUNK), &same)
+            .unwrap();
+        assert_eq!(
+            e.meta.pending_upload_claims(&same_hash, file.ino).unwrap(),
+            2,
+            "both sealed positions enrolled a claim"
+        );
+
+        // Rewrite position 0 with different bytes: its claim goes, the
+        // claim of position 2 stays.
+        e.fs.do_write(file.ino, 0, &chunk(b'C')).unwrap();
+        assert_eq!(
+            e.meta.pending_upload_claims(&same_hash, file.ino).unwrap(),
+            1
+        );
+
+        e.fs.flush_inode(file.ino, false).unwrap();
+        let manifest = e.fs.load_manifest(file.ino).unwrap();
+        let chunks = e.fs.chunk_list(&manifest).unwrap();
+        assert_eq!(chunks.get(&2), Some(&same_hash));
+        e.assert_manifest_backed(file.ino);
+
+        e.upload_round();
+        assert!(e.meta.pending_uploads().unwrap().is_empty());
+        e.assert_manifest_in_s3(file.ino);
+        assert_eq!(e.rt.block_on(e.store.get_chunk(&same_hash)).unwrap(), same);
+    }
+
+    /// The same content already claimed by an earlier, not yet uploaded
+    /// manifest of the inode: a new write session seals it again and then
+    /// overwrites it, which must not cancel the earlier manifest's claim.
+    #[test]
+    fn unsealing_does_not_cancel_an_earlier_manifests_claim() {
+        let e = env();
+        let file = e.meta.create(ROOT_INO, "again", 0o644, 0, 0).unwrap();
+        let same = chunk(b'D');
+        let same_hash = ChunkHash::of(&same);
+        e.fs.do_write(file.ino, 0, &same).unwrap();
+        e.fs.do_write(file.ino, u64::from(CHUNK), &same).unwrap();
+        e.fs.flush_inode(file.ino, false).unwrap();
+        e.assert_manifest_backed(file.ino);
+
+        // Second session: seal the same bytes at position 0, then
+        // overwrite them before the flush.
+        e.fs.do_write(file.ino, 0, &same).unwrap();
+        e.fs.do_write(file.ino, u64::from(CHUNK), &same).unwrap();
+        e.fs.do_write(file.ino, 0, &chunk(b'E')).unwrap();
+        e.fs.flush_inode(file.ino, false).unwrap();
+        assert!(
+            e.meta.pending_upload_claims(&same_hash, file.ino).unwrap() >= 1,
+            "position 1 still names the content the first manifest enrolled"
+        );
+        e.assert_manifest_backed(file.ino);
+        e.upload_round();
+        e.assert_manifest_in_s3(file.ino);
+    }
+
+    /// Two files share a chunk: rewriting it in one, or deleting that
+    /// file outright, leaves the other's claim alone.
+    #[test]
+    fn another_inodes_rewrite_or_delete_leaves_the_shared_chunk_enrolled() {
+        let e = env();
+        let a = e.meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let b = e.meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+        let c = e.meta.create(ROOT_INO, "c", 0o644, 0, 0).unwrap();
+        let shared = chunk(b'S');
+        let shared_hash = ChunkHash::of(&shared);
+        for ino in [a.ino, b.ino, c.ino] {
+            // A full chunk plus one byte seals position 0.
+            e.fs.do_write(ino, 0, &shared).unwrap();
+            e.fs.do_write(ino, u64::from(CHUNK), b"x").unwrap();
+        }
+        for ino in [a.ino, b.ino, c.ino] {
+            assert_eq!(e.meta.pending_upload_claims(&shared_hash, ino).unwrap(), 1);
+        }
+
+        // a rewrites the shared chunk; c is committed and then deleted.
+        e.fs.do_write(a.ino, 0, &chunk(b'T')).unwrap();
+        for ino in [a.ino, b.ino, c.ino] {
+            e.fs.flush_inode(ino, false).unwrap();
+        }
+        e.meta.unlink(ROOT_INO, "c").unwrap();
+        assert!(e.meta.pending_upload_claims(&shared_hash, b.ino).unwrap() >= 1);
+        e.assert_manifest_backed(a.ino);
+        e.assert_manifest_backed(b.ino);
+
+        e.upload_round();
+        e.assert_manifest_in_s3(a.ino);
+        e.assert_manifest_in_s3(b.ino);
     }
 }

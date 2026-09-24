@@ -1853,8 +1853,16 @@ fn cmd_mount_body(
             for (id, _) in added {
                 node.join_mount(id)?;
             }
-            drop(rt);
-            Ok(())
+            let failed = node.shutdown_error();
+            drop(node);
+            // Never wait indefinitely for a blocking task a failed drain
+            // left behind: the exit is what the caller is waiting for.
+            rt.shutdown_timeout(std::time::Duration::from_secs(10));
+            match failed {
+                // Already logged in full by `NodeRuntime::shutdown`.
+                Some(message) => bail!(message),
+                None => Ok(()),
+            }
         }
     }
 }
@@ -3509,6 +3517,27 @@ pub(crate) async fn upload_dirty_chunks_report(
                 let _ = cache.remove(&hash);
             }
             let Some(data) = cache.get(&hash)? else {
+                // Not in the cache is not the same as lost: the content
+                // may already be durable in the bucket. The common way
+                // there: a same-content writer on this node uploaded it
+                // and the chunk was demoted to clean (and then evicted)
+                // before this row's writer had enrolled it — demotion
+                // checks for pending rows, and this one did not exist
+                // yet. Content addressing makes that upload this row's
+                // too, exactly as a `Probe` HEAD hit would: acknowledge
+                // it instead of holding the writer's records back.
+                if store.chunk_durable(&hash).await? {
+                    tracing::info!(
+                        %hash,
+                        "pending chunk not in the local cache but durable in S3; acknowledged"
+                    );
+                    return Ok(Some((
+                        hash,
+                        inos,
+                        constellation_store_s3::ChunkPutMode::Create,
+                        true,
+                    )));
+                }
                 missing_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 {
                     let mut sample = missing_sample.lock().unwrap();
@@ -5631,6 +5660,120 @@ mod pending_upload_tests {
         );
         assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
         assert!(f.meta.pending_uploads().unwrap().is_empty());
+    }
+
+    /// The clean-demotion race, as a deterministic interleaving. Writer 1
+    /// and writer 2 store the same content on one node. Writer 2's
+    /// `cache_for_upload` merges into writer 1's dirty entry, but writer
+    /// 2 has not enrolled its pending row yet (that happens at its
+    /// manifest commit) when writer 1's upload round finishes: the round
+    /// sees no pending row for the hash and demotes the chunk to clean,
+    /// and cache pressure evicts it. Writer 2 then enrols. Its chunk is
+    /// gone from the cache but durable in S3 (writer 1 uploaded the very
+    /// same bytes), so its round must acknowledge it rather than report it
+    /// lost and hold writer 2's records back.
+    #[test]
+    fn a_writer_enrolled_after_demotion_and_eviction_is_acknowledged_not_held() {
+        let f = fixture();
+        let data = b"same bytes, two writers".to_vec();
+        let hash = ChunkHash::of(&data);
+        let root = constellation_fs_core::types::ROOT_INO;
+        let w1 = f.meta.create(root, "w1", 0o644, 0, 0).unwrap();
+        let w2 = f.meta.create(root, "w2", 0o644, 0, 0).unwrap();
+        // Writer 1 caches and commits.
+        f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
+        f.meta
+            .set_manifest_dirty(w1.ino, None, b"M1", data.len() as u64, &[hash])
+            .unwrap();
+        // Writer 2's cache_for_upload: a merge into the dirty entry.
+        f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
+        // Writer 1's round uploads and, seeing no pending row, demotes.
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &UploadRuntime::for_test(true),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(f.cache.state_of(&hash), Some(ChunkState::Clean));
+        // Cache pressure evicts the clean chunk; then writer 2 enrols.
+        f.cache.prune_to(0).unwrap();
+        assert!(!f.cache.contains(&hash));
+        f.meta
+            .set_manifest_dirty(w2.ino, None, b"M2", data.len() as u64, &[hash])
+            .unwrap();
+
+        let report = rt()
+            .block_on(upload_dirty_chunks_report(
+                &f.cache,
+                &f.meta,
+                &f.store,
+                CompressionSetting::RAW,
+                &UploadRuntime::for_test(true),
+                None,
+                None,
+            ))
+            .unwrap();
+        assert!(
+            report.missing.is_empty(),
+            "held although durable: {:?}",
+            report.missing
+        );
+        assert!(f.meta.pending_uploads().unwrap().is_empty());
+        assert!(f.meta.unrecoverable_chunks().unwrap().is_empty());
+        assert_eq!(rt().block_on(f.store.get_chunk(&hash)).unwrap(), data);
+    }
+
+    /// The acknowledgement above trusts S3 exactly as far as a dedup
+    /// does: a chunk bucket GC has condemned may be deleted at any moment,
+    /// so a pending row whose chunk is gone from the cache and condemned
+    /// in the bucket is still reported lost (and its records held), never
+    /// acknowledged.
+    #[test]
+    fn a_cache_missing_chunk_condemned_in_s3_is_still_reported_lost() {
+        let f = fixture();
+        let data = b"condemned and evicted".to_vec();
+        let hash = queue(&f, "condemned-evicted", &data);
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &UploadRuntime::for_test(true),
+            None,
+            None,
+        ))
+        .unwrap();
+        rt().block_on(constellation_store_s3::publish_condemned(
+            f.store.inner(),
+            vec![hash.to_hex()],
+            1,
+        ))
+        .unwrap();
+        f.cache.prune_to(0).unwrap();
+        let late = f
+            .meta
+            .create(constellation_fs_core::types::ROOT_INO, "late", 0o644, 0, 0)
+            .unwrap();
+        f.meta
+            .set_manifest_dirty(late.ino, None, b"M", data.len() as u64, &[hash])
+            .unwrap();
+        let report = rt()
+            .block_on(upload_dirty_chunks_report(
+                &f.cache,
+                &f.meta,
+                &f.store,
+                CompressionSetting::RAW,
+                &UploadRuntime::for_test(true),
+                None,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(report.missing, vec![(hash, late.ino)]);
+        assert_eq!(f.meta.pending_uploads().unwrap(), vec![(hash, late.ino)]);
     }
 }
 

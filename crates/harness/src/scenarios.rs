@@ -567,6 +567,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m4::poison_record_isolation,
     },
     Scenario {
+        name: "unmount-with-held-records",
+        desc: "a final flush that cannot finish (records held behind a lost pending chunk, then also with S3 cut) still lets the daemon exit promptly and non-zero, saying why; the journal and held rows survive for the next mount, where drop-held still recovers and the unmount is clean",
+        requires: &[],
+        run: m4::unmount_with_held_records,
+    },
+    Scenario {
         name: "publish-only-holder",
         desc: "plan 30 M4: S3 requests per node by area on an idle and a busy 3-node cluster; only the lease holder PUTs commits or reads condemned lists",
         requires: &[],
@@ -727,6 +733,12 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M13 (hybrid): with P2P off, two non-holders sustain a create/unlink storm; sustained inbox demand escalates to a lease request, every op gets its errno right, and throughput is never worse than lease ping-pong (>= 41 ops/s)",
         requires: &[],
         run: inbox_create_storm_p2p_off,
+    },
+    Scenario {
+        name: "dedup-write-storm",
+        desc: "storm-hang regression: 16 threads per round write the same bytes to different files at once (one chunk hash raced into the cache), read back and unlink, in write-through then write-back; every read matches, nothing is held, no upload reports a pending chunk missing from the cache, and the unmount exits 0",
+        requires: &[],
+        run: dedup_write_storm,
     },
     Scenario {
         name: "inbox-sporadic-write-p2p-off",
@@ -8400,6 +8412,15 @@ fn inbox_create_storm_p2p_off(seed: u64) -> Result<()> {
             }));
         }
     }
+    // A storm that stops making progress (records held back behind a
+    // lost pending chunk stall every dependent op) fails here with the
+    // held set, instead of hanging until the harness timeout.
+    join_storm_workers(
+        "inbox-create-storm-p2p-off",
+        &handles,
+        Duration::from_secs(storm_secs + 120),
+        &[&holder, &r1, &r2],
+    )?;
     let mut totals = Vec::new();
     for h in handles {
         totals.push(
@@ -8545,10 +8566,224 @@ fn inbox_create_storm_p2p_off(seed: u64) -> Result<()> {
         Ok(())
     })?;
     ensure_no_conflicts(&[&holder, &r1, &r2])?;
+    ensure_no_lost_chunks(&[&holder, &r1, &r2])?;
     let (mut holder, mut r1, mut r2) = (holder, r1, r2);
-    holder.unmount()?;
-    r1.unmount()?;
-    r2.unmount()?;
+    for c in [&mut holder, &mut r1, &mut r2] {
+        let status = c.unmount_exit(Duration::from_secs(120))?;
+        anyhow::ensure!(
+            status.success(),
+            "inbox-create-storm-p2p-off: {} exited {status} after the unmount: {}",
+            c.name,
+            c.tail_log_n(20)
+        );
+    }
+    ensure_no_lost_chunks(&[&holder, &r1, &r2])?;
+    Ok(())
+}
+
+/// The storm-hang regression, distilled: many threads on one node write
+/// the *same* bytes to different files at the same moment (a barrier per
+/// round), read them back and unlink them. Identical content is one chunk
+/// hash, so every round races several inserts of one hash into the chunk
+/// cache; the old cache published the entry before its file and a racing
+/// reader (or uploader) forgot it, stranding a pending upload ("missing
+/// from local cache", records held back, the storm wedged). Every round
+/// must read back what it wrote, nothing may be held, no upload may report
+/// a missing chunk, and the unmount must be clean.
+fn dedup_write_storm(_seed: u64) -> Result<()> {
+    const THREADS: usize = 16;
+    let (env, root) = setup("dedup-write-storm")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/dedup-write-storm-{}", ts());
+    let mut modes = Vec::new();
+    let wanted = std::env::var("CHAOS_DEDUP_STORM_MODES").unwrap_or_else(|_| "through,back".into());
+    for mode in wanted.split(',').filter(|m| !m.is_empty()) {
+        let mut c = Client::new(
+            root.path(),
+            &format!("dedup-{mode}"),
+            &env.endpoint,
+            &backend,
+        )?
+        .with_own_node_key()
+        .with_write_mode(mode)
+        .with_env("CONSTELLATION_P2P", "off");
+        // A tiny cache keeps eviction turning over the very hashes the
+        // writers race on.
+        if let Some(bytes) = std::env::var("CHAOS_DEDUP_STORM_CACHE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            c = c.with_cache_size(bytes);
+        }
+        if modes.is_empty() {
+            c.fs_create()?;
+        }
+        c.mount()?;
+        let dir = c.mnt.join(format!("dedup-{mode}"));
+        std::fs::create_dir_all(&dir)?;
+        let secs = std::env::var("CHAOS_DEDUP_STORM_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15u64);
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let errors: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let dir = dir.clone();
+                let stop = stop.clone();
+                let barrier = barrier.clone();
+                let errors = errors.clone();
+                std::thread::spawn(move || -> u64 {
+                    let mut round = 0u64;
+                    loop {
+                        // Thread 0 decides for everyone, so no thread
+                        // waits at a barrier the others have left.
+                        if t == 0 && std::time::Instant::now() >= deadline {
+                            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        barrier.wait();
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            return round;
+                        }
+                        round += 1;
+                        let content = format!("dedup round {round} ").into_bytes();
+                        let path = dir.join(format!("t{t}-{round}"));
+                        let result = std::fs::write(&path, &content)
+                            .map_err(|e| format!("write: {e}"))
+                            .and_then(|()| std::fs::read(&path).map_err(|e| format!("read: {e}")))
+                            .and_then(|got| {
+                                if got == content {
+                                    Ok(())
+                                } else {
+                                    Err(format!("read back {} bytes", got.len()))
+                                }
+                            })
+                            .and_then(|()| {
+                                std::fs::remove_file(&path).map_err(|e| format!("unlink: {e}"))
+                            });
+                        if let Err(e) = result {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("thread {t} round {round}: {e}"));
+                        }
+                        barrier.wait();
+                    }
+                })
+            })
+            .collect();
+        join_storm_workers(
+            "dedup-write-storm",
+            &handles,
+            Duration::from_secs(secs + 120),
+            &[&c],
+        )?;
+        let rounds = handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        let errs = errors.lock().unwrap().clone();
+        anyhow::ensure!(
+            errs.is_empty(),
+            "dedup-write-storm ({mode}): {} error(s) in {rounds} rounds, first: {}\n{}",
+            errs.len(),
+            errs[0],
+            c.tail_log_n(20)
+        );
+        anyhow::ensure!(
+            rounds > 10,
+            "dedup-write-storm ({mode}): only {rounds} rounds"
+        );
+        eprintln!(
+            "    dedup-write-storm: write-mode {mode}: {rounds} rounds x {THREADS} same-content writers"
+        );
+        eventually("the journal drains", Duration::from_secs(60), || {
+            journal_drained(&c)
+        })?;
+        ensure_no_lost_chunks(&[&c])?;
+        let status = c.unmount_exit(Duration::from_secs(120))?;
+        anyhow::ensure!(
+            status.success(),
+            "dedup-write-storm ({mode}): exited {status}: {}",
+            c.tail_log_n(20)
+        );
+        ensure_no_lost_chunks(&[&c])?;
+        modes.push(c);
+    }
+    Ok(())
+}
+
+/// Wait for a storm's worker threads, failing (with every node's held
+/// set and log tail) if they are not done within `within`. The workers
+/// are left blocked in their syscalls; dropping the clients kills the
+/// daemons, which releases them.
+fn join_storm_workers<T>(
+    scenario: &str,
+    handles: &[std::thread::JoinHandle<T>],
+    within: Duration,
+    nodes: &[&Client],
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + within;
+    while handles.iter().any(|h| !h.is_finished()) {
+        if std::time::Instant::now() >= deadline {
+            let mut report = String::new();
+            for c in nodes {
+                let held = c
+                    .control_status()
+                    .map(|s| s["held"].clone())
+                    .unwrap_or_default();
+                report.push_str(&format!(
+                    "\n--- {} held {held}\n{}",
+                    c.name,
+                    c.tail_log_n(30)
+                ));
+            }
+            anyhow::bail!(
+                "{scenario}: {} of {} workers still blocked {within:?} after the start{report}",
+                handles.iter().filter(|h| !h.is_finished()).count(),
+                handles.len()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// No node lost a pending chunk: nothing is held back and no upload
+/// round ever reported a pending chunk missing from the local cache
+/// (the storm-hang regression: a dedup race in the chunk cache forgot a
+/// dirty entry whose file was still on disk). Works on unmounted nodes
+/// too, from their logs alone.
+fn ensure_no_lost_chunks(nodes: &[&Client]) -> Result<()> {
+    for c in nodes {
+        let log = c.log_text();
+        let missing = log.matches("missing from local cache").count();
+        let held_logs = log
+            .lines()
+            .filter(|l| l.contains("constellation_meta::store::held"))
+            .count();
+        anyhow::ensure!(
+            missing == 0 && held_logs == 0,
+            "{}: {missing} missing-pending-chunk warning(s), {held_logs} held-record error(s): {}",
+            c.name,
+            log.lines()
+                .find(|l| l.contains("missing from local cache"))
+                .unwrap_or("")
+        );
+        if let Ok(status) = c.control_status() {
+            let held = &status["held"];
+            anyhow::ensure!(
+                held["transactions"].as_u64().unwrap_or(0) == 0
+                    && held["inodes"].as_array().is_none_or(|i| i.is_empty()),
+                "{}: records held back: {held}",
+                c.name
+            );
+        }
+    }
     Ok(())
 }
 

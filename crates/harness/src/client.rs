@@ -451,6 +451,36 @@ impl Client {
         Ok(())
     }
 
+    /// Unmount and return the daemon's exit status, which must arrive
+    /// within `within` (the daemon is SIGKILLed and this fails otherwise).
+    /// Unlike [`Self::unmount`], a daemon that exits non-zero is not an
+    /// error here: the caller asserts on the status.
+    pub fn unmount_exit(&mut self, within: Duration) -> Result<std::process::ExitStatus> {
+        let _ = Command::new("fusermount3")
+            .args(["-u"])
+            .arg(&self.mnt)
+            .status();
+        let mut child = self.child.take().context("not mounted")?;
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        child.kill().ok();
+        let _ = child.wait();
+        let _ = Command::new("fusermount3")
+            .args(["-u", "-z"])
+            .arg(&self.mnt)
+            .status();
+        bail!(
+            "{} daemon did not exit within {within:?} of the unmount: {}",
+            self.name,
+            self.tail_log()
+        )
+    }
+
     /// Crash: SIGKILL the daemon, then clean up the dead mountpoint.
     pub fn kill9(&mut self) -> Result<()> {
         let mut child = self.child.take().context("not mounted")?;
@@ -517,6 +547,11 @@ impl Client {
 
     pub fn tail_log(&self) -> String {
         self.tail_log_n(15)
+    }
+
+    /// The whole mount log (every mount of this client appends to it).
+    pub fn log_text(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
     pub fn tail_log_n(&self, n: usize) -> String {

@@ -50,7 +50,9 @@
 //!   own bookkeeping keys (`cli::mtree_publish`), and (plan 30 §M4) the
 //!   `poisoned/<hash><ino>` marks of pending uploads whose chunk is gone
 //!   from the local cache (`store::held`).
-//! - `pending_upload` — `hash(32) ++ ino(8 BE) -> ()`.
+//! - `pending_upload` — `hash(32) ++ ino(8 BE) -> claims(u32 LE)`, the
+//!   number of outstanding claims on uploading that chunk for that inode
+//!   (an empty value, as older rows have, is one claim).
 //! - `chunk_ref` / `chunk_ref_by_ino` — `hash(32) ++ ino(8 BE) -> ()`
 //!   and its by-ino mirror `ino(8 BE) ++ hash(32) -> ()`, maintained in
 //!   the same transaction as every manifest change.

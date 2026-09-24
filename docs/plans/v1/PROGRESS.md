@@ -15832,3 +15832,397 @@ needed a mechanical correction.
 
 Nothing — no non-mechanical issue was found. All required scenarios,
 sweeps, and perf checks are clean.
+
+## Fix: pending-chunk loss under the inbox storm; failed final flush wedges exit
+
+(coder, 2026-09-24; uncommitted on `fix-pending-chunk-loss` = main 4fcb6fb)
+
+### What was seen
+
+A second `inbox-create-storm-p2p-off` run on 4fcb6fb hung until the
+harness timeout. On requester r1 (lease holder from 18:51:47), at
+18:51:48, ten seconds into the storm, an upload round logged `pending
+upload chunks missing from local cache ... sample_hash=0649f706…` and
+held back the records that needed it, then repeated it about 18k times.
+Every storm op is in one directory, so everything after the held
+transaction depended on it: r1's journal stopped shipping (11,996
+records at unmount), the storm's ops stopped completing at about
+18:51:57, and the harness sat out its 600 s timeout. At the SIGTERM the
+final flush failed (`node shutdown after last mount removed failed
+error=final log flush`).
+
+The chunk file `state/cache/06/49/0649f706…` was **still on disk** in
+the evidence, with the right bytes (`worker 0 file 147 xxxxxx`, 24
+bytes). That content does not name the thread, so any of r1's 16 worker
+threads that picked length 24 for its file 147 wrote the same bytes: one
+chunk hash, several files, at nearly the same moment. So the chunk was
+not evicted or overwritten; the cache's in-memory entry for it had been
+dropped while its file stayed.
+
+### Root cause (bug A): the chunk cache published an entry before its file
+
+`DiskCache::insert` reserved the entry (accounting and state) under the
+lock, released the lock, and only then wrote `<hex>.tmp`, fsynced it
+and renamed it into place. For the milliseconds of that write:
+
+1. a second `insert` of the same hash (a second file with the same
+   content: the dedup in `cache_for_upload`/`seal_crossed_chunks`) found
+   the entry and returned `Ok` at once, so its writer went on to commit a
+   manifest and enrol a pending upload for bytes not yet on disk;
+2. that writer's read-back or upload round called `DiskCache::get`, which
+   found the entry, got `NotFound` reading the file, and **forgot the
+   entry**. The first writer's rename then landed, leaving the file on
+   disk but not in the accounting, so every later upload round saw
+   `cache.get() == None` and declared the pending chunk unrecoverable.
+   Nothing re-reads the directory until the next mount;
+3. worse, once the entry was forgotten a third `insert` of the same hash
+   created a new entry and wrote the **same** `<hex>.tmp` as the first.
+   One of the two renames then failed with `NotFound`, which rolled its
+   entry back and returned an error, which `cache_for_upload` maps to
+   `ENOSPC`. The flush failed at `close`, and `std::fs::write` ignores
+   close errors, so the manifest was never committed and the file read
+   back as **0 bytes**. This is the likely source of the zero-byte
+   read-backs below; the cache fix removes them. The new `dedup-write-storm` scenario hits this in
+   write-back mode on 4fcb6fb (5 to 7 zero-byte read-backs per 3,000
+   rounds).
+
+There was also a related race in eviction. `plan_eviction`/`prune_to`
+dropped a victim's entry under the lock but unlinked its file after
+releasing it. A dirty re-insert of the same hash in between had its
+fresh file deleted, which left a dirty entry with no bytes.
+
+None of the listed suspects was involved. The fault knob was not set.
+Nothing is evicted with the default 10 GiB budget. M7's deferral and the
+inbox or forwarding path only supply the concurrency. The dedup suspect
+was the right one, but the defect was in the cache, not in the
+dedup-hit logic.
+
+**Pre-existing.** The reserve-then-write `insert` dates from Phase 1
+(8e5b5bd). ee7243b (before the store-s3 fix) was built in a scratch
+detached worktree, since removed. The new `dedup-write-storm` fails on
+it the same way (6 zero-byte read-backs in write-back mode), and on
+4fcb6fb it fails in write-through mode with 10 missing-pending-chunk
+warnings and 10 held-record errors within 15 s. The store-s3 fix only
+exposed the bug, through the higher throughput. Six baseline
+`inbox-create-storm-p2p-off` runs on 4fcb6fb did not hit it, so the
+storm itself triggers it rarely.
+
+### Fix (bug A): `crates/fs-core/src/cache.rs`
+
+- `insert` writes the bytes to a private spill file (`.spill/<pid>-<n>`,
+  never shared between writers) and publishes it through `commit_spill`,
+  which creates the entry and renames the file into place **under one
+  lock hold**. An entry is never visible without its file, and a
+  concurrent same-hash insert returns only once the bytes are on disk.
+  `write_atomic` and its shared `<hex>.tmp` are gone. The accounting and
+  `CacheFull` behaviour are unchanged, except that the check happens at
+  the commit.
+- Victim files (in `commit_spill`, `insert` and `prune_to`) are unlinked
+  by `unlink_absent`, one short lock hold per victim, and only if the
+  hash has not been re-inserted since the eviction. `remove` forgets and
+  unlinks under one lock hold.
+- `get` treats `NotFound` as "gone" only after re-checking under the lock
+  that the entry still exists and its file does not. An entry that was
+  evicted and re-inserted meanwhile is re-read, not forgotten.
+
+Tests:
+
+- `cache::tests::concurrent_same_hash_insert_is_readable_on_return`: 8
+  threads, a barrier per round, each inserting the same hash and reading
+  it back.
+- `cache::tests::eviction_never_unlinks_a_reinserted_chunk`: a tiny
+  cache churned by clean fillers while dirty writers re-insert
+  just-evicted hashes; every entry must match a file.
+
+Both fail deterministically on the old `cache.rs` and pass on the new.
+
+Harness:
+
+- New scenario `dedup-write-storm`: 16 threads per round write
+  identical bytes to different files, read them back and unlink them,
+  for 15 s in write-through and then 15 s in write-back mode. It asserts
+  no errno, no content mismatch, 0 held records, 0 missing-chunk
+  warnings and 0 held-record errors, and an exit status of 0. Two knobs:
+  `CHAOS_DEDUP_STORM_MODES`, and `CHAOS_DEDUP_STORM_CACHE` for a small
+  `--cache-size`. It fails on 4fcb6fb and on ee7243b, and passes on the
+  fix (6 of 6 runs, including `--cache-size` 64 KiB and 4 KiB).
+- `inbox-create-storm-p2p-off` now asserts that each node has 0 held
+  records and 0 missing-chunk warnings (`ensure_no_lost_chunks`) and
+  exits 0. A watchdog (`join_storm_workers`) fails the scenario after
+  storm + 120 s, printing the held set, instead of hanging until the
+  harness timeout.
+
+### Bug B: a failed final flush and the exit
+
+In the evidence, the drain failed within 6 ms of starting, and the log
+ends 4 ms after that. The 600 s wait was the storm itself, stalled behind
+the held records, and the process most likely did exit. It exited
+**0**, though: `shutdown()`'s error was only logged (as `error=final log
+flush`, without the cause), and `mount` returned `Ok`. A reproduction
+(the new `unmount-with-held-records` scenario, run on 4fcb6fb) confirms
+exit 0 with held records. There were also two ways the exit could wedge.
+The drain had no bound: with S3 unreachable and production retry
+budgets, object_store spends up to three minutes per request, round
+after round. And `drop(rt)` waits indefinitely for blocking tasks.
+
+Behaviour now (`crates/cli/src/node_runtime.rs`, `crates/cli/src/main.rs`):
+
+- **Bounded by progress, not by the wall clock.** A watchdog samples
+  `pending_upload_count` and `journal_len` every 500 ms and gives up the
+  drain once neither has shrunk for `CONSTELLATION_SHUTDOWN_STALL_S`
+  (default 120 s). A large write-back backlog that is still draining is
+  never cut off.
+- **Exit status reflects what is left.** If the drain fails and the
+  journal or the pending uploads are not empty, `shutdown` logs one
+  ERROR, records it, and the foreground `mount` exits 1 with it. The
+  ERROR has the whole cause chain and what was left behind: backlog,
+  pending uploads, held transactions and their inodes, plus the pointer
+  to `status` / `repair drop-held`. Example:
+
+  ```
+  final flush failed: final log flush: the drain made no progress for 15s
+  (pending uploads 2, journal backlog 4; is S3 reachable?); giving up
+  (CONSTELLATION_SHUTDOWN_STALL_S); left on disk for the next mount of this
+  state dir: journal backlog 4 record(s), 2 pending chunk upload(s),
+  1 transaction(s) held back behind unrecoverable chunks of inode(s) [...]
+  ```
+
+  A failure that leaves nothing unshipped only logs a WARN and exits 0.
+  The storm shows this on about one node per run (`flush or release
+  failed` after the journal had drained, most likely the lease release
+  or re-read losing to a peer's takeover). It is not new: the same
+  `error=final log flush` WARN appears in the passing runs on 4fcb6fb.
+- Nothing on disk is touched. The journal, the pending rows, the held
+  set and the cached chunks are all there for the next mount.
+- The runtime is shut down with `shutdown_timeout(10 s)` instead of
+  `drop`, so a blocking task left behind by an abandoned drain cannot
+  hold the process.
+
+Tests:
+
+- `node_runtime::tests::a_failed_final_flush_is_reported_and_left_for_the_next_mount`:
+  the failed drain returns promptly with the message, `shutdown_error`
+  is recorded, and the row stays. A node with nothing to ship shuts down
+  clean.
+- New harness scenario `unmount-with-held-records`:
+  1. With S3 up and held records, the daemon exits 1 within about 0.1 s
+     and says why.
+  2. After a remount the records are held again. S3 is then cut with
+     object_store's production retry budget, a write-back file is left
+     behind, and the unmount exits 1 after the 15 s stall bound.
+  3. After another remount the offline file is intact. `drop-held`
+     drains, and the unmount exits 0. A fresh node then reads the
+     offline file from S3.
+
+  On 4fcb6fb, phase 1 fails ("must exit non-zero, got exit status: 0").
+
+Harness `Client` gained `unmount_exit(within)` (it returns the exit
+status and kills the daemon if it overruns) and `log_text()`.
+
+### Test results
+
+- `cargo fmt --all --check`: clean. `cargo clippy --workspace
+  --all-targets -- -D warnings`: clean.
+- `cargo test -p constellation-fs-core -p constellation -p
+  constellation-harness`: all pass (cli 199 + 1 ignored, fs-core 35,
+  harness 13). `cargo test -p constellation-authority --release`: 61 +
+  3 + 47 (6 ignored), all pass.
+- Harness runs on the fixed binary, with prefix
+  `constellation-harness-fixchunk`. Every run passed:
+  - `inbox-create-storm-p2p-off` ×5 (seeds 11 to 15): 2293 to 2412
+    ops/s. On 4fcb6fb the same host did 2270 to 2342 ops/s over six
+    runs, so throughput is unchanged. Every node had 0 missing-chunk
+    warnings and 0 held records, and every node exited 0. About one node
+    per run logs the benign "final flush failed, but nothing is left
+    unshipped" WARN.
+  - `poison-record-isolation` ×2. Its deliberate lost chunk still holds
+    the records back, and `drop-held` still recovers them.
+  - `writeback-drain`, `writeback-backpressure`, `big-file-write`,
+    `unmount-drain`, `staging-crash`, `kill9-remount`,
+    `create-storm-s3-only` and `holder-ships-under-forward-load`.
+  - `dedup-write-storm` ×7 (two of the runs with `--cache-size` 64 KiB,
+    one with 4 KiB).
+  - `unmount-with-held-records` ×3.
+
+### Found while reading the write path (fixed in round 2 below)
+
+- **Clean demotion races a same-content writer's enrolment.** The upload
+  loop does `ack_upload`, then `upload_pending_for_hash`, then
+  `set_state(Clean)`. A concurrent writer of the same content can
+  `insert(Dirty)` (a merge) before that check and enrol its pending row
+  only after it. The chunk then ends up Clean with a pending row, so it
+  can be evicted before that row's upload, which reports it missing and
+  holds the writer's records back. The bytes are in S3, uploaded by the
+  first writer. This needs cache pressure plus a narrow interleaving; it
+  did not reproduce even with `--cache-size` 4 KiB. A sound fix is a
+  per-entry "writer in flight" count held from `cache_for_upload` or
+  `seal_crossed_chunks` until the row is enrolled, plus a
+  dirty-generation check on demotion.
+- **Cancelling a rewritten sealed chunk drops a row another chunk index
+  still needs.** `do_write` and `punch_hole` call
+  `cancel_pending_upload(old_hash, ino)` when a sealed chunk is
+  rewritten. Rows are keyed `(hash, ino)` with no count. If the same
+  inode has the same full-chunk content sealed at two indices, rewriting
+  one drops the only row. The other index's manifest entry is then
+  committed with no pending upload (`compose_manifest` enrols a sealed
+  chunk only if a row exists), so the chunk may never reach S3.
+
+### Round 2: the two write-path races, fixed
+
+(The coordinator asked for both to be fixed on this branch.)
+
+**Pending-row cancel (data loss).** `pending_upload` rows were presence
+rows keyed `(hash, ino)`, and `cancel_pending_upload` deleted the row.
+One inode can need the same content for several reasons at once:
+
+- identical bytes at two chunk indices;
+- a sealed chunk of the open write session, plus an earlier committed
+  manifest whose upload is still pending.
+
+Rewriting or punching one sealed copy therefore cancelled the claim the
+other still needed. The manifest was then committed naming a chunk that
+nothing would upload. It stayed dirty in the cache, and after a remount
+(the rescan marks everything clean) it was evictable, so it could be
+lost for good.
+
+A deterministic test, run against the old semantics, fails with "ino
+1024 chunk 2 is in neither S3 nor the upload queue".
+
+Fix:
+
+- A row's value is now a **claim count**, `u32` LE. An empty value,
+  which is what older rows have, counts as one claim, so no migration is
+  needed.
+- `add_pending_upload` and `set_manifest_dirty` add one claim each, in a
+  write transaction.
+- `cancel_pending_upload` withdraws one claim and deletes the row only
+  with its last claim.
+- `ack_upload` still removes the whole row: an upload satisfies every
+  claim.
+- Rows stay keyed `(hash, ino)`, so M4's held/poison marks, M7's deferral
+  seeds, `drop-held` and the purge paths are unchanged. They only test
+  whether a row exists.
+- On the write side, `WriteState` records which sealed indices enrolled a
+  claim (`enrolled`). `seal_crossed_chunks` skips enrolment for content
+  already known durable, so a cancel for such an index would otherwise
+  withdraw somebody else's claim. `ConstellationFs::unseal` (used by
+  `do_write` and `punch_hole`) withdraws exactly the claim its seal made.
+- Over-counting is harmless: a claim that is never cancelled only causes
+  an extra upload or probe, which the next ack clears. Under-counting is
+  the data-loss direction.
+
+The cross-inode case was already sound, because rows are per inode. The
+tests below pin it down, covering both a rewrite in the other file and
+deleting the other file.
+
+Tests:
+
+- `store::misc::pending_claim_tests`: claim counting, cancel withdrawing
+  one claim, ack clearing all claims, and legacy empty rows.
+- `fusefs::pending_row_tests::rewriting_one_of_two_identical_sealed_chunks_keeps_the_other_enrolled`:
+  the coordinator's case. Identical 1 MiB chunks at positions 0 and 2,
+  position 0 rewritten, then flush and an upload round. Position 2's
+  chunk is in S3.
+- `fusefs::pending_row_tests::unsealing_does_not_cancel_an_earlier_manifests_claim`:
+  a sealed chunk of the open session plus an earlier committed manifest's
+  claim on the same content.
+- `fusefs::pending_row_tests::another_inodes_rewrite_or_delete_leaves_the_shared_chunk_enrolled`:
+  three files share a chunk; one rewrites it and one is deleted.
+
+Every test checks the invariant that each chunk a committed manifest
+names is in S3, or is pending and in the cache. After the upload round,
+it checks that every such chunk is in S3.
+
+**Clean-demotion race.** After an upload, the round acknowledges its
+rows and demotes the chunk to clean if no pending row names the hash.
+A second same-content writer on the node has already merged into the
+dirty cache entry (`cache_for_upload` / `seal_crossed_chunks`) but
+enrols its row only at its manifest commit. So the chunk can become
+clean in between, and cache pressure can evict it. The second writer's
+round then found no cached bytes, reported the chunk unrecoverable and
+held its records, although writer 1 had put those exact bytes in S3.
+
+Fix: before reporting a pending chunk that is missing from the cache,
+the round checks the bucket with `ChunkStore::chunk_durable`: not
+condemned by bucket GC, and a HEAD finds the object. If both hold, it
+acknowledges the rows, just as a `Probe` put's HEAD hit already does (a
+dedup without sending bytes).
+
+- A writer whose chunk is durable in S3 is never held.
+- A chunk GC has condemned may be deleted at any moment, so it is still
+  reported lost. This keeps the same trust boundary as `put_chunk_mode`,
+  which re-uploads condemned chunks instead of deduplicating them.
+- The check costs one condemned-list read and one HEAD, and only on the
+  already-exceptional missing path.
+- Chunks that truly were lost (never uploaded) are unaffected: the HEAD
+  404s and M4's hold applies. `poison-record-isolation` and
+  `unmount-with-held-records` still pass.
+
+I chose this over serialising demotion against enrolment, which would
+need writer pins from `compose_manifest` to the commit plus a
+dirty-generation check. This fix also covers every other way a
+durable chunk can go missing from the cache (a corrupt cache file, a
+cache wiped under a live node), and it leaves the upload loop's hot path
+alone.
+
+Tests (`crates/cli/src/main.rs`):
+
+- `a_writer_enrolled_after_demotion_and_eviction_is_acknowledged_not_held`:
+  the exact interleaving, in order: writer 2's merge, writer 1's round
+  and its clean demotion, `prune_to(0)`, writer 2's enrolment, then a
+  round. Nothing is missing, no rows remain and nothing is
+  unrecoverable. Without the fallback it fails with "held although
+  durable".
+- `a_cache_missing_chunk_condemned_in_s3_is_still_reported_lost`.
+
+Files (round 2):
+
+- `crates/meta/src/store/misc.rs`: claim counts, and the helpers
+  `pending_claims`, `encode_claims`, `add_pending_claim_tx` and
+  `pending_upload_claims`.
+- `crates/meta/src/store/writes.rs`: `set_manifest_dirty` adds claims.
+- `crates/meta/src/store/mod.rs`: the schema doc.
+- `crates/cli/src/fusefs.rs`: `enrolled`, `unseal`, and the tests.
+- `crates/cli/src/fusefs_ops.rs`: `do_write` and `punch_hole` call
+  `unseal`.
+- `crates/store-s3/src/store.rs`: `chunk_durable`.
+- `crates/cli/src/main.rs`: the fallback in `upload_dirty_chunks_report`,
+  and the tests.
+
+Round 2 checks:
+
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -D
+  warnings` are clean.
+- `cargo test` for fs-core, meta, constellation and store-s3: all pass
+  (cli 204 with 1 ignored, fs-core 35, meta 69 plus its integration
+  tests, store-s3 192 with 2 ignored).
+- Harness: see below.
+- Harness on the round-2 binary, with prefix
+  `constellation-harness-fixchunk`. Every run passed:
+  - `dedup-write-storm` ×3: default cache, `--cache-size` 64 KiB and
+    4 KiB. Both write modes had 0 missing-chunk warnings, 0 held records
+    and exited 0.
+  - `inbox-create-storm-p2p-off` ×2: 1,881 and 2,184 ops/s (see the
+    throughput check below). Every node had 0 missing-chunk warnings, 0
+    held records and exited 0.
+  - `poison-record-isolation`. Its deliberately lost, never-uploaded
+    chunk is still held and recovered.
+  - `writeback-drain`, `big-file-write`, `unmount-drain`, `staging-crash`,
+    `existence-bloom-dedup`, `gc-dedup-race`, `coop-cache-hit` and
+    `unmount-with-held-records`.
+- Throughput check. The two round-2 storm runs were lower than round 1
+  (2,293 to 2,412 ops/s). The candidate cost is `add_pending_upload`,
+  which is now a write transaction rather than a plain insert. So I
+  interleaved three more storm runs of this binary with three of 4fcb6fb
+  on the same host, while the load average was 17 to 32 (another
+  session's load):
+
+  | Seed | Fix (ops/s) | 4fcb6fb (ops/s) |
+  |---|---|---|
+  | 41 | 2,345 | 2,228 |
+  | 42 | 2,228 | 2,263 |
+  | 43 | 2,264 | 2,331 |
+
+  The means are 2,279 and 2,274, so there is no regression; the two low
+  runs were host noise. All six runs passed with 0 missing-chunk
+  warnings and 0 held records.

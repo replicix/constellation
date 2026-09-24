@@ -269,6 +269,10 @@ pub struct NodeRuntime {
     /// `CONSTELLATION_KERNEL_INVALIDATE=0`.
     kernel_inval: Option<crate::kernel_inval::KernelInvalidator>,
     shutdown_started: AtomicBool,
+    /// Why the node-wide shutdown could not ship everything, when it
+    /// could not: the process must then exit non-zero (see
+    /// [`NodeRuntime::shutdown`]).
+    shutdown_error: Mutex<Option<String>>,
 }
 
 impl NodeRuntime {
@@ -1218,6 +1222,7 @@ impl NodeRuntime {
             threads: Mutex::new(HashMap::new()),
             next_mount_id: AtomicU64::new(1),
             shutdown_started: AtomicBool::new(false),
+            shutdown_error: Mutex::new(None),
         });
 
         // Signals are node-level: unmount every currently-mounted view,
@@ -1526,9 +1531,9 @@ impl NodeRuntime {
                 mounts.is_empty()
             };
             if now_empty {
-                if let Err(e) = node.shutdown() {
-                    tracing::warn!(error = %e, "node shutdown after last mount removed failed");
-                }
+                // `shutdown` logs its own failure (and records it for the
+                // process's exit status).
+                let _ = node.shutdown();
             }
         });
         self.threads.lock().unwrap().insert(id, thread);
@@ -1609,17 +1614,75 @@ impl NodeRuntime {
     /// is really gone rather than timing out. Idempotent — called once,
     /// when the last mount is removed or on signal; later calls are a
     /// harmless no-op.
+    ///
+    /// A drain that fails (records held back behind a lost chunk, S3
+    /// unreachable, a drain that stops making progress) never blocks the
+    /// exit: the journal, the pending-upload rows and the held set all
+    /// stay in `meta.db` and the chunks in the cache, and the next mount
+    /// ships them. If anything is actually left unshipped, the error is
+    /// logged, returned, and recorded for [`Self::shutdown_error`] so the
+    /// foreground `mount` exits non-zero; a failure that left nothing
+    /// behind (typically the lease release losing a race, which costs
+    /// peers at most a TTL) is only a warning.
     pub fn shutdown(&self) -> Result<()> {
         if self.shutdown_started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let result = self.drain_for_shutdown();
+        let result = match self.drain_for_shutdown() {
+            Ok(()) => Ok(()),
+            Err(error) => match self.unshipped_summary() {
+                None => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "final flush failed, but nothing is left unshipped; exiting cleanly"
+                    );
+                    Ok(())
+                }
+                Some(left) => {
+                    let message = format!(
+                        "final flush failed: {error:#}; left on disk for the next mount \
+                         of this state dir: {left}"
+                    );
+                    tracing::error!("{message}");
+                    *self.shutdown_error.lock().unwrap() = Some(message.clone());
+                    Err(anyhow::anyhow!(message))
+                }
+            },
+        };
         // Best-effort, and unconditional even if the drain above failed:
         // a process that is exiting either way must not leave files
         // behind that make it look like a live daemon is still here.
         let _ = std::fs::remove_file(self.state_dir.join(constellation_api::SOCKET_NAME));
         let _ = std::fs::remove_file(self.state_dir.join("daemon.pid"));
         result
+    }
+
+    /// Why the node-wide shutdown left something unshipped, if it did.
+    pub fn shutdown_error(&self) -> Option<String> {
+        self.shutdown_error.lock().unwrap().clone()
+    }
+
+    /// What an exiting node leaves for its next mount, or `None` when
+    /// the journal and the pending uploads are both empty.
+    fn unshipped_summary(&self) -> Option<String> {
+        let backlog = constellation_meta::MetaStore::journal_len(&*self.meta).unwrap_or(u64::MAX);
+        let pending = self.meta.pending_upload_count().unwrap_or(u64::MAX);
+        if backlog == 0 && pending == 0 {
+            return None;
+        }
+        let held = self.meta.held_summary();
+        let mut left =
+            format!("journal backlog {backlog} record(s), {pending} pending chunk upload(s)");
+        if held.transactions > 0 {
+            left.push_str(&format!(
+                ", {} transaction(s) held back behind unrecoverable chunks of inode(s) {:?} \
+                 (`constellation status` lists them; `constellation repair drop-held <ino>` \
+                 discards them into a conflict copy)",
+                held.transactions,
+                held.inodes.keys().collect::<Vec<_>>()
+            ));
+        }
+        Some(left)
     }
 
     fn drain_for_shutdown(&self) -> Result<()> {
@@ -1640,7 +1703,7 @@ impl NodeRuntime {
             journal_backlog = backlog,
             "clean unmount drain starting"
         );
-        let flush = self.rt.block_on(async {
+        let flush = async {
             // Plan 05a step 2: an orderly unmount must not publish manifests
             // for chunks that never made it to S3. If a previous best-effort
             // eager upload (`try_upload_dirty`) failed and only logged, this
@@ -1674,11 +1737,61 @@ impl NodeRuntime {
                 .await
                 .map_err(|_| anyhow::anyhow!("sync task stopped before the final flush"))?
                 .map_err(anyhow::Error::msg)
+        };
+        // Bound the drain by progress, not by a wall clock: a large
+        // write-back backlog may legitimately take a long time, but a
+        // drain that stops shrinking the journal and the pending uploads
+        // (S3 unreachable: every PUT spends its retry budget and fails,
+        // round after round) must not keep the process alive forever.
+        let stall = shutdown_stall_limit();
+        let meta = self.meta.clone();
+        let watchdog = async move {
+            let progress = || {
+                (
+                    meta.pending_upload_count().unwrap_or(u64::MAX),
+                    constellation_meta::MetaStore::journal_len(&*meta).unwrap_or(u64::MAX),
+                )
+            };
+            let mut best = progress();
+            let mut since = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let now = progress();
+                if now.0 < best.0 || now.1 < best.1 {
+                    best = (now.0.min(best.0), now.1.min(best.1));
+                    since = Instant::now();
+                } else if since.elapsed() >= stall {
+                    return now;
+                }
+            }
+        };
+        let flush = self.rt.block_on(async {
+            tokio::select! {
+                result = flush => result,
+                (pending, backlog) = watchdog => Err(anyhow::anyhow!(
+                    "the drain made no progress for {stall:?} (pending uploads {pending}, \
+                     journal backlog {backlog}; is S3 reachable?); giving up \
+                     (CONSTELLATION_SHUTDOWN_STALL_S)"
+                )),
+            }
         });
         flush.context("final log flush")?;
         tracing::info!("clean unmount drain complete");
         Ok(())
     }
+}
+
+/// How long an unmount's drain may go without shrinking the journal or
+/// the pending uploads before the process gives up and exits (non-zero,
+/// everything left on disk for the next mount).
+fn shutdown_stall_limit() -> Duration {
+    Duration::from_secs(
+        std::env::var("CONSTELLATION_SHUTDOWN_STALL_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &u64| *v > 0)
+            .unwrap_or(120),
+    )
 }
 
 impl std::fmt::Debug for MountId {
@@ -1846,6 +1959,65 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    }
+
+    /// The storm-hang follow-up: a final flush that cannot ship what the
+    /// node holds must neither wedge nor pass for a clean exit. Here a
+    /// pending upload whose chunk is not in the cache (as with a lost
+    /// chunk) fails the drain: `shutdown` returns promptly, says what was
+    /// left behind, records it for the process's exit status, and leaves
+    /// the row for the next mount. A node with nothing to ship shuts down
+    /// cleanly and records nothing.
+    #[test]
+    fn a_failed_final_flush_is_reported_and_left_for_the_next_mount() {
+        unsafe {
+            std::env::set_var("CONSTELLATION_P2P", "off");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let backend = format!("file://{}/backend", root.path().display());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let store = ChunkStore::new(
+                rt.block_on(crate::backend::open_backend(&backend))
+                    .expect("open backend"),
+            );
+            let meta = FsMeta::new(1024 * 1024, "raw");
+            rt.block_on(store.create_fs(&meta)).expect("create_fs");
+        }
+
+        let clean = start_node(rt.handle(), &backend, root.path().join("state-clean"));
+        clean.shutdown().expect("nothing to ship: a clean shutdown");
+        assert_eq!(clean.shutdown_error(), None);
+
+        let node = start_node(rt.handle(), &backend, root.path().join("state-lost"));
+        let lost = constellation_fs_core::ChunkHash::of(b"never reached the cache");
+        node.meta.add_pending_upload(&lost, 42).unwrap();
+        let started = Instant::now();
+        let error = node
+            .shutdown()
+            .expect_err("the drain cannot upload the lost chunk");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "a failed drain must not wedge the shutdown"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("final flush failed") && message.contains("1 pending chunk upload"),
+            "{message}"
+        );
+        assert_eq!(node.shutdown_error(), Some(message));
+        assert_eq!(
+            node.meta.pending_upload_count().unwrap(),
+            1,
+            "the pending row stays for the next mount"
+        );
+        // Idempotent: a second call neither drains again nor clears it.
+        node.shutdown().unwrap();
+        assert!(node.shutdown_error().is_some());
     }
 
     /// Regression for the daemon-sharing refactor (plan 21): two views of

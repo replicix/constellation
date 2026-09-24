@@ -350,13 +350,31 @@ impl DiskCache {
             st.entries.get_mut(hash).unwrap().atime = clock;
         }
         let path = self.path_for(hash);
-        let data = match fs::read(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.forget(hash);
-                return Ok(None);
+        let data = loop {
+            match fs::read(&path) {
+                Ok(d) => break d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // An entry's file appears and disappears only under the
+                    // state lock (see `commit_spill`, `unlink_absent`), so
+                    // re-check there: the entry this read saw may have been
+                    // evicted and re-inserted meanwhile, and forgetting the
+                    // new entry would orphan its file — a pending chunk the
+                    // uploader then reports as lost.
+                    let st = self.state.lock().unwrap();
+                    if !st.entries.contains_key(hash) {
+                        return Ok(None);
+                    }
+                    if path.exists() {
+                        continue;
+                    }
+                    drop(st);
+                    // Present in the accounting but gone from disk:
+                    // something outside the cache removed it.
+                    self.forget(hash);
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         };
         if &self.hash(&data) != hash {
             // Corrupt local copy: drop it, let the caller refetch.
@@ -431,15 +449,24 @@ impl DiskCache {
             victims
         };
 
-        for (victim, _) in &victims {
-            let _ = fs::remove_file(self.path_for(victim));
-        }
+        self.unlink_absent(&victims);
         Ok(())
     }
 
-    /// Insert a chunk with reserve-before-accept: evicts clean LRU entries
-    /// to make room, fails with `CacheFull` (never partial state) if
-    /// non-evictable content leaves no room.
+    /// Insert a chunk: evicts clean LRU entries to make room, fails with
+    /// `CacheFull` (never partial state) if non-evictable content leaves
+    /// no room.
+    ///
+    /// The bytes go to a private spill file first and are published by
+    /// [`Self::commit_spill`], which creates the entry and renames the file
+    /// into place under one lock hold. An entry is therefore never visible
+    /// before its file: a concurrent insert of the same hash (two files
+    /// with the same content, which the write path dedups) returns only
+    /// once the bytes are on disk, and a concurrent `get` can never see
+    /// the entry without its file and forget it. Reserving the entry first
+    /// and writing afterwards allowed exactly that, and a forgotten dirty
+    /// entry is a pending upload whose chunk is "missing from the local
+    /// cache" although its file is right there.
     pub fn insert(
         &self,
         hash: &ChunkHash,
@@ -447,8 +474,7 @@ impl DiskCache {
         state: ChunkState,
     ) -> Result<(), CoreError> {
         debug_assert_eq!(&self.hash(data), hash);
-        let size = data.len() as u64;
-        let victims = {
+        {
             let mut st = self.state.lock().unwrap();
             if let Some((old, now)) = st.entries.get_mut(hash).map(|e| {
                 let old = e.state;
@@ -458,46 +484,10 @@ impl DiskCache {
                 st.note(*hash, Some(old), Some(now));
                 return Ok(());
             }
-            let victims = plan_eviction(&mut st, size, self.budget)?;
-            for (vh, _) in &victims {
-                st.note(*vh, Some(ChunkState::Clean), None);
-            }
-            // Reserve: account now, before any disk write.
-            st.used += size;
-            st.clock += 1;
-            let atime = st.clock;
-            st.entries.insert(*hash, Entry { size, state, atime });
-            st.note(*hash, None, Some(state));
-            victims
-        };
-        for (vh, _) in &victims {
-            let _ = fs::remove_file(self.path_for(vh));
         }
-        let path = self.path_for(hash);
-        if let Err(e) = self.write_atomic(&path, data) {
-            // Roll back the reservation: no partial state.
-            let mut st = self.state.lock().unwrap();
-            if let Some(entry) = st.entries.remove(hash) {
-                st.used -= entry.size;
-                st.note(*hash, Some(entry.state), None);
-            }
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    fn write_atomic(&self, path: &Path, data: &[u8]) -> Result<(), CoreError> {
-        let dir = path.parent().unwrap();
-        fs::create_dir_all(dir)?;
-        let tmp = path.with_extension("tmp");
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(data)?;
-        f.sync_data()?;
-        if let Err(e) = fs::rename(&tmp, path) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e.into());
-        }
-        Ok(())
+        let mut spill = self.begin_spill()?;
+        spill.write_all(data)?;
+        self.commit_spill(hash, spill, state)
     }
 
     /// Change a chunk's state (e.g. dirty -> clean after upload).
@@ -516,11 +506,31 @@ impl DiskCache {
 
     /// Remove a chunk from cache and disk.
     pub fn remove(&self, hash: &ChunkHash) -> Result<(), CoreError> {
-        self.forget(hash);
+        let mut st = self.state.lock().unwrap();
+        if let Some(e) = st.entries.remove(hash) {
+            st.used -= e.size;
+            st.note(*hash, Some(e.state), None);
+        }
         match fs::remove_file(self.path_for(hash)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete evicted victims' files, each only if its hash has not been
+    /// re-inserted since the eviction dropped its entry. Files appear only
+    /// by a rename under the state lock, so checking and unlinking under
+    /// it cannot delete a re-inserted chunk's fresh file (an unconditional
+    /// unlink after the lock was released could, leaving a dirty entry
+    /// without its bytes). One short lock hold per victim keeps a large
+    /// prune from stalling readers.
+    fn unlink_absent(&self, victims: &[(ChunkHash, u64)]) {
+        for (victim, _) in victims {
+            let st = self.state.lock().unwrap();
+            if !st.entries.contains_key(victim) {
+                let _ = fs::remove_file(self.path_for(victim));
+            }
         }
     }
 
@@ -579,9 +589,7 @@ impl DiskCache {
             };
             (victims, report)
         };
-        for (vh, _) in &victims {
-            let _ = fs::remove_file(self.path_for(vh));
-        }
+        self.unlink_absent(&victims);
         Ok(report)
     }
 
@@ -1009,5 +1017,125 @@ mod tests {
             c.take_digest_events().events,
             vec![DigestChange::Remove(h), DigestChange::Add(h)]
         );
+    }
+
+    /// The storm-hang regression (inbox-create-storm-p2p-off): two files
+    /// with the same content insert the same hash concurrently. The
+    /// second insert used to return as soon as the first had *reserved*
+    /// the entry, before its file existed, so the second writer's read
+    /// (or the uploader's) found no file and forgot the entry — leaving a
+    /// pending upload whose chunk was "missing from the local cache"
+    /// while the file sat on disk. After an insert returns, the chunk must
+    /// be readable and must stay in the accounting.
+    #[test]
+    fn concurrent_same_hash_insert_is_readable_on_return() {
+        let dir = TempDir::new().unwrap();
+        let c = std::sync::Arc::new(DiskCache::open(dir.path(), 1 << 30).unwrap());
+        let threads = 8;
+        let rounds = 400u32;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let c = c.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    for round in 0..rounds {
+                        let data = format!("worker 0 file {round} xxxxxx").into_bytes();
+                        let hash = ChunkHash::of(&data);
+                        barrier.wait();
+                        c.insert(&hash, &data, ChunkState::Dirty).unwrap();
+                        assert_eq!(
+                            c.get(&hash).unwrap().as_deref(),
+                            Some(&data[..]),
+                            "round {round}: a just-inserted chunk must be readable"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        for round in 0..rounds {
+            let data = format!("worker 0 file {round} xxxxxx").into_bytes();
+            let hash = ChunkHash::of(&data);
+            assert_eq!(c.state_of(&hash), Some(ChunkState::Dirty), "round {round}");
+        }
+        assert_eq!(c.dirty_chunks().len(), rounds as usize);
+    }
+
+    /// Eviction drops the victim's entry under the lock but used to unlink
+    /// its file after releasing it; a dirty re-insert of the same hash in
+    /// between had its fresh file deleted. Churn a tiny cache with clean
+    /// fillers while other threads re-insert recently evicted hashes as
+    /// dirty: every dirty chunk must stay readable.
+    #[test]
+    fn eviction_never_unlinks_a_reinserted_chunk() {
+        let dir = TempDir::new().unwrap();
+        // Room for ~16 chunks of 64 bytes.
+        let c = std::sync::Arc::new(DiskCache::open(dir.path(), 16 * 64).unwrap());
+        let shared = |i: u32| {
+            let mut d = format!("shared {i} ").into_bytes();
+            d.resize(64, b'x');
+            d
+        };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churners: Vec<_> = (0..4u32)
+            .map(|t| {
+                let c = c.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut i = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        // Clean copies of the shared set plus fillers keep
+                        // the LRU turning over the very hashes the dirty
+                        // writers insert.
+                        let d = shared(i % 64);
+                        let _ = c.insert(&ChunkHash::of(&d), &d, ChunkState::Clean);
+                        let mut f = format!("filler {t} {i} ").into_bytes();
+                        f.resize(64, b'y');
+                        let _ = c.insert(&ChunkHash::of(&f), &f, ChunkState::Clean);
+                        i = i.wrapping_add(1);
+                    }
+                })
+            })
+            .collect();
+        let writers: Vec<_> = (0..2u32)
+            .map(|w| {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    for n in 0..300u32 {
+                        let d = shared((n * 2 + w) % 64);
+                        let h = ChunkHash::of(&d);
+                        if c.insert(&h, &d, ChunkState::Dirty).is_err() {
+                            continue; // full of dirty chunks: fine
+                        }
+                        assert_eq!(
+                            c.get(&h).unwrap().as_deref(),
+                            Some(&d[..]),
+                            "a dirty chunk lost its file"
+                        );
+                        // "Uploaded": make it evictable again.
+                        c.set_state(&h, ChunkState::Clean);
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in churners {
+            t.join().unwrap();
+        }
+        // Accounting matches the disk.
+        for (hash, size, _) in c.entries() {
+            let on_disk = fs::metadata(c.path_for(&hash)).map(|m| m.len());
+            assert_eq!(
+                on_disk.ok(),
+                Some(size),
+                "{hash:?} accounted but not on disk"
+            );
+        }
     }
 }

@@ -96,6 +96,33 @@ pub(crate) fn cr_key(hash: &ChunkHash, ino: Ino) -> Vec<u8> {
     k
 }
 
+/// A `pending_upload` row's claim count. Rows written before counts
+/// existed carry an empty value and hold one claim.
+pub(crate) fn pending_claims(value: &[u8]) -> u32 {
+    value
+        .get(..4)
+        .map_or(1, |b| u32::from_le_bytes(b.try_into().unwrap()).max(1))
+}
+
+pub(crate) fn encode_claims(n: u32) -> Vec<u8> {
+    n.to_le_bytes().to_vec()
+}
+
+/// Add one claim to `(hash, ino)`'s pending row inside `tx`.
+pub(crate) fn add_pending_claim_tx(
+    tx: &mut SingleWriterWriteTx,
+    pending_upload: &SingleWriterTxKeyspace,
+    hash: &ChunkHash,
+    ino: Ino,
+) -> Result<(), MetaError> {
+    let key = cr_key(hash, ino);
+    let n = tx
+        .get(pending_upload, &key)?
+        .map_or(0, |v| pending_claims(&v));
+    tx.insert(pending_upload, key, encode_claims(n.saturating_add(1)));
+    Ok(())
+}
+
 pub(crate) fn cri_key(ino: Ino, hash: &ChunkHash) -> Vec<u8> {
     let mut k = ino.to_be_bytes().to_vec();
     k.extend_from_slice(&hash.0);
@@ -197,9 +224,30 @@ impl Meta {
         Ok(out)
     }
 
+    /// Enrol one claim on uploading `hash` for `ino`.
+    ///
+    /// A row is a *count* of claims (see [`pending_claims`]): one inode can
+    /// need the same content for several reasons at once — two chunk
+    /// indices with identical bytes, a sealed chunk of the open write
+    /// session plus an earlier, still unshipped manifest — and
+    /// [`Self::cancel_pending_upload`] must withdraw only the claim it
+    /// made. With a plain presence row, rewriting one of two identical
+    /// sealed chunks cancelled the row the other still needed, and its
+    /// manifest was committed naming a chunk nothing would ever upload.
+    /// An upload satisfies every claim at once ([`Self::ack_upload`]
+    /// removes the row).
     pub fn add_pending_upload(&self, hash: &ChunkHash, ino: Ino) -> Result<(), MetaError> {
-        self.pending_upload.insert(cr_key(hash, ino), Vec::new())?;
+        let mut tx = self.db.write_tx();
+        add_pending_claim_tx(&mut tx, &self.pending_upload, hash, ino)?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// How many claims `(hash, ino)`'s pending row holds (0: no row).
+    pub fn pending_upload_claims(&self, hash: &ChunkHash, ino: Ino) -> Result<u32, MetaError> {
+        let r = self.db.read_tx();
+        Ok(r.get(&self.pending_upload, cr_key(hash, ino))?
+            .map_or(0, |v| pending_claims(&v)))
     }
 
     pub fn pending_upload_count(&self) -> Result<u64, MetaError> {
@@ -222,8 +270,23 @@ impl Meta {
         Ok(())
     }
 
+    /// Withdraw one claim enrolled by [`Self::add_pending_upload`] (a
+    /// sealed chunk the writer has since overwritten or punched). The row
+    /// goes only with its last claim; other claims on the same content
+    /// keep it, so the chunk still uploads.
     pub fn cancel_pending_upload(&self, hash: &ChunkHash, ino: Ino) -> Result<(), MetaError> {
-        self.ack_upload(hash, ino)
+        let mut tx = self.db.write_tx();
+        let key = cr_key(hash, ino);
+        match tx
+            .get(&self.pending_upload, &key)?
+            .map(|v| pending_claims(&v))
+        {
+            None => return Ok(()),
+            Some(n) if n <= 1 => tx.remove(&self.pending_upload, key),
+            Some(n) => tx.insert(&self.pending_upload, key, encode_claims(n - 1)),
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn clear_pending_uploads(&self) -> Result<(), MetaError> {
@@ -539,5 +602,66 @@ impl Meta {
     pub fn reintegration_conflict_count(&self) -> Result<u64, MetaError> {
         let r = self.db.read_tx();
         crate::store::journal::conflict_count(&r, &self.reintegration)
+    }
+}
+
+#[cfg(test)]
+mod pending_claim_tests {
+    use crate::store::Meta;
+    use crate::MetaStore;
+    use constellation_fs_core::ChunkHash;
+
+    /// One inode needing the same content twice (identical bytes at two
+    /// chunk indices, or a sealed chunk plus an earlier manifest) holds
+    /// two claims; cancelling one leaves the row, so the chunk still
+    /// uploads. An upload satisfies every claim at once.
+    #[test]
+    fn a_row_counts_claims_and_cancel_withdraws_only_one() {
+        let meta = Meta::open_in_memory().unwrap();
+        let h = ChunkHash::of(b"same bytes at two indices");
+        meta.add_pending_upload(&h, 7).unwrap();
+        meta.add_pending_upload(&h, 7).unwrap();
+        assert_eq!(meta.pending_upload_claims(&h, 7).unwrap(), 2);
+        meta.cancel_pending_upload(&h, 7).unwrap();
+        assert_eq!(meta.pending_uploads().unwrap(), vec![(h, 7)]);
+        assert!(meta.upload_pending_for_hash(&h).unwrap());
+        meta.cancel_pending_upload(&h, 7).unwrap();
+        assert!(meta.pending_uploads().unwrap().is_empty());
+        // Cancelling what is not there is a no-op.
+        meta.cancel_pending_upload(&h, 7).unwrap();
+
+        // The manifest commit's claims count too, and other inodes' rows
+        // are separate.
+        meta.add_pending_upload(&h, 7).unwrap();
+        let file = meta
+            .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
+            .unwrap();
+        meta.set_manifest_dirty(file.ino, None, b"M", 1, &[h])
+            .unwrap();
+        meta.add_pending_upload(&h, file.ino).unwrap();
+        assert_eq!(meta.pending_upload_claims(&h, file.ino).unwrap(), 2);
+        meta.cancel_pending_upload(&h, file.ino).unwrap();
+        assert_eq!(meta.pending_upload_claims(&h, file.ino).unwrap(), 1);
+        assert_eq!(meta.pending_upload_claims(&h, 7).unwrap(), 1);
+        meta.ack_upload(&h, file.ino).unwrap();
+        assert_eq!(meta.pending_upload_claims(&h, file.ino).unwrap(), 0);
+        assert_eq!(meta.pending_uploads().unwrap(), vec![(h, 7)]);
+    }
+
+    /// Rows written before claims were counted have an empty value: one
+    /// claim.
+    #[test]
+    fn a_legacy_empty_row_is_one_claim() {
+        let meta = Meta::open_in_memory().unwrap();
+        let h = ChunkHash::of(b"legacy");
+        meta.pending_upload
+            .insert(super::cr_key(&h, 3), Vec::new())
+            .unwrap();
+        assert_eq!(meta.pending_upload_claims(&h, 3).unwrap(), 1);
+        meta.add_pending_upload(&h, 3).unwrap();
+        assert_eq!(meta.pending_upload_claims(&h, 3).unwrap(), 2);
+        meta.cancel_pending_upload(&h, 3).unwrap();
+        meta.cancel_pending_upload(&h, 3).unwrap();
+        assert!(meta.pending_uploads().unwrap().is_empty());
     }
 }

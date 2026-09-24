@@ -498,9 +498,7 @@ impl Meta {
             size,
         )?;
         for hash in dirty_hashes {
-            let mut k = hash.0.to_vec();
-            k.extend_from_slice(&ino.to_be_bytes());
-            tx.insert(&self.pending_upload, k, Vec::new());
+            crate::store::misc::add_pending_claim_tx(&mut tx, &self.pending_upload, hash, ino)?;
         }
         crate::store::adjust_usage_tx(&mut tx, &self.local, delta, 0)?;
         self.finish_local(&mut tx, local)?;

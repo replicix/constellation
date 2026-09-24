@@ -1404,16 +1404,11 @@ impl ConstellationFs {
             let full_len = layout.chunk_len(new_file_len, slice.index);
             let is_whole_chunk = slice.offset == 0 && slice.len == full_len;
             let chunk_start = slice.index * self.chunk_size as u64;
-            let sealed = ws.sealed.remove(&slice.index);
+            let sealed = self.unseal(ws, ino, slice.index)?;
             ws.holes.clear(slice.index);
             ws.staging
                 .prepare_chunk(slice.index, self.chunk_size)
                 .map_err(|e| staging_errno(&e))?;
-            if let Some(old_hash) = sealed {
-                self.meta
-                    .cancel_pending_upload(&old_hash, ino)
-                    .map_err(|error| errno(&error))?;
-            }
             // A partial (not-whole-chunk) write into a chunk this open
             // handle has not touched yet must first seed the untouched
             // bytes from the committed content — otherwise they would
@@ -1539,11 +1534,7 @@ impl ConstellationFs {
                     .filter(|index| *index >= full_start && *index < full_end)
                     .collect();
                 for index in sealed {
-                    if let Some(hash) = ws.sealed.remove(&index) {
-                        self.meta
-                            .cancel_pending_upload(&hash, ino)
-                            .map_err(|error| errno(&error))?;
-                    }
+                    self.unseal(ws, ino, index)?;
                 }
                 ws.staging
                     .punch_chunks(full_start, full_end, self.chunk_size);

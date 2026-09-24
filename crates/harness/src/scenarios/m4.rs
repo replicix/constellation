@@ -563,3 +563,157 @@ pub(super) fn poison_record_isolation(seed: u64) -> Result<()> {
     b.unmount()?;
     Ok(())
 }
+
+/// A final flush that cannot finish must not wedge the daemon's exit.
+///
+/// Records held back behind a lost pending chunk (the same fault
+/// `poison-record-isolation` injects) can never ship, so an unmount's
+/// final flush fails. The daemon must still exit — promptly, non-zero,
+/// saying why — and leave its journal and held rows on disk for the next
+/// mount, where `repair drop-held` still recovers. With S3 unreachable at
+/// unmount (the storm-hang evidence: the harness had already torn its
+/// proxy down) and production-sized S3 retry budgets, the drain is
+/// bounded by `CONSTELLATION_SHUTDOWN_STALL_S`, and what it could not
+/// upload is still there after the remount.
+pub(super) fn unmount_with_held_records(seed: u64) -> Result<()> {
+    fn held_ino(c: &Client) -> Result<u64> {
+        let held = c.control_status()?["held"].clone();
+        let inodes = held["inodes"].as_array().cloned().unwrap_or_default();
+        anyhow::ensure!(inodes.len() == 1, "no held inode yet: {held}");
+        inodes[0]["ino"].as_u64().context("held inode has no ino")
+    }
+    let (env, root) = setup("unmount-with-held-records")?;
+    let proxy = env.s3_proxy()?;
+    let prefix = format!("unmount-held-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let lost = super::pattern(seed, 64 * 1024);
+    let lost_hex = blake3::hash(&lost).to_hex().to_string();
+    let node = |stall_s: &str| -> Result<Client> {
+        Ok(Client::new(root.path(), "held-a", &env.endpoint, &backend)?
+            .with_own_node_key()
+            .with_write_mode("back")
+            .with_env("CONSTELLATION_P2P", "off")
+            .with_env("CONSTELLATION_FAULT_LOSE_CHUNKS", &lost_hex)
+            .with_env("CONSTELLATION_SHUTDOWN_STALL_S", stall_s))
+    };
+    let mut a = node("120")?;
+    a.fs_create()?;
+    a.mount()?;
+    std::fs::write(a.mnt.join("broken"), &lost)?;
+    std::fs::write(a.mnt.join("after"), b"written after the broken file")?;
+    eventually("A reports the held set", Duration::from_secs(60), || {
+        held_ino(&a).map(|_| ())
+    })?;
+
+    // 1. S3 up: the final flush fails on the held records; exit anyway,
+    //    at once, non-zero, saying why.
+    let started = std::time::Instant::now();
+    let status = a.unmount_exit(Duration::from_secs(60))?;
+    let log = a.log_text();
+    anyhow::ensure!(
+        !status.success(),
+        "a daemon whose final flush failed must exit non-zero, got {status}"
+    );
+    anyhow::ensure!(
+        log.contains("final flush failed") && log.contains("held back"),
+        "the exit must say why (final flush failed, held records): {}",
+        a.tail_log_n(20)
+    );
+    eprintln!(
+        "    unmount-with-held-records: S3 up: exited {status} after {:?}: {}",
+        started.elapsed(),
+        log.lines()
+            .find(|l| l.contains("final flush failed"))
+            .unwrap_or("")
+    );
+
+    // 2. The journal and held rows survived: the next mount holds them
+    //    again. Cut S3 with the production S3 retry budget (object_store's
+    //    default ten retries within three minutes, instead of the
+    //    harness's fail-fast two) and leave an upload behind: the drain
+    //    stalls, and the stall bound ends it.
+    let mut a = node("15")?
+        .with_env("CONSTELLATION_S3_MAX_RETRIES", "10")
+        .with_env("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "180000");
+    a.mount()?;
+    eventually(
+        "the remount holds the records again",
+        Duration::from_secs(60),
+        || held_ino(&a).map(|_| ()),
+    )?;
+    proxy.cut()?;
+    let offline = super::pattern(seed + 1, 200 * 1024);
+    std::fs::write(a.mnt.join("offline"), &offline)?;
+    let started = std::time::Instant::now();
+    let status = a.unmount_exit(Duration::from_secs(120));
+    proxy.heal()?;
+    let status = status?;
+    let log = a.log_text();
+    anyhow::ensure!(
+        !status.success(),
+        "a daemon whose drain stalled (S3 down) must exit non-zero, got {status}"
+    );
+    anyhow::ensure!(
+        log.contains("final flush failed"),
+        "the exit must say why: {}",
+        a.tail_log_n(20)
+    );
+    eprintln!(
+        "    unmount-with-held-records: S3 down: exited {status} after {:?}: {}",
+        started.elapsed(),
+        log.lines()
+            .find(|l| l.contains("final flush failed"))
+            .unwrap_or("")
+    );
+
+    // 3. Recovery still works: the offline write is still there, drop
+    //    the held inode, drain, clean exit.
+    let mut a = node("120")?;
+    a.mount()?;
+    let ino = {
+        let mut found = 0;
+        eventually(
+            "the second remount holds the records again",
+            Duration::from_secs(60),
+            || {
+                found = held_ino(&a)?;
+                Ok(())
+            },
+        )?;
+        found
+    };
+    anyhow::ensure!(
+        std::fs::read(a.mnt.join("offline"))? == offline,
+        "the write made while S3 was down survived the stalled unmount"
+    );
+    let reply = a.control(&serde_json::json!({ "cmd": "drop_held", "ino": ino }))?;
+    anyhow::ensure!(reply["resp"] == "ok", "drop-held failed: {reply}");
+    eventually("A's journal drains", Duration::from_secs(60), || {
+        journal_drained(&a)
+    })?;
+    anyhow::ensure!(
+        std::fs::read(a.mnt.join("after"))? == b"written after the broken file",
+        "the unrelated file survived"
+    );
+    let status = a.unmount_exit(Duration::from_secs(60))?;
+    anyhow::ensure!(
+        status.success(),
+        "a clean unmount must exit 0, got {status}: {}",
+        a.tail_log_n(20)
+    );
+    // A fresh node sees the offline write: it really reached S3.
+    let mut d = Client::new(root.path(), "held-d", &env.endpoint, &backend)?
+        .with_own_node_key()
+        .with_env("CONSTELLATION_P2P", "off");
+    d.mount()?;
+    let seen = eventually(
+        "a fresh node reads the offline write",
+        Duration::from_secs(60),
+        || {
+            anyhow::ensure!(std::fs::read(d.mnt.join("offline"))? == offline);
+            Ok(())
+        },
+    );
+    d.unmount()?;
+    seen
+}

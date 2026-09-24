@@ -444,6 +444,23 @@ impl ChunkStore {
         }
     }
 
+    /// Whether `hash` is durable in the bucket and may stand in for an
+    /// upload: its object exists and bucket GC has not condemned it (a
+    /// condemned chunk may be deleted at any moment, which is why
+    /// [`Self::put_chunk_mode`] re-uploads rather than dedups one). The
+    /// same test a `Probe` put's HEAD applies before acknowledging an
+    /// upload without sending the bytes.
+    pub async fn chunk_durable(&self, hash: &ChunkHash) -> Result<bool, StoreError> {
+        if crate::gc::is_condemned(&self.store, hash).await? {
+            return Ok(false);
+        }
+        match self.store.head(&layout::chunk_key(hash)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Fetch and verify a chunk by content address.
     pub async fn get_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, StoreError> {
         Ok(self.get_chunk_timed(hash).await?.0)
