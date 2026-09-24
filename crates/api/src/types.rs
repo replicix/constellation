@@ -417,6 +417,10 @@ pub struct StatusReport {
     /// pending chunks (everything else keeps shipping).
     #[serde(default)]
     pub held: HeldStatus,
+    /// Plan 30 §M6: the session wait on local reads (read-your-writes,
+    /// monotonic reads) and its latency distribution.
+    #[serde(default)]
+    pub session: SessionStatus,
     /// Cooperative cache (phase 5, DESIGN.md §7).
     #[serde(default)]
     pub coop: CoopStatus,
@@ -958,6 +962,44 @@ pub struct PeerPathsStatus {
     /// Round-trip estimate of each open path, `kind:ms`, selected first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rtts: Vec<String>,
+}
+
+/// Plan 30 §M6: the session wait FUSE reads go through
+/// (`constellation_meta::session`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionStatus {
+    /// `CONSTELLATION_SESSION_WAIT_MS` (0: disabled).
+    #[serde(default)]
+    pub budget_ms: u64,
+    /// Reads checked, and how each ended: at once on the applied
+    /// position, at once on covering speculation, after a wait, or
+    /// degraded after the whole budget.
+    #[serde(default)]
+    pub reads: u64,
+    #[serde(default)]
+    pub fast: u64,
+    #[serde(default)]
+    pub covered: u64,
+    #[serde(default)]
+    pub waited: u64,
+    #[serde(default)]
+    pub timeouts: u64,
+    /// Timeouts while M4 held-back rows existed (a held row stalls the
+    /// shipped-through position).
+    #[serde(default)]
+    pub degraded_held: u64,
+    /// Reads that waited for a queued replay of this node's own write.
+    #[serde(default)]
+    pub replay_blocked: u64,
+    /// Waits by log2 milliseconds: `[0]` < 1 ms, `[i]` < 2^i ms.
+    #[serde(default)]
+    pub waits_ms: Vec<u64>,
+    #[serde(default)]
+    pub wait_ms_total: u64,
+    /// Times the `observed` watermark rose (replies whose effects were
+    /// not installed here).
+    #[serde(default)]
+    pub raised: u64,
 }
 
 /// Plan 30 §M4: records held back behind unrecoverable pending chunks.

@@ -8,6 +8,7 @@ pub mod record;
 pub mod reintegrate;
 pub mod replay;
 pub mod rid;
+pub mod session;
 pub mod store;
 
 pub use error::MetaError;
@@ -17,6 +18,7 @@ pub use record::{CloneNode, LogRecord};
 pub use reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 pub use replay::TouchSet;
 pub use rid::Rid;
+pub use session::{JournalPos, KeySet, Position, ReadKey, SessionStats, SessionWait};
 pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};
 pub use store::spec::{

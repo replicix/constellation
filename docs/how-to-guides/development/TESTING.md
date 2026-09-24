@@ -892,6 +892,28 @@ relay of its own so requests can be attributed per role):
   returns at once; the arriving `Unlink(f2)` then removes the renamed
   entry and the rename record finds no `f1`, so B has no `f2` at all
   (the convergence check fails first, the early-return check second).
+- **Plan 30 M6 session scenarios** (`session-*`; each prints the node's
+  `status.session` block: reads checked, fast / covered / waited /
+  timed out, replay-blocked, `observed` raises and the log2-ms wait
+  histogram — the read-latency measurement):
+  - `session-exists-observed`: A holds with its sync held and journals
+    `g` then `f`; B's create of `f` is refused; B's `stat g` (and
+    `stat f`) wait for A's position and succeed once the hold lifts
+    0.5 s later (before M6 `stat g` answered `ENOENT` at once);
+  - `session-forwarded-ryw`: `touch a; ls; stat .; stat a; cat a` on a
+    non-holder right after each forwarded create, with A's shipping held
+    and then running: `waited` must stay 0 (installed shadows raise
+    nothing);
+  - `session-stale-base-rename`: runs `stale-base-rename-divergence`;
+  - `session-ryw-after-holder-kill`: C's forwarded create is acked by A
+    (S3 cut), A is killed, B takes over; C stats its own file every 20 ms
+    through the stranding and the replay and must never miss it;
+  - `session-wait-degrades`: with `CONSTELLATION_SESSION_WAIT_MS=1500`
+    and A's shipping held after a refusal, B's lookups answer after the
+    budget (no `EIO`), one warning, `timeouts` counted, fast again once A
+    ships;
+  - `session-idle-latency`: after a 3-node write burst an idle read
+    phase never waits; a single node never waits.
 - **`sticky-lease-handoff-over-s3`** runs with `CONSTELLATION_INBOX=off`
   since M5 phase 2: it tests the S3-only cooperative handoff, and with
   M13's inbox on a lone blocked write is answered through the holder's
@@ -1075,7 +1097,7 @@ bug.
 ```bash
 cargo test -p constellation-authority                 # 1,000 CI seeds + regressions, ~15 s release / ~50 s debug
 AUTHORITY_SIM_SEED=152 cargo test -p constellation-authority --test sim replay_seed -- --nocapture --exact
-AUTHORITY_SIM_SEED=200 AUTHORITY_SIM_CONFIG=bugb ...  # buga | bugb | s3:<rule index> | single | long | inbox
+AUTHORITY_SIM_SEED=200 AUTHORITY_SIM_CONFIG=bugb ...  # buga | bugb | s3:<rule index> | single | long | inbox | sessions | sessions-inbox | plain
 RUST_LOG=constellation_authority=debug,sim=debug ...  # narrate a replay
 cargo test -p constellation-authority --test sim -- --ignored long_random   # AUTHORITY_SIM_SEEDS, AUTHORITY_SIM_START
 ```
@@ -1092,6 +1114,15 @@ through the log, sustained demand escalating to a lease request —
 long configuration against the production core in phase 2) are the
 simulation's counterparts of the model crate's `today_finds_bug_*`
 tests; see PROGRESS.md's "Plan 30 M5" sections for what each covers.
+
+Plan 30 M6: clients also read (the CI shards with probability 0.3 after
+each op, `session_guarantees_hold` with 0.7, P2P and inbox), through the
+session wait (`Meta::session_ready`, polled — the runtime is
+single-threaded), and every run checks per-node read-your-writes and
+monotonic reads against the log's version order (`tests/sim/session.rs`;
+violations on names a tentative op touched are counted, not failed).
+`session_wait_off_is_found` is the non-vacuity seed: with the wait off
+the checker must find a violation.
 
 The checker design, settled in phase 2: the exact log-witnessed
 linearizability check runs on every seed; Stateright's

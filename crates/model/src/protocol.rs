@@ -10,6 +10,7 @@
 use crate::namespace::{
     eval, force_apply, present, with_presence, DirState, Errno, NamespaceSpec, NsOp, NsRet, Record,
 };
+use crate::positions::{Obs, Pos, Step};
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
 use stateright::{Model, Property};
 
@@ -132,6 +133,12 @@ pub enum Phase {
         epoch: Epoch,
         n: crate::inbox::BatchNo,
     },
+    /// Plan 30 §M6 (`Positions` only): accepted under `epoch` by a holder
+    /// whose reply's base this replica had not applied, so its record was
+    /// not installed ahead of the log; the client is answered when the
+    /// rid's completion arrives through the log, or the op is retried by
+    /// rid if a higher-epoch segment arrives first (M5's `AwaitingLog`).
+    AwaitingLog { epoch: Epoch },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -180,6 +187,10 @@ pub struct ShadowEntry {
     pub rid: Rid,
     pub epoch: Epoch,
     pub rec: Record,
+    /// Plan 30 §M6 (`Positions` only, `Pos::ZERO` otherwise): the reply's
+    /// position. A read of the shadow's name skips the session wait only
+    /// while this is at least the node's `observed` watermark.
+    pub pos: Pos,
 }
 
 /// `Recovery` only: a stranded op queued for replay by rid
@@ -202,6 +213,12 @@ pub struct ReplayEntry {
     /// message id, so an uncapped retry loop only grows the state space
     /// without reaching a new kind of state.
     pub attempts: u8,
+    /// Plan 30 §M6 (`Positions` only): the replay was accepted under this
+    /// epoch on a base this replica had not applied, so nothing was
+    /// installed; the entry stays queued (blocking reads of its name, and
+    /// further replays) until the log carries the rid, or a segment from a
+    /// higher epoch proves the accepting tenure over.
+    pub awaiting: Option<Epoch>,
 }
 
 /// Replay requests one stranded op may send before the model stops
@@ -221,6 +238,16 @@ pub enum MsgBody {
         to: NodeId,
         corr: MsgId,
         outcome: Outcome,
+        /// Plan 30 §M6: the answering holder's state after evaluating the
+        /// op (`positions::Obs`) — the reply's position under `Positions`,
+        /// and the session properties' record of what the client observed.
+        /// `Obs::ZERO` for `NotHolder`, and in every configuration that
+        /// neither runs `Positions` nor issues reads.
+        at: Obs,
+        /// Plan 30 §M6 (`Positions` only): the slot the requester must have
+        /// applied to install an `Accepted` record ahead of the log, or
+        /// `None` when only the log can deliver it in order (M5's `base`).
+        base: Option<Seq>,
     },
     HandoffReq {
         from: NodeId,
@@ -269,8 +296,8 @@ pub struct Node {
     pub replays: Vec<ReplayEntry>,
     pub client_op: Option<ClientOp>,
     /// Ops this node's (single, serialized) FUSE-calling client will
-    /// still issue, oldest first.
-    pub pending_ops: Vec<NsOp>,
+    /// still issue, oldest first: mutations, and (plan 30 §M6) reads.
+    pub pending_ops: Vec<Step>,
     /// This incarnation's persisted counter (`local` keyspace), bumped on
     /// `Restart` before the node serves again (plan 30 §M2).
     pub incarnation: Incarnation,
@@ -294,6 +321,15 @@ pub struct Node {
     /// [`Node::refusals`]/[`Node::cursor`], written through
     /// [`Node::inbox_mut`] and normalized back to `None` afterwards.
     pub inbox: Option<Box<NodeInbox>>,
+    /// Plan 30 §M6 (`Positions` only, `Pos::ZERO` otherwise): the highest
+    /// reply position this node's client ops returned from. Volatile, like
+    /// the session it belongs to: reset on `Restart`.
+    pub observed: Pos,
+    /// Ghost state for the session properties (only maintained when the
+    /// workload issues reads): the newest holder state this node's client
+    /// observed through a reply (`positions::prop_monotonic_reads`). Not
+    /// read by any transition.
+    pub seen: [Obs; crate::namespace::N_NAMES as usize],
 }
 
 /// See [`Node::inbox`].
@@ -378,6 +414,9 @@ pub struct State {
     /// [`State::inbox`], written through [`State::inbox_mut`] and
     /// normalized afterwards.
     pub inbox: Option<Box<Vec<crate::inbox::InboxBatch>>>,
+    /// Ghost: which session properties a read has violated
+    /// (`positions::RYW_VIOLATED`/`positions::MR_VIOLATED`). Sticky.
+    pub session_violations: u8,
 }
 
 impl State {
@@ -435,6 +474,10 @@ pub enum Action {
     /// takeover re-submits the same rid under the new epoch (or resolves
     /// it against its own applied log first).
     ResubmitInbox(NodeId),
+    /// Plan 30 §M6: the node's client reads (a lookup of one name, or a
+    /// readdir of all) from its local replica. Offered under `Positions`
+    /// only once the session wait allows it (`positions::read_allowed`).
+    Read(NodeId),
 }
 
 /// Selects the modeled protocol variant. `Today` (M1) and `ExactlyOnce`
@@ -507,20 +550,55 @@ pub enum Action {
 ///     the new holder already re-executed is answered, not re-run.
 ///
 ///   The continuation-epoch path (`adopt_epoch_hold`) is not modeled.
-/// - `Positions`/`Backup`/`FlexEpochs`/`Delegation` (M6/M9/M10/M11) each
-///   extend `State`/`Action` further; none are added speculatively here.
+/// - `Positions` (M6), layered on `Recovery` (every `Recovery` rule
+///   above holds unchanged; see `crate::positions` for the full rules):
+///   - every `MutateRep` carries the answering holder's position
+///     (`positions::Obs`: its epoch, applied slot and journal length
+///     after evaluating the op), from which the requester derives the
+///     reply's `positions::Pos`, and a `base` (the holder's applied
+///     slot, or none when its unshipped journal had already touched the
+///     op's name);
+///   - a requester installs an `Accepted` reply as a shadow only when it
+///     has applied the base; otherwise the op waits for its rid to arrive
+///     through the log (`Phase::AwaitingLog`, M5's `AwaitingLog`), and a
+///     replayed op the same way (`ReplayEntry::awaiting`);
+///   - each node keeps an `observed` watermark (`Node::observed`), the
+///     maximum position of the replies its client ops returned from;
+///   - a read (`Action::Read`) of a name waits until the applied
+///     position reaches `observed`, unless a shadow on that name is at
+///     least as new as `observed`, and never runs while a queued replay
+///     touches the name (the client's own acknowledged write is missing
+///     from the replica until the replay lands).
+///
+///   `AuthorityModel::session_wait` and `AuthorityModel::
+///   stale_base_shadows` are non-vacuity knobs that switch the wait and
+///   the base rule off.
+/// - `Backup`/`FlexEpochs`/`Delegation` (M9/M10/M11) each extend
+///   `State`/`Action` further; none are added speculatively here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Protocol {
     Today,
     ExactlyOnce,
     Recovery,
+    Positions,
 }
 
 impl Protocol {
-    /// Rid-keyed dedup (plan 30 §M2): `ExactlyOnce`, and `Recovery` on
-    /// top of it.
+    /// Rid-keyed dedup (plan 30 §M2): `ExactlyOnce`, and every variant
+    /// layered on top of it.
     fn dedups(self) -> bool {
-        matches!(self, Protocol::ExactlyOnce | Protocol::Recovery)
+        matches!(
+            self,
+            Protocol::ExactlyOnce | Protocol::Recovery | Protocol::Positions
+        )
+    }
+
+    /// The speculation log and stranded-op recovery (plan 30 §M3a/§M3b):
+    /// `Recovery`, and `Positions` (M6) on top of it. Every rule the docs
+    /// above attribute to `Recovery` is gated on this, not on the variant
+    /// itself.
+    pub fn recovers(self) -> bool {
+        matches!(self, Protocol::Recovery | Protocol::Positions)
     }
 }
 
@@ -544,7 +622,7 @@ pub struct AuthorityModel {
     pub max_forward_retries: u8,
     pub initial_holder: Option<NodeId>,
     pub initial_expiry: Tick,
-    pub workload: Vec<(NodeId, NsOp)>,
+    pub workload: Vec<(NodeId, Step)>,
     /// `within_boundary`'s message-id backstop (see its doc comment).
     /// Defaults to 200, generous enough for `Today`/`ExactlyOnce`'s
     /// smaller action set. `Recovery` adds a whole extra dimension
@@ -581,6 +659,19 @@ pub struct AuthorityModel {
     /// (epoch 0, slot 1, no rids) every node has applied. Lets a config
     /// start with something to unlink or refuse to create.
     pub genesis: Vec<NsOp>,
+    /// Plan 30 §M6, `Positions` only, a non-vacuity knob (default `true`):
+    /// reads wait for the session guarantees. `false` lets every read run
+    /// at once, which the tests show violates them.
+    pub session_wait: bool,
+    /// Plan 30 §M6, `Positions` only, a non-vacuity knob (default
+    /// `false`): install an `Accepted` reply as a shadow even when the
+    /// requester has not applied its base (M3a's behaviour, M5's
+    /// `speculate_on_stale_base`).
+    pub stale_base_shadows: bool,
+    /// Set by `with_lookup`/`with_readdir`: the workload reads, so the
+    /// session ghost state (`Node::seen`, `MutateRep::at`) is maintained.
+    /// Configurations without reads keep their state spaces unchanged.
+    pub tracks_sessions: bool,
 }
 
 impl AuthorityModel {
@@ -605,6 +696,9 @@ impl AuthorityModel {
             inbox_drain_dedup: true,
             inbox_record_refusals: true,
             genesis: Vec::new(),
+            session_wait: true,
+            stale_base_shadows: false,
+            tracks_sessions: false,
         }
     }
 
@@ -660,8 +754,39 @@ impl AuthorityModel {
     }
 
     pub fn with_op(mut self, node: NodeId, op: NsOp) -> Self {
-        self.workload.push((node, op));
+        self.workload.push((node, Step::Mutate(op)));
         self
+    }
+
+    /// Plan 30 §M6: `node`'s client looks `name` up (after its earlier
+    /// workload steps).
+    pub fn with_lookup(mut self, node: NodeId, name: crate::namespace::Name) -> Self {
+        self.workload.push((node, Step::Lookup(name)));
+        self.tracks_sessions = true;
+        self
+    }
+
+    /// Plan 30 §M6: `node`'s client lists the directory.
+    pub fn with_readdir(mut self, node: NodeId) -> Self {
+        self.workload.push((node, Step::Readdir));
+        self.tracks_sessions = true;
+        self
+    }
+
+    pub fn with_session_wait(mut self, b: bool) -> Self {
+        self.session_wait = b;
+        self
+    }
+
+    pub fn with_stale_base_shadows(mut self, b: bool) -> Self {
+        self.stale_base_shadows = b;
+        self
+    }
+
+    /// Whether replies carry `at`/`base` (`Positions`, or a workload that
+    /// reads and so needs the session ghost).
+    pub(crate) fn records_positions(&self) -> bool {
+        self.protocol == Protocol::Positions || self.tracks_sessions
     }
 
     pub fn with_max_next_id(mut self, n: MsgId) -> Self {
@@ -709,13 +834,29 @@ impl AuthorityModel {
     /// (the reply lost a race with the requester's own tail), since the
     /// effect is then already part of the log prefix and re-applying it
     /// on top of later records would move the replica backwards.
-    fn install_shadow(&self, s: &mut State, id: NodeId, rid: Rid, epoch: Epoch, rec: Record) {
-        if self.protocol == Protocol::Recovery && rid_in_applied_log(s, id, rid) {
+    fn install_shadow(
+        &self,
+        s: &mut State,
+        id: NodeId,
+        rid: Rid,
+        epoch: Epoch,
+        rec: Record,
+        pos: Pos,
+    ) {
+        if self.protocol.recovers() && rid_in_applied_log(s, id, rid) {
             return;
         }
-        s.nodes[id as usize]
-            .shadows
-            .push(ShadowEntry { rid, epoch, rec });
+        let pos = if self.protocol == Protocol::Positions {
+            pos
+        } else {
+            Pos::ZERO
+        };
+        s.nodes[id as usize].shadows.push(ShadowEntry {
+            rid,
+            epoch,
+            rec,
+            pos,
+        });
     }
 
     /// Execute a stranded op locally, by rid, as the holder
@@ -767,7 +908,7 @@ impl AuthorityModel {
         rec: Record,
         epoch: Epoch,
     ) {
-        let entry = if self.protocol == Protocol::Recovery {
+        let entry = if self.protocol.recovers() {
             let view = node_replica(s, id);
             JournalEntry {
                 rid: Some(rid),
@@ -795,8 +936,7 @@ impl AuthorityModel {
     /// replay by rid instead. A stale `held_epoch` (deposition not yet
     /// noticed) only ever errs towards replaying, which dedup makes safe.
     fn reply_superseded(&self, s: &State, id: NodeId, epoch: Epoch) -> bool {
-        self.protocol == Protocol::Recovery
-            && s.nodes[id as usize].held_epoch.is_some_and(|h| h > epoch)
+        self.protocol.recovers() && s.nodes[id as usize].held_epoch.is_some_and(|h| h > epoch)
     }
 }
 
@@ -824,7 +964,10 @@ fn has_unshipped(node: &Node) -> bool {
 /// arm, folded into the same pass since nothing here ever needs the two
 /// separately).
 #[allow(clippy::type_complexity)]
-fn log_fold(log: &[Option<Segment>], upto: Seq) -> (DirState, Epoch, Vec<(Rid, Record, Epoch)>) {
+pub(crate) fn log_fold(
+    log: &[Option<Segment>],
+    upto: Seq,
+) -> (DirState, Epoch, Vec<(Rid, Record, Epoch)>) {
     let mut dir: DirState = 0;
     let mut max_epoch: Epoch = 0;
     let mut completions = Vec::new();
@@ -884,7 +1027,7 @@ pub(crate) fn rid_completed_record(
         .find(|(r, _, _)| *r == rid)
         .map(|(_, rec, epoch)| (rec, epoch))
         .or_else(|| {
-            if protocol != Protocol::Recovery {
+            if !protocol.recovers() {
                 return None;
             }
             node.journal
@@ -924,7 +1067,7 @@ pub(crate) fn rid_in_applied_log(state: &State, id: NodeId, rid: Rid) -> bool {
 /// takeover-time replay look like a double execution.
 pub(crate) fn authority(state: &State, id: NodeId, protocol: Protocol) -> Option<Epoch> {
     let held = state.nodes[id as usize].held_epoch?;
-    if protocol != Protocol::Recovery {
+    if !protocol.recovers() {
         return Some(held);
     }
     let lease = &state.lease;
@@ -1046,6 +1189,7 @@ fn strand_local(s: &mut State, id: NodeId, below: Epoch) {
                 deposed: true,
                 inflight: None,
                 attempts: 0,
+                awaiting: None,
             });
             if rid.node == id {
                 tentative.push(rid);
@@ -1131,8 +1275,11 @@ fn tail_one(s: &mut State, id: NodeId, protocol: Protocol) {
     // Plan 30 §M13: a pending inbox op learns its outcome (or its
     // stranding) from the segment just applied.
     crate::inbox::on_tailed(s, id, &seg);
+    // Plan 30 §M6: an op or replay waiting for its rid learns it landed
+    // (or that its accepting tenure is over).
+    crate::positions::on_tailed(s, id, &seg);
     let node = &mut s.nodes[id as usize];
-    if protocol == Protocol::Recovery {
+    if protocol.recovers() {
         node.shadows
             .retain(|sh| !seg.records.iter().any(|(rid, _)| *rid == Some(sh.rid)));
         let (stranded, kept): (Vec<ShadowEntry>, Vec<ShadowEntry>) =
@@ -1145,6 +1292,7 @@ fn tail_one(s: &mut State, id: NodeId, protocol: Protocol) {
                 deposed: false,
                 inflight: None,
                 attempts: 0,
+                awaiting: None,
             });
         }
         if node.held_epoch.is_some_and(|h| h < seg.epoch) {
@@ -1305,6 +1453,8 @@ impl Model for AuthorityModel {
                 next_seq: 0,
                 recent: Vec::new(),
                 inbox: None,
+                observed: Pos::ZERO,
+                seen: [Obs::ZERO; crate::namespace::N_NAMES as usize],
             });
         }
         for (n, op) in &self.workload {
@@ -1352,6 +1502,7 @@ impl Model for AuthorityModel {
             next_id: 0,
             crashes_used: 0,
             inbox: None,
+            session_violations: 0,
         }]
     }
 
@@ -1371,8 +1522,14 @@ impl Model for AuthorityModel {
                 actions.push(Action::Resume(id));
                 continue;
             }
-            if node.client_op.is_none() && !node.pending_ops.is_empty() {
-                actions.push(Action::ClientInvoke(id));
+            if node.client_op.is_none() {
+                match node.pending_ops.first() {
+                    Some(Step::Mutate(_)) => actions.push(Action::ClientInvoke(id)),
+                    Some(step) if crate::positions::read_allowed(self, state, id, step.names()) => {
+                        actions.push(Action::Read(id))
+                    }
+                    _ => {}
+                }
             }
             if let Some(cop) = &node.client_op {
                 match &cop.phase {
@@ -1386,7 +1543,7 @@ impl Model for AuthorityModel {
                                 // capacity, it is not offered once the
                                 // log is full (`ship_epoch_marker`).
                                 let marker_fits = !needs_tail
-                                    || self.protocol != Protocol::Recovery
+                                    || !self.protocol.recovers()
                                     || log_head(&state.log) < self.max_seq;
                                 if (!needs_tail || node.applied_seq == log_head(&state.log))
                                     && marker_fits
@@ -1437,6 +1594,8 @@ impl Model for AuthorityModel {
                         }
                     }
                     Phase::WaitingHandoff { .. } => {}
+                    // Plan 30 §M6: waiting on the log (`positions::on_tailed`).
+                    Phase::AwaitingLog { .. } => {}
                     // Plan 30 §M13: waiting on the log. The only way out
                     // other than tailing the outcome is the lease path,
                     // once the holder it submitted to is gone (released
@@ -1471,7 +1630,11 @@ impl Model for AuthorityModel {
             if let Some(head) = node.replays.first() {
                 let target_exists = authority(state, id, self.protocol).is_some()
                     || state.lease.holder.is_some_and(|h| h != id);
-                if head.inflight.is_none() && head.attempts < MAX_REPLAY_ATTEMPTS && target_exists {
+                if head.inflight.is_none()
+                    && head.awaiting.is_none()
+                    && head.attempts < MAX_REPLAY_ATTEMPTS
+                    && target_exists
+                {
                     actions.push(Action::ReplayStranded(id));
                 }
             }
@@ -1500,8 +1663,8 @@ impl Model for AuthorityModel {
             // journal is non-empty, substituting before-images for the
             // unshipped entries (`log_prefix_view`, see `Publish`). The
             // shadow deferral stays.
-            let speculating = self.protocol == Protocol::Recovery && !node.shadows.is_empty();
-            let journal_gate = self.protocol != Protocol::Recovery && has_unshipped(node);
+            let speculating = self.protocol.recovers() && !node.shadows.is_empty();
+            let journal_gate = !self.protocol.recovers() && has_unshipped(node);
             if !journal_gate && !speculating {
                 actions.push(Action::Publish(id));
             }
@@ -1541,7 +1704,9 @@ impl Model for AuthorityModel {
                 s.tick += 1;
             }
             Action::ClientInvoke(id) => {
-                let op = s.nodes[id as usize].pending_ops.remove(0);
+                let Step::Mutate(op) = s.nodes[id as usize].pending_ops.remove(0) else {
+                    return None;
+                };
                 // Rid allocated at the top, unconditionally, and kept
                 // across every retry this op goes through (plan 30 §M2:
                 // "every `MutateOp` a FUSE call issues gets its rid at
@@ -1637,7 +1802,7 @@ impl Model for AuthorityModel {
                 // anything else; `Today`/`ExactlyOnce` keep M1/M2's order
                 // (dedup first), which only matters for a node that is no
                 // longer holder but still remembers the rid.
-                let cached = if dedup && (held.is_some() || self.protocol != Protocol::Recovery) {
+                let cached = if dedup && (held.is_some() || !self.protocol.recovers()) {
                     rid_completed_record(&s, to, rid, self.protocol)
                 } else {
                     None
@@ -1657,6 +1822,17 @@ impl Model for AuthorityModel {
                 } else {
                     None
                 };
+                // Plan 30 §M6: whether the unshipped journal had already
+                // touched the op's name before this evaluation (the reply's
+                // `base` is then unknown: only the log can order them), and
+                // whether this is a fresh execution (a dedup answer's
+                // records are already somewhere in the log or journal, so
+                // its base is unknown too).
+                let touched_before = s.nodes[to as usize]
+                    .journal
+                    .iter()
+                    .any(|e| e.rec.name() == op.name());
+                let fresh = cached.is_none() && refused.is_none() && held.is_some();
                 let outcome = if let Some((rec, epoch)) = cached {
                     Outcome::Accepted(rec, epoch)
                 } else if let Some(e) = refused {
@@ -1681,6 +1857,11 @@ impl Model for AuthorityModel {
                 } else {
                     Outcome::NotHolder
                 };
+                let (at, base) = if self.records_positions() {
+                    crate::positions::reply_position(&s, to, outcome, fresh && !touched_before)
+                } else {
+                    (Obs::ZERO, None)
+                };
                 let rep_id = s.next_id;
                 s.next_id += 1;
                 s.network.push(Envelope {
@@ -1689,16 +1870,28 @@ impl Model for AuthorityModel {
                         to: from,
                         corr,
                         outcome,
+                        at,
+                        base,
                     },
                 });
             }
             Action::DeliverForwardReply(mid) => {
                 let idx = s.network.iter().position(|e| e.id == mid)?;
                 let env = s.network.remove(idx);
-                let (to, corr, outcome) = match env.body {
-                    MsgBody::MutateRep { to, corr, outcome } => (to, corr, outcome),
+                let (to, corr, outcome, at, base) = match env.body {
+                    MsgBody::MutateRep {
+                        to,
+                        corr,
+                        outcome,
+                        at,
+                        base,
+                    } => (to, corr, outcome, at, base),
                     _ => return None,
                 };
+                // Plan 30 §M6: whether an `Accepted` record may be installed
+                // ahead of the log here (`Positions`; the other variants
+                // always install).
+                let base_ok = crate::positions::base_ok(self, &s, to, base);
                 let mut completed = None;
                 if let Some(cop) = s.nodes[to as usize].client_op.clone() {
                     if let Phase::WaitingReply { corr: waiting, .. } = cop.phase {
@@ -1721,12 +1914,29 @@ impl Model for AuthorityModel {
                                                 deposed: false,
                                                 inflight: None,
                                                 attempts: 0,
+                                                awaiting: None,
                                             });
                                         }
+                                        completed = Some(NsRet::Ok);
+                                    } else if !base_ok && !rid_in_applied_log(&s, to, cop.rid) {
+                                        // Plan 30 §M6: evaluated on a base
+                                        // this replica has not applied —
+                                        // the log delivers the record in
+                                        // order, and the client is
+                                        // answered then.
+                                        s.nodes[to as usize].client_op.as_mut().unwrap().phase =
+                                            Phase::AwaitingLog { epoch };
                                     } else {
-                                        self.install_shadow(&mut s, to, cop.rid, epoch, rec);
+                                        self.install_shadow(
+                                            &mut s,
+                                            to,
+                                            cop.rid,
+                                            epoch,
+                                            rec,
+                                            at.pos(),
+                                        );
+                                        completed = Some(NsRet::Ok);
                                     }
-                                    completed = Some(NsRet::Ok);
                                 }
                                 Outcome::Errno(e) => completed = Some(NsRet::Err(e)),
                                 Outcome::NotHolder => {
@@ -1743,8 +1953,21 @@ impl Model for AuthorityModel {
                         .as_ref()
                         .expect("completed only with a client op")
                         .rid;
+                    let name = s.nodes[to as usize]
+                        .client_op
+                        .as_ref()
+                        .expect("completed only with a client op")
+                        .op
+                        .name();
                     s.history.push(HistEvt::Return(to, ret, rid));
                     s.nodes[to as usize].client_op = None;
+                    // Plan 30 §M6: the client has now observed the
+                    // holder's state at `at` for the op's name; an
+                    // accepted op's effect is installed here (a shadow, the
+                    // applied log, or a replay that blocks reads of the
+                    // name), so only a refusal raises `observed`.
+                    let installed = matches!(outcome, Outcome::Accepted(..));
+                    crate::positions::observe_reply(self, &mut s, to, at, name, installed);
                 }
                 // Plan 30 §M3a: or the reply to a replay-by-rid request.
                 // Client forwards and replays each mint their own `corr`,
@@ -1769,11 +1992,19 @@ impl Model for AuthorityModel {
                                 } else {
                                     s.nodes[to as usize].replays[i].inflight = None;
                                 }
+                            } else if !base_ok && !rid_in_applied_log(&s, to, entry.rid) {
+                                // Plan 30 §M6: accepted on a base this
+                                // replica has not applied. Nothing is
+                                // installed; the entry waits for the log
+                                // (`positions::on_tailed`).
+                                let e = &mut s.nodes[to as usize].replays[i];
+                                e.inflight = None;
+                                e.awaiting = Some(epoch);
                             } else {
                                 // Replayed: a fresh shadow under the new
                                 // holder's epoch, retiring like any other.
                                 s.nodes[to as usize].replays.remove(i);
-                                self.install_shadow(&mut s, to, entry.rid, epoch, rec);
+                                self.install_shadow(&mut s, to, entry.rid, epoch, rec, at.pos());
                             }
                         }
                         Outcome::Errno(_) => {
@@ -1912,7 +2143,7 @@ impl Model for AuthorityModel {
                     // `diagnose_lost_renew` -> `mark_lost`: deposition is
                     // terminal, the journal is stranded.
                     s.nodes[id as usize].held_epoch = None;
-                    if self.protocol == Protocol::Recovery {
+                    if self.protocol.recovers() {
                         // Plan 30 §M3b (`recovery::recover_deposed`):
                         // every Local entry belongs to the lost tenure, so
                         // all of them roll back and queue for replay by
@@ -1963,7 +2194,7 @@ impl Model for AuthorityModel {
                     released: false,
                 };
                 s.nodes[id as usize].held_epoch = Some(new_epoch);
-                if self.protocol == Protocol::Recovery {
+                if self.protocol.recovers() {
                     // Plan 30 §M3a takeover gate
                     // (`shipper::acquire_lease_for` → `LeaseKeeper::
                     // commit_gated`): after tailing to head and winning
@@ -2015,6 +2246,7 @@ impl Model for AuthorityModel {
                             deposed: false,
                             inflight: None,
                             attempts: 0,
+                            awaiting: None,
                         });
                     }
                     // Plan 30 §M3b: this node's own Local entries from an
@@ -2089,6 +2321,10 @@ impl Model for AuthorityModel {
             Action::ResubmitInbox(id) => {
                 crate::inbox::resubmit(self, &mut s, id)?;
             }
+            Action::Read(id) => {
+                let step = s.nodes[id as usize].pending_ops.remove(0);
+                crate::positions::read(self, &mut s, id, step);
+            }
             Action::ReplayStranded(id) => {
                 // Plan 30 §M3a recovery step 3: "replay the stranded ops,
                 // by rid and in original order, to the current sequencer
@@ -2135,7 +2371,7 @@ impl Model for AuthorityModel {
                 // earliest before-image (`log_prefix_view`), claimed at
                 // `applied_seq`. `raw_holder_publish` (a test-only knob)
                 // publishes the raw replica instead, journal included.
-                let dir = if self.protocol == Protocol::Recovery && !self.raw_holder_publish {
+                let dir = if self.protocol.recovers() && !self.raw_holder_publish {
                     log_prefix_view(&s, id)
                 } else {
                     node_replica(&s, id)
@@ -2164,6 +2400,11 @@ impl Model for AuthorityModel {
                 s.nodes[id as usize].incarnation += 1;
                 s.nodes[id as usize].next_seq = 0;
                 s.nodes[id as usize].recent.clear();
+                // Plan 30 §M6: the watermark is in-memory core state, and
+                // the client session it served died with the process; the
+                // restarted node's client is a new session.
+                s.nodes[id as usize].observed = Pos::ZERO;
+                s.nodes[id as usize].seen = [Obs::ZERO; crate::namespace::N_NAMES as usize];
                 // The replay queue is durable (`pending_replay`); a
                 // request that was in flight is simply re-sent later.
                 for entry in &mut s.nodes[id as usize].replays {
@@ -2184,7 +2425,7 @@ impl Model for AuthorityModel {
     }
 
     fn properties(&self) -> Vec<Property<Self>> {
-        vec![
+        let mut props = vec![
             Property::always("linearizable", prop_linearizable),
             Property::always("converged_at_quiescence", prop_converged_at_quiescence),
             Property::always("commits_are_log_prefixes", prop_commits_are_log_prefixes),
@@ -2193,7 +2434,24 @@ impl Model for AuthorityModel {
                 crate::inbox::prop_no_rid_executes_twice,
             ),
             Property::sometimes("progress", prop_progress),
-        ]
+        ];
+        // Plan 30 §M6: only for a workload that reads. Registering them
+        // everywhere would be harmless for correctness (they cannot fail
+        // without a read) but would stop every counterexample search from
+        // ending early: the checker stops once *every* property has a
+        // discovery, and `today_finds_bug_b` went from 106K states to its
+        // 60M cap when these two were always registered.
+        if self.tracks_sessions {
+            props.push(Property::always(
+                "read_your_writes",
+                crate::positions::prop_read_your_writes,
+            ));
+            props.push(Property::always(
+                "monotonic_reads",
+                crate::positions::prop_monotonic_reads,
+            ));
+        }
+        props
     }
 
     /// A defensive backstop, not a load-bearing part of the model: every
@@ -2299,7 +2557,7 @@ fn prop_converged_at_quiescence(m: &AuthorityModel, s: &State) -> bool {
     if !no_client_op_in_flight(s) || !every_durable_slot_applied_everywhere(s) {
         return true;
     }
-    if m.protocol == Protocol::Recovery && failover_pending(s) {
+    if m.protocol.recovers() && failover_pending(s) {
         return true;
     }
     let head = log_head(&s.log);
@@ -2321,7 +2579,12 @@ fn prop_commits_are_log_prefixes(_m: &AuthorityModel, s: &State) -> bool {
 }
 
 fn prop_progress(m: &AuthorityModel, s: &State) -> bool {
-    let total_ops = m.workload.len();
+    // Reads record no history events (see `crate::positions`).
+    let total_ops = m
+        .workload
+        .iter()
+        .filter(|(_, step)| matches!(step, Step::Mutate(_)))
+        .count();
     let completed = s
         .history
         .iter()

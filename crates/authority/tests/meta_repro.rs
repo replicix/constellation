@@ -108,7 +108,7 @@ fn fresh(prefix: u64) -> Meta {
 
 fn apply(meta: &Meta, segments: &[Segment], seq: u64) {
     let (_, _, _, records) = &segments[seq as usize - 1];
-    Replica::apply_segment(meta, seq, 1, records).unwrap();
+    Replica::apply_segment(meta, seq, 1, 0, records).unwrap();
 }
 
 fn listing_at(segments: &[Segment], seq: u64) -> Vec<String> {

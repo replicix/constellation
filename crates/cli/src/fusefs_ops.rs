@@ -81,6 +81,7 @@ impl Filesystem for ConstellationFs {
                 return;
             }
         }
+        self.session_wait(&[ReadKey::Dentry(parent, name.to_string())]);
         match self.meta.lookup(parent, &name) {
             Ok(Some(mut attr)) => {
                 // Same overlay and the same ordering argument as
@@ -124,6 +125,10 @@ impl Filesystem for ConstellationFs {
         // FUSE dispatch that interleaving is routine: the harness's
         // single-client `baseline` read sizes of 0 back for just-closed
         // files about half the time.
+        //
+        // Plan 30 §M6: the session wait comes first — never block while
+        // holding a write shard.
+        self.session_wait(&[ReadKey::Ino(ino)]);
         let writes = self.writes.lock(ino);
         let attr = self
             .meta
@@ -233,6 +238,7 @@ impl Filesystem for ConstellationFs {
             }
             return;
         }
+        self.session_wait(&[ReadKey::Ino(ino)]);
         match self.meta.readlink(ino) {
             Ok(Some(target)) => reply.data(target.as_bytes()),
             Ok(None) => reply.error(Errno::from_i32(libc::EINVAL)),
@@ -674,6 +680,7 @@ impl Filesystem for ConstellationFs {
             }
             return;
         }
+        self.session_wait(&[ReadKey::Ino(ino)]);
         let attr = self
             .meta
             .getattr(ino)
@@ -867,6 +874,10 @@ impl Filesystem for ConstellationFs {
             reply.ok();
             return;
         }
+        // Plan 30 §M6: once per listing (its first chunk).
+        if offset == 0 {
+            self.session_wait(&[ReadKey::Dir(ino)]);
+        }
         let entries = match if self.meta.is_scratch_dir(ino).unwrap_or(false)
             || self.meta.scratch_getattr(ino).ok().flatten().is_some()
         {
@@ -1029,6 +1040,9 @@ impl Filesystem for ConstellationFs {
             Ok(name) => name,
             Err(error) => return reply.error(Errno::from_i32(error)),
         };
+        if !Self::is_synthetic(ino) {
+            self.session_wait(&[ReadKey::Ino(ino)]);
+        }
         let value = if virtual_xattr(&name) {
             let aggregate = if Self::is_synthetic(ino) {
                 self.synthetic_recursive_size(ino)
@@ -1074,6 +1088,9 @@ impl Filesystem for ConstellationFs {
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
+        if !Self::is_synthetic(ino) {
+            self.session_wait(&[ReadKey::Ino(ino)]);
+        }
         let names = if Self::is_synthetic(ino) {
             self.synthetic_xattrs(ino)
                 .map(|attrs| attrs.into_iter().map(|(name, _)| name).collect())

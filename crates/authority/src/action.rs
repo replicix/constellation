@@ -169,8 +169,6 @@ pub enum TimerKind {
     AcquireRetry,
     /// A client op's overall deadline (`acquire_deadline`, 2×TTL).
     ClientDeadline,
-    /// Read-your-refusal wait after an `EEXIST`/`ENOENT` from the holder.
-    CausalWait,
     /// The stranded-op replay drain tick.
     ReplayDrain,
     /// A job's peer request (a `LeaseRequest`) went unanswered. Every

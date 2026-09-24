@@ -231,6 +231,14 @@ pub enum Payload {
         /// log delivers the records, in their order).
         #[serde(default)]
         base: Option<u64>,
+        /// Plan 30 §M6: the state the holder evaluated the op against —
+        /// its shipped-through log sequence, and its unshipped journal
+        /// position `(epoch, journal seq)` if it had one
+        /// (`constellation_meta::Position`).
+        #[serde(default)]
+        position_seq: u64,
+        #[serde(default)]
+        position_pending: Option<(u64, u64)>,
     },
     /// Gossiped RTT vector for holder-driven lease placement.
     PeerRtts {

@@ -548,6 +548,9 @@ pub struct Meta {
     /// poisoned or held; the cost tests in `store::local` pin that it stays
     /// at zero otherwise.
     pub(crate) held_work: AtomicU64,
+    /// Plan 30 §M6: positions, the `observed` watermark and the read
+    /// wait (`crate::session`).
+    pub(crate) session: crate::session::SessionState,
     usage: UsageTracker,
     #[allow(dead_code)]
     path: Option<PathBuf>,
@@ -645,6 +648,7 @@ impl Meta {
             held_any: AtomicBool::new(false),
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
             held_work: AtomicU64::new(0),
+            session: crate::session::SessionState::default(),
             usage: UsageTracker::new(0, 0),
             path,
         };

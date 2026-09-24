@@ -17,7 +17,7 @@
 //! continuation-epoch hold), the log cursor (next expected sequence,
 //! highest epoch seen, head), the sync round's phase and its queued
 //! successors, every client op in flight (forward attempts, backoff, the
-//! inbox queue and its waiters, the lease path, the causal wait), the
+//! inbox queue and its waiters, the lease path), the
 //! replay drain's cursor and the conflict-copy retries, the ack tracker,
 //! the holder's inbox poll schedule, the escalation window, the P2P
 //! reachability record, and every outstanding correlation id and timer.
@@ -110,8 +110,6 @@ pub struct Config {
     pub publish_idle_ms: u64,
     pub replay_drain_ms: u64,
     pub replay_lease_fallback_ms: u64,
-    pub causal_wait_ms: u64,
-    pub causal_poll_ms: u64,
     pub held_tail_staleness_ms: u64,
     pub segment_batch: usize,
     /// Byte ceiling on one shipped segment (`shipper::SEGMENT_MAX_BYTES`).
@@ -182,8 +180,6 @@ impl Config {
             publish_idle_ms: 30_000,
             replay_drain_ms: 250,
             replay_lease_fallback_ms: 10_000,
-            causal_wait_ms: 3_000,
-            causal_poll_ms: 10,
             held_tail_staleness_ms: 5_000,
             segment_batch: 10_000,
             segment_max_bytes: 4 << 20,
@@ -365,7 +361,6 @@ enum Timer {
     ForwardBackoff(Rid),
     AcquireRetry(Rid),
     ClientDeadline(Rid),
-    CausalWait(Rid),
     ReplayDrain,
     /// A job's outstanding peer request (`req`) went unanswered.
     JobRequestTimeout(OpId),
@@ -383,7 +378,6 @@ impl Timer {
             Timer::ForwardBackoff(_) => TimerKind::ForwardBackoff,
             Timer::AcquireRetry(_) => TimerKind::AcquireRetry,
             Timer::ClientDeadline(_) => TimerKind::ClientDeadline,
-            Timer::CausalWait(_) => TimerKind::CausalWait,
             Timer::ReplayDrain => TimerKind::ReplayDrain,
             Timer::JobRequestTimeout(_) => TimerKind::JobRequestTimeout,
             Timer::InboxPoll => TimerKind::InboxPoll,
@@ -658,9 +652,12 @@ impl Core {
                 op,
                 acked_through,
             } => self.on_mutate_request(now, from, req, rid, op, acked_through, replica, out),
-            PeerMsg::MutateReply { req, outcome, base } => {
-                self.on_mutate_reply(now, from, req, outcome, base, replica, out)
-            }
+            PeerMsg::MutateReply {
+                req,
+                outcome,
+                base,
+                position,
+            } => self.on_mutate_reply(now, from, req, outcome, (base, position), replica, out),
             PeerMsg::LeaseRequest { req } => self.on_lease_request(now, from, req, replica, out),
             PeerMsg::LeaseHandoff {
                 req,
@@ -747,7 +744,6 @@ impl Core {
             Timer::ForwardBackoff(rid) => self.on_forward_backoff(now, rid, replica, out),
             Timer::AcquireRetry(rid) => self.on_acquire_retry(now, rid, replica, out),
             Timer::ClientDeadline(rid) => self.on_client_deadline(now, rid, replica, out),
-            Timer::CausalWait(rid) => self.on_causal_wait(now, rid, replica, out),
             Timer::ReplayDrain => {
                 self.drain_timer = None;
                 self.on_drain_tick(now, replica, out);
@@ -1027,11 +1023,5 @@ impl Core {
             next = next.min(self.cfg.inbox_tail_ms.max(1));
         }
         next
-    }
-
-    /// The lowest sequence anything this holder does from now on ships in
-    /// (`MutateOutcome::Exists::ship_floor`).
-    pub(crate) fn ship_floor(&self) -> Seq {
-        self.ship.head_seq.saturating_add(1)
     }
 }

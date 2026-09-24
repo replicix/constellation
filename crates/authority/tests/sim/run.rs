@@ -73,6 +73,14 @@ pub struct SimConfig {
     /// Test-only: node 1's driver panics after handling this many
     /// events, to pin that a panic fails the seed instead of hanging it.
     pub panic_after_events: Option<u64>,
+    /// Plan 30 §M6: after each op, a client reads the name it touched
+    /// with this probability (and a random name with a quarter of it).
+    pub read_ratio: f64,
+    /// Plan 30 §M6: reads go through the session wait
+    /// (`Meta::session_ready`, polled), bounded by `session_wait_ms`.
+    /// `false` is the non-vacuity knob: reads never wait.
+    pub session_wait: bool,
+    pub session_wait_ms: u64,
 }
 
 /// Core tunables scaled down for simulation (seconds, not minutes).
@@ -98,7 +106,6 @@ pub fn sim_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.publish_idle_ms = 5_000;
     c.replay_drain_ms = 200;
     c.replay_lease_fallback_ms = 5_000;
-    c.causal_wait_ms = 1_000;
     c.held_tail_staleness_ms = 2_000;
     c.atime_ship_max_delay_ms = 60_000;
     c.inbox_warm_max_ms = 1_000;
@@ -137,6 +144,9 @@ impl Default for SimConfig {
             settle_ms: 90_000,
             core: Arc::new(sim_core_config),
             panic_after_events: None,
+            read_ratio: 0.0,
+            session_wait: true,
+            session_wait_ms: 2_000,
         }
     }
 }
@@ -158,6 +168,8 @@ pub struct Report {
     pub stateright_checked: bool,
     /// Refusals explained only by an acked-then-rolled-back effect (L2).
     pub observed_tentative: usize,
+    /// Plan 30 §M6: the per-node session checks.
+    pub sessions: super::session::SessionReport,
     pub stats: BTreeMap<NodeId, Stats>,
     pub faults: Vec<String>,
     pub simulated_ms: u64,
@@ -278,18 +290,83 @@ async fn panic_watch() -> String {
 const STATERIGHT_EVENT_BOUND: usize = 80;
 const STATERIGHT_TENTATIVE_BOUND: usize = 6;
 
+/// One step of a simulated client.
+#[derive(Clone, Debug)]
+pub enum Step {
+    Op(NsOp),
+    /// Plan 30 §M6: look a name up in the local replica.
+    Read(String),
+}
+
+/// Plan 30 §M6: a client read — the session wait (polled: this runtime
+/// is single-threaded, so the blocking `Meta::session_wait` would stall
+/// it), then the lookup.
+async fn client_read(
+    handle: &NodeHandle,
+    history: &History,
+    thread: u64,
+    name: String,
+    wait: Option<u64>,
+) {
+    let inv = history.tick();
+    let keys = [constellation_meta::ReadKey::Dentry(ROOT_INO, name.clone())];
+    let mut timed_out = false;
+    if let Some(budget) = wait {
+        let mut waited = 0;
+        while !handle.meta.session_ready(&keys) {
+            if waited >= budget || !handle.alive() {
+                timed_out = waited >= budget;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            waited += 5;
+        }
+    }
+    if !handle.alive() {
+        return;
+    }
+    let present = constellation_meta::MetaStore::lookup(&*handle.meta, ROOT_INO, &name)
+        .ok()
+        .flatten()
+        .is_some();
+    history.read(super::history::ReadEvt {
+        node: handle.id,
+        incarnation: handle
+            .shared
+            .incarnation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        thread,
+        name,
+        present,
+        inv,
+        ret: history.tick(),
+        timed_out,
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn client_thread(
     cluster: Arc<Cluster>,
     history: Arc<History>,
     node: NodeId,
     thread: u64,
-    ops: Vec<NsOp>,
+    steps: Vec<Step>,
     abandoned: Arc<Mutex<HashSet<Rid>>>,
     failures: Arc<Mutex<Vec<String>>>,
     pace_ms: u64,
+    wait: Option<u64>,
 ) {
-    for op in ops {
+    for step in steps {
+        let op = match step {
+            Step::Op(op) => op,
+            Step::Read(name) => {
+                let handle = cluster.get(node);
+                if handle.alive() {
+                    client_read(&handle, &history, thread, name, wait).await;
+                }
+                continue;
+            }
+        };
         tokio::time::sleep(Duration::from_millis(pace_ms)).await;
         let handle = cluster.get(node);
         if !handle.alive() {
@@ -366,6 +443,31 @@ fn gen_ops(rng: &mut StdRng, n: u64, names: usize) -> Vec<NsOp> {
             }
         })
         .collect()
+}
+
+/// Plan 30 §M6: interleave reads with `ops`.
+fn with_reads(rng: &mut StdRng, ops: Vec<NsOp>, names: usize, ratio: f64) -> Vec<Step> {
+    let mut out = Vec::new();
+    for op in ops {
+        let touched = match &op {
+            NsOp::Create(n) | NsOp::Unlink(n) => n.clone(),
+            NsOp::Rename(a, b) => {
+                if rng.random_bool(0.5) {
+                    a.clone()
+                } else {
+                    b.clone()
+                }
+            }
+        };
+        out.push(Step::Op(op));
+        if ratio > 0.0 && rng.random_bool(ratio.min(1.0)) {
+            out.push(Step::Read(touched));
+        }
+        if ratio > 0.0 && rng.random_bool((ratio / 4.0).min(1.0)) {
+            out.push(Step::Read(format!("f{}", rng.random_range(0..names))));
+        }
+    }
+    out
 }
 
 fn gen_faults(rng: &mut StdRng, cfg: &SimConfig, horizon_ms: u64) -> Vec<ScheduledFault> {
@@ -640,15 +742,20 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         for k in 0..cfg.clients_per_node {
             let ops = gen_ops(&mut rng, cfg.ops_per_client, cfg.names);
             let pace = rng.random_range(20..400);
+            // Reads draw from their own generator, so a config without
+            // reads replays exactly the schedules it had before M6.
+            let mut read_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x5e55);
+            let steps = with_reads(&mut read_rng, ops, cfg.names, cfg.read_ratio);
             clients.push(tokio::spawn(client_thread(
                 cluster.clone(),
                 history.clone(),
                 node,
                 node * 16 + k,
-                ops,
+                steps,
                 abandoned.clone(),
                 failures.clone(),
                 pace,
+                cfg.session_wait.then_some(cfg.session_wait_ms),
             )));
         }
     }
@@ -898,6 +1005,23 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 .map(|id| (id, cluster.get(id).alive(), cluster.get(id).view()))
                 .collect::<Vec<_>>()
         ));
+    }
+    // Plan 30 §M6: per-node read-your-writes and monotonic reads, with the
+    // log as the witness (see `session.rs`). Enforced when reads wait.
+    report.sessions = super::session::check_sessions(
+        &events,
+        &history.ticks(),
+        &history.reads(),
+        &tentative,
+        &oracle.completed_at,
+    );
+    if cfg.session_wait {
+        if let Some((checker, what)) = report.sessions.violations.first() {
+            return Err(format!(
+                "session guarantee violated ({checker}): {what}\n  faults: {:?}",
+                report.faults
+            ));
+        }
     }
     check::check_exactly_once(
         &history.returned(),

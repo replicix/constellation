@@ -15,8 +15,8 @@
 use crate::ids::{Epoch, Seq};
 use constellation_fs_core::Ino;
 use constellation_meta::{
-    execute_mutate, CompletedOutcome, InboxAck, JournalBatch, LogRecord, Meta, MetaError,
-    MetaStore, MutateOp, Rid, Stranded, StrandedOp, TouchSet,
+    execute_mutate, CompletedOutcome, InboxAck, JournalBatch, JournalPos, KeySet, LogRecord, Meta,
+    MetaError, MetaStore, MutateOp, Position, Rid, Stranded, StrandedOp, TouchSet,
 };
 
 /// What applying a foreign segment did (`Meta::apply_segment`).
@@ -125,14 +125,16 @@ pub trait Replica {
     /// otherwise.
     fn journal_head_matching(&self, records: &[LogRecord]) -> Result<Option<Vec<u64>>, MetaError>;
     /// The rows `seqs` shipped in segment `at`: delete them, advance the
-    /// applied position, retire their speculation.
-    fn ack_journal(&self, seqs: &[u64], at: Seq) -> Result<(), MetaError>;
+    /// applied position (plan 30 §M6: to journal position `pos`, the
+    /// segment's `(epoch, through)`), retire their speculation.
+    fn ack_journal(&self, seqs: &[u64], at: Seq, pos: Option<JournalPos>) -> Result<(), MetaError>;
     /// Apply a foreign segment: strand what its epoch supersedes, apply,
-    /// retire, advance the applied position.
+    /// retire, advance the applied position (to `(epoch, through)` too).
     fn apply_segment(
         &self,
         seq: Seq,
         epoch: Epoch,
+        through: u64,
         records: &[LogRecord],
     ) -> Result<Applied, MetaError>;
     /// A fenced segment (older epoch): advance the position past it
@@ -140,6 +142,21 @@ pub trait Replica {
     fn skip_segment(&self, seq: Seq) -> Result<(), MetaError>;
     /// Whether the metadata tree has dirty keys to publish.
     fn has_dirty(&self) -> bool;
+
+    // ---- plan 30 §M6: positions and the session watermark ----
+
+    /// The acked watermark shipping `seqs` will leave (a segment's
+    /// `through`).
+    fn journal_through_after(&self, seqs: &[u64]) -> Result<u64, MetaError>;
+    /// The unshipped journal this holder evaluates against right now
+    /// (`None`: everything shipped).
+    fn journal_position(&self, epoch: Epoch) -> Option<JournalPos>;
+    /// A client-visible reply whose effects are not installed here
+    /// observed `pos`: local reads wait for it.
+    fn raise_observed(&self, pos: Position);
+    /// Speculation for `keys` was installed from a reply at `pos`: reads of
+    /// those keys need not wait for positions up to it.
+    fn note_covering(&self, keys: KeySet, pos: Position);
 
     // ---- read-time atime (plan 20): ride-along and standalone ships ----
 
@@ -323,18 +340,28 @@ impl Replica for Meta {
         Meta::match_own_segment(self, &journaled)
     }
 
-    fn ack_journal(&self, seqs: &[u64], at: Seq) -> Result<(), MetaError> {
-        Meta::ack_journal_rows_at(self, seqs, at)
+    fn ack_journal(&self, seqs: &[u64], at: Seq, pos: Option<JournalPos>) -> Result<(), MetaError> {
+        Meta::ack_journal_rows_at(self, seqs, at)?;
+        self.session().advance(at, pos);
+        Ok(())
     }
 
     fn apply_segment(
         &self,
         seq: Seq,
         epoch: Epoch,
+        through: u64,
         records: &[LogRecord],
     ) -> Result<Applied, MetaError> {
         let pending: TouchSet = Meta::pending_touches(self)?;
         let applied = Meta::apply_segment(self, seq, epoch, records, &pending)?;
+        self.session().advance(
+            seq,
+            Some(JournalPos {
+                epoch,
+                jseq: through,
+            }),
+        );
         Ok(Applied {
             stranded: applied.stranded,
             skipped: applied.skipped,
@@ -344,7 +371,25 @@ impl Replica for Meta {
     }
 
     fn skip_segment(&self, seq: Seq) -> Result<(), MetaError> {
-        Meta::set_applied_seq(self, seq)
+        Meta::set_applied_seq(self, seq)?;
+        self.session().advance(seq, None);
+        Ok(())
+    }
+
+    fn journal_through_after(&self, seqs: &[u64]) -> Result<u64, MetaError> {
+        Meta::journal_through_after(self, seqs)
+    }
+
+    fn journal_position(&self, epoch: Epoch) -> Option<JournalPos> {
+        Meta::journal_position(self, epoch)
+    }
+
+    fn raise_observed(&self, pos: Position) {
+        self.session().raise_observed(pos)
+    }
+
+    fn note_covering(&self, keys: KeySet, pos: Position) {
+        self.session().note_covering(keys, pos)
     }
 
     fn has_dirty(&self) -> bool {

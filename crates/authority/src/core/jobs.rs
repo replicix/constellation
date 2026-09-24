@@ -20,7 +20,7 @@ use crate::ids::{Epoch, Ms, NodeId, OpId, Seq};
 use crate::replica::Replica;
 use crate::segment;
 use constellation_fs_core::Ino;
-use constellation_meta::LogRecord;
+use constellation_meta::{JournalPos, LogRecord};
 use constellation_store_s3::{Lease, LeaseTag};
 
 /// A request for the slot.
@@ -101,6 +101,9 @@ enum Phase {
         seq: Seq,
         payload: Vec<u8>,
         epoch: Epoch,
+        /// Plan 30 §M6: the journal seq this segment ships through (the
+        /// envelope's `through`).
+        through: u64,
         attempts: u32,
         atime_inos: Vec<Ino>,
         purpose: ShipPurpose,
@@ -369,7 +372,7 @@ impl Core {
                     self.cfg.node_id
                 );
             };
-            replica.ack_journal(&seqs, seq)?;
+            replica.ack_journal(&seqs, seq, Some(seg.journal_pos()))?;
             self.stats.own_recovered += 1;
             tracing::info!(
                 node = self.cfg.node_id,
@@ -397,7 +400,7 @@ impl Core {
             );
             replica.skip_segment(seq)?;
         } else {
-            let applied = replica.apply_segment(seq, seg.epoch, &seg.records)?;
+            let applied = replica.apply_segment(seq, seg.epoch, seg.through, &seg.records)?;
             tracing::debug!(
                 node = self.cfg.node_id,
                 seq,
@@ -487,8 +490,14 @@ impl Core {
             .iter()
             .map(|(ino, _, _)| *ino)
             .collect();
-        let payload =
-            segment::encode(self.cfg.node_id, epoch, &records).map_err(|e| e.to_string())?;
+        // Plan 30 §M6: every journal row at or below `through` will have
+        // shipped once this lands (a held-back transaction — M4 — stops
+        // it below itself): the acked watermark this ship will leave.
+        let through = replica
+            .journal_through_after(&seqs)
+            .map_err(|e| e.to_string())?;
+        let payload = segment::encode(self.cfg.node_id, epoch, through, &records)
+            .map_err(|e| e.to_string())?;
         let seq = self.ship.next_seq;
         let op = self.issue_s3(
             S3Op::SegmentPut {
@@ -504,6 +513,7 @@ impl Core {
                 seq,
                 payload,
                 epoch,
+                through,
                 attempts,
                 atime_inos,
                 purpose: ShipPurpose::Journal,
@@ -548,7 +558,8 @@ impl Core {
                 time_ns: *time_ns,
             })
             .collect();
-        let Ok(payload) = segment::encode(self.cfg.node_id, epoch, &records) else {
+        let through = replica.journal_acked_seq().unwrap_or(0);
+        let Ok(payload) = segment::encode(self.cfg.node_id, epoch, through, &records) else {
             return false;
         };
         let atime_inos: Vec<Ino> = rows.iter().map(|(ino, _, _)| *ino).collect();
@@ -567,6 +578,7 @@ impl Core {
                 seq,
                 payload,
                 epoch,
+                through,
                 attempts,
                 atime_inos,
                 purpose,
@@ -607,13 +619,22 @@ impl Core {
         now: Ms,
         seqs: &[u64],
         seq: Seq,
-        epoch: Epoch,
+        (epoch, through): (Epoch, u64),
         payload: Vec<u8>,
         atime_inos: &[Ino],
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<(), String> {
-        replica.ack_journal(seqs, seq).map_err(|e| e.to_string())?;
+        replica
+            .ack_journal(
+                seqs,
+                seq,
+                Some(JournalPos {
+                    epoch,
+                    jseq: through,
+                }),
+            )
+            .map_err(|e| e.to_string())?;
         if !atime_inos.is_empty() {
             let _ = replica.clear_atime(atime_inos);
         }
@@ -662,11 +683,15 @@ impl Core {
         Ok(())
     }
 
-    fn issue_marker(&mut self, attempts: u32, out: &mut Vec<Action>) {
+    fn issue_marker(&mut self, attempts: u32, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some(gate) = self.lease.gate else {
             return;
         };
-        let payload = segment::encode(self.cfg.node_id, gate.epoch, &[]).expect("empty segment");
+        // Plan 30 §M6: the new tenure's journal position starts here, above
+        // every position of the tenure it ends.
+        let through = replica.journal_acked_seq().unwrap_or(0);
+        let payload =
+            segment::encode(self.cfg.node_id, gate.epoch, through, &[]).expect("empty segment");
         let seq = self.ship.next_seq;
         let op = self.issue_s3(S3Op::SegmentPut { seq, payload }, S3For::Job, out);
         self.set_phase(Phase::Marker { attempts }, Some(op));
@@ -735,14 +760,28 @@ impl Core {
         let Some(gate) = self.lease.gate.as_mut() else {
             return Ok(());
         };
-        replica.ack_journal(&[], seq).map_err(|e| e.to_string())?;
-        gate.marker_shipped = true;
         let epoch = gate.epoch;
+        let through = replica.journal_acked_seq().map_err(|e| e.to_string())?;
+        replica
+            .ack_journal(
+                &[],
+                seq,
+                Some(JournalPos {
+                    epoch,
+                    jseq: through,
+                }),
+            )
+            .map_err(|e| e.to_string())?;
+        let Some(gate) = self.lease.gate.as_mut() else {
+            return Ok(());
+        };
+        gate.marker_shipped = true;
         self.ship.next_seq = seq + 1;
         self.ship.head_seq = self.ship.head_seq.max(seq);
         self.ship.max_epoch = self.ship.max_epoch.max(epoch);
         self.stats.epoch_markers += 1;
-        let payload = segment::encode(self.cfg.node_id, epoch, &[]).expect("empty segment");
+        let payload =
+            segment::encode(self.cfg.node_id, epoch, through, &[]).expect("empty segment");
         out.push(Action::Announce {
             seq,
             epoch,
@@ -1037,7 +1076,7 @@ impl Core {
             match self.complete_gate(now, replica, out) {
                 GateStep::Done => {}
                 GateStep::NeedMarker => {
-                    self.issue_marker(0, out);
+                    self.issue_marker(0, replica, out);
                     return;
                 }
                 GateStep::NeedDrain => {
@@ -1544,7 +1583,7 @@ impl Core {
     fn acquire_gate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
         match self.complete_gate(now, replica, out) {
             GateStep::Done => self.finish_acquire(now, true, replica, out),
-            GateStep::NeedMarker => self.issue_marker(0, out),
+            GateStep::NeedMarker => self.issue_marker(0, replica, out),
             GateStep::NeedDrain => self.issue_drain(out),
             GateStep::Failed(error) => {
                 tracing::error!(%error, node = self.cfg.node_id, "takeover gate failed; the view stays closed");
@@ -1966,15 +2005,23 @@ impl Core {
                     seq,
                     payload,
                     epoch,
+                    through,
                     atime_inos,
                     purpose,
                     ..
                 },
                 S3Result::SegmentPut(Ok(())),
             ) => {
-                if let Err(error) =
-                    self.ship_landed(now, &seqs, seq, epoch, payload, &atime_inos, replica, out)
-                {
+                if let Err(error) = self.ship_landed(
+                    now,
+                    &seqs,
+                    seq,
+                    (epoch, through),
+                    payload,
+                    &atime_inos,
+                    replica,
+                    out,
+                ) {
                     self.job_failed(now, error, replica, out);
                     return;
                 }
@@ -2153,7 +2200,7 @@ impl Core {
             }
             TailThen::Marker => {
                 let attempts = self.marker_attempts;
-                self.issue_marker(attempts, out);
+                self.issue_marker(attempts, replica, out);
             }
             TailThen::Ship => {
                 let attempts = self.ship_attempts;

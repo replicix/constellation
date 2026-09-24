@@ -19,6 +19,7 @@ mod coop_churn;
 mod m4;
 /// Plan 30 §M5 phase 2: the stale-base rule on the wire.
 mod m5;
+mod m6;
 
 pub struct Scenario {
     pub name: &'static str,
@@ -556,6 +557,42 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M5: a holder's accepted reply names the unshipped base it was evaluated on; the requester waits for the log instead of installing a rename-over-existing-name as a shadow that the holder's unshipped unlink then removes, so A, B and C agree `f2` is the renamed `f1`",
         requires: &[],
         run: m5::stale_base_rename_divergence,
+    },
+    Scenario {
+        name: "session-exists-observed",
+        desc: "plan 30 M6: a refused create observes the holder's unshipped state; the requester's lookups of the refused name AND of another name the holder had wait for that position (not a per-name causal wait) and both find their files once the holder ships",
+        requires: &[],
+        run: m6::session_exists_observed,
+    },
+    Scenario {
+        name: "session-forwarded-ryw",
+        desc: "plan 30 M6 (decision 2): `touch a; ls; stat .; stat a; cat a` right after forwarded creates, with the holder's shipping held and then running, never waits: installed shadows raise nothing",
+        requires: &[],
+        run: m6::session_forwarded_ryw,
+    },
+    Scenario {
+        name: "session-stale-base-rename",
+        desc: "plan 30 M6: the stale-base half (M5's stale-base-rename-divergence): a rename accepted on an unapplied base waits for the log; A, B and C agree",
+        requires: &[],
+        run: m6::session_stale_base_rename,
+    },
+    Scenario {
+        name: "session-ryw-after-holder-kill",
+        desc: "plan 30 M6: C's forwarded create is acked by A, A dies before shipping, B takes over; C stats its own file every 20 ms through the stranding and replay and never misses it",
+        requires: &[],
+        run: m6::session_ryw_after_holder_kill,
+    },
+    Scenario {
+        name: "session-wait-degrades",
+        desc: "plan 30 M6: a requester whose observed position cannot be reached (holder's shipping held) answers reads after the budget from its replica — no EIO, one warning, timeouts counted — and recovers once the holder ships",
+        requires: &[],
+        run: m6::session_wait_degrades,
+    },
+    Scenario {
+        name: "session-idle-latency",
+        desc: "plan 30 M6: after a 3-node write burst, a read-only phase never waits (status.session.waited flat); a single node never waits at all; prints the wait histograms",
+        requires: &[],
+        run: m6::session_idle_latency,
     },
     Scenario {
         name: "inbox-create-storm-p2p-off",

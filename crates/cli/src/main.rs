@@ -2404,7 +2404,7 @@ impl constellation_net::PeerService for P2pBridge {
             };
             let (reply, receive) = tokio::sync::oneshot::channel();
             let started = std::time::Instant::now();
-            let (outcome, base) = if self
+            let (outcome, base, position) = if self
                 .nudge
                 .send(fusefs::SyncRequest::Mutate {
                     requester,
@@ -2415,11 +2415,17 @@ impl constellation_net::PeerService for P2pBridge {
                 })
                 .is_ok()
             {
-                receive
-                    .await
-                    .unwrap_or((constellation_meta::MutateOutcome::Busy, None))
+                receive.await.unwrap_or((
+                    constellation_meta::MutateOutcome::Busy,
+                    None,
+                    constellation_meta::Position::ZERO,
+                ))
             } else {
-                (constellation_meta::MutateOutcome::Busy, None)
+                (
+                    constellation_meta::MutateOutcome::Busy,
+                    None,
+                    constellation_meta::Position::ZERO,
+                )
             };
             tracing::trace!(
                 requester,
@@ -2430,6 +2436,8 @@ impl constellation_net::PeerService for P2pBridge {
                 req_id,
                 outcome: outcome.to_postcard().unwrap_or_default(),
                 base,
+                position_seq: position.seq,
+                position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
             }
         })
     }
@@ -3566,6 +3574,22 @@ impl constellation_api::StatusSource for DaemonStatus {
                 }
             },
             held: held::status(&self.meta),
+            session: {
+                let s = self.meta.session().stats();
+                constellation_api::SessionStatus {
+                    budget_ms: self.meta.session().budget().as_millis() as u64,
+                    reads: s.reads,
+                    fast: s.fast,
+                    covered: s.covered,
+                    waited: s.waited,
+                    timeouts: s.timeouts,
+                    degraded_held: s.degraded_held,
+                    replay_blocked: s.replay_blocked,
+                    waits_ms: s.waits_ms.to_vec(),
+                    wait_ms_total: s.wait_ms_total,
+                    raised: s.raised,
+                }
+            },
             coop,
             prefetch: self.prefetch_stats.snapshot(),
             writeback: {

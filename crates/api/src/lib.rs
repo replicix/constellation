@@ -16,7 +16,7 @@ pub use types::{
     PruneRootStatus, PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response,
     SnapshotStatus, SourceStatus, SpeculationStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
-pub use types::{CasProbeStatus, HeldInodeStatus, HeldStatus, PeerPathsStatus};
+pub use types::{CasProbeStatus, HeldInodeStatus, HeldStatus, PeerPathsStatus, SessionStatus};
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -408,6 +408,7 @@ mod tests {
                 reintegration: ReintegrationStatus::default(),
                 speculation: SpeculationStatus::default(),
                 held: HeldStatus::default(),
+                session: SessionStatus::default(),
                 coop: CoopStatus::default(),
                 prefetch: PrefetchStatus::default(),
                 writeback: WritebackStatus::default(),

@@ -11005,3 +11005,828 @@ range that found it; no regression in the daemon-side abort-on-panic
 change (all 4 scenarios that start/stop the daemon passed); the
 authority and cli unit suites are clean. Nothing further to report from
 this round.
+
+## Plan 30 M6 — phase 1: model, chaos checkers, phase 2 design: **PHASE 1 DONE** (coder, 2026-09-24; nothing in `crates/cli`, `crates/authority` or `crates/meta/src/store` touched — phase 2 builds on M5's extracted core once it merges)
+
+| Item | State | Where |
+|---|---|---|
+| Model: client reads (`Step::{Mutate, Lookup, Readdir}`, `Action::Read`, `with_lookup`/`with_readdir`); reads record no history event and are not linearizability-checked | done | `crates/model/src/positions.rs`, `protocol.rs` |
+| Model: properties `read_your_writes` and `monotonic_reads`, per node, on write sets per name (registered only when the workload reads, so every existing search still stops early — see below) | done | same |
+| Model: `Protocol::Positions` on top of `Recovery` (`Protocol::recovers()` now gates every M3 rule): replies carry the holder's position `at` and M5's `base`; stale-base `Accepted` → `Phase::AwaitingLog` (and `ReplayEntry::awaiting` for replays); `Node::observed`; the read wait with the "speculation covers the key" exception and the queued-replay block; non-vacuity knobs `with_session_wait(false)`, `with_stale_base_shadows(true)` | done | same |
+| Model tests: counterexamples for today's system and for each knob, `Positions` clean (exhaustive where it fits, bounded + explicit paths for three nodes) | done | `crates/model/tests/positions.rs` |
+| Existing model tests unchanged: same state counts as the M13 final run (`today_bugs.rs` 34s / 2.06 GB single-threaded; `today_finds_bug_b` 105,622 states) | verified | — |
+| Chaos: per-node read-your-writes and monotonic-reads checkers over recorded histories, wired into `check_history`, report-only until `sessions::ENFORCE_SESSION_GUARANTEES` flips (or `CONSTELLATION_CHAOS_ENFORCE_SESSIONS=1`); `chaos check` prints the session coverage | done | `crates/chaos/src/sessions.rs`, `check.rs`, `main.rs`, `lib.rs` |
+| Phase 2 design and checklist | this section | — |
+
+### The model
+
+**Reads and the properties.** A node's client runs its steps in order;
+a read is a lookup of one name or a readdir of both, served from the
+node's replica (applied log prefix + shadows + its own journal). The
+properties are Terry-style session guarantees on *write sets*, per name:
+the view of a read of `x` is the set of rids of records on `x` its
+replica has applied or speculates.
+- `read_your_writes`: every `Ok` return of this session's own ops on `x`
+  is in the view. `Tentative`/`Conflicted` returns (M13 round 3a: a
+  deposed holder's own acked-but-unshipped op) are exempt, exactly as
+  `linearizable` exempts them. A `Restart` starts a new session.
+- `monotonic_reads`: every write the session *observed* on `x` is in the
+  view. A client observes the holder's state through every reply it
+  returns from (refusals included — plan 29 M6's `Exists` case), so a
+  ghost field records the newest holder state a reply carried (`Obs`:
+  epoch, applied slot, journal length), and the check rebuilds its write
+  set from the log and journals at read time. The observation's unshipped
+  part is **void** once its tenure ended without shipping it (another
+  epoch's segment took the next slot, or the register moved on): the
+  L2 window seen by a third party (M5 finding 6), consistent with M13's
+  `Tentative` rule — nothing may be required to see such effects.
+  Observations nest (a takeover tails to head first; a journal only grows
+  until it ships whole), so the newest one subsumes the rest.
+
+Set-level rather than value-level on purpose: with a create/unlink
+namespace a stale-base shadow is value-correct and only `rename` makes the
+divergence visible (M5 finding 1); on write sets the model sees it.
+
+**`Positions`.** A reply's position is "slot the holder ships its journal
+in, through row `j`" (or "fully applied through slot `a`" with an empty
+journal) — the model's stand-in for `(epoch, journal_seq)`, the same
+order because a tenure ships its whole journal as one segment at the next
+slot. Rules: shadow only on an applied base (else `AwaitingLog`),
+`observed` = max position of the replies the client returned from, a read
+of `x` waits until `applied ≥ observed` unless the newest shadow on `x`
+has a position ≥ `observed`, and never runs while a queued replay touches
+`x`.
+
+**Results** (release, `/usr/bin/time -v`, each test alone; whole
+`positions.rs` binary: 24.8 s, 1.63 GB peak with its tests in parallel):
+
+| Test | Config | States (unique) | Time | Peak RSS | Result |
+|---|---|---|---|---|---|
+| `recovery_reads_violate_monotonic_reads` | `Recovery` + reads, 2 nodes, refusal | 131,435 (23,104), exhaustive | 0.08 s | 8 MB | **counterexample** |
+| `recovery_reads_violate_read_your_writes` | `Recovery` + reads, 3 nodes, takeover strands a shadow | 3.0M (670K), bounded | 1.6 s | 446 MB | **counterexample** |
+| `positions_without_the_wait_violates_both` | `Positions`, `session_wait=false`, both configs | 131K / 3.0M | 1.7 s | 448 MB | **both counterexamples** |
+| `positions_with_stale_base_shadows_violates_monotonic_reads` | `Positions`, `stale_base_shadows=true` | 156,480 (27,330), exhaustive | 0.07 s | 9 MB | **counterexample** |
+| `positions_refusal_waits_for_the_observed_position` | `Positions`, refusal | 131,203 (23,048), exhaustive | 0.06 s | 9 MB | clean + path |
+| `positions_stale_base_waits_for_the_log` | `Positions`, stale base + readdir | 157,803 (27,541), exhaustive | 0.07 s | 9 MB | clean + path |
+| `positions_stranded_shadow_read_waits_for_the_replay` | `Positions`, 3 nodes | 3.0M (671K), bounded (depth 13) | 1.6 s | 446 MB | clean + path |
+| `positions_holds_across_a_crash_and_takeover` | `Positions`, 2 nodes, crash, requester takeover, lookup + unlink + readdir | 30.5M (5.8M), exhaustive | 21.4 s | 1.07 GB | clean |
+| `inbox_outcomes_keep_sessions_without_a_watermark` | inbox, `Recovery` and `Positions` | 1,193 (290) each, exhaustive | <0.01 s | 2 MB | clean under both |
+| `positions_stranded_shadow_deep` (`#[ignore]`) | `Positions`, 3 nodes | 40M (5.7M), bounded (depth 19) | 23 s | 1.6 GB | clean |
+
+The counterexamples (hand-built paths, each asserted to fail exactly at
+its last step; the searches also find them and print theirs):
+- **monotonic reads, today** (5 actions): `ClientInvoke(0)` (holder
+  journals `create 0`), `ClientInvoke(1)` (forwards `create 0`),
+  `DeliverForwardRequest(0)` (refused `EEXIST` against the unshipped
+  create), `DeliverForwardReply(1)`, `Read(1)` — the lookup does not
+  contain the create the refusal observed. Production point-fixes this
+  one name with the causal wait; the property also covers every other
+  name the holder's state included.
+- **read-your-writes, today** (9 actions): `ClientInvoke(1)`,
+  `DeliverForwardRequest(0)`, `DeliverForwardReply(1)` (shadow),
+  `Tick` (lease expires), `ClientInvoke(2)`, `ForwardTimeout(2)`,
+  `AcquireLease(2)` (takeover, epoch marker), `Tail(1)` (the marker
+  strands node 1's shadow), `Read(1)` — node 1's own acknowledged create
+  is missing until its replay lands.
+- **stale base** (5 actions, `Positions` with `stale_base_shadows`): as
+  the first path with `unlink 0` instead of `create 0` on node 1: the
+  unlink is accepted on top of the unshipped create, installed as a
+  shadow that covers the name, and the read's write set lacks the create.
+
+Under `Positions` the first path's `Read(1)` is disabled until node 0
+ships and node 1 tails; the second's until the replay is accepted on an
+applied base and reinstalls the shadow; the third's unlink goes to
+`AwaitingLog` and returns once the log carries it.
+
+**A trap found and avoided:** registering the two session properties for
+every model (they cannot fail without reads) made `today_finds_bug_b` run
+to its 60M-state cap at 7.7 GB instead of 105K states — Stateright only
+stops early once *every* property has a discovery. They are registered
+only when the workload reads.
+
+### The chaos checkers
+
+`crates/chaos/src/sessions.rs`. A worker is one mount doing one op at a
+time, so a worker's ops are a node's session. Black-box and conservative:
+each observation is explained by the writes that could have produced it
+(the create/write of that content; any creating write for "present"; any
+removal plus the initial state for "absent"; unknown-content writes —
+append, write_at, truncate, rename/link targets — explain anything; only
+`Ok` or in-doubt writes, never one invoked after the observation
+completed; for a *refusal*, which the sequencer evaluated on its current
+state, also not one a contradicting write certainly followed). `O2`
+after `O1` in a session violates when every explanation of `O2` completed
+before any explanation of `O1` was invoked — against an own `Ok` write
+that is read-your-writes, against an earlier observation monotonic
+reads. Refusals are observations (`EEXIST` = present, `ENOENT` = absent).
+
+Status: 14 unit tests plus one `#[ignore]`d file reporter (violating synthetic histories for both checkers,
+including the `Exists` anomaly and a stale read after an `ENOENT`
+refusal; ambiguous/concurrent, cross-node staleness, in-doubt writes and
+removals not flagged; report-vs-enforce; the `check_history` wiring),
+green in both modes. `check_history` calls
+`sessions::check_history_sessions(history, sessions::enforced())`: today
+it logs `session guarantees ... not enforced yet (plan 30 M6 phase 2)`
+with the count and first violation and passes. Phase 2 flips
+`ENFORCE_SESSION_GUARANTEES`. Run offline over the 12 saved soak
+histories under `/tmp/chaos-soak-*` (`chaos check`, which now prints the
+coverage): 3,900–4,500 observations judged per history, 89–154
+unexplained, **0 violations** — the generator's in-step reads rarely race
+a node's own earlier observation, which is why phase 2 adds a `session`
+generator family (below). The three saved histories that fail `chaos
+check` fail M4's Elle checker; run through the session checkers alone
+(the `#[ignore]`d `sessions::tests::report_saved_history`, pointed at a
+file by `CHAOS_SESSION_HISTORY`), two of them show **real monotonic-reads
+violations**, three workers each: after a `mkdir` storm, each loser saw
+`EEXIST` and a later `stat` found no directory
+(`soak-1790100165`, `d824` — the `Exists` shape); after an `unlink`
+storm, each loser saw `ENOENT` and a later `stat` still found the file
+(`soak-1790101574`, `u132`). So the checker is not vacuous on real
+histories; these are old soak runs, not re-run on this build (no harness
+runs in this phase).
+
+Note for the coordinator: M4's Elle checker treats reads on
+single-assignment paths as linearizable (real-time edges), so it already
+flags the `Exists` anomaly as `G-single-realtime` when it happens on such
+a path (found while writing the wiring test), and would flag a cross-node
+stale read there too. That is stricter than bounded close-to-open; it
+has held so far because the generator's recorded reads on those paths are
+the post-convergence quiesce reads.
+
+### Phase 2 design
+
+**1. `Position` generalizes `base` and replaces `ship_floor`.**
+`Position { epoch: Epoch, jseq: u64 }`, ordered epoch-first: `jseq` is the
+holder's journal sequence (`local["next_journal_seq"]`, durable and
+monotonic across the holder's restarts, unique per epoch because one node
+holds an epoch). The segment envelope (v3) gains `through: u64`: the
+highest `jseq` such that every journal row up to it has shipped (the
+contiguous prefix — M4's held-back transactions keep it from advancing
+past a held row); an epoch marker carries the new holder's last allocated
+`jseq`. Every replica keeps a persisted `applied_position` next to
+`applied_seq`, advanced by `apply_segment`/`ack_journal` to
+`(segment epoch, through)`, untouched by a fenced segment. Lexicographic
+order does the M13 `Tentative` work by itself: a position from a tenure
+that ended unshipped is below every position of the next epoch, so an
+observer waits at most until it tails the takeover marker, and is then
+not owed the stranded effects (the model's void rule).
+
+`PeerMsg::MutateReply { req, outcome, position: Position, base:
+Option<Position> }`, for every variant:
+
+| Outcome | `position` | `base` |
+|---|---|---|
+| `Accepted` (fresh execution) | the op's last journal row (its `Completed`) | the holder's `applied_position` before the op, or `None` when `unshipped_overlaps(keys)` (M5's rule, now a `Position`) |
+| `Accepted` (dedup: `recent`) | the recorded row's position | `None` (only the log orders it) |
+| `Accepted` (dedup: `completed`) | the completing segment's `(epoch, through)` | `None` (the requester's `completed_position` answers it, or `AwaitingLog`) |
+| `Exists { records }` | the holder's current `journal_position()` (the entry as of it) | — (hint rule below) |
+| `Errno(_)` (`EEXIST`, `ENOENT`, `ENOTEMPTY`, …) | `journal_position()` | — |
+| `Conflict { manifest }` | `journal_position()` | — |
+| `Busy`, `NotHolder` | the answerer's `applied_position` (carried for uniformity; the client observes nothing, so the requester does **not** raise `observed`) | — |
+
+`journal_position()` = `(held epoch, last allocated jseq)`: every row up
+to it was in the holder's replica when it evaluated the op. `ship_floor`
+(on `MutateOutcome::Exists` and in `forward::safe_to_install_early`)
+goes: "install the hint iff `applied_position < position`" is the same
+test in the new order, and the hint *retires* when `applied_position ≥
+position` — the holder's current position, not its next segment, which
+also fixes M5 finding 3 (hints outliving an idle cluster).
+
+**2. Where `observed` lives, and the read wait.** The *rule* is the
+core's (which events raise it, to what); the *value* lives in `Meta`'s
+volatile memory, written through a new `Replica::raise_observed(pos)`
+(monotonic max), read by the FUSE threads directly. Not a core field
+behind an action: the FUSE read paths never enter the core (a lookup must
+not pay an event-queue hop), and the thing a read waits on —
+`applied_position` — advances inside `Meta` (`apply_segment`,
+`ack_journal_rows_at`), so the condition variable belongs next to it,
+with no lost wake-up between the core and the driver. Volatile on
+purpose: a restart is a new FUSE session (the model resets it on
+`Restart` too). The core raises it in `on_mutate_reply` for every
+outcome the client returns from (`Accepted` installed or already
+completed, `Exists`, `Errno`, `Conflict`), and never for replays (not
+client-visible) or `Busy`/`NotHolder`.
+
+`Meta::session_wait(keys, budget) -> SessionWait`, called at the top of
+each read op in `fusefs_ops.rs`, after the synthetic/scratch shortcuts
+and **before** `self.writes.lock` (never block holding a write shard):
+
+| FUSE op | keys |
+|---|---|
+| `lookup(parent, name)` | `Dentry(parent, name)`, then `Ino(child)` for the attrs |
+| `getattr(ino)`, `open(ino)`, `readlink(ino)`, `getxattr(ino, _)`, `listxattr(ino)` | `Ino(ino)` |
+| `readdir`/`readdirplus(dir)` | `Dir(dir)`: every dentry of `dir` |
+
+1. Fast path: `applied_position ≥ observed` → go (two atomic loads; the
+   idle, single-node and holder cases, since `observed` only rises on a
+   forwarded op's reply).
+2. Any key touched by a queued replay (`pending_replay`) → wait: the
+   session's own acknowledged write is rolled back until the replay
+   lands (the model's `read_allowed` rule; RYW otherwise fails at
+   exactly the stranding path above).
+3. Covered: the newest speculative entry (`Shadow`/`Hint`) on every key
+   has `position ≥ observed` → go. `Dir(dir)` is covered only by the
+   fast path in the first cut (see open question 2).
+4. Otherwise block on `Meta`'s condvar (signalled on every
+   `applied_position` advance and replay resolution) until 1–3 hold or
+   `CONSTELLATION_SESSION_WAIT_MS` (default 2000; 0 disables the wait)
+   passes. On timeout: answer from the replica anyway — **degraded, not
+   an error** — bump `session_wait_timeouts`, and `warn!` once per mount
+   (with the keys, `observed` and `applied_position`), later timeouts
+   only counted.
+
+Mutations never wait (the sequencer validates them).
+
+**3. `Exists` is an instance of the general rule.** The reply raises
+`observed` to its position, and — iff `applied_position < position` —
+installs the entry as a `Hint { position }`, which covers that dentry
+(step 3), so the lookup that typically follows a refused create answers
+at once and every *other* key waits for the position. The client's
+refusal returns immediately: M5's `Phase::CausalWait`,
+`Core::causal_wait_then_finish`/`on_causal_wait`, `Timer::CausalWait`,
+`TimerKind::CausalWait`, `Config::causal_wait_ms`/`causal_poll_ms`,
+`causal_wait_target`, and today's `forward::CAUSAL_WAIT` all go. `EEXIST`
+without an entry and `ENOENT` (`Errno`) are the same rule without a hint.
+
+**4. The M13 inbox path.** Outcomes (`Completed { rid }`, `Refused { rid,
+errno }`) ride the log, and the requester answers when it applies the
+segment carrying one (`answer_awaiting_log`). The outcome row is journaled
+after the evaluation it records, so that segment's `through` is past the
+evaluation position: `applied_position` already covers what the client
+observed, and nothing needs raising (the model shows the inbox keeps both
+properties even under `Recovery`, with no watermark). The phase 2 code
+still calls `raise_observed(applied_position())` at that answer — a
+no-op today that keeps the rule "every client-visible outcome raises
+`observed`" uniform if an inbox reply path ever answers early. In-doubt
+answers (`InDoubt`, a resubmission) observe nothing.
+
+**5. Read-latency measurement.** Counters (in `Meta`, surfaced in
+`constellation status --json` and the harness spool info):
+`session_reads{op}`, `session_fast`, `session_covered`,
+`session_replay_blocked`, `session_waited`, a log2 histogram of wait
+milliseconds (1 ms … 2048 ms), `session_wait_timeouts`. Expectations and
+gates:
+- idle cluster (3 nodes, read-only phase of `meta-bench` after
+  quiescence): `session_waited == 0`, wait p99 = 0 — asserted;
+- single node: `observed` never rises, `session_waited == 0` —
+  asserted;
+- write-then-read on a non-holder (forwarded create, then `stat` of it):
+  covered by the shadow, 0 wait — asserted;
+- refused create then `stat` of another name the holder had: one
+  ship + tail (or gossip push) interval — reported p50/p99, compared
+  with today's 3 s causal-wait bound;
+- untar-then-`ls` on a non-holder: `readdir` wait distribution —
+  reported; the gate for open question 2;
+- M16 on EC2 (`bench/remote`): the same columns with real RTTs, plus S3
+  request counts (positions add no request; the envelope grows by one
+  varint).
+
+**6. Harness scenarios to add.**
+- `session-exists-observed` (2 nodes): A holds, creates `g` then `f`
+  with shipping held back (a fault knob delaying the ship, as M0's
+  reply-delay knob does for replies); B's `create f` → `EEXIST`; B's
+  `stat f` (hint, no wait) and `stat g` (waits for the position) both
+  succeed. Today only `f` is point-fixed.
+- `session-forwarded-ryw` (2 nodes): B creates through A and at once
+  `stat`s and reads the file: visible, `session_waited == 0`.
+- `session-stale-base-rename` (2 nodes): M5 finding 1 end to end — A
+  renames `f1 → f2` unshipped, B renames `f0 → f1` through A (base
+  `None` → `AwaitingLog`); B's listing is right and every replica
+  converges (today: divergence).
+- `session-ryw-after-holder-kill` (3 nodes): B writes through A, A is
+  `kill9`ed before shipping, C takes over; B's `stat` of its file right
+  after tailing the marker waits for the replay (< 2 s) and succeeds.
+- `session-wait-degrades` (2 nodes): the holder is `SIGSTOP`ped right
+  after answering B's refused create; B's `stat` of another name returns
+  after ~2 s from its replica (no `EIO`), one warning, one timeout
+  counted.
+- `session-idle-latency` (3 nodes): the idle and single-node gates of
+  item 5.
+- chaos: a `session` generator family (forward a write then read it on
+  the same worker; refused create then stat and readdir; a write on one
+  node, then two reads on another) and `chaos-ci` with
+  `CONSTELLATION_CHAOS_ENFORCE_SESSIONS=1`; flip
+  `ENFORCE_SESSION_GUARANTEES` when it is green.
+
+**7. Phase 2 checklist, against M5's core** (names as in the M5 worktree
+when this was written):
+1. `ids.rs`: `Position { epoch, jseq }` (`Ord`, serde, `ZERO`).
+2. `segment.rs`: envelope v3 with `through`; `encode(node, epoch, through,
+   records)`/`decode`; the shipper computes the contiguous shipped
+   `jseq` (M4 held rows), `issue_marker` uses `journal_position()`.
+3. `Replica` (+ `impl for Meta`): `applied_position()`,
+   `journal_position()`, `raise_observed(Position)`; `apply_segment(seq,
+   epoch, through, records)` and `ack_journal(seqs, at, through)` persist
+   `applied_position`; `completed_position` also yields the completing
+   `Position`; `install_shadow(.., position)` and
+   `install_hint(records, position)` store it in the `spec` entry
+   (`SpecKind::Shadow`/`Hint`); `speculation_covers(keys, Position)`,
+   `replay_touches(keys)`; `Meta::session_wait` + the condvar.
+4. `event.rs`: `PeerMsg::MutateReply { req, outcome, position, base:
+   Option<Position> }`; retype `ReadIndexReply::position` (M8) and
+   `DelegateStream::deps` (M11) to `Position` now, while they are only
+   declared.
+5. `constellation_meta::MutateOutcome::Exists { records }` (drop
+   `ship_floor`, `epoch` = `position.epoch`); delete
+   `forward::safe_to_install_early` and the `ship_floor` plumbing with
+   the extraction.
+6. `holder.rs`: `on_mutate_request` fills `position` for every outcome
+   (table in item 1); `reply_base` returns `Option<Position>`.
+7. `client.rs` `on_mutate_reply`: `base_ok = base ≤ applied_position`;
+   `Accepted` → shadow with its position + `raise_observed`, or
+   `AwaitingLog` (unchanged); `Exists` → hint iff `applied_position <
+   position` + `raise_observed` + finish; `Errno`/`Conflict` →
+   `raise_observed` + finish; remove the causal wait (item 3).
+   `Config::speculate_on_stale_base` stays as the sim's non-vacuity knob;
+   add `Config::session_wait_ms` for the sim.
+8. `replay.rs` `on_replay_outcome`: accepted on an applied base → shadow
+   with its position; otherwise keep the entry queued until the log
+   carries the rid, and re-queue it if a higher-epoch segment arrives
+   first (the model's `ReplayEntry::awaiting`); never raise `observed`.
+9. M13 in the core: the inbox answer calls
+   `raise_observed(applied_position())` (item 4); nothing else.
+10. `fusefs_ops.rs`: `session_wait` at the top of `lookup`, `getattr`,
+    `readdir`/`readdirplus`, `open`, `readlink`, `getxattr`, `listxattr`
+    (keys in item 2); `CONSTELLATION_SESSION_WAIT_MS`; warn once;
+    counters (item 5).
+11. Sim (`crates/authority/tests/sim`): record reads (a lookup/readdir
+    through `Meta` with the session wait) in histories; check per-node
+    RYW/MR with the model's write-set definition (positions make the
+    observed write set exact there); seeds `session_wait_off_is_found`
+    and `stale_base_speculation_is_found` (kept).
+12. Model: update the mapping rows for `Read`, the reply position and
+    `AwaitingLog` in `crates/model/src/lib.rs` to the final names.
+13. Chaos: `session` family, then flip `ENFORCE_SESSION_GUARANTEES`.
+14. Harness scenarios of item 6; the measurements of item 5 in the
+    tester's gate report.
+
+**Open questions for phase 2.**
+1. M4's held-back rows stall `through`, so an observer of a later
+   position waits (bounded) until the held row ships. Rare by M4's
+   design; a per-key refinement is possible later.
+2. `readdir` coverage: with only the fast path, `ls` right after
+   forwarding creates into a directory waits one ship + tail interval.
+   If item 5's measurement shows that matters, the holder can certify
+   per reply that no *other requester's* unshipped row touches the parent
+   directory, and the shadow then covers `Dir(parent)`.
+3. Coverage keys are the op's keys (what `unshipped_overlaps` checked),
+   not every key its records touch (the parent's times): a `getattr` of
+   the parent right after a forwarded create waits. Extending the base
+   check to the records' `TouchSet` would cover it.
+
+## Plan 30 M6 — phase 2: positions on every reply, the read wait, enforced session checkers: **WRITTEN, CODER-TESTED** (pipelined on the M5 WIP base 236c39a; all M6 work is `git diff 236c39a`, uncommitted)
+
+| Item (phase-1 checklist) | State | Where |
+|---|---|---|
+| 1. `Position { seq, pending: Option<JournalPos { epoch, jseq }> }` (see "Position, as built" below) | done | `crates/meta/src/session.rs` (re-exported by `constellation_meta`) |
+| 2. Segment envelope `through` (trailing field, v2 kept: readers of the first four fields still decode); computed by `Meta::journal_through_after` (the acked watermark the ship leaves — an M4 held row stops it); markers carry the new holder's acked seq | done | `crates/authority/src/segment.rs`, `core/jobs.rs` |
+| 3. `Replica`: `apply_segment(seq, epoch, through, records)`, `ack_journal(seqs, at, pos)`, `journal_through_after`, `journal_position`, `raise_observed`, `note_covering`; `Meta::session_wait`/`session_ready`/`replay_touches`/`has_pending_replays`; the condvar is woken by every applied-position advance, every covering install and every `forget_replay` | done | `crates/authority/src/replica.rs`, `crates/meta/src/session.rs`, `store/spec.rs`, `store/inbox.rs` |
+| 4. `PeerMsg::MutateReply { req, outcome, base, position }`; `Payload::MutateReply` gains `position_seq`, `position_pending`; the driver's reply channel carries it | done | `event.rs`, `crates/net/src/message.rs`, `cli/src/authority_driver.rs`, `cli/src/main.rs`, `cli/src/fusefs.rs` |
+| 5. `MutateOutcome::Exists { records, epoch }` (no `ship_floor`; the hint floor is `Position::hint_floor`) | done | `crates/meta/src/mutate.rs` |
+| 6. Holder: `on_mutate_request` fills `position = (head_seq, journal_position(epoch))` right after executing, for every outcome it answers as holder; `ZERO` for `Busy`/`NotHolder` | done | `core/holder.rs` |
+| 7. Requester `on_mutate_reply`: coordinator decision 2 (below); `Exists` hint iff base ok and `applied < hint_floor`, covering its keys, else raise; `Errno`/`Conflict` raise; the causal wait is gone (`Phase::CausalWait`, `Timer::CausalWait`, `TimerKind::CausalWait`, `Config::causal_wait_ms`/`causal_poll_ms`, `causal_wait_target`) | done | `core/client.rs`, `core/mod.rs`, `action.rs` |
+| 8. Replays: never raise `observed` (`Core::observe` checks `Origin::Client`); a replay accepted on a stale base already waits for the log in M5's client machine | done | `core/client.rs` |
+| 9. M13 inbox answers raise nothing (the outcome rides the log behind every row it was evaluated against) | done | `core/client.rs` `answer_awaiting_log` |
+| 10. FUSE `lookup`, `getattr`, `readdir` (first chunk), `open`, `readlink`, `getxattr`, `listxattr` call `session_wait` before reading (before any write-shard lock); `CONSTELLATION_SESSION_WAIT_MS` (default 2000, 0 off); warn once; single-node mounts without a sync handle skip it | done | `cli/src/fusefs_ops.rs`, `cli/src/fusefs.rs` |
+| 11. `status.session` (`SessionStatus`): reads, fast, covered, waited, timeouts, `degraded_held` (coordinator decision 1), `replay_blocked`, `raised`, log2-ms wait histogram, total wait ms, budget | done | `crates/api/src/types.rs`, `cli/src/main.rs` |
+| 12. Sim: clients read (CI shards 0.3 reads per op, `session_guarantees_hold` 0.7, P2P and inbox); per-node RYW/MR checked on every run against the log's version order; `session_wait_off_is_found` | done | `crates/authority/tests/sim/{session,history,run,node}.rs`, `tests/sim.rs` |
+| 13. Model: phase-2 rules (below) | done | `crates/model/src/{positions,protocol}.rs` |
+| 14. Chaos: `ENFORCE_SESSION_GUARANTEES = true` (`CONSTELLATION_CHAOS_ENFORCE_SESSIONS=0` reports only) | done | `crates/chaos/src/sessions.rs` |
+| 15. Six harness scenarios (`session-*`) | done, each run once (below) | `crates/harness/src/scenarios/m6.rs` |
+| Core unit tests: `touch_ls_stat_after_forwarded_creates_take_the_fast_path`, `a_refusal_raises_observed_until_the_segment_lands`, `a_queued_replay_blocks_reads_of_its_keys`; meta unit tests for positions, the wait, the parent keys | done | `core/tests.rs`, `meta/src/session.rs` |
+
+### Position, as built
+
+Not the `(epoch, jseq)` of the phase-1 text alone: `Position { seq, pending }`
+— the holder's shipped-through **log sequence**, plus its unshipped
+journal position `(epoch, jseq)` if it had unshipped rows. The reason is
+a replica that bootstrapped from a commit (or restarted: the applied
+journal position is volatile, like the watermark): it cannot know the
+`(epoch, through)` of segments it never applied, but it knows its
+`applied_seq`. An idle holder answers `pending: None`, so the observation
+is exactly "applied through log seq `seq`" — checkable by anyone. A
+position is satisfied when `applied_seq ≥ seq` and the applied journal
+position (the `(epoch, through)` of the last applied or shipped segment)
+is `≥ pending`, epoch-first; `observed` is the component-wise maximum.
+`base` stays the `Accepted`/`Exists` install precondition (a log seq, as
+in M5): it and `position` answer different questions (may the records go
+in ahead of the log; what did the client see).
+
+### The coordinator's decisions, as implemented
+
+1. **M4 held rows stalling `through`.** `journal_through_after` stops
+   `through` below a held row, so an observer of a later position waits;
+   a timed-out wait while `Meta::held_any` is set counts in
+   `status.session.degraded_held` (and `timeouts`).
+2. **Only uncovered replies raise `observed`.** `Accepted` installed as a
+   shadow → `note_covering(KeySet::from_records(records), position)`, no
+   raise. Raises: `Errno`, `Conflict`, `Exists` without an installed hint,
+   an `Accepted` found already completed in the applied log, an
+   `AwaitingLog` completion (normally already dominated — the segment
+   carrying the completion shipped everything before it — except behind
+   an M4 held row). Tests: `touch_ls_stat_after_forwarded_creates_take_the_fast_path`
+   (three forwarded creates, holder unshipped; `Dentry`, `Dir(root)`,
+   `Ino(root)` all `Fast`, `raised == 0`) and the harness scenario
+   `session-forwarded-ryw` (`touch a; ls; stat .; stat a; cat a` × 50
+   with the holder's shipping held for the first 25: 309 reads, all fast).
+   The model follows (below).
+3. **Parent-directory attributes.** A forwarded create's shadow records
+   are the holder's `Create { parent, .. }` (plus `Completed`); applying
+   it runs the replay path's parent-time update, so the parent's mtime
+   moves at once (asserted in the fast-path test), and with nothing raised
+   `getattr(parent)` is on the fast path. *Revised in the rebase onto M5
+   (below):* the parent's inode is no longer a *covered* key after a
+   refusal raised `observed` — M5's per-key base does not look at later
+   shipped touches of the parent — so in that case `getattr(parent)`
+   waits for the applied position.
+
+### The read wait
+
+`Meta::session_wait(keys)` (see `crates/meta/src/session.rs`): (1) a
+queued replay touching the keys → wait (read-your-writes across a
+stranding); (2) applied position dominates `observed` → fast; (3) every
+key covered by speculation at a position ≥ `observed` → covered; (4)
+otherwise block on the condvar, 20 ms slices, until the budget; on
+timeout answer from the replica, warn once, count. The fast path is one
+mutex, one `applied_seq` read and one pending-replay counter read (a
+fjall point read). `Dir` keys are only satisfied by (2), and blocked by a
+replay of any entry in the directory. Covering entries are dropped once
+the applied position dominates them (a stranded shadow's position is then
+dominated by the new epoch too, so it never covers stale state).
+
+### Model (phase-2 rules)
+
+The `Positions` variant now raises `observed` only on refusals (an
+accepted op is installed: a shadow, the applied log, or a queued replay
+that blocks reads of its name), and the session ghost is per name
+(`Node::seen[x]`: a reply observes the op's name, per-key session
+guarantees). Results unchanged in shape:
+
+| Test | States (unique) | Time | Result |
+|---|---|---|---|
+| `recovery_reads_violate_monotonic_reads` | 131,435 (23,104) | 0.09 s | counterexample |
+| `recovery_reads_violate_read_your_writes` | 3.0M (670K), capped | 1.8 s | counterexample |
+| `positions_without_the_wait_violates_both` | 131K / 3.0M | 1.8 s | both counterexamples |
+| `positions_with_stale_base_shadows_violates_monotonic_reads` | 156,908 (27,434) | 0.10 s | counterexample |
+| `positions_refusal_waits_for_the_observed_position` | 131,203 (23,048) | 0.09 s | clean + path |
+| `positions_stale_base_waits_for_the_log` | 157,915 (27,569) | 0.10 s | clean + path |
+| `positions_stranded_shadow_read_waits_for_the_replay` | 3.0M, capped | 1.8 s | clean + path |
+| `positions_holds_across_a_crash_and_takeover` | 30.7M (5.8M) | 23.6 s | clean, exhaustive |
+| `inbox_outcomes_keep_sessions_without_a_watermark` | 1,193 (290) ×2 | <0.01 s | clean |
+
+### Simulation
+
+`cargo test -p constellation-authority --release`: 17 core unit tests,
+3 `meta_repro`, 20 sim tests (+1 ignored) in 14.5 s, 0.96 GB peak. The
+1,000 CI seeds now read (0.3 reads per op) with the session checks
+enforced; `session_guarantees_hold` (60 seeds each of P2P and inbox,
+0.7 reads per op, default random faults): 1,839 / 1,835 reads, 0 timed
+out, 0 violations, 0 tentative-exempt; `session_wait_off_is_found`: seed
+602 violates monotonic reads with the wait off (a refused
+`create f3` then a read of `f3` as absent). `long_random` with reads,
+400 seeds: green (21.7 s).
+
+**One M5 regression test needed its config changed.**
+`regression_bug_b_holder_dies_with_unshipped_forwards` asserts some seed
+strands speculation. On the M5 base, 2 of its 12 seeds did — and the
+rollbacks were *hints* (M5's hint floor was the holder's next segment, so
+a hint outlived a holder crash; with M6's exact floor an idle holder's
+hint is not installed at all, or retires at once). With M6 0 of 60 seeds
+stranded anything, because in that config (5–40 ms S3) the holder ships
+within the window before the 1.2 s crash. The config now uses 40–160 ms
+S3 latency: seeds 200, 207, 208, 211 strand shadows (22 of 60). For the
+coordinator: the test was passing on hint rollbacks, not shadow ones, on
+the base.
+
+### Harness scenarios (each run once, `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m6opus`, release build)
+
+| Scenario | Result | Evidence |
+|---|---|---|
+| `session-exists-observed` | PASSED | B's `stat g` (a name B never touched; only A's unshipped state had it) after B's refused `create f` waited 514 ms (the hold lifted at 500 ms) and found `g`; `raised 1`, `waited 1`, `timeouts 0`, histogram bucket 10 (512–1023 ms) |
+| `session-forwarded-ryw` | PASSED (122.6 s, mostly the forwarded creates with the holder's rounds held) | 309 reads, 309 fast, 0 waited, 0 raised |
+| `session-stale-base-rename` | PASSED | runs M5's `stale-base-rename-divergence`: B's rename waited while held, returned OK 3.0 s later, A/B/C agree |
+| `session-ryw-after-holder-kill` | PASSED | C listed + stat'ed its phantom 556 times through A's kill, B's takeover, the stranding and the replay: never missing; 1,128 reads, 1 replay-blocked (waited 31 ms), 0 timeouts; slowest check 32 ms |
+| `session-wait-degrades` | PASSED | budget 1500 ms: lookups answered `ENOENT` (no `EIO`) after 1.50 s, 3.00 s, 3.00 s (the kernel issues two lookups for a missing name on the 2nd and 3rd, each a full wait: 5 timeouts for 3 calls); one warning in the log; fast again once A shipped |
+| `session-idle-latency` | PASSED | after a 3-node burst of 120 files, the idle read phase (stat + read of every file, `readdir` ×3, on each node): 811 / 810 / 811 reads, all fast, 0 waited, histogram all zero, 473 ms for the whole phase; single node: 164 reads, all fast, 0 raised |
+
+### Read latency
+
+- Idle (3 nodes, after the burst): **0 waits in 2,432 checked reads**;
+  single node: 0 in 164. The fast path is two in-memory loads and one
+  counter read per FUSE read op.
+- Write-then-read on a non-holder (forwarded creates, holder unshipped):
+  0 waits in 309 reads.
+- A refusal then a read of another name the holder had unshipped: one
+  wait, bounded by the holder's next ship + the requester's tail (514 ms
+  with a 500 ms forced hold).
+- A stranded own write: the read waited 31 ms for the replay.
+- Degraded: exactly the budget per daemon call.
+
+### chaos
+
+`ENFORCE_SESSION_GUARANTEES = true`; both runs on this build, seed 42:
+
+- `chaos-ci`: PASSED (3.2 s; 8 steps including `mkdir_storm` and
+  `rmdir_storm`), session checkers enforced inside the run.
+- `chaos-soak-4`: PASSED (303.8 s; 20 `mkdir_storm` and 10
+  `unlink_storm` steps among 194). Re-checked offline with `chaos check`:
+  1,553 session observations judged, 32 unexplained, **0 violations**.
+  The two historical monotonic-reads violations (the losers of a
+  `mkdir` storm seeing `EEXIST` then no directory; of an `unlink` storm
+  seeing `ENOENT` then the file) did not reproduce.
+
+### What the tester must run
+
+- `cargo test -p constellation-meta -p constellation-authority -p constellation-chaos -p constellation-model -p constellation-api -p constellation-net -p constellation` (model in `--release`: `positions.rs` 24.8 s / 1.63 GB with its tests in parallel; `today_bugs.rs` unchanged at 34 s / 2.06 GB).
+- `cargo test -p constellation-authority --release` (sim with reads), and
+  `AUTHORITY_SIM_SEEDS=2000 cargo test -p constellation-authority --release --test sim -- --ignored long_random`.
+- Harness: the six `session-*` scenarios, `chaos-ci`, `chaos-soak-4`,
+  `stale-base-rename-divergence`, and the scenarios whose behaviour the
+  removed causal wait touched: `create-storm-s3-only`, the plan 29 M6
+  `Exists` scenarios, `takeover-marker-strands-promptly`, the M3a
+  phantom scenarios, the inbox scenarios; then the full suite.
+- Perf gate: `meta-bench` (every FUSE read now runs the session check —
+  one fjall counter read for the replay queue; if it shows, the counter
+  can move to an atomic mirror), and the forwarded-latency configs.
+
+### Open items / notes for the coordinator
+
+- The applied journal position is in-memory: after a restart it starts
+  at zero until a segment is applied. Harmless (the watermark restarts
+  empty too, and a new observation's `seq` part is exact); a position
+  with `pending` from before the next segment waits for that segment.
+- Holder position is read right after the execution (`journal_position`),
+  so a FUSE-thread local write committing in that microsecond makes it
+  larger — only ever more waiting, and a covering entry slightly
+  over-claiming for a key the concurrent write also touched (vanishingly
+  rare; noted, not fixed).
+- The harness scenarios read through the kernel's 1 s entry/attr cache;
+  `session-ryw-after-holder-kill` lists the directory (never cached) for
+  that reason.
+
+## Plan 30 M6 — rebase onto M5 (617499b): **GREEN** (coder, 2026-09-24; uncommitted on `plan30-m6` = main 617499b; the pre-rebase state is `stash@{0}`, untouched)
+
+**Conflicts resolved.**
+- `core/client.rs`: M5's causal-wait functions (now `get`-based) against
+  M6's removal of the causal wait. Took M6's `Core::observe`; the causal
+  wait stays gone. M5's other client changes are kept as they are:
+  `inbox_keys`, the multi-batch withdraw, the re-entrancy-safe
+  `release_gated`, the `get` lookups, and `Origin::Replay` in doubt.
+- `core/tests.rs`: kept both M5's round 3–5 tests and M6's three tests.
+  M5's new `MutateReply` literals gain `position: Position::ZERO`.
+- `tests/sim/run.rs`: `SimConfig` keeps M5's `panic_after_events` next to
+  M6's `read_ratio`/`session_wait`/`session_wait_ms`.
+- `cli/src/main.rs`: M5's `started` service-time trace next to M6's
+  three-field reply.
+- `PROGRESS.md`: M5's sections, then M6's.
+
+**Re-derived on M5's new base.** M5 round 3 makes `base` "the last
+shipped touch of the op's keys" (`Core::shipped_touches` /
+`shipped_floor`, `reply_base`), no longer the head. M6 keeps that `base`
+unchanged as the install precondition. `position` is still the holder's
+whole evaluated state: `head_seq` plus `journal_position`.
+
+The one consequence is coverage. A shadow installed on the per-key base
+is current only for the keys that base was computed over, which are the
+records' `TouchSet`. So `KeySet::from_records` no longer adds the parent
+directory's inode:
+- after a refusal has raised `observed`, `getattr(parent)` waits for the
+  applied position, where it used to be `Covered`. Later shipped creates
+  in the same directory can have changed the parent's times and link
+  count, and the per-key base does not look at them;
+- without a raise it is still on the fast path, so decision 2's
+  `touch a; ls; stat .` is unaffected. The shadow still updates the
+  parent's mtime at once.
+
+The meta test `keys_of_a_create_cover_its_own_keys_not_the_parent` and the
+core test `a_refusal_raises_observed_until_the_segment_lands` (3
+timeouts, 1 covered) pin this. A queued replay still blocks the parent,
+through `KeySet::from_op`.
+
+**Checked for semantic interactions** in the files that applied cleanly
+(`authority_driver`, `fusefs`, `fusefs_ops`, `meta/store`, `net`):
+- no reference to anything M5 removed or renamed remains: no
+  `causal_wait*`, `CausalWait`, `ship_floor` or `safe_to_install_early`
+  anywhere outside the model's docs;
+- every `apply_segment`/`ack_journal`/`segment::encode` call site in the
+  merged `jobs.rs` passes a position or `through`;
+- the FUSE session waits still run before any write-shard lock.
+
+**Sim seeds.**
+- `regression_every_inbox_batch_of_a_rid_is_withdrawn` asserted that
+  seeds 10247 and 10507 reach the multi-batch withdraw. M6's core changes
+  (no causal-wait timers) shift every schedule, and 10247 no longer
+  reaches it on this tree, although it still converges. The test now
+  checks 10247 for convergence and 10396/10507 for the withdraw.
+  `find_multi_batch_withdraw_seeds` (`#[ignore]`) is the re-pin helper;
+  it found 15 such seeds in 10000–11499.
+- `long_config` is M5's again, with no reads: its pinned seeds are
+  M5's schedules. `long_sessions_config` adds reads.
+  `long_random` defaults to reads; `AUTHORITY_SIM_READS=0` gives
+  the read-free sweep. `AUTHORITY_SIM_CONFIG=long-sessions` replays one
+  seed with reads.
+- `regression_bug_b`'s slower S3 (40–160 ms) is still needed on 617499b:
+  with M5's default latency no seed strands.
+
+**Results.**
+- `cargo fmt --all`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --exclude constellation-model` (debug): all
+  green (authority sim 23 passed + 2 ignored in 65.7 s debug; cli 191;
+  meta 91; …).
+- `cargo test -p constellation-model --release`: all green, 82 s,
+  2.25 GB peak with the binaries' tests in parallel.
+- `cargo test -p constellation-authority --release`: 22 core unit, 3
+  `meta_repro`, 23 sim tests (+2 ignored), 15.3 s, 0.95 GB.
+- M5-pinned seeds pass: 10476 (with 2267, 2277), 11932, 10247 and 10507
+  (and 10396), 12666 (replayed under `long` and `long-sessions`).
+- `long_random`: 1,500 seeds with reads (10000–11499) and 1,500 without
+  (11500–12999, covering 11932 and 12666), 3,000/3,000 ok, about 108 s
+  each.
+- Harness (`constellation-harness-m6opus`, release build of this tree):
+  all six `session-*` scenarios and `chaos-ci` PASSED.
+
+| Scenario | Evidence |
+|---|---|
+| `session-exists-observed` | `stat g` waited 508 ms, then found `g` |
+| `session-forwarded-ryw` | 307 reads, all fast |
+| `session-stale-base-rename` | rename waited, then returned OK after 3.0 s |
+| `session-ryw-after-holder-kill` | 569 checks, never missing; one read waited 9 ms, replay-blocked |
+| `session-wait-degrades` | 1.5 / 3.0 / 3.0 s, answered degraded (no `EIO`), one warning |
+| `session-idle-latency` | 2,433 idle reads, 0 waits; single node 164, 0 waits |
+
+## Plan 30 M6 — tester gate run
+
+Worktree `/home/bra/cvs/constellation-m6`, branch `plan30-m6`, uncommitted
+on main 617499b (the rebase-onto-M5 state above). Every harness command
+used `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m6` /
+`CONSTELLATION_BIN=/home/bra/cvs/constellation-m6/target/release/constellation`,
+foreground with explicit timeouts. Baseline A/Bs used a fresh detached
+worktree at main `617499b` (`git worktree add --detach
+<scratchpad>/m6-baseline-617499b 617499b`), its own release build, under
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m6base`;
+removed (`git worktree remove --force`) at the end. No mechanical fixes
+were needed anywhere — the tree built, formatted and linted clean as
+handed off.
+
+### Gate 1 — fmt / clippy / workspace + model tests
+
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean, zero
+  warnings.
+- `cargo test --workspace --exclude constellation-model` (debug): every
+  crate green, 0 failed (cli, meta, api, net, store-s3, authority (22
+  core unit + 3 `meta_repro` + 23 sim tests, 2 ignored), chaos, harness,
+  upload-concurrency, uploadbench, mtree doc-test).
+- `cargo test -p constellation-model --release`: 23 passed, 0 failed, 5
+  ignored (documented `#[ignore]`d "deep" siblings). Per-binary timing
+  with `/usr/bin/time -v` (isolated runs): **`positions.rs` 24.65 s wall,
+  1.64 GB peak RSS** (matches the coder's 24.8 s / 1.63 GB); `today_bugs.rs`
+  29.07 s wall, 2.22 GB peak RSS (coder reported 34 s / 2.06 GB — within
+  host-load noise, still under the 60 s/2 GB-ish per-binary budget).
+
+### Gate 2 — the simulator
+
+- `cargo test -p constellation-authority --release`: 22 core unit, 3
+  `meta_repro`, 23 sim tests (+2 ignored), 18.26 s, matching the coder's
+  15.3 s within host-load noise.
+- `AUTHORITY_SIM_SEEDS=2000 cargo test -p constellation-authority
+  --release --test sim -- --ignored long_random` (reads, the default
+  `long_sessions_config`): seeds 10000–11999, **2000/2000 ok**, 135.2 s.
+- `AUTHORITY_SIM_SEEDS=1000 AUTHORITY_SIM_READS=0 cargo test -p
+  constellation-authority --release --test sim -- --ignored long_random`
+  (read-free `long_config`): seeds 10000–10999, **1000/1000 ok**, 61.8 s.
+- No failing seed to report in either sweep.
+
+### Gate 3 — release build
+
+`cargo build --release --workspace`: clean.
+
+### Gate 4 — harness scenarios
+
+All scenarios named in the milestone's gate list, run under this tree's
+release build (seed 42 unless the scenario is seedless):
+
+| Scenario | Runs | Result |
+|---|---|---|
+| `baseline`, `git-workflow`, `two-clients-shared`, `kill9-remount`, `forwarded-mutations`, `mkdir-p-race` (plan 29 M6's `Exists` scenario), `stale-base-rename-divergence`, `takeover-marker-strands-promptly`, `holder-crash-phantom-shadow`, `holder-crash-phantom-new-holder` | 1 each | all PASSED |
+| `inbox-create-storm-p2p-off` | 1 | PASSED (16,560 files/49,680 ops in 32.4 s = 1533.8 ops/s, ping-pong floor 41 ops/s; 4 lease handoffs, 2 escalations) |
+| `inbox-sporadic-write-p2p-off` | 4 | **1 FAILED, 3 PASSED** — see Findings |
+| `inbox-requester-crash-mid-batch`, `inbox-holder-takeover-pending-batch` | 1 each | PASSED |
+| `create-storm-s3-only` | 1 | PASSED (46.0 s) |
+| `fresh-node-bootstrap` | 1 | PASSED (62.5 s) — the M5 regression (self-unmount on a lost mount-time lease race) does not reproduce on this tree |
+| `holder-ships-under-forward-load` | 1 | PASSED (6.6 s: 6,400 forwarded creates in 4.05 s, max `journal_backlog` 234, `ship_rounds_cancelled=0`) — the M5-round regression (~8× slower, backlog >500) is gone |
+| `session-exists-observed`, `session-forwarded-ryw`, `session-stale-base-rename`, `session-ryw-after-holder-kill`, `session-wait-degrades`, `session-idle-latency` | 2 each | all 12 runs PASSED (numbers match the coder's within noise; `session-forwarded-ryw` ran 31.4 s then 122.4 s depending on how long the holder's shipping was held) |
+| `chaos-ci` | 2 | both PASSED (3.9 s, 3.1 s; 9 steps each, `exactly_once_log` 13 outcomes each once); session checkers enforced (`ENFORCE_SESSION_GUARANTEES = true` in `crates/chaos/src/sessions.rs:60`, confirmed in source, not just report-only) |
+| `chaos-soak-4` | 1 | PASSED (309.6 s; `exactly_once_log` 1,692 outcomes, each once) |
+
+**Finding — `inbox-sporadic-write-p2p-off`, transient, not reproduced.**
+First run FAILED in 61.5 s: `the lease moved for sporadic writes (epoch 1
+-> 1)` — the assertion is `lease_of(&holder)?["held"] == true &&
+epoch_after == epoch_before`; since both epochs print as `1`, the holder
+must have answered `held: false` at the one check point, epoch
+unchanged. Reran 3× more on this tree: **3/3 PASSED** (p50 ≈ 570–580 ms,
+p99 ≈ 1.05–1.14 s each time, no epoch movement). Ran 3× on the main
+617499b build for comparison: **3/3 PASSED**, same latency shape. Net:
+1/4 on M6, 0/3 on main — too rare to call a regression and not
+reproduced under either binary on a second look; flagged for the
+coordinator rather than dismissed, since "held: false" at that instant
+is exactly the shape a real lease hiccup would take.
+
+### Gate 5 — smoke / pjdfstest
+
+- `tests/smoke.sh` (local file backend, `CONSTELLATION_BIN` = this
+  tree's release binary): **PASSED** (etag-CAS-unavailable messages are
+  the expected local-backend shape, not a failure).
+- pjdfstest: this worktree's own `docker compose --profile test run --rm
+  compliance` couldn't bind host port 4566 — `constellation-floci-1`
+  (a different, apparently-active session's container) already holds
+  it. Worked around exactly as M4/M5's testers did: built the `suite`
+  image from this tree's own source under a scoped tag
+  (`SMOKE_IMAGE=constellation-smoke:m6t`) and ran it under
+  `COMPOSE_PROJECT_NAME=constellation-m6t` with a scratch override
+  (`services: {floci: {ports: !reset []}}`, `docker compose -f
+  docker-compose.yml -f floci-no-port.yml`) so this project's floci never
+  tries to publish 4566 on the host — `compliance`'s container still
+  talks to it by in-network DNS name, so nothing about what is tested
+  changes. **8798 passed, 0 failed**, empty baseline. Torn down after
+  (`down -v --remove-orphans`, this project only) and the scratch image
+  removed; `constellation-floci-1` and every other worktree's containers
+  were left untouched throughout.
+
+### Gate 6 — perf (measured last; host load recorded per row)
+
+This host ran other worktrees' concurrent sims/harnesses throughout
+(`uptime` load1 ranged 7–26 across the session, well above a quiet
+host); a bounded wait (~13 min) got load1 from 14.7 down to 7.1 before
+starting the meta-bench matrix, and a second bounded wait (~4 min) got
+it back to 8.9 before the last three `3node-p2pon-shared-create-lat0`
+rounds. `1node-*` and the first three `3node-*` rounds ran while load1
+climbed back into the mid-teens to mid-20s from other worktrees'
+activity resuming — noted per row. All comparisons interleaved (M6 run,
+then main run, repeated), via each tree's own release `harness` +
+`constellation` binaries, `CONSTELLATION_METABENCH_ONLY=<config>`.
+
+**meta-bench, 3 interleaved pairs per config** (`agg` ops/s):
+
+| config | M6 runs (load1 at run) | M6 avg | main runs (load1 at run) | main avg | M6/main |
+|---|---|---|---|---|---|
+| `1node-create-lat0` | 7949 (7.1), 7919 (7.5), 7005 (8.0) | 7624 | 7520 (7.3), 3968 (10*), 7603 (8.2) | 6364 | 1.20 (noisy: main's round 2 dip lines up with a load spike, not a code difference) |
+| `1node-write4k-lat0` | 3057 (9), 1366 (13*), 2865 (10) | 2429 | 3165 (9.5), 2379 (12), 3115 (10) | 2886 | 0.84 (noisy: M6's round 2 dip is the outlier; rounds 1+3 alone are 0.94×) |
+| `3node-p2pon-shared-create-lat0`, rounds 1–3 (load1 14–26, heavy contention) | 881, 2987, 154 | 1341 | 133, 3077, 2576 | 1929 | 0.70, but see rounds 4–6 |
+| `3node-p2pon-shared-create-lat0`, rounds 4–6 (load1 7.4–11.4, quieter) | 2680, 3053, 3030 | 2921 | 2915, 1643, 1564 | 2041 | **1.43** — M6 faster, and rounds 1–3's apparent M6 deficit reverses once the host quiets down |
+
+No config shows the kind of consistent multiple-of-slowdown M5's tester
+found for this same config (`0.19×`, every round) — here both binaries
+swing between roughly 0.7× and 1.4× of each other depending on which
+one drew the quieter interleaved slot, which reads as host-load noise
+dominating a fast (sub-millisecond to low-millisecond) operation, not a
+code regression. `holder-ships-under-forward-load` (gate 4) independently
+shows no repeat of the M5-era forwarding regression (4.05 s for 6,400
+forwarded creates, vs. that regression's ~90 s).
+
+**Read-heavy measurement** (meta-bench has no read workload; used
+`harness bench --files 2000 --json`, single node, 3 interleaved pairs;
+load1 7.4–19.1 across these six runs):
+
+| metric | M6 runs | M6 avg | main runs | main avg | M6/main |
+|---|---|---|---|---|---|
+| `metadata_walk_files_per_sec` (pure `stat` walk — every FUSE `getattr` now runs `session_wait`) | 175214, 232208, 174849 | 194090 | 192906, 169578, 185449 | 182644 | 1.06 |
+| `cold_read_files_per_sec` (tar read-back, cold cache) | 41739, 47441, 50702 | 46627 | 21984, 44508, 46516 | 37669 | 1.24 |
+| `sequential_cold_read_mib_per_sec` | 370, 413, 332 | 372 | 235, 339, 323 | 299 | 1.24 |
+| `warm_random_read_iops` | 1393257, 41437*, 1336806 | — | 419475*, 1290133, 1303377 | — | both sides have one order-of-magnitude-low outlier under load; not usable for a ratio |
+
+None of the read-path metrics show M6 slower than main — if anything M6
+trends a few percent to ~24% faster on average, which given the noise
+reads as "no regression" rather than "M6 is actually faster": the
+session-wait fast path is two atomic loads and one counter read (the
+coder's own characterization), small next to a real FUSE/S3 round trip.
+`warm_random_read_iops` is too noisy on both binaries (one low outlier
+each, almost certainly page-cache/host-memory-pressure related given
+33+ GB used and swap active on this host) to say anything about it
+either way.
+
+**Conclusion for the coordinator:** within the noise this contended,
+shared host allows, M6 shows no read-path or write-path regression
+against main; the one clear historical regression this milestone's
+lineage had (`holder-ships-under-forward-load` / `3node-p2pon-shared-create-lat0`,
+M5's ~5–8× slowdown) does not reproduce here — it looks like the M5
+round-3–5 fixes already resolved it, independent of this milestone's own
+changes.
+
+### Summary for the coordinator
+
+- Gates 1, 2, 3, 5: clean, no fixes needed.
+- Gate 4: every named scenario PASSED at least once; the only failure
+  seen (`inbox-sporadic-write-p2p-off`, 1/4 on this tree) did not
+  reproduce in 3 more tries on this tree or 3 tries on main — reported,
+  not dismissed, per the tester's rule never to call something
+  pre-existing/flaky without an A/B (done here: A/B ran, found nothing
+  on main either, sample too small to conclude either way).
+- Gate 6: no regression found in any of the 3 meta-bench configs or the
+  4 read-heavy `harness bench` metrics; the host's shared load (7–26
+  throughout) made several individual data points noisy, documented per
+  row rather than smoothed over.
+- No commits made; `git status` on `/home/bra/cvs/constellation-m6` is
+  unchanged from what the coder handed off (same modified/untracked file
+  list as the "rebase onto M5" section above).

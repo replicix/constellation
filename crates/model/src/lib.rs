@@ -57,6 +57,21 @@
 //! `no_rid_executes_twice`, and two naive-variant knobs the tests use
 //! to show the model finds the bugs in the obvious design.
 //!
+//! [`protocol::Protocol::Positions`] (plan 30 §M6, module [`positions`])
+//! is layered on `Recovery`: clients also *read* (`AuthorityModel::
+//! with_lookup`/`with_readdir`, `protocol::Action::Read`), replies carry
+//! the answering holder's position and M5's `base`, an accepted record on
+//! a base the requester has not applied waits for the log instead of
+//! being installed, and a read waits until the node's applied position
+//! reaches its `observed` watermark unless a shadow at least that new
+//! covers the name (and never while a queued replay touches it). It adds
+//! the properties `read_your_writes` and `monotonic_reads` (registered
+//! only for a workload that reads), defined on write sets per name; today's
+//! system (`Recovery` with reads) violates both, as does `Positions` with
+//! either rule switched off (`with_session_wait(false)`,
+//! `with_stale_base_shadows(true)`), and `tests/positions.rs` keeps those
+//! counterexamples.
+//!
 //! # What is modeled
 //!
 //! - **Actors.** `N` `Node`s (2–3 across the tests) plus one implicit
@@ -123,6 +138,9 @@
 //! | `ResubmitInbox` (`inbox`) | the stranded requester's re-submission of the same rid under the new epoch (after resolving against its own `completed` first, and deleting its stale batch) |
 //! | `AcquireLease` (drain, `inbox`) | `store_s3::inbox::InboxStore::drain_below` executed inside `shipper::complete_gate`, after the stranded-op replays and before the view opens |
 //! | `GcInbox` (`inbox`) | `store_s3::inbox::InboxPoller::delete` after the outcome's segment shipped, keeping each requester's newest consumed batch (`gc_keep_newest`) |
+//! | `Read` (plan 30 §M6) | the FUSE read paths (`fusefs_ops.rs`: `lookup`, `getattr`, `readdir`, `open`, `readlink`, `getxattr`, `listxattr`); under `Positions` gated by the session wait (phase 2: a `Replica`/core check before the local `MetaStore` read, bounded by `CONSTELLATION_SESSION_WAIT_MS`) |
+//! | `DeliverForwardRequest` reply position (`Positions`) | `Core::on_mutate_request` → `PeerMsg::MutateReply { position, base }` (M5's `reply_base` generalized; `positions::reply_position`) |
+//! | `DeliverForwardReply` → `Phase::AwaitingLog` (`Positions`) | `Core::on_mutate_reply`'s stale-base branch → `ClientPhase::AwaitingLog`, answered by `answer_awaiting_log` (`positions::on_tailed`) |
 //!
 //! # Simplifications
 //!
@@ -268,9 +286,20 @@
 //!     through the takeover epoch marker (simplification 12): the
 //!     stranded requester tails the empty higher-epoch segment before
 //!     the drain's outcome ships (`inbox_marker_strands_and_resubmits`).
+//! 17. (`Positions`) A position is a log slot plus a journal row count
+//!     (`positions::Pos`), standing for the real `(epoch, journal_seq)`:
+//!     a tenure ships its whole journal as one segment at the next slot,
+//!     so the two orders agree (see `positions`' module doc). The read
+//!     wait is unbounded in the model (a disabled action); the real one
+//!     is bounded and then answers degraded, which is a liveness choice.
+//!     `EEXIST` hints are not modeled (simplification 6), so a refusal
+//!     is only ever followed by the wait, never by a covering hint; M6's
+//!     hint is a latency optimization of the same rule. Reads record no
+//!     history events and are not linearizability-checked.
 
 pub mod inbox;
 pub mod namespace;
+pub mod positions;
 pub mod protocol;
 
 pub use namespace::{Errno, NamespaceSpec, NsOp, NsRet, N_NAMES};

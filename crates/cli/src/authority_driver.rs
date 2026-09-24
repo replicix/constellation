@@ -35,7 +35,7 @@ use constellation_authority::{
     TimerKind, UploadResult,
 };
 use constellation_fs_core::cache::DiskCache;
-use constellation_meta::{LogRecord, Meta, MutateOp, MutateOutcome, Rid};
+use constellation_meta::{JournalPos, LogRecord, Meta, MutateOp, MutateOutcome, Position, Rid};
 use constellation_net::Payload;
 use constellation_store_s3::inbox::InboxStore;
 use constellation_store_s3::lease::now_unix_ms;
@@ -265,7 +265,7 @@ pub struct Driver {
     sync_tx: mpsc::UnboundedSender<SyncRequest>,
     sync_rx: mpsc::UnboundedReceiver<SyncRequest>,
     replies: HashMap<Rid, oneshot::Sender<ClientReply>>,
-    mutate_replies: HashMap<OpId, oneshot::Sender<(MutateOutcome, Option<u64>)>>,
+    mutate_replies: HashMap<OpId, oneshot::Sender<(MutateOutcome, Option<u64>, Position)>>,
     handoff_replies: HashMap<OpId, oneshot::Sender<Option<HandoffResult>>>,
     controls: HashMap<OpId, ControlReply>,
     next_control: u64,
@@ -525,7 +525,8 @@ impl Driver {
                 let op = match MutateOp::from_postcard(&op) {
                     Ok(op) => op,
                     Err(_) => {
-                        let _ = reply.send((MutateOutcome::Errno(libc::EINVAL), None));
+                        let _ =
+                            reply.send((MutateOutcome::Errno(libc::EINVAL), None, Position::ZERO));
                         return None;
                     }
                 };
@@ -889,7 +890,12 @@ impl Driver {
 
     fn send(&mut self, to: NodeId, msg: PeerMsg) {
         match msg {
-            PeerMsg::MutateReply { req, outcome, base } => {
+            PeerMsg::MutateReply {
+                req,
+                outcome,
+                base,
+                position,
+            } => {
                 if let Some(tx) = self.mutate_replies.remove(&req) {
                     if matches!(outcome, MutateOutcome::Accepted { .. }) {
                         self.deps.placement.note_forwarded(to);
@@ -901,10 +907,10 @@ impl Driver {
                         // for.
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
-                            let _ = tx.send((outcome, base));
+                            let _ = tx.send((outcome, base, position));
                         });
                     } else {
-                        let _ = tx.send((outcome, base));
+                        let _ = tx.send((outcome, base, position));
                     }
                 }
             }
@@ -942,6 +948,7 @@ impl Driver {
                                 req,
                                 outcome: MutateOutcome::Errno(libc::EINVAL),
                                 base: None,
+                                position: Position::ZERO,
                             },
                         }));
                         return;
@@ -965,7 +972,14 @@ impl Driver {
                             req_id,
                             outcome,
                             base,
+                            position_seq,
+                            position_pending,
                         })) if req_id == req.0 => {
+                            let position = Position {
+                                seq: position_seq,
+                                pending: position_pending
+                                    .map(|(epoch, jseq)| JournalPos { epoch, jseq }),
+                            };
                             let outcome = if outcome.is_empty() {
                                 MutateOutcome::Busy
                             } else {
@@ -985,7 +999,12 @@ impl Driver {
                             }
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
-                                msg: PeerMsg::MutateReply { req, outcome, base },
+                                msg: PeerMsg::MutateReply {
+                                    req,
+                                    outcome,
+                                    base,
+                                    position,
+                                },
                             }));
                         }
                         Ok(Ok(_)) => {
@@ -996,6 +1015,7 @@ impl Driver {
                                     req,
                                     outcome: MutateOutcome::Busy,
                                     base: None,
+                                    position: Position::ZERO,
                                 },
                             }));
                         }

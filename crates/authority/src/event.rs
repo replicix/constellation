@@ -13,7 +13,7 @@
 
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 use constellation_fs_core::Ino;
-use constellation_meta::{LogRecord, MutateOp, MutateOutcome, Rid};
+use constellation_meta::{LogRecord, MutateOp, MutateOutcome, Position, Rid};
 use constellation_store_s3::inbox::InboxBatch;
 use constellation_store_s3::{Lease, LeaseTag};
 
@@ -185,10 +185,20 @@ pub enum PeerMsg {
     /// installed on a stale base, then the segment carrying both the
     /// earlier record and the op applied on top (`rename` makes it
     /// visible; the model's create/unlink-only namespace cannot).
+    ///
+    /// Plan 30 §M6: `position` is the state the holder evaluated the op
+    /// against — its shipped-through log sequence plus its unshipped
+    /// journal position (`constellation_meta::Position`) — on every
+    /// outcome. `base` stays the install precondition for `Accepted`
+    /// (and the hint of `Exists`); `position` is what the requester's
+    /// `observed` watermark rises to when the reply's effects are not
+    /// installed there, and what installed speculation covers up to.
+    /// `Position::ZERO` on `Busy`/`NotHolder` (nothing observed).
     MutateReply {
         req: OpId,
         outcome: MutateOutcome,
         base: Option<Seq>,
+        position: Position,
     },
     /// "I want the lease" (`Payload::LeaseRequest`), sent to the holder.
     LeaseRequest {

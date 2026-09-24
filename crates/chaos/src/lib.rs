@@ -9,7 +9,9 @@
 //! - [`LocalCluster`] — in-process mounts (used by harness `chaos-ci`)
 //! - [`TcpCluster`] — remote workers for multi-node soak
 //! - [`check_history`] — pure offline checkers over a [`History`]:
-//!   the per-step invariants, exactly-once, and Elle-style cycles
+//!   the per-step invariants, exactly-once, Elle-style cycles, and plan 30
+//!   §M6's per-node session guarantees ([`sessions`], enforced since M6
+//!   phase 2: [`sessions::ENFORCE_SESSION_GUARANTEES`])
 //! - [`check_convergence`] / [`check_log_completions`] — plan 30 §M4's
 //!   whole-cluster checks the harness runs after a run (every replica's
 //!   tree, a fresh one's included; every rid completes once in the log)
@@ -28,6 +30,7 @@ pub mod gen;
 pub mod history;
 pub mod op;
 pub mod proto;
+pub mod sessions;
 pub mod store;
 pub mod worker;
 

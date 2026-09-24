@@ -123,6 +123,9 @@ impl NodeHandle {
             }
         };
         let incarnation = meta.bump_incarnation().expect("incarnation");
+        // Plan 30 §M6: the session state is the process's; a restart is a
+        // new FUSE session.
+        meta.session().reset();
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             replies: Mutex::new(HashMap::new()),

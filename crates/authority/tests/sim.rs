@@ -15,6 +15,7 @@ mod sim {
     pub mod history;
     pub mod node;
     pub mod run;
+    pub mod session;
     pub mod store;
 }
 
@@ -28,7 +29,12 @@ fn run_shard(shard: u64) {
     let mut failures = Vec::new();
     let mut summary = (0usize, 0usize, 0usize, 0usize);
     for seed in (shard * CI_SEEDS_PER_SHARD)..((shard + 1) * CI_SEEDS_PER_SHARD) {
-        match run_seed(seed, SimConfig::default()) {
+        // Plan 30 §M6: the CI seeds read too (session checks enforced).
+        let cfg = SimConfig {
+            read_ratio: 0.3,
+            ..SimConfig::default()
+        };
+        match run_seed(seed, cfg) {
             Ok(report) => {
                 assert_eq!(report.seed, seed);
                 summary.0 += report.ops_returned;
@@ -155,6 +161,11 @@ fn bug_b_config() -> SimConfig {
         ops_per_client: 8,
         names: 3,
         random_faults: 0,
+        // Plan 30 §M6: slower S3 widens the window in which the holder
+        // has acknowledged forwards it has not shipped yet. (With M6's
+        // exact hint floor, hints no longer strand in this config — they
+        // used to make up most of the rollbacks this test counted.)
+        s3_latency: (40, 160),
         faults: vec![ScheduledFault {
             at_ms: 1_200,
             kind: FaultKind::CrashHolder {
@@ -167,7 +178,9 @@ fn bug_b_config() -> SimConfig {
 }
 
 /// Replay one seed with `AUTHORITY_SIM_SEED` (and `AUTHORITY_SIM_CONFIG`
-/// = `default` | `buga` | `bugb` | `s3:<i>` | `single` | `long` | `inbox`); a
+/// = `default` | `buga` | `bugb` | `s3:<i>` | `single` | `long` | `inbox` |
+/// `long-sessions` | `sessions` | `sessions-inbox` | `plain` (the default
+/// without reads)); a
 /// no-op without it.
 #[test]
 fn replay_seed() {
@@ -189,11 +202,27 @@ fn replay_seed() {
             ..SimConfig::default()
         },
         Ok("long") => long_config(),
+        Ok("long-sessions") => long_sessions_config(),
         Ok("inbox") => SimConfig {
             core: std::sync::Arc::new(sim::run::inbox_core_config),
             ..SimConfig::default()
         },
-        _ => SimConfig::default(),
+        // Plan 30 §M6's session tests.
+        Ok("sessions") => SimConfig {
+            read_ratio: 0.7,
+            ..SimConfig::default()
+        },
+        Ok("sessions-inbox") => SimConfig {
+            read_ratio: 0.7,
+            core: std::sync::Arc::new(sim::run::inbox_core_config),
+            ..SimConfig::default()
+        },
+        Ok("plain") => SimConfig::default(),
+        // The CI shards' configuration (reads included since M6).
+        _ => SimConfig {
+            read_ratio: 0.3,
+            ..SimConfig::default()
+        },
     };
     match run_seed(seed, config) {
         Ok(report) => eprintln!("seed {seed} passed: {report:#?}"),
@@ -312,6 +341,70 @@ fn stale_base_speculation_is_found() {
     );
 }
 
+/// Plan 30 §M6: clients read the names they write (and others) from
+/// their local replica through the session wait; every run is checked for
+/// per-node read-your-writes and monotonic reads against the log's version
+/// order (`sim/session.rs`), with the default random faults (crashes,
+/// takeovers, partitions, pauses, slow replies, S3 errors). The P2P
+/// configuration and the M13 inbox configuration both.
+#[test]
+fn session_guarantees_hold() {
+    for (label, core) in [
+        (
+            "p2p",
+            std::sync::Arc::new(sim::run::sim_core_config)
+                as std::sync::Arc<
+                    dyn Fn(u64, u32) -> constellation_authority::Config + Send + Sync,
+                >,
+        ),
+        ("inbox", std::sync::Arc::new(sim::run::inbox_core_config)),
+    ] {
+        let cfg = SimConfig {
+            read_ratio: 0.7,
+            core,
+            ..SimConfig::default()
+        };
+        let mut totals = (0usize, 0usize, 0usize, 0usize);
+        for seed in 600..660 {
+            let report =
+                run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+            totals.0 += report.sessions.reads;
+            totals.1 += report.sessions.degraded;
+            totals.2 += report.sessions.tentative;
+            totals.3 += report.sessions.degraded_violations;
+        }
+        eprintln!(
+            "session_guarantees_hold ({label}): {} reads, {} degraded (timed out), {} \
+             violations exempt as tentative, {} on degraded reads",
+            totals.0, totals.1, totals.2, totals.3
+        );
+        assert!(totals.0 > 500, "{label}: too few reads to mean anything");
+    }
+}
+
+/// Plan 30 §M6's non-vacuity seed: the same workload with the session
+/// wait off (reads never wait, as before M6) must violate a session
+/// guarantee somewhere — the checker finds what the wait prevents.
+#[test]
+fn session_wait_off_is_found() {
+    let cfg = SimConfig {
+        read_ratio: 0.9,
+        session_wait: false,
+        ..SimConfig::default()
+    };
+    let mut found = None;
+    for seed in 600..700 {
+        let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        if let Some(v) = report.sessions.violations.first() {
+            found = Some((seed, v.clone()));
+            break;
+        }
+    }
+    let (seed, (checker, what)) =
+        found.expect("no seed violated a session guarantee with the wait off");
+    eprintln!("session wait off: seed {seed}: {checker}: {what}");
+}
+
 /// Plan 30 §M13: P2P off, so every non-holder write goes through the
 /// holder's S3 inbox (submitted under its epoch, executed in order by the
 /// holder's poll, answered through the log), sustained demand escalates
@@ -396,11 +489,15 @@ fn regression_resubmitted_rid_withdraws_its_batch() {
 /// next takeover drained the forgotten batch and created the file after
 /// the client had been told it existed (seed 10476 on the M5+M6+M7 stack,
 /// found by the M8 coder, bisected by the M7 coder). Seeds 10247 and
-/// 10507 reach the multi-batch withdraw on this tree's timing (two
-/// forwards each that first withdraw ≥ 2 batches); 10476 is pinned above.
+/// 10507 reached the multi-batch withdraw on M5's timing; plan 30 M6's
+/// core changes (no causal-wait timers) shift every schedule, and on this
+/// tree 10507 and 10396 reach it (`find_multi_batch_withdraw_seeds`
+/// re-pins). 10247 stays as a convergence seed; 10476 is pinned above.
 #[test]
 fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
-    for seed in [10247, 10507] {
+    let report = run_seed(10247, long_config()).unwrap_or_else(|e| panic!("seed 10247: {e}"));
+    assert!(report.converged_checked, "seed 10247 did not converge");
+    for seed in [10396, 10507] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats
@@ -412,6 +509,35 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
             "seed {seed} no longer forwards an op with several batches to withdraw ({multi})"
         );
         assert!(report.converged_checked, "seed {seed} did not converge");
+    }
+}
+
+/// Re-pin helper for `regression_every_inbox_batch_of_a_rid_is_withdrawn`:
+/// lists the long-configuration seeds that reach the multi-batch withdraw
+/// on this tree's timing (a core change shifts every schedule).
+/// `AUTHORITY_SIM_START`/`AUTHORITY_SIM_SEEDS` as for `long_random`.
+#[test]
+#[ignore]
+fn find_multi_batch_withdraw_seeds() {
+    let start: u64 = std::env::var("AUTHORITY_SIM_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+    let seeds: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000);
+    for seed in start..start + seeds {
+        if let Ok(report) = run_seed(seed, long_config()) {
+            let multi: u64 = report
+                .stats
+                .values()
+                .map(|s| s.inbox_multi_batch_withdrawals)
+                .sum();
+            if multi > 0 {
+                eprintln!("multi-batch withdraw: seed {seed} ({multi})");
+            }
+        }
     }
 }
 
@@ -469,12 +595,23 @@ fn single_node_is_clean() {
     }
 }
 
+/// The long configuration M5's pinned regression seeds were found and
+/// bisected under (no reads: reads change a seed's schedule).
 fn long_config() -> SimConfig {
     SimConfig {
         ops_per_client: 12,
         random_faults: 4,
         p2p_drop: 0.02,
         ..SimConfig::default()
+    }
+}
+
+/// Plan 30 M6: the long configuration with reads through the session
+/// wait (and the session checks enforced).
+fn long_sessions_config() -> SimConfig {
+    SimConfig {
+        read_ratio: 0.3,
+        ..long_config()
     }
 }
 
@@ -490,7 +627,12 @@ fn long_random() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
-    let cfg = long_config();
+    // Plan 30 M6: `AUTHORITY_SIM_READS=0` sweeps the read-free
+    // configuration M5's seeds are pinned under; the default reads.
+    let cfg = match std::env::var("AUTHORITY_SIM_READS").as_deref() {
+        Ok("0") => long_config(),
+        _ => long_sessions_config(),
+    };
     let mut failures = Vec::new();
     for seed in start..start + seeds {
         let started = std::time::Instant::now();

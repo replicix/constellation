@@ -16,7 +16,9 @@ use crate::event::{PeerMsg, Policy, S3Result};
 use crate::ids::{Epoch, Ms, NodeId, OpId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
-use constellation_meta::{CompletedOutcome, MetaError, MutateOp, MutateOutcome, Rid};
+use constellation_meta::{
+    CompletedOutcome, KeySet, MetaError, MutateOp, MutateOutcome, Position, Rid,
+};
 use std::collections::BTreeSet;
 
 /// How many `InDoubt` rids the core remembers for their resubmission.
@@ -60,15 +62,9 @@ pub(crate) enum Phase {
     AcquireRetry,
     /// Accepted by the holder on a base this replica has not applied
     /// (`PeerMsg::MutateReply::base`): the records arrive through the
-    /// log; answered when the rid's completion is applied.
-    AwaitingLog { epoch: Epoch },
-    /// The outcome is decided; waiting for the refused entry to become
-    /// visible locally before answering.
-    CausalWait {
-        outcome: MutateOutcome,
-        target: (Ino, String, bool),
-        until: Ms,
-    },
+    /// log; answered when the rid's completion is applied. `position` is
+    /// the reply's (plan 30 §M6), raised into `observed` then.
+    AwaitingLog { epoch: Epoch, position: Position },
 }
 
 /// The externally visible phase, for tests and `status`.
@@ -84,7 +80,6 @@ pub enum ClientPhase {
     WaitingLease,
     AcquireRetry,
     AwaitingLog,
-    CausalWait,
 }
 
 #[derive(Debug)]
@@ -136,7 +131,6 @@ impl ClientOp {
             Phase::WaitingLease => ClientPhase::WaitingLease,
             Phase::AcquireRetry => ClientPhase::AcquireRetry,
             Phase::AwaitingLog { .. } => ClientPhase::AwaitingLog,
-            Phase::CausalWait { .. } => ClientPhase::CausalWait,
         }
     }
 }
@@ -228,23 +222,6 @@ pub(crate) fn named_child(op: &MutateOp) -> Option<(Ino, &str)> {
         | MutateOp::Symlink { parent, name, .. }
         | MutateOp::Mknod { parent, name, .. }
         | MutateOp::Link { parent, name, .. } => Some((*parent, name.as_str())),
-        _ => None,
-    }
-}
-
-/// `forward::causal_wait_target`.
-fn causal_wait_target(op: &MutateOp, outcome: &MutateOutcome) -> Option<(Ino, String, bool)> {
-    match outcome {
-        MutateOutcome::Exists { .. } => named_child(op).map(|(p, n)| (p, n.to_string(), true)),
-        MutateOutcome::Errno(errno) if *errno == libc::EEXIST => {
-            named_child(op).map(|(p, n)| (p, n.to_string(), true))
-        }
-        MutateOutcome::Errno(errno) if *errno == libc::ENOENT => match op {
-            MutateOp::Unlink { parent, name } | MutateOp::Rmdir { parent, name } => {
-                Some((*parent, name.clone(), false))
-            }
-            _ => None,
-        },
         _ => None,
     }
 }
@@ -566,7 +543,7 @@ impl Core {
         from: NodeId,
         req: OpId,
         outcome: MutateOutcome,
-        base: Option<crate::ids::Seq>,
+        (base, position): (Option<crate::ids::Seq>, Position),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -591,6 +568,7 @@ impl Core {
             node = self.cfg.node_id,
             ?rid,
             ?base,
+            ?position,
             applied,
             base_ok,
             ?outcome,
@@ -603,6 +581,9 @@ impl Core {
                 // them ahead of records they follow. The log delivers
                 // them in order; answer when it has.
                 if replica.completed_position(rid).ok().flatten().is_some() {
+                    // Delivered by the log already; the rest of what the
+                    // holder evaluated against normally came with it.
+                    self.observe(rid, position, replica);
                     self.finish(
                         now,
                         rid,
@@ -614,7 +595,7 @@ impl Core {
                 }
                 self.stats.awaited_log += 1;
                 let c = self.clients.get_mut(&rid).expect("present");
-                c.phase = Phase::AwaitingLog { epoch };
+                c.phase = Phase::AwaitingLog { epoch, position };
                 self.nudge(now, out);
             }
             MutateOutcome::Accepted { epoch, records } => {
@@ -625,6 +606,11 @@ impl Core {
                     Ok(true) => {
                         tracing::debug!(node = self.cfg.node_id, ?rid, epoch, "shadow installed");
                         self.stats.shadows_installed += 1;
+                        // Plan 30 §M6 (coordinator decision 2): installed
+                        // effects do not raise `observed`; the shadow
+                        // covers its keys (the parent directory's
+                        // attributes included) up to the reply's position.
+                        replica.note_covering(KeySet::from_records(&records), position);
                         self.finish(
                             now,
                             rid,
@@ -644,6 +630,7 @@ impl Core {
                             self.stats.queued_behind_takeover += 1;
                             self.lease_path(now, rid, replica, out);
                         } else {
+                            self.observe(rid, position, replica);
                             self.finish(
                                 now,
                                 rid,
@@ -673,25 +660,35 @@ impl Core {
                     self.lease_path(now, rid, replica, out);
                 }
             }
-            MutateOutcome::Exists {
-                ref records,
-                ship_floor,
-                epoch,
-            } => {
+            MutateOutcome::Exists { ref records, epoch } => {
+                // Plan 30 §M6: `Exists` is the general rule plus a hint.
                 // Same base rule as a shadow: the entry was read on the
                 // holder's state, which this replica must have applied.
-                if base_ok && applied < ship_floor {
-                    match replica.install_hint(records, ship_floor, epoch) {
-                        Ok(()) => self.stats.hints_installed += 1,
+                // Installed, the hint covers the entry's keys up to the
+                // reply's position; otherwise the refusal observed state
+                // this replica lacks, and reads wait for it.
+                let floor = position.hint_floor();
+                let mut hinted = false;
+                if base_ok && applied < floor {
+                    match replica.install_hint(records, floor, epoch) {
+                        Ok(()) => {
+                            self.stats.hints_installed += 1;
+                            replica.note_covering(KeySet::from_records(records), position);
+                            hinted = true;
+                        }
                         Err(error) => tracing::warn!(%error, "failed to install hint"),
                     }
                 }
-                self.causal_wait_then_finish(now, rid, outcome, replica, out);
+                if !hinted {
+                    self.observe(rid, position, replica);
+                }
+                self.finish(now, rid, outcome, replica, out);
             }
-            outcome @ MutateOutcome::Errno(_) => {
-                self.causal_wait_then_finish(now, rid, outcome, replica, out)
-            }
-            outcome @ MutateOutcome::Conflict { .. } => {
+            outcome @ (MutateOutcome::Errno(_) | MutateOutcome::Conflict { .. }) => {
+                // Plan 30 §M6: a refusal observed the holder's state
+                // without installing anything here (this replaces plan 29
+                // M6's per-name causal wait: every later read waits).
+                self.observe(rid, position, replica);
                 self.finish(now, rid, outcome, replica, out)
             }
         }
@@ -1012,71 +1009,17 @@ impl Core {
 
     // ---- finishing ----
 
-    fn causal_wait_then_finish(
-        &mut self,
-        now: Ms,
-        rid: Rid,
-        outcome: MutateOutcome,
-        replica: &dyn Replica,
-        out: &mut Vec<Action>,
-    ) {
-        let Some(op) = self.clients.get(&rid).map(|c| &c.op) else {
-            return;
-        };
-        let Some(target) = causal_wait_target(op, &outcome) else {
-            self.finish(now, rid, outcome, replica, out);
-            return;
-        };
-        if replica.entry_exists(target.0, &target.1) == target.2 {
-            self.finish(now, rid, outcome, replica, out);
-            return;
+    /// Plan 30 §M6: a client-visible reply to `rid` observed `position`
+    /// without installing its effects here: raise `observed`. A replay's
+    /// outcome is not client-visible and raises nothing.
+    fn observe(&self, rid: Rid, position: Position, replica: &dyn Replica) {
+        if self
+            .clients
+            .get(&rid)
+            .is_some_and(|c| c.origin == Origin::Client)
+        {
+            replica.raise_observed(position);
         }
-        let until = now.plus(self.cfg.causal_wait_ms);
-        let c = self.clients.get_mut(&rid).expect("present");
-        c.phase = Phase::CausalWait {
-            outcome,
-            target,
-            until,
-        };
-        let timer = self.set_timer(
-            now.plus(self.cfg.causal_poll_ms),
-            Timer::CausalWait(rid),
-            out,
-        );
-        self.clients.get_mut(&rid).expect("present").timer = Some(timer);
-        self.nudge(now, out);
-    }
-
-    pub(crate) fn on_causal_wait(
-        &mut self,
-        now: Ms,
-        rid: Rid,
-        replica: &dyn Replica,
-        out: &mut Vec<Action>,
-    ) {
-        let Some(c) = self.clients.get_mut(&rid) else {
-            return;
-        };
-        let Phase::CausalWait {
-            outcome,
-            target,
-            until,
-        } = &c.phase
-        else {
-            return;
-        };
-        c.timer = None;
-        if replica.entry_exists(target.0, &target.1) == target.2 || now >= *until {
-            let outcome = outcome.clone();
-            self.finish(now, rid, outcome, replica, out);
-            return;
-        }
-        let timer = self.set_timer(
-            now.plus(self.cfg.causal_poll_ms),
-            Timer::CausalWait(rid),
-            out,
-        );
-        self.clients.get_mut(&rid).expect("present").timer = Some(timer);
     }
 
     /// After segments were applied: answer every op waiting for the log
@@ -1088,23 +1031,30 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let waiting: Vec<(Rid, Epoch, bool)> = self
+        let waiting: Vec<(Rid, Epoch, Option<Position>)> = self
             .clients
             .iter()
             .filter_map(|(rid, c)| match c.phase {
-                Phase::AwaitingLog { epoch } => Some((*rid, epoch, false)),
+                Phase::AwaitingLog { epoch, position } => Some((*rid, epoch, Some(position))),
                 Phase::InboxWaiting { epoch } | Phase::InboxQueued { epoch } => {
-                    Some((*rid, epoch, true))
+                    Some((*rid, epoch, None))
                 }
                 _ => None,
             })
             .collect();
-        for (rid, epoch, inbox) in waiting {
+        for (rid, epoch, position) in waiting {
             let Some(outcome) = completed_as_outcome(replica, rid, epoch) else {
                 continue;
             };
-            if inbox {
-                self.inbox_answered(now, rid);
+            match position {
+                // Plan 30 §M6: normally already dominated by the applied
+                // position (the segment carrying the completion ships
+                // everything before it), unless an M4 held row keeps the
+                // shipped-through position below it.
+                Some(position) => self.observe(rid, position, replica),
+                // M13: an inbox outcome rides the log behind every row it
+                // was evaluated against; nothing to raise.
+                None => self.inbox_answered(now, rid),
             }
             self.finish(now, rid, outcome, replica, out);
         }

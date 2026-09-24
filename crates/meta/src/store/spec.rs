@@ -1579,6 +1579,12 @@ impl Meta {
     ///
     /// One counter read (`store::KV_SPEC_LIVE_COUNT`): `spec_live`'s own
     /// first key would walk the tombstones of every retired shadow.
+    /// Whether any stranded op is queued for replay (one counter read).
+    pub fn has_pending_replays(&self) -> bool {
+        let r = self.db.read_tx();
+        counter_get(&r, &self.local, KV_PENDING_REPLAY_COUNT).is_ok_and(|n| n > 0)
+    }
+
     pub fn has_outstanding_speculation(&self) -> bool {
         let r = self.db.read_tx();
         counter_get(&r, &self.local, KV_SPEC_LIVE_COUNT).is_ok_and(|n| n > 0)
@@ -1641,6 +1647,8 @@ impl Meta {
             counter_add_tx(&mut tx, &self.local, KV_PENDING_REPLAY_COUNT, -1)?;
         }
         tx.commit()?;
+        // Plan 30 §M6: a read waiting on this replay's keys may go.
+        self.session.notify();
         Ok(())
     }
 }

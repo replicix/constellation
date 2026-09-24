@@ -219,7 +219,7 @@ fn the_lease_path_resolves_an_in_doubt_rid_from_the_log() {
     let holder = Meta::open_in_memory().unwrap();
     holder.set_node_prefix(2).unwrap();
     let records = constellation_meta::execute_mutate(&holder, &op, Some(rid)).unwrap();
-    crate::replica::Replica::apply_segment(&h.meta, 1, 1, &records).unwrap();
+    crate::replica::Replica::apply_segment(&h.meta, 1, 1, 0, &records).unwrap();
     // The reply never comes; the retries run out; the lease path starts
     // and this node wins the lease outright (no object yet).
     let mut t = timeout;
@@ -590,6 +590,7 @@ fn overlapping_forwards_from_one_node_are_issued_in_order() {
             req: *req,
             outcome: MutateOutcome::Errno(libc::EINVAL),
             base: Some(0),
+            position: constellation_meta::Position::ZERO,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -853,6 +854,7 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
             req,
             outcome: MutateOutcome::Errno(libc::EIO),
             base: Some(0),
+            position: constellation_meta::Position::ZERO,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -931,9 +933,213 @@ fn releasing_several_gated_ops_survives_the_nested_release() {
             req,
             outcome: MutateOutcome::Errno(libc::EIO),
             base: Some(0),
+            position: constellation_meta::Position::ZERO,
         },
     });
     let answered: Vec<Rid> = replies(&out).into_iter().map(|(rid, _)| rid).collect();
     assert_eq!(answered, vec![a, h.rid(2), h.rid(3)]);
     assert_eq!(h.core.clients().count(), 0);
+}
+
+// ---- plan 30 §M6: positions and the session wait ----
+
+/// A requester (node 2) forwarding to a holder (node 1): one op through
+/// the pair, returning the requester's client reply.
+fn forward_through(
+    holder: &mut Harness,
+    requester: &mut Harness,
+    rid: Rid,
+    op: MutateOp,
+) -> Vec<Action> {
+    let out = requester.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    let sent = sends(&out);
+    let [(1, request)] = sent.as_slice() else {
+        panic!("expected one forward to node 1: {sent:?}")
+    };
+    let answer = holder.step(Event::Peer {
+        from: 2,
+        msg: (*request).clone(),
+    });
+    let reply = sends(&answer)[0].1.clone();
+    requester.step(Event::Peer {
+        from: 1,
+        msg: reply,
+    })
+}
+
+fn pair() -> (Harness, Harness) {
+    let mut holder = Harness::new(1);
+    holder.hold(1, None);
+    let mut requester = Harness::new(2);
+    requester.step(Event::Peers {
+        links: [1, 3]
+            .into_iter()
+            .map(|node| crate::event::PeerLink {
+                node,
+                connected: true,
+                last_seen: None,
+            })
+            .collect(),
+    });
+    requester.core.lease.cached_holder = Some(1);
+    requester.meta.session().set_budget_ms(20);
+    (holder, requester)
+}
+
+/// Coordinator decision 2: a forwarded op accepted and installed as a
+/// shadow raises nothing, so `touch a; ls; stat .` (and `stat a`) right
+/// after forwarded creates never waits — even though the holder has not
+/// shipped any of them. Decision 3: the shadow's records carry the parent
+/// directory's update (its mtime moves here at once).
+#[test]
+fn touch_ls_stat_after_forwarded_creates_take_the_fast_path() {
+    use constellation_meta::{MetaStore, ReadKey, SessionWait};
+    let (mut holder, mut requester) = pair();
+    let before = requester.meta.getattr(ROOT_INO).unwrap().unwrap().mtime_ns;
+    for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
+        let rid = requester.rid(i as u64 + 1);
+        let op = requester.create(name);
+        let out = forward_through(&mut holder, &mut requester, rid, op);
+        assert!(matches!(
+            replies(&out)[0].1,
+            ClientReply::Outcome(MutateOutcome::Accepted { .. })
+        ));
+        for keys in [
+            vec![ReadKey::Dentry(ROOT_INO, name.into())],
+            vec![ReadKey::Dir(ROOT_INO)],
+            vec![ReadKey::Ino(ROOT_INO)],
+        ] {
+            assert_eq!(
+                requester.meta.session_wait(&keys),
+                SessionWait::Fast,
+                "{name}: {keys:?}"
+            );
+        }
+    }
+    assert_eq!(requester.core.stats.shadows_installed, 3);
+    assert_eq!(requester.meta.session().stats().raised, 0);
+    let after = requester.meta.getattr(ROOT_INO).unwrap().unwrap().mtime_ns;
+    assert!(after > before, "the shadow moved the parent's mtime");
+    assert!(
+        MetaStore::lookup(&requester.meta, ROOT_INO, "c")
+            .unwrap()
+            .is_some(),
+        "the entry is visible"
+    );
+}
+
+/// A refusal observes the holder's unshipped state: later reads wait for
+/// it (here they time out at the 20 ms test budget, degraded), except a
+/// key a newer shadow covers — the parent's attributes included — until
+/// the segment carrying it is applied.
+#[test]
+fn a_refusal_raises_observed_until_the_segment_lands() {
+    use constellation_meta::{ReadKey, SessionWait};
+    let (mut holder, mut requester) = pair();
+    // The holder creates `a` itself; it stays unshipped.
+    let out = holder.step(Event::Submit {
+        policy: Policy::Client,
+        rid: holder.rid(1),
+        op: holder.create("a"),
+    });
+    assert!(matches!(
+        replies(&out)[0].1,
+        ClientReply::Outcome(MutateOutcome::Accepted { .. })
+    ));
+    // The requester's create of `a` is refused against it: no hint (the
+    // holder's unshipped journal touched the name), `observed` rises.
+    let rid = requester.rid(1);
+    let op = requester.create("a");
+    let out = forward_through(&mut holder, &mut requester, rid, op);
+    assert!(matches!(
+        replies(&out)[0].1,
+        ClientReply::Outcome(MutateOutcome::Exists { .. } | MutateOutcome::Errno(libc::EEXIST))
+    ));
+    assert_eq!(requester.meta.session().stats().raised, 1);
+    let observed = requester.meta.session().observed();
+    assert!(observed.pending.is_some(), "{observed:?}");
+    assert!(matches!(
+        requester
+            .meta
+            .session_wait(&[ReadKey::Dentry(ROOT_INO, "a".into())]),
+        SessionWait::TimedOut(_)
+    ));
+    // A later forwarded create of `d` is installed at a newer position:
+    // it covers its own name, but neither the listing nor the parent's
+    // attributes (outside the per-key base, M5 round 3).
+    let rid = requester.rid(2);
+    let op = requester.create("d");
+    forward_through(&mut holder, &mut requester, rid, op);
+    assert_eq!(
+        requester
+            .meta
+            .session_wait(&[ReadKey::Dentry(ROOT_INO, "d".into())]),
+        SessionWait::Covered
+    );
+    for keys in [vec![ReadKey::Ino(ROOT_INO)], vec![ReadKey::Dir(ROOT_INO)]] {
+        assert!(
+            matches!(requester.meta.session_wait(&keys), SessionWait::TimedOut(_)),
+            "{keys:?}"
+        );
+    }
+    // The holder ships its journal; the requester applies the segment.
+    let batch = constellation_meta::MetaStore::take_journal(&holder.meta, 100).unwrap();
+    let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+    let through = holder.meta.journal_through_after(&seqs).unwrap();
+    let records: Vec<_> = batch.into_iter().map(|(_, r)| r).collect();
+    crate::replica::Replica::apply_segment(&requester.meta, 1, 1, through, &records).unwrap();
+    for keys in [
+        vec![ReadKey::Dentry(ROOT_INO, "a".into())],
+        vec![ReadKey::Dir(ROOT_INO)],
+        vec![ReadKey::Ino(ROOT_INO)],
+    ] {
+        assert_eq!(
+            requester.meta.session_wait(&keys),
+            SessionWait::Fast,
+            "{keys:?}"
+        );
+    }
+    let stats = requester.meta.session().stats();
+    assert_eq!((stats.timeouts, stats.covered), (3, 1), "{stats:?}");
+}
+
+/// Read-your-writes across a stranding: while one of this node's own ops
+/// is queued for replay (rolled back), reads of its keys wait even on the
+/// fast path; other keys do not.
+#[test]
+fn a_queued_replay_blocks_reads_of_its_keys() {
+    use constellation_meta::{ReadKey, SessionWait};
+    let requester = Harness::new(2);
+    requester.meta.session().set_budget_ms(20);
+    let op = requester.create("x");
+    requester.meta.queue_replay(requester.rid(1), &op).unwrap();
+    assert!(matches!(
+        requester
+            .meta
+            .session_wait(&[ReadKey::Dentry(ROOT_INO, "x".into())]),
+        SessionWait::TimedOut(_)
+    ));
+    assert!(matches!(
+        requester.meta.session_wait(&[ReadKey::Dir(ROOT_INO)]),
+        SessionWait::TimedOut(_)
+    ));
+    assert_eq!(
+        requester
+            .meta
+            .session_wait(&[ReadKey::Dentry(ROOT_INO, "y".into())]),
+        SessionWait::Fast
+    );
+    let queued = requester.meta.pending_replays().unwrap();
+    requester.meta.forget_replay(queued[0].queue_seq).unwrap();
+    assert_eq!(
+        requester
+            .meta
+            .session_wait(&[ReadKey::Dentry(ROOT_INO, "x".into())]),
+        SessionWait::Fast
+    );
+    assert_eq!(requester.meta.session().stats().replay_blocked, 2);
 }

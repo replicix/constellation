@@ -186,16 +186,9 @@ pub enum MutateOutcome {
     /// back to `Busy`.
     Exists {
         records: Vec<LogRecord>,
-        /// The lowest log sequence anything the holder does from now on
-        /// can ship in (its next segment). The entry exists on the
-        /// holder *now*, so any delete of it is still in the holder's
-        /// future and can only ship at or above this sequence: a
-        /// requester whose replay is below it cannot have seen one,
-        /// which is what makes installing the record early safe. At or
-        /// above it the record may already be stale, and installing it
-        /// would resurrect a deleted entry that the log has nothing left
-        /// to correct.
-        ship_floor: u64,
+        // Plan 30 §M6: the hint's floor is no longer carried here; the
+        // reply's position (`PeerMsg::MutateReply::position`) gives it
+        // (`Position::hint_floor`).
         /// The answering holder's epoch. Plan 30 §M3a: the installed
         /// entry is speculation (`Meta::install_hint`) and is rolled back
         /// if a segment from a later epoch reaches this replica before

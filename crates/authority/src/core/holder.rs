@@ -9,7 +9,7 @@ use crate::action::{Action, S3Op};
 use crate::event::PeerMsg;
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq};
 use crate::replica::Replica;
-use constellation_meta::{MetaError, MutateOp, MutateOutcome, Rid, TouchSet};
+use constellation_meta::{MetaError, MutateOp, MutateOutcome, Position, Rid, TouchSet};
 
 /// The keys `op` reads or writes, before it runs (a refusal touches
 /// nothing but is evaluated against them), as the replica's unshipped
@@ -86,6 +86,7 @@ impl Core {
     ) {
         replica.forget_acked_through(rid.node, rid.incarnation, acked_through);
         let mut base = None;
+        let mut position = Position::ZERO;
         let outcome = if self.lease.fenced() {
             MutateOutcome::Busy
         } else if let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) {
@@ -93,7 +94,17 @@ impl Core {
             // handoff pause closes this node's *own* new writes so a
             // waiter can claim, not a peer's forwarded ones.
             base = self.reply_base(&op, replica);
-            self.holder_execute(now, epoch, rid, &op, replica, out)
+            let outcome = self.holder_execute(now, epoch, rid, &op, replica, out);
+            // Plan 30 §M6: the state the op was evaluated against, its
+            // own rows included — everything shipped through `head_seq`,
+            // plus the unshipped journal through its last row. Read right
+            // after the execution; a local write committing in between
+            // only makes it larger.
+            position = Position {
+                seq: self.ship.head_seq,
+                pending: replica.journal_position(epoch),
+            };
+            outcome
         } else if self.lease.lost {
             MutateOutcome::Busy
         } else {
@@ -111,7 +122,12 @@ impl Core {
         };
         out.push(Action::Send {
             to: from,
-            msg: PeerMsg::MutateReply { req, outcome, base },
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome,
+                base,
+                position,
+            },
         });
     }
 
@@ -189,7 +205,6 @@ impl Core {
                 Some((parent, name)) => match replica.entry_as_record(parent, name) {
                     Some(record) => MutateOutcome::Exists {
                         records: vec![record],
-                        ship_floor: self.ship_floor(),
                         epoch,
                     },
                     None => MutateOutcome::Errno(libc::EEXIST),

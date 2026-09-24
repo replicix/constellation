@@ -16,6 +16,12 @@ struct SegmentEnvelope {
     #[serde(default)]
     epoch: u64,
     records: Vec<LogRecord>,
+    /// Plan 30 §M6: the shipping holder's journal seq every row at or
+    /// below which has now shipped (0: none). Appended last, so a reader
+    /// that decodes only the first four fields (the harness's log
+    /// checks) still reads the envelope.
+    #[serde(default)]
+    through: u64,
 }
 
 /// A decoded segment.
@@ -24,6 +30,20 @@ pub struct Segment {
     pub node: u64,
     pub epoch: u64,
     pub records: Vec<LogRecord>,
+    /// Plan 30 §M6: see `SegmentEnvelope::through`. A replica that applied
+    /// this segment has the shipping tenure's journal through
+    /// `(epoch, through)`.
+    pub through: u64,
+}
+
+impl Segment {
+    /// The journal position applying this segment reaches.
+    pub fn journal_pos(&self) -> constellation_meta::JournalPos {
+        constellation_meta::JournalPos {
+            epoch: self.epoch,
+            jseq: self.through,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -34,12 +54,18 @@ pub enum SegmentError {
     Version(u32),
 }
 
-pub fn encode(node: u64, epoch: u64, records: &[LogRecord]) -> Result<Vec<u8>, SegmentError> {
+pub fn encode(
+    node: u64,
+    epoch: u64,
+    through: u64,
+    records: &[LogRecord],
+) -> Result<Vec<u8>, SegmentError> {
     Ok(postcard::to_allocvec(&SegmentEnvelope {
         v: SEGMENT_VERSION,
         node,
         epoch,
         records: records.to_vec(),
+        through,
     })?)
 }
 
@@ -52,6 +78,7 @@ pub fn decode(payload: &[u8]) -> Result<Segment, SegmentError> {
         node: env.node,
         epoch: env.epoch,
         records: env.records,
+        through: env.through,
     })
 }
 
@@ -76,7 +103,7 @@ mod tests {
                 },
             },
         ];
-        let bytes = encode(5, 3, &records).unwrap();
+        let bytes = encode(5, 3, 17, &records).unwrap();
         // `v=2, node=5, epoch=3` then the record vector, all postcard
         // varints: the prefix the shipper writes for the same envelope.
         assert_eq!(&bytes[..3], &[2, 5, 3]);
@@ -84,8 +111,9 @@ mod tests {
         assert_eq!(seg.node, 5);
         assert_eq!(seg.epoch, 3);
         assert_eq!(seg.records, records);
+        assert_eq!(seg.through, 17);
         assert!(matches!(
-            decode(&[1, 0, 0, 0]),
+            decode(&[1, 0, 0, 0, 0]),
             Err(SegmentError::Version(1))
         ));
     }

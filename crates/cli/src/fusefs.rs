@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest, SparseChunks};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
-use constellation_meta::{Meta, MetaError, MetaStore};
+use constellation_meta::{Meta, MetaError, MetaStore, ReadKey};
 use constellation_store_s3::{ChunkStore, CompressionSetting, DecodePriority};
 use fuser::{
     BsdFileFlags, Errno, FileHandle, FileType, Filesystem, INodeNo, InitFlags, KernelConfig,
@@ -227,7 +227,11 @@ pub enum SyncRequest {
         /// Plan 30 §M2 GC: prune `recent` outcomes for `requester`'s
         /// current incarnation up to this seq.
         acked_through: u64,
-        reply: tokio::sync::oneshot::Sender<(constellation_meta::MutateOutcome, Option<u64>)>,
+        reply: tokio::sync::oneshot::Sender<(
+            constellation_meta::MutateOutcome,
+            Option<u64>,
+            constellation_meta::Position,
+        )>,
     },
     /// This node's own mutation, when the FUSE fast path could not
     /// execute it locally: the core forwards it, submits it through the
@@ -1223,6 +1227,18 @@ impl ConstellationFs {
     /// stall behind. The one exception is the earliest checks
     /// (`is_synthetic`, no `self.sync`), which run *before* a rid is
     /// even allocated — there is nothing to mark yet.
+    /// Plan 30 §M6: every local read path's session wait (read-your-
+    /// writes and monotonic reads per node; see `constellation_meta::
+    /// session`). A single-node mount (no sync handle) observes nothing
+    /// and skips it. Bounded by `CONSTELLATION_SESSION_WAIT_MS`; a timeout
+    /// answers from the replica anyway (degraded, not an error).
+    pub(crate) fn session_wait(&self, keys: &[ReadKey]) {
+        if self.sync.is_none() {
+            return;
+        }
+        let _ = self.meta.session_wait(keys);
+    }
+
     pub(crate) fn mutate_op_rebasable(
         &self,
         part_hint_ino: Ino,

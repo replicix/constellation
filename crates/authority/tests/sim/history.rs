@@ -86,24 +86,62 @@ pub enum HistEvt {
     },
 }
 
+/// Plan 30 §M6: one client read of a name from the local replica.
+#[derive(Clone, Debug)]
+pub struct ReadEvt {
+    pub node: u64,
+    pub incarnation: u32,
+    pub thread: ThreadId,
+    pub name: String,
+    pub present: bool,
+    /// Ticks (the history's real-time order) at invoke and return.
+    pub inv: u64,
+    pub ret: u64,
+    /// The session wait ran out and the read answered degraded.
+    pub timed_out: bool,
+}
+
 #[derive(Default)]
 pub struct History {
     events: Mutex<Vec<HistEvt>>,
+    /// Plan 30 §M6: the tick of each event in `events` (same index), on
+    /// the clock reads share.
+    ticks: Mutex<Vec<u64>>,
+    reads: Mutex<Vec<ReadEvt>>,
+    clock: std::sync::atomic::AtomicU64,
 }
 
 impl History {
+    fn push(&self, e: HistEvt) {
+        let tick = self.tick();
+        let mut events = self.events.lock().unwrap();
+        events.push(e);
+        self.ticks.lock().unwrap().push(tick);
+    }
+
+    /// The next tick of the shared real-time order.
+    pub fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn invoke(&self, thread: ThreadId, rid: Rid, op: NsOp) {
-        self.events
-            .lock()
-            .unwrap()
-            .push(HistEvt::Invoke { thread, rid, op });
+        self.push(HistEvt::Invoke { thread, rid, op });
     }
 
     pub fn ret(&self, thread: ThreadId, rid: Rid, ret: NsRet) {
-        self.events
-            .lock()
-            .unwrap()
-            .push(HistEvt::Return { thread, rid, ret });
+        self.push(HistEvt::Return { thread, rid, ret });
+    }
+
+    pub fn read(&self, r: ReadEvt) {
+        self.reads.lock().unwrap().push(r);
+    }
+
+    pub fn reads(&self) -> Vec<ReadEvt> {
+        self.reads.lock().unwrap().clone()
+    }
+
+    pub fn ticks(&self) -> Vec<u64> {
+        self.ticks.lock().unwrap().clone()
     }
 
     pub fn events(&self) -> Vec<HistEvt> {

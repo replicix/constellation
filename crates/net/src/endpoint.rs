@@ -202,6 +202,8 @@ pub trait PeerService: Send + Sync + 'static {
                 req_id,
                 outcome: Vec::new(),
                 base: None,
+                position_seq: 0,
+                position_pending: None,
             }
         })
     }

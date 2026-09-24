@@ -122,6 +122,21 @@ fn main() -> Result<()> {
         }
         Command::Check { history } => {
             check_file(&history).with_context(|| format!("check {}", history.display()))?;
+            // Plan 30 §M6: the session checkers' coverage, so a run shows
+            // how much they judged even while they only report.
+            let loaded = constellation_chaos::History::load_jsonl(&history)?;
+            let sessions = constellation_chaos::sessions::check_sessions(&loaded);
+            println!(
+                "sessions: {} observations judged, {} unexplained, {} violations ({})",
+                sessions.judged,
+                sessions.unexplained,
+                sessions.violations.len(),
+                if constellation_chaos::sessions::enforced() {
+                    "enforced"
+                } else {
+                    "reported only"
+                }
+            );
             println!("ok: {}", history.display());
             Ok(())
         }

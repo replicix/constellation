@@ -237,6 +237,28 @@ impl Meta {
         journal::peek_next_seq(&r, &self.local)
     }
 
+    /// The seqs of the journal rows still present in `[from, to]`
+    /// (plan 30 §M6's `through` with held-back rows).
+    pub fn journal_seqs_between(&self, from: u64, to: u64) -> Result<Vec<u64>, MetaError> {
+        let r = self.db.read_tx();
+        let mut out = Vec::new();
+        if from > to {
+            return Ok(out);
+        }
+        for guard in r.range(
+            &self.journal_ks,
+            journal::seq_key(from)..=journal::seq_key(to),
+        ) {
+            let (k, _) = guard.into_inner()?;
+            out.push(u64::from_be_bytes(
+                k.as_ref()
+                    .try_into()
+                    .map_err(|_| MetaError::Invalid("journal key".into()))?,
+            ));
+        }
+        Ok(out)
+    }
+
     /// Every journal row at or below this has shipped (plan 30 §M3b's
     /// acked watermark): what the holder's inbox GC compares against.
     pub fn journal_acked_seq(&self) -> Result<u64, MetaError> {
