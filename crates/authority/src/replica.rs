@@ -16,7 +16,7 @@ use crate::ids::{Epoch, Seq};
 use constellation_fs_core::Ino;
 use constellation_meta::{
     execute_mutate, CompletedOutcome, InboxAck, JournalBatch, JournalPos, KeySet, LogRecord, Meta,
-    MetaError, MetaStore, MutateOp, Position, Rid, Stranded, StrandedOp, TouchSet,
+    MetaError, MetaStore, MutateOp, Position, ReadDelegations, Rid, Stranded, StrandedOp, TouchSet,
 };
 
 /// What applying a foreign segment did (`Meta::apply_segment`).
@@ -165,6 +165,28 @@ pub trait Replica {
     fn clear_atime(&self, inos: &[Ino]) -> Result<(), MetaError>;
     fn drop_atime(&self) -> Result<(), MetaError>;
     fn atime_oldest_pending_ns(&self) -> Result<Option<i64>, MetaError>;
+
+    // ---- plan 30 §M8: read delegations (`cto=strict`) ----
+
+    /// Both sides' delegation tables, shared with the FUSE threads (see
+    /// `constellation_meta::readdeleg` for why they live in `Meta`).
+    fn read_delegations(&self) -> &ReadDelegations;
+    /// Persist, before answering a grant, that grants may be live until
+    /// `until_ms` (the restart quarantine's horizon). `false`: it could not
+    /// be persisted, and the grant must not be made.
+    fn note_grant_horizon(&self, until_ms: i64) -> bool;
+    /// At start: the previous incarnation's grants may be live until the
+    /// returned time; the table is quarantined until then.
+    fn load_grant_quarantine(&self, now_ms: i64) -> Option<i64>;
+    /// Whether the unshipped journal touched what a ReadIndex for `ino`
+    /// (a directory's entries with `dir`; the entry `name` → `child`)
+    /// reads.
+    fn unshipped_touches_read(
+        &self,
+        ino: Ino,
+        dir: bool,
+        child: Option<(&str, Option<Ino>)>,
+    ) -> bool;
 
     // ---- holder state ----
 
@@ -356,6 +378,10 @@ impl Replica for Meta {
         let pending: TouchSet = Meta::pending_touches(self)?;
         let applied = Meta::apply_segment(self, seq, epoch, records, &pending)?;
         self.note_foreign_applied(records);
+        // Plan 30 §M8: a newer epoch voids the delegations an older
+        // holder granted (each was capped by that holder's lease, which is
+        // the safety argument; this only stops honouring them sooner).
+        self.read_delegations().void_below_epoch(epoch);
         self.session().advance(
             seq,
             Some(JournalPos {
@@ -411,6 +437,33 @@ impl Replica for Meta {
 
     fn atime_oldest_pending_ns(&self) -> Result<Option<i64>, MetaError> {
         MetaStore::atime_oldest_pending_ns(self, "p0")
+    }
+
+    fn read_delegations(&self) -> &ReadDelegations {
+        Meta::read_delegations(self)
+    }
+
+    fn note_grant_horizon(&self, until_ms: i64) -> bool {
+        match Meta::note_grant_horizon(self, until_ms) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "persisting the read-grant horizon failed; not granting");
+                false
+            }
+        }
+    }
+
+    fn load_grant_quarantine(&self, now_ms: i64) -> Option<i64> {
+        Meta::load_grant_quarantine(self, now_ms)
+    }
+
+    fn unshipped_touches_read(
+        &self,
+        ino: Ino,
+        dir: bool,
+        child: Option<(&str, Option<Ino>)>,
+    ) -> bool {
+        Meta::unshipped_touches_read(self, ino, dir, child)
     }
 
     fn set_holder_epoch(&self, epoch: Epoch) {

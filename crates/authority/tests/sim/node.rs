@@ -95,6 +95,8 @@ pub struct NodeHandle {
     pub id: NodeId,
     pub meta: Arc<Meta>,
     pub shared: Arc<Shared>,
+    /// This node's clock (plan 30 §M8: possibly skewed).
+    pub clock: Clock,
     tx: mpsc::UnboundedSender<Event>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -107,6 +109,25 @@ pub struct NodeEnv {
     pub config: Arc<dyn Fn(NodeId, u32) -> Config + Send + Sync>,
     /// See `SimConfig::panic_after_events`.
     pub panic_after_events: Option<u64>,
+    /// Plan 30 §M8: every node's clock is off by up to this (ms), by a
+    /// seeded constant per node.
+    pub clock_skew_ms: i64,
+    pub seed: u64,
+}
+
+impl NodeEnv {
+    /// Node `id`'s clock: the shared one, off by a seeded constant within
+    /// `±clock_skew_ms`.
+    pub fn clock_of(&self, id: NodeId) -> Clock {
+        if self.clock_skew_ms == 0 {
+            return self.clock;
+        }
+        let h = (self.seed ^ id.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let span = 2 * self.clock_skew_ms + 1;
+        self.clock
+            .skewed((h % span as u64) as i64 - self.clock_skew_ms)
+    }
 }
 
 impl NodeHandle {
@@ -148,7 +169,7 @@ impl NodeHandle {
             core: Core::new(cfg),
             store: env.bucket.handle(id),
             bus: env.bus.clone(),
-            clock: env.clock,
+            clock: env.clock_of(id),
             tx: tx.clone(),
             rx,
             shared: shared.clone(),
@@ -164,6 +185,7 @@ impl NodeHandle {
             id,
             meta,
             shared,
+            clock: env.clock_of(id),
             tx,
             task,
         }

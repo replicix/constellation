@@ -341,7 +341,10 @@ impl Core {
             }
             // In doubt: leave it queued; the next tick finds it completed
             // or resends it.
-            None | Some(MutateOutcome::Busy) | Some(MutateOutcome::NotHolder { .. }) => return,
+            None
+            | Some(MutateOutcome::Busy)
+            | Some(MutateOutcome::NotHolder { .. })
+            | Some(MutateOutcome::Held { .. }) => return,
             Some(MutateOutcome::Errno(errno)) if refusal_is_satisfied(&queued.op, errno) => {
                 self.stats.stranded_replayed += 1;
                 let _ = replica.forget_replay(queue_seq);

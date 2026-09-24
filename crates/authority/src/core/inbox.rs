@@ -164,6 +164,11 @@ enum Halt {
     /// The lease view is closed (releasing, or the takeover gate is
     /// pending): stop at this batch and re-fetch it next round.
     Fenced,
+    /// Plan 30 §M8: the next op touches inodes other nodes hold read
+    /// delegations on. Its acknowledgement is the log, which cannot be
+    /// held back per op, so it is not executed until they are recalled;
+    /// the requester is polled again then.
+    Recall,
     Meta(MetaError),
 }
 
@@ -930,11 +935,13 @@ impl Core {
         }
         let saturated = run.len() >= width;
         let mut halted = false;
+        // Plan 30 §M8: another node's ops — the lone-node kernel latch.
+        self.note_foreign(now, replica, out);
         for batch in &run {
             if batch.wants_lease {
                 self.lease.note_wanted(now, batch.node);
             }
-            match self.execute_inbox_batch(now, batch, true, replica) {
+            match self.execute_inbox_batch(now, batch, true, replica, out) {
                 Ok(seq) => {
                     let holder = self.inbox.holder.as_mut().expect("holding");
                     holder.executed.push((batch.key(), seq));
@@ -943,6 +950,12 @@ impl Core {
                     }
                 }
                 Err(Halt::Fenced) => {
+                    halted = true;
+                    break;
+                }
+                Err(Halt::Recall) => {
+                    // Re-polled when the recalls are done (or at the
+                    // ordinary halted cadence, whichever is first).
                     halted = true;
                     break;
                 }
@@ -971,6 +984,21 @@ impl Core {
             let at = rp.due_at;
             self.arm_inbox_poll_min(at, out);
         }
+    }
+
+    /// Plan 30 §M8: the recalls an inbox op waited for are done: poll its
+    /// requester again now.
+    pub(crate) fn inbox_repoll(&mut self, now: Ms, node: NodeId, out: &mut Vec<Action>) {
+        let Some(rp) = self
+            .inbox
+            .holder
+            .as_mut()
+            .and_then(|h| h.requesters.get_mut(&node))
+        else {
+            return;
+        };
+        rp.due_at = now;
+        self.arm_inbox_poll_min(now, out);
     }
 
     fn arm_inbox_poll_min(&mut self, at: Ms, out: &mut Vec<Action>) {
@@ -1053,6 +1081,7 @@ impl Core {
         batch: &InboxBatch,
         admitted: bool,
         replica: &dyn Replica,
+        out: &mut Vec<Action>,
     ) -> Result<u64, Halt> {
         for (i, op) in batch.ops.iter().enumerate() {
             let rid = rid_of(op);
@@ -1079,10 +1108,19 @@ impl Core {
                 return Err(Halt::Fenced);
             }
             let decoded = MutateOp::from_postcard(&op.op);
+            // Plan 30 §M8: recall before executing (see `Halt::Recall`).
+            let touched = decoded
+                .as_ref()
+                .map(constellation_meta::recall_inos_of_op)
+                .unwrap_or_default();
+            if admitted && self.inbox_recall_first(now, batch.node, &touched, replica, out) {
+                return Err(Halt::Recall);
+            }
             let executed = match &decoded {
                 Ok(op) => replica.execute_inbox(ack, op, rid),
                 Err(_) => Err(MetaError::Invalid("undecodable inbox op".into())),
             };
+            self.inbox_unblock(now, &touched);
             match executed {
                 Ok(records) => {
                     replica.remember_outcome(rid, &records);
@@ -1120,9 +1158,11 @@ impl Core {
     ) -> Result<(), MetaError> {
         let mut ops = 0u64;
         for batch in &batches {
-            match self.execute_inbox_batch(now, batch, false, replica) {
+            match self.execute_inbox_batch(now, batch, false, replica, out) {
                 Ok(_) => {}
-                Err(Halt::Fenced) => unreachable!("no view admission inside the gate"),
+                Err(Halt::Fenced) | Err(Halt::Recall) => {
+                    unreachable!("no view admission or recall inside the gate")
+                }
                 Err(Halt::Meta(error)) => return Err(error),
             }
             ops += batch.ops.len() as u64;

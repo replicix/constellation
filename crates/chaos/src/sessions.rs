@@ -320,6 +320,123 @@ fn explanations(
         .reduce(|(lo, hi), (l, h)| (lo.min(l), hi.max(h)))
 }
 
+/// Plan 30 §M8: the `Info` event a coordinator records when its mounts
+/// run `--cto strict`.
+pub const CTO_STRICT_INFO: &str = "cto:strict";
+
+/// `1` enforces the close-to-open checker, `0` only reports it; unset
+/// enforces it exactly when the history says its mounts were strict.
+pub const ENFORCE_CTO_ENV: &str = "CONSTELLATION_CHAOS_ENFORCE_CTO";
+
+/// Whether close-to-open violations fail the check of `history`.
+pub fn close_to_open_enforced(history: &History) -> bool {
+    match std::env::var(ENFORCE_CTO_ENV).as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => history
+            .events()
+            .iter()
+            .any(|e| e.kind == EventKind::Info && e.info.as_deref() == Some(CTO_STRICT_INFO)),
+    }
+}
+
+/// Plan 30 §M8's checker; fail on the first violation only when
+/// `enforce` (the history was recorded with `--cto strict` mounts).
+/// Under bounded mode the same violations are the documented staleness
+/// strict mode removes, and are only counted.
+pub fn check_history_close_to_open(
+    history: &History,
+    enforce: bool,
+) -> Result<SessionReport, CheckFailure> {
+    let report = check_close_to_open(history);
+    if let Some(first) = report.violations.first() {
+        if enforce {
+            return Err(first.clone());
+        }
+        tracing::info!(
+            violations = report.violations.len(),
+            first = %first,
+            "close-to-open not guaranteed (bounded mode): reads that missed another \
+             node's completed write"
+        );
+    }
+    Ok(report)
+}
+
+/// **Close-to-open** (plan 30 §M8): an observation must not show a state
+/// strictly older than a write *another worker* completed (`Ok`) before
+/// the observation was issued. Same black-box rule as the session
+/// checkers: violated only when every explanation of the observation
+/// completed before that write was invoked. The floor-setting writes are
+/// the ones read-your-writes uses (whole-content writes, creates,
+/// removals, renames, links — never the ones that may be no-ops).
+/// Reads (content, `stat`, `ENOENT`) are what strict mode's open and
+/// lookup cover; refusals are evaluated by the sequencer and never
+/// violate it.
+pub fn check_close_to_open(history: &History) -> SessionReport {
+    let done = done_ops(history);
+    let mut by_path: HashMap<&str, Vec<Cand>> = HashMap::new();
+    let mut owned: Vec<Vec<(String, CandKind)>> = Vec::with_capacity(done.len());
+    for d in &done {
+        owned.push(candidates(d));
+    }
+    for (d, cands) in done.iter().zip(&owned) {
+        for (path, kind) in cands {
+            by_path.entry(path.as_str()).or_default().push(Cand {
+                kind: kind.clone(),
+                lo: d.lo,
+                hi: d.hi,
+            });
+        }
+    }
+    // Completed writes per path: (invoke, complete, worker, op).
+    let mut writes: HashMap<String, Vec<(i64, i64, usize, u64)>> = HashMap::new();
+    for d in &done {
+        for path in own_writes(d) {
+            writes
+                .entry(path)
+                .or_default()
+                .push((d.lo, d.hi, d.worker, d.op_id));
+        }
+    }
+    let mut report = SessionReport::default();
+    for d in &done {
+        if d.complete.is_none() {
+            continue;
+        }
+        for (path, fact, via) in observations(d) {
+            let Some((_, hi)) = explanations(&by_path, &path, &fact, via, (d.lo, d.hi)) else {
+                report.unexplained += 1;
+                continue;
+            };
+            report.judged += 1;
+            // The latest-invoked write another worker completed before
+            // this observation was issued.
+            let floor = writes
+                .get(&path)
+                .into_iter()
+                .flatten()
+                .filter(|(_, whi, worker, _)| *worker != d.worker && *whi < d.lo)
+                .max_by_key(|(wlo, ..)| *wlo);
+            if let Some((wlo, _, worker, by)) = floor {
+                if hi < *wlo {
+                    report.violations.push(CheckFailure {
+                        checker: "close_to_open".into(),
+                        message: format!(
+                            "worker {} observed {path} as {fact:?} in op {} {:?}, but worker \
+                             {worker}'s op {by} on it completed before that op was issued \
+                             (every explanation completed before op {by} began)",
+                            d.worker, d.op_id, d.op
+                        ),
+                        op_ids: vec![*by, d.op_id],
+                    });
+                }
+            }
+        }
+    }
+    report
+}
+
 /// Both checkers over `history`: every violation, never failing.
 pub fn check_sessions(history: &History) -> SessionReport {
     let done = done_ops(history);
@@ -630,6 +747,76 @@ mod tests {
         assert_eq!(r.violations.len(), 1);
         let e = check_history_sessions(&h, true).unwrap_err();
         assert_eq!(e.checker, "read_your_writes");
+    }
+
+    fn cto_checkers(h: &History) -> Vec<String> {
+        check_close_to_open(h)
+            .violations
+            .into_iter()
+            .map(|v| v.checker)
+            .collect()
+    }
+
+    /// Plan 30 §M8: another worker's completed overwrite, then a read that
+    /// still shows the old content: close-to-open violated (the session
+    /// checkers allow it — `another_nodes_stale_first_read_is_fine`).
+    #[test]
+    fn another_nodes_completed_write_then_stale_read_violates_close_to_open() {
+        let h = sequential(vec![
+            (0, create("f", b"a"), ok_c()),
+            (0, write("f", b"b"), ok_c()),
+            (1, read("f"), read_c(b"a")),
+        ]);
+        assert!(checkers(&h).is_empty(), "sessions allow it");
+        assert_eq!(cto_checkers(&h), vec!["close_to_open"]);
+    }
+
+    #[test]
+    fn another_nodes_create_then_enoent_violates_close_to_open() {
+        let h = sequential(vec![
+            (0, create("f", b"a"), ok_c()),
+            (1, Op::Stat { path: "f".into() }, fail_c("ENOENT")),
+        ]);
+        assert_eq!(cto_checkers(&h), vec!["close_to_open"]);
+    }
+
+    /// A write still in flight when the read began owes nothing.
+    #[test]
+    fn a_concurrent_write_owes_nothing() {
+        let mut h = sequential(vec![(0, create("f", b"a"), ok_c())]);
+        h.record_invoke(0, 10, write("f", b"b"));
+        h.record_invoke(1, 11, read("f"));
+        h.record_complete(0, 10, ok_c());
+        h.record_complete(1, 11, read_c(b"a"));
+        assert!(cto_checkers(&h).is_empty());
+    }
+
+    /// Enforced exactly when the history says its mounts were strict.
+    #[test]
+    fn close_to_open_is_enforced_only_for_strict_histories() {
+        // Overwrites only (M4's Elle checker judges single-assignment
+        // paths as linearizable and would flag this itself).
+        let stale = vec![
+            (0, write("f", b"a"), ok_c()),
+            (0, write("f", b"b"), ok_c()),
+            (1, read("f"), read_c(b"a")),
+        ];
+        let bounded = sequential(stale.clone());
+        if std::env::var(ENFORCE_CTO_ENV).is_err() {
+            assert!(!close_to_open_enforced(&bounded));
+            assert!(crate::check::check_history(&bounded).is_ok());
+            let mut strict = History::new();
+            strict.record_info(CTO_STRICT_INFO);
+            for (i, (w, op, c)) in stale.into_iter().enumerate() {
+                strict.record_invoke(w, i as u64 + 1, op);
+                strict.record_complete(w, i as u64 + 1, c);
+            }
+            assert!(close_to_open_enforced(&strict));
+            assert_eq!(
+                crate::check::check_history(&strict).unwrap_err().checker,
+                "close_to_open"
+            );
+        }
     }
 
     /// Report on a saved history regardless of the other checkers

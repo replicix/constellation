@@ -137,6 +137,20 @@ fn main() -> Result<()> {
                     "reported only"
                 }
             );
+            // Plan 30 §M8: close-to-open coverage (enforced for histories
+            // recorded with `--cto strict` mounts).
+            let cto = constellation_chaos::sessions::check_close_to_open(&loaded);
+            println!(
+                "close-to-open: {} observations judged, {} unexplained, {} violations ({})",
+                cto.judged,
+                cto.unexplained,
+                cto.violations.len(),
+                if constellation_chaos::sessions::close_to_open_enforced(&loaded) {
+                    "enforced: cto=strict"
+                } else {
+                    "reported only: bounded"
+                }
+            );
             println!("ok: {}", history.display());
             Ok(())
         }

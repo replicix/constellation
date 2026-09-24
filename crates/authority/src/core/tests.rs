@@ -1439,3 +1439,501 @@ fn a_lone_node_never_subscribes() {
     let out = solo.step(Event::Peers { links: Vec::new() });
     assert!(sends(&out).is_empty(), "subscribed to itself: {out:?}");
 }
+
+// ---- plan 30 §M8: ReadIndex, read delegations, recalls ----
+
+mod cto {
+    use super::*;
+    use crate::action::{ControlOk, ReadAnswer};
+    use crate::event::{Control, ReadGrantMsg, ReadIndexOutcome};
+    use constellation_fs_core::Ino;
+    use constellation_meta::Position;
+
+    fn setattr(ino: Ino) -> MutateOp {
+        MutateOp::Setattr {
+            ino,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        }
+    }
+
+    /// A holder with a file `f` (created locally, unshipped).
+    fn holder_with_file() -> (Harness, Ino) {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let op = h.create("f");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        (h, ino)
+    }
+
+    fn ask(h: &mut Harness, from: NodeId, req: u64, ino: Ino) -> ReadIndexOutcome {
+        let out = h.step(Event::Peer {
+            from,
+            msg: PeerMsg::ReadIndex {
+                req: OpId(req),
+                ino,
+                dir: false,
+                name: None,
+            },
+        });
+        match sends(&out).as_slice() {
+            [(to, PeerMsg::ReadIndexReply { req: r, outcome })] if *to == from => {
+                assert_eq!(*r, OpId(req));
+                outcome.clone()
+            }
+            other => panic!("expected one ReadIndexReply: {other:?}"),
+        }
+    }
+
+    fn grant_of(outcome: &ReadIndexOutcome) -> ReadGrantMsg {
+        match outcome {
+            ReadIndexOutcome::Ok { grant: Some(g), .. } => *g,
+            other => panic!("expected a grant: {other:?}"),
+        }
+    }
+
+    fn forward(h: &mut Harness, from: NodeId, req: u64, seq: u64, op: MutateOp) -> Vec<Action> {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: Rid {
+                    node: from,
+                    incarnation: 1,
+                    seq,
+                },
+                op,
+                acked_through: 0,
+            },
+        })
+    }
+
+    fn mutate_replies(out: &[Action]) -> Vec<(NodeId, OpId, MutateOutcome)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::MutateReply { req, outcome, .. } => Some((to, *req, outcome.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn recalls(out: &[Action]) -> Vec<(NodeId, OpId, Ino, u64)> {
+        sends(out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::DelegationRecall { req, ino, grant } => Some((to, *req, *ino, *grant)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn timer_of(out: &[Action], kind: TimerKind) -> TimerId {
+        let t = timers(out, kind);
+        assert_eq!(t.len(), 1, "expected one {kind:?} timer: {out:?}");
+        t[0]
+    }
+
+    /// The position covers the unshipped create (the reader waits for
+    /// it); the grant is capped by nothing here (10 s of lease left); a
+    /// third node's forwarded write on the file is not answered until the
+    /// delegate acks the recall.
+    #[test]
+    fn a_grant_is_recalled_before_a_forwarded_writes_reply() {
+        let (mut h, ino) = holder_with_file();
+        let outcome = ask(&mut h, 2, 7, ino);
+        let ReadIndexOutcome::Ok { position, .. } = &outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(
+            position.pending.is_some(),
+            "the unshipped create is part of it"
+        );
+        let g = grant_of(&outcome);
+        assert_eq!(g.ttl_ms, 5_000);
+        assert_eq!(h.meta.read_delegations().live_grants(), 1);
+        let out = forward(&mut h, 3, 9, 1, setattr(ino));
+        assert!(mutate_replies(&out).is_empty(), "the reply waits: {out:?}");
+        let rs = recalls(&out);
+        let [(2, recall, rino, grant)] = rs.as_slice() else {
+            panic!("expected one recall to node 2: {out:?}")
+        };
+        assert_eq!((*rino, *grant), (ino, g.id));
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: *recall },
+        });
+        let [(3, OpId(9), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice() else {
+            panic!("expected the held reply: {out:?}")
+        };
+        assert_eq!(h.core.stats.recalls_acked, 1);
+        assert_eq!(h.meta.read_delegations().live_grants(), 0);
+    }
+
+    /// The writer's own delegation is not recalled (read-your-writes
+    /// covers its reads); unrelated inodes recall nothing.
+    #[test]
+    fn the_writers_own_grant_and_unrelated_inodes_recall_nothing() {
+        let (mut h, ino) = holder_with_file();
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let out = forward(&mut h, 2, 9, 1, setattr(ino));
+        assert_eq!(mutate_replies(&out).len(), 1);
+        assert!(recalls(&out).is_empty());
+        let other = h.create("g");
+        let out = forward(&mut h, 3, 10, 1, other);
+        assert_eq!(mutate_replies(&out).len(), 1);
+        assert!(recalls(&out).is_empty());
+    }
+
+    /// A delegate that never answers is outwaited: TTL + margin by the
+    /// holder's clock. Meanwhile the requester's RPC is answered `Held`
+    /// before it would time out, and its retry re-attaches.
+    #[test]
+    fn an_unanswered_recall_is_outwaited_and_a_long_wait_answers_held() {
+        let (mut h, ino) = holder_with_file();
+        let granted_at = h.now;
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let out = forward(&mut h, 3, 9, 1, setattr(ino));
+        let held = timer_of(&out, TimerKind::HeldReply);
+        let expiry = timer_of(&out, TimerKind::GrantExpiry);
+        assert_eq!(
+            h.core.timer_at(expiry),
+            Some(granted_at.plus(5_000 + 1_000)),
+            "live until granted + ttl + margin"
+        );
+        h.advance(250);
+        let out = h.step(Event::Timer { id: held });
+        let [(3, OpId(9), MutateOutcome::Held { .. })] = mutate_replies(&out).as_slice() else {
+            panic!("expected Held: {out:?}")
+        };
+        // The requester retries the same rid: re-attached, no answer yet.
+        let out = forward(&mut h, 3, 10, 1, setattr(ino));
+        assert!(mutate_replies(&out).is_empty(), "{out:?}");
+        h.now = granted_at.plus(6_000);
+        let out = h.step(Event::Timer { id: expiry });
+        let [(3, OpId(10), MutateOutcome::Accepted { .. })] = mutate_replies(&out).as_slice()
+        else {
+            panic!("expected the reply to the retry: {out:?}")
+        };
+        assert_eq!(h.core.stats.recalls_expired, 1);
+        assert_eq!(h.core.stats.held_replies, 1);
+    }
+
+    /// The sequencer's own writes (the core's local execution) recall too.
+    #[test]
+    fn a_local_write_recalls_before_its_reply() {
+        let (mut h, ino) = holder_with_file();
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            rid,
+            op: setattr(ino),
+            policy: Policy::Client,
+        });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        let rs = recalls(&out);
+        let [(2, recall, _, _)] = rs.as_slice() else {
+            panic!("{out:?}")
+        };
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: *recall },
+        });
+        assert_eq!(replies(&out).len(), 1);
+    }
+
+    /// The FUSE fast path's `Control::Recall` is answered once recalled.
+    #[test]
+    fn a_fuse_write_recall_control_waits_for_the_ack() {
+        let (mut h, ino) = holder_with_file();
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let out = h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Recall { inos: vec![ino] },
+        });
+        assert!(!out.iter().any(|a| matches!(a, Action::ControlDone { .. })));
+        let rs = recalls(&out);
+        let [(2, recall, _, _)] = rs.as_slice() else {
+            panic!("{out:?}")
+        };
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: *recall },
+        });
+        assert!(out
+            .iter()
+            .any(|a| matches!(a, Action::ControlDone { op, .. } if *op == OpId(1 << 50))));
+    }
+
+    /// A grant never outlives the lease backing it (minus the margin).
+    #[test]
+    fn a_grant_is_capped_by_the_lease() {
+        let (mut h, ino) = holder_with_file();
+        h.advance(7_000); // 3 s of the 10 s lease left
+        let g = grant_of(&ask(&mut h, 2, 7, ino));
+        assert_eq!(g.ttl_ms, 2_000);
+        h.advance(2_500); // 500 ms left: under the margin, not usable
+        assert!(matches!(
+            ask(&mut h, 2, 8, ino),
+            ReadIndexOutcome::NotHolder { .. }
+        ));
+    }
+
+    /// A release (here a flush) recalls every grant first, and no new
+    /// grant is made meanwhile.
+    #[test]
+    fn a_release_waits_for_its_grants() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        grant_of(&ask(&mut h, 2, 7, ROOT_INO));
+        let out = h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Flush,
+        });
+        let upload = out
+            .iter()
+            .find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            })
+            .expect("the flush uploads first");
+        let mut out = h.step(Event::UploadsDone {
+            op: upload,
+            result: UploadResult::Done { held: 0 },
+        });
+        if let Some(op) = out.iter().find_map(|a| match a {
+            Action::Publish { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            out = h.step(Event::PublishDone { op, ok: true });
+        }
+        assert!(
+            !s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. })),
+            "no release CAS before the recall: {out:?}"
+        );
+        let rs = recalls(&out);
+        let [(2, recall, _, _)] = rs.as_slice() else {
+            panic!("{out:?}")
+        };
+        assert!(matches!(
+            ask(&mut h, 3, 8, ROOT_INO),
+            ReadIndexOutcome::Busy
+        ));
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::DelegationRecalled { req: *recall },
+        });
+        assert!(s3_ops(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::LeaseSwap { lease, .. } if lease.released)));
+    }
+
+    /// A restart inside the lease: the previous incarnation's grants are
+    /// unknown, so every acknowledgement waits the persisted horizon out.
+    #[test]
+    fn a_restart_quarantines_acks_until_the_grant_horizon() {
+        let (h0, ino) = holder_with_file();
+        let now = h0.now;
+        h0.meta.note_grant_horizon(now.0 + 3_000).unwrap();
+        let meta = h0.meta;
+        let mut core = Core::new(h0.core.cfg.clone());
+        let mut out = Vec::new();
+        core.start(now, &meta, &mut out);
+        let quarantine = timer_of(&out, TimerKind::GrantQuarantine);
+        let mut h = Harness { core, meta, now };
+        h.hold(1, None);
+        let out = forward(&mut h, 3, 9, 1, setattr(ino));
+        assert!(mutate_replies(&out).is_empty(), "{out:?}");
+        h.now = now.plus(4_000);
+        let out = h.step(Event::Timer { id: quarantine });
+        assert_eq!(mutate_replies(&out).len(), 1, "{out:?}");
+    }
+
+    /// A lone strict sequencer (it keeps a kernel cache TTL): the first
+    /// forwarded op flips the latch and its reply waits the drain out;
+    /// later ones are answered at once.
+    #[test]
+    fn the_first_foreign_op_drains_a_lone_strict_nodes_kernel_cache() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.kernel_cache_ttl_ms = 1_000;
+        assert!(h.meta.read_delegations().is_alone());
+        let flipped_at = h.now;
+        let out = forward(&mut h, 3, 9, 1, setattr(ino));
+        assert!(mutate_replies(&out).is_empty(), "{out:?}");
+        assert!(!h.meta.read_delegations().is_alone());
+        let drain = timer_of(&out, TimerKind::GrantQuarantine);
+        assert_eq!(h.core.timer_at(drain), Some(flipped_at.plus(1_000)));
+        h.advance(1_000);
+        let out = h.step(Event::Timer { id: drain });
+        assert_eq!(mutate_replies(&out).len(), 1, "{out:?}");
+        let out = forward(&mut h, 3, 10, 2, setattr(ino));
+        assert_eq!(mutate_replies(&out).len(), 1, "no second drain: {out:?}");
+    }
+
+    // ---- the reader ----
+
+    fn reader() -> Harness {
+        let mut r = Harness::new(2);
+        r.core.lease.cached_holder = Some(1);
+        r
+    }
+
+    fn read_control(r: &mut Harness, op: u64, ino: Ino) -> OpId {
+        let out = r.step(Event::Control {
+            op: OpId(op),
+            req: Control::ReadIndex {
+                ino,
+                dir: false,
+                name: None,
+            },
+        });
+        match sends(&out).as_slice() {
+            [(1, PeerMsg::ReadIndex { req, .. })] => *req,
+            other => panic!("expected a ReadIndex to node 1: {other:?}"),
+        }
+    }
+
+    fn answer(out: &[Action], op: u64) -> ReadAnswer {
+        out.iter()
+            .find_map(|a| match a {
+                Action::ControlDone {
+                    op: o,
+                    result: Ok(ControlOk::ReadIndex(answer)),
+                } if *o == OpId(op) => Some(*answer),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no answer for {op}: {out:?}"))
+    }
+
+    fn granted(id: u64) -> ReadIndexOutcome {
+        ReadIndexOutcome::Ok {
+            position: Position {
+                seq: 3,
+                pending: None,
+            },
+            grant: Some(ReadGrantMsg {
+                id,
+                ttl_ms: 5_000,
+                epoch: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_holder_reads_locally() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::ReadIndex {
+                ino: ROOT_INO,
+                dir: true,
+                name: Some("x".into()),
+            },
+        });
+        assert_eq!(answer(&out, 5), ReadAnswer::Holder);
+        assert!(sends(&out).is_empty());
+    }
+
+    /// The reader installs the grant (honoured until sent + ttl − margin),
+    /// a recall removes it, and a recall that overtakes the reply carrying
+    /// a grant voids that grant (the position still answers the read).
+    #[test]
+    fn a_strict_read_installs_its_grant_and_an_overtaking_recall_voids_it() {
+        let mut r = reader();
+        let sent = r.now;
+        let req = read_control(&mut r, 50, 42);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReadIndexReply {
+                req,
+                outcome: granted(1),
+            },
+        });
+        assert!(matches!(
+            answer(&out, 50),
+            ReadAnswer::Position {
+                delegated: true,
+                ..
+            }
+        ));
+        let d = r.meta.read_delegations();
+        assert!(d.valid(42, sent.0 + 3_999).is_some());
+        assert!(d.valid(42, sent.0 + 4_000).is_none(), "sent + ttl − margin");
+        // A fresh grant, then a recall.
+        let req = read_control(&mut r, 51, 42);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReadIndexReply {
+                req,
+                outcome: granted(2),
+            },
+        });
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegationRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: 2,
+            },
+        });
+        assert!(matches!(
+            sends(&out).as_slice(),
+            [(1, PeerMsg::DelegationRecalled { req: OpId(77) })]
+        ));
+        assert!(r.meta.read_delegations().valid(42, r.now.0).is_none());
+        // Overtaken: the recall of grant 3 arrives before its reply.
+        let req = read_control(&mut r, 52, 42);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegationRecall {
+                req: OpId(78),
+                ino: 42,
+                grant: 3,
+            },
+        });
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::ReadIndexReply {
+                req,
+                outcome: granted(3),
+            },
+        });
+        assert!(matches!(
+            answer(&out, 52),
+            ReadAnswer::Position {
+                delegated: false,
+                ..
+            }
+        ));
+        assert!(r.meta.read_delegations().valid(42, r.now.0).is_none());
+        assert_eq!(r.meta.read_delegations().stats().delegations_raced, 1);
+    }
+
+    /// No answer within the budget: degraded, not an error.
+    #[test]
+    fn an_unanswered_read_index_degrades() {
+        let mut r = reader();
+        let out = r.step(Event::Control {
+            op: OpId(60),
+            req: Control::ReadIndex {
+                ino: 42,
+                dir: false,
+                name: None,
+            },
+        });
+        let deadline = timer_of(&out, TimerKind::ReadIndexDeadline);
+        r.advance(2_000);
+        let out = r.step(Event::Timer { id: deadline });
+        assert_eq!(answer(&out, 60), ReadAnswer::Degraded);
+    }
+}

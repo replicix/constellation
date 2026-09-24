@@ -35,10 +35,11 @@ pub mod ids;
 pub mod replica;
 pub mod segment;
 
-pub use action::{Action, ClientReply, ControlOk, S3Op, TimerKind};
+pub use action::{Action, ClientReply, ControlOk, ReadAnswer, S3Op, TimerKind};
 pub use core::{Config, Core, EpochState, InboxView, ShipState, Stats};
 pub use event::{
-    CasFailure, Control, Event, PeerLink, PeerMsg, Policy, S3Failure, S3Result, UploadResult,
+    CasFailure, Control, Event, PeerLink, PeerMsg, Policy, ReadGrantMsg, ReadIndexOutcome,
+    S3Failure, S3Result, UploadResult,
 };
 pub use ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 pub use replica::Replica;

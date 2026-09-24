@@ -147,6 +147,17 @@ pub enum Control {
     /// Final flush + release on unmount (`Shipper::shutdown_all`); the
     /// core stops afterwards.
     Shutdown,
+    /// Plan 30 §M8: a `cto=strict` open or lookup on this node needs a
+    /// ReadIndex (answered with `ControlOk::ReadIndex`).
+    ReadIndex {
+        ino: Ino,
+        dir: bool,
+        name: Option<String>,
+    },
+    /// Plan 30 §M8: a FUSE write this node executed as the sequencer
+    /// touched `inos`, which carry read delegations: recall them (or
+    /// wait them out), then answer `Done` — the write returns only then.
+    Recall { inos: Vec<Ino> },
     /// Continuation epochs (DESIGN.md §5.3): the driver's epoch machine
     /// changed state. `open`: a promise or active epoch blocks S3
     /// takeover; `active`: writes are local (no S3 CAS); `frozen`: a
@@ -261,23 +272,30 @@ pub enum PeerMsg {
         req: OpId,
         refused: bool,
     },
-    /// M8: `cto=strict` open(): ask the owning sequencer for the current
-    /// position and inode record, and possibly a read delegation.
+    /// Plan 30 §M8: a `cto=strict` open (`dir: false`) or lookup (`dir:
+    /// true`, with the looked-up `name`) on a node that is not the
+    /// sequencer asks it where the state it reads is: the answer's
+    /// position covers every mutation of `ino` (its record; a
+    /// directory's entries; the named entry and its target) acknowledged
+    /// before the request arrived. The sequencer may grant a read
+    /// delegation on `ino` with it.
     ReadIndex {
         req: OpId,
         ino: Ino,
+        dir: bool,
+        name: Option<String>,
     },
     ReadIndexReply {
         req: OpId,
-        position: Seq,
-        record: Option<LogRecord>,
-        delegation_ttl_ms: Option<u64>,
+        outcome: ReadIndexOutcome,
     },
-    /// M8: the sequencer recalls a read delegation before acking a
-    /// mutation on that inode; the delegate acks.
+    /// Plan 30 §M8: the sequencer recalls read delegation `grant` on
+    /// `ino` before acknowledging a mutation that touched it; the
+    /// delegate stops honouring it, then acks.
     DelegationRecall {
         req: OpId,
         ino: Ino,
+        grant: u64,
     },
     DelegationRecalled {
         req: OpId,
@@ -341,6 +359,32 @@ impl PeerMsg {
             _ => None,
         }
     }
+}
+
+/// Plan 30 §M8: the sequencer's answer to a `ReadIndex`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadIndexOutcome {
+    /// Wait until the replica reaches `position`, then read; with a read
+    /// delegation on the inode when `grant` is set.
+    Ok {
+        position: Position,
+        grant: Option<ReadGrantMsg>,
+    },
+    /// Not the holder (`holder`: whom it believes holds, 0 unknown).
+    NotHolder { holder: NodeId },
+    /// The holder, but fenced (its takeover gate, or a release in
+    /// progress): ask again shortly.
+    Busy,
+}
+
+/// A read delegation as granted on the wire: `ttl_ms` counts from when
+/// the requester *sent* its request (it measures from there, minus the
+/// margin); `epoch` is the grant's lease epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadGrantMsg {
+    pub id: u64,
+    pub ttl_ms: u64,
+    pub epoch: Epoch,
 }
 
 /// The result of one `S3Op` (see `crate::action::S3Op`). Each variant

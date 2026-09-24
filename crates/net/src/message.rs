@@ -268,6 +268,40 @@ pub enum Payload {
         #[serde(default)]
         position_pending: Option<(u64, u64)>,
     },
+    /// Plan 30 §M8: a `cto=strict` reader asks the sequencer where the
+    /// state of `ino` is (its record; with `dir`, its entries; with
+    /// `name`, that entry and its target) — `constellation_authority`'s
+    /// `PeerMsg::ReadIndex`.
+    ReadIndex {
+        requester: u64,
+        req_id: u64,
+        ino: u64,
+        dir: bool,
+        name: Option<String>,
+    },
+    /// The sequencer's answer: `status` 0 = the position (and maybe a
+    /// read delegation `(id, ttl_ms, epoch)`), 1 = not the holder
+    /// (`holder`: whom it believes holds, 0 unknown), 2 = busy (fenced).
+    ReadIndexReply {
+        req_id: u64,
+        status: u8,
+        holder: u64,
+        position_seq: u64,
+        position_pending: Option<(u64, u64)>,
+        grant: Option<(u64, u64, u64)>,
+    },
+    /// Plan 30 §M8: the sequencer recalls read delegation `grant` on
+    /// `ino`; the delegate stops honouring it, then answers
+    /// [`Payload::ReadRecalled`].
+    ReadRecall {
+        holder: u64,
+        req_id: u64,
+        ino: u64,
+        grant: u64,
+    },
+    ReadRecalled {
+        req_id: u64,
+    },
     /// Gossiped RTT vector for holder-driven lease placement.
     PeerRtts {
         node_id: u64,

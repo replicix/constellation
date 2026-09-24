@@ -78,6 +78,10 @@ pub fn check_history(history: &History) -> Result<(), CheckFailure> {
     crate::exactly_once::check_history_exactly_once(history)?;
     crate::elle::check_cycles(history)?;
     crate::sessions::check_history_sessions(history, crate::sessions::enforced())?;
+    crate::sessions::check_history_close_to_open(
+        history,
+        crate::sessions::close_to_open_enforced(history),
+    )?;
     Ok(())
 }
 

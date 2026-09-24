@@ -30,6 +30,12 @@ impl Coordinator {
 
         let mut gen = Generator::new(profile.clone());
         let history = Mutex::new(History::new());
+        if profile.cto_strict {
+            history
+                .lock()
+                .expect("history")
+                .record_info(crate::sessions::CTO_STRICT_INFO);
+        }
         let op_ids = AtomicU64::new(1);
         let started = Instant::now();
         let deadline = profile
@@ -56,6 +62,7 @@ impl Coordinator {
                     &op_ids,
                     &step,
                     Duration::from_secs(profile.quiesce_timeout_secs),
+                    profile.cto_strict,
                 )?;
                 tracing::info!(tag = %step.tag, elapsed_s = started.elapsed().as_secs(), "step ok");
                 {
@@ -107,6 +114,7 @@ fn run_step(
     op_ids: &AtomicU64,
     step: &Step,
     quiesce_timeout: Duration,
+    strict: bool,
 ) -> Result<()> {
     history
         .lock()
@@ -165,7 +173,7 @@ fn run_step(
         cluster.barrier(name)?;
         // TCP/local barrier only syncs chaos workers. Constellation close-to-open
         // visibility is async (log tail + FUSE), so poll until all workers agree.
-        wait_converged_verify(cluster, history, op_ids, step, quiesce_timeout)?;
+        wait_converged_verify(cluster, history, op_ids, step, quiesce_timeout, strict)?;
     }
 
     Ok(())
@@ -198,12 +206,19 @@ fn verify_group_key(op: &Op) -> String {
 
 /// Poll verify reads across all workers until every path observation agrees,
 /// then record that final round into the history for checkers.
+///
+/// Plan 30 §M8: with `--cto strict` mounts (`strict`) the *first* round is
+/// recorded too, whether it agrees or not: its reads were issued after
+/// every op of the step completed, so each must already see them — the
+/// close-to-open checker judges exactly that, where bounded mode's first
+/// round may legitimately lag (and is not recorded).
 fn wait_converged_verify(
     cluster: &mut dyn Cluster,
     history: &Mutex<History>,
     op_ids: &AtomicU64,
     step: &Step,
     timeout: Duration,
+    strict: bool,
 ) -> Result<()> {
     history
         .lock()
@@ -247,6 +262,15 @@ fn wait_converged_verify(
                 .push((*w, observe_key(complete)));
         }
 
+        if strict && attempt == 1 {
+            let mut h = history.lock().expect("history");
+            for (w, id, op, complete) in &collected {
+                h.record_invoke(*w, *id, op.clone());
+                h.record_complete(*w, *id, complete.clone());
+            }
+            h.record_info(format!("cto_first_round:{}", step.tag));
+        }
+
         let mut disagreement: Option<String> = None;
         for (op_key, entries) in &by_op {
             if entries.is_empty() {
@@ -260,6 +284,12 @@ fn wait_converged_verify(
         }
 
         if disagreement.is_none() {
+            // Already recorded as the strict first round.
+            let collected = if strict && attempt == 1 {
+                Vec::new()
+            } else {
+                collected
+            };
             for (w, id, op, complete) in collected {
                 history.lock().expect("history").record_invoke(w, id, op);
                 history

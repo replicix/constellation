@@ -148,6 +148,17 @@ impl LeaseView {
         self.valid_until_ms.load(Ordering::Relaxed) - now_unix_ms() > expiry_margin_ms()
     }
 
+    /// Plan 30 §M8: this node is the sequencer for reads — a usable
+    /// lease, no takeover gate, no release in progress — so its replica
+    /// is authoritative and a `cto=strict` read needs no ReadIndex. The
+    /// handoff pause does not matter (it closes this node's own new
+    /// writes, not its authority).
+    pub fn reads_locally(&self) -> bool {
+        !self.releasing.load(Ordering::SeqCst)
+            && !self.gate_pending.load(Ordering::SeqCst)
+            && self.usable()
+    }
+
     /// As [`Self::usable`], but also closed by the releasing flag, a
     /// pending takeover gate and the handoff pause.
     pub fn open_for_new_mutation(&self) -> bool {

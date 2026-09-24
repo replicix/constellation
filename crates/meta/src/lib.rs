@@ -4,6 +4,7 @@
 pub mod error;
 pub mod mutate;
 pub mod prune;
+pub mod readdeleg;
 pub mod record;
 pub mod reintegrate;
 pub mod replay;
@@ -14,6 +15,10 @@ pub mod store;
 pub use error::MetaError;
 pub use mutate::{execute as execute_mutate, MutateOp, MutateOutcome};
 pub use prune::{Policy, PolicyError, PRUNE_XATTR};
+pub use readdeleg::{
+    recall_inos, recall_inos_of_op, CtoStats, HeldDelegation, ReadDelegations, ReadGrant,
+    RecallNeed,
+};
 pub use record::{CloneNode, LogRecord};
 pub use reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 pub use replay::TouchSet;

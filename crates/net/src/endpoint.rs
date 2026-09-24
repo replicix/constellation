@@ -529,6 +529,37 @@ pub trait PeerService: Send + Sync + 'static {
             }
         })
     }
+    /// Plan 30 §M8: a strict reader's ReadIndex. Default: not the holder.
+    fn read_index_requested(
+        &self,
+        _requester: u64,
+        req_id: u64,
+        _ino: u64,
+        _dir: bool,
+        _name: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::ReadIndexReply {
+                req_id,
+                status: 1,
+                holder: 0,
+                position_seq: 0,
+                position_pending: None,
+                grant: None,
+            }
+        })
+    }
+    /// Plan 30 §M8: the sequencer recalls a read delegation. The default
+    /// holds none, so it acks at once.
+    fn read_recall_requested(
+        &self,
+        _holder: u64,
+        req_id: u64,
+        _ino: u64,
+        _grant: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move { Payload::ReadRecalled { req_id } })
+    }
     /// Holder offered us this lease (placement). Default ignores it.
     fn lease_offered(&self, _part: String, _epoch: u64) {}
     /// A peer gossiped its RTT vector. Default ignores it.

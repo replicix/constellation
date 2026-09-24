@@ -195,6 +195,19 @@ pub enum TimerKind {
     StreamHeartbeat,
     /// M7: a subscriber's check that its log stream is still alive.
     StreamWatchdog,
+    /// M8: a read delegation's holder-side expiry (a recall that was not
+    /// acked is outwaited to here).
+    GrantExpiry,
+    /// M8: the restart quarantine ends.
+    GrantQuarantine,
+    /// M8: a forwarded op's reply held for recalls answers `Held` before
+    /// the requester's RPC times out.
+    HeldReply,
+    /// M8: a strict open's ReadIndex round trip, retry backoff, and
+    /// overall budget.
+    ReadIndexTimeout,
+    ReadIndexRetry,
+    ReadIndexDeadline,
 }
 
 /// Successful control-plane results.
@@ -214,4 +227,27 @@ pub enum ControlOk {
     },
     /// `Reintegrate`: what the recovery did.
     Text(String),
+    /// Plan 30 §M8: how a strict open or lookup may read.
+    ReadIndex(ReadAnswer),
+}
+
+/// Plan 30 §M8: the answer to `Control::ReadIndex`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAnswer {
+    /// This node is the sequencer (a usable lease, view open): its replica
+    /// is authoritative; read it.
+    Holder,
+    /// Wait until the replica reaches `position` (M6's wait with a
+    /// per-read floor), then read. `delegated`: a read delegation on the
+    /// inode was installed with it.
+    Position {
+        position: constellation_meta::Position,
+        delegated: bool,
+    },
+    /// No live sequencer (or no P2P path to ask one): the replica tailed
+    /// the log to its head in S3; read it.
+    Tailed,
+    /// No answer within the budget: read the replica as bounded mode
+    /// would (degraded, not an error — M6's rule).
+    Degraded,
 }

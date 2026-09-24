@@ -4,6 +4,7 @@ mod atime;
 mod authority_driver;
 mod backend;
 mod coop;
+mod cto;
 mod daemonize;
 mod designation;
 mod doctor;
@@ -103,6 +104,14 @@ enum Command {
         /// ship) or "s3" (record durable in the shared log).
         #[arg(long)]
         fsync_mode: Option<String>,
+        /// Close-to-open consistency (plan 30 §M8): "bounded" (the
+        /// default: an open reads the local replica, which follows the
+        /// log within the visibility bound) or "strict" (an open or lookup
+        /// sees every close another node completed before it started: one
+        /// ReadIndex round trip to the sequencer, then local under a read
+        /// delegation). `CONSTELLATION_CTO` supplies the default.
+        #[arg(long)]
+        cto: Option<String>,
         /// Chunk close policy: "through" waits for S3; "back" returns
         /// after the local durable queue is journaled.
         #[arg(long)]
@@ -683,6 +692,7 @@ fn main() -> Result<()> {
         allow_other,
         fs_name,
         fsync_mode,
+        cto,
         write_mode,
         read_only_member,
         atime,
@@ -704,6 +714,7 @@ fn main() -> Result<()> {
                 allow_other,
                 fs_name,
                 fsync_mode,
+                cto,
                 write_mode,
                 read_only_member,
                 atime,
@@ -1179,6 +1190,7 @@ struct MountArgs {
     allow_other: bool,
     fs_name: Option<String>,
     fsync_mode: Option<String>,
+    cto: Option<String>,
     write_mode: Option<String>,
     read_only_member: bool,
     atime: Option<String>,
@@ -1272,6 +1284,7 @@ fn cmd_mount(
         allow_other,
         fs_name,
         fsync_mode,
+        cto,
         write_mode,
         read_only_member,
         atime,
@@ -1280,6 +1293,7 @@ fn cmd_mount(
         ephemeral,
         web_ui,
     } = args;
+    let cto_strict = crate::cto::strict_from(cto.as_deref())?;
     // Resolve once: env CONSTELLATION_ATIME overrides the --atime flag.
     let atime_mode =
         crate::atime::AtimeMode::resolve(atime.as_deref().and_then(crate::atime::AtimeMode::parse));
@@ -1485,6 +1499,7 @@ fn cmd_mount(
             node_s3,
             node_cache_size,
             fsync_s3,
+            cto_strict,
             initial_write_mode,
             read_only_member,
             atime_mode,
@@ -1501,6 +1516,7 @@ fn cmd_mount(
                 node_s3,
                 node_cache_size,
                 fsync_s3,
+                cto_strict,
                 initial_write_mode,
                 read_only_member,
                 atime_mode,
@@ -1575,6 +1591,7 @@ fn cmd_mount_body(
     s3: String,
     cache_size: u64,
     fsync_s3: bool,
+    cto_strict: bool,
     initial_write_mode: writeback::WriteMode,
     read_only_member: bool,
     atime_mode: crate::atime::AtimeMode,
@@ -1652,6 +1669,7 @@ fn cmd_mount_body(
                     state_dir: Some(state_dir.to_path_buf()),
                     cache_size,
                     fsync_s3,
+                    cto_strict,
                     initial_write_mode,
                     read_only_member,
                     web_ui,
@@ -2475,6 +2493,84 @@ impl constellation_net::PeerService for P2pBridge {
                 position_seq: position.seq,
                 position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
             }
+        })
+    }
+
+    fn read_index_requested(
+        &self,
+        requester: u64,
+        req_id: u64,
+        ino: u64,
+        dir: bool,
+        name: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let sent = self
+                .nudge
+                .send(fusefs::SyncRequest::PeerReadIndex {
+                    requester,
+                    ino,
+                    dir,
+                    name,
+                    reply,
+                })
+                .is_ok();
+            let outcome = if sent {
+                receive
+                    .await
+                    .unwrap_or(constellation_authority::ReadIndexOutcome::Busy)
+            } else {
+                constellation_authority::ReadIndexOutcome::Busy
+            };
+            use constellation_authority::ReadIndexOutcome as O;
+            let (status, holder, position, grant) = match outcome {
+                O::Ok { position, grant } => {
+                    (0, 0, position, grant.map(|g| (g.id, g.ttl_ms, g.epoch)))
+                }
+                O::NotHolder { holder } => (1, holder, constellation_meta::Position::ZERO, None),
+                O::Busy => (2, 0, constellation_meta::Position::ZERO, None),
+            };
+            constellation_net::Payload::ReadIndexReply {
+                req_id,
+                status,
+                holder,
+                position_seq: position.seq,
+                position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
+                grant,
+            }
+        })
+    }
+
+    fn read_recall_requested(
+        &self,
+        holder: u64,
+        req_id: u64,
+        ino: u64,
+        grant: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            if self
+                .nudge
+                .send(fusefs::SyncRequest::PeerRecall {
+                    holder,
+                    ino,
+                    grant,
+                    reply,
+                })
+                .is_ok()
+            {
+                // Acked only once the delegation is no longer honoured;
+                // a dropped reply (daemon shutting down) acks nothing.
+                if receive.await.is_err() {
+                    return constellation_net::Payload::ReadRecalled { req_id: 0 };
+                }
+                return constellation_net::Payload::ReadRecalled { req_id };
+            }
+            constellation_net::Payload::ReadRecalled { req_id: 0 }
         })
     }
 
@@ -3644,6 +3740,42 @@ impl constellation_api::StatusSource for DaemonStatus {
                     waits_ms: s.waits_ms.to_vec(),
                     wait_ms_total: s.wait_ms_total,
                     raised: s.raised,
+                }
+            },
+            cto: {
+                let d = self.meta.read_delegations();
+                let c = d.stats();
+                constellation_api::CtoStatus {
+                    strict: self.node.cto_strict(),
+                    grants_enabled: core.read_delegations,
+                    strict_reads: c.strict_reads,
+                    holder_local: c.holder_local,
+                    delegation_local: c.delegation_local,
+                    read_index: c.read_index,
+                    s3_tail: c.s3_tail,
+                    degraded: c.degraded,
+                    read_index_ms_total: c.read_index_ms_total,
+                    read_index_ms: c.read_index_ms.to_vec(),
+                    renewals: c.renewals,
+                    delegations_installed: c.delegations_installed,
+                    delegations_raced: c.delegations_raced,
+                    delegations_held: d.held_count() as u64,
+                    recalled: c.recalled,
+                    read_index_served: stats.read_index_served,
+                    read_index_refused: stats.read_index_refused,
+                    grants: c.grants,
+                    live_grants: d.live_grants(),
+                    recalls_sent: stats.recalls_sent,
+                    recalls_acked: stats.recalls_acked,
+                    recalls_expired: stats.recalls_expired,
+                    recall_waits: stats.recall_waits,
+                    recall_wait_ms_total: stats.recall_wait_ms_total,
+                    held_replies: stats.held_replies,
+                    held_retries: stats.held_retries,
+                    fuse_writes_recalled: c.fuse_writes_recalled,
+                    fuse_recall_wait_ms_total: c.fuse_recall_wait_ms_total,
+                    parked_acks: core.read.parked_acks as u64,
+                    recalls_in_flight: core.read.recalls_in_flight as u64,
                 }
             },
             coop,
@@ -5276,6 +5408,7 @@ mod umount_tests {
                 state_dir: Some(state_dir.clone()),
                 cache_size: 16 * 1024 * 1024,
                 fsync_s3: false,
+                cto_strict: false,
                 initial_write_mode: writeback::WriteMode::Through,
                 read_only_member: false,
                 web_ui: 0,

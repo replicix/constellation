@@ -85,8 +85,16 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         replica.forget_acked_through(rid.node, rid.incarnation, acked_through);
+        self.note_foreign(now, replica, out);
+        // Plan 30 §M8: a retry of an op whose reply waits for recalls
+        // re-attaches to that wait (its outcome is final; only the
+        // acknowledgement is held).
+        if self.reattach_parked(now, from, req, rid, out) {
+            return;
+        }
         let mut base = None;
         let mut position = Position::ZERO;
+        let mut fresh = None;
         let outcome = if self.lease.fenced() {
             MutateOutcome::Busy
         } else if let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) {
@@ -94,7 +102,8 @@ impl Core {
             // handoff pause closes this node's *own* new writes so a
             // waiter can claim, not a peer's forwarded ones.
             base = self.reply_base(&op, replica);
-            let outcome = self.holder_execute(now, epoch, rid, &op, replica, out);
+            let (outcome, executed) = self.holder_execute(now, epoch, rid, &op, replica, out);
+            fresh = executed;
             // Plan 30 §M6: the state the op was evaluated against, its
             // own rows included — everything shipped through `head_seq`,
             // plus the unshipped journal through its last row. Read right
@@ -120,6 +129,16 @@ impl Core {
                 },
             }
         };
+        // Plan 30 §M8: the op took effect here just now; its reply may
+        // leave only once no other node still honours a read delegation
+        // on what it touched. The requester's own delegation is not
+        // recalled: its reads of its own write are read-your-writes (M6).
+        if let Some(inos) = fresh {
+            if let Some(wait) = self.recall_needed(now, &inos, Some(from), replica, out) {
+                self.park_reply(now, wait, from, req, rid, outcome, base, position, out);
+                return;
+            }
+        }
         out.push(Action::Send {
             to: from,
             msg: PeerMsg::MutateReply {
@@ -156,7 +175,9 @@ impl Core {
 
     /// `forward::holder_execute`: dedup by `recent`, then by `completed`,
     /// then execute; refusals carry what the requester needs to rebase or
-    /// to install the existing entry.
+    /// to install the existing entry. The second value is set when the op
+    /// executed just now: the inodes its records touched (plan 30 §M8's
+    /// recall set).
     pub(crate) fn holder_execute(
         &mut self,
         now: Ms,
@@ -165,35 +186,42 @@ impl Core {
         op: &MutateOp,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
-    ) -> MutateOutcome {
+    ) -> (MutateOutcome, Option<Vec<u64>>) {
         if let Some(records) = replica.recent_outcome(rid) {
             self.stats.forward_dedup_hits += 1;
-            return MutateOutcome::Accepted { epoch, records };
+            return (MutateOutcome::Accepted { epoch, records }, None);
         }
         match replica.completed_outcome(rid).ok().flatten() {
             Some(constellation_meta::CompletedOutcome::Executed { .. }) => {
                 self.stats.forward_dedup_hits += 1;
-                return MutateOutcome::Accepted {
-                    epoch,
-                    records: Vec::new(),
-                };
+                return (
+                    MutateOutcome::Accepted {
+                        epoch,
+                        records: Vec::new(),
+                    },
+                    None,
+                );
             }
             Some(constellation_meta::CompletedOutcome::Refused { errno }) => {
                 self.stats.forward_dedup_hits += 1;
-                return if errno == libc::ESTALE {
-                    MutateOutcome::Conflict { manifest: None }
-                } else {
-                    MutateOutcome::Errno(errno)
-                };
+                return (
+                    if errno == libc::ESTALE {
+                        MutateOutcome::Conflict { manifest: None }
+                    } else {
+                        MutateOutcome::Errno(errno)
+                    },
+                    None,
+                );
             }
             None => {}
         }
-        match replica.execute(op, Some(rid)) {
+        let outcome = match replica.execute(op, Some(rid)) {
             Ok(records) => {
                 replica.remember_outcome(rid, &records);
                 self.lease.touch(now);
                 self.nudge(now, out);
-                MutateOutcome::Accepted { epoch, records }
+                let inos = constellation_meta::recall_inos(&records);
+                return (MutateOutcome::Accepted { epoch, records }, Some(inos));
             }
             Err(MetaError::Conflict) => match op {
                 MutateOp::SetManifest { ino, .. } => MutateOutcome::Conflict {
@@ -212,7 +240,8 @@ impl Core {
                 None => MutateOutcome::Errno(libc::EEXIST),
             },
             Err(e) => MutateOutcome::Errno(meta_errno(&e)),
-        }
+        };
+        (outcome, None)
     }
 
     /// `SyncRequest::HandOff`: a peer wants the lease. If this node holds
@@ -229,6 +258,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        self.note_foreign(now, replica, out);
         let can_serve = self.lease.ship_epoch(now, &self.cfg).is_some() && !self.lease.fenced();
         if !can_serve {
             self.stats.handoffs_declined += 1;

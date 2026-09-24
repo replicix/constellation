@@ -253,6 +253,18 @@ the work root — the fresh one's included — to be identical
 bucket and require every `Completed { rid }` to appear once
 (**exactly-once in the log**).
 
+Plan 30 M8 added a **close-to-open** checker (`sessions::check_close_to_open`):
+an observation issued after another worker's write to the same path
+completed must not show a state strictly older than that write (same
+black-box explanation rule as the session checkers). It is enforced when
+the history was recorded with `--cto strict` mounts (the coordinator
+records an `Info` event `cto:strict`; `CONSTELLATION_CHAOS_ENFORCE_CTO=1|0`
+overrides) and reported otherwise. `harness run chaos-ci-strict` runs the
+Ci profile with every mount `--cto strict`; in strict mode the
+coordinator also records the *first* round of each step's verify reads
+(issued after every op of the step completed), not only the converged
+one. `chaos check` prints the checker's coverage.
+
 On failure, artifacts land under the scenario tempdir's `chaos-store/`
 (`config.json`, `history.jsonl`, `failure.md`). Re-check offline with
 `chaos check --history …/history.jsonl`. Multi-node hour-long soaks
@@ -931,6 +943,45 @@ relay of its own so requests can be attributed per role):
   latencies), `VIS_RUST_LOG=info,constellation_authority::stream=debug,constellation::log_stream=debug`
   (every segment's ship → stream send → receive → apply, with
   `CHAOS_KEEP_TMP=1`).
+- **Plan 30 M8 `cto-*` scenarios** (each prints the nodes'
+  `status.cto` block: strict reads by how they were answered — as the
+  sequencer, under a read delegation, after a ReadIndex round trip, by
+  an S3 tail, degraded — the ReadIndex latency histogram, and the
+  sequencer's grants, recalls sent / acked / outwaited, acknowledgements
+  that waited and for how long, `Held` replies):
+  - `cto-strict`: three nodes (A sequencer, W writer, R reader), every
+    mount `--cto strict` (`CONSTELLATION_CTO=strict`). 40 iterations:
+    W (forwarding) or A (every fourth, the sequencer's own write)
+    overwrites `f` and creates `n<i>`, and the harness — the
+    out-of-band channel — at once opens both on R: every read must see
+    the close; R never degraded. Prints R's open latency and the
+    writers' close latency.
+  - `cto-bounded`: the same loop under `--cto bounded`, documenting the
+    staleness strict removes (reads that missed the close, and how long
+    until they saw it; fails only if a close never becomes visible).
+  - `cto-delegation-recall`: R's 30 opens of `f` cost at most a few
+    ReadIndex round trips (then local under the delegation); W's 10
+    overwrites each recall R's delegation (acked) before W's close
+    returns, and R reads each new content at once. Prints R's first
+    open against its delegated opens and W's close latency with and
+    without an outstanding delegation.
+  - `cto-recall-unreachable`: `CONSTELLATION_READ_DELEGATION_TTL_MS=3000`.
+    R takes a fresh delegation on `f` and is frozen (SIGSTOP); W's close
+    of `f` (forwarded), then A's own, return only after A outwaited the
+    grant — at least TTL + margin after R's open, at most a few seconds
+    more — with `recalls_expired` counted; R, thawed, reads the new
+    content.
+  - `cto-latency`: single-node strict against bounded open latency on the
+    same workload (strict must ask no sequencer), and a LAN
+    non-sequencer's first strict open of each of 50 files (one ReadIndex
+    each) against its repeat opens (none).
+  - Diagnosis: `RUST_LOG=info,constellation_authority::core::readindex=debug,constellation::cto=debug`
+    (with `CHAOS_KEEP_TMP=1`) traces every strict read (how it was
+    answered, the position, the wait) and every ReadIndex answer
+    (touched, head, pending, granted) and recall.
+  - `cto-second-node-joins`: a lone strict node keeps a kernel cache
+    (TTL half the lease margin); a second node mounts and writes, and the
+    first node's very next open must see it (the latch).
 - **`sticky-lease-handoff-over-s3`** runs with `CONSTELLATION_INBOX=off`
   since M5 phase 2: it tests the S3-only cooperative handoff, and with
   M13's inbox on a lone blocked write is answered through the holder's
@@ -1159,6 +1210,26 @@ segment frames: the gap is noticed at the next frame, the sequence comes
 from S3, the subscriber resubscribes, every replica converges).
 `AUTHORITY_SIM_CONFIG=streams-off | stream-faults | stream-gap` replays
 them; the shard summary prints the stream counters.
+
+Plan 30 M8: `SimConfig::strict` makes client reads `cto=strict` (local
+under a read delegation on the directory, else `Control::ReadIndex`
+through the core, then the session wait at the answer's position), and
+`SimConfig::clock_skew_ms` gives every node a clock off by a seeded
+constant within ± that (leases and delegations are judged on it). Every
+run checks close-to-open across nodes (`tests/sim/cto.rs`: a read
+invoked after another node's write returned `Ok` must be explained by
+that write's state or a later one, with the log as the version order),
+enforced under `strict` with P2P and reported otherwise. Tests:
+`strict_close_to_open_holds` (60 seeds, CI faults; delegations,
+recalls, ReadIndex all exercised), `strict_close_to_open_holds_with_clock_skew_and_loss`
+(±200 ms clocks — the sim's margin is 500 ms — and 3 % P2P loss, so
+recalls are lost and outwaited), `strict_without_delegations_holds`,
+`strict_with_p2p_off_tails_s3` (reported only: no ReadIndex without P2P),
+and the non-vacuity seeds `bounded_mode_reads_stale` and
+`delegations_without_recall_are_found` (`Config::recall_before_ack =
+false`). `long_strict` (`#[ignore]`) is the long configuration in strict
+mode with skew and loss. `AUTHORITY_SIM_CONFIG=strict | strict-skew |
+long-strict` replays them.
 
 The checker design, settled in phase 2: the exact log-witnessed
 linearizability check runs on every seed; Stateright's

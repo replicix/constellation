@@ -12613,3 +12613,723 @@ smoke, pjdfstest 8798/8798, and perf (no regression found; import
 throughput measurably improved, consistent with the milestone's design).
 No mechanical fixes were needed — the tree was already clean. Nothing is
 sent back to the coder.
+
+## Plan 30 M8 — `cto=strict`: read delegations and ReadIndex: **WRITTEN, CODER-TESTED** (pipelined on the M7 WIP base b906e90; all M8 work is uncommitted on top of it — `git diff b906e90` plus the new, untracked files listed under "Files")
+
+| Item | State | Where |
+|---|---|---|
+| Model first: a focused Stateright model of ReadIndex, read delegations, recalls, lease-capped grants, recall-before-release and epoch changes over per-node clocks with bounded drift; property `close_to_open` | done, 13 tests + 1 `#[ignore]` | `crates/model/src/cto.rs`, `crates/model/tests/cto.rs` |
+| Mount option `--cto bounded\|strict` (default `bounded`; `CONSTELLATION_CTO` supplies the default) | done | `crates/cli/src/{main,cto,node_runtime}.rs` |
+| Both sides' delegation tables in `Meta` (shared by the core and the FUSE threads), the persisted grant horizon, the lone-node latch, counters | done | `crates/meta/src/readdeleg.rs` (new) |
+| M6's session wait with a per-read position floor (`session_wait_at` / `session_ready_at`) | done | `crates/meta/src/session.rs` |
+| Core: ReadIndex (reader and sequencer), grants (capped, persisted, inserted before the position is read), per-key positions, recalls, parked acknowledgements (forwarded reply, local finish, FUSE fast path, release, inbox), `Held`, restart quarantine, lone-node latch, S3-tail answers coalesced | done | `crates/authority/src/core/readindex.rs` (new), `core/{mod,holder,client,jobs,inbox,replay}.rs`, `event.rs`, `action.rs`, `replica.rs` |
+| `MutateOutcome::Held { retry_ms }` (the forwarded reply waiting for recalls answers before the requester's RPC gives up) | done | `crates/meta/src/mutate.rs`, `core/client.rs`, `docs/reference/features/forwarded-mutations.md` |
+| Wire: `Payload::{ReadIndex, ReadIndexReply, ReadRecall, ReadRecalled}`, `PeerService::{read_index_requested, read_recall_requested}` | done | `crates/net/src/{message,endpoint,peers}.rs` |
+| Driver and FUSE: `SyncRequest::{ReadIndex, Recall, PeerReadIndex, PeerRecall}`; strict `open`/`lookup`/`readdir`; recall after the sequencer's own fast-path writes; kernel TTL 0 under strict (the lone sequencer excepted); `status.cto` | done | `crates/cli/src/{authority_driver,fusefs,fusefs_ops,lease,main}.rs`, `crates/api/src/{types,lib}.rs` |
+| Core unit tests (13) | done | `core/tests.rs` (`mod cto`) |
+| Sim: strict reads, per-node clock skew, close-to-open check (enforced under strict with P2P), 6 tests + `long_strict` (`#[ignore]`) | done | `crates/authority/tests/sim/{cto,run,node,clock}.rs`, `tests/sim.rs` |
+| Chaos: close-to-open checker, enforced for histories recorded with `--cto strict` mounts (`Info` `cto:strict`); strict runs record the first verify round too; `chaos check` prints coverage | done | `crates/chaos/src/{sessions,check,coord,gen,main}.rs` |
+| Harness: `cto-strict`, `cto-bounded`, `cto-delegation-recall`, `cto-recall-unreachable`, `cto-latency`, `cto-second-node-joins`, `chaos-ci-strict` | done, each run (below) | `crates/harness/src/scenarios/m8.rs` (new), `scenarios.rs`, TESTING.md |
+
+### Design, as built
+
+**What a delegation promises.** A read delegation on inode `ino` is a
+time-bounded promise from the sequencer (the lease holder until M11) to
+one node: no mutation touching `ino` — its attributes, manifest, xattrs,
+or, for a directory, its entries — is *acknowledged* to anyone but that
+node until it has stopped honouring the delegation. "Touching" is
+`KeySet::from_records(records).inos`, which holds every changed inode and
+every dentry's parent. The delegate answers strict opens, lookups and
+listings under `ino` from its own replica, after the replica has reached
+the grant's position once (M6's wait with a per-read floor).
+
+**The reader** (`ConstellationFs::strict_read`, called by `lookup`
+(parent, `dir`, the name), `open` (the file) and the first `readdir`
+chunk):
+1. the sequencer itself (`LeaseView::reads_locally`: a usable lease, no
+   takeover gate, no release in progress) reads its replica — no event,
+   no round trip;
+2. a valid delegation on the inode: local, `session_wait_at(keys,
+   grant position)`; past half its TTL a read renews it in the
+   background (one renewal in flight per inode);
+3. otherwise `SyncRequest::ReadIndex` → `Control::ReadIndex` → the core
+   asks the cached holder (or reads the lease; no live holder → a tail
+   to head in S3) → waits for the answer's position → reads. No answer in
+   `CONSTELLATION_READ_INDEX_BUDGET_MS` (2000): `Degraded`, read as
+   bounded mode would — M6's rule, never an error.
+
+**The sequencer** answers a ReadIndex only while its lease is usable and
+its view open (`LeaseState::usable` and not `fenced`: the lease-read
+rule). The position is `(head_seq, pending)`, where `pending` (its
+unshipped journal position) is included only when the unshipped journal
+touched what is read (`Meta::unshipped_touches_read`: the inode, a
+directory's entries, the looked-up entry and its target). So a file
+nobody else writes costs one round trip and no wait, however busy the
+sequencer is elsewhere; a file written just now costs the round trip plus
+the ship the sequencer starts at once (it nudges its round when `pending`
+is set) and the stream to the reader. The grant (TTL
+`CONSTELLATION_READ_DELEGATION_TTL_MS`, 5000) is
+- **capped by the lease**: `ttl = min(TTL, lease.expires − margin −
+  now)`, so no grant outlives the lease backing it;
+- **persisted** before it is answered (`Meta::note_grant_horizon`, a
+  local kv written at most once a second while granting): a holder that
+  restarts inside its own live lease re-adopts the *same* epoch (M4), its
+  delegates learn nothing, and its in-memory table is gone — so at start
+  it quarantines every acknowledgement until the horizon has passed
+  (`Timer::GrantQuarantine`; the takeover gate's inbox drain waits too);
+- **inserted before the position is read**. The sequencer's own FUSE
+  writes never enter the core; they commit, join the unshipped key set,
+  and then look up grants. One mutex orders the two: either the write
+  sees the grant and recalls it, or the grant came after, and the
+  position read after it includes the write (`readdeleg`'s module doc).
+
+**Recall before every acknowledgement** of a mutation that touched a
+delegated inode: the sequencer sends `DelegationRecall` to each holder of
+a grant on a touched inode (other than the writer: its own reads are M6's
+read-your-writes) and waits for `DelegationRecalled` — the delegate drops
+the delegation *before* acking — or for the grant's expiry by its own
+clock, `granted + ttl + margin`. The wait is a **parked continuation**,
+never a blocked handler: the op has executed and its records ship like
+any other (a recall never holds the ship round back), unrelated keys and
+other requesters proceed, and only the acknowledgement waits:
+- a forwarded op's `MutateReply` (`park_reply`); still parked after
+  `recall_hold_ms` (half the forward timeout) it is answered `Held {
+  retry_ms }` and the requester retries the same rid without spending an
+  attempt; the retry re-attaches to the park, or is answered from the
+  holder's dedup once the wait is over;
+- the core's own local execution (`execute_local` → `finish` parks,
+  `Phase::Recalling`, never in doubt);
+- the FUSE fast path (`recall_after_local_write` → `Control::Recall`:
+  one lock and an empty map when nobody holds a delegation);
+- an inbox op, whose acknowledgement is the log and cannot be held back
+  per op: *recall before executing* — the batch halts at that op
+  (`Halt::Recall`), new grants on its inodes are blocked, and the
+  requester is polled again when the recalls are done;
+- a release (idle release, handoff, flush, epoch flush): a released
+  lease can be claimed at once, so `issue_release` recalls every live
+  grant first (`Phase::RecallBeforeRelease`); `releasing` is up, so no
+  grant is made meanwhile.
+Per-key head-of-line: the requester's key gate still serializes that
+node's ops on common inodes behind the recalled one, as it did behind a
+slow holder; nothing else waits.
+
+**A recall that overtakes its grant.** The model found it (below): the
+holder grants, then executes a write and recalls, and the reply carrying
+the grant arrives after the recall. The delegate counts the recalls it
+receives; a reply's grant is installed only if none arrived since the
+request was sent (the position still serves that one read, which began
+before the recalled write could complete).
+
+**Epoch changes void every delegation.** Safety comes from the cap (and
+the release recall); in addition a delegate drops delegations below the
+epoch of every segment it applies (`Replica::apply_segment`), and a new
+tenure's table holds only its own grants.
+
+**The kernel's caches.** A strict open must reach the daemon and its
+answer must reach what the process reads, so a strict mount answers the
+kernel with attribute and entry TTL 0 — except on a **lone sequencer**:
+while no other node has shown itself (`ReadDelegations::is_alone`),
+nothing but its own FUSE writes can change what it serves, so it keeps a
+short TTL (half the lease margin: 500 ms at the default TTL) and strict
+costs a single node nothing (measured below). The first sign of another
+node — a forwarded op, a ReadIndex, a lease request, an inbox batch, the
+roster, a peer link, or its own release — flips the latch
+(`leave_alone`) and every acknowledgement and release waits once for the
+entries cached until then (`lone_kernel_drain_ms` = TTL + 500 ms slack;
+it joins the quarantine every acknowledgement waits on). The lone TTL is
+given only while the lease is usable, and is half the margin, so the last
+such entry expires before a taker could claim the lease.
+
+**P2P off (M13's inbox) — the decision.** No ReadIndex and no
+delegations without P2P (there is nothing to recall them over, and the
+sequencer's unshipped state is not in S3). A strict open *waits for the
+log*: it tails S3 to head (`ReadAnswer::Tailed`; strict reads arriving
+while one tail is queued share it) and reads. That covers every close
+whose records are in the log when the open starts — every inbox write
+(its outcome, hence its close, comes from the log) — but not the
+sequencer's *own* writes, which are acknowledged before they ship: under
+P2P off those reach other nodes' strict opens at the sequencer's next
+ship (the sync interval). The sim reports close-to-open under P2P off
+without enforcing it; it measured 0 stale reads in 30 seeds. Cost: one
+S3 GET-next per batch of strict reads. The inbox *with* P2P on elsewhere
+(one requester cut off) is covered by recall-before-execute (above).
+
+**Deviation from the plan text: no hint.** The plan says "install the
+record as a hint if it's newer, then wait per M6". Installing the inode's
+current record ahead of the log can be regressed: the holder's journal
+may ship an *older* write of the same inode in a later segment (a byte-cap
+split, or M7's deferral of a transaction behind a still-uploading chunk,
+which keeps per-key order but not segment boundaries), and applying that
+segment on top of the hint would show the older state until the next
+one — exactly the stale read strict mode exists to prevent. The
+per-key position gives what the hint was for: no wait for files the
+sequencer's unshipped journal does not touch, and for a just-written
+file one round trip plus the ship the ReadIndex triggers (LAN p50 1.1 ms
+end to end, below). Across continents that is one WAN round trip plus
+the sequencer's local S3 PUT (the stream to the reader overlaps the
+reply), so "one WAN round trip, the minimum" holds up to the PUT.
+
+### The drift margin (written down, as asked)
+
+All three margins are the lease's own `expiry_margin_ms` (`M`); clocks
+are within `D` of real time, so a duration measured on one clock is off
+by at most `2D`.
+- **Recall override (unreachable delegate).** The delegate honours a
+  grant only while `local < sent + ttl − M`, measured from when it *sent*
+  its request; the sequencer considers it live until `local ≥ granted +
+  ttl + M` by its clock, and `sent ≤ granted` in real time. The delegate
+  stops by real time `s + ttl − M + 2D`; the sequencer overrides from
+  `g + ttl + M − 2D`. Safe when `2M > 4D`, i.e. `M > 2D`.
+- **Epoch change (takeover).** The grant is capped at `E − M − now` in
+  the old holder's clock (`E`: the lease's expiry), so the delegate stops
+  by real time `E − 2M + 3D`; a new holder claims at real time `≥ E − D`.
+  Safe when `2M > 4D`.
+- **The lease itself** needs `M > 2D` (holder stops at `E − M + D`, a
+  taker starts at `E − D`).
+- **Without drift no margin is needed at all**: the delegate's
+  measurement starts before the sequencer's (`sent ≤ granted`), so it
+  always stops first — the model shows margins 0 clean with honest clocks
+  and a violation with margin 1 and ±1-tick clocks that step once each.
+
+So the delegation holder stops honouring earlier than the sequencer
+assumes it has stopped, under exactly the clock assumption the lease
+already makes (`M > 2D`: the default `M` = 1 s tolerates ±500 ms).
+Safety depends on no failure detector: an unreachable, frozen or
+partitioned delegate costs the writer one wait of at most TTL + M, never
+a stale read.
+
+### The model
+
+A focused second `stateright::Model` (`crates/model/src/cto.rs`),
+separate from the authority model because clocks are its subject and
+what the authority model leaves out (its M6 configurations already need
+30M states). It models the durable log with epoch markers, one file
+whose writes are versions, replicas as applied prefixes, the lease
+register with the lease's margin discipline, a global real time with
+per-node clocks off by up to `±D` that may step within that bound, a
+lossy reordering network, the holder's table, recalls and their expiry,
+releases, takeovers, and M6's read-your-writes for a writer (its replica
+has its own write when its close returns). The module doc maps each
+action to the code. Property `close_to_open` (always): a read that
+starts after another node's close completed returns that close's version
+or newer (ghost: the highest version whose close completed, recorded at
+read start). `sometimes` properties guard against vacuity.
+
+Release build, the whole test binary with its tests in parallel: **9.4 s,
+1.57 GB peak**.
+
+| Test | Config | States (unique) | Result |
+|---|---|---|---|
+| `bounded_mode_violates_close_to_open` | bounded, holder writes, reader reads | 885 (395) | **counterexample** |
+| `delegations_without_recall_violate` | strict, `recall: false` | 413K (155K) | **counterexample** |
+| `a_recall_overtaking_its_grant_violates_without_the_generation_check` | strict, `recall_gen_check: false` | 112K (43K) | **counterexample** (how the rule was found) |
+| `recall_override_without_enough_margin_violates_under_drift` | margins 1, clocks ±1 stepping once each | 549K (181K) | **counterexample** |
+| `uncapped_grants_violate_across_a_takeover` | `cap_by_lease: false`, delegate never voids | 76K (30K) | **counterexample** |
+| `release_without_recall_violates` | `recall_before_release: false` | 129K (48K) | **counterexample** |
+| `strict_readindex_without_delegations_is_clean` | 3 nodes, takeover possible | 1.3M (327K), exhaustive | clean |
+| `strict_with_delegations_is_clean` | 3 nodes, a lost message, recalls acked and outwaited | 14.7M (3.1M), exhaustive | clean; delegation reads and acked recalls witnessed |
+| `the_writers_own_delegation_is_left_alone_safely` | writers read before and after writing | 861K (289K), exhaustive | clean, non-vacuous |
+| `outwaiting_an_unreachable_delegate_is_clean_without_drift` | margins 0, 2 lost messages | 7.4M (1.8M), exhaustive | clean |
+| `recall_override_with_the_lease_margin_is_clean_under_drift` | margins 3 (`> 2D`), clocks ±1 stepping | 22.7M (5.3M), exhaustive | clean, delegation used |
+| `capped_grants_are_clean_across_a_takeover` | cap on, delegate never voids | 1.3M (337K), exhaustive | clean |
+| `release_after_recall_is_clean` | release allowed | 1.3M (387K), exhaustive | clean |
+| `deep_drift_takeover_release` (`#[ignore]`) | 3 nodes, every offset combination, steps, renewals, a takeover and a release | 40M (9.9M), capped at depth 10 (13.6 s, 4.8 GB) | clean in the explored region |
+
+The counterexamples, as the checker prints them (abridged): *drift* —
+the delegate sends its ReadIndex at local 1 (its clock +1), steps to 0;
+the holder (clock −1) grants with `until = 2`, steps to +1 and at once
+finds the grant expired, so its write needs no recall and completes; the
+delegate still honours until local 2 and reads the old version.
+*Overtaken grant* — the holder grants to R, executes W's write and
+recalls R's (not yet installed) delegation; the recall arrives first, R
+acks, W's close completes, and the reply with the grant arrives and is
+installed; R's next open is local and stale.
+
+### Simulation
+
+`cargo test -p constellation-authority --release`: 35 lib tests (13 of
+them M8's), 3 `meta_repro`, 29 sim tests (+2 ignored) green; the whole
+crate in ~20 s.
+
+| Test | What | Totals |
+|---|---|---|
+| `strict_close_to_open_holds` | 60 seeds, CI faults, reads 0.7/op, strict, check enforced | 1,799 reads, 1,626 constrained by another node's completed write, 0 stale; 282 grants, 264 recalls (262 acked, 2 outwaited), 643 ReadIndex, 3 degraded |
+| `strict_close_to_open_holds_with_clock_skew_and_loss` | ±200 ms clocks (margin 500 ms), 3 % P2P loss | 1,567 reads, 0 stale; 296 recalls (278 acked, 18 outwaited), 164 `Held` replies |
+| `strict_without_delegations_holds` | sequencer grants nothing | 909 reads, 0 stale, 630 ReadIndex |
+| `strict_with_p2p_off_tails_s3` | inbox config (reported only) | 920 reads, 0 stale, 543 S3 tails, 0 ReadIndex |
+| `bounded_mode_reads_stale` | non-vacuity | seed 831: node 1 read `f2` present after node 2's unlink returned |
+| `delegations_without_recall_are_found` | `Config::recall_before_ack = false` | seed 864 fails the enforced check |
+| `long_strict` (`#[ignore]`) | long config + strict + ±200 ms skew + 2 % loss, 1,000 seeds (40000–40999) | 54 s; 53,433 reads, 50,469 constrained, 0 stale; 8,748 grants, 8,179 recalls (7,819 acked, 360 outwaited), 3,194 `Held`, 377 degraded reads |
+
+### Measurements (floci, this host, while other sessions ran; single runs)
+
+| What | Number | Where |
+|---|---|---|
+| Single node, open+read of a written file, **bounded vs strict** | p50 **51.0 µs vs 50.9 µs**, p99 93 vs 116 µs; strict asked no sequencer (655 strict reads, all as the sequencer) | `cto-latency` (before the lone-node latch strict was 76 µs vs 41 µs: TTL 0 kernel caches; the latch removed it) |
+| LAN non-sequencer, **first** strict open+read (files A wrote once, nobody writes again) | p50 **372 µs**, p90 1.2 ms (one ReadIndex per file, no wait: per-key position) | `cto-latency` (another run: 240 µs); `cto-delegation-recall`'s first open 0.63–1.33 ms |
+| LAN non-sequencer, strict opens **with a delegation held** | p50 **121 µs** (0 ReadIndex for 250 opens); 68–90 µs for one hot file | `cto-latency`, `cto-delegation-recall` |
+| Open right after another node's close (write-then-open) | strict: p50 **0.96 ms**, p99 2.7 ms, **0 stale of 80**; bounded: p50 0.24 ms, **16 stale of 80** (visible 252 ms later: the holder's round) | `cto-strict`, `cto-bounded` |
+| **Recall rate** | `cto-strict`: 102 recalls (all acked) for 80 writes (1.3 per write: the reader's and the other writer's delegations on the file and the directory); `cto-delegation-recall`: 10 recalls for 10 writes; sim `long_strict`: 8,179 recalls for 50k reads (4.4 % outwaited, with 2 % loss and ±200 ms skew) | |
+| **Write latency with a delegation outstanding** (LAN, recall acked) | W's close p50 **3.23 ms vs 3.33 ms** without (noise: the recall is one LAN round trip, ~0.1 ms, run in parallel with nothing else); the sequencer's parked acks averaged 11 ms in `cto-strict` (884 ms over 81, one latch drain included) | `cto-delegation-recall`, `cto-strict` |
+| Write latency with the **delegate unreachable** (frozen) | **4.005 s** = TTL (3 s) + margin (1 s), for a forwarded close and for the sequencer's own | `cto-recall-unreachable` |
+| A lone strict node's first foreign acknowledgement (the latch) | **0.94 s** once per mount (lone TTL 0.5 s + 0.5 s slack) | `cto-second-node-joins` |
+| S3 requests | ReadIndex, grants and recalls are P2P only: no S3 request per strict open with P2P; one persisted-horizon kv write per second of granting (local fjall); with P2P off one GET-next per batch of strict reads | — |
+
+### Harness scenarios run (prefix `constellation-harness-m8opus`, release build)
+
+All PASSED, one run each (plus earlier runs during development): `cto-strict`,
+`cto-bounded`, `cto-delegation-recall`, `cto-recall-unreachable`,
+`cto-latency`, `cto-second-node-joins`, `chaos-ci-strict` (`chaos check`:
+42 observations judged, 0 violations, enforced), `chaos-ci`,
+`forwarded-mutations`, `lease-handover`, `p2p-handover`,
+`session-forwarded-ryw`, `session-exists-observed`,
+`session-idle-latency`, `session-wait-degrades`,
+`session-ryw-after-holder-kill`, `stale-base-rename-divergence`,
+`inbox-sporadic-write-p2p-off`, `inbox-holder-takeover-pending-batch`,
+`kill9-remount`, `two-clients-shared`, `e2e-two-nodes`,
+`holder-crash-phantom-shadow`, `visibility-after-burst`. Not run: the full
+suite, pjdfstest, `chaos-soak-4`, meta-bench, smoke/integration.
+
+### Found, not fixed here
+
+- `long_random` seed 10476 (default long config, bounded) fails the
+  log-witnessed linearizability check — **on the base b906e90 too**
+  (replayed on a clean `git archive` of it: same seed, same class of
+  failure), so it predates M8. Seeds 10000–10999: that seed is the only
+  failure in both builds.
+- Chaos coverage is thin: `chaos-ci-strict` judges 42 observations, all
+  of them verify reads after a quiesce barrier; the harness `cto-*`
+  scenarios and the sim carry the weight.
+- Not recalled, by design: an `unlink` does not recall a delegation on
+  the unlinked *file* (its content is unchanged; its `nlink`/`ctime` may
+  read stale under the delegation until it expires — a `stat` detail, not
+  close-to-open); prune (a system op with no client acknowledgement)
+  and the offline-designation path (which does recall now) aside.
+
+### Files
+
+New: `crates/meta/src/readdeleg.rs`, `crates/authority/src/core/readindex.rs`,
+`crates/authority/tests/sim/cto.rs`, `crates/cli/src/cto.rs`,
+`crates/model/src/cto.rs`, `crates/model/tests/cto.rs`,
+`crates/harness/src/scenarios/m8.rs` (untracked: `git add -N` them to see
+them in `git diff b906e90`).
+Changed: `crates/meta/src/{lib,mutate,session}.rs`, `store/mod.rs`;
+`crates/authority/src/{action,event,lib,replica}.rs`,
+`core/{mod,holder,client,jobs,inbox,replay,tests}.rs`,
+`tests/sim.rs`, `tests/sim/{clock,node,run}.rs`;
+`crates/net/src/{message,endpoint,peers}.rs`;
+`crates/api/src/{types,lib}.rs`;
+`crates/cli/src/{authority_driver,fusefs,fusefs_ops,lease,main,node_runtime}.rs`;
+`crates/chaos/src/{check,coord,gen,main,sessions}.rs`;
+`crates/harness/src/scenarios.rs`; `crates/model/src/lib.rs`;
+`docs/how-to-guides/development/TESTING.md`,
+`docs/reference/features/forwarded-mutations.md`, this file.
+
+### What the tester must run
+
+- `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`.
+- `cargo test -p constellation-model --release --test cto` (9.4 s, 1.6 GB
+  with its tests in parallel), and the rest of the model crate as before;
+  optionally `--ignored deep_drift_takeover_release`.
+- `cargo test -p constellation-authority --release` (the fjall-drop hang
+  of the M7 notes may stall it: rerun), and
+  `AUTHORITY_SIM_SEEDS=1000 cargo test -p constellation-authority --release --test sim -- --ignored long_strict`
+  (54 s); `long_random` as before (seed 10476 fails on the base too).
+- `cargo test -p constellation-meta -p constellation-chaos -p constellation-net -p constellation-api -p constellation -p constellation-harness`.
+- Release build, then `harness run cto-strict cto-bounded cto-delegation-recall cto-recall-unreachable cto-latency cto-second-node-joins chaos-ci-strict`,
+  and the scenarios whose paths M8 touched in bounded mode: the
+  forwarding, handoff, session, inbox and visibility scenarios listed
+  above, `chaos-ci`, then the full suite.
+- pjdfstest (single node, bounded: the fast path now checks the grant
+  table after every write — one lock, an empty map).
+- `meta-bench` before/after (the write path's added cost is that check).
+- M16: strict on EC2 — a far reader's first open (one WAN round trip),
+  delegated opens, and a writer's close with a far delegate outstanding
+  (one WAN round trip for the recall).
+
+## Plan 30 M8 — rebase onto M5+M6+M7: **GREEN** (coder, 2026-09-24; uncommitted on `plan30-m8` = main 617499b + the WIP bases 75aeacf (M6 rebased) and 5b728c0 (M7 rebased); the pre-rebase state is `stash@{0}`, untouched)
+
+**Conflicts resolved** (both sides kept everywhere):
+- `tests/sim/node.rs`, `tests/sim/run.rs`: `NodeEnv` keeps M5's
+  `panic_after_events` next to M8's `clock_skew_ms`/`seed` and
+  `clock_of`.
+- `cli/src/authority_driver.rs`: M5's `TimerKind` import next to M8's
+  `ReadAnswer`/`ReadGrantMsg`/`ReadIndexOutcome`.
+- `PROGRESS.md`: M5's sections, M6, M6's rebase, M7 (with the seed-10476
+  bisect), M7's rebase, then M8's section and this note.
+
+**Semantic interactions checked in the files that applied cleanly.**
+1. **Recall sets lost the parent directory — fixed.** M6's rebase made
+   `KeySet::from_records` leave the dentry's parent out (a shadow on
+   M5's per-key `base` is current only for its records' own keys). M8
+   used `KeySet::from_records(..).inos` as the *recall* set, so after the
+   rebase a create, unlink or rename in a directory no longer recalled a
+   delegation on the directory — a delegate could have kept answering
+   lookups there from its stale replica. The recall set is now its own
+   function, `constellation_meta::recall_inos` (every changed inode plus
+   every dentry's parent), used by the forwarded reply, the core's local
+   execution and the FUSE fast path; `recall_inos_of_op` (from
+   `KeySet::from_op`, which keeps parents) for the inbox's
+   recall-before-execute. Pinned by `a_create_recalls_its_parent_directory`;
+   the sim's strict tests (directory delegations on the root, every write
+   a create/unlink/rename in it) are the end-to-end check. M6's coverage
+   rule itself is untouched.
+2. **ReadIndex `position` against M6's rebased positions.** Unchanged and
+   consistent: M6's `position` is still the holder's whole evaluated
+   state (`head_seq` plus `journal_position`); M8's ReadIndex answers
+   `head_seq` plus the unshipped journal position when the unshipped
+   journal touched what is read. It deliberately does *not* use M5's
+   per-key `base` (`shipped_touches`): a lookup or listing reads the
+   directory's entries and a child's attributes, which the per-key base
+   does not track (the same reason M6's rebase stopped covering parent
+   attributes). With M7's streams the reader is at head anyway.
+3. **Parked continuations against M5's re-entrancy fix.** `complete_ready`
+   now looks each parked entry up with `let Some(..) = remove(..) else
+   continue` (a `finish` run earlier in the loop re-enters
+   `release_gated`, which may execute and park or finish other ops), the
+   `Held` retry arm uses `get_mut` instead of `expect`, and the reader's
+   `ReadReq` lookups are `let … else return`. A parked `Finish` already
+   tolerated a finished op (`finish` returns when the rid is gone); a
+   parked op (`Phase::Recalling`) is skipped by `release_gated` (not
+   `Gated`), by the deadline, and by the lease-path sweeps.
+4. **Strict S3 tail against M7's streams.** No interaction: the
+   tail-to-head job always runs an S3 `SegmentRun` (it never takes the
+   round's stream-covered skip), and it is only used when there is no
+   live sequencer (then nothing streams) or no P2P (no streams). A strict
+   open on a stream subscriber with a live sequencer takes the ReadIndex
+   path, whose position the stream usually already covers
+   (`waited=Fast` in every trace below).
+5. **Per-read floor against M6's watermarks.** `SessionState::check`
+   joins the floor into `observed` for that read only: `Fast` when the
+   applied position dominates both, `Covered` only by a covering entry
+   (a shadow or hint) that dominates both — M6's rule with a higher
+   target. The ReadIndex never raises `observed` (M6's decision 2: only
+   uncovered client replies do). M6's rebase narrowed coverage (no
+   parent attributes), which only makes strict reads of a parent's
+   attributes wait for the position rather than be `Covered` — safe.
+
+**A bug the rebase run exposed (it predates the rebase).** `cto-strict`
+failed intermittently (1 run in 5): R read a file the sequencer A had
+just written and closed as empty. The traces (`RUST_LOG=
+constellation_authority::core::readindex=debug,constellation::cto=debug`,
+added for this) showed A answering R's ReadIndex for the file with
+`touched=false, pending=None` although A's manifest commit had not
+shipped. A holder's own whole-file manifest commit (the FUSE flush,
+`commit_manifest_local` → `Meta::set_manifest_dirty`) does not go through
+`execute_mutate`, so it neither joined M5's unshipped key set nor ran M8's
+recall. Fixed at both ends: `set_manifest_dirty` adds the inode to the
+unshipped set after it commits, and `finish_flush` recalls read
+delegations on the file after the local commit (`recall_after_local_inos`),
+before the close returns. The same gap affected M5's `base` rule (a
+forward on an inode whose manifest the holder had just committed locally
+got a `base` that ignored it); the Meta fix closes it for both. Pinned by
+`readdeleg::tests::a_direct_manifest_commit_is_unshipped`; afterwards
+`cto-strict` passed 30 runs out of 30 (plus the batch below).
+
+**The scenario's degraded check now judges the loop only.** In one of
+those runs R's strict reads during *cluster formation* degraded: A's P2P
+allowlist had not yet learned R (it rejects an unregistered peer until
+its next registry refresh), so R's ReadIndex could not reach A within the
+2 s budget and R read its replica (M6's rule; counted). `cto-strict` now
+compares R's `degraded` before and after the close-then-open loop.
+
+**Results.**
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`: clean.
+- `cargo test --workspace --exclude constellation-model`: all green.
+  `cargo test -p constellation-model --release`: all green, 76 s, 2.1 GB
+  peak (the `cto` binary 9.6 s).
+- `cargo test -p constellation-authority --release`: 40 lib (12 M8), 3
+  `meta_repro`, 32 sim (+3 ignored), 19.5 s.
+- Sweeps: `long_random` 10000–10999 with reads (M6's default) and
+  11000–11999 read-free, 2,000/2,000 ok; `long_strict` 40000–40999,
+  1,000/1,000 ok (50,466 constrained reads, 0 stale; 8,211 recalls, 371
+  outwaited).
+- Pinned seeds replayed under `long` and `long-sessions`: 2267, 2277,
+  10247, 10396, 10476 (fixed by M5), 10507, 11932, 12666 — all pass. The
+  M8 section's note that 10476 fails "on the base too" is superseded.
+- Harness (`constellation-harness-m8opus`, release build): `cto-strict`
+  (30 loop runs + 1), `cto-bounded`, `cto-delegation-recall`,
+  `cto-recall-unreachable`, `cto-latency`, `cto-second-node-joins`,
+  `chaos-ci-strict`, `chaos-ci`, `forwarded-mutations`,
+  `session-forwarded-ryw`, `session-exists-observed`,
+  `session-ryw-after-holder-kill`, `stale-base-rename-divergence`,
+  `visibility-after-burst` — all PASSED. Measurements unchanged in shape:
+  single node strict/bounded open p50 45.0/45.3 µs; LAN first strict open
+  p50 481 µs, delegated 82 µs (0 ReadIndex for 250 opens); strict
+  open right after a close elsewhere p50 1.17 ms, 0 stale of 80 (bounded
+  12 stale, visible ~252 ms later); frozen delegate: the close took
+  4.002 s = TTL 3 s + margin 1 s.
+
+**Files touched by the rebase** (on top of the M8 set): `crates/meta/src/
+{readdeleg,lib}.rs` (`recall_inos`, `recall_inos_of_op`, test),
+`crates/meta/src/store/writes.rs` (`set_manifest_dirty` joins the
+unshipped set), `crates/authority/src/core/{readindex,client,holder,
+inbox}.rs`, `crates/cli/src/fusefs.rs` (manifest-commit recall, `constellation::cto`
+debug traces), `crates/harness/src/scenarios/m8.rs`, the conflict files
+above.
+
+## Plan 30 M8 — tester gate run (2026-09-24)
+
+Worktree `/home/bra/cvs/constellation-m8`, branch `plan30-m8`, uncommitted
+on top of main 0f9583d (M5+M6+M7+the P2P-restart fix). Baseline: a
+detached worktree at main 0f9583d, built once
+(`target/release/{constellation,harness}`), used for every A/B below,
+removed with `git worktree remove --force` at the end. Harness prefix
+`constellation-harness-m8`. **All required gates PASSED.** No design-level
+issues found; no mechanical fixes were needed (the tree was already
+fmt/clippy-clean and every test green on the first attempt) — nothing is
+sent back to the coder. `git status`/`git stash list` unchanged from the
+start of this run.
+
+### Gate 1 — fmt, clippy, workspace + model tests
+
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --exclude constellation-model` (debug): **833
+  passed, 0 failed, 12 ignored** across every crate (net, store-s3, meta,
+  api, chaos, upload-concurrency, cli, harness, authority (32 sim +3
+  ignored, 76.65 s in debug), mtree doc-test, uploadbench, etc.).
+- `cargo test -p constellation-model --release`: **45 passed, 0 failed, 7
+  ignored** (the `_deep` cases). Longest file `tests/today_bugs.rs`
+  (`exactly_once_is_linearizable` inside it) at 28.97 s, well under the
+  60 s/2 GB per-test model budget.
+- `cto.rs` specifically (as asked): `13 passed, 0 failed, 1 ignored
+  (deep_drift_takeover_release)` in **9.65 s** inside the full `cargo
+  test` run; run standalone under `/usr/bin/time -v` for the RSS number:
+  **9.25 s wall, 1,564,376 KB (1.53 GB) peak RSS** — matches the coder's
+  reported ~9.4 s/1.57 GB.
+
+### Gate 2 — authority + simulation
+
+- `cargo test -p constellation-authority --release`: **40 lib + 3
+  meta_repro + 32 sim tests (+3 ignored), 19.5 s total** (0.15 s lib +
+  0.24 s meta_repro + 19.34 s sim). Includes all 5 `core::tests::cto::*`
+  unit tests, `strict_close_to_open_holds`,
+  `strict_close_to_open_holds_with_clock_skew_and_loss`,
+  `strict_without_delegations_holds`, `strict_with_p2p_off_tails_s3`,
+  `bounded_mode_reads_stale`, `delegations_without_recall_are_found`, the
+  M5/M6/M7 regression set, and the 4 seed shards — all green.
+- `AUTHORITY_SIM_SEEDS=2000 cargo test -p constellation-authority
+  --release --test sim -- --ignored long_random` (seeds 10000–11999,
+  reads on): **ok, 0 failed, 107.3 s.** No failing seed — the M7-era
+  10476 log-witnessed-linearizability failure noted as "predates M8" in
+  the coder's section does **not** reproduce in this build (already
+  fixed by the M5+M6+M7 rebase per that section's own note); no replay
+  command needed.
+- `AUTHORITY_SIM_SEEDS=1000 cargo test -p constellation-authority
+  --release --test sim -- --ignored long_strict` (seeds 40000–40999):
+  **ok, 0 failed, 51.2 s.** `CtoTotals { reads: 53428, constrained:
+  50466, degraded: 387, stale: 0, grants: 8772, recalls_sent: 8211,
+  recalls_acked: 7840, recalls_expired(outwaited): 371, held_replies:
+  3274, read_index_sent: 18979 }` — 0 stale reads across all 1,000
+  seeds, numbers matching the coder's report shape (53,433/50,469/0
+  stale, 8,748 grants there vs. 8,772 here — seed-for-seed identical
+  config, the small deltas are noise-free RNG draws from unrelated
+  scheduling, not a discrepancy). The `LEASE LOST`/`stranded op replay
+  refused` lines in the log are the sim's own scripted takeovers and
+  conflict-copy materialization — expected `ERROR`-level narration, not
+  failures.
+
+### Gate 3 — release build
+
+`cargo build --release --workspace`: clean, **47.0 s**.
+
+### Gate 4 — harness
+
+Binaries: `CONSTELLATION_BIN=/home/bra/cvs/constellation-m8/target/release/constellation`,
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m8`.
+
+**M8's own scenarios**, all **PASSED**:
+- `cto-strict` ×5: 8.4–8.8 s each; every run **0 stale of 80** "read
+  right after a close elsewhere" checks (400/400 across the 5 runs); R's
+  read mix stable at reads≈164 (delegation≈41, read-index≈123).
+- `cto-bounded` ×2: 4.9–5.3 s, bounded mode takes no ReadIndex path as
+  expected.
+- `cto-delegation-recall` ×3: 8.2–8.3 s; identical shape each run
+  (reads 144: delegation 131, read-index 13; held 2, recalled 11).
+- `cto-recall-unreachable` ×2: 20.6 s each (the frozen-delegate TTL+
+  margin wait dominates); reads 12, 1–2 delegation-served, 10–11
+  read-index.
+- `cto-latency`: 11.7 s — numbers in the perf section below.
+- `cto-second-node-joins` ×2: 7.2–7.3 s; the lone-node latch drains once
+  per mount, ack-wait total 939 ms / 946 ms (≈0.94 s, matching the
+  design's TTL 0.5 s + 0.5 s slack).
+- `chaos-ci-strict` ×2: 2.7–2.8 s; 19 and 21 exactly-once-log outcomes,
+  each rid once, no violation.
+
+**Six `session-*`, `chaos-ci`, `chaos-soak-4`**, all **PASSED**:
+`session-exists-observed` (3.1 s), `session-forwarded-ryw` (122.3 s, 309
+reads all fast/0 waited), `session-stale-base-rename` (6.4 s),
+`session-ryw-after-holder-kill` (13.0 s), `session-wait-degrades` (9.8 s,
+degraded stats [1.50 s, 3.00 s, 3.00 s]), `session-idle-latency` (4.3 s).
+`chaos-ci` (3.1 s, 14 outcomes). `chaos-soak-4` (**310.7 s**, 1,592
+exactly-once-log outcomes each rid once, converged, no checker false
+positive; it reported — did not enforce, correctly, since this soak runs
+bounded mode — 35 close-to-open violations, which is the expected
+non-vacuity signal for bounded mode, not a bug).
+
+**The rest of the listed matrix**, all **PASSED** on first attempt except
+one noted below: `visibility-after-burst` (29.3 s; S3 tail GETs during
+the fsync'd markers dropped from 1,663–1,676 with streams off to 0–1
+with streams on), `stale-base-rename-divergence` (6.4 s),
+`forwarded-mutations` (1.5 s), `holder-ships-under-forward-load` (5.5 s;
+6,400 forwarded creates, max journal backlog 142,
+`ship_rounds_cancelled=0`), `takeover-marker-strands-promptly` (10.2 s),
+`kill9-remount` (2.0 s), `fresh-node-bootstrap` (62.5 s), `snapshot-mount`
+(34.3 s), `two-clients-shared` (8.7 s), `lease-handover` (36.7 s, epochs
+1→6), `p2p-same-identity-restart` (10.6 s), `inbox-sporadic-write-p2p-off`
+(64.1 s; 16 writes, p50 574 ms, p99 1.08 s), `writeback-fsync` (2.4 s),
+`unmount-drain` (6.5 s), `baseline` (2.6–2.9 s, run twice), `git-workflow`
+(6.9 s).
+
+**`inbox-create-storm-p2p-off` — one transient timeout, resolved as host
+noise, not an M8 regression.** First attempt under a 240 s harness
+timeout hit the timeout (exit 124) with no leftover process or container
+(clean shutdown). Per the tester protocol this was rerun 3× and checked
+against main:
+- Retry 1 (400 s timeout): **PASSED in 40.6 s** — 22,439 files (67,317
+  ops) at 2,045.5 ops/s.
+- Retry 2: **PASSED in 37.5 s.** Retry 3: **PASSED in 47.9 s.**
+- Main build (0f9583d), same scenario, same prefix pattern
+  (`constellation-harness-m8base`): **PASSED in 45.2 s** — run while
+  `uptime` reported a **1-minute load average of 21.68** (this sandbox
+  was carrying several other concurrent worktree sessions' harness/build
+  activity throughout this gate run; load ranged from ~5 to ~22).
+  3/3 M8 retries plus a main-build run at comparable-or-worse load all
+  passed comfortably inside the original 240 s budget once the host
+  wasn't mid-spike — **this is host contention, not a product bug**; no
+  code or config difference between the failing and passing attempts.
+
+### Gate 5 — smoke and pjdfstest
+
+- `tests/smoke.sh` (local file backend): **PASSED**. The "etag CAS
+  (If-Match) ... unavailable/MISSING" lines are the known
+  `object_store` `LocalFileSystem` CAS gap the `doctor` probe correctly
+  reports — not an M8 regression (same as M4/M7's tester notes).
+- pjdfstest, default (bounded) mount: built the compliance image fresh
+  (`cargo build --release -p constellation -p constellation-harness`
+  inside the image, 46.1 s total build). Host port 4566 was held by the
+  independent, long-running `constellation-floci-1` container, so used
+  the same workaround as M4/M7/M13's tester runs:
+  `docker compose -p constellation-m8 -f docker-compose.yml -f
+  <scratchpad>/floci-no-port.yml --profile test run --rm compliance`
+  (drops floci's host port publish only; `compliance` reaches it by
+  in-network DNS regardless, so nothing tested changes). Result: **8798
+  passed, 0 failed, empty baseline.**
+- pjdfstest with `--cto strict`: the compliance setup **can** pass mount
+  arguments — `crates/cli/src/cto.rs` reads `CONSTELLATION_CTO` directly
+  as the mount default when no `--cto` flag is given, so
+  `docker compose ... run --rm -e CONSTELLATION_CTO=strict compliance`
+  exercises a real strict single-node mount with no script edits.
+  Result: **8798 passed, 0 failed, empty baseline** — identical to the
+  default-mount run. (Single node ⇒ the lone-sequencer fast path, so
+  this mainly confirms strict mode doesn't break any POSIX semantics on
+  its own reads/opens; it does not exercise the multi-node recall paths,
+  which the harness `cto-*` scenarios and the sim cover instead.)
+- Both compliance runs torn down with `down -v` under project name
+  `constellation-m8` immediately after; `constellation-floci-1` and other
+  worktrees' containers were untouched throughout (verified before and
+  after).
+
+### Gate 6 — perf (main 0f9583d vs. this tree, interleaved)
+
+Host load was elevated and variable throughout this gate — other
+concurrent worktree sessions were active (a live `constellation-m10`
+harness/build chain observed). Per the instructions, `meta-bench` and
+`cto-latency` were run once load had first dropped under ~8 (waited via
+a polling loop); `harness bench` needed a second wait mid-run when load
+spiked again. Load is reported per round/run below; a few individual
+numbers are called out as noise, not a systematic direction.
+
+**`meta-bench`** (`CONSTELLATION_METABENCH_ONLY=<label>`, via
+`<scratchpad>/mb.sh`, 1 run per side per round, 3 interleaved
+main→M8 pairs per config; load ~4–8 throughout this block):
+
+| Config | Round | main agg ops/s | M8 agg ops/s | main p99 ms | M8 p99 ms |
+|---|---|---|---|---|---|
+| `1node-create-lat0` | 1 | 7861 | 8134 | 0.35 | 0.34 |
+| `1node-create-lat0` | 2 | 7122 | 7811 | 0.49 | 0.30 |
+| `1node-create-lat0` | 3 | 7705 | 8323 | 0.24 | 0.22 |
+| `1node-write4k-lat0` | 1 | 3275 | 3200 | 0.58 | 0.59 |
+| `1node-write4k-lat0` | 2 | 2854 | 3164 | 0.88 | 0.59 |
+| `1node-write4k-lat0` | 3 | 3168 | 3048 | 0.64 | 0.64 |
+| `3node-p2pon-shared-create-lat0` | 1 | 2941 | 3062 | 6.51 | 6.64 |
+| `3node-p2pon-shared-create-lat0` | 2 | 3075 | 3256 | 6.53 | 6.48 |
+| `3node-p2pon-shared-create-lat0` | 3 | 2910 | 2795 | 6.64 | 7.24 |
+
+Averages: `1node-create-lat0` main 7,562.7 vs. M8 8,089.3 (**M8 +7.0%**);
+`1node-write4k-lat0` main 3,099.0 vs. M8 3,137.3 (**M8 +1.2%**);
+`3node-p2pon-shared-create-lat0` main 2,975.3 vs. M8 3,037.7 (**M8
++2.1%**). No config regresses; all three are flat-to-faster, consistent
+with M8's write-path addition being "one lock, an empty map" per write
+when no delegation exists.
+
+**`harness bench`** (`--files 5000 --json`, same params both sides, 5
+interleaved main→M8 pairs — round 2 flagged as a load-spike outlier and
+excluded from the trusted average, consistent with M7's own precedent
+for this metric):
+
+| Round | Load (1-min) during round | main import f/s | M8 import f/s | main durable f/s | M8 durable f/s |
+|---|---|---|---|---|---|
+| 1 | ~5 (calm) | 105.1 | 100.8 | 104.2 | 99.6 |
+| 2 (**excluded, spike**) | rose to 16.6 mid-round | 103.4 | 66.7 | 102.8 | 66.4 |
+| 2-retry | ~6–7 (calm) | 85.6 | 105.6 | 85.4 | 105.1 |
+| 3 | rose 9→14 (borderline) | 95.0 | 88.2 | 94.6 | 87.5 |
+| 4 | ~7–9 (calm) | 81.0 | 95.3 | 80.5 | 94.4 |
+
+Trusted average (calm rounds 1, 2-retry, 4): `import_files_per_sec` main
+90.6 vs. M8 100.6 (**M8 +11.0%**); `durable_import_files_per_sec` main
+90.0 vs. M8 99.7 (**M8 +10.7%**). Including every round (even the
+excluded spike and the borderline round 3): main 94.0 vs. M8 91.3
+(**M8 −2.9%**) — still inside the 5% bound either way.
+
+Other `harness bench` metrics over the same 5 rounds were noisy at
+this sample size, the same conclusion M7's tester reached for these same
+metrics: `writeback_import_files_per_sec` (calm rounds: main 1,274.1,
+M8 1,231.9, **−3.3%**), `metadata_walk_files_per_sec` (main 261,822, M8
+262,341, **+0.2%**), `cold_read_files_per_sec` (main 50,472, M8 48,777,
+**−3.4%**), `sequential_cold_read_mib_per_sec` (main 330.2, M8 283.7,
+**−14.1%**, driven by one low M8 sample in the 2-retry round) — but
+`main`'s own round-to-round spread on `sequential_cold_read_mib_per_sec`
+alone was 280.7–399.5 (a 42% swing on the *same* binary) and on
+`cold_read_files_per_sec` was 20,289–68,327 (3.4×), both larger than the
+M8 deltas above, so none of these four metrics is distinguishable from
+host noise at 5 pairs. **No metric shows a systematic M8 regression; the
+metric most directly exercised by every op on the write path
+(import/durable-import throughput) is flat-to-faster.**
+
+**`cto-latency`** (single node unless noted; from the harness run above):
+
+| Measurement | p50 | p90 | p99 | max | n |
+|---|---|---|---|---|---|
+| Single node, bounded, open+read | 46.97 µs | 58.59 µs | 120.83 µs | 156.03 µs | 250 |
+| Single node, strict, open+read | 38.53 µs | 47.03 µs | 96.88 µs | 117.19 µs | 250 |
+| LAN non-sequencer, **first** strict open of each file | 451.6 µs | 559.8 µs | 30.51 ms* | 30.51 ms* | 50 |
+| LAN non-sequencer, repeat strict opens **under a held delegation** | 58.42 µs | 71.53 µs | 139.12 µs | 167.51 µs | 250 |
+
+(*n=50, so p99=max is one straggler ReadIndex round trip, not the
+typical case — the p50/p90 are representative: one ReadIndex round trip
+per first-open file, zero for the 250 delegated repeat opens.) Strict is
+*not* slower than bounded on a lone node — the lone-sequencer latch
+means strict costs nothing extra there, matching the design note.
+`cto-latency`'s own sequencer (`A`) recorded 2 recalls acked with 933 ms
+total ack-wait for its 2 fuse-writes-recalled during the run (a small-n
+artifact of this scenario's specific write/read interleaving, not a
+general recall cost — `cto-strict`'s much larger sample averaged its
+parked acks near 11 ms per the coder's own report).
+
+### Summary
+
+All required gates green: fmt/clippy/workspace/model tests (cto.rs 9.25 s
+/ 1.53 GB, inside budget), authority unit+sim tests, 2,000 `long_random`
++ 1,000 `long_strict` seeds (0 failures, 0 stale reads), release build,
+the full listed harness matrix (every scenario passed; one transient
+`inbox-create-storm-p2p-off` timeout traced to host load and cleared on
+3/3 retries plus a main-build A/B at comparable load), smoke,
+pjdfstest 8798/8798 in both default and `--cto strict` mounts, and perf
+(no regression found on any metric; meta-bench and the primary
+`harness bench` import-throughput signal are flat-to-faster for M8,
+consistent with the milestone's write-path addition being a single
+uncontended lock check). No mechanical fixes were needed — the tree was
+already clean. Nothing is sent back to the coder.

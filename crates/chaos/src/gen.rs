@@ -46,6 +46,11 @@ pub struct Profile {
     /// How long to poll for cross-node close-to-open convergence after a
     /// quiesce barrier (Constellation log/gossip lag is async).
     pub quiesce_timeout_secs: u64,
+    /// Plan 30 §M8: the mounts run `--cto strict`. Recorded in the
+    /// history (an `Info` event `cto:strict`), which makes the
+    /// close-to-open checker enforced when the history is checked.
+    #[serde(default)]
+    pub cto_strict: bool,
 }
 
 impl Profile {
@@ -60,6 +65,7 @@ impl Profile {
             work_root: "chaos-ci".into(),
             multi_chunk: false,
             quiesce_timeout_secs: 30,
+            cto_strict: false,
         }
     }
 
@@ -74,6 +80,7 @@ impl Profile {
             work_root: "chaos-soak".into(),
             multi_chunk: true,
             quiesce_timeout_secs: 60,
+            cto_strict: false,
         }
     }
 }

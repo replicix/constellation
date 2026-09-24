@@ -1096,6 +1096,27 @@ async fn handle_stream<S: PeerService>(
             service.lease_offered(part, epoch);
             None
         }
+        Payload::ReadIndex {
+            requester,
+            req_id,
+            ino,
+            dir,
+            name,
+        } => Some(
+            service
+                .read_index_requested(requester, req_id, ino, dir, name)
+                .await,
+        ),
+        Payload::ReadRecall {
+            holder,
+            req_id,
+            ino,
+            grant,
+        } => Some(
+            service
+                .read_recall_requested(holder, req_id, ino, grant)
+                .await,
+        ),
         Payload::PeerRtts { node_id, rtts } => {
             service.peer_rtts(node_id, rtts);
             None
@@ -1168,7 +1189,9 @@ async fn handle_stream<S: PeerService>(
         | Payload::ChunkResponse { .. }
         | Payload::LogFrame { .. }
         | Payload::LogEnd { .. }
-        | Payload::MutateReply { .. } => None,
+        | Payload::MutateReply { .. }
+        | Payload::ReadIndexReply { .. }
+        | Payload::ReadRecalled { .. } => None,
     };
     if let Some(reply) = reply {
         let signed = Signed::new(inner.p2p.secret_key(), &reply)?;

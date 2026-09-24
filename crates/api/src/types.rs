@@ -421,6 +421,9 @@ pub struct StatusReport {
     /// monotonic reads) and its latency distribution.
     #[serde(default)]
     pub session: SessionStatus,
+    /// Plan 30 §M8: `cto=strict` and read delegations.
+    #[serde(default)]
+    pub cto: CtoStatus,
     /// Cooperative cache (phase 5, DESIGN.md §7).
     #[serde(default)]
     pub coop: CoopStatus,
@@ -1002,6 +1005,89 @@ pub struct SessionStatus {
     /// not installed here).
     #[serde(default)]
     pub raised: u64,
+}
+
+/// Plan 30 §M8: `cto=strict` reads, read delegations and recalls.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CtoStatus {
+    /// This mount is `--cto strict`.
+    #[serde(default)]
+    pub strict: bool,
+    /// This node, as sequencer, grants read delegations.
+    #[serde(default)]
+    pub grants_enabled: bool,
+    // ---- reader side ----
+    /// Strict opens, lookups and listings, and how each was answered: by
+    /// this node as the sequencer, under a read delegation, after a
+    /// ReadIndex round trip, by tailing S3 (no live sequencer, or no
+    /// P2P), or degraded (no answer in the budget).
+    #[serde(default)]
+    pub strict_reads: u64,
+    #[serde(default)]
+    pub holder_local: u64,
+    #[serde(default)]
+    pub delegation_local: u64,
+    #[serde(default)]
+    pub read_index: u64,
+    #[serde(default)]
+    pub s3_tail: u64,
+    #[serde(default)]
+    pub degraded: u64,
+    /// ReadIndex round trip plus the wait for its position, total ms and
+    /// log2 histogram (`[0]` < 1 ms, `[i]` < 2^i ms).
+    #[serde(default)]
+    pub read_index_ms_total: u64,
+    #[serde(default)]
+    pub read_index_ms: Vec<u64>,
+    #[serde(default)]
+    pub renewals: u64,
+    #[serde(default)]
+    pub delegations_installed: u64,
+    /// Grants not installed because a recall overtook their reply.
+    #[serde(default)]
+    pub delegations_raced: u64,
+    /// Delegations held right now, and recalls received.
+    #[serde(default)]
+    pub delegations_held: u64,
+    #[serde(default)]
+    pub recalled: u64,
+    // ---- sequencer side ----
+    #[serde(default)]
+    pub read_index_served: u64,
+    #[serde(default)]
+    pub read_index_refused: u64,
+    #[serde(default)]
+    pub grants: u64,
+    #[serde(default)]
+    pub live_grants: u64,
+    /// Recalls sent, acked, and outwaited (TTL + margin: the delegate was
+    /// unreachable).
+    #[serde(default)]
+    pub recalls_sent: u64,
+    #[serde(default)]
+    pub recalls_acked: u64,
+    #[serde(default)]
+    pub recalls_expired: u64,
+    /// Acknowledgements that waited for recalls, and the total wait (ms).
+    #[serde(default)]
+    pub recall_waits: u64,
+    #[serde(default)]
+    pub recall_wait_ms_total: u64,
+    /// Forwarded replies answered `Held` (and, as requester, retried).
+    #[serde(default)]
+    pub held_replies: u64,
+    #[serde(default)]
+    pub held_retries: u64,
+    /// This node's own FUSE writes that waited for recalls, and how long.
+    #[serde(default)]
+    pub fuse_writes_recalled: u64,
+    #[serde(default)]
+    pub fuse_recall_wait_ms_total: u64,
+    /// Parked acknowledgements and recalls in flight right now.
+    #[serde(default)]
+    pub parked_acks: u64,
+    #[serde(default)]
+    pub recalls_in_flight: u64,
 }
 
 /// Plan 30 §M7: the direct log stream.

@@ -1,0 +1,1077 @@
+//! Plan 30 §M8: `cto=strict` — ReadIndex, read delegations and recalls.
+//!
+//! # The reader
+//!
+//! A strict open or lookup on a node that is not the sequencer
+//! (`Control::ReadIndex`, from a FUSE thread that found no delegation to
+//! read under) asks the sequencer for a **position**: the state that
+//! covers every mutation of what it reads that was acknowledged before
+//! the question arrived. The FUSE thread then waits (M6's session wait,
+//! with the position as a per-read floor) and reads its own replica. The
+//! answer may carry a **read delegation** on the inode; the core installs
+//! it in `Meta`'s table (`constellation_meta::readdeleg`), and later opens
+//! and lookups under it are answered locally by the FUSE thread, with no
+//! event and no round trip, until it expires or is recalled. No live
+//! sequencer, or no P2P path to ask one: the core tails the log to its
+//! head in S3 instead (`ReadAnswer::Tailed`; M13's P2P-off mode — see the
+//! module doc's last section). No answer within the budget: `Degraded`,
+//! and the read is bounded, as M6's timed-out wait is.
+//!
+//! # The sequencer
+//!
+//! It answers a ReadIndex only while its lease is usable and its view is
+//! open (not in the takeover gate, not releasing) — the lease-read rule:
+//! a usable lease is exclusive, so its replica is the authority. The
+//! position is `(head_seq, pending)`, where `pending` — its unshipped
+//! journal position — is included only when the unshipped journal
+//! touched what the reader reads (`Meta::unshipped_touches_read`): a
+//! file nobody else writes costs the reader one round trip and no wait,
+//! however busy the sequencer is with other files. A grant is made
+//! **before** the position is read (the ordering the FUSE fast path
+//! relies on, see `readdeleg`'s module doc), is persisted as a horizon
+//! before it is answered (a restart inside the lease must not forget it),
+//! and is capped so it never outlives the lease that backs it.
+//!
+//! Before the acknowledgement of any mutation that touched a delegated
+//! inode leaves this node — a forwarded op's reply, a local op's reply,
+//! the FUSE fast path's return (`Control::Recall`), an inbox op's
+//! execution (whose acknowledgement is the log), a release (which lets
+//! another node take over at once) — every grant on it held by a node
+//! other than the writer is recalled over P2P, or outwaited: the grant is
+//! live until `granted + ttl + margin` by this node's clock. The wait is
+//! a *parked* continuation, never a blocked handler: unrelated keys, the
+//! ship round and other requesters proceed. A forwarded op whose reply is
+//! parked longer than `recall_hold_ms` is answered `Held`, and the
+//! requester retries the same rid (the reply then comes from dedup, or
+//! re-attaches to the park).
+//!
+//! # The margins
+//!
+//! The delegate honours a grant until `sent + ttl − margin` (its clock,
+//! from when it sent the request), the sequencer outwaits it until
+//! `granted + ttl + margin` (its clock), and a grant's `ttl` is capped at
+//! `lease.expires − margin − now` — `margin` being the lease's own
+//! `expiry_margin_ms` everywhere. `crates/model/src/cto.rs` has the
+//! argument (every condition reduces to the lease's own `margin > 2D`
+//! for clocks within `D` of real time) and the model that checks it.
+//!
+//! # P2P off (M13's inbox)
+//!
+//! With no P2P there is no ReadIndex, no delegation and no recall: a
+//! strict open tails S3 to head and reads. That makes every close whose
+//! records are *in the log* when the open starts visible — which covers
+//! every write that went through the inbox (its outcome, hence its
+//! close, comes from the log). The sequencer's *own* writes are
+//! acknowledged before they ship, so under P2P off they become visible
+//! to other nodes' strict opens only at its next ship: strict degrades
+//! to "the log", as bounded as the ship interval. The inbox path with
+//! P2P *on* elsewhere (one requester cut off) is handled: the sequencer
+//! recalls before it executes an inbox op on a delegated inode, and
+//! blocks new grants on it until it has.
+
+use super::client::Phase as ClientPhase;
+use super::{Core, S3For, Timer};
+use crate::action::{Action, ControlOk, ReadAnswer, S3Op};
+use crate::event::{PeerMsg, ReadGrantMsg, ReadIndexOutcome, S3Result};
+use crate::ids::{Ms, NodeId, OpId, Seq, TimerId};
+use crate::replica::Replica;
+use constellation_fs_core::Ino;
+use constellation_meta::{HeldDelegation, MutateOutcome, Position, RecallNeed, Rid};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// A strict read waiting for its answer.
+#[derive(Debug)]
+struct ReadReq {
+    ino: Ino,
+    dir: bool,
+    name: Option<String>,
+    /// The peer request in flight, if any.
+    req: Option<OpId>,
+    holder: NodeId,
+    /// When the request was sent (the delegation's lifetime counts from
+    /// here) and the recall generation then.
+    sent_at: Ms,
+    gen: u64,
+    attempts: u32,
+    redirected: bool,
+    deadline: TimerId,
+}
+
+/// A grant being recalled.
+#[derive(Debug)]
+struct Recalling {
+    req: OpId,
+    timer: TimerId,
+}
+
+/// What a parked acknowledgement will do once its recalls are done.
+#[derive(Debug)]
+enum ParkedWhat {
+    /// A forwarded op's reply. `req: None` once it was answered `Held`
+    /// (the requester's retry re-attaches).
+    Reply {
+        to: NodeId,
+        req: Option<OpId>,
+        rid: Rid,
+        outcome: MutateOutcome,
+        base: Option<Seq>,
+        position: Position,
+        held_timer: Option<TimerId>,
+    },
+    /// A local client op's `finish`.
+    Finish { rid: Rid, outcome: MutateOutcome },
+    /// A FUSE fast-path write (`Control::Recall`).
+    Control { op: OpId },
+    /// A release CAS.
+    Release,
+    /// An inbox op halted before executing: poll its requester again.
+    InboxRepoll { node: NodeId },
+}
+
+#[derive(Debug)]
+struct Parked {
+    waiting: BTreeSet<u64>,
+    quarantine: Option<Ms>,
+    since: Ms,
+    what: ParkedWhat,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReadState {
+    reads: BTreeMap<OpId, ReadReq>,
+    by_req: BTreeMap<OpId, OpId>,
+    recalls: BTreeMap<u64, Recalling>,
+    recall_by_req: BTreeMap<OpId, u64>,
+    parked: BTreeMap<u64, Parked>,
+    next_park: u64,
+    parked_rids: BTreeMap<Rid, u64>,
+    /// `execute_local` found recalls needed; `finish` parks.
+    pub(crate) parked_local: BTreeMap<Rid, (BTreeSet<u64>, Option<Ms>)>,
+    /// Inodes an inbox op waits to execute on: no new grants until then.
+    blocked: BTreeMap<Ino, Ms>,
+    /// Strict reads answered by a tail to head (no live sequencer, or no
+    /// P2P): the leader's job, not yet started, that later reads join —
+    /// a tail that starts after a read began covers it — and each
+    /// leader's followers.
+    pub(crate) read_tail_open: Option<OpId>,
+    pub(crate) read_tails: BTreeMap<OpId, Vec<OpId>>,
+    quarantine_timer: Option<TimerId>,
+}
+
+/// Plan 30 §M8's view for `status`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadView {
+    pub reads_in_flight: usize,
+    pub recalls_in_flight: usize,
+    pub parked_acks: usize,
+}
+
+impl Core {
+    pub fn read_view(&self) -> ReadView {
+        ReadView {
+            reads_in_flight: self.rd.reads.len(),
+            recalls_in_flight: self.rd.recalls.len(),
+            parked_acks: self.rd.parked.len(),
+        }
+    }
+
+    /// At start: a previous incarnation's grants may still be honoured.
+    pub(crate) fn read_start(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if !self.cfg.read_delegations {
+            return;
+        }
+        if let Some(until) = replica.load_grant_quarantine(now.0) {
+            tracing::info!(
+                node = self.cfg.node_id,
+                wait_ms = until - now.0,
+                "read delegations granted before this restart may still be honoured; \
+                 acknowledgements wait until they have expired"
+            );
+            let id = self.set_timer(Ms(until), Timer::GrantQuarantine, out);
+            self.rd.quarantine_timer = Some(id);
+        }
+    }
+
+    // ------------------------------------------------------------ holder
+
+    /// Another node showed itself. A lone strict node's kernel cache must
+    /// drain before anything another node started is acknowledged (see
+    /// `Config::kernel_cache_ttl_ms`): the latch flips once, and the drain
+    /// deadline joins the quarantine every acknowledgement waits on.
+    pub(crate) fn note_foreign(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if self.cfg.kernel_cache_ttl_ms == 0 {
+            return;
+        }
+        if let Some(until) = replica
+            .read_delegations()
+            .leave_alone(now.0, self.cfg.kernel_cache_ttl_ms)
+        {
+            tracing::info!(
+                node = self.cfg.node_id,
+                drain_ms = self.cfg.kernel_cache_ttl_ms,
+                "another node showed itself: strict mounts stop caching in the kernel; \
+                 acknowledgements wait once for the entries cached until now to expire"
+            );
+            if self.rd.quarantine_timer.is_none() {
+                let id = self.set_timer(Ms(until), Timer::GrantQuarantine, out);
+                self.rd.quarantine_timer = Some(id);
+            }
+        }
+    }
+
+    /// The sequencer answers where the state a strict reader reads is.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on_read_index(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        req: OpId,
+        ino: Ino,
+        dir: bool,
+        name: Option<String>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.note_foreign(now, replica, out);
+        let outcome = if !self.lease.usable(now, &self.cfg) {
+            self.stats.read_index_refused += 1;
+            let holder = self
+                .lease
+                .cached_holder
+                .filter(|h| *h != self.cfg.node_id)
+                .unwrap_or(0);
+            ReadIndexOutcome::NotHolder { holder }
+        } else if self.lease.fenced() {
+            self.stats.read_index_refused += 1;
+            ReadIndexOutcome::Busy
+        } else {
+            let epoch = self.lease.epoch().unwrap_or(0);
+            let grant = self.maybe_grant(now, from, ino, epoch, replica);
+            // After the grant (see `readdeleg`'s ordering argument).
+            let child = name.as_deref().map(|n| (n, replica.lookup_ino(ino, n)));
+            let touched = replica.unshipped_touches_read(ino, dir, child);
+            let pending = if touched {
+                replica.journal_position(epoch)
+            } else {
+                None
+            };
+            if pending.is_some() {
+                // The reader waits for the ship that carries it: soon.
+                self.nudge(now, out);
+            }
+            self.stats.read_index_served += 1;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                from,
+                ino,
+                dir,
+                ?name,
+                touched,
+                head = self.ship.head_seq,
+                ?pending,
+                granted = grant.is_some(),
+                "answered a ReadIndex"
+            );
+            ReadIndexOutcome::Ok {
+                position: Position {
+                    seq: self.ship.head_seq,
+                    pending,
+                },
+                grant,
+            }
+        };
+        out.push(Action::Send {
+            to: from,
+            msg: PeerMsg::ReadIndexReply { req, outcome },
+        });
+    }
+
+    fn maybe_grant(
+        &mut self,
+        now: Ms,
+        to: NodeId,
+        ino: Ino,
+        epoch: u64,
+        replica: &dyn Replica,
+    ) -> Option<ReadGrantMsg> {
+        if !self.cfg.read_delegations || self.lease.epoch_held() || to == self.cfg.node_id {
+            return None;
+        }
+        if self.rd.blocked.get(&ino).is_some_and(|until| *until > now) {
+            return None;
+        }
+        let (lease, _) = self.lease.held.as_ref()?;
+        let margin = self.cfg.expiry_margin_ms as i64;
+        // Never outlive the lease that backs the promise.
+        let cap = lease.expires_unix_ms - margin - now.0;
+        let ttl = (self.cfg.read_delegation_ttl_ms as i64).min(cap);
+        if ttl <= 0 {
+            return None;
+        }
+        let until = now.0 + ttl + margin;
+        if !replica.note_grant_horizon(until) {
+            return None;
+        }
+        let id = replica.read_delegations().grant(to, ino, until);
+        self.stats.read_grants += 1;
+        Some(ReadGrantMsg {
+            id,
+            ttl_ms: ttl as u64,
+            epoch,
+        })
+    }
+
+    /// What acknowledging a mutation with these touched inodes must wait
+    /// for, the recalls started. `None`: nothing (the common case, one
+    /// lock and an empty map).
+    pub(crate) fn recall_needed(
+        &mut self,
+        now: Ms,
+        inos: &[Ino],
+        except: Option<NodeId>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> Option<(BTreeSet<u64>, Option<Ms>)> {
+        if !self.cfg.recall_before_ack {
+            return None;
+        }
+        let need = replica.read_delegations().touching(inos, except, now.0);
+        self.start_recalls(now, need, out)
+    }
+
+    fn start_recalls(
+        &mut self,
+        now: Ms,
+        need: RecallNeed,
+        out: &mut Vec<Action>,
+    ) -> Option<(BTreeSet<u64>, Option<Ms>)> {
+        if need.is_empty() {
+            return None;
+        }
+        let mut waiting = BTreeSet::new();
+        for g in need.grants {
+            waiting.insert(g.id);
+            if self.rd.recalls.contains_key(&g.id) {
+                continue;
+            }
+            let req = self.op_id();
+            let timer = self.set_timer(Ms(g.until_ms), Timer::GrantExpiry(g.id), out);
+            self.rd.recalls.insert(g.id, Recalling { req, timer });
+            self.rd.recall_by_req.insert(req, g.id);
+            self.stats.recalls_sent += 1;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                delegate = g.node,
+                ino = g.ino,
+                grant = g.id,
+                "recalling a read delegation"
+            );
+            out.push(Action::Send {
+                to: g.node,
+                msg: PeerMsg::DelegationRecall {
+                    req,
+                    ino: g.ino,
+                    grant: g.id,
+                },
+            });
+        }
+        let quarantine = need.quarantine_until.map(Ms);
+        if let (Some(at), None) = (quarantine, self.rd.quarantine_timer) {
+            let id = self.set_timer(at, Timer::GrantQuarantine, out);
+            self.rd.quarantine_timer = Some(id);
+        }
+        let _ = now;
+        Some((waiting, quarantine))
+    }
+
+    fn park(&mut self, now: Ms, wait: (BTreeSet<u64>, Option<Ms>), what: ParkedWhat) -> u64 {
+        self.rd.next_park += 1;
+        let id = self.rd.next_park;
+        self.stats.recall_waits += 1;
+        self.rd.parked.insert(
+            id,
+            Parked {
+                waiting: wait.0,
+                quarantine: wait.1,
+                since: now,
+                what,
+            },
+        );
+        id
+    }
+
+    /// A forwarded op's reply must wait: park it, and answer `Held` if it
+    /// is still parked shortly before the requester's RPC gives up.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn park_reply(
+        &mut self,
+        now: Ms,
+        wait: (BTreeSet<u64>, Option<Ms>),
+        to: NodeId,
+        req: OpId,
+        rid: Rid,
+        outcome: MutateOutcome,
+        base: Option<Seq>,
+        position: Position,
+        out: &mut Vec<Action>,
+    ) {
+        let id = self.park(
+            now,
+            wait,
+            ParkedWhat::Reply {
+                to,
+                req: Some(req),
+                rid,
+                outcome,
+                base,
+                position,
+                held_timer: None,
+            },
+        );
+        self.rd.parked_rids.insert(rid, id);
+        let timer = self.set_timer(now.plus(self.cfg.recall_hold_ms), Timer::HeldReply(id), out);
+        if let Some(Parked {
+            what: ParkedWhat::Reply { held_timer, .. },
+            ..
+        }) = self.rd.parked.get_mut(&id)
+        {
+            *held_timer = Some(timer);
+        }
+    }
+
+    /// A retry of a forwarded op whose reply is parked: attach it.
+    pub(crate) fn reattach_parked(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        req: OpId,
+        rid: Rid,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let Some(&id) = self.rd.parked_rids.get(&rid) else {
+            return false;
+        };
+        let hold = self.cfg.recall_hold_ms;
+        let timer = self.set_timer(now.plus(hold), Timer::HeldReply(id), out);
+        let Some(Parked {
+            what:
+                ParkedWhat::Reply {
+                    to,
+                    req: r,
+                    held_timer,
+                    ..
+                },
+            ..
+        }) = self.rd.parked.get_mut(&id)
+        else {
+            return false;
+        };
+        *to = from;
+        *r = Some(req);
+        let old = held_timer.replace(timer);
+        if let Some(old) = old {
+            self.cancel_timer(old, out);
+        }
+        true
+    }
+
+    pub(crate) fn on_held_reply_timer(&mut self, id: u64, out: &mut Vec<Action>) {
+        let retry_ms = self.cfg.held_retry_ms;
+        let Some(Parked {
+            what:
+                ParkedWhat::Reply {
+                    to,
+                    req,
+                    held_timer,
+                    ..
+                },
+            ..
+        }) = self.rd.parked.get_mut(&id)
+        else {
+            return;
+        };
+        *held_timer = None;
+        if let Some(req) = req.take() {
+            self.stats.held_replies += 1;
+            out.push(Action::Send {
+                to: *to,
+                msg: PeerMsg::MutateReply {
+                    req,
+                    outcome: MutateOutcome::Held { retry_ms },
+                    base: None,
+                    position: Position::ZERO,
+                },
+            });
+        }
+    }
+
+    /// The FUSE fast path wrote inodes that may carry delegations.
+    pub(crate) fn on_recall_control(
+        &mut self,
+        now: Ms,
+        op: OpId,
+        inos: Vec<Ino>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        match self.recall_needed(now, &inos, None, replica, out) {
+            None => out.push(Action::ControlDone {
+                op,
+                result: Ok(ControlOk::Done),
+            }),
+            Some(wait) => {
+                self.park(now, wait, ParkedWhat::Control { op });
+            }
+        }
+    }
+
+    /// A release lets another node take over at once: every live grant
+    /// must be gone first. `true`: parked; the release is re-issued when
+    /// the recalls are done.
+    pub(crate) fn park_release_for_recalls(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if !self.cfg.read_delegations && self.cfg.kernel_cache_ttl_ms == 0 {
+            return false;
+        }
+        // Releasing lets another node take over at once: that is another
+        // node for the kernel-cache latch too.
+        self.note_foreign(now, replica, out);
+        // `all_live` carries the kernel drain, not the restart quarantine.
+        let need = replica.read_delegations().all_live(now.0);
+        match self.start_recalls(now, need, out) {
+            None => false,
+            Some(wait) => {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    grants = wait.0.len(),
+                    "release waits for read delegations to be recalled"
+                );
+                self.park(now, wait, ParkedWhat::Release);
+                true
+            }
+        }
+    }
+
+    /// An inbox op would touch delegated inodes: recall, block new grants
+    /// on them, and have the requester polled again when done.
+    pub(crate) fn inbox_recall_first(
+        &mut self,
+        now: Ms,
+        node: NodeId,
+        inos: &[Ino],
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let Some(wait) = self.recall_needed(now, inos, Some(node), replica, out) else {
+            return false;
+        };
+        let until = now.plus(2 * (self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms));
+        for ino in inos {
+            self.rd.blocked.insert(*ino, until);
+        }
+        self.park(now, wait, ParkedWhat::InboxRepoll { node });
+        true
+    }
+
+    /// The inbox op executed: grants on its inodes may resume.
+    pub(crate) fn inbox_unblock(&mut self, now: Ms, inos: &[Ino]) {
+        for ino in inos {
+            self.rd.blocked.remove(ino);
+        }
+        self.rd.blocked.retain(|_, until| *until > now);
+    }
+
+    pub(crate) fn on_delegation_recalled(
+        &mut self,
+        now: Ms,
+        req: OpId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(id) = self.rd.recall_by_req.remove(&req) else {
+            return;
+        };
+        self.stats.recalls_acked += 1;
+        self.grant_done(now, id, replica, out);
+    }
+
+    pub(crate) fn on_grant_expiry(
+        &mut self,
+        now: Ms,
+        id: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if let Some(r) = self.rd.recalls.get(&id) {
+            self.rd.recall_by_req.remove(&r.req);
+            self.stats.recalls_expired += 1;
+            tracing::info!(
+                node = self.cfg.node_id,
+                grant = id,
+                "a read delegation's recall went unanswered; outwaited it (TTL + margin)"
+            );
+        }
+        self.grant_done(now, id, replica, out);
+    }
+
+    pub(crate) fn on_grant_quarantine(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.rd.quarantine_timer = None;
+        let q = replica.read_delegations().quarantine_until();
+        if q > now.0 {
+            let id = self.set_timer(Ms(q), Timer::GrantQuarantine, out);
+            self.rd.quarantine_timer = Some(id);
+            return;
+        }
+        self.complete_ready(now, replica, out);
+        // A takeover gate that waited for the quarantine can finish now.
+        self.nudge(now, out);
+    }
+
+    fn grant_done(&mut self, now: Ms, id: u64, replica: &dyn Replica, out: &mut Vec<Action>) {
+        replica.read_delegations().forget(id);
+        if let Some(r) = self.rd.recalls.remove(&id) {
+            self.cancel_timer(r.timer, out);
+            self.rd.recall_by_req.remove(&r.req);
+        }
+        for p in self.rd.parked.values_mut() {
+            p.waiting.remove(&id);
+        }
+        self.complete_ready(now, replica, out);
+    }
+
+    fn complete_ready(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let ready: Vec<u64> = self
+            .rd
+            .parked
+            .iter()
+            .filter(|(_, p)| p.waiting.is_empty() && p.quarantine.is_none_or(|q| q <= now))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ready {
+            // Tolerate re-entrancy the way M5's `release_gated` does: a
+            // continuation run earlier in this loop (a `finish`, which
+            // re-enters `release_gated`) may have completed or replaced
+            // later entries.
+            let Some(p) = self.rd.parked.remove(&id) else {
+                continue;
+            };
+            self.stats.recall_wait_ms_total += now.since(p.since).max(0) as u64;
+            match p.what {
+                ParkedWhat::Reply {
+                    to,
+                    req,
+                    rid,
+                    outcome,
+                    base,
+                    position,
+                    held_timer,
+                } => {
+                    self.rd.parked_rids.remove(&rid);
+                    if let Some(t) = held_timer {
+                        self.cancel_timer(t, out);
+                    }
+                    if let Some(req) = req {
+                        out.push(Action::Send {
+                            to,
+                            msg: PeerMsg::MutateReply {
+                                req,
+                                outcome,
+                                base,
+                                position,
+                            },
+                        });
+                    }
+                    // Answered `Held` already: the retry is answered from
+                    // the holder's dedup.
+                }
+                ParkedWhat::Finish { rid, outcome } => self.finish(now, rid, outcome, replica, out),
+                ParkedWhat::Control { op } => out.push(Action::ControlDone {
+                    op,
+                    result: Ok(ControlOk::Done),
+                }),
+                ParkedWhat::Release => self.release_after_recalls(now, replica, out),
+                ParkedWhat::InboxRepoll { node } => self.inbox_repoll(now, node, out),
+            }
+        }
+    }
+
+    /// `finish` found this op's local execution needs recalls first.
+    pub(crate) fn park_finish(
+        &mut self,
+        now: Ms,
+        rid: Rid,
+        wait: (BTreeSet<u64>, Option<Ms>),
+        outcome: MutateOutcome,
+    ) {
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.phase = ClientPhase::Recalling;
+        }
+        self.park(now, wait, ParkedWhat::Finish { rid, outcome });
+    }
+
+    // ------------------------------------------------------------ delegate
+
+    /// The sequencer recalls a delegation: stop honouring it, then ack.
+    pub(crate) fn on_delegation_recall(
+        &mut self,
+        from: NodeId,
+        req: OpId,
+        ino: Ino,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        replica.read_delegations().recall(Some(ino));
+        out.push(Action::Send {
+            to: from,
+            msg: PeerMsg::DelegationRecalled { req },
+        });
+    }
+
+    // ------------------------------------------------------------ reader
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on_read_index_control(
+        &mut self,
+        now: Ms,
+        op: OpId,
+        ino: Ino,
+        dir: bool,
+        name: Option<String>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.lease.usable(now, &self.cfg) && !self.lease.fenced() {
+            self.read_answer(op, ReadAnswer::Holder, out);
+            return;
+        }
+        if !self.cfg.p2p {
+            // No ReadIndex without P2P: the log in S3 is the index.
+            self.read_tail(now, op, replica, out);
+            return;
+        }
+        let deadline = self.set_timer(
+            now.plus(self.cfg.read_index_deadline_ms),
+            Timer::ReadIndexDeadline(op),
+            out,
+        );
+        self.rd.reads.insert(
+            op,
+            ReadReq {
+                ino,
+                dir,
+                name,
+                req: None,
+                holder: 0,
+                sent_at: now,
+                gen: 0,
+                attempts: 0,
+                redirected: false,
+                deadline,
+            },
+        );
+        self.read_route(now, op, replica, out);
+    }
+
+    fn read_route(&mut self, now: Ms, op: OpId, replica: &dyn Replica, out: &mut Vec<Action>) {
+        match self.lease.cached_holder.filter(|h| *h != self.cfg.node_id) {
+            Some(holder) => self.send_read_index(now, op, holder, replica, out),
+            None => {
+                self.issue_s3(S3Op::LeaseGet, S3For::ReadHolder(op), out);
+            }
+        }
+    }
+
+    fn send_read_index(
+        &mut self,
+        now: Ms,
+        op: OpId,
+        holder: NodeId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let req = self.op_id();
+        let timer_at = now.plus(self.cfg.forward_timeout_ms);
+        let Some(r) = self.rd.reads.get_mut(&op) else {
+            return;
+        };
+        r.req = Some(req);
+        r.holder = holder;
+        r.sent_at = now;
+        r.gen = replica.read_delegations().recall_gen();
+        let msg = PeerMsg::ReadIndex {
+            req,
+            ino: r.ino,
+            dir: r.dir,
+            name: r.name.clone(),
+        };
+        self.rd.by_req.insert(req, op);
+        self.set_timer(timer_at, Timer::ReadIndexTimeout(req), out);
+        self.stats.read_index_sent += 1;
+        out.push(Action::Send { to: holder, msg });
+    }
+
+    pub(crate) fn on_read_holder_learned(
+        &mut self,
+        now: Ms,
+        op: OpId,
+        result: S3Result,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.rd.reads.contains_key(&op) {
+            return;
+        }
+        let object = match result {
+            S3Result::LeaseGet(Ok(Some((lease, _)))) => {
+                self.lease.note_object(now, &lease);
+                Some(lease)
+            }
+            S3Result::LeaseGet(Ok(None)) => None,
+            _ => {
+                self.read_retry(now, op, out);
+                return;
+            }
+        };
+        let live = object.filter(|l| l.holder != 0 && !l.is_claimable(now.0));
+        match live {
+            Some(lease) if lease.holder != self.cfg.node_id => {
+                self.send_read_index(now, op, lease.holder, replica, out)
+            }
+            // Our own live lease while our view is closed (a gate, a
+            // release): ask again shortly.
+            Some(_) => self.read_retry(now, op, out),
+            // Nobody holds it: every acknowledged write is in the log
+            // (or was lost with an unshipped tenure, which nothing may be
+            // owed). Tail to head and read.
+            None => {
+                let Some(r) = self.rd.reads.remove(&op) else {
+                    return;
+                };
+                self.cancel_timer(r.deadline, out);
+                self.read_tail(now, op, replica, out);
+            }
+        }
+    }
+
+    pub(crate) fn on_read_index_reply(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        req: OpId,
+        outcome: ReadIndexOutcome,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(op) = self.rd.by_req.remove(&req) else {
+            return;
+        };
+        if self.rd.reads.get(&op).is_none_or(|r| r.req != Some(req)) {
+            return;
+        }
+        self.note_p2p_result(now, from, true);
+        let Some(r) = self.rd.reads.get_mut(&op) else {
+            return;
+        };
+        r.req = None;
+        match outcome {
+            ReadIndexOutcome::Ok { position, grant } => {
+                self.lease.cached_holder = Some(from);
+                let Some(r) = self.rd.reads.remove(&op) else {
+                    return;
+                };
+                self.cancel_timer(r.deadline, out);
+                let mut delegated = false;
+                if let Some(g) = grant {
+                    let margin = self.cfg.expiry_margin_ms as i64;
+                    let ttl = g.ttl_ms as i64;
+                    let held = HeldDelegation {
+                        until_ms: r.sent_at.0 + ttl - margin,
+                        position,
+                        epoch: g.epoch,
+                        holder: from,
+                        grant: g.id,
+                        renew_at_ms: r.sent_at.0 + ttl / 2,
+                    };
+                    if held.until_ms > now.0 {
+                        delegated = replica.read_delegations().install(r.ino, held, r.gen);
+                    }
+                }
+                if !delegated {
+                    replica.read_delegations().renewal_done(r.ino);
+                }
+                self.stats.read_index_answered += 1;
+                self.read_answer(
+                    op,
+                    ReadAnswer::Position {
+                        position,
+                        delegated,
+                    },
+                    out,
+                );
+            }
+            ReadIndexOutcome::NotHolder { holder } => {
+                let redirect = holder != 0 && holder != from && holder != self.cfg.node_id;
+                if redirect && !r.redirected {
+                    r.redirected = true;
+                    self.lease.cached_holder = Some(holder);
+                    self.send_read_index(now, op, holder, replica, out);
+                } else {
+                    self.lease.cached_holder = None;
+                    self.read_retry(now, op, out);
+                }
+            }
+            ReadIndexOutcome::Busy => self.read_retry(now, op, out),
+        }
+    }
+
+    /// A read request failed at the transport, or its reply timed out.
+    pub(crate) fn on_read_request_failed(
+        &mut self,
+        now: Ms,
+        req: OpId,
+        to: NodeId,
+        outage: bool,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if let Some(id) = self.rd.recall_by_req.get(&req).copied() {
+            // A recall that did not arrive: the grant's expiry answers it.
+            tracing::debug!(
+                node = self.cfg.node_id,
+                delegate = to,
+                grant = id,
+                "a read-delegation recall failed at the transport; outwaiting the grant"
+            );
+            return true;
+        }
+        let Some(op) = self.rd.by_req.remove(&req) else {
+            return false;
+        };
+        self.note_p2p_result(now, to, !outage);
+        if let Some(r) = self.rd.reads.get_mut(&op) {
+            if r.req == Some(req) {
+                r.req = None;
+                self.lease.cached_holder = None;
+                self.read_retry(now, op, out);
+            }
+        }
+        true
+    }
+
+    pub(crate) fn on_read_index_timeout(&mut self, now: Ms, req: OpId, out: &mut Vec<Action>) {
+        let Some(op) = self.rd.by_req.remove(&req) else {
+            return;
+        };
+        if let Some(r) = self.rd.reads.get_mut(&op) {
+            if r.req == Some(req) {
+                r.req = None;
+                self.read_retry(now, op, out);
+            }
+        }
+    }
+
+    fn read_retry(&mut self, now: Ms, op: OpId, out: &mut Vec<Action>) {
+        let Some(r) = self.rd.reads.get_mut(&op) else {
+            return;
+        };
+        r.attempts += 1;
+        let delay = (self.cfg.forward_backoff_ms / 4).max(10) * u64::from(r.attempts.min(8));
+        self.set_timer(now.plus(delay), Timer::ReadIndexRetry(op), out);
+    }
+
+    pub(crate) fn on_read_index_retry(
+        &mut self,
+        now: Ms,
+        op: OpId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.rd.reads.get(&op).is_some_and(|r| r.req.is_none()) {
+            return;
+        }
+        if self.lease.usable(now, &self.cfg) && !self.lease.fenced() {
+            let Some(r) = self.rd.reads.remove(&op) else {
+                return;
+            };
+            self.cancel_timer(r.deadline, out);
+            self.read_answer(op, ReadAnswer::Holder, out);
+            return;
+        }
+        self.read_route(now, op, replica, out);
+    }
+
+    pub(crate) fn on_read_index_deadline(
+        &mut self,
+        op: OpId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(r) = self.rd.reads.remove(&op) else {
+            return;
+        };
+        if let Some(req) = r.req {
+            self.rd.by_req.remove(&req);
+        }
+        replica.read_delegations().renewal_done(r.ino);
+        self.stats.read_index_degraded += 1;
+        tracing::debug!(
+            node = self.cfg.node_id,
+            ino = r.ino,
+            "strict read: no sequencer answer within the budget; reading the replica (degraded)"
+        );
+        self.read_answer(op, ReadAnswer::Degraded, out);
+    }
+
+    /// Answer strict read `op` with a tail to head: joins a queued tail
+    /// that has not started yet (it will read everything the read is
+    /// owed), else queues one. One S3 tail answers every strict read
+    /// that arrived while the previous one ran.
+    fn read_tail(&mut self, now: Ms, op: OpId, replica: &dyn Replica, out: &mut Vec<Action>) {
+        self.stats.read_index_tailed += 1;
+        if let Some(leader) = self.rd.read_tail_open {
+            self.rd.read_tails.entry(leader).or_default().push(op);
+            return;
+        }
+        self.rd.read_tail_open = Some(op);
+        self.rd.read_tails.insert(op, Vec::new());
+        self.enqueue_job(
+            now,
+            super::jobs::JobReq::TailToHead { control: op },
+            replica,
+            out,
+        );
+    }
+
+    /// The tail job `control` ended: answer the reads that joined it.
+    pub(crate) fn read_tail_done(
+        &mut self,
+        control: OpId,
+        result: &Result<ControlOk, String>,
+        out: &mut Vec<Action>,
+    ) {
+        if self.rd.read_tail_open == Some(control) {
+            self.rd.read_tail_open = None;
+        }
+        for op in self.rd.read_tails.remove(&control).unwrap_or_default() {
+            out.push(Action::ControlDone {
+                op,
+                result: result.clone(),
+            });
+        }
+    }
+
+    fn read_answer(&mut self, op: OpId, answer: ReadAnswer, out: &mut Vec<Action>) {
+        out.push(Action::ControlDone {
+            op,
+            result: Ok(ControlOk::ReadIndex(answer)),
+        });
+    }
+}

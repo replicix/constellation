@@ -65,6 +65,9 @@ pub(crate) enum Phase {
     /// log; answered when the rid's completion is applied. `position` is
     /// the reply's (plan 30 §M6), raised into `observed` then.
     AwaitingLog { epoch: Epoch, position: Position },
+    /// Plan 30 §M8: executed here as the sequencer; the reply waits for
+    /// read delegations on what it touched to be recalled.
+    Recalling,
 }
 
 /// The externally visible phase, for tests and `status`.
@@ -80,6 +83,7 @@ pub enum ClientPhase {
     WaitingLease,
     AcquireRetry,
     AwaitingLog,
+    Recalling,
 }
 
 #[derive(Debug)]
@@ -131,6 +135,7 @@ impl ClientOp {
             Phase::WaitingLease => ClientPhase::WaitingLease,
             Phase::AcquireRetry => ClientPhase::AcquireRetry,
             Phase::AwaitingLog { .. } => ClientPhase::AwaitingLog,
+            Phase::Recalling => ClientPhase::Recalling,
         }
     }
 }
@@ -647,6 +652,18 @@ impl Core {
                 }
             }
             MutateOutcome::Busy => self.retry_or_lease(now, rid, replica, out),
+            MutateOutcome::Held { retry_ms } => {
+                // Plan 30 §M8: executed; the holder is recalling read
+                // delegations before it acknowledges. Ask again (same
+                // rid, no attempt spent) — the holder answers from its
+                // dedup, or holds the retry until the recalls are done.
+                self.stats.held_retries += 1;
+                let timer = self.set_timer(now.plus(retry_ms), Timer::ForwardBackoff(rid), out);
+                if let Some(c) = self.clients.get_mut(&rid) {
+                    c.phase = Phase::Backoff;
+                    c.timer = Some(timer);
+                }
+            }
             MutateOutcome::NotHolder { holder } => {
                 if holder != 0 {
                     self.lease.cached_holder = Some(holder);
@@ -1000,6 +1017,12 @@ impl Core {
                     self.lease.touch(now);
                 }
                 self.nudge(now, out);
+                // Plan 30 §M8: the sequencer's own writes recall read
+                // delegations too; `finish` parks the reply until done.
+                let inos = constellation_meta::recall_inos(&records);
+                if let Some(wait) = self.recall_needed(now, &inos, None, replica, out) {
+                    self.rd.parked_local.insert(rid, wait);
+                }
                 MutateOutcome::Accepted { epoch, records }
             }
             Err(MetaError::Conflict) => MutateOutcome::Conflict { manifest: None },
@@ -1070,6 +1093,11 @@ impl Core {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
+        if c.phase == Phase::Recalling {
+            // Executed; only the acknowledgement waits, and a recall ends
+            // by the grant's TTL: not in doubt.
+            return;
+        }
         if let Phase::Forwarded { req, .. } = c.phase {
             self.by_req.remove(&req);
         }
@@ -1135,6 +1163,12 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if let Some(wait) = self.rd.parked_local.remove(&rid) {
+            if self.clients.contains_key(&rid) {
+                self.park_finish(now, rid, wait, outcome);
+                return;
+            }
+        }
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };

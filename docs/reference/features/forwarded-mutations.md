@@ -68,6 +68,13 @@ Both messages are signed iroh payloads. Mutation bodies use postcard encoding.
 - `Conflict { manifest }`: a stale `SetManifest` base (see below).
 - `Exists { records, ship_floor, epoch }`: an `EEXIST` refusal carrying the
   entry that is there, the holder's next ship position, and its epoch.
+- `Held { retry_ms }` (plan 30 §M8): the op executed, but its
+  acknowledgement waits until the `cto=strict` read delegations other
+  nodes hold on what it touched are recalled (or outwaited: TTL plus the
+  lease's drift margin). The holder answers this before the requester's
+  forward timeout; the requester retries the same `rid` after `retry_ms`
+  without spending an attempt, and the retry is answered from the
+  holder's dedup once the wait is over (or re-attaches to it).
 
 An empty or undecodable outcome is treated as `Busy`.
 

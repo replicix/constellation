@@ -17,7 +17,8 @@ pub use types::{
     SnapshotStatus, SourceStatus, SpeculationStatus, SpoolStatus, StatusReport, WritebackStatus,
 };
 pub use types::{
-    CasProbeStatus, HeldInodeStatus, HeldStatus, LogStreamStatus, PeerPathsStatus, SessionStatus,
+    CasProbeStatus, CtoStatus, HeldInodeStatus, HeldStatus, LogStreamStatus, PeerPathsStatus,
+    SessionStatus,
 };
 
 use anyhow::{Context, Result};
@@ -411,6 +412,7 @@ mod tests {
                 speculation: SpeculationStatus::default(),
                 held: HeldStatus::default(),
                 session: SessionStatus::default(),
+                cto: crate::CtoStatus::default(),
                 coop: CoopStatus::default(),
                 prefetch: PrefetchStatus::default(),
                 writeback: WritebackStatus::default(),

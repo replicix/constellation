@@ -551,6 +551,8 @@ pub struct Meta {
     /// Plan 30 §M6: positions, the `observed` watermark and the read
     /// wait (`crate::session`).
     pub(crate) session: crate::session::SessionState,
+    /// Plan 30 §M8: read delegations, both sides (`crate::readdeleg`).
+    pub(crate) read_delegations: crate::readdeleg::ReadDelegations,
     /// Plan 30 §M7: told the records of every foreign segment this replica
     /// applied (the daemon invalidates the kernel's FUSE caches for what
     /// they touched, so another node's write is visible without waiting
@@ -671,6 +673,7 @@ impl Meta {
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
             held_work: AtomicU64::new(0),
             session: crate::session::SessionState::default(),
+            read_delegations: crate::readdeleg::ReadDelegations::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
             usage: UsageTracker::new(0, 0),
             path,

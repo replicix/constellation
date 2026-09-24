@@ -112,6 +112,9 @@ enum Phase {
     FlushPublish { op: OpId },
     /// `LeaseSwap(released)` outstanding.
     Release,
+    /// Plan 30 §M8: waiting for read delegations to be recalled before
+    /// the release CAS.
+    RecallBeforeRelease,
     /// `LeaseGet` after a release CAS conflict.
     ReleaseReread,
     /// A deposition recovery's `RebuildReplica` outstanding.
@@ -209,6 +212,11 @@ enum GateStep {
     NeedMarker,
     NeedDrain,
     Failed(String),
+    /// Plan 30 §M8: the restart quarantine has not passed; draining the
+    /// inbox would acknowledge ops (their outcomes ride the log) while a
+    /// previous incarnation's read delegations may still be honoured.
+    /// Retried like a failure, without the alarm.
+    Wait,
 }
 
 /// How many of `records` fit in one segment under `cap` bytes
@@ -282,6 +290,11 @@ impl Core {
                 } => self.begin_acquire(now, reason, ask_handoff, replica, out),
                 JobReq::Handoff { req, from } => self.begin_handoff(now, req, from, replica, out),
                 JobReq::TailToHead { control } => {
+                    // Plan 30 §M8: strict reads arriving from now on are
+                    // not covered by this tail; they queue the next.
+                    if self.rd.read_tail_open == Some(control) {
+                        self.rd.read_tail_open = None;
+                    }
                     self.job = Some(Job {
                         what: What::TailToHead { control },
                         phase: Phase::Tail {
@@ -778,6 +791,9 @@ impl Core {
             return GateStep::Failed(e.to_string());
         }
         if !gate.drained {
+            if replica.read_delegations().quarantine_until() > now.0 {
+                return GateStep::Wait;
+            }
             return GateStep::NeedDrain;
         }
         self.lease.gate = None;
@@ -1122,6 +1138,12 @@ impl Core {
                 GateStep::Failed(error) => {
                     tracing::error!(%error, node = self.cfg.node_id, "takeover gate failed; retrying next round");
                 }
+                GateStep::Wait => {
+                    tracing::debug!(
+                        node = self.cfg.node_id,
+                        "takeover gate waits out the read-delegation quarantine"
+                    );
+                }
             }
         }
         self.round_tail(now, replica, out);
@@ -1279,10 +1301,22 @@ impl Core {
         if self.issue_atime_ship(now, 0, ShipPurpose::AtimeBeforeRelease, replica, out) {
             return;
         }
-        self.issue_release(out);
+        self.issue_release(now, replica, out);
     }
 
-    fn issue_release(&mut self, out: &mut Vec<Action>) {
+    /// The release CAS — but a released lease can be taken over at once,
+    /// so plan 30 §M8's read delegations must all be recalled (or
+    /// outwaited) first. `releasing` is up by now: no new grant is made
+    /// while the recalls run or the CAS is in flight.
+    fn issue_release(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if self.lease.held.is_none() {
+            return;
+        }
+        self.lease.releasing = true;
+        if self.park_release_for_recalls(now, replica, out) {
+            self.set_phase(Phase::RecallBeforeRelease, None);
+            return;
+        }
         let Some((lease, tag)) = self.lease.held.clone() else {
             return;
         };
@@ -1295,6 +1329,32 @@ impl Core {
             out,
         );
         self.set_phase(Phase::Release, Some(op));
+    }
+
+    /// Plan 30 §M8: the recalls a release waited for are done.
+    pub(crate) fn release_after_recalls(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(job) = self.job.as_ref() else {
+            return;
+        };
+        if !matches!(job.phase, Phase::RecallBeforeRelease) {
+            return;
+        }
+        let kind = job.kind();
+        if self.lease.held.is_some() && !self.lease.lost {
+            self.issue_release(now, replica, out);
+            return;
+        }
+        // The lease went away while the recalls ran: nothing to release.
+        self.lease.releasing = false;
+        match kind {
+            JobKind::Round => self.finish_round(now, None, replica, out),
+            _ => self.finish_flush_job(now, false, replica, out),
+        }
     }
 
     fn finish_round(
@@ -1631,6 +1691,13 @@ impl Core {
             GateStep::NeedDrain => self.issue_drain(out),
             GateStep::Failed(error) => {
                 tracing::error!(%error, node = self.cfg.node_id, "takeover gate failed; the view stays closed");
+                self.finish_acquire(now, false, replica, out);
+            }
+            GateStep::Wait => {
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    "takeover gate waits out the read-delegation quarantine"
+                );
                 self.finish_acquire(now, false, replica, out);
             }
         }
@@ -2077,7 +2144,7 @@ impl Core {
                         _ => self.flush_continue(now, 0, replica, out),
                     },
                     ShipPurpose::AtimeStale => self.round_publish(now, replica, out),
-                    ShipPurpose::AtimeBeforeRelease => self.issue_release(out),
+                    ShipPurpose::AtimeBeforeRelease => self.issue_release(now, replica, out),
                 }
             }
             (
@@ -2089,7 +2156,7 @@ impl Core {
                 if attempts >= COLLISION_RETRIES {
                     if purpose == ShipPurpose::AtimeBeforeRelease {
                         let _ = replica.drop_atime();
-                        self.issue_release(out);
+                        self.issue_release(now, replica, out);
                         return;
                     }
                     self.job_failed(
@@ -2122,7 +2189,7 @@ impl Core {
                     ShipPurpose::AtimeBeforeRelease => {
                         tracing::debug!(node = self.cfg.node_id, error = %e, "final atime ship failed; dropping rows");
                         let _ = replica.drop_atime();
-                        self.issue_release(out);
+                        self.issue_release(now, replica, out);
                     }
                 }
             }
@@ -2259,7 +2326,9 @@ impl Core {
                     purpose => {
                         if !self.issue_atime_ship(now, attempts, purpose, replica, out) {
                             match purpose {
-                                ShipPurpose::AtimeBeforeRelease => self.issue_release(out),
+                                ShipPurpose::AtimeBeforeRelease => {
+                                    self.issue_release(now, replica, out)
+                                }
                                 _ => self.round_publish(now, replica, out),
                             }
                         }
@@ -2303,6 +2372,7 @@ impl Core {
                         op: control,
                         result: Ok(ControlOk::Done),
                     });
+                    self.read_tail_done(control, &Ok(ControlOk::Done), out);
                 }
                 self.start_next_job(now, replica, out);
             }
@@ -2326,9 +2396,11 @@ impl Core {
                     ..
                 }) = self.job.take()
                 {
+                    let result = Err(error);
+                    self.read_tail_done(control, &result, out);
                     out.push(Action::ControlDone {
                         op: control,
-                        result: Err(error),
+                        result,
                     });
                 }
                 self.start_next_job(now, replica, out);

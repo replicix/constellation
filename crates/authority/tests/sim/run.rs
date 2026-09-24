@@ -84,6 +84,13 @@ pub struct SimConfig {
     /// Plan 30 §M7: faults on log-stream frames (loss, reorder, the
     /// holder dropping a subscriber).
     pub stream_faults: StreamFaults,
+    /// Plan 30 §M8: reads are `cto=strict` (a delegation, or a ReadIndex
+    /// through the core, then the wait at its position), and the
+    /// close-to-open check is enforced.
+    pub strict: bool,
+    /// Plan 30 §M8: each node's clock is off by a seeded constant within
+    /// `±clock_skew_ms` (leases and delegations are judged on it).
+    pub clock_skew_ms: i64,
 }
 
 /// Core tunables scaled down for simulation (seconds, not minutes).
@@ -158,6 +165,8 @@ impl Default for SimConfig {
             session_wait: true,
             session_wait_ms: 2_000,
             stream_faults: StreamFaults::default(),
+            strict: false,
+            clock_skew_ms: 0,
         }
     }
 }
@@ -181,6 +190,8 @@ pub struct Report {
     pub observed_tentative: usize,
     /// Plan 30 §M6: the per-node session checks.
     pub sessions: super::session::SessionReport,
+    /// Plan 30 §M8: close-to-open (enforced under `strict`).
+    pub cto: super::cto::CtoReport,
     pub stats: BTreeMap<NodeId, Stats>,
     pub faults: Vec<String>,
     pub simulated_ms: u64,
@@ -318,13 +329,48 @@ async fn client_read(
     thread: u64,
     name: String,
     wait: Option<u64>,
+    strict: bool,
 ) {
     let inv = history.tick();
     let keys = [constellation_meta::ReadKey::Dentry(ROOT_INO, name.clone())];
     let mut timed_out = false;
+    // Plan 30 §M8: a strict lookup — local under a delegation on the
+    // directory, else a ReadIndex through the core (answered `Holder` on
+    // the sequencer) — then the session wait at the answer's position.
+    let mut floor = constellation_meta::Position::ZERO;
+    if strict {
+        let now = handle.clock.now().0;
+        let ask = |handle: &NodeHandle| {
+            handle.control(constellation_authority::Control::ReadIndex {
+                ino: ROOT_INO,
+                dir: true,
+                name: Some(name.clone()),
+            })
+        };
+        match handle.meta.read_delegations().valid(ROOT_INO, now) {
+            Some((held, renew)) => {
+                floor = held.position;
+                if renew {
+                    drop(ask(handle));
+                }
+            }
+            None => match ask(handle).await {
+                Ok(Ok(constellation_authority::ControlOk::ReadIndex(
+                    constellation_authority::ReadAnswer::Position { position, .. },
+                ))) => floor = position,
+                Ok(Ok(constellation_authority::ControlOk::ReadIndex(
+                    constellation_authority::ReadAnswer::Degraded,
+                )))
+                | Ok(Err(_))
+                | Err(_) => timed_out = true,
+                // The sequencer's own replica, or tailed to head.
+                Ok(Ok(_)) => {}
+            },
+        }
+    }
     if let Some(budget) = wait {
         let mut waited = 0;
-        while !handle.meta.session_ready(&keys) {
+        while !handle.meta.session_ready_at(&keys, &floor) {
             if waited >= budget || !handle.alive() {
                 timed_out = waited >= budget;
                 break;
@@ -366,6 +412,7 @@ async fn client_thread(
     failures: Arc<Mutex<Vec<String>>>,
     pace_ms: u64,
     wait: Option<u64>,
+    strict: bool,
 ) {
     for step in steps {
         let op = match step {
@@ -373,7 +420,7 @@ async fn client_thread(
             Step::Read(name) => {
                 let handle = cluster.get(node);
                 if handle.alive() {
-                    client_read(&handle, &history, thread, name, wait).await;
+                    client_read(&handle, &history, thread, name, wait, strict).await;
                 }
                 continue;
             }
@@ -735,6 +782,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         commits: commits.clone(),
         config: cfg.core.clone(),
         panic_after_events: cfg.panic_after_events,
+        clock_skew_ms: cfg.clock_skew_ms,
+        seed,
     };
     let cluster = Arc::new(Cluster {
         nodes: Mutex::new(BTreeMap::new()),
@@ -768,6 +817,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 failures.clone(),
                 pace,
                 cfg.session_wait.then_some(cfg.session_wait_ms),
+                cfg.strict,
             )));
         }
     }
@@ -1032,6 +1082,28 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             return Err(format!(
                 "session guarantee violated ({checker}): {what}\n  faults: {:?}",
                 report.faults
+            ));
+        }
+    }
+    // Plan 30 §M8: close-to-open across nodes (see `cto.rs`); enforced
+    // under `strict`, reported otherwise.
+    report.cto = super::cto::check_cto(
+        &events,
+        &history.ticks(),
+        &history.reads(),
+        &tentative,
+        &oracle.completed_at,
+    );
+    // With P2P off there is no ReadIndex: a strict read tails S3, which
+    // covers closes whose records are in the log (inbox writes) but not a
+    // holder's own acked-unshipped writes (see `core::readindex`, "P2P
+    // off"). Reported there, enforced with P2P.
+    let p2p = (cfg.core)(1, 1).p2p;
+    if cfg.strict && p2p {
+        if let Some(what) = report.cto.violations.first() {
+            return Err(format!(
+                "close-to-open violated (cto=strict): {what}\n  faults: {:?}\n  stats: {:#?}",
+                report.faults, report.stats
             ));
         }
     }

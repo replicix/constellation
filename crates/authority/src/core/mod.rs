@@ -51,6 +51,7 @@ mod holder;
 mod inbox;
 mod jobs;
 mod lease;
+mod readindex;
 mod replay;
 mod stream;
 #[cfg(test)]
@@ -68,6 +69,7 @@ pub use client::{meta_errno, ClientPhase};
 pub use inbox::InboxView;
 pub use jobs::JobKind;
 pub use lease::{LeaseState, PendingGate, Plan};
+pub use readindex::ReadView;
 pub use stream::StreamView;
 
 /// Tunables, all read from `CONSTELLATION_*` by the production driver and
@@ -168,6 +170,32 @@ pub struct Config {
     /// Backoff between subscription attempts (doubling to the max).
     pub stream_retry_min_ms: u64,
     pub stream_retry_max_ms: u64,
+    // ---- plan 30 §M8: cto=strict ----
+    /// Grant read delegations with ReadIndex answers
+    /// (`CONSTELLATION_READ_DELEGATIONS`, default on). Holder-side: a
+    /// bounded-mode sequencer still serves strict readers correctly.
+    pub read_delegations: bool,
+    /// `CONSTELLATION_READ_DELEGATION_TTL_MS` (default 5000).
+    pub read_delegation_ttl_ms: u64,
+    /// How long a forwarded op's reply is held for recalls before it is
+    /// answered `Held` (below the requester's forward timeout).
+    pub recall_hold_ms: u64,
+    /// The retry delay a `Held` answer asks for.
+    pub held_retry_ms: u64,
+    /// A strict read's overall budget for its ReadIndex (then degraded:
+    /// M6's `CONSTELLATION_SESSION_WAIT_MS`).
+    pub read_index_deadline_ms: u64,
+    /// Plan 30 §M8: this node has `cto=strict` mounts, which keep a short
+    /// kernel cache TTL while no other node has shown itself; the first
+    /// sign of one makes every acknowledgement and release wait this long
+    /// (the cached entries' lifetime plus slack) once. 0: no strict
+    /// mounts here, nothing to drain.
+    pub kernel_cache_ttl_ms: u64,
+    /// Recall read delegations before acknowledging a mutation that
+    /// touched them. Always on in production; the simulation turns it
+    /// off to show the close-to-open check finds what it prevents (as
+    /// `speculate_on_stale_base` does for M5's rule).
+    pub recall_before_ack: bool,
 }
 
 impl Config {
@@ -234,6 +262,13 @@ impl Config {
             stream_buffer_bytes: 64 << 20,
             stream_retry_min_ms: 500,
             stream_retry_max_ms: 5_000,
+            read_delegations: true,
+            read_delegation_ttl_ms: 5_000,
+            recall_hold_ms: 250,
+            held_retry_ms: 10,
+            read_index_deadline_ms: 2_000,
+            recall_before_ack: true,
+            kernel_cache_ttl_ms: 0,
         }
     }
 }
@@ -333,6 +368,32 @@ pub struct Stats {
     pub inbox_largest_batch_ops: u64,
     pub inbox_escalations: u64,
     pub inbox_lease_requests: u64,
+    // ---- M8: cto=strict ----
+    /// Holder: ReadIndex requests answered with a position, and refused
+    /// (not the holder, or fenced).
+    pub read_index_served: u64,
+    pub read_index_refused: u64,
+    /// Holder: read delegations granted.
+    pub read_grants: u64,
+    /// Holder: recalls sent, acked, and outwaited (no ack by the grant's
+    /// expiry: an unreachable delegate).
+    pub recalls_sent: u64,
+    pub recalls_acked: u64,
+    pub recalls_expired: u64,
+    /// Holder: acknowledgements that waited for recalls, and for how long
+    /// in total (ms).
+    pub recall_waits: u64,
+    pub recall_wait_ms_total: u64,
+    /// Holder: forwarded replies answered `Held` (the requester retried).
+    pub held_replies: u64,
+    /// Requester: forwards answered `Held` and retried.
+    pub held_retries: u64,
+    /// Reader: ReadIndex requests sent, answered, degraded, and strict
+    /// reads answered by tailing S3 (no live sequencer, or P2P off).
+    pub read_index_sent: u64,
+    pub read_index_answered: u64,
+    pub read_index_degraded: u64,
+    pub read_index_tailed: u64,
 }
 
 /// The log cursor and ship bookkeeping (`Shipper::PartState` + `SpoolInfo`).
@@ -410,6 +471,8 @@ pub(crate) enum S3For {
     /// M13: a requester deleting its own durable batch before forwarding
     /// the op over P2P instead.
     InboxWithdraw(Rid),
+    /// M8: a strict read learning who holds the lease.
+    ReadHolder(OpId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +491,12 @@ enum Timer {
     EscalateTick,
     StreamHeartbeat,
     StreamWatchdog,
+    GrantExpiry(u64),
+    GrantQuarantine,
+    HeldReply(u64),
+    ReadIndexTimeout(OpId),
+    ReadIndexRetry(OpId),
+    ReadIndexDeadline(OpId),
 }
 
 impl Timer {
@@ -446,6 +515,12 @@ impl Timer {
             Timer::EscalateTick => TimerKind::EscalateTick,
             Timer::StreamHeartbeat => TimerKind::StreamHeartbeat,
             Timer::StreamWatchdog => TimerKind::StreamWatchdog,
+            Timer::GrantExpiry(_) => TimerKind::GrantExpiry,
+            Timer::GrantQuarantine => TimerKind::GrantQuarantine,
+            Timer::HeldReply(_) => TimerKind::HeldReply,
+            Timer::ReadIndexTimeout(_) => TimerKind::ReadIndexTimeout,
+            Timer::ReadIndexRetry(_) => TimerKind::ReadIndexRetry,
+            Timer::ReadIndexDeadline(_) => TimerKind::ReadIndexDeadline,
         }
     }
 }
@@ -519,6 +594,8 @@ pub struct Core {
     links: BTreeMap<NodeId, PeerLink>,
     pub(crate) inbox: inbox::InboxState,
     stream: stream::StreamState,
+    /// M8: ReadIndex requests, grants being recalled, parked acks.
+    pub(crate) rd: readindex::ReadState,
     stopped: bool,
     pub stats: Stats,
 }
@@ -563,6 +640,7 @@ impl Core {
             links: BTreeMap::new(),
             inbox: inbox::InboxState::default(),
             stream: stream::StreamState::default(),
+            rd: readindex::ReadState::default(),
             stopped: false,
             stats: Stats::default(),
             cfg,
@@ -631,6 +709,7 @@ impl Core {
         }
         self.arm_poll(now, 0, out);
         self.arm_drain(now, out);
+        self.read_start(now, replica, out);
     }
 
     /// Handle one event. Every action returned must be carried out by the
@@ -667,6 +746,9 @@ impl Core {
             }
             Event::RebuildDone { op, ok } => self.on_rebuild_done(now, op, ok, replica, &mut out),
             Event::Roster { write_eligible } => {
+                if write_eligible.iter().any(|n| *n != self.cfg.node_id) {
+                    self.note_foreign(now, replica, &mut out);
+                }
                 self.roster = write_eligible;
                 // A holder polls a requester it has just learned of at
                 // once (M13 round 2), not at its next round's end.
@@ -675,6 +757,9 @@ impl Core {
                 }
             }
             Event::Peers { links } => {
+                if links.iter().any(|l| l.node != self.cfg.node_id) {
+                    self.note_foreign(now, replica, &mut out);
+                }
                 self.links = links.into_iter().map(|l| (l.node, l)).collect();
                 self.stream_on_peers(now);
             }
@@ -749,6 +834,21 @@ impl Core {
             PeerMsg::LogStreamEnd { req, refused } => {
                 self.on_log_stream_end(now, from, req, refused, out)
             }
+            PeerMsg::ReadIndex {
+                req,
+                ino,
+                dir,
+                name,
+            } => self.on_read_index(now, from, req, ino, dir, name, replica, out),
+            PeerMsg::ReadIndexReply { req, outcome } => {
+                self.on_read_index_reply(now, from, req, outcome, replica, out)
+            }
+            PeerMsg::DelegationRecall { req, ino, .. } => {
+                self.on_delegation_recall(from, req, ino, replica, out)
+            }
+            PeerMsg::DelegationRecalled { req } => {
+                self.on_delegation_recalled(now, req, replica, out)
+            }
             // Later milestones' messages: acknowledged by the interface,
             // answered by nothing until they are implemented.
             other => {
@@ -772,6 +872,9 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         if self.on_stream_failed(now, req, out) {
+            return;
+        }
+        if self.on_read_request_failed(now, req, to, outage, out) {
             return;
         }
         if let Some(rid) = self.by_req.remove(&req) {
@@ -810,6 +913,7 @@ impl Core {
             S3For::InboxRecheck => self.on_inbox_recheck(now, result, replica, out),
             S3For::InboxGc(key) => self.on_inbox_gc(now, key, result),
             S3For::InboxWithdraw(rid) => self.on_inbox_withdrawn(now, rid, result, replica, out),
+            S3For::ReadHolder(op) => self.on_read_holder_learned(now, op, result, replica, out),
         }
     }
 
@@ -852,6 +956,12 @@ impl Core {
             }
             Timer::StreamHeartbeat => self.on_stream_heartbeat(now, out),
             Timer::StreamWatchdog => self.on_stream_watchdog(now, out),
+            Timer::GrantExpiry(grant) => self.on_grant_expiry(now, grant, replica, out),
+            Timer::GrantQuarantine => self.on_grant_quarantine(now, replica, out),
+            Timer::HeldReply(park) => self.on_held_reply_timer(park, out),
+            Timer::ReadIndexTimeout(req) => self.on_read_index_timeout(now, req, out),
+            Timer::ReadIndexRetry(op) => self.on_read_index_retry(now, op, replica, out),
+            Timer::ReadIndexDeadline(op) => self.on_read_index_deadline(op, replica, out),
         }
     }
 
@@ -942,6 +1052,10 @@ impl Core {
                     out,
                 );
             }
+            Control::ReadIndex { ino, dir, name } => {
+                self.on_read_index_control(now, op, ino, dir, name, replica, out)
+            }
+            Control::Recall { inos } => self.on_recall_control(now, op, inos, replica, out),
             Control::Epoch {
                 open,
                 active,

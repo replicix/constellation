@@ -72,6 +72,13 @@
 //! `with_stale_base_shadows(true)`), and `tests/positions.rs` keeps those
 //! counterexamples.
 //!
+//! Plan 30 §M8 (module [`cto`]) is a second, focused model: `cto=strict`
+//! reads (ReadIndex, read delegations with recall, lease-capped grants,
+//! recall before release) over per-node clocks with bounded drift, and
+//! the `close_to_open` property. It is separate because clocks are what
+//! it is about and what this model deliberately leaves out; see its
+//! module doc for the abstraction and the drift-margin argument.
+//!
 //! # What is modeled
 //!
 //! - **Actors.** `N` `Node`s (2–3 across the tests) plus one implicit
@@ -297,6 +304,7 @@
 //!     hint is a latency optimization of the same rule. Reads record no
 //!     history events and are not linearizability-checked.
 
+pub mod cto;
 pub mod inbox;
 pub mod namespace;
 pub mod positions;

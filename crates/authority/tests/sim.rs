@@ -12,6 +12,7 @@ mod sim {
     pub mod bus;
     pub mod check;
     pub mod clock;
+    pub mod cto;
     pub mod history;
     pub mod node;
     pub mod run;
@@ -257,6 +258,14 @@ fn replay_seed() {
             ..SimConfig::default()
         },
         Ok("plain") => SimConfig::default(),
+        // Plan 30 §M8.
+        Ok("strict") => strict_config(),
+        Ok("long-strict") => long_strict_config(),
+        Ok("strict-skew") => SimConfig {
+            clock_skew_ms: 200,
+            p2p_drop: 0.03,
+            ..strict_config()
+        },
         // Plan 30 §M7.
         Ok("streams-off") => streams_off_config(),
         Ok("stream-faults") => stream_faults_config(),
@@ -446,6 +455,183 @@ fn session_wait_off_is_found() {
     let (seed, (checker, what)) =
         found.expect("no seed violated a session guarantee with the wait off");
     eprintln!("session wait off: seed {seed}: {checker}: {what}");
+}
+
+/// Plan 30 §M8: the read-delegation counters summed over a run's nodes.
+#[derive(Debug, Default, Clone, Copy)]
+struct CtoTotals {
+    reads: usize,
+    constrained: usize,
+    degraded: usize,
+    tentative: usize,
+    stale: usize,
+    grants: u64,
+    recalls_sent: u64,
+    recalls_acked: u64,
+    recalls_expired: u64,
+    recall_waits: u64,
+    held_replies: u64,
+    read_index_sent: u64,
+    read_index_degraded: u64,
+    read_index_tailed: u64,
+}
+
+impl CtoTotals {
+    fn add(&mut self, r: &Report) {
+        self.reads += r.cto.reads;
+        self.constrained += r.cto.constrained;
+        self.degraded += r.cto.degraded;
+        self.tentative += r.cto.tentative;
+        self.stale += r.cto.violations.len();
+        for s in r.stats.values() {
+            self.grants += s.read_grants;
+            self.recalls_sent += s.recalls_sent;
+            self.recalls_acked += s.recalls_acked;
+            self.recalls_expired += s.recalls_expired;
+            self.recall_waits += s.recall_waits;
+            self.held_replies += s.held_replies;
+            self.read_index_sent += s.read_index_sent;
+            self.read_index_degraded += s.read_index_degraded;
+            self.read_index_tailed += s.read_index_tailed;
+        }
+    }
+}
+
+fn strict_config() -> SimConfig {
+    SimConfig {
+        read_ratio: 0.7,
+        strict: true,
+        ..SimConfig::default()
+    }
+}
+
+fn run_strict(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> CtoTotals {
+    let mut t = CtoTotals::default();
+    for seed in seeds {
+        let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+            panic!(
+                "{label} seed {seed}: {e}\n  replay: AUTHORITY_SIM_SEED={seed} \
+                 AUTHORITY_SIM_CONFIG=strict cargo test -p constellation-authority \
+                 --test sim replay_seed -- --nocapture --exact"
+            )
+        });
+        t.add(&report);
+    }
+    eprintln!("{label}: {t:?}");
+    t
+}
+
+/// Plan 30 §M8: `cto=strict` reads — delegations on the directory,
+/// recalls on every write into it, ReadIndex otherwise — keep
+/// close-to-open across nodes under the CI faults (crashes, restarts,
+/// pauses, partitions, S3 errors), with the check enforced in the run.
+#[test]
+fn strict_close_to_open_holds() {
+    let t = run_strict("strict", strict_config(), 800..860);
+    assert!(
+        t.reads > 500 && t.constrained > 200,
+        "too few reads to mean anything"
+    );
+    assert!(
+        t.grants > 0 && t.recalls_sent > 0 && t.recalls_acked > 0,
+        "vacuous: {t:?}"
+    );
+}
+
+/// The same with every node's clock off by up to ±200 ms (the sim's
+/// lease margin is 500 ms: `2D < margin`, the lease's own assumption),
+/// and 3 % P2P loss so recalls are lost and outwaited.
+#[test]
+fn strict_close_to_open_holds_with_clock_skew_and_loss() {
+    let cfg = SimConfig {
+        clock_skew_ms: 200,
+        p2p_drop: 0.03,
+        ..strict_config()
+    };
+    let t = run_strict("strict-skew", cfg, 900..950);
+    assert!(t.recalls_sent > 0, "vacuous: {t:?}");
+}
+
+/// ReadIndex alone (the sequencer grants nothing): still close-to-open,
+/// one round trip per strict read.
+#[test]
+fn strict_without_delegations_holds() {
+    let cfg = SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::sim_core_config(id, inc);
+            c.read_delegations = false;
+            c
+        }),
+        ..strict_config()
+    };
+    let t = run_strict("strict-no-delegations", cfg, 1000..1030);
+    assert_eq!(t.grants, 0);
+    assert!(t.read_index_sent > 0);
+}
+
+/// P2P off: no ReadIndex, strict reads tail S3 (reported, not enforced:
+/// the sequencer's own writes are acknowledged before they ship).
+#[test]
+fn strict_with_p2p_off_tails_s3() {
+    let cfg = SimConfig {
+        core: std::sync::Arc::new(sim::run::inbox_core_config),
+        ..strict_config()
+    };
+    let t = run_strict("strict-p2p-off", cfg, 1100..1130);
+    assert_eq!(t.grants, 0);
+    assert_eq!(t.read_index_sent, 0);
+    assert!(t.read_index_tailed > 0);
+}
+
+/// Non-vacuity for the recall: the same strict workload with the
+/// sequencer acknowledging writes without recalling delegations must
+/// break close-to-open somewhere (a delegate reads its directory locally
+/// after another node's create or unlink completed).
+#[test]
+fn delegations_without_recall_are_found() {
+    let cfg = SimConfig {
+        read_ratio: 0.9,
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::sim_core_config(id, inc);
+            c.recall_before_ack = false;
+            c
+        }),
+        ..strict_config()
+    };
+    let mut found = None;
+    for seed in 800..900 {
+        if let Err(e) = run_seed(seed, cfg.clone()) {
+            assert!(e.contains("close-to-open violated"), "seed {seed}: {e}");
+            found = Some((seed, e));
+            break;
+        }
+    }
+    let (seed, e) = found.expect("no seed broke close-to-open without recalls");
+    eprintln!(
+        "without recalls, seed {seed}: {}",
+        e.lines().next().unwrap_or("")
+    );
+}
+
+/// The counterexample: bounded mode (reads never ask the sequencer) reads
+/// stale state after another node's write completed — the checker finds
+/// it, so it is not vacuous.
+#[test]
+fn bounded_mode_reads_stale() {
+    let cfg = SimConfig {
+        read_ratio: 0.9,
+        ..SimConfig::default()
+    };
+    let mut found = None;
+    for seed in 800..900 {
+        let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        if let Some(v) = report.cto.violations.first() {
+            found = Some((seed, v.clone()));
+            break;
+        }
+    }
+    let (seed, what) = found.expect("bounded mode never read stale: the checker is vacuous");
+    eprintln!("bounded mode, seed {seed}: {what}");
 }
 
 /// Plan 30 §M13: P2P off, so every non-holder write goes through the
@@ -851,5 +1037,46 @@ fn long_random() {
             }
         }
     }
+    assert!(failures.is_empty(), "failing seeds: {failures:?}");
+}
+
+/// Plan 30 §M8: the long configuration with `cto=strict` reads (0.6 per
+/// op), ±200 ms clock skew and 2 % P2P loss:
+/// `cargo test -p constellation-authority --release --test sim -- --ignored long_strict`
+/// (`AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_START`; replay one with
+/// `AUTHORITY_SIM_CONFIG=long-strict`).
+fn long_strict_config() -> SimConfig {
+    SimConfig {
+        read_ratio: 0.6,
+        strict: true,
+        clock_skew_ms: 200,
+        ..long_config()
+    }
+}
+
+#[test]
+#[ignore]
+fn long_strict() {
+    let seeds: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000);
+    let start: u64 = std::env::var("AUTHORITY_SIM_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40_000);
+    let cfg = long_strict_config();
+    let mut failures = Vec::new();
+    let mut totals = CtoTotals::default();
+    for seed in start..start + seeds {
+        match run_seed(seed, cfg.clone()) {
+            Ok(report) => totals.add(&report),
+            Err(e) => {
+                eprintln!("seed {seed}: {e}");
+                failures.push(seed);
+            }
+        }
+    }
+    eprintln!("long_strict: {totals:?}");
     assert!(failures.is_empty(), "failing seeds: {failures:?}");
 }

@@ -244,6 +244,37 @@ pub enum SyncRequest {
         policy: constellation_authority::Policy,
         reply: tokio::sync::oneshot::Sender<constellation_authority::ClientReply>,
     },
+    /// Plan 30 §M8: a strict open or lookup on this node needs to know
+    /// how it may read (`constellation_authority::ReadAnswer`).
+    ReadIndex {
+        ino: Ino,
+        dir: bool,
+        name: Option<String>,
+        reply: tokio::sync::oneshot::Sender<constellation_authority::ReadAnswer>,
+    },
+    /// Plan 30 §M8: a write the FUSE fast path executed here as the
+    /// sequencer touched inodes other nodes hold read delegations on:
+    /// answered once they are recalled (or outwaited).
+    Recall {
+        inos: Vec<Ino>,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Plan 30 §M8: a peer's ReadIndex, to answer as the sequencer.
+    PeerReadIndex {
+        requester: u64,
+        ino: Ino,
+        dir: bool,
+        name: Option<String>,
+        reply: tokio::sync::oneshot::Sender<constellation_authority::ReadIndexOutcome>,
+    },
+    /// Plan 30 §M8: the sequencer recalls a read delegation this node
+    /// holds; answered once it is no longer honoured.
+    PeerRecall {
+        holder: u64,
+        ino: Ino,
+        grant: u64,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     /// A peer's gossip says segment `seq` landed (plan 30 §M7: a hint
     /// with no payload). The core tails now unless its log stream from
     /// the holder delivers it.
@@ -288,6 +319,8 @@ pub struct SyncHandle {
     pub tx: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
     /// `--fsync-mode s3`: fsync() returns only once the journal is in S3.
     pub fsync_s3: bool,
+    /// Plan 30 §M8: `--cto strict` (see `crate::cto`).
+    pub cto_strict: bool,
     /// Lock-free lease view (the core's state, mirrored by the driver);
     /// the write gate reads it per mutating op.
     pub lease: Arc<crate::lease::LeaseView>,
@@ -1259,6 +1292,163 @@ impl ConstellationFs {
         let _ = self.meta.session_wait(keys);
     }
 
+    /// The attribute and entry TTL the kernel may cache replies for: 1 s,
+    /// or none under `--cto strict` (plan 30 §M8) — a cached entry or size
+    /// would let the kernel answer an open without asking, and the strict
+    /// open's freshness would not reach what it reads.
+    pub(crate) fn ttl(&self) -> &'static Duration {
+        static ZERO: Duration = Duration::ZERO;
+        static LONE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+        match &self.sync {
+            Some(h) if h.cto_strict => {
+                // A lone sequencer keeps a short kernel cache (see
+                // `cto::lone_kernel_ttl`): strict costs a single node
+                // nothing.
+                if self.meta.read_delegations().is_alone() && h.lease.reads_locally() {
+                    LONE.get_or_init(crate::cto::lone_kernel_ttl)
+                } else {
+                    &ZERO
+                }
+            }
+            _ => &TTL,
+        }
+    }
+
+    /// Plan 30 §M8: the read wait of a `cto=strict` open (`dir: false`)
+    /// or lookup (`dir: true`, `name`) of `ino`, reading `keys`. Bounded
+    /// mode, and a mount without a sync handle, is M6's session wait.
+    ///
+    /// Strict: the sequencer reads its own replica (authoritative); a
+    /// node holding a read delegation on `ino` reads locally once its
+    /// replica has reached the grant's position (renewing it in the
+    /// background past half its lifetime); anyone else asks the sequencer
+    /// (`SyncRequest::ReadIndex`) and waits for the position it answers.
+    /// Every path ends in the session wait, bounded as M6's is: a
+    /// sequencer that does not answer degrades the read, never fails it.
+    pub(crate) fn strict_read(&self, ino: Ino, dir: bool, name: Option<&str>, keys: &[ReadKey]) {
+        let Some(h) = &self.sync else {
+            return;
+        };
+        if !h.cto_strict {
+            let _ = self.meta.session_wait(keys);
+            return;
+        }
+        let deleg = self.meta.read_delegations();
+        deleg.count(|s| s.strict_reads += 1);
+        if h.lease.reads_locally() {
+            deleg.count(|s| s.holder_local += 1);
+            let _ = self.meta.session_wait(keys);
+            return;
+        }
+        let now = constellation_store_s3::lease::now_unix_ms();
+        if let Some((held, renew)) = deleg.valid(ino, now) {
+            deleg.count(|s| s.delegation_local += 1);
+            if renew {
+                // In use and past half its life: renew in the background
+                // (the answer installs the new grant; nobody waits).
+                deleg.count(|s| s.renewals += 1);
+                let (reply, _) = tokio::sync::oneshot::channel();
+                let _ = h.tx.send(SyncRequest::ReadIndex {
+                    ino,
+                    dir,
+                    name: name.map(str::to_string),
+                    reply,
+                });
+            }
+            let waited = self.meta.session_wait_at(keys, &held.position);
+            tracing::debug!(
+                target: "constellation::cto",
+                ino,
+                dir,
+                name,
+                position = ?held.position,
+                ?waited,
+                "strict read under a delegation"
+            );
+            return;
+        }
+        let started = std::time::Instant::now();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let sent =
+            h.tx.send(SyncRequest::ReadIndex {
+                ino,
+                dir,
+                name: name.map(str::to_string),
+                reply,
+            })
+            .is_ok();
+        let answer = if sent {
+            answer.blocking_recv().ok()
+        } else {
+            None
+        };
+        match answer {
+            Some(constellation_authority::ReadAnswer::Holder) => {
+                deleg.count(|s| s.holder_local += 1);
+                let _ = self.meta.session_wait(keys);
+            }
+            Some(constellation_authority::ReadAnswer::Position {
+                position,
+                delegated,
+            }) => {
+                let waited = self.meta.session_wait_at(keys, &position);
+                tracing::debug!(
+                    target: "constellation::cto",
+                    ino,
+                    dir,
+                    name,
+                    ?position,
+                    delegated,
+                    ?waited,
+                    applied = ?self.meta.session().applied(),
+                    "strict read after a ReadIndex"
+                );
+                deleg.note_read_index(started.elapsed().as_millis() as u64);
+            }
+            Some(constellation_authority::ReadAnswer::Tailed) => {
+                tracing::debug!(target: "constellation::cto", ino, dir, name, "strict read: tailed S3");
+                deleg.count(|s| s.s3_tail += 1);
+                let _ = self.meta.session_wait(keys);
+            }
+            Some(constellation_authority::ReadAnswer::Degraded) | None => {
+                deleg.count(|s| s.degraded += 1);
+                let _ = self.meta.session_wait(keys);
+            }
+        }
+    }
+
+    /// Plan 30 §M8: a write this node's FUSE fast path executed as the
+    /// sequencer returns only once no other node honours a read
+    /// delegation on what it touched. One lock and an empty map when
+    /// nobody holds one (every single-node and bounded-only cluster).
+    fn recall_after_local_write(&self, h: &SyncHandle, records: &[constellation_meta::LogRecord]) {
+        self.recall_after_local_inos(h, constellation_meta::recall_inos(records));
+    }
+
+    /// [`Self::recall_after_local_write`] for writes that do not go
+    /// through `execute_mutate` (the holder's own manifest commit).
+    fn recall_after_local_inos(&self, h: &SyncHandle, inos: Vec<Ino>) {
+        let now = constellation_store_s3::lease::now_unix_ms();
+        if self
+            .meta
+            .read_delegations()
+            .touching(&inos, None, now)
+            .is_empty()
+        {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let (reply, done) = tokio::sync::oneshot::channel();
+        if h.tx.send(SyncRequest::Recall { inos, reply }).is_ok() {
+            let _ = done.blocking_recv();
+        }
+        let waited = started.elapsed().as_millis() as u64;
+        self.meta.read_delegations().count(|s| {
+            s.fuse_writes_recalled += 1;
+            s.fuse_recall_wait_ms_total += waited;
+        });
+    }
+
     pub(crate) fn mutate_op_rebasable(
         &self,
         part_hint_ino: Ino,
@@ -1321,9 +1511,10 @@ impl ConstellationFs {
             match self.rt.block_on(designations.check(&path)) {
                 crate::designation::GateDecision::NoDesignation => {}
                 crate::designation::GateDecision::Proceed => {
-                    return constellation_meta::execute_mutate(&self.meta, op, Some(rid))
-                        .map(|_| ())
-                        .map_err(mutate_fail);
+                    let records = constellation_meta::execute_mutate(&self.meta, op, Some(rid))
+                        .map_err(mutate_fail)?;
+                    self.recall_after_local_write(h, &records);
+                    return Ok(());
                 }
                 crate::designation::GateDecision::ReadOnly { .. } => {
                     return Err(MutateFail::Errno(libc::EROFS));
@@ -1333,14 +1524,19 @@ impl ConstellationFs {
         // Plan 30 §M3b: the fast path admits the op (counted in flight)
         // atomically with respect to a release's final flush + CAS — see
         // `lease.rs`'s module doc, "The releasing flag".
-        if let Some(_admitted) = h.lease.admit() {
-            let result = constellation_meta::execute_mutate(&self.meta, op, Some(rid))
-                .map(|_| ())
-                .map_err(mutate_fail);
-            if result.is_ok() {
-                h.lease.touch();
-            }
-            return result;
+        if let Some(admitted) = h.lease.admit() {
+            let result = constellation_meta::execute_mutate(&self.meta, op, Some(rid));
+            // The row is journaled: a release's quiescence wait need not
+            // wait on the recall below (it recalls every grant itself).
+            drop(admitted);
+            return match result {
+                Ok(records) => {
+                    h.lease.touch();
+                    self.recall_after_local_write(h, &records);
+                    Ok(())
+                }
+                Err(e) => Err(mutate_fail(e)),
+            };
         }
         if h.lease.is_lost() {
             return Err(MutateFail::Errno(libc::EIO));
@@ -1366,6 +1562,8 @@ impl ConstellationFs {
         match rx.blocking_recv() {
             Ok(constellation_authority::ClientReply::Outcome(outcome)) => match outcome {
                 constellation_meta::MutateOutcome::Accepted { .. } => Ok(()),
+                // Never a client outcome: the core retries it.
+                constellation_meta::MutateOutcome::Held { .. } => Err(MutateFail::Errno(libc::EIO)),
                 constellation_meta::MutateOutcome::Errno(e) => Err(MutateFail::Errno(e)),
                 // The name exists on the holder; the core installed the
                 // entry it sent with the refusal, so the caller's next
@@ -1892,6 +2090,12 @@ impl ConstellationFs {
             if let Err(error) = committed {
                 writes.insert(ino, ws);
                 return Err(error);
+            }
+            // Plan 30 §M8: the sequencer's own manifest commit bypasses
+            // `execute_mutate`; it recalls read delegations on the file
+            // before the close returns, like every other local write.
+            if let Some(h) = &self.sync {
+                self.recall_after_local_inos(h, vec![ino]);
             }
         } else if let Err(error) =
             self.commit_manifest_forwarded(ino, &ws, base, manifest_bytes, dirty_hashes)

@@ -9,6 +9,9 @@ use std::time::Duration;
 pub struct Clock {
     base: tokio::time::Instant,
     base_ms: i64,
+    /// Plan 30 §M8: this node's clock error (ms, constant): its `now` is
+    /// real time plus this. Leases and read delegations are judged on it.
+    offset_ms: i64,
 }
 
 impl Clock {
@@ -17,15 +20,21 @@ impl Clock {
             base: tokio::time::Instant::now(),
             // A fixed, plausible epoch so log lines read like production.
             base_ms: 1_780_000_000_000,
+            offset_ms: 0,
         }
     }
 
+    /// The same clock, `offset_ms` off (a node whose clock disagrees).
+    pub fn skewed(&self, offset_ms: i64) -> Self {
+        Self { offset_ms, ..*self }
+    }
+
     pub fn now(&self) -> Ms {
-        Ms(self.base_ms + self.base.elapsed().as_millis() as i64)
+        Ms(self.base_ms + self.offset_ms + self.base.elapsed().as_millis() as i64)
     }
 
     pub fn at(&self, at: Ms) -> tokio::time::Instant {
-        let delta = (at.0 - self.base_ms).max(0) as u64;
+        let delta = (at.0 - self.offset_ms - self.base_ms).max(0) as u64;
         self.base + Duration::from_millis(delta)
     }
 

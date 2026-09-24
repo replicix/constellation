@@ -196,6 +196,16 @@ pub enum MutateOutcome {
         /// unshipped work, stranded with it.
         epoch: u64,
     },
+    /// Plan 30 §M8: the holder executed the op (or found it executed),
+    /// but its acknowledgement waits for the read delegations on what it
+    /// touched to be recalled, or to expire (`cto=strict`'s close-to-open:
+    /// no delegate may still serve the old state once this op completes).
+    /// The requester retries the same rid after `retry_ms` without
+    /// counting an attempt; the holder answers from its dedup once the
+    /// wait is over. Never reaches a client.
+    Held {
+        retry_ms: u64,
+    },
 }
 
 impl MutateOutcome {

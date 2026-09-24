@@ -22,6 +22,8 @@ mod m5;
 mod m6;
 /// Plan 30 §M7: log streams and cross-node visibility.
 mod m7;
+/// Plan 30 §M8: `--cto strict`, read delegations and recalls.
+mod m8;
 
 pub struct Scenario {
     pub name: &'static str,
@@ -607,6 +609,48 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M7: 3 nodes; A writes a large write-back burst, then a paced series of fsync'd markers while B and C poll for each; cross-node visibility p99 < 2 s with log streams off and on, and with streams on the pollers issue ~0 S3 tail GETs during the markers",
         requires: &[],
         run: m7::visibility_after_burst,
+    },
+    Scenario {
+        name: "chaos-ci-strict",
+        desc: "plan 30 M8: chaos-ci with every mount --cto strict; the history records it and the close-to-open checker (a read issued after another worker's write completed must not show an older state) is enforced",
+        requires: &[],
+        run: chaos_ci_strict,
+    },
+    Scenario {
+        name: "cto-strict",
+        desc: "plan 30 M8: 3 nodes with --cto strict; a writer (forwarding, and the holder itself) closes, the harness at once opens on the reader: every read sees the close (overwrites and new names); prints ReadIndex/delegation counters and latencies",
+        requires: &[],
+        run: m8::cto_strict,
+    },
+    Scenario {
+        name: "cto-bounded",
+        desc: "plan 30 M8: the cto-strict loop under --cto bounded (the default), documenting the staleness strict removes: how many reads right after a close elsewhere miss it, and how long until they see it",
+        requires: &[],
+        run: m8::cto_bounded,
+    },
+    Scenario {
+        name: "cto-delegation-recall",
+        desc: "plan 30 M8: a reader's repeated opens cost one ReadIndex, then are local under a read delegation; a writer's close recalls it (acked) before returning and the reader sees the new content; writer latency with and without an outstanding delegation",
+        requires: &[],
+        run: m8::cto_delegation_recall,
+    },
+    Scenario {
+        name: "cto-recall-unreachable",
+        desc: "plan 30 M8: the delegate is frozen (SIGSTOP): a forwarded write's and the holder's own write's close each return only after the sequencer waited out TTL + drift margin; the thawed delegate reads the new content",
+        requires: &[],
+        run: m8::cto_recall_unreachable,
+    },
+    Scenario {
+        name: "cto-latency",
+        desc: "plan 30 M8: single-node strict vs bounded open latency (no ReadIndex on a single node), and a LAN non-sequencer's first strict open against its delegated opens",
+        requires: &[],
+        run: m8::cto_latency,
+    },
+    Scenario {
+        name: "cto-second-node-joins",
+        desc: "plan 30 M8: a lone strict node keeps a kernel cache (free on a single node); a second node joins and writes, and the first node's very next open sees it (the latch turns the cache off and drains it before acking the newcomer)",
+        requires: &[],
+        run: m8::cto_second_node_joins,
     },
     Scenario {
         name: "inbox-create-storm-p2p-off",
@@ -5325,9 +5369,24 @@ fn writeback_backpressure(seed: u64) -> Result<()> {
 /// Same-path conflict races via constellation-chaos Ci profile on three
 /// local mounts of one filesystem (no VMs).
 fn chaos_ci(seed: u64) -> Result<()> {
+    chaos_ci_with(seed, false)
+}
+
+/// Plan 30 §M8: `chaos-ci` with every mount `--cto strict`; the history
+/// records it, so the close-to-open checker is enforced on it.
+fn chaos_ci_strict(seed: u64) -> Result<()> {
+    chaos_ci_with(seed, true)
+}
+
+fn chaos_ci_with(seed: u64, strict: bool) -> Result<()> {
     use constellation_chaos::{Coordinator, LocalCluster, Profile};
 
-    let (env, root) = setup("chaos-ci")?;
+    let name = if strict {
+        "chaos-ci-strict"
+    } else {
+        "chaos-ci"
+    };
+    let (env, root) = setup(name)?;
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/chaos-{}", ts());
     // Distinct P2P identities: three real nodes creating/writing
@@ -5343,9 +5402,15 @@ fn chaos_ci(seed: u64) -> Result<()> {
     // "unexpected errno EIO on worker N during create_storm" (the sibling
     // scenarios `chaos-soak-4`/`disjoint-write-4` already call this for
     // the same reason).
-    let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?.with_own_node_key();
-    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?.with_own_node_key();
-    let mut c2 = Client::new(root.path(), "c2", &env.endpoint, &backend)?.with_own_node_key();
+    let mode = if strict { "strict" } else { "bounded" };
+    let mk = |who: &str| -> Result<Client> {
+        Ok(Client::new(root.path(), who, &env.endpoint, &backend)?
+            .with_own_node_key()
+            .with_env("CONSTELLATION_CTO", mode))
+    };
+    let mut c0 = mk("c0")?;
+    let mut c1 = mk("c1")?;
+    let mut c2 = mk("c2")?;
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
@@ -5367,10 +5432,11 @@ fn chaos_ci(seed: u64) -> Result<()> {
     std::fs::create_dir_all(&store)?;
     let mounts = vec![c0.mnt.clone(), c1.mnt.clone(), c2.mnt.clone()];
     let mut cluster = LocalCluster::new(mounts)?;
-    let profile = Profile::ci(seed, 3);
+    let mut profile = Profile::ci(seed, 3);
+    profile.cto_strict = strict;
     let work_root = profile.work_root.clone();
     Coordinator::run(&mut cluster, profile, &store)
-        .with_context(|| format!("chaos-ci artifacts under {}", store.display()))?;
+        .with_context(|| format!("{name} artifacts under {}", store.display()))?;
     // Plan 30 M4: convergence at quiescence (a fresh replica included)
     // and exactly-once in the log.
     m4::after_chaos(&env, root.path(), &backend, &[&c0, &c1, &c2], &work_root)?;

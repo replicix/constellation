@@ -51,7 +51,7 @@ impl Filesystem for ConstellationFs {
         let name = checked_name!(name, reply);
         match self.lookup_synthetic(parent, &name) {
             Ok(Some((_ino, attr))) => {
-                reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0));
+                reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0));
                 return;
             }
             Ok(None) => {}
@@ -72,7 +72,7 @@ impl Filesystem for ConstellationFs {
             .transpose();
         match scratch {
             Ok(Some(Some(attr))) => {
-                reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0));
+                reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0));
                 return;
             }
             Ok(_) => {}
@@ -81,7 +81,15 @@ impl Filesystem for ConstellationFs {
                 return;
             }
         }
-        self.session_wait(&[ReadKey::Dentry(parent, name.to_string())]);
+        // Plan 30 §M8: under `--cto strict` a lookup sees every entry
+        // another node's completed close made (the first step of an
+        // open by path).
+        self.strict_read(
+            parent,
+            true,
+            Some(&name),
+            &[ReadKey::Dentry(parent, name.to_string())],
+        );
         match self.meta.lookup(parent, &name) {
             Ok(Some(mut attr)) => {
                 // Same overlay and the same ordering argument as
@@ -96,7 +104,7 @@ impl Filesystem for ConstellationFs {
                     attr = fresh;
                 }
                 drop(writes);
-                reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0))
+                reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0))
             }
             Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
             Err(e) => reply.error(Errno::from_i32(errno(&e))),
@@ -112,7 +120,7 @@ impl Filesystem for ConstellationFs {
                 reply.error(Errno::from_i32(libc::ESTALE));
             } else {
                 let attr = self.visible_attr(self.synthetic_attr(ino, &node));
-                reply.attr(&TTL, &to_fuse_attr(&attr));
+                reply.attr(self.ttl(), &to_fuse_attr(&attr));
             }
             return;
         }
@@ -152,7 +160,7 @@ impl Filesystem for ConstellationFs {
                 } else {
                     attr
                 };
-                reply.attr(&TTL, &to_fuse_attr(&attr))
+                reply.attr(self.ttl(), &to_fuse_attr(&attr))
             }
             Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
             Err(e) => reply.error(Errno::from_i32(errno(&e))),
@@ -215,7 +223,7 @@ impl Filesystem for ConstellationFs {
                     .ok_or(libc::ENOENT)
             });
         match result {
-            Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr)),
+            Ok(attr) => reply.attr(self.ttl(), &to_fuse_attr(&attr)),
             Err(error) => reply.error(Errno::from_i32(error)),
         }
     }
@@ -269,7 +277,7 @@ impl Filesystem for ConstellationFs {
                 .meta
                 .scratch_mkdir(parent, &name, ino, mode, req.uid(), req.gid())
             {
-                Ok(attr) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                Ok(attr) => reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0)),
                 Err(e) => reply.error(Errno::from_i32(errno(&e))),
             };
         }
@@ -283,7 +291,7 @@ impl Filesystem for ConstellationFs {
         };
         match self.mutate_op(parent, op) {
             Ok(()) => match self.meta.getattr(ino) {
-                Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                Ok(Some(attr)) => reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0)),
                 Ok(None) => reply.error(Errno::from_i32(libc::EIO)),
                 Err(e) => reply.error(Errno::from_i32(errno(&e))),
             },
@@ -342,7 +350,7 @@ impl Filesystem for ConstellationFs {
         };
         match self.mutate_op(parent, op) {
             Ok(()) => match self.meta.getattr(ino) {
-                Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                Ok(Some(attr)) => reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0)),
                 Ok(None) => reply.error(Errno::from_i32(libc::EIO)),
                 Err(e) => reply.error(Errno::from_i32(errno(&e))),
             },
@@ -370,7 +378,7 @@ impl Filesystem for ConstellationFs {
         };
         match self.mutate_op(newparent, op) {
             Ok(()) => match self.meta.getattr(ino) {
-                Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                Ok(Some(attr)) => reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0)),
                 Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
                 Err(e) => reply.error(Errno::from_i32(errno(&e))),
             },
@@ -424,7 +432,7 @@ impl Filesystem for ConstellationFs {
             Ok(attr) => {
                 *self.opens.lock().unwrap().entry(attr.ino).or_insert(0) += 1;
                 reply.created(
-                    &TTL,
+                    self.ttl(),
                     &to_fuse_attr(&attr),
                     fuser::Generation(0),
                     FileHandle(attr.ino),
@@ -461,7 +469,7 @@ impl Filesystem for ConstellationFs {
         };
         match self.mutate_op(parent, op) {
             Ok(()) => match self.meta.getattr(ino) {
-                Ok(Some(attr)) => reply.entry(&TTL, &to_fuse_attr(&attr), fuser::Generation(0)),
+                Ok(Some(attr)) => reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0)),
                 Ok(None) => reply.error(Errno::from_i32(libc::EIO)),
                 Err(e) => reply.error(Errno::from_i32(errno(&e))),
             },
@@ -680,7 +688,8 @@ impl Filesystem for ConstellationFs {
             }
             return;
         }
-        self.session_wait(&[ReadKey::Ino(ino)]);
+        // Plan 30 §M8: under `--cto strict`, the close-to-open point.
+        self.strict_read(ino, false, None, &[ReadKey::Ino(ino)]);
         let attr = self
             .meta
             .getattr(ino)
@@ -874,9 +883,10 @@ impl Filesystem for ConstellationFs {
             reply.ok();
             return;
         }
-        // Plan 30 §M6: once per listing (its first chunk).
+        // Plan 30 §M6: once per listing (its first chunk). §M8: a strict
+        // listing sees every entry a completed close elsewhere made.
         if offset == 0 {
-            self.session_wait(&[ReadKey::Dir(ino)]);
+            self.strict_read(ino, true, None, &[ReadKey::Dir(ino)]);
         }
         let entries = match if self.meta.is_scratch_dir(ino).unwrap_or(false)
             || self.meta.scratch_getattr(ino).ok().flatten().is_some()

@@ -389,34 +389,51 @@ impl SessionState {
 
     /// The decision for one check, with `applied_seq` refreshed by the
     /// caller when it is stale. `None` = keep waiting.
-    fn check(&self, keys: &[ReadKey], replay_touches: bool) -> Option<SessionWait> {
+    ///
+    /// `floor` is a per-read target on top of `observed` (plan 30 §M8: a
+    /// `cto=strict` open waits for the position its ReadIndex answer, or
+    /// its delegation, carried — without raising the node-wide watermark,
+    /// so unrelated reads never wait for it).
+    fn check(
+        &self,
+        keys: &[ReadKey],
+        replay_touches: bool,
+        floor: &Position,
+    ) -> Option<SessionWait> {
         if replay_touches {
             return None;
         }
         let g = self.inner.lock().unwrap();
+        let target = g.observed.join(floor);
         let applied = g.applied_position();
-        if applied.dominates(&g.observed) {
+        if applied.dominates(&target) {
             return Some(SessionWait::Fast);
         }
         let covered = keys.iter().all(|k| {
             g.covering
                 .iter()
                 .filter(|(ks, _)| ks.covers(k))
-                .any(|(_, p)| p.dominates(&g.observed))
+                .any(|(_, p)| p.dominates(&target))
         });
         covered.then_some(SessionWait::Covered)
     }
 
     /// One non-blocking check (a caller that cannot block a thread —
     /// the simulation's single-threaded runtime — polls this instead).
-    pub fn ready(&self, keys: &[ReadKey], applied_seq: u64, replay_touches: bool) -> bool {
+    pub fn ready(
+        &self,
+        keys: &[ReadKey],
+        applied_seq: u64,
+        replay_touches: bool,
+        floor: &Position,
+    ) -> bool {
         {
             let mut g = self.inner.lock().unwrap();
             if applied_seq > g.applied_seq {
                 g.applied_seq = applied_seq;
             }
         }
-        self.check(keys, replay_touches).is_some()
+        self.check(keys, replay_touches, floor).is_some()
     }
 
     /// The wait loop; `refresh` returns the store's applied sequence and
@@ -425,6 +442,7 @@ impl SessionState {
     pub(crate) fn wait(
         &self,
         keys: &[ReadKey],
+        floor: &Position,
         mut refresh: impl FnMut() -> (u64, bool),
         held: impl Fn() -> bool,
     ) -> SessionWait {
@@ -444,7 +462,7 @@ impl SessionState {
                     g.applied_seq = seq;
                 }
             }
-            if let Some(ok) = self.check(keys, replay_touches) {
+            if let Some(ok) = self.check(keys, replay_touches, floor) {
                 break if slept {
                     SessionWait::Waited(started.elapsed())
                 } else {
@@ -511,8 +529,15 @@ impl crate::store::Meta {
     /// The FUSE read paths' session wait for `keys` (see the module doc).
     /// Never fails: a store error only skips the replay check.
     pub fn session_wait(&self, keys: &[ReadKey]) -> SessionWait {
+        self.session_wait_at(keys, &Position::ZERO)
+    }
+
+    /// [`Self::session_wait`] with a per-read position `floor` on top of
+    /// the watermark (plan 30 §M8's strict open).
+    pub fn session_wait_at(&self, keys: &[ReadKey], floor: &Position) -> SessionWait {
         self.session.wait(
             keys,
+            floor,
             || {
                 let seq = self.applied_seq().unwrap_or(0);
                 (seq, self.replay_touches(keys))
@@ -524,8 +549,14 @@ impl crate::store::Meta {
     /// [`SessionState::ready`] against this store: whether a read of
     /// `keys` may run right now without waiting.
     pub fn session_ready(&self, keys: &[ReadKey]) -> bool {
+        self.session_ready_at(keys, &Position::ZERO)
+    }
+
+    /// [`Self::session_ready`] with a per-read position floor.
+    pub fn session_ready_at(&self, keys: &[ReadKey], floor: &Position) -> bool {
         let seq = self.applied_seq().unwrap_or(0);
-        self.session.ready(keys, seq, self.replay_touches(keys))
+        self.session
+            .ready(keys, seq, self.replay_touches(keys), floor)
     }
 
     /// Whether a queued replay (a stranded op rolled back until it lands)
@@ -617,7 +648,10 @@ mod tests {
         let s = SessionState::default();
         s.set_budget_ms(30);
         let k = [ReadKey::Dentry(1, "a".into())];
-        assert_eq!(s.wait(&k, || (0, false), || false), SessionWait::Fast);
+        assert_eq!(
+            s.wait(&k, &Position::ZERO, || (0, false), || false),
+            SessionWait::Fast
+        );
         let obs = Position {
             seq: 3,
             pending: jp(1, 7),
@@ -634,22 +668,25 @@ mod tests {
                 pending: jp(1, 8),
             },
         );
-        assert_eq!(s.wait(&k, || (3, false), || false), SessionWait::Covered);
+        assert_eq!(
+            s.wait(&k, &Position::ZERO, || (3, false), || false),
+            SessionWait::Covered
+        );
         // The directory is not covered: it waits, then times out.
         assert!(matches!(
-            s.wait(&[ReadKey::Dir(1)], || (3, false), || true),
+            s.wait(&[ReadKey::Dir(1)], &Position::ZERO, || (3, false), || true),
             SessionWait::TimedOut(_)
         ));
         assert_eq!(s.stats().degraded_held, 1);
         // Applying the segment shipped through the position releases it.
         s.advance(4, jp(1, 9));
         assert_eq!(
-            s.wait(&[ReadKey::Dir(1)], || (4, false), || false),
+            s.wait(&[ReadKey::Dir(1)], &Position::ZERO, || (4, false), || false),
             SessionWait::Fast
         );
         // A queued replay touching the key blocks even the fast path.
         assert!(matches!(
-            s.wait(&k, || (4, true), || false),
+            s.wait(&k, &Position::ZERO, || (4, true), || false),
             SessionWait::TimedOut(_)
         ));
     }
@@ -664,7 +701,12 @@ mod tests {
         });
         let s2 = s.clone();
         let t = std::thread::spawn(move || {
-            s2.wait(&[ReadKey::Ino(1)], || (s2.applied().seq, false), || false)
+            s2.wait(
+                &[ReadKey::Ino(1)],
+                &Position::ZERO,
+                || (s2.applied().seq, false),
+                || false,
+            )
         });
         std::thread::sleep(Duration::from_millis(30));
         s.advance(2, None);

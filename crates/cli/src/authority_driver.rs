@@ -31,8 +31,8 @@ use constellation_authority::action::ControlOk;
 use constellation_authority::core::JobKind;
 use constellation_authority::{
     Action, CasFailure, ClientReply, Config, Control, Core, EpochState, Event, InboxView, Ms,
-    NodeId, OpId, PeerLink, PeerMsg, Policy, S3Failure, S3Op, S3Result, ShipState, Stats,
-    TimerKind, UploadResult,
+    NodeId, OpId, PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure,
+    S3Op, S3Result, ShipState, Stats, TimerKind, UploadResult,
 };
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::{JournalPos, LogRecord, Meta, MutateOp, MutateOutcome, Position, Rid};
@@ -69,6 +69,9 @@ pub struct CoreStatus {
     /// Plan 30 §M7.
     pub stream: constellation_authority::core::StreamView,
     pub stream_enabled: bool,
+    /// Plan 30 §M8.
+    pub read: constellation_authority::core::ReadView,
+    pub read_delegations: bool,
 }
 
 /// Short names for the trace line around every core step.
@@ -312,6 +315,9 @@ enum ControlReply {
     ClaimOffer,
     Text(oneshot::Sender<std::result::Result<String, String>>),
     Leave(oneshot::Sender<std::result::Result<String, String>>),
+    /// Plan 30 §M8.
+    ReadIndex(oneshot::Sender<ReadAnswer>),
+    Recall(oneshot::Sender<()>),
 }
 
 /// What reaches the driver task from the IO it spawned.
@@ -384,6 +390,22 @@ pub fn load_config(
     );
     c.stream_timeout_ms = env_ms("CONSTELLATION_LOG_STREAM_TIMEOUT_MS", c.stream_timeout_ms);
     c.stream_backstop_ms = env_ms("CONSTELLATION_LOG_STREAM_BACKSTOP_MS", c.stream_backstop_ms);
+    // Plan 30 §M8: read delegations (granted to `cto=strict` readers
+    // that ask; on unless `CONSTELLATION_READ_DELEGATIONS` is 0/off/false)
+    // and their TTL. A forwarded reply held for recalls answers `Held`
+    // at half the forward timeout, well inside the requester's RPC.
+    c.read_delegations = p2p
+        && !matches!(
+            std::env::var("CONSTELLATION_READ_DELEGATIONS")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "off" | "false"
+        );
+    c.read_delegation_ttl_ms = crate::cto::read_delegation_ttl_ms();
+    c.recall_hold_ms = (c.forward_timeout_ms / 2).max(1);
+    c.read_index_deadline_ms = crate::cto::read_index_budget_ms();
     c
 }
 
@@ -415,6 +437,10 @@ pub struct Driver {
     replies: HashMap<Rid, oneshot::Sender<ClientReply>>,
     mutate_replies: HashMap<OpId, oneshot::Sender<(MutateOutcome, Option<u64>, Position)>>,
     handoff_replies: HashMap<OpId, oneshot::Sender<Option<HandoffResult>>>,
+    /// Plan 30 §M8: peers' ReadIndex requests and recalls, by the id the
+    /// driver minted for the core.
+    read_index_replies: HashMap<OpId, oneshot::Sender<ReadIndexOutcome>>,
+    recall_replies: HashMap<OpId, oneshot::Sender<()>>,
     controls: HashMap<OpId, ControlReply>,
     next_control: u64,
     /// Whether this node holds (from the last refresh), for the tickers.
@@ -459,6 +485,8 @@ impl Driver {
             replies: HashMap::new(),
             mutate_replies: HashMap::new(),
             handoff_replies: HashMap::new(),
+            read_index_replies: HashMap::new(),
+            recall_replies: HashMap::new(),
             controls: HashMap::new(),
             next_control: 1 << 48,
             last_epoch_reported: None,
@@ -583,6 +611,8 @@ impl Driver {
         status.epoch = self.core.epoch_state();
         status.stream = self.core.stream_view();
         status.stream_enabled = cfg.log_streams && cfg.p2p;
+        status.read = self.core.read_view();
+        status.read_delegations = cfg.read_delegations;
     }
 
     /// Tell the core the epoch machine's state when it changed (or
@@ -721,6 +751,50 @@ impl Driver {
                     }));
                 }
                 Some(Internal::Event(Event::Submit { rid, op, policy }))
+            }
+            SyncRequest::ReadIndex {
+                ino,
+                dir,
+                name,
+                reply,
+            } => control(
+                Control::ReadIndex { ino, dir, name },
+                ControlReply::ReadIndex(reply),
+            ),
+            SyncRequest::Recall { inos, reply } => {
+                control(Control::Recall { inos }, ControlReply::Recall(reply))
+            }
+            SyncRequest::PeerReadIndex {
+                requester,
+                ino,
+                dir,
+                name,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.read_index_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from: requester,
+                    msg: PeerMsg::ReadIndex {
+                        req,
+                        ino,
+                        dir,
+                        name,
+                    },
+                }))
+            }
+            SyncRequest::PeerRecall {
+                holder,
+                ino,
+                grant,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.recall_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from: holder,
+                    msg: PeerMsg::DelegationRecall { req, ino, grant },
+                }))
             }
             SyncRequest::SegmentHint { seq, epoch } => Some(Internal::Event(Event::Peer {
                 from: 0,
@@ -1084,6 +1158,111 @@ impl Driver {
                         let _ = tx.send((outcome, base, position));
                     }
                 }
+            }
+            PeerMsg::ReadIndexReply { req, outcome } => {
+                if let Some(tx) = self.read_index_replies.remove(&req) {
+                    let _ = tx.send(outcome);
+                }
+            }
+            PeerMsg::DelegationRecalled { req } => {
+                if let Some(tx) = self.recall_replies.remove(&req) {
+                    let _ = tx.send(());
+                }
+            }
+            PeerMsg::ReadIndex {
+                req,
+                ino,
+                dir,
+                name,
+            } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let requester = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().forward_timeout_ms);
+                tokio::spawn(async move {
+                    let payload = Payload::ReadIndex {
+                        requester,
+                        req_id: req.0,
+                        ino,
+                        dir,
+                        name,
+                    };
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::ReadIndexReply {
+                            req_id,
+                            status,
+                            holder,
+                            position_seq,
+                            position_pending,
+                            grant,
+                        })) if req_id == req.0 => {
+                            let outcome = match status {
+                                0 => ReadIndexOutcome::Ok {
+                                    position: Position {
+                                        seq: position_seq,
+                                        pending: position_pending
+                                            .map(|(epoch, jseq)| JournalPos { epoch, jseq }),
+                                    },
+                                    grant: grant.map(|(id, ttl_ms, epoch)| ReadGrantMsg {
+                                        id,
+                                        ttl_ms,
+                                        epoch,
+                                    }),
+                                },
+                                2 => ReadIndexOutcome::Busy,
+                                _ => ReadIndexOutcome::NotHolder { holder },
+                            };
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::ReadIndexReply { req, outcome },
+                            }));
+                        }
+                        _ => {
+                            let outage = !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
+            }
+            PeerMsg::DelegationRecall { req, ino, grant } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let holder = self.node_id;
+                // A recall that goes unanswered is outwaited by the
+                // grant's expiry in the core; this only bounds the RPC.
+                let timeout = Duration::from_millis(
+                    self.core.config().read_delegation_ttl_ms + self.core.config().expiry_margin_ms,
+                );
+                tokio::spawn(async move {
+                    let payload = Payload::ReadRecall {
+                        holder,
+                        req_id: req.0,
+                        ino,
+                        grant,
+                    };
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::ReadRecalled { req_id })) if req_id == req.0 => {
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::DelegationRecalled { req },
+                            }));
+                        }
+                        _ => {
+                            let outage = !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
             }
             PeerMsg::LeaseHandoff {
                 req,
@@ -1529,6 +1708,18 @@ impl Driver {
                 if let Ok(ControlOk::Lease { acquired: true, .. }) = result {
                     self.deps.placement.mark_migrated();
                 }
+            }
+            ControlReply::ReadIndex(tx) => {
+                let _ = tx.send(match result {
+                    Ok(ControlOk::ReadIndex(answer)) => answer,
+                    // The S3 path (no live sequencer, or no P2P): a
+                    // tail-to-head job answered it.
+                    Ok(_) => ReadAnswer::Tailed,
+                    Err(_) => ReadAnswer::Degraded,
+                });
+            }
+            ControlReply::Recall(tx) => {
+                let _ = tx.send(());
             }
             ControlReply::Publish(tx) => match result {
                 Ok(_) => {

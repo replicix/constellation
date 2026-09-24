@@ -132,6 +132,8 @@ pub struct NodeConfig {
     pub state_dir: Option<PathBuf>,
     pub cache_size: u64,
     pub fsync_s3: bool,
+    /// Plan 30 §M8: `--cto strict`.
+    pub cto_strict: bool,
     pub initial_write_mode: writeback::WriteMode,
     pub read_only_member: bool,
     pub web_ui: u16,
@@ -241,6 +243,7 @@ pub struct NodeRuntime {
     last_sync_ms: Arc<AtomicU64>,
     read_only_member: bool,
     fsync_s3: bool,
+    cto_strict: bool,
     pins: Arc<pin::PinManager>,
     reintegration: Arc<reintegrate::ReintegrationState>,
     stop: Arc<AtomicBool>,
@@ -266,6 +269,11 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
+    /// Plan 30 §M8: this node's mounts are `--cto strict`.
+    pub fn cto_strict(&self) -> bool {
+        self.cto_strict
+    }
+
     /// Per-node setup: open the backend/replica/cache, claim or validate
     /// node identity, start the lease keeper, P2P endpoint, periodic GC,
     /// and the metadata shipper/sync task. No view is mounted yet.
@@ -275,6 +283,7 @@ impl NodeRuntime {
             state_dir,
             cache_size,
             fsync_s3,
+            cto_strict,
             initial_write_mode,
             read_only_member,
             web_ui,
@@ -710,7 +719,7 @@ impl NodeRuntime {
         epochs.set_propose_grace(Duration::from_millis(interval_ms));
         // Plan 30 M5: the authority core's tunables, from the same
         // `CONSTELLATION_*` knobs the extracted code read.
-        let core_config = crate::authority_driver::load_config(
+        let mut core_config = crate::authority_driver::load_config(
             node_id,
             incarnation,
             lease_mode,
@@ -720,6 +729,12 @@ impl NodeRuntime {
             idle_max_ms,
             retention_s,
         );
+        // Plan 30 §M8: a lone strict sequencer keeps a short kernel cache
+        // TTL; the core drains it (see `cto::lone_kernel_ttl_ms`) before
+        // acknowledging anything another node started.
+        if cto_strict {
+            core_config.kernel_cache_ttl_ms = crate::cto::lone_kernel_drain_ms();
+        }
         // Plan 28 §11: publish the §P6 tree on the publish cadence.
         // A read-only member publishes nothing: it ships no segments, so
         // it has no authority to commit one.
@@ -1156,6 +1171,7 @@ impl NodeRuntime {
             last_sync_ms,
             read_only_member,
             fsync_s3,
+            cto_strict,
             pins,
             reintegration,
             stop,
@@ -1305,6 +1321,7 @@ impl NodeRuntime {
                 sync: Some(fusefs::SyncHandle {
                     tx: self.sync_tx.clone(),
                     fsync_s3: self.fsync_s3,
+                    cto_strict: self.cto_strict,
                     lease: self.lease.clone(),
                     acquire_deadline: self.acquire_deadline,
                     designations: Some(self.designations.clone()),
@@ -1734,6 +1751,7 @@ mod tests {
                 state_dir: Some(state_dir),
                 cache_size: 16 * 1024 * 1024,
                 fsync_s3: false,
+                cto_strict: false,
                 initial_write_mode: writeback::WriteMode::Through,
                 read_only_member: false,
                 web_ui: 0,

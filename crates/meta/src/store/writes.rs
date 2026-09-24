@@ -506,6 +506,12 @@ impl Meta {
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
         self.usage_tracker().adjust(delta, 0);
+        // Plan 30 §M5's unshipped key set is fed by `mutate::execute`; a
+        // holder's own whole-file manifest commit (the FUSE flush) comes
+        // here instead and must join it too: a forward reply's `base`
+        // (M5) and a ReadIndex position (M8) both ask whether unshipped
+        // work touched this inode.
+        self.unshipped.lock().unwrap().inos.insert(ino);
         Ok(())
     }
 
