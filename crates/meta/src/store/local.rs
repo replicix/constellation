@@ -94,8 +94,8 @@ use crate::record::LogRecord;
 use crate::replay::{apply_batch_tx, ApplyCx, TouchSet};
 use crate::rid::Rid;
 use crate::store::{
-    adjust_usage_tx, counter_add_tx, counter_get, journal, ns, spec, usage_note_begin,
-    usage_note_take, Meta, UsageTracker, KV_LOCAL_SPEC_COUNT, KV_SPEC_LIVE_COUNT,
+    adjust_usage_tx, counter_add_tx, counter_get, journal, kv_get_tx, kv_set_tx, ns, spec,
+    usage_note_begin, usage_note_take, Meta, UsageTracker, KV_LOCAL_SPEC_COUNT, KV_SPEC_LIVE_COUNT,
     KV_UNCAPTURED_TX_COUNT,
 };
 use crate::TreeInode;
@@ -116,6 +116,14 @@ pub(crate) struct JournalTx {
     pub spec_seq: Option<u64>,
     /// The lease epoch it executed under; 0 when this node held none.
     pub epoch: u64,
+    /// Plan 30 §M11: the delegation stream this transaction belongs to
+    /// (`gen` 0: none) and its index in it — executed here as the
+    /// delegate, or appended here as the root from a delegate's stream.
+    /// A delegate's rows retire when a segment carries their origin and
+    /// strand when the log recalls their generation; a root's rows of a
+    /// delegate origin ship with it in the segment envelope.
+    pub gen: u64,
+    pub idx: u64,
     /// The rid `mutate::execute` ran it under, if any.
     pub rid: Option<Rid>,
     /// The op `mutate::execute` ran, if the transaction came from one. A
@@ -123,6 +131,10 @@ pub(crate) struct JournalTx {
     /// one (a local manifest commit, a snapshot row) is replayed from its
     /// records instead (`spec::derive_replay_op`).
     pub op: Option<MutateOp>,
+    /// Plan 30 §M11: the position the op's requester had observed when
+    /// it was submitted (its causal dependencies), recorded as the
+    /// record's `deps`.
+    pub deps: crate::session::Position,
 }
 
 /// The leading fields of a [`JournalTx`], decoded without the (possibly
@@ -136,6 +148,8 @@ pub(crate) struct JournalTxHead {
     pub last: u64,
     pub spec_seq: Option<u64>,
     pub epoch: u64,
+    pub gen: u64,
+    pub idx: u64,
 }
 
 pub(crate) fn tx_key(first: u64) -> Vec<u8> {
@@ -275,8 +289,12 @@ impl Meta {
         let epoch = self.holder_epoch.load(Ordering::SeqCst);
         // A holder always captures; a non-holder only while speculation
         // exists — answered from two counters, not a scan of `spec`.
+        // Plan 30 §M11: a delegate's transactions are speculation like a
+        // holder's (retired by the log, stranded by a recall), so they
+        // are captured too.
         let capturing = self.holder_capture()
             && (epoch != 0
+                || journal::PendingDelegate::peek().is_some()
                 || counter_get(tx, &self.local, KV_SPEC_LIVE_COUNT)? > 0
                 || counter_get(tx, &self.local, KV_LOCAL_SPEC_COUNT)? > 0);
         let capture = if capturing {
@@ -327,6 +345,28 @@ impl Meta {
                 None
             }
         };
+        // Plan 30 §M11: the transaction's delegation origin. A delegate
+        // takes the generation's next index (a persisted counter, so a
+        // restart continues the stream); the root records the index the
+        // delegate assigned.
+        let (gen, idx, deps) = match journal::PendingDelegate::take() {
+            Some(d) => {
+                let idx = match d.idx {
+                    Some(i) => i,
+                    None => {
+                        let key = deleg_idx_key(d.gen);
+                        let next = kv_get_tx(tx, &self.local, &key)?
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0)
+                            + 1;
+                        kv_set_tx(tx, &self.local, &key, &next.to_string());
+                        next
+                    }
+                };
+                (d.gen, idx, d.deps)
+            }
+            None => (0, 0, crate::session::Position::ZERO),
+        };
         put_journal_tx(
             tx,
             self,
@@ -335,10 +375,170 @@ impl Meta {
                 last: end - 1,
                 spec_seq,
                 epoch: local.epoch,
+                gen,
+                idx,
                 rid,
                 op,
+                deps,
             },
         )
+    }
+
+    /// Plan 30 §M11: execute `op` here as the delegate of generation
+    /// `gen` (the caller checked ownership and the grant): journaled with
+    /// the generation's next stream index and the requester's `deps`.
+    /// Returns the records and the index.
+    pub fn delegate_execute(
+        &self,
+        op: &MutateOp,
+        rid: Option<Rid>,
+        gen: u64,
+        deps: crate::session::Position,
+    ) -> Result<(Vec<LogRecord>, u64), MetaError> {
+        let _d = journal::PendingDelegate::set(gen, None, deps);
+        let records = crate::mutate::execute(self, op, rid)?;
+        let idx = self.delegate_idx(gen)?;
+        Ok((records, idx))
+    }
+
+    /// The highest stream index this node assigned under `gen` (0: none).
+    pub fn delegate_idx(&self, gen: u64) -> Result<u64, MetaError> {
+        let r = self.db.read_tx();
+        Ok(kv_get_tx(&r, &self.local, &deleg_idx_key(gen))?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// Plan 30 §M11: the root appends one of a delegate's transactions
+    /// (validated by the delegate; no re-validation) into its own
+    /// journal with the delegate's origin and `deps`, completing `rid`
+    /// once. A rid the log or this journal already completed is skipped
+    /// (`Ok(false)`).
+    pub fn apply_delegate_tx(
+        &self,
+        records: &[LogRecord],
+        rid: Option<Rid>,
+        gen: u64,
+        idx: u64,
+        deps: crate::session::Position,
+    ) -> Result<bool, MetaError> {
+        // A delegate's refusal (see `delegate_refusal`) is a `Refused`
+        // row of its own: journaled here the same way, under the
+        // stream's origin.
+        if let [LogRecord::Refused { rid: r, errno }] = records {
+            if self.completed_position(*r)?.is_some() {
+                return Ok(false);
+            }
+            let _d = journal::PendingDelegate::set(gen, Some(idx), deps);
+            self.journal_refusal(*r, *errno)?;
+            return Ok(true);
+        }
+        if let Some(rid) = rid {
+            if self.completed_position(rid)?.is_some() {
+                return Ok(false);
+            }
+        }
+        let _d = journal::PendingDelegate::set(gen, Some(idx), deps);
+        self.apply_records_journaled_completing(records, rid)?;
+        Ok(true)
+    }
+
+    /// Plan 30 §M11: a delegate's refusal of `rid` (plan 30 §M9's
+    /// journaled `Refused` row), as the next transaction of stream
+    /// `gen` — the root appends it like any other, so a retry by rid
+    /// anywhere finds the same errno. Returns the stream index.
+    pub fn delegate_refusal(
+        &self,
+        rid: Rid,
+        errno: i32,
+        gen: u64,
+        deps: crate::session::Position,
+    ) -> Result<u64, MetaError> {
+        let _d = journal::PendingDelegate::set(gen, None, deps);
+        self.journal_refusal(rid, errno)?;
+        self.delegate_idx(gen)
+    }
+
+    /// Plan 30 §M11: this node's unretired transactions of delegation
+    /// stream `gen` from index `from_idx` on, oldest first, at most
+    /// `max_rows` journal rows (whole transactions).
+    pub fn delegate_txs_from(
+        &self,
+        gen: u64,
+        from_idx: u64,
+        max_rows: usize,
+    ) -> Result<Vec<DelegateTx>, MetaError> {
+        let r = self.db.read_tx();
+        let mut out = Vec::new();
+        let mut rows = 0usize;
+        for (first, row) in read_journal_txs(&r, self)? {
+            if row.gen != gen || row.idx < from_idx {
+                continue;
+            }
+            let records: Vec<LogRecord> = journal_records(&r, self, first, row.last)?
+                .into_iter()
+                .map(|(_, rec)| rec)
+                .collect();
+            rows += records.len();
+            out.push(DelegateTx {
+                idx: row.idx,
+                rid: row.rid,
+                records,
+                deps: row.deps,
+            });
+            if rows >= max_rows {
+                break;
+            }
+        }
+        out.sort_by_key(|t| t.idx);
+        Ok(out)
+    }
+
+    /// Plan 30 §M11: the delegation origin of each journal row in
+    /// `seqs` (`(0, 0)` for this node's own rows), for the segment
+    /// envelope.
+    pub fn journal_origins(&self, seqs: &[u64]) -> Result<Vec<(u64, u64)>, MetaError> {
+        let r = self.db.read_tx();
+        let heads = read_journal_tx_heads(&r, self)?;
+        Ok(seqs
+            .iter()
+            .map(|seq| {
+                heads
+                    .iter()
+                    .find(|(first, h)| *first <= *seq && *seq <= h.last)
+                    .map(|(_, h)| (h.gen, h.idx))
+                    .unwrap_or((0, 0))
+            })
+            .collect())
+    }
+
+    /// Plan 30 §M11: whether the unshipped journal holds any transaction
+    /// that is not a delegate-stream row (only those take the lease path
+    /// before a forward, M5 round 3).
+    pub fn journal_has_undelegated(&self) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        Ok(read_journal_tx_heads(&r, self)?
+            .iter()
+            .any(|(_, h)| h.gen == 0))
+    }
+
+    /// Plan 30 §M11: the journal seqs of this node's transactions whose
+    /// origins are in `origins` (a segment carried them: they retire).
+    pub(crate) fn journal_seqs_of_origins(
+        &self,
+        r: &impl Readable,
+        origins: &[(u64, u64)],
+    ) -> Result<Vec<(u64, u64, Option<u64>)>, MetaError> {
+        if origins.iter().all(|(g, _)| *g == 0) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for (first, h) in read_journal_tx_heads(r, self)? {
+            if h.gen != 0 && origins.contains(&(h.gen, h.idx)) {
+                out.push((first, h.last, h.spec_seq));
+            }
+        }
+        Ok(out)
     }
 
     /// The largest prefix of `batch` (journal rows in order, starting at a
@@ -1018,4 +1218,19 @@ mod root_substitution_tests {
             "the log-prefix root carries the shipped owner"
         );
     }
+}
+
+/// `local` kv: the next stream index a delegate assigns under a
+/// generation.
+fn deleg_idx_key(gen: u64) -> String {
+    format!("deleg_idx:{gen}")
+}
+
+/// Plan 30 §M11: one transaction of a delegate's stream.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DelegateTx {
+    pub idx: u64,
+    pub rid: Option<Rid>,
+    pub records: Vec<LogRecord>,
+    pub deps: crate::session::Position,
 }

@@ -224,6 +224,12 @@ pub enum TimerKind {
     /// M10: the idle promise watch (a lease re-read while P2P is
     /// unavailable).
     PromiseWatch,
+    /// M11: the root outwaits a recalled (or unrenewed) generation.
+    DelegExpiry,
+    /// M11: a delegate renews its grant.
+    DelegRenew,
+    /// M11: a delegate's stream tick (a batch to send, a lost ack).
+    DelegStream,
 }
 
 /// Successful control-plane results.

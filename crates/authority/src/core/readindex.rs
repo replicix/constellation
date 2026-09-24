@@ -76,7 +76,7 @@ use crate::event::{PeerMsg, ReadGrantMsg, ReadIndexOutcome, S3Result};
 use crate::ids::{Ms, NodeId, OpId, Seq, TimerId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
-use constellation_meta::{HeldDelegation, MutateOutcome, Position, RecallNeed, Rid};
+use constellation_meta::{HeldDelegation, MutateOp, MutateOutcome, Position, RecallNeed, Rid};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A strict read waiting for its answer.
@@ -106,7 +106,7 @@ struct Recalling {
 
 /// What a parked acknowledgement will do once its recalls are done.
 #[derive(Debug)]
-enum ParkedWhat {
+pub(crate) enum ParkedWhat {
     /// A forwarded op's reply. `req: None` once it was answered `Held`
     /// (the requester's retry re-attaches).
     Reply {
@@ -116,6 +116,7 @@ enum ParkedWhat {
         outcome: MutateOutcome,
         base: Option<Seq>,
         position: Position,
+        gen: u64,
         held_timer: Option<TimerId>,
     },
     /// A local client op's `finish`.
@@ -126,6 +127,21 @@ enum ParkedWhat {
     Release,
     /// An inbox op halted before executing: poll its requester again.
     InboxRepoll { node: NodeId },
+    /// Plan 30 §M11: a forwarded op the root executes once the write
+    /// delegations its keys fall under are recalled and its `deps` are
+    /// here (`req: None` once answered `Held`; the retry re-attaches).
+    ExecuteReply {
+        from: NodeId,
+        req: Option<OpId>,
+        rid: Rid,
+        op: MutateOp,
+        acked_through: u64,
+        deps: Position,
+        held_timer: Option<TimerId>,
+    },
+    /// Plan 30 §M11: a local op of this root, executed (and finished)
+    /// once the recall is done and its `deps` are here.
+    ExecuteLocal { rid: Rid },
 }
 
 #[derive(Debug)]
@@ -135,6 +151,8 @@ struct Parked {
     /// Plan 30 §M9: the journal seq that must be durable (on every
     /// backup, or shipped) before this acknowledgement leaves.
     durable: Option<u64>,
+    /// Plan 30 §M11: the position the replica must reach first.
+    deps: Option<Position>,
     since: Ms,
     what: ParkedWhat,
 }
@@ -290,6 +308,7 @@ impl Core {
                 position: Position {
                     seq: self.ship.head_seq,
                     pending,
+                    streams: Default::default(),
                 },
                 grant,
             }
@@ -398,7 +417,24 @@ impl Core {
         Some((waiting, quarantine))
     }
 
-    fn park(&mut self, now: Ms, wait: RecallWait, durable: Option<u64>, what: ParkedWhat) -> u64 {
+    pub(crate) fn park(
+        &mut self,
+        now: Ms,
+        wait: RecallWait,
+        durable: Option<u64>,
+        what: ParkedWhat,
+    ) -> u64 {
+        self.park_with_deps(now, wait, durable, None, what)
+    }
+
+    pub(crate) fn park_with_deps(
+        &mut self,
+        now: Ms,
+        wait: RecallWait,
+        durable: Option<u64>,
+        deps: Option<Position>,
+        what: ParkedWhat,
+    ) -> u64 {
         self.rd.next_park += 1;
         let id = self.rd.next_park;
         if !wait.0.is_empty() || wait.1.is_some() {
@@ -413,11 +449,97 @@ impl Core {
                 waiting: wait.0,
                 quarantine: wait.1,
                 durable,
+                deps,
                 since: now,
                 what,
             },
         );
         id
+    }
+
+    /// Plan 30 §M11: park a forwarded op's *execution* (the root recalls
+    /// the write delegations first, or waits for `deps`); the requester
+    /// is answered `Held` before its RPC times out and re-attaches.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn park_exec_reply(
+        &mut self,
+        now: Ms,
+        wait: BTreeSet<u64>,
+        deps: Option<Position>,
+        from: NodeId,
+        req: OpId,
+        rid: Rid,
+        op: MutateOp,
+        acked_through: u64,
+        out: &mut Vec<Action>,
+    ) {
+        self.stats.deleg_exec_parked += 1;
+        let id = self.park_with_deps(
+            now,
+            (wait, None),
+            None,
+            deps,
+            ParkedWhat::ExecuteReply {
+                from,
+                req: Some(req),
+                rid,
+                op,
+                acked_through,
+                deps: deps.unwrap_or(Position::ZERO),
+                held_timer: None,
+            },
+        );
+        self.rd.parked_rids.insert(rid, id);
+        let timer = self.set_timer(now.plus(self.cfg.recall_hold_ms), Timer::HeldReply(id), out);
+        if let Some(Parked {
+            what: ParkedWhat::ExecuteReply { held_timer, .. },
+            ..
+        }) = self.rd.parked.get_mut(&id)
+        {
+            *held_timer = Some(timer);
+        }
+    }
+
+    /// Plan 30 §M11: park a local op's execution.
+    pub(crate) fn park_exec_local(
+        &mut self,
+        now: Ms,
+        wait: BTreeSet<u64>,
+        deps: Option<Position>,
+        rid: Rid,
+    ) {
+        self.stats.deleg_exec_parked += 1;
+        self.dl.pending_exec.insert(rid);
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.phase = ClientPhase::Recalling;
+        }
+        self.park_with_deps(
+            now,
+            (wait, None),
+            None,
+            deps,
+            ParkedWhat::ExecuteLocal { rid },
+        );
+    }
+
+    /// Whether any parked continuation waits for a position.
+    pub(crate) fn has_deps_parks(&self) -> bool {
+        self.rd.parked.values().any(|p| p.deps.is_some())
+    }
+
+    /// Plan 30 §M11: a write delegation's wait id is done (its generation
+    /// ended): release what waited on it.
+    pub(crate) fn deleg_wait_done(
+        &mut self,
+        now: Ms,
+        id: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        for p in self.rd.parked.values_mut() {
+            p.waiting.remove(&id);
+        }
+        self.complete_ready(now, replica, out);
     }
 
     /// Acknowledgements parked for durability (plan 30 §M9, `status`).
@@ -504,6 +626,7 @@ impl Core {
                                 outcome: MutateOutcome::Busy,
                                 base: None,
                                 position: Position::ZERO,
+                                gen: 0,
                             },
                         });
                     }
@@ -529,6 +652,21 @@ impl Core {
                 }),
                 ParkedWhat::Release => {}
                 ParkedWhat::InboxRepoll { .. } => {}
+                ParkedWhat::ExecuteReply {
+                    rid, held_timer, ..
+                } => {
+                    self.rd.parked_rids.remove(&rid);
+                    if let Some(t) = held_timer {
+                        self.cancel_timer(t, out);
+                    }
+                }
+                ParkedWhat::ExecuteLocal { rid } => {
+                    self.dl.pending_exec.remove(&rid);
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.phase = ClientPhase::WaitingLease;
+                    }
+                    self.retry_or_lease(now, rid, replica, out);
+                }
             }
         }
         n
@@ -548,6 +686,7 @@ impl Core {
         outcome: MutateOutcome,
         base: Option<Seq>,
         position: Position,
+        gen: u64,
         out: &mut Vec<Action>,
     ) {
         let id = self.park(
@@ -561,6 +700,7 @@ impl Core {
                 outcome,
                 base,
                 position,
+                gen,
                 held_timer: None,
             },
         );
@@ -589,18 +729,28 @@ impl Core {
         };
         let hold = self.cfg.recall_hold_ms;
         let timer = self.set_timer(now.plus(hold), Timer::HeldReply(id), out);
-        let Some(Parked {
-            what:
-                ParkedWhat::Reply {
-                    to,
-                    req: r,
-                    held_timer,
-                    ..
-                },
-            ..
-        }) = self.rd.parked.get_mut(&id)
-        else {
-            return false;
+        let (to, r, held_timer) = match self.rd.parked.get_mut(&id) {
+            Some(Parked {
+                what:
+                    ParkedWhat::Reply {
+                        to,
+                        req: r,
+                        held_timer,
+                        ..
+                    },
+                ..
+            }) => (to, r, held_timer),
+            Some(Parked {
+                what:
+                    ParkedWhat::ExecuteReply {
+                        from,
+                        req: r,
+                        held_timer,
+                        ..
+                    },
+                ..
+            }) => (from, r, held_timer),
+            _ => return false,
         };
         *to = from;
         *r = Some(req);
@@ -612,19 +762,30 @@ impl Core {
     }
 
     pub(crate) fn on_held_reply_timer(&mut self, id: u64, out: &mut Vec<Action>) {
-        let Some(Parked {
-            what:
-                ParkedWhat::Reply {
-                    to,
-                    req,
-                    held_timer,
-                    ..
-                },
-            durable,
-            ..
-        }) = self.rd.parked.get_mut(&id)
-        else {
-            return;
+        let (to, req, held_timer, durable) = match self.rd.parked.get_mut(&id) {
+            Some(Parked {
+                what:
+                    ParkedWhat::Reply {
+                        to,
+                        req,
+                        held_timer,
+                        ..
+                    },
+                durable,
+                ..
+            }) => (to, req, held_timer, durable),
+            Some(Parked {
+                what:
+                    ParkedWhat::ExecuteReply {
+                        from,
+                        req,
+                        held_timer,
+                        ..
+                    },
+                durable,
+                ..
+            }) => (from, req, held_timer, durable),
+            _ => return,
         };
         // A durability wait (an S3 round trip) is longer than a LAN
         // recall: the retry comes back at the hold interval, not every
@@ -644,6 +805,7 @@ impl Core {
                     outcome: MutateOutcome::Held { retry_ms },
                     base: None,
                     position: Position::ZERO,
+                    gen: 0,
                 },
             });
         }
@@ -801,6 +963,7 @@ impl Core {
                 p.waiting.is_empty()
                     && p.quarantine.is_none_or(|q| q <= now)
                     && p.durable.is_none_or(|j| self.durable_covers(j))
+                    && p.deps.as_ref().is_none_or(|d| replica.reaches_streams(d))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -839,6 +1002,7 @@ impl Core {
                     outcome,
                     base,
                     position,
+                    gen,
                     held_timer,
                 } => {
                     self.rd.parked_rids.remove(&rid);
@@ -853,6 +1017,7 @@ impl Core {
                                 outcome,
                                 base,
                                 position,
+                                gen,
                             },
                         });
                     }
@@ -866,6 +1031,53 @@ impl Core {
                 }),
                 ParkedWhat::Release => self.release_after_recalls(now, replica, out),
                 ParkedWhat::InboxRepoll { node } => self.inbox_repoll(now, node, out),
+                ParkedWhat::ExecuteReply {
+                    from,
+                    req,
+                    rid,
+                    op,
+                    acked_through,
+                    deps,
+                    held_timer,
+                } => {
+                    self.rd.parked_rids.remove(&rid);
+                    if let Some(t) = held_timer {
+                        self.cancel_timer(t, out);
+                    }
+                    // Executes now (the recall ended, `deps` are here); a
+                    // retry answered `Held` meanwhile is answered from the
+                    // dedup when it comes back.
+                    self.on_mutate_request(
+                        now,
+                        from,
+                        req.unwrap_or(OpId(0)),
+                        rid,
+                        op,
+                        acked_through,
+                        deps,
+                        replica,
+                        out,
+                    );
+                }
+                ParkedWhat::ExecuteLocal { rid } => {
+                    self.dl.pending_exec.remove(&rid);
+                    if !self.clients.contains_key(&rid) {
+                        continue;
+                    }
+                    if let Some(epoch) = self.lease.new_mutation_epoch(now, &self.cfg) {
+                        let outcome =
+                            self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
+                        tracing::debug!(
+                            node = self.cfg.node_id,
+                            ?rid,
+                            ?outcome,
+                            "parked local execution ran"
+                        );
+                        self.finish(now, rid, outcome, replica, out);
+                    } else {
+                        self.lease_path(now, rid, replica, out);
+                    }
+                }
             }
         }
     }

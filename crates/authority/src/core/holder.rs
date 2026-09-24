@@ -9,6 +9,7 @@ use crate::action::{Action, S3Op};
 use crate::event::PeerMsg;
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq};
 use crate::replica::Replica;
+use constellation_meta::delegation::Ownership;
 use constellation_meta::{MetaError, MutateOp, MutateOutcome, Position, Rid, TouchSet};
 
 /// The keys `op` reads or writes, before it runs (a refusal touches
@@ -81,6 +82,7 @@ impl Core {
         rid: Rid,
         op: MutateOp,
         acked_through: u64,
+        deps: Position,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -89,7 +91,25 @@ impl Core {
         // Plan 30 §M8: a retry of an op whose reply waits for recalls
         // re-attaches to that wait (its outcome is final; only the
         // acknowledgement is held).
-        if self.reattach_parked(now, from, req, rid, out) {
+        if req != OpId(0) && self.reattach_parked(now, from, req, rid, out) {
+            return;
+        }
+        // Plan 30 §M11: a delegate executes what is its own; the root
+        // recalls what a live delegation owns before it executes, and
+        // redirects what is wholly a delegate's.
+        if self.cfg.delegation
+            && self.delegate_try_execute(
+                now,
+                from,
+                Some(req),
+                rid,
+                &op,
+                deps,
+                acked_through,
+                replica,
+                out,
+            )
+        {
             return;
         }
         let mut base = None;
@@ -101,6 +121,68 @@ impl Core {
             // Deliberately `ship_epoch`, not `new_mutation_epoch`: the
             // handoff pause closes this node's *own* new writes so a
             // waiter can claim, not a peer's forwarded ones.
+            if self.cfg.delegation && !self.dl.gens.is_empty() {
+                let keys = keys_of_op(&op);
+                if let Ownership::Delegated(d) = replica.resolve_ownership(&keys) {
+                    if d.node != self.cfg.node_id
+                        && !self.dl.gens.get(&d.gen).is_some_and(|g| g.ended)
+                    {
+                        // Wholly a live delegate's: the requester's table
+                        // was stale; send it there.
+                        self.stats.deleg_not_owner += 1;
+                        out.push(Action::Send {
+                            to: from,
+                            msg: PeerMsg::MutateReply {
+                                req,
+                                outcome: MutateOutcome::NotHolder { holder: d.node },
+                                base: None,
+                                position: Position::ZERO,
+                                gen: 0,
+                            },
+                        });
+                        return;
+                    }
+                }
+                let wait = self
+                    .deleg_recall_needed(now, &keys, replica, out)
+                    .unwrap_or_default();
+                let deps_wait = (!replica.reaches_streams(&deps)).then_some(deps);
+                if !wait.is_empty() || deps_wait.is_some() {
+                    if deps_wait.is_some() {
+                        self.stats.deleg_deps_waits += 1;
+                    }
+                    if req != OpId(0) {
+                        self.park_exec_reply(
+                            now,
+                            wait,
+                            deps_wait,
+                            from,
+                            req,
+                            rid,
+                            op,
+                            acked_through,
+                            out,
+                        );
+                    }
+                    return;
+                }
+            } else if self.cfg.delegation && !replica.reaches_streams(&deps) {
+                self.stats.deleg_deps_waits += 1;
+                if req != OpId(0) {
+                    self.park_exec_reply(
+                        now,
+                        Default::default(),
+                        Some(deps),
+                        from,
+                        req,
+                        rid,
+                        op,
+                        acked_through,
+                        out,
+                    );
+                }
+                return;
+            }
             base = self.reply_base(&op, replica);
             let (outcome, executed) = self.holder_execute(now, epoch, rid, &op, replica, out);
             fresh = executed;
@@ -112,6 +194,7 @@ impl Core {
             position = Position {
                 seq: self.ship.head_seq,
                 pending: replica.journal_position(epoch),
+                streams: Default::default(),
             };
             outcome
         } else if self.lease.lost {
@@ -152,8 +235,14 @@ impl Core {
                 outcome,
                 base,
                 position,
+                0,
                 out,
             );
+            return;
+        }
+        if req == OpId(0) {
+            // A parked execution whose requester was answered `Held`: its
+            // retry is answered from the dedup.
             return;
         }
         out.push(Action::Send {
@@ -163,6 +252,7 @@ impl Core {
                 outcome,
                 base,
                 position,
+                gen: 0,
             },
         });
     }
@@ -176,7 +266,7 @@ impl Core {
     /// load every requester trails and which would send every reply to
     /// `AwaitingLog` (M5 round 3: `holder-ships-under-forward-load` at 8×
     /// main's time).
-    fn reply_base(&self, op: &MutateOp, replica: &dyn Replica) -> Option<Seq> {
+    pub(crate) fn reply_base(&self, op: &MutateOp, replica: &dyn Replica) -> Option<Seq> {
         let keys = keys_of_op(op);
         if replica.unshipped_overlaps(&keys) {
             return None;
@@ -308,7 +398,11 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.note_foreign(now, replica, out);
-        let can_serve = self.lease.ship_epoch(now, &self.cfg).is_some() && !self.lease.fenced();
+        // Plan 30 §M11: no handoff while a delegation is live (the root
+        // stays; see `round_release`).
+        let can_serve = self.lease.ship_epoch(now, &self.cfg).is_some()
+            && !self.lease.fenced()
+            && self.deleg_live_generations() == 0;
         if !can_serve {
             self.stats.handoffs_declined += 1;
             out.push(Action::Send {

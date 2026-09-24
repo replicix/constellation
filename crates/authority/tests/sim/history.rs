@@ -22,6 +22,19 @@ pub enum NsOp {
     Create(String),
     Unlink(String),
     Rename(String, String),
+    /// Plan 30 §M11: the destination half of a rename in a per-directory
+    /// projection (`project_dir`): sets the name present, always `Ok`.
+    /// Never issued by a client.
+    Put(String),
+}
+
+/// Plan 30 §M11: the directory a name lives in (`"d1/x"` → `"d1"`; a
+/// bare name lives in the root directory, `""`).
+pub fn dir_of(name: &str) -> &str {
+    match name.rfind('/') {
+        Some(i) => &name[..i],
+        None => "",
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -66,8 +79,96 @@ impl SequentialSpec for NsSpec {
                     NsRet::Ok
                 }
             }
+            NsOp::Put(n) => {
+                self.present.insert(n.clone());
+                NsRet::Ok
+            }
         }
     }
+}
+
+/// Plan 30 §M11: the history restricted to directory `dir`, for the
+/// per-key checks under delegation (the log orders keys of different
+/// owners independently; only ops sharing a directory are ordered by
+/// real time). An op wholly in another directory disappears; a rename
+/// across directories becomes its `Unlink` half here (with the rename's
+/// return) or its `Put` half (present only when the rename returned
+/// `Ok`, or has not returned yet).
+pub fn project_dir(events: &[HistEvt], dir: &str) -> Vec<HistEvt> {
+    use std::collections::HashMap;
+    let mut returns: HashMap<Rid, NsRet> = HashMap::new();
+    for e in events {
+        if let HistEvt::Return { rid, ret, .. } = e {
+            returns.insert(*rid, *ret);
+        }
+    }
+    let mut out = Vec::new();
+    // Which projected op each rid became (so its return maps the same way).
+    let mut projected: HashMap<Rid, NsOp> = HashMap::new();
+    for e in events {
+        match e {
+            HistEvt::Invoke { thread, rid, op } => {
+                let p = match op {
+                    NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) if dir_of(n) == dir => {
+                        Some(op.clone())
+                    }
+                    NsOp::Rename(a, b) if dir_of(a) == dir && dir_of(b) == dir => Some(op.clone()),
+                    NsOp::Rename(a, _) if dir_of(a) == dir => Some(NsOp::Unlink(a.clone())),
+                    NsOp::Rename(_, b) if dir_of(b) == dir => {
+                        if returns.get(rid).is_some_and(|r| *r != NsRet::Ok) {
+                            None
+                        } else {
+                            Some(NsOp::Put(b.clone()))
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(p) = p {
+                    projected.insert(*rid, p.clone());
+                    out.push(HistEvt::Invoke {
+                        thread: *thread,
+                        rid: *rid,
+                        op: p,
+                    });
+                }
+            }
+            HistEvt::Return { thread, rid, ret } => {
+                if let Some(p) = projected.get(rid) {
+                    let ret = match p {
+                        NsOp::Put(_) => NsRet::Ok,
+                        _ => *ret,
+                    };
+                    out.push(HistEvt::Return {
+                        thread: *thread,
+                        rid: *rid,
+                        ret,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every directory the history touches.
+pub fn dirs_of(events: &[HistEvt]) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for e in events {
+        if let HistEvt::Invoke { op, .. } = e {
+            let names: Vec<&str> = match op {
+                NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) => vec![n],
+                NsOp::Rename(a, b) => vec![a, b],
+            };
+            for n in names {
+                let d = dir_of(n).to_string();
+                if !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+        }
+    }
+    dirs.sort();
+    dirs
 }
 
 pub type ThreadId = u64;
@@ -347,10 +448,19 @@ pub fn check_linearizable_witnessed(
             witness.observed_tentative += 1;
             continue;
         }
+        let at = |i: usize| -> String {
+            index_of
+                .iter()
+                .find(|(_, ib)| **ib == i)
+                .map(|(b, _)| format!("{b:?} {:?}", invoke_at[b].1))
+                .unwrap_or_default()
+        };
         return Err(format!(
             "rid {rid:?} ({op:?}) returned {ret:?} but no state in its window \
-             (log positions {lo}..={hi}) refuses it that way, even with tentative \
-             effects applied"
+             (log positions {lo}..={hi}; before: {}; after: {}) refuses it that way, \
+             even with tentative effects applied",
+            at(lo.saturating_sub(1)),
+            at(hi)
         ));
     }
     Ok(witness)

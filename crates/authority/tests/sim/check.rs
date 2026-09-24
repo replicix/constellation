@@ -67,10 +67,22 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
                 .map(|r| match r {
                     LogRecord::Completed { rid } =>
                         format!("Completed({},{},{})", rid.node, rid.incarnation, rid.seq),
-                    LogRecord::Create { name, ino, .. } => format!("Create({name},{ino:#x})"),
-                    LogRecord::Unlink { name, .. } => format!("Unlink({name})"),
-                    LogRecord::Rename { name, new_name, .. } =>
-                        format!("Rename({name}->{new_name})"),
+                    LogRecord::Create {
+                        parent, name, ino, ..
+                    } => format!("Create({parent:#x}/{name},{ino:#x})"),
+                    LogRecord::Unlink { parent, name, .. } => format!("Unlink({parent:#x}/{name})"),
+                    LogRecord::Rename {
+                        parent,
+                        name,
+                        new_parent,
+                        new_name,
+                        ..
+                    } => format!("Rename({parent:#x}/{name}->{new_parent:#x}/{new_name})"),
+                    LogRecord::Refused { rid, errno } => format!(
+                        "Refused({},{},{};{errno})",
+                        rid.node, rid.incarnation, rid.seq
+                    ),
+                    LogRecord::Recall { gen, .. } => format!("Recall(g{gen})"),
                     other => format!("{other:?}")
                         .split_whitespace()
                         .next()
@@ -89,8 +101,16 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
                     completed_at.entry(*rid).or_insert((*seq, i));
                 }
             }
-            Replica::apply_segment(&meta, *seq, seg.epoch, seg.through, &seg.rows, &seg.records)
-                .expect("apply");
+            Replica::apply_segment(
+                &meta,
+                *seq,
+                seg.epoch,
+                seg.through,
+                &seg.rows,
+                &seg.origins,
+                &seg.records,
+            )
+            .expect("apply");
             max_epoch = max_epoch.max(seg.epoch);
         }
         head = *seq;

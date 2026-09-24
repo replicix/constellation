@@ -1,6 +1,7 @@
 //! Metadata plane: local full replica in SQLite behind an engine trait
 //! (DECISIONS.md ADR-9), log records and the local journal (DESIGN.md §4).
 
+pub mod delegation;
 pub mod error;
 pub mod mutate;
 pub mod prune;
@@ -23,7 +24,10 @@ pub use record::{CloneNode, LogRecord};
 pub use reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 pub use replay::TouchSet;
 pub use rid::Rid;
-pub use session::{DurableWait, JournalPos, KeySet, Position, ReadKey, SessionStats, SessionWait};
+pub use session::{
+    DurableWait, JournalPos, KeySet, Position, ReadKey, SessionStats, SessionWait, Streams,
+    STREAMS_CAP,
+};
 pub use store::backup::{BackupRole, BackupTx};
 pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};
@@ -32,8 +36,8 @@ pub use store::spec::{
     LOCAL_REPLAY_INCARNATION,
 };
 pub use store::{
-    BootstrapIndexBuilder, ForeignApplyHook, JournalBatch, LogPrefixView, Meta, PublishBasis,
-    SCRATCH_XATTR,
+    BootstrapIndexBuilder, DelegateTx, ForeignApplyHook, JournalBatch, LogPrefixView, Meta,
+    PublishBasis, SCRATCH_XATTR,
 };
 
 use constellation_fs_core::{FileAttr, Ino};

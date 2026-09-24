@@ -887,6 +887,7 @@ pub async fn run_gossip<S: PeerService>(
                 op,
                 rid,
                 acked_through,
+                deps,
             } => {
                 let _ = service
                     .mutate_requested(
@@ -897,6 +898,7 @@ pub async fn run_gossip<S: PeerService>(
                         op.clone(),
                         *rid,
                         *acked_through,
+                        deps.clone(),
                     )
                     .await;
             }
@@ -1106,11 +1108,40 @@ async fn handle_stream<S: PeerService>(
             op,
             rid,
             acked_through,
+            deps,
         } => Some(
             service
-                .mutate_requested(part, requester, req_id, epoch_seen, op, rid, acked_through)
+                .mutate_requested(
+                    part,
+                    requester,
+                    req_id,
+                    epoch_seen,
+                    op,
+                    rid,
+                    acked_through,
+                    deps,
+                )
                 .await,
         ),
+        Payload::DelegateStream {
+            from,
+            req_id,
+            gen,
+            txs,
+        } => Some(
+            service
+                .delegate_stream_requested(from, req_id, gen, txs)
+                .await,
+        ),
+        Payload::DelegRenew { from, req_id, gen } => {
+            Some(service.deleg_renew_requested(from, req_id, gen).await)
+        }
+        Payload::DelegRecall {
+            root,
+            req_id,
+            dir,
+            gen,
+        } => Some(service.deleg_recall_requested(root, req_id, dir, gen).await),
         Payload::LeaseOffer { part, epoch } => {
             service.lease_offered(part, epoch);
             None
@@ -1253,6 +1284,9 @@ async fn handle_stream<S: PeerService>(
         | Payload::MutateReply { .. }
         | Payload::ReadIndexReply { .. }
         | Payload::ReadRecalled { .. }
+        | Payload::DelegateStreamAck { .. }
+        | Payload::DelegRenewed { .. }
+        | Payload::DelegRecalled { .. }
         | Payload::BackupAck { .. }
         | Payload::PromiseReply { .. }
         | Payload::Ok { .. } => None,

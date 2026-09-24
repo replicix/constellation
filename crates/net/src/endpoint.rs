@@ -537,6 +537,7 @@ pub trait PeerService: Send + Sync + 'static {
         _op: Vec<u8>,
         _rid: (u64, u32, u64),
         _acked_through: u64,
+        _deps: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::MutateReply {
@@ -545,6 +546,57 @@ pub trait PeerService: Send + Sync + 'static {
                 base: None,
                 position_seq: 0,
                 position_pending: None,
+                position_streams: Vec::new(),
+                gen: 0,
+            }
+        })
+    }
+    /// Plan 30 §M11: a delegate's stream batch for the root. Default:
+    /// refused.
+    fn delegate_stream_requested(
+        &self,
+        _from: u64,
+        req_id: u64,
+        gen: u64,
+        _txs: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::DelegateStreamAck {
+                req_id,
+                gen,
+                through: 0,
+                refused: true,
+            }
+        })
+    }
+    /// Plan 30 §M11: a delegate's renewal. Default: refused (ttl 0).
+    fn deleg_renew_requested(
+        &self,
+        _from: u64,
+        req_id: u64,
+        gen: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::DelegRenewed {
+                req_id,
+                gen,
+                ttl_ms: 0,
+            }
+        })
+    }
+    /// Plan 30 §M11: the root's recall. Default: nothing executed.
+    fn deleg_recall_requested(
+        &self,
+        _root: u64,
+        req_id: u64,
+        _dir: u64,
+        gen: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::DelegRecalled {
+                req_id,
+                gen,
+                through: 0,
             }
         })
     }
@@ -565,6 +617,7 @@ pub trait PeerService: Send + Sync + 'static {
                 position_seq: 0,
                 position_pending: None,
                 grant: None,
+                position_streams: Vec::new(),
             }
         })
     }

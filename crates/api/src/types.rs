@@ -23,6 +23,18 @@ pub enum Request {
         #[serde(default)]
         read_only: bool,
     },
+    /// Plan 30 §M11: delegate the directory at `path` to `node` (this
+    /// node must hold the lease).
+    Delegate {
+        path: String,
+        node: u64,
+    },
+    /// Plan 30 §M11: recall the delegation on the directory at `path`.
+    Undelegate {
+        path: String,
+    },
+    /// Plan 30 §M11: the live delegation table as this node knows it.
+    ListDelegations,
     /// Release this node's designation for `path`.
     Online {
         path: String,
@@ -205,6 +217,10 @@ pub enum Response {
     Designations {
         designations: Vec<DesignationStatus>,
     },
+    /// Plan 30 §M11.
+    Delegations {
+        delegations: Vec<DelegationStatus>,
+    },
     Snapshots {
         snapshots: Vec<SnapshotStatus>,
     },
@@ -346,6 +362,86 @@ pub struct DesignationStatus {
     pub read_only: bool,
 }
 
+/// Plan 30 §M11: one live delegation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DelegationStatus {
+    pub dir: u64,
+    pub path: String,
+    pub node: u64,
+    pub gen: u64,
+}
+
+/// Plan 30 §M11: this node's delegation state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DelegationReport {
+    /// `CONSTELLATION_DELEGATION` is on (and P2P).
+    #[serde(default)]
+    pub enabled: bool,
+    /// The live table.
+    #[serde(default)]
+    pub table: Vec<DelegationStatus>,
+    /// Delegations this node holds: `(dir, gen, until_ms, stopped,
+    /// streamed_through, executed, parked)`.
+    #[serde(default)]
+    pub mine: Vec<(u64, u64, i64, bool, u64, u64, usize)>,
+    /// As the root: `(dir, node, gen, cursor, until_ms, recall, ended)`.
+    #[serde(default)]
+    pub gens: Vec<(u64, u64, u64, u64, i64, String, bool)>,
+    #[serde(default)]
+    pub executed: u64,
+    /// Ops the FUSE fast path executed here as the delegate (not
+    /// counted in `executed`, which is the core's).
+    #[serde(default)]
+    pub fast_path_executed: u64,
+    #[serde(default)]
+    pub forwarded_to_delegate: u64,
+    #[serde(default)]
+    pub deps_waits: u64,
+    #[serde(default)]
+    pub parked_expired: u64,
+    #[serde(default)]
+    pub not_owner: u64,
+    #[serde(default)]
+    pub installed: u64,
+    #[serde(default)]
+    pub streamed_txs: u64,
+    #[serde(default)]
+    pub stream_refused: u64,
+    #[serde(default)]
+    pub renewals: u64,
+    #[serde(default)]
+    pub renewals_refused: u64,
+    #[serde(default)]
+    pub recalls_received: u64,
+    #[serde(default)]
+    pub delegated: u64,
+    #[serde(default)]
+    pub appended_txs: u64,
+    #[serde(default)]
+    pub stream_refusals: u64,
+    #[serde(default)]
+    pub deps_unsatisfied_at_append: u64,
+    #[serde(default)]
+    pub cross_subtree: u64,
+    #[serde(default)]
+    pub recalls_sent: u64,
+    #[serde(default)]
+    pub recalls_drained: u64,
+    #[serde(default)]
+    pub recalls_expired: u64,
+    #[serde(default)]
+    pub reclaimed: u64,
+    #[serde(default)]
+    pub ended: u64,
+    #[serde(default)]
+    pub deps_overflow_to_root: u64,
+    #[serde(default)]
+    pub exec_parked: u64,
+    /// Delegate rows stranded here by a recall (rolled back, replayed).
+    #[serde(default)]
+    pub stranded: u64,
+}
+
 /// One pinned subtree on this node.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PinStatus {
@@ -404,6 +500,9 @@ pub struct StatusReport {
     /// agree modulo the periodic refresh lag.
     #[serde(default)]
     pub designations: Vec<DesignationStatus>,
+    /// Plan 30 §M11.
+    #[serde(default)]
+    pub delegation: DelegationReport,
     /// Continuation epoch (phase 4b, DESIGN.md §5.3).
     #[serde(default)]
     pub epoch: EpochStatus,

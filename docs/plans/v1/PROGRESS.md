@@ -16226,3 +16226,1204 @@ Round 2 checks:
   The means are 2,279 and 2,274, so there is no regression; the two low
   runs were host noise. All six runs passed with 0 missing-chunk
   warnings and 0 held records.
+
+## Plan 30 M11 — phase 1 (coder, 2026-09-24): the `Delegation` model, the design, pure helpers
+
+Phase 1 of the largest milestone: the Stateright model of delegated
+sub-sequencers over one log, the design phase 2 implements, and the pure
+helpers the core can adopt. Nothing in `crates/authority/**`,
+`crates/cli/**` or `crates/meta/src/store/**` is touched (M9 and M10 are
+rebasing through them); M9 was read from `/home/bra/cvs/constellation-m9`
+(`core/backup.rs`, its PROGRESS sections) and M10 from
+`/home/bra/cvs/constellation-m10` (`model/src/flex.rs`, its phase-1 and
+coordinator-decision sections). Nothing is committed.
+
+| Item | State | Where |
+|---|---|---|
+| `DelegModel`: a root and delegates for disjoint subtrees over a fixed directory tree; `Delegate{dir,node,gen}` / `Recall{dir,gen}` records; ownership by an ancestor walk on each node's own applied prefix; delegate execution as speculation streamed to the root with `deps`; root append in stream order under a generation check, without re-validation; cross-subtree `Move` recalled to the root (drain, or outwait by TTL + margin under bounded drift); grant renewal capped by the root lease; delegate crash with and without a backup (seal + drain to the root); root failover by lease expiry with the root's journal stranded and delegates re-streaming; replay by rid; M6 session waits and read-your-writes; the `marker_order` probe | done | `crates/model/src/delegation.rs` (new), `crates/model/src/lib.rs` |
+| Properties: `per_key_linearizable` (a boolean register per key, a `Move` as two halves, M13 round 3a's tentative treatment), `causal_cut`, `marker_order`, `recall_safety`, `log_records_valid`, `exactly_once`, `converged_at_quiescence`, `read_your_writes`, `stable_without_faults`, `durable_acks_stand` (M9's `acked_never_lost` per delegate); eleven `sometimes` witnesses | done | same |
+| Counterexamples, each a hand-built path asserted to fail exactly at its last step, walked again under the design (the design has no such step or keeps every property), and found again by the checker: append without `deps` (root), a delegate ignoring `deps`, recall without draining, re-delegation without a generation check, acking under an expired delegation without margin under drift, an uncapped grant across a root takeover | done: 6 tests | `crates/model/tests/delegation.rs` (new) |
+| The design, clean and exhaustive: local and forwarded writes, a cross-subtree move drained, an unreachable delegate outwaited and its op replayed, a delegate crash without and with a backup, root failover with a live delegate, a nested move local to its delegate, marker order, re-delegation, drift with the margin | done: 11 tests + 1 `#[ignore]` | same |
+| Pure helpers: `DelegationRecord`, `DelegationTable` (apply, ancestor walk, `resolve` of a `TouchSet` into `Root` / `Delegated` / `CrossSubtree`), the `Namespace` trait, `DelegPosition` (per-stream pending part: `raise`, `join`, `dominates`, `normalize`) | done, 4 unit tests | `crates/meta/src/delegation.rs` (new), `crates/meta/src/lib.rs` |
+| The core, driver, store, placement, harness | phase 2 (checklist below) | — |
+
+### The model (`constellation_model::delegation::DelegModel`)
+
+A third focused model, like M8's `cto`, M9's `backup` and M10's `flex`:
+the authority model has one executor, and everything M11 adds is about
+two executors disagreeing on who owns a key at an instant, which needs
+clocks. The namespace is a fixed directory tree (`parents`, e.g. `/`,
+`/D1`, `/D2`, `/D1/D3`) with two names per directory and one presence
+bit per key; the ops are `Create`, `Unlink`, `Move(src, dst)` (`ENOENT`
+when the source is absent, else the source removed and the destination
+set: the shape of a rename), a `Read` under the M6 session wait, and a
+`ReadPair{marker, data}` probe (one replica snapshot, no wait). The log
+is one sequence of entries, each with its *origin* — the stream it came
+from (the root's journal in epoch `e`, or generation `g`) and its index
+in that stream, M9's segment `rows` generalized — and its `deps`, a
+position. A position is the log length applied plus, per stream, the
+highest index observed (M6's `Position { seq, pending }` with the
+pending part per stream). The module doc has the action-to-code table
+and the drift argument (M8's, unchanged: `deleg_margin + root_margin >
+4D` for the override, `lease_margin + deleg_margin > 4D` for the cap;
+all three equal to the lease's `M > 2D`).
+
+Release build, the whole test binary serially, `/usr/bin/time -v`:
+**16.1 s, 352 MB peak** (5.5 s with the tests in parallel). Every search
+is capped at 5M states (≈ 1.9 GB) and 55 s; a clean run asserts it
+finished below both.
+
+| Test | Naive knob | States (unique) | Time | Result |
+|---|---|---|---|---|
+| `appending_without_deps_violates_marker_order` | `deps_at_root: false` | 1,329 (470) | 2 ms | **counterexample**, hand-built path of 6 steps |
+| `a_delegate_ignoring_deps_violates_marker_order_and_the_causal_cut` | `deps_at_delegate: false` | 1,404 (498) | 3 ms | **counterexample** (`causal_cut` one step before `marker_order`), 5 steps |
+| `recall_without_draining_strands_an_acknowledged_op_without_any_fault` | `drain_before_execute: false` | 5,478 (1,951) | 10 ms | **counterexample** for `stable_without_faults`, 3 steps; the move then answers `ENOENT` against a view without the acknowledged create |
+| `redelegation_without_a_generation_check_appends_an_invalid_record` | `gen_check: false` | 675,583 (236,967) | 1.5 s | **counterexample** for `log_records_valid`, 19 steps (the search finds a 13-step one) |
+| `acking_under_an_expired_delegation_without_margin_violates_under_drift` | margins 0, clocks stepping ±1 | 17,922 (5,450) | 16 ms | **counterexample** for `recall_safety` and `per_key_linearizable`, 10 steps; margins 3 survive it |
+| `an_uncapped_grant_outlives_the_root_lease_across_a_takeover` | `cap_by_lease: false`, no horizon | 6,560 (2,889) | 12 ms | **counterexample** for `recall_safety`, 8 steps; the cap survives it, so does the horizon |
+| `design_local_writes_are_clean` | two delegates and the root writing and reading locally | 105,710 (28,393) | 0.15 s | clean, exhaustive |
+| `design_forwarded_writes_are_clean` | a forward into a subtree, read-your-writes through the log | 3,428 (1,306) | 6 ms | clean |
+| `design_cross_subtree_move_drains_the_delegation` | a move between `/D1` and `/`, the requester's next write redirected | 43,354 (14,292) | 53 ms | clean; recall drained |
+| `design_unreachable_delegate_is_outwaited_and_replayed` | one message lost | 144,582 (39,829) | 0.26 s | clean; timeout and replay witnessed |
+| `design_delegate_crash_without_backup_replays_by_rid` | one crash, the root reclaims the expired grant | 13,880 (4,539) | 18 ms | clean; replay landed |
+| `design_delegate_crash_with_backup_keeps_every_durable_ack` | the delegate's own write, its backup seals and drains | 115,859 (38,573) | 0.12 s | clean; drain witnessed |
+| `design_root_failover_with_a_live_delegate` | journal on, lease expiry, re-stream, renewal with the new root | 3,830,069 (928,025) | 5.5 s | clean, exhaustive; takeover and re-stream witnessed |
+| `design_nested_move_is_local_to_the_delegate` | `/D1/x → /D1/D3/y` | 261 (120) | <1 ms | clean |
+| `design_marker_order_holds` | markers in another delegate's and the root's directory, readers on the delegate and a tailer | 98,549 (21,660) | 0.14 s | clean; the deps wait witnessed |
+| `design_redelegation_after_a_timed_out_recall` | recall outwaited, `Delegate` to a new node, renewal | 2,400,661 (627,591) | 3.2 s | clean; re-delegation witnessed |
+| `design_is_clean_under_drift_with_the_margin` | margins 3, clocks ±1 stepping, one loss | 4,701,527 (915,405) | 4.9 s | clean, exhaustive |
+| `deep_root_failover_two_delegates` (`#[ignore]`) | two delegates, a cross-subtree move, journal, a crash | 20M (7.7M), depth 10 | 33 s, 15.4 GB | clean in the explored region |
+
+The counterexamples as the paths read: *append without deps* — the
+delegate acknowledges the data write, its client forwards the marker
+to the root with `deps = (gen 1, 1)`, the root executes it at once; a
+reader tails the marker and sees it without the data. *Delegate
+ignores deps* — the same with the marker in a second delegate's
+directory; that delegate's own reader sees its speculation without the
+data, and its replica already breaks the causal cut before any read.
+*Recall without draining* — the delegate's create is acknowledged with
+its stream record in flight; the root ends the generation on receiving
+the move and executes it: the create is retracted with no fault in the
+run, and the move answers `ENOENT` for a name whose create completed
+before the move was invoked. *Re-delegation without a generation
+check* — the recall is outwaited with a stream record in flight, the
+directory re-delegated, the new delegate creates the same name, and the
+stale record is appended: a create on a present name in the log.
+*Expired ack* — with margins 0 the root's clock steps ahead and the
+delegate's behind; the recall is lost, the root outwaits it, executes a
+move into the subtree, and the delegate still honours its grant and
+acknowledges a create of the moved-to name. *Uncapped grant* — the
+delegate's clock steps behind, a new root takes over at the old lease's
+expiry and treats the inherited grant as dead; the delegate still
+acknowledges.
+
+**Rules the model found load-bearing, beyond the plan's list.** Each was
+a violation in a design configuration before the rule; each is now a
+line in the module doc and in the checklist:
+
+1. **The delegate waits for `deps` too, not only the root.** The root's
+   check protects the log's order; the delegate's own readers see its
+   speculation, so it executes a forwarded op only once its replica has
+   the op's `deps` (`deps_at_delegate`). With that rule the root's check
+   on *streamed* records is an assertion (a delegate's deps are in the
+   log before it executes); the root's check is load-bearing only for
+   ops it executes itself.
+2. **A dependency on an ended stream past its cut is void** (M6's rule
+   for a tenure that ended without shipping, applied per stream): a
+   requester lowers its `observed` at the cut when it tails the
+   `Recall`, an executor treats such a dependency as satisfied, and —
+   the part found last — an executor *normalizes* the `deps` it records
+   (`State::normalize_deps`), or a record names a position no replica
+   can ever hold and the causal cut is unsatisfiable forever (the
+   failover configuration found this with a replayed op).
+3. **An acknowledgement from a stream that ended past its cut is
+   tentative wherever it is** (M3b's reply-racing-takeover rule): those
+   in requesters' Layer-A memory at the cut, those still in flight, and
+   those arriving after the requester tailed the `Recall`. Without the
+   in-flight part the redelegation configuration produced two `Ok`
+   creates of one name.
+4. **A generation with a live backup ends through the backup's seal and
+   drain, never by TTL alone** (M9's failover shape), and **once the
+   root has begun a recall or a reclaim it refuses renewals** of that
+   generation. The model first cut a backup-acknowledged record whose
+   stream frame was in flight (the root saw the sealed backup as "no
+   backup" and fell back to TTL), then renewed a generation it had asked
+   the backup to seal and ended it through the drain while the delegate
+   honoured the renewal.
+5. **A deferred acknowledgement re-checks the grant before it leaves**
+   (M9's parked reply): a backup ack that arrives after the grant's
+   `until` acknowledges nothing; the requester retries after its view
+   changes and is deduplicated by the log.
+6. **The root reclaims an expired, unrenewed grant on its own**
+   (`reclaim_expired`): a crashed delegate is otherwise never recalled
+   unless a cross-subtree op happens to need its subtree.
+7. **The initial grant is capped like every renewal**, and **the cap
+   makes every inherited grant dead at a takeover**, so the new root may
+   reclaim at once; without the cap it must wait `deleg_ttl + margin`
+   (`takeover_horizon`), and without either the uncapped counterexample
+   above.
+8. **A recall the root outwaits counts as a fault** for
+   `stable_without_faults`: a reply delayed past the grant's TTL is
+   indistinguishable from a dead delegate, and outwaiting it is the
+   design. Likewise a lease expiring unrenewed (a stalled root).
+9. **`durable_acks_stand` is "never lost", not "never retracted"**: with
+   the backup crashed and a renewal delayed past the TTL the delegate's
+   acknowledged record is retracted and replayed (Layer A), which is
+   M9's guarantee shape (`acked_never_lost`: in the log or held by a
+   live node). What a backup adds is surviving the *requester's* death:
+   the delegate's own acknowledged write reaches the log through the
+   drain after the delegate crashed (the backup configuration).
+
+Two deliberate scope cuts, stated here and in the module doc: forward
+timeouts and same-rid retries (M2's, checked by the authority model and
+the sim; here an unanswered forward waits for the view to change, and a
+lost message is unreachability), and requester shadows (M3a's; here a
+forwarded op's read-your-writes waits for the log, which is M6's
+`AwaitingLog` path). Close-to-open (M8's ReadIndex to the *owner*) is
+designed below but not modeled: the M8 model's argument transfers
+unchanged once "the sequencer" is read as "the key's owner", and the
+budget was spent on the write-side properties.
+
+### Design for phase 2
+
+#### The delegation table
+
+- **Records.** `LogRecord::Delegate { dir, node, gen }` and
+  `LogRecord::Recall { dir, gen }` (`crates/meta/src/record.rs`,
+  appended after `InboxAck`; they touch no key, like `Completed`, so
+  `TouchSet::add` skips them). Generations are minted by the root from
+  a counter it keeps in the replica's `kv` (`KV_NEXT_DELEG_GEN`),
+  persisted before the record is journaled; a successor root continues
+  from the highest generation in the log plus one.
+- **Where the table lives.** Derived state, not stored: `Meta` keeps a
+  `DelegationTable` (`crates/meta/src/delegation.rs`) in memory,
+  rebuilt by folding the applied log's `Delegate`/`Recall` records at
+  open and updated by `apply_segment` (foreign and own) and by the
+  holder's journal writes (the root's own `Delegate`/`Recall` are in its
+  journal before they ship, and the root resolves ownership against log
+  plus journal, exactly as the model's `entries_of`). A crash loses
+  nothing: the fold at open restores it.
+- **Replication.** Through the log only. A delegate *serves* only once
+  its `Delegate` record is in its applied prefix (the model's
+  `tail` installs the delegation from the record, never from a
+  message), which is what makes a delegation that the old root's
+  stranded journal carried a non-event: nobody ever served under it.
+  Every replica applies the same records, so every replica resolves
+  ownership from the same table modulo staleness, and staleness earns a
+  `NotOwner` reply and a retry once the view changes.
+- **A bootstrapped replica** learns the table from the commit it loads
+  plus the log tail it applies: the `Delegate`/`Recall` records must
+  therefore be *in the published tree*. Publish them under a `0x30`
+  subsystem row (`Subsystem::Delegation`, next to `Designation` in
+  `crates/mtree/src/keys.rs`): the live table as of the commit's
+  `applied_seq`, written by the publisher from `Meta`'s table (it is
+  log-prefix state: the root substitutes its journal's unshipped
+  `Delegate`/`Recall` out exactly as M3b substitutes before-images —
+  `publish_basis_at` learns one more key). The bootstrap ingests the
+  row like any other and rebuilds the in-memory table from it.
+- **Single node, no-op.** With no `Delegate` record the table is empty
+  and every resolution is one `is_empty` check; no message, timer or
+  record M11 adds exists. `CONSTELLATION_DELEGATION=off` (and P2P off,
+  M13) keeps it that way in a cluster.
+
+#### Ownership resolution and its cost
+
+`DelegationTable::resolve(ns, keys)` over `keys_of_op(op)` (the
+`TouchSet` `holder.rs` already computes): a dentry key belongs to the
+delegation containing its parent (the ancestor walk), an inode key to
+the delegation containing its primary link's parent (one `0x04` read),
+root-owned otherwise; two owners is cross-subtree. Cost: with an empty
+table nothing; otherwise one parent lookup per ancestor walked per
+distinct directory in the op (the `0x01` read of the parent inode's
+record, which `Meta::path_of` already does for designations) — the
+directory depth at worst, two or three walks for a rename. A per-node
+cache `dir → (owner, table_version)` invalidated by every table change
+turns the common case into one map lookup; the model does not need it,
+and phase 2a should measure before adding it. The walk runs on the
+submitting node (`Core::submit`, before `route`), on the executor
+(re-resolved against *its* view before executing, the `NotOwner` check)
+and on the root before appending a stream record (its keys must be under
+the stream's generation: the ownership check the plan asks for).
+
+#### A delegate inside the M5 core
+
+**Decision: a per-subtree sequencer instance, not a second job slot.**
+The job slot is the root's S3-facing machine (rounds, acquisition,
+handoff, flush); a delegate does no S3 work for its subtree at all. What
+a delegate needs is what the *holder* side of `holder.rs` is — admit,
+execute, journal, reply — under a different authority: a grant instead
+of the lease, a stream instead of a segment ship. So `core` gains
+`delegate.rs` with a `DelegateState` per held delegation (`dir`, `gen`,
+`until`, `stopped`, `next_idx`, `streamed_through`, the parked ops
+waiting for `deps` or for a renewal, the backup-gated acknowledgements,
+the renewal in flight), a table of them (`BTreeMap<Ino, DelegateState>`;
+one per directory, no overlap), and the root's `GenState` table
+(`cursor`, `until`, `RecallPhase`, `seal_asked`, ended) inside the
+lease-holding state. The M2b rule holds as before: a delegate execution
+is a synchronous check-then-write on `Replica` — `LeaseState::
+new_mutation_epoch` gains a sibling `DelegateState::may_execute(now)`
+(`local < until − margin`, not stopped, the op's keys under `dir` per
+the current table) — with no event boundary, and it never enters the
+job slot. The FUSE fast path (`LeaseView::admit`) gets the same
+sibling, so a delegate's own writes run at local speed without a
+round trip to the core, mirrored the way `admit` mirrors the releasing
+flag; the delegate's speculation table is readable by FUSE threads the
+way `ReadDelegations` is (M8), under the same one-mutex ordering
+argument.
+
+Execution on a delegate: `Replica::execute(op, rid)` against the
+replica (authoritative for the subtree), journaled as a transaction
+whose `journal_tx` row carries `origin = Gen(g), idx` (M3b's `Local`
+capture, one more field), acknowledged per the delegate's own policy
+(below), and streamed. The delegate's journal is speculation exactly as
+a holder's is — before-images, rollback on stranding, log-prefix
+publishing by substitution — with one difference: it *retires by the
+log carrying its `(gen, idx)`*, not by its own ship, and it *strands by
+a `Recall` of its generation* (or a `Delegate` of the same directory
+at a higher generation), not by an epoch marker. `Meta::apply_segment`
+learns both: a segment's `rows` envelope (M9) carries the origin of
+every delegate batch, so retirement is a range match on `(gen, idx)`;
+stranding rewinds every transaction of the ended generation past the
+cut (`strand_local_tx` keyed by origin) and queues its op for replay
+by rid, as a deposition does.
+
+#### The append stream and the root append without re-validation
+
+- **Wire.** `PeerMsg::DelegateStream { gen, rid, records, deps }`
+  (declared since M5) becomes a per-generation ordered stream:
+  `DelegateStream { gen, first_idx, txs: Vec<(idx, rid, records,
+  deps)> }`, batched like `BackupAppend`, one in flight per generation
+  (group commit); the root answers `DelegateStreamAck { gen, through }`
+  (a flow-control ack, not a durability one: retirement is by the log).
+  Over a QUIC stream order and loss are the transport's; a re-subscribe
+  after a break restarts from the root's cursor.
+- **Root append.** `Core::on_delegate_stream`: the generation must be
+  live and not ended (the generation check), every key of every record
+  must resolve to that generation on the root's current table (the
+  ownership check), the batch must start at `cursor + 1`, and the
+  batch's `deps` must be satisfied by the root (an assertion under rule
+  1; a violation is logged and the stream refused). Then
+  `Replica::apply_records_journaled(records, rid)` — M9's gate helper —
+  journals the rows with their `Completed{rid}` and origin, no
+  validation, and `cursor = idx`. The rows ship in the root's next
+  segment like its own. A stream record whose rid the log already
+  completed (a re-stream after a root change overlapping what the old
+  root shipped) is skipped by the same dedup the gate uses.
+- **Re-stream.** A delegate keeps its unretired transactions and, on
+  learning of a new root (a marker, a lease read, a redirect), streams
+  them again from the log's cut; the new root's cursor is what the log
+  holds. The model's `Restream` action; `SAW_RESTREAM` is witnessed in
+  the failover configuration.
+- **Never shipped by the delegate.** A delegate ships nothing to S3 and
+  publishes commits only by substitution (its unretired journal is
+  unshipped speculation exactly as a holder's). `route()`'s "unshipped
+  local journal takes the lease path" rule must exempt journal rows
+  whose origin is a live generation this node holds.
+
+#### `deps`: M6 positions subsume it
+
+`Position { seq, pending: Option<JournalPos> }` becomes
+`DelegPosition { seq, pending: Vec<(StreamId, u64)> }`
+(`crates/meta/src/delegation.rs`; `StreamId::Epoch(e)` for a root
+tenure's journal, `StreamId::Gen(g)` for a delegation), sorted, with
+`join`, `dominates` and `normalize`. Every reply carries the executor's
+position (a delegate's: its applied `seq` plus `(Gen(g), idx)`; the
+root's: `seq` plus `(Epoch(e), jseq)` plus every generation's cursor),
+`observed` is the join as today, and a forward carries `observed` as
+`deps`. So `deps` is not new tracking: it is the M6 watermark with one
+more kind of pending stream, and the session wait, `AwaitingLog` and
+`note_covering` all read it through `dominates`. What is new:
+
+- the executor-side wait (rule 1): a delegate parks a forwarded op
+  until `Replica` satisfies its `deps` (`Phase::DepsWait`, retried on
+  every segment applied, bounded by the client deadline as every wait
+  is); the root parks its own ops likewise against its cursors;
+- the void rule (rule 2): `apply_segment` lowers the watermark's
+  pending part at a `Recall` (per generation) and at a marker (per
+  epoch, already M6's), and an executor normalizes the `deps` it
+  records;
+- the segment envelope carries each delegate batch's `(gen, first,
+  last)` next to M9's `rows`, so a replica's `applied_of(stream)` is
+  one map per stream updated on apply, and a delegate's retirement is
+  a range match.
+
+The M5 `base` is unchanged in meaning: the last *shipped* position that
+touched the op's keys, or `None` when the executor's unshipped journal
+already did. A delegate's `shipped_touches` window is fed by the
+segments it applies (its rows are shipped by the root), and its
+"unshipped journal" is its unretired speculation. The requester's
+install rule (shadow only on an applied base) needs no change.
+
+#### Interplay
+
+- **M3/M3b.** A delegate's journal is `SpecKind::Local` with an origin;
+  the stranding trigger is the `Recall` (not the epoch); the replay
+  drain routes by ownership (a replayed op resolves like any other,
+  and a cross-subtree replay goes to the root). Conflict copies are
+  unchanged. The `Recall` record is the delegate's "marker": it tells
+  every replica the cut, so `strand_below_epoch`'s sibling is
+  `strand_generation(gen, cut)`.
+- **M5 `base`/`shipped_touches`.** As above; the root's
+  `note_shipped_touches` covers delegate rows it ships. The gate
+  (`complete_gate`) runs on the root only; a delegate has no gate — its
+  authority starts at the `Delegate` record, whose prefix it has
+  applied by construction.
+- **M6.** Positions as above. Session waits are per node and unchanged;
+  `read_your_writes` on a forwarded op waits for the log (or a shadow),
+  exactly as today. `Refused` outcomes: a delegate's refusal rides its
+  reply as any P2P refusal does; through the inbox (M13) delegation is
+  off.
+- **M7 streams.** The root's log stream is the only stream of the log.
+  A delegate's speculation is not streamed to its readers: they read it
+  from the delegate's replica if they are on it, or from the log after
+  the root ships it. Under M9's pre-S3 streaming the root pushes a
+  delegate's rows to subscribers once *its* backup acknowledged them
+  (they are journal rows on the root by then). A delegate-to-readers
+  stream is a later optimization, not needed for any property.
+- **M8 read delegations.** Strict reads under a delegated directory ask
+  the *owner*: `strict_read` resolves the key's owner and sends
+  `ReadIndex` there; the delegate answers with its position (its
+  applied `seq` plus `(Gen(g), idx)`) and may grant a read delegation
+  capped by its own grant's usable end (`min(read_ttl, until − margin −
+  now)`), recorded in `ReadDelegations` under `(ino, grant)` as today;
+  it recalls them before acknowledging a write it executes (M8's
+  `recall_needed`, run on the delegate). A cross-subtree op the root
+  executes recalls the write delegation first, which — as part of the
+  drain — recalls every read delegation the delegate granted (the
+  delegate's `Recalled` waits for them, or outwaits them by their TTL).
+  M9's delegation horizon applies per grant with the same `M > 2D`.
+  The M8 model's argument is unchanged with "sequencer" read as
+  "owner"; the sim's `close_to_open` checker covers it in phase 2b.
+- **M9 backups.** A delegate chooses its own backup by RTT to *itself*
+  (the same `backup.rs` selection over its links), streams `BackupAppend`
+  with the delegate's origin, and acknowledges only after the write-all
+  ack, refusals included (rule 5 re-checks the grant before the parked
+  reply leaves). Its backup keeps a `backup_tail` keyed by generation
+  and trims by the segments it applies. **Failover of a delegate is by
+  seal**: the root, before ending a generation whose delegate is silent,
+  asks the backup to seal (`PeerMsg::SealDelegation { gen }`); the
+  backup seals (persisted), answers every later append `sealed`, and
+  drains its tail to the root (`DelegateStream` from the root's cursor,
+  marked `drain`), after which the root ends the generation and may
+  re-delegate — to the backup, which holds the subtree's state. The
+  root cuts by TTL only when the delegate has no live backup. No backup
+  is ever selected under P2P off, and with `ack=s3` the delegate's
+  acknowledgement waits for the *root's* segment to land (its rows ride
+  it), which is a `Position`-based durability wait on the requester's
+  side (`durable_covers` on the delegate stream's cursor mapped to the
+  shipped seq). The M9 lease object's `backups` is the root's; a
+  delegate's backup is announced in its `Delegate` record's successor,
+  `DelegateBackup { gen, backups }` (a table row; the root refuses a
+  seal request from a node that is not listed).
+- **M10 epochs.** A continuation epoch holds the *root* lease; with S3
+  unreachable the root cannot ship, and delegates keep streaming to it
+  (the stream is P2P): delegation continues inside an epoch as long as
+  the delegate is a member. A recall inside an epoch is the same P2P
+  exchange. A delegate outside the epoch's component is cut off from
+  the root and its grant expires; the root ends its generation once the
+  epoch holder may act (the grant's expiry is measured on the root's
+  clock, and nothing in an epoch changes it). The claim resolution rule
+  (M10 phase 1) is unaffected: delegations are rows, not authority
+  roots, and the log's `Recall` records are what a resumed root uses.
+- **M13 inbox.** P2P off means no delegation: the root writes no
+  `Delegate`, and every live generation is recalled (by drain if the
+  delegate is reachable on P2P, by TTL otherwise) when P2P goes down.
+  An inbox-submitted op under a delegated directory is executed by the
+  root only after it recalled the delegation (the recall set includes
+  it exactly as for a cross-subtree op), so the "hybrid" of M13 stays
+  correct at the cost of a recall.
+- **M4 held records.** A delegate's journal transaction whose manifest
+  names an unrecoverable chunk is held on the delegate, which streams
+  around it (out of journal order, whole transactions, the M4 rule)
+  and reports it in `status.held`; the root appends what arrives. A
+  recall's drain waits for held transactions as a release does
+  (`keep_lease_while_held`), or the root outwaits the grant and the
+  held transactions become stranded replays, which `repair drop-held`
+  already handles.
+
+#### Placement (ADR-15 generalized)
+
+The root sees every record's origin node (the rid) and every op's
+directory. Per directory it keeps a sliding window (`CONSTELLATION_
+DELEGATION_WINDOW_S`, 30 s) of ops by writer, rolled up to ancestors:
+`ops[dir][node]` and `ops_subtree[dir][node]` (a directory's count
+plus its children's). Metrics: per-node forward rates into each
+subtree (already in `Stats::forwards_ok` per peer once split by
+directory), the root's own rate, and per-delegation ops streamed and
+recalls. Decisions, evaluated every window on the root:
+
+- **Delegate** the *highest* directory `D` such that one node `n`
+  writes `≥ CONSTELLATION_DELEGATION_DOMINANCE` (70 %) of
+  `ops_subtree[D]`, `ops_subtree[D] ≥ CONSTELLATION_DELEGATION_MIN_OPS`
+  (200 per window, i.e. a subtree whose forwards cost more than a
+  recall would), `n ≠ root`, `n` is P2P-reachable and write-eligible,
+  and `D` is not under a live delegation. Walk from each candidate
+  directory towards the root while the dominance condition still holds;
+  delegate the topmost, so one delegation covers a writer's whole
+  working set rather than a swarm of leaves.
+- **Recall** when over `CONSTELLATION_DELEGATION_DWELL_S` (60 s) the
+  delegate's share of the subtree fell below 50 % (hysteresis: enter at
+  70 %, leave at 50 %), or the subtree's rate fell below half the
+  threshold for the dwell, or the delegate is silent (rule 6).
+  Cross-subtree recalls (an op) are not placement decisions and do not
+  reset dwell.
+- **Re-delegate** after a recall only after a cool-down
+  (`CONSTELLATION_DELEGATION_COOLDOWN_S`, 30 s), so a directory does not
+  ping-pong between two writers (Ceph's finding: delegate to the
+  dominant writer, never split a subtree between writers; M12's
+  hash-range split is the answer for shared directories).
+- `constellation delegation list|delegate <path> <node>|recall <path>`
+  for operators and the harness (manual delegation is phase 2a's only
+  placement).
+
+#### Designations as non-stealable delegations
+
+An offline designation (`designations/<hash>.json`) becomes a
+delegation with `gen` minted at `offline <path>` and *no expiry while
+designated*: the root writes `Delegate { dir, node: designee, gen,
+designated: true }` when it sees the designation object (its refresh
+already lists them), never recalls it by TTL or placement, and a
+cross-subtree op touching it is refused with `EXDEV` (a rename out of a
+designated subtree by a non-designee) or executed by the designee
+(forwarded to it, both keys under its delegation) — the plan's "no
+sub-delegation" holds since a designation is one delegation.
+`online <path>` releases the object and the root writes the `Recall`
+(with the designee's drain; an unreachable designee's designation stays
+until it returns, as DESIGN.md §5.2 says). The M3-era P2P delegation
+machinery (`crates/net/src/delegation.rs`, `DelegationGranter`/
+`DelegationHolder`, the flush-ack) is replaced: a non-designee writing
+under a designated path forwards to the designee like any delegated
+write (sub-ms on a LAN, one RTT to the designee — the same cost
+DESIGN.md accepts), and the designee's invariant (it holds every
+committed change under its path) is exactly the delegate's (every write
+under `D` goes through it). `--ro` designations stay a pinning/read
+guarantee and delegate nothing.
+
+#### Root failover with live delegates
+
+Unchanged M9/M5 machinery plus four rules, all in the model: (1) the
+new root reads the table from the log (its tail to head) and continues
+every live generation's stream from the log's cursor; (2) every
+inherited grant is dead by the time the successor can act (the cap:
+`ttl ≤ old expires − M − now`, with the M9 horizon rule for a *fast*
+seal takeover of an unexpired lease — the successor's ack floor already
+waits `backup_takeover_ms + read_delegation_ttl + 2M`, which must be
+raised to cover `deleg_ttl` too, one constant), so the new root may
+renew or recall at once; (3) delegates re-stream their unretired
+transactions on learning the new epoch (`Restream`), and the new root
+deduplicates by rid; (4) the old root's journal — its own ops,
+delegate rows it appended, `Delegate`/`Recall` records — is stranded by
+the marker as any deposed holder's; delegates whose rows were in it
+still hold them and re-stream, requesters of the old root's own ops
+replay by rid, and a stranded `Recall` means the generation is still
+live from the log's view (the delegate resumes under it when renewed by
+the new root, or the new root ends it again). A `Delegate` the old root
+wrote but never shipped was never served under. `status` reports the
+table, per-generation cursors and grant expiries on the root, and the
+grant, `until`, unretired rows and parked ops on a delegate.
+
+#### Harness scenarios (phase 2)
+
+`crates/harness/src/scenarios/m11.rs`:
+
+- `delegated-subtrees` (2a): three LAN nodes, `delegate` each its own
+  directory, each writes 2,000 creates in it; per-node op latency
+  within 1.5× the single-node `meta-bench` figure, aggregate throughput
+  ≥ 2× the M9 baseline, replicas converge, S3 requests per op
+  unchanged (`CountingProxy`).
+- `cross-subtree-rename` (2a): a rename between two delegated
+  directories while both delegates write; the rename lands once, the
+  delegations are recalled and re-delegated (`status.delegation`
+  counters), no conflict copy.
+- `delegate-crash` (2a) with and without a backup: `kill -9` the
+  delegate mid-burst; without a backup the requesters' acknowledged ops
+  land by replay (zero lost, zero duplicates, `replay_landed` in
+  status); with a backup the delegate's own acknowledged creates are in
+  the log within 3 s.
+- `marker-order` (2a): data written in `D1` by node A, a marker in `D2`
+  by A; node C polls the marker and must always see the data with it.
+- `delegate-partition` (2a): the delegate cut from the root on P2P for
+  longer than the grant; the recall is outwaited (`recalls_expired`),
+  the delegate's later writes are refused locally and go to the root,
+  no divergence.
+- `root-failover-with-delegates` (2b): `kill -9` the root with two live
+  delegates streaming; failover by seal (M9) or TTL, delegates
+  re-stream, zero lost acknowledged ops, no duplicates.
+- `automatic-placement` (2b): one node dominates a subtree for a
+  window; a `Delegate` appears without an operator; a second node
+  takes over the writes; the delegation moves after the dwell.
+- `designation-as-delegation` (2b): `offline`/`online` through the new
+  path, with the existing designation scenarios kept green.
+- `single-node-unchanged` and `p2p-off-no-delegation`: no
+  `Delegate` record is ever written; `meta-bench` numbers unchanged.
+
+#### Phase-2 checklist
+
+**2a — minimum viable delegation** (static, manual; correct execution,
+append, recall, crash):
+
+1. `crates/meta`: `LogRecord::{Delegate, Recall}` (+ `TouchSet::add`
+   skip, postcard order), `KV_NEXT_DELEG_GEN`; `Meta` implements
+   `delegation::Namespace` (`parent_of` from the `0x01` record's
+   parent, `primary_parent` from the first `0x04` entry) and keeps the
+   `DelegationTable` (fold at open, update in `apply_segment` and the
+   journal write funnel); `journal_tx` rows and `SpecKind::Local` gain
+   `origin: Option<(gen, idx)>`; `retire_by_origin(gen, range)`,
+   `strand_generation(gen, cut)`, `applied_of(StreamId)` (the
+   per-stream map, persisted next to `KV_APPLIED_SEQ`); `Position` →
+   `DelegPosition` (`session.rs`: `dominates`/`join`/`hint_floor`
+   through it), `session_wait_at` over it; the segment envelope
+   (`crates/authority/src/segment.rs`) carries delegate batches'
+   origins next to `rows`; the `0x30 Delegation` subsystem row and its
+   publish/bootstrap.
+2. `crates/authority`: `core/delegate.rs` (`DelegateState`, the
+   parked ops, `Timer::{DelegRenew, DelegExpiry, RecallWait}`);
+   `GenState` on the root (`cursor`, `until`, `RecallPhase`,
+   `seal_asked`); `PeerMsg::{DelegateStream, DelegateStreamAck,
+   RenewDelegation, DelegationRenewed, Recall, Recalled,
+   SealDelegation}` (the M5 placeholders, revised); `Core::submit` →
+   `route` resolves ownership (local delegate execution, forward to the
+   owner with `deps`, root); `on_mutate_request` on a delegate and on
+   the root (the cross-subtree recall set, `Phase::RecallWait`,
+   `Phase::DepsWait`); `on_delegate_stream` (generation, ownership,
+   cursor and deps checks → `apply_records_journaled`); `end_generation`
+   (the `Recall` record, journaled; the drain's completion or the timer;
+   rule 4's backup path deferred to 2b when there is no backup); renewal
+   capped by the lease (`maybe_grant`'s cap reused) and refused once a
+   recall began; `NotOwner` replies and the requester's retry on a view
+   change; the void rule on `observed` at `Recall`; re-stream on epoch
+   change; `Control::{Delegate, RecallDelegation, DelegationList}` and
+   `status.delegation`; the FUSE fast path's `may_execute` sibling.
+3. `crates/cli`: driver arms for the new messages and controls;
+   `constellation delegation list|delegate|recall`; `CONSTELLATION_
+   DELEGATION` (on/off), `_DELEGATION_TTL_MS` (5000), the margin shared
+   with the lease's; `status` output; the `route()` exemption for
+   live-generation journal rows.
+4. Sim (`crates/authority/tests/sim`): a `delegated` configuration
+   (manual delegations at start, cross-subtree renames in the workload,
+   `CrashDelegate`, `PartitionDelegate`), the log-witnessed
+   per-key check extended with origins, `causal_cut` over every node's
+   `Meta` (every applied row's `deps` dominated by the replica's
+   position), exactly-once unchanged; the marker-order checker
+   (session.rs's snapshot reads).
+5. Harness: `delegated-subtrees`, `cross-subtree-rename`,
+   `delegate-crash` (no backup), `marker-order`, `delegate-partition`,
+   `single-node-unchanged`, `p2p-off-no-delegation`; `meta-bench`
+   before/after; S3 request counts.
+
+**2b — automatic placement, designations, root failover, backups:**
+
+6. Placement: the per-directory window on the root, the dominance walk,
+   dwell/hysteresis/cool-down, the knobs; `automatic-placement`.
+7. Designations: the `designated` flag, `offline`/`online` through
+   `Delegate`/`Recall`, `EXDEV` for cross-subtree ops out of a
+   designation, removal of `crates/net/src/delegation.rs` and the
+   flush-ack path in `authority_driver.rs`; the existing designation
+   harness scenarios re-pointed.
+8. Root failover: the horizon constant covering `deleg_ttl`, the
+   successor's table from the log, re-stream dedup, `status`;
+   `root-failover-with-delegates`; the sim's `CrashHolder` with
+   delegates live.
+9. Delegate backups: RTT-selected by the delegate, `BackupAppend` with
+   origin, the parked acknowledgement's grant re-check,
+   `SealDelegation` → drain → end, re-delegation to the backup,
+   `DelegateBackup` rows, `ack=s3` through the root's segment;
+   `delegate-crash` with a backup; `durable_acks_stand` in the sim.
+10. M8 strict reads to the owner and read delegations granted by a
+    delegate; the sim's `close_to_open` under delegation.
+11. Measure: throughput against the M9 baseline locally and on EC2
+    (M16), latency per node, S3 requests unchanged, recalls per hour
+    under the placement defaults.
+
+### Open questions for the coordinator and the user
+
+- **Dependency latency across subtrees.** Rule 1 means a client that
+  wrote in `D1` (delegate A) and then writes in `D2` (delegate B) pays,
+  on the second write, the time for A's record to reach the log and B
+  to apply it (P2P to the root, the root's ship or M9 pre-S3 stream, B's
+  tail) — a few hundred ms without a root backup, tens of ms with one.
+  Only cross-subtree *sequences by one client* pay it; a client working
+  in one subtree never does. The alternative (B executes at once and
+  its readers wait per record) keeps the delegate's replica non-causal
+  and complicates every read path. Recommend rule 1; confirm.
+- **Delegate acknowledgements under Layer A.** A delegate without a
+  backup acknowledges from its own disk; a recall outwaited (or its
+  crash) strands what it acknowledged past the cut, replayed by rid
+  (Tentative, as a deposed holder's). This is today's L2 per subtree;
+  M9's per-delegate backup closes it where a peer is in budget. The
+  user's constraint "a delegate executes locally with no WAN hop" is
+  met either way. Confirm Layer A is acceptable for delegates as it is
+  for the root.
+- **Where `deps` waits are bounded.** The model's waits are unbounded;
+  the code bounds every wait by the client deadline (`InDoubt`, then a
+  retry by rid). A `deps` wait that outlives the deadline means the
+  dependency's stream is stuck (a root down); the retry after the
+  takeover resolves it. Confirm the deadline is the right bound rather
+  than a degraded execution.
+- **Cross-subtree recalls under M12.** M12's hash-range delegations
+  make every rename across ranges a recall of two generations; if
+  ranges are re-delegated after each, a rename-heavy shared directory
+  would thrash. Phase 2b should measure; the cool-down covers it.
+- **Position size on the wire.** `DelegPosition.pending` is one entry
+  per stream a node observed; with `N` delegations it is bounded by
+  `N + 1` but in practice one or two. A cap (drop the oldest ended
+  streams: they are void) keeps replies small.
+- **A delegate that is also a strict reader of another subtree**
+  needs a `ReadIndex` to *that* owner; nothing new, but the M8 timers
+  and grants become per owner in `ReadDelegations`.
+
+### Commands run (phase 1)
+
+- `cargo test -p constellation-model --release --test delegation --
+  --test-threads=1` (under `/usr/bin/time -v`): 17 passed, 1 ignored,
+  16.1 s, 352 MB peak RSS. `--ignored`: `deep_root_failover_two_
+  delegates` clean in the explored region (20M states, depth 10, 33 s,
+  15.4 GB).
+- `cargo test -p constellation-model --release`: every test binary
+  green (cto 13, delegation 17, holder_side 4, inbox 9, positions 9,
+  today_bugs 7, lib 5).
+- `cargo test -p constellation-meta --lib delegation`: 4 passed.
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+
+### Plan 30 M11 — coordinator decisions on phase 1's open questions
+
+1. **Cross-subtree dependency latency** (a client writing in D1 and then
+   in D2 pays one log round trip on the second write): accepted. It is
+   the price of one log with no two-phase commit. Measure it in 2a's
+   `marker-order` and `delegated-subtrees`.
+2. **Layer A for delegates** (an outwaited recall strands acknowledged
+   ops as Tentative, which are then replayed by rid): accepted. This is
+   the same semantics as a holder under Layer A. Per-delegate M9 backups
+   (2b) close it when a peer is within the RTT budget.
+3. **`deps` waits:** bounded by the client deadline, then retried by rid
+   (after a takeover or recall). No degraded execution: executing
+   without its deps would break the causal cut.
+4. **`DelegPosition.pending` size:** cap it (for example 8 streams). An
+   op whose deps exceed the cap goes to the root, which reads its own
+   log and needs no tracking. Count these as `deps_overflow_to_root`.
+   M12's hash-range recall churn on rename-heavy shared directories:
+   cool-down plus measurement in 2b, as proposed.
+
+## Plan 30 M11 — phase 2a (coder, 2026-09-24): minimum viable manual delegation
+
+Delegated sub-sequencers, one log, on top of M0–M10 (main `0e1017b` +
+the M10 WIP base `8c1522d`, uncommitted). Exactly the phase-1 checklist
+2a: the meta records and table, origins and `DelegPosition` (now
+`Position.streams`), the segment envelope, the `0x30` row, the core's
+`delegate.rs` with the root's `GenState`, routing by ownership, the
+delegate stream with generation/ownership/cursor/deps checks,
+`end_generation`, capped renewals, `NotHolder` plus retry, the void rule,
+re-streaming, controls and status, the FUSE fast-path sibling, the CLI
+(`constellation delegate <dir> --to <node>`, `undelegate`,
+`delegations`) and knobs, the sim's `delegated` configurations with
+per-directory, causal-cut and marker checks, and the harness scenarios.
+
+### What was built
+
+- **Log and table.** `LogRecord::Delegate { dir, node, gen }` and
+  `Recall { dir, gen }`, folded into one `ns` row (`0x30|Delegation|""`)
+  through the dirty-tracked `ns_insert` funnel: commits carry it, publish
+  substitution applies, bootstrap learns it. `DelegationTable` resolves
+  ownership by the ancestor walk (`Root`, `Delegated`, `CrossSubtree`);
+  `Meta` implements `Namespace` through the `0x04` reverse dentries.
+  `Meta::next_delegation_gen` persists the generation counter.
+- **Positions.** `Position { seq, pending, streams }` with
+  `Streams([(gen, idx); 8])` (fixed cap 8, `Copy`); a write's `deps` is
+  the submitting node's `observed` joined with every position its
+  clients were answered with (`SessionState::deps`, the *frontier*: a
+  shadow or hint does not raise `observed`, M6's rule, but the next write
+  of the same client must order after it wherever it executes) and,
+  on the root, its own journal position. Overflow (`None`) sends the op
+  to the root (`deps_overflow_to_root`). The root checks the streams
+  component only (`reaches_streams`: its own journal is the rest); a
+  delegate checks the whole position (`reaches`). `void_stream` on
+  `Recall` makes dependencies on an ended generation satisfied past the
+  cut.
+- **Delegate journal.** `JournalTx` carries the origin `(gen, idx)` and
+  `deps`; `finish_local` assigns the generation's next index from a
+  persisted counter (`deleg_idx:<gen>`); a delegate's refusal is a
+  `Refused` transaction of the stream (`Meta::delegate_refusal`), so a
+  retry by rid anywhere finds the same errno. Segments carry `origins`
+  parallel to `rows` (envelope v3); a delegate retires its own
+  transactions when a segment carries their origins
+  (`journal_seqs_of_origins`, `ack_rows_tx`), strands them on a `Recall`
+  past the cut (`stranded_by_recall`: rolled back, replayed by rid) and
+  never by epoch (`stranded_by` is false for a `gen > 0` `Local` row).
+  The root appends a batch with `apply_delegate_tx` (no re-validation;
+  dedup by rid; a `Refused` batch through `journal_refusal`).
+- **Core (`core/delegate.rs`).** `DelegationState { gens, mine, .. }`:
+  the root's `GenState { cursor, until, recall, ended, .. }` per
+  generation and the delegate's `DelegateState { until, stopped,
+  streamed_through, inflight, parked, .. }`. Routing: an op wholly a
+  live delegate's is executed there (own client: `delegate_try_execute`;
+  a forwarded op: the same, or `NotHolder { holder: delegate }` from
+  the root, and `NotHolder { root }` from a stopped delegate — two
+  redirects allowed). A cross-subtree op parks on the root until every
+  involved generation ends (`deleg_recall_needed`, `park_exec_local` /
+  `park_exec_reply`, released by `deleg_wait_done`); the inbox drain
+  parks the same way. Recall: `DelegRecall` → `DelegRecalled { through }`
+  → the root drains to `through` and ends the generation
+  (`end_generation` journals `Recall`, voids the stream, releases the
+  parks); an unanswered recall or an unrenewed grant ends at
+  `until = granted + ttl + margin` (`deleg_recalls_expired` /
+  `deleg_reclaimed`). Renewals are delegate-initiated at `ttl/2`,
+  measured from the send, capped by the root's usable lease end. The
+  root's lease is sticky while a generation is live (no idle release,
+  no handoff: a successor could not honour the grants). Epochs (M10):
+  no delegation inside an active epoch; the root recalls everything and
+  delegates stop (`deleg_on_epoch`); `Control::Delegate` is refused
+  while an epoch is open. The stream backs off on a failed send
+  (doubling from four ticks to 2 s; the tick retries), and a
+  `DelegateStreamAck { refused }` stops the stream (the log says why).
+- **Driver and FUSE.** `crate::lease::DelegateView` mirrors the core's
+  view; the FUSE fast-path sibling executes a write under a live grant
+  through `Meta::delegate_execute` when the session reaches its `deps`,
+  counts it (`fast_path_executed`) and pokes the core with `Journaled`
+  (not `Nudge`: a round per write races the flush's upload drain). A
+  recall stops fast-path admissions in the driver first and lets the
+  admitted ones journal before the core answers (`DelegateAdmission`,
+  `in_flight`), so nothing lands past the `through` the root drains to.
+  Wire: `Payload::{DelegateStream, DelegateStreamAck, DelegRenew,
+  DelegRenewed, DelegRecall, DelegRecalled}`, `MutateRequest.deps`,
+  `MutateReply.gen` (a shadow or hint from a delegate's reply strands on
+  its `Recall`), `position_streams` on replies. `CONSTELLATION_DELEGATION`
+  (on unless `0|off|false`; requires P2P), `CONSTELLATION_DELEGATION_TTL_MS`
+  (5000). The P2P deny fault (`CONSTELLATION_FAULT_P2P_DENY_FILE`) now
+  covers the delegation sends. `status.delegation` reports the table,
+  the grants held, the root's generations and every counter; the CLI
+  gained `delegate`, `undelegate` and `delegations`.
+- **Sim.** Directory-prefixed names (`d1/f0`), per-directory projected
+  linearizability (`project_dir`), marker writers and watchers, the
+  `deleg_deps_unsatisfied_at_append == 0` assertion, configs
+  `delegated`, `delegated-marker`, `delegated-crash`,
+  `delegated-partition`, `delegated-epoch`, `delegated-faults`,
+  `long-delegated` (ignored). The log dump names parents, refused rids
+  and recalled generations; a refusal check failure names the window's
+  neighbours.
+
+### Bugs found and fixed on the way (all by the sim or the harness)
+
+1. A delegate's reply moved the requester's cached holder (and its log
+   stream subscription) to the delegate; the root's `NotHolder` naming a
+   delegate did the same. Replies carry `gen`; only `gen == 0` caches.
+2. The `ship-pending-journal` fallback acquired the lease for a
+   delegate's unretired stream rows (`journal_has_undelegated` now).
+3. A delegate's refusals were `gen 0` journal rows: never streamed,
+   never retired (quiescence never came). They are stream transactions.
+4. The root's shadows for its own ops executed by a delegate never
+   retired (no segment applies on the root): the ship's completions
+   retire them (`ack_rows_tx` runs `retire_tx` with the shipped
+   `Completed`/`Refused` rids). Retiring them at append time instead
+   broke the publish substitution (seed 60000: the commit at 8 showed a
+   create the log had at 9).
+5. The root's own op forwarded to a delegate awaited the log for a
+   completion the root itself appends: `on_delegate_stream` runs
+   `answer_awaiting_log`.
+6. The marker order: the marker's `deps` lacked the data's position
+   (M6: a shadow does not raise `observed`) — the deps frontier above.
+7. The inbox drain executed a delegated subtree's op on the root
+   without a recall (partition seed 63005: a create in the log, then
+   the delegate's unlink of it refused ENOENT).
+8. `apply_segment_rows` on a delegate (a `Local` row outstanding makes
+   the insert-and-redo path its ordinary one) redid, after the segment,
+   a hint the segment retired and the delegate's own rows the segment
+   carried: a stale name came back (epoch seed 64010). Retired
+   speculation is dropped from the redo, and rolled-back own or streamed
+   rows apply from the segment in log order (never both skipped and
+   redone).
+9. The delegate's stream retried per event when the root was
+   unreachable (440k sends in a 9 s cut): the backoff above.
+10. A sync round's upload drain and a flush's `drain_inode` both read
+    the same pending row and both PUT it — 1.3 chunk PUTs per file on a
+    forwarding node, 1.7 on a delegate (a poke per write). Drains claim
+    their chunks (`UploadRuntime::in_flight`); the second waits for the
+    first's ack. Exactly one chunk PUT per file everywhere now, the
+    single-sequencer baseline included.
+11. A write admitted by the fast path in the window between the core's
+    `stopped` and the driver's mirror landed past the recall's
+    `through`: refused by the root, rolled back on the delegate, its
+    manifest replayed as an empty file (harness `cross-subtree-rename`).
+    The stop-then-drain admission above.
+
+### Results
+
+- Model (`crates/model`, release): 17 delegation tests + 1 ignored, and
+  the rest of the crate: every suite green (`cargo test -p
+  constellation-model --release`).
+- `cargo test -p constellation-authority --release`: 61 core + 3
+  meta_repro + 54 sim (7 ignored), including the six M11 sim tests
+  (`delegated_subtrees_are_linearizable_per_directory` 60000..60040,
+  `delegated_marker_order_holds` 61000..61030,
+  `delegated_delegate_crash_replays_by_rid` 62000..62030,
+  `delegated_partition_outwaits_the_recall` 63000..63030,
+  `delegated_epoch_recalls_every_generation` 64000..64030,
+  `delegated_under_random_faults` 65000..65030,
+  `no_delegation_without_a_delegate_record`).
+- `cargo test -p constellation-meta --release` (70 + the rest),
+  `cargo test -p constellation --release` (198): green.
+  `cargo clippy --workspace --all-targets --release -- -D warnings` and
+  `cargo fmt --all -- --check`: clean.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m11fable`,
+  the release binary): `delegated-subtrees`, `cross-subtree-rename`,
+  `delegate-crash`, `marker-order`, `delegate-partition`,
+  `p2p-off-no-delegation` and M9's `single-node-unchanged` all PASSED
+  (each run several times while the fixes above landed; the last full
+  batch after the `CONSTELLATION_LEASE_WANTED_GRACE_MS` knob is the
+  reference).
+
+### Measurements (`delegated-subtrees`, three nodes on one host behind
+counting proxies, 100 files per measurement, 20 s lease TTL, 3 s grant)
+
+| what | single sequencer | delegated |
+|---|---|---|
+| b's write into `d1` (p50 / p90 / p99) | forwarded: 3.10 / 3.53 / 8.68 ms | local: 2.06 / 2.52 / 4.14 ms |
+| c's write into `d2` | forwarded: 3.16 / 3.61 / 6.58 ms | local: 2.12 / 2.43 / 3.99 ms |
+| a's local write (the root) | 1.62 / 2.21 / 9.11 ms | 2.01 / 2.55 / 8.86 ms |
+| b + c writing concurrently, 200 files | 384 ms, 521 files/s | 264 ms, 758 files/s |
+| `log/` PUTs by the root for the phase | 573 | 532 |
+| `log/` PUTs by b, c | 0, 0 | 0, 0 |
+| chunk PUTs a, b, c | 100, 200, 200 | 100, 200, 200 |
+
+The cross-subtree rename (`d1/del-0 -> d2/moved` on b, both
+generations live and quiet) returned in 2.4 ms: the recalls drained at
+once, the root executed after them and ended both generations. b's
+writes into `d1` after the recall (forwarded again): p50 4.05 ms.
+`delegate-crash`: the first write into the dead delegate's subtree from
+a third node returned 4.5 s after the kill (grant TTL 3 s + margin:
+`reclaimed 1`); the remounted delegate replayed its acknowledged writes
+by rid and every file converged. `delegate-partition`: the cut delegate
+kept writing locally inside its grant (p50 1.95 ms), stopped 3.8 s after
+the cut, the root reclaimed (`reclaimed 1`), the third node's write into
+the subtree took 4.9 ms through the root, the delegate's own write after
+stopping 3.5 ms (the S3 inbox), and after the heal the 20 stranded
+transactions replayed by rid and everything converged.
+`marker-order`: 3169 data/marker pairs by three writers in 12 s,
+3.46 M marker checks by three watchers, 0 violations, `deps_waits`
+686 on b and 705 on c (the marker's delegate waited for the data's
+segment). `single-node-unchanged`: p50 1.95 ms over 200 writes, the
+same requests as before.
+
+### Decisions taken (beyond the coordinator's four)
+
+- The root's `deps` check is streams-only; a delegate's is the whole
+  position (the root's own `pending` is its journal).
+- A delegate's refusal is a stream transaction (a `Refused` row under
+  the origin), appended by the root through `journal_refusal`.
+- Renewals `touch` the lease; the root is sticky while a generation
+  is live; a successor inheriting generations from the log gets
+  `until = now + ttl + margin` and recalls before touching their
+  subtrees.
+- No delegation inside an active epoch; an epoch recalls every
+  generation. Tested by `delegated_epoch_recalls_every_generation`
+  (the model's rules hold: the recalled streams' effects are in the log
+  before the epoch's writes; the rest of the epoch machinery is M10's).
+- The fast path reports its executions separately
+  (`status.delegation.fast_path_executed`).
+
+### What the tester must run
+
+- `cargo test -p constellation-model --release`
+- `cargo test -p constellation-authority --release` (the sim; each
+  `delegated_*` test is 30–40 seeds)
+- `cargo test -p constellation-meta -p constellation --release`
+- `cargo clippy --workspace --all-targets --release -- -D warnings`;
+  `cargo fmt --all -- --check`
+- `cargo build --release -p constellation -p constellation-harness`, then
+  with `CONSTELLATION_BIN=target/release/constellation` and a private
+  `CONSTELLATION_HARNESS_DOCKER_PREFIX`: `target/release/harness run
+  delegated-subtrees cross-subtree-rename delegate-crash marker-order
+  delegate-partition p2p-off-no-delegation single-node-unchanged`
+  (about two minutes; the measurements print per scenario).
+
+### Known gaps (phase 2b)
+
+- Per-delegate backups (a delegate's acknowledged-but-unstreamed writes
+  are as durable as the delegate: replayed by rid on its return, as
+  `delegate-crash` shows; lost with its disk).
+- `DelegateStreamAck { refused }` stops the stream for good (the log
+  ends the generation): a root that has not yet applied the `Delegate`
+  record would refuse an early batch and the delegate would wait for
+  the recall; in practice the delegate installs from the same log the
+  root wrote, so the root knows first.
+- A cross-subtree op ends both generations for good (no automatic
+  re-delegation); the operator delegates again.
+- `long_delegated` (ignored) is the soak.
+
+## Plan 30 M11 — rebase onto b292e5c (coder, 2026-09-24)
+
+The 2a diff applied 3-way onto main `b292e5c` (M10 committed, the
+store-s3 `get_run` fix, the chunk-cache insert race fix with claim-counted
+pending rows, `chunk_durable`, the bounded shutdown drain). Only
+PROGRESS.md had conflicted (both sides kept by the coordinator).
+
+### The upload-claim interaction, checked
+
+b292e5c makes a `pending_upload` row a *count* of claims per `(hash,
+ino)` (`add_pending_upload` / `set_manifest_dirty` add one,
+`cancel_pending_upload` withdraws one, `ack_upload` removes the row: an
+upload satisfies every claim). 2a's per-drain claim
+(`UploadRuntime::in_flight`) is about *drains*, not rows: a drain claims
+the hashes it will upload; a concurrent drain leaves those hashes to it
+and waits for the row to be acked. They compose:
+
+- No double PUT: the second drain never uploads a hash the first holds;
+  a writer's claim added between the first drain's read and its ack is
+  removed with the row by `ack_upload` — the content is in S3 by then
+  (same hash, same bytes), as b292e5c's own design says.
+- Nothing left un-uploaded: a writer's claim added *after* the ack makes
+  a fresh row, which the next drain uploads (a `Probe` HEAD hit when the
+  existence cache knows it). A drain that deferred to a claim which
+  ended with the row still pending (the first drain failed, or found the
+  chunk missing) no longer returns an error: it goes round again and
+  claims the row itself (`upload_dirty_chunks_pass`, at most four
+  passes), so a missing chunk is reported by the pass that holds it
+  (M4's held records, `note_unrecoverable_chunks`), a transient error
+  is retried, and a write-through flush never fails because of another
+  drain's outcome.
+- M4's held/poison logic is untouched: `held.rs` removes the whole row
+  of a missing chunk as before; `ack_rows_tx` (2a's factoring, plus the
+  root's shadow retirement) does not touch pending rows.
+- `chunk_durable` is consulted exactly where b292e5c put it, in the
+  drain that holds the claim; the deferring drain never sees the
+  missing-cache path for a hash another drain holds.
+- 2a's manifest-commit skip (a chunk the cache holds *clean* with no
+  pending row is not re-enrolled) uses the same "in the cache and not
+  pending means durable" rule as the seal path; with claim counting it
+  only saves a claim on a row `ack_upload` would remove anyway.
+
+Other store interleavings: b292e5c touches `misc.rs` (claims),
+`writes.rs` (`set_manifest_dirty` adds a claim inside the manifest
+transaction) and `mod.rs` (docs); 2a's `writes.rs` change is
+`ack_rows_tx`, its `local.rs`/`spec.rs`/`journal.rs` changes are the
+delegation journal and speculation rules — no shared state beyond
+`pending_upload`, covered above. The fast-path sibling in `fusefs.rs`
+executes through `Meta::delegate_execute` (the same `execute_mutate`
+path as the holder's fast path), so the write session's claim
+bookkeeping (`enrolled`, `unseal`) is the same under a grant.
+
+### Two 2a omissions the rebase run caught (fixed here)
+
+- The stop-then-drain fast-path admission (`DelegateAdmission`,
+  `DelegateView::stop` / `in_flight`, the driver holding the recall
+  until every admitted op is journaled) had not been written: the
+  script that carried it aborted on an earlier hunk, and 2a's
+  `cross-subtree-rename` passed on timing. It is in now; the scenario
+  passes twice in a row.
+- The fast-path sibling did not note its stream index in the session
+  (the core's path does it in the `Replica` adapter), so a later write
+  of the same node's client carried `deps` without its own delegate
+  execution: under load (the test suites running beside the harness)
+  `marker-order` showed `c saw d2/b-25-marker without d1/b-25-data`
+  four times. `session.note_stream(gen, idx)` after the execution; the
+  marker's delegate now waits for the data's segment every time
+  (`marker-order`: 0 violations under the same load; ~1300 pairs in
+  12 s instead of ~3300, the cross-subtree dependency latency the
+  coordinator accepted, and `deps_waits` ~320 per delegate).
+
+### Results (release, on b292e5c + 2a)
+
+- `constellation-model` 5 + 7 + 18 + 17 (+ the rest), `fs-core` 35,
+  `store-s3`: green. `constellation-meta` 72 + the rest: green.
+  `constellation` (cli) 204: green. `constellation-authority`: 61 core,
+  3 meta_repro, 54 sim (7 ignored): green. `cargo clippy --workspace
+  --all-targets --release -- -D warnings` and `cargo fmt --all --check`:
+  clean.
+- Harness (prefix `constellation-harness-m11fable`, release binary):
+  `delegated-subtrees` (b local p50 2.3 ms vs forwarded 3.3 ms; 200
+  chunk PUTs per delegate in both phases; log PUTs 604 → 573; the
+  delegates ship nothing), `cross-subtree-rename` ×2 (1.6 ms),
+  `delegate-crash`, `marker-order` (0 violations), `delegate-partition`
+  (stopped 3.8 s after the cut, `reclaimed 1`), `p2p-off-no-delegation`,
+  `single-node-unchanged`: PASSED. `dedup-write-storm` ×2 (34 s each),
+  `inbox-create-storm-p2p-off` ×2 (2156 and 2167 ops/s),
+  `poison-record-isolation`, `unmount-with-held-records`,
+  `writeback-drain`, `big-file-write`: PASSED.
+
+### What the tester must run
+
+As in the 2a section, plus `dedup-write-storm`,
+`inbox-create-storm-p2p-off`, `poison-record-isolation`,
+`unmount-with-held-records`, `writeback-drain` and `big-file-write`
+under the same harness prefix.
+
+## Plan 30 M11 — phase 2a tester gate run
+
+Ran the full tiered gate list against `/home/bra/cvs/constellation-m11`
+(branch `plan30-m11`, rebased onto main `b292e5c`, uncommitted). No code
+changes were needed — every gate passed mechanically. No commits made.
+
+### Gate 1 — fmt, clippy, workspace tests
+
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --release`: every one of 49 test-result blocks
+  `ok`, 0 failures (unit tests, `constellation-authority`'s core/meta_repro/sim
+  suites, `constellation-meta`, `constellation-mtree`, `constellation-net`,
+  `constellation-store-s3`, doctests).
+- `constellation-model`'s `delegation.rs`, isolated under `/usr/bin/time -v`
+  serially (`--test-threads=1`, as phase 1 measured): **17 passed, 1
+  ignored, 14.93 s test time (19.6 s wall including cargo overhead),
+  385 MB peak RSS** — well inside the 60 s / 2 GB per-test model budget
+  (phase 1's own isolated measurement was 16.1 s / 352 MB, so this is
+  consistent).
+
+### Gate 2 — authority crate, long sweeps
+
+- `cargo test -p constellation-authority --release`: 61 core + 3
+  meta_repro + 54 sim (7 ignored) — matches the phase-2a coder's own
+  count exactly, including all six M11 `delegated_*` sim tests.
+- `AUTHORITY_SIM_SEEDS=1000 cargo test -p constellation-authority --release
+  --test sim -- --ignored long_random`: **PASSED** (60.63 s).
+- `AUTHORITY_SIM_SEEDS=500 ... long_strict`: **PASSED** (33.49 s; the
+  `LEASE LOST` lines are the sim's own fault-injection log output, not
+  failures).
+- `AUTHORITY_SIM_SEEDS=300 ... long_backup`: **PASSED** (18.40 s;
+  `failover n=236 p50=1211ms p90=2670ms max=9559ms`).
+- `AUTHORITY_SIM_SEEDS=300 ... long_flex`: **PASSED** (31.59 s).
+- `long_delegated` is `#[test] #[ignore]` (`crates/authority/tests/sim.rs`)
+  — per the gate's own instruction for an ignored sweep, **skipped**.
+
+### Gate 3 — release build
+
+- `cargo build --release -p constellation -p constellation-harness`:
+  clean, 34.0 s incremental (`target/release/constellation`,
+  `target/release/harness` both freshly linked).
+
+### Gate 4 — harness
+
+All runs used `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m11`
+and `CONSTELLATION_BIN=/home/bra/cvs/constellation-m11/target/release/constellation`,
+each wrapped in `timeout`, foreground. No `/tmp/harness-*` directories were
+left behind after any batch (the harness cleans up its own on success).
+
+- **M11** (`delegated-subtrees` ×2, `cross-subtree-rename` ×3,
+  `delegate-crash` ×2, `marker-order` ×2, `delegate-partition` ×2,
+  `p2p-off-no-delegation`, `single-node-unchanged`): **ALL PASSED.**
+  Numbers under "Measurements" below.
+- **Write path / storms** (`dedup-write-storm` ×2, `inbox-create-storm-p2p-off`,
+  `poison-record-isolation`, `unmount-with-held-records`, `writeback-drain`,
+  `big-file-write`, `staging-crash`): **ALL PASSED.**
+- **Regressions** (`forwarded-mutations`, `holder-ships-under-forward-load`,
+  `kill9-remount`, `fresh-node-bootstrap`, `two-clients-shared`,
+  `backup-failover`, `cto-strict`, `session-ryw-after-holder-kill`,
+  `epoch-missing-node`, `node-leave`, `baseline`, `git-workflow`, plus
+  `chaos-ci` and `chaos-soak-4` run separately): 13 of 14 **PASSED** on
+  the first pass; one non-mechanical result below.
+  - `chaos-soak-4` (312.8 s, 4 mounts, bounded write-back + fsync s3):
+    **PASSED**, `exactly_once_log` 2857 outcomes each once. It logged one
+    informational line — `close-to-open not guaranteed (bounded mode):
+    reads that missed another node's completed write violations=1` — which
+    is the scenario's own expected-and-tolerated bounded-mode note (bounded
+    mode explicitly does not guarantee CTO; the scenario only fails on an
+    *unexpected* divergence), not a test failure.
+
+  **Non-mechanical finding: `session-ryw-after-holder-kill` failed once.**
+  First run: `FAILED in 48.6s: C's shadow was never stranded (the scenario
+  did not exercise the window)`. Evidence gathered per the tester's
+  instructions (rerun 3×, then A/B against main), since the scenario is
+  pre-existing (not M11-specific — it exists unchanged on main `b292e5c`)
+  and the failure message itself says the timing window the scenario needs
+  (a shadow outstanding exactly when the holder is killed) was not hit that
+  run:
+  - Rerun 3× on the M11 build: **3/3 PASSED** (12.7 s, 9.0 s, 9.0 s — all
+    much faster than the 48.6 s failing run, consistent with the race
+    window closing before the kill in the passing runs).
+  - A/B: built main `b292e5c` in a scratch detached worktree
+    (`/tmp/claude-1000/.../scratchpad/main-b292e5c`, removed after) and
+    ran the identical scenario there **5× — 5/5 PASSED** (9.6 s, 9.0 s,
+    9.0 s, 9.1 s, 12.8 s).
+  - A second batch of 5 more on the M11 build: **5/5 PASSED** (9.0, 12.8,
+    12.8, 12.8, 12.9 s).
+  - Overall: 1 failure in 9 M11 runs (11%), 0 in 5 main runs — too small a
+    sample to prove the rate is unequal, and the failure mode (a timing
+    window not exercised) is exactly the kind of host-scheduling-sensitive
+    flake this repo's own tester notes have repeatedly documented for
+    holder-kill/shadow-stranding scenarios. Not root-caused further per the
+    tester's role; flagged here as evidence rather than called
+    "pre-existing" outright, since a single A/B pass cannot rule out a
+    lowered probability of hitting the window under M11's added ownership
+    checks. Recommend the coordinator judge whether 1/9 warrants a deeper
+    look or is within this host's known noise band.
+
+Cleanup: the compliance/perf worktree and containers below were removed
+immediately after use in every case; `constellation-floci-1` (an
+independent, long-running container from another worktree) and other
+worktrees were verified untouched throughout.
+
+### Gate 5 — smoke and pjdfstest
+
+- `tests/smoke.sh`: **PASSED.** The "etag CAS (If-Match) ... unavailable/MISSING"
+  lines are the known `object_store` `LocalFileSystem` CAS gap the `doctor`
+  probe correctly reports (same as every prior milestone's tester notes),
+  not an M11 regression.
+- pjdfstest, default (bounded) mount: host port 4566 was held by the
+  independent `constellation-floci-1` container (confirmed via `docker ps`
+  before starting), so used this worktree's own scratchpad's
+  `floci-no-port.yml` override (drops floci's host port publish only;
+  `compliance` reaches it by in-network DNS regardless) under a private
+  project name: `docker compose -p constellation-m11-tester -f
+  docker-compose.yml -f <scratchpad>/floci-no-port.yml --profile test run
+  --rm compliance`. Result: **8798 passed, 0 failed, empty baseline**
+  (`COMPLIANCE TEST PASSED (baseline: 0 known failures)`).
+- Torn down with `down -v` under project name `constellation-m11-tester`
+  immediately after; `constellation-floci-1` and other worktrees'
+  containers were untouched.
+
+### Gate 6 — perf, interleaved against main
+
+Built main `b292e5c` in a scratch detached worktree
+(`/tmp/claude-1000/.../scratchpad/main-b292e5c`, `cargo build --release
+-p constellation -p constellation-harness`, removed after use) and ran
+`harness meta-bench` (filtered per label via `CONSTELLATION_METABENCH_ONLY`)
+interleaved M11-then-main, 3 pairs per config, each under its own
+`CONSTELLATION_HARNESS_DOCKER_PREFIX`:
+
+| config | M11 (3 runs, ops/s agg) | M11 avg | main (3 runs) | main avg | delta |
+|---|---|---|---|---|---|
+| `1node-create-lat0` | 7231, 6334, 6439 | 6668 | 7165, 5413, 6450 | 6343 | **+5.1%** |
+| `1node-write4k-lat0` | 2381, 2488, 2327 | 2399 | 2629, 2650, 2510 | 2596 | **−7.6%** |
+| `3node-p2pon-shared-create-lat0` | 1833, 1960, 2163 | 1985 | 2129, 2035, 2020 | 2061 | **−3.7%** |
+
+All three within the gate's 5–10% band (`write4k` at −7.6% is the widest,
+still inside 10%). With no delegations configured M11's ownership
+resolution is an `is_empty` check, so this is consistent with the "M11
+must be a no-op" requirement — the swings are in both directions and of
+the same magnitude this repo's own prior tester notes measured as pure
+host-scheduling noise between two runs of one identical binary (M2's
+tester notes: 8–23% swings, zero code change). No regression evidence
+beyond that noise floor.
+
+`delegated-subtrees` printed latency/throughput (two runs, same harness
+batch as gate 4, `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m11`):
+
+- Run 1: single-sequencer — b forwarded p50 2.79 ms/p99 13.2 ms, c
+  forwarded p50 2.71 ms/p99 4.5 ms, a local p50 1.55 ms; b+c concurrently
+  200 files in 330 ms (606 files/s). Delegated — b local p50 1.79 ms/p99
+  2.6 ms, c local p50 1.90 ms/p99 4.1 ms, a local p50 1.76 ms; b+c
+  concurrently 200 files in 210 ms (**950 files/s**, vs 606 files/s single
+  sequencer). S3 PUTs: single sequencer 1170 vs delegated 1056; log PUTs
+  613→508, chunk PUTs unchanged [100,200,200] in both phases. Cross-subtree
+  rename 1.61 ms (2 recalls sent/drained/ended). b's forwarded writes after
+  the recall: p50 3.39 ms.
+- Run 2: single-sequencer — b forwarded p50 2.84 ms, c forwarded p50
+  2.78 ms, a local p50 1.58 ms; b+c 200 files in 321 ms (624 files/s).
+  Delegated — b local p50 1.97 ms, c local p50 1.94 ms, a local p50
+  1.60 ms; b+c 200 files in 222 ms (**899 files/s**). S3 PUTs 1149 vs
+  1099; log PUTs 595→548. Cross-subtree rename 1.90 ms. b's writes after
+  recall: p50 3.39 ms.
+
+### Mechanical fixes made
+
+None — every gate passed without needing a code change.
+
+### Summary
+
+| Gate | Result |
+|---|---|
+| 1: fmt/clippy/workspace tests | PASSED |
+| 2: authority crate + long sweeps | PASSED (`long_delegated` skipped, `#[ignore]`) |
+| 3: release build | PASSED |
+| 4: harness (M11 + write-path + regressions + chaos) | PASSED (1 non-mechanical flake, see above) |
+| 5: smoke + pjdfstest | PASSED (8798/8798) |
+| 6: perf vs. main | PASSED (all 3 configs within 5–10%) |

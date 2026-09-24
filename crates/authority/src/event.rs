@@ -13,7 +13,7 @@
 
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 use constellation_fs_core::Ino;
-use constellation_meta::{BackupTx, LogRecord, MutateOp, MutateOutcome, Position, Rid};
+use constellation_meta::{BackupTx, DelegateTx, MutateOp, MutateOutcome, Position, Rid};
 use constellation_store_s3::heartbeat::Promise;
 use constellation_store_s3::inbox::InboxBatch;
 use constellation_store_s3::{Lease, LeaseTag};
@@ -208,6 +208,12 @@ pub enum Control {
     /// `leave --node-id`): it never acquires, promises or acknowledges
     /// again.
     Retire,
+    /// Plan 30 §M11: delegate `dir` to `node` (this node must hold the
+    /// root lease; answered `Text`).
+    Delegate { dir: Ino, node: NodeId },
+    /// Plan 30 §M11: recall the delegation on `dir` (drained, or outwaited
+    /// by its grant's expiry; answered `Text` once the generation ended).
+    Undelegate { dir: Ino },
 }
 
 /// Plan 30 §M10: the lease a continuation epoch carries, exactly as the
@@ -236,6 +242,10 @@ pub enum PeerMsg {
         /// Plan 30 §M2 GC receipt: the requester has seen replies for
         /// every seq of its incarnation up to here.
         acked_through: u64,
+        /// Plan 30 §M11: the position the requester has observed (its
+        /// causal dependencies): an executor runs the op only once its
+        /// replica holds everything it names.
+        deps: Position,
     },
     /// The holder's answer. `base` is the first form of plan 30 §M6's
     /// position on replies: the log position the requester must have
@@ -261,6 +271,10 @@ pub enum PeerMsg {
         outcome: MutateOutcome,
         base: Option<Seq>,
         position: Position,
+        /// Plan 30 §M11: the delegation generation that executed the op
+        /// (0: the root). A shadow or hint installed from the reply
+        /// strands when the log recalls it.
+        gen: u64,
     },
     /// "I want the lease" (`Payload::LeaseRequest`), sent to the holder.
     LeaseRequest {
@@ -397,22 +411,51 @@ pub enum PeerMsg {
         until: Option<i64>,
         epoch_slack: u32,
     },
-    /// M11: a delegate's ordered record stream to the root (`deps` is the
-    /// highest position the delegate's requester observed).
+    /// Plan 30 §M11: a delegate streams its executed transactions of
+    /// generation `gen` to the root, in stream order from index
+    /// `from_idx` (`txs[0].idx`), one batch in flight per generation.
+    /// Each carries the requester's `deps`. Answered by
+    /// [`PeerMsg::DelegateStreamAck`].
     DelegateStream {
+        req: OpId,
         gen: u64,
-        rid: Rid,
-        records: Vec<LogRecord>,
-        deps: Seq,
+        txs: Vec<DelegateTx>,
     },
-    /// M11: the root recalls a delegation; the delegate drains and acks.
-    Recall {
+    /// Plan 30 §M11: the root appended the stream through `through`
+    /// (the delegate re-sends from there), or `refused` the generation
+    /// (unknown, ended, or not this node's): the delegate stops streaming
+    /// it and waits for the log.
+    DelegateStreamAck {
+        req: OpId,
+        gen: u64,
+        through: u64,
+        refused: bool,
+    },
+    /// Plan 30 §M11: a delegate renews its grant on `gen`; the root
+    /// answers with the ttl (0: refused — the generation is ending or is
+    /// not this delegate's). The delegate measures from its send.
+    DelegRenew {
+        req: OpId,
+        gen: u64,
+    },
+    DelegRenewed {
+        req: OpId,
+        gen: u64,
+        ttl_ms: u64,
+    },
+    /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
+    /// delegate stops executing under it and answers with the highest
+    /// stream index it executed (`through`), which the root waits for
+    /// (or outwaits by the grant's expiry).
+    DelegRecall {
         req: OpId,
         dir: Ino,
         gen: u64,
     },
-    Recalled {
+    DelegRecalled {
         req: OpId,
+        gen: u64,
+        through: u64,
     },
 }
 
@@ -426,7 +469,9 @@ impl PeerMsg {
             | PeerMsg::DelegationRecalled { req }
             | PeerMsg::BackupAck { req, .. }
             | PeerMsg::PromiseReply { req, .. }
-            | PeerMsg::Recalled { req } => Some(*req),
+            | PeerMsg::DelegateStreamAck { req, .. }
+            | PeerMsg::DelegRenewed { req, .. }
+            | PeerMsg::DelegRecalled { req, .. } => Some(*req),
             _ => None,
         }
     }
@@ -442,7 +487,9 @@ impl PeerMsg {
             | PeerMsg::DelegationRecall { req, .. }
             | PeerMsg::BackupAppend { req, .. }
             | PeerMsg::PromiseRequest { req, .. }
-            | PeerMsg::Recall { req, .. } => Some(*req),
+            | PeerMsg::DelegateStream { req, .. }
+            | PeerMsg::DelegRenew { req, .. }
+            | PeerMsg::DelegRecall { req, .. } => Some(*req),
             _ => None,
         }
     }

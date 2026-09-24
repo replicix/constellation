@@ -29,6 +29,12 @@ struct SegmentEnvelope {
     /// even when M4/M7 ship transactions out of journal order.
     #[serde(default)]
     rows: Vec<u64>,
+    /// Plan 30 §M11: the delegation origin `(gen, idx)` of each row in
+    /// `rows` (`(0, 0)`: the shipper's own). A delegate retires its own
+    /// transactions by it; every replica keeps its per-generation applied
+    /// index from it.
+    #[serde(default)]
+    origins: Vec<(u64, u64)>,
 }
 
 /// A decoded segment.
@@ -43,6 +49,8 @@ pub struct Segment {
     pub through: u64,
     /// Plan 30 §M9: see `SegmentEnvelope::rows`.
     pub rows: Vec<u64>,
+    /// Plan 30 §M11: see `SegmentEnvelope::origins`.
+    pub origins: Vec<(u64, u64)>,
 }
 
 impl Segment {
@@ -68,6 +76,7 @@ pub fn encode(
     epoch: u64,
     through: u64,
     rows: &[u64],
+    origins: &[(u64, u64)],
     records: &[LogRecord],
 ) -> Result<Vec<u8>, SegmentError> {
     Ok(postcard::to_allocvec(&SegmentEnvelope {
@@ -77,6 +86,7 @@ pub fn encode(
         records: records.to_vec(),
         through,
         rows: rows.to_vec(),
+        origins: origins.to_vec(),
     })?)
 }
 
@@ -91,6 +101,7 @@ pub fn decode(payload: &[u8]) -> Result<Segment, SegmentError> {
         records: env.records,
         through: env.through,
         rows: env.rows,
+        origins: env.origins,
     })
 }
 
@@ -115,7 +126,7 @@ mod tests {
                 },
             },
         ];
-        let bytes = encode(5, 3, 17, &[16, 17], &records).unwrap();
+        let bytes = encode(5, 3, 17, &[16, 17], &[(0, 0), (2, 5)], &records).unwrap();
         // `v=3, node=5, epoch=3` then the record vector, all postcard
         // varints: the prefix the shipper writes for the same envelope.
         assert_eq!(&bytes[..3], &[3, 5, 3]);
@@ -125,8 +136,9 @@ mod tests {
         assert_eq!(seg.records, records);
         assert_eq!(seg.through, 17);
         assert_eq!(seg.rows, vec![16, 17]);
+        assert_eq!(seg.origins, vec![(0, 0), (2, 5)]);
         assert!(matches!(
-            decode(&[1, 0, 0, 0, 0, 0]),
+            decode(&[1, 0, 0, 0, 0, 0, 0]),
             Err(SegmentError::Version(1))
         ));
     }

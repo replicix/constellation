@@ -81,6 +81,8 @@ pub struct CoreView {
     pub claim: EpochClaimView,
     pub epoch_held: bool,
     pub s3_held: Option<(u64, i64)>,
+    /// Plan 30 §M11.
+    pub delegation: constellation_authority::core::DelegView,
 }
 
 /// Plan 30 §M10: a node's continuation-epoch state, as the sim's epoch
@@ -526,6 +528,7 @@ impl Driver {
         view.journal_len = Replica::journal_len(&*self.meta).unwrap_or(0);
         view.speculation = self.meta.speculation_counts().unwrap_or_default();
         view.ack = self.core.ack_view();
+        view.delegation = self.core.deleg_view();
         let now = self.clock.now();
         view.claim = self.core.epoch_claim_view(now);
         view.epoch_held = lease.epoch_held();

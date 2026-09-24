@@ -50,6 +50,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+/// What a forwarded mutation's reply carries back to the bridge: the
+/// outcome, plan 30 §M6's `base`, the position and (§M11) the executing
+/// delegation generation (0: the root).
+pub type MutateReplyParts = (MutateOutcome, Option<u64>, Position, u64);
+
 /// The core's observable state, refreshed after every event, for
 /// `status` and the background tickers (placement, atime, prune).
 #[derive(Debug, Clone, Default)]
@@ -75,6 +80,11 @@ pub struct CoreStatus {
     /// Plan 30 §M9.
     pub ack: constellation_authority::core::AckView,
     pub ack_s3: bool,
+    /// Plan 30 §M11.
+    pub delegation: constellation_authority::core::DelegView,
+    pub delegation_enabled: bool,
+    /// Ops the FUSE fast path executed as the delegate (`DelegateView`).
+    pub delegation_fast_path_executed: u64,
 }
 
 /// Short names for the trace line around every core step.
@@ -165,6 +175,8 @@ pub struct DriverDeps {
     pub e2e: Option<constellation_store_s3::SharedE2eKeys>,
     pub peers: constellation_net::Peers,
     pub view: Arc<LeaseView>,
+    /// Plan 30 §M11: the FUSE fast path's delegate check.
+    pub delegates: Arc<crate::lease::DelegateView>,
     pub epochs: Arc<crate::epoch::EpochManager>,
     pub designations: Arc<crate::designation::DesignationManager>,
     pub placement: Arc<crate::placement::Placement>,
@@ -328,6 +340,10 @@ enum ControlReply {
 }
 
 /// What reaches the driver task from the IO it spawned.
+// An event is moved through the channel once and matched on at once;
+// boxing the large variant would cost an allocation per event for no
+// benefit.
+#[allow(clippy::large_enum_variant)]
 enum Internal {
     Event(Event),
     Control { req: Control, reply: ControlReply },
@@ -352,8 +368,16 @@ pub fn load_config(
     c.ttl_ms = ttl_ms;
     c.expiry_margin_ms = crate::lease::expiry_margin_ms() as u64;
     c.idle_release_ms = crate::lease::idle_release_ms();
-    c.dwell_ms = crate::lease::LEASE_MIN_DWELL_MS;
-    c.wanted_grace_ms = crate::lease::LEASE_WANTED_GRACE_MS;
+    // Overridable for the harness (plan 30 §M11's measurement scenario
+    // keeps the lease on its root through a burst of forwarded writes).
+    c.dwell_ms = env_ms(
+        "CONSTELLATION_LEASE_DWELL_MS",
+        crate::lease::LEASE_MIN_DWELL_MS,
+    );
+    c.wanted_grace_ms = env_ms(
+        "CONSTELLATION_LEASE_WANTED_GRACE_MS",
+        crate::lease::LEASE_WANTED_GRACE_MS,
+    );
     c.handoff_pause_ms = crate::lease::HANDOFF_PAUSE_MS as u64;
     c.forwarding = crate::forward::forwarding_enabled();
     c.p2p = p2p;
@@ -419,6 +443,18 @@ pub fn load_config(
     // seals and takes over, and pre-S3 streaming to followers.
     // (`0` is meaningful here — no peer is ever in budget — so not
     // `env_ms`, which treats 0 as unset.)
+    // Plan 30 §M11: delegation (on unless `CONSTELLATION_DELEGATION` is
+    // 0/off/false; P2P off disables it) and the grant ttl.
+    c.delegation = p2p
+        && !matches!(
+            std::env::var("CONSTELLATION_DELEGATION")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "off" | "false"
+        );
+    c.delegation_ttl_ms = env_ms("CONSTELLATION_DELEGATION_TTL_MS", c.delegation_ttl_ms);
     c.backup_rtt_budget_ms = std::env::var("CONSTELLATION_BACKUP_RTT_BUDGET_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -502,12 +538,17 @@ pub struct Driver {
     sync_tx: mpsc::UnboundedSender<SyncRequest>,
     sync_rx: mpsc::UnboundedReceiver<SyncRequest>,
     replies: HashMap<Rid, oneshot::Sender<ClientReply>>,
-    mutate_replies: HashMap<OpId, oneshot::Sender<(MutateOutcome, Option<u64>, Position)>>,
+    mutate_replies: HashMap<OpId, oneshot::Sender<MutateReplyParts>>,
     handoff_replies: HashMap<OpId, oneshot::Sender<Option<HandoffResult>>>,
     /// Plan 30 §M8: peers' ReadIndex requests and recalls, by the id the
     /// driver minted for the core.
     read_index_replies: HashMap<OpId, oneshot::Sender<ReadIndexOutcome>>,
     recall_replies: HashMap<OpId, oneshot::Sender<()>>,
+    /// Plan 30 §M11: peers' delegate-stream batches, renewals and
+    /// recalls this node is answering.
+    deleg_stream_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
+    deleg_renew_replies: HashMap<OpId, oneshot::Sender<u64>>,
+    deleg_recall_replies: HashMap<OpId, oneshot::Sender<u64>>,
     /// Plan 30 §M10: peers' promise requests this node is answering.
     promise_replies: HashMap<OpId, oneshot::Sender<(Option<i64>, u32)>>,
     /// Plan 30 §M9: the holder's `BackupAppend` requests this node is
@@ -559,6 +600,9 @@ impl Driver {
             handoff_replies: HashMap::new(),
             read_index_replies: HashMap::new(),
             recall_replies: HashMap::new(),
+            deleg_stream_replies: HashMap::new(),
+            deleg_renew_replies: HashMap::new(),
+            deleg_recall_replies: HashMap::new(),
             promise_replies: HashMap::new(),
             backup_replies: HashMap::new(),
             controls: HashMap::new(),
@@ -719,6 +763,10 @@ impl Driver {
         status.read_delegations = cfg.read_delegations;
         status.ack = self.core.ack_view();
         status.ack_s3 = cfg.ack_s3;
+        status.delegation = self.core.deleg_view();
+        status.delegation_enabled = cfg.delegation;
+        status.delegation_fast_path_executed = self.deps.delegates.executed();
+        self.deps.delegates.mirror(&status.delegation);
         drop(status);
         self.deps
             .epochs
@@ -834,13 +882,19 @@ impl Driver {
                 op,
                 rid,
                 acked_through,
+                deps,
                 reply,
             } => {
+                let deps = Position::from_postcard(&deps);
                 let op = match MutateOp::from_postcard(&op) {
                     Ok(op) => op,
                     Err(_) => {
-                        let _ =
-                            reply.send((MutateOutcome::Errno(libc::EINVAL), None, Position::ZERO));
+                        let _ = reply.send((
+                            MutateOutcome::Errno(libc::EINVAL),
+                            None,
+                            Position::ZERO,
+                            0,
+                        ));
                         return None;
                     }
                 };
@@ -860,8 +914,66 @@ impl Driver {
                         rid,
                         op,
                         acked_through,
+                        deps,
                     },
                 }))
+            }
+            SyncRequest::PeerDelegateStream {
+                from,
+                gen,
+                txs,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.deleg_stream_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from,
+                    msg: PeerMsg::DelegateStream { req, gen, txs },
+                }))
+            }
+            SyncRequest::PeerDelegRenew { from, gen, reply } => {
+                let req = self.control_id();
+                self.deleg_renew_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from,
+                    msg: PeerMsg::DelegRenew { req, gen },
+                }))
+            }
+            SyncRequest::PeerDelegRecall {
+                root,
+                dir,
+                gen,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.deleg_recall_replies.insert(req, reply);
+                // The fast path admits nothing more under `gen` from
+                // here; the core answers the recall (with the stream
+                // index it reads then) once every admitted op is
+                // journaled, so nothing lands past the `through` the
+                // root drains to (harness `cross-subtree-rename`: an op
+                // admitted in that window was refused by the root and
+                // rolled back here).
+                let delegates = self.deps.delegates.clone();
+                delegates.stop(gen);
+                let tx = self.int_tx.clone();
+                tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    while delegates.in_flight() > 0 && started.elapsed() < Duration::from_secs(5) {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    let _ = tx.send(Internal::Event(Event::Peer {
+                        from: root,
+                        msg: PeerMsg::DelegRecall { req, dir, gen },
+                    }));
+                });
+                None
+            }
+            SyncRequest::Delegate { dir, node, reply } => {
+                control(Control::Delegate { dir, node }, ControlReply::Text(reply))
+            }
+            SyncRequest::Undelegate { dir, reply } => {
+                control(Control::Undelegate { dir }, ControlReply::Text(reply))
             }
             SyncRequest::Submit {
                 op,
@@ -1332,6 +1444,7 @@ impl Driver {
                 outcome,
                 base,
                 position,
+                gen,
             } => {
                 tracing::trace!(target: "constellation::fwd", req = req.0, "mutate reply sent");
                 if let Some(tx) = self.mutate_replies.remove(&req) {
@@ -1345,10 +1458,10 @@ impl Driver {
                         // for.
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
-                            let _ = tx.send((outcome, base, position));
+                            let _ = tx.send((outcome, base, position, gen));
                         });
                     } else {
-                        let _ = tx.send((outcome, base, position));
+                        let _ = tx.send((outcome, base, position, gen));
                     }
                 }
             }
@@ -1356,6 +1469,160 @@ impl Driver {
                 if let Some(tx) = self.read_index_replies.remove(&req) {
                     let _ = tx.send(outcome);
                 }
+            }
+            PeerMsg::DelegateStreamAck {
+                req,
+                through,
+                refused,
+                ..
+            } => {
+                if let Some(tx) = self.deleg_stream_replies.remove(&req) {
+                    let _ = tx.send((through, refused));
+                }
+            }
+            PeerMsg::DelegRenewed { req, ttl_ms, .. } => {
+                if let Some(tx) = self.deleg_renew_replies.remove(&req) {
+                    let _ = tx.send(ttl_ms);
+                }
+            }
+            PeerMsg::DelegRecalled { req, through, .. } => {
+                if let Some(tx) = self.deleg_recall_replies.remove(&req) {
+                    let _ = tx.send(through);
+                }
+            }
+            PeerMsg::DelegateStream { req, gen, txs } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let from = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().forward_timeout_ms * 4);
+                let bytes = postcard::to_allocvec(&txs).unwrap_or_default();
+                if crate::fault::p2p_denied(to) {
+                    let _ = tx.send(Internal::Event(Event::PeerFailed {
+                        req,
+                        to,
+                        outage: true,
+                    }));
+                    return;
+                }
+                tokio::spawn(async move {
+                    let payload = Payload::DelegateStream {
+                        from,
+                        req_id: req.0,
+                        gen,
+                        txs: bytes,
+                    };
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::DelegateStreamAck {
+                            req_id,
+                            gen,
+                            through,
+                            refused,
+                        })) if req_id == req.0 => {
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::DelegateStreamAck {
+                                    req,
+                                    gen,
+                                    through,
+                                    refused,
+                                },
+                            }));
+                        }
+                        _ => {
+                            let outage = !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
+            }
+            PeerMsg::DelegRenew { req, gen } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let from = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().forward_timeout_ms * 2);
+                if crate::fault::p2p_denied(to) {
+                    let _ = tx.send(Internal::Event(Event::PeerFailed {
+                        req,
+                        to,
+                        outage: true,
+                    }));
+                    return;
+                }
+                tokio::spawn(async move {
+                    let payload = Payload::DelegRenew {
+                        from,
+                        req_id: req.0,
+                        gen,
+                    };
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::DelegRenewed {
+                            req_id,
+                            gen,
+                            ttl_ms,
+                        })) if req_id == req.0 => {
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::DelegRenewed { req, gen, ttl_ms },
+                            }));
+                        }
+                        _ => {
+                            let outage = !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
+            }
+            PeerMsg::DelegRecall { req, dir, gen } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let root = self.node_id;
+                // Unanswered: outwaited by the grant's expiry in the core.
+                let timeout = Duration::from_millis(
+                    self.core.config().delegation_ttl_ms + self.core.config().expiry_margin_ms,
+                );
+                if crate::fault::p2p_denied(to) {
+                    // Dropped: the recall is outwaited like an unanswered one.
+                    return;
+                }
+                tokio::spawn(async move {
+                    let payload = Payload::DelegRecall {
+                        root,
+                        req_id: req.0,
+                        dir,
+                        gen,
+                    };
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::DelegRecalled {
+                            req_id,
+                            gen,
+                            through,
+                        })) if req_id == req.0 => {
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::DelegRecalled { req, gen, through },
+                            }));
+                        }
+                        _ => {
+                            let outage = !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
             }
             PeerMsg::DelegationRecalled { req } => {
                 if let Some(tx) = self.recall_replies.remove(&req) {
@@ -1393,6 +1660,7 @@ impl Driver {
                             position_seq,
                             position_pending,
                             grant,
+                            position_streams,
                         })) if req_id == req.0 => {
                             let outcome = match status {
                                 0 => ReadIndexOutcome::Ok {
@@ -1400,7 +1668,9 @@ impl Driver {
                                         seq: position_seq,
                                         pending: position_pending
                                             .map(|(epoch, jseq)| JournalPos { epoch, jseq }),
-                                    },
+                                        streams: Default::default(),
+                                    }
+                                    .with_streams_wire(&position_streams),
                                     grant: grant.map(|(id, ttl_ms, epoch)| ReadGrantMsg {
                                         id,
                                         ttl_ms,
@@ -1476,10 +1746,12 @@ impl Driver {
                 rid,
                 op,
                 acked_through,
+                deps,
             } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
                 let forward = self.deps.forward.clone();
+                let deps_bytes = deps.to_postcard();
                 let timeout = Duration::from_millis(self.core.config().forward_timeout_ms);
                 let requester = self.node_id;
                 let op_bytes = match op.to_postcard() {
@@ -1492,6 +1764,7 @@ impl Driver {
                                 outcome: MutateOutcome::Errno(libc::EINVAL),
                                 base: None,
                                 position: Position::ZERO,
+                                gen: 0,
                             },
                         }));
                         return;
@@ -1506,6 +1779,7 @@ impl Driver {
                         op: op_bytes,
                         rid: (rid.node, rid.incarnation, rid.seq),
                         acked_through,
+                        deps: deps_bytes,
                     };
                     let started = std::time::Instant::now();
                     let reply =
@@ -1523,12 +1797,16 @@ impl Driver {
                             base,
                             position_seq,
                             position_pending,
+                            position_streams,
+                            gen,
                         })) if req_id == req.0 => {
                             let position = Position {
                                 seq: position_seq,
                                 pending: position_pending
                                     .map(|(epoch, jseq)| JournalPos { epoch, jseq }),
-                            };
+                                streams: Default::default(),
+                            }
+                            .with_streams_wire(&position_streams);
                             let outcome = if outcome.is_empty() {
                                 MutateOutcome::Busy
                             } else {
@@ -1553,6 +1831,7 @@ impl Driver {
                                     outcome,
                                     base,
                                     position,
+                                    gen,
                                 },
                             }));
                         }
@@ -1565,6 +1844,7 @@ impl Driver {
                                     outcome: MutateOutcome::Busy,
                                     base: None,
                                     position: Position::ZERO,
+                                    gen: 0,
                                 },
                             }));
                         }

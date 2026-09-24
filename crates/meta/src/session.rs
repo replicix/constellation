@@ -61,6 +61,99 @@ pub struct JournalPos {
     pub jseq: u64,
 }
 
+/// Plan 30 §M11: how many delegation streams a position can name. An
+/// op whose requester observed more goes to the root, which reads its
+/// own log and needs no tracking (`deps_overflow_to_root`).
+pub const STREAMS_CAP: usize = 8;
+
+/// Plan 30 §M11: the per-stream pending part of a [`Position`] — for
+/// each delegation generation, the highest stream index observed (a
+/// delegate's acknowledgement carries its own; the root's carries every
+/// generation's appended cursor). `(0, 0)` entries are empty; the used
+/// entries are sorted by generation and come first. Fixed-size so a
+/// position stays `Copy` and small on the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Streams(pub [(u64, u64); STREAMS_CAP]);
+
+impl Streams {
+    pub const NONE: Streams = Streams([(0, 0); STREAMS_CAP]);
+
+    pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.0.iter().copied().take_while(|(g, _)| *g != 0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0[0].0 == 0
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.0[STREAMS_CAP - 1].0 != 0
+    }
+
+    pub fn get(&self, gen: u64) -> Option<u64> {
+        self.iter().find(|(g, _)| *g == gen).map(|(_, i)| i)
+    }
+
+    /// Raise generation `gen` to at least `idx`. `false` when the table
+    /// is full and `gen` is not in it (the caller overflows to the root).
+    pub fn raise(&mut self, gen: u64, idx: u64) -> bool {
+        if gen == 0 {
+            return true;
+        }
+        for e in self.0.iter_mut() {
+            if e.0 == gen {
+                e.1 = e.1.max(idx);
+                return true;
+            }
+            if e.0 == 0 {
+                *e = (gen, idx);
+                self.0
+                    .sort_by_key(|(g, _)| if *g == 0 { u64::MAX } else { *g });
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Lower generation `gen` to at most `cut` (M6's void rule: the part
+    /// of an observation a stream never appended is void once the stream
+    /// ended); a cut of 0 drops it.
+    pub fn lower(&mut self, gen: u64, cut: u64) {
+        let mut v: Vec<(u64, u64)> = self.iter().collect();
+        for e in v.iter_mut() {
+            if e.0 == gen {
+                e.1 = e.1.min(cut);
+            }
+        }
+        v.retain(|(_, i)| *i > 0);
+        *self = Streams::NONE;
+        for (k, e) in v.into_iter().enumerate() {
+            self.0[k] = e;
+        }
+    }
+
+    pub fn dominates(&self, other: &Streams) -> bool {
+        other
+            .iter()
+            .all(|(g, i)| self.get(g).is_some_and(|mine| mine >= i))
+    }
+
+    /// The component-wise maximum; `None` when it would not fit.
+    pub fn join(&self, other: &Streams) -> Option<Streams> {
+        let mut s = *self;
+        for (g, i) in other.iter() {
+            if !s.raise(g, i) {
+                return None;
+            }
+        }
+        Some(s)
+    }
+}
+
 /// The state a holder evaluated an op against (see the module doc).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Position {
@@ -68,26 +161,64 @@ pub struct Position {
     pub seq: u64,
     /// Plus its unshipped journal through here, if it had any.
     pub pending: Option<JournalPos>,
+    /// Plan 30 §M11: plus, per delegation stream, what it held ahead of
+    /// the log (see [`Streams`]).
+    #[serde(default)]
+    pub streams: Streams,
 }
 
 impl Position {
     pub const ZERO: Position = Position {
         seq: 0,
         pending: None,
+        streams: Streams::NONE,
     };
 
     /// Whether a replica at `self` has everything `other` names
     /// (component-wise; `None < Some`).
     pub fn dominates(&self, other: &Position) -> bool {
-        self.seq >= other.seq && self.pending >= other.pending
+        self.seq >= other.seq
+            && self.pending >= other.pending
+            && self.streams.dominates(&other.streams)
     }
 
-    /// The component-wise maximum.
+    /// The component-wise maximum. A stream table that would overflow
+    /// keeps `self`'s streams and sets [`Position::overflowed`]'s
+    /// condition (the caller checks `streams.is_full()`); see
+    /// [`Streams::join`].
     pub fn join(&self, other: &Position) -> Position {
         Position {
             seq: self.seq.max(other.seq),
             pending: self.pending.max(other.pending),
+            streams: self.streams.join(&other.streams).unwrap_or(self.streams),
         }
+    }
+
+    /// Whether joining `other` would exceed the stream cap.
+    pub fn overflows_with(&self, other: &Position) -> bool {
+        self.streams.join(&other.streams).is_none()
+    }
+
+    /// The wire form of the streams part (`(gen, idx)` pairs).
+    pub fn streams_wire(&self) -> Vec<(u64, u64)> {
+        self.streams.iter().collect()
+    }
+
+    pub fn with_streams_wire(mut self, wire: &[(u64, u64)]) -> Position {
+        for (g, i) in wire {
+            if !self.streams.raise(*g, *i) {
+                break;
+            }
+        }
+        self
+    }
+
+    pub fn to_postcard(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).unwrap_or_default()
+    }
+
+    pub fn from_postcard(bytes: &[u8]) -> Position {
+        postcard::from_bytes(bytes).unwrap_or(Position::ZERO)
     }
 
     /// The lowest log sequence at which a delete of what this position
@@ -267,6 +398,7 @@ pub struct SessionStats {
     pub fast_acks_in_doubt: u64,
 }
 
+#[derive(Default)]
 struct Inner {
     /// The applied log sequence as last reported (refreshed from the
     /// store on the slow path).
@@ -277,14 +409,46 @@ struct Inner {
     /// Speculation installed with a position, until the applied position
     /// dominates it.
     covering: Vec<(KeySet, Position)>,
+    /// Plan 30 §M11: per delegation generation, the stream index this
+    /// replica holds (applied, executed or appended).
+    streams: std::collections::BTreeMap<u64, u64>,
+    /// Plan 30 §M11: generations whose `Recall` this replica applied:
+    /// any dependency on them is satisfied (void past the cut).
+    voided: std::collections::BTreeSet<u64>,
+    /// Plan 30 §M11: the delegation stream positions this node's
+    /// clients were answered with (a shadow or hint installed from a
+    /// delegate's reply does not raise `observed`, M6's rule, but a
+    /// later write of the same client must order after it wherever it
+    /// executes): the `deps` of the next write carry them.
+    frontier: std::collections::BTreeMap<u64, u64>,
+    /// Plan 30 §M11: the log part of the same (the root's replies, whose
+    /// shadows do not raise `observed` either).
+    frontier_log: Position,
 }
 
 impl Inner {
     fn applied_position(&self) -> Position {
+        let mut streams = Streams::NONE;
+        for (g, i) in &self.streams {
+            if !streams.raise(*g, *i) {
+                break;
+            }
+        }
         Position {
             seq: self.applied_seq,
             pending: self.applied,
+            streams,
         }
+    }
+
+    /// `applied_position().dominates(target)` with the void rule: a
+    /// dependency on an ended generation counts as satisfied.
+    fn reaches(&self, target: &Position) -> bool {
+        self.applied_seq >= target.seq
+            && self.applied >= target.pending
+            && target.streams.iter().all(|(g, i)| {
+                self.voided.contains(&g) || self.streams.get(&g).is_some_and(|m| *m >= i)
+            })
     }
 }
 
@@ -330,12 +494,7 @@ fn budget_default() -> u64 {
 impl Default for SessionState {
     fn default() -> Self {
         SessionState {
-            inner: Mutex::new(Inner {
-                applied_seq: 0,
-                applied: None,
-                observed: Position::ZERO,
-                covering: Vec::new(),
-            }),
+            inner: Mutex::new(Inner::default()),
             cv: Condvar::new(),
             budget_ms: AtomicU64::new(budget_default()),
             warned: AtomicBool::new(false),
@@ -380,6 +539,110 @@ impl SessionState {
 
     pub fn observed(&self) -> Position {
         self.inner.lock().unwrap().observed
+    }
+
+    /// Plan 30 §M11: a delegate answered one of this node's clients at
+    /// stream position `(gen, idx)`: the next write's `deps` carry it
+    /// (see `deps`).
+    pub fn note_frontier(&self, pos: &Position) {
+        let mut g = self.inner.lock().unwrap();
+        if pos.seq > g.frontier_log.seq {
+            g.frontier_log.seq = pos.seq;
+        }
+        if pos.pending > g.frontier_log.pending {
+            g.frontier_log.pending = pos.pending;
+        }
+        for (gen, idx) in pos.streams.iter() {
+            let cur = g.frontier.entry(gen).or_insert(0);
+            if idx > *cur {
+                *cur = idx;
+            }
+        }
+    }
+
+    /// Plan 30 §M11: the position a write submitted here depends on —
+    /// `observed`, with every delegation stream position this node
+    /// holds or was answered with (its own delegate executions, the
+    /// streams it applied, the replies it installed). `None` when they
+    /// do not fit `Streams` (the write goes to the root, which orders
+    /// after everything).
+    pub fn deps(&self) -> Option<Position> {
+        let g = self.inner.lock().unwrap();
+        let mut streams = g.observed.streams;
+        for (gen, idx) in g.frontier.iter().chain(g.streams.iter()) {
+            if g.voided.contains(gen) {
+                continue;
+            }
+            if !streams.raise(*gen, *idx) {
+                return None;
+            }
+        }
+        Some(Position {
+            seq: g.observed.seq.max(g.frontier_log.seq).max(g.applied_seq),
+            pending: g
+                .observed
+                .pending
+                .max(g.frontier_log.pending)
+                .max(g.applied),
+            streams,
+        })
+    }
+
+    /// Plan 30 §M11: this replica holds delegation stream `gen` through
+    /// `idx` — applied from a segment carrying the row's origin, executed
+    /// here as the delegate, or appended here as the root.
+    pub fn note_stream(&self, gen: u64, idx: u64) {
+        if gen == 0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        let cur = g.streams.entry(gen).or_insert(0);
+        if idx > *cur {
+            *cur = idx;
+        }
+        let applied = g.applied_position();
+        g.covering.retain(|(_, p)| !applied.dominates(p));
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Plan 30 §M11: generation `gen` ended at `cut` (a `Recall` record
+    /// applied): every dependency on it past the cut is void. The
+    /// watermark is lowered to the cut; from here on a wait on the stream
+    /// is satisfied at once.
+    pub fn void_stream(&self, gen: u64, cut: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.voided.insert(gen);
+        g.observed.streams.lower(gen, cut);
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Whether this replica has everything `deps` names, with the void
+    /// rule (a dependency on a recalled generation is satisfied).
+    pub fn reaches(&self, deps: &Position) -> bool {
+        self.inner.lock().unwrap().reaches(deps)
+    }
+
+    /// The streams part of [`Self::reaches`] alone: what the *root*
+    /// checks before executing (its own tenure's journal positions are
+    /// its own; an older tenure's are applied or void).
+    pub fn reaches_streams(&self, deps: &Position) -> bool {
+        let g = self.inner.lock().unwrap();
+        deps.streams
+            .iter()
+            .all(|(gen, i)| g.voided.contains(&gen) || g.streams.get(&gen).is_some_and(|m| *m >= i))
+    }
+
+    /// The stream index this replica holds of `gen` (0: none).
+    pub fn stream_applied(&self, gen: u64) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .streams
+            .get(&gen)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn applied(&self) -> Position {
@@ -503,8 +766,7 @@ impl SessionState {
         }
         let g = self.inner.lock().unwrap();
         let target = g.observed.join(floor);
-        let applied = g.applied_position();
-        if applied.dominates(&target) {
+        if g.reaches(&target) {
             return Some(SessionWait::Fast);
         }
         let covered = keys.iter().all(|k| {
@@ -750,23 +1012,27 @@ mod tests {
         let a = Position {
             seq: 5,
             pending: jp(1, 100),
+            streams: Default::default(),
         };
         let b = Position {
             seq: 6,
             pending: jp(2, 3),
+            streams: Default::default(),
         };
         assert!(b.dominates(&a));
         assert!(!a.dominates(&b));
         let c = Position {
             seq: 9,
             pending: None,
+            streams: Default::default(),
         };
         assert!(!c.dominates(&a), "an unshipped row is not in any seq");
         assert_eq!(
             a.join(&c),
             Position {
                 seq: 9,
-                pending: jp(1, 100)
+                pending: jp(1, 100),
+                streams: Default::default()
             }
         );
         assert_eq!(a.hint_floor(), 6);
@@ -785,6 +1051,7 @@ mod tests {
         let obs = Position {
             seq: 3,
             pending: jp(1, 7),
+            streams: Default::default(),
         };
         s.raise_observed(obs);
         // Covered by a shadow at least as new.
@@ -796,6 +1063,7 @@ mod tests {
             Position {
                 seq: 3,
                 pending: jp(1, 8),
+                streams: Default::default(),
             },
         );
         assert_eq!(
@@ -838,6 +1106,7 @@ mod tests {
         s.raise_observed(Position {
             seq: 2,
             pending: None,
+            streams: Default::default(),
         });
         let s2 = s.clone();
         let t = std::thread::spawn(move || {

@@ -97,6 +97,50 @@ impl Drop for PendingLocalOpGuard {
     }
 }
 
+thread_local! {
+    static PENDING_DELEGATE: std::cell::Cell<Option<PendingDelegate>> = const { std::cell::Cell::new(None) };
+}
+
+/// Plan 30 §M11: the delegation generation the transaction being
+/// journaled belongs to — executed here as the delegate (`idx: None`:
+/// the next index of the generation is assigned in `finish_local`) or
+/// appended here as the root (`idx: Some(..)`: the delegate's index) —
+/// and the `deps` it carries. Same thread-local scoping as
+/// [`PendingLocalOp`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingDelegate {
+    pub gen: u64,
+    pub idx: Option<u64>,
+    pub deps: crate::session::Position,
+}
+
+impl PendingDelegate {
+    pub(crate) fn set(
+        gen: u64,
+        idx: Option<u64>,
+        deps: crate::session::Position,
+    ) -> PendingDelegateGuard {
+        PENDING_DELEGATE.with(|c| c.set(Some(PendingDelegate { gen, idx, deps })));
+        PendingDelegateGuard
+    }
+
+    pub(crate) fn peek() -> Option<PendingDelegate> {
+        PENDING_DELEGATE.with(|c| c.get())
+    }
+
+    pub(crate) fn take() -> Option<PendingDelegate> {
+        PENDING_DELEGATE.with(|c| c.take())
+    }
+}
+
+pub(crate) struct PendingDelegateGuard;
+
+impl Drop for PendingDelegateGuard {
+    fn drop(&mut self) {
+        PENDING_DELEGATE.with(|c| c.set(None));
+    }
+}
+
 /// The rid `mutate::execute` is completing, visible only to the thread
 /// running it.
 ///

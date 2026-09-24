@@ -238,10 +238,13 @@ pub enum SyncRequest {
         /// Plan 30 §M2 GC: prune `recent` outcomes for `requester`'s
         /// current incarnation up to this seq.
         acked_through: u64,
+        /// Plan 30 §M11: postcard of the requester's observed position.
+        deps: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<(
             constellation_meta::MutateOutcome,
             Option<u64>,
             constellation_meta::Position,
+            u64,
         )>,
     },
     /// This node's own mutation, when the FUSE fast path could not
@@ -277,6 +280,40 @@ pub enum SyncRequest {
     Recall {
         inos: Vec<Ino>,
         reply: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Plan 30 §M11: a delegate's stream batch (this node is the root);
+    /// answered `(through, refused)`.
+    PeerDelegateStream {
+        from: u64,
+        gen: u64,
+        txs: Vec<constellation_meta::DelegateTx>,
+        reply: tokio::sync::oneshot::Sender<(u64, bool)>,
+    },
+    /// Plan 30 §M11: a delegate's renewal; answered with the ttl (0:
+    /// refused).
+    PeerDelegRenew {
+        from: u64,
+        gen: u64,
+        reply: tokio::sync::oneshot::Sender<u64>,
+    },
+    /// Plan 30 §M11: the root recalls a generation this node holds;
+    /// answered with the highest stream index executed here.
+    PeerDelegRecall {
+        root: u64,
+        dir: Ino,
+        gen: u64,
+        reply: tokio::sync::oneshot::Sender<u64>,
+    },
+    /// Plan 30 §M11: operator controls (`constellation delegate` /
+    /// `undelegate`).
+    Delegate {
+        dir: Ino,
+        node: u64,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    Undelegate {
+        dir: Ino,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// Plan 30 §M8: a peer's ReadIndex, to answer as the sequencer.
     PeerReadIndex {
@@ -374,6 +411,9 @@ pub struct SyncHandle {
     /// Lock-free lease view (the core's state, mirrored by the driver);
     /// the write gate reads it per mutating op.
     pub lease: Arc<crate::lease::LeaseView>,
+    /// Plan 30 §M11: the delegations this node holds (the fast path's
+    /// sibling check).
+    pub delegates: Arc<crate::lease::DelegateView>,
     /// Bound on how long a mutation waits for a foreign holder.
     pub acquire_deadline: Duration,
     /// Offline designation (DESIGN.md §5.2). `None` when no designations
@@ -1571,6 +1611,48 @@ impl ConstellationFs {
                 }
             }
         }
+        // Plan 30 §M11: the delegate's own writes run here at local speed
+        // (the sequencer's fast path, under a grant instead of the
+        // lease); the core streams them from the journal. A write whose
+        // `deps` this replica lacks, or whose grant is not honoured, goes
+        // through the core, which parks it.
+        if let Some(admission) = h
+            .delegates
+            .admit_for(&self.meta, &constellation_meta::TouchSet::from_op(op))
+        {
+            let gen = admission.gen;
+            let session = self.meta.session();
+            // The op's `deps` (`observed` plus every position this
+            // node's clients were answered with); `None` (the streams
+            // overflow) goes through the core, to the root.
+            if let Some(deps) = session.deps().filter(|d| session.reaches(d)) {
+                let result = self.meta.delegate_execute(op, Some(rid), gen, deps);
+                // Journaled (or refused): the admission ends here, before
+                // the core can answer a recall with a `through` this op
+                // would be past.
+                drop(admission);
+                // `Journaled`, not `Nudge`: the core streams the row on
+                // any event (`deleg_after_event`); a nudge would start a
+                // sync round per write, whose upload drain races the
+                // flush's own (each chunk uploaded twice).
+                let _ = h.tx.send(SyncRequest::Journaled);
+                return match result {
+                    Ok((records, idx)) => {
+                        // This replica holds the stream through `idx`
+                        // (what the core's path notes in its adapter):
+                        // the next write of this node's clients carries
+                        // it in its `deps`, so a marker written after
+                        // this data into another subtree waits for it
+                        // there (harness `marker-order` under load).
+                        session.note_stream(gen, idx);
+                        h.delegates.note_executed();
+                        self.recall_after_local_write(h, &records);
+                        Ok(())
+                    }
+                    Err(e) => Err(mutate_fail(e)),
+                };
+            }
+        }
         // Plan 30 §M3b: the fast path admits the op (counted in flight)
         // atomically with respect to a release's final flush + CAS — see
         // `lease.rs`'s module doc, "The releasing flag".
@@ -2314,6 +2396,22 @@ impl ConstellationFs {
                 // the same chunk the very first attempt (if any)
                 // already drained.
                 for hash in dirty_hashes {
+                    // Sealed into the cache and no longer pending: a
+                    // sync round's drain already uploaded it (the round
+                    // races this flush); enrolling it again would upload
+                    // it twice (plan 30 §M11's `delegated-subtrees`
+                    // measured 1.7 chunk PUTs per file from the rounds a
+                    // delegate's writes trigger).
+                    let known_durable = matches!(
+                        self.cache.state_of(hash),
+                        Some(ChunkState::Clean) | Some(ChunkState::Pinned)
+                    ) && !self
+                        .meta
+                        .upload_pending_for_hash(hash)
+                        .map_err(mutate_fail)?;
+                    if known_durable {
+                        continue;
+                    }
                     self.meta
                         .add_pending_upload(hash, ino)
                         .map_err(mutate_fail)?;

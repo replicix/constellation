@@ -108,7 +108,7 @@ fn fresh(prefix: u64) -> Meta {
 
 fn apply(meta: &Meta, segments: &[Segment], seq: u64) {
     let (_, _, _, records) = &segments[seq as usize - 1];
-    Replica::apply_segment(meta, seq, 1, 0, &[], records).unwrap();
+    Replica::apply_segment(meta, seq, 1, 0, &[], &[], records).unwrap();
 }
 
 fn listing_at(segments: &[Segment], seq: u64) -> Vec<String> {
@@ -129,7 +129,7 @@ fn shadows_installed_on_the_holders_base_converge() {
     for seq in 1..=19u64 {
         let (_, rid, op, records) = &segments[seq as usize - 1];
         if rid.node == 2 {
-            assert!(Replica::install_shadow(&requester, *rid, 1, op, records).unwrap());
+            assert!(Replica::install_shadow(&requester, *rid, 1, 0, op, records).unwrap());
         }
         apply(&requester, &segments, seq);
         assert_eq!(
@@ -154,7 +154,7 @@ fn a_shadow_survives_an_unrelated_rename_tailed_under_it() {
     }
     let (_, rid18, op18, records18) = &segments[17];
     assert!(matches!(op18, MutateOp::Unlink { .. }));
-    assert!(Replica::install_shadow(&requester, *rid18, 1, op18, records18).unwrap());
+    assert!(Replica::install_shadow(&requester, *rid18, 1, 0, op18, records18).unwrap());
     apply(&requester, &segments, 17);
     let mut expected = listing_at(&segments, 17);
     expected.retain(|e| !e.starts_with("f0="));
@@ -187,7 +187,7 @@ fn a_hint_installed_on_a_stale_base_diverges() {
         }
         Replica::entry_as_record(&m, ROOT_INO, "f1").unwrap()
     };
-    Replica::install_hint(&requester, &[f1_after_15], 16, 1).unwrap();
+    Replica::install_hint(&requester, &[f1_after_15], 16, 1, 0).unwrap();
     for seq in 14..=19 {
         apply(&requester, &segments, seq);
     }

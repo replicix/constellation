@@ -273,6 +273,10 @@ pub enum Payload {
         /// requester's incarnation up to this seq — a request carries
         /// its own future GC receipt.
         acked_through: u64,
+        /// Plan 30 §M11: postcard bytes of the requester's observed
+        /// `constellation_meta::Position` (its causal dependencies).
+        #[serde(default)]
+        deps: Vec<u8>,
     },
     /// Holder's answer: postcard-encoded `MutateOutcome`.
     MutateReply {
@@ -295,6 +299,12 @@ pub enum Payload {
         position_seq: u64,
         #[serde(default)]
         position_pending: Option<(u64, u64)>,
+        /// Plan 30 §M11: the position's per-stream part (`(gen, idx)`).
+        #[serde(default)]
+        position_streams: Vec<(u64, u64)>,
+        /// Plan 30 §M11: the generation that executed the op (0: root).
+        #[serde(default)]
+        gen: u64,
     },
     /// Plan 30 §M8: a `cto=strict` reader asks the sequencer where the
     /// state of `ino` is (its record; with `dir`, its entries; with
@@ -317,6 +327,49 @@ pub enum Payload {
         position_seq: u64,
         position_pending: Option<(u64, u64)>,
         grant: Option<(u64, u64, u64)>,
+        #[serde(default)]
+        position_streams: Vec<(u64, u64)>,
+    },
+    /// Plan 30 §M11: a delegate streams its transactions of generation
+    /// `gen` to the root (`txs`: postcard of
+    /// `Vec<constellation_meta::DelegateTx>`). Answered by
+    /// [`Payload::DelegateStreamAck`].
+    DelegateStream {
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        txs: Vec<u8>,
+    },
+    DelegateStreamAck {
+        req_id: u64,
+        gen: u64,
+        through: u64,
+        refused: bool,
+    },
+    /// Plan 30 §M11: a delegate renews its grant on `gen`; `ttl_ms` 0
+    /// refuses.
+    DelegRenew {
+        from: u64,
+        req_id: u64,
+        gen: u64,
+    },
+    DelegRenewed {
+        req_id: u64,
+        gen: u64,
+        ttl_ms: u64,
+    },
+    /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
+    /// delegate stops and answers the highest stream index it executed.
+    DelegRecall {
+        root: u64,
+        req_id: u64,
+        dir: u64,
+        gen: u64,
+    },
+    DelegRecalled {
+        req_id: u64,
+        gen: u64,
+        through: u64,
     },
     /// Plan 30 §M8: the sequencer recalls read delegation `grant` on
     /// `ino`; the delegate stops honouring it, then answers

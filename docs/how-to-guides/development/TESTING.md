@@ -1047,6 +1047,61 @@ relay of its own so requests can be attributed per role):
     backup out or the sealed backup has taken over — never two holders
     — and after the heal every file is everywhere with no conflict and
     exactly one holder.
+- **Plan 30 M11 scenarios** (`crates/harness/src/scenarios/m11.rs`):
+  delegated sub-sequencers, one log. Every mount has a 20 s lease TTL,
+  idle release off, no backup peer (`CONSTELLATION_BACKUP_RTT_BUDGET_MS=0`),
+  a 3 s grant TTL (`CONSTELLATION_DELEGATION_TTL_MS=3000`) and a handoff
+  grace of 10 minutes (`CONSTELLATION_LEASE_WANTED_GRACE_MS=600000`: the
+  root keeps its lease through the bursts of forwarded writes the
+  measurement compares against); each
+  scenario prints the nodes' `status.delegation` block (the table, the
+  grants held, the root's generations and every M11 counter):
+  - `delegated-subtrees`: three nodes behind counting proxies; `d1` is
+    delegated to `b` and `d2` to `c` (`delegate` on the root's control
+    socket). Each node's writes into its subtree are executed by the
+    delegate and appended by the root; everything converges on every
+    node; the root never appends a stream batch whose deps it lacks
+    (`deps_unsatisfied_at_append` is 0); same-subtree writes recall
+    nothing; the delegates make no S3 request for their writes; the
+    root's segment PUTs do not grow. Prints each node's write latency on
+    its delegated subtree against the same node's forwarded writes
+    (before the delegation) and the root's local ones, the aggregate
+    throughput of both nodes writing concurrently with and without
+    delegation, the cross-subtree rename's latency (it recalls both
+    generations) and the S3 requests per node in each phase.
+  - `cross-subtree-rename`: both delegates write in the background while
+    `c` renames `d1/x-7` into `d2`: the root recalls and drains both
+    generations, executes the rename after their streams and ends them;
+    the file is exactly where the rename put it on every node, nothing
+    is lost or duplicated, `d1` is delegated again (a new generation)
+    and `undelegate` recalls it.
+  - `delegate-crash`: the delegate of `d1` is killed right after an
+    acknowledged write, without a backup; the root reclaims the
+    unrenewable grant within the grant TTL (`reclaimed` or
+    `recalls_expired`), a third node's write into `d1` completes through
+    the root, the dead node remounts with its journal (its acknowledged
+    writes replay by rid), everything converges and `d1` is delegated
+    again at a higher generation.
+  - `marker-order`: three writers (the root and both delegates) each
+    write data into `d1` (delegated to `b`) then a marker into `d2`
+    (delegated to `c`), for 12 s; three watchers list `d2` continuously
+    and read the data of every marker they see: no node ever shows a
+    marker without its data (the marker's `deps` carry the data's stream
+    position; `c` waits for the root's segment carrying it).
+  - `delegate-partition`: the delegate of `d1` loses its P2P link to the
+    root (`CONSTELLATION_FAULT_P2P_DENY_FILE`, both ways; S3 and the
+    third node stay): its writes inside the grant stay local, it stops on
+    its own clock when it cannot renew (within two grant TTLs), the root
+    outwaits its recall or reclaims the grant, the third node's and the
+    delegate's later writes go through the root (the delegate's over the
+    S3 inbox); after the heal every file is everywhere with no conflict,
+    the root still holds, and `d1` is delegated again.
+  - `p2p-off-no-delegation`: `CONSTELLATION_P2P=off` on two nodes:
+    `status.delegation.enabled` is false, `delegate` is refused, nothing
+    is ever delegated, appended or executed by a delegate, and both
+    nodes' writes complete as before.
+  - `single-node-unchanged` (M9's) still passes: delegation is on by
+    default but a single node never delegates.
 - **`sticky-lease-handoff-over-s3`** runs with `CONSTELLATION_INBOX=off`
   since M5 phase 2: it tests the S3-only cooperative handoff, and with
   M13's inbox on a lone blocked write is answered through the holder's

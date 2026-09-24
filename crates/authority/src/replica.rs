@@ -14,10 +14,11 @@
 
 use crate::ids::{Epoch, Seq};
 use constellation_fs_core::Ino;
+use constellation_meta::delegation::{DelegationTable, Ownership};
 use constellation_meta::{
-    execute_mutate, BackupRole, BackupTx, CompletedOutcome, InboxAck, JournalBatch, JournalPos,
-    KeySet, LogRecord, Meta, MetaError, MetaStore, MutateOp, Position, ReadDelegations, Rid,
-    Stranded, StrandedOp, TouchSet,
+    execute_mutate, BackupRole, BackupTx, CompletedOutcome, DelegateTx, InboxAck, JournalBatch,
+    JournalPos, KeySet, LogRecord, Meta, MetaError, MetaStore, MutateOp, Position, ReadDelegations,
+    Rid, Stranded, StrandedOp, TouchSet,
 };
 
 /// What applying a foreign segment did (`Meta::apply_segment`).
@@ -91,6 +92,7 @@ pub trait Replica {
         &self,
         rid: Rid,
         epoch: Epoch,
+        gen: u64,
         op: &MutateOp,
         records: &[LogRecord],
     ) -> Result<bool, MetaError>;
@@ -99,6 +101,7 @@ pub trait Replica {
         records: &[LogRecord],
         floor: Seq,
         epoch: Epoch,
+        gen: u64,
     ) -> Result<(), MetaError>;
     fn has_outstanding_speculation(&self) -> bool;
     /// Roll back every speculative entry accepted below `epoch` and
@@ -145,11 +148,83 @@ pub trait Replica {
         epoch: Epoch,
         through: u64,
         rows: &[u64],
+        origins: &[(u64, u64)],
         records: &[LogRecord],
     ) -> Result<Applied, MetaError>;
     /// A fenced segment (older epoch): advance the position past it
     /// without applying.
     fn skip_segment(&self, seq: Seq) -> Result<(), MetaError>;
+
+    // ---- plan 30 §M11: delegated sub-sequencers ----
+
+    /// The live delegation table as this replica knows it.
+    fn delegation_table(&self) -> DelegationTable;
+    /// Who executes an op touching `keys` (an ancestor walk on this
+    /// replica's table; `Root` at once when the table is empty).
+    fn resolve_ownership(&self, keys: &TouchSet) -> Ownership;
+    /// Execute `op` here as the delegate of `gen` (journaled with the
+    /// generation's next stream index and `deps`).
+    fn delegate_execute(
+        &self,
+        op: &MutateOp,
+        rid: Option<Rid>,
+        gen: u64,
+        deps: Position,
+    ) -> Result<(Vec<LogRecord>, u64), MetaError>;
+    /// The root appends a delegate's transaction with its origin
+    /// (`Ok(false)`: the rid was completed already).
+    fn apply_delegate_tx(
+        &self,
+        records: &[LogRecord],
+        rid: Option<Rid>,
+        gen: u64,
+        idx: u64,
+        deps: Position,
+    ) -> Result<bool, MetaError>;
+    /// This node's unretired transactions of stream `gen` from `from_idx`.
+    fn delegate_txs_from(&self, gen: u64, from_idx: u64, max_rows: usize) -> Vec<DelegateTx>;
+    /// Plan 30 §M11: journal a delegate's refusal as the next transaction
+    /// of stream `gen`.
+    fn delegate_refusal(
+        &self,
+        rid: Rid,
+        errno: i32,
+        gen: u64,
+        deps: Position,
+    ) -> Result<(), MetaError>;
+    /// The delegation origin of each journal row (for the segment).
+    fn journal_origins(&self, seqs: &[u64]) -> Vec<(u64, u64)>;
+    /// Whether the unshipped journal has rows that are not delegate
+    /// stream rows.
+    fn journal_has_undelegated(&self) -> bool;
+    /// The next delegation generation (at least `at_least`).
+    fn next_delegation_gen(&self, at_least: u64) -> Result<u64, MetaError>;
+    /// The replica's applied position, streams included.
+    fn applied_position(&self) -> Position;
+    /// A replica-level "has everything `deps` names" with the void rule.
+    fn reaches(&self, deps: &Position) -> bool;
+    /// The streams part of [`Self::reaches`] (the root's check).
+    fn reaches_streams(&self, deps: &Position) -> bool;
+    /// This replica holds stream `gen` through `idx` (executed here or
+    /// appended here).
+    fn note_stream(&self, gen: u64, idx: u64);
+    /// The stream index this replica holds of `gen`.
+    fn stream_applied(&self, gen: u64) -> u64;
+    /// The highest stream index this node assigned as the delegate of
+    /// `gen`.
+    fn delegate_idx(&self, gen: u64) -> u64;
+    /// Generation `gen` ended at `cut` (the void rule).
+    fn void_stream(&self, gen: u64, cut: u64);
+    /// The session watermark (what this node's client has observed).
+    fn observed(&self) -> Position;
+    /// Plan 30 §M11: the `deps` of a write submitted here (`observed`
+    /// plus every delegation stream position this node holds or was
+    /// answered with); `None` when they overflow `Streams`.
+    fn deps(&self) -> Option<Position>;
+    /// Plan 30 §M11: a sequencer answered this node's client at `pos`.
+    fn note_frontier(&self, pos: &Position);
+    /// The namespace, for ownership walks.
+    fn namespace(&self) -> &dyn constellation_meta::delegation::Namespace;
     /// Whether the metadata tree has dirty keys to publish.
     fn has_dirty(&self) -> bool;
 
@@ -358,10 +433,11 @@ impl Replica for Meta {
         &self,
         rid: Rid,
         epoch: Epoch,
+        gen: u64,
         op: &MutateOp,
         records: &[LogRecord],
     ) -> Result<bool, MetaError> {
-        Meta::install_shadow(self, rid, epoch, op, records)
+        Meta::install_shadow_from(self, rid, epoch, gen, op, records)
     }
 
     fn install_hint(
@@ -369,8 +445,9 @@ impl Replica for Meta {
         records: &[LogRecord],
         floor: Seq,
         epoch: Epoch,
+        gen: u64,
     ) -> Result<(), MetaError> {
-        Meta::install_hint(self, records, floor, epoch)
+        Meta::install_hint_from(self, records, floor, epoch, gen)
     }
 
     fn has_outstanding_speculation(&self) -> bool {
@@ -448,11 +525,25 @@ impl Replica for Meta {
         epoch: Epoch,
         through: u64,
         rows: &[u64],
+        origins: &[(u64, u64)],
         records: &[LogRecord],
     ) -> Result<Applied, MetaError> {
         let pending: TouchSet = Meta::pending_touches(self)?;
-        let applied = Meta::apply_segment_rows(self, seq, epoch, through, rows, records, &pending)?;
+        let applied =
+            Meta::apply_segment_rows(self, seq, epoch, through, rows, origins, records, &pending)?;
         self.note_foreign_applied(records);
+        // Plan 30 §M11: the per-generation applied index, and the void
+        // rule for a recalled generation (its cut is what this replica
+        // holds of it now: everything appended is before the record).
+        for (gen, idx) in origins {
+            self.session().note_stream(*gen, *idx);
+        }
+        for rec in records {
+            if let LogRecord::Recall { gen, .. } = rec {
+                let cut = self.session().stream_applied(*gen);
+                self.session().void_stream(*gen, cut);
+            }
+        }
         // Plan 30 §M8: a newer epoch voids the delegations an older
         // holder granted (each was capped by that holder's lease, which is
         // the safety argument; this only stops honouring them sooner).
@@ -470,6 +561,111 @@ impl Replica for Meta {
             retired: applied.retired,
             inserted_before_local: applied.inserted_before_local,
         })
+    }
+
+    fn delegation_table(&self) -> DelegationTable {
+        Meta::delegation_table(self)
+    }
+
+    fn resolve_ownership(&self, keys: &TouchSet) -> Ownership {
+        Meta::resolve_ownership(self, keys)
+    }
+
+    fn delegate_execute(
+        &self,
+        op: &MutateOp,
+        rid: Option<Rid>,
+        gen: u64,
+        deps: Position,
+    ) -> Result<(Vec<LogRecord>, u64), MetaError> {
+        let (records, idx) = Meta::delegate_execute(self, op, rid, gen, deps)?;
+        self.session().note_stream(gen, idx);
+        Ok((records, idx))
+    }
+
+    fn apply_delegate_tx(
+        &self,
+        records: &[LogRecord],
+        rid: Option<Rid>,
+        gen: u64,
+        idx: u64,
+        deps: Position,
+    ) -> Result<bool, MetaError> {
+        let applied = Meta::apply_delegate_tx(self, records, rid, gen, idx, deps)?;
+        self.session().note_stream(gen, idx);
+        Ok(applied)
+    }
+
+    fn delegate_txs_from(&self, gen: u64, from_idx: u64, max_rows: usize) -> Vec<DelegateTx> {
+        Meta::delegate_txs_from(self, gen, from_idx, max_rows).unwrap_or_default()
+    }
+
+    fn delegate_refusal(
+        &self,
+        rid: Rid,
+        errno: i32,
+        gen: u64,
+        deps: Position,
+    ) -> Result<(), MetaError> {
+        let idx = Meta::delegate_refusal(self, rid, errno, gen, deps)?;
+        self.session().note_stream(gen, idx);
+        Ok(())
+    }
+
+    fn journal_origins(&self, seqs: &[u64]) -> Vec<(u64, u64)> {
+        Meta::journal_origins(self, seqs).unwrap_or_else(|_| vec![(0, 0); seqs.len()])
+    }
+
+    fn journal_has_undelegated(&self) -> bool {
+        Meta::journal_has_undelegated(self).unwrap_or(true)
+    }
+
+    fn next_delegation_gen(&self, at_least: u64) -> Result<u64, MetaError> {
+        Meta::next_delegation_gen(self, at_least)
+    }
+
+    fn applied_position(&self) -> Position {
+        self.session().applied()
+    }
+
+    fn reaches(&self, deps: &Position) -> bool {
+        self.session().reaches(deps)
+    }
+
+    fn reaches_streams(&self, deps: &Position) -> bool {
+        self.session().reaches_streams(deps)
+    }
+
+    fn note_stream(&self, gen: u64, idx: u64) {
+        self.session().note_stream(gen, idx)
+    }
+
+    fn stream_applied(&self, gen: u64) -> u64 {
+        self.session().stream_applied(gen)
+    }
+
+    fn delegate_idx(&self, gen: u64) -> u64 {
+        Meta::delegate_idx(self, gen).unwrap_or(0)
+    }
+
+    fn void_stream(&self, gen: u64, cut: u64) {
+        self.session().void_stream(gen, cut)
+    }
+
+    fn observed(&self) -> Position {
+        self.session().observed()
+    }
+
+    fn deps(&self) -> Option<Position> {
+        self.session().deps()
+    }
+
+    fn note_frontier(&self, pos: &Position) {
+        self.session().note_frontier(pos)
+    }
+
+    fn namespace(&self) -> &dyn constellation_meta::delegation::Namespace {
+        self
     }
 
     fn skip_segment(&self, seq: Seq) -> Result<(), MetaError> {

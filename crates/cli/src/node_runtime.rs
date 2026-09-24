@@ -220,6 +220,9 @@ pub struct NodeRuntime {
     /// The authority core's lease state, mirrored for the FUSE fast path
     /// (`authority_driver`).
     lease: Arc<lease::LeaseView>,
+    /// Plan 30 §M11: the delegations this node holds, mirrored for the
+    /// FUSE fast path's sibling check.
+    delegates: Arc<lease::DelegateView>,
     /// The core's observable state, for `status` and the tickers.
     core_status: Arc<std::sync::Mutex<crate::authority_driver::CoreStatus>>,
     /// Rid seqs the FUSE fast path completed, drained by the driver.
@@ -522,6 +525,7 @@ impl NodeRuntime {
         // Plan 30 M5: the lease is the authority core's state; this is the
         // lock-free mirror the FUSE fast path and `status` read.
         let lease_view = Arc::new(lease::LeaseView::default());
+        let delegate_view = Arc::new(lease::DelegateView::default());
         // A mutation waits at most ~2 TTLs for a foreign holder to release
         // or expire before failing with EIO.
         let acquire_deadline = Duration::from_millis(2 * lease::lease_ttl_ms());
@@ -830,6 +834,7 @@ impl NodeRuntime {
                     e2e: e2e_keys.clone(),
                     peers: peers.clone(),
                     view: lease_view.clone(),
+                    delegates: delegate_view.clone(),
                     epochs: epochs.clone(),
                     designations: designations.clone(),
                     placement: placement.clone(),
@@ -1191,6 +1196,7 @@ impl NodeRuntime {
             staging_budget,
             lease_mode,
             lease: lease_view,
+            delegates: delegate_view,
             core_status,
             pending_acks,
             acquire_deadline,
@@ -1362,6 +1368,7 @@ impl NodeRuntime {
                     fsync_s3: self.fsync_s3,
                     cto_strict: self.cto_strict,
                     lease: self.lease.clone(),
+                    delegates: self.delegates.clone(),
                     acquire_deadline: self.acquire_deadline,
                     designations: Some(self.designations.clone()),
                     epoch_frozen: Some(self.epochs.frozen.clone()),

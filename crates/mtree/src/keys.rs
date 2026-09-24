@@ -133,18 +133,23 @@ pub enum Subsystem {
     Quota = 0x03,
     Designation = 0x04,
     Hold = 0x05,
+    /// Plan 30 §M11: the live delegation table (one global record, an
+    /// empty id), maintained by the `Delegate`/`Recall` log records so
+    /// that a bootstrapped replica learns it from the commit it loads.
+    Delegation = 0x07,
     // 0x06 was `Partition` (the namespace-partition map), retired by
     // plan 29 M0a along with namespace partitions themselves. Reserved
     // and deliberately unused rather than reassigned.
 }
 
 /// Every subsystem, in key order.
-pub const SUBSYSTEMS: [Subsystem; 5] = [
+pub const SUBSYSTEMS: [Subsystem; 6] = [
     Subsystem::Snapshot,
     Subsystem::Clone,
     Subsystem::Quota,
     Subsystem::Designation,
     Subsystem::Hold,
+    Subsystem::Delegation,
 ];
 
 impl Subsystem {

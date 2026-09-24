@@ -236,6 +236,28 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Plan 30 §M11: delegate a directory's subtree to a node (this
+    /// node must hold the lease).
+    Delegate {
+        target: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// The delegate's node id.
+        #[arg(long)]
+        to: u64,
+    },
+    /// Plan 30 §M11: recall the delegation on a directory.
+    Undelegate {
+        target: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Plan 30 §M11: list the live delegation table.
+    Delegations {
+        target: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     /// Run this node's deposition recovery now: roll back the journal a
     /// deposition stranded and queue its ops for replay by rid through the
     /// current holder (plan 30 M3b; it also runs by itself on the next sync
@@ -1059,6 +1081,33 @@ fn main() -> Result<()> {
             rt.block_on(control_call(
                 &dir,
                 constellation_api::Request::ListDesignations,
+            ))
+        }
+        Command::Delegate {
+            target,
+            state_dir,
+            to,
+        } => {
+            let (t, dir) = resolve_target(&target, state_dir)?;
+            let path = target::effective_path(&t);
+            rt.block_on(control_call(
+                &dir,
+                constellation_api::Request::Delegate { path, node: to },
+            ))
+        }
+        Command::Undelegate { target, state_dir } => {
+            let (t, dir) = resolve_target(&target, state_dir)?;
+            let path = target::effective_path(&t);
+            rt.block_on(control_call(
+                &dir,
+                constellation_api::Request::Undelegate { path },
+            ))
+        }
+        Command::Delegations { target, state_dir } => {
+            let (_, dir) = resolve_target(&target, state_dir)?;
+            rt.block_on(control_call(
+                &dir,
+                constellation_api::Request::ListDelegations,
             ))
         }
         Command::Reintegrate { target, state_dir } => {
@@ -2621,6 +2670,7 @@ impl constellation_net::PeerService for P2pBridge {
         op: Vec<u8>,
         rid: (u64, u32, u64),
         acked_through: u64,
+        deps: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -2633,13 +2683,14 @@ impl constellation_net::PeerService for P2pBridge {
             let (reply, receive) = tokio::sync::oneshot::channel();
             let started = std::time::Instant::now();
             tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate request queued");
-            let (outcome, base, position) = if self
+            let (outcome, base, position, gen) = if self
                 .nudge
                 .send(fusefs::SyncRequest::Mutate {
                     requester,
                     op,
                     rid,
                     acked_through,
+                    deps,
                     reply,
                 })
                 .is_ok()
@@ -2648,12 +2699,14 @@ impl constellation_net::PeerService for P2pBridge {
                     constellation_meta::MutateOutcome::Busy,
                     None,
                     constellation_meta::Position::ZERO,
+                    0,
                 ))
             } else {
                 (
                     constellation_meta::MutateOutcome::Busy,
                     None,
                     constellation_meta::Position::ZERO,
+                    0,
                 )
             };
             tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate reply taken");
@@ -2668,6 +2721,109 @@ impl constellation_net::PeerService for P2pBridge {
                 base,
                 position_seq: position.seq,
                 position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
+                position_streams: position.streams_wire(),
+                gen,
+            }
+        })
+    }
+
+    fn delegate_stream_requested(
+        &self,
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        txs: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let refuse = constellation_net::Payload::DelegateStreamAck {
+                req_id,
+                gen,
+                through: 0,
+                refused: true,
+            };
+            let Ok(txs) = postcard::from_bytes::<Vec<constellation_meta::DelegateTx>>(&txs) else {
+                return refuse;
+            };
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            if self
+                .nudge
+                .send(fusefs::SyncRequest::PeerDelegateStream {
+                    from,
+                    gen,
+                    txs,
+                    reply,
+                })
+                .is_err()
+            {
+                return refuse;
+            }
+            match receive.await {
+                Ok((through, refused)) => constellation_net::Payload::DelegateStreamAck {
+                    req_id,
+                    gen,
+                    through,
+                    refused,
+                },
+                Err(_) => refuse,
+            }
+        })
+    }
+
+    fn deleg_renew_requested(
+        &self,
+        from: u64,
+        req_id: u64,
+        gen: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let ttl_ms = if self
+                .nudge
+                .send(fusefs::SyncRequest::PeerDelegRenew { from, gen, reply })
+                .is_ok()
+            {
+                receive.await.unwrap_or(0)
+            } else {
+                0
+            };
+            constellation_net::Payload::DelegRenewed {
+                req_id,
+                gen,
+                ttl_ms,
+            }
+        })
+    }
+
+    fn deleg_recall_requested(
+        &self,
+        root: u64,
+        req_id: u64,
+        dir: u64,
+        gen: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let through = if self
+                .nudge
+                .send(fusefs::SyncRequest::PeerDelegRecall {
+                    root,
+                    dir,
+                    gen,
+                    reply,
+                })
+                .is_ok()
+            {
+                receive.await.unwrap_or(0)
+            } else {
+                0
+            };
+            constellation_net::Payload::DelegRecalled {
+                req_id,
+                gen,
+                through,
             }
         })
     }
@@ -2715,6 +2871,7 @@ impl constellation_net::PeerService for P2pBridge {
                 position_seq: position.seq,
                 position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
                 grant,
+                position_streams: position.streams_wire(),
             }
         })
     }
@@ -3257,6 +3414,27 @@ struct UploadRuntime {
     decisions: std::sync::atomic::AtomicU64,
     coop: Option<std::sync::Arc<crate::coop::Coop>>,
     existence: std::sync::Arc<crate::existence::Existence>,
+    /// Chunks a drain is uploading right now. A sync round's drain and a
+    /// flush's `drain_inode` overlap freely; without this, both read the
+    /// same pending row and both PUT it (plan 30 §M11's
+    /// `delegated-subtrees` measured 1.3–1.7 chunk PUTs per file). The
+    /// second drain leaves the row to the first and waits for its ack.
+    in_flight: std::sync::Mutex<std::collections::HashSet<constellation_fs_core::ChunkHash>>,
+}
+
+/// Releases a drain's claim on its chunks when it ends, however it ends.
+struct InFlightClaim<'a> {
+    upload: &'a UploadRuntime,
+    hashes: Vec<constellation_fs_core::ChunkHash>,
+}
+
+impl Drop for InFlightClaim<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.upload.in_flight.lock().unwrap();
+        for hash in &self.hashes {
+            in_flight.remove(hash);
+        }
+    }
 }
 
 impl UploadRuntime {
@@ -3303,6 +3481,7 @@ impl UploadRuntime {
             decisions: std::sync::atomic::AtomicU64::new(0),
             coop,
             existence,
+            in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -3410,6 +3589,7 @@ impl UploadRuntime {
             decisions: std::sync::atomic::AtomicU64::new(0),
             coop: None,
             existence: crate::existence::Existence::new(1024, false, None),
+            in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -3459,6 +3639,32 @@ pub(crate) async fn upload_dirty_chunks_report(
     only_ino: Option<constellation_fs_core::Ino>,
     only_part: Option<&str>,
 ) -> Result<UploadReport> {
+    upload_dirty_chunks_pass(
+        cache,
+        meta,
+        store,
+        compression,
+        upload,
+        only_ino,
+        only_part,
+        0,
+    )
+    .await
+}
+
+/// One pass of [`upload_dirty_chunks_report`]: `depth` counts the passes
+/// a row another drain had claimed sent this one back for.
+#[allow(clippy::too_many_arguments)]
+async fn upload_dirty_chunks_pass(
+    cache: &DiskCache,
+    meta: &Meta,
+    store: &ChunkStore,
+    compression: CompressionSetting,
+    upload: &UploadRuntime,
+    only_ino: Option<constellation_fs_core::Ino>,
+    only_part: Option<&str>,
+    depth: u8,
+) -> Result<UploadReport> {
     use futures::StreamExt;
     let mut grouped: std::collections::HashMap<
         constellation_fs_core::ChunkHash,
@@ -3475,6 +3681,25 @@ pub(crate) async fn upload_dirty_chunks_report(
         }
         grouped.entry(hash).or_default().push(ino);
     }
+    // Rows another drain is uploading right now are its; this one waits
+    // for their acks below instead of uploading them again.
+    let mut deferred: Vec<constellation_fs_core::ChunkHash> = Vec::new();
+    {
+        let mut in_flight = upload.in_flight.lock().unwrap();
+        grouped.retain(|hash, _| {
+            if in_flight.contains(hash) {
+                deferred.push(*hash);
+                false
+            } else {
+                in_flight.insert(*hash);
+                true
+            }
+        });
+    }
+    let _claim = InFlightClaim {
+        upload,
+        hashes: grouped.keys().copied().collect(),
+    };
     let total = grouped.len() as u64;
     let priority = only_ino.is_some() && total <= PRIORITY_DRAIN_CHUNKS;
     if total > 0 {
@@ -3641,6 +3866,48 @@ pub(crate) async fn upload_dirty_chunks_report(
     }
     if total > 0 {
         tracing::debug!(uploaded = total, "pending chunk upload complete");
+    }
+    // The chunks another drain claimed: this pass is complete only once
+    // they are acked too (a write-through flush must not name a hash S3
+    // lacks). A claim that ends with the row still pending (the other
+    // drain failed, or found the chunk missing) leaves the row to this
+    // pass: it goes round again and claims it itself, so a missing
+    // chunk is reported here (M4's held records) and a transient error
+    // there is retried here, never turned into this caller's error.
+    let mut unclaimed_pending = false;
+    for hash in deferred {
+        let started = std::time::Instant::now();
+        loop {
+            if !meta.upload_pending_for_hash(&hash)? {
+                break;
+            }
+            let claimed = upload.in_flight.lock().unwrap().contains(&hash);
+            if !claimed {
+                unclaimed_pending = true;
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(120) {
+                anyhow::bail!("upload {hash} still in flight elsewhere after 120 s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+    if unclaimed_pending {
+        if depth >= 3 {
+            anyhow::bail!("pending uploads left behind by concurrent drains after 4 passes");
+        }
+        drop(_claim);
+        return Box::pin(upload_dirty_chunks_pass(
+            cache,
+            meta,
+            store,
+            compression,
+            upload,
+            only_ino,
+            only_part,
+            depth + 1,
+        ))
+        .await;
     }
     Ok(UploadReport {
         missing: missing_rows,
@@ -4050,6 +4317,50 @@ impl constellation_api::StatusSource for DaemonStatus {
                     reads_durability_blocked: s.durability_blocked,
                 }
             },
+            delegation: {
+                let v = &core.delegation;
+                constellation_api::DelegationReport {
+                    enabled: core.delegation_enabled,
+                    table: self
+                        .meta
+                        .delegation_table()
+                        .iter()
+                        .map(|d| constellation_api::DelegationStatus {
+                            dir: d.dir,
+                            path: self.meta.path_of(d.dir).unwrap_or_default(),
+                            node: d.node,
+                            gen: d.gen,
+                        })
+                        .collect(),
+                    mine: v.mine.clone(),
+                    gens: v.gens.clone(),
+                    executed: stats.deleg_executed,
+                    fast_path_executed: core.delegation_fast_path_executed,
+                    forwarded_to_delegate: stats.deleg_forwarded,
+                    deps_waits: stats.deleg_deps_waits,
+                    parked_expired: stats.deleg_parked_expired,
+                    not_owner: stats.deleg_not_owner,
+                    installed: stats.deleg_installed,
+                    streamed_txs: stats.deleg_streamed_txs,
+                    stream_refused: stats.deleg_stream_refused,
+                    renewals: stats.deleg_renewals,
+                    renewals_refused: stats.deleg_renewals_refused,
+                    recalls_received: stats.deleg_recalls_received,
+                    delegated: stats.deleg_delegated,
+                    appended_txs: stats.deleg_appended_txs,
+                    stream_refusals: stats.deleg_stream_refusals,
+                    deps_unsatisfied_at_append: stats.deleg_deps_unsatisfied_at_append,
+                    cross_subtree: stats.deleg_cross_subtree,
+                    recalls_sent: stats.deleg_recalls_sent,
+                    recalls_drained: stats.deleg_recalls_drained,
+                    recalls_expired: stats.deleg_recalls_expired,
+                    reclaimed: stats.deleg_reclaimed,
+                    ended: stats.deleg_ended,
+                    deps_overflow_to_root: stats.deps_overflow_to_root,
+                    exec_parked: stats.deleg_exec_parked,
+                    stranded: stats.local_rolled_back,
+                }
+            },
             cto: {
                 let d = self.meta.read_delegations();
                 let c = d.stats();
@@ -4248,6 +4559,53 @@ impl constellation_api::StatusSource for DaemonStatus {
                 path: d.path,
                 designee: d.designee,
                 read_only: d.read_only,
+            })
+            .collect()
+    }
+
+    fn delegate(&self, path: &str, node: u64) -> std::result::Result<String, String> {
+        let dir = self
+            .meta
+            .resolve_path(path)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| format!("no such directory: {path}"))?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sync_tx
+            .send(fusefs::SyncRequest::Delegate { dir, node, reply })
+            .map_err(|_| "sync task is not running".to_string())?;
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(receive)
+                .map_err(|_| "sync task stopped".to_string())?
+        })
+    }
+
+    fn undelegate(&self, path: &str) -> std::result::Result<String, String> {
+        let dir = self
+            .meta
+            .resolve_path(path)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or_else(|| format!("no such directory: {path}"))?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sync_tx
+            .send(fusefs::SyncRequest::Undelegate { dir, reply })
+            .map_err(|_| "sync task is not running".to_string())?;
+        tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(receive)
+                .map_err(|_| "sync task stopped".to_string())?
+        })
+    }
+
+    fn list_delegations(&self) -> Vec<constellation_api::DelegationStatus> {
+        self.meta
+            .delegation_table()
+            .iter()
+            .map(|d| constellation_api::DelegationStatus {
+                dir: d.dir,
+                path: self.meta.path_of(d.dir).unwrap_or_default(),
+                node: d.node,
+                gen: d.gen,
             })
             .collect()
     }

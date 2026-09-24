@@ -236,7 +236,7 @@ fn the_lease_path_resolves_an_in_doubt_rid_from_the_log() {
     let holder = Meta::open_in_memory().unwrap();
     holder.set_node_prefix(2).unwrap();
     let records = constellation_meta::execute_mutate(&holder, &op, Some(rid)).unwrap();
-    crate::replica::Replica::apply_segment(&h.meta, 1, 1, 0, &[], &records).unwrap();
+    crate::replica::Replica::apply_segment(&h.meta, 1, 1, 0, &[], &[], &records).unwrap();
     // The reply never comes; the retries run out; the lease path starts
     // and this node wins the lease outright (no object yet).
     let mut t = timeout;
@@ -312,6 +312,7 @@ fn a_peers_forward_is_busy_while_fenced_and_executes_once_the_gate_opens() {
         rid,
         op: op.clone(),
         acked_through: 0,
+        deps: constellation_meta::Position::ZERO,
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -397,6 +398,7 @@ fn a_reply_base_names_the_unshipped_overlap() {
                 },
                 op,
                 acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
             },
         });
         match sends(&out)[0].1 {
@@ -616,6 +618,7 @@ fn overlapping_forwards_from_one_node_are_issued_in_order() {
             outcome: MutateOutcome::Errno(libc::EINVAL),
             base: Some(0),
             position: constellation_meta::Position::ZERO,
+            gen: 0,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -772,6 +775,7 @@ fn a_reply_base_is_the_last_shipped_touch_not_the_head() {
                 },
                 op,
                 acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
             },
         });
         match sends(&out)[0].1 {
@@ -880,6 +884,7 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
             outcome: MutateOutcome::Errno(libc::EIO),
             base: Some(0),
             position: constellation_meta::Position::ZERO,
+            gen: 0,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -959,6 +964,7 @@ fn releasing_several_gated_ops_survives_the_nested_release() {
             outcome: MutateOutcome::Errno(libc::EIO),
             base: Some(0),
             position: constellation_meta::Position::ZERO,
+            gen: 0,
         },
     });
     let answered: Vec<Rid> = replies(&out).into_iter().map(|(rid, _)| rid).collect();
@@ -1118,7 +1124,8 @@ fn a_refusal_raises_observed_until_the_segment_lands() {
     let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
     let through = holder.meta.journal_through_after(&seqs).unwrap();
     let records: Vec<_> = batch.into_iter().map(|(_, r)| r).collect();
-    crate::replica::Replica::apply_segment(&requester.meta, 1, 1, through, &[], &records).unwrap();
+    crate::replica::Replica::apply_segment(&requester.meta, 1, 1, through, &[], &[], &records)
+        .unwrap();
     for keys in [
         vec![ReadKey::Dentry(ROOT_INO, "a".into())],
         vec![ReadKey::Dir(ROOT_INO)],
@@ -1234,7 +1241,7 @@ fn holder_segment(holder: &mut Harness, name: &str, seq: Seq) -> Vec<u8> {
     Replica::ack_journal(&holder.meta, &seqs, seq, None).unwrap();
     holder.core.ship.next_seq = seq + 1;
     holder.core.ship.head_seq = seq;
-    crate::segment::encode(1, 1, 0, &[], &records).unwrap()
+    crate::segment::encode(1, 1, 0, &[], &[], &records).unwrap()
 }
 
 fn stream_frames(actions: &[Action]) -> Vec<PeerMsg> {
@@ -1531,6 +1538,7 @@ mod cto {
                 },
                 op,
                 acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
             },
         })
     }
@@ -1839,6 +1847,7 @@ mod cto {
             position: Position {
                 seq: 3,
                 pending: None,
+                streams: Default::default(),
             },
             grant: Some(ReadGrantMsg {
                 id,
@@ -2136,6 +2145,7 @@ mod refusal_outcomes {
                 },
                 op,
                 acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
             },
         })
     }

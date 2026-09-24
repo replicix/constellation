@@ -1122,6 +1122,25 @@ impl Core {
             if admitted && self.inbox_recall_first(now, batch.node, &touched, replica, out) {
                 return Err(Halt::Recall);
             }
+            // Plan 30 §M11: the same for write delegations — an inbox op
+            // in a delegated subtree waits for the recall (the delegate's
+            // stream is appended first), like a forwarded one.
+            if admitted && self.cfg.delegation && !self.dl.gens.is_empty() {
+                if let Ok(op) = &decoded {
+                    let keys = super::holder::keys_of_op(op);
+                    if let Some(wait) = self.deleg_recall_needed(now, &keys, replica, out) {
+                        if !wait.is_empty() {
+                            self.park(
+                                now,
+                                (wait, None),
+                                None,
+                                super::readindex::ParkedWhat::InboxRepoll { node: batch.node },
+                            );
+                            return Err(Halt::Recall);
+                        }
+                    }
+                }
+            }
             let executed = match &decoded {
                 Ok(op) => replica.execute_inbox(ack, op, rid),
                 Err(_) => Err(MetaError::Invalid("undecodable inbox op".into())),

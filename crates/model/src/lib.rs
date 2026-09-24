@@ -96,6 +96,20 @@
 //! `converged_at_quiescence`; `tests/flex_epochs.rs` has the naive
 //! variants' counterexamples and the full rule clean.
 //!
+//! Plan 30 §M11 (module [`delegation`]) is a third focused model:
+//! delegated sub-sequencers over one log — a root and delegates for
+//! disjoint subtrees, `Delegate`/`Recall` records, ownership by an
+//! ancestor walk, delegate execution as speculation streamed to the root
+//! with `deps`, cross-subtree ops recalled to the root, recall of an
+//! unreachable delegate by TTL and margin under bounded drift, delegate
+//! crashes with and without a backup, and root failover with live
+//! delegates. Its properties are per-key linearizability, the causal
+//! cut, `marker_order`, recall safety, log-record validity,
+//! exactly-once, convergence, read-your-writes, and two stability
+//! properties (nothing stranded without a fault; a backup-acknowledged
+//! op never lost). `tests/delegation.rs` keeps the hand-built
+//! counterexample paths for the naive variants as the primary checks.
+//!
 //! # What is modeled
 //!
 //! - **Actors.** `N` `Node`s (2–3 across the tests) plus one implicit
@@ -323,6 +337,7 @@
 
 pub mod backup;
 pub mod cto;
+pub mod delegation;
 pub mod flex;
 pub mod inbox;
 pub mod namespace;

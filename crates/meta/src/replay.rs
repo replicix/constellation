@@ -86,7 +86,9 @@ impl TouchSet {
             // suppressed, exactly like `Atime` (see this type's doc).
             | LogRecord::Completed { .. }
             | LogRecord::Refused { .. }
-            | LogRecord::InboxAck { .. } => {}
+            | LogRecord::InboxAck { .. }
+            | LogRecord::Delegate { .. }
+            | LogRecord::Recall { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
                     self.dentries.insert((node.parent, node.name.clone()));
@@ -94,6 +96,58 @@ impl TouchSet {
                 }
             }
         }
+    }
+
+    /// The keys `op` reads or writes, before it runs (plan 30 §M11's
+    /// ownership resolution and the core's reply base both use it).
+    pub fn from_op(op: &crate::mutate::MutateOp) -> Self {
+        use crate::mutate::MutateOp;
+        let mut set = TouchSet::default();
+        let mut dentry = |p: u64, n: &str| {
+            set.dentries.insert((p, n.to_string()));
+        };
+        match op {
+            MutateOp::Mkdir { parent, name, .. }
+            | MutateOp::Create { parent, name, .. }
+            | MutateOp::Symlink { parent, name, .. }
+            | MutateOp::Mknod { parent, name, .. }
+            | MutateOp::Unlink { parent, name }
+            | MutateOp::Rmdir { parent, name } => dentry(*parent, name),
+            MutateOp::Link { ino, parent, name } => {
+                dentry(*parent, name);
+                set.inos.insert(*ino);
+            }
+            MutateOp::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+            } => {
+                dentry(*parent, name);
+                dentry(*new_parent, new_name);
+            }
+            MutateOp::Setattr { ino, .. }
+            | MutateOp::SetManifest { ino, .. }
+            | MutateOp::SetXattr { ino, .. }
+            | MutateOp::RemoveXattr { ino, .. } => {
+                set.inos.insert(*ino);
+            }
+            MutateOp::Publish {
+                ino, parent, name, ..
+            } => {
+                dentry(*parent, name);
+                set.inos.insert(*ino);
+            }
+            MutateOp::AtimeBatch { entries } => {
+                for (i, _, _) in entries {
+                    set.inos.insert(*i);
+                }
+            }
+            MutateOp::Records { records } => {
+                set = TouchSet::from_records(records.iter());
+            }
+        }
+        set
     }
 
     pub fn conflicts(&self, rec: &LogRecord) -> bool {
@@ -519,6 +573,30 @@ fn apply_one(
                     i: *i,
                 },
             )?;
+            Ok(Applied::Done)
+        }
+        // Plan 30 §M11: the delegation table is one `0x30` row written
+        // through the ordinary `ns` funnel — dirty-tracked (so the
+        // publisher carries it) and captured (so a holder's unshipped
+        // `Delegate`/`Recall` is substituted out of its commits like any
+        // other unshipped effect).
+        LogRecord::Delegate { dir, node, gen } => {
+            let mut table = crate::delegation::read_table_tx(tx, meta)?;
+            table.apply(crate::delegation::DelegationRecord::Delegate {
+                dir: *dir,
+                node: *node,
+                gen: *gen,
+            });
+            crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
+            Ok(Applied::Done)
+        }
+        LogRecord::Recall { dir, gen } => {
+            let mut table = crate::delegation::read_table_tx(tx, meta)?;
+            table.apply(crate::delegation::DelegationRecord::Recall {
+                dir: *dir,
+                gen: *gen,
+            });
+            crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             Ok(Applied::Done)
         }
     }

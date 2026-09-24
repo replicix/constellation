@@ -48,6 +48,7 @@
 
 mod backup;
 mod client;
+mod delegate;
 mod holder;
 mod inbox;
 mod jobs;
@@ -69,6 +70,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub use backup::AckView;
 pub use client::{meta_errno, ClientPhase};
+pub use delegate::{DelegView, RecallPhase};
 pub use inbox::InboxView;
 pub use jobs::JobKind;
 pub use lease::{LeaseState, PendingGate, Plan};
@@ -266,6 +268,22 @@ pub struct Config {
     /// simulation turns it off to show its single-authority check finds
     /// what it prevents (as `speculate_on_stale_base` does for M5).
     pub takeover_promise_check: bool,
+    // ---- plan 30 §M11: delegated sub-sequencers ----
+    /// `CONSTELLATION_DELEGATION` (default on): this node delegates (as
+    /// the root) and accepts delegations (as a delegate). Off, or P2P
+    /// off, is a strict no-op: no `Delegate` record is ever written.
+    pub delegation: bool,
+    /// `CONSTELLATION_DELEGATION_TTL_MS` (default 5000): a grant's ttl;
+    /// the margin is the lease's (`expiry_margin_ms`).
+    pub delegation_ttl_ms: u64,
+    /// Rows per `DelegateStream` batch.
+    pub delegation_stream_rows: usize,
+    /// The delegate's stream/renew retry tick.
+    pub delegation_stream_tick_ms: u64,
+    /// The root reclaims a grant nobody renewed (a crashed delegate).
+    /// Always on in production; the simulation turns it off to pin the
+    /// liveness it provides.
+    pub delegation_reclaim_expired: bool,
 }
 
 impl Config {
@@ -358,6 +376,11 @@ impl Config {
             promise_wait_ms: 1_000,
             promise_watch_ms: 5_000,
             takeover_promise_check: true,
+            delegation: true,
+            delegation_ttl_ms: 5_000,
+            delegation_stream_rows: 256,
+            delegation_stream_tick_ms: 50,
+            delegation_reclaim_expired: true,
         }
     }
 }
@@ -483,6 +506,42 @@ pub struct Stats {
     pub read_index_answered: u64,
     pub read_index_degraded: u64,
     pub read_index_tailed: u64,
+    // ---- M11: delegated sub-sequencers ----
+    /// Delegate: ops executed here under a delegation, forwarded to a
+    /// delegate, parked for `deps` / an unrenewed grant, and answered
+    /// `NotHolder` because the delegation ended.
+    pub deleg_executed: u64,
+    pub deleg_forwarded: u64,
+    pub deleg_deps_waits: u64,
+    pub deleg_parked_expired: u64,
+    pub deleg_not_owner: u64,
+    /// Delegate: delegations installed here, transactions streamed,
+    /// batches refused, renewals granted/refused, recalls received.
+    pub deleg_installed: u64,
+    pub deleg_streamed_txs: u64,
+    pub deleg_stream_refused: u64,
+    pub deleg_renewals: u64,
+    pub deleg_renewals_refused: u64,
+    pub deleg_recalls_received: u64,
+    /// Root: delegations written, transactions appended, batches
+    /// refused, appends whose `deps` were not here (the causal-cut
+    /// assertion), cross-subtree ops, recalls sent / drained / expired,
+    /// unrenewed grants reclaimed, generations ended.
+    pub deleg_delegated: u64,
+    pub deleg_appended_txs: u64,
+    pub deleg_stream_refusals: u64,
+    pub deleg_deps_unsatisfied_at_append: u64,
+    pub deleg_cross_subtree: u64,
+    pub deleg_recalls_sent: u64,
+    pub deleg_recalls_drained: u64,
+    pub deleg_recalls_expired: u64,
+    pub deleg_reclaimed: u64,
+    pub deleg_ended: u64,
+    /// Requester: ops sent to the root because the observed stream
+    /// table was full (coordinator decision 4).
+    pub deps_overflow_to_root: u64,
+    /// Root: executions parked for a recall of a write delegation.
+    pub deleg_exec_parked: u64,
     // ---- M9: backups, seals, `ack=s3` ----
     /// Holder: backups added to / removed from the lease, and the lease
     /// CASes spent on it (a reconfiguration is one CAS when it lands).
@@ -678,6 +737,9 @@ enum Timer {
     StreamAhead,
     PromiseWait,
     PromiseWatch,
+    DelegExpiry(u64),
+    DelegRenew(u64),
+    DelegStream,
 }
 
 impl Timer {
@@ -707,6 +769,9 @@ impl Timer {
             Timer::StreamAhead => TimerKind::BackupTick,
             Timer::PromiseWait => TimerKind::PromiseWait,
             Timer::PromiseWatch => TimerKind::PromiseWatch,
+            Timer::DelegExpiry(_) => TimerKind::DelegExpiry,
+            Timer::DelegRenew(_) => TimerKind::DelegRenew,
+            Timer::DelegStream => TimerKind::DelegStream,
         }
     }
 }
@@ -788,6 +853,8 @@ pub struct Core {
     pub(crate) bk: backup::BackupState,
     /// M10: heartbeat promises, the takeover check, the carried lease.
     pub(crate) pr: promise::PromiseState,
+    /// M11: delegations held here and, as the root, the generations.
+    pub(crate) dl: delegate::DelegationState,
     /// The `now` of the event being handled (for `issue_s3`'s send time).
     last_now: Ms,
     stopped: bool,
@@ -838,6 +905,7 @@ impl Core {
             ack: backup::AckState::default(),
             bk: backup::BackupState::default(),
             pr: promise::PromiseState::default(),
+            dl: delegate::DelegationState::default(),
             last_now: Ms(0),
             stopped: false,
             stats: Stats::default(),
@@ -989,6 +1057,7 @@ impl Core {
         self.stream_after_event(now, &mut out);
         self.backup_after_event(now, replica, &mut out);
         self.promise_after_event(now, replica, &mut out);
+        self.deleg_after_event(now, replica, &mut out);
         out
     }
 
@@ -1013,13 +1082,15 @@ impl Core {
                 rid,
                 op,
                 acked_through,
-            } => self.on_mutate_request(now, from, req, rid, op, acked_through, replica, out),
+                deps,
+            } => self.on_mutate_request(now, from, req, rid, op, acked_through, deps, replica, out),
             PeerMsg::MutateReply {
                 req,
                 outcome,
                 base,
                 position,
-            } => self.on_mutate_reply(now, from, req, outcome, (base, position), replica, out),
+                gen,
+            } => self.on_mutate_reply(now, from, req, outcome, (base, position, gen), replica, out),
             PeerMsg::LeaseRequest { req } => self.on_lease_request(now, from, req, replica, out),
             PeerMsg::LeaseHandoff {
                 req,
@@ -1096,15 +1167,24 @@ impl Core {
                 until,
                 epoch_slack,
             } => self.on_promise_reply(now, from, req, until, epoch_slack, replica, out),
-            // Later milestones' messages: acknowledged by the interface,
-            // answered by nothing until they are implemented.
-            other => {
-                tracing::debug!(
-                    node = self.cfg.node_id,
-                    from,
-                    ?other,
-                    "unhandled peer message"
-                );
+            PeerMsg::DelegateStream { req, gen, txs } => {
+                self.on_delegate_stream(now, from, req, gen, txs, replica, out)
+            }
+            PeerMsg::DelegateStreamAck {
+                req,
+                gen,
+                through,
+                refused,
+            } => self.on_delegate_stream_ack(now, req, gen, through, refused, replica, out),
+            PeerMsg::DelegRenew { req, gen } => self.on_deleg_renew(now, from, req, gen, out),
+            PeerMsg::DelegRenewed { req, gen, ttl_ms } => {
+                self.on_deleg_renewed(now, req, gen, ttl_ms, replica, out)
+            }
+            PeerMsg::DelegRecall { req, gen, .. } => {
+                self.on_deleg_recall(now, from, req, gen, replica, out)
+            }
+            PeerMsg::DelegRecalled { req, gen, through } => {
+                self.on_deleg_recalled(now, req, gen, through, replica, out)
             }
         }
     }
@@ -1128,6 +1208,9 @@ impl Core {
             return;
         }
         if self.on_promise_request_failed(now, req, replica, out) {
+            return;
+        }
+        if self.on_deleg_request_failed(now, req, out) {
             return;
         }
         if let Some(rid) = self.by_req.remove(&req) {
@@ -1244,6 +1327,9 @@ impl Core {
                 self.pr.watch_timer = None;
                 self.on_promise_watch(now, out);
             }
+            Timer::DelegExpiry(gen) => self.on_deleg_expiry(now, gen, replica, out),
+            Timer::DelegRenew(gen) => self.on_deleg_renew_timer(now, gen, out),
+            Timer::DelegStream => self.on_deleg_stream_timer(now, replica, out),
         }
     }
 
@@ -1381,6 +1467,10 @@ impl Core {
                     result: Ok(ControlOk::Done),
                 });
             }
+            Control::Delegate { dir, node } => {
+                self.on_control_delegate(now, op, dir, node, replica, out)
+            }
+            Control::Undelegate { dir } => self.on_control_undelegate(now, op, dir, replica, out),
             Control::Retire => {
                 self.on_retire(now, replica, out);
                 out.push(Action::ControlDone {
@@ -1416,6 +1506,7 @@ impl Core {
     ) {
         let before = self.epoch;
         self.epoch = state;
+        self.deleg_on_epoch(now, state.active && !state.frozen, replica, out);
         if state.active && !before.active {
             self.skip_ship = true;
             // Plan 30 §M10's claim resolution: a member whose lease claim

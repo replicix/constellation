@@ -201,6 +201,19 @@ pub enum LogRecord {
         n: u64,
         i: u32,
     },
+    /// Plan 30 §M11: `dir` and everything under it is sequenced by
+    /// `node` under delegation generation `gen` from this record on. The
+    /// replicated delegation table is the fold of these records; applying
+    /// one updates the `0x30 | Delegation` row (`crate::delegation`), so a
+    /// commit carries the table and a bootstrapped replica learns it.
+    /// Touches no inode or dentry (see `TouchSet::add`).
+    Delegate { dir: u64, node: u64, gen: u64 },
+    /// Plan 30 §M11: generation `gen` of the delegation on `dir` ended.
+    /// Every record of its stream that is not before this one in the log
+    /// is void: a delegate that still holds such records rolls them back
+    /// and replays them by rid, and a requester's observation of them is
+    /// void (M6's rule for a tenure that ended without shipping).
+    Recall { dir: u64, gen: u64 },
 }
 
 impl LogRecord {

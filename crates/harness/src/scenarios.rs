@@ -17,6 +17,8 @@ use std::time::Duration;
 mod coop_churn;
 /// Plan 30 §M10: flexible-quorum continuation epochs.
 mod m10;
+/// Plan 30 §M11: delegated sub-sequencers, one log.
+mod m11;
 /// Plan 30 §M4's scenarios and the chaos runs' whole-cluster checks.
 mod m4;
 /// Plan 30 §M5 phase 2: the stale-base rule on the wire.
@@ -727,6 +729,42 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M10: epoch_slack 0 (the default) never touches heartbeat/; with epoch_slack 1 the steady state publishes only the mount's slack advertisement (promises are on demand); prints heartbeat PUTs per node per day",
         requires: &[],
         run: m10::epoch_slack_zero_unchanged,
+    },
+    Scenario {
+        name: "delegated-subtrees",
+        desc: "plan 30 M11: three nodes behind counting proxies; d1 delegated to b and d2 to c: each node's writes into its subtree are executed locally by the delegate and appended by the root, everything converges, the root appends nothing whose deps it lacks, the delegates make no S3 request for their writes; prints each node's latency on its delegated subtree vs its forwarded writes and the root's local ones, the aggregate throughput vs the single sequencer, the cross-subtree rename's latency and the S3 requests per phase",
+        requires: &[],
+        run: m11::delegated_subtrees,
+    },
+    Scenario {
+        name: "cross-subtree-rename",
+        desc: "plan 30 M11: a rename from d1 (delegated to b) into d2 (delegated to c) while both delegates write: the root recalls and drains both generations, executes the rename after their streams and ends them; the file is exactly where the rename put it on every node, nothing is lost or duplicated, and the directories can be delegated again and undelegated",
+        requires: &[],
+        run: m11::cross_subtree_rename,
+    },
+    Scenario {
+        name: "delegate-crash",
+        desc: "plan 30 M11: the delegate of d1 is killed mid-burst without a backup; the root reclaims its unrenewable grant within the grant TTL, a third node's write into d1 completes through the root, the dead node remounts with its journal and its acknowledged writes replay by rid; everything converges and d1 is delegated again at a higher generation",
+        requires: &[],
+        run: m11::delegate_crash,
+    },
+    Scenario {
+        name: "marker-order",
+        desc: "plan 30 M11: three writers each write data into d1 (delegated to b) then a marker into d2 (delegated to c); three watchers list d2 continuously: no node ever shows a marker without its data (the marker's deps carry the data's stream position)",
+        requires: &[],
+        run: m11::marker_order,
+    },
+    Scenario {
+        name: "delegate-partition",
+        desc: "plan 30 M11: the delegate of d1 loses its P2P link to the root (CONSTELLATION_FAULT_P2P_DENY_FILE; S3 and the third node stay): it stops on its own clock when it cannot renew, the root outwaits its recall or reclaims the grant, the third node's and the delegate's later writes go through the root; after the heal everything is everywhere with no conflict and d1 is delegated again",
+        requires: &[],
+        run: m11::delegate_partition,
+    },
+    Scenario {
+        name: "p2p-off-no-delegation",
+        desc: "plan 30 M11: CONSTELLATION_P2P=off on two nodes: delegation reports itself off, `delegate` is refused, nothing is ever delegated, appended or executed by a delegate, and both nodes' writes complete as before",
+        requires: &[],
+        run: m11::p2p_off_no_delegation,
     },
     Scenario {
         name: "inbox-create-storm-p2p-off",

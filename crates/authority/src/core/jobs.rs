@@ -454,8 +454,14 @@ impl Core {
             );
             replica.skip_segment(seq)?;
         } else {
-            let applied =
-                replica.apply_segment(seq, seg.epoch, seg.through, &seg.rows, &seg.records)?;
+            let applied = replica.apply_segment(
+                seq,
+                seg.epoch,
+                seg.through,
+                &seg.rows,
+                &seg.origins,
+                &seg.records,
+            )?;
             tracing::debug!(
                 node = self.cfg.node_id,
                 seq,
@@ -491,6 +497,19 @@ impl Core {
             // Plan 30 §M9: a backup's tail is trimmed by the log itself;
             // the pre-S3 stream cursor follows the log.
             self.backup_note_segment(seg.epoch, seg.through, &seg.rows, replica);
+            // Plan 30 §M11: a delegate's reply base is the last *applied*
+            // segment that touched the keys (it ships nothing itself);
+            // and the table may have changed.
+            if !self.dl.mine.is_empty() {
+                self.note_shipped_touches(seq, payload);
+            }
+            if seg
+                .records
+                .iter()
+                .any(|r| matches!(r, LogRecord::Delegate { .. } | LogRecord::Recall { .. }))
+            {
+                self.delegation_sync(now, replica, out);
+            }
         }
         self.ship.max_epoch = self.ship.max_epoch.max(seg.epoch);
         self.ship.next_seq = seq + 1;
@@ -572,7 +591,17 @@ impl Core {
         let through = replica
             .journal_through_after(&seqs)
             .map_err(|e| e.to_string())?;
-        let payload = segment::encode(self.cfg.node_id, epoch, through, &seqs, &records)
+        // Plan 30 §M11: each row's delegation origin rides the envelope.
+        let origins = replica.journal_origins(&seqs);
+        if origins.iter().any(|o| o.0 != 0) {
+            tracing::trace!(
+                node = self.cfg.node_id,
+                ?seqs,
+                ?origins,
+                "shipping delegate origins"
+            );
+        }
+        let payload = segment::encode(self.cfg.node_id, epoch, through, &seqs, &origins, &records)
             .map_err(|e| e.to_string())?;
         let seq = self.ship.next_seq;
         let op = self.issue_s3(
@@ -635,7 +664,8 @@ impl Core {
             })
             .collect();
         let through = replica.journal_acked_seq().unwrap_or(0);
-        let Ok(payload) = segment::encode(self.cfg.node_id, epoch, through, &[], &records) else {
+        let Ok(payload) = segment::encode(self.cfg.node_id, epoch, through, &[], &[], &records)
+        else {
             return false;
         };
         let atime_inos: Vec<Ino> = rows.iter().map(|(ino, _, _)| *ino).collect();
@@ -777,7 +807,7 @@ impl Core {
         // Plan 30 §M6: the new tenure's journal position starts here, above
         // every position of the tenure it ends.
         let through = replica.journal_acked_seq().unwrap_or(0);
-        let payload = segment::encode(self.cfg.node_id, gate.epoch, through, &[], &[])
+        let payload = segment::encode(self.cfg.node_id, gate.epoch, through, &[], &[], &[])
             .expect("empty segment");
         let seq = self.ship.next_seq;
         let op = self.issue_s3(S3Op::SegmentPut { seq, payload }, S3For::Job, out);
@@ -887,8 +917,8 @@ impl Core {
         self.ship.head_seq = self.ship.head_seq.max(seq);
         self.ship.max_epoch = self.ship.max_epoch.max(epoch);
         self.stats.epoch_markers += 1;
-        let payload =
-            segment::encode(self.cfg.node_id, epoch, through, &[], &[]).expect("empty segment");
+        let payload = segment::encode(self.cfg.node_id, epoch, through, &[], &[], &[])
+            .expect("empty segment");
         self.stream_passed(now, seq, epoch, &payload, out);
         out.push(Action::Announce {
             seq,
@@ -931,6 +961,7 @@ impl Core {
         let _ = replica.persist_lost(true);
         self.inbox.holder = None;
         self.ack_abort_parked(now, replica, out);
+        self.deleg_on_lease_gone(out);
     }
 
     /// Plan 30 §M9: whether the job in the slot has a lease CAS (or its
@@ -1309,7 +1340,7 @@ impl Core {
                     && self.lease.gate.is_none()
                     && self.lease.held.is_none()
                     && !self.lease.epoch_held()
-                    && replica.journal_len().unwrap_or(0) > 0
+                    && replica.journal_has_undelegated()
                 {
                     self.queued_jobs.push_back(JobReq::Acquire {
                         reason: "ship-pending-journal",
@@ -1400,6 +1431,14 @@ impl Core {
         }
         if self.lease.held.is_none() || self.lease.lost || !self.lease.wants_handoff(now, &self.cfg)
         {
+            self.finish_round(now, None, replica, out);
+            return;
+        }
+        // Plan 30 §M11: the root lease stays while a delegation is live —
+        // a successor could not honour the grants' expiries (it has no
+        // clock for them), and the delegates keep their local speed
+        // exactly by the root not moving. Other writers forward.
+        if self.deleg_live_generations() > 0 {
             self.finish_round(now, None, replica, out);
             return;
         }
@@ -1973,6 +2012,8 @@ impl Core {
         }
         self.on_acquire_finished(now, acquired, replica, out);
         if acquired {
+            // Plan 30 §M11: the generations a predecessor left live.
+            self.delegation_sync(now, replica, out);
             // M13/M5: start polling requesters' inboxes now, not at the
             // end of the first round — that round can spend seconds in
             // the upload pass (the write-back delay) with nothing armed.

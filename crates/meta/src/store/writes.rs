@@ -77,14 +77,38 @@ impl Meta {
     /// `applied_seq`: delete them, advance `applied_seq`, and retire the
     /// transactions they complete (plan 30 §M3b: their `journal_tx` rows,
     /// and their `Local` speculation — see `spec::retire_local_tx`).
-    pub fn ack_journal_rows_at(
+    /// The transaction-level body of [`Self::ack_journal_rows_at`]:
+    /// retire the shipped transactions and delete their rows. Plan 30
+    /// §M11 also calls it for a delegate's own transactions that came back
+    /// through a segment.
+    pub(crate) fn ack_rows_tx(
         &self,
+        tx: &mut fjall::SingleWriterWriteTx,
         journal_seqs: &[u64],
         applied_seq: u64,
     ) -> Result<(), MetaError> {
-        use crate::store::spec::{retire_local_tx, Shipped};
-        let mut tx = self.db.write_tx();
+        use crate::store::spec::{retire_local_tx, retire_tx, Shipped};
         let mut held_below = false;
+        // Plan 30 §M11: the root's own ops forwarded to a delegate are
+        // shadows here (§M6) that no segment apply completes: the
+        // completions this ship carries retire them, as the segment
+        // would on any other replica.
+        if crate::store::counter_get(tx, &self.local, crate::store::KV_SPEC_LIVE_COUNT)? > 0 {
+            let mut completes = std::collections::HashSet::new();
+            for seq in journal_seqs {
+                if let Some(v) = tx.get(&self.journal_ks, crate::store::journal::seq_key(*seq))? {
+                    match LogRecord::from_postcard(&v)? {
+                        LogRecord::Completed { rid } | LogRecord::Refused { rid, .. } => {
+                            completes.insert(rid);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !completes.is_empty() {
+                retire_tx(tx, self, &completes, applied_seq, None)?;
+            }
+        }
         if let Some(&upto) = journal_seqs.iter().max() {
             // Plan 30 §M4: exactly these rows shipped — a held-back
             // transaction between them stays outstanding (`store::held`).
@@ -98,7 +122,7 @@ impl Meta {
                 set = journal_seqs.iter().copied().collect();
                 Shipped::Set(&set)
             };
-            let retired = retire_local_tx(&mut tx, self, upto, applied_seq, Some(only))?;
+            let retired = retire_local_tx(tx, self, upto, applied_seq, Some(only))?;
             held_below = retired.held_below;
             if held_below {
                 self.held_work
@@ -106,13 +130,22 @@ impl Meta {
             }
         }
         crate::store::journal::ack_rows_at(
-            &mut tx,
+            tx,
             &self.journal_ks,
             &self.local,
             journal_seqs,
             applied_seq,
             held_below,
-        )?;
+        )
+    }
+
+    pub fn ack_journal_rows_at(
+        &self,
+        journal_seqs: &[u64],
+        applied_seq: u64,
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        self.ack_rows_tx(&mut tx, journal_seqs, applied_seq)?;
         // Plan 30 §M5: with nothing left unshipped, no key is behind an
         // unshipped record any more (`Meta::unshipped_overlaps`).
         let empty = crate::store::journal::len(&tx, &self.journal_ks, &self.local)? == 0;

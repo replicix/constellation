@@ -293,6 +293,14 @@ fn replay_seed() {
         Ok("flex-long") => flex_config(),
         Ok("flex-backup") => flex_backup_config(),
         Ok("flex-zero") => flex_zero_config(),
+        // Plan 30 §M11.
+        Ok("delegated") => delegated_config(),
+        Ok("delegated-marker") => delegated_marker_config(),
+        Ok("delegated-crash") => delegated_crash_config(),
+        Ok("delegated-partition") => delegated_partition_config(),
+        Ok("delegated-epoch") => delegated_epoch_config(),
+        Ok("delegated-faults") => delegated_faults_config(),
+        Ok("long-delegated") => long_delegated_config(),
         // Plan 30 §M7.
         Ok("streams-off") => streams_off_config(),
         Ok("stream-faults") => stream_faults_config(),
@@ -1788,4 +1796,316 @@ fn long_flex() {
         .unwrap_or(500);
     run_flex("flex", flex_config(), 20_000..20_000 + n);
     run_flex("flex-crash", flex_crash_config(), 30_000..30_000 + n);
+}
+
+// ===================================================================
+// Plan 30 §M11: delegated sub-sequencers.
+
+/// Three nodes; node 1 holds the lease (the root) and delegates `d1`
+/// to node 2 and `d2` to node 3 before the clients start. Each node's
+/// clients write in their home directory (node 1 in the root
+/// directory), a third of the renames cross into another directory
+/// (recalled to the root), reads follow the session wait.
+fn delegated_config() -> SimConfig {
+    SimConfig {
+        nodes: 3,
+        clients_per_node: 2,
+        ops_per_client: 8,
+        names: 4,
+        random_faults: 0,
+        read_ratio: 0.5,
+        dirs: vec!["d1".into(), "d2".into()],
+        delegations: vec![("d1".into(), 2), ("d2".into(), 3)],
+        cross_ratio: 0.3,
+        ..SimConfig::default()
+    }
+}
+
+/// Marker pairs: every node writes data in its home directory and a
+/// marker in the next one; watchers on every node check.
+fn delegated_marker_config() -> SimConfig {
+    SimConfig {
+        marker_pairs: 3,
+        cross_ratio: 0.0,
+        ..delegated_config()
+    }
+}
+
+/// The delegate of `d1` dies mid-burst (no backup): the root reclaims
+/// its expired grant, the requesters' acknowledged ops replay by rid
+/// through the root, and the node comes back with its journal.
+fn delegated_crash_config() -> SimConfig {
+    SimConfig {
+        // No cross-subtree ops: the grant is live when the node dies.
+        cross_ratio: 0.0,
+        faults: vec![ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::CrashNode {
+                node: 2,
+                restart_ms: Some(9_000),
+                keep_journal: true,
+            },
+        }],
+        ..delegated_config()
+    }
+}
+
+/// The delegate of `d1` is cut from the root for longer than its grant:
+/// recalls are outwaited, its later writes are refused locally and go
+/// through the root, no divergence.
+fn delegated_partition_config() -> SimConfig {
+    SimConfig {
+        cross_ratio: 0.0,
+        faults: vec![ScheduledFault {
+            at_ms: 1_000,
+            kind: FaultKind::Partition {
+                a: 1,
+                b: 2,
+                for_ms: 9_000,
+            },
+        }],
+        ..delegated_config()
+    }
+}
+
+/// A continuation epoch forms under delegation (`f = 1`, the M10
+/// outage): the root recalls every generation, delegates stop, and
+/// everything stays linearizable and converged.
+fn delegated_epoch_config() -> SimConfig {
+    SimConfig {
+        epoch_slack: 1,
+        core: std::sync::Arc::new(sim::run::flex_core_config),
+        faults: vec![ScheduledFault {
+            at_ms: 1_200,
+            kind: FaultKind::EpochOutage {
+                members: 2,
+                for_ms: 5_000,
+            },
+        }],
+        ..delegated_config()
+    }
+}
+
+/// The CI's random faults on top of delegation (root crashes included:
+/// a successor root learns the generations from the log).
+fn delegated_faults_config() -> SimConfig {
+    SimConfig {
+        random_faults: 2,
+        ..delegated_config()
+    }
+}
+
+fn long_delegated_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 12,
+        random_faults: 3,
+        p2p_drop: 0.02,
+        marker_pairs: 2,
+        ..delegated_config()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct M11Totals {
+    seeds: u64,
+    executed: u64,
+    forwarded: u64,
+    appended: u64,
+    streamed: u64,
+    deps_waits: u64,
+    cross_subtree: u64,
+    recalls_sent: u64,
+    recalls_drained: u64,
+    recalls_expired: u64,
+    reclaimed: u64,
+    ended: u64,
+    installed: u64,
+    not_owner: u64,
+    exec_parked: u64,
+    stranded: u64,
+    marker_checks: u64,
+    dirs_checked: usize,
+    epochs: usize,
+}
+
+impl M11Totals {
+    fn add(&mut self, r: &Report) {
+        self.seeds += 1;
+        for s in r.stats.values() {
+            self.executed += s.deleg_executed;
+            self.forwarded += s.deleg_forwarded;
+            self.appended += s.deleg_appended_txs;
+            self.streamed += s.deleg_streamed_txs;
+            self.deps_waits += s.deleg_deps_waits;
+            self.cross_subtree += s.deleg_cross_subtree;
+            self.recalls_sent += s.deleg_recalls_sent;
+            self.recalls_drained += s.deleg_recalls_drained;
+            self.recalls_expired += s.deleg_recalls_expired;
+            self.reclaimed += s.deleg_reclaimed;
+            self.ended += s.deleg_ended;
+            self.installed += s.deleg_installed;
+            self.not_owner += s.deleg_not_owner;
+            self.exec_parked += s.deleg_exec_parked;
+            self.stranded += s.local_rolled_back;
+        }
+        self.marker_checks += r.marker_checks;
+        self.dirs_checked += r.dirs_checked;
+        self.epochs += r.epochs_formed;
+    }
+}
+
+fn run_m11(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M11Totals {
+    let mut totals = M11Totals::default();
+    for seed in seeds {
+        let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+            panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+        });
+        totals.add(&report);
+    }
+    eprintln!("{label}: {totals:?}");
+    totals
+}
+
+/// Plan 30 §M11: delegates execute their subtrees locally, the root
+/// appends their streams and recalls for cross-subtree renames; every
+/// directory's history is linearizable, the log valid, replicas
+/// converge, and the root never appends a batch whose deps it lacks.
+#[test]
+fn delegated_subtrees_are_linearizable_per_directory() {
+    let t = run_m11("delegated", delegated_config(), 60_000..60_040);
+    assert!(t.executed > 200, "delegates rarely executed: {t:?}");
+    assert!(t.appended > 200, "the root rarely appended: {t:?}");
+    assert!(t.cross_subtree > 20, "no cross-subtree ops: {t:?}");
+    assert!(t.recalls_drained > 10, "recalls never drained: {t:?}");
+    assert!(
+        t.dirs_checked >= 3 * t.seeds as usize,
+        "per-directory checks missing: {t:?}"
+    );
+}
+
+/// Plan 30 §M11: data in one delegated directory, a marker in another;
+/// no replica ever shows the marker without the data.
+#[test]
+fn delegated_marker_order_holds() {
+    let t = run_m11(
+        "delegated-marker",
+        delegated_marker_config(),
+        61_000..61_030,
+    );
+    assert!(t.marker_checks > 1_000, "markers rarely checked: {t:?}");
+    assert!(t.deps_waits > 0, "the deps wait was never exercised: {t:?}");
+}
+
+/// Plan 30 §M11: the delegate crashes without a backup; the root
+/// reclaims the grant, requesters replay by rid, the node returns.
+#[test]
+fn delegated_delegate_crash_replays_by_rid() {
+    let t = run_m11("delegated-crash", delegated_crash_config(), 62_000..62_030);
+    assert!(
+        t.reclaimed + t.recalls_expired > 10,
+        "the grant was never reclaimed: {t:?}"
+    );
+    assert!(t.ended > 10, "no generation ended: {t:?}");
+}
+
+/// Plan 30 §M11: the delegate is partitioned from the root; a recall is
+/// outwaited by the grant's expiry, the delegate stops on its own clock
+/// first, its later writes go through the root.
+#[test]
+fn delegated_partition_outwaits_the_recall() {
+    let t = run_m11(
+        "delegated-partition",
+        delegated_partition_config(),
+        63_000..63_030,
+    );
+    assert!(
+        t.recalls_expired + t.reclaimed > 5,
+        "no recall was outwaited: {t:?}"
+    );
+}
+
+/// Plan 30 §M10 × §M11: an epoch forms; every delegation is recalled.
+#[test]
+fn delegated_epoch_recalls_every_generation() {
+    let t = run_m11("delegated-epoch", delegated_epoch_config(), 64_000..64_020);
+    assert!(t.epochs > 0, "no epoch formed: {t:?}");
+    assert!(
+        t.ended >= t.epochs as u64,
+        "delegations survived an epoch: {t:?}"
+    );
+}
+
+/// Plan 30 §M11: the CI's random faults on top of delegation.
+#[test]
+fn delegated_under_random_faults() {
+    let t = run_m11(
+        "delegated-faults",
+        delegated_faults_config(),
+        65_000..65_040,
+    );
+    assert!(t.executed > 100, "delegates rarely executed: {t:?}");
+}
+
+/// Plan 30 §M11 (single-node-unchanged / p2p-off-no-delegation): the
+/// ordinary configurations never write a `Delegate` record and never
+/// park an execution on a delegation.
+#[test]
+fn no_delegation_without_a_delegate_record() {
+    for (label, cfg) in [
+        (
+            "single",
+            SimConfig {
+                nodes: 1,
+                clients_per_node: 2,
+                ops_per_client: 10,
+                random_faults: 0,
+                ..SimConfig::default()
+            },
+        ),
+        (
+            "inbox",
+            SimConfig {
+                core: std::sync::Arc::new(sim::run::inbox_core_config),
+                ..SimConfig::default()
+            },
+        ),
+        ("plain", SimConfig::default()),
+    ] {
+        for seed in 66_000..66_010 {
+            let r =
+                run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+            for (id, s) in &r.stats {
+                assert_eq!(s.deleg_delegated, 0, "{label} node {id} delegated");
+                assert_eq!(
+                    s.deleg_installed, 0,
+                    "{label} node {id} installed a delegation"
+                );
+                assert_eq!(
+                    s.deleg_exec_parked, 0,
+                    "{label} node {id} parked an execution"
+                );
+                assert_eq!(s.deleg_deps_waits, 0, "{label} node {id} waited for deps");
+            }
+        }
+    }
+}
+
+/// `cargo test -p constellation-authority --release --test sim -- --ignored long_delegated`
+#[test]
+#[ignore]
+fn long_delegated() {
+    let seeds = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
+    let start = std::env::var("AUTHORITY_SIM_START")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(70_000);
+    let t = run_m11(
+        "long-delegated",
+        long_delegated_config(),
+        start..start + seeds,
+    );
+    assert!(t.executed > 0);
 }

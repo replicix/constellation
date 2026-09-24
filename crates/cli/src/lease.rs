@@ -393,3 +393,112 @@ mod tests {
         });
     }
 }
+
+/// Plan 30 §M11: the delegations this node holds, mirrored from the
+/// core after every event for the FUSE fast path's sibling check
+/// (`fusefs::mutate_op_rebasable_with_rid`): a write whose keys fall
+/// under one of them, while its grant is honoured, executes on the FUSE
+/// thread as the delegate (`Meta::delegate_execute`) with no channel
+/// round trip, and the core streams it from the journal.
+#[derive(Debug, Default)]
+pub struct DelegateView {
+    /// `(dir, gen, honoured until unix ms, stopped)`.
+    entries: std::sync::Mutex<Vec<(u64, u64, i64, bool)>>,
+    /// Ops the FUSE fast path executed here as the delegate (the core's
+    /// `deleg_executed` counts the ones that went through it).
+    executed: std::sync::atomic::AtomicU64,
+    /// Generations the driver stopped ahead of the core (a recall came
+    /// in): the fast path admits nothing under them from that instant,
+    /// so the `through` the core answers the recall with is final.
+    stopped: std::sync::Mutex<std::collections::HashSet<u64>>,
+    /// Fast-path executions admitted and not yet journaled.
+    in_flight: std::sync::atomic::AtomicU64,
+}
+
+/// A fast-path execution admitted under a grant; dropped once the op is
+/// journaled (or refused), so a recall can wait for every admitted op.
+pub struct DelegateAdmission<'a> {
+    pub gen: u64,
+    view: &'a DelegateView,
+}
+
+impl Drop for DelegateAdmission<'_> {
+    fn drop(&mut self) {
+        self.view
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl DelegateView {
+    /// A recall of `gen` arrived: admit nothing more under it. The
+    /// caller waits for `in_flight` to drain before the core answers.
+    pub fn stop(&self, gen: u64) {
+        self.stopped.lock().unwrap().insert(gen);
+        let mut g = self.entries.lock().unwrap();
+        for e in g.iter_mut() {
+            if e.1 == gen {
+                e.3 = true;
+            }
+        }
+    }
+
+    /// Fast-path executions admitted and not yet journaled.
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The fast path executed one op as the delegate.
+    pub fn note_executed(&self) {
+        self.executed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ops the fast path executed as the delegate so far.
+    pub fn executed(&self) -> u64 {
+        self.executed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn mirror(&self, view: &constellation_authority::core::DelegView) {
+        let mut stopped = self.stopped.lock().unwrap();
+        let mut g = self.entries.lock().unwrap();
+        g.clear();
+        for (dir, gen, until, is_stopped, _, _, _) in &view.mine {
+            g.push((*dir, *gen, *until, *is_stopped || stopped.contains(gen)));
+        }
+        // A generation the core dropped is over: forget the stop.
+        stopped.retain(|gen| view.mine.iter().any(|m| m.1 == *gen));
+    }
+
+    /// The generation this node executes `keys` under right now, if any:
+    /// the keys' owner is one of this node's live, honoured delegations.
+    /// The admission is in flight until dropped.
+    pub fn admit_for(
+        &self,
+        meta: &constellation_meta::Meta,
+        keys: &constellation_meta::TouchSet,
+    ) -> Option<DelegateAdmission<'_>> {
+        let g = self.entries.lock().unwrap();
+        if g.is_empty() {
+            return None;
+        }
+        drop(g);
+        let constellation_meta::delegation::Ownership::Delegated(d) = meta.resolve_ownership(keys)
+        else {
+            return None;
+        };
+        let now = now_unix_ms();
+        // Counted before the check under the same lock a `stop` takes:
+        // once `stop` returns, no new admission of that generation
+        // exists and every earlier one is counted.
+        let g = self.entries.lock().unwrap();
+        let gen = g
+            .iter()
+            .find(|(_, gen, until, stopped)| *gen == d.gen && !*stopped && now < *until)
+            .map(|(_, gen, _, _)| *gen)?;
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        drop(g);
+        Some(DelegateAdmission { gen, view: self })
+    }
+}

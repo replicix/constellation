@@ -141,10 +141,19 @@ pub const LOCAL_REPLAY_INCARNATION: u32 = u32::MAX - 1;
 pub enum SpecKind {
     /// A forwarded op's accepted reply, installed ahead of the log.
     /// `epoch` is the accepting holder's; `op` is what a replay re-sends.
-    Shadow { rid: Rid, epoch: u64, op: MutateOp },
+    /// Plan 30 §M11: `gen` is the accepting delegate's generation (0: the
+    /// root's); the log's `Recall` of it strands the shadow.
+    Shadow {
+        rid: Rid,
+        epoch: u64,
+        op: MutateOp,
+        gen: u64,
+    },
     /// The `Exists` early install: retires once the applied position
-    /// reaches `floor`, strands if a segment above `epoch` arrives first.
-    Hint { floor: u64, epoch: u64 },
+    /// reaches `floor`, strands if a segment above `epoch` arrives first
+    /// (or, plan 30 §M11, the log recalls the answering delegate's
+    /// generation `gen`).
+    Hint { floor: u64, epoch: u64, gen: u64 },
     /// Plan 30 §M9: one of the holder's journal transactions (rows
     /// `first..=last` of its tenure at `epoch`), streamed to this
     /// subscriber once its backups held it, ahead of the log. Retires
@@ -199,10 +208,27 @@ struct SpecRow {
 /// stores; `Local` is derived from `journal_tx`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum LiveEntry {
-    Shadow { rid: Rid, epoch: u64 },
-    Hint { floor: u64, epoch: u64 },
-    Streamed { epoch: u64, last: u64 },
-    Local { first: u64, epoch: u64 },
+    Shadow {
+        rid: Rid,
+        epoch: u64,
+        gen: u64,
+    },
+    Hint {
+        floor: u64,
+        epoch: u64,
+        gen: u64,
+    },
+    Streamed {
+        epoch: u64,
+        last: u64,
+    },
+    /// Plan 30 §M11: `gen` is the delegation stream the transaction
+    /// belongs to (0: this node's own row as a holder).
+    Local {
+        first: u64,
+        epoch: u64,
+        gen: u64,
+    },
 }
 
 impl LiveEntry {
@@ -218,11 +244,27 @@ impl LiveEntry {
     /// Whether a segment from, or a takeover at, `epoch` strands this
     /// entry: the epoch that produced it can no longer reach the log. A
     /// `Local` entry written without a lease (epoch 0) is not tied to any
-    /// epoch and only ever retires by shipping.
+    /// epoch and only ever retires by shipping. Plan 30 §M11: a delegate
+    /// stream's row is tied to its generation, not to any epoch — a root
+    /// takeover strands nothing of it (the delegate re-streams to the
+    /// successor); only the log's `Recall` of the generation does.
     fn stranded_by(&self, epoch: u64) -> bool {
         match self {
             LiveEntry::Local { epoch: 0, .. } => false,
+            LiveEntry::Local { gen, .. } if *gen != 0 => false,
             entry => entry.epoch() < epoch,
+        }
+    }
+
+    /// Plan 30 §M11: whether the log's recall of `gen` strands this
+    /// entry: a delegate's unappended row of that generation, or a
+    /// shadow/hint a requester installed from that delegate's reply.
+    fn stranded_by_recall(&self, recalled: &HashSet<u64>) -> bool {
+        match self {
+            LiveEntry::Local { gen, .. }
+            | LiveEntry::Shadow { gen, .. }
+            | LiveEntry::Hint { gen, .. } => *gen != 0 && recalled.contains(gen),
+            LiveEntry::Streamed { .. } => false,
         }
     }
 }
@@ -403,6 +445,7 @@ fn read_live(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, Me
                 LiveEntry::Local {
                     first,
                     epoch: row.epoch,
+                    gen: row.gen,
                 },
             ));
         }
@@ -491,13 +534,17 @@ fn record_tx(
 ) -> Result<u64, MetaError> {
     let seq = next_spec_seq_tx(tx, &meta.local)?;
     let live = match &kind {
-        SpecKind::Shadow { rid, epoch, .. } => Some(LiveEntry::Shadow {
+        SpecKind::Shadow {
+            rid, epoch, gen, ..
+        } => Some(LiveEntry::Shadow {
             rid: *rid,
             epoch: *epoch,
+            gen: *gen,
         }),
-        SpecKind::Hint { floor, epoch } => Some(LiveEntry::Hint {
+        SpecKind::Hint { floor, epoch, gen } => Some(LiveEntry::Hint {
             floor: *floor,
             epoch: *epoch,
+            gen: *gen,
         }),
         SpecKind::Streamed { epoch, last, .. } => Some(LiveEntry::Streamed {
             epoch: *epoch,
@@ -1038,7 +1085,7 @@ pub struct ShippedRows<'a> {
 /// Retire every outstanding shadow whose rid `completes` names, every
 /// hint whose floor `applied_seq` has reached, and every streamed
 /// transaction `shipped` confirms.
-fn retire_tx(
+pub(crate) fn retire_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     completes: &HashSet<Rid>,
@@ -1509,6 +1556,19 @@ impl Meta {
         op: &MutateOp,
         records: &[LogRecord],
     ) -> Result<bool, MetaError> {
+        self.install_shadow_from(rid, epoch, 0, op, records)
+    }
+
+    /// [`Self::install_shadow`] for a reply accepted by a delegate of
+    /// generation `gen` (plan 30 §M11; 0: the root).
+    pub fn install_shadow_from(
+        &self,
+        rid: Rid,
+        epoch: u64,
+        gen: u64,
+        op: &MutateOp,
+        records: &[LogRecord],
+    ) -> Result<bool, MetaError> {
         let mut tx = self.db.write_tx();
         if tx.get(&self.completed, rid.to_key())?.is_some() {
             return Ok(false);
@@ -1553,6 +1613,7 @@ impl Meta {
             rid,
             epoch,
             op: op.clone(),
+            gen,
         };
         self.install_speculative_tx(tx, kind, records)?;
         Ok(true)
@@ -1569,8 +1630,20 @@ impl Meta {
         floor: u64,
         epoch: u64,
     ) -> Result<(), MetaError> {
+        self.install_hint_from(records, floor, epoch, 0)
+    }
+
+    /// [`Self::install_hint`] for a refusal answered by a delegate of
+    /// generation `gen` (plan 30 §M11).
+    pub fn install_hint_from(
+        &self,
+        records: &[LogRecord],
+        floor: u64,
+        epoch: u64,
+        gen: u64,
+    ) -> Result<(), MetaError> {
         let tx = self.db.write_tx();
-        self.install_speculative_tx(tx, SpecKind::Hint { floor, epoch }, records)
+        self.install_speculative_tx(tx, SpecKind::Hint { floor, epoch, gen }, records)
     }
 
     /// Plan 30 §M9: install one of the holder's backup-acked journal
@@ -1684,19 +1757,29 @@ impl Meta {
         records: &[LogRecord],
         pending: &TouchSet,
     ) -> Result<SegmentApplied, MetaError> {
-        self.apply_segment_rows(seq, epoch, 0, &[], records, pending)
+        self.apply_segment_rows(seq, epoch, 0, &[], &[], records, pending)
     }
 
     /// [`Self::apply_segment`] with the segment's journal bookkeeping
     /// (plan 30 §M9): the shipping tenure's `through` and the journal
     /// seqs of its rows, which retire the `Streamed` entries they
     /// confirm (step 3).
+    /// Plan 30 §M11: `origins` are the delegation origins of the rows
+    /// (parallel to `rows`; `(0, 0)` for the shipper's own). A row of a
+    /// generation this node executed as the delegate is its own
+    /// transaction coming back through the log: its records are skipped
+    /// (applied here already) and the transaction retires like a shipped
+    /// one. A `Recall` record strands what is left of that generation
+    /// here (the delegate's unappended rows, rolled back and queued for
+    /// replay by rid).
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_segment_rows(
         &self,
         seq: u64,
         epoch: u64,
         through: u64,
         rows: &[u64],
+        origins: &[(u64, u64)],
         records: &[LogRecord],
         pending: &TouchSet,
     ) -> Result<SegmentApplied, MetaError> {
@@ -1713,6 +1796,40 @@ impl Meta {
             entry.stranded_by(epoch)
                 && !matches!(entry, LiveEntry::Shadow { rid, .. } if completes.contains(rid))
         })?;
+        // Plan 30 §M11: this node's own delegate transactions the segment
+        // carries — their segment rows are skipped below, and the
+        // transactions retire after the apply.
+        let own_txs = self.journal_seqs_of_origins(&tx, origins)?;
+        if origins.iter().any(|o| o.0 != 0) {
+            tracing::trace!(
+                seq,
+                ?rows,
+                ?origins,
+                ?own_txs,
+                "segment carries delegate origins"
+            );
+        }
+        // Segment row -> the own transaction's `spec_seq` (its `Local`
+        // speculation row, if captured).
+        let own_rows: HashMap<u64, Option<u64>> = if own_txs.is_empty() {
+            HashMap::new()
+        } else {
+            rows.iter()
+                .zip(origins.iter())
+                .filter(|(_, o)| o.0 != 0)
+                .filter_map(|(r, o)| {
+                    own_txs
+                        .iter()
+                        .find(|(first, last, _)| {
+                            local::get_journal_tx_head(&tx, self, *first)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|h| (h.gen, h.idx) == *o && h.last == *last)
+                        })
+                        .map(|(_, _, spec_seq)| (*r, *spec_seq))
+                })
+                .collect()
+        };
         let live: HashMap<u64, LiveEntry> = read_live(&tx, self)?.into_iter().collect();
         // Plan 30 §M9: the streamed transactions this segment carries are
         // applied already. Re-applying their records would not converge
@@ -1741,10 +1858,30 @@ impl Meta {
                 }
             }
         }
-        let skipped_rows: HashSet<u64> = confirmed
+        // Plan 30 §M11: with a `Local` row outstanding the segment is
+        // inserted by a rewind (below), which rolls back every row from
+        // the oldest one on. A streamed or own-delegate transaction that
+        // the rewind rolls back is *not* applied any more: its records
+        // apply from the segment, in log order (epoch seed 64010: redone
+        // after the segment instead, a delegate's `Create` came back
+        // after the rename the segment carried and the name diverged).
+        let first_local = live
             .iter()
+            .filter(|(_, entry)| matches!(entry, LiveEntry::Local { .. }))
+            .map(|(seq, _)| *seq)
+            .min();
+        let rolled_back = |spec_seq: u64| first_local.is_some_and(|cutoff| spec_seq >= cutoff);
+        let mut skipped_rows: HashSet<u64> = confirmed
+            .iter()
+            .filter(|(spec_seq, _, _)| !rolled_back(*spec_seq))
             .flat_map(|(_, first, last)| *first..=*last)
             .collect();
+        let own_rolled_back: HashSet<u64> = own_rows
+            .iter()
+            .filter(|(_, spec_seq)| spec_seq.is_some_and(&rolled_back))
+            .map(|(r, _)| *r)
+            .collect();
+        skipped_rows.extend(own_rows.keys().filter(|r| !own_rolled_back.contains(r)));
         let filtered: Vec<LogRecord>;
         let records: &[LogRecord] = if skipped_rows.is_empty() {
             records
@@ -1768,19 +1905,33 @@ impl Meta {
                 .collect();
             &filtered
         };
-        let first_local = live
-            .iter()
-            .filter(|(_, entry)| matches!(entry, LiveEntry::Local { .. }))
-            .map(|(seq, _)| *seq)
-            .min();
         let mut inserted_before_local = false;
         let skipped = if let Some(cutoff) = first_local {
             inserted_before_local = true;
+            // Plan 30 §M11: a delegate holds `Local` rows (its unretired
+            // stream transactions) older than its shadows and hints, so
+            // the insert-and-redo path is its ordinary one. What this
+            // segment retires — a shadow whose completion it carries, a
+            // hint whose floor it reaches, a streamed row it confirms —
+            // is retired speculation whose effect the segment carries:
+            // redone after it, a hint would resurrect the entry the
+            // segment's later records moved (epoch seed 64010).
+            let own_spec: HashSet<u64> = own_txs.iter().filter_map(|(_, _, s)| *s).collect();
+            let live_after: HashMap<u64, LiveEntry> = live
+                .iter()
+                .filter(|(spec_seq, entry)| match entry {
+                    LiveEntry::Shadow { rid, .. } => !completes.contains(rid),
+                    LiveEntry::Hint { floor, .. } => seq < *floor,
+                    LiveEntry::Streamed { .. } => !confirmed.iter().any(|(s, _, _)| s == *spec_seq),
+                    LiveEntry::Local { .. } => !own_spec.contains(spec_seq),
+                })
+                .map(|(s, e)| (*s, *e))
+                .collect();
             rewind_tx(
                 &mut tx,
                 self,
                 &staged,
-                &live,
+                &live_after,
                 &HashSet::new(),
                 cutoff,
                 Some(Inserted {
@@ -1841,6 +1992,38 @@ impl Meta {
                 retired += 1;
             }
         }
+        // Plan 30 §M11: the own delegate transactions this segment
+        // carries are in the log now: retire them (journal rows deleted,
+        // their `Local` rows converted or dropped, the acked watermark
+        // moved as an out-of-order ship would, M4's rule).
+        let mut own_seqs: Vec<u64> = own_txs
+            .iter()
+            .flat_map(|(first, last, _)| *first..=*last)
+            .collect();
+        own_seqs.sort_unstable();
+        if !own_seqs.is_empty() {
+            self.ack_rows_tx(&mut tx, &own_seqs, seq)?;
+            retired += own_txs.len();
+        }
+        // Plan 30 §M11: a generation the log recalls strands whatever of
+        // it this node still holds unappended (past the cut: everything
+        // appended is before the `Recall` record, hence retired above).
+        let recalled: HashSet<u64> = records
+            .iter()
+            .filter_map(|rec| match rec {
+                LogRecord::Recall { gen, .. } => Some(*gen),
+                _ => None,
+            })
+            .collect();
+        let mut stranded = stranded;
+        if !recalled.is_empty() {
+            let more = strand_tx(&mut tx, self, &staged, |entry| {
+                entry.stranded_by_recall(&recalled)
+            })?;
+            stranded.shadows += more.shadows;
+            stranded.hints += more.hints;
+            stranded.locals += more.locals;
+        }
         let from = journal_from(&tx, self)?;
         compact_tx(&mut tx, self, from)?;
         kv_set_tx(&mut tx, &self.local, KV_APPLIED_SEQ, &seq.to_string());
@@ -1848,6 +2031,11 @@ impl Meta {
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
         staged.drain_into(self.usage_tracker());
+        if !own_seqs.is_empty() {
+            if let Some(&upto) = own_seqs.iter().max() {
+                let _ = self.prune_recent_shipped(upto);
+            }
+        }
         Ok(SegmentApplied {
             skipped,
             stranded,

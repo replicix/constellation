@@ -43,7 +43,7 @@ pub struct SessionReport {
 
 fn names_of(op: &NsOp) -> Vec<&str> {
     match op {
-        NsOp::Create(n) | NsOp::Unlink(n) => vec![n.as_str()],
+        NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) => vec![n.as_str()],
         NsOp::Rename(a, b) => vec![a.as_str(), b.as_str()],
     }
 }
@@ -102,7 +102,7 @@ pub fn check_sessions(
         for (rid, _) in &successes {
             let (_, op) = &invoke[rid];
             match op {
-                NsOp::Create(x) if x == n => cur = true,
+                NsOp::Create(x) | NsOp::Put(x) if x == n => cur = true,
                 NsOp::Unlink(x) if x == n => cur = false,
                 NsOp::Rename(a, b) => {
                     if a == n {

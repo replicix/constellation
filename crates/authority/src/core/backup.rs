@@ -1726,6 +1726,7 @@ impl Core {
                                 epoch,
                                 jseq: tx.last,
                             }),
+                            streams: Default::default(),
                         },
                     );
                     self.bk.ahead_next = Some((epoch, tx.last + 1));

@@ -16,6 +16,7 @@ use crate::event::{PeerMsg, Policy, S3Result};
 use crate::ids::{Epoch, Ms, NodeId, OpId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
+use constellation_meta::delegation::Ownership;
 use constellation_meta::{
     CompletedOutcome, KeySet, MetaError, MutateOp, MutateOutcome, Position, Rid,
 };
@@ -97,7 +98,9 @@ pub(crate) struct ClientOp {
     /// The inodes the op reads or writes (`forward::conflict_keys`).
     pub keys: Vec<Ino>,
     pub attempts: u32,
-    pub redirected: bool,
+    /// `NotHolder` redirects followed (plan 30 §M11: two, since a
+    /// delegate's names the root and the root's a delegate).
+    pub redirected: u32,
     /// Sent to a holder at least once (or into an inbox): it may have
     /// taken effect there, so every later local execution first checks
     /// `completed`.
@@ -120,6 +123,9 @@ pub(crate) struct ClientOp {
     /// drained by the next takeover after the client was already
     /// answered from the P2P reply.
     pub inbox_keys: Vec<constellation_store_s3::inbox::InboxKey>,
+    /// Plan 30 §M11: what this node had observed when the op was
+    /// submitted — the op's causal dependencies, carried on every forward.
+    pub deps: Position,
 }
 
 impl ClientOp {
@@ -296,6 +302,31 @@ impl Core {
             out,
         );
         let keys = conflict_keys(&op, replica);
+        // Plan 30 §M11: `None` (the streams overflow) is a root-only op:
+        // the root orders after everything it appended.
+        let (mut deps, overflow) = match replica.deps() {
+            Some(d) => (d, false),
+            None => (
+                Position {
+                    streams: Default::default(),
+                    ..replica.observed()
+                },
+                true,
+            ),
+        };
+        if overflow {
+            self.stats.deps_overflow_to_root += 1;
+        }
+        // The root's own journal (its local executions, the streams it
+        // appended) is ahead of what it shipped: a delegate orders after
+        // all of it.
+        if let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) {
+            if let Some(jp) = replica.journal_position(epoch) {
+                if Some(jp) > deps.pending {
+                    deps.pending = Some(jp);
+                }
+            }
+        }
         // A rid this core already answered `InDoubt` may have taken
         // effect somewhere: its resubmission is in doubt from the start.
         // So is a stranded op's replay (`Origin::Replay`): its first
@@ -317,7 +348,7 @@ impl Core {
                 order: self.next_client_order,
                 keys,
                 attempts: 0,
-                redirected: false,
+                redirected: 0,
                 forwarded: in_doubt,
                 acquire_retries: 0,
                 deadline,
@@ -325,8 +356,38 @@ impl Core {
                 inbox_since: None,
                 inbox_durable_at: None,
                 inbox_keys,
+                deps,
             },
         );
+        // Plan 30 §M11: a delegate executes its own subtree here; an op
+        // under another node's delegation goes to that delegate (or to
+        // the root, which recalls, when the observed stream table is
+        // full or the delegate is unreachable).
+        if self.cfg.delegation {
+            let op_ref = self
+                .clients
+                .get(&rid)
+                .map(|c| c.op.clone())
+                .expect("present");
+            if self.delegate_try_execute(now, 0, None, rid, &op_ref, deps, 0, replica, out) {
+                return;
+            }
+            if self.cfg.forwarding && self.cfg.p2p {
+                if let Ownership::Delegated(d) =
+                    replica.resolve_ownership(&super::holder::keys_of_op(&op_ref))
+                {
+                    if d.node != self.cfg.node_id {
+                        if deps.streams.is_full() && deps.streams.get(d.gen).is_none() {
+                            self.stats.deps_overflow_to_root += 1;
+                        } else if self.reaches(now, d.node) {
+                            self.stats.deleg_forwarded += 1;
+                            self.send_forward(now, rid, d.node, out);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         // The local fast path: the view is open, so execute here with no
         // await between the check and the write.
         if let Some(epoch) = self.lease.new_mutation_epoch(now, &self.cfg) {
@@ -424,7 +485,9 @@ impl Core {
         // Only this node can execute it, after its journal ships — the
         // lease path, which the `ship-pending-journal` acquisition is
         // already on. A non-holder with nothing journaled never pays this.
-        if replica.journal_len().unwrap_or(0) > 0 {
+        // Plan 30 §M11: a delegate's own stream rows are not such work
+        // (the root ships them); only undelegated rows count.
+        if replica.journal_len().unwrap_or(0) > 0 && replica.journal_has_undelegated() {
             tracing::debug!(
                 node = self.cfg.node_id,
                 ?rid,
@@ -537,6 +600,7 @@ impl Core {
         c.phase = Phase::Forwarded { req, holder };
         c.timer = Some(timer);
         c.forwarded = true;
+        let deps = c.deps;
         self.by_req.insert(req, rid);
         out.push(Action::Send {
             to: holder,
@@ -545,6 +609,7 @@ impl Core {
                 rid,
                 op: c.op.clone(),
                 acked_through,
+                deps,
             },
         });
     }
@@ -558,7 +623,7 @@ impl Core {
         from: NodeId,
         req: OpId,
         outcome: MutateOutcome,
-        (base, position): (Option<crate::ids::Seq>, Position),
+        (base, position, gen): (Option<crate::ids::Seq>, Position, u64),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -576,7 +641,14 @@ impl Core {
         }
         self.stats.forwards_ok += 1;
         self.note_p2p_result(now, from, true);
-        self.lease.cached_holder = Some(from);
+        // Plan 30 §M11: whatever the reply installs here, this client's
+        // next write orders after the answering sequencer's position.
+        replica.note_frontier(&position);
+        if gen == 0 {
+            // Plan 30 §M11: a delegate's reply says nothing about the
+            // lease; only the root's names the holder.
+            self.lease.cached_holder = Some(from);
+        }
         let applied = replica.applied_seq().unwrap_or(0);
         let base_ok = self.cfg.speculate_on_stale_base || base.is_some_and(|b| applied >= b);
         tracing::debug!(
@@ -617,7 +689,7 @@ impl Core {
                 let Some(op) = self.clients.get(&rid).map(|c| c.op.clone()) else {
                     return;
                 };
-                match replica.install_shadow(rid, epoch, &op, &records) {
+                match replica.install_shadow(rid, epoch, gen, &op, &records) {
                     Ok(true) => {
                         tracing::debug!(node = self.cfg.node_id, ?rid, epoch, "shadow installed");
                         self.stats.shadows_installed += 1;
@@ -675,12 +747,17 @@ impl Core {
                 }
             }
             MutateOutcome::NotHolder { holder } => {
-                if holder != 0 {
+                // Plan 30 §M11: the root's `NotHolder` names a delegate
+                // (the op is wholly the delegate's); that is a route, not
+                // the lease holder, so the cache keeps the root.
+                let names_delegate =
+                    holder != 0 && replica.delegation_table().iter().any(|e| e.node == holder);
+                if holder != 0 && !names_delegate {
                     self.lease.cached_holder = Some(holder);
                 }
                 let c = self.clients.get_mut(&rid).expect("present");
-                if holder != 0 && holder != from && holder != self.cfg.node_id && !c.redirected {
-                    c.redirected = true;
+                if holder != 0 && holder != from && holder != self.cfg.node_id && c.redirected < 2 {
+                    c.redirected += 1;
                     self.stats.forward_redirects += 1;
                     self.send_forward(now, rid, holder, out);
                 } else {
@@ -697,7 +774,7 @@ impl Core {
                 let floor = position.hint_floor();
                 let mut hinted = false;
                 if base_ok && applied < floor {
-                    match replica.install_hint(records, floor, epoch) {
+                    match replica.install_hint(records, floor, epoch, gen) {
                         Ok(()) => {
                             self.stats.hints_installed += 1;
                             replica.note_covering(KeySet::from_records(records), position);
@@ -963,7 +1040,7 @@ impl Core {
                 if holder != self.cfg.node_id && self.reaches(now, holder) {
                     let c = self.clients.get_mut(&rid).expect("present");
                     c.attempts = 0;
-                    c.redirected = false;
+                    c.redirected = 0;
                     self.send_forward(now, rid, holder, out);
                     return;
                 }
@@ -991,7 +1068,7 @@ impl Core {
     /// earlier attempt took effect (or was refused through an inbox) and
     /// nothing runs again. An op that was never sent anywhere cannot have
     /// taken effect and skips the read (the fast path's cost).
-    fn resolve_in_doubt_then_execute(
+    pub(crate) fn resolve_in_doubt_then_execute(
         &mut self,
         now: Ms,
         rid: Rid,
@@ -1013,6 +1090,7 @@ impl Core {
                 let position = Position {
                     seq: self.ship.head_seq,
                     pending: replica.journal_position(epoch),
+                    streams: Default::default(),
                 };
                 if let Some(need) = self.ack_need(&position) {
                     self.rd
@@ -1035,11 +1113,43 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> MutateOutcome {
-        let Some((op, policy)) = self.clients.get(&rid).map(|c| (c.op.clone(), c.policy)) else {
+        let Some((op, policy, deps)) = self
+            .clients
+            .get(&rid)
+            .map(|c| (c.op.clone(), c.policy, c.deps))
+        else {
             // Already finished by a nested pass (see `release_gated`);
             // the outcome goes to `finish`, which drops it.
             return MutateOutcome::Errno(libc::EIO);
         };
+        // Plan 30 §M11: as the root, recall the write delegations the
+        // op's keys fall under first, and wait for its `deps`; `finish`
+        // skips this rid until the parked continuation executes it.
+        if self.cfg.delegation {
+            let keys = super::holder::keys_of_op(&op);
+            let wait = if self.dl.gens.is_empty() {
+                Default::default()
+            } else {
+                self.deleg_recall_needed(now, &keys, replica, out)
+                    .unwrap_or_default()
+            };
+            let deps_wait = (!replica.reaches_streams(&deps)).then_some(deps);
+            if !wait.is_empty() || deps_wait.is_some() {
+                if deps_wait.is_some() {
+                    self.stats.deleg_deps_waits += 1;
+                }
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    ?wait,
+                    ?deps_wait,
+                    applied = ?replica.applied_position(),
+                    "root parks a local execution"
+                );
+                self.park_exec_local(now, wait, deps_wait, rid);
+                return MutateOutcome::Busy;
+            }
+        }
         let outcome = match replica.execute(&op, Some(rid)) {
             Ok(records) => {
                 if policy == Policy::Client {
@@ -1075,6 +1185,7 @@ impl Core {
         let position = Position {
             seq: self.ship.head_seq,
             pending: replica.journal_position(epoch),
+            streams: Default::default(),
         };
         let durable = self.ack_need(&position);
         let (outcome, wait) = outcome;
@@ -1175,6 +1286,7 @@ impl Core {
             self.cancel_timer(t, out);
         }
         self.stats.in_doubt += 1;
+        tracing::debug!(node = self.cfg.node_id, ?rid, "op goes in doubt");
         self.finish_in_doubt(now, rid, replica, out);
     }
 
@@ -1233,6 +1345,11 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // Plan 30 §M11: the execution itself is parked (a recall, `deps`);
+        // the parked continuation finishes it.
+        if self.dl.pending_exec.contains(&rid) {
+            return;
+        }
         if let Some((wait, durable)) = self.rd.parked_local.remove(&rid) {
             if self.clients.contains_key(&rid) {
                 self.park_finish(now, rid, wait, durable, outcome);

@@ -5,6 +5,7 @@
 use super::bus::{Bus, StreamFaults};
 use super::check;
 use super::clock::Clock;
+use super::history::dir_of;
 use super::history::{check_linearizable, check_linearizable_witnessed, History, NsOp, NsRet};
 use super::node::{read_lease, CommitRecord, NodeEnv, NodeHandle};
 use super::store::{Bucket, Fault, OpKind, Rule, When};
@@ -118,6 +119,19 @@ pub struct SimConfig {
     /// Plan 30 §M10: the slack the sim's epoch coordinator forms epochs
     /// under (the cores' `Config::epoch_slack` must agree).
     pub epoch_slack: u32,
+    /// Plan 30 §M11: directories under `/` created before the clients
+    /// start; a client's names live in its node's home directory
+    /// (`dirs[(node − 1) % dirs.len()]`, `""` when empty) with
+    /// `cross_ratio` of its renames crossing into another one.
+    pub dirs: Vec<String>,
+    /// Plan 30 §M11: `(dir, node)` delegated by the initial holder
+    /// (node 1) before the clients start.
+    pub delegations: Vec<(String, NodeId)>,
+    pub cross_ratio: f64,
+    /// Plan 30 §M11: a writer per node writes data in its home
+    /// directory then a marker in another; watchers on every node must
+    /// never see a marker without its data (`marker_order`).
+    pub marker_pairs: u64,
     /// Random faults may include `JoinFresh`. Off for the M10 configs: a
     /// node enrolled during an epoch is plan 30 §M10's documented gap
     /// (`flex_node_enrolled_during_an_epoch_is_the_known_gap`).
@@ -259,6 +273,10 @@ impl Default for SimConfig {
             rtts: Vec::new(),
             epoch_slack: 0,
             join_fresh: true,
+            dirs: Vec::new(),
+            delegations: Vec::new(),
+            cross_ratio: 0.0,
+            marker_pairs: 0,
         }
     }
 }
@@ -298,6 +316,11 @@ pub struct Report {
     pub epochs_formed: usize,
     pub epochs_missing_node: usize,
     pub authority_samples: u64,
+    /// Plan 30 §M11: marker pairs checked and violations seen.
+    pub marker_checks: u64,
+    pub marker_violations: u64,
+    /// Plan 30 §M11: per-directory checks run.
+    pub dirs_checked: usize,
 }
 
 pub struct Cluster {
@@ -359,26 +382,51 @@ fn ns_ret(outcome: &MutateOutcome) -> Result<NsRet, String> {
     }
 }
 
+/// Plan 30 §M11: `"d1/x"` is name `x` in directory `d1` (created under
+/// the root before the clients start); a bare name is in the root.
+fn split_name(meta: &Meta, name: &str) -> (u64, String) {
+    match name.rfind('/') {
+        Some(i) => {
+            let dir = &name[..i];
+            let parent = meta
+                .child_ino(ROOT_INO, dir)
+                .ok()
+                .flatten()
+                .unwrap_or(ROOT_INO);
+            (parent, name[i + 1..].to_string())
+        }
+        None => (ROOT_INO, name.to_string()),
+    }
+}
+
 fn mutate_op(meta: &Meta, op: &NsOp) -> MutateOp {
     match op {
-        NsOp::Create(name) => MutateOp::Create {
-            parent: ROOT_INO,
-            name: name.clone(),
-            ino: meta.allocate_ino(ROOT_INO).expect("ino"),
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-        },
-        NsOp::Unlink(name) => MutateOp::Unlink {
-            parent: ROOT_INO,
-            name: name.clone(),
-        },
-        NsOp::Rename(a, b) => MutateOp::Rename {
-            parent: ROOT_INO,
-            name: a.clone(),
-            new_parent: ROOT_INO,
-            new_name: b.clone(),
-        },
+        NsOp::Create(name) => {
+            let (parent, name) = split_name(meta, name);
+            MutateOp::Create {
+                parent,
+                name,
+                ino: meta.allocate_ino(parent).expect("ino"),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            }
+        }
+        NsOp::Unlink(name) => {
+            let (parent, name) = split_name(meta, name);
+            MutateOp::Unlink { parent, name }
+        }
+        NsOp::Rename(a, b) => {
+            let (parent, name) = split_name(meta, a);
+            let (new_parent, new_name) = split_name(meta, b);
+            MutateOp::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+            }
+        }
+        NsOp::Put(_) => unreachable!("Put is a projection-only op"),
     }
 }
 
@@ -458,7 +506,8 @@ async fn client_read(
     strict: bool,
 ) {
     let inv = history.tick();
-    let keys = [constellation_meta::ReadKey::Dentry(ROOT_INO, name.clone())];
+    let (parent, leaf) = split_name(&handle.meta, &name);
+    let keys = [constellation_meta::ReadKey::Dentry(parent, leaf.clone())];
     let mut timed_out = false;
     // Plan 30 §M8: a strict lookup — local under a delegation on the
     // directory, else a ReadIndex through the core (answered `Holder` on
@@ -468,12 +517,12 @@ async fn client_read(
         let now = handle.clock.now().0;
         let ask = |handle: &NodeHandle| {
             handle.control(constellation_authority::Control::ReadIndex {
-                ino: ROOT_INO,
+                ino: parent,
                 dir: true,
-                name: Some(name.clone()),
+                name: Some(leaf.clone()),
             })
         };
-        match handle.meta.read_delegations().valid(ROOT_INO, now) {
+        match handle.meta.read_delegations().valid(parent, now) {
             Some((held, renew)) => {
                 floor = held.position;
                 if renew {
@@ -508,7 +557,7 @@ async fn client_read(
     if !handle.alive() {
         return;
     }
-    let present = constellation_meta::MetaStore::lookup(&*handle.meta, ROOT_INO, &name)
+    let present = constellation_meta::MetaStore::lookup(&*handle.meta, parent, &leaf)
         .ok()
         .flatten()
         .is_some();
@@ -636,14 +685,36 @@ async fn client_thread(
     }
 }
 
-fn gen_ops(rng: &mut StdRng, n: u64, names: usize) -> Vec<NsOp> {
-    let pool: Vec<String> = (0..names).map(|i| format!("f{i}")).collect();
+/// Plan 30 §M11: ops on `home`'s names (`home/f<i>`), with `cross_ratio`
+/// of the renames moving a name into another directory of `dirs`.
+fn gen_ops_in(
+    rng: &mut StdRng,
+    n: u64,
+    names: usize,
+    home: &str,
+    dirs: &[String],
+    cross_ratio: f64,
+) -> Vec<NsOp> {
+    let prefix = |d: &str, i: usize| {
+        if d.is_empty() {
+            format!("f{i}")
+        } else {
+            format!("{d}/f{i}")
+        }
+    };
+    let pool: Vec<String> = (0..names).map(|i| prefix(home, i)).collect();
     (0..n)
         .map(|_| match rng.random_range(0..10) {
             0..=4 => NsOp::Create(pool.choose(rng).unwrap().clone()),
             5..=7 => NsOp::Unlink(pool.choose(rng).unwrap().clone()),
             _ => {
                 let a = pool.choose(rng).unwrap().clone();
+                let others: Vec<&String> = dirs.iter().filter(|d| d.as_str() != home).collect();
+                if !others.is_empty() && rng.random_bool(cross_ratio.min(1.0)) {
+                    let d = others.choose(rng).unwrap();
+                    let b = prefix(d, rng.random_range(0..names));
+                    return NsOp::Rename(a, b);
+                }
                 let mut b = pool.choose(rng).unwrap().clone();
                 if b == a {
                     b = pool[(pool.iter().position(|x| *x == a).unwrap() + 1) % pool.len()].clone();
@@ -659,7 +730,7 @@ fn with_reads(rng: &mut StdRng, ops: Vec<NsOp>, names: usize, ratio: f64) -> Vec
     let mut out = Vec::new();
     for op in ops {
         let touched = match &op {
-            NsOp::Create(n) | NsOp::Unlink(n) => n.clone(),
+            NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) => n.clone(),
             NsOp::Rename(a, b) => {
                 if rng.random_bool(0.5) {
                     a.clone()
@@ -670,10 +741,15 @@ fn with_reads(rng: &mut StdRng, ops: Vec<NsOp>, names: usize, ratio: f64) -> Vec
         };
         out.push(Step::Op(op));
         if ratio > 0.0 && rng.random_bool(ratio.min(1.0)) {
-            out.push(Step::Read(touched));
+            out.push(Step::Read(touched.clone()));
         }
         if ratio > 0.0 && rng.random_bool((ratio / 4.0).min(1.0)) {
-            out.push(Step::Read(format!("f{}", rng.random_range(0..names))));
+            let random = format!("f{}", rng.random_range(0..names));
+            let random = match dir_of(&touched) {
+                "" => random,
+                d => format!("{d}/{random}"),
+            };
+            out.push(Step::Read(random));
         }
     }
     out
@@ -1018,11 +1094,31 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let failures = Arc::new(Mutex::new(Vec::new()));
     let fault_log = Arc::new(Mutex::new(Vec::new()));
 
+    // Plan 30 §M11: the directories, then the delegations (node 1 takes
+    // the lease with the first mkdir and delegates as the root).
+    let markers: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let marker_stats: Arc<Mutex<(u64, u64)>> = Arc::new(Mutex::new((0, 0)));
+    if !cfg.dirs.is_empty() {
+        setup_dirs(&cluster, &cfg, &failures).await;
+    }
+
     // The workload.
     let mut clients = Vec::new();
     for node in 1..=cfg.nodes {
         for k in 0..cfg.clients_per_node {
-            let ops = gen_ops(&mut rng, cfg.ops_per_client, cfg.names);
+            // Plan 30 §M11: node 1 (the root) writes in the root
+            // directory, node `n ≥ 2` in `dirs[n − 2]` (its delegation,
+            // when one is configured); a second client writes in the
+            // next directory (a forward to its delegate).
+            let home = home_dir(&cfg.dirs, node, k);
+            let ops = gen_ops_in(
+                &mut rng,
+                cfg.ops_per_client,
+                cfg.names,
+                &home,
+                &cfg.dirs,
+                cfg.cross_ratio,
+            );
             let pace = rng.random_range(20..400);
             // Reads draw from their own generator, so a config without
             // reads replays exactly the schedules it had before M6.
@@ -1039,6 +1135,34 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 pace,
                 cfg.session_wait.then_some(cfg.session_wait_ms),
                 cfg.strict,
+            )));
+        }
+    }
+    // Plan 30 §M11: marker writers and watchers.
+    let mut marker_tasks = Vec::new();
+    if cfg.marker_pairs > 0 && cfg.dirs.len() >= 2 {
+        for node in 1..=cfg.nodes {
+            let home = home_dir(&cfg.dirs, node, 0);
+            let other = home_dir(&cfg.dirs, node, 1);
+            marker_tasks.push(tokio::spawn(marker_writer(
+                cluster.clone(),
+                history.clone(),
+                node,
+                (1 << 16) + node,
+                home,
+                other,
+                cfg.marker_pairs,
+                markers.clone(),
+                abandoned.clone(),
+            )));
+        }
+        for node in 1..=cfg.nodes {
+            marker_tasks.push(tokio::spawn(marker_watcher(
+                cluster.clone(),
+                node,
+                markers.clone(),
+                marker_stats.clone(),
+                failures.clone(),
             )));
         }
     }
@@ -1059,6 +1183,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     super::node::note_waiting("run", "clients".into());
     for c in clients {
         c.await.expect("client task");
+    }
+    for m in marker_tasks {
+        // Watchers loop until the writers are done and the markers
+        // settled; the writer tasks end on their own.
+        let _ = tokio::time::timeout(Duration::from_secs(120), m).await;
     }
     super::node::note_waiting("run", "faults".into());
     for f in fault_tasks {
@@ -1202,6 +1331,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .count();
     }
     report.authority_samples = super::epochs::SAMPLES.with(|s| s.get());
+    {
+        let (checks, violations) = *marker_stats.lock().unwrap();
+        report.marker_checks = checks;
+        report.marker_violations = violations;
+    }
     if let Some(what) = cluster.split_brains.lock().unwrap().first() {
         return Err(format!(
             "two authorities at once (plan 30 §M10): {what}\n  faults: {:?}",
@@ -1282,8 +1416,26 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // The log-witnessed check is exact for this spec and always runs; the
     // generic tester's search is exponential in ops left in flight, so it
     // runs only while few ops are tentative (see `history.rs`).
-    let witness = check_linearizable_witnessed(&events, &tentative, &oracle.completed_at)
-        .map_err(lin_context)?;
+    // Plan 30 §M11: under delegation the log orders keys of different
+    // owners independently, so linearizability is per directory: every
+    // check runs on the history projected to one directory (a rename
+    // across two appears in both as its halves).
+    let dirs = super::history::dirs_of(&events);
+    let per_dir = !cfg.dirs.is_empty();
+    let projections: Vec<Vec<super::history::HistEvt>> = if per_dir {
+        dirs.iter()
+            .map(|d| super::history::project_dir(&events, d))
+            .collect()
+    } else {
+        vec![events.clone()]
+    };
+    report.dirs_checked = projections.len();
+    let mut witness = super::history::Witness::default();
+    for (i, proj) in projections.iter().enumerate() {
+        let w = check_linearizable_witnessed(proj, &tentative, &oracle.completed_at)
+            .map_err(|e| lin_context(format!("[directory {:?}] {e}", dirs.get(i))))?;
+        witness.observed_tentative += w.observed_tentative;
+    }
     report.observed_tentative = witness.observed_tentative;
     if cfg.strict_durability && witness.observed_tentative > 0 {
         return Err(lin_context(format!(
@@ -1292,8 +1444,27 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         )));
     }
     if events.len() <= STATERIGHT_EVENT_BOUND && tentative.len() <= STATERIGHT_TENTATIVE_BOUND {
-        check_linearizable(&events, &tentative).map_err(lin_context)?;
+        for proj in &projections {
+            check_linearizable(proj, &tentative).map_err(lin_context)?;
+        }
         report.stateright_checked = true;
+    }
+    // Plan 30 §M11: the causal-cut assertion at the root (a delegate
+    // waited for its deps before executing, so the root never sees a
+    // batch whose deps it lacks), and no marker without its data.
+    for (id, stats) in &report.stats {
+        if stats.deleg_deps_unsatisfied_at_append > 0 {
+            return Err(format!(
+                "node {id} appended {} delegate batches whose deps it lacked (causal cut)\n  stats: {:#?}",
+                stats.deleg_deps_unsatisfied_at_append, report.stats
+            ));
+        }
+    }
+    if report.marker_violations > 0 {
+        return Err(format!(
+            "marker order violated {} times (of {} checks)\n  faults: {:?}",
+            report.marker_violations, report.marker_checks, report.faults
+        ));
     }
     let counts = bucket.counts();
     report.s3_puts = counts.puts;
@@ -1385,4 +1556,217 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         )
     })?;
     Ok(report)
+}
+
+/// Plan 30 §M11: create `cfg.dirs` under the root through node 1 (it
+/// takes the lease), then delegate `cfg.delegations` from it; wait until
+/// every delegate has installed its generation.
+async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mutex<Vec<String>>>) {
+    let handle = cluster.get(1);
+    for d in &cfg.dirs {
+        let rid = handle.next_rid();
+        let op = MutateOp::Mkdir {
+            parent: ROOT_INO,
+            name: d.clone(),
+            ino: handle.meta.allocate_ino(ROOT_INO).expect("ino"),
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        let mut ok = false;
+        for _ in 0..20 {
+            match handle.submit(rid, op.clone()).await {
+                Ok(ClientReply::Outcome(MutateOutcome::Accepted { .. })) => {
+                    ok = true;
+                    break;
+                }
+                Ok(ClientReply::Outcome(MutateOutcome::Errno(e))) if e == libc::EEXIST => {
+                    ok = true;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+        if !ok {
+            failures
+                .lock()
+                .unwrap()
+                .push(format!("setup: could not create directory {d}"));
+            return;
+        }
+    }
+    // Every node applies the directories before anything is delegated
+    // (a delegate resolves ownership on its own replica).
+    for _ in 0..200 {
+        let all = cluster.ids().into_iter().all(|id| {
+            let n = cluster.get(id);
+            cfg.dirs
+                .iter()
+                .all(|d| n.meta.child_ino(ROOT_INO, d).ok().flatten().is_some())
+        });
+        if all {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for (dir, node) in &cfg.delegations {
+        let Some(ino) = handle.meta.child_ino(ROOT_INO, dir).ok().flatten() else {
+            failures
+                .lock()
+                .unwrap()
+                .push(format!("setup: directory {dir} missing on node 1"));
+            return;
+        };
+        let mut done = false;
+        for _ in 0..30 {
+            match handle
+                .control(constellation_authority::Control::Delegate {
+                    dir: ino,
+                    node: *node,
+                })
+                .await
+            {
+                Ok(Ok(_)) => {
+                    done = true;
+                    break;
+                }
+                Ok(Err(e)) if e.contains("already holds") => {
+                    done = true;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+        if !done {
+            failures
+                .lock()
+                .unwrap()
+                .push(format!("setup: could not delegate {dir} to node {node}"));
+            return;
+        }
+    }
+    // Installed and renewed on every delegate.
+    for _ in 0..400 {
+        let all = cfg.delegations.iter().all(|(_, node)| {
+            let v = cluster.get(*node).view();
+            v.delegation
+                .mine
+                .iter()
+                .any(|(_, _, until, stopped, ..)| !*stopped && *until > 0)
+        });
+        if all {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    failures
+        .lock()
+        .unwrap()
+        .push("setup: delegations were not installed on the delegates".into());
+}
+
+/// Plan 30 §M11: write `pairs` data names in `home`, each followed by a
+/// marker in `other` registered for the watchers between the two writes.
+#[allow(clippy::too_many_arguments)]
+async fn marker_writer(
+    cluster: Arc<Cluster>,
+    history: Arc<History>,
+    node: NodeId,
+    thread: u64,
+    home: String,
+    other: String,
+    pairs: u64,
+    markers: Arc<Mutex<Vec<(String, String)>>>,
+    abandoned: Arc<Mutex<HashSet<Rid>>>,
+) {
+    for k in 0..pairs {
+        let data = format!("{home}/m{node}-{k}-data");
+        let marker = format!("{other}/m{node}-{k}-marker");
+        for name in [data.clone(), marker.clone()] {
+            let handle = cluster.get(node);
+            if !handle.alive() {
+                return;
+            }
+            let rid = handle.next_rid();
+            let op = NsOp::Create(name.clone());
+            let mop = mutate_op(&handle.meta, &op);
+            history.invoke(thread, rid, op);
+            let mut acked = false;
+            for _ in 0..MAX_RESUBMITS {
+                let handle = cluster.get(node);
+                if !handle.alive() {
+                    break;
+                }
+                match handle.submit(rid, mop.clone()).await {
+                    Ok(ClientReply::Outcome(outcome)) => {
+                        if let Ok(ret) = ns_ret(&outcome) {
+                            history.ret(thread, rid, ret);
+                            acked = ret == NsRet::Ok;
+                        }
+                        break;
+                    }
+                    _ => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            }
+            if !acked {
+                abandoned.lock().unwrap().insert(rid);
+                return;
+            }
+            if name == data {
+                markers.lock().unwrap().push((marker.clone(), data.clone()));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Plan 30 §M11: on `node`, every registered marker that is visible must
+/// have its data visible in the same snapshot.
+async fn marker_watcher(
+    cluster: Arc<Cluster>,
+    node: NodeId,
+    markers: Arc<Mutex<Vec<(String, String)>>>,
+    stats: Arc<Mutex<(u64, u64)>>,
+    failures: Arc<Mutex<Vec<String>>>,
+) {
+    for _ in 0..600 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let handle = cluster.get(node);
+        if !handle.alive() {
+            continue;
+        }
+        let pairs = markers.lock().unwrap().clone();
+        for (marker, data) in pairs {
+            let (mp, ml) = split_name(&handle.meta, &marker);
+            let (dp, dl) = split_name(&handle.meta, &data);
+            let marker_seen = handle.meta.child_ino(mp, &ml).ok().flatten().is_some();
+            let data_seen = handle.meta.child_ino(dp, &dl).ok().flatten().is_some();
+            let mut s = stats.lock().unwrap();
+            s.0 += 1;
+            if marker_seen && !data_seen {
+                s.1 += 1;
+                failures.lock().unwrap().push(format!(
+                    "node {node} saw marker {marker} without its data {data}"
+                ));
+            }
+        }
+    }
+}
+
+/// Plan 30 §M11: a client's home directory (see the workload loop).
+fn home_dir(dirs: &[String], node: NodeId, client: u64) -> String {
+    if dirs.is_empty() {
+        return String::new();
+    }
+    let base = if node == 1 {
+        None
+    } else {
+        Some(((node - 2) as usize) % dirs.len())
+    };
+    match (base, client) {
+        (None, 0) => String::new(),
+        (None, k) => dirs[((k - 1) as usize) % dirs.len()].clone(),
+        (Some(b), 0) => dirs[b].clone(),
+        (Some(b), k) => dirs[(b + k as usize) % dirs.len()].clone(),
+    }
 }

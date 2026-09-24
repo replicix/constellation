@@ -14,11 +14,12 @@ pub use types::{
     PeerPathsStatus, SessionStatus,
 };
 pub use types::{
-    AtimeStatus, CacheEntryStatus, CacheStatus, CoopStatus, DesignationStatus, DirectoryEntry,
-    DoctorStatus, DownloadSession, EpochStatus, InboxStatus, InspectStatus, LeaseStatus,
-    ManifestStatus, MountInfo, MountViewOpts, P2pStatus, PeerStatus, PinStatus, PrefetchStatus,
-    PruneRootStatus, PruneStatus, QuotaStatus, ReintegrationStatus, Request, Response,
-    SnapshotStatus, SourceStatus, SpeculationStatus, SpoolStatus, StatusReport, WritebackStatus,
+    AtimeStatus, CacheEntryStatus, CacheStatus, CoopStatus, DelegationReport, DelegationStatus,
+    DesignationStatus, DirectoryEntry, DoctorStatus, DownloadSession, EpochStatus, InboxStatus,
+    InspectStatus, LeaseStatus, ManifestStatus, MountInfo, MountViewOpts, P2pStatus, PeerStatus,
+    PinStatus, PrefetchStatus, PruneRootStatus, PruneStatus, QuotaStatus, ReintegrationStatus,
+    Request, Response, SnapshotStatus, SourceStatus, SpeculationStatus, SpoolStatus, StatusReport,
+    WritebackStatus,
 };
 
 use anyhow::{Context, Result};
@@ -60,6 +61,19 @@ pub trait StatusSource: Send + Sync + 'static {
     }
 
     fn list_designations(&self) -> Vec<DesignationStatus> {
+        Vec::new()
+    }
+
+    /// Plan 30 §M11.
+    fn delegate(&self, _path: &str, _node: u64) -> std::result::Result<String, String> {
+        Err("delegation is not supported by this daemon".into())
+    }
+
+    fn undelegate(&self, _path: &str) -> std::result::Result<String, String> {
+        Err("delegation is not supported by this daemon".into())
+    }
+
+    fn list_delegations(&self) -> Vec<DelegationStatus> {
         Vec::new()
     }
 
@@ -225,6 +239,11 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
         Request::ListDesignations => Response::Designations {
             designations: source.list_designations(),
         },
+        Request::Delegate { path, node } => result(source.delegate(&path, node)),
+        Request::Undelegate { path } => result(source.undelegate(&path)),
+        Request::ListDelegations => Response::Delegations {
+            delegations: source.list_delegations(),
+        },
         Request::Reintegrate => result(source.reintegrate()),
         Request::Leave { node_id, force } => result(source.leave(node_id, force)),
         Request::SetWriteMode { mode } => result(source.set_write_mode(&mode)),
@@ -369,6 +388,7 @@ mod tests {
     impl StatusSource for Fake {
         fn status(&self) -> StatusReport {
             StatusReport {
+                delegation: Default::default(),
                 fs_uuid: "test-uuid".into(),
                 backend: "s3://bucket/prefix".into(),
                 mounts: vec![MountInfo {
