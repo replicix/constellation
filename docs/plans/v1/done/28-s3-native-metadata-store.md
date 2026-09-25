@@ -606,6 +606,14 @@ transfers apply to metadata with no new protocol. Two payoffs:
 
 ### P12 — Optional latency tier: S3 Express One Zone
 
+> **Retired by plan 30 (2026-09).** Constellation uses portable S3 only
+> and one bucket: see
+> [ADR-27](../../../explanation/DECISIONS.md#adr-27-portable-s3-only-and-one-bucket).
+> A directory-bucket tier is AWS-only and adds a second bucket. Plan 30
+> gets low write latency without it, through forwarding, delegated
+> sub-sequencers and topology-matched durability layers. The text below
+> is kept as the record of what was considered.
+
 General-purpose S3 now has both conditional-write primitives this design
 needs (`If-None-Match: *` for commit creation, `If-Match` for leases),
 which is the whole reason the plan works without a coordinator. Directory

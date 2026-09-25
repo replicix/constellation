@@ -1,18 +1,31 @@
 # Configuration
 
-Runtime environment variables. Set them before mounting (or before the
-CLI command that reads them); values are typically parsed once at
-startup. AWS credentials follow the ordinary AWS SDK chain
-(`AWS_REGION`, `AWS_PROFILE`, shared config files, IMDS, etc.) and are
-not listed here.
+Mount options, per-filesystem settings, and runtime environment
+variables. Set environment variables before mounting (or before the CLI
+command that reads them); values are typically parsed once at startup.
+AWS credentials follow the ordinary AWS SDK chain (`AWS_REGION`,
+`AWS_PROFILE`, shared config files, IMDS, etc.) and are not listed here.
 
 ## Table of Contents
 
+- [Mount and filesystem options](#mount-and-filesystem-options)
+  - [Mount flags](#mount-flags)
+  - [Per-filesystem settings](#per-filesystem-settings)
+  - [Precedence](#precedence)
+  - [Plan 30 commands](#plan-30-commands)
 - [Environment variables](#environment-variables)
   - [Identity and secrets](#identity-and-secrets)
   - [Leases and mutations](#leases-and-mutations)
+  - [Exactly-once and speculation](#exactly-once-and-speculation)
+  - [Sessions, close-to-open, and log streams](#sessions-close-to-open-and-log-streams)
+  - [Backups, acknowledgement, and failover](#backups-acknowledgement-and-failover)
+  - [Continuation epochs](#continuation-epochs)
+  - [Delegation and placement](#delegation-and-placement)
+  - [The S3 inbox](#the-s3-inbox)
+  - [Cluster locks](#cluster-locks)
   - [Metadata sync](#metadata-sync)
   - [Merkle metadata tree (plan 28)](#merkle-metadata-tree-plan-28)
+  - [Node-local metadata engine (plan 29)](#node-local-metadata-engine-plan-29)
   - [Read-time atime](#read-time-atime)
   - [P2P and cooperative cache](#p2p-and-cooperative-cache)
   - [Prefetch and scan-ahead](#prefetch-and-scan-ahead)
@@ -20,8 +33,9 @@ not listed here.
   - [S3 client](#s3-client)
   - [Existence hints](#existence-hints)
   - [Garbage collection](#garbage-collection)
+  - [Retention pruning](#retention-pruning)
   - [FUSE and runtime threads](#fuse-and-runtime-threads)
-  - [Filesystem stats](#filesystem-stats)
+  - [Filesystem stats and quota](#filesystem-stats-and-quota)
   - [Named filesystems and daemonization](#named-filesystems-and-daemonization)
   - [Control UI](#control-ui)
   - [Fault injection (testing only)](#fault-injection-testing-only)
@@ -29,13 +43,73 @@ not listed here.
 - [Build-time](#build-time)
 - [References](#references)
 
+## Mount and filesystem options
+
+### Mount flags
+
+The `mount` flags that choose consistency, durability and lock
+semantics. Plan 30 added `--cto`, `--locks` and `--ack`. `--fsync-mode`
+and `--write-mode` are older and are listed because they combine with
+`--ack`. See [Durability and failover](features/durability-and-failover.md),
+[Close-to-open modes](features/cto-modes.md) and
+[Cluster locks](features/cluster-locks.md).
+
+| Flag | Default | Values | Env default | Persisted in the registry | Meaning |
+|---|---|---|---|---|---|
+| `--cto` | `bounded` | `bounded`, `strict` | `CONSTELLATION_CTO` | no | close-to-open mode (plan 30 M8). `strict`: an open, lookup or listing sees every close another node completed before it began |
+| `--locks` | `cluster` with P2P, `local` without | `local`, `cluster` | `CONSTELLATION_LOCKS` | no | `flock`/`fcntl` scope (plan 30 M14). An explicit `cluster` with P2P off fails the mount |
+| `--ack` | the filesystem's `ack_policy`, else `local` | `local`, `s3` | `CONSTELLATION_ACK` | no | what a mutation's acknowledgement waits for (plan 30 M9). `local`: journaled on the holder, plus its backup when one is in budget. `s3`: the record's segment is in the bucket. The policy belongs to the lease tenure, so it applies to tenures this mount acquires; a mount forwarding to another holder gets that holder's policy |
+| `--fsync-mode` | `local` | `local`, `s3` | none | yes | what `fsync()` waits for. `local`: the node's metadata store is forced to disk. `s3`: also the file's chunks and the journal up to the call are in the bucket. `s3` also forces `--write-mode through` |
+| `--write-mode` | `through` | `through`, `back` | none | yes | chunk close policy. `through`: `close()` waits for the upload; `back`: `close()` returns once the upload is queued durably on local disk. `fsync`, `O_SYNC` and `--fsync-mode s3` always act as `through`. `constellation write-mode TARGET MODE` changes it on a running mount |
+
+Values are case-insensitive for `--cto`, `--locks` and `--ack`; any
+other value fails the mount. The flags that are not persisted apply to
+the mount command that carries them: a later bare `mount NAME` uses the
+environment or the default again.
+
+### Per-filesystem settings
+
+Stored in the bucket's `meta.json` and read by every mount.
+
+| Setting | Set with | Default | Meaning |
+|---|---|---|---|
+| `ack_policy` | `fs create --ack-policy local\|s3` | `local` (absent) | the acknowledgement policy a mount uses for the tenures it acquires, unless its own `--ack` or `CONSTELLATION_ACK` says otherwise. There is no `fs set` for it |
+| `epoch_slack` (`f`) | `fs create --epoch-slack N`, `fs set epoch-slack TARGET N` | `0` (absent) | how many write-eligible nodes a continuation epoch may form without (plan 30 M10). With `f > 0`, an S3 takeover of an expired lease needs `f` other nodes' heartbeat promises. See [Durability and failover](features/durability-and-failover.md#flexible-continuation-epochs) |
+
+`fs set epoch-slack` refuses `N` at or above the write-eligible roster
+size and warns when `N > roster − 2`, because a single crashed holder
+then blocks TTL failover until it returns. Mounted nodes pick up a
+change within about a minute. With `f > 0`, `CONSTELLATION_PROMISE_TTL_S`
+must be at most a quarter of `CONSTELLATION_LEASE_TTL_MS`; otherwise
+`fs create`, `fs set` and the mount fail.
+
+### Precedence
+
+| Setting | Order (first that is set wins) |
+|---|---|
+| `ack` | `--ack`, `CONSTELLATION_ACK`, `meta.json` `ack_policy`, `local` |
+| `cto` | `--cto`, `CONSTELLATION_CTO`, `bounded` |
+| `locks` | `--locks`, `CONSTELLATION_LOCKS`, `cluster` if P2P is on, else `local` |
+| `atime` | `CONSTELLATION_ATIME`, `--atime`, `off` (the environment wins here, unlike the rows above) |
+| `epoch_slack` | `meta.json` only |
+
+### Plan 30 commands
+
+| Command | Meaning |
+|---|---|
+| `constellation delegate TARGET --to NODE [--range IDX/COUNT]` | delegate a directory's subtree, or one of `COUNT` name-hash ranges of it (`COUNT` is 2, 4, 8 or 16), to node `NODE`. The node running it must hold the lease. See [Delegations](features/delegations.md) |
+| `constellation undelegate TARGET` | recall the delegation on a directory |
+| `constellation delegations TARGET` | list the live delegation table |
+| `constellation reintegrate TARGET` | run a deposed holder's recovery now: roll back the stranded journal and replay it by rid (it also runs on its own) |
+| `constellation repair drop-held TARGET INO` | discard held-back records of an inode into a conflict copy (plan 30 M4, see [Write-path hygiene](features/write-path-hygiene.md)) |
+
 ## Environment variables
 
 ### Identity and secrets
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
-| `CONSTELLATION_NODE_KEY` | `~/.config/constellation/node.key` | path | host Ed25519 key for the P2P endpoint id; one key per host, not per mount |
+| `CONSTELLATION_NODE_KEY` | `$XDG_CONFIG_HOME/constellation/node.key`, else `~/.config/constellation/node.key`, else `/etc/constellation/node.key` | path | host Ed25519 key for the P2P endpoint id; one key per host, not per mount |
 | `CONSTELLATION_PASSPHRASE` | prompt | string | E2E filesystem passphrase (`fs init`, mount, `fs passwd`); required non-interactively |
 | `CONSTELLATION_NEW_PASSPHRASE` | prompt | string | new passphrase for `fs passwd` |
 
@@ -47,8 +121,16 @@ not listed here.
 | `CONSTELLATION_LEASE_IDLE_RELEASE_MS` | `30000` | milliseconds | idle threshold for releasing a held lease — **only** once a requester is registered |
 | `CONSTELLATION_FORWARD_TIMEOUT_MS` | `500` | milliseconds | forwarded mutation request |
 | `CONSTELLATION_FORWARD` | `on` | boolean | requester-side mutation forwarding; `off` makes non-holder writes acquire the lease instead |
-| `CONSTELLATION_FORWARD_MAX_INFLIGHT` | `64` | count, positive | forwards actually in flight (network round trip + apply) at once per node (plan 29 M5); does not affect correctness, only concurrency — ops queued behind the requester-side ordering gate are unaffected by this bound |
-| `CONSTELLATION_LEASE_PLACEMENT` | `on` | boolean | holder-driven placement |
+| `CONSTELLATION_LEASE_PLACEMENT` | `on` | boolean | holder-driven placement of the root lease (see [Lease placement](features/lease-placement.md)) |
+| `CONSTELLATION_LEASE_DWELL_MS` | `5000` | milliseconds; `0` means the default | a lease handed over cannot be handed back before this (it stops two competing writers ping-ponging it) |
+| `CONSTELLATION_LEASE_WANTED_GRACE_MS` | `5000` | milliseconds; `0` means the default | a requester registered in `wanted_by` is answered within this, busy holder or not |
+
+The lease's expiry margin (a lease is usable only while at least this
+much of it is left, and every grant backed by it is capped by it) is
+`min(1000 ms, CONSTELLATION_LEASE_TTL_MS / 4)`. It is not a separate
+knob. Plan 29 M5's `CONSTELLATION_FORWARD_MAX_INFLIGHT` no longer
+exists: since plan 30 M5 each forward runs as its own task, ordered only
+by the requester-side key gate.
 
 #### Sticky leases
 
@@ -72,12 +154,117 @@ holder — while the common single-writer case loses three S3 round trips
 per cold write. See [Diagnose lease
 thrash](../how-to-guides/operations/diagnose-lease-thrash.md).
 
+### Exactly-once and speculation
+
+Plan 30 M2–M3. See [Forwarded mutations](features/forwarded-mutations.md).
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_COMPLETION_RETENTION_S` | `900` | seconds | how long the node-local `completed` keyspace keeps a rid, and the age below which log GC never prunes a segment (the coverage rule; see [Garbage collection](#garbage-collection)). It also sets the `completed` prune cadence (a quarter of it, clamped to 30–3600 s) and caps an inbox op's in-doubt deadline at half of it |
+| `CONSTELLATION_HOLDER_CAPTURE` | on | exact `0`, `off` or `false` (case-sensitive) disable it | internal switch: capture a holder's own journaled writes as speculation (before-images). Off is the M3b performance-gate fallback: a holder with an unshipped journal then defers publishing, and a deposed holder rebuilds its namespace from the shared log instead of rolling back. Not a tuning knob |
+
+### Sessions, close-to-open, and log streams
+
+Plan 30 M6–M8. See [Close-to-open modes](features/cto-modes.md).
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_CTO` | `bounded` | `bounded`, `strict` | default for `--cto`; the flag wins |
+| `CONSTELLATION_SESSION_WAIT_MS` | `2000` | milliseconds; `0` disables the wait | how long a read waits for this node's replica to reach the position its client already observed (read-your-writes, monotonic reads). On timeout the read answers from the replica and is counted as degraded, never an error |
+| `CONSTELLATION_READ_INDEX_BUDGET_MS` | `2000` | milliseconds, at least 1 | how long a strict read waits for the sequencer's ReadIndex answer before it reads the replica anyway (degraded) |
+| `CONSTELLATION_READ_DELEGATIONS` | on | boolean | this node, as sequencer, grants read delegations to strict readers. Off: every strict read costs a round trip. Always off with P2P off |
+| `CONSTELLATION_READ_DELEGATION_TTL_MS` | `5000` | milliseconds, at least 1 | a read delegation's lifetime, renewed while in use; also capped by the granting lease |
+| `CONSTELLATION_LOG_STREAMS` | on | boolean | followers subscribe to the holder's direct log stream instead of polling S3 (plan 30 M7). Always off with P2P off |
+| `CONSTELLATION_LOG_STREAM_HEARTBEAT_MS` | `1000` | milliseconds; `0` means the default | the holder's heartbeat frame to a subscriber it has sent nothing to |
+| `CONSTELLATION_LOG_STREAM_TIMEOUT_MS` | `3500` | milliseconds; `0` means the default | a subscription with no frame for this long is dead; the subscriber falls back to S3 and resubscribes |
+| `CONSTELLATION_LOG_STREAM_BACKSTOP_MS` | `10000` | milliseconds; `0` means the default | a caught-up subscriber still probes S3 with one GET this often |
+| `CONSTELLATION_LOG_STREAM_QUEUE` | `1024` | frames, positive | frames queued per subscriber |
+| `CONSTELLATION_LOG_STREAM_BUFFER_BYTES` | `33554432` (32 MiB) | bytes, positive | segment bytes queued per subscriber before the holder drops it back to S3 tailing. The holder never waits for a subscriber |
+| `CONSTELLATION_KERNEL_INVALIDATE` | on | boolean | push kernel entry and inode invalidations for records applied from other nodes |
+
+### Backups, acknowledgement, and failover
+
+Plan 30 M9. See [Durability and failover](features/durability-and-failover.md).
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_ACK` | unset | `local`, `s3` | default for `--ack`; the flag wins, and the filesystem's `ack_policy` applies when neither is set |
+| `CONSTELLATION_BACKUP_RTT_BUDGET_MS` | `5` | milliseconds; `0` accepted | a peer is a backup candidate only while its measured RTT to the holder is within this. `0` means never use a backup |
+| `CONSTELLATION_BACKUPS` | `1` | count; `0` accepted | the most backups a holder keeps. `0` means none |
+| `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` | `1000` | milliseconds; `0` means the default | a backup that makes no acknowledgement progress for this long is removed by a lease CAS before the holder acknowledges anything further |
+| `CONSTELLATION_BACKUP_TAKEOVER_MS` | `1500` | milliseconds; `0` means the default | holder silence after which a backup seals the epoch and takes the lease over (under `ack=s3`, any peer may). Liveness only: safety comes from the seal and the log-slot CAS |
+| `CONSTELLATION_BACKUP_HEARTBEAT_MS` | `300` | milliseconds, clamped to at most a third of the takeover time | the holder's heartbeat append to an idle backup |
+| `CONSTELLATION_PRE_S3_STREAMING` | on | boolean | stream backup-acknowledged transactions to log-stream subscribers before they reach S3; subscribers hold them as speculation. Only used while the lease has a backup. Always off with P2P off |
+
+### Continuation epochs
+
+Plan 30 M10. The slack `f` itself is a per-filesystem setting
+(`epoch_slack`, see [Per-filesystem settings](#per-filesystem-settings)).
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_PROMISE_TTL_S` | lease TTL / 4 (15 s) | seconds, positive | how long a heartbeat promise binds its writer. Must be at most a quarter of the lease TTL when `epoch_slack > 0`, or `fs create`, `fs set epoch-slack` and the mount fail; with slack 0 a violation only logs a warning |
+
+Promises are published on demand, not on a timer: when a would-be taker
+asks over P2P, when a node sees a lease expire unrenewed, or when its
+slack changes. A cluster with `epoch_slack = 0` writes no promises.
+
+### Delegation and placement
+
+Plan 30 M11–M12. See [Delegations](features/delegations.md). The
+percentages and counts below are read like the millisecond knobs: `0`
+or an unparsable value means the default.
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_DELEGATION` | on | boolean | this node delegates subtrees (as the root) and accepts delegations (as a delegate). Off, or P2P off: no `Delegate` record is ever written |
+| `CONSTELLATION_DELEGATION_TTL_MS` | `5000` | milliseconds | a delegation grant's lifetime, renewed at half of it |
+| `CONSTELLATION_DELEGATION_PLACEMENT` | on | boolean | the root delegates dominated subtrees and splits hot shared directories by itself. Off keeps manual `delegate` only. Needs `CONSTELLATION_DELEGATION` |
+| `CONSTELLATION_DELEGATION_WINDOW_MS` | `30000` | milliseconds | placement's sliding window of ops per directory and node |
+| `CONSTELLATION_DELEGATION_MIN_OPS` | `200` | ops per window | rate floor: a subtree (or, for a split, the directory itself) needs this many ops in the window |
+| `CONSTELLATION_DELEGATION_DOMINANCE` | `70` | percent | the share of a subtree's ops one node needs to be given it |
+| `CONSTELLATION_DELEGATION_LEAVE` | `50` | percent | a placed delegation whose delegate stays below this share for a whole dwell is recalled |
+| `CONSTELLATION_DELEGATION_SPLIT` | `20` | percent | a hot directory that no node dominates is split into name-hash ranges when several nodes each write at least this share of it. `0` cannot be set from the environment (it reads as the default); turn placement off to stop splits |
+| `CONSTELLATION_DELEGATION_DWELL_MS` | `60000` | milliseconds | how long a recall condition must hold before placement recalls |
+| `CONSTELLATION_DELEGATION_COOLDOWN_MS` | `30000` | milliseconds | a recalled directory is not placed or split again for this long |
+
+### The S3 inbox
+
+Plan 30 M13. See [Forwarded mutations — the inbox](features/forwarded-mutations.md#the-inbox-forwarding-without-p2p).
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_INBOX` | on | boolean | forward mutations through the holder's S3 inbox when there is no P2P path to it. Off restores the pre-plan-30 behaviour: a non-holder with no P2P path takes the lease |
+| `CONSTELLATION_INBOX_P2P_GRACE_MS` | `3000` | milliseconds | how long an outage to the holder (a failed dial, or a transport error that evicted its connection) may last, with nothing heard from it since, before the inbox counts the P2P path as gone. A known peer never talked to is reachable; a timeout on a still-open connection is never an outage |
+| `CONSTELLATION_INBOX_HOT_MS` | `20` | milliseconds, clamped to `[1, CONSTELLATION_SYNC_INTERVAL_MS]` | the holder's poll interval for a requester right after a hit, and for the ~25 misses after it |
+| `CONSTELLATION_INBOX_IDLE_MAX_MS` | `2000` | milliseconds | the *warm* poll ceiling: a requester that submitted within the last minute is polled at least this often. Per requester, doubling from `CONSTELLATION_SYNC_INTERVAL_MS` on every miss |
+| `CONSTELLATION_INBOX_COLD_MAX_MS` | `CONSTELLATION_SYNC_IDLE_MAX_MS` (10000) | milliseconds | the *cold* poll ceiling, after about a minute of misses: what an idle P2P-off cluster pays per requester (one GET per interval on the holder) |
+| `CONSTELLATION_INBOX_POLL_WIDTH` | `4` | count, at least 1 | batches fetched per poll (a saturated poll is repeated at once) |
+| `CONSTELLATION_INBOX_TAIL_MS` | `20` | milliseconds, at least 1 | the requester's log-tail interval while one of its ops waits for an outcome. With the hot poll this sets the floor of an inbox round trip |
+| `CONSTELLATION_INBOX_RECHECK_MS` | `1000` | milliseconds, at least 100 | how often a waiting requester re-reads the lease object, to notice a takeover (re-submit under the new epoch) or an expired holder (take the lease path) |
+| `CONSTELLATION_INBOX_ESCALATE` | on | boolean | a requester with sustained inbox demand asks for the lease. Off keeps it on the inbox however busy it is |
+| `CONSTELLATION_INBOX_ESCALATE_WINDOW_MS` | `10000` | milliseconds, at least 1000 | the sliding window over this node's inbox-answered ops that decides "sustained" |
+| `CONSTELLATION_INBOX_ESCALATE_OPS` | `8` | count, at least 2 | inbox-answered ops in the window that make demand sustained. De-escalation needs the window under half of this and half of the wait threshold |
+| `CONSTELLATION_INBOX_ESCALATE_WAIT_MS` | `1500` | milliseconds | cumulative inbox round-trip wait in the window that makes demand sustained, the term that fires first on a slow (real) S3. It needs at least five ops in the window and leaves the single slowest out, so one slow op (a first contact) never moves the lease |
+| `CONSTELLATION_INBOX_ESCALATE_RETRY_MS` | `2000` | milliseconds, at least 100 | the longest gap between an escalated requester's lease requests (they back off from 100 ms) |
+
+### Cluster locks
+
+Plan 30 M14. See [Cluster locks](features/cluster-locks.md).
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_LOCKS` | `cluster` with P2P, `local` without | `local`, `cluster` | default for `--locks`; the flag wins |
+| `CONSTELLATION_LOCK_TTL_MS` | `5000` | milliseconds; `0` means the default | a lock grant's lifetime, renewed in the background while held. A node whose grant lapsed fails I/O on the locked files with `EIO` |
+| `CONSTELLATION_LOCK_CACHE_IDLE_MS` | `30000` | milliseconds; `0` means the default | how long a grant with no local lock under it is kept (so an uncontended re-lock costs nothing) before it is released |
+
 ### Metadata sync
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_SYNC_INTERVAL_MS` | `500` | milliseconds | background log tail/ship poll; the **floor** of the idle backoff |
 | `CONSTELLATION_SYNC_IDLE_MAX_MS` | `10000` | milliseconds | **ceiling** of the idle poll backoff |
+| `CONSTELLATION_ROUND_UPLOAD_WAIT_MS` | `250` | milliseconds; `0` means the default | plan 30 M7: how long a sync round waits for the upload pass before shipping what is already shippable. A transaction whose manifest still names a pending chunk is deferred to a later round, so a write-back backlog no longer blocks every other record |
 
 Plan 29 M0b retired the whole-DB `VACUUM INTO` checkpoint and its
 byte-proportional cadence, I/O concurrency knob, and
@@ -227,9 +414,8 @@ mode; `CONSTELLATION_ATIME` overrides the flag. See
 | `CONSTELLATION_ATIME_FLUSH_MS` | `10000` | milliseconds | accumulator flush period |
 | `CONSTELLATION_ATIME_MAX_PENDING` | `65536` | distinct inodes | accumulator cap; overflow drops the new entry |
 | `CONSTELLATION_ATIME_SHIP_MAX_DELAY_S` | `300` | seconds | max delay before an atime-only partition ships on its own |
-| `CONSTELLATION_ATIME_FORWARD_TIMEOUT_MS` | `200` | milliseconds | batched-forward timeout to the lease holder |
 | `CONSTELLATION_ATIME_SKEW_TOLERANCE_S` | `300` | seconds | clamp applied to a claimed atime on apply |
-| `CONSTELLATION_ATIME_RO_FORWARD` | `0` | boolean | let a read-only member forward atime batches |
+| `CONSTELLATION_ATIME_RO_FORWARD` | off | exactly `1` or `true` enable it | let a read-only member forward atime batches |
 
 Atime never blocks a read, never acquires a lease, and never delays an
 unmount or lease handoff. A dropped bump only costs freshness.
@@ -239,10 +425,10 @@ unmount or lease handoff. A dropped bump only costs freshness.
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_P2P` | `on` | boolean | complete iroh fast path |
-| `CONSTELLATION_P2P_RELAY` | `off` | `off`, `default`/`public`/`n0`, or comma-separated relay URLs | iroh relay policy |
+| `CONSTELLATION_P2P_RELAY` | `off` | `off` (also `disabled`, `none`, `0`, `false`), `default`/`public`/`n0`, or comma-separated relay URLs | iroh relay policy |
 | `CONSTELLATION_P2P_RELAY_TOKEN` | unset | string | optional bearer token for custom relays |
 | `CONSTELLATION_COOP` | `on` | boolean | cooperative cache |
-| `CONSTELLATION_COOP_DIGEST` | `exact` | `exact` or `bloom` | how peers learn each other's cached chunks: exact mirrors kept by reconciliation, or bloom digests |
+| `CONSTELLATION_COOP_DIGEST` | `exact` | `exact` (alias `rbsr`) or `bloom`; an unknown value warns and uses `exact` | how peers learn each other's cached chunks: exact mirrors kept by reconciliation, or bloom digests |
 | `CONSTELLATION_DIGEST_INTERVAL_S` | `30` | seconds, minimum `1` | exact: summary heartbeat and liveness sweep; bloom: snapshot rotation |
 | `CONSTELLATION_DIGEST_TTL_S` | `4 × DIGEST_INTERVAL_S` | seconds, at least `2 × DIGEST_INTERVAL_S` | how long an unconfirmed peer mirror or digest stays usable |
 
@@ -261,7 +447,7 @@ protocol, message bounds and counters.
 |---|---:|---|---|
 | `CONSTELLATION_PREFETCH_MIN_BYTES` | `8388608` | bytes, positive | initial adaptive sequential-read window |
 | `CONSTELLATION_PREFETCH_MAX_BYTES` | `2147483648` | bytes, positive | window ceiling, additionally capped at one quarter of cache budget |
-| `CONSTELLATION_PREFETCH_CONCURRENCY` | unset | requests, positive | pin background-fetch concurrency instead of adapting it |
+| `CONSTELLATION_PREFETCH_CONCURRENCY` | unset | requests; `0` is treated as `1` | pin background-fetch concurrency instead of adapting it |
 | `CONSTELLATION_PREFETCH_MAX_CONCURRENCY` | `128` | requests, `1..512` | adaptive background-fetch ceiling |
 | `CONSTELLATION_SCAN_AHEAD` | `on` | boolean | ordered directory-walk readahead |
 
@@ -314,22 +500,8 @@ hinted), never "proven absent".
 | `CONSTELLATION_COMMIT_RETENTION` | `64` | commits, at least 1 | newest plan 28 metadata commits always kept by GC |
 | `CONSTELLATION_COMMIT_RETENTION_S` | `86400` | seconds | commits younger than this are kept however many there are; a commit is deleted only when it is outside the newest `CONSTELLATION_COMMIT_RETENTION` *and* older than this |
 | `CONSTELLATION_COMPACT_BYTES_PER_S` | `33554432` (32 MiB/s) | bytes per second; `0` unpaced | read budget for metadata pack deletion and compaction in a GC round |
-| `CONSTELLATION_GC_THREADS` | one per core | threads, positive | width of the metadata mark and pack rewrite pools |
-| `CONSTELLATION_COMPLETION_RETENTION_S` | `900` | seconds | plan 30 M2: how long the node-local `completed` keyspace is retained, and the floor log-segment retention respects regardless of `CONSTELLATION_LOG_RETENTION_SEGMENTS` |
-| `CONSTELLATION_HOLDER_CAPTURE` | on | `0`/`off`/`false` to disable | plan 30 M3b internal switch: capture a holder's own journaled writes as speculation (before-images). Off is the performance-gate fallback — a holder with an unshipped journal then defers publishing, and a deposed holder rebuilds its namespace from the shared log instead of rolling back. Not a tuning knob |
-| `CONSTELLATION_INBOX` | on | `0`/`off`/`false` to disable | plan 30 M13: forward mutations through the holder's S3 inbox when there is no P2P path to it. Off restores the pre-M13 behaviour (a non-holder with no P2P path takes the lease) |
-| `CONSTELLATION_INBOX_IDLE_MAX_MS` | `2000` | milliseconds | plan 30 M13: the holder's *warm* inbox poll ceiling — how long a requester that submitted within the last minute waits at most before its next batch is noticed. Per requester, doubling from `CONSTELLATION_SYNC_INTERVAL_MS` on every miss |
-| `CONSTELLATION_INBOX_COLD_MAX_MS` | `CONSTELLATION_SYNC_IDLE_MAX_MS` (10000) | milliseconds | plan 30 M13: the *cold* inbox poll ceiling, after about a minute of misses. What an idle P2P-off cluster pays per requester: one GET per this interval on the holder |
-| `CONSTELLATION_INBOX_POLL_WIDTH` | `4` | count, positive | plan 30 M13: batches fetched per inbox poll (a saturated poll is repeated at once) |
-| `CONSTELLATION_INBOX_RECHECK_MS` | `1000` | milliseconds | plan 30 M13: how often a requester waiting for an inbox outcome re-reads the lease object, to notice a takeover (re-submit under the new epoch) or an expired holder (take the lease path) |
-| `CONSTELLATION_INBOX_HOT_MS` | `20` | milliseconds | plan 30 M13 round 2: the holder's inbox poll interval right after a hit and for the ~25 misses after it (a requester that is writing right now). Clamped to the sync interval |
-| `CONSTELLATION_INBOX_TAIL_MS` | `20` | milliseconds | plan 30 M13 round 2: the requester's log-tail interval while one of its ops waits for an inbox outcome. Together with the hot poll this sets the floor of an inbox round trip |
-| `CONSTELLATION_INBOX_P2P_GRACE_MS` | `3000` | milliseconds | plan 30 M13: how long an outage to the holder (a failed dial, or a transport error that evicted its connection) may last, with nothing heard from it since, before the inbox counts the P2P path as gone. A known peer never talked to is reachable (the forward dials it); a timeout on a still-open connection is never an outage; inside the grace an outage stays on M2's retries and the lease fallback; past it, the inbox |
-| `CONSTELLATION_INBOX_ESCALATE` | on | `0`/`off`/`false` to disable | plan 30 M13 hybrid: a requester with sustained inbox demand asks for the lease. Off keeps it on the inbox however busy it is |
-| `CONSTELLATION_INBOX_ESCALATE_WINDOW_MS` | `10000` | milliseconds | plan 30 M13 hybrid: the sliding window over this node's inbox-answered ops that decides "sustained" |
-| `CONSTELLATION_INBOX_ESCALATE_OPS` | `20` | count | plan 30 M13 hybrid: inbox-answered ops in the window that make demand sustained (2 ops/s at the default window). De-escalation needs the window under half of this and half of the wait threshold |
-| `CONSTELLATION_INBOX_ESCALATE_WAIT_MS` | `3000` | milliseconds | plan 30 M13 hybrid: cumulative inbox round-trip wait in the window that makes demand sustained — the term that fires first on a slow (real) S3. Needs at least five ops in the window and leaves the single slowest out, so one slow op (a first contact) never moves the lease |
-| `CONSTELLATION_INBOX_ESCALATE_RETRY_MS` | `2000` | milliseconds | plan 30 M13 hybrid: the longest gap between an escalated requester's lease requests (they back off from 100 ms) |
+| `CONSTELLATION_GC_THREADS` | one per core | threads; `0` means one per core | width of the metadata mark and pack rewrite pools |
+| `CONSTELLATION_COMPLETION_RETENTION_S` | `900` | seconds | plan 30 M2: the floor below which a log segment is never pruned (see below and [Exactly-once and speculation](#exactly-once-and-speculation)) |
 
 Log retention is evaluated against the position a fresh replica resumes
 from: the head plan 28 commit's `applied` position. With no commit yet
@@ -380,12 +552,11 @@ xattr and evaluated by a singleton background pruner. See
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
-| `CONSTELLATION_PRUNE` | `1` | boolean | master switch for the background pruner |
+| `CONSTELLATION_PRUNE` | on | exactly `0` or `false` disable it (`off` does not) | master switch for the background pruner |
 | `CONSTELLATION_PRUNE_INTERVAL_S` | `3600` | seconds | background prune tick interval |
 | `CONSTELLATION_PRUNE_GRACE_S` | `86400` | seconds | quiet period after a marked directory's ctime changes |
 | `CONSTELLATION_PRUNE_MAX_LAG_S` | `300` | seconds | replica-staleness refusal threshold |
 | `CONSTELLATION_PRUNE_SCAN_BUDGET_MS` | `5000` | milliseconds | per-run walk budget before the cursor is saved |
-| `CONSTELLATION_PRUNE_FORWARD_TIMEOUT_MS` | `2000` | milliseconds | unlink forward timeout to the lease holder |
 
 ### FUSE and runtime threads
 
@@ -440,7 +611,8 @@ operator has cleared.
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_REGISTRY` | `$XDG_CONFIG_HOME/constellation/registry.toml` | path | local named-filesystem registry file (see [named filesystems](features/named-filesystems.md)) |
-| `CONSTELLATION_NO_DAEMONIZE` | unset | boolean-ish (any non-empty value) | force `--foreground` behavior for every `mount` (CI/harness convenience) |
+| `CONSTELLATION_NO_DAEMONIZE` | unset | presence (any value, even empty) | force `--foreground` behavior for every `mount` (CI/harness convenience) |
+| `CONSTELLATION_SHUTDOWN_STALL_S` | `120` | seconds, positive | an unmount's drain that makes no progress (the journal and pending uploads stop shrinking) for this long gives up and exits non-zero, leaving everything on disk for the next mount |
 
 ### Control UI
 
@@ -458,13 +630,27 @@ filesystem.
 |---|---:|---|---|
 | `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` | `0` (disabled) | milliseconds | sleeps this long, holder-side, immediately before replying to a forwarded mutation — after the op has already executed and the keepers lock has been released. Used to make a forwarded mutation's reply race the requester's own `CONSTELLATION_FORWARD_TIMEOUT_MS` deadline deterministically (plan 30 `forward-timeout-reexec`); logs one `tracing::warn!` at startup when non-zero |
 | `CONSTELLATION_FAULT_LOSE_CHUNKS` | unset | comma-separated chunk hashes (hex) | plan 30 M4: the upload pass deletes these chunks from the local cache right before reading them, so a pending upload of one finds its content gone (the "missing from local cache" condition, at a precise point; `poison-record-isolation`) |
+| `CONSTELLATION_FAULT_P2P_DENY_FILE` | unset | a file path, one node id per line, re-read on every use | plan 30 M9/M11: drops P2P traffic to and from the listed nodes and reports them unconnected, for backup appends, pre-S3 streaming, delegation, lock, lease-request and promise messages (a one-sided partition) |
 | `CONSTELLATION_FAULT_HOLD_SYNC_FILE` | unset | a file path | plan 30 M4: while the file exists every managed sync round returns at once (nothing uploads, ships or publishes, and the lease is not renewed — keep holds short); a held round writes `<path>.held`, so a harness knows no round is still in flight |
 
 ## Boolean values
 
-Most boolean switches are enabled when unset. `CONSTELLATION_ATIME_RO_FORWARD`
-and `CONSTELLATION_P2P_RELAY` default off. `off`, `0`, and `false`
-(case-insensitive) disable a switch that defaults on.
+Most boolean switches are enabled when unset, and `off`, `0`, and
+`false` (trimmed, case-insensitive) disable them. The exceptions:
+
+- `CONSTELLATION_ATIME_RO_FORWARD` defaults off and is enabled only by
+  exactly `1` or `true`.
+- `CONSTELLATION_P2P_RELAY` defaults off (see its row).
+- `CONSTELLATION_PRUNE` is disabled only by exactly `0` or `false`.
+- `CONSTELLATION_HOLDER_CAPTURE` is disabled only by exactly `0`,
+  `off` or `false` (case-sensitive, not trimmed).
+- `CONSTELLATION_NO_DAEMONIZE` is enabled by its presence, whatever the
+  value.
+
+Several switches are forced off when P2P is off, whatever they say:
+`CONSTELLATION_LOG_STREAMS`, `CONSTELLATION_READ_DELEGATIONS`,
+`CONSTELLATION_PRE_S3_STREAMING` and `CONSTELLATION_DELEGATION` (and
+with it placement), and the default of `CONSTELLATION_LOCKS`.
 
 ## Build-time
 
@@ -476,6 +662,10 @@ and `CONSTELLATION_P2P_RELAY` default off. `off`, `0`, and `false`
 
 - [Forwarded mutations](features/forwarded-mutations.md)
 - [Lease placement](features/lease-placement.md)
+- [Close-to-open modes](features/cto-modes.md)
+- [Durability and failover](features/durability-and-failover.md)
+- [Delegations](features/delegations.md)
+- [Cluster locks](features/cluster-locks.md)
 - [P2P relays](features/p2p-relays.md)
 - [Prefetch](features/prefetch.md)
 - [Read-time atime](features/atime.md)

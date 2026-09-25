@@ -169,8 +169,12 @@ HEAD.
 
 ## Status and metrics
 
-The control API's `status` reply (JSON, under `coop`), `constellation
-status`, and `/metrics` expose:
+The control API's `status` reply (JSON, under `coop`) and `constellation
+status` expose the counters below. `/metrics` exports a subset:
+`peer_hits`, `peer_misses`, `peer_false_positives`, `peer_stale_misses`,
+`peer_errors`, `hedges`, `digest_bytes_sent`, `digest_bytes_received`,
+`digest_cpu_us`, `reconcile_rounds` and `peer_set_entries`, as
+`constellation_coop_*`.
 
 - `digest_mode`
 - `peer_false_positives`, `peer_stale_misses`, `peer_misses`
@@ -184,6 +188,13 @@ status`, and `/metrics` expose:
 - `local_set_entries`, `peer_set_entries`, `peer_set_bytes`
 
 ## Comparing the modes
+
+Whether exact mode also costs less digest traffic than blooms is not
+settled yet. The only comparison so far ran at a 1 s digest interval
+under heavy churn and measured about 2.4 kB/s of fleet digest traffic
+in exact mode against about 0.65 kB/s for blooms (both with zero false
+positives). The bloom code stays until a run at the production interval
+settles it ([ADR-26](../../explanation/DECISIONS.md#adr-26-exact-chunk-location-reconciliation-replaces-bloom-digests)).
 
 The harness scenario `coop-digest-compare` runs the same seeded churn
 workload in both modes and prints, per mode, fleet digest bytes/s,

@@ -1,16 +1,20 @@
 # Forwarded mutations
 
-Forwarded mutations let a non-holder ask the partition lease holder to
-sequence a write over iroh. They reduce lease churn without changing S3
-authority. Delivery is **exactly-once** (plan 30 M2, the RIFL design
-applied to forwarding): a forwarded mutation carries a stable request
-id, and neither a slow reply nor a takeover can make it execute twice.
+Forwarded mutations let a node that does not own a key ask the node
+that sequences it (the lease holder, or the delegate of the key's
+subtree) to execute a write over iroh. They reduce lease churn without
+changing S3 authority. Delivery is **exactly-once** (plan 30 M2, the
+RIFL design applied to forwarding): a forwarded mutation carries a
+stable request id, and neither a slow reply nor a takeover can make it
+execute twice. Without a P2P path, the same ops go through the
+holder's S3 inbox instead.
 
 ## Table of Contents
 
 - [Terminology](#terminology)
 - [Wire messages](#wire-messages)
 - [Request flow](#request-flow)
+- [Routing to delegates](#routing-to-delegates)
 - [Exactly-once identity and in-doubt handling](#exactly-once-identity-and-in-doubt-handling)
 - [Acknowledgement and durability](#acknowledgement-and-durability)
 - [Speculation and stranded-op recovery](#speculation-and-stranded-op-recovery)
@@ -21,9 +25,14 @@ id, and neither a slow reply nor a takeover can make it execute twice.
 
 ## Terminology
 
-- **Holder / sequencer**: the node with the live S3 lease and the only node
-  allowed to append the partition log.
-- **Requester**: a non-holder sending an operation to the sequencer.
+- **Holder**: the node with the live S3 lease and the only node allowed
+  to append the log.
+- **Sequencer**: the node that validates and orders a key's mutations:
+  the holder, or the delegate whose subtree contains the key (see
+  [Delegations](delegations.md)).
+- **Requester**: a node sending an operation to the sequencer.
+- **Position**: the state a reply was evaluated against (see
+  [Close-to-open modes](cto-modes.md#positions)).
 - **Speculation**: anything a node applied to its replica ahead of the
   durable log, recorded with the before-images needed to undo it (plan 30
   M3a, the node-local speculation log).
@@ -46,7 +55,7 @@ Both messages are signed iroh payloads. Mutation bodies use postcard encoding.
 
 `MutateRequest` contains:
 
-- `part`: target partition.
+- `part`: the log stream (always `p0`; partitions were removed in plan 29).
 - `requester`: requester's node id.
 - `req_id`: requester-local correlation id, fresh on every attempt (wire
   request/reply matching only — see `rid` below for the identity that
@@ -58,16 +67,36 @@ Both messages are signed iroh payloads. Mutation bodies use postcard encoding.
 - `acked_through`: the highest contiguous `rid.seq` of this requester's
   incarnation whose reply it has already received; lets the holder drop
   its in-memory dedup cache for anything it no longer needs.
+- `deps` (plan 30 M11): the requester's observed position, including the
+  delegate streams it has seen. The sequencer does not execute or append
+  the op before its replica has all of it (see
+  [Delegations](delegations.md#the-append-path-and-dependencies)).
 
-`MutateReply` contains the matching `req_id` and an encoded `MutateOutcome`:
+`MutateReply` contains the matching `req_id`, an encoded
+`MutateOutcome`, and:
+
+- `base`: the last shipped log sequence that touched the op's keys when
+  the sequencer evaluated it, or none when its unshipped journal had
+  already touched one of them. The requester installs the reply's records
+  ahead of the log only once its replica has applied `base`; otherwise
+  it waits for the log to deliver them in order.
+- `position` (`position_seq`, `position_pending`, `position_streams`,
+  plan 30 M6): the state the op was evaluated against. It feeds the
+  requester's session guarantees (see
+  [Close-to-open modes](cto-modes.md#session-guarantees)).
+- `gen` (plan 30 M11): the delegation generation that executed the op,
+  or 0 for the root.
+
+The outcomes:
 
 - `Accepted { epoch, records }`
 - `Errno(errno)`
 - `NotHolder { holder }`
 - `Busy`
 - `Conflict { manifest }`: a stale `SetManifest` base (see below).
-- `Exists { records, ship_floor, epoch }`: an `EEXIST` refusal carrying the
-  entry that is there, the holder's next ship position, and its epoch.
+- `Exists { records, epoch }`: an `EEXIST` refusal carrying the entry
+  that is there and the sequencer's epoch. The reply's position gives
+  the floor of the hint the requester installs.
 - `Held { retry_ms }` (plan 30 §M8): the op executed, but its
   acknowledgement waits until the `cto=strict` read delegations other
   nodes hold on what it touched are recalled (or outwaited: TTL plus the
@@ -89,12 +118,31 @@ An empty or undecodable outcome is treated as `Busy`.
    one metadata transaction, and returns the journal records.
 5. The requester applies those records to its local replica as a shadow in
    its speculation log, in one transaction with the before-images of every
-   key they touch.
-6. The holder ships its journal to S3. A small segment may also be carried in
-   the `SegmentPublished` gossip payload; larger segments are fetched from S3.
+   key they touch (once its replica has reached the reply's `base`).
+6. The holder ships its journal to S3 and streams the shipped segment to
+   its log-stream subscribers (plan 30 M7). `SegmentPublished` gossip is
+   only a hint to tail now; it carries no segment bytes.
 
-A `NotHolder` response updates the cached holder and permits one retry at the
-redirected node.
+A `NotHolder` response updates the cached owner and permits a retry at
+the redirected node, up to two redirects (a delegate names the root, the
+root names a delegate).
+
+What the sequencer's `Accepted` means for durability depends on the
+lease's acknowledgement policy; see
+[Acknowledgement and durability](#acknowledgement-and-durability).
+
+## Routing to delegates
+
+With delegations (plan 30 M11), the sequencer of an op is resolved per
+key from the replicated delegation table: a key under a delegated
+subtree (or a delegated name-hash range) belongs to that delegate,
+everything else to the holder. A requester sends the op to the owner. An
+op whose keys have two owners (a rename across delegations, `rmdir` of a
+delegated root) goes to the holder, which recalls the delegations
+involved before it executes. An op a node sends to a stale owner is
+answered `NotHolder` with the right one. Everything in this page (rids,
+dedup, speculation, positions) applies to a delegate as it does to the
+holder. See [Delegations](delegations.md).
 
 ## Exactly-once identity and in-doubt handling
 
@@ -121,10 +169,14 @@ checks:
   `Completed` records — this is what a *different* node (after a
   takeover) checks instead.
 
-An executed rid is never executed again. Refusals are not recorded: a
-retried refused op is simply re-evaluated, and takes effect (or not) at
-the retry, which is still linearizable. A `SetManifest` rebase is a new
-op with a new rid.
+An executed rid is never executed again. A definitive refusal
+(`Errno`, `Exists`) is an outcome too: since plan 30 M9 the sequencer
+journals it as `Refused { rid, errno }`, which ships like `Completed`
+and enters `completed` on every replica, so a second execution of the
+rid (a retry after a lost reply, a deposed holder's replay, an inbox
+drain) answers the same errno instead of re-evaluating the op. A
+transient refusal (`Conflict`, a stale manifest base) is not recorded; a
+`SetManifest` rebase is a new op with a new rid.
 
 **Requester-side retry.** A timeout, a transport error, or `Busy` leaves
 the op *in doubt*, never refused — only an explicit `Errno`, `Conflict`,
@@ -156,14 +208,24 @@ re-execution.
 
 ## Acknowledgement and durability
 
-`Accepted` means the holder committed the operation to its local journal. It
-does **not** mean the partition segment is already on S3. The requester applies
-the returned records so read-your-write does not wait for segment shipping.
+What `Accepted` (and a refusal) means depends on the lease's
+acknowledgement policy (plan 30 M9, see
+[Durability and failover](durability-and-failover.md)):
 
-Mounts using `--fsync-mode s3` add the existing inode/partition `Barrier`:
-`fsync()` waits for dirty chunks and metadata through that point to reach S3.
-The default `--fsync-mode local` only requires local durability and nudges the
-background shipper.
+| Policy | The reply leaves the sequencer once |
+|---|---|
+| `Local` (no peer within the RTT budget) | the op is committed to the sequencer's local journal |
+| `Backup` (a peer within the budget) | every backup listed in the lease object holds the journal through the op |
+| `S3` (`--ack s3`) | the segment carrying the op is in the bucket |
+
+In every case the requester applies the returned records at once, so
+read-your-writes does not wait for shipping, and it keeps them as
+speculation with the op and its rid, so an op acknowledged under
+`Local` is replayed by rid if the sequencer dies before shipping it.
+
+`--fsync-mode s3` makes `fsync()` wait for the inode's dirty chunks and
+records to reach S3. The default `--fsync-mode local` forces the node's
+own metadata store to disk and nudges the background shipper.
 
 ## Speculation and stranded-op recovery
 
@@ -329,19 +391,23 @@ base is a truncate and keeps its own length instead.
 
 ### Concurrent forwarding, correctly ordered
 
-A requester's forwards run concurrently, not one at a time: the daemon's
-sync task hands each `Forward` request off to its own task (bounded by
-`CONSTELLATION_FORWARD_MAX_INFLIGHT`, default 64) and immediately goes
-back to draining its queue, instead of awaiting the round trip inline
-(plan 29 M4 measured the inline version as the reason 3-node forwarded
-throughput came in *below* single-node).
+A requester's forwards run concurrently, not one at a time: each network
+round trip runs as its own task, and the authority core goes straight
+back to its queue instead of awaiting the round trip inline (plan 29 M4
+measured the inline version as the reason 3-node forwarded throughput
+came in *below* single-node). Plan 29's
+`CONSTELLATION_FORWARD_MAX_INFLIGHT` bound no longer exists.
 
-Concurrency is safe only because a requester-side ordering gate
-(`crate::keygate::KeyGate` in `crates/cli`) serializes any two forwards
-whose *conflict-key sets* overlap — every inode an op reads or writes,
-including parents (two creates in one directory both bump its
-mtime/ctime; two `SetManifest`s on one file race each other's base; a
-rename touches two parents and possibly the moved/replaced inodes).
+Concurrency is safe only because a requester-side ordering gate (in the
+authority core's client, `crates/authority/src/core/client.rs`)
+serializes any two forwards whose *conflict-key sets* overlap: every
+key an op reads or writes. Since plan 30 M12, a create, unlink or link
+holds its `(parent, name)` entry exclusively and the parent directory
+only *shared* (parent `mtime`/`ctime` merge by `max`, and `nlink`
+changes as a delta), so creates of different names in one directory run
+in parallel. `rmdir`, renaming a directory and `setattr` on it hold it
+exclusively; two `SetManifest`s on one file race each other's base; a
+rename touches two parents and possibly the moved or replaced inodes.
 Ops with disjoint key sets run fully in parallel; overlapping ops
 resolve in the order this node issued them, so they land on the holder,
 and get installed back as shadows on the requester, in that same order.
@@ -358,8 +424,6 @@ speculation log's rollback assumes shadows were captured in it.
 - `forwarded_err`: timeouts, transport/decode failures, redirects, and
   non-accepted replies.
 - `forward_p50_ms`: median of the last 256 successful forward latencies.
-- `pushed_segments_applied`: segment payloads applied directly without an S3
-  fetch.
 - `forward_dedup_hits`: forwarded requests the holder answered from
   `recent`/`completed` instead of re-executing (plan 30 M2).
 - `forward_retries`: same-rid forward retries this node's requester side
@@ -384,6 +448,9 @@ speculation log's rollback assumes shadows were captured in it.
   takeover.
 - `speculation.gate_pending`: this node holds the lease but its takeover
   gate has not completed; new mutations wait.
+- `speculation.copies_pending`, `speculation.copies_stalled`: refused
+  replays whose conflict copy is still being written (it backs off and
+  retries, and is never dropped).
 
 The same counters are exported as `constellation_speculation_*` metrics.
 A rollback logs `segment from a later epoch stranded speculative state`
@@ -399,22 +466,27 @@ not stable.
 
 ## Failure and fallback
 
-Forwarding is optional. A timeout, empty reply, `Busy`, stale holder, disabled
-P2P, or unreachable peer leaves the op in doubt and retries the same rid (see
-above) before falling back to the normal lease-acquisition path. Handoff can
+Forwarding is optional. A timeout, empty reply, `Busy`, stale holder, or
+unreachable peer leaves the op in doubt and retries the same rid (see
+above) before falling back to the normal lease-acquisition path. With no
+P2P path to the holder at all (P2P disabled, or an outage past its
+grace), the op goes through the S3 inbox instead (see below). Handoff can
 release a reachable holder immediately; otherwise the requester waits for
 release or TTL expiry and claims through S3 CAS. Every path — same-holder
 retry, redirected-holder retry, or the lease-acquisition fallback — resolves
 to exactly one execution, never a repeat.
 
 The default request timeout is 500 ms
-(`CONSTELLATION_FORWARD_TIMEOUT_MS`). Setting `CONSTELLATION_FORWARD=off`
+(`CONSTELLATION_FORWARD_TIMEOUT_MS`). An op still in doubt at its client
+deadline (twice the lease TTL) fails with `EIO` and is never
+re-executed. Setting `CONSTELLATION_FORWARD=off`
 disables requester-side forwarding entirely: every non-holder mutation
 takes the lease-acquisition path (P2P handoff, then S3 CAS) directly, with
 no rid retries to attempt first, restoring writer-follows-lease placement.
-A holder crash after `Accepted` strands the op in its unshipped journal;
-the requester's speculation log rolls the shadow back and replays the op by
-rid through the next holder (see above). A holder that was deposed rather
+A holder crash after `Accepted` under the `Local` policy strands the op
+in its unshipped journal; the requester's speculation log rolls the shadow
+back and replays the op by rid through the next holder (see above). Under
+`Backup`, the sealed backup that takes over already holds it. A holder that was deposed rather
 than killed rolls its own unshipped journal back the same way and replays
 it by rid through the new holder. Epoch fencing, and the new holder's
 epoch marker, prevent a competing append history.
@@ -442,14 +514,15 @@ reached at all.
 **The hybrid.** The inbox is for *sporadic* writes: one occasional
 write from a non-holder is answered without moving the lease and
 without disturbing the holder. A requester whose inbox demand is
-*sustained* — at least `CONSTELLATION_INBOX_ESCALATE_OPS` (20)
-inbox-answered ops, or at least five ops that together (leaving the
-single slowest out) waited `CONSTELLATION_INBOX_ESCALATE_WAIT_MS` (3 s)
-on their round trips, within `CONSTELLATION_INBOX_ESCALATE_WINDOW_MS`
-(10 s) — *escalates*: it asks
+*sustained* — at least `CONSTELLATION_INBOX_ESCALATE_OPS` (8)
+inbox-answered ops, or at least five ops whose waits on their round
+trips add up (the time covered by any of them, leaving the single
+slowest out) to `CONSTELLATION_INBOX_ESCALATE_WAIT_MS` (1.5 s), within
+`CONSTELLATION_INBOX_ESCALATE_WINDOW_MS` (10 s) — *escalates*: it asks
 for the lease through the ordinary lease path (`wanted_by`, answered by
-the holder's dwell and grace rules, so no new ping-pong is created) and
-keeps writing through the inbox until the lease arrives; the takeover
+the holder's dwell and grace rules, so no new ping-pong is created; its
+batches also carry a `wants_lease` flag the holder sees at its next
+poll) and keeps writing through the inbox until the lease arrives; the takeover
 gate's drain of lower epochs then executes whatever is still queued, in
 order, before its first local op, and later writes run locally at full
 speed. It stops asking once the window has fallen below half of both
@@ -459,9 +532,11 @@ the lease back or on. Why: Linux serializes creates in one directory
 each op is one sequential inbox round trip and batches cannot form —
 there the lease must move, as it does today. `status.inbox.escalated`,
 `escalations`, `lease_requests`, `inbox_ops` and `local_ops` show which
-regime a node is in. A node that has inbox ops waiting and then finds a
-P2P path again lets them finish before forwarding over it, so its
-overlapping ops still land in issue order.
+regime a node is in. An escalation is dropped if the holder becomes
+reachable over P2P again. Before an op that went into the inbox is
+forwarded over a P2P path that came back, the requester withdraws
+(deletes) its own batch, so the op is not executed through both paths
+out of order; the rid dedups either way.
 
 1. The op, with its rid, goes into the next **batch object**
    `inbox/<epoch>/<node>/<n>` under the epoch the lease object currently
@@ -500,22 +575,23 @@ overlapping ops still land in issue order.
    has shipped, keeping each requester's newest one (the high-water mark
    a restarted requester resumes from). A takeover drains every older
    epoch's batches inside its gate — after its own stranded ops, before
-   its view opens — and deletes them.
+   its view opens — and deletes them. A drain that reaches an op under a
+   live delegation stops there and recalls the delegation first; the
+   batches it did not reach are left for the requester's re-submission
+   (see [Known gaps](#known-gaps)).
 
-**Why refusals are outcomes here, unlike on the P2P path.** Above, a
-refusal rides the reply and is not recorded: only the requester ever
-retries, and a requester that holds a refusal never retries it. On the
-inbox path the *holder* re-reads batches (a successor's drain), and a
-requester may re-submit a rid whose refusal sits in a segment it has
-not tailed yet (it noticed the takeover by reading the lease). Re-
-evaluating a refused `create(x)` after `x` was unlinked would execute
-it: the caller was told `EEXIST` and `x` appears anyway. So a
-`Refused` record enters `completed` on every replica, and every dedup
-site — the holder's executor, the drain, the lease path's in-doubt
-check, a stranded replay — answers the rid with the errno. The
-Stateright model shows both naive variants failing
+**Why refusals must be outcomes.** On the inbox path the *holder*
+re-reads batches (a successor's drain), and a requester may re-submit a
+rid whose refusal sits in a segment it has not tailed yet (it noticed
+the takeover by reading the lease). Re-evaluating a refused `create(x)`
+after `x` was unlinked would execute it: the caller was told `EEXIST`
+and `x` appears anyway. So a `Refused` record enters `completed` on
+every replica, and every dedup site — the holder's executor, the drain,
+the lease path's in-doubt check, a stranded replay — answers the rid
+with the errno. The Stateright model shows both naive variants failing
 (`crates/model/tests/inbox.rs`: a drain without rid dedup, and refusals
-not deduplicated).
+not deduplicated). This is why plan 30 M13 introduced `Refused`; M9
+then extended it to P2P refusals (see above).
 
 **Exactly-once across epochs.** An epoch-`e` batch when the lease moves
 to `e+1`: the new holder drains it inside its gate, and the requester —
@@ -534,9 +610,30 @@ in-doubt check then finds the rid.
 `refused_ops`, `deduped_ops`, `drained_batches`, `polls`, `poll_hits`,
 `gc_deleted`, `tracked_requesters`), exported as `constellation_inbox_*`.
 
+Locks and `cto=strict` ReadIndex never go through the inbox: with no P2P
+path, cluster locks are unavailable and a strict open tails S3 instead
+(see [Cluster locks](cluster-locks.md#without-p2p) and
+[Close-to-open modes](cto-modes.md#without-p2p)).
+
+### Known gaps
+
+- A takeover drain that stops at an op under a live delegation leaves
+  that batch, and every later batch in the drain, including other
+  requesters', in older-epoch inbox slots that the holder's polls do
+  not read. A live requester re-submits its ops under the new epoch
+  when it notices the takeover, but a batch whose requester has crashed
+  waits for the next takeover.
+- `MAX_BATCH_BYTES` (1 MiB) is defined but not enforced; a batch is
+  bounded by its op count (512).
+
 ## References
 
-- [Lease placement](lease-placement.md)
+- [Lease placement](lease-placement.md), [Delegations](delegations.md)
+- [Durability and failover](durability-and-failover.md),
+  [Close-to-open modes](cto-modes.md)
 - [Configuration](../configuration.md)
-- [ADR-14](../../explanation/DECISIONS.md#adr-14-forward-mutations-to-the-lease-holder-instead-of-moving-the-lease)
+- [ADR-14](../../explanation/DECISIONS.md#adr-14-forward-mutations-to-the-lease-holder-instead-of-moving-the-lease),
+  [ADR-18](../../explanation/DECISIONS.md#adr-18-exactly-once-forwarding-with-request-ids),
+  [ADR-19](../../explanation/DECISIONS.md#adr-19-the-replica-is-a-log-prefix-plus-explicit-speculation),
+  [ADR-24](../../explanation/DECISIONS.md#adr-24-the-hybrid-s3-inbox-for-writes-without-a-p2p-path)
 - [DESIGN.md §4–6](../../explanation/DESIGN.md)
