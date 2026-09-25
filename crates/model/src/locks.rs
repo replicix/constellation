@@ -15,7 +15,9 @@
 //! - **Grant.** The owner grants `ttl = min(lock_ttl, usable end of its
 //!   own authority − now)` (the cap: a root's lease, a delegate's
 //!   delegation) and records the grant live until `now + ttl +
-//!   seq_margin` in its clock. The requester honours it until `sent +
+//!   seq_margin` in its clock — for a parked request served later, from
+//!   the request's *arrival* instead of `now` (the requester's window
+//!   counts from its send, which came before). The requester honours it until `sent +
 //!   ttl − node_margin`, measured from when it *sent* the request.
 //! - **Renew.** A node holding a grant renews it (`Renew` → `RenewAck`,
 //!   the same `sent`-based measurement) while it still honours it; a
@@ -245,6 +247,11 @@ pub struct Park {
     pub node: u8,
     pub mode: Mode,
     pub sent: i16,
+    /// The owner's clock when the request arrived: a parked request is
+    /// granted live from here, not from when it is served (the code's
+    /// `Waiter::recv` — a requester killed while parked then costs one
+    /// window from its last message, not from the push).
+    pub recv: i16,
 }
 
 /// Node side: the grant it holds (cached across local unlocks).
@@ -494,15 +501,24 @@ impl State {
         });
     }
 
-    /// Issue a grant at owner `h` to `node`.
-    fn grant(&mut self, cfg: &LockModel, h: usize, node: u8, mode: Mode, ttl: i16) -> u8 {
+    /// Issue a grant at owner `h` to `node`, live from `base` (the
+    /// request's arrival; never later than now).
+    fn grant(
+        &mut self,
+        cfg: &LockModel,
+        h: usize,
+        node: u8,
+        mode: Mode,
+        ttl: i16,
+        base: i16,
+    ) -> u8 {
         let now = self.local(h);
         let id = self.fresh_id();
         self.nodes[h].table.retain(|g| g.node != node);
         self.nodes[h].table.push(Grant {
             node,
             mode,
-            until: now + ttl + cfg.seq_margin,
+            until: base.min(now) + ttl + cfg.seq_margin,
             id,
             recalled: false,
         });
@@ -522,7 +538,15 @@ impl State {
 
     /// Try to grant `mode` to `node` at `h`; else recall the conflicting
     /// grants and return `false`.
-    fn try_grant(&mut self, cfg: &LockModel, h: usize, node: u8, mode: Mode, sent: i16) -> bool {
+    fn try_grant(
+        &mut self,
+        cfg: &LockModel,
+        h: usize,
+        node: u8,
+        mode: Mode,
+        sent: i16,
+        base: i16,
+    ) -> bool {
         let now = self.local(h);
         self.nodes[h].table.retain(|g| g.until > now);
         if self.nodes[h].floor.is_some_and(|f| now < f) {
@@ -552,7 +576,7 @@ impl State {
             if ttl <= 0 {
                 return false;
             }
-            let id = self.grant(cfg, h, node, mode, ttl);
+            let id = self.grant(cfg, h, node, mode, ttl, base);
             self.send(Msg::LockReply {
                 to: node,
                 sent,
@@ -588,7 +612,7 @@ impl State {
         let parks = std::mem::take(&mut self.nodes[h].parks);
         let mut rest = Vec::new();
         for p in parks {
-            if !self.try_grant(cfg, h, p.node, p.mode, p.sent) {
+            if !self.try_grant(cfg, h, p.node, p.mode, p.sent, p.recv) {
                 rest.push(p);
             }
         }
@@ -1119,11 +1143,13 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             }
             // A re-sent request of a parked node refreshes its `sent`.
             s.nodes[h].parks.retain(|p| p.node != from);
-            if !s.try_grant(cfg, h, from, mode, sent) {
+            let recv = s.local(h);
+            if !s.try_grant(cfg, h, from, mode, sent, recv) {
                 s.nodes[h].parks.push(Park {
                     node: from,
                     mode,
                     sent,
+                    recv,
                 });
             }
         }

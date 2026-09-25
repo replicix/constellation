@@ -87,6 +87,15 @@ struct Waiter {
     /// The requester's clock when it sent its request (echoed with a
     /// push: the grant's window counts from there, never later).
     sent: Ms,
+    /// This owner's clock when that request (the park, or the latest
+    /// re-send) arrived: a grant served to a remote waiter is live from
+    /// here, not from when it is served. The requester's window counts
+    /// from `sent`, which was before, so the owner's record still
+    /// outlasts it by `2 × margin` — and a requester that died while
+    /// parked costs at most `ttl + margin` from its last message, never
+    /// that plus however long it sat in the queue (the EC2 lock run,
+    /// PROGRESS.md "Fix: M14 follow-ups").
+    recv: Ms,
     /// This node's own request (its `LockOp`).
     op: Option<OpId>,
     held_timer: Option<TimerId>,
@@ -318,6 +327,7 @@ impl Core {
             let timer = self.set_timer(now.plus(hold), Timer::LockHeldReply(wid), out);
             let w = &mut self.lk.waiters[i];
             w.sent = sent;
+            w.recv = now;
             w.req = Some(req);
             let old = w.held_timer.replace(timer);
             if let Some(old) = old {
@@ -387,11 +397,11 @@ impl Core {
                 Served::Outcome(LockOutcome::WouldBlock)
             };
         }
-        let conflicting = match self.lock_try_grant(now, from, ino, mode, cap_ms, gen, out, replica)
-        {
-            Ok(outcome) => return Served::Outcome(outcome),
-            Err(conflicting) => conflicting,
-        };
+        let conflicting =
+            match self.lock_try_grant(now, now, from, ino, mode, cap_ms, gen, out, replica) {
+                Ok(outcome) => return Served::Outcome(outcome),
+                Err(conflicting) => conflicting,
+            };
         for g in conflicting {
             self.lock_recall(now, g, replica, out);
         }
@@ -408,11 +418,14 @@ impl Core {
     /// live grant it already holds (an owner never downgrades: the
     /// node's local locks may be under the stronger mode; the sim found
     /// a shared request in flight behind an exclusive one) — or the
-    /// conflicting grants to recall.
+    /// conflicting grants to recall. `base`: when the request being
+    /// answered arrived (`now` for one answered on arrival; see
+    /// [`Waiter::recv`]).
     #[allow(clippy::too_many_arguments)]
     fn lock_try_grant(
         &mut self,
         now: Ms,
+        base: Ms,
         from: NodeId,
         ino: Ino,
         mode: LockMode,
@@ -443,7 +456,7 @@ impl Core {
         if ttl <= 0 {
             return Ok(LockOutcome::Busy);
         }
-        let until = now.0 + ttl + self.lock_margin_ms();
+        let until = base.0.min(now.0) + ttl + self.lock_margin_ms();
         if !replica.note_grant_horizon(until) {
             return Ok(LockOutcome::Busy);
         }
@@ -609,6 +622,7 @@ impl Core {
             mode,
             req,
             sent,
+            recv: now,
             op,
             held_timer,
             since: now,
@@ -648,7 +662,15 @@ impl Core {
     /// A waiter's RPC has been held long enough: answer `Waiting` (the
     /// requester re-sends; the grant is pushed if it comes first).
     pub(crate) fn on_lock_held_reply_timer(&mut self, wid: u64, out: &mut Vec<Action>) {
-        let retry_ms = self.cfg.lock_ttl_ms / 2;
+        // Re-sent well inside the window a grant served from the re-send
+        // would have (`ttl - margin` from its arrival): a waiter silent
+        // for that long is skipped (`lock_serve_waiters`).
+        let retry_ms = (self
+            .cfg
+            .lock_ttl_ms
+            .saturating_sub(self.cfg.expiry_margin_ms)
+            / 2)
+        .max(50);
         let Some(w) = self.lk.waiters.iter_mut().find(|w| w.id == wid) else {
             return;
         };
@@ -676,13 +698,33 @@ impl Core {
         let idx: Vec<usize> = (0..self.lk.waiters.len())
             .filter(|i| self.lk.waiters[*i].ino == ino)
             .collect();
+        let ttl = self.lock_ttl_ms();
+        let margin = self.lock_margin_ms();
         let mut done = Vec::new();
+        let mut gone = Vec::new();
         for i in idx {
-            let (node, mode, req, op, sent) = {
+            let (node, mode, req, op, sent, recv) = {
                 let w = &self.lk.waiters[i];
-                (w.node, w.mode, w.req, w.op, w.sent)
+                (w.node, w.mode, w.req, w.op, w.sent, w.recv)
             };
-            match self.lock_serve_again(now, node, ino, mode, replica, out) {
+            // A remote waiter not heard from within its window (a live
+            // one re-sends every `(ttl - margin) / 2`) would find a grant lapsed on
+            // arrival and ask again anyway — or it is gone (killed while
+            // parked): granting it would make everyone behind it wait out
+            // `ttl + margin` for nothing, once per such waiter. Skipped,
+            // not granted; a re-send re-attaches it in place, and one
+            // silent for long is dropped (it re-parks if it ever asks).
+            if op.is_none() && req.is_none() {
+                if now.0 >= recv.0 + 4 * ttl {
+                    gone.push(i);
+                    continue;
+                }
+                if now.0 >= recv.0 + ttl - margin {
+                    continue;
+                }
+            }
+            let base = if op.is_some() { now } else { recv };
+            match self.lock_serve_again(now, base, node, ino, mode, replica, out) {
                 Some(outcome) => {
                     done.push(i);
                     self.lock_deliver(now, node, ino, req, op, sent, outcome, replica, out);
@@ -692,6 +734,17 @@ impl Core {
                 }
             }
         }
+        if !gone.is_empty() {
+            self.stats.lock_waiters_dropped += gone.len() as u64;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ino,
+                n = gone.len(),
+                "dropped lock waiters silent for 4 × ttl"
+            );
+        }
+        done.extend(gone);
+        done.sort_unstable();
         for i in done.into_iter().rev() {
             let w = self.lk.waiters.remove(i);
             if let Some(t) = w.held_timer {
@@ -704,9 +757,11 @@ impl Core {
 
     /// Try a parked request again: `Some` once it can be answered (a
     /// grant, or a refusal that ends the wait).
+    #[allow(clippy::too_many_arguments)]
     fn lock_serve_again(
         &mut self,
         now: Ms,
+        base: Ms,
         from: NodeId,
         ino: Ino,
         mode: LockMode,
@@ -727,7 +782,7 @@ impl Core {
         if self.lock_grace_active(now, ino, replica) {
             return None;
         }
-        match self.lock_try_grant(now, from, ino, mode, cap_ms, gen, out, replica) {
+        match self.lock_try_grant(now, base, from, ino, mode, cap_ms, gen, out, replica) {
             Ok(outcome) => Some(outcome),
             Err(conflicting) => {
                 for g in conflicting {
@@ -1400,7 +1455,18 @@ impl Core {
                 self.stats.lock_grant_ms_total += waited;
                 let b = (64 - waited.max(1).leading_zeros()).min(13) as usize;
                 self.stats.lock_grant_ms[b] += 1;
-                self.lock_arm_renew_tick(now, out);
+                if held.renew_at_ms <= now.0 {
+                    // Served late in its window (a push to a request
+                    // parked a while): renew now, not at the next tick,
+                    // which may come after the window.
+                    if let Some(t) = self.lk.renew_timer.take() {
+                        self.cancel_timer(t, out);
+                    }
+                    let t = self.set_timer(now.plus(1), Timer::LockRenewTick, out);
+                    self.lk.renew_timer = Some(t);
+                } else {
+                    self.lock_arm_renew_tick(now, out);
+                }
                 out.push(Action::ControlDone {
                     op,
                     result: Ok(ControlOk::Lock(LockAnswer::Granted { position })),

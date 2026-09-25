@@ -4133,9 +4133,20 @@ mod locks {
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
         h.advance(250);
         let out = h.step(Event::Timer { id: held });
-        let [(3, OpId(8), LockOutcome::Waiting { .. })] = lock_replies(&out).as_slice() else {
-            panic!("expected Waiting: {out:?}")
+        let [(3, OpId(8), LockOutcome::Waiting { retry_ms: 2_000 })] =
+            lock_replies(&out).as_slice()
+        else {
+            panic!("expected Waiting, re-sent within (ttl - margin) / 2: {out:?}")
         };
+        // The waiter re-sends as told (re-attaching in place); each RPC
+        // is held, then answered `Waiting` again.
+        for at in [2_250, 4_500] {
+            h.now = granted_at.plus(at);
+            let out = request(&mut h, 3, 8 + at, ino, X, true);
+            let held = timer_of(&out, TimerKind::LockHeldReply);
+            h.advance(250);
+            h.step(Event::Timer { id: held });
+        }
         h.now = granted_at.plus(6_000);
         let out = h.step(Event::Timer { id: expiry });
         assert!(lock_replies(&out).is_empty(), "no RPC to answer: {out:?}");
@@ -4145,7 +4156,127 @@ mod locks {
         };
         assert_eq!(*i, ino);
         assert_eq!(h.core.stats.lock_recalls_expired, 1);
-        assert_eq!(h.core.stats.lock_waiting_replies, 1);
+        assert_eq!(h.core.stats.lock_waiting_replies, 3);
+    }
+
+    /// Park `node`'s request and answer it `Waiting` once its RPC has
+    /// been held (as the held-reply timer does).
+    fn park(h: &mut Harness, node: NodeId, req: u64, ino: Ino) -> TimerId {
+        let out = request(h, node, req, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        timer_of(&out, TimerKind::LockHeldReply)
+    }
+
+    /// A waiter killed while parked (the EC2 lock run: node c died with
+    /// its request queued) is granted from its request's *arrival*: the
+    /// grant is outwaited `ttl + margin` after the last message it sent,
+    /// not after however long it sat in the queue — and the waiter
+    /// behind it, which keeps re-sending, is served at that point.
+    #[test]
+    fn a_waiter_killed_while_parked_costs_one_window_from_its_last_message() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let t0 = h.now;
+        // Node 3 parks, then dies (never re-sends); node 4 parks behind
+        // it and stays alive, re-sending every (ttl - margin) / 2.
+        let held3 = park(&mut h, 3, 8, ino);
+        h.advance(100);
+        let held4 = park(&mut h, 4, 9, ino);
+        h.advance(150);
+        h.step(Event::Timer { id: held3 });
+        h.advance(100);
+        h.step(Event::Timer { id: held4 });
+        h.now = t0.plus(2_350);
+        let held4 = park(&mut h, 4, 10, ino);
+        h.advance(250);
+        h.step(Event::Timer { id: held4 });
+        // Node 2 releases 3 s after node 3's request: node 3 (first in
+        // line, still inside its window) is granted — live from t0.
+        h.now = t0.plus(3_000);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased { ino, grant: g2 },
+        });
+        let ps = pushes(&out);
+        let [(3, _, o)] = ps.as_slice() else {
+            panic!("expected node 3's grant pushed: {out:?}")
+        };
+        let (g3, _) = granted(o);
+        assert_eq!(
+            h.meta.locks().get(g3).unwrap().until_ms,
+            t0.0 + 5_000 + 1_000,
+            "live from its request's arrival, not from now"
+        );
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        assert_eq!(h.core.timer_at(expiry), Some(t0.plus(6_000)));
+        h.now = t0.plus(4_600);
+        let held4 = park(&mut h, 4, 11, ino);
+        h.advance(250);
+        h.step(Event::Timer { id: held4 });
+        // Nobody answers the recall: outwaited at t0 + ttl + margin, and
+        // node 4 is served then — 3 s earlier than a grant stamped at its
+        // push would have allowed.
+        h.now = t0.plus(6_000);
+        let out = h.step(Event::Timer { id: expiry });
+        let ps = pushes(&out);
+        let [(4, _, LockOutcome::Granted { .. })] = ps.as_slice() else {
+            panic!("expected node 4's grant pushed: {out:?}")
+        };
+        assert_eq!(h.core.stats.lock_recalls_expired, 1);
+    }
+
+    /// A parked remote waiter silent past its window is skipped, not
+    /// granted: a live one would find such a grant lapsed on arrival
+    /// (and re-sends well within it), a dead one would make everyone
+    /// behind it wait `ttl + margin` — once per dead waiter. After
+    /// `4 × ttl` of silence it is dropped.
+    #[test]
+    fn a_silent_parked_waiter_is_skipped_and_then_dropped() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let t0 = h.now;
+        // Nodes 3 and 5 park and die; node 4 parks and keeps re-sending.
+        let held = [
+            park(&mut h, 3, 8, ino),
+            park(&mut h, 5, 9, ino),
+            park(&mut h, 4, 10, ino),
+        ];
+        h.advance(250);
+        for id in held {
+            h.step(Event::Timer { id });
+        }
+        h.now = t0.plus(2_250);
+        let held4 = park(&mut h, 4, 11, ino);
+        h.advance(250);
+        h.step(Event::Timer { id: held4 });
+        h.now = t0.plus(4_250);
+        park(&mut h, 4, 12, ino);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased { ino, grant: g2 },
+        });
+        let rs = lock_replies(&out);
+        let [(4, OpId(12), o)] = rs.as_slice() else {
+            panic!("expected node 4's grant at once: {out:?}")
+        };
+        let (g4, _) = granted(o);
+        assert!(
+            pushes(&out).is_empty(),
+            "nothing for the silent waiters: {out:?}"
+        );
+        assert!(h.meta.locks().own_grant(ino, 3, h.now.0).is_none());
+        assert!(h.meta.locks().own_grant(ino, 5, h.now.0).is_none());
+        assert_eq!(h.core.lock_view().waiters, 2, "skipped, still parked");
+        // Past 4 × ttl of silence they are dropped at the next serve.
+        h.now = t0.plus(20_000);
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::LockReleased { ino, grant: g4 },
+        });
+        assert_eq!(h.core.stats.lock_waiters_dropped, 2);
+        assert_eq!(h.core.lock_view().waiters, 0);
     }
 
     /// A renewal extends a known grant (and reports its recalled flag);

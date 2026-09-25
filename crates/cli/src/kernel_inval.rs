@@ -126,6 +126,13 @@ pub struct InodeInvalidator {
 }
 
 impl InodeInvalidator {
+    /// Queue the invalidation of one file without waiting for it.
+    pub fn invalidate(&self, ino: Ino) {
+        let _ = self
+            .tx
+            .send(Msg::Batch(vec![Inval::Inode { ino, data: true }]));
+    }
+
     /// `true` once sent, `false` on timeout (or no invalidation thread).
     pub fn invalidate_and_wait(&self, ino: Ino, timeout: std::time::Duration) -> bool {
         let (done, wait) = mpsc::channel();

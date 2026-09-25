@@ -1365,8 +1365,19 @@ Harness scenarios (the harness process is the application: it calls
 | `lock-holder-partitioned` | the lock holder cut from the owner is fenced (`EIO`) and the waiter is granted only after ttl + margin, never before the fence; the healed node locks again |
 | `lock-failover` | the holder is killed with a lock held under an M9 backup; the successor reclaims/mirrors the grant (no `EIO` for the locker), refuses the contender throughout, grants it after the unlock |
 | `lock-latency` | measurements: first lock from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff, and a lone node under `cluster` against `local` |
+| `lock-holder-killed-contention` | four nodes increment one `flock`ed counter (read, add, write, `fsync`); the holder is `kill -9`'d with the lock held. The survivors stall only until its grant is outwaited (ttl + margin, never less than its remaining life), hand the lock on with no further outwait (the owner's `recalls_expired` is 1), and the count is exact. Then a node killed while parked first in line costs the next waiter nothing (granted within milliseconds of the unlock, not ttl + margin later) |
+| `lock-fence-at-close` | B writes under a lock and is cut from the owner past its grant; C takes the lock and writes. B's close returns `EIO` (`fcntl` closed while still locked; `flock` unlocked first, then closed), and the file holds C's data on every node |
 
-On failure `lock-failover` keeps the node logs under `/tmp/harness-m14-logs`.
+On failure `lock-failover`, `lock-holder-killed-contention` and
+`lock-fence-at-close` keep the node logs under `/tmp/harness-m14-logs`.
+
+`chaos-ci` and `chaos-soak-4` diagnose a convergence failure before they
+tear down. For the path the coordinator could not get agreement on, they
+print what each node serves (length, BLAKE3), its metadata view
+(`inspect`: inode, size, mtime, the manifest's digest, length and chunk
+ids) and its position (`head_seq`, the lease). They sample again at 30,
+60 and 120 s: a late agreement is slowness, and a node still serving
+other content after two minutes is a divergence.
 
 ## xfstests
 

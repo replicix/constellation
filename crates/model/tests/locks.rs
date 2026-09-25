@@ -14,7 +14,10 @@ use constellation_model::locks::{LockModel, Mode, Op, NONE};
 use stateright::{Checker, Model};
 use std::time::{Duration, Instant};
 
-const CAP: (usize, Duration) = (30_000_000, Duration::from_secs(55));
+// `drift-margin-3` is the largest clean run: 43.7M states (13.9M unique)
+// since parked requests carry their arrival time (PROGRESS.md "Fix: M14
+// follow-ups"); 16.9M before.
+const CAP: (usize, Duration) = (60_000_000, Duration::from_secs(150));
 
 /// Clean runs go breadth-first (exhaustive, shortest paths); violation
 /// runs go depth-first, which reaches the deep counterexamples (a

@@ -316,6 +316,18 @@ pub struct ManifestStatus {
     pub chunk_size: u32,
     pub chunk_count: u64,
     pub spilled: bool,
+    /// The manifest's own length (the inode's `size` can differ while a
+    /// setattr and a manifest commit are apart).
+    #[serde(default)]
+    pub file_len: u64,
+    /// BLAKE3 of the encoded manifest: two nodes serving the same file
+    /// version agree on it.
+    #[serde(default)]
+    pub digest: String,
+    /// `index:chunk hash` of the first chunks (or the spilled list's
+    /// hash), for telling apart what two nodes serve.
+    #[serde(default)]
+    pub chunks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

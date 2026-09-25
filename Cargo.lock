@@ -1023,6 +1023,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "clap",
  "constellation-api",
  "constellation-authority",

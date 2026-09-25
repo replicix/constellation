@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 constellation-fs-core.workspace = true
+blake3.workspace = true
 constellation-authority.workspace = true
 constellation-meta.workspace = true
 constellation-mtree.workspace = true

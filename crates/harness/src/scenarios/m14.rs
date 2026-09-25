@@ -541,6 +541,435 @@ pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
     result
 }
 
+// ------------------------------------------------------------------ lock-holder-killed-contention
+
+/// One node's share of the counter workload: `n` times, `flock(LOCK_EX)`,
+/// read the 8-byte counter, add one, write it back, `fsync`, unlock.
+/// `hold`: at increment `at`, with the lock held and before reading,
+/// signal and wait (the node is killed meanwhile). Returns the
+/// increments made, when each completed, and the error that stopped it.
+struct CounterRun {
+    done: u64,
+    times: Vec<Instant>,
+    error: Option<String>,
+}
+
+type Hold = (
+    u64,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+fn counter_worker(path: PathBuf, n: u64, hold: Option<Hold>) -> CounterRun {
+    use std::os::unix::fs::FileExt;
+    let mut run = CounterRun {
+        done: 0,
+        times: Vec::new(),
+        error: None,
+    };
+    let f = match open_rw(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            run.error = Some(format!("{e:#}"));
+            return run;
+        }
+    };
+    for i in 0..n {
+        if let Err(e) = flock(&f, libc::LOCK_EX) {
+            run.error = Some(format!("flock: errno {e}"));
+            return run;
+        }
+        if let Some((at, tx, rx)) = &hold {
+            if i == *at {
+                let _ = tx.send(());
+                let _ = rx.recv_timeout(Duration::from_secs(120));
+            }
+        }
+        let step = (|| -> std::io::Result<()> {
+            let mut buf = [0u8; 8];
+            let got = f.read_at(&mut buf, 0)?;
+            let cur = if got == 8 { u64::from_be_bytes(buf) } else { 0 };
+            f.write_at(&(cur + 1).to_be_bytes(), 0)?;
+            f.sync_all()
+        })();
+        if let Err(e) = step {
+            run.error = Some(format!("increment {i}: {e}"));
+            return run;
+        }
+        run.done += 1;
+        run.times.push(Instant::now());
+        if let Err(e) = flock(&f, libc::LOCK_UN) {
+            run.error = Some(format!("unlock: errno {e}"));
+            return run;
+        }
+    }
+    run
+}
+
+fn read_counter(path: &Path) -> Result<u64> {
+    let b = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    anyhow::ensure!(b.len() == 8, "{}: {} bytes", path.display(), b.len());
+    Ok(u64::from_be_bytes(b[..8].try_into().unwrap()))
+}
+
+/// Four nodes contend on one `flock`ed counter (read, add one, write,
+/// `fsync`), as the EC2 lock run did; the holder of the lock (a
+/// non-sequencer) is killed with the lock held. The survivors are
+/// stalled only until its grant is outwaited (`ttl + margin` from its
+/// last renewal at the owner) and then hand the lock among themselves
+/// with no further outwait; the counter is exact. Then a node is killed
+/// while its request is *parked* at the owner, first in line: the next
+/// waiter is granted as soon as the holder unlocks, not `ttl + margin`
+/// later (a grant pushed to the dead waiter would have to be outwaited
+/// first).
+pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-holder-killed-contention";
+    const LOCK_TTL_MS: u64 = 3_000;
+    // The lease's expiry margin (min(1 s, lease ttl / 4)): the owner's
+    // outwait is `ttl + margin` after the holder's last renewal.
+    const MARGIN_MS: u64 = 1_000;
+    const PER_NODE: u64 = 30;
+    const VICTIM_AT: u64 = 8;
+    // Host slack on top of the protocol's own bound (a loaded CI host:
+    // the handoff's flush, a fsync through S3).
+    const SLACK_MS: u64 = 3_000;
+    let ttl = LOCK_TTL_MS.to_string();
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "b", "c", "d"],
+        &[
+            ("CONSTELLATION_LOCK_TTL_MS", &ttl),
+            ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+            (
+                "RUST_LOG",
+                "info,constellation_authority::core::locks=debug",
+            ),
+        ],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        std::fs::write(clients[0].mnt.join("counter"), [0u8; 8])?;
+        for c in &clients[1..] {
+            eventually(
+                "counter visible everywhere",
+                Duration::from_secs(30),
+                || {
+                    anyhow::ensure!(read_counter(&c.mnt.join("counter"))? == 0);
+                    Ok(())
+                },
+            )?;
+        }
+        // ---- phase 1: the lock holder is killed mid-contention.
+        let victim = 2usize;
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let mut hold = Some((VICTIM_AT, held_tx, go_rx));
+        let mut workers = Vec::new();
+        for (i, c) in clients.iter().enumerate() {
+            let path = c.mnt.join("counter");
+            let h = if i == victim { hold.take() } else { None };
+            workers.push(std::thread::spawn(move || {
+                counter_worker(path, PER_NODE, h)
+            }));
+        }
+        held_rx
+            .recv_timeout(Duration::from_secs(120))
+            .context("the victim never reached its increment with the lock held")?;
+        clients[victim].kill9()?;
+        let killed = Instant::now();
+        let _ = go_tx.send(());
+        eprintln!(
+            "    {NAME}: killed {} holding the lock after {VICTIM_AT} increments",
+            clients[victim].name
+        );
+        let runs: Vec<CounterRun> = workers
+            .into_iter()
+            .map(|w| w.join().expect("counter worker"))
+            .collect();
+        let mut survivors_done = 0;
+        let mut after: Vec<Instant> = Vec::new();
+        for (i, r) in runs.iter().enumerate() {
+            if i == victim {
+                eprintln!(
+                    "    {NAME}: victim {}: {} increments, stopped by: {:?}",
+                    clients[i].name, r.done, r.error
+                );
+                anyhow::ensure!(r.done == VICTIM_AT, "victim made {} increments", r.done);
+                continue;
+            }
+            anyhow::ensure!(
+                r.error.is_none() && r.done == PER_NODE,
+                "survivor {}: {} of {PER_NODE} increments, error {:?}",
+                clients[i].name,
+                r.done,
+                r.error
+            );
+            survivors_done += r.done;
+            after.extend(r.times.iter().copied().filter(|t| *t > killed));
+        }
+        after.sort();
+        let first = *after.first().context("no increment after the kill")?;
+        let stall = first - killed;
+        let drained = *after.last().unwrap() - killed;
+        let mut gaps: Vec<Duration> = after.windows(2).map(|w| w[1] - w[0]).collect();
+        gaps.sort();
+        let max_gap = gaps.last().copied().unwrap_or_default();
+        eprintln!(
+            "    {NAME}: survivors stalled {stall:?} after the kill (bound: ttl + margin = {} ms, + {SLACK_MS} ms host slack); \
+             {} increments after it, drained in {drained:?}, largest gap between them {max_gap:?}",
+            LOCK_TTL_MS + MARGIN_MS,
+            after.len()
+        );
+        anyhow::ensure!(
+            stall <= Duration::from_millis(LOCK_TTL_MS + MARGIN_MS + SLACK_MS),
+            "the survivors waited {stall:?} for the dead holder's grant"
+        );
+        // And not less than the grant's remaining life: the dead holder
+        // renewed at most `ttl/2 + ttl/4` before the kill, so its grant
+        // outlives the kill by at least `ttl/4 + margin` at the owner.
+        anyhow::ensure!(
+            stall >= Duration::from_millis(LOCK_TTL_MS / 4 + MARGIN_MS),
+            "the survivors got the lock {stall:?} after the kill: before the dead holder's grant expired"
+        );
+        // No second outwait among the living: one would stall everyone
+        // for most of `ttl + margin` again.
+        anyhow::ensure!(
+            max_gap < Duration::from_millis(LOCK_TTL_MS),
+            "a {max_gap:?} gap between increments after the recovery (an outwait among live nodes?)"
+        );
+        let expected = survivors_done + VICTIM_AT;
+        let got = read_counter(&clients[0].mnt.join("counter"))?;
+        anyhow::ensure!(
+            got == expected,
+            "counter {got}, expected {expected} (lost or doubled increments)"
+        );
+        let expired = locks_of(&clients[0])?["recalls_expired"]
+            .as_u64()
+            .unwrap_or(0);
+        eprintln!("    {NAME}: counter {got} exact; the owner outwaited {expired} grant(s)");
+        anyhow::ensure!(
+            expired == 1,
+            "{expired} grants outwaited; expected the dead holder's only"
+        );
+
+        // ---- phase 2: a node killed while parked, first in line.
+        clients[victim].mount()?;
+        {
+            let refs: Vec<&Client> = clients.iter().collect();
+            wait_for_p2p(&refs)?;
+        }
+        let held = hold_flock(
+            clients[1].mnt.join("counter"),
+            libc::LOCK_EX,
+            Duration::from_secs(30),
+        )?;
+        let spawn_waiter = |p: PathBuf| {
+            std::thread::spawn(move || -> Result<Instant> {
+                let f = open_rw(&p)?;
+                flock(&f, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("errno {e}"))?;
+                let at = Instant::now();
+                let _ = flock(&f, libc::LOCK_UN);
+                Ok(at)
+            })
+        };
+        let dead = spawn_waiter(clients[victim].mnt.join("counter"));
+        std::thread::sleep(Duration::from_millis(700));
+        let next = spawn_waiter(clients[3].mnt.join("counter"));
+        std::thread::sleep(Duration::from_millis(300));
+        clients[victim].kill9()?;
+        // Longer than the dead waiter's window (`ttl - margin` from its
+        // last message): whatever it was sent now would lapse on arrival.
+        std::thread::sleep(Duration::from_millis(LOCK_TTL_MS));
+        let released = Instant::now();
+        held.release();
+        let granted = next.join().expect("waiter")?;
+        let waited = granted.saturating_duration_since(released);
+        let _ = dead.join();
+        let expired2 = locks_of(&clients[0])?["recalls_expired"]
+            .as_u64()
+            .unwrap_or(0);
+        eprintln!(
+            "    {NAME}: with {} dead in the queue ahead of it, {} was granted {waited:?} after the unlock; outwaited grants {expired} -> {expired2}",
+            clients[victim].name, clients[3].name
+        );
+        anyhow::ensure!(
+            waited < Duration::from_millis(LOCK_TTL_MS + MARGIN_MS) / 2,
+            "the next waiter waited {waited:?}: the dead waiter's grant was outwaited first"
+        );
+        anyhow::ensure!(expired2 == expired, "a grant was outwaited in phase 2");
+        for c in &clients {
+            print_locks(NAME, c);
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        keep_logs(NAME, &clients);
+    }
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
+}
+
+// ------------------------------------------------------------------ lock-fence-at-close
+
+/// A lock holder writes under its lock, then is cut from the owner past
+/// its grant's lease; another node takes the lock and writes. When the
+/// old holder closes, what it wrote under the lapsed grant must be
+/// discarded — its close fails with `EIO` — and the file holds the new
+/// holder's data everywhere. Twice: `fcntl`, closed with the lock still
+/// held (the close drops the POSIX lock; the fence must be checked
+/// before), and `flock`, unlocked first and then closed (the unlock
+/// lifts the fence; the data stays tainted).
+pub fn lock_fence_at_close(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-fence-at-close";
+    const LOCK_TTL_MS: u64 = 3_000;
+    const OLD: &[u8] = b"B-OLD-UNDER-LOCK";
+    const NEW: &[u8] = b"C-NEW-UNDER-LOCK";
+    let ttl = LOCK_TTL_MS.to_string();
+    let (_env, root, mut clients, _) = cluster(
+        NAME,
+        &["a", "b", "c"],
+        &[
+            ("CONSTELLATION_LOCK_TTL_MS", &ttl),
+            ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"),
+            (
+                "RUST_LOG",
+                "info,constellation_authority::core::locks=debug,constellation::locks=debug",
+            ),
+        ],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let b = &clients[1];
+        let c = &clients[2];
+        let a_id = node_id(a)?;
+        let b_id = node_id(b)?;
+        for (variant, file, posix) in [
+            ("fcntl, closed while locked", "g1", true),
+            ("flock, unlocked then closed", "g2", false),
+        ] {
+            std::fs::write(a.mnt.join(file), b"initial")?;
+            for n in [b, c] {
+                eventually(
+                    "the file visible everywhere",
+                    Duration::from_secs(30),
+                    || {
+                        anyhow::ensure!(std::fs::read(n.mnt.join(file))? == b"initial");
+                        Ok(())
+                    },
+                )?;
+            }
+            let lock = |f: &File, blocking: bool| -> std::result::Result<(), i32> {
+                if posix {
+                    let cmd = if blocking {
+                        libc::F_SETLKW
+                    } else {
+                        libc::F_SETLK
+                    };
+                    fcntl_lock(f, cmd, libc::F_WRLCK as i16, 0, 0)
+                } else {
+                    flock(f, libc::LOCK_EX)
+                }
+            };
+            let mut wb = open_rw(&b.mnt.join(file))?;
+            lock(&wb, true).map_err(|e| anyhow::anyhow!("B's lock: errno {e}"))?;
+            write_at(&mut wb, 0, OLD).context("B's write under its lock")?;
+            // Cut B from the owner (A), both directions: its renewals
+            // fail and its grant lapses.
+            std::fs::write(
+                super::m9::c_deny_path(root.path(), &a.name),
+                format!("{b_id}\n"),
+            )?;
+            std::fs::write(
+                super::m9::c_deny_path(root.path(), &b.name),
+                format!("{a_id}\n"),
+            )?;
+            let cut = Instant::now();
+            // C takes the lock (after the owner outwaited B's grant) and
+            // writes the new content through.
+            let fc = open_rw(&c.mnt.join(file))?;
+            lock(&fc, true).map_err(|e| anyhow::anyhow!("C's lock: errno {e}"))?;
+            let granted = cut.elapsed();
+            {
+                use std::os::unix::fs::FileExt;
+                fc.write_at(NEW, 0)?;
+                fc.sync_all()?;
+            }
+            if posix {
+                fcntl_lock(&fc, libc::F_SETLK, libc::F_UNLCK as i16, 0, 0).ok();
+            } else {
+                let _ = flock(&fc, libc::LOCK_UN);
+            }
+            drop(fc);
+            // B's I/O under the lapsed grant is fenced.
+            let fenced = write_at(&mut wb, 0, OLD);
+            anyhow::ensure!(
+                fenced.as_ref().err().and_then(|e| e.raw_os_error()) == Some(libc::EIO),
+                "{variant}: B's write after its grant lapsed: {fenced:?}"
+            );
+            // Heal; B's application closes (or unlocks, then closes).
+            let _ = std::fs::remove_file(super::m9::c_deny_path(root.path(), &a.name));
+            let _ = std::fs::remove_file(super::m9::c_deny_path(root.path(), &b.name));
+            if !posix {
+                flock(&wb, libc::LOCK_UN).map_err(|e| anyhow::anyhow!("B's unlock: errno {e}"))?;
+            }
+            let fd = std::os::unix::io::IntoRawFd::into_raw_fd(wb);
+            let rc = unsafe { libc::close(fd) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            eprintln!(
+                "    {NAME}: {variant}: C granted {granted:?} after the cut; B's close returned {rc} (errno {errno:?})"
+            );
+            anyhow::ensure!(
+                rc == -1 && errno == Some(libc::EIO),
+                "{variant}: B's close of data written under a lapsed grant returned {rc} (errno {errno:?}), expected EIO"
+            );
+            for n in [a, b, c] {
+                eventually(
+                    "the new holder's data everywhere",
+                    Duration::from_secs(30),
+                    || {
+                        let got = std::fs::read(n.mnt.join(file))?;
+                        anyhow::ensure!(
+                            got == NEW,
+                            "{variant}: {} reads {:?}",
+                            n.name,
+                            String::from_utf8_lossy(&got)
+                        );
+                        Ok(())
+                    },
+                )?;
+            }
+            // Nothing stale is published later either (B's release, a
+            // later close on B).
+            std::fs::read(b.mnt.join(file))?;
+            std::thread::sleep(Duration::from_millis(1_500));
+            for n in [a, b, c] {
+                let got = std::fs::read(n.mnt.join(file))?;
+                anyhow::ensure!(
+                    got == NEW,
+                    "{variant}: {} reads {:?} later",
+                    n.name,
+                    String::from_utf8_lossy(&got)
+                );
+            }
+            eprintln!("    {NAME}: {variant}: the file holds C's data on every node");
+        }
+        for c in &clients {
+            print_locks(NAME, c);
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        keep_logs(NAME, &clients);
+    }
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
+}
+
 // ------------------------------------------------------------------ lock-failover
 
 /// Three nodes with an M9 backup; B holds an exclusive lock and writes

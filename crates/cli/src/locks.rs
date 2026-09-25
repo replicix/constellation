@@ -135,6 +135,31 @@ impl ClusterLocks {
         self.meta.locks().fenced(ino, now_ms())
     }
 
+    /// Whether `ino`'s dirty data must be discarded rather than
+    /// published (`Some(fenced)`; see `LockTables::take_discard`).
+    pub fn take_discard(&self, ino: Ino) -> Option<bool> {
+        self.meta.locks().take_discard(ino, now_ms())
+    }
+
+    /// A discard nobody could be told about: the next close or `fsync`
+    /// of `ino` reports `EIO`.
+    pub fn owe(&self, ino: Ino) {
+        self.meta.locks().owe(ino)
+    }
+
+    pub fn take_owed(&self, ino: Ino) -> bool {
+        self.meta.locks().take_owed(ino)
+    }
+
+    /// Drop the kernel's pages and attributes of `ino` (not waited for:
+    /// callers are FUSE request handlers, which the notification may be
+    /// queued behind).
+    pub fn invalidate(&self, ino: Ino) {
+        if let Some(inval) = &self.inval {
+            inval.invalidate(ino);
+        }
+    }
+
     /// `getlk`: the conflicting lock, as `(start, end, type, pid)`;
     /// `F_UNLCK` when there is none. `typ == F_UNLCK` asks about any lock
     /// (a read test). Another node's grant answers as a whole-file lock

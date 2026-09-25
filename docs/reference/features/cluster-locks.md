@@ -106,6 +106,26 @@ or close) or a new grant arrives. Namespace operations (create, rename,
 unlink) are not fenced. With no local lock anywhere on the node, the
 fence check is a single atomic load.
 
+Data written under a grant that ended without its release's flush is
+**never published**. That covers a grant that lapsed with local locks
+under it, a lapsed or lost grant the node was caching with no lock under
+it (the application unlocked but has not closed the file yet), and
+locks removed after the lapse (an unlock or a close under the fence). The
+file's unpublished writes on that node are discarded, and the kernel's
+cached pages of the file are dropped with them:
+
+- `close` (the kernel's `flush`) checks the fence *before* it drops the
+  closing process's locks, so a close under the fence fails with `EIO`;
+- `release`, `fsync`, and the flush that precedes a recalled grant's
+  release check it too;
+- a close or `fsync` of a file whose unlocked writes were discarded fails
+  with `EIO`, including when the application unlocked first;
+- the next lock or write on the file first discards what is left. The
+  next `close` or `fsync` then reports `EIO` once.
+
+Publishing that data later would overwrite what the next holder wrote
+under its own grant.
+
 ### Conflicts, recalls and blocking waits
 
 When a node asks for a grant that conflicts with grants held elsewhere:
@@ -119,8 +139,15 @@ When a node asks for a grant that conflicts with grants held elsewhere:
    last one is unlocked.
 3. A blocking request (`F_SETLKW`, `flock` without `LOCK_NB`) is
    parked, first-in first-out per inode. The request is answered
-   `Waiting` after a short hold, and the grant is pushed to the node
-   (`LockGranted`) when it becomes free.
+   `Waiting` after a short hold (`recall_hold_ms`, 250 ms). The node
+   re-sends it every `(ttl − margin) / 2`, and the grant is pushed to the
+   node (`LockGranted`) when it becomes free. A parked request is granted
+   live from its latest arrival, not from when it is served. A waiter
+   silent for longer than `ttl − margin` is passed over: a grant would
+   already have lapsed when it arrived. After `4 × ttl` of silence the
+   waiter is dropped. So a node that dies while queued costs the waiters
+   behind it at most one `ttl + margin` from its last message, and
+   nothing if the lock frees later than that.
 4. A non-blocking request (`F_SETLK`, `flock -n`) that conflicts gets
    `EAGAIN` at once. The recall still goes out, so a retry succeeds once
    the other node's application unlocks (SQLite's busy loop relies on
@@ -218,12 +245,12 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
   the file as unlocked.
 - **Adjacent ranges of one owner are not merged**, so `getlk` can
   report a piece of a range.
-- **Known gap: the fence does not cover the last close.** `close()` of
-  the last lock owner drops its local locks before the fence is
-  checked, and `release` does not check it, so data written *before*
-  the grant lapsed can still be published by that close. Until this is
-  fixed, an application that sees `EIO` from a fenced file should not
-  rely on its earlier unflushed writes being discarded.
+- **The fence is checked when a flush starts, not when it lands.** A
+  flush that passes the fence while its grant is still honoured
+  publishes even if the grant lapses while the flush is in flight. The
+  two margins (`2 × margin`) cover a flush that finishes promptly. A
+  flush stalled for longer can land after another node was granted the
+  lock, because the sequencer does not check grants on a commit.
 - OFD locks and mandatory locks get no special handling.
 
 ## Configuration
@@ -261,7 +288,9 @@ The node's grant lapsed: `fenced_io` rises and `lost` counts the grants.
 The usual cause is a partition from the owning sequencer longer than
 `CONSTELLATION_LOCK_TTL_MS`, or a TTL takeover of the root lease. Close
 the file or unlock, then lock again. The application must assume that
-another node may have taken the lock in between.
+another node may have taken the lock in between. If `close` or `fsync`
+returns `EIO`, the writes it made under the lapsed grant, and not yet
+flushed, were discarded. The file holds what the next holder wrote.
 
 ### `flock -n` or `F_SETLK` fails once, then succeeds
 

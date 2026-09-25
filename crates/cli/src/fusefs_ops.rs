@@ -218,6 +218,7 @@ impl Filesystem for FuseFs {
                 reply.error(Errno::from_i32(libc::EIO));
                 return;
             }
+            self.lock_discard_tainted(ino);
             if let Err(error) = self.truncate(ino, new_size) {
                 reply.error(Errno::from_i32(error));
                 return;
@@ -634,6 +635,21 @@ impl Filesystem for FuseFs {
                 reply.error(Errno::from_i32(libc::EXDEV));
                 return;
             }
+            // Plan 30 §M14: publishing the file is a publication point.
+            match self.lock_publish_gate(attr.ino) {
+                Err(error) => {
+                    reply.error(Errno::from_i32(error));
+                    return;
+                }
+                Ok(true) => {
+                    // Owed to the application's next close, not to this
+                    // rename.
+                    if let Some(l) = self.cluster_locks() {
+                        l.owe(attr.ino);
+                    }
+                }
+                Ok(false) => {}
+            }
             if let Err(error) = self.flush_inode(attr.ino, true) {
                 reply.error(Errno::from_i32(error));
                 return;
@@ -782,6 +798,7 @@ impl Filesystem for FuseFs {
             reply.error(Errno::from_i32(libc::EIO));
             return;
         }
+        self.lock_discard_tainted(ino);
         match self.do_write(ino, offset, data) {
             Ok(n) if flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0 => {
                 match self.flush_inode(ino, true) {
@@ -797,18 +814,22 @@ impl Filesystem for FuseFs {
     fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
-        // Plan 30 §M14: a close drops the closing process's POSIX locks
-        // on the file (any descriptor's close, as POSIX says); the kernel
-        // also sends an explicit unlock, which then finds nothing. A
-        // fenced file (other owners' locks under a lapsed grant) refuses
-        // to publish what was written under it.
+        // Plan 30 §M14: the fence first, while the closing owner's locks
+        // are still there (dropping them would lift it): data written
+        // under a lapsed grant is discarded, never published. Then the
+        // close drops the process's POSIX locks on the file (any
+        // descriptor's close, as POSIX says); the kernel also sends an
+        // explicit unlock, which then finds nothing.
         let locks = self.cluster_locks().filter(|_| !ConstellationFs::is_synthetic(ino));
+        let gate = self.lock_publish_gate(ino);
         let idle = locks.map(|l| l.drop_owner(ino, lock_owner.0));
-        if self.lock_fenced(ino) {
-            reply.error(Errno::from_i32(libc::EIO));
-            return;
-        }
-        let r = self.flush_inode(ino, false);
+        let r = gate.and_then(|owed| {
+            self.flush_inode(ino, false)?;
+            if owed {
+                return Err(libc::EIO);
+            }
+            Ok(())
+        });
         // The release of a recalled grant flushes the file first; asking
         // for it only after this flush lets that flush find it done.
         if let (Some(l), Some(true)) = (locks, idle) {
@@ -823,12 +844,18 @@ impl Filesystem for FuseFs {
     fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
-        if self.lock_fenced(ino) {
-            reply.error(Errno::from_i32(libc::EIO));
-            return;
-        }
+        // Plan 30 §M14: nothing written under a lapsed grant is made
+        // durable (`lock_publish_gate`).
+        let owed = match self.lock_publish_gate(ino) {
+            Ok(owed) => owed,
+            Err(e) => {
+                reply.error(Errno::from_i32(e));
+                return;
+            }
+        };
         match self.flush_inode(ino, true) {
             Ok(()) => match self.sync_barrier(ino) {
+                Ok(()) if owed => reply.error(Errno::from_i32(libc::EIO)),
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(Errno::from_i32(e)),
             },
@@ -852,14 +879,22 @@ impl Filesystem for FuseFs {
             reply.ok();
             return;
         }
-        // Plan 30 §M14: `FUSE_RELEASE_FLOCK_UNLOCK` — the last close of an
-        // open file drops its `flock` lock (whose owner is the open file).
+        // Plan 30 §M14: the fence first (as in `flush`), then
+        // `FUSE_RELEASE_FLOCK_UNLOCK` — the last close of an open file
+        // drops its `flock` lock (whose owner is the open file).
         let locks = self.cluster_locks();
+        let gate = self.lock_publish_gate(ino);
         let idle = match (locks, lock_owner) {
             (Some(l), Some(owner)) => l.drop_owner(ino, owner.0),
             _ => false,
         };
-        let flush_result = self.flush_inode(ino, flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0);
+        let flush_result = gate.and_then(|owed| {
+            self.flush_inode(ino, flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0)?;
+            if owed {
+                return Err(libc::EIO);
+            }
+            Ok(())
+        });
         if let (Some(l), true) = (locks, idle) {
             l.idle(ino);
         }
@@ -1366,6 +1401,9 @@ impl Filesystem for FuseFs {
             reply.error(Errno::from_i32(libc::ENOLCK));
             return;
         }
+        // Data written under an earlier grant that ended without its
+        // flush does not ride along under the new one.
+        self.lock_discard_tainted(ino);
         let lock = constellation_meta::locks::LocalLock {
             owner: lock_owner.0,
             pid,

@@ -829,6 +829,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m14::lock_failover,
     },
     Scenario {
+        name: "lock-holder-killed-contention",
+        desc: "plan 30 M14 follow-up: four nodes increment one flock'ed counter (read, add, write, fsync); the holder is kill -9'd with the lock held: the survivors stall only until its grant is outwaited (ttl + margin), hand the lock on with no further outwait, and the count is exact; then a node killed while parked first in line costs the next waiter nothing",
+        requires: &[],
+        run: m14::lock_holder_killed_contention,
+    },
+    Scenario {
+        name: "lock-fence-at-close",
+        desc: "plan 30 M14 follow-up: B writes under a lock and is cut from the owner past its grant; C takes the lock and writes; B's close (fcntl: still locked; flock: unlocked first) returns EIO and the file holds C's data on every node",
+        requires: &[],
+        run: m14::lock_fence_at_close,
+    },
+    Scenario {
         name: "lock-latency",
         desc: "plan 30 M14 measurements: first lock on a file from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff; and a lone node under --locks cluster against --locks local",
         requires: &[],
@@ -6471,8 +6483,10 @@ fn chaos_ci_with(seed: u64, strict: bool) -> Result<()> {
     let mut profile = Profile::ci(seed, 3);
     profile.cto_strict = strict;
     let work_root = profile.work_root.clone();
-    Coordinator::run(&mut cluster, profile, &store)
-        .with_context(|| format!("{name} artifacts under {}", store.display()))?;
+    if let Err(e) = Coordinator::run(&mut cluster, profile, &store) {
+        diagnose_divergence(name, &format!("{e:#}"), &[&c0, &c1, &c2]);
+        return Err(e).with_context(|| format!("{name} artifacts under {}", store.display()));
+    }
     // Plan 30 M4: convergence at quiescence (a fresh replica included)
     // and exactly-once in the log.
     m4::after_chaos(&env, root.path(), &backend, &[&c0, &c1, &c2], &work_root)?;
@@ -6667,6 +6681,100 @@ fn create_storm_s3_only(seed: u64) -> Result<()> {
     Ok(())
 }
 
+/// The path a chaos convergence failure names: the coordinator reports
+/// `convergence not reached within .. after <tag>: <key>: [(worker,
+/// observation), ..]`, the key being the verified path (or
+/// `read_at:<path>@<off>+<len>`).
+fn diverged_path(err: &str) -> Option<String> {
+    let rest = err.split("convergence not reached within ").nth(1)?;
+    let (_, after) = rest.split_once(" after ")?;
+    let (_tag, detail) = after.split_once(": ")?;
+    let key = detail.split(": [").next()?;
+    let key = key.strip_prefix("read_at:").unwrap_or(key);
+    let key = key.split('@').next()?;
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// On a chaos convergence failure, what each node serves for the path
+/// the coordinator could not get agreement on, and whether it converges
+/// if given longer: the content (length, BLAKE3 as the chaos checker
+/// hashes it), the node's metadata view (`inspect`: inode, size, mtime,
+/// the manifest's digest, length and chunk ids), and its position (the
+/// log sequence it holds, the lease as it sees it) — sampled now and 30,
+/// 60 and 120 s later. A late convergence is slowness; a node still
+/// serving other content after two minutes is a divergence.
+fn diagnose_divergence(scenario: &str, err: &str, clients: &[&Client]) {
+    let Some(path) = diverged_path(err) else {
+        return;
+    };
+    eprintln!("    {scenario}: diagnosing the divergence on {path}");
+    let started = std::time::Instant::now();
+    for wait in [0u64, 30, 60, 120] {
+        let at = started + Duration::from_secs(wait);
+        if let Some(d) = at.checked_duration_since(std::time::Instant::now()) {
+            std::thread::sleep(d);
+        }
+        let mut contents = Vec::new();
+        for c in clients {
+            let content = match std::fs::read(c.mnt.join(&path)) {
+                Ok(b) => format!(
+                    "len {} blake3 {}",
+                    b.len(),
+                    &blake3::hash(&b).to_hex()[..16]
+                ),
+                Err(e) => format!("read error: {e}"),
+            };
+            let entry = c
+                .control(&serde_json::json!({"cmd": "inspect", "path": format!("/{path}")}))
+                .map(|v| {
+                    let e = &v["entry"];
+                    let m = &e["manifest"];
+                    format!(
+                        "ino {:#x} size {} mtime_ns {} manifest {{len {} digest {} chunks {}}}",
+                        e["ino"].as_u64().unwrap_or(0),
+                        e["size"],
+                        e["mtime_ns"],
+                        m["file_len"],
+                        m["digest"]
+                            .as_str()
+                            .map(|d| &d[..d.len().min(16)])
+                            .unwrap_or("-"),
+                        m["chunks"]
+                    )
+                })
+                .unwrap_or_else(|e| format!("inspect failed: {e:#}"));
+            let position = c
+                .control_status()
+                .map(|v| {
+                    format!(
+                        "head_seq {} lease {{holder {} epoch {} held {}}}",
+                        v["spool"]["head_seq"],
+                        v["lease"]["holder"],
+                        v["lease"]["epoch"],
+                        v["lease"]["held"]
+                    )
+                })
+                .unwrap_or_else(|e| format!("status failed: {e:#}"));
+            eprintln!(
+                "      +{wait:>3}s {}: {content} | {entry} | {position}",
+                c.name
+            );
+            contents.push(content);
+        }
+        if contents.windows(2).all(|w| w[0] == w[1]) {
+            eprintln!(
+                "    {scenario}: {path} converged {:?} after the failure (slow, not diverged)",
+                started.elapsed()
+            );
+            return;
+        }
+    }
+    eprintln!(
+        "    {scenario}: {path} still differs {:?} after the failure: a divergence",
+        started.elapsed()
+    );
+}
+
 /// Fleet soak shape on one host: four write-back mounts, soak profile,
 /// seed 42. Used to reproduce `disjoint_write` / `write_disjoint:wd41`
 /// without EC2.
@@ -6718,6 +6826,8 @@ fn chaos_soak_4(seed: u64) -> Result<()> {
     });
     if let Err(ref e) = result {
         eprintln!("chaos-soak-4 FAILED: {e}");
+        let refs: Vec<&Client> = clients.iter().collect();
+        diagnose_divergence("chaos-soak-4", &format!("{e:#}"), &refs);
         eprintln!("artifacts kept at: {}", store.display());
         for c in &clients {
             eprintln!("--- {} mount.log (tail) ---\n{}", c.name, c.tail_log());
@@ -10077,4 +10187,24 @@ fn inbox_holder_takeover_pending_batch(_seed: u64) -> Result<()> {
     r1.unmount()?;
     r2.unmount()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_convergence_failure_names_its_path() {
+        let err = "convergence not reached within 60s after write_full_duel:wf293: \
+                   chaos-soak/wf293: [(0, \"hash:1beb3151\"), (1, \"hash:a2764f1b\")]";
+        assert_eq!(
+            super::diverged_path(err).as_deref(),
+            Some("chaos-soak/wf293")
+        );
+        let err = "x: convergence not reached within 60s after write_disjoint:wd41: \
+                   read_at:chaos-soak/wd41@32+32: [(0, \"hash:aa\")]";
+        assert_eq!(
+            super::diverged_path(err).as_deref(),
+            Some("chaos-soak/wd41")
+        );
+        assert_eq!(super::diverged_path("something else"), None);
+    }
 }

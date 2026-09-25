@@ -21664,3 +21664,272 @@ baseline). Gate 6 (perf) is deferred to EC2 per the coordinator's
 instruction, not run here. Two items need the coordinator's attention:
 `chaos-soak-4`'s single M14-only failure (recommend a longer soak) and
 the Docker build-cache hazard (process note for future testers).
+
+## Fix: M14 follow-ups (lock recovery after holder kill, chaos-soak-4)
+
+(coder, 2026-09-25; uncommitted on `m14-followups` = main 3caec49.) Three
+items: the EC2 report's Finding 3 (lock recovery after a holder kill took
+"~2 minutes"), the docs writer's close-fence gap, and `chaos-soak-4`'s one
+failure on the M14 tree.
+
+### 1. Lock recovery after the holder is killed
+
+**What the EC2 logs say** (`/home/bra/cvs/constellation-m14/ec2-logs/locks1/`;
+the orchestrator `scenario_locks.py` and its `locks1.log` are in that
+session's scratchpad). Node a (node 2) had been the sequencer since the
+first, broken kill attempt (takeover at 12:32:32). For the corrected run:
+- the run started at about 12:35:23. That is a's first metadata publish
+  since the takeover, at 12:35:24.4. c (node 1) was killed at about
+  12:35:25–28: its next incarnation (3) started at 12:35:28.8;
+- the owner outwaited exactly one grant, c's, at 12:35:33.96 (`a lock
+  grant's recall went unanswered; outwaited it (TTL + margin) holder=1`;
+  `recalls_expired: 1` in a's status). That is `ttl 5 s + margin 1 s`
+  after the grant was made, at 12:35:27.96, at or after c's death. It
+  matches a grant pushed to c's request while that request was parked;
+- one shipped segment per increment (seq 406 after the 400 increments of
+  tests 1–2), and a metadata commit every 32 segments. The commits came
+  at 24.4, 25.4, 26.5 and 27.7, then a gap during the outwait, then 34.7,
+  35.9, 38.3 and 40.9. After that there was only the idle publish at
+  12:36:17 (`publish_idle_ms` 30 s after 40.9: the journal was idle
+  before 12:36:10). So the survivors finished at about 12:35:41–45,
+  **~15–20 s after the kill**. About 6 s of that was the one outwait;
+- every survivor's `grant_ms` histogram (a, b, d) has exactly one wait
+  of 4.1 s or more (bucket 13) and none of 2–4 s. That is **one outwait,
+  not one per waiter**.
+
+Where "~2 minutes" came from: the orchestrator's
+`wait_counters_done` counts workers with `pgrep -f 'chaos_worker.py
+counter_incr'` over ssh. pgrep also matches its own `bash -c` wrapper,
+which contains the pattern. Tests 1 and 2 logged `running=4` at exactly
+their 180 s timeout, and test 3 logged `running=3` for its whole 90 s,
+although test 3's workers had died at once on an argparse error. Those
+wall times are the timeouts, not measurements. The manual re-run's "~2
+min" is not supported by the daemon logs.
+
+**The timer.** The stall is the dead node's **lock grant lease**: the
+owner outwaits `ttl + margin` from the grant (or its last renewal). The
+other candidates are ruled out:
+- the node lease or a takeover: a was the sequencer and stayed alive;
+  there was no takeover in that run;
+- c's remount: nothing waits for it, and nothing was reclaimed;
+- a handoff grace: none was active;
+- a per-waiter timeout: ruled out by the histograms.
+
+This is by design. The cost of the stall is one `ttl + margin`.
+
+**One real gap.** A parked request's grant was stamped from when it was
+*served*: `until = now + ttl + margin`. So a node that died while queued
+cost everyone behind it `ttl + margin` from the moment the lock freed,
+however long ago it died. That was about 3 s extra in the EC2 run
+(pushed at 27.96, three seconds after the kill), and it could be much
+longer. A queue with k dead waiters paid it k times, serially.
+
+Fix (`crates/authority/src/core/locks.rs`):
+- a `Waiter` records `recv`, the owner's clock when its request (the park,
+  or the latest re-send) arrived. A grant served to a remote waiter is
+  live from `recv` (`lock_try_grant`'s `base`), never from later. The
+  requester's window counts from its send, which came before the
+  arrival, so the owner's record still outlasts it by `2 × margin`. This
+  is the same inequality as a reply on arrival, and the model checks it
+  (below);
+- a remote waiter with no RPC in flight that has been silent for
+  `ttl − margin` is skipped, not granted. A grant would lapse on arrival
+  (the node's own rule re-requests it), and granting a dead node makes
+  the queue wait. A waiter silent for `4 × ttl` is dropped
+  (`lock_waiters_dropped`); it re-parks if it ever asks again;
+- `Waiting` now tells the requester to re-send every
+  `(ttl − margin) / 2` instead of `ttl / 2`, so a live waiter re-attaches
+  well inside the skip threshold;
+- a grant installed past its `renew_at` renews on the next event, not
+  at the next tick. A push can arrive late in its window, and the next
+  tick could come after the window ends.
+
+Model (`crates/model/src/locks.rs`): a `Park` carries `recv`, and a
+parked request is granted live from it. `drift-margin-3` is still clean
+and exhaustive at 43.7M states (13.9M unique; it was 16.9M), so `CAP` in
+`tests/locks.rs` is 60M states / 150 s. All 20 tests are as intended
+(63 s). The skip is not modeled: it only removes grants.
+
+Unit tests (`core::tests::locks`):
+- `a_waiter_killed_while_parked_costs_one_window_from_its_last_message`:
+  the grant to a dead first-in-line waiter is live from its arrival. The
+  waiter behind it is pushed its grant at `t0 + ttl + margin`, 3 s
+  earlier than before;
+- `a_silent_parked_waiter_is_skipped_and_then_dropped`: two dead waiters
+  ahead cost the live one nothing, and they are dropped after
+  `4 × ttl`;
+- `an_unanswered_recall_is_outwaited_and_the_grant_is_pushed` now has its
+  waiter re-send, as a live node does.
+
+**Harness `lock-holder-killed-contention`** (new; ttl 3 s, margin 1 s,
+no backup). Four nodes increment one `flock`ed counter (read, add one,
+write, `fsync`, 30 each). c is `kill -9`'d holding the lock after 8
+increments. The scenario asserts:
+- the survivors' stall is at most `ttl + margin + 3 s` of host slack, and
+  at least `ttl/4 + margin` (never before the dead grant expires);
+- no gap of `ttl` or more between increments afterwards;
+- the owner's `recalls_expired` is 1;
+- the counter is exact.
+
+Phase 2: b holds the lock, c (remounted) parks, then d parks, and c is
+killed. After `ttl` b unlocks. d must be granted within
+`(ttl + margin) / 2`, with no further outwait.
+
+| | phase 1: stall after the kill | then | phase 2: d granted after the unlock | outwaited grants |
+|---|---|---|---|---|
+| before (M14 daemon, `CONSTELLATION_BIN`) | 4.00 s | 64 increments in 0.41 s | **4.009 s** (FAIL) | 1 → **2** |
+| after (6 runs) | 3.975–3.99 s (= ttl + margin) | 61–64 increments in 0.38–0.43 s, largest gap 8–18 ms | **9–17 ms** | 1 → 1 |
+
+So recovery after a holder kill is one `ttl + margin` (5 s + 1 s = 6 s
+at the defaults), and handoffs among the live nodes are milliseconds
+again right after it.
+
+### 2. The close fence (the docs writer's item)
+
+Verified by reading `fusefs_ops.rs` at df14686. There were five holes:
+- `flush` dropped the closing owner's POSIX locks *before* checking the
+  fence. That lifts the fence, so the last owner's close published the
+  data written under the lapsed grant;
+- `release` never checked the fence;
+- an `EIO` from `flush` left the dirty `WriteState` in place, and
+  `release` or any later close published it;
+- an unlock after the lapse, or a cached grant that lapsed after the
+  application unlocked but before it closed, lifted the fence with the
+  data still dirty;
+- the flush before a recalled grant's release (`flush_for_lock`) had no
+  check either.
+
+Fix:
+- `LockTables` (`crates/meta/src/locks.rs`) now **taints** an inode whose
+  grant ended without its release's flush. That covers `drop_held`
+  (lapsed), `lost`, a lapsed grant found at a publication point, and a
+  local unlock or close under the fence.
+  `take_discard(ino, now)` is asked at every publication point:
+  `Some(fenced)` means discard, with local locks still fenced when
+  `fenced` is true. `owe`/`take_owed` carry an `EIO` for a discard made
+  where nobody could be told. The fast path is two relaxed loads (local
+  locks, plus held grants and taints);
+- in the FUSE layer (`fusefs.rs` `lock_publish_gate`,
+  `lock_discard_tainted`, `discard_lock_writes`):
+  - `flush` checks the gate *before* dropping the owner's locks.
+    `release`, `fsync` and the scratch rename that publishes a file check
+    it too. On discard the file's `WriteState` goes, with its staged
+    bytes and pending-upload claims, and the kernel's pages go with it
+    (a new non-waiting `InodeInvalidator::invalidate`). The call returns
+    `EIO` if anything was discarded or locks are still fenced;
+  - `flush_for_lock` discards instead of publishing when its grant has
+    lapsed, and owes the `EIO`;
+  - a new local lock, a write or a truncation first discards tainted
+    data and owes the `EIO` to the next close or `fsync`.
+
+The residual limit, documented: the gate is checked when a flush
+*starts*. A flush that passes while the grant is honoured and lands
+after it lapsed is covered only by the `2 × margin` slack, because the
+sequencer does not check grants on a commit.
+
+**Harness `lock-fence-at-close`** (new; ttl 3 s). B locks, writes 16
+bytes and is cut from the owner. C is granted about 4.0 s after the cut,
+writes other 16 bytes and `fsync`s. B's write after the lapse gets `EIO`.
+The cut heals, then B either closes with its `fcntl` lock still held,
+or `flock(LOCK_UN)`s first and then closes. The scenario asserts:
+- B's `close()` returns `EIO`;
+- the file holds C's bytes on a, b and c, and still does 1.5 s later.
+
+Results:
+- before (M14 daemon): **FAIL**, B's close returned 0, which means it
+  published its stale bytes;
+- after: 6/6 PASS for both variants.
+
+Docs:
+- `docs/reference/features/cluster-locks.md`: the fence section, the
+  parked-waiter behaviour, the known gap replaced by the flush-start
+  limit, and the troubleshooting note;
+- `docs/how-to-guides/development/TESTING.md`: the two scenarios, and
+  the chaos diagnostics below.
+
+### 3. `chaos-soak-4`
+
+**Decoding the one failure.** The chaos schedule is a function of the
+seed. `wf293` is seed 42's step 118, about 22 s into the soak
+(setup + 22 s + the 60 s quiesce ≈ the 96.5 s failure). It is four
+concurrent 256-byte `WriteFull`s. The BLAKE3 hashes of the four contents
+(from a kept seed-42 history):
+- `a2764f1b…` is worker 0's `wf0:294:…`;
+- `1beb3151…` is **worker 3's** `wf3:297:…`.
+
+So nodes 1–3 served worker 0's write, including worker 3's own node,
+and node 0 served worker 3's write, although node 0 wrote the content
+the others serve. In a passing run worker 0 wins the create and 1–3 get
+`EEXIST`. In the failing run worker 3's write landed too, and node 0
+kept the two commits in the opposite order from the other three nodes
+for 60 s.
+
+That is not a slow replica catching up (a lagging node would serve an
+*older* state that the others also passed through, and would not hold
+out against its own later write). It reads as **a real divergence**:
+node-local state out of log order for two manifest commits of one inode.
+The likely place is the speculation and apply-ordering machinery
+(`meta::store::spec`: shadows, the holder's own flush commit and its
+in-doubt re-commit, and the skip of records colliding with the pending
+journal).
+
+**Not M14's, as far as the code shows.** The workload takes no locks.
+What M14 changed on its path:
+- the FUSE init flags (`FUSE_POSIX_LOCKS`/`FUSE_FLOCK_LOCKS`: the kernel
+  then forwards locks and tracks none, so nothing extra happens on
+  close);
+- `drop_owner` in `flush`/`release` (a no-op without locks);
+- `SessionState::reaches` treating a fresh generation's `(gen, 0)` as
+  reached (no delegations in this scenario);
+- handoff and idle release refused while grants are live (there are
+  none).
+
+None of these touches manifest commit ordering or speculation.
+
+**Soak.** 13 runs, all PASSED:
+- 10 on the unmodified M14 tree (df14686): seed 42 six times, and seeds
+  43, 44, 45 and 46;
+- 3 on this branch: seeds 42, 47 and 48.
+
+Up to three ran in parallel under private prefixes, with the host's load
+average up to 111 at 2.4 GHz. Including the tester's runs, that is 1
+failure in 15 runs on the M14 tree and 0 in 3 on main. That does not
+show M14 caused it, and it did not reproduce here.
+
+**Diagnostics for the next occurrence** (`crates/harness/src/scenarios.rs`
+`diagnose_divergence`, called from `chaos-ci` and `chaos-soak-4` before
+teardown):
+- the scenario parses the path from the coordinator's error
+  (`diverged_path`, with a unit test on this failure's exact message);
+- for each node it prints the content (length and BLAKE3, as the chaos
+  checker hashes it), the metadata view through the control API's
+  `inspect` (inode, size, mtime, and the manifest's `file_len`, `digest`
+  and first chunk ids; `ManifestStatus` gained these three fields,
+  `crates/api`, `crates/cli/src/main.rs`) and the position (`head_seq`,
+  and the lease holder, epoch and held);
+- it samples again at 30, 60 and 120 s, and reports either "converged
+  after …" (slowness) or "still differs … a divergence";
+- the full mount logs are still kept next to the history.
+
+### Gates (this branch)
+
+- `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` are clean;
+- `cargo test -p constellation-authority --release`: 89 lib + 84 sim
+  passed (8 ignored);
+- `long_locks` (300 seeds × 8 configs): PASS (284 s under load);
+- the model `--test locks`: 20 passed (63 s);
+- unit tests: meta 86, cli 221, api, and harness 14 (including
+  `diverged_path`), all passed;
+- harness, private prefix `constellation-harness-m14fix`, 3 rounds:
+  `flock-cross-node`, `sqlite-two-nodes` (80 txns, integrity ok, p50
+  about 17 ms under load), `lock-holder-partitioned` (fenced 2.01 s and C
+  granted 4.00 s after the cut), `lock-failover` (0 `EIO`, 115
+  refusals) and `lock-latency` (contended handoff p50 about 2 ms), 3/3
+  each;
+- the new scenarios: `lock-fence-at-close` and
+  `lock-holder-killed-contention` 6/6 each, and both fail on the M14
+  daemon.
+
+No containers, mounts, `/tmp/harness-*` or `/tmp/chaos-soak-4-*`
+directories of this session are left.

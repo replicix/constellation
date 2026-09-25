@@ -660,6 +660,9 @@ pub struct Stats {
     pub lock_recalls_expired: u64,
     pub lock_waiters_parked: u64,
     pub lock_waiting_replies: u64,
+    /// Plan 30 §M14: remote waiters dropped after `4 × ttl` of silence
+    /// (killed while parked; a live one re-sends every `ttl/2`).
+    pub lock_waiters_dropped: u64,
     pub lock_wait_ms_total: u64,
     pub lock_renewals_served: u64,
     pub lock_reclaimed: u64,

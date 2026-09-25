@@ -5225,10 +5225,24 @@ impl constellation_api::StatusSource for DaemonStatus {
             .map_err(|error| error.to_string())?
             .map(|bytes| {
                 constellation_fs_core::manifest::Manifest::decode(&bytes)
-                    .map(|manifest| constellation_api::ManifestStatus {
-                        chunk_size: manifest.layout.chunk_size,
-                        chunk_count: manifest.layout.chunk_count(manifest.file_len),
-                        spilled: manifest.is_spilled(),
+                    .map(|manifest| {
+                        use constellation_fs_core::manifest::ChunkInfo;
+                        let chunks = match &manifest.chunks {
+                            ChunkInfo::Inline(map) => map
+                                .iter()
+                                .take(8)
+                                .map(|(index, hash)| format!("{index}:{}", hash.to_hex()))
+                                .collect(),
+                            ChunkInfo::Spilled(hash) => vec![format!("spilled:{}", hash.to_hex())],
+                        };
+                        constellation_api::ManifestStatus {
+                            chunk_size: manifest.layout.chunk_size,
+                            chunk_count: manifest.layout.chunk_count(manifest.file_len),
+                            spilled: manifest.is_spilled(),
+                            file_len: manifest.file_len,
+                            digest: blake3::hash(&bytes).to_hex().to_string(),
+                            chunks,
+                        }
                     })
                     .map_err(|error| error.to_string())
             })

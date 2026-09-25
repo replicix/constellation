@@ -41,7 +41,12 @@
 //!   reclaimed late;
 //! - I/O on a file this node holds local locks on is **fenced** once its
 //!   grant lapsed ([`LockTables::fenced`]): `EIO` until a lock is taken
-//!   again (NFSv4's rule).
+//!   again (NFSv4's rule);
+//! - dirty data written under a grant that ended *without* its release's
+//!   flush (lapsed, lost, or unlocked while fenced) is never published:
+//!   the inode is **tainted**, and every point that would publish it
+//!   (close, release, `fsync`, a recalled grant's flush, the next lock)
+//!   asks [`LockTables::take_discard`] first and throws the data away.
 //!
 //! # Cost when unused
 //!
@@ -208,7 +213,19 @@ struct Inner {
     /// Ids this node released or dropped (the last few hundred): a
     /// reply that crosses the release is refused.
     released: std::collections::VecDeque<GrantId>,
+    /// Node side: inodes whose dirty data may have been written under a
+    /// grant that ended without the release's flush (see
+    /// [`LockTables::take_discard`]); `Owed`: it was discarded while no
+    /// publish point was there to report it, and the next one reports
+    /// `EIO`.
+    taint: BTreeMap<u64, Taint>,
     stats: LockStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Taint {
+    Dirty,
+    Owed,
 }
 
 const RELEASED_KEPT: usize = 512;
@@ -220,6 +237,18 @@ impl Inner {
         }
         self.released.push_back(id);
     }
+
+    /// `ino`'s grant ended without the release's flush: whatever is
+    /// dirty on it must not be published.
+    fn taint(&mut self, ino: u64) {
+        self.taint.insert(ino, Taint::Dirty);
+    }
+
+    /// Local locks on `ino` and no honoured grant.
+    fn fenced_at(&self, ino: u64, now_ms: i64) -> bool {
+        self.local.get(&ino).is_some_and(|v| !v.is_empty())
+            && !self.held.get(&ino).is_some_and(|h| h.until_ms > now_ms)
+    }
 }
 
 #[derive(Default)]
@@ -227,6 +256,9 @@ pub struct LockTables {
     inner: Mutex<Inner>,
     /// Inodes with at least one local lock: the fence's fast path.
     local_inos: AtomicUsize,
+    /// Held grants plus tainted inodes: [`LockTables::take_discard`]'s
+    /// fast path (with `local_inos`).
+    tracked: AtomicUsize,
     next_seq: AtomicU64,
 }
 
@@ -246,6 +278,12 @@ pub enum LocalOutcome {
 impl LockTables {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// After a change to `held` or `taint` (under the table lock).
+    fn track(&self, g: &Inner) {
+        self.tracked
+            .store(g.held.len() + g.taint.len(), Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> LockStats {
@@ -501,6 +539,7 @@ impl LockTables {
             }
         }
         g.stats.granted += 1;
+        self.track(&g);
         Installed::Ok { recalled }
     }
 
@@ -519,6 +558,7 @@ impl LockTables {
                 }
                 g.held.remove(&ino);
                 g.tombstone(id);
+                self.track(&g);
                 true
             }
             _ => false,
@@ -552,13 +592,16 @@ impl LockTables {
         Some(*h)
     }
 
-    /// The release completed (or the grant is otherwise gone).
+    /// The grant is gone without a release (it lapsed): what was written
+    /// under it and not flushed must not be published (tainted).
     pub fn drop_held(&self, ino: u64, id: GrantId) -> bool {
         let mut g = self.lock();
         match g.held.get(&ino) {
             Some(h) if h.id == id => {
                 g.held.remove(&ino);
                 g.tombstone(id);
+                g.taint(ino);
+                self.track(&g);
                 true
             }
             _ => false,
@@ -570,7 +613,9 @@ impl LockTables {
         let h = g.held.remove(&ino);
         if let Some(h) = h {
             g.tombstone(h.id);
+            g.taint(ino);
         }
+        self.track(&g);
         h
     }
 
@@ -642,7 +687,9 @@ impl LockTables {
         if gone {
             g.held.remove(&ino);
             g.tombstone(id);
+            g.taint(ino);
             g.stats.lost += 1;
+            self.track(&g);
         }
         gone
     }
@@ -664,15 +711,68 @@ impl LockTables {
             return false;
         }
         let mut g = self.lock();
-        let locked = g.local.get(&ino).is_some_and(|v| !v.is_empty());
-        if !locked {
-            return false;
-        }
-        let fenced = !g.held.get(&ino).is_some_and(|h| h.until_ms > now_ms);
+        let fenced = g.fenced_at(ino, now_ms);
         if fenced {
             g.stats.fenced_io += 1;
         }
         fenced
+    }
+
+    /// Plan 30 §M14, the fence at every publication point (close,
+    /// release, `fsync`, a recalled grant's flush, a new lock): whether
+    /// `ino`'s dirty data must be **discarded** instead of published —
+    /// `Some(fenced)` then (`fenced`: local locks are still under the
+    /// lapsed grant, so the caller answers `EIO` even with nothing
+    /// dirty), `None` when it may be published.
+    ///
+    /// A held grant found lapsed here is dropped (as the renewal tick
+    /// would), which taints the inode; a taint is consumed (the caller
+    /// discards). One relaxed load of two counters when this node holds
+    /// no grant, no local lock and no taint.
+    pub fn take_discard(&self, ino: u64, now_ms: i64) -> Option<bool> {
+        if self.local_inos.load(Ordering::Relaxed) == 0 && self.tracked.load(Ordering::Relaxed) == 0
+        {
+            return None;
+        }
+        let mut g = self.lock();
+        if let Some(h) = g.held.get(&ino).copied().filter(|h| h.until_ms <= now_ms) {
+            g.held.remove(&ino);
+            g.tombstone(h.id);
+            g.taint(ino);
+        }
+        let fenced = g.fenced_at(ino, now_ms);
+        let tainted = g.taint.get(&ino) == Some(&Taint::Dirty);
+        if tainted {
+            g.taint.remove(&ino);
+        }
+        if fenced {
+            g.stats.fenced_io += 1;
+        }
+        self.track(&g);
+        (fenced || tainted).then_some(fenced)
+    }
+
+    /// Dirty data of `ino` was discarded where nobody could be told (a
+    /// new lock, a recalled grant's flush): the next close or `fsync`
+    /// reports `EIO` ([`Self::take_owed`]).
+    pub fn owe(&self, ino: u64) {
+        let mut g = self.lock();
+        g.taint.entry(ino).or_insert(Taint::Owed);
+        self.track(&g);
+    }
+
+    /// Whether an `EIO` for discarded data is owed on `ino` (cleared).
+    pub fn take_owed(&self, ino: u64) -> bool {
+        if self.tracked.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let mut g = self.lock();
+        let owed = g.taint.get(&ino) == Some(&Taint::Owed);
+        if owed {
+            g.taint.remove(&ino);
+            self.track(&g);
+        }
+        owed
     }
 
     // ------------------------------------------------------ node: local locks
@@ -782,9 +882,11 @@ impl LockTables {
     /// does). Returns whether `ino` has no local lock left.
     pub fn local_unlock(&self, ino: u64, owner: u64, start: u64, end: u64, now_ms: i64) -> bool {
         let mut g = self.lock();
+        let fenced = g.fenced_at(ino, now_ms);
         let Some(v) = g.local.get_mut(&ino) else {
             return true;
         };
+        let touched = v.iter().any(|l| l.owner == owner && l.overlaps(start, end));
         Self::cut(v, owner, start, end);
         let idle = v.is_empty();
         if idle {
@@ -794,6 +896,13 @@ impl LockTables {
                 h.idle_since_ms = Some(now_ms);
             }
         }
+        if fenced && touched {
+            // Unlocked under a lapsed grant: the fence lifts with the
+            // last lock; the taint keeps what was written under it from
+            // being published.
+            g.taint(ino);
+            self.track(&g);
+        }
         idle
     }
 
@@ -801,11 +910,18 @@ impl LockTables {
     /// `ino` has no local lock left.
     pub fn local_release_owner(&self, ino: u64, owner: u64, now_ms: i64) -> bool {
         let mut g = self.lock();
+        let fenced = g.fenced_at(ino, now_ms);
         let Some(v) = g.local.get_mut(&ino) else {
             return true;
         };
+        let before = v.len();
         v.retain(|l| l.owner != owner);
+        let dropped = v.len() != before;
         let idle = v.is_empty();
+        if fenced && dropped {
+            g.taint(ino);
+            self.track(&g);
+        }
         if idle {
             g.local.remove(&ino);
             self.local_inos.fetch_sub(1, Ordering::Relaxed);
@@ -951,6 +1067,98 @@ mod tests {
         assert!(!t.fenced(8, 100));
         assert!(t.local_unlock(7, 1, 0, 10, 100));
         assert!(!t.fenced(7, 100));
+    }
+
+    #[test]
+    fn a_grant_that_ends_without_its_release_taints_the_dirty_data() {
+        let t = LockTables::default();
+        // Nothing held, locked or tainted: nothing to discard.
+        assert_eq!(t.take_discard(7, 0), None);
+        t.install_held(7, held(LockMode::Exclusive, 100));
+        assert_eq!(t.local_set(7, lk(1, true, 0, 10), 0), LocalOutcome::Done);
+        // Honoured: publish.
+        assert_eq!(t.take_discard(7, 50), None);
+        // Lapsed with the lock still held: fenced (discard, EIO even with
+        // nothing dirty) — checked before the close drops the owner.
+        assert_eq!(t.take_discard(7, 100), Some(true));
+        assert!(t.held(7).is_none(), "the lapsed grant is dropped");
+        // The close drops the owner under the fence: tainted, so the
+        // release that follows discards too — but owes no EIO of its own.
+        assert!(t.local_release_owner(7, 1, 100));
+        assert_eq!(t.take_discard(7, 100), Some(false));
+        assert_eq!(t.take_discard(7, 100), None);
+
+        // An explicit unlock after the lapse, then the close.
+        t.install_held(
+            8,
+            HeldGrant {
+                id: GrantId { node: 1, seq: 2 },
+                ..held(LockMode::Exclusive, 200)
+            },
+        );
+        assert_eq!(t.local_set(8, lk(1, true, 0, 10), 150), LocalOutcome::Done);
+        assert!(t.local_unlock(8, 1, 0, 10, 250));
+        assert!(!t.fenced(8, 250), "the fence lifts with the last lock");
+        assert_eq!(
+            t.take_discard(8, 250),
+            Some(false),
+            "but the data stays tainted"
+        );
+
+        // A cached grant with no local lock (unlocked, file still open)
+        // that lapses: found at the next publication point.
+        t.install_held(
+            9,
+            HeldGrant {
+                id: GrantId { node: 1, seq: 3 },
+                ..held(LockMode::Exclusive, 300)
+            },
+        );
+        assert_eq!(t.local_set(9, lk(1, true, 0, 10), 250), LocalOutcome::Done);
+        assert!(t.local_unlock(9, 1, 0, 10, 260));
+        assert_eq!(t.take_discard(9, 299), None);
+        assert_eq!(t.take_discard(9, 300), Some(false));
+
+        // Lost at a renewal, or dropped lapsed by the tick: tainted.
+        let id = GrantId { node: 1, seq: 5 };
+        t.install_held(
+            10,
+            HeldGrant {
+                id,
+                ..held(LockMode::Shared, 400)
+            },
+        );
+        assert!(t.lost(10, id));
+        assert_eq!(t.take_discard(10, 0), Some(false));
+        let id2 = GrantId { node: 1, seq: 4 };
+        t.install_held(
+            11,
+            HeldGrant {
+                id: id2,
+                ..held(LockMode::Shared, 400)
+            },
+        );
+        assert!(t.drop_held(11, id2));
+        assert_eq!(t.take_discard(11, 0), Some(false));
+        assert_eq!(t.take_discard(11, 0), None);
+    }
+
+    #[test]
+    fn a_released_grant_leaves_nothing_to_discard_and_owed_eio_is_reported_once() {
+        let t = LockTables::default();
+        let id = GrantId { node: 1, seq: 1 };
+        t.install_held(7, held(LockMode::Exclusive, 100));
+        assert_eq!(t.local_set(7, lk(1, true, 0, 10), 0), LocalOutcome::Done);
+        assert!(t.local_unlock(7, 1, 0, 10, 10));
+        assert_eq!(t.recall_held(7, id), Some(false));
+        assert!(t.begin_release(7).is_some());
+        assert!(t.end_release(7, id));
+        assert_eq!(t.take_discard(7, 500), None);
+        assert!(!t.take_owed(7));
+        t.owe(7);
+        assert_eq!(t.take_discard(7, 500), None, "owed is not a discard");
+        assert!(t.take_owed(7));
+        assert!(!t.take_owed(7));
     }
 
     #[test]
