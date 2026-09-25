@@ -347,6 +347,9 @@ pub struct Report {
     pub marker_violations: u64,
     /// Plan 30 §M11: per-directory checks run.
     pub dirs_checked: usize,
+    /// `InDoubt` answers sent (every one checked against the log by
+    /// `check::check_in_doubt_answers`).
+    pub in_doubt_answers: usize,
 }
 
 pub struct Cluster {
@@ -1097,11 +1100,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let bus = Bus::new(seed, cfg.p2p_delay, cfg.p2p_drop);
     bus.set_stream_faults(cfg.stream_faults.clone());
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));
     let env = NodeEnv {
         bucket: bucket.clone(),
         bus: bus.clone(),
         clock,
         commits: commits.clone(),
+        in_doubt: in_doubt.clone(),
         config: cfg.core.clone(),
         panic_after_events: cfg.panic_after_events,
         clock_skew_ms: cfg.clock_skew_ms,
@@ -1616,6 +1621,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             ));
         }
     }
+    report.in_doubt_answers = in_doubt.lock().unwrap().len();
+    check::check_in_doubt_answers(&in_doubt.lock().unwrap(), &oracle).map_err(|e| {
+        format!(
+            "{e}\n  faults: {:?}\n  log: {:#?}\n  stats: {:#?}",
+            report.faults, oracle.describe, report.stats
+        )
+    })?;
     check::check_exactly_once(
         &history.returned(),
         &tentative,

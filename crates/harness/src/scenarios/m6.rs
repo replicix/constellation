@@ -362,6 +362,130 @@ pub fn session_forwarded_ryw(_seed: u64) -> Result<()> {
     result
 }
 
+/// The shape `session-forwarded-ryw` had before its rewrite, made a
+/// scenario of its own: a forwarded close that waits for the log, then
+/// the requester takes the lease over. A holds with its sync held (its
+/// journal unshipped) and B as its M9 backup. B creates `f` (forwarded),
+/// then writes it and closes: the close's manifest commit is accepted by
+/// A on a base B has not applied (A's unshipped create of `f`), so B
+/// waits for the log (`AwaitingLog`). A stalls (SIGSTOP); B, its backup,
+/// seals A's epoch and takes the lease over, with A's backup tail — the
+/// manifest commit's completion included — in its own journal. B's close
+/// must return at once and succeed. Before the fix it waited for a log
+/// that would never carry the op and returned `EIO` at the 120 s client
+/// deadline, for a write that had landed.
+pub fn takeover_resolves_awaiting_close(_seed: u64) -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::IntoRawFd;
+    const NAME: &str = "takeover-resolves-awaiting-close";
+    let tmp = tempfile::tempdir()?;
+    let hold = tmp.path().join("hold-a");
+    let (_env, _root, mut a, mut b) = two_nodes(
+        NAME,
+        &[("CONSTELLATION_LEASE_PLACEMENT", "off")],
+        Some(&hold),
+    )?;
+    let mut paused = false;
+    let result = (|| -> Result<()> {
+        let b_id = b.control_status()?["node_id"]
+            .as_u64()
+            .context("B reports no node id")?;
+        eventually("A lists B as its backup", Duration::from_secs(30), || {
+            let ack = ack_of(&a)?;
+            let backups: Vec<u64> = ack["backups"]
+                .as_array()
+                .map(|v| v.iter().filter_map(|x| x.as_u64()).collect())
+                .unwrap_or_default();
+            anyhow::ensure!(
+                ack["policy"] == "backup" && backups == [b_id],
+                "A's backup set is not [B]: {ack}"
+            );
+            Ok(())
+        })?;
+        let epoch = lease_of(&a)?["epoch"].as_u64().unwrap_or(0);
+        hold_sync(tmp.path(), &hold)?;
+        create_new(&b.mnt, "f").context("B's forwarded create of f")?;
+        let content = b"written through a holder that then stalled".to_vec();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let path = b.mnt.join("f");
+            let content = content.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let result = (|| -> std::io::Result<()> {
+                    let mut f = std::fs::OpenOptions::new().write(true).open(&path)?;
+                    f.write_all(&content)?;
+                    // The close is where the manifest commit happens; its
+                    // error must not be lost in `File`'s drop.
+                    let fd = f.into_raw_fd();
+                    // SAFETY: `fd` is ours (just taken out of the `File`).
+                    if unsafe { libc::close(fd) } != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })();
+                let _ = done_tx.send((result, started.elapsed()));
+            })
+        };
+        // The close waits for the log (A has not shipped the create).
+        match done_rx.recv_timeout(Duration::from_millis(1500)) {
+            Err(_) => {}
+            Ok((r, took)) => bail!(
+                "B's close returned ({r:?} after {took:?}) while A's sync was held: \
+                 the manifest commit did not wait for the log, the scenario's precondition"
+            ),
+        }
+        let stalled = Instant::now();
+        a.pause().context("SIGSTOP A")?;
+        paused = true;
+        let (result, took) = done_rx.recv_timeout(Duration::from_secs(30)).map_err(|_| {
+            anyhow::anyhow!(
+                "B's close had not returned 30 s after A stalled (B lease {:?}, spec {:?})",
+                lease_of(&b).ok(),
+                speculation_of(&b).ok()
+            )
+        })?;
+        let after_stall = stalled.elapsed();
+        let _ = writer.join();
+        let lb = lease_of(&b)?;
+        eprintln!(
+            "    {NAME}: B's close returned {result:?} after {took:?} ({after_stall:?} after A \
+             stalled); B lease {lb}"
+        );
+        result.context("B's close (the manifest commit) after B took the lease over")?;
+        anyhow::ensure!(
+            lb["held"] == true && lb["epoch"].as_u64().unwrap_or(0) > epoch,
+            "B does not hold a newer epoch than A's {epoch}: {lb}"
+        );
+        anyhow::ensure!(
+            after_stall < Duration::from_secs(15),
+            "B's close took {after_stall:?} after A stalled (the seal takes ~1.5 s)"
+        );
+        let read = std::fs::read(b.mnt.join("f")).context("B reads f back")?;
+        anyhow::ensure!(read == content, "B reads back other content for f");
+        let _ = std::fs::remove_file(&hold);
+        a.resume().context("SIGCONT A")?;
+        paused = false;
+        eventually("A sees B's f", Duration::from_secs(30), || {
+            let got = std::fs::read(a.mnt.join("f"))?;
+            anyhow::ensure!(got == content, "A reads {} bytes of f", got.len());
+            Ok(())
+        })?;
+        Ok(())
+    })();
+    if paused {
+        let _ = a.resume();
+    }
+    let _ = std::fs::remove_file(&hold);
+    // The scenario's own verdict first: a close still blocked keeps B's
+    // mount busy, and the unmount error would hide why.
+    let unmounted_b = b.unmount();
+    let unmounted_a = a.unmount();
+    result?;
+    unmounted_b?;
+    unmounted_a
+}
+
 /// M5 finding 1 end to end, the stale-base half of M6: plan 30 M5's
 /// `stale-base-rename-divergence` (a rename accepted on a base the
 /// requester has not applied waits for the log instead of installing a

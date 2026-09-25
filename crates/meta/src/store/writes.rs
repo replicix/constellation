@@ -542,7 +542,7 @@ impl Meta {
         // here instead and must join it too: a forward reply's `base`
         // (M5) and a ReadIndex position (M8) both ask whether unshipped
         // work touched this inode.
-        self.unshipped.lock().unwrap().inos.insert(ino);
+        self.note_unshipped_ino(ino);
         Ok(())
     }
 

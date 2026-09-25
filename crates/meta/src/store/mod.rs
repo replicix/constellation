@@ -549,6 +549,11 @@ pub struct Meta {
     /// the journal ships out completely. Conservative when it is stale
     /// (a key stays until the next full ship), never permissive.
     pub(crate) unshipped: std::sync::Mutex<crate::replay::TouchSet>,
+    /// Plan 30 §M9, per row: for each key of `unshipped`, an upper bound
+    /// on the journal seq of the rows that touched it (see
+    /// [`UnshippedSeqs`]), so a gated holder's read waits for the rows it
+    /// would observe, not for every row. Cleared with `unshipped`.
+    pub(crate) unshipped_seqs: std::sync::Mutex<UnshippedSeqs>,
     /// Plan 30 §M9 round 2: a lower bound on every live `backup_tail`
     /// key, `(epoch, first)`, so a trim scans the live tail and not the
     /// tombstones of everything trimmed before it (`Meta::backup_trim`).
@@ -685,6 +690,7 @@ impl Meta {
             held: std::sync::Mutex::new(held::HeldSummary::default()),
             held_any: AtomicBool::new(false),
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
+            unshipped_seqs: std::sync::Mutex::new(UnshippedSeqs::default()),
             backup_tail_floor: std::sync::Mutex::new(None),
             held_work: AtomicU64::new(0),
             session: crate::session::SessionState::default(),
@@ -861,16 +867,80 @@ impl Meta {
 
     /// Records just journaled: their keys join the unshipped set.
     pub(crate) fn note_unshipped(&self, records: &[crate::record::LogRecord]) {
-        let mut mine = self.unshipped.lock().unwrap();
-        for rec in records {
-            mine.add(rec);
+        let touched = crate::replay::TouchSet::from_records(records.iter());
+        {
+            let mut mine = self.unshipped.lock().unwrap();
+            mine.dentries.extend(touched.dentries.iter().cloned());
+            mine.inos.extend(touched.inos.iter().copied());
         }
+        self.note_unshipped_seqs(&touched);
+    }
+
+    /// An inode's record just journaled outside `mutate::execute` (the
+    /// holder's own manifest commit): it joins the unshipped set.
+    pub(crate) fn note_unshipped_ino(&self, ino: u64) {
+        self.unshipped.lock().unwrap().inos.insert(ino);
+        let mut touched = crate::replay::TouchSet::default();
+        touched.inos.insert(ino);
+        self.note_unshipped_seqs(&touched);
+    }
+
+    /// Plan 30 §M9, per row: `touched`'s rows are journaled (committed),
+    /// so the journal tip read now bounds their seqs from above. The tip
+    /// costs a point read, paid only while the durability gate is on;
+    /// with it off the keys are marked untracked (compared against the
+    /// tip at read time, as before) until the journal ships out — a gate
+    /// that comes on later must not trust a bound that missed rows.
+    fn note_unshipped_seqs(&self, touched: &crate::replay::TouchSet) {
+        if touched.dentries.is_empty() && touched.inos.is_empty() {
+            return;
+        }
+        let seq = if self.session.durable_gated() {
+            self.journal_tip().unwrap_or(UNTRACKED)
+        } else {
+            UNTRACKED
+        };
+        self.unshipped_seqs.lock().unwrap().note(touched, seq);
+    }
+
+    /// Plan 30 §M9, per row: the journal seq through which the rows the
+    /// unshipped journal wrote for `keys` reach — `None` when none of
+    /// them is touched, [`UNTRACKED`] when some key's rows are not
+    /// tracked (the caller compares the tip). The read semantics are
+    /// [`Self::unshipped_touches_keys`]'s.
+    pub(crate) fn unshipped_seq_for(&self, keys: &[crate::session::ReadKey]) -> Option<u64> {
+        if !self.unshipped_touches_keys(keys) {
+            return None;
+        }
+        let seqs = self.unshipped_seqs.lock().unwrap();
+        let mut need = 0u64;
+        for k in keys {
+            let s = match k {
+                crate::session::ReadKey::Dentry(parent, name) => seqs
+                    .dentries
+                    .get(&(*parent, name.clone()))
+                    .copied()
+                    .unwrap_or(0),
+                crate::session::ReadKey::Ino(ino) => seqs.inos.get(ino).copied().unwrap_or(0),
+                crate::session::ReadKey::Dir(dir) => seqs
+                    .inos
+                    .get(dir)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(seqs.dirs.get(dir).copied().unwrap_or(0)),
+            };
+            need = need.max(s);
+        }
+        // A key of the set with no bound at all (journaled before this
+        // map existed for it): untracked.
+        Some(if need == 0 { UNTRACKED } else { need })
     }
 
     /// The journal shipped out completely: nothing unshipped touches
     /// anything any more.
     pub(crate) fn clear_unshipped(&self) {
         *self.unshipped.lock().unwrap() = crate::replay::TouchSet::default();
+        *self.unshipped_seqs.lock().unwrap() = UnshippedSeqs::default();
     }
 
     /// The epoch this node executes under as holder, 0 when it holds none.
@@ -1624,5 +1694,38 @@ mod dentry_copy_tests {
             .collect();
         b.apply_records(&records).unwrap();
         assert_copies_match(&b, "replay");
+    }
+}
+
+/// [`UnshippedSeqs`]: a key whose rows' seqs are not known (journaled
+/// while the durability gate was off): compare the journal tip.
+pub(crate) const UNTRACKED: u64 = u64::MAX;
+
+/// Plan 30 §M9, per row: for the keys of the unshipped set, the highest
+/// journal seq (an upper bound) of a row that touched them — per dentry,
+/// per inode, and per directory over the dentries in it (a `Dir` read).
+/// [`UNTRACKED`] is sticky until the journal ships out.
+#[derive(Debug, Default)]
+pub(crate) struct UnshippedSeqs {
+    pub dentries: std::collections::HashMap<(u64, String), u64>,
+    pub inos: std::collections::HashMap<u64, u64>,
+    pub dirs: std::collections::HashMap<u64, u64>,
+}
+
+impl UnshippedSeqs {
+    fn note(&mut self, touched: &crate::replay::TouchSet, seq: u64) {
+        fn raise(slot: &mut u64, seq: u64) {
+            *slot = (*slot).max(seq);
+        }
+        for (parent, name) in &touched.dentries {
+            raise(
+                self.dentries.entry((*parent, name.clone())).or_insert(0),
+                seq,
+            );
+            raise(self.dirs.entry(*parent).or_insert(0), seq);
+        }
+        for ino in &touched.inos {
+            raise(self.inos.entry(*ino).or_insert(0), seq);
+        }
     }
 }

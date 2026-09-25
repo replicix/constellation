@@ -599,6 +599,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m6::session_forwarded_ryw,
     },
     Scenario {
+        name: "takeover-resolves-awaiting-close",
+        desc: "a forwarded close waits for the log (the holder's sync held), the holder stalls, the requester (its M9 backup) takes the lease over: the close returns at once and succeeds, answered from the completion the takeover brought (was: EIO at the 120 s deadline)",
+        requires: &[],
+        run: m6::takeover_resolves_awaiting_close,
+    },
+    Scenario {
         name: "session-stale-base-rename",
         desc: "plan 30 M6: the stale-base half (M5's stale-base-rename-divergence): a rename accepted on an unapplied base waits for the log; A, B and C agree",
         requires: &[],
@@ -7091,6 +7097,10 @@ fn holder_ships_under_forward_load(_seed: u64) -> Result<()> {
     let max_backlog = AtomicU64::new(0);
     let last_sample_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+    let own = holder.mnt.join(dir).join(".establish-holder");
+    let reading = std::sync::atomic::AtomicBool::new(true);
+    let holder_reads = AtomicU64::new(0);
+
     std::thread::scope(|scope| -> Result<()> {
         let sampler = scope.spawn(|| {
             while sampling.load(Ordering::Relaxed) {
@@ -7104,6 +7114,28 @@ fn holder_ships_under_forward_load(_seed: u64) -> Result<()> {
                     }
                 }
                 std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        // Plan 30 §M9 per-row durability, measured: throughout the burst
+        // the holder rewrites one file of its own and reads it back
+        // (open + read, both through the session check). Its row is
+        // durable before the close returns, but the journal rarely ships
+        // out completely under this load, so the file stays in the
+        // unshipped key set while other clients' rows are in flight to
+        // the backup — the coarse rule held such a read for them, the
+        // per-row rule does not.
+        let session_before = holder.control_status()?["session"].clone();
+        let reader = scope.spawn(|| {
+            let mut i = 0u64;
+            while reading.load(Ordering::Relaxed) {
+                i += 1;
+                if std::fs::write(&own, i.to_le_bytes()).is_ok()
+                    && std::fs::read(&own).is_ok_and(|b| b == i.to_le_bytes())
+                {
+                    holder_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(2));
             }
         });
 
@@ -7135,6 +7167,27 @@ fn holder_ships_under_forward_load(_seed: u64) -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("burst worker thread panicked"))??;
         }
         let burst_elapsed = t0.elapsed();
+        reading.store(false, Ordering::Relaxed);
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("holder reader thread panicked"))?;
+        if let Ok(status) = holder.control_status() {
+            let (a, b) = (&session_before, &status["session"]);
+            let d = |k: &str| b[k].as_u64().unwrap_or(0) - a[k].as_u64().unwrap_or(0);
+            eprintln!(
+                "holder-ships-under-forward-load: holder rewrote and read back its own file {} \
+                 times during the burst: session reads {} waited {} timeouts {} wait-ms {}; \
+                 reads durability-blocked {}",
+                holder_reads.load(Ordering::Relaxed),
+                d("reads"),
+                d("waited"),
+                d("timeouts"),
+                d("wait_ms_total"),
+                status["ack"]["reads_durability_blocked"]
+                    .as_u64()
+                    .unwrap_or(0)
+            );
+        }
 
         sampling.store(false, Ordering::Relaxed);
         sampler

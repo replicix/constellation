@@ -138,7 +138,16 @@ pub struct Shared {
     pub commits: Arc<Mutex<Vec<CommitRecord>>>,
     /// Plan 30 §M10.
     pub epoch: Mutex<SimEpoch>,
+    /// Every `InDoubt` reply of any incarnation (see `NodeEnv`).
+    pub in_doubt: InDoubtLog,
 }
+
+/// Every `InDoubt` reply a node's core sent: `(node, rid, the log
+/// sequence its replica had applied at that moment)`. An in-doubt answer
+/// for a rid whose completion was already in that applied prefix told a
+/// client `EIO` for a write it could have been told had landed
+/// (`check::check_in_doubt_answers`).
+pub type InDoubtLog = Arc<Mutex<Vec<(NodeId, Rid, u64)>>>;
 
 pub struct NodeHandle {
     pub id: NodeId,
@@ -155,6 +164,7 @@ pub struct NodeEnv {
     pub bus: Arc<Bus>,
     pub clock: Clock,
     pub commits: Arc<Mutex<Vec<CommitRecord>>>,
+    pub in_doubt: InDoubtLog,
     pub config: Arc<dyn Fn(NodeId, u32) -> Config + Send + Sync>,
     /// See `SimConfig::panic_after_events`.
     pub panic_after_events: Option<u64>,
@@ -217,6 +227,7 @@ impl NodeHandle {
             tentative: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
             epoch: Mutex::new(epoch),
+            in_doubt: env.in_doubt.clone(),
         });
         env.bus.attach(id, tx.clone());
         let cfg = (env.config)(id, incarnation);
@@ -611,6 +622,14 @@ impl Driver {
         for action in actions {
             match action {
                 Action::Reply { rid, reply } => {
+                    if matches!(reply, ClientReply::InDoubt) {
+                        let applied = Replica::applied_seq(&*self.meta).unwrap_or(0);
+                        self.shared
+                            .in_doubt
+                            .lock()
+                            .unwrap()
+                            .push((self.id, rid, applied));
+                    }
                     if let Some(tx) = self.shared.replies.lock().unwrap().remove(&rid) {
                         let _ = tx.send(reply);
                     }

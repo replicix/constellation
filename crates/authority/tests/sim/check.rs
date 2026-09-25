@@ -287,3 +287,25 @@ pub fn check_exactly_once(
     }
     Ok(())
 }
+
+/// No client is told "in doubt" (`EIO`) for a rid whose outcome the
+/// answering node already had: its completion was in an unfenced log
+/// segment at or below the log sequence that node's replica had applied
+/// when it answered. (An op accepted by a holder that then stalled, and
+/// whose requester took the lease over, used to wait out its deadline
+/// for a log that already carried it — or carried it through the
+/// successor's own ship — and answer in doubt.)
+pub fn check_in_doubt_answers(answers: &[(u64, Rid, Seq)], oracle: &Oracle) -> Result<(), String> {
+    for (node, rid, applied) in answers {
+        if let Some((seq, _)) = oracle.completed_at.get(rid) {
+            if *seq <= *applied {
+                return Err(format!(
+                    "node {node} answered rid {rid:?} in doubt with its completion already \
+                     applied (log seq {seq} <= applied {applied}): a client was told EIO for \
+                     a write that had landed"
+                ));
+            }
+        }
+    }
+    Ok(())
+}

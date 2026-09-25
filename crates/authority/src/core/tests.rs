@@ -1178,6 +1178,161 @@ fn a_queued_replay_blocks_reads_of_its_keys() {
     assert_eq!(requester.meta.session().stats().replay_blocked, 2);
 }
 
+// ---- an `AwaitingLog` forward when this node takes the lease over ----
+
+/// Node 2 forwards `create name` to node 1, which accepts it under epoch
+/// 1 on a base node 2 has not applied (`base: None`): the op waits for
+/// the log (`AwaitingLog`). Returns the requester, the rid and the
+/// holder's records (not applied anywhere yet).
+fn awaiting_log_forward(name: &str) -> (Harness, Rid, Vec<LogRecord>) {
+    let (holder, mut requester) = pair();
+    let rid = requester.rid(1);
+    let op = requester.create(name);
+    let out = requester.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: op.clone(),
+    });
+    let sent = sends(&out);
+    let [(1, PeerMsg::MutateRequest { req, .. })] = sent.as_slice() else {
+        panic!("expected one forward to node 1: {sent:?}")
+    };
+    let req = *req;
+    let records = constellation_meta::execute_mutate(&holder.meta, &op, Some(rid)).unwrap();
+    let out = requester.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::MutateReply {
+            req,
+            outcome: MutateOutcome::Accepted {
+                epoch: 1,
+                records: records.clone(),
+            },
+            base: None,
+            position: constellation_meta::Position {
+                seq: 1,
+                pending: Some(constellation_meta::JournalPos { epoch: 1, jseq: 9 }),
+                streams: Default::default(),
+            },
+            gen: 0,
+        },
+    });
+    assert!(replies(&out).is_empty(), "the op waits for the log");
+    assert_eq!(
+        requester.core.clients().collect::<Vec<_>>(),
+        vec![(rid, ClientPhase::AwaitingLog)]
+    );
+    (requester, rid, records)
+}
+
+fn activity(h: &mut Harness) -> Vec<Action> {
+    let now = h.now;
+    h.step(Event::Activity {
+        last_write: now,
+        acked_seqs: Vec::new(),
+    })
+}
+
+/// The harness `session-forwarded-ryw` stall (PROGRESS, "Fix:
+/// AwaitingLog forwards resolved on takeover"): node 2's forward waits
+/// for the log, node 1 stalls, node 2 takes the lease over — and the
+/// op's completion comes with the takeover (the tail to head, or node
+/// 1's backup tail applied into node 2's own journal), not through a
+/// segment the stream or a tail delivers later. Node 2 answers the op
+/// from `completed` as soon as its view opens, without executing it
+/// again. Before the fix it waited out the client deadline and answered
+/// in doubt (`EIO`) for a write that had landed.
+#[test]
+fn an_awaiting_log_forward_is_answered_from_completed_once_this_node_holds() {
+    let (mut requester, rid, records) = awaiting_log_forward("a");
+    // The takeover brought the completion (here: applied from the log;
+    // the backup tail lands in `completed` the same way).
+    crate::replica::Replica::apply_segment(&requester.meta, 1, 1, 0, &[], &[], &records).unwrap();
+    let journal_before = constellation_meta::MetaStore::journal_len(&requester.meta).unwrap();
+    // The gate is still pending: nothing moves yet.
+    requester.hold(
+        2,
+        Some(PendingGate {
+            epoch: 2,
+            takeover: true,
+            marker_shipped: false,
+            drained: false,
+            fast_prev: None,
+            backup_tail_epoch: None,
+            shippable: false,
+        }),
+    );
+    let out = activity(&mut requester);
+    assert!(replies(&out).is_empty(), "not before the gate opens");
+    // The view opens: the next event answers it.
+    requester.core.lease.gate = None;
+    let out = activity(&mut requester);
+    let r = replies(&out);
+    assert_eq!(r.len(), 1, "answered at once: {out:?}");
+    assert_eq!(r[0].0, rid);
+    assert!(matches!(
+        r[0].1,
+        ClientReply::Outcome(MutateOutcome::Accepted { records, .. }) if records.is_empty()
+    ));
+    assert_eq!(requester.core.stats.awaiting_log_resolved, 1);
+    assert_eq!(requester.core.stats.forward_indoubt_resolved, 1);
+    assert_eq!(
+        constellation_meta::MetaStore::journal_len(&requester.meta).unwrap(),
+        journal_before,
+        "not executed a second time"
+    );
+    assert_eq!(requester.core.clients().count(), 0);
+}
+
+/// The same, but node 1's acceptance never landed (it stalled with the
+/// row unshipped and no backup had it): under node 2's epoch the op
+/// executes here by rid, once, and is answered.
+#[test]
+fn an_awaiting_log_forward_that_never_landed_executes_here_once_this_node_holds() {
+    let (mut requester, rid, _) = awaiting_log_forward("b");
+    requester.hold(2, None);
+    let out = activity(&mut requester);
+    let r = replies(&out);
+    assert_eq!(r.len(), 1, "answered at once: {out:?}");
+    assert_eq!(r[0].0, rid);
+    assert!(matches!(
+        r[0].1,
+        ClientReply::Outcome(MutateOutcome::Accepted { records, .. }) if !records.is_empty()
+    ));
+    assert_eq!(requester.core.stats.awaiting_log_resolved, 1);
+    assert!(
+        requester.meta.completed_outcome(rid).unwrap().is_some(),
+        "journaled here under the new epoch"
+    );
+    assert!(MetaStore::lookup(&requester.meta, ROOT_INO, "b")
+        .unwrap()
+        .is_some());
+}
+
+/// Not moot: the acceptance was under the epoch this node holds (a
+/// delegate's stream, or a lease this node re-took at the same epoch) —
+/// the log carries it; and a continuation-epoch hold (S3 away:
+/// `completed` is not exact) resolves nothing.
+#[test]
+fn an_awaiting_log_forward_under_the_held_epoch_or_a_continuation_hold_keeps_waiting() {
+    let (mut requester, rid, _) = awaiting_log_forward("c");
+    requester.hold(1, None);
+    let out = activity(&mut requester);
+    assert!(replies(&out).is_empty());
+    assert_eq!(
+        requester.core.clients().collect::<Vec<_>>(),
+        vec![(rid, ClientPhase::AwaitingLog)]
+    );
+
+    let (mut requester, rid, _) = awaiting_log_forward("d");
+    requester.core.lease.adopt_epoch_hold(requester.now, 5);
+    let out = activity(&mut requester);
+    assert!(replies(&out).is_empty());
+    assert_eq!(
+        requester.core.clients().collect::<Vec<_>>(),
+        vec![(rid, ClientPhase::AwaitingLog)]
+    );
+}
+
 // ---- plan 30 §M7: log streams ----
 
 /// A holder (node 1, streams on, holding epoch 1) and a subscriber

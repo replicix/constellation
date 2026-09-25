@@ -918,16 +918,22 @@ impl crate::store::Meta {
 
     /// Plan 30 §M9: this holder acknowledges only what is durable on its
     /// backups (or in the log), and its own reads observe nothing less:
-    /// `true` while the unshipped journal touched `keys` and reaches past
-    /// the durable watermark. One atomic load when the gate is off.
+    /// `true` while a row of the unshipped journal that touched `keys` is
+    /// past the durable watermark — the rows the read would observe, not
+    /// every row (an unrelated client's row in flight to the backup does
+    /// not hold this read). Rows journaled while the gate was off are
+    /// untracked and compared by the journal tip, as before. One atomic
+    /// load when the gate is off.
     pub fn durability_pending(&self, keys: &[ReadKey]) -> bool {
         if !self.session.durable_gated() {
             return false;
         }
-        if !self.unshipped_touches_keys(keys) {
-            return false;
-        }
-        self.journal_tip().unwrap_or(0) > self.session.durable_jseq()
+        let need = match self.unshipped_seq_for(keys) {
+            None => return false,
+            Some(crate::store::UNTRACKED) => self.journal_tip().unwrap_or(0),
+            Some(seq) => seq,
+        };
+        need > self.session.durable_jseq()
     }
 
     /// [`SessionState::ready`] against this store: whether a read of
@@ -1157,5 +1163,59 @@ mod tests {
         };
         let q = KeySet::from_op(&op);
         assert!(q.touches(&ReadKey::Ino(1)) && q.touches(&ReadKey::Ino(7)));
+    }
+
+    /// Plan 30 §M9, per row: a gated holder's read waits only while a
+    /// row it would observe is past the durable watermark — not while
+    /// some other key's row is (the coarse rule it replaces: any
+    /// unshipped touch of the keys plus any non-durable row). Rows
+    /// journaled with the gate off are untracked and fall back to the
+    /// journal tip.
+    #[test]
+    fn a_gated_read_waits_only_for_the_rows_it_would_observe() {
+        let meta = crate::store::Meta::open_in_memory().unwrap();
+        meta.set_node_prefix(1).unwrap();
+        let root = constellation_fs_core::types::ROOT_INO;
+        let create = |name: &str| MutateOp::Create {
+            parent: root,
+            name: name.into(),
+            ino: meta.allocate_ino(root).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let dentry = |name: &str| [ReadKey::Dentry(root, name.into())];
+        let s = meta.session();
+        s.set_durable(true, 0, false);
+        crate::mutate::execute(&meta, &create("a"), None).unwrap();
+        assert!(meta.durability_pending(&dentry("a")));
+        s.set_durable(true, meta.journal_tip().unwrap(), false);
+        crate::mutate::execute(&meta, &create("b"), None).unwrap();
+        // `a` is durable although `b`'s row (a different key) is not.
+        assert!(!meta.durability_pending(&dentry("a")));
+        assert!(meta.durability_pending(&dentry("b")));
+        assert!(!meta.durability_pending(&dentry("zzz")), "untouched");
+        assert!(
+            meta.durability_pending(&[ReadKey::Dir(root)]),
+            "`ls` sees b"
+        );
+        s.set_durable(true, meta.journal_tip().unwrap(), false);
+        assert!(!meta.durability_pending(&[ReadKey::Dir(root)]));
+
+        // Gate off: `c` is journaled untracked; with the gate back on it
+        // is compared against the tip (and `a` stays exact).
+        s.set_durable(false, u64::MAX, false);
+        let before = meta.journal_tip().unwrap();
+        crate::mutate::execute(&meta, &create("c"), None).unwrap();
+        s.set_durable(true, before, false);
+        assert!(meta.durability_pending(&dentry("c")));
+        assert!(!meta.durability_pending(&dentry("a")));
+        assert!(
+            meta.durability_pending(&[ReadKey::Dir(root)]),
+            "the directory's bound became untracked with c"
+        );
+        s.set_durable(true, meta.journal_tip().unwrap(), false);
+        assert!(!meta.durability_pending(&dentry("c")));
+        assert!(!meta.durability_pending(&[ReadKey::Dir(root)]));
     }
 }

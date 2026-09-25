@@ -451,6 +451,12 @@ pub struct Stats {
     /// Accepted forwards not installed ahead of the log because the
     /// holder reported a stale base; answered once the log carried them.
     pub awaited_log: u64,
+    /// Ops of this node whose wait its own acquisition made moot
+    /// (`resolve_moot_waits`): accepted forwards awaiting the log from an
+    /// earlier epoch, and inbox ops durable under an earlier epoch —
+    /// answered from `completed` or executed by rid at once.
+    pub awaiting_log_resolved: u64,
+    pub inbox_waits_resolved: u64,
     /// Forwards answered (any outcome) and forwards that failed at the
     /// transport or timed out (`ForwardState::ok`/`err`).
     pub forwards_ok: u64,
@@ -1154,6 +1160,7 @@ impl Core {
             Event::Slack { epoch_slack } => self.on_slack(now, epoch_slack, replica, &mut out),
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),
         }
+        self.resolve_moot_waits(now, replica, &mut out);
         self.inbox_after_event(now, &mut out);
         self.stream_after_event(now, &mut out);
         self.backup_after_event(now, replica, &mut out);

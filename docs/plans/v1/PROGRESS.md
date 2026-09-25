@@ -18280,3 +18280,205 @@ AwaitingLog stall and seal takeover in its logs.
 - **The harness hold fault also stops lease renewals.** Any scenario
   that holds a holder's sync past the lease TTL loses the lease to a
   seal or expiry takeover.
+
+## Fix: AwaitingLog forwards resolved on takeover (2026-09-25; uncommitted on `fix-awaitlog-takeover` = main 00d073a)
+
+The item "an AwaitingLog forward outlives this node's own takeover" from
+the session-forwarded-ryw fix. **A correctness bug**: a client was told
+`EIO` (in doubt) for a write that had landed.
+
+### The bug
+
+A node forwards an op. The holder accepts it on a base the node has not
+applied (`base: None`, M5/M6), so the node waits for the log
+(`Phase::AwaitingLog`). Then the holder stalls, and the node itself takes
+the lease over (seal failover, expiry, a placement offer or an acquire).
+The op stays in `AwaitingLog`: `answer_awaiting_log` runs only after
+segments are *applied* (tail, stream, delegate). A takeover brings the
+op's completion another way — the predecessor's backup tail goes into
+the successor's own journal (`apply_backup_tail`), or the tail to head
+applied it before anything was waiting on it. Or the op never landed at
+all. Either way nothing answers it until the client deadline
+(`acquire_deadline_ms` = 2×TTL = 120 s), and then the client hears
+`InDoubt` → `EIO`. The old `session-forwarded-ryw` hit exactly this.
+
+### The fix (`crates/authority/src/core/client.rs`, `core/mod.rs`)
+
+`Core::resolve_moot_waits` runs after every event (`Core::handle`). It
+returns at once unless this node holds an **S3 lease with its view
+open** (gate done, `new_mutation_epoch == held epoch`, not a
+continuation-epoch hold). Then every op of this node in one of these
+phases is resolved now, in submission order, through
+`resolve_in_doubt_then_execute`:
+- `AwaitingLog { epoch < held }`;
+- `InboxWaiting { epoch < held }`;
+- `AcquireRetry`.
+
+`resolve_in_doubt_then_execute` is the same coverage rule the lease path
+already uses: the acquisition tailed to head and applied the backup tail
+before the view opened, so `completed` is exact below this epoch. Found
+→ answered from it (parked for durability under Backup/S3, like a fresh
+execution). Not found → it never landed and cannot any more (the
+predecessor's later segments are fenced by the marker) → executed here
+by rid. Under a delegation, `execute_local` recalls the generation first
+and re-checks `completed` after the park, so a delegate's streamed
+completion is found, not duplicated.
+
+Counters: `Stats::awaiting_log_resolved`, `Stats::inbox_waits_resolved`.
+
+**Audit of the other waits a takeover can make moot:**
+
+| Wait | Verdict |
+|---|---|
+| `AwaitingLog` from an earlier epoch | **the bug**; resolved as above |
+| `AwaitingLog` under the held epoch (a delegate's acceptance, or the same epoch re-taken) | not moot: the log carries it; left waiting (pinned by a core test) |
+| `InboxWaiting` from an earlier epoch | the gate drained that epoch's inbox, so the same rule holds; resolved at once (it used to wait for the next `inbox_recheck_ms` = 1 s tick, whose "holder is me" arm did the same through the lease path) |
+| `InboxQueued` | not yet durable anywhere; `inbox_kick` re-routes stale-epoch items itself; left |
+| `AcquireRetry` | resolved at once (it used to wait up to `acquire_retry_max_ms` = 2 s) |
+| `WaitingLease` | already resolved by `on_acquire_finished` |
+| `Forwarded` / `Backoff` (including M8 `Held` and the M11 delegate `Held` retries) | bounded by `forward_timeout_ms` (500 ms) or the backoff (≤ 600 ms, `held_retry_ms` 10 ms). `on_forward_backoff` already checks the view (and the M11 own-delegation path) first. Left |
+| Durability parks (`Recalling` + `parked_local`) | this node's own executions as holder; a takeover *by* this node does not make them moot. A deposition already aborts them into in-doubt (`abort_durable_parks`). Left |
+| Continuation-epoch hold | S3 away: `completed` is not exact. Excluded deliberately |
+
+### Tests
+
+- **Core** (`core/tests.rs`):
+  - `an_awaiting_log_forward_is_answered_from_completed_once_this_node_holds`:
+    not while the gate is pending; answered at once when it opens, from
+    `completed`, with nothing journaled again.
+  - `an_awaiting_log_forward_that_never_landed_executes_here_once_this_node_holds`.
+  - `an_awaiting_log_forward_under_the_held_epoch_or_a_continuation_hold_keeps_waiting`.
+  - The first two **fail without the fix** (hook disabled); the third
+    passes either way.
+- **Sim assertion** (`tests/sim/{node,run,check}.rs`):
+  - Every `InDoubt` reply is recorded with the answering node's
+    `applied_seq` at that moment. `check_in_doubt_answers` fails the run
+    if the rid's completion was in an unfenced log segment at or below
+    it: the node had the outcome and still told the client `EIO`.
+    `Report::in_doubt_answers` counts them.
+  - **Non-vacuous:** with the fix disabled, 4 of the 62 default sim
+    tests fail on it: `backup_failover_reships_the_tail` (backup-crash
+    seed 801), `pre_s3_streaming_installs_and_retires` (seed 1407),
+    `fast_failover_with_delegations_keeps_close_to_open`
+    (backup-strict seed 1308) and `regression_refused_forward_is_not_re_executed`
+    (backup-crash-slow seed 1403). Each is "node N answered rid … in
+    doubt with its completion already applied (log seq 23 <= applied
+    28)" or similar. With the fix, all pass.
+- **Harness** `takeover-resolves-awaiting-close` (new, `m6.rs`; the old
+  `session-forwarded-ryw` shape):
+  - Setup: A holds with its sync held and B as its backup, placement
+    off. B creates `f` (forwarded), writes it and calls `close(2)`
+    explicitly. The manifest commit comes back `base: None`, so B's
+    close waits; the scenario checks it is still blocked after 1.5 s.
+  - A is `SIGSTOP`ped. B seals A's epoch and takes over (backup tail
+    applied).
+  - B's close must return `0` within 15 s of the stall, B must hold a
+    newer epoch, and B, then A after `SIGCONT`, must read the content.
+  - With the fix, B's log shows `resolving a wait its acquisition made
+    moot … kind=AwaitingLog epoch=2` 1 ms after `acquired the lease`,
+    and the close returned 1.3 s after the stall.
+  - **Without the fix** (hook disabled, same tree): FAILED, "B's close
+    had not returned 30 s after A stalled", with B already holding
+    epoch 2.
+
+### Per-row durability wait (item 2)
+
+Before, `Meta::durability_pending(keys)` returned true when **any**
+unshipped row touched the keys and the journal tip was past the durable
+watermark. A holder under a backup that rewrote a file and read it back
+could therefore wait for *other* clients' rows in flight to the backup.
+The unshipped key set is cleared only when the journal ships out
+completely, which rarely happens under forward load.
+
+**Now:**
+- `Meta` keeps `UnshippedSeqs` (`store/mod.rs`) next to the unshipped
+  key set: per dentry, per inode, and per directory over its dentries,
+  an upper bound on the journal seq of the rows that touched it. The
+  bound is the journal tip read right after the op's transaction
+  committed. It is fed at the same three points as the set
+  (`mutate::execute`, the applied-records path in `store/local.rs`, and
+  the holder's manifest commit, now `note_unshipped_ino`), and cleared
+  with it.
+- A read waits only while the bound for its keys is past `durable_jseq`.
+- Key semantics are exactly `unshipped_touches_keys`'s, so a `Dir` read
+  still sees every dentry in the directory.
+
+**Why it is safe (M9's tentative-observer rule):**
+- The bound is ≥ every row that touched the key, so a read of `k` never
+  sees a non-durable row of `k`. What it skips are rows it does not read.
+- The tip read costs a point read, paid only while the gate is on. Rows
+  journaled with the gate off are marked `UNTRACKED`, which is sticky
+  until the journal ships out: such a key falls back to the old
+  tip-versus-durable comparison, so a gate that comes on later never
+  trusts a bound that missed rows.
+- Pinned by `session::tests::a_gated_read_waits_only_for_the_rows_it_would_observe`
+  (`a` durable while `b` is not; `ls` still waits for `b`; the
+  untracked fallback). The coarse rule fails its first per-row
+  assertion.
+
+**Measured.**
+- `backup-failover` ×2 and `holder-ships-under-forward-load` as they
+  stand never read on the holder during writes:
+  `reads-durability-blocked 0` before and after.
+- So `holder-ships-under-forward-load` now also measures this. During
+  the burst, the holder rewrites its own file and reads it back every
+  2 ms, and the scenario prints the holder's session and
+  durability-blocked counts. There is no assertion; it is a measurement.
+  Interleaved, 3 runs each:
+
+  | Binary | Durability-blocked reads per run | Total waited |
+  |---|---|---|
+  | main's rule | 0, 0, 54 (of 2,049–3,635 reads) | 54 ms |
+  | per-row | 0, 0, 0 (of 1,985–2,047 reads) | 0 ms |
+
+- The effect is small at this load: the backup acks in about 0.4 ms, so
+  the coarse rule only bites when the host stalls. That is how the
+  baseline's third run went: its burst took 10.4 s instead of about
+  3.3 s.
+
+**Still not covered, and not new:** `TouchSet` records a create's dentry
+and child, not the parent inode. `stat .` on the holder can therefore
+see the parent's mtime/nlink change from another client's non-durable
+create, under both rules. Closing that means adding the parent inode to
+the per-key bound for `Ino(dir)`. That makes `stat .` wait on every
+in-flight create in the directory, so it is a separate decision.
+
+### Results (this tree)
+
+- `cargo test -p constellation-authority --release`: 65 core (3 new),
+  3 meta_repro, 62 sim (7 ignored, the new assertion on every run):
+  green.
+- `cargo test -p constellation -p constellation-meta --release`: 206 cli
+  and 73 meta, green.
+- `AUTHORITY_SIM_SEEDS=1000 … --ignored long_random`: ok (81 s).
+- `AUTHORITY_SIM_SEEDS=300 … --ignored long_backup`: ok (19 s).
+- `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo fmt --all -- --check`: clean.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-fixawait`):
+
+  | Scenario | Result |
+  |---|---|
+  | `session-forwarded-ryw` ×3 | 3/3 passed (7.8–8.2 s) |
+  | `backup-failover` ×2 | 2/2 passed |
+  | `root-failover-with-delegates` | passed |
+  | `lease-handover` | passed |
+  | `forward-timeout-reexec` | passed |
+  | `kill9-remount` | passed |
+  | `chaos-ci` | passed |
+  | `holder-ships-under-forward-load` | passed, 1 plain run and 3 measured |
+  | `takeover-resolves-awaiting-close` ×3 | 3/3 passed (10.8–17.6 s) |
+  | `takeover-marker-strands-promptly` ×6 | 5/6 passed |
+
+  The one `takeover-marker-strands-promptly` failure has the
+  pre-existing signature "C must hold the accepted create as an
+  outstanding shadow … outstanding:0", documented since M5. A no-fix
+  binary passed its 3 reruns; with the fix it was 5/6. C is a
+  non-holder there, so `resolve_moot_waits` never runs on it.
+
+- **Coordinator decision (2026-09-25):** the parent-directory mtime
+  exposure stays as documented. A holder's `stat .` may show the mtime
+  bump from another client's not-yet-durable create. Since M12, parent
+  times are HLC `max` merges, so a rolled-back create leaves the mtime
+  bumped rather than moving it backwards. That is harmless metadata, not
+  data. Making every `stat .` wait for in-flight creates in the
+  directory would cost far more than it protects.

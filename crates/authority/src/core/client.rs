@@ -1299,6 +1299,93 @@ impl Core {
         }
     }
 
+    /// After every event: once this node holds an S3 lease with its view
+    /// open, the waits a takeover makes moot end at once instead of at
+    /// their own timers — above all an op of this node that some earlier
+    /// holder accepted on a base this replica had not applied
+    /// (`AwaitingLog`). The acquisition tailed the log to head and
+    /// applied the predecessor's backup tail before the view opened, so
+    /// `completed` is exact for every epoch below this one: the rid's
+    /// outcome is there (answered from it, parked for durability like a
+    /// fresh execution's), or it never landed and cannot any more (the
+    /// predecessor's later segments are fenced by the marker), so it
+    /// executes here by rid. Before, such an op waited for a log that
+    /// would never carry it, up to the client deadline, and the client
+    /// heard in doubt (`EIO`) for a write that had landed.
+    ///
+    /// Also: an inbox op durable under an older epoch (the gate drained
+    /// that epoch's inbox, so the same rule holds; before, it waited for
+    /// the next recheck), and an op backing off between acquisitions.
+    /// Not: a continuation-epoch hold (S3 away, `completed` not exact);
+    /// an op awaiting the log under this very epoch (a delegate's
+    /// stream: the log carries it); a forward in flight or backing off
+    /// (its own short timer checks the view first).
+    pub(crate) fn resolve_moot_waits(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.clients.is_empty() || self.lease.epoch_held() {
+            return;
+        }
+        let Some(held) = self.lease.held.as_ref().map(|(l, _)| l.epoch) else {
+            return;
+        };
+        if self.lease.new_mutation_epoch(now, &self.cfg) != Some(held) {
+            return;
+        }
+        let epoch = held;
+        let moot = |phase: &Phase| match *phase {
+            Phase::AwaitingLog { epoch: e, .. } | Phase::InboxWaiting { epoch: e } => e < epoch,
+            Phase::AcquireRetry => true,
+            _ => false,
+        };
+        let mut rids: Vec<(u64, Rid)> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| moot(&c.phase))
+            .map(|(rid, c)| (c.order, *rid))
+            .collect();
+        if rids.is_empty() {
+            return;
+        }
+        rids.sort_unstable();
+        for (_, rid) in rids {
+            // An earlier iteration's `finish` may have released or
+            // finished this one; the view may have closed.
+            let Some(c) = self.clients.get_mut(&rid) else {
+                continue;
+            };
+            if !moot(&c.phase) {
+                continue;
+            }
+            if self.lease.new_mutation_epoch(now, &self.cfg) != Some(epoch) {
+                return;
+            }
+            let c = self.clients.get_mut(&rid).expect("present");
+            let kind = c.phase_kind();
+            if let Some(t) = c.timer.take() {
+                self.cancel_timer(t, out);
+            }
+            self.inbox.pending.remove(&rid);
+            match kind {
+                ClientPhase::AwaitingLog => self.stats.awaiting_log_resolved += 1,
+                ClientPhase::InboxWaiting => self.stats.inbox_waits_resolved += 1,
+                _ => {}
+            }
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                ?kind,
+                epoch,
+                "this node holds: resolving a wait its acquisition made moot"
+            );
+            let outcome = self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
+            self.finish(now, rid, outcome, replica, out);
+        }
+    }
+
     pub(crate) fn on_client_deadline(
         &mut self,
         now: Ms,
