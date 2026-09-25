@@ -708,6 +708,7 @@ impl NodeRuntime {
             Some(coop.clone()),
             crate::existence::Existence::with_meta(meta.clone()),
         ));
+        upload.inherit(meta.pending_uploads()?.into_iter().map(|(hash, _)| hash));
         let forward = forward::ForwardState::new(incarnation);
         let placement = Arc::new(placement::Placement::new());
         let departed = Arc::new(AtomicBool::new(false));

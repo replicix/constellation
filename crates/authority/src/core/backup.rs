@@ -188,8 +188,15 @@ pub(crate) struct AckState {
     /// The tenure's marker time, for the successor's floor (see the
     /// module doc); `None` after the floor was set or when none is due.
     pending_floor: Option<(i64, Ms)>,
-    /// The journal seq the last stream-ahead covered.
+    /// The journal seq the last stream-ahead covered, for every
+    /// subscriber.
     streamed_through: u64,
+    /// Subscribers streamed further than `streamed_through`: the
+    /// forwarder of a manifest whose chunks are still uploading on it
+    /// gets that transaction (it has the bytes) before anyone else may
+    /// (`Replica::releasable_prefix`). Dropped once the common cursor
+    /// catches up.
+    ahead_of: BTreeMap<NodeId, u64>,
     /// The stream-ahead hold-off timer, and whether rows became durable
     /// while it ran (sent when it fires).
     stream_ahead_timer: Option<TimerId>,
@@ -238,10 +245,20 @@ pub(crate) struct BackupState {
     /// `(epoch, jseq)` — contiguity with what the log and earlier batches
     /// gave us.
     ahead_next: Option<(Epoch, u64)>,
+    /// Subscriber: `StreamAhead` batches that arrived before the log
+    /// segment they follow (`base`) — the holder streams them right after
+    /// shipping it, on another QUIC stream, so they often overtake it.
+    /// Kept (oldest first, a few) and installed once the segment is
+    /// applied ([`Core::retry_stream_ahead`]) instead of dropped, which
+    /// sent every forward whose reply waited for them to the log.
+    ahead_waiting: std::collections::VecDeque<(NodeId, Epoch, Seq, Vec<BackupTx>)>,
     /// `ack=s3` fast takeover: since when the known holder has been
     /// silent on P2P.
     holder_silent_since: Option<Ms>,
 }
+
+/// How many early `StreamAhead` batches a subscriber keeps.
+const AHEAD_WAITING_MAX: usize = 32;
 
 /// Plan 30 §M9's view for `status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -637,6 +654,7 @@ impl Core {
                 self.ack.shipped_rows.clear();
             }
             self.ack.streamed_through = 0;
+            self.ack.ahead_of.clear();
             self.ack.stream_ahead_pending = false;
             self.ack.acked_hwm = 0;
             self.report_durable(replica);
@@ -1284,7 +1302,20 @@ impl Core {
 
     /// The durable range `(from, to]` just became backup-acked: stream it
     /// to the log-stream subscribers as speculation (plan 30 §M9).
-    fn stream_ahead(
+    ///
+    /// A manifest whose chunks are not in S3 yet — a write-back close
+    /// here, or a non-owner's `back` close forwarded with its chunks still
+    /// uploading (`meta::store::remote`) — stops the stream: a subscriber
+    /// that installed it would find its bytes nowhere (S3 lacks them and
+    /// dirty chunks are never served), and the stream must stay in
+    /// journal order. It and what follows reach subscribers with the
+    /// segment (whose ship plan waits for the chunks) or with a later
+    /// stream once they are up. The one exception is the forwarder
+    /// itself: it has the bytes, and its own close waits for its
+    /// transaction to arrive when the holder's unshipped journal touched
+    /// the same file (plan 30 §M5's `base`), so it is streamed past such
+    /// a transaction of its own ([`AckState::ahead_of`]).
+    pub(crate) fn stream_ahead(
         &mut self,
         now: Ms,
         from: u64,
@@ -1304,32 +1335,81 @@ impl Core {
         let subscribers: Vec<NodeId> = self.stream_subscribers();
         if subscribers.is_empty() {
             self.ack.streamed_through = to;
+            self.ack.ahead_of.clear();
             return;
         }
-        let txs: Vec<BackupTx> = replica
-            .journal_txs_from(start, self.cfg.backup_batch_rows)
-            .into_iter()
-            .filter(|t| t.last <= to)
-            .collect();
-        if txs.is_empty() {
-            return;
-        }
-        self.ack.streamed_through = txs.last().map(|t| t.last).unwrap_or(to);
         let Some(epoch) = self.lease.epoch() else {
             return;
         };
-        self.stats.streamed_ahead += txs.len() as u64;
+        let window = |from: u64| -> Vec<BackupTx> {
+            replica
+                .journal_txs_from(from, self.cfg.backup_batch_rows)
+                .into_iter()
+                .filter(|t| t.last <= to)
+                .collect()
+        };
+        let txs = window(start);
+        let common = replica.releasable_prefix(&txs, None).min(txs.len());
+        if common < txs.len() {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                first = txs[common].first,
+                held = txs.len() - common,
+                "stream-ahead stops before a transaction naming chunks not in S3 yet"
+            );
+        }
+        let through = if common > 0 {
+            txs[common - 1].last
+        } else {
+            self.ack.streamed_through
+        };
         let base = self.ship.head_seq;
+        let mut sent = 0u64;
         for n in subscribers {
+            let cursor = self
+                .ack
+                .ahead_of
+                .get(&n)
+                .copied()
+                .unwrap_or(self.ack.streamed_through);
+            // A subscriber already ahead continues from its own cursor.
+            let own;
+            let (list, upto) = if cursor > self.ack.streamed_through {
+                own = window(cursor + 1);
+                let upto = replica.releasable_prefix(&own, Some(n)).min(own.len());
+                (&own, upto)
+            } else {
+                let upto = replica
+                    .releasable_prefix(&txs, Some(n))
+                    .max(common)
+                    .min(txs.len());
+                (&txs, upto)
+            };
+            let batch: Vec<BackupTx> = list[..upto]
+                .iter()
+                .filter(|t| t.first > cursor)
+                .cloned()
+                .collect();
+            let reached = batch.last().map_or(cursor, |t| t.last);
+            if reached > through {
+                self.ack.ahead_of.insert(n, reached);
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            sent = sent.max(batch.len() as u64);
             out.push(Action::Send {
                 to: n,
                 msg: PeerMsg::StreamAhead {
                     epoch,
                     base,
-                    txs: txs.clone(),
+                    txs: batch,
                 },
             });
         }
+        self.ack.streamed_through = through;
+        self.ack.ahead_of.retain(|_, c| *c > through);
+        self.stats.streamed_ahead += sent;
         let _ = now;
     }
 
@@ -1727,8 +1807,16 @@ impl Core {
                 replica.backup_clear();
             }
         }
-        // The next streamed transaction must follow the log.
-        self.bk.ahead_next = Some((epoch, through + 1));
+        // The next streamed transaction must follow the log — or what the
+        // stream already installed past it: a segment through `through`
+        // that arrives after the stream gave us later transactions of the
+        // same epoch must not pull the cursor back (the next batch, which
+        // continues from those, was then dropped as not contiguous, and
+        // every forward waiting for it waited for the log instead).
+        self.bk.ahead_next = match self.bk.ahead_next {
+            Some((e, next)) if e == epoch && next > through + 1 => Some((e, next)),
+            _ => Some((epoch, through + 1)),
+        };
     }
 
     // -------------------------------------------- pre-S3 stream subscriber
@@ -1750,11 +1838,30 @@ impl Core {
             || self.lease.epoch_held()
             || self.lease.cached_holder != Some(from)
             || epoch != self.ship.max_epoch
-            || self.ship.head_seq < base
             || !self.cursor_free()
         {
+            tracing::trace!(
+                node = self.cfg.node_id,
+                from,
+                epoch,
+                max_epoch = self.ship.max_epoch,
+                cursor_free = self.cursor_free(),
+                txs = txs.len(),
+                "stream-ahead batch dropped"
+            );
             self.stats.streamed_dropped += txs.len() as u64;
             self.bk.ahead_next = None;
+            return;
+        }
+        if self.ship.head_seq < base {
+            // Ahead of the segment it follows: wait for that segment.
+            if self.bk.ahead_waiting.len() >= AHEAD_WAITING_MAX {
+                if let Some((_, _, _, old)) = self.bk.ahead_waiting.pop_front() {
+                    self.stats.streamed_dropped += old.len() as u64;
+                    self.bk.ahead_next = None;
+                }
+            }
+            self.bk.ahead_waiting.push_back((from, epoch, base, txs));
             return;
         }
         let mut completed: Vec<(constellation_meta::Rid, constellation_meta::KeySet)> = Vec::new();
@@ -1773,6 +1880,14 @@ impl Core {
                 continue;
             }
             if tx.first != next {
+                tracing::trace!(
+                    node = self.cfg.node_id,
+                    first = tx.first,
+                    next,
+                    base,
+                    head = self.ship.head_seq,
+                    "stream-ahead transaction dropped: not contiguous"
+                );
                 self.stats.streamed_dropped += 1;
                 self.bk.ahead_next = None;
                 continue;
@@ -1830,6 +1945,26 @@ impl Core {
         // effect here now.
         if !completed.is_empty() {
             self.answer_awaiting_streamed(now, &completed, replica, out);
+        }
+    }
+
+    /// A segment was applied: install the early `StreamAhead` batches it
+    /// was the base of (see [`BackupState::ahead_waiting`]), in arrival
+    /// order; those still ahead of the log keep waiting.
+    pub(crate) fn retry_stream_ahead(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        while self
+            .bk
+            .ahead_waiting
+            .front()
+            .is_some_and(|(_, _, base, _)| *base <= self.ship.head_seq)
+        {
+            let (from, epoch, base, txs) = self.bk.ahead_waiting.pop_front().expect("front");
+            self.on_stream_ahead(now, from, epoch, base, txs, replica, out);
         }
     }
 

@@ -1958,6 +1958,10 @@ mod tests {
                 .unwrap();
             cache_a.insert(h, data, ChunkState::Clean).unwrap();
         }
+        // The two endpoints settle (gossip neighbours, paths) before the
+        // burst, as they did while these uploads each read the condemned
+        // pointer first (8 x 200 ms); a unique upload reads nothing now.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
         let (_, published) = a.drain_digest_events(true);
         let service = Arc::new(ServeOnly(a.clone()));
         tokio::spawn(async move { peers_a.serve(service).await });

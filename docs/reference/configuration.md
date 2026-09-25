@@ -60,7 +60,7 @@ because they combine with it. See [Durability and failover](features/durability-
 | `--cto` | `bounded` | `bounded`, `strict` | `CONSTELLATION_CTO` | no | close-to-open mode (plan 30 M8). `strict`: an open, lookup or listing sees every close another node completed before it began |
 | `--locks` | `cluster` with P2P, `local` without | `local`, `cluster` | `CONSTELLATION_LOCKS` | no | `flock`/`fcntl` scope (plan 30 M14). An explicit `cluster` with P2P off fails the mount |
 | `--fsync-mode` | `local` | `local`, `s3` | none | yes | what `fsync()` waits for. `local`: the node's metadata store is forced to disk. `s3`: also the file's chunks and the journal up to the call are in the bucket. `s3` also forces `--write-mode through` |
-| `--write-mode` | `through` | `through`, `back` | none | yes | chunk close policy. `through`: `close()` waits for the upload; `back`: `close()` returns once the upload is queued durably on local disk. `fsync`, `O_SYNC` and `--fsync-mode s3` always act as `through`. `constellation write-mode TARGET MODE` changes it on a running mount |
+| `--write-mode` | `through` | `through`, `back` | none | yes | chunk close policy. `through`: `close()` returns once the file's chunks are in S3 and its manifest is committed at the sequencer (one S3 round trip for a small file). `back`: `close()` returns once the chunks are queued durably on this node's disk and the manifest is committed at the sequencer (no S3 round trip, on the sequencer and on any other node); the bytes live only on this node until the upload drains. `fsync`, `O_SYNC`, `O_DSYNC`, `--fsync-mode s3` and a cluster lock's release always act as `through`. `constellation write-mode TARGET MODE` changes it on a running mount (switching to `through` drains the queue). Use `back` for bulk imports (untar, rsync, `cp -r`) and switch back afterwards; see [When to use `--write-mode back`](features/durability-and-failover.md#when-to-use---write-mode-back) |
 
 Values are case-insensitive for `--cto` and `--locks`; any
 other value fails the mount. The flags that are not persisted apply to
@@ -470,6 +470,8 @@ protocol, message bounds and counters.
 | `CONSTELLATION_UPLOAD_CONCURRENCY` | unset (adaptive) | requests, positive | pin write-back upload pool size instead of adapting it |
 | `CONSTELLATION_UPLOAD_MAX_CONCURRENCY` | `128` | requests, `1..128` | adaptive upload concurrency ceiling |
 | `CONSTELLATION_UPLOAD_PROGRESS_INTERVAL_S` | `10` | seconds, positive | INFO progress summary period for pending uploads |
+| `CONSTELLATION_PROBE_MIN_BYTES` | `262144` | bytes; `0` lets every chunk probe | a chunk smaller than this is uploaded with one conditional create instead of a `HEAD` first, unless a hint (existence cache, a peer's digest) says it is already in S3: a probe's miss costs a second serialized round trip, which costs more than resending a small body |
+| `CONSTELLATION_REMOTE_CHUNK_WAIT_S` | `60` | seconds | on the sequencer, for a chunk another node's `--write-mode back` close forwarded while it was still uploading: how long a read of it, or a pass that must leave nothing pending (an `fsync` barrier, a forced publish, an unmount's final flush), waits for the uploader's report. Past it the read fails with `EIO` and the pass leaves the manifest unshipped |
 | `CONSTELLATION_ENCODE_CONCURRENCY` | `min(CPUs, 8)` | workers, positive | parallel chunk compression/encryption gate |
 
 ### S3 client

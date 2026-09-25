@@ -487,6 +487,14 @@ impl Meta {
     /// Plan 30 §M11: this node's unretired transactions of delegation
     /// stream `gen` from index `from_idx` on, oldest first, at most
     /// `max_rows` journal rows (whole transactions).
+    ///
+    /// The batch stops before the first transaction whose manifest names
+    /// a chunk still pending here (`store::remote`: a non-owner forwarded
+    /// it under `--write-mode back`, or this node's own write-back): the
+    /// root appends what it is sent without re-validating, and so does
+    /// the root with a sealed backup's tail, so neither the stream nor
+    /// the backup may carry a manifest before its chunks are in S3. The
+    /// stream's order is kept: what follows waits too.
     pub fn delegate_txs_from(
         &self,
         gen: u64,
@@ -494,16 +502,22 @@ impl Meta {
         max_rows: usize,
     ) -> Result<Vec<DelegateTx>, MetaError> {
         let r = self.db.read_tx();
+        let mut pending = crate::store::remote::PendingView::new(&r, self)?;
         let mut out = Vec::new();
         let mut rows = 0usize;
-        for (first, row) in read_journal_txs(&r, self)? {
-            if row.gen != gen || row.idx < from_idx {
-                continue;
-            }
+        let mut txs: Vec<(u64, JournalTx)> = read_journal_txs(&r, self)?
+            .into_iter()
+            .filter(|(_, row)| row.gen == gen && row.idx >= from_idx)
+            .collect();
+        txs.sort_by_key(|(_, row)| row.idx);
+        for (first, row) in txs {
             let records: Vec<LogRecord> = journal_records(&r, self, first, row.last)?
                 .into_iter()
                 .map(|(_, rec)| rec)
                 .collect();
+            if pending.names_pending(&records)? {
+                break;
+            }
             rows += records.len();
             out.push(DelegateTx {
                 idx: row.idx,

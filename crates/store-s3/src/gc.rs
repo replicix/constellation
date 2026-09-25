@@ -1,9 +1,12 @@
 //! Bucket-GC coordination objects (DESIGN.md §14).
 //!
 //! The condemned pointer closes delete-vs-dedup: it is CAS-published before
-//! the grace wait, and every upload checks it before deciding an existing
-//! object is a usable dedup hit. The journal is write-new, never overwritten,
-//! so fsck can audit every destructive action independently of daemon logs.
+//! the grace wait, and every dedup decision (an upload finding its object
+//! already there) checks it before relying on the existing object — see
+//! [`CondemnedView`] for when, and why reading it *after* the existence
+//! answer is as safe as reading it before. The journal is write-new, never
+//! overwritten, so fsck can audit every destructive action independently
+//! of daemon logs.
 
 use crate::{layout, StoreError};
 use constellation_fs_core::ChunkHash;
@@ -36,15 +39,212 @@ pub async fn read_condemned(
     }
 }
 
-pub async fn is_condemned(
-    store: &Arc<dyn ObjectStore>,
-    hash: &ChunkHash,
-) -> Result<bool, StoreError> {
-    let Some(list) = read_condemned(store).await? else {
-        return Ok(false);
-    };
-    let needle = hash.to_hex();
-    Ok(list.hashes.iter().any(|candidate| candidate == &needle))
+/// Which state of the condemned pointer an observation saw. Every
+/// publication writes a new `(epoch, published_ms)` (the epoch is CAS-
+/// advanced; nothing ever deletes the pointer), so two observations with
+/// the same identity saw the same publication and no other one landed
+/// between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerId {
+    /// No round has ever published a pointer (it is never deleted).
+    Absent,
+    Published {
+        epoch: u64,
+        published_ms: i64,
+    },
+}
+
+/// One completed read of the pointer.
+#[derive(Debug, Clone)]
+struct Observation {
+    id: PointerId,
+    /// For the next read's `If-None-Match` (a `304` costs no body).
+    e_tag: Option<String>,
+    hashes: Arc<std::collections::HashSet<String>>,
+}
+
+/// What a dedup hit may conclude from the pointer (see [`CondemnedView`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupVerdict {
+    /// The existing object may stand in for an upload.
+    Sound,
+    /// A GC round intends to delete it: upload the bytes (an unconditional
+    /// PUT, which resurrects it if the delete already happened).
+    Condemned,
+    /// Undecided: the pointer changed between the last observation made
+    /// before the existence answer and the read made after it (or nothing
+    /// was observed before). Ask the existence question again now that
+    /// the read precedes it (or upload the bytes).
+    Unordered,
+}
+
+/// The condemned pointer as one upload path sees it: the last completed
+/// read, kept so a dedup decision can tell whether the pointer moved
+/// around its existence check.
+///
+/// # When the pointer is read, and why that is safe
+///
+/// DESIGN.md §14's handshake: a GC round `R` lists candidates, CAS-
+/// publishes them as the pointer, waits one lease TTL, tails the log,
+/// re-checks liveness, and deletes (each candidate at most once, never
+/// one that is not on its own list). The pointer only matters to an
+/// upload that finds its object *already there* and wants to rely on it
+/// (a dedup hit): that is the one decision a deletion could invalidate.
+///
+/// Before plan 30's small-file fix every chunk upload GET the pointer
+/// first, then asked S3 (a conditional create or a `HEAD`) — two serialized
+/// round trips per unique file. Now:
+///
+/// 1. **The object turned out absent** (the create created it, or the
+///    `HEAD` found nothing and the bytes were PUT): the pointer is not
+///    read at all. With the object absent, a create and an unconditional
+///    PUT have the same effect and the same result, and the pointer's
+///    answer only ever chose between those two — so whatever it would
+///    have said, the old order would have left the bucket in exactly this
+///    state. (And no round deletes the new object: a round deletes each
+///    of its candidates once, and an absent candidate was already
+///    deleted; a new round lists it with a fresh modification time, far
+///    inside `gc.horizon`.)
+/// 2. **The object was there** (at time `t_e`): the pointer is read
+///    *after* that answer (at `t_r > t_e`), and
+///    - it lists the hash → upload the bytes unconditionally, exactly the
+///      old path for a condemned hash;
+///    - it is absent → no round ever published, so none deleted anything:
+///      the object still exists at `t_r`, and "read at `t_r`, then find
+///      the object" is an execution of the old order;
+///    - it does not list the hash and has the same identity as an
+///      observation *completed before the existence request was sent*
+///      (`t_s < t_e`) → no publication landed in `(t_s, t_r)`. The round
+///      whose list was current throughout does not list the hash, so it
+///      deletes nothing of it; earlier rounds finished before that list
+///      was published, i.e. before `t_e`, when the object existed. So the
+///      object still exists at `t_r`: again an execution of the old
+///      order (read at `t_r`, object found right after);
+///    - otherwise (the pointer moved, or nothing was observed before) →
+///      [`DedupVerdict::Unordered`]: a deletion by a round that a newer
+///      round already superseded could have fallen between `t_e` and
+///      `t_r`, so the hit is not relied on. The caller asks again — a
+///      `HEAD` sent after this read (at `t_h > t_r`): found, that is the
+///      old order exactly (read at `t_r`, not condemned, object found
+///      after it); absent, it uploads the bytes. (Uploading is never less
+///      safe than a hit either: it only makes the object present with a
+///      fresher modification time, and GC's choices depend on nothing
+///      else.)
+///
+/// Every execution of the new order is therefore one the old order could
+/// produce, so the old order's argument (the horizon, the TTL wait, the
+/// post-wait tail and re-check) carries over unchanged. Same premise as
+/// before: the deletes of a round happen while its own list is current
+/// (the `_gc` singleton lease; the pointer's CAS stops two holders from
+/// both advancing the epoch).
+///
+/// Reads use `If-None-Match` with the last observation's ETag, so an
+/// unchanged pointer (the common case: rounds are daily) answers `304`
+/// with no body; a store that ignores the header answers `200` and the
+/// identity is compared from the body instead.
+#[derive(Debug, Default)]
+pub struct CondemnedView {
+    last: std::sync::Mutex<Option<Observation>>,
+    /// Set once a store refused a conditional GET outright: plain GETs.
+    unconditional: std::sync::atomic::AtomicBool,
+}
+
+impl CondemnedView {
+    /// The identity of the last completed read, taken *before* sending
+    /// the existence request a later [`Self::verdict`] judges.
+    pub fn snapshot(&self) -> Option<PointerId> {
+        self.last.lock().unwrap().as_ref().map(|o| o.id)
+    }
+
+    /// Read the pointer now (conditionally on the last observation's
+    /// ETag) and remember it.
+    async fn read(&self, store: &Arc<dyn ObjectStore>) -> Result<Observation, StoreError> {
+        let cached = self.last.lock().unwrap().clone();
+        let conditional = !self
+            .unconditional
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let if_none_match = cached
+            .as_ref()
+            .filter(|_| conditional)
+            .and_then(|o| o.e_tag.clone());
+        let options = object_store::GetOptions {
+            if_none_match: if_none_match.clone(),
+            ..Default::default()
+        };
+        let result = match store.get_opts(&layout::gc_condemned(), options).await {
+            Err(object_store::Error::NotModified { .. }) => {
+                if let Some(cached) = cached {
+                    return Ok(cached);
+                }
+                // A 304 with nothing cached cannot happen (no ETag was
+                // sent); read plainly.
+                store.get(&layout::gc_condemned()).await
+            }
+            Err(object_store::Error::NotFound { .. }) => {
+                let observed = Observation {
+                    id: PointerId::Absent,
+                    e_tag: None,
+                    hashes: Arc::default(),
+                };
+                *self.last.lock().unwrap() = Some(observed.clone());
+                return Ok(observed);
+            }
+            Err(_) if if_none_match.is_some() => {
+                // Maybe a store that rejects the conditional header: read
+                // plainly, and if that works, stop sending it (comparing
+                // the body's identity is enough). A plain read failing too
+                // is the store's transient error, reported as such.
+                let plain = store.get(&layout::gc_condemned()).await;
+                if matches!(&plain, Ok(_) | Err(object_store::Error::NotFound { .. })) {
+                    self.unconditional
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Err(object_store::Error::NotFound { .. }) = plain {
+                    let observed = Observation {
+                        id: PointerId::Absent,
+                        e_tag: None,
+                        hashes: Arc::default(),
+                    };
+                    *self.last.lock().unwrap() = Some(observed.clone());
+                    return Ok(observed);
+                }
+                plain
+            }
+            other => other,
+        }?;
+        let e_tag = result.meta.e_tag.clone();
+        let list: CondemnedList = serde_json::from_slice(&result.bytes().await?)?;
+        let observed = Observation {
+            id: PointerId::Published {
+                epoch: list.epoch,
+                published_ms: list.published_ms,
+            },
+            e_tag,
+            hashes: Arc::new(list.hashes.into_iter().collect()),
+        };
+        *self.last.lock().unwrap() = Some(observed.clone());
+        Ok(observed)
+    }
+
+    /// Judge a dedup hit on `hash`: read the pointer now — after the
+    /// existence answer — and compare it with `before`, the
+    /// [`Self::snapshot`] taken before that request was sent. See the
+    /// type's doc for the argument.
+    pub async fn verdict(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        hash: &ChunkHash,
+        before: Option<PointerId>,
+    ) -> Result<DedupVerdict, StoreError> {
+        let now = self.read(store).await?;
+        if now.hashes.contains(&hash.to_hex()) {
+            return Ok(DedupVerdict::Condemned);
+        }
+        if now.id == PointerId::Absent || before == Some(now.id) {
+            return Ok(DedupVerdict::Sound);
+        }
+        Ok(DedupVerdict::Unordered)
+    }
 }
 
 /// CAS-publish a replacement pointer. Concurrent GC holders cannot both
@@ -267,6 +467,16 @@ mod tests {
         let second = publish_condemned(&store, Vec::new(), 20).await.unwrap();
         assert_eq!(first.epoch, 1);
         assert_eq!(second.epoch, 2);
-        assert!(!is_condemned(&store, &hash).await.unwrap());
+        let view = CondemnedView::default();
+        assert_eq!(
+            view.verdict(&store, &hash, None).await.unwrap(),
+            DedupVerdict::Unordered,
+            "nothing observed before the existence answer"
+        );
+        let before = view.snapshot();
+        assert_eq!(
+            view.verdict(&store, &hash, before).await.unwrap(),
+            DedupVerdict::Sound
+        );
     }
 }

@@ -71,6 +71,18 @@ Both messages are signed iroh payloads. Mutation bodies use postcard encoding.
   delegate streams it has seen. The sequencer does not execute or append
   the op before its replica has all of it (see
   [Delegations](delegations.md#the-append-path-and-dependencies)).
+- `pending`: for a `SetManifest`, the chunks it names that are still
+  uploading on the requester (a `--write-mode back` close; empty after a
+  `through` close, which uploads first). The recipient enrolls them as
+  pending uploads it awaits from the requester *before* it executes the
+  op, so nothing naming them ships, or streams ahead to another node,
+  until they are in S3. The requester reports them with
+  `ChunksDurable { from, hashes }` once they are up; the recipient
+  checks S3 itself if that report never comes. Computed when the
+  request is sent, so a retry or a replay by rid names what is pending
+  then. The inbox path carries no such list: a manifest goes there only
+  after its chunks are up. See
+  [Durability and failover](durability-and-failover.md#--fsync-mode-and---write-mode).
 
 `MutateReply` contains the matching `req_id`, an encoded
 `MutateOutcome`, and:

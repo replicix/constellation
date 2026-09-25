@@ -301,12 +301,22 @@ pub enum SyncRequest {
         acked_through: u64,
         /// Plan 30 §M11: postcard of the requester's observed position.
         deps: Vec<u8>,
+        /// Chunks the op's manifest names that are still uploading on the
+        /// requester (`meta::store::remote`): enrolled before it executes.
+        pending: Vec<ChunkHash>,
         reply: tokio::sync::oneshot::Sender<(
             constellation_meta::MutateOutcome,
             Option<u64>,
             constellation_meta::Position,
             u64,
         )>,
+    },
+    /// `from` reports chunks it forwarded as pending durable in S3: ack
+    /// the rows this node awaits for them (`meta::store::remote`).
+    ChunksDurable {
+        from: u64,
+        hashes: Vec<ChunkHash>,
+        reply: tokio::sync::oneshot::Sender<()>,
     },
     /// This node's own mutation, when the FUSE fast path could not
     /// execute it locally: the core forwards it, submits it through the
@@ -2086,6 +2096,27 @@ impl ConstellationFs {
         self.fetch_chunk_for_inode(None, hash)
     }
 
+    /// A chunk another node forwarded in a manifest while it was still
+    /// uploading there (`meta::store::remote`: only a sequencer has such
+    /// manifests before the chunk is up) is in no store yet and no peer
+    /// serves it: wait for its report rather than fail the read, up to
+    /// `CONSTELLATION_REMOTE_CHUNK_WAIT_S`.
+    fn wait_forwarded_chunk(&self, hash: &ChunkHash) {
+        if !self.meta.awaits_remote_chunk(hash).unwrap_or(false) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let limit = crate::remote_chunk_wait();
+        while started.elapsed() < limit && self.meta.awaits_remote_chunk(hash).unwrap_or(false) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tracing::debug!(
+            hash = %hash.to_hex(),
+            waited_ms = started.elapsed().as_millis() as u64,
+            "read waited for a chunk another node forwarded as pending"
+        );
+    }
+
     fn fetch_chunk_for_inode(&self, ino: Option<Ino>, hash: &ChunkHash) -> Result<Vec<u8>, i32> {
         if let Ok(Some(data)) = self.cache.get(hash) {
             return Ok(data);
@@ -2106,6 +2137,7 @@ impl ConstellationFs {
             self.prefetch.note_stall(ino);
             self.scan.note_stall(ino);
         }
+        self.wait_forwarded_chunk(hash);
         if let Some(coop) = &self.coop {
             return self.rt.block_on(coop.fetch(hash)).map_err(|error| {
                 tracing::warn!(
@@ -2643,7 +2675,8 @@ impl ConstellationFs {
                     // again through the core, which resolves it — the
                     // base check refuses a duplicate and the rebase then
                     // lays this flush over whatever survived.
-                    if let Err(error) = self.commit_manifest_forwarded(ino, &ws, base, bytes, dirty)
+                    if let Err(error) =
+                        self.commit_manifest_forwarded(ino, &ws, base, bytes, dirty, false)
                     {
                         writes.insert(ino, ws);
                         return Err(error);
@@ -2656,9 +2689,14 @@ impl ConstellationFs {
             if let Some(h) = &self.sync {
                 self.recall_after_local_inos(h, vec![ino]);
             }
-        } else if let Err(error) =
-            self.commit_manifest_forwarded(ino, &ws, base, manifest_bytes, dirty_hashes)
-        {
+        } else if let Err(error) = self.commit_manifest_forwarded(
+            ino,
+            &ws,
+            base,
+            manifest_bytes,
+            dirty_hashes,
+            self.defers_upload(ino, force_through, epoch_active),
+        ) {
             writes.insert(ino, ws);
             return Err(error);
         }
@@ -2717,6 +2755,33 @@ impl ConstellationFs {
         )
     }
 
+    /// Whether a non-owner's close of `ino` forwards its manifest before
+    /// its chunks are up (`--write-mode back`; see
+    /// [`Self::commit_manifest_forwarded`]): not when the close must act
+    /// as `through` (`fsync`, `O_SYNC`, `--fsync-mode s3`, a lock's
+    /// flush), not in a continuation epoch (which never drains at close
+    /// anyway), and only for a file the root sequences — a delegate's
+    /// stream and backup feed hold such a manifest back until its chunks
+    /// are up (`Meta::delegate_txs_from`), which under a delegate's
+    /// backup would make the close wait for them anyway.
+    fn defers_upload(&self, ino: Ino, force_through: bool, epoch_active: bool) -> bool {
+        let Some(h) = &self.sync else {
+            return false;
+        };
+        !epoch_active
+            && h.write_mode.effective(force_through, false, h.fsync_s3)
+                == crate::writeback::WriteMode::Back
+            && self
+                .meta
+                .root_fast_path(&constellation_meta::MutateOp::SetManifest {
+                    ino,
+                    base_manifest: None,
+                    manifest: Vec::new(),
+                    size: 0,
+                })
+                .is_some()
+    }
+
     /// Forward a whole-file manifest commit to the lease holder,
     /// rebasing if our base turns out to be stale.
     ///
@@ -2726,6 +2791,21 @@ impl ConstellationFs {
     /// concurrent disjoint `WriteAt`s from several nodes used to lose
     /// every patch but the last. On rejection, lay this flush's own
     /// chunks over the manifest that is current and try again.
+    ///
+    /// `defer_upload` (a `--write-mode back` close, see
+    /// [`Self::defers_upload`]): forward at once instead of uploading
+    /// first. The chunks stay enrolled here (durable on local disk, as a
+    /// sequencer's own `back` close leaves them); the forward names the
+    /// ones still pending (`crate::forwarded_pending_chunks`, attached by
+    /// the sync task as it sends), and the sequencer awaits them before
+    /// anything naming them leaves it — its ship, its pre-S3 stream —
+    /// until this node reports them up (`meta::store::remote`). So the
+    /// log still never names a chunk S3 lacks, and the close costs one
+    /// forward instead of an S3 round trip and a forward. Everything else
+    /// is the forward's as before: the base check and rebase, the
+    /// exactly-once rid, the shadow that gives this node read-your-writes
+    /// (the bytes are in its cache), stranding and replay by rid (the
+    /// queued op is re-sent with its pending list).
     fn commit_manifest_forwarded(
         &self,
         ino: Ino,
@@ -2733,6 +2813,7 @@ impl ConstellationFs {
         base: Manifest,
         manifest_bytes: Vec<u8>,
         dirty_hashes: Vec<ChunkHash>,
+        defer_upload: bool,
     ) -> Result<(), i32> {
         self.commit_manifest_with_rebase(
             ino,
@@ -2784,10 +2865,10 @@ impl ConstellationFs {
                         .as_ref()
                         .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
                 });
-                if !epoch_active {
+                if !epoch_active && !defer_upload {
                     self.drain_inode(ino).map_err(MutateFail::Errno)?;
                 }
-                self.mutate_op_rebasable(
+                let result = self.mutate_op_rebasable(
                     ino,
                     constellation_meta::MutateOp::SetManifest {
                         ino,
@@ -2795,7 +2876,15 @@ impl ConstellationFs {
                         manifest: manifest_bytes.to_vec(),
                         size: file_len,
                     },
-                )
+                );
+                if defer_upload {
+                    // The chunks go up in the next round, which then
+                    // reports them to the sequencer.
+                    if let Some(h) = &self.sync {
+                        let _ = h.tx.send(SyncRequest::Nudge);
+                    }
+                }
+                result
             },
         )
     }
@@ -4249,6 +4338,91 @@ mod durable_ack_tests {
         );
         std::mem::forget(rt);
         (fs, dir, rx)
+    }
+
+    /// A non-owner's close, driven against a scripted core: what it asks
+    /// the sync task for, in order, answering each (a drain succeeds, a
+    /// forward is accepted).
+    fn nonowner_close(mode: crate::writeback::WriteMode) -> (Vec<&'static str>, Arc<Meta>, Ino) {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let (mut fs, _dir, mut core) = holder_fs(meta.clone(), false);
+        {
+            let h = fs.sync.as_mut().unwrap();
+            // Not the holder: the fast path is closed, the close forwards.
+            h.lease = Arc::new(crate::lease::LeaseView::default());
+            h.write_mode.set(mode);
+        }
+        fs.do_write(file.ino, 0, b"small file").unwrap();
+        let mut seen = Vec::new();
+        std::thread::scope(|scope| {
+            let close = scope.spawn(|| fs.flush_inode(file.ino, false));
+            let started = std::time::Instant::now();
+            loop {
+                match core.try_recv() {
+                    Ok(SyncRequest::DrainInode { reply, .. }) => {
+                        seen.push("drain");
+                        reply.send(Ok(())).unwrap();
+                    }
+                    Ok(SyncRequest::Submit { op, reply, .. }) => {
+                        assert!(matches!(
+                            op,
+                            constellation_meta::MutateOp::SetManifest { .. }
+                        ));
+                        seen.push("forward");
+                        reply
+                            .send(constellation_authority::ClientReply::Outcome(
+                                constellation_meta::MutateOutcome::Accepted {
+                                    epoch: 1,
+                                    records: Vec::new(),
+                                },
+                            ))
+                            .unwrap();
+                    }
+                    Ok(SyncRequest::Nudge) => seen.push("nudge"),
+                    Ok(_) => {}
+                    Err(_) if close.is_finished() => break,
+                    Err(_) => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(10),
+                            "the close is stuck: {seen:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            close.join().unwrap().unwrap();
+        });
+        while let Ok(req) = core.try_recv() {
+            if matches!(req, SyncRequest::Nudge) {
+                seen.push("nudge");
+            }
+        }
+        (seen, meta, file.ino)
+    }
+
+    /// The small-file fix: under `through` a non-owner uploads before it
+    /// forwards (the log never names a chunk S3 lacks); under `back` it
+    /// forwards at once — its chunks stay enrolled here, the forward names
+    /// them as pending, and the next round uploads them.
+    #[test]
+    fn a_nonowner_back_close_forwards_before_its_upload() {
+        let (seen, _, _) = nonowner_close(crate::writeback::WriteMode::Through);
+        assert_eq!(&seen[..2], ["drain", "forward"], "through: {seen:?}");
+        let (seen, meta, ino) = nonowner_close(crate::writeback::WriteMode::Back);
+        assert!(!seen.contains(&"drain"), "back: {seen:?}");
+        assert_eq!(seen.first(), Some(&"forward"), "back: {seen:?}");
+        assert!(
+            seen.contains(&"nudge"),
+            "back: the upload is started: {seen:?}"
+        );
+        let pending: Vec<_> = meta
+            .pending_uploads()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, i)| *i == ino)
+            .collect();
+        assert_eq!(pending.len(), 1, "the chunk stays enrolled for the upload");
     }
 
     #[test]

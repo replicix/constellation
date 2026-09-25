@@ -534,6 +534,8 @@ impl Core {
         self.ship.next_seq = seq + 1;
         self.ship.head_seq = self.ship.head_seq.max(seq);
         self.ship.last_error = None;
+        // Plan 30 §M9: pre-S3 batches that overtook this segment.
+        self.retry_stream_ahead(now, replica, out);
         // M7: a holder streams what its cursor passes, read back from S3
         // included (its own unacked segments), so subscribers never miss
         // a sequence it knows.

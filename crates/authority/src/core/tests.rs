@@ -1601,6 +1601,210 @@ fn a_streamed_segment_is_applied_through_the_tail_path() {
     assert_eq!(Replica::applied_seq(&sub.meta).unwrap(), 1);
 }
 
+/// Ship everything the holder journaled so far as segment `seq`, through
+/// its last row (what a real ship's envelope says).
+fn holder_ship(holder: &mut Harness, seq: Seq, max_rows: usize) -> (Vec<u8>, u64) {
+    let batch = Replica::take_journal(&holder.meta, max_rows).unwrap();
+    let records: Vec<_> = batch.iter().map(|(_, r)| r.clone()).collect();
+    let rows: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+    let through = *rows.last().expect("something to ship");
+    Replica::ack_journal(&holder.meta, &rows, seq, None).unwrap();
+    holder.core.ship.next_seq = seq + 1;
+    holder.core.ship.head_seq = seq;
+    let payload = crate::segment::encode(1, 1, through, &rows, &[], &records).unwrap();
+    (payload, through)
+}
+
+fn submit_create(holder: &mut Harness, seq: u64, name: &str) {
+    let rid = holder.rid(seq);
+    let op = holder.create(name);
+    let out = holder.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    assert!(matches!(
+        replies(&out)[0].1,
+        ClientReply::Outcome(MutateOutcome::Accepted { .. })
+    ));
+}
+
+fn segment_frame(req: OpId, n: u64, seq: Seq, payload: Vec<u8>) -> PeerMsg {
+    PeerMsg::LogStream {
+        req,
+        n,
+        epoch: 1,
+        head: seq,
+        segment: Some((seq, payload)),
+    }
+}
+
+/// The small-file fix: the holder streams a transaction ahead of S3 right
+/// after shipping the segment it follows, and the batch (another QUIC
+/// stream) often overtakes that segment. It waits for it and installs
+/// then — it used to be dropped, and a forward whose reply waited for it
+/// waited for the log instead (a non-owner's close: one S3 round trip
+/// more).
+#[test]
+fn a_stream_ahead_batch_that_overtakes_its_segment_waits_for_it() {
+    let (mut holder, mut sub, req) = stream_pair();
+    submit_create(&mut holder, 1, "a");
+    let (p1, through) = holder_ship(&mut holder, 1, 100);
+    submit_create(&mut holder, 2, "b");
+    let txs = Replica::journal_txs_from(&holder.meta, through + 1, 100);
+    assert_eq!(txs.len(), 1);
+    sub.core.ship.max_epoch = 1;
+    sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::StreamAhead {
+            epoch: 1,
+            base: 1,
+            txs,
+        },
+    });
+    assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "b")
+        .unwrap()
+        .is_none());
+    assert_eq!(sub.core.stats.streamed_dropped, 0, "kept, not dropped");
+    sub.step(Event::Peer {
+        from: 1,
+        msg: segment_frame(req, 1, 1, p1),
+    });
+    assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "a")
+        .unwrap()
+        .is_some());
+    assert!(
+        MetaStore::lookup(&sub.meta, ROOT_INO, "b")
+            .unwrap()
+            .is_some(),
+        "installed once its segment was applied"
+    );
+    assert_eq!(sub.core.stats.streamed_installed, 1);
+    assert_eq!(sub.core.stats.streamed_dropped, 0);
+}
+
+/// A segment that ships less than the stream already installed (the
+/// holder shipped `b`; the stream gave us `b` and `c` already) must not
+/// pull the stream's cursor back: the next batch (`d`) continues from `c`.
+#[test]
+fn a_segment_behind_the_stream_keeps_its_cursor() {
+    let (mut holder, mut sub, req) = stream_pair();
+    submit_create(&mut holder, 1, "a");
+    let (p1, through) = holder_ship(&mut holder, 1, 100);
+    sub.step(Event::Peer {
+        from: 1,
+        msg: segment_frame(req, 1, 1, p1),
+    });
+    submit_create(&mut holder, 2, "b");
+    submit_create(&mut holder, 3, "c");
+    let txs = Replica::journal_txs_from(&holder.meta, through + 1, 100);
+    assert_eq!(txs.len(), 2);
+    let b_rows = txs[0].records.len();
+    let txs_last = txs[1].last;
+    sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::StreamAhead {
+            epoch: 1,
+            base: 1,
+            txs,
+        },
+    });
+    assert_eq!(sub.core.stats.streamed_installed, 2);
+    let after_c = txs_last;
+    // The holder ships `b` alone as segment 2; then streams `d`.
+    let (p2, _) = holder_ship(&mut holder, 2, b_rows);
+    sub.step(Event::Peer {
+        from: 1,
+        msg: segment_frame(req, 2, 2, p2),
+    });
+    submit_create(&mut holder, 4, "d");
+    let txs: Vec<_> = Replica::journal_txs_from(&holder.meta, after_c + 1, 100);
+    assert_eq!(txs.len(), 1);
+    sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::StreamAhead {
+            epoch: 1,
+            base: 2,
+            txs,
+        },
+    });
+    assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "d")
+        .unwrap()
+        .is_some());
+    assert_eq!(sub.core.stats.streamed_dropped, 0);
+}
+
+/// A manifest whose chunk is still uploading on the node that forwarded
+/// it (`Meta::enroll_remote_chunks`) is streamed ahead to that node — it
+/// has the bytes, and its close may be waiting for the transaction — and
+/// to nobody else until the chunk is reported up.
+#[test]
+fn stream_ahead_gives_a_pending_manifest_only_to_its_forwarder() {
+    use constellation_fs_core::{ChunkHash, Manifest};
+    let (mut holder, _sub2, _) = stream_pair();
+    // A second subscriber, node 3.
+    let served = holder.step(Event::Peer {
+        from: 3,
+        msg: PeerMsg::LogSubscribe {
+            req: OpId(77),
+            from: 1,
+        },
+    });
+    assert!(!sends(&served).is_empty());
+    let file = holder.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    let chunk = ChunkHash::of(b"uploading on node 2");
+    let manifest = Manifest::from_sparse_chunks(
+        4096,
+        19,
+        [(0u64, chunk)].into_iter().collect(),
+        64,
+        ChunkHash::of,
+    )
+    .0
+    .encode();
+    holder
+        .meta
+        .enroll_remote_chunks(file.ino, &[chunk], 2)
+        .unwrap();
+    constellation_meta::execute_mutate(
+        &holder.meta,
+        &MutateOp::SetManifest {
+            ino: file.ino,
+            base_manifest: None,
+            manifest,
+            size: 19,
+        },
+        None,
+    )
+    .unwrap();
+    let tip = Replica::journal_tip(&holder.meta);
+    // Who got the manifest (a `WriteManifest` record) in a batch.
+    let manifest_to = |out: &[Action]| -> Vec<NodeId> {
+        sends(out)
+            .into_iter()
+            .filter(|(_, m)| {
+                matches!(m, PeerMsg::StreamAhead { txs, .. } if txs.iter().any(|t| t
+                    .records
+                    .iter()
+                    .any(|r| matches!(r, LogRecord::WriteManifest { .. }))))
+            })
+            .map(|(to, _)| to)
+            .collect()
+    };
+    let mut out = Vec::new();
+    holder
+        .core
+        .stream_ahead(holder.now, 0, tip, &holder.meta, &mut out);
+    assert_eq!(manifest_to(&out), vec![2], "only the forwarder: {out:?}");
+    // Reported up: everyone else gets it now, the forwarder not twice.
+    holder.meta.ack_remote_chunks(&[chunk]).unwrap();
+    let mut out = Vec::new();
+    holder
+        .core
+        .stream_ahead(holder.now, 0, tip, &holder.meta, &mut out);
+    assert_eq!(manifest_to(&out), vec![3], "{out:?}");
+}
+
 /// A lost frame (the numbering jumps) breaks the stream: the subscriber
 /// unsubscribes, counts the gap, and a round runs at once to read the log
 /// from S3.

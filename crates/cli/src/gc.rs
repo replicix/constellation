@@ -319,8 +319,19 @@ async fn run_chunks(
             if refreshed_live.contains(&hash) || refreshed_snaps.contains(&hash) {
                 continue;
             }
-            if store.head(&Path::from(mark.key.clone())).await.is_err() {
+            let Ok(now_there) = store.head(&Path::from(mark.key.clone())).await else {
                 continue; // a concurrent pass already removed it
+            };
+            // A writer that found the chunk condemned uploaded it again
+            // (`CondemnedView`: a condemned hit is re-PUT, not relied on)
+            // and may commit a manifest naming it after this round's
+            // second tail: the object is not the one marked, so leave it
+            // (never less safe: keeping an object cannot dangle anything).
+            // A HEAD's time has one-second resolution; the marked object
+            // is older than `gc.horizon` in any real round.
+            if reuploaded_since_marked(mark, now_there.last_modified.timestamp_millis()) {
+                tracing::info!(key = %mark.key, "condemned chunk uploaded again since it was marked; kept");
+                continue;
             }
         }
         store.delete(&Path::from(mark.key.clone())).await?;
@@ -343,6 +354,15 @@ async fn run_chunks(
         condemned_epoch: Some(condemned.epoch),
         metadata: None,
     })
+}
+
+/// Whether the object behind a chunk mark was written again after the
+/// listing that marked it (its modification time moved on by more than
+/// the one-second resolution of a `HEAD`'s `Last-Modified`).
+fn reuploaded_since_marked(mark: &Mark, head_last_modified_ms: i64) -> bool {
+    mark.evidence["last_modified_ms"]
+        .as_i64()
+        .is_some_and(|marked| head_last_modified_ms > marked + 1000)
 }
 
 async fn live_roots(
@@ -638,6 +658,31 @@ mod tests {
         // Floor 250 - 128 = 122: segments 1..=121.
         assert_eq!(marked.len(), 121);
         assert_eq!(marked.iter().max(), Some(&121));
+    }
+
+    /// A chunk re-uploaded after it was marked (a writer that found it
+    /// condemned PUT it again, and may commit a manifest naming it after
+    /// the round's last tail) is not deleted: the object is not the one
+    /// the mark saw.
+    #[test]
+    fn a_chunk_uploaded_again_since_it_was_marked_is_kept() {
+        let mark = |marked_ms: i64| Mark {
+            key: "chunks/ab/cd/abcd".into(),
+            rule: "orphan-horizon".into(),
+            evidence: json!({"last_modified_ms": marked_ms, "horizon_ms": 0}),
+            hash: None,
+        };
+        let t = 1_790_000_000_000;
+        assert!(!reuploaded_since_marked(&mark(t), t));
+        // A HEAD's second resolution: the same object, rounded.
+        assert!(!reuploaded_since_marked(&mark(t + 999), t));
+        assert!(!reuploaded_since_marked(&mark(t), t + 1000));
+        assert!(reuploaded_since_marked(&mark(t), t + 5000));
+        let no_evidence = Mark {
+            evidence: json!({}),
+            ..mark(t)
+        };
+        assert!(!reuploaded_since_marked(&no_evidence, t + 5000));
     }
 
     /// Plan 29 M3a: chunk GC's liveness view is the *local* replica

@@ -12,7 +12,7 @@
 //! The method set is exactly what the decision logic touches, and nothing
 //! else in `Meta` is reachable from the core.
 
-use crate::ids::{Epoch, Seq};
+use crate::ids::{Epoch, NodeId, Seq};
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{DelegationTable, Ownership};
 use constellation_meta::{
@@ -320,6 +320,14 @@ pub trait Replica {
     /// (whole transactions, at most `max_rows` rows), for a backup append
     /// or a pre-S3 stream batch.
     fn journal_txs_from(&self, from: u64, max_rows: usize) -> Vec<BackupTx>;
+    /// How many of `txs` may be streamed to `subscriber` (`None`: to
+    /// every subscriber) ahead of S3: the prefix before the first
+    /// transaction whose manifest names a chunk still pending here that
+    /// `subscriber` does not have (`Meta::releasable_prefix`).
+    fn releasable_prefix(&self, txs: &[BackupTx], subscriber: Option<NodeId>) -> usize {
+        let _ = subscriber;
+        txs.len()
+    }
     /// The highest journal seq allocated (0: none).
     fn journal_tip(&self) -> u64;
     /// Backup side: persist the holder's transactions (`true` when
@@ -869,6 +877,12 @@ impl Replica for Meta {
 
     fn journal_txs_from(&self, from: u64, max_rows: usize) -> Vec<BackupTx> {
         Meta::journal_txs_from(self, from, max_rows).unwrap_or_default()
+    }
+
+    fn releasable_prefix(&self, txs: &[BackupTx], subscriber: Option<NodeId>) -> usize {
+        // An error reads as "nothing is releasable": the S3 ship still
+        // carries everything, gated by its own plan.
+        Meta::releasable_prefix(self, txs, subscriber).unwrap_or(0)
     }
 
     fn journal_tip(&self) -> u64 {

@@ -153,6 +153,10 @@ pub struct ChunkStore {
     /// A demand (foreground) decrypt always cuts ahead of queued
     /// background (prefetch) decrypts — see `decode_gate.rs`.
     decode_gate: Arc<DecodeGate>,
+    /// The condemned pointer as this store's dedup decisions last saw it
+    /// (`crate::gc::CondemnedView`: read only after a hit, and why that
+    /// is as safe as reading it first).
+    condemned: crate::gc::CondemnedView,
 }
 
 const DEFAULT_MAX_ENCODE_CONCURRENCY: usize = 8;
@@ -204,6 +208,7 @@ impl ChunkStore {
             e2e,
             encode_gate: Arc::new(tokio::sync::Semaphore::new(concurrency.max(1))),
             decode_gate: Arc::new(DecodeGate::new(1)),
+            condemned: crate::gc::CondemnedView::default(),
         }
     }
 
@@ -486,9 +491,18 @@ impl ChunkStore {
     /// Encoding is CPU-bound zstd work and must not occupy an async
     /// runtime worker when a bounded upload pool runs many chunks at
     /// once. `PutMode::Create` is one RTT and treats `AlreadyExists` as
-    /// success. object_store does not send `Expect: 100-continue`, so
+    /// a dedup hit. object_store does not send `Expect: 100-continue`, so
     /// a create hit still transmits the body; it saves the HEAD and
     /// avoids creating another version, not uplink bandwidth.
+    ///
+    /// The condemned pointer is read only after S3 said the object is
+    /// already there, and only then (`crate::gc::CondemnedView` has the
+    /// safety argument): a unique chunk costs one request — the create,
+    /// or `Probe`'s HEAD and PUT — where it used to cost a pointer GET
+    /// first. A hit costs the existence request plus one pointer read,
+    /// as before, and that read is a bodyless `304` while the pointer is
+    /// unchanged; the first hit after a mount or a GC publication adds a
+    /// HEAD (`DedupVerdict::Unordered`).
     pub async fn put_chunk_mode(
         &self,
         hash: &ChunkHash,
@@ -498,19 +512,24 @@ impl ChunkStore {
     ) -> Result<ChunkPutResult, StoreError> {
         debug_assert_eq!(&self.hash(data), hash);
         let key = layout::chunk_key(hash);
-        // Stronger than the minimum renewal-time refresh: checking the
-        // pointer at each dedup decision also covers a writer acquired just
-        // before publication. An unconditional idempotent PUT resurrects the
-        // bytes before its manifest can commit.
-        let mode = if crate::gc::is_condemned(&self.store, hash).await? {
-            ChunkPutMode::Overwrite
-        } else {
-            mode
-        };
+        // Taken before the existence request is sent: what a hit's
+        // verdict compares the pointer with.
+        let before = self.condemned.snapshot();
+        let mut mode = mode;
         if mode == ChunkPutMode::Probe {
             match self.store.head(&key).await {
-                Ok(_) => return Ok(ChunkPutResult { existed: true }),
-                Err(object_store::Error::NotFound { .. }) => {}
+                Ok(_) => match self.condemned.verdict(&self.store, hash, before).await? {
+                    crate::gc::DedupVerdict::Sound => return Ok(ChunkPutResult { existed: true }),
+                    // Re-upload: resurrects a condemned chunk.
+                    crate::gc::DedupVerdict::Condemned => mode = ChunkPutMode::Overwrite,
+                    crate::gc::DedupVerdict::Unordered => {
+                        if self.exists_after_verdict(&key).await? {
+                            return Ok(ChunkPutResult { existed: true });
+                        }
+                        mode = ChunkPutMode::Overwrite
+                    }
+                },
+                Err(object_store::Error::NotFound { .. }) => mode = ChunkPutMode::Overwrite,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -528,19 +547,46 @@ impl ChunkStore {
             }
         })
         .await?;
-        match mode {
+        let obj = bytes::Bytes::from(obj);
+        if mode == ChunkPutMode::Create {
             // Plan 30 §M4 item 1: a 409 is retried, never a dedup hit
             // (`crate::cas::create_content_addressed`).
-            ChunkPutMode::Create => {
-                let existed =
-                    crate::cas::create_content_addressed(self.store.as_ref(), &key, obj.into())
-                        .await?;
-                Ok(ChunkPutResult { existed })
+            let existed =
+                crate::cas::create_content_addressed(self.store.as_ref(), &key, obj.clone())
+                    .await?;
+            if !existed {
+                return Ok(ChunkPutResult { existed: false });
             }
-            ChunkPutMode::Probe | ChunkPutMode::Overwrite => {
-                self.store.put(&key, PutPayload::from(obj)).await?;
-                Ok(ChunkPutResult { existed: false })
+            match self.condemned.verdict(&self.store, hash, before).await? {
+                crate::gc::DedupVerdict::Sound => return Ok(ChunkPutResult { existed: true }),
+                crate::gc::DedupVerdict::Condemned => {}
+                crate::gc::DedupVerdict::Unordered => {
+                    if self.exists_after_verdict(&key).await? {
+                        return Ok(ChunkPutResult { existed: true });
+                    }
+                }
             }
+        }
+        // `Overwrite`, a `Probe` miss, or a create hit the pointer does
+        // not let this upload rely on: an unconditional PUT (idempotent
+        // for content-addressed bytes; it resurrects a deleted chunk).
+        self.store.put(&key, PutPayload::from(obj)).await?;
+        Ok(ChunkPutResult { existed: false })
+    }
+
+    /// An undecided dedup hit (`DedupVerdict::Unordered`: the pointer
+    /// read found no condemnation, but it moved since the last
+    /// observation, or there was none) asks again: a `HEAD` sent after
+    /// that read. Found, the hit is sound — read, then object found, is
+    /// the old order exactly; absent, the caller uploads.
+    async fn exists_after_verdict(
+        &self,
+        key: &object_store::path::Path,
+    ) -> Result<bool, StoreError> {
+        match self.store.head(key).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -549,15 +595,22 @@ impl ChunkStore {
     /// condemned chunk may be deleted at any moment, which is why
     /// [`Self::put_chunk_mode`] re-uploads rather than dedups one). The
     /// same test a `Probe` put's HEAD applies before acknowledging an
-    /// upload without sending the bytes.
+    /// upload without sending the bytes, in the same order: the HEAD
+    /// first, the pointer only when the object is there
+    /// (`crate::gc::CondemnedView`). An undecided verdict asks again with
+    /// a second HEAD, which the pointer read then precedes.
     pub async fn chunk_durable(&self, hash: &ChunkHash) -> Result<bool, StoreError> {
-        if crate::gc::is_condemned(&self.store, hash).await? {
-            return Ok(false);
+        let key = layout::chunk_key(hash);
+        let before = self.condemned.snapshot();
+        match self.store.head(&key).await {
+            Ok(_) => {}
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error.into()),
         }
-        match self.store.head(&layout::chunk_key(hash)).await {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(error) => Err(error.into()),
+        match self.condemned.verdict(&self.store, hash, before).await? {
+            crate::gc::DedupVerdict::Sound => Ok(true),
+            crate::gc::DedupVerdict::Condemned => Ok(false),
+            crate::gc::DedupVerdict::Unordered => self.exists_after_verdict(&key).await,
         }
     }
 
@@ -1003,6 +1056,262 @@ mod tests {
 
     fn store() -> ChunkStore {
         ChunkStore::new(Arc::new(InMemory::new()))
+    }
+
+    /// Requests a put made, by kind, on chunk keys and on the pointer.
+    fn counts(faulty: &crate::faulty::FaultyStore) -> [usize; 4] {
+        use crate::faulty::OpKind;
+        [
+            faulty.calls(OpKind::Put, "chunks/"),
+            faulty.calls(OpKind::Head, "chunks/"),
+            faulty.calls(OpKind::Get, "chunks/"),
+            faulty.calls(OpKind::Get, "condemned"),
+        ]
+    }
+
+    /// The OVH run's finding 3: a unique chunk is one request — the
+    /// create, or `Probe`'s HEAD and PUT — with no condemned-pointer read
+    /// in front of it (it used to GET `gc/condemned` first, every time).
+    #[tokio::test]
+    async fn a_unique_chunk_costs_no_condemned_read() {
+        let faulty = crate::faulty::FaultyStore::new();
+        let s = ChunkStore::new(faulty.clone());
+        // Published behind the counters' back (the GC round's own GET).
+        let uncounted: Arc<dyn ObjectStore> = faulty.inner();
+        crate::gc::publish_condemned(&uncounted, vec![], 1)
+            .await
+            .unwrap();
+        let a = b"unique-a";
+        let r = s
+            .put_chunk_mode(&s.hash(a), a, CompressionSetting::RAW, ChunkPutMode::Create)
+            .await
+            .unwrap();
+        assert!(!r.existed);
+        assert_eq!(counts(&faulty), [1, 0, 0, 0], "create: one PUT");
+        let b = b"unique-b";
+        let r = s
+            .put_chunk_mode(&s.hash(b), b, CompressionSetting::RAW, ChunkPutMode::Probe)
+            .await
+            .unwrap();
+        assert!(!r.existed);
+        assert_eq!(counts(&faulty), [2, 1, 0, 0], "probe miss: HEAD + PUT");
+        let c = b"unique-c";
+        assert!(!s.chunk_durable(&s.hash(c)).await.unwrap());
+        assert_eq!(counts(&faulty), [2, 2, 0, 0], "absent: one HEAD");
+    }
+
+    /// A hit reads the pointer after the existence answer: the first hit
+    /// after mount has nothing observed before it, so it asks again with
+    /// a HEAD; every later hit with the pointer unchanged is sound at
+    /// once, and its read is a bodyless `304`.
+    #[tokio::test]
+    async fn a_hit_reads_the_pointer_after_the_existence_answer() {
+        let faulty = crate::faulty::FaultyStore::new();
+        let s = ChunkStore::new(faulty.clone());
+        let uncounted: Arc<dyn ObjectStore> = faulty.inner();
+        crate::gc::publish_condemned(&uncounted, vec![], 1)
+            .await
+            .unwrap();
+        let a = b"shared-content";
+        let h = s.hash(a);
+        s.put_chunk_mode(&h, a, CompressionSetting::RAW, ChunkPutMode::Create)
+            .await
+            .unwrap();
+        let r = s
+            .put_chunk_mode(&h, a, CompressionSetting::RAW, ChunkPutMode::Create)
+            .await
+            .unwrap();
+        assert!(r.existed, "asked again after the read, and found");
+        // create, create (412), pointer GET, HEAD (nothing observed before
+        // the first create's answer: the HEAD after the read decides)
+        assert_eq!(counts(&faulty), [2, 1, 0, 1]);
+        let r = s
+            .put_chunk_mode(&h, a, CompressionSetting::RAW, ChunkPutMode::Create)
+            .await
+            .unwrap();
+        assert!(r.existed, "the pointer did not move around the hit");
+        assert_eq!(counts(&faulty), [3, 1, 0, 2]);
+        let r = s
+            .put_chunk_mode(&h, a, CompressionSetting::RAW, ChunkPutMode::Probe)
+            .await
+            .unwrap();
+        assert!(r.existed);
+        assert_eq!(counts(&faulty), [3, 2, 0, 3], "probe hit: HEAD + pointer");
+        assert!(s.chunk_durable(&h).await.unwrap());
+        assert_eq!(counts(&faulty), [3, 3, 0, 4]);
+    }
+
+    /// No round ever published a pointer: every hit is sound at once.
+    #[tokio::test]
+    async fn a_hit_with_no_pointer_published_is_sound() {
+        let faulty = crate::faulty::FaultyStore::new();
+        let s = ChunkStore::new(faulty.clone());
+        let a = b"never-condemned";
+        let h = s.hash(a);
+        s.put_chunk_mode(&h, a, CompressionSetting::RAW, ChunkPutMode::Create)
+            .await
+            .unwrap();
+        let r = s
+            .put_chunk_mode(&h, a, CompressionSetting::RAW, ChunkPutMode::Create)
+            .await
+            .unwrap();
+        assert!(r.existed);
+        assert_eq!(counts(&faulty), [2, 0, 0, 1]);
+    }
+
+    /// A hit on a condemned chunk is re-uploaded, whatever the ladder
+    /// rung, and the upload resurrects a chunk GC already deleted.
+    #[tokio::test]
+    async fn a_condemned_hit_is_reuploaded_on_every_rung() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let s = ChunkStore::new(inner.clone());
+        let a = b"condemned-content";
+        let h = s.hash(a);
+        s.put_chunk_mode(&h, a, CompressionSetting::RAW, ChunkPutMode::Create)
+            .await
+            .unwrap();
+        crate::gc::publish_condemned(&inner, vec![h.to_hex()], 1)
+            .await
+            .unwrap();
+        // Observed, so a later identity match would otherwise count.
+        let _ = s.chunk_durable(&h).await.unwrap();
+        for mode in [ChunkPutMode::Create, ChunkPutMode::Probe] {
+            let r = s
+                .put_chunk_mode(&h, a, CompressionSetting::RAW, mode)
+                .await
+                .unwrap();
+            assert!(!r.existed, "{mode:?}: a condemned hit is not relied on");
+        }
+        assert!(!s.chunk_durable(&h).await.unwrap());
+        // GC deletes it after the last upload's pointer read; a writer
+        // that still sees it condemned uploads again and brings it back.
+        inner.delete(&layout::chunk_key(&h)).await.unwrap();
+        s.put_chunk_mode(&h, a, CompressionSetting::RAW, ChunkPutMode::Create)
+            .await
+            .unwrap();
+        assert_eq!(s.get_chunk(&h).await.unwrap(), a);
+    }
+
+    /// The window the post-hit read opens (`CondemnedView`'s doc): the
+    /// create finds the chunk, then — before the pointer read — a round
+    /// that condemned it deletes it and a newer round publishes a list
+    /// without it. The read sees a pointer that moved since the snapshot
+    /// taken before the create, so the hit is not relied on: the HEAD
+    /// asked after it finds nothing and the bytes go up again — the chunk
+    /// exists when the put returns.
+    #[tokio::test]
+    async fn a_pointer_that_moved_around_the_hit_is_not_relied_on() {
+        use object_store::path::Path;
+        #[derive(Debug)]
+        struct RaceStore {
+            inner: Arc<InMemory>,
+            chunk: Path,
+            fired: std::sync::atomic::AtomicBool,
+        }
+        impl std::fmt::Display for RaceStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "RaceStore")
+            }
+        }
+        #[async_trait::async_trait]
+        impl ObjectStore for RaceStore {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+            async fn get_opts(
+                &self,
+                location: &Path,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                let armed = location.as_ref().contains("condemned")
+                    && !options.head
+                    && self.inner.head(&self.chunk).await.is_ok();
+                if armed && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // Round 2 deletes the chunk; round 3 publishes a list
+                    // without it — all between the hit and this read.
+                    self.inner.delete(&self.chunk).await?;
+                    let store: Arc<dyn ObjectStore> = self.inner.clone();
+                    crate::gc::publish_condemned(&store, vec![], 3)
+                        .await
+                        .expect("round 3 publishes");
+                }
+                self.inner.get_opts(location, options).await
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+                self.inner.delete_stream(locations)
+            }
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+            {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &Path,
+                to: &Path,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
+            }
+        }
+        for mode in [ChunkPutMode::Create, ChunkPutMode::Probe] {
+            let a = b"deleted-behind-the-hit";
+            let hash = ChunkStore::new(Arc::new(InMemory::new())).hash(a);
+            let inner = Arc::new(InMemory::new());
+            let race = Arc::new(RaceStore {
+                inner: inner.clone(),
+                chunk: layout::chunk_key(&hash),
+                fired: std::sync::atomic::AtomicBool::new(true),
+            });
+            let s = ChunkStore::new(race.clone());
+            s.put_chunk_mode(&hash, a, CompressionSetting::RAW, ChunkPutMode::Create)
+                .await
+                .unwrap();
+            let dyn_inner: Arc<dyn ObjectStore> = inner.clone();
+            // Round 1 (an unrelated list), observed by this store.
+            crate::gc::publish_condemned(&dyn_inner, vec![], 1)
+                .await
+                .unwrap();
+            assert!(s.chunk_durable(&hash).await.unwrap());
+            // Round 2 condemns it (unobserved), then the race arms.
+            crate::gc::publish_condemned(&dyn_inner, vec![hash.to_hex()], 2)
+                .await
+                .unwrap();
+            race.fired.store(false, std::sync::atomic::Ordering::SeqCst);
+            let r = s
+                .put_chunk_mode(&hash, a, CompressionSetting::RAW, mode)
+                .await
+                .unwrap();
+            assert!(race.fired.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                !r.existed,
+                "{mode:?}: relied on a hit the pointer moved around"
+            );
+            assert_eq!(s.get_chunk(&hash).await.unwrap(), a, "{mode:?}");
+        }
     }
 
     /// The OVH run: after `fs create`, a `GET` of `meta.json` answered

@@ -35,6 +35,9 @@ mod m9;
 /// The OVH real-S3 run's findings: the create race, a non-owner's
 /// per-op S3 round trip.
 mod ovh;
+/// The small-file write path: S3 round trips per close, `back` for
+/// non-owners.
+mod writepath;
 
 pub struct Scenario {
     pub name: &'static str,
@@ -926,6 +929,18 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M13: a requester dies right after submitting a batch the holder has not read; the batch executes exactly once anyway, and the remounted requester resumes its numbering (LIST-last) so its next batches are polled",
         requires: &[],
         run: inbox_requester_crash_mid_batch,
+    },
+    Scenario {
+        name: "small-file-write-path",
+        desc: "OVH finding 3: under injected S3 latency the sequencer and a non-owner close small unique files, in write-through then write-back; through: one S3 request per file on the writer (no condemned-pointer read, no HEAD) and one S3 round trip per close; back: no S3 round trip per close on either node (the non-owner forwards with its chunks still uploading, the sequencer holds the manifest until they are reported up); every file reads back right on a third node",
+        requires: &[],
+        run: writepath::small_file_write_path,
+    },
+    Scenario {
+        name: "nonowner-back-crash",
+        desc: "under slow S3 a non-owner closes files under write-back and is killed with its uploads in flight, then remounted: the sequencer never ships a manifest naming the missing chunks meanwhile (its own reader of one waits for the bytes), ships them once they are up after the restart, a third node reads every file right, and fsck finds no dangling reference",
+        requires: &[],
+        run: writepath::nonowner_back_crash,
     },
     Scenario {
         name: "inbox-holder-takeover-pending-batch",

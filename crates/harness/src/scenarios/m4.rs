@@ -216,11 +216,12 @@ pub(super) fn after_chaos(
 ///
 /// Asserted: a node that did not hold the lease during a window PUTs no
 /// commit (the publish-only write). A condemned-list read is *not*
-/// holder-exclusive — `ChunkStore::put_chunk_mode` consults it on every
-/// content-addressed chunk PUT, from any writer, as a pre-existing
-/// anti-resurrection guard (`store.rs`'s `is_condemned` check, unrelated
-/// to plan 30 §M4) — so it is reported per node for the measurement
-/// record but not asserted to be zero for a non-holder. The per-area
+/// holder-exclusive — `ChunkStore::put_chunk_mode` consults it after
+/// every dedup hit (an upload that found its chunk already in S3), from
+/// any writer, as the anti-resurrection guard (`gc::CondemnedView`,
+/// unrelated to plan 30 §M4; a unique chunk no longer reads it) — so it
+/// is reported per node for the measurement record but not asserted to
+/// be zero for a non-holder. The per-area
 /// breakdown is printed for the milestone's measurement record.
 pub(super) fn publish_only_holder(seed: u64) -> Result<()> {
     const WINDOW_S: u64 = 20;
@@ -333,7 +334,7 @@ pub(super) fn publish_only_holder(seed: u64) -> Result<()> {
             );
             if !was_holder {
                 // Condemned-list reads are not part of this assertion: see
-                // the function doc — every writer's chunk uploads read it,
+                // the function doc — any writer's dedup hits read it,
                 // holder or not.
                 anyhow::ensure!(
                     commit_puts == 0,

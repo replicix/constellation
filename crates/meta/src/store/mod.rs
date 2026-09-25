@@ -98,6 +98,7 @@ pub(crate) mod local;
 pub(crate) mod misc;
 pub(crate) mod ns;
 mod reads;
+pub mod remote;
 mod scratch;
 pub(crate) mod snapshot;
 pub mod spec;

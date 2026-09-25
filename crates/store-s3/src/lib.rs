@@ -46,9 +46,9 @@ pub use e2e::{
 };
 pub use error::StoreError;
 pub use gc::{
-    append_journal, is_condemned, publish_condemned, publish_condemned_blobs,
-    publish_condemned_packs, read_condemned, read_condemned_blobs, read_condemned_packs,
-    CondemnedList, GcJournalEntry,
+    append_journal, publish_condemned, publish_condemned_blobs, publish_condemned_packs,
+    read_condemned, read_condemned_blobs, read_condemned_packs, CondemnedList, CondemnedView,
+    DedupVerdict, GcJournalEntry, PointerId,
 };
 pub use heartbeat::{HeartbeatStore, Promise, PromiseConfig, TakeoverCheck};
 pub use inbox::{

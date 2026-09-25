@@ -260,6 +260,13 @@ pub enum Payload {
         /// `constellation_meta::Position` (its causal dependencies).
         #[serde(default)]
         deps: Vec<u8>,
+        /// The chunks a `SetManifest` op names that are still uploading
+        /// on the requester (a `--write-mode back` close). The recipient
+        /// enrolls them as pending uploads of its own, awaited from the
+        /// requester, before it executes the op, so nothing naming them
+        /// leaves it before they are in S3 (`meta::store::remote`).
+        #[serde(default)]
+        pending: Vec<[u8; 32]>,
     },
     /// Holder's answer: postcard-encoded `MutateOutcome`.
     MutateReply {
@@ -445,6 +452,14 @@ pub enum Payload {
     /// A reply with nothing to say.
     Ok {
         req_id: u64,
+    },
+    /// `from` has put `hashes` in S3: chunks it named in a forwarded
+    /// manifest while they were still uploading ([`Payload::MutateRequest`]'s
+    /// `pending`). The recipient acks the rows it awaits for them.
+    /// Answered with [`Payload::Ok`].
+    ChunksDurable {
+        from: u64,
+        hashes: Vec<[u8; 32]>,
     },
     /// Gossiped RTT vector for holder-driven lease placement.
     PeerRtts {

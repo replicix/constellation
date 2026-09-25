@@ -888,6 +888,7 @@ pub async fn run_gossip<S: PeerService>(
                 rid,
                 acked_through,
                 deps,
+                pending,
             } => {
                 let _ = service
                     .mutate_requested(
@@ -899,6 +900,7 @@ pub async fn run_gossip<S: PeerService>(
                         *rid,
                         *acked_through,
                         deps.clone(),
+                        pending.clone(),
                     )
                     .await;
             }
@@ -1109,6 +1111,7 @@ async fn handle_stream<S: PeerService>(
             rid,
             acked_through,
             deps,
+            pending,
         } => Some(
             service
                 .mutate_requested(
@@ -1120,9 +1123,27 @@ async fn handle_stream<S: PeerService>(
                     rid,
                     acked_through,
                     deps,
+                    pending,
                 )
                 .await,
         ),
+        Payload::ChunksDurable { from, hashes } => {
+            // Only the node that forwarded the chunks as pending speaks
+            // for them, never a peer on its behalf.
+            let sender = inner
+                .peers
+                .lock()
+                .unwrap()
+                .values()
+                .find(|p| p.pubkey_hex.eq_ignore_ascii_case(hex))
+                .map(|p| p.node_id);
+            if sender == Some(from) {
+                service.chunks_durable(from, hashes).await;
+            } else {
+                tracing::warn!(peer = %hex, from, "dropping a chunks-durable report not sent by its node");
+            }
+            Some(Payload::Ok { req_id: 0 })
+        }
         Payload::DelegateStream {
             from,
             req_id,

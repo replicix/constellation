@@ -804,6 +804,14 @@ pub struct WritebackStatus {
     pub existence_misses: u64,
     #[serde(default)]
     pub existence_peer_hints: u64,
+    /// Pending rows for chunks other nodes forwarded in a manifest while
+    /// they were still uploading there (`--write-mode back` on a
+    /// non-owner): what this node's ship waits for their reports on.
+    #[serde(default)]
+    pub remote_chunks_awaited: u64,
+    /// The oldest of them, in seconds (0: none).
+    #[serde(default)]
+    pub remote_chunks_oldest_s: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

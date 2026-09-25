@@ -24,6 +24,7 @@ sans-IO authority core, `crates/authority/src/core/`.
 - [§6 Consistency Modes](#6-consistency-modes)
 - [§9 Failure Handling](#9-failure-handling)
 - [Stale text outside §4–§6 and §9](#stale-text-outside-46-and-9)
+- [§3 and §14: the small-file write path](#3-and-14-the-small-file-write-path)
 
 ## Constraints to state up front
 
@@ -438,3 +439,90 @@ worth a follow-up:
   checkpoint" and "rebuilds its replica from the latest checkpoint".
 - **GOALS.md, "Three machines, one life"**: "they form a continuation
   epoch (all write-eligible nodes present)" — true at `f = 0` only.
+
+## §3 and §14: the small-file write path
+
+From the fix for the OVH run's finding 3 (PROGRESS.md, "Fix: small-file
+write path round trips"). Code: `crates/store-s3/src/gc.rs`
+(`CondemnedView`), `crates/store-s3/src/store.rs` (`put_chunk_mode`,
+`chunk_durable`), `crates/meta/src/store/remote.rs`,
+`crates/cli/src/fusefs.rs` (`defers_upload`,
+`commit_manifest_forwarded`), `crates/cli/src/main.rs` (the upload pass,
+`put_mode`), `crates/authority/src/core/backup.rs` (`stream_ahead`,
+`on_stream_ahead`), `crates/cli/src/gc.rs` (the delete loop).
+
+- **§14, "The dedup race, and the layered defense", item 2.** The text
+  says writers re-read the condemned pointer at lease renewal. The code
+  never did: it read it before *every* chunk upload, which put a GET in
+  front of every unique small file. Now the pointer is read only after
+  S3 said the object already exists (a dedup hit), and the rule is:
+  - **the object was absent** (the create created it, a `Probe`'s HEAD
+    missed): no read. With the object absent a create and an
+    unconditional PUT have the same effect and result, and the pointer
+    only ever chose between them, so the old order would have left the
+    bucket in the same state;
+  - **the object was there** (at `t_e`): read the pointer after it
+    (`t_r > t_e`). Listed → upload the bytes (as before). Absent (never
+    published) → sound. Unlisted and with the same identity (`epoch`,
+    `published_ms`) as the last read that completed before the
+    existence request was sent → sound: no publication landed in
+    between, so the round whose list was current deleted nothing of the
+    object, and earlier rounds finished before `t_e`. Otherwise (it
+    moved, or nothing was observed before: the first hit after a mount)
+    → a `HEAD` after the read decides (found: "read, then object found"
+    is the old order exactly).
+  Every execution is one the old order could produce, so the rest of the
+  argument (horizon, TTL wait, post-wait tail and re-check) carries over.
+  The read is `If-None-Match` on the last ETag: a `304` while nothing
+  changed. Same premise as before: a round deletes only while its own
+  list is current (singleton GC lease; the pointer's CAS epoch).
+- **§14, same item: "an identical-content PUT is idempotent and
+  resurrects the chunk".** Only if the PUT lands after the delete. A
+  writer that read the pointer late in the TTL wait, re-PUT the chunk
+  and committed after the round's second tail (a write-back ship lagging
+  its upload can) had its chunk deleted from under the commit. The
+  delete loop now keeps an object whose `Last-Modified` moved past the
+  marked listing's (by more than a HEAD's one-second resolution): the
+  object is not the one marked. The HEAD→DELETE gap stays (no
+  conditional DELETE in portable S3); a write inside it needs a
+  condemned hit re-PUT in that very gap *and* a commit after the second
+  tail.
+- **§3, "Write path".** Add the per-mode close contract and its request
+  count for a small unique file (one chunk), measured by the harness
+  `small-file-write-path` (200 ms per S3 request): `through`, sequencer
+  and non-owner alike, 1 S3 request (the conditional create) and one S3
+  round trip per close (was 2 on the sequencer: pointer GET + create,
+  and 3 on a non-owner whose ladder had switched to `Probe`: pointer
+  GET, HEAD, PUT); `back`, 0 round trips in the close on either node
+  (was: a non-owner's `back` close = its `through` close). A chunk below
+  `CONSTELLATION_PROBE_MIN_BYTES` (256 KiB) probes only on a positive
+  hint (existence cache, peer digest), never on the adaptive policy's
+  guess.
+- **§3/§5, a non-owner's `back` close** (new). It forwards the manifest
+  at once, naming the chunks still pending on it; the sequencer enrolls
+  them as pending uploads of its own, marked remote, *before* executing
+  the op, so every existing gate applies: the root's ship plan defers
+  the transaction and its dependents (M7), a delegate's stream and
+  backup feed stop before it (`Meta::delegate_txs_from`), the pre-S3
+  stream stops before it for everyone but the forwarder (which has the
+  bytes and whose close may be waiting for the transaction). The
+  forwarder reports the chunks once they are up (`Payload::
+  ChunksDurable`); the sequencer checks S3 itself as a fallback (2 s,
+  doubling to 16 s). Nothing about the forward changes: the base check
+  and rebase, exactly-once rid, shadow, stranding and replay (the
+  replayed forward names what is still pending then). The log still
+  never names a chunk S3 lacks. Readers on the sequencer — the only node
+  with the manifest before the chunk is up — wait for the chunk
+  (`CONSTELLATION_REMOTE_CHUNK_WAIT_S`, 60 s). Why not the literal "defer
+  the forward until the upload": the close would be acknowledged before
+  the sequencer validated it (a `Conflict` after the close has no write
+  session left to rebase: an acknowledged close would become a conflict
+  copy), `--cto strict` would no longer see a completed close, and the
+  node's own reads would need a new kind of speculation.
+- **§6/§9, pre-S3 streaming (M9).** Two subscriber fixes the faster
+  closes exposed: a `StreamAhead` batch that overtakes the segment it
+  follows waits for it instead of being dropped, and a segment behind
+  what the stream already installed no longer pulls the stream's cursor
+  back. Before, either sent a forward waiting for its transaction to the
+  log (one S3 round trip more per non-owner close).
+

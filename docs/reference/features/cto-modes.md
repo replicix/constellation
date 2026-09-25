@@ -263,6 +263,14 @@ the margin (6 s at the defaults).
   `ls` after a refusal waits even when speculation covers the entry.
 - A degraded strict read can take the ReadIndex budget plus a session
   wait.
+- `--write-mode back` on the writer: its `close()` returns before the
+  file's chunks are in S3, and no node but the writer (and, waiting for
+  them, the sequencer) can read them until they are. A strict `open`
+  elsewhere gets a position covering the close, but its replica reaches
+  it only when the manifest ships, after the upload: the open waits up to
+  `CONSTELLATION_SESSION_WAIT_MS` and then answers degraded, from the file
+  as it was. Strict close-to-open for content holds for `through` writers
+  (and after an `fsync`); see [When to use `--write-mode back`](durability-and-failover.md#when-to-use---write-mode-back).
 
 ## Configuration
 

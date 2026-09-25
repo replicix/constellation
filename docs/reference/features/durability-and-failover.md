@@ -20,6 +20,7 @@ opt-in.
   - [No client observes a tentative effect](#no-client-observes-a-tentative-effect)
   - [Pre-S3 streaming](#pre-s3-streaming)
   - [`--fsync-mode` and `--write-mode`](#--fsync-mode-and---write-mode)
+  - [When to use `--write-mode back`](#when-to-use---write-mode-back)
   - [Flexible continuation epochs](#flexible-continuation-epochs)
   - [Epochs and fast takeovers](#epochs-and-fast-takeovers)
   - [Known limits](#known-limits)
@@ -217,11 +218,21 @@ could still lose.
 ### Pre-S3 streaming
 
 Under `Backup`, once a batch is backup-acknowledged the holder streams it
-to its log-stream subscribers ahead of S3 (`StreamAhead`), except to its
-backups, at most every 5 ms. Subscribers apply it as speculation, which
+to its log-stream subscribers ahead of S3 (`StreamAhead`), backups
+included, at most every 5 ms. Subscribers apply it as speculation, which
 retires when the segment arrives and is rolled back if a takeover
 strands it. Visibility no longer waits for S3.
 `CONSTELLATION_PRE_S3_STREAMING=0` turns it off.
+
+The stream stops before a transaction whose manifest names a chunk that
+is not in S3 yet (a write-back close, see below): a subscriber could
+fetch its bytes from nowhere, since dirty chunks are never served. That
+transaction and what follows it reach subscribers with the segment,
+whose ship waits for the chunks, or with a later stream once they are
+up. The node that forwarded such a manifest is the exception: it has the
+bytes, so it is streamed past it. A batch that arrives before the
+segment it follows (the two travel on different streams) waits for that
+segment instead of being dropped.
 
 ### `--fsync-mode` and `--write-mode`
 
@@ -233,10 +244,72 @@ These are older, per-mount knobs that combine with the policies above:
   records are in the bucket. It is the per-call form of Layer C.
 - `--write-mode through` (default): `close()` waits for the file's chunk
   uploads. `back`: `close()` returns once the uploads are queued durably
-  on local disk. `fsync`, `O_SYNC`, `O_DSYNC` and `--fsync-mode s3`
-  always act as `through`. `constellation write-mode TARGET MODE`
-  switches a running mount; switching to `through` drains the queue
-  first.
+  on local disk. `fsync`, `O_SYNC`, `O_DSYNC`, `--fsync-mode s3` and a
+  cluster lock's release always act as `through`. `constellation
+  write-mode TARGET MODE` switches a running mount; switching to
+  `through` drains the queue first.
+
+What a `close()` has done when it returns, by mode and node:
+
+| | Sequencer (lease holder, or the file's delegate) | Any other node |
+|---|---|---|
+| `through` | chunks in S3; manifest journaled and acknowledged under the ack policy | chunks in S3; manifest forwarded, committed at the sequencer and acknowledged |
+| `back` | chunks queued on this node's disk; manifest journaled and acknowledged | chunks queued on this node's disk; manifest forwarded, committed at the sequencer and acknowledged, naming the chunks still uploading here |
+| S3 round trips in the close, small new file | `through` 1, `back` 0 | `through` 1, `back` 0 |
+
+In every mode the log never names a chunk S3 lacks: a `back` manifest is
+shipped (and streamed ahead to other nodes) only once its chunks are up.
+For a non-owner's `back` close the sequencer enrolls the chunks the
+forward names as pending uploads it awaits from that node, before it
+executes the op; the node reports them once they are up, and the
+sequencer checks S3 itself if the report never comes (2 s, doubling to
+16 s).
+
+### When to use `--write-mode back`
+
+For bulk imports of many small files — `tar x`, `rsync`, `cp -r`,
+unpacking a build tree — where waiting for S3 at every `close()` makes
+the import S3-latency bound (one round trip per file, 50–400 ms on real
+buckets). Switch it on for the import and back afterwards:
+
+```bash
+constellation write-mode myfs back
+tar xf big.tar -C /mnt/myfs/dst
+constellation write-mode myfs through   # drains the queue first
+```
+
+What `back` gives up, and what it keeps:
+
+- **Durability.** Until the upload drains, the bytes exist only on the
+  writing node's disk (its chunk cache, fsynced with the metadata). A
+  crash or reboot of that node loses nothing: the queue is journaled and
+  uploads on the next mount. Losing the node's disk for good before the
+  drain loses those files' content: their manifests stay held on the
+  sequencer (`status.writeback.remote_chunks_awaited`, the file reads
+  `EIO` there after `CONSTELLATION_REMOTE_CHUNK_WAIT_S`), and `constellation
+  repair drop-held` turns them into conflict copies with holes.
+- **Visibility.** Other nodes see the new content once the chunks are
+  up and the manifest ships (bounded close-to-open: that much later than
+  under `through`). The writing node sees it at once. On the sequencer
+  a read waits for the chunk rather than failing. Unrelated changes the
+  same node makes afterwards can become visible first (the ship plan
+  defers only what depends on the pending file, as for the sequencer's
+  own write-back since plan 30 M7).
+- **`--cto strict`.** An `open` elsewhere still sees every completed
+  close's manifest (the sequencer has it); reading the content waits for
+  the upload on the sequencer, and elsewhere reads the file as it was
+  until the manifest arrives there (the ReadIndex wait is bounded by
+  `CONSTELLATION_SESSION_WAIT_MS`, then degrades). Applications that
+  need a completed `close()` to be readable everywhere at once should
+  not use `back`, or should `fsync`.
+- **`fsync`.** One on a file with unflushed writes flushes them as
+  `through` would (upload, then commit). One after the `close()` under
+  `--fsync-mode local` returns once this node's store is on disk — the
+  chunks are, in its cache — as it does everywhere; under `--fsync-mode
+  s3` it also uploads the file's pending chunks first.
+- **Correctness is unchanged**: rebases, exactly-once forwarding,
+  conflict detection, locks (a lock's release flushes through) and
+  failover behave as under `through`.
 
 ### Flexible continuation epochs
 
@@ -322,7 +395,8 @@ promises cannot gate it. Epochs are kept away from such leases instead:
 |---|---|---|
 | `fs create --ack-policy local\|s3` | `CONSTELLATION_ACK`, else `local` | the filesystem's acknowledgement policy, for every mount and tenure; fixed at creation |
 | `--fsync-mode local\|s3` | `local` | what `fsync()` waits for |
-| `--write-mode through\|back` | `through` | what `close()` waits for |
+| `--write-mode through\|back` | `through` | what `close()` waits for (see [When to use `--write-mode back`](#when-to-use---write-mode-back)) |
+| `CONSTELLATION_REMOTE_CHUNK_WAIT_S` | `60` | how long the sequencer's readers and must-finish passes wait for a non-owner's `back` chunks |
 | `CONSTELLATION_ACK` | unset | default for `fs create --ack-policy` (a mount only warns when it disagrees with the filesystem) |
 | `CONSTELLATION_BACKUP_RTT_BUDGET_MS` | `5` | backup candidates' RTT limit; `0` disables backups |
 | `CONSTELLATION_BACKUPS` | `1` | most backups; `0` disables backups |

@@ -2760,6 +2760,31 @@ impl constellation_net::PeerService for P2pBridge {
         self.node_id
     }
 
+    fn chunks_durable(
+        &self,
+        from: u64,
+        hashes: Vec<[u8; 32]>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let (reply, done) = tokio::sync::oneshot::channel();
+            let hashes = hashes
+                .into_iter()
+                .map(constellation_fs_core::ChunkHash)
+                .collect();
+            if self
+                .nudge
+                .send(fusefs::SyncRequest::ChunksDurable {
+                    from,
+                    hashes,
+                    reply,
+                })
+                .is_ok()
+            {
+                let _ = done.await;
+            }
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn mutate_requested(
         &self,
@@ -2771,10 +2796,15 @@ impl constellation_net::PeerService for P2pBridge {
         rid: (u64, u32, u64),
         acked_through: u64,
         deps: Vec<u8>,
+        pending: Vec<[u8; 32]>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
             let _ = part;
+            let pending = pending
+                .into_iter()
+                .map(constellation_fs_core::ChunkHash)
+                .collect();
             let rid = constellation_meta::Rid {
                 node: rid.0,
                 incarnation: rid.1,
@@ -2791,6 +2821,7 @@ impl constellation_net::PeerService for P2pBridge {
                     rid,
                     acked_through,
                     deps,
+                    pending,
                     reply,
                 })
                 .is_ok()
@@ -3700,6 +3731,124 @@ struct UploadRuntime {
     /// `delegated-subtrees` measured 1.3–1.7 chunk PUTs per file). The
     /// second drain leaves the row to the first and waits for its ack.
     in_flight: std::sync::Mutex<std::collections::HashSet<constellation_fs_core::ChunkHash>>,
+    /// Chunks smaller than this skip `Probe` (see [`Self::put_mode`]).
+    probe_min_bytes: u64,
+    /// Chunks this node named in a forwarded manifest while they were
+    /// still pending here (a `back` close), and the nodes it forwarded to:
+    /// each is told once the chunk is up (`meta::store::remote`).
+    forwarded: std::sync::Mutex<
+        std::collections::HashMap<
+            constellation_fs_core::ChunkHash,
+            std::collections::BTreeSet<u64>,
+        >,
+    >,
+    /// Reports owed, per node: forwarded chunks now durable.
+    durable_reports:
+        std::sync::Mutex<std::collections::HashMap<u64, Vec<constellation_fs_core::ChunkHash>>>,
+    /// Since when reports to a node have not been delivered (see
+    /// [`Self::requeue_report`]).
+    report_attempts: std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+    /// When this node next checks S3 itself for a chunk another node
+    /// forwarded as pending (the fallback when its report never comes),
+    /// and the current backoff.
+    remote_polls: std::sync::Mutex<
+        std::collections::HashMap<
+            constellation_fs_core::ChunkHash,
+            (std::time::Instant, std::time::Duration),
+        >,
+    >,
+    /// Chunks another node reported durable recently, kept for a minute:
+    /// its report can overtake the forward that names them (the report
+    /// and the forward travel on different streams), and a forward whose
+    /// chunks were already reported must not await them.
+    reported: std::sync::Mutex<
+        std::collections::HashMap<constellation_fs_core::ChunkHash, std::time::Instant>,
+    >,
+    /// Pending chunks this node found at mount: a crash may have lost
+    /// whom it forwarded them to (`forwarded` is in memory), so once up
+    /// they are reported to every peer — a node that awaits one acks it,
+    /// the rest ignore the report.
+    inherited: std::sync::Mutex<std::collections::HashSet<constellation_fs_core::ChunkHash>>,
+}
+
+/// The `durable_reports` key of a report owed to every peer.
+const REPORT_TO_ALL: u64 = 0;
+
+/// How long an undelivered durable report is retried.
+const REPORT_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a durable report is remembered for a forward it overtook.
+const REPORTED_KEEP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// First S3 check of a chunk another node forwarded as pending, if its
+/// report has not come by then; the checks back off to [`REMOTE_POLL_MAX`].
+const REMOTE_POLL_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
+const REMOTE_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(16);
+
+/// `CONSTELLATION_REMOTE_CHUNK_WAIT_S` (default 60): how long a pass that
+/// must leave nothing pending (a barrier, a forced publish, an unmount's
+/// final flush) — and a reader that needs the bytes — waits for chunks
+/// another node forwarded as pending before giving up on them.
+pub(crate) fn remote_chunk_wait() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("CONSTELLATION_REMOTE_CHUNK_WAIT_S")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60),
+    )
+}
+
+/// The chunks a forwarded `SetManifest` names that are still pending here
+/// (`meta::store::remote`): empty for any other op, and for a close that
+/// uploaded first (`--write-mode through`). A spilled manifest's chunk
+/// list comes from the local cache, where this node's flush put it.
+pub(crate) fn forwarded_pending_chunks(
+    meta: &Meta,
+    cache: &DiskCache,
+    op: &constellation_meta::MutateOp,
+) -> Vec<constellation_fs_core::ChunkHash> {
+    let constellation_meta::MutateOp::SetManifest { ino, manifest, .. } = op else {
+        return Vec::new();
+    };
+    let mut named = std::collections::BTreeSet::new();
+    let spilled = match constellation_fs_core::Manifest::decode(manifest).map(|m| m.chunks) {
+        Ok(constellation_fs_core::ChunkInfo::Inline(chunks)) => {
+            named.extend(chunks.into_values());
+            None
+        }
+        Ok(constellation_fs_core::ChunkInfo::Spilled(blob)) => Some(blob),
+        // Undecodable: whatever is pending for the inode (below).
+        Err(_) => Some(constellation_fs_core::ChunkHash([0; 32])),
+    };
+    if let Some(blob) = spilled {
+        named.insert(blob);
+        if let Ok(Some(bytes)) = cache.get(&blob) {
+            if let Ok(list) = constellation_fs_core::manifest::decode_chunk_list(&bytes) {
+                named.extend(list.into_values());
+            }
+        }
+        // The list may not be readable here (the blob uploaded and
+        // evicted): every chunk still pending for the inode counts too.
+        // Rare (files past the inline limit) and a local scan.
+        if let Ok(rows) = meta.pending_uploads() {
+            named.extend(rows.into_iter().filter(|(_, i)| i == ino).map(|(h, _)| h));
+        }
+    }
+    named
+        .into_iter()
+        .filter(|hash| meta.upload_pending_for_hash(hash).unwrap_or(true))
+        .collect()
+}
+
+/// `CONSTELLATION_PROBE_MIN_BYTES` (default 256 KiB; `0` lets every
+/// chunk probe): the size below which an upload always uses a
+/// conditional create instead of a HEAD-first probe. 256 KiB is about
+/// 2 ms at 1 Gbit/s — less than any S3 round trip it saves.
+fn probe_min_bytes() -> u64 {
+    std::env::var("CONSTELLATION_PROBE_MIN_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(256 * 1024)
 }
 
 /// Releases a drain's claim on its chunks when it ends, however it ends.
@@ -3762,7 +3911,126 @@ impl UploadRuntime {
             coop,
             existence,
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            probe_min_bytes: probe_min_bytes(),
+            forwarded: Default::default(),
+            durable_reports: Default::default(),
+            report_attempts: Default::default(),
+            remote_polls: Default::default(),
+            reported: Default::default(),
+            inherited: Default::default(),
         }
+    }
+
+    /// `hashes` went out in a manifest forwarded to `to` while still
+    /// pending here.
+    pub(crate) fn note_forwarded(&self, hashes: &[constellation_fs_core::ChunkHash], to: u64) {
+        if hashes.is_empty() {
+            return;
+        }
+        let mut forwarded = self.forwarded.lock().unwrap();
+        for hash in hashes {
+            forwarded.entry(*hash).or_default().insert(to);
+        }
+    }
+
+    /// Another node reported `hashes` durable.
+    pub(crate) fn note_reported(&self, hashes: &[constellation_fs_core::ChunkHash]) {
+        let now = std::time::Instant::now();
+        let mut reported = self.reported.lock().unwrap();
+        reported.retain(|_, at| now.duration_since(*at) < REPORTED_KEEP);
+        for hash in hashes {
+            reported.insert(*hash, now);
+        }
+    }
+
+    /// `hashes` without the ones another node reported durable recently.
+    pub(crate) fn not_reported(
+        &self,
+        hashes: Vec<constellation_fs_core::ChunkHash>,
+    ) -> Vec<constellation_fs_core::ChunkHash> {
+        let reported = self.reported.lock().unwrap();
+        if reported.is_empty() {
+            return hashes;
+        }
+        hashes
+            .into_iter()
+            .filter(|hash| !reported.contains_key(hash))
+            .collect()
+    }
+
+    /// The pending chunks found at mount (see `inherited`).
+    pub(crate) fn inherit(
+        &self,
+        hashes: impl IntoIterator<Item = constellation_fs_core::ChunkHash>,
+    ) {
+        self.inherited.lock().unwrap().extend(hashes);
+    }
+
+    /// `hash` is up: owe its report to every node it was forwarded to
+    /// (to every peer, for one found pending at mount).
+    pub(crate) fn note_up(&self, hash: &constellation_fs_core::ChunkHash) {
+        let nodes = self.forwarded.lock().unwrap().remove(hash);
+        let inherited = self.inherited.lock().unwrap().remove(hash);
+        let mut reports = self.durable_reports.lock().unwrap();
+        if inherited {
+            reports.entry(REPORT_TO_ALL).or_default().push(*hash);
+        }
+        for node in nodes.into_iter().flatten() {
+            reports.entry(node).or_default().push(*hash);
+        }
+    }
+
+    /// A report that could not go out (its node unreachable, or no peer
+    /// known yet right after a restart): owed again at the next pass, for
+    /// up to [`REPORT_RETRY`] of failures in a row; past that the
+    /// recipient's own S3 check covers it.
+    pub(crate) fn requeue_report(&self, node: u64, hashes: Vec<constellation_fs_core::ChunkHash>) {
+        let mut attempts = self.report_attempts.lock().unwrap();
+        let since = *attempts.entry(node).or_insert_with(std::time::Instant::now);
+        if since.elapsed() > REPORT_RETRY {
+            attempts.remove(&node);
+            return;
+        }
+        self.durable_reports
+            .lock()
+            .unwrap()
+            .entry(node)
+            .or_default()
+            .extend(hashes);
+    }
+
+    pub(crate) fn report_delivered(&self, node: u64) {
+        self.report_attempts.lock().unwrap().remove(&node);
+    }
+
+    /// The reports owed, per node (taken: see [`Self::requeue_report`]).
+    pub(crate) fn take_durable_reports(
+        &self,
+    ) -> std::collections::HashMap<u64, Vec<constellation_fs_core::ChunkHash>> {
+        std::mem::take(&mut *self.durable_reports.lock().unwrap())
+    }
+
+    /// Whether this node should check S3 now for `hash`, which another
+    /// node forwarded as pending; schedules the next check if so.
+    fn remote_poll_due(&self, hash: &constellation_fs_core::ChunkHash) -> bool {
+        let now = std::time::Instant::now();
+        let mut polls = self.remote_polls.lock().unwrap();
+        match polls.get_mut(hash) {
+            None => {
+                polls.insert(*hash, (now + REMOTE_POLL_FIRST, REMOTE_POLL_FIRST));
+                false
+            }
+            Some((next, delay)) if now >= *next => {
+                *delay = (*delay * 2).min(REMOTE_POLL_MAX);
+                *next = now + *delay;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    pub(crate) fn forget_remote_poll(&self, hash: &constellation_fs_core::ChunkHash) {
+        self.remote_polls.lock().unwrap().remove(hash);
     }
 
     /// Hard ceiling on real concurrency and thus on worst-case pending-
@@ -3819,10 +4087,23 @@ impl UploadRuntime {
         }
     }
 
+    /// The dedup-ladder rung for a chunk of `len` bytes.
+    ///
+    /// A small chunk probes only on a positive hint (a peer's digest or
+    /// this node's existence cache says the bytes are already there): the
+    /// adaptive policy's guess alone does not make it. `Probe` spends a
+    /// HEAD to save sending the body on a hit, and a miss then costs a
+    /// second serialized round trip (HEAD, then PUT). Below
+    /// [`probe_min_bytes`] the body is cheaper than that round trip, so a
+    /// conditional create (one round trip, hit or miss) is never slower —
+    /// the OVH run's non-owner paid HEAD + PUT on every small file once
+    /// its ladder had switched to `Probe`.
     fn put_mode(
         &self,
         hash: &constellation_fs_core::ChunkHash,
+        len: usize,
     ) -> constellation_store_s3::ChunkPutMode {
+        let small = self.create_if_absent && (len as u64) < self.probe_min_bytes;
         if self.existence.peer_hints_enabled()
             && self
                 .coop
@@ -3834,6 +4115,9 @@ impl UploadRuntime {
         }
         if self.existence.contains(hash) {
             return constellation_store_s3::ChunkPutMode::Probe;
+        }
+        if small {
+            return constellation_store_s3::ChunkPutMode::Create;
         }
         let n = self
             .decisions
@@ -3870,6 +4154,13 @@ impl UploadRuntime {
             coop: None,
             existence: crate::existence::Existence::new(1024, false, None),
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            probe_min_bytes: probe_min_bytes(),
+            forwarded: Default::default(),
+            durable_reports: Default::default(),
+            report_attempts: Default::default(),
+            remote_polls: Default::default(),
+            reported: Default::default(),
+            inherited: Default::default(),
         }
     }
 }
@@ -3902,6 +4193,9 @@ struct UploadReport {
     /// Pending `(chunk, ino)` rows whose chunk is gone from the local
     /// cache: unrecoverable content (plan 30 §M4).
     missing: Vec<(constellation_fs_core::ChunkHash, constellation_fs_core::Ino)>,
+    /// Chunks another node forwarded as pending that are not in S3 yet
+    /// (`meta::store::remote`): not lost, only not up yet.
+    awaiting: u64,
 }
 
 /// Upload every pending chunk (or one inode's). A chunk missing from the
@@ -4046,10 +4340,12 @@ async fn upload_dirty_chunks_pass(
         constellation_fs_core::ChunkHash,
         constellation_fs_core::Ino,
     )>::new()));
+    let awaiting = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let in_flight = futures::stream::iter(grouped.into_iter().map(|(hash, inos)| {
         let missing_count = missing_count.clone();
         let missing_sample = missing_sample.clone();
         let missing_rows = missing_rows.clone();
+        let awaiting = awaiting.clone();
         async move {
             let _permit = if priority {
                 upload.permit_priority().await
@@ -4061,6 +4357,27 @@ async fn upload_dirty_chunks_pass(
                 let _ = cache.remove(&hash);
             }
             let Some(data) = cache.get(&hash)? else {
+                // Another node forwarded a manifest naming this chunk while
+                // it was still uploading there (`meta::store::remote`): it
+                // reports it once it is up. Until then it is awaited, not
+                // lost; S3 is checked here only now and then, in case the
+                // report never comes.
+                let remote = inos
+                    .iter()
+                    .any(|ino| meta.remote_chunk(&hash, *ino).ok().flatten().is_some());
+                if remote {
+                    if upload.remote_poll_due(&hash) && store.chunk_durable(&hash).await? {
+                        tracing::debug!(%hash, "a forwarded chunk is in S3; acknowledged");
+                        return Ok(Some((
+                            hash,
+                            inos,
+                            constellation_store_s3::ChunkPutMode::Create,
+                            true,
+                        )));
+                    }
+                    awaiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(None);
+                }
                 // Not in the cache is not the same as lost: the content
                 // may already be durable in the bucket. The common way
                 // there: a same-content writer on this node uploaded it
@@ -4096,7 +4413,7 @@ async fn upload_dirty_chunks_pass(
                 return Ok(None);
             };
             let bytes = data.len() as u64;
-            let mode = upload.put_mode(&hash);
+            let mode = upload.put_mode(&hash, data.len());
             let mut last = None;
             let started = std::time::Instant::now();
             for attempt in 0..3 {
@@ -4144,6 +4461,8 @@ async fn upload_dirty_chunks_pass(
                 for ino in inos {
                     meta.ack_upload(&hash, ino)?;
                 }
+                upload.note_up(&hash);
+                upload.forget_remote_poll(&hash);
                 if !meta.upload_pending_for_hash(&hash)? {
                     cache.set_state(&hash, constellation_fs_core::cache::ChunkState::Clean);
                 }
@@ -4155,7 +4474,14 @@ async fn upload_dirty_chunks_pass(
             }
         }
         completed += 1;
-        if total > 0 && (completed == total || last_progress.elapsed() >= progress_interval) {
+        // Rows only awaited (another node's upload) are not progress:
+        // a pass of nothing but those would log this every round.
+        let awaited_only =
+            completed == total && awaiting.load(std::sync::atomic::Ordering::Relaxed) >= total;
+        if total > 0
+            && !awaited_only
+            && (completed == total || last_progress.elapsed() >= progress_interval)
+        {
             tracing::info!(
                 completed,
                 total,
@@ -4230,6 +4556,7 @@ async fn upload_dirty_chunks_pass(
     }
     Ok(UploadReport {
         missing: missing_rows,
+        awaiting: awaiting.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -4786,6 +5113,7 @@ impl constellation_api::StatusSource for DaemonStatus {
             coop,
             prefetch: self.prefetch_stats.snapshot(),
             writeback: {
+                let remote = self.meta.remote_chunks().unwrap_or_default();
                 let probe = self.upload.probe.lock().unwrap();
                 let existence = self.upload.existence.report();
                 constellation_api::WritebackStatus {
@@ -4802,6 +5130,16 @@ impl constellation_api::StatusSource for DaemonStatus {
                     existence_chunk_ref_hits: existence.chunk_ref_hits,
                     existence_misses: existence.misses,
                     existence_peer_hints: existence.peer_hints,
+                    remote_chunks_awaited: remote.len() as u64,
+                    remote_chunks_oldest_s: remote
+                        .iter()
+                        .map(|r| r.enrolled_ms)
+                        .min()
+                        .map(|oldest| {
+                            (constellation_store_s3::lease::now_unix_ms() - oldest).max(0) as u64
+                                / 1000
+                        })
+                        .unwrap_or(0),
                 }
             },
             forwarded_ok: self.forward.ok.load(std::sync::atomic::Ordering::Relaxed),
@@ -6644,7 +6982,8 @@ mod pending_upload_tests {
         queue(&f, "new", b"not in S3");
         let existence = crate::existence::Existence::new(1024, true, None);
         existence.insert(&known);
-        let upload = UploadRuntime::new(true, None, existence);
+        let mut upload = UploadRuntime::new(true, None, existence);
+        upload.probe_min_bytes = 0;
         rt().block_on(upload_dirty_chunks(
             &f.cache,
             &f.meta,
@@ -6677,7 +7016,8 @@ mod pending_upload_tests {
         let hash = queue(&f, "false-positive", data);
         let existence = crate::existence::Existence::new(1024, true, None);
         existence.insert(&hash);
-        let upload = UploadRuntime::new(true, None, existence);
+        let mut upload = UploadRuntime::new(true, None, existence);
+        upload.probe_min_bytes = 0;
 
         rt().block_on(upload_dirty_chunks(
             &f.cache,
@@ -6711,14 +7051,15 @@ mod pending_upload_tests {
             buckets: 1,
         });
         let existence = crate::existence::Existence::new(1024, true, None);
-        let upload = UploadRuntime::new(true, Some(coop), existence);
+        let mut upload = UploadRuntime::new(true, Some(coop), existence);
+        upload.probe_min_bytes = 0;
         assert_eq!(
-            upload.put_mode(&hinted),
+            upload.put_mode(&hinted, 1 << 20),
             constellation_store_s3::ChunkPutMode::Probe
         );
         assert_eq!(upload.existence.report().peer_hints, 1);
         assert_eq!(
-            upload.put_mode(&ChunkHash::of(b"peer miss")),
+            upload.put_mode(&ChunkHash::of(b"peer miss"), 1 << 20),
             constellation_store_s3::ChunkPutMode::Probe,
             "an unhinted hash must keep the adaptive probe"
         );
@@ -6739,7 +7080,8 @@ mod pending_upload_tests {
         f.failing.heads.store(0, Ordering::SeqCst);
         let existence = crate::existence::Existence::new(1024, true, None);
         existence.insert(&hash);
-        let upload = UploadRuntime::new(true, None, existence);
+        let mut upload = UploadRuntime::new(true, None, existence);
+        upload.probe_min_bytes = 0;
 
         rt().block_on(upload_dirty_chunks(
             &f.cache,
@@ -6751,11 +7093,214 @@ mod pending_upload_tests {
             None,
         ))
         .unwrap();
+        // The hinted HEAD comes first now (`CondemnedView`: the pointer is
+        // read only once the object is there); the chunk is not in S3,
+        // so the probe's miss uploads it.
+        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 1);
+        assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
+        assert!(f.meta.pending_uploads().unwrap().is_empty());
+
+        // In S3 and condemned: the HEAD finds it, the pointer (read after
+        // it) lists it, and the bytes go up again.
+        let file = f
+            .meta
+            .create(constellation_fs_core::types::ROOT_INO, "again", 0o644, 0, 0)
+            .unwrap();
+        f.cache.insert(&hash, data, ChunkState::Dirty).unwrap();
+        f.meta
+            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
+            .unwrap();
+        f.failing.puts.store(0, Ordering::SeqCst);
+        f.failing.heads.store(0, Ordering::SeqCst);
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &upload,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 1);
         assert_eq!(
-            f.failing.heads.load(Ordering::SeqCst),
-            0,
-            "condemned must bypass the hinted HEAD and overwrite"
+            f.failing.puts.load(Ordering::SeqCst),
+            1,
+            "a condemned hit is re-uploaded"
         );
+        assert!(f.meta.pending_uploads().unwrap().is_empty());
+    }
+
+    /// The sequencer's side of a non-owner's `back` close: a chunk the
+    /// forward named as pending is in neither its cache nor S3. The pass
+    /// awaits it — not "missing" (no poison, no held records), not an
+    /// error even for a strict drain — and checks S3 itself only once the
+    /// first backoff is over; found there, the row is acked.
+    #[test]
+    fn a_chunk_forwarded_as_pending_is_awaited_not_lost() {
+        let f = fixture();
+        let file = f
+            .meta
+            .create(constellation_fs_core::types::ROOT_INO, "fwd", 0o644, 0, 0)
+            .unwrap();
+        let data = b"uploading on the forwarder";
+        let hash = ChunkHash::of(data);
+        f.meta.enroll_remote_chunks(file.ino, &[hash], 2).unwrap();
+        let upload = UploadRuntime::for_test(true);
+        let pass = |upload: &UploadRuntime| {
+            rt().block_on(upload_dirty_chunks_report(
+                &f.cache,
+                &f.meta,
+                &f.store,
+                CompressionSetting::RAW,
+                upload,
+                None,
+                None,
+            ))
+            .unwrap()
+        };
+        let report = pass(&upload);
+        assert!(report.missing.is_empty());
+        assert_eq!(report.awaiting, 1);
+        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 0, "no S3 check yet");
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &upload,
+            Some(file.ino),
+            None,
+        ))
+        .expect("an awaited chunk is not a lost one");
+        assert!(
+            f.meta.unrecoverable_chunks().unwrap().is_empty(),
+            "nothing poisoned"
+        );
+        // The forwarder's upload lands; its report was lost; the backoff
+        // runs out and this node finds the chunk itself.
+        rt().block_on(f.store.put_chunk(&hash, data, CompressionSetting::RAW))
+            .unwrap();
+        upload
+            .remote_polls
+            .lock()
+            .unwrap()
+            .insert(hash, (std::time::Instant::now(), REMOTE_POLL_FIRST));
+        let report = pass(&upload);
+        assert_eq!(report.awaiting, 0);
+        assert!(f.meta.pending_uploads().unwrap().is_empty());
+        assert!(!f.meta.awaits_remote_chunk(&hash).unwrap());
+    }
+
+    /// The forwarder's side: once its pass puts a chunk it forwarded as
+    /// pending up, it owes the node it forwarded to a report — and only
+    /// for those chunks.
+    #[test]
+    fn a_chunk_forwarded_as_pending_is_reported_once_up() {
+        let f = fixture();
+        let forwarded = queue(&f, "forwarded", b"forwarded while pending");
+        let other = queue(&f, "other", b"never forwarded");
+        let upload = UploadRuntime::for_test(true);
+        upload.note_forwarded(&[forwarded], 9);
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &upload,
+            None,
+            None,
+        ))
+        .unwrap();
+        let reports = upload.take_durable_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[&9], vec![forwarded]);
+        assert!(!reports[&9].contains(&other));
+        assert!(upload.take_durable_reports().is_empty(), "sent once");
+    }
+
+    /// What a forward says is still pending: the chunks its manifest names
+    /// that have a pending row here, nothing for any other op.
+    #[test]
+    fn a_forward_names_only_the_chunks_still_pending() {
+        let f = fixture();
+        let pending = queue(&f, "p", b"pending here");
+        let durable = ChunkHash::of(b"already up");
+        let manifest = |hashes: &[ChunkHash]| {
+            constellation_fs_core::Manifest::from_sparse_chunks(
+                4096,
+                4096 * hashes.len() as u64,
+                hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| (i as u64, *h))
+                    .collect(),
+                8,
+                ChunkHash::of,
+            )
+            .0
+            .encode()
+        };
+        let op = constellation_meta::MutateOp::SetManifest {
+            ino: 5,
+            base_manifest: None,
+            manifest: manifest(&[durable, pending]),
+            size: 8192,
+        };
+        assert_eq!(
+            forwarded_pending_chunks(&f.meta, &f.cache, &op),
+            vec![pending]
+        );
+        let other = constellation_meta::MutateOp::Unlink {
+            parent: constellation_fs_core::types::ROOT_INO,
+            name: "p".into(),
+        };
+        assert!(forwarded_pending_chunks(&f.meta, &f.cache, &other).is_empty());
+    }
+
+    /// The OVH run's finding 3: a small chunk does not probe on the
+    /// ladder's guess — a HEAD-first probe of a unique small file is two
+    /// serialized round trips where a conditional create is one. A
+    /// positive hint (the bytes were seen up) still probes: a HEAD is
+    /// cheaper than re-sending them.
+    #[test]
+    fn a_small_chunk_creates_instead_of_probing() {
+        let f = fixture();
+        let data = b"a small file's only chunk";
+        let hash = queue(&f, "small", data);
+        let existence = crate::existence::Existence::new(1024, true, None);
+        let hinted = ChunkHash::of(b"seen up before");
+        existence.insert(&hinted);
+        let upload = UploadRuntime::new(true, None, existence);
+        assert_eq!(
+            upload.put_mode(&hinted, 16),
+            constellation_store_s3::ChunkPutMode::Probe,
+            "a hinted small chunk probes"
+        );
+        assert!(
+            upload.probe.lock().unwrap().enabled(),
+            "the ladder leans to Probe"
+        );
+        assert_eq!(
+            upload.put_mode(&hash, data.len()),
+            constellation_store_s3::ChunkPutMode::Create
+        );
+        assert_eq!(
+            upload.put_mode(&hash, 4 << 20),
+            constellation_store_s3::ChunkPutMode::Probe,
+            "a large chunk still follows the ladder"
+        );
+        rt().block_on(upload_dirty_chunks(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &upload,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 0);
         assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
         assert!(f.meta.pending_uploads().unwrap().is_empty());
     }

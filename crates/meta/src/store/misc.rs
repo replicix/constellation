@@ -272,7 +272,9 @@ impl Meta {
 
     pub fn ack_upload(&self, hash: &ChunkHash, ino: Ino) -> Result<(), MetaError> {
         self.pending_upload.remove(cr_key(hash, ino))?;
-        Ok(())
+        // The row may have been another node's (`store::remote`): the
+        // content is up, so its mark goes too.
+        self.forget_remote_mark(hash, ino)
     }
 
     /// Withdraw one claim enrolled by [`Self::add_pending_upload`] (a
@@ -313,6 +315,7 @@ impl Meta {
             tx.remove(&self.local, k);
         }
         crate::store::counter_set_tx(&mut tx, &self.local, crate::store::KV_POISONED_COUNT, 0);
+        self.clear_remote_marks_tx(&mut tx)?;
         tx.commit()?;
         Ok(())
     }

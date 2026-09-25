@@ -345,7 +345,7 @@ impl BulkPass {
         let mut rx = self.join(upload.clone(), tx, budget);
         if complete {
             let _ = rx.wait_for(|r| r.is_some()).await;
-            return upload.run(None).await.map_err(|e| format!("{e:#}"));
+            return upload.run_complete().await.map_err(|e| format!("{e:#}"));
         }
         let finished = tokio::time::timeout(budget, rx.wait_for(|r| r.is_some()))
             .await
@@ -977,6 +977,49 @@ impl Driver {
                 });
                 None
             }
+            SyncRequest::ChunksDurable {
+                from,
+                hashes,
+                reply,
+            } => {
+                self.deps.upload.note_reported(&hashes);
+                match self.deps.meta.ack_remote_chunks(&hashes) {
+                    Ok(acked) => {
+                        for (hash, _) in &acked {
+                            // Content this node also held dirty (it wrote the
+                            // same bytes) is durable now: evictable again.
+                            if !self.deps.meta.upload_pending_for_hash(hash).unwrap_or(true)
+                                && self.deps.cache.state_of(hash)
+                                    == Some(constellation_fs_core::cache::ChunkState::Dirty)
+                            {
+                                self.deps.cache.set_state(
+                                    hash,
+                                    constellation_fs_core::cache::ChunkState::Clean,
+                                );
+                            }
+                            self.deps.upload.forget_remote_poll(hash);
+                        }
+                        tracing::debug!(
+                            from,
+                            reported = hashes.len(),
+                            acked = acked.len(),
+                            "forwarded chunks reported durable"
+                        );
+                        let _ = reply.send(());
+                        if acked.is_empty() {
+                            None
+                        } else {
+                            // Ship what they held back.
+                            control(Control::Nudge, ControlReply::None)
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, from, "could not ack reported chunks");
+                        let _ = reply.send(());
+                        None
+                    }
+                }
+            }
             SyncRequest::DrainInode { ino, reply } => {
                 let upload = self.uploader();
                 tokio::spawn(async move {
@@ -1005,6 +1048,7 @@ impl Driver {
                 rid,
                 acked_through,
                 deps,
+                pending,
                 reply,
             } => {
                 let deps = Position::from_postcard(&deps);
@@ -1020,6 +1064,33 @@ impl Driver {
                         return None;
                     }
                 };
+                // A `back` close forwarded before its chunks were in S3:
+                // await them here — enrolled before the op can execute,
+                // so no row of this node naming them is ever releasable
+                // without them (`meta::store::remote`). An op that ends
+                // up refused or executed elsewhere leaves rows the
+                // requester's report (or this node's S3 check) acks.
+                // A report that overtook this forward already covers
+                // what it names.
+                let pending = self.deps.upload.not_reported(pending);
+                if !pending.is_empty() {
+                    if let MutateOp::SetManifest { ino, .. } = &op {
+                        if let Err(error) = self
+                            .deps
+                            .meta
+                            .enroll_remote_chunks(*ino, &pending, requester)
+                        {
+                            tracing::warn!(%error, ino, "could not await a forwarded manifest's chunks");
+                            let _ = reply.send((
+                                MutateOutcome::Errno(libc::EIO),
+                                None,
+                                Position::ZERO,
+                                0,
+                            ));
+                            return None;
+                        }
+                    }
+                }
                 let req = self.control_id();
                 tracing::trace!(
                     target: "constellation::fwd",
@@ -1450,6 +1521,8 @@ impl Driver {
             store: self.deps.chunk_store.clone(),
             compression: self.deps.compression,
             upload: self.deps.upload.clone(),
+            peers: Some(self.deps.peers.clone()),
+            node_id: self.node_id,
         }
     }
 
@@ -2303,6 +2376,20 @@ impl Driver {
                 acked_through,
                 deps,
             } => {
+                // A manifest naming chunks still uploading here (a `back`
+                // close) says so; the recipient awaits them, and this
+                // node reports them once they are up (`Uploader::run`).
+                let pending =
+                    crate::forwarded_pending_chunks(&self.deps.meta, &self.deps.cache, &op);
+                self.deps.upload.note_forwarded(&pending, to);
+                // A pass that acked one of them between the two lines
+                // above found no forward to report it to: owe it now.
+                for hash in &pending {
+                    if !self.deps.meta.upload_pending_for_hash(hash).unwrap_or(true) {
+                        self.deps.upload.note_up(hash);
+                    }
+                }
+                let pending: Vec<[u8; 32]> = pending.iter().map(|h| h.0).collect();
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
                 let forward = self.deps.forward.clone();
@@ -2336,6 +2423,7 @@ impl Driver {
                         rid: (rid.node, rid.incarnation, rid.seq),
                         acked_through,
                         deps: deps_bytes,
+                        pending,
                     };
                     let started = std::time::Instant::now();
                     if denied {
@@ -2900,6 +2988,7 @@ impl Driver {
         let view = self.deps.view.clone();
         let meta = self.deps.meta.clone();
         let heartbeats = constellation_store_s3::HeartbeatStore::new(self.deps.store_inner.clone());
+        let uploader = self.uploader();
         tokio::spawn(async move {
             let result = match req {
                 S3Op::LeaseGet => S3Result::LeaseGet(leases.get().await.map_err(s3_failure)),
@@ -2931,13 +3020,28 @@ impl Driver {
                 S3Op::SegmentRun { from, width } => {
                     S3Result::SegmentRun(log.get_run(from, width).await.map_err(s3_failure))
                 }
-                S3Op::InboxPut { batch } => S3Result::InboxPut(
-                    inbox
-                        .put_batch(&batch)
-                        .await
-                        .map(|_| ())
-                        .map_err(cas_failure),
-                ),
+                S3Op::InboxPut { batch } => {
+                    // The inbox carries no pending-chunk list (a P2P forward
+                    // does): a manifest goes through it only once its
+                    // chunks are up, as every close's did before.
+                    let mut drained = Ok(());
+                    for ino in inbox_manifests_pending(&uploader, &batch) {
+                        if let Err(e) = uploader.run(Some(ino)).await {
+                            drained = Err(CasFailure::Failed(format!(
+                                "uploading a manifest's chunks before the inbox: {e:#}"
+                            )));
+                            break;
+                        }
+                    }
+                    S3Result::InboxPut(match drained {
+                        Ok(()) => inbox
+                            .put_batch(&batch)
+                            .await
+                            .map(|_| ())
+                            .map_err(cas_failure),
+                        Err(e) => Err(e),
+                    })
+                }
                 S3Op::InboxRun {
                     epoch,
                     node,
@@ -3081,6 +3185,28 @@ impl Driver {
     }
 }
 
+/// The inodes of the `SetManifest` ops in `batch` whose chunks are still
+/// pending here.
+fn inbox_manifests_pending(
+    uploader: &Uploader,
+    batch: &constellation_store_s3::InboxBatch,
+) -> Vec<constellation_fs_core::Ino> {
+    let mut inos = Vec::new();
+    for op in &batch.ops {
+        let Ok(op) = MutateOp::from_postcard(&op.op) else {
+            continue;
+        };
+        if let MutateOp::SetManifest { ino, .. } = &op {
+            if !crate::forwarded_pending_chunks(&uploader.meta, &uploader.cache, &op).is_empty()
+                && !inos.contains(ino)
+            {
+                inos.push(*ino);
+            }
+        }
+    }
+    inos
+}
+
 /// The chunk upload pass, as the driver's spawned tasks run it.
 #[derive(Clone)]
 struct Uploader {
@@ -3089,11 +3215,27 @@ struct Uploader {
     store: Arc<ChunkStore>,
     compression: CompressionSetting,
     upload: Arc<crate::UploadRuntime>,
+    /// For the durable reports this pass owes (`meta::store::remote`).
+    peers: Option<constellation_net::Peers>,
+    node_id: u64,
 }
 
 impl Uploader {
     async fn run(&self, only_ino: Option<constellation_fs_core::Ino>) -> Result<()> {
-        crate::upload_dirty_chunks_report(
+        self.run_report(only_ino).await.map(|_| ())
+    }
+
+    /// One pass, then the reports it owes: every node this node forwarded
+    /// a manifest to while some of its chunks were still pending here
+    /// learns which of them are up now, so it can let the manifest go.
+    /// Sent in the background (a pass never waits on a peer); one that
+    /// does not arrive is retried at the next passes, and the recipient
+    /// checks S3 itself in the end.
+    async fn run_report(
+        &self,
+        only_ino: Option<constellation_fs_core::Ino>,
+    ) -> Result<crate::UploadReport> {
+        let result = crate::upload_dirty_chunks_report(
             &self.cache,
             &self.meta,
             &self.store,
@@ -3102,8 +3244,77 @@ impl Uploader {
             only_ino,
             None,
         )
-        .await
-        .map(|_| ())
+        .await;
+        let reporter = self.clone();
+        tokio::spawn(async move { reporter.send_durable_reports().await });
+        result
+    }
+
+    async fn send_durable_reports(&self) {
+        let Some(peers) = &self.peers else {
+            return;
+        };
+        let mut reports = self.upload.take_durable_reports();
+        if let Some(all) = reports.remove(&crate::REPORT_TO_ALL) {
+            let known = peers.remote_snapshot();
+            if known.is_empty() {
+                // Right after a restart: nobody to tell yet.
+                self.upload.requeue_report(crate::REPORT_TO_ALL, all);
+            } else {
+                self.upload.report_delivered(crate::REPORT_TO_ALL);
+                for peer in known {
+                    reports.entry(peer.node_id).or_default().extend(&all);
+                }
+            }
+        }
+        let sends = reports.into_iter().map(|(node, hashes)| {
+            let payload = Payload::ChunksDurable {
+                from: self.node_id,
+                hashes: hashes.iter().map(|h| h.0).collect(),
+            };
+            async move {
+                let sent = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    peers.request_to_node(node, &payload),
+                )
+                .await;
+                if matches!(sent, Ok(Ok(_))) {
+                    self.upload.report_delivered(node);
+                } else {
+                    tracing::debug!(
+                        node,
+                        chunks = hashes.len(),
+                        "durable report not delivered; retried at the next pass"
+                    );
+                    self.upload.requeue_report(node, hashes);
+                }
+            }
+        });
+        futures::future::join_all(sends).await;
+    }
+
+    /// A pass that must leave nothing pending (a barrier, a forced
+    /// publish, a final flush): chunks other nodes forwarded as pending
+    /// are waited for — their reports ack them — up to
+    /// `CONSTELLATION_REMOTE_CHUNK_WAIT_S`; past that the ship holds what
+    /// needs them and the caller sees the journal not shipped.
+    async fn run_complete(&self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let limit = crate::remote_chunk_wait();
+        loop {
+            let report = self.run_report(None).await?;
+            if report.awaiting == 0 || started.elapsed() >= limit {
+                if report.awaiting > 0 {
+                    tracing::warn!(
+                        awaiting = report.awaiting,
+                        waited_s = started.elapsed().as_secs(),
+                        "chunks other nodes forwarded as pending are still not in S3"
+                    );
+                }
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 

@@ -513,6 +513,7 @@ pub trait PeerService: Send + Sync + 'static {
         _rid: (u64, u32, u64),
         _acked_through: u64,
         _deps: Vec<u8>,
+        _pending: Vec<[u8; 32]>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::MutateReply {
@@ -525,6 +526,15 @@ pub trait PeerService: Send + Sync + 'static {
                 gen: 0,
             }
         })
+    }
+    /// `from` reports chunks it forwarded as pending now durable in S3
+    /// ([`Payload::ChunksDurable`]). Default: ignored.
+    fn chunks_durable(
+        &self,
+        _from: u64,
+        _hashes: Vec<[u8; 32]>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {})
     }
     /// Plan 30 §M11: a delegate's stream batch for the root. Default:
     /// refused.

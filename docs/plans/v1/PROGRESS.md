@@ -22961,3 +22961,254 @@ a root down gracefully with a delegation live.
 - unit tests: `constellation` bin 229, `constellation-net` 90,
   `constellation-meta` 88;
 - `constellation-model --test locks`: 29 passed.
+
+## Fix: small-file write path round trips (condemned check, back for non-owners)
+
+Follows the OVH run's finding 3 above: a unique small file cost two
+serialized S3 round trips per `close()` on the sequencer (a
+`gc/condemned` GET, then the chunk PUT) and three on a non-owner whose
+adaptive ladder had switched to `Probe` (GET, HEAD, PUT); and
+`--write-mode back` helped the sequencer only.
+
+### 1. The condemned-pointer read moved behind the existence answer
+
+What it protects (DESIGN §14 item 2): a dedup hit — an upload that finds
+its chunk already in S3 and relies on it — on a chunk a GC round has
+condemned and may delete before the manifest commits. Only a hit needs
+the pointer. `crate::gc::CondemnedView` (store-s3) now:
+
+- **object absent** (the create created it; a `Probe` HEAD missed): no
+  read. With the object absent, a create and an unconditional PUT have
+  the same effect and the same result, and the pointer only ever chose
+  between those two — the old order would have left the bucket in the
+  same state whatever it said;
+- **object there** (at `t_e`): read the pointer after it (`t_r > t_e`),
+  `If-None-Match` on the last ETag (a bodyless `304` while unchanged).
+  Listed → re-upload (as before). Never published → sound. Unlisted and
+  the same identity (`epoch`, `published_ms`) as the last read that
+  completed *before the existence request was sent* → sound: no
+  publication landed in `(t_s, t_r)`, so the round whose list was current
+  deleted nothing of it and earlier rounds finished before `t_e`.
+  Otherwise (moved, or no earlier read: the first hit after a mount) →
+  a HEAD sent after the read decides (found = the old order exactly).
+
+Every execution is one the old order could produce, so the old argument
+(horizon, TTL wait, post-wait tail and re-check) carries over unchanged;
+same premise as before (a round deletes only while its own list is
+current). The argument is in `CondemnedView`'s doc and the design notes
+(`30-design-md-notes.md`, new "§3 and §14" section). Rejected: reading
+the pointer in parallel with the create (a read linearized after the
+existence answer can miss a round that deleted the chunk and was
+superseded in between — this is what the identity check closes);
+caching it until "a GC round could start" (weakens the TTL window).
+
+While reading §14 closely: the "an identical-content PUT … resurrects
+the chunk" defense only works if the PUT lands *after* the delete. A
+writer that saw the chunk condemned late in the TTL wait, re-PUT it and
+committed after the round's second tail (a write-back ship lagging its
+upload can) lost it. Pre-existing; the delete loop (cli `gc.rs`) now
+keeps an object whose `Last-Modified` moved past the marked listing's
+(`reuploaded_since_marked`; never less safe — keeping an object cannot
+dangle anything). The HEAD→DELETE gap remains (no conditional DELETE).
+
+`chunk_durable` (the upload pass's "not in the cache but in S3" check)
+uses the same order: HEAD, then the pointer only when present.
+
+### 2. Serialization inside one close
+
+- `put_chunk_mode`: no pointer GET in front of a unique chunk (above).
+- `UploadRuntime::put_mode`: a chunk under `CONSTELLATION_PROBE_MIN_BYTES`
+  (256 KiB) no longer probes on the adaptive policy's guess: a probe's
+  miss is a second serialized round trip (HEAD, PUT), a create's hit only
+  resends a small body. A positive hint (existence cache, peer digest)
+  still probes — a second upload attempt of a chunk this node just put up
+  stays a HEAD (`shared-dir-multi-writer` asserts chunk PUT counts: with
+  a plain "small → create" rule its delegated phase showed 1–3 extra
+  PUTs, 3/3 runs; main 0/3).
+- Chunks within a close already go up in parallel (`buffer_unordered`),
+  the spill blob with them; nothing else S3-bound is serial in a close.
+- Found with the faster closes, in M9's pre-S3 stream (core
+  `backup.rs`): a non-owner close whose reply waits for its transaction
+  (M5 `base = None`, the create of the same file still unshipped) was
+  answered by the log, one S3 round trip later, whenever (a) the
+  `StreamAhead` batch overtook the segment it follows (different QUIC
+  streams) — the subscriber dropped it; or (b) a segment behind what the
+  stream had already installed reset the stream cursor backwards — the
+  next batch was dropped as not contiguous. Now (a) such a batch waits
+  (`BackupState::ahead_waiting`, up to 32, retried after each applied
+  segment), (b) `backup_note_segment` never moves the cursor back within
+  an epoch. `nonowner-op-latency`'s `UniqueWrite` on non-owners: p50 471
+  ms, p90 610 → 208/209 ms; `streamed_dropped` 218 → 0.
+
+### 3. `--write-mode back` for non-owners
+
+Designed and implemented, but not as "return after the local journal,
+forward later": that conflicts with plan 30. A deferred `SetManifest`
+is acknowledged before the sequencer validated it — a `Conflict` after
+the close has no write session left to rebase (an acknowledged close
+would become a conflict copy); `--cto strict`'s "an open sees every
+completed close" would break; later ops of the same file would have to
+queue behind it or be acknowledged unvalidated; and the node's own reads
+would need a new kind of speculation. Instead the close **forwards at
+once, without uploading first, naming the chunks still pending here**,
+and the sequencer holds back everything that names them until they are
+up:
+
+- `MutateRequest.pending` (net): filled by the sync task as it sends
+  (`crate::forwarded_pending_chunks`: the chunks the manifest names that
+  have a pending row here; empty after a `through` close), so a retry or
+  a replay by rid names what is pending then. Only for root-owned files
+  (`ConstellationFs::defers_upload`); `fsync`/`O_SYNC`/`--fsync-mode s3`/
+  lock releases and continuation epochs are unchanged.
+- The recipient enrolls them as pending uploads marked remote
+  (`meta::store::remote`, `remote-chunk/<hash><ino>` in `local`) in one
+  transaction **before the op executes**. Every existing gate then
+  applies: the root's ship plan defers the transaction and its
+  dependents (M7); a delegate's stream and backup feed stop before it
+  (`Meta::delegate_txs_from` — also what makes a sealed delegate
+  backup's tail safe to append); the pre-S3 stream stops before it
+  (`Meta::releasable_prefix`), per subscriber, except for the forwarder,
+  which has the bytes (`AckState::ahead_of`). The log never names a
+  chunk S3 lacks, and no node but the forwarder sees such a manifest
+  before its chunks are up — which also fixes a pre-existing hole: the
+  sequencer's *own* write-back manifests were streamed ahead to readers
+  who then got `EIO` (dirty chunks are never served, S3 had nothing).
+- The forwarder's next upload pass puts the chunks up and reports them
+  (`Payload::ChunksDurable`, sender-verified; background, retried for
+  60 s); the recipient acks the remote rows and nudges a ship. Fallback,
+  when a report never comes (the forwarder restarted — it then reports
+  its inherited pending chunks to every peer — or the message was
+  lost): the recipient's upload pass checks S3 itself (`chunk_durable`,
+  2 s, doubling to 16 s). A report that overtakes the forward is
+  remembered for a minute. Awaited rows are neither uploads nor
+  unrecoverable (not poisoned, no `held` status); a must-finish pass (a
+  barrier, a forced publish, a final flush) waits for them up to
+  `CONSTELLATION_REMOTE_CHUNK_WAIT_S` (60 s).
+- Readers on the sequencer (the only node with the manifest early) wait
+  for such a chunk instead of failing (`wait_forwarded_chunk`, same
+  bound). The forwarder reads its own dirty cache (its shadow gives it
+  the manifest): read-your-writes is unchanged.
+- Crash: the forwarder's pending rows and dirty chunks are durable; the
+  accepted op is a shadow on it and a journal row on the sequencer. After
+  a restart the rows upload and are reported to every peer; a stranded
+  shadow is replayed by rid and the replay names what is still pending.
+  The inbox path (no P2P) carries no list: the driver uploads a
+  manifest's pending chunks before `InboxPut`.
+- `status.writeback.remote_chunks_awaited` / `remote_chunks_oldest_s`.
+
+### 4. Docs
+
+`configuration.md` (`--write-mode` row with the exact contract;
+`CONSTELLATION_PROBE_MIN_BYTES`, `CONSTELLATION_REMOTE_CHUNK_WAIT_S`),
+`durability-and-failover.md` (per-mode close contract table; "When to
+use `--write-mode back`": bulk imports, what it gives up and keeps;
+pre-S3 stream rules), `cto-modes.md` (strict × `back` writers: known
+gap), `forwarded-mutations.md` (`pending`, `ChunksDurable`), TESTING.md
+(new scenarios), design notes. The default write mode is unchanged.
+
+### Request counts per small-file close
+
+One small unique file (one ~1.3 KB chunk), requests on the writer's own
+counting relay, S3 at 200 ms per request (harness
+`small-file-write-path`, `nonowner-op-latency`; "before" = main
+`edd3d5d` in the same scenario):
+
+| | before: requests / close p50 | after: requests / close p50 |
+|---|---|---|
+| sequencer, `through` | 2 (GET `gc/condemned`, PUT) / 420 ms | 1 (PUT) / 206 ms |
+| non-owner, `through` | 3 (GET `gc/condemned`, HEAD, PUT) / 612 ms | 1 (PUT) / 208 ms |
+| sequencer, `back` | 2, in the background / ~3 ms | 1, in the background / 2–7 ms |
+| non-owner, `back` | as `through`: 3 / 612 ms | 1, in the background, and 0 on the sequencer (report over P2P) / 6–13 ms |
+
+A dedup hit: 2 requests before (GET, then HEAD or PUT) and after (HEAD
+or PUT, then a `304` GET); the first hit after a mount or a GC
+publication adds a HEAD. `shared-dir-multi-writer`: a writer's S3
+requests per 100 files 518 → 412. The fallback S3 check costs a HEAD
+and a `304` GET per awaited chunk. Readable on a third node after the
+last close: `through` 0.2–1.7 s, `back` 0.8–2.6 s (at 200 ms per
+request).
+
+### Tests
+
+- Unit: store-s3 (`a_unique_chunk_costs_no_condemned_read`,
+  `a_hit_reads_the_pointer_after_the_existence_answer`,
+  `a_hit_with_no_pointer_published_is_sound`,
+  `a_condemned_hit_is_reuploaded_on_every_rung`,
+  `a_pointer_that_moved_around_the_hit_is_not_relied_on` — the window
+  the post-hit read opens, driven by a store that deletes the chunk and
+  publishes a newer round between the hit and the read — and the gc
+  view test); meta (`remote_rows_are_pending_until_another_node_reports_them`,
+  `a_manifest_naming_a_pending_chunk_is_not_releasable`); authority core
+  (`a_stream_ahead_batch_that_overtakes_its_segment_waits_for_it`,
+  `a_segment_behind_the_stream_keeps_its_cursor`,
+  `stream_ahead_gives_a_pending_manifest_only_to_its_forwarder`; all
+  three fail with the fixes reverted); cli
+  (`a_nonowner_back_close_forwards_before_its_upload`,
+  `a_chunk_forwarded_as_pending_is_awaited_not_lost`,
+  `a_chunk_forwarded_as_pending_is_reported_once_up`,
+  `a_forward_names_only_the_chunks_still_pending`,
+  `a_small_chunk_creates_instead_of_probing`,
+  `a_chunk_uploaded_again_since_it_was_marked_is_kept`; the ladder tests
+  adapted: the pointer is read after the HEAD now).
+- `cargo fmt`, `cargo clippy --tests -D warnings` (store-s3, meta, net,
+  authority, constellation, harness, api): clean. store-s3 203, meta all
+  suites, net 90 + 3, api, authority lib 97 + 3, cli 234: pass, except
+  pre-existing failures A/B'd against main: cli
+  `random_write_truncate_fallocate_sequences_match_a_model` (fails on
+  main too — the truncate/fallocate fuzz another coder owns) and meta
+  `completion_ownership` (flaky: 10/12 failures on main, 1/7 here).
+  `coop::a_burst_past_the_serve_cap_is_served_by_the_peer_not_s3` had
+  depended on the setup's 8 pointer GETs (200 ms each) to let the
+  endpoints settle: failed 1/5 full-suite runs; it now sleeps that long
+  explicitly (5/5).
+- `cargo test -p constellation-authority --release`: 85 + 8 ignored
+  pass; `long_backup` 500, `long_random` 500, `long_delegated` 400: pass.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-writepath`):
+  new `small-file-write-path` 5/5 on the final build (and 11/11 on the
+  two before it) and `nonowner-back-crash` 5/5 on the final build (and
+  10/10 on the ones before it): the killed writer's uploads were in
+  flight, the remount put them up, a third node read every file and
+  fsck found no `dangling_manifest_ref`; the sequencer's reader waited
+  6–8 s for a still-uploading chunk instead of failing. (Its "readable
+  … after the remount" is 8–10 s or ~32 s: the reader then fetches 12
+  chunks from S3 one by one at 2 s each when the restarted writer's
+  cache is not yet in its peer mirror.) Once each,
+  PASS: gc-dedup-race, gc-lifecycle, writeback-latency,
+  writeback-bigfile, writeback-drain, writeback-fsync,
+  writeback-backpressure, big-file-write, dedup-write-storm,
+  forwarded-mutations, backup-failover, backup-departs,
+  backup-partition, backup-failover-with-delegation,
+  backup-takeover-holds-missing-chunks, holder-publishes-log-prefix-backup,
+  session-ryw-after-holder-kill, cto-strict, cto-bounded,
+  delegated-subtrees, shared-dir-multi-writer (3/3 after the hint rule),
+  nonowner-op-latency, publish-only-holder, chaos-ci.
+  `session-forwarded-ryw` failed once in a batch ("an acknowledgement …
+  returned before its row was durable" — the flake the OVH fix recorded
+  on main, 1/6) and passed 6/6 alone; `visibility-after-burst` failed
+  once in a batch (17 S3 backstop GETs, stream live, no gaps) and passed
+  3/3 alone; main fails it the same way (1 of 2 runs, 17 GETs).
+
+### Findings for other owners (not fixed here)
+
+- **M9 under very slow S3** (2 s per request, TTL 20 s): the holder's
+  `ship_epoch` lapsed while a lease renewal was in flight;
+  `backup_after_event` then cleared its backup peers, heartbeats
+  stopped, and the backup sealed the (live) holder's epoch after 1.5 s
+  (`holder silent`); forwarded writes got `EIO` for ~40 s until the
+  holder reconfigured. Seen in 3 of 4 early `nonowner-back-crash` runs
+  at that latency (the scenario now uses 1 s); not reproduced in one run
+  on main, whose timing differed.
+- **A restarted backup seals its healthy holder**: after a remount a
+  node whose persisted role says "backup" hears nothing for 1.5 s and
+  seals (`backup_start` arms the watch with `last_heard = now`); seen
+  when the killed writer was the holder's backup (the scenario now picks
+  the other non-owner).
+- **A non-owner that alone loses S3** (its proxy cut) proposes
+  continuation epochs; the others decline ("this member reaches S3"),
+  and its closes took 40–80 s each meanwhile (M10).
+- A deposed holder's own write-back rows are replayed by rid through the
+  new holder from their records (`spec.rs` reconstructs a `SetManifest`
+  op); before this fix nothing told the new holder the chunks might
+  still be uploading on the deposed node. The replay's forward now
+  carries them (the sync task fills `pending` at send time), so this is
+  closed for P2P replays; worth a look by the M3b owner anyway.
