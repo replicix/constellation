@@ -348,6 +348,10 @@ pub enum Payload {
         /// with the first renewal; empty otherwise.
         #[serde(default)]
         locks: Vec<u8>,
+        /// Plan 30 §M14: the remaining lock grace on the subtree (ms; 0:
+        /// none) — see `PeerMsg::DelegRenewed::lock_grace_ms`.
+        #[serde(default)]
+        lock_grace_ms: u64,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
     /// delegate stops and answers the highest stream index it executed.
@@ -1037,6 +1041,7 @@ mod tests {
                 gen: 2,
                 ttl_ms: 3,
                 locks: vec![1, 2, 3],
+                lock_grace_ms: 4,
             },
         ] {
             let signed = Signed::new(&k, &payload).unwrap();

@@ -519,6 +519,7 @@ pub fn check_linearizable_witnessed(
         });
         if explained {
             witness.observed_tentative += 1;
+            witness.observers.insert(*rid);
             continue;
         }
         let at = |i: usize| -> String {
@@ -540,11 +541,19 @@ pub fn check_linearizable_witnessed(
 }
 
 /// What the witnessed check saw besides a pass.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Witness {
     /// Refusals explained only by an acked-then-rolled-back effect the
     /// refusing holder still had at the time (the L2 window).
     pub observed_tentative: usize,
+    /// Their rids. The generic tester ([`check_linearizable`]) must treat
+    /// them as tentative too: under `Local` their answer depended on an
+    /// effect the log placed later (or never), exactly like the tentative
+    /// op's own acknowledgement — without this the two checkers enforced
+    /// different contracts, and a small history (the only kind the
+    /// generic tester runs on) with one such refusal failed as "not
+    /// linearizable" (`locks-faults` seed 195356).
+    pub observers: HashSet<Rid>,
 }
 
 #[cfg(test)]

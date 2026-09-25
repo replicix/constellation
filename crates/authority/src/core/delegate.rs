@@ -1607,6 +1607,7 @@ impl Core {
     }
 
     /// Root side: grant (or refuse) a renewal.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_deleg_renew(
         &mut self,
         now: Ms,
@@ -1614,6 +1615,7 @@ impl Core {
         req: OpId,
         gen: u64,
         backup: Option<NodeId>,
+        replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         let mut ttl_ms = 0u64;
@@ -1647,10 +1649,14 @@ impl Core {
         // Plan 30 §M14: the lock grants under the subtree travel with the
         // first renewal that grants, and again with every later one while
         // they may be live (the reply can be lost).
-        let locks = if ttl_ms > 0 {
-            self.lock_take_handoff(now, gen)
+        // So does what is left of a lock grace here that covers it.
+        let (locks, lock_grace_ms) = if ttl_ms > 0 {
+            (
+                self.lock_take_handoff(now, gen),
+                self.lock_grace_for_generation(now, gen, replica),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
         out.push(Action::Send {
             to: from,
@@ -1659,6 +1665,7 @@ impl Core {
                 gen,
                 ttl_ms,
                 locks,
+                lock_grace_ms,
             },
         });
     }

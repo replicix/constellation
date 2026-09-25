@@ -627,7 +627,7 @@ pub struct Driver {
     /// Plan 30 §M11: peers' delegate-stream batches, renewals and
     /// recalls this node is answering.
     deleg_stream_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
-    deleg_renew_replies: HashMap<OpId, oneshot::Sender<(u64, Vec<Grant>)>>,
+    deleg_renew_replies: HashMap<OpId, oneshot::Sender<(u64, Vec<Grant>, u64)>>,
     deleg_recall_replies: HashMap<OpId, oneshot::Sender<(u64, Vec<Grant>)>>,
     /// Plan 30 §M14: peers' lock requests, recalls, renewals and tests
     /// this node is answering.
@@ -1751,10 +1751,14 @@ impl Driver {
                 }
             }
             PeerMsg::DelegRenewed {
-                req, ttl_ms, locks, ..
+                req,
+                ttl_ms,
+                locks,
+                lock_grace_ms,
+                ..
             } => {
                 if let Some(tx) = self.deleg_renew_replies.remove(&req) {
-                    let _ = tx.send((ttl_ms, locks));
+                    let _ = tx.send((ttl_ms, locks, lock_grace_ms));
                 }
             }
             PeerMsg::DelegRecalled {
@@ -2081,6 +2085,7 @@ impl Driver {
                             gen,
                             ttl_ms,
                             locks,
+                            lock_grace_ms,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
@@ -2089,6 +2094,7 @@ impl Driver {
                                     gen,
                                     ttl_ms,
                                     locks: crate::locks::grants_of(&locks),
+                                    lock_grace_ms,
                                 },
                             }));
                         }

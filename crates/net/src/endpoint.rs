@@ -593,6 +593,7 @@ pub trait PeerService: Send + Sync + 'static {
                 gen,
                 ttl_ms: 0,
                 locks: Vec::new(),
+                lock_grace_ms: 0,
             }
         })
     }

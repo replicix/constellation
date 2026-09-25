@@ -328,6 +328,7 @@ fn replay_seed() {
         Ok("locks-faults") => locks_faults_config(),
         Ok("locks-pause") => locks_pause_config(),
         Ok("locks-delegated") => locks_delegated_config(),
+        Ok("locks-released-delegated") => locks_released_delegated_config(),
         Ok("locks-nofence") => SimConfig {
             lock_ignore_fence: true,
             ..locks_partition_config()
@@ -3100,6 +3101,37 @@ fn locks_delegated_config() -> SimConfig {
     }
 }
 
+/// Plan 30 §M14: a takeover of a *released* lease, then a delegation
+/// inside the new root's lock grace. The lock files live in `d1`, which
+/// is the root's (`d2` is delegated to node 3); at 1.5 s the holder shuts
+/// down gracefully — it releases its lease with its lock grants live —
+/// and 0.2 s later `d1` is delegated through whoever holds the lease
+/// then. The grants of the old tenure are known to nobody: the new root
+/// covers them with a grace on the whole namespace (reclaims only), and
+/// its delegate of `d1` must honour what is left of it.
+fn locks_released_delegated_config() -> SimConfig {
+    SimConfig {
+        lock_files: 2,
+        lock_ratio: 0.7,
+        lock_dir: Some("d1".into()),
+        delegations: vec![("d2".into(), 3)],
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::ShutdownHolder { restart_ms: 3_000 },
+            },
+            ScheduledFault {
+                at_ms: 1_700,
+                kind: FaultKind::DelegateDir {
+                    dir: "d1".into(),
+                    within_ms: 3_000,
+                },
+            },
+        ],
+        ..delegated_config()
+    }
+}
+
 /// Plan 30 §M14: the lock counters summed over a run's nodes.
 #[derive(Debug, Default)]
 struct M14Totals {
@@ -3117,6 +3149,7 @@ struct M14Totals {
     reclaimed: u64,
     moved: u64,
     reinstated: u64,
+    graces_inherited: u64,
     lost: u64,
     released: u64,
     granted_recalled: u64,
@@ -3160,6 +3193,7 @@ impl M14Totals {
             self.reclaimed += s.lock_reclaimed;
             self.moved += s.lock_moved;
             self.reinstated += s.lock_reinstated;
+            self.graces_inherited += s.lock_graces_inherited;
             self.lost += s.lock_lost;
             self.released += s.lock_released;
             self.granted_recalled += s.lock_granted_recalled;
@@ -3280,6 +3314,57 @@ fn locks_in_a_delegated_subtree() {
     );
 }
 
+/// Plan 30 §M14: a subtree delegated inside the lock grace a released
+/// takeover left at the new root: its delegate inherits what is left of
+/// the grace (PROGRESS.md "Fix: locks-faults 195356 and the delegated
+/// grace gap"), and mutual exclusion holds.
+#[test]
+fn locks_released_takeover_then_delegation() {
+    let t = run_m14(
+        "locks-released-delegated",
+        locks_released_delegated_config(),
+        98_000..98_060,
+    );
+    assert!(t.grants > 300, "{t:?}");
+    assert!(
+        t.grace_periods > 0,
+        "no released takeover left a grace: {t:?}"
+    );
+    assert!(
+        t.graces_inherited > 0,
+        "no delegation started inside the grace: {t:?}"
+    );
+}
+
+/// `locks-released-delegated` seeds that violated mutual exclusion while
+/// the root's grace stayed at the root (the delegate of `d1` granted over
+/// the released tenure's grants).
+#[test]
+fn regression_locks_released_takeover_grace_follows_the_delegation() {
+    for seed in [198_012, 198_043, 198_056, 198_103] {
+        run_seed(seed, locks_released_delegated_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-released-delegated seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-released-delegated"
+            )
+        });
+    }
+}
+
+/// `locks-faults` seed 195356: a refusal answered from an effect its
+/// holder had acknowledged under `Local` and then lost to a crash (the
+/// L2 window, allowed without a backup) failed the generic tester, which
+/// had no such exemption, while the log-witnessed check counted it as
+/// `observed_tentative` (PROGRESS.md "Fix: locks-faults 195356 and the
+/// delegated grace gap").
+#[test]
+fn regression_locks_faults_refusal_observed_a_rolled_back_effect() {
+    let report = run_seed(195_356, locks_faults_config())
+        .unwrap_or_else(|e| panic!("locks-faults seed 195356: {e}"));
+    assert_eq!(report.observed_tentative, 1);
+    assert!(report.stateright_checked, "the generic tester did not run");
+}
+
 /// `locks-delegated` seeds where two nodes held exclusive grants on one
 /// file (PROGRESS.md "Fix: long_locks seed 196102"): a delegation's lock
 /// handoff rides its first renewal reply, the generation's recall
@@ -3368,5 +3453,10 @@ fn long_locks() {
         "locks-delegated",
         locks_delegated_config(),
         196_000..196_000 + n,
+    );
+    run_m14(
+        "locks-released-delegated",
+        locks_released_delegated_config(),
+        198_000..198_000 + n,
     );
 }

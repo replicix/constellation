@@ -680,6 +680,9 @@ pub struct Stats {
     /// Grants handed to a delegation that ended without handing them
     /// back, reinstated in the root's table.
     pub lock_reinstated: u64,
+    /// Delegate: generations that started inside the root's lock grace
+    /// (carried with their first granting renewal).
+    pub lock_graces_inherited: u64,
     /// Node side.
     pub lock_requests: u64,
     pub lock_unavailable: u64,
@@ -1389,17 +1392,24 @@ impl Core {
                 refused,
             } => self.on_delegate_stream_ack(now, req, gen, through, refused, replica, out),
             PeerMsg::DelegRenew { req, gen, backup } => {
-                self.on_deleg_renew(now, from, req, gen, backup, out)
+                self.on_deleg_renew(now, from, req, gen, backup, replica, out)
             }
             PeerMsg::DelegRenewed {
                 req,
                 gen,
                 ttl_ms,
                 locks,
+                lock_grace_ms,
             } => {
                 // The renewal installs the generation's window first; the
-                // handoff is tagged with the generation itself.
+                // handoff is tagged with the generation itself. A grace
+                // the root carried binds a delegate that starts serving
+                // with this renewal.
+                let serving = self.deleg_mine_until(gen).is_some();
                 self.on_deleg_renewed(now, req, gen, ttl_ms, replica, out);
+                if ttl_ms > 0 && !serving {
+                    self.lock_take_grace(now, gen, lock_grace_ms);
+                }
                 if ttl_ms > 0 && !locks.is_empty() {
                     self.lock_install_moved(now, gen, locks, replica);
                 }

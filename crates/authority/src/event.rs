@@ -479,6 +479,13 @@ pub enum PeerMsg {
         /// Plan 30 §M14: the root's lock grants under the subtree, handed
         /// over with the first renewal (restamped by the delegate).
         locks: Vec<constellation_meta::locks::Grant>,
+        /// Plan 30 §M14: how much longer the root refuses new lock grants
+        /// on the subtree (a grace: after a takeover of a released lease,
+        /// an outwaited delegate, a restart quarantine) — grants of an
+        /// earlier tenure it cannot hand over may still be honoured. A
+        /// delegate that starts serving with this renewal refuses new
+        /// grants (and accepts reclaims) as long, plus the margin.
+        lock_grace_ms: u64,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
     /// delegate stops executing under it and answers with the highest

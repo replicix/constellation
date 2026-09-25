@@ -22781,3 +22781,183 @@ has no config combining a released takeover with delegations.
 - `constellation-model --test locks`: 27 passed.
 
 No harness runs: the change is core-only and the sim covers it.
+
+## Fix: locks-faults 195356 and the delegated grace gap
+
+(coder, 2026-09-25; uncommitted on `fix-lock-seed-2` = main 381c66d.)
+
+### 1. `locks-faults` seed 195356: not a product violation; the two checkers disagreed
+
+**What happens.** The run's faults are "cut S3 for node 1 (holder) for
+1653 ms" at t=1461 and "crash holder 1 (restart, keep journal)" at
+t=1588. The policy is `Local`, and no backup was ever selected
+(`backups_added: 0`).
+- t=1722: holder 1 executes its own `Create f0` (rid 1,1,8) and acks it
+  from its local journal. It cannot ship: S3 is cut.
+- t=1752: node 2's `Create f0` (rid 2,1,9) is forwarded to node 1, which
+  refuses it with `Exists` because of 1,1,8. The reply's position has
+  `pending: jseq 39`, unshipped. `Local` does not wait (`ack_need` is
+  `None`), so node 2's client gets `EEXIST`.
+- t=1791: node 1 crashes. Node 3 takes over at epoch 2 and runs seqs
+  16–21. Node 1 restarts deposed, rolls back its journal and replays
+  1,1,8 by rid; it lands at seq 22. The journaled `Refused(2,1,9)` row
+  is dropped with the rollback (M13's rule).
+- The refusal's thread went on to 2,1,11 (seq 17), so the refusal must
+  linearize before seq 17. `f0` exists only from seq 22.
+
+**This is the documented L2 window**, an acknowledgement that exists in
+one place until S3 has it, seen by a third party. PROGRESS "M5 finding
+6" and seed 20334 already recorded it. The durability reference ("No
+client observes a tentative effect") promises the opposite only under
+`Backup` and `S3`: there the holder parks refusals until the rows they
+observed are durable, and the sim's `strict_durability` fails any such
+observation. Under `Local` without a backup it is allowed.
+
+**The failing check was the generic one.** The log-witnessed checker
+(`check_linearizable_witnessed`) re-tries this refusal with the
+tentative effects applied and counts it as `observed_tentative = 1`,
+which passes. The stateright `LinearizabilityTester` runs only on small
+histories (at most 80 events and 6 tentative rids). It had no such rule,
+so it failed the same history as "not linearizable". That is also why
+this showed up so rarely (1 in 3000 `locks-faults` seeds): it needs a
+holder crash during an S3 cut, a refusal observing the holder's
+unshipped effect, and a history small enough for the generic tester.
+
+**Fix (test side, `crates/authority/tests/sim/{history,run}.rs`).**
+`Witness` now also returns the rids of such refusals (`observers`). The
+generic tester treats them as in flight forever, exactly like the
+tentative effect they observed. Nothing is relaxed under a durable
+policy, where `strict_durability` already fails any observer.
+
+**No product change**, deliberately. Closing L2 under `Local` would mean
+parking every forwarded refusal (and, to be consistent, every
+acceptance) until S3 has the rows, which is `ack=s3`. If the coordinator
+wants `Local` to close it anyway, that is the change, in
+`holder.rs` `ack_need`.
+
+Regression test: `regression_locks_faults_refusal_observed_a_rolled_back_effect`
+asserts that the seed passes, with `observed_tentative == 1` and the
+generic tester having run.
+
+### 2. The delegated grace gap: a root grace now follows the subtree
+
+**Gap.** When the new root takes over a *released*, unexpired lease
+(`lock_on_released_takeover`), it starts with an empty table and a grace
+on the whole namespace. This happens on a graceful shutdown of the root
+with lock grants live, which `Control::Shutdown` does regardless of
+grants and delegations. The old tenure's grants are known to nobody. A
+subtree delegated inside that grace had a delegate with an empty table
+and no grace, and it granted over them. The same holds for any
+root-side grace (an outwaited delegate's subtree grace, the
+restart/takeover quarantine) when a new delegation of an overlapping
+subtree starts inside it.
+
+**Fix.**
+- `PeerMsg::DelegRenewed` has a new field, `lock_grace_ms`. It is
+  plumbed through `net::Payload::DelegRenewed` (serde default), the
+  driver's reply channel (`SyncRequest::PeerDelegRenew`,
+  `deleg_renew_replies`) and the `PeerService` bridge (`main.rs`).
+- Root: `on_deleg_renew` (now taking the `replica`) fills the field
+  from `lock_grace_for_generation`. That is what is left of the
+  quarantine and of any grace whose directory is the root, contains the
+  generation's directory or is inside it.
+- Delegate: if that renewal is the one it *starts serving* with
+  (`deleg_mine_until(gen)` was `None` before it),
+  `lock_take_grace` puts a grace on the subtree until
+  `receipt + lock_grace_ms + margin`. Measured from the receipt, which
+  comes after the root's send, so it outlasts the root's grace. It
+  refuses new grants and accepts reclaims.
+- A delegate already serving does not need it. Its table held every
+  grant on the subtree from before, and a grace protects only grants
+  the root never knew. A released lease has no live delegations
+  anyway, since `round_release` and handoffs refuse while one is live.
+- New stat: `lock_graces_inherited`.
+- Delegation code touched: `on_deleg_renew`'s signature (`replica`) and
+  the reply in `delegate.rs` (10 lines added, 3 removed).
+
+**Sim.**
+- Two new faults. `ShutdownHolder { restart_ms }` sends
+  `Control::Shutdown`, which flushes and releases, then stops the node
+  and restarts it with its journal. `DelegateDir { dir, within_ms }`
+  delegates a directory through whoever holds the lease, to the lowest
+  live other node.
+- New config `locks-released-delegated`, built on `delegated_config`.
+  The lock files are in `d1`, which the root owns; `d2` is delegated to
+  node 3. The holder shuts down at 1.5 s and `d1` is delegated at 1.7 s.
+- New in `replay_seed`, `long_locks` (seeds 198000+) and CI:
+  `locks_released_takeover_then_delegation` (98000..98060: 935 grants,
+  119 grace periods, 40 inherited).
+- `regression_locks_released_takeover_grace_follows_the_delegation`
+  pins seeds 198012, 198043, 198056 and 198103.
+
+Non-vacuity: with the delegate ignoring the carried grace (a temporary
+env switch, removed), **28 of 400 seeds (198000..198400) violated mutual
+exclusion**. With the fix, 0.
+
+**Model (`crates/model/src/locks.rs`).**
+- New knobs: `released_takeover` (`Release(i)`, then any node takes
+  over with an empty table and a grace of `lock_ttl + seq_margin`) and
+  `grace_follows_delegation` (the handoff carries `grace_left`; a
+  delegate that starts with it sets its floor to `receipt + grace +
+  margin`).
+- `a_delegation_inside_a_released_takeovers_grace_violates_if_the_grace_stays`
+  finds the violation (70K states, 19 steps: release, takeover,
+  delegate, the delegate grants, the old holder does I/O).
+- `a_released_takeovers_grace_follows_the_delegation` is clean and
+  exhaustive (13.6M states), with the released takeover, the inherited
+  grace and the move all witnessed.
+- The earlier `handoff_grace` counterexample test now pins
+  `grace_follows_delegation: false`. A carried grace would also have
+  covered seed 196102's path, less precisely than reinstatement.
+- Suite: 29 passed, 1 ignored.
+
+### Sweeps (final code)
+
+| What | Seeds | Result |
+|---|---|---|
+| `locks-faults` (with the checker fix) | 195000..198000 | 3000 pass |
+| `long_backup` | 50000..51000 | 1000 pass |
+| `long_random` | 10000..11000 | 1000 pass (3 seeds with observed-tentative refusals, as before) |
+| `long_backup_hot` | 90000..91000 | 1000 pass |
+| `locks-released-delegated` | 198000..200000 | 1999 pass; **198670** fails, a namespace failure, not a lock property (below) |
+| `locks-delegated`, `locks-faults`, `locks-failover-backup`, `locks`, `locks-failover` (after part 2) | 1000 each | all pass |
+| `long_delegated` | 70000..71000 | 999 pass; 70705 is the known failure (the delegation coder's) |
+
+The `long_backup`, `long_random` and `long_backup_hot` sweeps ran on the
+build after part 1. Part 2 touches only the lock grace carried by
+delegation renewals.
+
+### Found, not fixed: `locks-released-delegated` seed 198670 (for the delegation coder)
+
+Failure: `[directory "d2"] rid (3,1,9) returned before rid (2,1,10) was
+invoked but follows it in the log`. It fails the same way with the
+grace carry disabled, and the failing path involves no lock.
+
+Narration:
+- The root (node 1) shuts down gracefully with generation 4 of `d2`
+  live (delegate node 3), and releases.
+- Node 3 executes and acks 3,1,9 (`Create d2/f2`, stream index 3).
+- Node 2's 2,1,10 (`Create d2/f0`) got a reply carrying gen-4 stream
+  position (4,4).
+- Node 2 takes over the released lease. Its takeover gate runs
+  `replay_locally` (`stranded op replayed locally rid=2,1,10`, seq 29)
+  *before* it inherits generation 4 ("inherited a delegation from a
+  predecessor root", next line). So the root executes an op of a live
+  delegated subtree itself, ahead of the delegate's index 3, which
+  lands at seq 30.
+
+It looks like the replay hold (`queued.gen != 0 && table has gen`,
+long-delegated seed 70075) did not apply: the queued entry's `gen` is
+probably 0. This is the same area as the delegated-holder-cut seeds
+and 70705. It is new here only because no config before this one shut
+a root down gracefully with a delegation live.
+
+### Gates
+
+- `cargo fmt --all -- --check` and `cargo clippy --workspace
+  --all-targets -- -D warnings`: clean;
+- `constellation-authority --release`: 95 lib + 3 + 90 sim passed (9
+  ignored);
+- unit tests: `constellation` bin 229, `constellation-net` 90,
+  `constellation-meta` 88;
+- `constellation-model --test locks`: 29 passed.

@@ -398,6 +398,9 @@ fn a_root_grace_that_stays_behind_violates_on_redelegation() {
         reinstate_handed: false,
         resend_handoff: false,
         handoff_grace: true,
+        // The design before this fix (a grace carried by the delegation
+        // would cover this path too, less precisely than reinstatement).
+        grace_follows_delegation: false,
         max_deleg_renews: 0,
         max_drops: 0,
         max_tick: 2,
@@ -484,6 +487,53 @@ fn lost_handoffs_resent_are_clean() {
         "handoff-lost-design",
         &m,
         &["all_ops_done", "moved", "resent"],
+    );
+}
+
+/// A released takeover (the root shuts down gracefully with node 1's
+/// grant live), then the new root delegates the subtree inside its
+/// grace. Left at the root, the grace does not bind the delegate, which
+/// grants over node 1's grant.
+#[test]
+fn a_delegation_inside_a_released_takeovers_grace_violates_if_the_grace_stays() {
+    let m = LockModel {
+        delegate: 2,
+        max_moves: 1,
+        released_takeover: true,
+        grace_follows_delegation: false,
+        max_epoch: 1,
+        max_deleg_renews: 0,
+        max_drops: 0,
+        max_tick: 2,
+        max_renews: 0,
+        ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X), Io]])
+    };
+    assert_violates("released-grace-stays", &m);
+}
+
+/// The design: the grace rides the delegation's first renewal; reclaims
+/// go to the delegate.
+#[test]
+fn a_released_takeovers_grace_follows_the_delegation() {
+    let m = LockModel {
+        delegate: 2,
+        max_moves: 1,
+        released_takeover: true,
+        max_epoch: 1,
+        max_deleg_renews: 1,
+        max_drops: 0,
+        max_tick: 4,
+        ..LockModel::design(contend())
+    };
+    assert_clean(
+        "released-grace-follows",
+        &m,
+        &[
+            "all_ops_done",
+            "released_takeover",
+            "grace_inherited",
+            "moved",
+        ],
     );
 }
 

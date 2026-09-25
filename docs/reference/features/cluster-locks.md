@@ -211,6 +211,14 @@ the same node on that file, or a conflicting grant. A delegate that was
 outwaited (it stopped answering) also leaves a grace period on its
 subtree.
 
+Some graces cover grants the root cannot hand over, because it never
+knew them. The main case is after taking over a lease that its holder
+released, for example on a graceful shutdown with locks held. A
+delegation's first renewal therefore carries what is left of any grace
+that covers its subtree. A delegate that starts serving inside a grace
+makes no new grants on the subtree until the grace has passed, plus the
+margin, and accepts reclaims meanwhile.
+
 Name-hash range delegations need nothing extra: a file's lock owner is
 resolved from its primary link, like every other ownership lookup.
 

@@ -2204,6 +2204,60 @@ impl Core {
         }
     }
 
+    /// Root: what is left of a grace here (a subtree grace overlapping
+    /// generation `gen`'s directory, the whole-namespace grace after a
+    /// released takeover, the restart or takeover quarantine) — carried
+    /// with the generation's granting renewals. The grants such a grace
+    /// protects are ones this root cannot hand over (it never knew them),
+    /// so a delegate that starts serving the subtree inside it must
+    /// honour it too; left here, the new delegate granted over them (the
+    /// sim's `locks-released-delegated`).
+    pub(crate) fn lock_grace_for_generation(
+        &mut self,
+        now: Ms,
+        gen: u64,
+        replica: &dyn Replica,
+    ) -> u64 {
+        let Some(dir) = self.dl.gens.get(&gen).map(|g| g.dir) else {
+            return 0;
+        };
+        self.lk.grace.retain(|(_, until)| *until > now);
+        let mut until = replica.read_delegations().quarantine_until();
+        for (g, u) in &self.lk.grace {
+            if *g == constellation_fs_core::types::ROOT_INO
+                || replica.is_under(dir, *g)
+                || replica.is_under(*g, dir)
+            {
+                until = until.max(u.0);
+            }
+        }
+        (until - now.0).max(0) as u64
+    }
+
+    /// Delegate: generation `gen`'s first granting renewal carried the
+    /// root's remaining grace on the subtree: no new grant there until
+    /// it passes (measured from the receipt, which is after the root's
+    /// send, plus the margin), reclaims accepted meanwhile.
+    pub(crate) fn lock_take_grace(&mut self, now: Ms, gen: u64, grace_ms: u64) {
+        if grace_ms == 0 {
+            return;
+        }
+        let Some(dir) = self.dl.mine.get(&gen).map(|d| d.dir) else {
+            return;
+        };
+        let until = Ms(now.0 + grace_ms as i64 + self.lock_margin_ms());
+        self.lk.grace.push((dir, until));
+        self.stats.lock_grace_periods += 1;
+        self.stats.lock_graces_inherited += 1;
+        tracing::info!(
+            node = self.cfg.node_id,
+            gen,
+            dir,
+            grace_ms,
+            "a delegation starts inside the root's lock grace; no new grants on the subtree until it passes"
+        );
+    }
+
     /// A takeover of a lease its holder *released* (not expired): its
     /// grants were capped by a lease still live, so they may be honoured
     /// for up to `ttl` more — a grace on everything, reclaims admitted

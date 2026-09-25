@@ -28,6 +28,16 @@ pub enum FaultKind {
         restart_ms: Option<u64>,
         keep_journal: bool,
     },
+    /// Plan 30 §M14: shut the current lease holder down gracefully
+    /// (`Control::Shutdown`: flush, then *release* the lease, live lock
+    /// grants and delegations or not), stop it, and restart it with its
+    /// journal after `restart_ms`. The next holder takes over a released,
+    /// unexpired lease: a lock grace on the whole namespace.
+    ShutdownHolder { restart_ms: u64 },
+    /// Plan 30 §M14: delegate directory `dir` (by name under the root)
+    /// to the lowest live node that is not the lease holder, through the
+    /// holder, retrying until it answers (up to `within_ms`).
+    DelegateDir { dir: String, within_ms: u64 },
     CrashNode {
         node: NodeId,
         restart_ms: Option<u64>,
@@ -1237,6 +1247,77 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
     tokio::time::sleep(Duration::from_millis(fault.at_ms)).await;
     let note = |s: String| log.lock().unwrap().push(s);
     match fault.kind {
+        FaultKind::ShutdownHolder { restart_ms } => {
+            let Some(lease) = read_lease(&cluster.env.bucket).await else {
+                note(format!("t={} shutdown-holder: no lease yet", fault.at_ms));
+                return;
+            };
+            let holder = lease.holder;
+            if holder == 0 || !cluster.ids().contains(&holder) || !cluster.get(holder).alive() {
+                note(format!(
+                    "t={} shutdown-holder: holder {holder} not alive",
+                    fault.at_ms
+                ));
+                return;
+            }
+            let h = cluster.get(holder);
+            let done = h.control(constellation_authority::Control::Shutdown);
+            let released = matches!(
+                tokio::time::timeout(Duration::from_secs(10), done).await,
+                Ok(Ok(Ok(_)))
+            );
+            note(format!(
+                "t={} shut down holder {holder} (released {released}; restart after {restart_ms}ms)",
+                cluster.env.clock.elapsed_ms()
+            ));
+            if !h.alive() {
+                return;
+            }
+            let now = cluster.env.clock.now().0;
+            cluster
+                .note_takedown(holder, Some(now + restart_ms as i64), fault.at_ms)
+                .await;
+            let meta = cluster.crash(holder);
+            tokio::time::sleep(Duration::from_millis(restart_ms)).await;
+            cluster.restart(holder, Some(meta));
+        }
+        FaultKind::DelegateDir { dir, within_ms } => {
+            let t0 = cluster.env.clock.elapsed_ms();
+            while cluster.env.clock.elapsed_ms() < t0 + within_ms {
+                let holder = read_lease(&cluster.env.bucket)
+                    .await
+                    .map(|l| l.holder)
+                    .filter(|h| *h != 0 && cluster.ids().contains(h) && cluster.get(*h).alive());
+                if let Some(holder) = holder {
+                    let h = cluster.get(holder);
+                    let to = cluster
+                        .ids()
+                        .into_iter()
+                        .find(|n| *n != holder && cluster.get(*n).alive());
+                    let ino = h.meta.child_ino(ROOT_INO, &dir).ok().flatten();
+                    if let (Some(to), Some(ino)) = (to, ino) {
+                        let r = tokio::time::timeout(
+                            Duration::from_millis(500),
+                            h.control(constellation_authority::Control::Delegate {
+                                range: (0, 0),
+                                dir: ino,
+                                node: to,
+                            }),
+                        )
+                        .await;
+                        if let Ok(Ok(Ok(_))) = r {
+                            note(format!(
+                                "t={} delegated {dir} to node {to} through holder {holder}",
+                                cluster.env.clock.elapsed_ms()
+                            ));
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            note(format!("t={} could not delegate {dir}", fault.at_ms));
+        }
         FaultKind::CrashHolder {
             restart_ms,
             keep_journal,
@@ -2088,6 +2169,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 ))
             })?;
         witness.observed_tentative += w.observed_tentative;
+        witness.observers.extend(w.observers);
     }
     report.observed_tentative = witness.observed_tentative;
     if strict_durability && witness.observed_tentative > 0 {
@@ -2096,9 +2178,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             witness.observed_tentative
         )));
     }
-    if events.len() <= STATERIGHT_EVENT_BOUND && tentative.len() <= STATERIGHT_TENTATIVE_BOUND {
+    // The generic tester enforces the same contract: a refusal that
+    // observed a tentative effect (allowed above unless
+    // `strict_durability`) is in flight forever, like that effect.
+    let in_flight: HashSet<Rid> = tentative.union(&witness.observers).copied().collect();
+    if events.len() <= STATERIGHT_EVENT_BOUND && in_flight.len() <= STATERIGHT_TENTATIVE_BOUND {
         for proj in &projections {
-            check_linearizable(proj, &tentative).map_err(lin_context)?;
+            check_linearizable(proj, &in_flight).map_err(lin_context)?;
         }
         report.stateright_checked = true;
     }

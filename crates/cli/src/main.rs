@@ -2880,7 +2880,7 @@ impl constellation_net::PeerService for P2pBridge {
     {
         Box::pin(async move {
             let (reply, receive) = tokio::sync::oneshot::channel();
-            let (ttl_ms, locks) = if self
+            let (ttl_ms, locks, lock_grace_ms) = if self
                 .nudge
                 .send(fusefs::SyncRequest::PeerDelegRenew {
                     from,
@@ -2899,6 +2899,7 @@ impl constellation_net::PeerService for P2pBridge {
                 gen,
                 ttl_ms,
                 locks: crate::locks::grants_wire(&locks),
+                lock_grace_ms,
             }
         })
     }

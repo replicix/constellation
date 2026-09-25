@@ -358,8 +358,9 @@ pub enum SyncRequest {
         /// Phase 2b: the delegate's backup peer (0: none).
         backup: u64,
         /// Answered with the ttl and (§M14) the root's lock grants under
-        /// the subtree, handed over with the first renewal.
-        reply: tokio::sync::oneshot::Sender<(u64, Vec<constellation_meta::locks::Grant>)>,
+        /// the subtree, handed over with the first renewal, and the
+        /// remaining lock grace on it (ms).
+        reply: tokio::sync::oneshot::Sender<(u64, Vec<constellation_meta::locks::Grant>, u64)>,
     },
     /// Plan 30 §M11: the root recalls a generation this node holds;
     /// answered with the highest stream index executed here (and, §M14,

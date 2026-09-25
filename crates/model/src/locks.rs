@@ -74,6 +74,13 @@
 //!   (`handoff_grace`: a grace at the root instead) is the sim's
 //!   `locks-delegated` seed 196102: the grace stayed at the root when
 //!   the subtree was delegated again.
+//! - **A released takeover** (`released_takeover`): the root releases its
+//!   lease with grants live (a graceful shutdown) and any node takes it
+//!   over at once, with an empty table under a grace (the grants of the
+//!   old tenure are nobody's to hand over). A subtree delegated inside
+//!   that grace gets what is left of it with its first renewal
+//!   (`grace_follows_delegation`, the code's `DelegRenewed::lock_grace_ms`);
+//!   left at the root, the delegate granted over a released grant.
 //!
 //! # The property
 //!
@@ -192,6 +199,14 @@ pub struct LockModel {
     pub copies_check_conflicts: bool,
     /// Delegation renewals (`DelegRenewal`) the root may answer.
     pub max_deleg_renews: u8,
+    /// The root may *release* its lease with grants live (a graceful
+    /// shutdown), and any node take it over at once: the successor's
+    /// table is empty and under a grace (`lock_on_released_takeover`).
+    pub released_takeover: bool,
+    /// A delegation carries what is left of the root's grace to its
+    /// delegate (`DelegRenewed::lock_grace_ms`); `false`: the grace stays
+    /// at the root, and a subtree delegated inside it starts free.
+    pub grace_follows_delegation: bool,
     /// The design before `reinstate_handed` (M14's follow-up to sim seed
     /// 196252): a generation that was sent a handoff ends with a grace
     /// on the subtree *at the root* — which the subtree's next delegate
@@ -244,6 +259,8 @@ impl LockModel {
             copies_check_conflicts: true,
             max_deleg_renews: 1,
             handoff_grace: false,
+            released_takeover: false,
+            grace_follows_delegation: true,
             seq_margin: 1,
             node_margin: 1,
             lease_margin: 1,
@@ -278,6 +295,9 @@ pub struct Reg {
     pub holder: u8,
     pub epoch: u8,
     pub expires: i16,
+    /// The holder released it (a graceful shutdown): any node may take
+    /// it over at once.
+    pub released: bool,
 }
 
 /// Owner side: a node's grant on `X`.
@@ -420,6 +440,8 @@ pub enum Msg {
         sent: i16,
         first: bool,
         table: Vec<Grant>,
+        /// What is left of the root's grace (0: none).
+        grace: i16,
     },
     DelegRecall {
         to: u8,
@@ -450,6 +472,8 @@ pub const SAW_RECALL_BY_TTL: u16 = 256;
 pub const SAW_MIRROR_USED: u16 = 512;
 pub const SAW_REINSTATED: u16 = 1024;
 pub const SAW_RESENT: u16 = 2048;
+pub const SAW_RELEASED_TAKEOVER: u16 = 4096;
+pub const SAW_GRACE_INHERITED: u16 = 8192;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -724,6 +748,17 @@ impl State {
         self.nodes[h].floor = None;
     }
 
+    /// Root `r`: what is left of its grace, carried to a delegate
+    /// (`grace_follows_delegation`).
+    fn grace_left(&self, cfg: &LockModel, r: usize) -> i16 {
+        if !cfg.grace_follows_delegation {
+            return 0;
+        }
+        self.nodes[r]
+            .floor
+            .map_or(0, |f| (f - self.local(r)).max(0))
+    }
+
     /// Root `r`: the generation ended; its copies of what it handed come
     /// back unless the delegate handed that node's grant back
     /// (`returned`) — with this root's own `until` (the holders measure
@@ -791,6 +826,8 @@ pub enum Action {
     /// Root: answer the delegate's renewal (with the handoff's live
     /// copies when `resend_handoff`).
     DelegRenewal,
+    /// Root: release the lease (a graceful shutdown).
+    Release(u8),
 }
 
 impl Model for LockModel {
@@ -836,6 +873,7 @@ impl Model for LockModel {
                 holder: h as u8,
                 epoch: 1,
                 expires,
+                released: false,
             },
             owner: Owner::Root,
             moves: 0,
@@ -926,8 +964,17 @@ impl Model for LockModel {
             }
             let ttl_claimable = self.ttl_takeover && now >= s.reg.expires;
             let fast = self.backup == iu && s.reg.holder != iu;
-            if (ttl_claimable || fast) && anyone_wants && s.reg.epoch <= self.max_epoch {
+            let released = self.released_takeover && s.reg.released;
+            if (ttl_claimable || fast || released) && anyone_wants && s.reg.epoch <= self.max_epoch
+            {
                 actions.push(Action::Takeover(iu));
+            }
+            if self.released_takeover
+                && s.usable_root(self, i)
+                && s.owner == Owner::Root
+                && s.reg.epoch <= self.max_epoch
+            {
+                actions.push(Action::Release(iu));
             }
             if node.table.iter().any(|g| g.until <= now) {
                 actions.push(Action::Expire(iu));
@@ -1020,6 +1067,7 @@ impl Model for LockModel {
                     holder: i as u8,
                     epoch,
                     expires,
+                    released: false,
                 };
                 s.nodes[i].lease = Some((epoch, expires));
                 s.nodes[i].last_probe = now;
@@ -1033,7 +1081,16 @@ impl Model for LockModel {
                 // code clears them when the lease is gone).
                 s.nodes[i].handed.clear();
                 s.nodes[prev.holder as usize].handed.clear();
-                if fast {
+                if prev.released {
+                    // The old root's grants may still be honoured (they
+                    // were capped by a lease that has not expired), and
+                    // nobody knows them: a grace on everything.
+                    s.saw |= SAW_RELEASED_TAKEOVER;
+                    s.nodes[i].table.clear();
+                    if self.grace {
+                        s.nodes[i].floor = Some(now + self.lock_ttl + self.seq_margin);
+                    }
+                } else if fast {
                     s.saw |= SAW_FAST_TAKEOVER;
                     let mirrored = std::mem::take(&mut s.nodes[i].mirror).1;
                     if !mirrored.is_empty() {
@@ -1167,14 +1224,21 @@ impl Model for LockModel {
                     s.nodes[r].handoff_sent = self.move_state && !table.is_empty();
                     let sent = s.local(d);
                     let gen = s.gen;
+                    let grace = s.grace_left(self, r);
                     s.send(Msg::Handoff {
                         to: d as u8,
                         gen,
                         sent,
                         first: true,
                         table: if self.move_state { table } else { Vec::new() },
+                        grace,
                     });
                 } else {
+                    let grace = s.grace_left(self, r);
+                    if grace > 0 {
+                        s.nodes[d].floor = Some(s.local(d) + grace + self.seq_margin);
+                        s.saw |= SAW_GRACE_INHERITED;
+                    }
                     s.nodes[d].dtenure = Some(s.local(d) + self.deleg_ttl - self.node_margin);
                     s.nodes[d].table = if self.move_state {
                         s.restamp(self, d, table)
@@ -1216,6 +1280,14 @@ impl Model for LockModel {
                     s.nodes[r].floor = Some(s.local(r) + self.lock_ttl + self.seq_margin);
                 }
             }
+            Action::Release(i) => {
+                let i = i as usize;
+                s.reg.released = true;
+                s.nodes[i].lease = None;
+                s.nodes[i].dgen = None;
+                s.nodes[i].handed.clear();
+                s.depose_owner(i);
+            }
             Action::DelegRenewal => {
                 let Owner::Delegate(d) = s.owner else {
                     return None;
@@ -1235,12 +1307,14 @@ impl Model for LockModel {
                 };
                 let sent = s.local(d as usize);
                 let gen = s.gen;
+                let grace = s.grace_left(self, r);
                 s.send(Msg::Handoff {
                     to: d,
                     gen,
                     sent,
                     first: false,
                     table,
+                    grace,
                 });
             }
         }
@@ -1294,6 +1368,12 @@ impl Model for LockModel {
             Property::sometimes("mirror_used", |_, s: &State| s.saw & SAW_MIRROR_USED != 0),
             Property::sometimes("reinstated", |_, s: &State| s.saw & SAW_REINSTATED != 0),
             Property::sometimes("resent", |_, s: &State| s.saw & SAW_RESENT != 0),
+            Property::sometimes("released_takeover", |_, s: &State| {
+                s.saw & SAW_RELEASED_TAKEOVER != 0
+            }),
+            Property::sometimes("grace_inherited", |_, s: &State| {
+                s.saw & SAW_GRACE_INHERITED != 0
+            }),
         ]
     }
 
@@ -1521,12 +1601,20 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             sent,
             first,
             table,
+            grace,
         } => {
             let d = to as usize;
             if s.nodes[d].dmine != Some(gen) {
                 // Not a generation this node serves (it answered the
                 // recall, or was outwaited): dropped, as the code does.
                 return;
+            }
+            // The renewal it starts serving with carries the root's grace
+            // (measured from the receipt, plus the margin).
+            if s.nodes[d].dtenure.is_none() && grace > 0 {
+                let f = s.local(d) + grace + cfg.seq_margin;
+                s.nodes[d].floor = Some(s.nodes[d].floor.map_or(f, |x| x.max(f)));
+                s.saw |= SAW_GRACE_INHERITED;
             }
             let tenure = sent + cfg.deleg_ttl - cfg.node_margin;
             s.nodes[d].dtenure = Some(s.nodes[d].dtenure.map_or(tenure, |u| u.max(tenure)));

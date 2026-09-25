@@ -790,7 +790,9 @@ strict mode (cross-node byte-range locks) had never been built.
   be lost, so the root keeps a copy of what it handed. It re-sends the
   copy with every renewal and takes it back into its own table if the
   delegation ends without returning it. A grace period left at the root
-  would not follow the subtree to its next delegate.
+  would not follow the subtree to its next delegate. So a delegation's
+  first renewal also carries what is left of any root grace over its
+  subtree, for example after a takeover of a released lease.
 
 **Consequences**: lock users get correct cross-node exclusion by
 default; workloads that never lock pay one atomic load per I/O; a single
