@@ -757,13 +757,17 @@ fn remember_endpoint(name: &str, endpoint: &str) {
 fn main() -> Result<()> {
     let log_buffer = log_buffer::LogBuffer::default();
     let log_writer = log_buffer.clone();
+    // aws_config logs the loaded credentials (access key id included) at
+    // INFO on every command: keep it at WARN even under an explicit
+    // `RUST_LOG=info` or `debug`, unless RUST_LOG names aws_config itself.
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_default();
+    let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if !rust_log.contains("aws_config") {
+        filter = filter.add_directive("aws_config=warn".parse().expect("static directive"));
+    }
     tracing_subscriber::fmt()
-        .with_env_filter(
-            // aws_config logs the loaded credentials (access key id
-            // included) at INFO on every command.
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,aws_config=warn".into()),
-        )
+        .with_env_filter(filter)
         .with_writer(move || log_writer.writer())
         .init();
     let cli = Cli::parse();
