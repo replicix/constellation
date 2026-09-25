@@ -77,6 +77,12 @@ fn assert_clean(label: &str, model: &LockModel, sometimes: &[&'static str]) {
         checker.is_done() && checker.state_count() < CAP.0,
         "{label}: expected exhaustive exploration within budget"
     );
+    if let Some(d) = checker.discovery("table_consistent") {
+        for a in d.clone().into_actions() {
+            println!("  {a:?}");
+        }
+        panic!("{label}: an owner's table holds conflicting live grants");
+    }
     if let Some(d) = checker.discovery("mutual_exclusion") {
         for (i, (a, st)) in d
             .clone()
@@ -352,10 +358,133 @@ fn delegation_moves_with_state_are_clean() {
         delegate: 2,
         max_moves: 2,
         max_drops: 0,
-        max_tick: 6,
+        max_tick: 5,
         ..LockModel::design(contend())
     };
     assert_clean("move-state", &m, &["all_ops_done", "moved"]);
+}
+
+/// The handoff rides the delegate's first renewal reply, and the
+/// generation's recall overtakes it: the delegate answers the recall
+/// with nothing and drops the late handoff (it no longer serves the
+/// generation). A root that forgets what it handed grants over node 1's
+/// live grant at once (sim seed 196252's first form).
+#[test]
+fn a_handoff_overtaken_by_its_recall_violates_without_reinstatement() {
+    let m = LockModel {
+        delegate: 2,
+        max_moves: 2,
+        reinstate_handed: false,
+        resend_handoff: false,
+        max_deleg_renews: 0,
+        max_drops: 0,
+        max_tick: 2,
+        max_renews: 0,
+        ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X), Io]])
+    };
+    assert_violates("handoff-overtaken", &m);
+}
+
+/// The design before this fix: that generation ends with a grace on the
+/// subtree at the root, so the root grants nothing there — but it
+/// delegates the subtree again, with an empty table, and the new
+/// delegate grants over the live grant (the sim's `locks-delegated`
+/// seeds 196102, 96425 and 96805).
+#[test]
+fn a_root_grace_that_stays_behind_violates_on_redelegation() {
+    let m = LockModel {
+        delegate: 2,
+        max_moves: 3,
+        reinstate_handed: false,
+        resend_handoff: false,
+        handoff_grace: true,
+        max_deleg_renews: 0,
+        max_drops: 0,
+        max_tick: 2,
+        max_renews: 0,
+        ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X), Io]])
+    };
+    assert_violates("handoff-grace-stays", &m);
+}
+
+/// The handoff's reply is lost; the delegate renews again and serves
+/// from that reply, which carries nothing: it grants over node 1's live
+/// grant. Reinstating at the generation's end does not help (the
+/// generation goes on); the root re-sends what it handed.
+#[test]
+fn a_lost_handoff_violates_without_the_resend() {
+    let m = LockModel {
+        delegate: 2,
+        max_moves: 1,
+        reinstate_handed: true,
+        resend_handoff: false,
+        max_deleg_renews: 1,
+        max_drops: 1,
+        max_tick: 2,
+        max_renews: 0,
+        ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X), Io]])
+    };
+    assert_violates("handoff-lost", &m);
+}
+
+/// The design: handoffs overtaken by their recall, the subtree delegated
+/// again, contention.
+#[test]
+fn overtaken_handoffs_and_redelegation_are_clean() {
+    let m = LockModel {
+        delegate: 2,
+        max_moves: 3,
+        max_deleg_renews: 0,
+        max_drops: 0,
+        max_tick: 4,
+        ..LockModel::design(contend())
+    };
+    assert_clean(
+        "handoff-overtaken-design",
+        &m,
+        &["all_ops_done", "moved", "reinstated"],
+    );
+}
+
+/// Reinstating a copy next to a conflicting grant: the copy's grant was
+/// released at the delegate, which then granted the other node; the
+/// root's table ends up with both live (the owner would re-affirm the
+/// stale one without a recall: sim seed 196004 against a first version
+/// of the fix).
+#[test]
+fn reinstating_next_to_a_conflicting_grant_breaks_the_table() {
+    let m = LockModel {
+        delegate: 2,
+        max_moves: 3,
+        max_deleg_renews: 0,
+        max_drops: 0,
+        max_tick: 4,
+        copies_check_conflicts: false,
+        ..LockModel::design(contend())
+    };
+    let checker = run_dfs("copies-over-conflicts", &m);
+    assert!(
+        checker.discovery("table_consistent").is_some(),
+        "expected a table with conflicting live grants"
+    );
+}
+
+/// The design: a handoff lost, re-sent with the next renewal.
+#[test]
+fn lost_handoffs_resent_are_clean() {
+    let m = LockModel {
+        delegate: 2,
+        max_moves: 1,
+        max_deleg_renews: 1,
+        max_drops: 1,
+        max_tick: 4,
+        ..LockModel::design(contend())
+    };
+    assert_clean(
+        "handoff-lost-design",
+        &m,
+        &["all_ops_done", "moved", "resent"],
+    );
 }
 
 /// A delegate outwaited by the root: the grants moved to it at the
@@ -368,6 +497,7 @@ fn an_outwaited_delegate_without_grace_violates() {
         max_moves: 1,
         recall_by_ttl: true,
         grace: false,
+        reinstate_handed: false,
         deleg_ttl: 2,
         lock_ttl: 5,
         max_drops: 0,
@@ -376,6 +506,30 @@ fn an_outwaited_delegate_without_grace_violates() {
         ..LockModel::design(vec![vec![Lock(X), Io], vec![Lock(X), Io, Unlock], vec![]])
     };
     assert_violates("deleg-ttl-no-grace", &m);
+}
+
+/// The same with the root's copies of the handoff reinstated when the
+/// generation ends: clean without the grace — the copies are exactly
+/// the grants the grace protected (the code keeps the grace anyway).
+#[test]
+fn an_outwaited_delegate_with_reinstatement_needs_no_grace() {
+    let m = LockModel {
+        delegate: 2,
+        max_moves: 1,
+        recall_by_ttl: true,
+        grace: false,
+        deleg_ttl: 2,
+        lock_ttl: 5,
+        max_drops: 0,
+        max_tick: 7,
+        max_renews: 0,
+        ..LockModel::design(vec![vec![Lock(X), Io], vec![Lock(X), Io, Unlock], vec![]])
+    };
+    assert_clean(
+        "deleg-ttl-reinstated",
+        &m,
+        &["all_ops_done", "recall_by_ttl", "moved", "reinstated"],
+    );
 }
 
 #[test]

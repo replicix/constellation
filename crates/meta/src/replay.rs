@@ -17,25 +17,32 @@ use constellation_fs_core::{Ino, InodeKind};
 use constellation_mtree::keys;
 use constellation_mtree::record::{self, Attrs, DentryRecord, Kind};
 use fjall::SingleWriterWriteTx;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 /// Which dentries/inos a batch of records touches, used to suppress a
 /// foreign record that collides with the caller's own not-yet-shipped
 /// work. Atime is deliberately invisible here (see [`LogRecord::Atime`]):
 /// it records neither a dentry nor an ino, so it can neither suppress
 /// nor be suppressed.
+///
+/// `BTreeSet`s: [`crate::delegation::DelegationTable::resolve`] walks these
+/// in order to list a cross-subtree op's `involved` delegations, and the
+/// root recalls them in that order; with `HashSet`s the order (and so
+/// the whole schedule after it) changed from process to process, and
+/// the authority sim's `locks-delegated` seed 196102 replayed its
+/// failure only about one run in two.
 #[derive(Default, Debug)]
 pub struct TouchSet {
-    pub dentries: HashSet<(u64, String)>,
+    pub dentries: BTreeSet<(u64, String)>,
     /// Inodes held *exclusively*: their own attributes change, or (a
     /// directory) their subtree is removed, moved or re-attributed.
-    pub inos: HashSet<u64>,
+    pub inos: BTreeSet<u64>,
     /// Plan 30 §M12: directories held *shared* — a create, unlink or
     /// link in them changes their times and link count, but by a
     /// commutative merge (`max` times, additive nlink), so two such
     /// holds never conflict; an exclusive hold on the same directory
     /// (rmdir, a rename of it, setattr on it) conflicts with both.
-    pub shared: HashSet<u64>,
+    pub shared: BTreeSet<u64>,
 }
 
 impl TouchSet {

@@ -22556,3 +22556,228 @@ from 9794abc, which introduced both the clip and the straddle re-cut.
 
 No containers, mounts, `/tmp/harness-*` or `/tmp/chaos-soak-4-*`
 directories of this session are left.
+
+## Fix: long_locks seed 196102 (double exclusive grant)
+
+(coder, 2026-09-25; uncommitted on `fix-lock-seed` = main edd3d5d.)
+`long_locks` failed on `locks-delegated` seed 196102: nodes 2 and 3 both
+did I/O under exclusive grants on one inode. Replaying the seed failed
+about half the time. There were two problems: the sim was not
+deterministic, and a delegation's lock handoff could be lost. When that
+happened, a grace period stayed behind at the root and did not follow
+the subtree to its next delegate.
+
+### 1. Nondeterminism: `TouchSet`'s `HashSet`s
+
+Two replays diverge first at a cross-subtree rename. The root listed the
+generations to recall in a different order (`Ownership::CrossSubtree {
+involved }`). `DelegationTable::resolve` builds `involved` by walking
+`TouchSet.dentries`/`inos`/`shared`, and those were `HashSet`s. Their
+iteration order is random per process, and per instance within a
+process. The recall order changed which message overtook which, and
+from there the whole schedule.
+
+Fix: they are `BTreeSet`s now (`crates/meta/src/replay.rs`). No caller
+depended on the set type.
+
+Verification:
+- 8 replays of 196102 with debug logs give byte-identical logs, after
+  normalizing wall-clock `time_ns` and segment bytes;
+- `locks_seed_replays_identically` now includes 196102 (in the
+  `locks-delegated` config). With `HashSet`s restored it fails 3 of 5
+  runs in one process;
+- `long_delegated` seed 70162, which failed 10/150 on main, now passes
+  8/8. Seed 70705 now fails deterministically (below).
+
+One residual: records carry wall-clock `time_ns` (meta's `now_ns`). The
+checker zeroes these times, no decision reads them, and their varint
+length is constant, so they change bytes, not the schedule.
+
+With the order fixed, 196102 takes the passing branch: d1's recall now
+goes first. The bug is still there. On the determinism-only build,
+`locks-delegated` seeds 96425 and 96805 fail every time in the same way
+(2 of 96000..97000; 0 of 196000..198000).
+
+### 2. Root cause
+
+These times are from a failing 196102 replay on main. Node 2 is the
+delegate of `d1`; the lock files are in `d1`.
+
+1. At t=1994, node 3 gets exclusive grant `…784` on `0x800` from node 2
+   (generation 3). Node 3 honours it until 2976 (`sent + ttl − margin`).
+   Node 1 holds `…783` exclusive on `0x801`.
+2. At about 2088, a cross-subtree rename makes the root recall
+   generations 3 and 4. Node 2 hands `…783` and `…784` back, and the
+   root re-delegates `d1` to node 2 as generation 5.
+   `lock_on_delegated` moves both grants into `handoff[5]`, to ride
+   generation 5's first granting `DelegRenewed`.
+3. At about 2131, another cross-subtree rename makes the root recall
+   generation 5 right after that renewal. The `DelegRecall` reaches
+   node 2 before the `DelegRenewed`. Node 2 answers with an empty table.
+   The late handoff is then installed under generation 5, which node 2
+   no longer serves. When the log ends generation 5 at 2196, node 2
+   drops the grants.
+4. The root ends generation 5. Because `handoff_sent` was set, it puts
+   a subtree grace on `d1`, but that grace lives only in the root's
+   `lk.grace`, which only the root's own grant decisions consult. In
+   the same event the root re-delegates `d1` as generation 7, with an
+   empty handoff.
+5. At 2431, node 2, as generation 7's delegate with an empty table,
+   grants itself `…786` exclusive on `0x800`. Node 3 is still honouring
+   `…784` (until 2976) and enters I/O at 2527: a violation. Node 3 learns
+   its grant is `Lost` only at 2741, at its next renewal.
+
+The same hole has a second entry: a lost handoff reply. The root takes
+`handoff[gen]` once. If the `DelegRenewed` carrying it is lost, the
+delegate renews again, gets a reply without it, and serves without
+those grants.
+
+Candidates ruled out:
+- arrival-time accounting and late-grant renewal (fc3c5f6): the grant
+  times are consistent;
+- failover and the backup mirror: the seed has no faults;
+- the checker. Its "hold" runs in true simulated time from the first
+  unfenced I/O step to the unlock or the first fenced step. Both
+  holders were inside their honoured windows. The holder's window
+  (`sent + ttl − margin`) and the grantor's record (`granted/arrival +
+  ttl + margin`, restamped `now + ttl + margin` at a move) are what
+  ADR-25 says.
+
+The violation is real.
+
+### 3. Fix (`crates/authority/src/core/locks.rs`, small hooks in `delegate.rs`/`mod.rs`)
+
+The root keeps copies of what it handed (`LockState::handed`, per
+generation, with the root's own `until`) until they would have expired
+there.
+- **Re-send.** Every granting renewal carries the live copies
+  (`lock_take_handoff(now, gen)`). The delegate installs each id once
+  (`moved_seen`), and only for a generation it serves
+  (`deleg_mine_until`). A handoff for a stopped or ended generation is
+  dropped, because the root reinstates it (next item). The delegate
+  serves only after a granting renewal, and every such renewal carries
+  the copies, so it never serves without them.
+- **Reinstate.** `end_generation` calls `lock_on_generation_ended`.
+  Copies still waiting and copies handed but not handed back return to
+  the root's table with the root's `until`. The subtree's next
+  delegation (`lock_on_delegated`) then takes them along.
+  `lock_install_returned` removes a returned grant's copy.
+- **Consistency.** A copy is installed, reinstated or re-sent only into
+  a table with no grant of the same node on that inode and no
+  conflicting grant (`LockTables::install_if_consistent`,
+  `crates/meta/src/locks.rs`). Either kind of grant is newer: the
+  delegate serves only with the copies installed, so it made that grant
+  after the copy's grant had left its table.
+
+  A first version checked only the same node. It revived a copy whose
+  grant had been released at the delegate next to the conflicting grant
+  made after it. The owner then re-affirmed the stale grant as the
+  node's own, with no conflict check (`lock_try_grant`'s `own.mode ==
+  mode` shortcut). That broke about 5% of `locks-delegated` seeds (for
+  example 196004, 96012, 197022).
+- The drained-but-handoff-sent grace is gone, because reinstatement is
+  exactly what it approximated. An outwaited generation (`!drained`)
+  still leaves its grace (the model shows reinstatement makes that
+  grace redundant too).
+
+Liveness is better. Over `locks_in_a_delegated_subtree`
+(96000..96080), main against this fix:
+- grace refusals: 84 → 0;
+- total lock wait: 637 s → 503 s;
+- outwaited recalls: 61 → 69. Revived copies whose holder had released
+  them cost one outwait each.
+
+New stat: `lock_reinstated`.
+
+### 4. Model (`crates/model/src/locks.rs`, `tests/locks.rs`)
+
+The model was clean because it moved the table atomically: the delegate
+served at once with it. It now carries the handoff as a message
+(`handoff_in_flight`, the design default). The delegate serves from its
+delivery. The recall can overtake it: a delegate that answered the
+recall drops a handoff for that generation (`dmine`). The handoff can
+be dropped, and `DelegRenewal` re-sends the copies. The generation
+counter lets the model re-delegate the same subtree. New knobs:
+`reinstate_handed`, `resend_handoff`, `copies_check_conflicts`, and
+`handoff_grace` (the design before this fix). New property:
+`table_consistent`, no table holds two live conflicting grants.
+
+| Test | Result |
+|---|---|
+| `a_handoff_overtaken_by_its_recall_violates_without_reinstatement` | violation (80K states) |
+| `a_root_grace_that_stays_behind_violates_on_redelegation` (`handoff_grace`) | violation (204K): recall overtakes, root grace, re-delegation, the new delegate grants: 196102's path |
+| `a_lost_handoff_violates_without_the_resend` | violation (288K) |
+| `reinstating_next_to_a_conflicting_grant_breaks_the_table` | `table_consistent` violated (the 196004 bug) |
+| `overtaken_handoffs_and_redelegation_are_clean` (3 moves) | clean, exhaustive (12.1M) |
+| `lost_handoffs_resent_are_clean` (a drop, a re-send) | clean, exhaustive (14.7M) |
+| `an_outwaited_delegate_with_reinstatement_needs_no_grace` | clean (3.1M) |
+| the 20 existing tests (the delegation ones now with the handoff in flight; `move-state` at `max_tick` 5, 38M) | as before |
+
+27 passed (1 ignored), 93 s in release.
+
+### 5. Regression tests (`crates/authority/tests/sim.rs`)
+
+- `regression_locks_delegated_handoff_overtaken_by_recall` runs seeds
+  196102, 96425, 96805 and 196004. 96425 and 96805 fail without the
+  fix; 196004 fails with the first version.
+- `locks_in_a_delegated_subtree` now asserts `reinstated > 0` (15 in
+  its range).
+- `locks_seed_replays_identically` now includes 196102.
+- `crates/meta` has a unit test for `install_if_consistent`.
+
+### 6. Sweeps (final code, per-seed `replay_seed` in parallel; `long_locks`' ranges and configs)
+
+| Config | Seeds | Result |
+|---|---|---|
+| `locks` | 190000..192000 | 2000 pass |
+| `locks-partition` | 191000..193000 | 2000 pass |
+| `locks-skew` | 192000..194000 | 2000 pass |
+| `locks-failover` | 193000..195000 | 2000 pass |
+| `locks-failover-backup` | 194000..196000 | 2000 pass |
+| `locks-faults` | 195000..197000 | 1999 pass; **195356** fails, pre-existing (below) |
+| `locks-pause` | 197000..199000 | 2000 pass |
+| `locks-delegated` | 196000..198000, plus 96000..97000 | 3000 pass |
+| `long_delegated` | 70000..71000 | 999 pass; **70705** fails, pre-existing (below) |
+
+The model `locks` suite: 27 pass.
+
+### Pre-existing failures found, not lock properties (for the coordinator)
+
+- **`locks-faults` seed 195356**: "history is not linearizable", after
+  "cut S3 for node 1 for 1653 ms" and "crash holder 1 (restart, keep
+  journal)" at t=1588. It fails 6/6 on a pristine main edd3d5d build.
+  The config has no delegations, so none of this fix's code runs. It
+  was outside M14's 300-seed range.
+- **`long_delegated` seed 70705**: "`Create("d2/f3")` returned `Eexist`
+  but no state in its window" (after an `Unlink("d2/f3")`). It fails
+  1/6 on main (random order) and every time now. It is probably the
+  same class as the earlier nondeterministic 70162 (M11 delegation
+  namespace).
+
+### Residual (documented, not fixed)
+
+A **released takeover's** grace (`lock_on_released_takeover`, a grace on
+the whole namespace at the new root) has the same shape as the bug. If
+the new root delegates a subtree inside that grace, the delegate learns
+nothing of the old tenure's grants. The new root has no copies to hand
+over, because it never knew those grants. The other root-side graces
+do not have this problem:
+- the fast-takeover floor keeps the view fenced, so no delegation
+  renewal is granted and no op executes;
+- the outwaited-delegate grace is covered by reinstatement.
+
+The fix would be to carry the remaining grace in `DelegRenewed`, and
+have the delegate apply it to its subtree from receipt, plus the
+margin. That changes `PeerMsg`, `net::Payload` and the driver. The sim
+has no config combining a released takeover with delegations.
+
+### Gates
+
+- `cargo fmt --all -- --check` and `cargo clippy --workspace
+  --all-targets -- -D warnings`: clean;
+- `cargo test -p constellation-authority --release`: 94 lib + 3 + 86
+  sim passed (8 ignored);
+- `constellation-meta`: all passed (88 lib);
+- `constellation-model --test locks`: 27 passed.
+
+No harness runs: the change is core-only and the sim covers it.

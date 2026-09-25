@@ -369,6 +369,29 @@ impl LockTables {
         g.grants.insert(grant.id, grant);
     }
 
+    /// Install a grant made elsewhere unless this table already has a
+    /// grant of the same node on the same inode, or a conflicting grant
+    /// of another node there — for the root's copy of a delegation
+    /// handoff, which is re-sent and may be reinstated after the table
+    /// moved on. Either grant here is newer than the copy: an owner that
+    /// knew the copy granted the node again (its holder replaced the old
+    /// id) or granted the conflicting one only after the copy left its
+    /// table (released, or expired at its holder). Reinstating it anyway
+    /// would put two conflicting grants in one table, and a request of
+    /// the copy's node would then be re-affirmed without a recall (sim
+    /// `locks-delegated` seed 196004). `false`: not installed.
+    pub fn install_if_consistent(&self, grant: Grant) -> bool {
+        let mut g = self.lock();
+        if g.grants
+            .values()
+            .any(|e| e.ino == grant.ino && (e.node == grant.node || e.mode.conflicts(grant.mode)))
+        {
+            return false;
+        }
+        g.grants.insert(grant.id, grant);
+        true
+    }
+
     /// Live grants on `ino` held by nodes other than `node` that conflict
     /// with `mode`. Expired grants are dropped on the way.
     pub fn conflicting(&self, ino: u64, node: u64, mode: LockMode, now_ms: i64) -> Vec<Grant> {
@@ -1009,6 +1032,30 @@ mod tests {
             start,
             end,
         }
+    }
+
+    #[test]
+    fn a_handoff_copy_is_installed_only_into_a_consistent_table() {
+        let t = LockTables::default();
+        let copy = |node: u64, seq: u64, mode: LockMode| Grant {
+            id: GrantId { node: 9, seq },
+            node,
+            ino: 7,
+            mode,
+            until_ms: 100,
+            recalled: false,
+            gen: 0,
+        };
+        // Node 2 was granted again (a newer id): the old copy stays out.
+        t.install(copy(2, 5, LockMode::Shared));
+        assert!(!t.install_if_consistent(copy(2, 1, LockMode::Exclusive)));
+        // Node 3's exclusive copy conflicts with node 2's grant (made
+        // after the copy's grant left): out.
+        assert!(!t.install_if_consistent(copy(3, 2, LockMode::Exclusive)));
+        // A compatible copy goes in, once.
+        assert!(t.install_if_consistent(copy(3, 3, LockMode::Shared)));
+        assert!(!t.install_if_consistent(copy(3, 3, LockMode::Shared)));
+        assert_eq!(t.grants_len(), 2);
     }
 
     #[test]

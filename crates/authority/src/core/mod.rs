@@ -677,6 +677,9 @@ pub struct Stats {
     pub lock_renewals_served: u64,
     pub lock_reclaimed: u64,
     pub lock_moved: u64,
+    /// Grants handed to a delegation that ended without handing them
+    /// back, reinstated in the root's table.
+    pub lock_reinstated: u64,
     /// Node side.
     pub lock_requests: u64,
     pub lock_unavailable: u64,
@@ -1428,10 +1431,8 @@ impl Core {
                 through,
                 locks,
             } => {
-                if !locks.is_empty() {
-                    // Back in the root's table (tag 0).
-                    self.lock_install_moved(now, 0, locks, replica);
-                }
+                // Back in the root's table (tag 0).
+                self.lock_install_returned(now, gen, locks, replica);
                 self.on_deleg_recalled(now, req, gen, through, replica, out)
             }
             PeerMsg::LockRequest {

@@ -58,6 +58,22 @@
 //!   found this: `tests/locks.rs`, `an_outwaited_delegate_without_grace_violates`).
 //!   `move_state = false` is the naive design that starts every move
 //!   with an empty table.
+//! - **The handoff in flight** (`handoff_in_flight`, the code's shape):
+//!   the table rides the delegate's first granting renewal *reply*
+//!   (`Handoff`), from which the delegate serves. The generation's recall
+//!   can overtake it — the delegate answers the recall with nothing and
+//!   drops a handoff for a generation it no longer serves — and it can
+//!   be lost. The root keeps a copy of what it handed: every granting
+//!   renewal re-sends the live copies (`resend_handoff`; the delegate
+//!   installs each id once), and a generation that ends without handing
+//!   a copy's grant back leaves the copy reinstated in the root's table
+//!   (`reinstate_handed`), whence the next delegation of the subtree
+//!   takes it along. A copy never goes into a table holding a newer
+//!   grant of its node or a conflicting one (`copies_check_conflicts`;
+//!   property `table_consistent`). The design before this
+//!   (`handoff_grace`: a grace at the root instead) is the sim's
+//!   `locks-delegated` seed 196102: the grace stayed at the root when
+//!   the subtree was delegated again.
 //!
 //! # The property
 //!
@@ -95,7 +111,9 @@
 //! | `Renew`/`RenewAck`/`Lost` | `Timer::LockRenew` → `PeerMsg::LockRenew` → `LockRenewed { ok }` |
 //! | `Io` fenced | `ConstellationFs::lock_fence(ino)` → `EIO` |
 //! | `Takeover` grace | `note_marker_landed`'s floor, extended to lock grants; reclaims in `on_lock_renew` |
-//! | `Delegate`/`Recall` state | `DelegRenewed { locks }` (first renewal) and `DelegRecalled { locks }` |
+//! | `Delegate`/`Recall` state | `DelegRenewed { locks }` (every granting renewal: `lock_take_handoff`) and `DelegRecalled { locks }` (`lock_install_returned`) |
+//! | `Handoff` delivered / dropped | `lock_install_moved` (`deleg_mine_until`, `moved_seen`, `install_if_consistent`) |
+//! | reinstated copies | `lock_on_generation_ended` from `end_generation` (`core/delegate.rs`) |
 //! | `Mirror` | `BackupAppend { locks }` (a snapshot rides the next append) |
 
 use stateright::{Model, Property};
@@ -153,6 +171,32 @@ pub struct LockModel {
     pub replicate: bool,
     /// A delegation move carries the table.
     pub move_state: bool,
+    /// The table rides the delegate's first granting renewal *reply*
+    /// (`Msg::Handoff`), as in the code: the delegate serves from its
+    /// delivery, the generation's recall can overtake it (a delegate
+    /// that answered the recall drops what arrives for the generation),
+    /// and it can be lost (the delegate renews again). `false`: the move
+    /// is atomic (the delegate serves at once with the table).
+    pub handoff_in_flight: bool,
+    /// The root keeps a copy of what it handed a generation, and a
+    /// generation that ends without handing a grant back leaves that copy
+    /// reinstated in the root's table (with the root's own `until`).
+    pub reinstate_handed: bool,
+    /// Every granting renewal re-sends the live copies; the delegate
+    /// installs each id once, never over a grant of the same node.
+    pub resend_handoff: bool,
+    /// A copy is reinstated (or installed from a re-send) only into a
+    /// table with no conflicting grant: one there is newer, and the copy
+    /// had left. `false` revives released copies next to them (the sim's
+    /// seed 196004 against a first version of the fix).
+    pub copies_check_conflicts: bool,
+    /// Delegation renewals (`DelegRenewal`) the root may answer.
+    pub max_deleg_renews: u8,
+    /// The design before `reinstate_handed` (M14's follow-up to sim seed
+    /// 196252): a generation that was sent a handoff ends with a grace
+    /// on the subtree *at the root* — which the subtree's next delegate
+    /// never learns of.
+    pub handoff_grace: bool,
     pub seq_margin: i16,
     pub node_margin: i16,
     pub lease_margin: i16,
@@ -194,6 +238,12 @@ impl LockModel {
             probe_freshness: true,
             replicate: true,
             move_state: true,
+            handoff_in_flight: true,
+            reinstate_handed: true,
+            resend_handoff: true,
+            copies_check_conflicts: true,
+            max_deleg_renews: 1,
+            handoff_grace: false,
             seq_margin: 1,
             node_margin: 1,
             lease_margin: 1,
@@ -303,6 +353,15 @@ pub struct Node {
     pub dtenure: Option<i16>,
     /// Root side: the delegation it granted is live below this.
     pub dgen: Option<i16>,
+    /// Delegate side: the generation it serves (from the delegation
+    /// record; `None` once it answered a recall or was outwaited).
+    pub dmine: Option<u8>,
+    /// Root side: its copies of what it handed the current generation.
+    pub handed: Vec<Grant>,
+    /// Root side: a non-empty handoff was sent to the current generation.
+    pub handoff_sent: bool,
+    /// Delegate side: the moved ids it installed (each once).
+    pub moved_seen: Vec<u8>,
     /// Backup side: the mirrored table and its version.
     pub mirror: (u8, Vec<Grant>),
     /// Root side: the mirror version counter.
@@ -352,6 +411,16 @@ pub enum Msg {
         ver: u8,
         table: Vec<Grant>,
     },
+    /// Root → delegate: a granting renewal reply of generation `gen`,
+    /// carrying the moved table (`first`: the first one of the
+    /// generation). `sent`: the delegate's clock when it asked.
+    Handoff {
+        to: u8,
+        gen: u8,
+        sent: i16,
+        first: bool,
+        table: Vec<Grant>,
+    },
     DelegRecall {
         to: u8,
     },
@@ -379,6 +448,8 @@ pub const SAW_TTL_TAKEOVER: u16 = 64;
 pub const SAW_FENCED: u16 = 128;
 pub const SAW_RECALL_BY_TTL: u16 = 256;
 pub const SAW_MIRROR_USED: u16 = 512;
+pub const SAW_REINSTATED: u16 = 1024;
+pub const SAW_RESENT: u16 = 2048;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -389,6 +460,9 @@ pub struct State {
     pub reg: Reg,
     pub owner: Owner,
     pub moves: u8,
+    /// The delegation generation counter.
+    pub gen: u8,
+    pub deleg_renews: u8,
     pub nodes: Vec<Node>,
     pub net: Vec<Msg>,
     pub next_id: u8,
@@ -650,6 +724,34 @@ impl State {
         self.nodes[h].floor = None;
     }
 
+    /// Root `r`: the generation ended; its copies of what it handed come
+    /// back unless the delegate handed that node's grant back
+    /// (`returned`) — with this root's own `until` (the holders measure
+    /// against the grants it made; the delegate never renewed one it did
+    /// not install).
+    fn reinstate_handed(&mut self, cfg: &LockModel, r: usize, returned: &[Grant]) {
+        let handed = std::mem::take(&mut self.nodes[r].handed);
+        if !cfg.reinstate_handed {
+            return;
+        }
+        let now = self.local(r);
+        for h in handed {
+            // A grant here of the same node, or a conflicting one, is
+            // newer: whoever made it knew the copy (the delegate serves
+            // only with the handoff installed), so the copy had left.
+            if h.until > now
+                && !returned.iter().any(|g| g.node == h.node)
+                && !self.nodes[r].table.iter().any(|g| {
+                    g.node == h.node || (cfg.copies_check_conflicts && g.mode.conflicts(h.mode))
+                })
+            {
+                self.nodes[r].table.push(h);
+                self.saw |= SAW_REINSTATED;
+            }
+        }
+        self.nodes[r].table.sort();
+    }
+
     fn restamp(&self, cfg: &LockModel, h: usize, table: Vec<Grant>) -> Vec<Grant> {
         let now = self.local(h);
         table
@@ -686,6 +788,9 @@ pub enum Action {
     RecallDelegation,
     /// Root: the delegation's TTL and margin passed without an answer.
     RecallByTtl,
+    /// Root: answer the delegate's renewal (with the handoff's live
+    /// copies when `resend_handoff`).
+    DelegRenewal,
 }
 
 impl Model for LockModel {
@@ -710,6 +815,10 @@ impl Model for LockModel {
                 last_probe: 0,
                 dtenure: None,
                 dgen: None,
+                dmine: None,
+                handed: Vec::new(),
+                handoff_sent: false,
+                moved_seen: Vec::new(),
                 mirror: (0, Vec::new()),
                 mirror_ver: 0,
             })
@@ -730,6 +839,8 @@ impl Model for LockModel {
             },
             owner: Owner::Root,
             moves: 0,
+            gen: 0,
+            deleg_renews: 0,
             nodes,
             net: Vec::new(),
             next_id: 0,
@@ -790,9 +901,18 @@ impl Model for LockModel {
                 {
                     actions.push(Action::Delegate(self.delegate));
                 }
-                if let Owner::Delegate(_) = s.owner {
+                if let Owner::Delegate(d) = s.owner {
                     if s.moves < self.max_moves {
                         actions.push(Action::RecallDelegation);
+                    }
+                    if self.handoff_in_flight
+                        && s.deleg_renews < self.max_deleg_renews
+                        && !s
+                            .net
+                            .iter()
+                            .any(|m| matches!(m, Msg::Handoff { to, .. } if *to == d))
+                    {
+                        actions.push(Action::DelegRenewal);
                     }
                 }
                 if self.recall_by_ttl
@@ -909,6 +1029,10 @@ impl Model for LockModel {
                 // delegate keeps owning `X` under the new root.
                 s.nodes[i].dgen = s.nodes[prev.holder as usize].dgen;
                 s.nodes[prev.holder as usize].dgen = None;
+                // A root's copies of a handoff die with its tenure (the
+                // code clears them when the lease is gone).
+                s.nodes[i].handed.clear();
+                s.nodes[prev.holder as usize].handed.clear();
                 if fast {
                     s.saw |= SAW_FAST_TAKEOVER;
                     let mirrored = std::mem::take(&mut s.nodes[i].mirror).1;
@@ -1026,13 +1150,38 @@ impl Model for LockModel {
                 let table = std::mem::take(&mut s.nodes[r].table);
                 s.nodes[r].parks.clear();
                 s.nodes[r].dgen = Some(s.local(r) + self.deleg_ttl + self.seq_margin);
-                s.nodes[d].dtenure = Some(s.local(d) + self.deleg_ttl - self.node_margin);
-                s.nodes[d].table = if self.move_state {
-                    s.restamp(self, d, table)
-                } else {
-                    Vec::new()
-                };
                 s.owner = Owner::Delegate(d as u8);
+                s.gen += 1;
+                if self.handoff_in_flight {
+                    // The delegate learns of the generation from the log
+                    // and serves from its first granting renewal, whose
+                    // reply carries the table.
+                    s.nodes[d].dmine = Some(s.gen);
+                    s.nodes[d].moved_seen.clear();
+                    s.nodes[r].handed =
+                        if self.move_state && (self.reinstate_handed || self.resend_handoff) {
+                            table.clone()
+                        } else {
+                            Vec::new()
+                        };
+                    s.nodes[r].handoff_sent = self.move_state && !table.is_empty();
+                    let sent = s.local(d);
+                    let gen = s.gen;
+                    s.send(Msg::Handoff {
+                        to: d as u8,
+                        gen,
+                        sent,
+                        first: true,
+                        table: if self.move_state { table } else { Vec::new() },
+                    });
+                } else {
+                    s.nodes[d].dtenure = Some(s.local(d) + self.deleg_ttl - self.node_margin);
+                    s.nodes[d].table = if self.move_state {
+                        s.restamp(self, d, table)
+                    } else {
+                        Vec::new()
+                    };
+                }
             }
             Action::RecallDelegation => {
                 let Owner::Delegate(d) = s.owner else {
@@ -1051,10 +1200,12 @@ impl Model for LockModel {
                 s.saw |= SAW_RECALL_BY_TTL;
                 s.nodes[r].dgen = None;
                 s.nodes[d as usize].dtenure = None;
+                s.nodes[d as usize].dmine = None;
                 s.nodes[d as usize].table.clear();
                 s.nodes[d as usize].parks.clear();
                 s.owner = Owner::Root;
                 s.nodes[r].table.clear();
+                s.reinstate_handed(self, r, &[]);
                 // The delegate's own grants were capped by its tenure,
                 // but the grants *moved* to it at the delegation carry
                 // the windows this root gave them (up to `lock_ttl` from
@@ -1065,6 +1216,33 @@ impl Model for LockModel {
                     s.nodes[r].floor = Some(s.local(r) + self.lock_ttl + self.seq_margin);
                 }
             }
+            Action::DelegRenewal => {
+                let Owner::Delegate(d) = s.owner else {
+                    return None;
+                };
+                let r = s.reg.holder as usize;
+                s.deleg_renews += 1;
+                // A renewal extends the root's record of the generation
+                // (measured from now, as the code's `until = now + ttl`).
+                let dgen = s.local(r) + self.deleg_ttl + self.seq_margin;
+                s.nodes[r].dgen = Some(s.nodes[r].dgen.map_or(dgen, |u| u.max(dgen)));
+                let now = s.local(r);
+                s.nodes[r].handed.retain(|g| g.until > now);
+                let table = if self.resend_handoff {
+                    s.nodes[r].handed.clone()
+                } else {
+                    Vec::new()
+                };
+                let sent = s.local(d as usize);
+                let gen = s.gen;
+                s.send(Msg::Handoff {
+                    to: d,
+                    gen,
+                    sent,
+                    first: false,
+                    table,
+                });
+            }
         }
         Some(s)
     }
@@ -1072,6 +1250,20 @@ impl Model for LockModel {
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always("mutual_exclusion", |_, s: &State| s.violation.is_none()),
+            // The owner's shortcuts (a node's own grant re-affirmed
+            // without a conflict check) rely on this: no table holds two
+            // live conflicting grants to different nodes.
+            Property::always("table_consistent", |_, s: &State| {
+                (0..s.nodes.len()).all(|h| {
+                    let now = s.local(h);
+                    let live: Vec<&Grant> =
+                        s.nodes[h].table.iter().filter(|g| g.until > now).collect();
+                    live.iter().all(|a| {
+                        live.iter()
+                            .all(|b| a.node == b.node || !a.mode.conflicts(b.mode))
+                    })
+                })
+            }),
             Property::sometimes("all_ops_done", |m: &LockModel, s: &State| {
                 s.nodes
                     .iter()
@@ -1100,6 +1292,8 @@ impl Model for LockModel {
                 s.saw & SAW_RECALL_BY_TTL != 0
             }),
             Property::sometimes("mirror_used", |_, s: &State| s.saw & SAW_MIRROR_USED != 0),
+            Property::sometimes("reinstated", |_, s: &State| s.saw & SAW_REINSTATED != 0),
+            Property::sometimes("resent", |_, s: &State| s.saw & SAW_RESENT != 0),
         ]
     }
 
@@ -1321,9 +1515,44 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 s.nodes[b].mirror = (ver, table);
             }
         }
+        Msg::Handoff {
+            to,
+            gen,
+            sent,
+            first,
+            table,
+        } => {
+            let d = to as usize;
+            if s.nodes[d].dmine != Some(gen) {
+                // Not a generation this node serves (it answered the
+                // recall, or was outwaited): dropped, as the code does.
+                return;
+            }
+            let tenure = sent + cfg.deleg_ttl - cfg.node_margin;
+            s.nodes[d].dtenure = Some(s.nodes[d].dtenure.map_or(tenure, |u| u.max(tenure)));
+            for g in s.restamp(cfg, d, table) {
+                if s.nodes[d].moved_seen.contains(&g.id) {
+                    continue;
+                }
+                s.nodes[d].moved_seen.push(g.id);
+                s.nodes[d].moved_seen.sort();
+                if s.nodes[d].table.iter().any(|e| {
+                    e.node == g.node || (cfg.copies_check_conflicts && e.mode.conflicts(g.mode))
+                }) {
+                    continue;
+                }
+                s.nodes[d].table.push(g);
+                s.nodes[d].table.sort();
+                if !first {
+                    s.saw |= SAW_RESENT;
+                }
+            }
+        }
         Msg::DelegRecall { to } => {
             let d = to as usize;
             let r = s.reg.holder;
+            s.nodes[d].dmine = None;
+            s.nodes[d].moved_seen.clear();
             s.nodes[d].dtenure = None;
             s.nodes[d].parks.clear();
             let table = std::mem::take(&mut s.nodes[d].table);
@@ -1341,7 +1570,11 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 return;
             }
             s.nodes[r].dgen = None;
-            s.nodes[r].table = s.restamp(cfg, r, table);
+            s.nodes[r].table = s.restamp(cfg, r, table.clone());
+            s.reinstate_handed(cfg, r, &table);
+            if cfg.handoff_grace && std::mem::take(&mut s.nodes[r].handoff_sent) {
+                s.nodes[r].floor = Some(s.local(r) + cfg.lock_ttl + cfg.seq_margin);
+            }
             s.owner = Owner::Root;
             s.mirror_push(cfg, r);
         }

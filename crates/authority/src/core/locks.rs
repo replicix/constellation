@@ -24,11 +24,15 @@
 //!   during a grace period, else `Lost`. The acknowledgement carries the
 //!   recalled flag, so a lost recall is repaired by the next renewal.
 //! - The table follows the subtree: handed to a delegate with its first
-//!   `DelegRenewed`, back with `DelegRecalled`; a delegate outwaited by
-//!   TTL leaves a grace on its subtree (the grants moved to it carry the
-//!   root's windows until their first renewal there — the model found
-//!   this). An asynchronous mirror rides to the backups (`LockMirror`);
-//!   a fast successor installs it, restamped, next to the floor.
+//!   granting `DelegRenewed`, back with `DelegRecalled`. The root keeps
+//!   its copy of what it handed ([`LockState::handed`]): every granting
+//!   renewal re-sends the live copies (the reply can be lost), and a
+//!   generation that ends without handing one back — its recall
+//!   overtook the reply — leaves it reinstated in the root's table,
+//!   where the subtree's next delegation takes it along. A delegate
+//!   outwaited by TTL also leaves a grace on its subtree. An
+//!   asynchronous mirror rides to the backups (`LockMirror`); a fast
+//!   successor installs it, restamped, next to the floor.
 //!
 //! # Node side
 //!
@@ -150,12 +154,25 @@ pub(crate) struct LockState {
     bk_mirror: Option<(u64, Vec<Grant>)>,
     /// Root: grants to hand to a delegate with its first renewal.
     handoff: BTreeMap<u64, Vec<Grant>>,
-    /// Root: generations a handoff was sent to. One may still be in
-    /// flight when the generation is recalled — the delegate's drained
-    /// answer then carries nothing back, and its holders still honour
-    /// their windows: such a generation ends with the subtree grace,
-    /// drained or not (sim seed 196252).
-    handoff_sent: std::collections::BTreeSet<u64>,
+    /// Root: the grants handed to a generation, as this root recorded
+    /// them (its clock), until they would have expired here. The handoff
+    /// rides a renewal *reply*, which the generation's recall can
+    /// overtake (the delegate answers the recall with nothing, then
+    /// drops what arrives for a generation it no longer serves) or which
+    /// can be lost (the delegate renews again and serves without them).
+    /// Either way the holders still honour the root's windows, so:
+    /// every granting renewal re-sends the live ones (the delegate
+    /// installs an id once), and a generation that ends without handing
+    /// one back leaves it reinstated here — where the next delegation of
+    /// the subtree takes it along. A subtree grace here instead covered
+    /// only this root's own grants: the next delegate of the subtree
+    /// granted over them (sim `locks-delegated` seed 196102, two
+    /// exclusive holders).
+    handed: BTreeMap<u64, Vec<Grant>>,
+    /// Delegate: the moved grant ids a generation installed (a re-sent
+    /// handoff installs each once: a grant released or replaced here
+    /// since is not revived).
+    moved_seen: BTreeMap<u64, std::collections::BTreeSet<GrantId>>,
 }
 
 impl LockState {
@@ -1999,18 +2016,67 @@ impl Core {
         }
     }
 
-    /// Root: what to hand a delegate with its renewal.
-    pub(crate) fn lock_take_handoff(&mut self, gen: u64) -> Vec<Grant> {
-        let grants = self.lk.handoff.remove(&gen).unwrap_or_default();
-        if !grants.is_empty() {
-            self.lk.handoff_sent.insert(gen);
+    /// Root: what to hand a delegate with a granting renewal — what is
+    /// waiting for its first one, and again every grant handed to it
+    /// before that this root would still consider live (see
+    /// [`LockState::handed`]; the delegate installs each id once).
+    pub(crate) fn lock_take_handoff(&mut self, now: Ms, gen: u64) -> Vec<Grant> {
+        let pending = self.lk.handoff.remove(&gen).unwrap_or_default();
+        let handed = self.lk.handed.entry(gen).or_default();
+        handed.extend(pending);
+        handed.retain(|g| g.until_ms > now.0);
+        let grants = handed.clone();
+        if grants.is_empty() {
+            self.lk.handed.remove(&gen);
         }
         grants
     }
 
-    /// Root: whether a handoff was ever sent to `gen` (cleared here).
-    pub(crate) fn lock_handoff_was_sent(&mut self, gen: u64) -> bool {
-        self.lk.handoff_sent.remove(&gen)
+    /// Root: generation `gen` ended. What was waiting for its first
+    /// renewal, and what was handed to it and not handed back, returns to
+    /// this table as this root recorded it (the holders measure their
+    /// windows against the grants it made or renewed; nobody renewed a
+    /// grant the delegate never installed, and one it did install and
+    /// renew came back with its drained answer — or was capped by its
+    /// tenure, which an outwait waited out). A grant here of the same node
+    /// on the same inode, or a conflicting one, is newer and stays (see
+    /// `LockTables::install_if_consistent`).
+    pub(crate) fn lock_on_generation_ended(&mut self, now: Ms, gen: u64, replica: &dyn Replica) {
+        let mut back = self.lk.handoff.remove(&gen).unwrap_or_default();
+        back.extend(self.lk.handed.remove(&gen).unwrap_or_default());
+        let mut n = 0;
+        for g in back {
+            if g.until_ms > now.0 && replica.locks().install_if_consistent(Grant { gen: 0, ..g }) {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.stats.lock_reinstated += n;
+            self.lk.mirror_dirty = true;
+            tracing::info!(
+                node = self.cfg.node_id,
+                gen,
+                n,
+                "a delegation ended without handing back grants this root handed it; reinstated"
+            );
+        }
+    }
+
+    /// Root: a delegate's drained answer handed `grants` back — installed
+    /// restamped; the root's copies of them are done.
+    pub(crate) fn lock_install_returned(
+        &mut self,
+        now: Ms,
+        gen: u64,
+        grants: Vec<Grant>,
+        replica: &dyn Replica,
+    ) {
+        if let Some(handed) = self.lk.handed.get_mut(&gen) {
+            handed.retain(|h| !grants.iter().any(|g| g.node == h.node && g.ino == h.ino));
+        }
+        if !grants.is_empty() {
+            self.lock_install_moved(now, 0, grants, replica);
+        }
     }
 
     /// Delegate: grants that came with a renewal or, root: with a recall
@@ -2022,20 +2088,50 @@ impl Core {
         grants: Vec<Grant>,
         replica: &dyn Replica,
     ) {
+        if gen != 0 && self.deleg_mine_until(gen).is_none() {
+            // A handoff for a generation this node no longer serves (its
+            // recall overtook the renewal reply carrying it, and was
+            // answered without it): the root reinstates what it handed
+            // when the generation ends. Installed here, the grants would
+            // be dropped at that end anyway.
+            if !grants.is_empty() {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    gen,
+                    n = grants.len(),
+                    "a lock handoff for a generation not served here; left to the root"
+                );
+            }
+            return;
+        }
         let until = self.restamp(now);
-        let n = grants.len();
+        let mut n = 0;
         for g in grants {
             // Tagged with the generation the move names (0: the root's
             // table) — never resolved from the delegation table, which
             // may not say yet (a handoff arrives with the renewal that
             // installs the generation; sim seed 196252 tagged it 0 and
             // lost it at the next recall).
-            replica.locks().install(Grant {
+            let g = Grant {
                 until_ms: until,
                 gen,
                 ..g
-            });
+            };
+            if gen == 0 {
+                replica.locks().install(g);
+            } else {
+                // A re-sent handoff: each id once, and never over a
+                // newer grant of the same node, or next to a conflicting
+                // one, here.
+                if !self.lk.moved_seen.entry(gen).or_default().insert(g.id) {
+                    continue;
+                }
+                if !replica.locks().install_if_consistent(g) {
+                    continue;
+                }
+            }
             self.stats.lock_moved += 1;
+            n += 1;
         }
         if n > 0 {
             tracing::debug!(
@@ -2054,6 +2150,7 @@ impl Core {
         // By tag, not by the table: a generation the log has already
         // ended resolves to nobody (sim seed 96046 left its grants
         // behind).
+        self.lk.moved_seen.remove(&gen);
         let mut taken = replica.locks().take_by_gen(gen);
         let by_tag = taken.len();
         taken.extend(replica.locks().take_where(|ino| {
@@ -2147,7 +2244,7 @@ impl Core {
         }
         self.lk.recall_by_req.clear();
         self.lk.handoff.clear();
-        self.lk.handoff_sent.clear();
+        self.lk.handed.clear();
         self.lk.grace.clear();
         let waiters = std::mem::take(&mut self.lk.waiters);
         for w in waiters {

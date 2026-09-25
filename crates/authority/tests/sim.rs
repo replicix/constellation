@@ -3116,6 +3116,7 @@ struct M14Totals {
     renewals_served: u64,
     reclaimed: u64,
     moved: u64,
+    reinstated: u64,
     lost: u64,
     released: u64,
     granted_recalled: u64,
@@ -3158,6 +3159,7 @@ impl M14Totals {
             self.renewals_served += s.lock_renewals_served;
             self.reclaimed += s.lock_reclaimed;
             self.moved += s.lock_moved;
+            self.reinstated += s.lock_reinstated;
             self.lost += s.lock_lost;
             self.released += s.lock_released;
             self.granted_recalled += s.lock_granted_recalled;
@@ -3272,17 +3274,44 @@ fn locks_in_a_delegated_subtree() {
         t.moved > 0,
         "the lock table never moved with the subtree: {t:?}"
     );
+    assert!(
+        t.reinstated > 0,
+        "no handoff was ever overtaken by its recall (the root's copies never reinstated): {t:?}"
+    );
+}
+
+/// `locks-delegated` seeds where two nodes held exclusive grants on one
+/// file (PROGRESS.md "Fix: long_locks seed 196102"): a delegation's lock
+/// handoff rides its first renewal reply, the generation's recall
+/// overtook it, and the root — which kept only a subtree grace, at the
+/// root — delegated the subtree again with an empty table; the new
+/// delegate granted over a live grant. 196102 is the `long_locks` seed
+/// (it failed about one run in two while `TouchSet` was `HashSet`s; with
+/// the order fixed it takes the passing branch); 96425 and 96805 fail
+/// that way deterministically without the fix; 196004 failed against a
+/// first version of it (a released grant's copy reinstated next to a
+/// conflicting grant).
+#[test]
+fn regression_locks_delegated_handoff_overtaken_by_recall() {
+    for seed in [196_102, 96_425, 96_805, 196_004] {
+        run_seed(seed, locks_delegated_config()).unwrap_or_else(|e| {
+            panic!("locks-delegated seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-delegated")
+        });
+    }
 }
 
 /// Plan 30 §M14: a lock seed replays identically (the lock tables and
-/// the ghost must not add nondeterminism).
+/// the ghost must not add nondeterminism; nor may the delegation
+/// table's resolution order — seed 196102's `HashSet`s).
 #[test]
 fn locks_seed_replays_identically() {
-    for seed in [90_003, 91_004] {
+    for seed in [90_003, 91_004, 196_102] {
         let cfg = if seed < 91_000 {
             locks_config()
-        } else {
+        } else if seed < 92_000 {
             locks_partition_config()
+        } else {
+            locks_delegated_config()
         };
         let a = run_seed(seed, cfg.clone()).expect("run a");
         let b = run_seed(seed, cfg).expect("run b");

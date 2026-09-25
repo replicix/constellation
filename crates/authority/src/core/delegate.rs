@@ -536,15 +536,16 @@ impl Core {
         // Plan 30 §M14: whatever lock grants of the subtree are still
         // here (the log ended the generation before the recall message
         // did, or without one) are dropped — their holders keep
-        // honouring them, which the root's outwait grace covers (a
-        // generation ended without the delegate's drained answer).
+        // honouring them: the root reinstated its copies of what it
+        // handed, and an outwaited generation's own grants were capped
+        // by its tenure.
         let dropped = self.lock_take_generation(gen, replica);
         if !dropped.is_empty() {
             tracing::info!(
                 node = self.me(),
                 gen,
                 n = dropped.len(),
-                "delegation ended by the log with lock grants still here; dropped (the root's grace covers their holders)"
+                "delegation ended by the log with lock grants still here; dropped"
             );
         }
         self.lock_reserve_all(now, replica, out);
@@ -1644,9 +1645,10 @@ impl Core {
             self.stats.deleg_renewals_refused += 1;
         }
         // Plan 30 §M14: the lock grants under the subtree travel with the
-        // first renewal that grants.
+        // first renewal that grants, and again with every later one while
+        // they may be live (the reply can be lost).
         let locks = if ttl_ms > 0 {
-            self.lock_take_handoff(gen)
+            self.lock_take_handoff(now, gen)
         } else {
             Vec::new()
         };
@@ -2261,20 +2263,14 @@ impl Core {
         replica.void_stream(gen, cursor);
         self.lease.touch(now);
         self.nudge(now, out);
-        // Plan 30 §M14: grants still waiting to be handed to this
-        // generation (it ended before its first renewal) come back to
-        // this table (sim seed 96027 lost them).
-        let back = self.lock_take_handoff(gen);
-        if !back.is_empty() {
-            self.lock_install_moved(now, 0, back, replica);
-        }
-        // A generation that did not hand its grants back (no graceful
-        // drain), or one whose handoff may still be in flight (sent with
-        // a renewal, recalled before it landed: the drained answer
-        // carries nothing), may leave holders honouring them: a grace on
-        // the subtree (sim seeds 96046, 196252).
-        let handoff_sent = self.lock_handoff_was_sent(gen);
-        if !drained || handoff_sent {
+        // Plan 30 §M14: grants handed to this generation and not handed
+        // back (still waiting for its first renewal — sim seed 96027 —,
+        // or sent with a renewal reply its recall overtook or that was
+        // lost — seeds 196252, 196102) come back to this table, where
+        // the subtree's next delegation takes them along. An outwaited
+        // generation also leaves a grace on the subtree (sim seed 96046).
+        self.lock_on_generation_ended(now, gen, replica);
+        if !drained {
             self.lock_on_generation_outwaited(now, gen, dir);
         }
         tracing::info!(

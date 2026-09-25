@@ -785,6 +785,12 @@ strict mode (cross-node byte-range locks) had never been built.
 - After a fast takeover, the successor waits out a grace period and
   accepts reclaims; after a TTL takeover every old grant has already
   lapsed. Locks never go through the S3 inbox.
+- The grant table moves with a delegated subtree. The handoff rides a
+  renewal reply, which the delegation's recall can overtake or which can
+  be lost, so the root keeps a copy of what it handed. It re-sends the
+  copy with every renewal and takes it back into its own table if the
+  delegation ends without returning it. A grace period left at the root
+  would not follow the subtree to its next delegate.
 
 **Consequences**: lock users get correct cross-node exclusion by
 default; workloads that never lock pay one atomic load per I/O; a single

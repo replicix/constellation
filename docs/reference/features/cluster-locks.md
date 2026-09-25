@@ -197,11 +197,22 @@ keeps the lease where it is.
 The lock table follows the subtree. The root hands a subtree's grants to
 its delegate with the delegate's first renewal, and gets them back when
 the delegation is recalled. The receiver restamps each grant so that it
-never expires at the owner before it lapses at the node. A delegate
-that was outwaited (it stopped answering) leaves a grace period on its
-subtree. Name-hash range delegations need nothing extra: a file's lock
-owner is resolved from its primary link, like every other ownership
-lookup.
+never expires at the owner before it lapses at the node.
+
+The handoff rides a renewal reply, so it can arrive after the
+delegation's recall, or not at all. The root therefore keeps a copy of
+what it handed. Every renewal it grants re-sends the copies that are
+still live, and the delegate installs each grant once. It starts
+serving locks only from a renewal that carried them. When a delegation
+ends without handing a grant back, the root puts its copy back in its
+own table. The next delegation of the subtree then takes that grant
+along. A copy is skipped when the table already holds a newer grant for
+the same node on that file, or a conflicting grant. A delegate that was
+outwaited (it stopped answering) also leaves a grace period on its
+subtree.
+
+Name-hash range delegations need nothing extra: a file's lock owner is
+resolved from its primary link, like every other ownership lookup.
 
 ### Without P2P
 
