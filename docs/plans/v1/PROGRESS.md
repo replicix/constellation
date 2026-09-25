@@ -19221,3 +19221,275 @@ replays through `setattr`, which now cuts the manifest.
   | `epoch-missing-node` | passed |
   | `epoch-peer-reaching-s3-declines` | passed |
   | `chaos-ci` | passed |
+
+## Fix: M9 backup-crash failures (branch `fix-backup-crash`)
+
+(2026-09-25. Off main 9589b85, uncommitted. Main has since moved to
+9794abc; its diff applies cleanly over this tree, and only
+`PROGRESS.md` needs a merge.)
+
+Sweeps of the backup configurations on main turned up about 0.2% of
+seeds failing in `backup-crash` and `backup-crash-slow` and a few in the
+others. The failures were:
+- acknowledged writes missing from the log;
+- ordering violations ("returned before … was invoked but follows it
+  in the log");
+- monotonic-read violations;
+- divergence;
+- runs that never quiesced or never answered.
+
+The coordinator added three seeds that fail on the M12 tree (below). Each
+distinct cause is listed here with its trace, fix, and deterministic test.
+All of them pass on the M12 tree with this diff applied (a scratch copy of
+M12 plus this diff, since removed).
+
+### The causes
+
+1. **Acknowledged under `Local` while a backup could be had.**
+   - `ack_need` looked only at `candidate`, while `durable_jseq` also
+     honours `eligible`.
+   - Seed 606255 (backup-crash): the holder's removal CAS emptied its
+     set (`Local`, config_version 3). Node 3 was eligible, but no
+     candidate had been named yet. Rid (1,1,5) was acknowledged at once,
+     with jseq 30 and durable 27. The holder then crashed with S3 cut, so
+     the successor never saw the row, and the create came back as a
+     conflict copy.
+   - Seed 603322 (backup-crash-slow) is the same thing in a tenure's
+     first event: the ops queued behind the acquisition ran before the
+     tenure's first selection pass had assessed eligibility.
+   - M12 seed 1438 is the same class.
+   - Fix:
+     - `ack_need` gates exactly when `durable_jseq` does.
+     - `eligible` is `Option<bool>`; `None` (not yet assessed) gates when
+       backups are possible at all.
+     - The acquisition assesses it on winning (`acquire_won`).
+     - Eligibility is kept while the lease is held, and reset only when
+       it is not.
+   - With no peer in budget, `Local` acknowledges at once as before:
+     `no_peer_in_budget_is_todays_behaviour` still sees 0 waits.
+   - Test: `nothing_is_acknowledged_locally_while_a_backup_could_be_had`.
+2. **A sealed backup's own lease at the next epoch is its landed
+   takeover.** Three ways it went wrong:
+   - Seed 603631 (backup-crash-slow): the takeover CAS applied, then
+     timed out (an injected `AppliedThenTimeout`). The retry re-adopted
+     the lease as a plain own-lease claim, which named no predecessor, so
+     the gate skipped the tail. The watch then read the lease, found it
+     "moved on", and voided the tail.
+   - Seed 601692: the successor crashed inside its gate (its marker had
+     landed) and restarted with its role, seal and tail on disk. The same
+     skip followed.
+   - M12 seed 1353: the watch's next lease read, taken after a
+     successful CAS, took the void branch.
+   - Fix:
+     - The gate re-ships the sealed tail when this node's own lease is at
+       `role.epoch + 1`.
+     - The watch never voids a tail on reading its own lease at that
+       epoch; it enqueues the acquisition instead.
+     - An ambiguous takeover CAS (`CasFailure::Failed`) remembers the
+       lease it replaced (`LeaseState::ambiguous_claim`), so the landed
+       takeover keeps its predecessor for the strict-read floor
+       (`fast_prev`) too.
+   - Tests: `a_sealed_backups_own_lease_at_the_next_epoch_reships_its_tail`
+     (the CAS applies but reports a timeout; checks the watch, the gate
+     and the marker) and `a_restarted_successor_reships_the_tail_it_sealed`.
+3. **A takeover deposed while retrying its marker never finished.**
+   - A marker conflict retries through a tail. When that tail found a
+     newer epoch, the node was deposed, which voids the gate. The marker
+     retry then issued nothing, and the `Acquire` job held the slot for
+     good: no round ran, and the node never tailed again.
+   - M12 seed 892 and backup seed 727961 never quiesced because of this.
+   - Fix: after the tail, a voided gate finishes the job the way a failed
+     marker PUT does. `acquire_gate` refuses to treat a lost node's
+     "no gate" as "open".
+   - Test: `a_takeover_deposed_while_retrying_its_marker_finishes_the_acquisition`.
+4. **A client retrying a rid that is under replay was never answered.**
+   - Long-acks3 seed 50557: the client heard `InDoubt`. Its retry by rid
+     arrived while this node's own replay of the same rid was forwarded,
+     and was dropped as a duplicate. The replay's outcome went only to
+     the replay queue.
+   - Fix: such a replay entry is marked `also_client`, and its outcome
+     (or `InDoubt`) answers the client too.
+   - Test: `a_client_retrying_a_rid_under_replay_is_answered_by_the_replay`.
+5. **The re-shipped tail and M6 positions: monotonic reads.**
+   - Seeds 607661 (backup), 600066, 600097, 601854 and 601917
+     (backup-crash-slow), and 603063 and 609068 (backup-crash).
+   - Seed 607661: node 2's `unlink f0` was refused `ENOENT` at the
+     holder's position `(seq 18, pending (1, 53))`. The name had been
+     renamed by node 1's acknowledged but unshipped `rename f0 f1`
+     (jseq 50). The holder crashed. Its sealed backup shipped its marker
+     at seq 19 and re-shipped the tail at seq 20. M6 orders positions
+     epoch-first, so node 2's observation was "reached" at the marker,
+     and a read in between saw `f0` again.
+   - M6's rule ("an observer of stranded work stops waiting at the
+     marker") is right for a TTL takeover, but not once M9 re-ships the
+     work.
+   - Fix:
+     - A sealed takeover's marker now carries the new record
+       `LogRecord::TailFollows { prev_epoch }`.
+     - A replica applying it calls `SessionState::owe`. Until the applied
+       journal position passes the marker, a target of an older epoch is
+       not reached.
+     - TTL takeovers' markers are unchanged.
+     - Own-segment recovery ignores the record.
+   - This is a log-format addition: a new `LogRecord` variant, so older
+     binaries cannot decode such markers. Plan 30 waives compatibility,
+     and M11 set the precedent with `Delegate`/`Recall`.
+   - The trace also showed that the re-applied tail dropped its outcome
+     rows. `Refused` and `InboxAck` touch no key, so the tail's journaled
+     apply never journaled them, and the log never carried the refusals.
+     The adopted path now journals them, with the refusal's `completed`
+     row at its journal seq. The tail's dedup also recognises a refusal
+     already in the log.
+   - Tests: `an_announced_tail_keeps_older_observations_waiting_past_the_marker`
+     (meta session) and `an_adopted_tails_refusal_and_inbox_ack_are_journaled`.
+6. **A hint over live speculation (divergence).**
+   - Seed 601075 (backup-crash-slow): replies overtook each other. The
+     `Exists` reply to `create f0` arrived after the shadow of the later
+     `rename f0 f1`, and the hint put `f0` back on the renamed inode,
+     leaving `f0` and `f1` on one inode.
+   - Fix: `install_hint_from` refuses when live speculation touches the
+     hint's keys. The refusal then waits for the log, which is always
+     correct. `Meta::install_hint` returns `bool`, and the property test
+     records only installed hints.
+   - Test: `a_hint_is_not_installed_over_live_speculation_on_its_keys`.
+7. **A shipped row's acknowledgement was stuck behind a lapsed lease.**
+   - Long-acks3 seed 801715: an `ack=s3` holder's segment landed while
+     the holder was paused past its lease. `backup_after_event`'s
+     non-holding branch never ran `complete_ready`, and it also reset
+     `shipped_through`. The park stayed until the client deadline
+     answered `EIO`.
+   - Fix: parks whose jseq is at or below the journal's shipped
+     watermark are released, whatever the lease says, and the
+     non-holding branch runs `complete_ready`. A deposition still aborts
+     parks first.
+   - Test: `a_shipped_row_is_acknowledged_though_the_lease_lapsed`.
+8. **In doubt at the deadline, though the log had the op.**
+   - Acks3 seeds 700087 and 701368: the deposed holder's own write had
+     landed in its last segment before a pause. The retries timed out,
+     and the deadline answered `EIO`.
+   - Fix: at the deadline, a node that holds no lease answers from
+     `completed`. Such a node only has `completed` rows from applied
+     segments.
+   - Test: `a_deadline_answers_from_the_applied_log`.
+9. **A non-backup claimed a `Backup` lease at its expiry.**
+   - Long-backup seed 802943: holder 1 was cut from S3 and could not
+     renew; it was also partitioned from node 2. Its backup, node 3,
+     still heard it and did not seal. Node 2 claimed by TTL at the
+     expiry. Node 3's acknowledged tail came back only as holder 1's
+     replay by rid, after ops invoked once it had been acknowledged.
+   - Fix: a node that is not a listed backup waits
+     `backup_claim_grace_ms` (2 × `backup_takeover_ms`) past a `Backup`
+     lease's expiry. A lapsed holder stops appending, so its backups seal
+     and claim first; only their claim re-ships the tail. If no backup
+     claims, anyone may claim after the grace.
+   - Behaviour change: after a holder dies with its backups also gone,
+     a TTL takeover by another node now comes 2 × `backup_takeover_ms`
+     (3 s by default) later. The grace also lets a backup that is back
+     from a crash in time claim (seed 602011).
+   - Test: `a_non_backup_waits_the_grace_before_claiming_a_backup_lease`.
+
+### What was not a product bug: two failures within one backup's budget
+
+One backup means an acknowledged row survives one failure. Some seeds
+crash the holder, then separately crash or pause its backup, or its
+sealed successor before that successor re-ships the tail. If they do so
+long enough that no copy can reach the log before others may claim the
+lease, the rows are lost, and they come back only as the deposed
+holder's replays, which may conflict.
+
+Examples, all proven from their traces:
+- 609417: the successor, mid-gate, was paused 6.9 s against a 6 s TTL.
+- 609380, 603226, 601486, 604392: the successor crashed after
+  re-applying the tail, before shipping it, until past its own lease.
+- 602011 and 701598: the backup crashed before sealing and was back too
+  late. With the claim grace, 602011 now passes strictly.
+
+The sim now records such faults (`Cluster::note_takedown`, reported as
+`Report::durability_budget_exceeded`). A takedown counts only when it is
+the *second* failure: every other copy is already down. Those copies are
+the holder the node backs (sealed or not), or the backups of the lease it
+holds. It must also keep every copy down past the point others may claim
+the lease, meaning its expiry (plus the backups' grace for a `Backup`
+lease), with each backup allowed its silence window and four S3 round
+trips to claim. For such a run, and only such a run, the strict-durability
+checks treat acknowledged ops like `Local`'s. Every other check still
+applies.
+
+A holder that acknowledged under `Local` because no peer was in budget is
+not counted: that is `Local`.
+
+Relaxation numbers, over the 150,000 fresh seeds below:
+- The rule fired on 1,055 seeds, all in configurations whose faults
+  include a holder crash plus a random fault.
+- Run with the relaxation off, only 16 of them fail, all in
+  `backup-crash-slow`.
+- Spot checks confirm those 16 are double faults.
+
+### Sweeps (release, 8 threads, fresh seeds 900000+, final build)
+
+| Config | Seeds | Failures | Budget-relaxed (fail strictly) |
+|---|---|---|---|
+| `backup-crash` | 30000 | 0 | 378 (0) |
+| `backup-crash-slow` | 20000 | 0 | 356 (16) |
+| `backup` | 30000 | 0 | 72 (0) |
+| `backup-strict` | 10000 | 0 | 117 (0) |
+| `backup-departs` | 10000 | 0 | 0 |
+| `backup-partition` | 10000 | 0 | 0 |
+| `acks3-crash` | 10000 | 0 | 0 |
+| `acks3` | 10000 | 0 | 0 |
+| `long-backup` | 10000 | 0 | 132 (0) |
+| `long-acks3` | 10000 | 0 | 0 |
+
+- Main 9589b85 on seeds 600000+ failed 20/10000 `backup-crash`,
+  30/5000 `backup-crash-slow` and 1/10000 `backup`.
+- Earlier builds of this branch found the last three classes on fresh
+  ranges: 8 (acks3 700087) on seeds 700000+, and 7 and 9 (long-acks3
+  801715, long-backup 802943) on seeds 800000+. All three are fixed.
+
+### Tests
+
+- The core unit tests above, plus the meta tests
+  `an_adopted_tails_refusal_and_inbox_ack_are_journaled`,
+  `a_hint_is_not_installed_over_live_speculation_on_its_keys` and
+  `an_announced_tail_keeps_older_observations_waiting_past_the_marker`.
+  Each was checked to fail with its fix reverted.
+- `regression_backup_crash_classes` pins one seed per class. Each fails
+  on main 9589b85 and must now pass with no budget relaxation: 606255,
+  603322, 1454, 727961, 603631, 601692, 50557, 607661, 600066, 601075,
+  700087, 801715, 802943 and 602011. It also asserts that the double
+  faults 609417 and 802797 *are* recognised.
+
+### CI seed ranges (grown again)
+
+| Config | Seeds before → after |
+|---|---|
+| `backup` | 600 (unchanged) |
+| `backup-crash` | 200 → 600 |
+| `acks3-crash` | 40 → 200 |
+| `acks3` | 30 → 100 |
+| `backup-departs`, `backup-partition`, `backup-strict` | 100 → 200 each |
+| `backup-crash-slow` | 50 → 300 |
+
+The sim test binary now costs 563 CPU-s (was 413 after the hint fix),
+and 36 s wall on a 32-core host under load average 58.
+
+### Results
+
+- `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test -p constellation-authority --release`: 75 lib, 3
+  `meta_repro` and 65 sim (7 ignored), all pass.
+- `cargo test -p constellation-meta --release`: 128 passed.
+- `AUTHORITY_SIM_SEEDS=1000` with `long_random` and with `long_backup`:
+  both pass, 54 s and 53 s.
+
+### Files
+
+- `crates/authority/src/core/{backup,client,jobs,lease,mod,readindex}.rs`
+- `crates/authority/src/core/tests.rs` (module `backup_crash`, plus
+  `a_takeover_deposed_while_retrying_its_marker_finishes_the_acquisition`)
+- `crates/authority/src/replica.rs`
+- `crates/authority/tests/sim.rs` and `tests/sim/run.rs` (the budget)
+- `crates/meta/src/{record,replay,session}.rs`
+- `crates/meta/src/store/{local,spec}.rs`
+- `crates/meta/tests/speculation.rs`

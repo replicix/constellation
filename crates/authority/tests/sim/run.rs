@@ -316,6 +316,10 @@ impl Default for SimConfig {
 #[derive(Debug, Default)]
 pub struct Report {
     pub seed: u64,
+    /// Plan 30 §M9: faults that exceeded the one-failure durability
+    /// budget (`Cluster::note_takedown`); non-empty relaxes the
+    /// strict-durability checks for the run.
+    pub durability_budget_exceeded: Vec<String>,
     pub ops_invoked: usize,
     pub ops_returned: usize,
     pub tentative: usize,
@@ -369,6 +373,16 @@ pub struct Cluster {
     /// Plan 30 §M9: holder crashes (simulated ms) and, once known, the
     /// first acknowledgement after each.
     pub failovers: Mutex<Vec<(u64, Option<u64>)>>,
+    /// Plan 30 §M9's failure budget: faults that took down the last live
+    /// copy of acknowledged, unshipped rows for longer than a lease TTL
+    /// (see `note_takedown`).
+    pub budget_exceeded: Mutex<Vec<String>>,
+    /// When each node taken down by a fault is back (simulated unix ms).
+    pub down: Mutex<BTreeMap<NodeId, i64>>,
+    /// What a backup that is back needs, past its silence window, to
+    /// claim the lease: a lease read, a tail and the CAS (four S3 round
+    /// trips at the configured worst latency).
+    pub claim_ms: i64,
 }
 
 impl Cluster {
@@ -378,6 +392,119 @@ impl Cluster {
 
     pub fn ids(&self) -> Vec<NodeId> {
         self.nodes.lock().unwrap().keys().copied().collect()
+    }
+
+    /// Plan 30 §M9: one backup makes an acknowledged row survive *one*
+    /// failure — the holder's or the backup's. `node` is being taken down
+    /// (a crash, or a pause) until `back` (simulated unix ms; `None`:
+    /// for good). The rows it shares with its partner — the holder it
+    /// backs (sealed or not), or the backups of the lease it holds — stay
+    /// recoverable only if one of the copies is back before the current
+    /// lease expires: after that anyone may claim it by TTL and start
+    /// from a log without them (backup-crash seed 609417: the holder
+    /// crashed, and its sealed backup — mid-takeover, the tail not yet
+    /// re-shipped — was paused for 6.9 s against a 6 s TTL; 602011: the
+    /// backup crashed before sealing, and came back after the dead
+    /// holder's lease had lapsed and been claimed — 209 ms before it
+    /// could seal; 701598: it sealed 28 ms before the lease lapsed and
+    /// lost the claim race to a TTL takeover; 609380: the sealed successor re-applied the tail, then
+    /// crashed before shipping it, until past its own lease). Such a
+    /// fault is
+    /// recorded, and the run's strict-durability checks then treat
+    /// acknowledged ops like `Local`'s (a replay by rid may become a
+    /// conflict copy); every other check still applies.
+    pub async fn note_takedown(&self, node: NodeId, back: Option<i64>, at_ms: u64) {
+        if !self.ids().contains(&node) {
+            return;
+        }
+        let now = self.env.clock.now().0;
+        let back = back.unwrap_or(i64::MAX);
+        self.down.lock().unwrap().insert(node, back);
+        let Some(lease) = read_lease(&self.env.bucket).await else {
+            return;
+        };
+        let v = self.get(node).view();
+        // The copies that can still put the rows in the log before the
+        // lease lapses: the node the lease names (it ships them) and the
+        // backups that could seal and take over from it. A deposed
+        // holder's own journal only comes back as replays by rid, which
+        // run after the next holder's own ops (and may conflict).
+        let copies: Vec<NodeId> = if v.ack.backing_holder != 0 {
+            if lease.holder == node {
+                vec![node]
+            } else {
+                vec![v.ack.backing_holder, node]
+            }
+        } else if v.held_epoch.is_some()
+            && v.journal_len > 0
+            && (!v.ack.backups.is_empty() || v.stats.backup_takeovers > 0)
+        {
+            // A holder with unshipped rows: its backups have them too —
+            // or, as the sealed successor that re-applied its
+            // predecessor's tail and has no backup of its own yet, nobody
+            // does (seed 609380: crashed before shipping it). (A holder
+            // that acknowledged under `Local` because no peer was in
+            // budget is not a budget matter: that is `Local`.)
+            let mut c = v.ack.backups.clone();
+            c.push(node);
+            c
+        } else {
+            return;
+        };
+        if !copies.contains(&lease.holder) {
+            return;
+        }
+        let ids = self.ids();
+        let back_at = |id: NodeId| -> i64 {
+            if !ids.contains(&id) {
+                return i64::MAX;
+            }
+            let down = self.down.lock().unwrap().get(&id).copied();
+            let n = self.get(id);
+            match down {
+                Some(b) if b > now => b,
+                _ if !n.alive() => i64::MAX,
+                _ => now,
+            }
+        };
+        // One failure is within the budget: only a takedown while every
+        // other copy is already down can exceed it.
+        if copies.iter().any(|c| *c != node && back_at(*c) <= now) {
+            return;
+        }
+        // A backup that is back must still hear nothing from the holder
+        // for `backup_takeover_ms` before it may seal (its only evidence
+        // of the holder's death); the lease's own holder re-adopts it.
+        let seal_ms = (self.env.config)(node, 0).backup_takeover_ms as i64 + self.claim_ms;
+        let first_back = copies
+            .iter()
+            .map(|c| {
+                let b = back_at(*c);
+                if *c == lease.holder {
+                    b
+                } else {
+                    b.saturating_add(seal_ms)
+                }
+            })
+            .min()
+            .unwrap_or(now);
+        // Nobody else may claim a `Backup` lease before its expiry plus
+        // the backups' grace (`LeaseState::classify`).
+        let claimable_by_others = if lease.ack_policy == constellation_store_s3::AckPolicy::Backup
+            && !lease.backups.is_empty()
+        {
+            lease.expires_unix_ms
+                + constellation_authority::core::backup_claim_grace_ms(&(self.env.config)(node, 0))
+        } else {
+            lease.expires_unix_ms
+        };
+        if first_back > claimable_by_others {
+            self.budget_exceeded.lock().unwrap().push(format!(
+                "t={at_ms} node {node} taken down; the copies {copies:?} of holder {}'s acknowledged rows are all down until {} ms past the point others may claim its lease",
+                lease.holder,
+                first_back.saturating_sub(claimable_by_others)
+            ));
+        }
     }
 
     pub fn restart(&self, id: NodeId, meta: Option<Arc<Meta>>) {
@@ -905,6 +1032,10 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 .lock()
                 .unwrap()
                 .push((cluster.env.clock.elapsed_ms(), None));
+            let now = cluster.env.clock.now().0;
+            cluster
+                .note_takedown(holder, restart_ms.map(|r| now + r as i64), fault.at_ms)
+                .await;
             let meta = cluster.crash(holder);
             if let Some(after) = restart_ms {
                 tokio::time::sleep(Duration::from_millis(after)).await;
@@ -923,6 +1054,10 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} crash node {node} (restart {restart_ms:?}, keep_journal {keep_journal})",
                 fault.at_ms
             ));
+            let now = cluster.env.clock.now().0;
+            cluster
+                .note_takedown(node, restart_ms.map(|r| now + r as i64), fault.at_ms)
+                .await;
             let meta = cluster.crash(node);
             if let Some(after) = restart_ms {
                 tokio::time::sleep(Duration::from_millis(after)).await;
@@ -952,6 +1087,10 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} pause node {node} for {for_ms}ms",
                 fault.at_ms
             ));
+            let now = cluster.env.clock.now().0;
+            cluster
+                .note_takedown(node, Some(now + for_ms as i64), fault.at_ms)
+                .await;
             let until = tokio::time::Instant::now() + Duration::from_millis(for_ms);
             cluster.get(node).pause_until(until);
         }
@@ -995,6 +1134,10 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} crash backup {backup} of holder {} (restart {restart_ms:?})",
                 fault.at_ms, lease.holder
             ));
+            let now = cluster.env.clock.now().0;
+            cluster
+                .note_takedown(backup, restart_ms.map(|r| now + r as i64), fault.at_ms)
+                .await;
             let meta = cluster.crash(backup);
             if let Some(after) = restart_ms {
                 tokio::time::sleep(Duration::from_millis(after)).await;
@@ -1132,6 +1275,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         nodes: Mutex::new(BTreeMap::new()),
         env,
         failovers: Mutex::new(Vec::new()),
+        budget_exceeded: Mutex::new(Vec::new()),
+        down: Mutex::new(BTreeMap::new()),
+        claim_ms: 4 * cfg.s3_latency.1 as i64,
         epochs: Mutex::new(Vec::new()),
         split_brains: Mutex::new(Vec::new()),
         slack: cfg.epoch_slack,
@@ -1419,6 +1565,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // op is never exempt — a rollback of one is exactly what the backup
     // (or `ack=s3`) exists to make impossible, so only ops the client
     // abandoned (its process died with the call in flight) are tentative.
+    let budget_exceeded = cluster.budget_exceeded.lock().unwrap().clone();
+    report.durability_budget_exceeded = budget_exceeded.clone();
+    let strict_durability = cfg.strict_durability && budget_exceeded.is_empty();
     let mut tentative: HashSet<Rid> = abandoned.lock().unwrap().clone();
     let acked: HashSet<Rid> = history.returned().into_iter().map(|(rid, _)| rid).collect();
     let mut rolled_back_acked = 0usize;
@@ -1428,7 +1577,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             if acked.contains(rid) {
                 rolled_back_acked += 1;
             }
-            if !cfg.strict_durability {
+            if !strict_durability {
                 tentative.insert(*rid);
             }
         }
@@ -1505,7 +1654,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         witness.observed_tentative += w.observed_tentative;
     }
     report.observed_tentative = witness.observed_tentative;
-    if cfg.strict_durability && witness.observed_tentative > 0 {
+    if strict_durability && witness.observed_tentative > 0 {
         return Err(lin_context(format!(
             "{} refusal(s) observed an acknowledged effect that was later rolled back              (impossible under a durable acknowledgement policy)",
             witness.observed_tentative

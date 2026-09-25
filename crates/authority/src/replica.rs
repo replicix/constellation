@@ -577,6 +577,17 @@ impl Replica for Meta {
         // holder granted (each was capped by that holder's lease, which is
         // the safety argument; this only stops honouring them sooner).
         self.read_delegations().void_below_epoch(epoch);
+        // Plan 30 §M9 × §M6: a sealed backup's takeover marker; the
+        // predecessor's acknowledged tail follows it.
+        if records
+            .iter()
+            .any(|r| matches!(r, LogRecord::TailFollows { .. }))
+        {
+            self.session().owe(JournalPos {
+                epoch,
+                jseq: through,
+            });
+        }
         self.session().advance(
             seq,
             Some(JournalPos {

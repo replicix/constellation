@@ -88,7 +88,8 @@ impl TouchSet {
             | LogRecord::Refused { .. }
             | LogRecord::InboxAck { .. }
             | LogRecord::Delegate { .. }
-            | LogRecord::Recall { .. } => {}
+            | LogRecord::Recall { .. }
+            | LogRecord::TailFollows { .. } => {}
             LogRecord::Clone { nodes, .. } => {
                 for node in nodes {
                     self.dentries.insert((node.parent, node.name.clone()));
@@ -605,6 +606,8 @@ fn apply_one(
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             Ok(Applied::Done)
         }
+        // The replica's session state reads it (`SessionState::owe`).
+        LogRecord::TailFollows { .. } => Ok(Applied::Done),
     }
 }
 

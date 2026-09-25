@@ -738,7 +738,11 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                         continue;
                     };
                     let recs = vec![create(name, i, 0)];
-                    meta.install_hint(&recs, next_seq, epoch).unwrap();
+                    if !meta.install_hint(&recs, next_seq, epoch).unwrap() {
+                        // Live speculation touches the name: not installed.
+                        trace.push(format!("hint {name} refused"));
+                        continue;
+                    }
                     events.push(Event::Speculation(specs.len(), recs));
                     specs.push(Spec {
                         epoch,
@@ -964,4 +968,88 @@ fn speculation_matches_log_plus_surviving_speculation_long() {
             panic!("{e}");
         }
     }
+}
+
+/// Plan 30 §M9 (backup seed 607661): a sealed backup re-applies its
+/// predecessor's tail with `apply_adopted_records`. The tail's outcome
+/// rows — a journaled refusal, an inbox acknowledgement — touch no key,
+/// and were applied but never journaled, so the log never carried them:
+/// a later execution of the refused rid was no longer deduplicated
+/// anywhere but here. They ride this tenure's journal now.
+#[test]
+fn an_adopted_tails_refusal_and_inbox_ack_are_journaled() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(2);
+    let refused = rid(40);
+    let before = meta.journal_len().unwrap();
+    meta.apply_adopted_records(
+        &[LogRecord::Refused {
+            rid: refused,
+            errno: 17,
+        }],
+        None,
+    )
+    .unwrap();
+    let ack = LogRecord::InboxAck {
+        epoch: 1,
+        node: 3,
+        n: 0,
+        i: 0,
+    };
+    meta.apply_adopted_records(
+        &[create("x", ino(41), 10), completed(rid(41)), ack.clone()],
+        Some(rid(41)),
+    )
+    .unwrap();
+    let txs = meta.journal_txs_from(0, 1000).unwrap();
+    let rows: Vec<LogRecord> = txs.iter().flat_map(|t| t.records.clone()).collect();
+    assert_eq!(
+        meta.journal_len().unwrap() - before,
+        4,
+        "refusal, create, completion, inbox ack: {rows:?}"
+    );
+    assert!(rows.contains(&LogRecord::Refused {
+        rid: refused,
+        errno: 17
+    }));
+    assert!(rows.contains(&ack));
+    assert!(matches!(
+        meta.completed_outcome(refused).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Refused { errno: 17 })
+    ));
+}
+
+/// backup-crash-slow seed 601075: replies overtake each other. The
+/// `Exists` reply to `create f0` (read before `rename f0 f1` on the
+/// holder) arrived after that rename's shadow was installed here; the
+/// hint put `f0` back on the renamed inode — `f0` and `f1` on one inode,
+/// which no segment ever undid. A hint whose keys live speculation
+/// touches is not installed (the refusal waits for the log instead).
+#[test]
+fn a_hint_is_not_installed_over_live_speculation_on_its_keys() {
+    let meta = Meta::open_in_memory().unwrap();
+    let a = ino(50);
+    apply(&meta, 1, 1, &[create("f0", a, 10)]);
+    let rename = LogRecord::Rename {
+        parent: ROOT_INO,
+        name: "f0".into(),
+        new_parent: ROOT_INO,
+        new_name: "f1".into(),
+        time_ns: 11,
+    };
+    let op = MutateOp::Rename {
+        parent: ROOT_INO,
+        name: "f0".into(),
+        new_parent: ROOT_INO,
+        new_name: "f1".into(),
+    };
+    assert!(meta
+        .install_shadow(rid(51), 1, &op, &[rename, completed(rid(51))])
+        .unwrap());
+    let installed = meta
+        .install_hint_from(Some(rid(52)), &[create("f0", a, 10)], 3, 1, 0)
+        .unwrap();
+    assert!(!installed, "the stale hint went in over the shadow");
+    assert!(meta.lookup(ROOT_INO, "f0").unwrap().is_none());
+    assert_eq!(meta.lookup(ROOT_INO, "f1").unwrap().map(|e| e.ino), Some(a));
 }

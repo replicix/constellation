@@ -1208,6 +1208,12 @@ impl Core {
     }
 
     pub(crate) fn complete_ready(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        // Plan 30 §M9: a row at or below the journal's shipped watermark
+        // is in the log — durable whatever the lease says now (long-acks3
+        // seed 801715: the holder's segment landed while it was paused
+        // past its lease; the acknowledgement it was parked for was
+        // never released, and its client heard `EIO` at the deadline).
+        let shipped = replica.journal_acked_seq().unwrap_or(0);
         let ready: Vec<u64> = self
             .rd
             .parked
@@ -1215,7 +1221,8 @@ impl Core {
             .filter(|(_, p)| {
                 p.waiting.is_empty()
                     && p.quarantine.is_none_or(|q| q <= now)
-                    && p.durable.is_none_or(|j| self.durable_covers(j))
+                    && p.durable
+                        .is_none_or(|j| j <= shipped || self.durable_covers(j))
                     && p.deps.as_ref().is_none_or(|d| replica.reaches_streams(d))
                     && p.stream_need
                         .is_none_or(|(g, i)| self.deleg_stream_durable(g, i, replica))

@@ -424,6 +424,13 @@ struct Inner {
     /// Plan 30 §M11: the log part of the same (the root's replies, whose
     /// shadows do not raise `observed` either).
     frontier_log: Position,
+    /// Plan 30 §M9 × §M6: the latest applied epoch marker that announced
+    /// a re-shipped predecessor tail (`LogRecord::TailFollows`), as the
+    /// journal position it reached. Until the applied position moves
+    /// past it, a target of an older epoch is not reached: the effects
+    /// it names are acknowledged rows of the predecessor that the
+    /// successor ships next (see [`SessionState::owe`]).
+    owed: Option<JournalPos>,
 }
 
 impl Inner {
@@ -444,7 +451,12 @@ impl Inner {
     /// `applied_position().dominates(target)` with the void rule: a
     /// dependency on an ended generation counts as satisfied.
     fn reaches(&self, target: &Position) -> bool {
-        self.applied_seq >= target.seq
+        let owed = match (self.owed, target.pending) {
+            (Some(marker), Some(p)) => p.epoch < marker.epoch && self.applied <= Some(marker),
+            _ => false,
+        };
+        !owed
+            && self.applied_seq >= target.seq
             && self.applied >= target.pending
             && target.streams.iter().all(|(g, i)| {
                 self.voided.contains(&g) || self.streams.get(&g).is_some_and(|m| *m >= i)
@@ -647,6 +659,21 @@ impl SessionState {
 
     pub fn applied(&self) -> Position {
         self.inner.lock().unwrap().applied_position()
+    }
+
+    /// Plan 30 §M9 × §M6: the segment just applied is a sealed backup's
+    /// takeover marker at `marker` (its epoch and `through`) whose
+    /// successor re-ships the predecessor's acknowledged tail next. Until
+    /// the applied journal position passes `marker`, a target position
+    /// of an older epoch is not reached (backup-crash-slow seed 600066
+    /// and six more: a refusal observed the old holder's acknowledged,
+    /// unshipped rename; a read after the marker, before the re-shipped
+    /// tail, went back to the name's older state).
+    pub fn owe(&self, marker: JournalPos) {
+        let mut g = self.inner.lock().unwrap();
+        if g.owed.is_none_or(|o| o < marker) {
+            g.owed = Some(marker);
+        }
     }
 
     /// The replica applied (or shipped) a segment at `seq` shipped through
@@ -1011,6 +1038,41 @@ mod tests {
 
     fn jp(epoch: u64, jseq: u64) -> Option<JournalPos> {
         Some(JournalPos { epoch, jseq })
+    }
+
+    /// Plan 30 §M9 × §M6 (backup seed 607661, backup-crash-slow 600066):
+    /// a refusal observed the old holder's acknowledged, unshipped state
+    /// at `(1, 53)`; the sealed backup took over and its marker announced
+    /// the tail it re-ships (`TailFollows`). The marker alone does not
+    /// reach the observation; the successor's next segment does. A TTL
+    /// takeover's marker (no announcement) still ends the wait, as M6
+    /// wants: that tenure's unshipped work is not coming back.
+    #[test]
+    fn an_announced_tail_keeps_older_observations_waiting_past_the_marker() {
+        let s = SessionState::default();
+        let observed = Position {
+            seq: 18,
+            pending: jp(1, 53),
+            streams: Default::default(),
+        };
+        s.owe(JournalPos { epoch: 2, jseq: 4 });
+        s.advance(19, jp(2, 4));
+        assert!(!s.reaches(&observed), "reached at the marker");
+        s.advance(20, jp(2, 9));
+        assert!(s.reaches(&observed), "the tail landed");
+        // Without the announcement the marker ends the wait.
+        let t = SessionState::default();
+        t.advance(19, jp(2, 4));
+        assert!(t.reaches(&observed));
+        // A position of the new tenure itself is unaffected.
+        let s = SessionState::default();
+        s.owe(JournalPos { epoch: 2, jseq: 4 });
+        s.advance(19, jp(2, 4));
+        assert!(s.reaches(&Position {
+            seq: 19,
+            pending: jp(2, 4),
+            streams: Default::default(),
+        }));
     }
 
     #[test]

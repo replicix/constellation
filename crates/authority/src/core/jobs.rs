@@ -417,7 +417,14 @@ impl Core {
         );
         let seg = segment::decode(payload)?;
         if seg.node == self.cfg.node_id {
-            let Some(seqs) = replica.journal_head_matching(&seg.records)? else {
+            // (A marker's `TailFollows` is no journal row.)
+            let rows: Vec<LogRecord> = seg
+                .records
+                .iter()
+                .filter(|r| !matches!(r, LogRecord::TailFollows { .. }))
+                .cloned()
+                .collect();
+            let Some(seqs) = replica.journal_head_matching(&rows)? else {
                 anyhow::bail!(
                     "segment {seq} claims our node id {} but does not match the journal: \
                      state dir reuse or id collision",
@@ -436,7 +443,11 @@ impl Core {
             );
             // A marker whose PUT landed but whose reply was lost: the gate
             // need not ship another.
-            if seg.records.is_empty() {
+            if seg
+                .records
+                .iter()
+                .all(|r| matches!(r, LogRecord::TailFollows { .. }))
+            {
                 if let Some(gate) = self.lease.gate.as_mut() {
                     if gate.epoch == seg.epoch {
                         gate.marker_shipped = true;
@@ -807,8 +818,15 @@ impl Core {
         // Plan 30 §M6: the new tenure's journal position starts here, above
         // every position of the tenure it ends.
         let through = replica.journal_acked_seq().unwrap_or(0);
-        let payload = segment::encode(self.cfg.node_id, gate.epoch, through, &[], &[], &[])
-            .expect("empty segment");
+        let payload = segment::encode(
+            self.cfg.node_id,
+            gate.epoch,
+            through,
+            &[],
+            &[],
+            &marker_records(&gate),
+        )
+        .expect("marker segment");
         let seq = self.ship.next_seq;
         let op = self.issue_s3(S3Op::SegmentPut { seq, payload }, S3For::Job, out);
         self.set_phase(Phase::Marker { attempts }, Some(op));
@@ -917,8 +935,9 @@ impl Core {
         self.ship.head_seq = self.ship.head_seq.max(seq);
         self.ship.max_epoch = self.ship.max_epoch.max(epoch);
         self.stats.epoch_markers += 1;
-        let payload = segment::encode(self.cfg.node_id, epoch, through, &[], &[], &[])
-            .expect("empty segment");
+        let records = marker_records(gate);
+        let payload = segment::encode(self.cfg.node_id, epoch, through, &[], &[], &records)
+            .expect("marker segment");
         self.stream_passed(now, seq, epoch, &payload, out);
         out.push(Action::Announce {
             seq,
@@ -1894,6 +1913,26 @@ impl Core {
         };
         let lease = sent;
         let epoch = lease.epoch;
+        // Plan 30 §M9: this node's own lease at the epoch of a takeover
+        // CAS whose outcome was unknown is that takeover having landed:
+        // its predecessor is the lease that CAS replaced (the sealed
+        // holder's), for the strict-read floor and the backup tail alike.
+        let ambiguous = self.lease.ambiguous_claim.take();
+        let prev = match (prev, ambiguous) {
+            (Some(p), Some((claimed, replaced)))
+                if p.holder == self.cfg.node_id && p.epoch == claimed && epoch == claimed =>
+            {
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    epoch,
+                    prev_holder = replaced.holder,
+                    prev_epoch = replaced.epoch,
+                    "an earlier takeover CAS had landed; its predecessor stays the one it replaced"
+                );
+                Some(replaced)
+            }
+            (p, _) => p,
+        };
         tracing::info!(
             node = self.cfg.node_id,
             epoch,
@@ -1903,6 +1942,11 @@ impl Core {
             "acquired the lease"
         );
         replica.set_holder_epoch(epoch);
+        // Plan 30 §M9: assess now whether a backup could be had — the
+        // ops queued behind this acquisition run before the tenure's first
+        // selection pass, and an unassessed tenure holds their
+        // acknowledgements until it (`durable_jseq`).
+        self.ack.eligible = Some(!self.backup_candidates(now).is_empty());
         // Plan 30 §M9: a takeover of an unexpired lease (a seal, or
         // `ack=s3`) is what the permit allowed; the predecessor's
         // strict-read horizon becomes this tenure's acknowledgement floor
@@ -1918,13 +1962,24 @@ impl Core {
         if let Some(p) = prev.as_ref().filter(|_| fast_prev.is_some()) {
             self.note_fast_takeover(p);
         }
+        // The sealed backup's tail is re-applied by the tenure that
+        // succeeds the epoch it backed: a takeover from that holder, or
+        // this node's own lease at the very next epoch — its takeover
+        // landed but its gate never ran (it crashed or restarted inside
+        // it, backup-crash-slow seed 601692; its CAS reported failure
+        // although it applied, 603631). The tail and the role are on
+        // disk; nobody else can have held in between.
+        let sealed = self.bk.sealed;
         let backup_tail_epoch = prev
             .as_ref()
-            .filter(|p| takeover && p.holder != self.cfg.node_id)
             .and_then(|p| {
-                self.bk
-                    .role
-                    .filter(|r| r.epoch == p.epoch && r.holder == p.holder)
+                self.bk.role.filter(|r| {
+                    if p.holder != self.cfg.node_id {
+                        takeover && r.epoch == p.epoch && r.holder == p.holder
+                    } else {
+                        p.epoch == r.epoch + 1 && epoch == p.epoch && sealed >= r.epoch
+                    }
+                })
             })
             .map(|r| r.epoch);
         // Plan 30 §M3 takeover gate; M13: every acquisition drains the
@@ -1949,6 +2004,12 @@ impl Core {
     }
 
     fn acquire_gate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if self.lease.lost {
+            // Deposed while the gate's marker or drain was in flight: the
+            // gate is void (`mark_lost`), and "no gate" is not "open".
+            self.finish_acquire(now, false, replica, out);
+            return;
+        }
         match self.complete_gate(now, replica, out) {
             GateStep::Done => self.finish_acquire(now, true, replica, out),
             GateStep::NeedMarker => self.issue_marker(0, replica, out),
@@ -2557,8 +2618,18 @@ impl Core {
             (Phase::Cas { .. }, S3Result::LeasePut(Err(CasFailure::Conflict))) => {
                 self.finish_acquire(now, false, replica, out)
             }
-            (Phase::Cas { .. }, S3Result::LeasePut(Err(CasFailure::Failed(e)))) => {
+            (Phase::Cas { plan, sent }, S3Result::LeasePut(Err(CasFailure::Failed(e)))) => {
                 tracing::warn!(node = self.cfg.node_id, error = %e, "lease CAS failed");
+                if let Plan::Claim {
+                    prev,
+                    takeover: true,
+                    ..
+                } = &plan
+                {
+                    if prev.holder != self.cfg.node_id {
+                        self.lease.ambiguous_claim = Some((sent.epoch, prev.clone()));
+                    }
+                }
                 self.finish_acquire(now, false, replica, out);
             }
             (phase, result) => {
@@ -2617,6 +2688,19 @@ impl Core {
                 });
             }
             TailThen::Marker => {
+                if self.lease.gate.is_none() {
+                    // The tail deposed this node (a newer epoch's segment:
+                    // the lease was taken while it retried), which voided
+                    // the gate: there is no marker to ship. Finish the job
+                    // like a failed marker PUT does, or it holds the slot
+                    // for good and no round ever tails again (the M12
+                    // coder's backup-crash seed 892).
+                    match self.job.as_ref().map(|j| j.kind()) {
+                        Some(JobKind::Acquire) => self.finish_acquire(now, false, replica, out),
+                        _ => self.round_tail(now, replica, out),
+                    }
+                    return;
+                }
                 let attempts = self.marker_attempts;
                 self.issue_marker(attempts, replica, out);
             }
@@ -2858,4 +2942,15 @@ impl Core {
             self.finish_acquire(now, false, replica, out);
         }
     }
+}
+
+/// Plan 30 §M9 × §M6: an epoch marker's records — none, or the
+/// announcement that this tenure re-ships its predecessor's acknowledged
+/// backup tail (`LogRecord::TailFollows`), which keeps readers' older
+/// observations waiting past the marker.
+fn marker_records(gate: &PendingGate) -> Vec<LogRecord> {
+    gate.backup_tail_epoch
+        .map(|prev_epoch| LogRecord::TailFollows { prev_epoch })
+        .into_iter()
+        .collect()
 }

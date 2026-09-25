@@ -79,7 +79,7 @@ pub use delegate::{DelegKind, DelegView, RecallPhase};
 pub const DELEG_READ_EPOCH_BASE: u64 = 1 << 48;
 pub use inbox::InboxView;
 pub use jobs::JobKind;
-pub use lease::{LeaseState, PendingGate, Plan};
+pub use lease::{backup_claim_grace_ms, LeaseState, PendingGate, Plan};
 pub use promise::{lease_may_carry, resolve_epoch_claims, EpochClaimView};
 pub use readindex::ReadView;
 pub use stream::StreamView;

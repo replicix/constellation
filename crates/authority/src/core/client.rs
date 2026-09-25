@@ -126,6 +126,11 @@ pub(crate) struct ClientOp {
     /// Plan 30 §M11: what this node had observed when the op was
     /// submitted — the op's causal dependencies, carried on every forward.
     pub deps: Position,
+    /// A replay (`Origin::Replay`) whose rid a client resubmitted while
+    /// it ran (after hearing `InDoubt`): the replay's outcome answers
+    /// that client too (long-acks3 seed 50557: the resubmission was
+    /// dropped as a duplicate and never answered).
+    pub also_client: bool,
 }
 
 impl ClientOp {
@@ -293,6 +298,19 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         if self.clients.contains_key(&rid) {
+            let c = self.clients.get_mut(&rid).expect("present");
+            if origin == Origin::Client && matches!(c.origin, Origin::Replay { .. }) {
+                // The client retries a rid this node is replaying by rid
+                // (it heard `InDoubt` for an earlier attempt, which the
+                // takeover stranded): one execution, both answered.
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    "a client resubmitted a rid under replay: the replay answers it"
+                );
+                c.also_client = true;
+                return;
+            }
             tracing::warn!(node = self.cfg.node_id, ?rid, "duplicate submit ignored");
             return;
         }
@@ -357,6 +375,7 @@ impl Core {
                 inbox_durable_at: None,
                 inbox_keys,
                 deps,
+                also_client: false,
             },
         );
         // Plan 30 §M11: a delegate executes its own subtree here; an op
@@ -1433,6 +1452,26 @@ impl Core {
         if let Some(t) = c.timer.take() {
             self.cancel_timer(t, out);
         }
+        // Plan 30 §M9: not in doubt if the log already answered it. A
+        // node that holds no lease has `completed` rows only from applied
+        // segments (speculation records none), so one here is the rid's
+        // outcome in the log (acks3 seed 700087: the deposed holder's own
+        // write had landed in its last segment before a pause; its
+        // durability wait was aborted, the retries timed out, and the
+        // client heard `EIO` for a write the log carried).
+        if self.lease.held.is_none() && !self.lease.epoch_held() {
+            let epoch = self.ship.max_epoch;
+            if let Some(outcome) = completed_as_outcome(replica, rid, epoch) {
+                self.stats.forward_indoubt_resolved += 1;
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    "deadline: the log answered the op; not in doubt"
+                );
+                self.finish(now, rid, outcome, replica, out);
+                return;
+            }
+        }
         self.stats.in_doubt += 1;
         tracing::debug!(node = self.cfg.node_id, ?rid, "op goes in doubt");
         self.finish_in_doubt(now, rid, replica, out);
@@ -1478,6 +1517,12 @@ impl Core {
                 });
             }
             Origin::Replay { queue_seq } => {
+                if c.also_client {
+                    out.push(Action::Reply {
+                        rid,
+                        reply: ClientReply::InDoubt,
+                    });
+                }
                 self.on_replay_outcome(now, queue_seq, rid, None, replica, out)
             }
         }
@@ -1525,6 +1570,15 @@ impl Core {
                 });
             }
             Origin::Replay { queue_seq } => {
+                if c.also_client {
+                    if rid.node == self.cfg.node_id && rid.incarnation == self.cfg.incarnation {
+                        self.acked.mark_done(rid.seq);
+                    }
+                    out.push(Action::Reply {
+                        rid,
+                        reply: ClientReply::Outcome(outcome.clone()),
+                    });
+                }
                 self.on_replay_outcome(now, queue_seq, rid, Some(outcome), replica, out)
             }
         }

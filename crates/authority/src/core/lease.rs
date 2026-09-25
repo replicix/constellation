@@ -109,6 +109,14 @@ pub struct LeaseState {
     /// gone silent. Checked against the lease object at classification
     /// (the object is the truth; this is only the permit to try).
     pub takeover_permit: Option<(Epoch, NodeId)>,
+    /// Plan 30 §M9: a takeover CAS whose outcome is unknown (the request
+    /// failed: it may have applied — S3's "applied, then timed out"):
+    /// the epoch it claimed and the lease it replaced. A later
+    /// acquisition that finds this node's own lease at that epoch is the
+    /// same takeover landing, and the replaced lease stays its
+    /// predecessor (backup-crash-slow seed 603631: re-adopted as a plain
+    /// own-lease claim, the tenure skipped the sealed backup's tail).
+    pub ambiguous_claim: Option<(Epoch, Lease)>,
 }
 
 impl LeaseState {
@@ -303,7 +311,35 @@ impl LeaseState {
                 marker: true,
             };
         }
-        if !prev.is_claimable(now.0) && !self.permit_allows(now, cfg, &prev, sealed_epoch) {
+        let permitted = self.permit_allows(now, cfg, &prev, sealed_epoch);
+        if !prev.is_claimable(now.0) && !permitted {
+            return Plan::Busy {
+                holder: prev.holder,
+                epoch: prev.epoch,
+                prev,
+                tag,
+            };
+        }
+        // Plan 30 §M9: the listed backups of a `Backup` lease hold the
+        // acknowledged rows its holder has not shipped; only a backup's
+        // claim re-ships them (its sealed tail). Anyone else waits
+        // `backup_claim_grace_ms` past the expiry, which is time for a
+        // backup to hear the lapsed holder fall silent, seal and claim
+        // (long-backup seed 802943: the holder, cut from S3, could not
+        // renew; a non-backup claimed at the expiry while the backup
+        // still held an acknowledged create, which came back later only
+        // as the deposed holder's replay — after ops invoked once it had
+        // been acknowledged). If no backup claims, the lease is anyone's
+        // after the grace (a double fault: the tail is lost).
+        if prev.ack_policy == AckPolicy::Backup
+            && !prev.released
+            && prev.holder != 0
+            && prev.holder != cfg.node_id
+            && !prev.backups.is_empty()
+            && !prev.backups.contains(&cfg.node_id)
+            && !permitted
+            && !prev.is_expired(now.0 - backup_claim_grace_ms(cfg))
+        {
             return Plan::Busy {
                 holder: prev.holder,
                 epoch: prev.epoch,
@@ -483,6 +519,13 @@ impl LeaseState {
         self.last_seen = Some(lease.clone());
         self.last_seen_at = Some(now);
     }
+}
+
+/// Plan 30 §M9: how long past a `Backup` lease's expiry a node that is not
+/// one of its listed backups waits before claiming it (see
+/// `LeaseState::classify`): twice the backups' silence window.
+pub fn backup_claim_grace_ms(cfg: &Config) -> i64 {
+    2 * cfg.backup_takeover_ms as i64
 }
 
 #[cfg(test)]

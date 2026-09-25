@@ -491,6 +491,27 @@ fn streamed_entry_refusing(
     )
 }
 
+/// Whether any live speculation (a shadow, a streamed transaction, a
+/// hint, this node's own unretired work) touches a key of `touches`.
+fn live_speculation_touches(
+    r: &impl Readable,
+    meta: &Meta,
+    touches: &TouchSet,
+) -> Result<bool, MetaError> {
+    for (seq, _) in read_live(r, meta)? {
+        if let Some(v) = r.get(&meta.spec, seq_key(seq))? {
+            let row: SpecRow = postcard::from_bytes(&v)?;
+            let theirs = TouchSet::from_records(row.records.iter());
+            if theirs.dentries.iter().any(|d| touches.dentries.contains(d))
+                || theirs.inos.iter().any(|i| touches.inos.contains(i))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn streamed_entry_with(
     r: &impl Readable,
     meta: &Meta,
@@ -1691,15 +1712,15 @@ impl Meta {
     /// `Hint` entry: it retires once the applied position reaches `floor`
     /// (the holder's next ship position when it answered), and is rolled
     /// back if a segment from a later epoch than the answering holder's
-    /// arrives first.
+    /// arrives first. `false`: not installed (see
+    /// [`Self::install_hint_from`]).
     pub fn install_hint(
         &self,
         records: &[LogRecord],
         floor: u64,
         epoch: u64,
-    ) -> Result<(), MetaError> {
+    ) -> Result<bool, MetaError> {
         self.install_hint_from(None, records, floor, epoch, 0)
-            .map(|_| ())
     }
 
     /// [`Self::install_hint`] for the refusal of `rid` (when known),
@@ -1717,7 +1738,13 @@ impl Meta {
     ///   rows, retiring the hint) would leave it there (backup sim seed
     ///   600396; M14's lock sim seed 194287: `f3` kept the hint's inode,
     ///   every other replica had the renamed one). The mirror of
-    ///   `install_shadow`'s streamed rule.
+    ///   `install_shadow`'s streamed rule;
+    /// - live speculation here touches the entry's keys: the store cannot
+    ///   order it against the hint, and a hint read *before* it (replies
+    ///   overtake each other) would put the old entry back over it
+    ///   (backup-crash-slow seed 601075: the `Exists` reply to `create
+    ///   f0` arrived after the shadow of the later `rename f0 f1`, and the
+    ///   hint left `f0` and `f1` on one inode).
     ///
     /// The caller then treats the refusal as uncovered (raises
     /// `observed`), which is always correct.
@@ -1736,6 +1763,9 @@ impl Meta {
             {
                 return Ok(false);
             }
+        }
+        if live_speculation_touches(&tx, self, &TouchSet::from_records(records.iter()))? {
+            return Ok(false);
         }
         self.install_speculative_tx(tx, SpecKind::Hint { floor, epoch, gen }, records)?;
         Ok(true)

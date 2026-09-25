@@ -796,6 +796,45 @@ impl Meta {
             }
         }
         if adopted {
+            // Plan 30 §M9: the predecessor's outcome rows ride its tail
+            // too — a journaled refusal (the rid's outcome, which every
+            // later execution of it must dedup to) and an inbox position's
+            // acknowledgement (the watermark a later drain skips by). They
+            // touch no key, so the loop above does not journal them; left
+            // out, the log never carried them (backup seed 607661: the
+            // re-shipped tail had the rename but not the two `Refused`
+            // rows that had observed it). Applied above already (the
+            // `completed` row, the watermark); journaled here, after the
+            // transaction's own rows, in order.
+            for rec in records {
+                match rec {
+                    LogRecord::Refused { rid, errno } => {
+                        let seq = journal::append_tx(
+                            &mut tx,
+                            &self.journal_ks,
+                            &self.local,
+                            &self.completed,
+                            rec,
+                        )?;
+                        let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
+                        tx.insert(
+                            &self.completed,
+                            rid.to_key(),
+                            Meta::encode_refused_row(seq, now_ms, *errno),
+                        );
+                    }
+                    LogRecord::InboxAck { .. } => {
+                        journal::append_tx(
+                            &mut tx,
+                            &self.journal_ks,
+                            &self.local,
+                            &self.completed,
+                            rec,
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
             for rec in &applied {
                 if let LogRecord::WriteManifest { ino, manifest, .. } = rec {
                     crate::store::held::enroll_adopted_manifest_tx(&mut tx, self, *ino, manifest)?;

@@ -3359,3 +3359,537 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
     assert_eq!(h.core.stats.deleg_retry_executed, 1);
     assert!(h.meta.child_ino(dir, "f").unwrap().is_some());
 }
+
+/// A lease object for the takeover tests below.
+fn lease_of(holder: NodeId, epoch: Epoch, expires_unix_ms: i64) -> Lease {
+    Lease {
+        v: 1,
+        partition: "p0".into(),
+        holder,
+        epoch,
+        expires_unix_ms,
+        released: false,
+        wanted_by: Vec::new(),
+        backups: Vec::new(),
+        config_version: 1,
+        ack_policy: constellation_store_s3::AckPolicy::Local,
+        granted_delegations: false,
+        retired: Vec::new(),
+    }
+}
+
+/// The one job S3 request in `out` (the periodic heartbeat read aside),
+/// and its op id.
+fn only_s3(out: &[Action]) -> (OpId, S3Op) {
+    let ops: Vec<_> = s3_ops(out)
+        .into_iter()
+        .filter(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+        .collect();
+    assert_eq!(ops.len(), 1, "expected one S3 request: {out:?}");
+    (ops[0].0, ops[0].1.clone())
+}
+
+/// Plan 30 §M9 (the M12 coder's backup-crash seed 892): a takeover whose
+/// marker slot was taken is deposed by what the retry's tail finds (a
+/// newer epoch claimed the lease while this node was paused). The
+/// deposition voids the gate; the marker retry then had nothing to ship
+/// and issued nothing, so the acquisition never finished — and while it
+/// held the job slot no round ran, the node tailed nothing and its
+/// forwards waited for a log it never read. The acquisition fails now.
+#[test]
+fn a_takeover_deposed_while_retrying_its_marker_finishes_the_acquisition() {
+    let mut h = Harness::new(1);
+    // (Plan 30 §M10's promise check is its own machinery; not here.)
+    h.core.cfg.takeover_promise_check = false;
+    let mut out = Vec::new();
+    h.core.enqueue_job(
+        h.now,
+        super::jobs::JobReq::Acquire {
+            reason: "test",
+            ask_handoff: false,
+        },
+        &h.meta,
+        &mut out,
+    );
+    let (get, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::LeaseGet));
+    // Node 3's lease at epoch 1 has expired: a takeover.
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((lease_of(3, 1, h.now.0 - 1), tag())))),
+    });
+    let (tail, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::SegmentRun { .. }), "{req:?}");
+    let out = h.step(Event::S3 {
+        op: tail,
+        result: S3Result::SegmentRun(Ok(Vec::new())),
+    });
+    let (cas, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::LeaseSwap { .. }), "{req:?}");
+    let out = h.step(Event::S3 {
+        op: cas,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+    let (marker, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::SegmentPut { .. }), "{req:?}");
+    assert!(h.core.lease().gate.is_some());
+    // The marker's slot is taken; the retry tails first.
+    let out = h.step(Event::S3 {
+        op: marker,
+        result: S3Result::SegmentPut(Err(CasFailure::Conflict)),
+    });
+    let (tail, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::SegmentRun { .. }), "{req:?}");
+    // ... and finds node 2's marker at epoch 3: this node is deposed.
+    let theirs = crate::segment::encode(2, 3, 0, &[], &[], &[]).unwrap();
+    let _ = h.step(Event::S3 {
+        op: tail,
+        result: S3Result::SegmentRun(Ok(vec![(1, theirs)])),
+    });
+    assert!(h.core.lease().lost);
+    assert_eq!(
+        h.core.job(),
+        None,
+        "the acquisition must finish once the deposition voided its gate"
+    );
+}
+
+/// Plan 30 §M9 fixes from the backup-crash sweeps (`fix-backup-crash`).
+mod backup_crash {
+    use super::*;
+    use constellation_store_s3::AckPolicy;
+
+    /// The job S3 request matching `pred` in `out` (heartbeat reads and
+    /// other traffic aside).
+    fn find_s3(out: &[Action], pred: impl Fn(&S3Op) -> bool) -> OpId {
+        s3_ops(out)
+            .into_iter()
+            .find(|(_, r)| pred(r))
+            .map(|(op, _)| op)
+            .unwrap_or_else(|| panic!("no matching S3 request in {out:?}"))
+    }
+
+    fn backup_lease(holder: NodeId, epoch: Epoch, expires: i64, backups: Vec<NodeId>) -> Lease {
+        Lease {
+            backups,
+            ack_policy: AckPolicy::Backup,
+            config_version: 2,
+            ..lease_of(holder, epoch, expires)
+        }
+    }
+
+    /// backup-crash seed 606255: the holder's removal CAS emptied its
+    /// backup set (`Local`) while a peer in budget was eligible and no
+    /// candidate was named yet; `ack_need` looked at the candidate alone
+    /// and acknowledged at once, on this disk alone (the holder then died
+    /// and the create came back as a conflict copy). backup-crash-slow
+    /// seed 603322: the same in a tenure's first event, before its first
+    /// selection pass had assessed eligibility at all.
+    #[test]
+    fn nothing_is_acknowledged_locally_while_a_backup_could_be_had() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let pos = constellation_meta::Position {
+            seq: 0,
+            pending: Some(constellation_meta::JournalPos { epoch: 1, jseq: 5 }),
+            streams: Default::default(),
+        };
+        assert_eq!(h.core.lease.ack_policy(), AckPolicy::Local);
+        assert!(h.core.ack.candidate.is_none());
+        // Not yet assessed this tenure: gated.
+        assert_eq!(h.core.ack.eligible, None);
+        assert_eq!(h.core.ack_need(&pos), Some(5));
+        // A peer in budget, no candidate yet: gated.
+        h.core.ack.eligible = Some(true);
+        assert_eq!(h.core.ack_need(&pos), Some(5));
+        // Nobody in budget: today's `Local`.
+        h.core.ack.eligible = Some(false);
+        assert_eq!(h.core.ack_need(&pos), None);
+        // A configuration that never selects a backup never gates.
+        h.core.ack.eligible = None;
+        h.core.cfg.backup_rtt_budget_ms = 0;
+        assert_eq!(h.core.ack_need(&pos), None);
+    }
+
+    /// backup-crash-slow seeds 603631 (the takeover CAS applied, then
+    /// timed out) and 601692 (the successor restarted inside its gate):
+    /// the sealed backup's own lease at the next epoch is its takeover
+    /// having landed. Its watch must not void the tail on reading that
+    /// lease (the M12 coder's backup-strict seed 1353 took the same
+    /// branch after a successful CAS), and the acquisition that adopts
+    /// it re-ships the tail — announced in its marker (`TailFollows`).
+    #[test]
+    fn a_sealed_backups_own_lease_at_the_next_epoch_reships_its_tail() {
+        // Node 1's journal: one acknowledged create, backed by node 2.
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        let create = holder.create("a");
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &create, Some(rid)).unwrap();
+        let txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+        let mut h = Harness::new(2);
+        h.core.cfg.takeover_promise_check = false;
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                from: 1,
+                txs,
+                through: 0,
+            },
+        });
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        // The holder falls silent: seal, read the lease, take over.
+        h.advance(5_000);
+        let out = h.step(Event::Timer { id: watch });
+        assert_eq!(h.core.bk.sealed, 1);
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let theirs = backup_lease(1, 1, h.now.plus(4_000).0, vec![2]);
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((theirs.clone(), tag())))),
+        });
+        let rewatch = timers(&out, TimerKind::BackupWatch)[0];
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((theirs, tag())))),
+        });
+        let tail = find_s3(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let cas = find_s3(&out, |r| matches!(r, S3Op::LeaseSwap { .. }));
+        // The CAS applies, but its reply is a timeout.
+        let _ = h.step(Event::S3 {
+            op: cas,
+            result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+        });
+        assert!(h.core.lease.held.is_none());
+        // The watch reads the lease again: it names this node now.
+        h.advance(2_000);
+        let out = h.step(Event::Timer { id: rewatch });
+        let mine = lease_of(2, 2, h.now.plus(6_000).0);
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((mine.clone(), tag())))),
+        });
+        assert!(
+            h.core.bk.role.is_some(),
+            "the tail was voided on reading this node's own takeover"
+        );
+        // The acquisition adopts it.
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let mut out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((mine, tag())))),
+        });
+        // (Adopting its own lease may tail and renew first.)
+        for _ in 0..4 {
+            if s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::SegmentPut { .. }))
+            {
+                break;
+            }
+            if let Some((op, req)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+            {
+                let result = match req {
+                    S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                    S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+                    other => panic!("unexpected {other:?}"),
+                };
+                out = h.step(Event::S3 { op, result });
+            }
+        }
+        assert_eq!(
+            h.core.lease.gate.and_then(|g| g.backup_tail_epoch),
+            Some(1),
+            "the gate re-ships the sealed tail"
+        );
+        assert!(
+            h.core.lease.gate.is_some_and(|g| g.fast_prev.is_some()),
+            "the replaced (unexpired) lease stays the predecessor: its \
+             strict-read horizon is this tenure's acknowledgement floor"
+        );
+        let (marker, payload) = s3_ops(&out)
+            .into_iter()
+            .find_map(|(op, r)| match r {
+                S3Op::SegmentPut { payload, .. } => Some((op, payload.clone())),
+                _ => None,
+            })
+            .expect("the marker");
+        let seg = crate::segment::decode(&payload).unwrap();
+        assert_eq!(
+            seg.records,
+            vec![LogRecord::TailFollows { prev_epoch: 1 }],
+            "the marker announces the tail"
+        );
+        let _ = h.step(Event::S3 {
+            op: marker,
+            result: S3Result::SegmentPut(Ok(())),
+        });
+        assert!(
+            h.meta.completed_position(rid).unwrap().is_some(),
+            "the acknowledged create is in this tenure's journal"
+        );
+        assert!(MetaStore::lookup(&h.meta, ROOT_INO, "a").unwrap().is_some());
+    }
+
+    /// backup-crash-slow seed 601692: the sealed successor crashed inside
+    /// its gate (the marker had landed, the tail was not yet re-applied)
+    /// and restarted with its role, seal and tail on disk. Re-adopting
+    /// its own lease, the gate re-ships the tail (before: the own-lease
+    /// claim named no predecessor, the tail was skipped and later voided,
+    /// and an acknowledged create became a conflict copy).
+    #[test]
+    fn a_restarted_successor_reships_the_tail_it_sealed() {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &holder.create("b"), Some(rid)).unwrap();
+        let txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+        let mut h = Harness::new(2);
+        let _ = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                from: 1,
+                txs,
+                through: 0,
+            },
+        });
+        h.meta.backup_seal(1).unwrap();
+        // Restart: a fresh core over the same store.
+        let mut cfg = h.core.cfg.clone();
+        cfg.takeover_promise_check = false;
+        h.core = Core::new(cfg);
+        let mut out = Vec::new();
+        h.core.start(h.now, &h.meta, &mut out);
+        assert!(h.core.bk.role.is_some(), "the role survived the restart");
+        let mut out = Vec::new();
+        h.core.enqueue_job(
+            h.now,
+            super::super::jobs::JobReq::Acquire {
+                reason: "test",
+                ask_handoff: false,
+            },
+            &h.meta,
+            &mut out,
+        );
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let mine = lease_of(2, 2, h.now.plus(6_000).0);
+        let mut out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((mine, tag())))),
+        });
+        for _ in 0..4 {
+            if h.core.lease.gate.is_some() {
+                break;
+            }
+            if let Some((op, req)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+            {
+                let result = match req {
+                    S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                    S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+                    other => panic!("unexpected {other:?}"),
+                };
+                out = h.step(Event::S3 { op, result });
+            }
+        }
+        assert_eq!(
+            h.core.lease.gate.and_then(|g| g.backup_tail_epoch),
+            Some(1),
+            "the restarted successor re-ships the tail it sealed"
+        );
+    }
+
+    /// long-acks3 seed 50557 ("a client op was never answered"): the
+    /// client heard `InDoubt` for a forward the takeover stranded; its
+    /// retry by rid arrived while this node's replay of the same rid was
+    /// in flight and was dropped as a duplicate. The replay's outcome now
+    /// answers the client too.
+    #[test]
+    fn a_client_retrying_a_rid_under_replay_is_answered_by_the_replay() {
+        let (holder, mut requester) = pair();
+        let rid = requester.rid(1);
+        let op = requester.create("x");
+        requester.meta.queue_replay(rid, &op).unwrap();
+        // A fresh core over the store arms the replay drain.
+        let cfg = requester.core.cfg.clone();
+        requester.core = Core::new(cfg);
+        let mut out = Vec::new();
+        requester
+            .core
+            .start(requester.now, &requester.meta, &mut out);
+        requester.step(Event::Peers {
+            links: [1, 3]
+                .into_iter()
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: None,
+                    rtt_ms: Some(1),
+                    since: Some(Ms(0)),
+                })
+                .collect(),
+        });
+        requester.core.lease.cached_holder = Some(1);
+        let drain = timers(&out, TimerKind::ReplayDrain)[0];
+        let out = requester.step(Event::Timer { id: drain });
+        let req = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::MutateRequest { req, rid: r, .. } if to == 1 && *r == rid => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the replay forwards the rid: {out:?}"));
+        // The client retries the rid meanwhile.
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+        });
+        assert!(replies(&out).is_empty());
+        let records = constellation_meta::execute_mutate(&holder.meta, &op, Some(rid)).unwrap();
+        let out = requester.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Accepted { epoch: 1, records },
+                base: Some(0),
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+            },
+        });
+        let r = replies(&out);
+        assert_eq!(r.len(), 1, "the retrying client is answered: {out:?}");
+        assert_eq!(r[0].0, rid);
+        assert!(matches!(
+            r[0].1,
+            ClientReply::Outcome(MutateOutcome::Accepted { .. })
+        ));
+        assert!(requester.meta.pending_replays().unwrap().is_empty());
+    }
+
+    /// acks3 seed 700087: an op whose completion this (non-holding) node
+    /// has applied from the log is answered from it at its deadline, not
+    /// in doubt (the client was told `EIO` for a write the log carried).
+    #[test]
+    fn a_deadline_answers_from_the_applied_log() {
+        let (holder, mut requester) = pair();
+        let rid = requester.rid(1);
+        let op = requester.create("d");
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: op.clone(),
+        });
+        let deadline = timers(&out, TimerKind::ClientDeadline)[0];
+        assert!(!sends(&out).is_empty(), "forwarded: {out:?}");
+        // The holder's segment carrying it lands here (its reply is lost).
+        let records = constellation_meta::execute_mutate(&holder.meta, &op, Some(rid)).unwrap();
+        crate::replica::Replica::apply_segment(&requester.meta, 1, 1, 0, &[], &[], &records)
+            .unwrap();
+        requester.advance(60_000);
+        let out = requester.step(Event::Timer { id: deadline });
+        let r = replies(&out);
+        assert_eq!(r.len(), 1, "{out:?}");
+        assert!(
+            matches!(r[0].1, ClientReply::Outcome(MutateOutcome::Accepted { .. })),
+            "answered in doubt: {:?}",
+            r[0].1
+        );
+    }
+
+    /// long-acks3 seed 801715: an `ack=s3` holder's own write, parked for
+    /// its segment, whose segment landed while the holder was paused
+    /// past its lease: the acknowledgement is released (the row is in the
+    /// log), not held until the client's deadline answers `EIO`.
+    #[test]
+    fn a_shipped_row_is_acknowledged_though_the_lease_lapsed() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        h.core.lease.held.as_mut().expect("held").0.ack_policy = AckPolicy::S3;
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create("s"),
+        });
+        assert!(replies(&out).is_empty(), "parked for the segment: {out:?}");
+        // The segment lands; the holder learns it only after its lease
+        // lapsed.
+        let tip = h.meta.journal_tip().unwrap();
+        let seqs: Vec<u64> = (1..=tip).collect();
+        h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        h.advance(60_000);
+        let out = activity(&mut h);
+        let r = replies(&out);
+        assert_eq!(r.len(), 1, "released: {out:?}");
+        assert!(matches!(
+            r[0].1,
+            ClientReply::Outcome(MutateOutcome::Accepted { .. })
+        ));
+    }
+
+    /// long-backup seed 802943: the holder, cut from S3, could not renew;
+    /// a non-backup claimed its `Backup` lease at the expiry while the
+    /// listed backup still held an acknowledged create, which came back
+    /// only as the deposed holder's replay, after later ops. A node that
+    /// is not a listed backup now waits `backup_claim_grace_ms` past the
+    /// expiry; a listed backup may claim at once.
+    #[test]
+    fn a_non_backup_waits_the_grace_before_claiming_a_backup_lease() {
+        let now = Ms(1_000_000);
+        let lease = backup_lease(1, 1, now.0 - 1, vec![2]);
+        let classify = |node: NodeId, at: Ms| {
+            let h = Harness::new(node);
+            let cfg = h.core.cfg.clone();
+            h.core
+                .lease
+                .classify(at, &cfg, Some((lease.clone(), tag())), 0)
+        };
+        assert!(
+            matches!(classify(3, now), Plan::Busy { .. }),
+            "a non-backup claimed inside the grace"
+        );
+        assert!(
+            matches!(classify(2, now), Plan::Claim { takeover: true, .. }),
+            "the listed backup may claim at the expiry"
+        );
+        let grace = crate::core::backup_claim_grace_ms(&Config::defaults(3, 1));
+        assert!(matches!(
+            classify(3, Ms(lease.expires_unix_ms + grace)),
+            Plan::Claim { takeover: true, .. }
+        ));
+        // A `Local` lease (no backups) is anyone's at the expiry.
+        let local = lease_of(1, 1, now.0 - 1);
+        let h = Harness::new(3);
+        let cfg = h.core.cfg.clone();
+        assert!(matches!(
+            h.core.lease.classify(now, &cfg, Some((local, tag())), 0),
+            Plan::Claim { .. }
+        ));
+    }
+}

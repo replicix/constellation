@@ -193,8 +193,10 @@ pub(crate) struct AckState {
     /// The tick fired since the last bookkeeping run.
     tick_fired: bool,
     /// Whether a peer in budget is eligible as a backup right now (the
-    /// last selection pass saw one).
-    pub eligible: bool,
+    /// last selection pass saw one); `None` until this tenure's first
+    /// selection pass ran, which gates like `Some(true)` (see
+    /// `durable_jseq`).
+    pub eligible: Option<bool>,
     /// When each node was last dropped or removed (not re-added within
     /// `backup_reconfig_min_ms`).
     last_dropped: BTreeMap<NodeId, Ms>,
@@ -351,7 +353,17 @@ impl Core {
                     // not listed). The wait ends with the CAS that lists
                     // it, or once no peer is in budget after all (today's
                     // behaviour).
-                    return if self.ack.candidate.is_some() || self.ack.eligible {
+                    //
+                    // Not yet known counts as could-be (backup-crash-slow
+                    // seed 603322): the ops queued behind an acquisition
+                    // run in the acquisition's own event, before the
+                    // tenure's first selection pass, and were
+                    // acknowledged at once on this disk alone.
+                    let unassessed = self.ack.eligible.is_none() && self.backups_possible();
+                    return if self.ack.candidate.is_some()
+                        || self.ack.eligible == Some(true)
+                        || unassessed
+                    {
                         self.ack.shipped_through
                     } else {
                         u64::MAX
@@ -375,10 +387,17 @@ impl Core {
 
     /// The journal seq an acknowledgement evaluated at `position` must
     /// wait for, or `None` when it may be given now.
+    ///
+    /// The gate is exactly `durable_jseq`'s: nothing waits only when it
+    /// says nothing gates (a continuation epoch; `Local` with no backup
+    /// to be had). In particular `Local` with an *eligible* peer but no
+    /// candidate yet — the moment after a removal CAS emptied the set,
+    /// before the next selection names one — gates too (backup-crash
+    /// seed 606255: an acknowledgement given then rested on the holder's
+    /// disk alone; the holder died, its successor never saw the row, and
+    /// the acknowledged create came back as a conflict copy).
     pub(crate) fn ack_need(&self, position: &constellation_meta::Position) -> Option<u64> {
-        if self.lease.epoch_held()
-            || (self.lease.ack_policy() == AckPolicy::Local && self.ack.candidate.is_none())
-        {
+        if self.durable_jseq() == u64::MAX {
             return None;
         }
         let jseq = position.pending.map(|p| p.jseq)?;
@@ -597,7 +616,11 @@ impl Core {
                 self.ack.reconfig = None;
                 self.ack.reconfig_wanted = None;
             }
-            self.ack.eligible = false;
+            if self.lease.held.is_none() {
+                // (Assessed again by the next tenure's acquisition; a
+                // held lease whose gate is still closed keeps it.)
+                self.ack.eligible = None;
+            }
             if self.ack.shipped_through != 0 || !self.ack.shipped_rows.is_empty() {
                 self.ack.shipped_through = 0;
                 self.ack.shipped_rows.clear();
@@ -607,6 +630,10 @@ impl Core {
             self.ack.acked_hwm = 0;
             self.report_durable(replica);
             self.watch_s3_holder(now, replica, out);
+            // What this node acknowledged as holder and has since shipped
+            // is durable though its lease lapsed (a deposition aborts the
+            // rest: `ack_abort_parked`).
+            self.complete_ready(now, replica, out);
             return;
         }
         self.reconcile_peers_with_lease();
@@ -655,6 +682,12 @@ impl Core {
             .retain(|n, p| p.committed || Some(*n) == candidate);
     }
 
+    /// Whether this configuration ever selects a backup (the selection
+    /// pass runs at all): P2P on, a budget and a set size.
+    fn backups_possible(&self) -> bool {
+        self.cfg.p2p && self.cfg.backup_rtt_budget_ms > 0 && self.cfg.backups_max > 0
+    }
+
     /// Eligible peers, best first: in the roster, connected, within the
     /// RTT budget, stable, not us, not already a backup.
     pub(crate) fn backup_candidates(&self, now: Ms) -> Vec<NodeId> {
@@ -683,7 +716,7 @@ impl Core {
 
     fn backup_select(&mut self, now: Ms, _replica: &dyn Replica, _out: &mut Vec<Action>) {
         let candidates = self.backup_candidates(now);
-        self.ack.eligible = !candidates.is_empty();
+        self.ack.eligible = Some(!candidates.is_empty());
         if self.ack.candidate.is_some()
             || self.ack.reconfig.is_some()
             || self.lease.backups().len() >= self.cfg.backups_max
@@ -1564,6 +1597,25 @@ impl Core {
                 // out, or is alive and renewed), the watch re-reads.
                 self.arm_backup_watch(now, out);
             }
+            Some((lease, _))
+                if lease.holder == self.cfg.node_id && lease.epoch == role.epoch + 1 =>
+            {
+                // Our own takeover CAS landed although its request failed
+                // (applied, then timed out): the tail is ours to re-ship;
+                // finish the acquisition (backup-crash-slow seed 603631
+                // discarded it here).
+                self.lease.note_object(now, &lease);
+                self.enqueue_job(
+                    now,
+                    super::jobs::JobReq::Acquire {
+                        reason: "backup-takeover",
+                        ask_handoff: false,
+                    },
+                    replica,
+                    out,
+                );
+                self.arm_backup_watch(now, out);
+            }
             Some((lease, _)) => {
                 // Not listed any more, or the lease moved on: our tail is
                 // void (a listed successor re-shipped what mattered).
@@ -1610,8 +1662,16 @@ impl Core {
                 constellation_meta::LogRecord::Completed { rid } => Some(*rid),
                 _ => None,
             });
-            let done =
-                rid.is_some_and(|rid| replica.completed_position(rid).ok().flatten().is_some());
+            // A refusal's transaction is done once its rid has an outcome
+            // here too (the log carried the refusal already).
+            let refused = tx.records.iter().find_map(|r| match r {
+                constellation_meta::LogRecord::Refused { rid, .. } => Some(*rid),
+                _ => None,
+            });
+            let done = rid
+                .is_some_and(|rid| replica.completed_position(rid).ok().flatten().is_some())
+                || refused
+                    .is_some_and(|rid| replica.completed_outcome(rid).ok().flatten().is_some());
             if !done {
                 replica
                     .apply_records_journaled(&tx.records, rid)

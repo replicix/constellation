@@ -223,6 +223,16 @@ pub enum LogRecord {
     /// and replays them by rid, and a requester's observation of them is
     /// void (M6's rule for a tenure that ended without shipping).
     Recall { dir: u64, gen: u64 },
+    /// Plan 30 §M9 × §M6: carried by the epoch marker of a sealed
+    /// backup's takeover. The successor re-ships the acknowledged tail of
+    /// the predecessor's tenure (`prev_epoch`) in its own segments *after*
+    /// this marker, so a replica's observation of a position of an older
+    /// epoch is not satisfied by the marker itself — it waits until the
+    /// successor's journal moves past the marker's `through` (M6's
+    /// "an observer of stranded work stops waiting at the marker" holds
+    /// for a TTL takeover, whose predecessor's unshipped work is lost,
+    /// but not here: that work comes back). Touches nothing.
+    TailFollows { prev_epoch: u64 },
 }
 
 impl LogRecord {

@@ -1353,7 +1353,7 @@ fn backup_no_acked_op_lost() {
 /// and every acknowledged op is in the log exactly once.
 #[test]
 fn backup_failover_reships_the_tail() {
-    let t = run_m9("backup-crash", backup_crash_config(), 800..1000);
+    let t = run_m9("backup-crash", backup_crash_config(), 800..1400);
     assert!(t.seals >= 20, "the backup rarely sealed: {t:?}");
     assert!(
         t.backup_takeovers >= 20,
@@ -1374,7 +1374,7 @@ fn backup_failover_reships_the_tail() {
 /// the log-slot CAS is the only fence.
 #[test]
 fn ack_s3_no_acked_op_lost() {
-    let t = run_m9("acks3-crash", ack_s3_crash_config(), 900..940);
+    let t = run_m9("acks3-crash", ack_s3_crash_config(), 900..1100);
     assert_eq!(t.backups_added, 0, "ack=s3 uses no backups: {t:?}");
     assert!(t.acks_waited > 100, "acknowledgements never waited: {t:?}");
     assert!(
@@ -1385,7 +1385,7 @@ fn ack_s3_no_acked_op_lost() {
     // stale journal copy of a row that had landed in S3 is rolled back at
     // its restart and its replay dedups — the log-level checks are what
     // says nothing was lost.)
-    run_m9("acks3", ack_s3_config(), 940..970);
+    run_m9("acks3", ack_s3_config(), 940..1040);
 }
 
 /// Plan 30 §M9: no peer within the RTT budget means today's behaviour —
@@ -1419,7 +1419,7 @@ fn no_peer_in_budget_is_todays_behaviour() {
 /// lease CAS and writes continue; when it returns it is brought back.
 #[test]
 fn backup_departs_reconfigures() {
-    let t = run_m9("backup-departs", backup_departs_config(), 1100..1200);
+    let t = run_m9("backup-departs", backup_departs_config(), 1100..1300);
     assert!(
         t.backups_removed >= 20,
         "the backup was rarely removed: {t:?}"
@@ -1433,7 +1433,7 @@ fn backup_departs_reconfigures() {
 /// durability, linearizability, convergence) say so.
 #[test]
 fn backup_partition_reconfigures_or_seals() {
-    let t = run_m9("backup-partition", backup_partition_config(), 1200..1300);
+    let t = run_m9("backup-partition", backup_partition_config(), 1200..1400);
     assert!(
         t.backups_removed + t.backup_takeovers >= 20,
         "the partition was rarely resolved either way: {t:?}"
@@ -1447,7 +1447,7 @@ fn backup_partition_reconfigures_or_seals() {
 /// holds (enforced).
 #[test]
 fn fast_failover_with_delegations_keeps_close_to_open() {
-    let t = run_m9("backup-strict", backup_strict_config(), 1300..1400);
+    let t = run_m9("backup-strict", backup_strict_config(), 1300..1500);
     assert!(t.backup_takeovers >= 15, "{t:?}");
     assert!(t.ack_floor_waits >= 10, "the successor never waited: {t:?}");
 }
@@ -1461,7 +1461,7 @@ fn pre_s3_streaming_installs_and_retires() {
         s3_latency: (60, 200),
         ..backup_crash_config()
     };
-    let t = run_m9("backup-crash-slow", cfg, 1400..1450);
+    let t = run_m9("backup-crash-slow", cfg, 1400..1700);
     assert!(t.streamed_ahead > 20, "{t:?}");
     assert!(t.streamed_installed > 20, "{t:?}");
 }
@@ -1588,6 +1588,98 @@ fn regression_exists_hint_after_its_streamed_refusal() {
             panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup")
         });
         assert!(report.converged_checked, "seed {seed} did not converge");
+    }
+}
+
+/// Plan 30 §M9, the backup-crash sweeps (`fix-backup-crash`): one seed
+/// per class, each failing before its fix. The core and meta tests named
+/// in each comment pin the mechanisms deterministically; these pin the
+/// whole-system symptom.
+#[test]
+fn regression_backup_crash_classes() {
+    let slow = || SimConfig {
+        s3_latency: (60, 200),
+        ..backup_crash_config()
+    };
+    let long_acks3 = || SimConfig {
+        core: std::sync::Arc::new(sim::run::ack_s3_core_config),
+        ..long_backup_config()
+    };
+    for (seed, cfg, alias, what) in [
+        // Acknowledged under `Local` while a backup could be had: an
+        // eligible peer and no candidate yet (606255), or eligibility
+        // not yet assessed in a tenure's first event (603322).
+        // `nothing_is_acknowledged_locally_while_a_backup_could_be_had`.
+        (
+            606_255u64,
+            backup_crash_config(),
+            "backup-crash",
+            "acked, then lost",
+        ),
+        (603_322, slow(), "backup-crash-slow", "acked, then lost"),
+        // The ordering violation a lost acknowledgement leaves.
+        (1_454, slow(), "backup-crash-slow", "ordering"),
+        // A takeover deposed while it retried its marker finishes its
+        // acquisition (the job held the slot for good; nothing tailed).
+        // `a_takeover_deposed_while_retrying_its_marker_finishes_the_acquisition`.
+        (727_961, backup_config(), "backup", "no quiescence"),
+        // The sealed backup's own lease at the next epoch is its landed
+        // takeover: its CAS applied, then timed out (603631), or it
+        // restarted inside its gate (601692); the tail is re-shipped.
+        // `a_sealed_backups_own_lease_at_the_next_epoch_reships_its_tail`,
+        // `a_restarted_successor_reships_the_tail_it_sealed`.
+        (603_631, slow(), "backup-crash-slow", "acked, then lost"),
+        (601_692, slow(), "backup-crash-slow", "acked, then lost"),
+        // A replay answers the client retrying its rid.
+        // `a_client_retrying_a_rid_under_replay_is_answered_by_the_replay`.
+        (50_557, long_acks3(), "long-acks3", "never answered"),
+        // The re-shipped tail keeps older observations waiting past the
+        // marker, and carries its refusals (607661, 600066).
+        // `an_announced_tail_keeps_older_observations_waiting_past_the_marker`,
+        // `an_adopted_tails_refusal_and_inbox_ack_are_journaled`.
+        (607_661, backup_config(), "backup", "monotonic reads"),
+        (600_066, slow(), "backup-crash-slow", "monotonic reads"),
+        // A hint is not installed over live speculation on its keys.
+        // `a_hint_is_not_installed_over_live_speculation_on_its_keys`.
+        (601_075, slow(), "backup-crash-slow", "divergence"),
+        // A deadline answers from the applied log, not in doubt.
+        // `a_deadline_answers_from_the_applied_log`.
+        (700_087, ack_s3_config(), "acks3", "in doubt"),
+        // A shipped row is acknowledged though the holder's lease lapsed.
+        // `a_shipped_row_is_acknowledged_though_the_lease_lapsed`.
+        (801_715, long_acks3(), "long-acks3", "in doubt"),
+        // Only a listed backup may claim an expired `Backup` lease until
+        // the grace has passed: it holds the acknowledged tail (802943: a
+        // non-backup claimed at the expiry; 602011: the backup came back
+        // from a crash in time to claim within the grace).
+        // `a_non_backup_waits_the_grace_before_claiming_a_backup_lease`.
+        (802_943, long_backup_config(), "long-backup", "ordering"),
+        (602_011, backup_crash_config(), "backup-crash", "ordering"),
+    ] {
+        let report = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("seed {seed} ({what}): {e}\n  replay with AUTHORITY_SIM_CONFIG={alias}")
+        });
+        assert!(report.converged_checked, "seed {seed} did not converge");
+        assert!(
+            report.durability_budget_exceeded.is_empty(),
+            "seed {seed} must pass under the strict checks: {:?}",
+            report.durability_budget_exceeded
+        );
+    }
+    // Two failures that took every copy of acknowledged rows down across
+    // the lease's lapse are beyond one backup's budget (the holder
+    // crashed; its sealed successor was paused past its own lease before
+    // re-shipping the tail, 609417; its backup crashed and came back too
+    // late to claim, 802797): recorded, and the strict checks relaxed for
+    // that run only (`Cluster::note_takedown`).
+    for seed in [609_417u64, 802_797] {
+        let report = run_seed(seed, backup_crash_config()).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-crash")
+        });
+        assert!(
+            !report.durability_budget_exceeded.is_empty(),
+            "seed {seed}: the double fault was not recognised"
+        );
     }
 }
 
