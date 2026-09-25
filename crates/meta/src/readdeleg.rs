@@ -57,6 +57,42 @@ pub fn recall_inos(records: &[crate::record::LogRecord]) -> Vec<u64> {
     inos
 }
 
+thread_local! {
+    static EXECUTED_VICTIMS: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// M16: inodes an op executed on this thread changed although its
+/// records do not name them — the inode an `unlink`/`rmdir` removed a
+/// link of (its `nlink` and `ctime`; with the last link, the inode
+/// itself), and the inodes a `rename` moved or replaced. The records
+/// name only the parent and the entry, so [`recall_inos`] alone left a
+/// read delegation on the unlinked inode live: a strict open of it by
+/// inode (a kernel-cached dentry) was answered from the delegate's stale
+/// replica, after the unlink was acknowledged. Filled inside the op's own
+/// write transaction (so it is exactly what the op changed, however
+/// concurrent ops raced it), read by [`recall_inos_executed`].
+pub(crate) fn note_victim(ino: u64) {
+    EXECUTED_VICTIMS.with(|v| v.borrow_mut().push(ino));
+}
+
+/// Cleared by `mutate::execute` before each op.
+pub(crate) fn clear_victims() {
+    EXECUTED_VICTIMS.with(|v| v.borrow_mut().clear());
+}
+
+/// The inodes to recall read delegations on once the op that produced
+/// `records` executed **on this thread** (right after
+/// `mutate::execute` / `execute_mutate` returned it): [`recall_inos`]
+/// plus the inodes it changed that the records do not name.
+pub fn recall_inos_executed(records: &[crate::record::LogRecord]) -> Vec<u64> {
+    let mut inos = recall_inos(records);
+    EXECUTED_VICTIMS.with(|v| inos.append(&mut v.borrow_mut()));
+    inos.sort_unstable();
+    inos.dedup();
+    inos
+}
+
 /// [`recall_inos`] for an op not yet executed (an inbox op recalls
 /// before it runs): `KeySet::from_op` keeps parents, except for a raw
 /// `Records` op, which goes through [`recall_inos`].
@@ -425,6 +461,43 @@ impl ReadDelegations {
 
 // ------------------------------------------------------------ Meta API
 
+impl crate::store::Meta {
+    /// [`recall_inos_of_op`] plus the inodes the op would change without
+    /// naming them (M16, see [`note_victim`]), looked up now: for the
+    /// paths that recall *before* executing (an inbox op, a delegate's
+    /// write). The lookup precedes the op's own transaction, so a
+    /// concurrent rename onto the same name in between could change the
+    /// victim; the grant table's `blocked` entries and the entry's own
+    /// recall (its parent is always included) bound what that can serve.
+    pub fn recall_inos_of_op_now(&self, op: &crate::mutate::MutateOp) -> Vec<u64> {
+        use crate::mutate::MutateOp;
+        let mut inos = recall_inos_of_op(op);
+        let mut child = |parent: u64, name: &str| {
+            if let Ok(Some(ino)) = self.child_ino(parent, name) {
+                inos.push(ino);
+            }
+        };
+        match op {
+            MutateOp::Unlink { parent, name } | MutateOp::Rmdir { parent, name } => {
+                child(*parent, name)
+            }
+            MutateOp::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+            } => {
+                child(*parent, name);
+                child(*new_parent, new_name);
+            }
+            _ => {}
+        }
+        inos.sort_unstable();
+        inos.dedup();
+        inos
+    }
+}
+
 /// Local kv key: the latest `until` of any grant this node made, persisted
 /// before the grant is answered (see [`crate::store::Meta::note_grant_horizon`]).
 pub(crate) const KV_READ_GRANT_HORIZON: &str = "read_grant_horizon_ms";
@@ -450,7 +523,9 @@ impl crate::store::Meta {
         if until_ms > stored {
             // Round up so continuous granting writes about once a second.
             let value = until_ms + 1_000;
-            self.kv_set(KV_READ_GRANT_HORIZON, &value.to_string())?;
+            // M16: synced — a holder that forgot it on a power loss would
+            // acknowledge writes behind grants still honoured elsewhere.
+            self.kv_set_durable(KV_READ_GRANT_HORIZON, &value.to_string())?;
         }
         Ok(())
     }

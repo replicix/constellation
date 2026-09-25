@@ -1356,6 +1356,7 @@ impl MetaStore for Meta {
         crate::store::adjust_usage_tx(&mut tx, &self.local, usage_delta.0, usage_delta.1)?;
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
+        crate::readdeleg::note_victim(ino);
         self.usage_tracker().adjust(usage_delta.0, usage_delta.1);
         Ok(())
     }
@@ -1401,6 +1402,7 @@ impl MetaStore for Meta {
         )?;
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
+        crate::readdeleg::note_victim(ino);
         Ok(())
     }
 
@@ -1414,6 +1416,9 @@ impl MetaStore for Meta {
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
         let dirty = local.dirty(self);
+        // M16: the entry a rename replaces, read in its own transaction
+        // (for the read-delegation recall, `readdeleg::note_victim`).
+        let replaced = ns::get_dentry_record(&tx, &self.ns, new_parent, new_name)?.map(|d| d.ino);
         let result = rename_in_tx(
             &mut tx,
             &self.ns,
@@ -1447,7 +1452,11 @@ impl MetaStore for Meta {
         }
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
-        if let Some((_, _, db, df)) = result {
+        if let Some((moved, _, db, df)) = result {
+            crate::readdeleg::note_victim(moved);
+            if let Some(r) = replaced.filter(|r| *r != moved) {
+                crate::readdeleg::note_victim(r);
+            }
             self.usage_tracker().adjust(db, df);
         }
         Ok(())

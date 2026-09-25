@@ -700,7 +700,7 @@ impl Core {
         if !self.cfg.read_delegations {
             return false;
         }
-        let inos = constellation_meta::recall_inos_of_op(op);
+        let inos = replica.recall_inos_of_op(op);
         if inos.is_empty() {
             return false;
         }
@@ -1048,9 +1048,12 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.note_foreign(now, replica, out);
-        let backing = self.dl.backing.contains_key(&gen) || replica.deleg_backup_acked_any(gen);
+        let backing = (self.dl.backing.contains_key(&gen) || replica.deleg_backup_acked_any(gen))
+            // Persisted (and synced) before it is acknowledged; not
+            // persisted: answered unsealed, and the root falls back to
+            // its plain reclaim.
+            && replica.deleg_backup_seal(gen);
         let txs = if backing {
-            replica.deleg_backup_seal(gen);
             self.dl.sealed.insert(gen);
             self.stats.deleg_backup_seals += 1;
             replica.deleg_backup_tail(gen)
@@ -1969,6 +1972,7 @@ impl Core {
             if !self.dl.pending_exec.is_empty()
                 || self.has_exec_parks()
                 || self.rd_has_recall_wait(gen)
+                || self.inbox_holds_redelegation(now)
             {
                 // The op that ended it has not run yet: next time.
                 if let Some(g) = self.dl.gens.get_mut(&gen) {
@@ -2685,11 +2689,32 @@ impl Core {
             });
             return;
         }
+        let table = replica.delegation_table();
+        let entries = table.ranges_of(dir);
+        // A designation is the operator's offline authority (plans
+        // 03–05): only `online` releases it. Recalling it here would just
+        // see it re-delegated by the next designation sync, after
+        // bouncing the designee's in-flight ops.
+        if entries.iter().any(|d| d.designated)
+            || entries.iter().any(|d| {
+                self.dl
+                    .gens
+                    .get(&d.gen)
+                    .is_some_and(|g| g.kind == DelegKind::Designated)
+            })
+        {
+            out.push(Action::ControlDone {
+                op,
+                result: Err(format!(
+                    "directory {dir} is designated (an offline designation); \
+                     release it with `constellation online`, not `undelegate`"
+                )),
+            });
+            return;
+        }
         // Plan 30 §M12: every generation of the directory (one whole, or
         // its ranges); the control is answered when the last one ended.
-        let gens: Vec<u64> = replica
-            .delegation_table()
-            .ranges_of(dir)
+        let gens: Vec<u64> = entries
             .iter()
             .map(|d| d.gen)
             .filter(|g| self.dl.gens.get(g).is_some_and(|s| !s.ended))

@@ -91,7 +91,7 @@ use std::sync::Arc;
 /// Current batch encoding version. A reader refuses any other
 /// ([`StoreError::InboxVersion`]): plan 30 waives compatibility, and a
 /// batch is a short-lived object that never outlives an upgrade window.
-pub const INBOX_VERSION: u32 = 2;
+pub const INBOX_VERSION: u32 = 3;
 
 /// The magic the version tag follows: a batch object is self-describing
 /// enough that a stray object under the prefix is rejected as corrupt
@@ -127,6 +127,13 @@ pub struct InboxRid {
 pub struct InboxOp {
     pub rid: InboxRid,
     pub op: Vec<u8>,
+    /// M16 (version 3): the op's causal dependencies, a postcard
+    /// `constellation_meta::Position` (empty: none), as a P2P forward
+    /// carries them. The holder executes the op only once its replica
+    /// reaches their delegation streams, so a write made after one a
+    /// delegate acknowledged (a marker after its data) is never
+    /// appended ahead of it.
+    pub deps: Vec<u8>,
 }
 
 /// One batch object. `epoch`, `node` and `n` are also the key; they are
@@ -950,6 +957,7 @@ mod tests {
         InboxOp {
             rid: rid(node, seq),
             op: format!("op-{node}-{seq}").into_bytes(),
+            deps: Vec::new(),
         }
     }
 
@@ -1285,6 +1293,7 @@ mod tests {
                                 seq: i,
                             },
                             op: vec![1],
+                            deps: Vec::new(),
                         }],
                         1,
                     )
@@ -1307,6 +1316,7 @@ mod tests {
                                 seq: i,
                             },
                             op: vec![2],
+                            deps: Vec::new(),
                         }],
                         1,
                     )
@@ -1586,6 +1596,7 @@ mod tests {
             vec![InboxOp {
                 rid: rid(5, 0),
                 op: secret.clone(),
+                deps: Vec::new(),
             }],
         );
         s.put_batch(&b).await.unwrap();

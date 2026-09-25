@@ -1745,7 +1745,9 @@ impl ConstellationFs {
     /// delegation on what it touched. One lock and an empty map when
     /// nobody holds one (every single-node and bounded-only cluster).
     fn recall_after_local_write(&self, h: &SyncHandle, records: &[constellation_meta::LogRecord]) {
-        self.recall_after_local_inos(h, constellation_meta::recall_inos(records));
+        // (Called right after the op executed on this thread: the inodes
+        // it changed that its records do not name are recalled too.)
+        self.recall_after_local_inos(h, constellation_meta::recall_inos_executed(records));
     }
 
     /// [`Self::recall_after_local_write`] for writes that do not go

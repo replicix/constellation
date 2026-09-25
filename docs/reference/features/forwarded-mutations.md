@@ -216,7 +216,7 @@ acknowledgement policy (plan 30 M9, see
 |---|---|
 | `Local` (no peer within the RTT budget) | the op is committed to the sequencer's local journal |
 | `Backup` (a peer within the budget) | every backup listed in the lease object holds the journal through the op |
-| `S3` (`--ack s3`) | the segment carrying the op is in the bucket |
+| `S3` (`fs create --ack-policy s3`) | the segment carrying the op is in the bucket |
 
 In every case the requester applies the returned records at once, so
 read-your-writes does not wait for shipping, and it keeps them as
@@ -396,7 +396,18 @@ round trip runs as its own task, and the authority core goes straight
 back to its queue instead of awaiting the round trip inline (plan 29 M4
 measured the inline version as the reason 3-node forwarded throughput
 came in *below* single-node). Plan 29's
-`CONSTELLATION_FORWARD_MAX_INFLIGHT` bound no longer exists.
+`CONSTELLATION_FORWARD_MAX_INFLIGHT` bound no longer exists, and none is
+needed: forwards are bounded by their sources. Each is one blocked
+caller on the requester (a FUSE worker thread, one of the bounded
+write-back uploads, or the replay queue, which runs one op at a time),
+retried at most `forward_retries` (3) times before it takes the lease
+path. On the holder, the P2P layer serves at most 32 concurrent
+streams per peer connection (`MAX_CONCURRENT_STREAMS`,
+`crates/net/src/peers.rs`), and a requester's further streams wait in
+QUIC flow control, so a slow holder backs its requesters off instead of
+queueing without limit: its queue is at most 32 requests per peer, and
+retries of a timed-out request take slots from that peer's own budget,
+not another's.
 
 Concurrency is safe only because a requester-side ordering gate (in the
 authority core's client, `crates/authority/src/core/client.rs`)
@@ -538,7 +549,10 @@ forwarded over a P2P path that came back, the requester withdraws
 (deletes) its own batch, so the op is not executed through both paths
 out of order; the rid dedups either way.
 
-1. The op, with its rid, goes into the next **batch object**
+1. The op, with its rid and its `deps` (what this node had observed,
+   including the delegate streams it was answered from, as a P2P
+   forward carries them; batch format version 3), goes into the next
+   **batch object**
    `inbox/<epoch>/<node>/<n>` under the epoch the lease object currently
    shows (one CAS-created PUT; everything a node's FUSE threads queue
    while a PUT is in flight shares the next batch, so requests per op
@@ -561,7 +575,10 @@ out of order; the rid dedups either way.
    single node and a healthy P2P cluster poll nothing; a node that
    appears in the roster is polled at the next round (the registry poll
    nudges one). Batches execute in order through the same dedup a P2P
-   forward gets (`recent`, `completed`).
+   forward gets (`recent`, `completed`), and an op whose `deps` name a
+   delegate stream the holder does not have yet waits for it (a marker
+   is never appended ahead of the data a delegate acknowledged before
+   it).
 3. **Outcomes ride the log.** An executed op ships its records,
    `Completed { rid }` and an `InboxAck` (its batch position); a refused
    one ships `Refused { rid, errno }` plus the ack. The requester, which
@@ -575,10 +592,17 @@ out of order; the rid dedups either way.
    has shipped, keeping each requester's newest one (the high-water mark
    a restarted requester resumes from). A takeover drains every older
    epoch's batches inside its gate — after its own stranded ops, before
-   its view opens — and deletes them. A drain that reaches an op under a
-   live delegation stops there and recalls the delegation first; the
-   batches it did not reach are left for the requester's re-submission
-   (see [Known gaps](#known-gaps)).
+   its view opens — and deletes them. A batch with an op under a live
+   delegation cannot run inside the gate (the delegation is recalled
+   first): that batch and the same requester's later ones are kept, in
+   order, while every other requester's batches still drain. Once the
+   view is open the holder runs the kept batches from its poll tick,
+   through the ordinary admitted path (which starts the recall and
+   waits for it), before it polls that requester under the new epoch,
+   and deletes them once they ran. A generation that such a recall
+   ended is not re-delegated while the op still waits to run (it would
+   recall again, forever). `drained_batches` counts batches that
+   executed.
 
 **Why refusals must be outcomes.** On the inbox path the *holder*
 re-reads batches (a successor's drain), and a requester may re-submit a
@@ -617,12 +641,6 @@ path, cluster locks are unavailable and a strict open tails S3 instead
 
 ### Known gaps
 
-- A takeover drain that stops at an op under a live delegation leaves
-  that batch, and every later batch in the drain, including other
-  requesters', in older-epoch inbox slots that the holder's polls do
-  not read. A live requester re-submits its ops under the new epoch
-  when it notices the takeover, but a batch whose requester has crashed
-  waits for the next takeover.
 - `MAX_BATCH_BYTES` (1 MiB) is defined but not enforced; a batch is
   bounded by its op count (512).
 

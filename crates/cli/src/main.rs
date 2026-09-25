@@ -121,15 +121,6 @@ enum Command {
         /// `CONSTELLATION_LOCKS` supplies the default.
         #[arg(long)]
         locks: Option<String>,
-        /// Acknowledgement policy (plan 30 §M9): "local" (a mutation is
-        /// acknowledged once journaled here; a backup peer within the
-        /// RTT budget, when there is one, holds it too) or "s3" (every
-        /// acknowledgement waits for the record to land in the shared
-        /// log; a silent holder is taken over fast). Omitted: the
-        /// filesystem's `ack_policy` (`fs create --ack-policy`), else
-        /// local. `CONSTELLATION_ACK` supplies the default.
-        #[arg(long)]
-        ack: Option<String>,
         /// Chunk close policy: "through" waits for S3; "back" returns
         /// after the local durable queue is journaled.
         #[arg(long)]
@@ -567,9 +558,13 @@ enum FsCommand {
         /// Optional logical size cap (e.g. 10G). Unbounded when omitted.
         #[arg(long, value_parser = parse_byte_size)]
         max_size: Option<u64>,
-        /// Acknowledgement policy for every mount of this filesystem
-        /// (plan 30 §M9): "local" (default) or "s3". A mount's `--ack`
-        /// overrides it.
+        /// Acknowledgement policy of the filesystem (plan 30 §M9), for
+        /// every mount and every lease tenure: "local" (default; a
+        /// mutation is acknowledged once journaled by its sequencer, and
+        /// held by a backup peer within the RTT budget when there is one)
+        /// or "s3" (every acknowledgement waits for the record to land in
+        /// the shared log; a silent holder is taken over fast). Fixed at
+        /// creation. `CONSTELLATION_ACK` supplies the default.
         #[arg(long)]
         ack_policy: Option<String>,
         /// Plan 30 §M10: how many write-eligible nodes a continuation
@@ -770,7 +765,6 @@ fn main() -> Result<()> {
         fsync_mode,
         cto,
         locks,
-        ack,
         write_mode,
         read_only_member,
         atime,
@@ -794,7 +788,6 @@ fn main() -> Result<()> {
                 fsync_mode,
                 cto,
                 locks,
-                ack,
                 write_mode,
                 read_only_member,
                 atime,
@@ -828,11 +821,7 @@ fn main() -> Result<()> {
                 },
         } => {
             constellation_fs_core::validate_chunk_size(chunk_size)?;
-            let ack_policy = match ack_policy.as_deref().map(|p| p.trim().to_ascii_lowercase()) {
-                None => None,
-                Some(p) if p == "local" || p == "s3" => Some(p),
-                Some(other) => bail!("invalid --ack-policy {other:?} (expected local or s3)"),
-            };
+            let ack_policy = crate::authority_driver::ack_policy_flag(ack_policy.as_deref())?;
             let setting: CompressionSetting =
                 compression.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
             let backend = rt
@@ -1378,7 +1367,6 @@ struct MountArgs {
     fsync_mode: Option<String>,
     cto: Option<String>,
     locks: Option<String>,
-    ack: Option<String>,
     write_mode: Option<String>,
     read_only_member: bool,
     atime: Option<String>,
@@ -1474,7 +1462,6 @@ fn cmd_mount(
         fsync_mode,
         cto,
         locks,
-        ack,
         write_mode,
         read_only_member,
         atime,
@@ -1489,7 +1476,6 @@ fn cmd_mount(
     // it actually started).
     let locks = crate::locks::cluster_flag(locks.as_deref())?;
     crate::locks::cluster_effective(locks, constellation_net::enabled())?;
-    let ack = crate::authority_driver::ack_flag(ack.as_deref())?;
     // Resolve once: env CONSTELLATION_ATIME overrides the --atime flag.
     let atime_mode =
         crate::atime::AtimeMode::resolve(atime.as_deref().and_then(crate::atime::AtimeMode::parse));
@@ -1697,7 +1683,6 @@ fn cmd_mount(
             fsync_s3,
             cto_strict,
             locks,
-            ack,
             initial_write_mode,
             read_only_member,
             atime_mode,
@@ -1716,7 +1701,6 @@ fn cmd_mount(
                 fsync_s3,
                 cto_strict,
                 locks,
-                ack,
                 initial_write_mode,
                 read_only_member,
                 atime_mode,
@@ -1793,7 +1777,6 @@ fn cmd_mount_body(
     fsync_s3: bool,
     cto_strict: bool,
     locks: Option<bool>,
-    ack: Option<bool>,
     initial_write_mode: writeback::WriteMode,
     read_only_member: bool,
     atime_mode: crate::atime::AtimeMode,
@@ -1873,7 +1856,6 @@ fn cmd_mount_body(
                     fsync_s3,
                     cto_strict,
                     locks,
-                    ack,
                     initial_write_mode,
                     read_only_member,
                     web_ui,
@@ -6939,7 +6921,6 @@ mod umount_tests {
                 fsync_s3: false,
                 cto_strict: false,
                 locks: None,
-                ack: None,
                 initial_write_mode: writeback::WriteMode::Through,
                 read_only_member: false,
                 web_ui: 0,

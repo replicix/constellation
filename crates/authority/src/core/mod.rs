@@ -104,7 +104,7 @@ pub struct Config {
     pub dwell_ms: u64,
     pub wanted_grace_ms: u64,
     pub handoff_pause_ms: u64,
-    /// `CONSTELLATION_FORWARDING`.
+    /// `CONSTELLATION_FORWARD`.
     pub forwarding: bool,
     /// P2P enabled (a handoff can be asked for over the network).
     pub p2p: bool,
@@ -379,8 +379,14 @@ impl Config {
             inbox_tail_ms: 20,
             escalation: true,
             escalate_window_ms: 10_000,
-            escalate_ops: 20,
-            escalate_wait_ms: 3_000,
+            // Plan 30 M5 retuned these with the sans-IO core in the
+            // simulation and on the `3node-p2poff-*` meta-bench (round 4's
+            // 20 ops / 3 s delayed the switch by most of a bench run). One
+            // write every few seconds is 2–3 ops and well under a second
+            // of waiting per window: never an escalation. The production
+            // knobs (`cli::inbox::knobs`) take their defaults from here.
+            escalate_ops: 8,
+            escalate_wait_ms: 1_500,
             escalate_retry_ms: 2_000,
             log_streams: true,
             stream_heartbeat_ms: 1_000,

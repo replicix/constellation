@@ -256,6 +256,17 @@ fn env_ms(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Like [`env_ms`], but `0` is a value, not "unset": for knobs where 0
+/// means something (no split, no share floor, no rate floor).
+fn env_u64_zero_ok(name: &str, default: u64) -> u64 {
+    parse_u64_zero_ok(std::env::var(name).ok().as_deref(), default)
+}
+
+fn parse_u64_zero_ok(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 /// One subscriber of this holder's log stream: the frames queued for its
 /// stream writer (the P2P handler), and how many bytes of segment payload
 /// sit in that queue.
@@ -500,14 +511,21 @@ pub fn load_config(
                 .as_str(),
             "0" | "off" | "false"
         );
-    c.placement_split_pct = env_ms("CONSTELLATION_DELEGATION_SPLIT", c.placement_split_pct);
+    // `0` is a value for the four share/rate knobs: SPLIT=0 turns hash
+    // range splits off, LEAVE=0 never recalls a placed delegation for
+    // its share (only for its rate), DOMINANCE=0 gives a subtree to its
+    // top writer whatever its share, MIN_OPS=0 drops the rate floor.
+    c.placement_split_pct =
+        env_u64_zero_ok("CONSTELLATION_DELEGATION_SPLIT", c.placement_split_pct).min(100);
     c.placement_window_ms = env_ms("CONSTELLATION_DELEGATION_WINDOW_MS", c.placement_window_ms);
-    c.placement_min_ops = env_ms("CONSTELLATION_DELEGATION_MIN_OPS", c.placement_min_ops);
-    c.placement_dominance_pct = env_ms(
+    c.placement_min_ops = env_u64_zero_ok("CONSTELLATION_DELEGATION_MIN_OPS", c.placement_min_ops);
+    c.placement_dominance_pct = env_u64_zero_ok(
         "CONSTELLATION_DELEGATION_DOMINANCE",
         c.placement_dominance_pct,
-    );
-    c.placement_leave_pct = env_ms("CONSTELLATION_DELEGATION_LEAVE", c.placement_leave_pct);
+    )
+    .min(100);
+    c.placement_leave_pct =
+        env_u64_zero_ok("CONSTELLATION_DELEGATION_LEAVE", c.placement_leave_pct).min(100);
     c.placement_dwell_ms = env_ms("CONSTELLATION_DELEGATION_DWELL_MS", c.placement_dwell_ms);
     c.placement_cooldown_ms = env_ms(
         "CONSTELLATION_DELEGATION_COOLDOWN_MS",
@@ -543,31 +561,35 @@ pub fn load_config(
     c
 }
 
-/// Plan 30 §M9: the `--ack` mount flag (`local` or `s3`), or
-/// `CONSTELLATION_ACK`; `None` leaves the choice to the filesystem's
-/// `ack_policy` (`fs create --ack-policy`).
-pub fn ack_flag(flag: Option<&str>) -> anyhow::Result<Option<bool>> {
+/// Plan 30 §M9: `fs create --ack-policy local|s3`, defaulting to
+/// `CONSTELLATION_ACK`; `None` (neither set) stores no policy (`local`).
+///
+/// M16: the policy is the filesystem's, not a mount's. It is recorded on
+/// every lease tenure (`Lease::ack_policy`) and what an acknowledgement
+/// means is the tenure's, so a per-mount flag could only ever apply to
+/// tenures its own mount acquired: a `--ack s3` requester forwarding to a
+/// `local` holder got local acknowledgements. One policy for every mount
+/// makes every tenure's policy the one each mount asked for.
+pub fn ack_policy_flag(flag: Option<&str>) -> anyhow::Result<Option<String>> {
     let env = std::env::var("CONSTELLATION_ACK").ok();
-    let Some(raw) = flag.or(env.as_deref()) else {
+    parse_ack_policy(flag.or(env.as_deref()))
+}
+
+fn parse_ack_policy(raw: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(raw) = raw else {
         return Ok(None);
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         "" => Ok(None),
-        "local" => Ok(Some(false)),
-        "s3" => Ok(Some(true)),
-        other => anyhow::bail!("invalid --ack {other:?} (expected local or s3)"),
+        p @ ("local" | "s3") => Ok(Some(p.to_string())),
+        other => anyhow::bail!("invalid --ack-policy {other:?} (expected local or s3)"),
     }
 }
 
-/// Plan 30 §M9: whether this mount acknowledges on the shared log
-/// (`ack=s3`): the flag, else the filesystem's policy, else `local`.
-pub fn ack_s3_resolved(flag: Option<bool>, fs_policy: Option<&str>) -> bool {
-    match flag {
-        Some(v) => v,
-        None => fs_policy
-            .map(|p| p.trim().eq_ignore_ascii_case("s3"))
-            .unwrap_or(false),
-    }
+/// Plan 30 §M9: whether the filesystem acknowledges on the shared log
+/// (`ack_policy = s3` in `meta.json`).
+pub fn ack_s3_of(fs_policy: Option<&str>) -> bool {
+    fs_policy.is_some_and(|p| p.trim().eq_ignore_ascii_case("s3"))
 }
 
 fn now() -> Ms {
@@ -823,6 +845,10 @@ impl Driver {
         if !notes.is_empty() {
             self.core.place_note_local(&notes, &*self.deps.meta);
         }
+        // M16: the root lease's placement counts them too (it hears of
+        // core-executed ops through `Action::Reply` only).
+        let fast_ops = self.deps.delegates.take_fast_path_ops();
+        self.deps.placement.note_ops(self.node_id, fast_ops);
         let cfg = self.core.config();
         let lease = self.core.lease();
         self.deps
@@ -3354,5 +3380,39 @@ impl Standalone {
                 | Action::EpochFlushed => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_u64_zero_ok;
+
+    /// The placement's share and rate knobs take `0` as a value (it turns
+    /// splitting, the share floor or the rate floor off); unset or
+    /// unparsable is the default.
+    #[test]
+    fn the_ack_policy_is_parsed_once_for_the_filesystem() {
+        use super::{ack_s3_of, parse_ack_policy};
+        assert_eq!(parse_ack_policy(None).unwrap(), None);
+        assert_eq!(
+            parse_ack_policy(Some(" S3 ")).unwrap().as_deref(),
+            Some("s3")
+        );
+        assert_eq!(
+            parse_ack_policy(Some("local")).unwrap().as_deref(),
+            Some("local")
+        );
+        assert!(parse_ack_policy(Some("backup")).is_err());
+        assert!(ack_s3_of(Some("s3")));
+        assert!(!ack_s3_of(Some("local")));
+        assert!(!ack_s3_of(None));
+    }
+
+    #[test]
+    fn zero_is_a_value_for_zero_ok_knobs() {
+        assert_eq!(parse_u64_zero_ok(Some("0"), 20), 0);
+        assert_eq!(parse_u64_zero_ok(Some(" 35 "), 20), 35);
+        assert_eq!(parse_u64_zero_ok(None, 20), 20);
+        assert_eq!(parse_u64_zero_ok(Some("off"), 20), 20);
     }
 }

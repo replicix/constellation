@@ -366,7 +366,9 @@ impl Core {
                 replica.remember_outcome(rid, &records);
                 self.lease.touch(now);
                 self.nudge(now, out);
-                let inos = constellation_meta::recall_inos(&records);
+                // (`_executed`: plus what an unlink or rename changed
+                // that its records do not name.)
+                let inos = constellation_meta::recall_inos_executed(&records);
                 return (MutateOutcome::Accepted { epoch, records }, Some(inos));
             }
             Err(MetaError::Conflict) => match op {

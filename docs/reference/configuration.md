@@ -48,9 +48,10 @@ AWS credentials follow the ordinary AWS SDK chain (`AWS_REGION`,
 ### Mount flags
 
 The `mount` flags that choose consistency, durability and lock
-semantics. Plan 30 added `--cto`, `--locks` and `--ack`. `--fsync-mode`
-and `--write-mode` are older and are listed because they combine with
-`--ack`. See [Durability and failover](features/durability-and-failover.md),
+semantics. Plan 30 added `--cto` and `--locks`; the acknowledgement
+policy is the filesystem's (`fs create --ack-policy`, below), not a
+mount flag. `--fsync-mode` and `--write-mode` are older and are listed
+because they combine with it. See [Durability and failover](features/durability-and-failover.md),
 [Close-to-open modes](features/cto-modes.md) and
 [Cluster locks](features/cluster-locks.md).
 
@@ -58,11 +59,10 @@ and `--write-mode` are older and are listed because they combine with
 |---|---|---|---|---|---|
 | `--cto` | `bounded` | `bounded`, `strict` | `CONSTELLATION_CTO` | no | close-to-open mode (plan 30 M8). `strict`: an open, lookup or listing sees every close another node completed before it began |
 | `--locks` | `cluster` with P2P, `local` without | `local`, `cluster` | `CONSTELLATION_LOCKS` | no | `flock`/`fcntl` scope (plan 30 M14). An explicit `cluster` with P2P off fails the mount |
-| `--ack` | the filesystem's `ack_policy`, else `local` | `local`, `s3` | `CONSTELLATION_ACK` | no | what a mutation's acknowledgement waits for (plan 30 M9). `local`: journaled on the holder, plus its backup when one is in budget. `s3`: the record's segment is in the bucket. The policy belongs to the lease tenure, so it applies to tenures this mount acquires; a mount forwarding to another holder gets that holder's policy |
 | `--fsync-mode` | `local` | `local`, `s3` | none | yes | what `fsync()` waits for. `local`: the node's metadata store is forced to disk. `s3`: also the file's chunks and the journal up to the call are in the bucket. `s3` also forces `--write-mode through` |
 | `--write-mode` | `through` | `through`, `back` | none | yes | chunk close policy. `through`: `close()` waits for the upload; `back`: `close()` returns once the upload is queued durably on local disk. `fsync`, `O_SYNC` and `--fsync-mode s3` always act as `through`. `constellation write-mode TARGET MODE` changes it on a running mount |
 
-Values are case-insensitive for `--cto`, `--locks` and `--ack`; any
+Values are case-insensitive for `--cto` and `--locks`; any
 other value fails the mount. The flags that are not persisted apply to
 the mount command that carries them: a later bare `mount NAME` uses the
 environment or the default again.
@@ -73,7 +73,7 @@ Stored in the bucket's `meta.json` and read by every mount.
 
 | Setting | Set with | Default | Meaning |
 |---|---|---|---|
-| `ack_policy` | `fs create --ack-policy local\|s3` | `local` (absent) | the acknowledgement policy a mount uses for the tenures it acquires, unless its own `--ack` or `CONSTELLATION_ACK` says otherwise. There is no `fs set` for it |
+| `ack_policy` | `fs create --ack-policy local\|s3` (default `CONSTELLATION_ACK`) | `local` (absent) | what a mutation's acknowledgement waits for (plan 30 M9), for every mount and every lease tenure. `local`: journaled by its sequencer, plus a backup when one is in budget. `s3`: the record's segment is in the bucket. Fixed at creation (there is no `fs set` for it, and no per-mount override: an acknowledgement is the sequencer's, so a per-mount setting could not apply to ops another node sequences) |
 | `epoch_slack` (`f`) | `fs create --epoch-slack N`, `fs set epoch-slack TARGET N` | `0` (absent) | how many write-eligible nodes a continuation epoch may form without (plan 30 M10). With `f > 0`, an S3 takeover of an expired lease needs `f` other nodes' heartbeat promises. See [Durability and failover](features/durability-and-failover.md#flexible-continuation-epochs) |
 
 `fs set epoch-slack` refuses `N` at or above the write-eligible roster
@@ -81,13 +81,15 @@ size and warns when `N > roster − 2`, because a single crashed holder
 then blocks TTL failover until it returns. Mounted nodes pick up a
 change within about a minute. With `f > 0`, `CONSTELLATION_PROMISE_TTL_S`
 must be at most a quarter of `CONSTELLATION_LEASE_TTL_MS`; otherwise
-`fs create`, `fs set` and the mount fail.
+`fs create`, `fs set` and the mount fail. A mounted node that started
+at `f = 0` with a longer TTL and sees `f` raised clamps its TTL to a
+quarter of the lease TTL and logs an error.
 
 ### Precedence
 
 | Setting | Order (first that is set wins) |
 |---|---|
-| `ack` | `--ack`, `CONSTELLATION_ACK`, `meta.json` `ack_policy`, `local` |
+| `ack_policy` | `meta.json` only (written by `fs create`: `--ack-policy`, else `CONSTELLATION_ACK`, else `local`) |
 | `cto` | `--cto`, `CONSTELLATION_CTO`, `bounded` |
 | `locks` | `--locks`, `CONSTELLATION_LOCKS`, `cluster` if P2P is on, else `local` |
 | `atime` | `CONSTELLATION_ATIME`, `--atime`, `off` (the environment wins here, unlike the rows above) |
@@ -98,7 +100,7 @@ must be at most a quarter of `CONSTELLATION_LEASE_TTL_MS`; otherwise
 | Command | Meaning |
 |---|---|
 | `constellation delegate TARGET --to NODE [--range IDX/COUNT]` | delegate a directory's subtree, or one of `COUNT` name-hash ranges of it (`COUNT` is 2, 4, 8 or 16), to node `NODE`. The node running it must hold the lease. See [Delegations](features/delegations.md) |
-| `constellation undelegate TARGET` | recall the delegation on a directory |
+| `constellation undelegate TARGET` | recall the delegation on a directory (refused for a designation: use `constellation online`) |
 | `constellation delegations TARGET` | list the live delegation table |
 | `constellation reintegrate TARGET` | run a deposed holder's recovery now: roll back the stranded journal and replay it by rid (it also runs on its own) |
 | `constellation repair drop-held TARGET INO` | discard held-back records of an inode into a conflict copy (plan 30 M4, see [Write-path hygiene](features/write-path-hygiene.md)) |
@@ -130,7 +132,15 @@ much of it is left, and every grant backed by it is capped by it) is
 `min(1000 ms, CONSTELLATION_LEASE_TTL_MS / 4)`. It is not a separate
 knob. Plan 29 M5's `CONSTELLATION_FORWARD_MAX_INFLIGHT` no longer
 exists: since plan 30 M5 each forward runs as its own task, ordered only
-by the requester-side key gate.
+by the requester-side key gate. Forwards are still bounded, by their
+callers and the transport rather than a knob: a requester has one
+forward per blocked caller (a FUSE worker thread, one of the bounded
+write-back uploads, the one-at-a-time replay queue), each retried at
+most `forward_retries` (3) times before it takes the lease path; a
+holder serves at most 32 concurrent streams per peer (the P2P layer's
+per-connection limit), and a further request waits in QUIC flow control
+on the requester's side. See
+[Forwarded mutations](features/forwarded-mutations.md#concurrent-forwarding-correctly-ordered).
 
 #### Sticky leases
 
@@ -188,7 +198,7 @@ Plan 30 M9. See [Durability and failover](features/durability-and-failover.md).
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
-| `CONSTELLATION_ACK` | unset | `local`, `s3` | default for `--ack`; the flag wins, and the filesystem's `ack_policy` applies when neither is set |
+| `CONSTELLATION_ACK` | unset | `local`, `s3` | default for `fs create --ack-policy`. A mount whose environment sets it to something other than the filesystem's policy logs a warning and uses the filesystem's |
 | `CONSTELLATION_BACKUP_RTT_BUDGET_MS` | `5` | milliseconds; `0` accepted | a peer is a backup candidate only while its measured RTT to the holder is within this. `0` means never use a backup |
 | `CONSTELLATION_BACKUPS` | `1` | count; `0` accepted | the most backups a holder keeps. `0` means none |
 | `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` | `1000` | milliseconds; `0` means the default | a backup that makes no acknowledgement progress for this long is removed by a lease CAS before the holder acknowledges anything further |
@@ -203,7 +213,7 @@ Plan 30 M10. The slack `f` itself is a per-filesystem setting
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
-| `CONSTELLATION_PROMISE_TTL_S` | lease TTL / 4 (15 s) | seconds, positive | how long a heartbeat promise binds its writer. Must be at most a quarter of the lease TTL when `epoch_slack > 0`, or `fs create`, `fs set epoch-slack` and the mount fail; with slack 0 a violation only logs a warning |
+| `CONSTELLATION_PROMISE_TTL_S` | lease TTL / 4 (15 s) | seconds, positive | how long a heartbeat promise binds its writer. Must be at most a quarter of the lease TTL when `epoch_slack > 0`, or `fs create`, `fs set epoch-slack` and the mount fail; with slack 0 a violation only logs a warning, and a later raise of the slack clamps it on the mounted node |
 
 Promises are published on demand, not on a timer: when a would-be taker
 asks over P2P, when a node sees a lease expire unrenewed, or when its
@@ -211,9 +221,10 @@ slack changes. A cluster with `epoch_slack = 0` writes no promises.
 
 ### Delegation and placement
 
-Plan 30 M11–M12. See [Delegations](features/delegations.md). The
-percentages and counts below are read like the millisecond knobs: `0`
-or an unparsable value means the default.
+Plan 30 M11–M12. See [Delegations](features/delegations.md). An
+unparsable value means the default. For the millisecond knobs `0` also
+means the default; for `_MIN_OPS`, `_DOMINANCE`, `_LEAVE` and `_SPLIT`,
+`0` is a value (percentages above 100 read as 100).
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
@@ -221,10 +232,10 @@ or an unparsable value means the default.
 | `CONSTELLATION_DELEGATION_TTL_MS` | `5000` | milliseconds | a delegation grant's lifetime, renewed at half of it |
 | `CONSTELLATION_DELEGATION_PLACEMENT` | on | boolean | the root delegates dominated subtrees and splits hot shared directories by itself. Off keeps manual `delegate` only. Needs `CONSTELLATION_DELEGATION` |
 | `CONSTELLATION_DELEGATION_WINDOW_MS` | `30000` | milliseconds | placement's sliding window of ops per directory and node |
-| `CONSTELLATION_DELEGATION_MIN_OPS` | `200` | ops per window | rate floor: a subtree (or, for a split, the directory itself) needs this many ops in the window |
-| `CONSTELLATION_DELEGATION_DOMINANCE` | `70` | percent | the share of a subtree's ops one node needs to be given it |
-| `CONSTELLATION_DELEGATION_LEAVE` | `50` | percent | a placed delegation whose delegate stays below this share for a whole dwell is recalled |
-| `CONSTELLATION_DELEGATION_SPLIT` | `20` | percent | a hot directory that no node dominates is split into name-hash ranges when several nodes each write at least this share of it. `0` cannot be set from the environment (it reads as the default); turn placement off to stop splits |
+| `CONSTELLATION_DELEGATION_MIN_OPS` | `200` | ops per window; `0` accepted | rate floor: a subtree (or, for a split, the directory itself) needs this many ops in the window. `0`: no floor |
+| `CONSTELLATION_DELEGATION_DOMINANCE` | `70` | percent; `0` accepted | the share of a subtree's ops one node needs to be given it. `0`: the top writer of a subtree above the rate floor gets it (and no directory is a split candidate, since some node always "dominates") |
+| `CONSTELLATION_DELEGATION_LEAVE` | `50` | percent; `0` accepted | a placed delegation whose delegate stays below this share for a whole dwell is recalled. `0`: never recalled for its share, only for the rate |
+| `CONSTELLATION_DELEGATION_SPLIT` | `20` | percent; `0` accepted | a hot directory that no node dominates is split into name-hash ranges when several nodes each write at least this share of it. `0` turns splitting off |
 | `CONSTELLATION_DELEGATION_DWELL_MS` | `60000` | milliseconds | how long a recall condition must hold before placement recalls |
 | `CONSTELLATION_DELEGATION_COOLDOWN_MS` | `30000` | milliseconds | a recalled directory is not placed or split again for this long |
 

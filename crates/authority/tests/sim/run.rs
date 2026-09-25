@@ -237,8 +237,8 @@ pub fn sim_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.inbox_deadline_ms = 8_000;
     c.inbox_p2p_grace_ms = 600;
     c.escalate_window_ms = 4_000;
-    c.escalate_ops = 8;
-    c.escalate_wait_ms = 1_500;
+    // (`escalate_ops` / `escalate_wait_ms`: the production defaults,
+    // `Config::defaults`, one source of truth.)
     c.escalate_retry_ms = 800;
     c.stream_heartbeat_ms = 300;
     c.stream_timeout_ms = 1_000;

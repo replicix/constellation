@@ -420,6 +420,11 @@ pub struct DelegateView {
     /// since the driver last drained them, for the placement's
     /// histogram (`Core::place_note_local`).
     fast_path_notes: std::sync::Mutex<Vec<constellation_meta::TouchSet>>,
+    /// M16: how many writes the root's fast path executed since the
+    /// driver last drained this, for the root lease's placement
+    /// (`crate::placement::Placement::note_ops`), exact even when
+    /// `fast_path_notes` drops its oldest entries.
+    fast_path_ops: std::sync::atomic::AtomicU64,
     /// Plan 30 §M12: ops the root's fast path sent through the core
     /// because a live delegation owned their keys (`status`).
     routed: std::sync::atomic::AtomicU64,
@@ -477,6 +482,8 @@ impl DelegateView {
 
     /// Plan 30 §M12: the root's fast path executed an op with `keys`.
     pub fn note_fast_path(&self, keys: constellation_meta::TouchSet) {
+        self.fast_path_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut g = self.fast_path_notes.lock().unwrap();
         // Bounded: the driver drains after every event; a long stall
         // keeps the latest instead of growing without bound.
@@ -489,6 +496,12 @@ impl DelegateView {
     /// The notes since the last drain.
     pub fn take_fast_path_notes(&self) -> Vec<constellation_meta::TouchSet> {
         std::mem::take(&mut *self.fast_path_notes.lock().unwrap())
+    }
+
+    /// The fast-path write count since the last drain.
+    pub fn take_fast_path_ops(&self) -> u64 {
+        self.fast_path_ops
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Plan 30 §M12: the root's fast path sent an op through the core

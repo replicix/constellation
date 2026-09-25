@@ -52,7 +52,9 @@ use crate::action::{Action, S3Op};
 use crate::event::{Carrier, PeerMsg, S3Result};
 use crate::ids::{Epoch, Ms, NodeId, OpId, TimerId};
 use crate::replica::Replica;
-use constellation_store_s3::heartbeat::{effective_slack, takeover_check, Promise};
+use constellation_store_s3::heartbeat::{
+    effective_slack, takeover_check, Promise, PromiseConfig, PROMISE_TTL_LEASE_DIVISOR,
+};
 use constellation_store_s3::{AckPolicy, Lease};
 use std::collections::BTreeMap;
 
@@ -200,7 +202,36 @@ impl Core {
             );
             self.cfg.epoch_slack = epoch_slack;
         }
+        self.clamp_promise_ttl();
         self.advertise_slack(now, replica, out);
+    }
+
+    /// Plan 30 §M10's promise-TTL rule (at most lease TTL / 4, positive)
+    /// is checked at mount only when `epoch_slack > 0` then; a mount that
+    /// started at `f = 0` with a longer `CONSTELLATION_PROMISE_TTL_S` and
+    /// is raised at runtime (`fs set epoch-slack`) is checked here. The
+    /// TTL is clamped rather than the slack refused: this node must run
+    /// with the filesystem's slack (a taker honours the largest one
+    /// advertised anyway), and a shorter promise is always safe — the
+    /// promises already issued stay persisted and still bind the join.
+    pub(crate) fn clamp_promise_ttl(&mut self) {
+        if self.cfg.epoch_slack == 0 {
+            return;
+        }
+        let promise = PromiseConfig::new(self.cfg.promise_ttl_ms);
+        if let Err(why) = promise.validate(self.cfg.ttl_ms) {
+            let clamped = (self.cfg.ttl_ms / PROMISE_TTL_LEASE_DIVISOR).max(1);
+            tracing::error!(
+                node = self.cfg.node_id,
+                epoch_slack = self.cfg.epoch_slack,
+                from_ms = self.cfg.promise_ttl_ms,
+                to_ms = clamped,
+                %why,
+                "epoch slack raised at runtime with an invalid promise TTL \
+                 (CONSTELLATION_PROMISE_TTL_S); clamping it to lease TTL / 4"
+            );
+            self.cfg.promise_ttl_ms = clamped;
+        }
     }
 
     /// Plan 30 §M10: the heartbeat carries the slack this node runs with.

@@ -36,7 +36,9 @@ opt-in.
   role for its subtree and picks its own backup the same way.
 - **Tenure**: one holder's time under one lease epoch.
 - **Acknowledgement policy** (`ack_policy` on the lease object):
-  `Local`, `Backup` or `S3`. It belongs to the tenure.
+  `Local`, `Backup` or `S3`. It is recorded on each tenure: `S3` when
+  the filesystem's policy is `s3` (`fs create --ack-policy s3`), else
+  `Backup` or `Local` depending on whether a backup is in budget.
 - **Backup**: a peer that holds a synchronous copy of the holder's
   unshipped journal.
 - **Seal**: a backup's persisted "epoch *e* is sealed": it refuses every
@@ -57,21 +59,52 @@ opt-in.
 | Single node | `Local` | none | nothing lost | n/a | n/a |
 | Only distant peers | `Local` | none | nothing lost | forwarded ops are replayed by their requesters; the holder's own un-shipped writes come back when it returns, as a replay | lease TTL (60 s default) |
 | A peer within the RTT budget | `Backup` (automatic) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS (≈ 1.5 s measured) |
-| `--ack s3`, any topology | `S3` | one S3 round trip per group commit | nothing lost | nothing lost | detection + one CAS (needs P2P) |
+| `fs create --ack-policy s3`, any topology | `S3` | one S3 round trip per group commit | nothing lost | nothing lost | detection + one CAS (needs P2P) |
 
 There is no `backup` setting: `Backup` is chosen automatically when a
-peer is in budget and `--ack s3` is not in effect.
+peer is in budget and the filesystem's policy is not `s3`. "Nothing
+lost" is for the failures named in the column; power loss is covered in
+[What "on disk" means](#what-on-disk-means).
 
 ## Details
 
 ### What "on disk" means
 
-A node's metadata store commits to OS buffers, not to stable storage. A
-commit survives a process crash, but a power loss can drop the most
-recent commits until something syncs them: an `fsync()` on the mount,
-or an orderly shutdown. This applies to the holder's journal, to a
-backup's copy, to a seal, and to a promise. Two nodes that lose power
-together (the same rack) can lose Layer-B-acknowledged writes.
+A node's metadata store commits to OS buffers (fjall
+`PersistMode::Buffer`), not to stable storage. A commit survives a crash
+of the process, but a power loss or kernel crash of that machine can
+drop the commits the OS had not yet written back (Linux writes dirty
+pages back within about 30 s by default) unless something synced them:
+an `fsync()` on the mount, an orderly shutdown, or one of the syncs
+below.
+
+**Safety state is always synced.** Every write whose loss would break a
+safety rule, not just lose work, is forced to stable storage before the
+node acts on it:
+
+- a promise, before its `heartbeat/` PUT, and the epoch join gate (a
+  member publishes no promise);
+- a continuation epoch's persisted state (the promise to a proposer,
+  its membership, the hold) whenever it changes;
+- a backup's seal (and a delegate backup's), before the backup refuses
+  an append, reads the lease to take over, or acknowledges the seal;
+- the read-grant horizon a restarted holder quarantines on.
+
+So a power loss can make a node forget work, never a promise it made.
+
+**The durability contract, per layer.** What an acknowledged mutation
+survives before its segment is in the bucket:
+
+| Policy | Survives | Can be lost |
+|---|---|---|
+| `Local` | any failure of the *requester* of a forwarded op (it is on the holder), a holder process crash, and a holder machine failure for forwarded ops (their requesters replay them, Layer A) | the holder's *own* clients' unshipped writes, if the holder machine loses power or its kernel crashes (they are lost together with the clients that wrote them); a forwarded op if its requester and the holder both lose power |
+| `Backup` | any failure of the holder (process, kernel, power), any failure of a backup (the holder still has it, and removes the backup by lease CAS), a backup's process crash at any time | writes acknowledged within the OS write-back window if the holder **and every backup** lose power (or their kernels crash) together: a correlated failure, such as one power domain. A backup commits an append before acknowledging it but does not fsync it (an fsync per append would put a disk flush on every acknowledgement, the latency Layer B exists to avoid) |
+| `S3` | everything short of losing the bucket | nothing |
+
+Plan 30 §3's "nothing lost" for `Backup` is the single-failure
+contract: one machine, whatever happens to it. Use `ack_policy = s3`, or
+`fsync()` with `--fsync-mode s3`, for writes that must survive a
+correlated power loss.
 
 ### Layer A: requesters keep what they were acknowledged
 
@@ -123,8 +156,8 @@ it has caught up.
 A backup that has heard nothing from its holder for
 `CONSTELLATION_BACKUP_TAKEOVER_MS` (1.5 s):
 
-1. **seals**: persists "epoch *e* sealed" and answers every later
-   epoch-*e* append with `sealed`;
+1. **seals**: persists and fsyncs "epoch *e* sealed", and answers
+   every later epoch-*e* append with `sealed`;
 2. re-reads the lease, and continues only if it still names that holder
    and epoch and still lists this backup;
 3. takes the lease at epoch *e*+1 by CAS, tails S3 to head, and ships an
@@ -150,10 +183,10 @@ not published naming missing chunks.
 
 ### Layer C: `ack=s3`
 
-`--ack s3`, `CONSTELLATION_ACK=s3`, or a filesystem created with
-`fs create --ack-policy s3` makes every acknowledgement wait until the
-record's segment is CAS-created in the log. Sync rounds group-commit
-whatever is waiting. No backups are used.
+A filesystem created with `fs create --ack-policy s3` (or with
+`CONSTELLATION_ACK=s3` in the environment of `fs create`) makes every
+acknowledgement wait until the record's segment is CAS-created in the
+log. Sync rounds group-commit whatever is waiting. No backups are used.
 
 The lease then records `ack_policy = S3`, and any peer may take it over
 when the holder falls silent for `CONSTELLATION_BACKUP_TAKEOVER_MS`,
@@ -163,9 +196,14 @@ holder. Silence is read from the holder's log stream (it heartbeats the
 stream), so fast takeover needs P2P. With P2P off, `ack=s3` still gives
 S3 durability but fails over at the TTL.
 
-The policy belongs to the tenure: it is set by the mount that acquired
-the lease. A `--ack s3` node forwarding to a holder whose tenure is
-`Local` gets that holder's acknowledgements.
+The policy is the filesystem's, fixed at creation, and every mount runs
+with it. There is no per-mount `--ack`: what an acknowledgement means is
+decided by the sequencer that gives it (the tenure's `ack_policy`), so a
+per-mount setting could only ever apply to the tenures its own mount
+acquired, and a node asking for `s3` while forwarding to a `local`
+holder would have got `local` acknowledgements. `CONSTELLATION_ACK` is
+only `fs create`'s default; a mount whose environment sets it to
+something else logs a warning and uses the filesystem's policy.
 
 ### No client observes a tentative effect
 
@@ -222,6 +260,11 @@ With `epoch_slack = f > 0` (`fs create --epoch-slack f`, or
   heartbeats.
 - A node joins an epoch only once its last issued promise has expired,
   and issues no promise while its epoch is open.
+- Raising `f` at runtime (`fs set epoch-slack`) on a mount whose
+  promise TTL exceeds a quarter of the lease TTL (never checked at mount
+  while `f` was 0) clamps the TTL to lease TTL / 4, with an error in the
+  log; a mount that starts with `f > 0` and an invalid TTL refuses to
+  mount.
 - An S3 takeover of an expired lease another node held needs at least
   `f` *other* roster nodes whose promise outlasts the lease's recorded
   expiry. The taker reads `heartbeat/` and asks every roster peer over
@@ -261,12 +304,14 @@ promises cannot gate it. Epochs are kept away from such leases instead:
 
 ### Known limits
 
-- "Persisted" survives a process crash, not a power loss, until synced
-  (see [What "on disk" means](#what-on-disk-means)).
+- A power loss (or kernel crash) of the holder and every backup
+  together can lose `Backup`-acknowledged writes of the last few
+  seconds; any single machine's failure cannot. Safety state (promises,
+  seals, epoch state) is synced and survives it (see
+  [What "on disk" means](#what-on-disk-means)).
 - One backup survives one failure. Two failures inside one backup's
   window fall back to Layer A replay.
 - With P2P off: no backups, no fast takeover, no pre-S3 streaming.
-- A mount-level `--ack` affects only tenures that mount acquires.
 - A node that enrolls during an open epoch is not accounted for.
 - An epoch's hold owner that dies leaves the other members frozen until
   it returns or is retired.
@@ -275,11 +320,10 @@ promises cannot gate it. Epochs are kept away from such leases instead:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `--ack local\|s3` | the filesystem's `ack_policy`, else `local` | acknowledgement policy for tenures this mount acquires |
-| `fs create --ack-policy local\|s3` | `local` | per-filesystem default |
+| `fs create --ack-policy local\|s3` | `CONSTELLATION_ACK`, else `local` | the filesystem's acknowledgement policy, for every mount and tenure; fixed at creation |
 | `--fsync-mode local\|s3` | `local` | what `fsync()` waits for |
 | `--write-mode through\|back` | `through` | what `close()` waits for |
-| `CONSTELLATION_ACK` | unset | default for `--ack` |
+| `CONSTELLATION_ACK` | unset | default for `fs create --ack-policy` (a mount only warns when it disagrees with the filesystem) |
 | `CONSTELLATION_BACKUP_RTT_BUDGET_MS` | `5` | backup candidates' RTT limit; `0` disables backups |
 | `CONSTELLATION_BACKUPS` | `1` | most backups; `0` disables backups |
 | `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` | `1000` | a backup without progress this long is removed |
@@ -324,7 +368,7 @@ with nothing lost. `CONSTELLATION_BACKUPS=0` turns it off.
 
 Check `ack.candidate` and the peer's RTT in `status.p2p`. The peer must
 be write-eligible, connected for at least 2 s, and within the budget.
-`--ack s3` also disables backups.
+A filesystem created with `--ack-policy s3` uses no backups.
 
 ### A takeover is refused with `epoch_slack` set
 

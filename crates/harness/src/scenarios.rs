@@ -728,7 +728,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "ack-s3-failover",
-        desc: "plan 30 M9: CONSTELLATION_ACK=s3 on every mount: every acknowledgement waits for the log (a follower through S3 alone sees each acknowledged file); the holder is frozen and a peer takes over well inside the 20 s lease; the thawed holder is deposed without conflicts",
+        desc: "plan 30 M9: a filesystem with ack_policy s3 (CONSTELLATION_ACK=s3 at fs create): every acknowledgement waits for the log (a follower through S3 alone sees each acknowledged file); the holder is frozen and a peer takes over well inside the 20 s lease; the thawed holder is deposed without conflicts",
         requires: &[],
         run: m9::ack_s3_failover,
     },

@@ -137,9 +137,6 @@ pub struct NodeConfig {
     /// Plan 30 §M14: `--locks cluster` (`Some(true)`), `--locks local`
     /// (`Some(false)`), or neither (cluster when P2P runs).
     pub locks: Option<bool>,
-    /// Plan 30 §M9: `--ack s3` (`Some(true)`), `--ack local`
-    /// (`Some(false)`), or the filesystem's policy (`None`).
-    pub ack: Option<bool>,
     pub initial_write_mode: writeback::WriteMode,
     pub read_only_member: bool,
     pub web_ui: u16,
@@ -302,7 +299,6 @@ impl NodeRuntime {
             fsync_s3,
             cto_strict,
             locks,
-            ack,
             initial_write_mode,
             read_only_member,
             web_ui,
@@ -755,11 +751,23 @@ impl NodeRuntime {
         if cto_strict {
             core_config.kernel_cache_ttl_ms = crate::cto::lone_kernel_drain_ms();
         }
-        // Plan 30 §M9: `ack=s3` from the flag, else the filesystem's
-        // policy; a strict mount marks its tenures as serving strict
-        // reads (a fast successor then waits the delegation horizon).
-        core_config.ack_s3 =
-            crate::authority_driver::ack_s3_resolved(ack, fsmeta.ack_policy.as_deref());
+        // Plan 30 §M9: `ack=s3` is the filesystem's policy (M16: one
+        // policy for every mount and tenure, fixed at `fs create`); a
+        // strict mount marks its tenures as serving strict reads (a fast
+        // successor then waits the delegation horizon).
+        core_config.ack_s3 = crate::authority_driver::ack_s3_of(fsmeta.ack_policy.as_deref());
+        if let Ok(env) = std::env::var("CONSTELLATION_ACK") {
+            if !env.trim().is_empty()
+                && crate::authority_driver::ack_s3_of(Some(&env)) != core_config.ack_s3
+            {
+                tracing::warn!(
+                    CONSTELLATION_ACK = %env,
+                    fs_policy = fsmeta.ack_policy.as_deref().unwrap_or("local"),
+                    "CONSTELLATION_ACK only sets `fs create`'s default; this filesystem's \
+                     acknowledgement policy applies"
+                );
+            }
+        }
         core_config.strict_mounts = cto_strict;
         // Plan 30 §M14: cluster locks need a P2P path to the sequencer.
         let locks_cluster = crate::locks::cluster_effective(locks, peers.is_enabled())?;
@@ -1965,7 +1973,6 @@ mod tests {
                 fsync_s3: false,
                 cto_strict: false,
                 locks: None,
-                ack: None,
                 initial_write_mode: writeback::WriteMode::Through,
                 read_only_member: false,
                 web_ui: 0,

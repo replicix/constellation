@@ -520,7 +520,9 @@ pub fn no_peer_in_budget(_seed: u64) -> Result<()> {
     result
 }
 
-/// `--ack s3` (through `CONSTELLATION_ACK`): every acknowledgement waits
+/// `ack_policy = s3` (`CONSTELLATION_ACK=s3` in the environment of `fs
+/// create`, which the cluster helper runs with every client's env; M16
+/// removed the per-mount `--ack`): every acknowledgement waits
 /// for the record to land in the log; a silent holder (frozen) is taken
 /// over well inside its lease, and every acknowledged file is on the
 /// successor; the thawed holder is deposed with no conflict.

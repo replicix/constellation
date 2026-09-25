@@ -7,7 +7,11 @@
 //! `(epoch BE, first journal seq BE) → BackupTx { last, records }`: one
 //! row per holder journal transaction the backup has persisted and
 //! acknowledged. A backup's acknowledgement means exactly "these rows are
-//! durable here", so `backup_append` commits before the core answers.
+//! committed here", so `backup_append` commits before the core answers.
+//! Committed, not fsynced (M16's decision, plan 30 §3's contract): the
+//! rows survive a crash of this process and any failure of the holder,
+//! not a simultaneous power loss of the holder and every backup — see
+//! `docs/reference/features/durability-and-failover.md`.
 //! The tail is trimmed by the log itself: every segment a backup applies
 //! names the journal seqs it carries (the envelope's `rows`, plan 30
 //! §M9) and its `through`, and [`Meta::backup_trim`] deletes what they
@@ -28,7 +32,9 @@
 //! sealed epoch stays sealed across a restart (the old holder must never
 //! collect an ack from a backup that has sealed, however the backup's
 //! process fared), and a restarted backup still knows whose tail it
-//! holds.
+//! holds. The seal is also fsynced before it is acted on (M16): it must
+//! survive a power loss too, since safety, not just durability, rests on
+//! it.
 
 use super::journal;
 use super::local::{tx_key, JournalTxHead};
@@ -335,10 +341,17 @@ impl Meta {
         let current: u64 = kv_get_tx(&tx, &self.local, KV_BACKUP_SEALED)?
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        if epoch > current {
+        let raises = epoch > current;
+        if raises {
             kv_set_tx(&mut tx, &self.local, KV_BACKUP_SEALED, &epoch.to_string());
         }
         tx.commit()?;
+        // M16: on stable storage before the caller acts on it (refuses an
+        // append, reads the lease to take over): a seal forgotten on a
+        // power loss could let the deposed holder collect an ack.
+        if raises {
+            self.sync()?;
+        }
         Ok(())
     }
 }
@@ -414,7 +427,8 @@ impl Meta {
         let mut tx = self.db.write_tx();
         kv_set_tx(&mut tx, &self.local, &deleg_sealed_key(gen), "1");
         tx.commit()?;
-        Ok(())
+        // M16: synced before the seal is acknowledged, like `backup_seal`.
+        self.sync()
     }
 
     pub fn deleg_backup_sealed(&self, gen: u64) -> Result<bool, MetaError> {
@@ -642,5 +656,58 @@ mod tests {
         assert_eq!(backup.backup_sealed_epoch().unwrap(), 3);
         backup.backup_clear().unwrap();
         assert!(backup.backup_role().unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use crate::store::Meta;
+
+    /// M16: every write whose safety rests on being remembered across a
+    /// power loss is synced before the caller acts on it — and a no-op
+    /// write (nothing raised) costs no fsync.
+    #[test]
+    fn safety_writes_request_a_sync() {
+        let meta = Meta::open_in_memory().unwrap();
+        let synced = |before: u64| meta.sync_count() - before;
+
+        let n = meta.sync_count();
+        assert!(meta.promise_issue(10_000).unwrap());
+        assert_eq!(synced(n), 1, "a new promise is synced before its PUT");
+        let n = meta.sync_count();
+        assert!(meta.promise_issue(5_000).unwrap());
+        assert_eq!(synced(n), 0, "a promise that extends nothing");
+
+        let n = meta.sync_count();
+        assert!(meta.promise_join_begin(20_000).unwrap());
+        assert_eq!(synced(n), 1, "the join gate");
+
+        let n = meta.sync_count();
+        meta.backup_seal(3).unwrap();
+        assert_eq!(synced(n), 1, "a seal");
+        let n = meta.sync_count();
+        meta.backup_seal(2).unwrap();
+        assert_eq!(synced(n), 0, "a lower seal changes nothing");
+
+        let n = meta.sync_count();
+        meta.deleg_backup_seal(7).unwrap();
+        assert_eq!(synced(n), 1, "a delegate backup's seal");
+
+        let n = meta.sync_count();
+        meta.note_grant_horizon(50_000).unwrap();
+        assert_eq!(synced(n), 1, "the read-grant horizon");
+
+        let base = std::collections::BTreeMap::new();
+        let n = meta.sync_count();
+        meta.persist_epoch("e1", &[1, 2], &base, 7, "promised")
+            .unwrap();
+        assert_eq!(synced(n), 1, "an epoch promise");
+        let n = meta.sync_count();
+        meta.persist_epoch("e1", &[1, 2], &base, 7, "promised")
+            .unwrap();
+        assert_eq!(synced(n), 0, "an unchanged epoch row");
+        meta.persist_epoch("e1", &[1, 2], &base, 7, "active")
+            .unwrap();
+        assert_eq!(synced(n), 1, "an epoch state change");
     }
 }

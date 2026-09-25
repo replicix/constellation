@@ -506,14 +506,19 @@ would put a WAN round trip on every write (plan 30 §2, constraint 4).
   the holder acknowledges anything further without it; a new backup is
   streamed the unshipped tail and CASed in once it has caught up.
 - **Seal-based failover.** A backup that hears nothing from the holder
-  for `CONSTELLATION_BACKUP_TAKEOVER_MS` (1.5 s) persists "epoch *e*
-  sealed" and refuses further epoch-*e* appends. The old holder can then
+  for `CONSTELLATION_BACKUP_TAKEOVER_MS` (1.5 s) persists and fsyncs
+  "epoch *e* sealed" and refuses further epoch-*e* appends. The old holder can then
   collect no write-all acknowledgement, so it can acknowledge nothing
   more. The backup CASes the lease to epoch *e*+1, tails S3 to head,
   re-ships its backup tail deduplicated by rid, and opens.
-- **Layer C (opt-in): `ack=s3`.** `--ack s3`, `CONSTELLATION_ACK=s3`, or
-  `fs create --ack-policy s3` acknowledges a mutation only once its
+- **Layer C (opt-in): `ack=s3`.** `fs create --ack-policy s3` (its
+  default is `CONSTELLATION_ACK`) acknowledges a mutation only once its
   segment is CAS-created in the log, group-committed per sync round.
+  The policy is the filesystem's, for every mount and tenure (M16: a
+  per-mount `--ack` could only apply to the tenures its own mount
+  acquired, since an acknowledgement is the sequencer's; a `--ack s3`
+  requester forwarding to a `local` holder got local acknowledgements.
+  It was removed rather than honoured per request).
   Any peer may then take over a silent holder before the TTL: the next
   log slot's create-if-absent CAS fences the old holder. `--fsync-mode
   s3` is the older, per-`fsync` form of the same guarantee.
@@ -534,11 +539,24 @@ with P2P off it gives durability but TTL failover. Safety never depends
 on the timeouts (ADR-12): the seal and the log-slot CAS are the fences.
 A fast takeover cannot be gated by an epoch's promises, so a
 continuation epoch never carries an `S3` lease, and carries a `Backup`
-lease only when every listed backup is a member (ADR-22). Known limits:
-"persisted" means committed to the node's fjall store, which survives a
-process crash but not a power loss until an `fsync` or a clean shutdown
-syncs it; one backup survives one failure; and the policy belongs to
-the tenure, chosen by the mount that acquired the lease.
+lease only when every listed backup is a member (ADR-22).
+
+The durability contract (M16) is plan 30 §3's single-failure one.
+"Persisted" means committed to the node's fjall store
+(`PersistMode::Buffer`): it survives a crash of the process, and the
+kernel writes it back within seconds, but a power loss or kernel crash
+can drop the last commits. What *safety* rests on is synced before it
+is acted on — a promise and the epoch join gate, the epoch's persisted
+state, a seal, the read-grant horizon — so a power loss makes a node
+forget work, never a promise. Backup appends are committed, not synced:
+a `Backup` acknowledgement survives any failure of the holder (power
+loss included, as long as a backup's OS keeps its copy until the
+takeover re-ships it) and any failure of a backup (the holder still
+has it), but not a power loss of the holder and every backup together.
+That is a correlated failure, outside the contract; `ack=s3` covers it.
+An fsync per append would put a disk flush on every Layer B
+acknowledgement, the latency the layer exists to avoid. One backup
+survives one failure.
 
 **Rejected**: a synchronous backup regardless of distance (a WAN round
 trip on every write). A majority quorum of replicas (Raft-style) inside

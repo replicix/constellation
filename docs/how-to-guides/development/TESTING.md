@@ -1021,7 +1021,8 @@ relay of its own so requests can be attributed per role):
     local policy, no backup or candidate, the fast path open, nothing
     waited; the holder killed, the second node's write waits for the
     lease to expire (seconds; no seal, no fast takeover).
-  - `ack-s3-failover`: `CONSTELLATION_ACK=s3` on every mount: the fast
+  - `ack-s3-failover`: a filesystem created with `ack_policy = s3`
+    (`CONSTELLATION_ACK=s3` in `fs create`'s environment): the fast
     path is gated and every acknowledgement waited for the log (a
     follower through S3 alone sees each acknowledged file); the holder
     frozen (SIGSTOP), a peer's write takes the lease over well inside

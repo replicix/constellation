@@ -1905,6 +1905,78 @@ mod cto {
         assert_eq!(h.meta.read_delegations().live_grants(), 0);
     }
 
+    /// M16: an unlink's records name only the parent and the entry, yet
+    /// it changes the unlinked inode (its last link: the inode is gone).
+    /// A read delegation on that inode must be recalled before the reply,
+    /// or its holder keeps answering a strict open of the inode (a kernel
+    /// dentry it still caches) from its stale replica after the unlink
+    /// completed. The same for the file a rename replaces, and for a
+    /// local unlink.
+    #[test]
+    fn an_unlink_or_a_replacing_rename_recalls_the_victims_grant() {
+        let (mut h, ino) = holder_with_file();
+        let g = grant_of(&ask(&mut h, 2, 7, ino));
+        let out = forward(
+            &mut h,
+            3,
+            9,
+            1,
+            MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "f".into(),
+            },
+        );
+        assert!(mutate_replies(&out).is_empty(), "the reply waits: {out:?}");
+        let rs = recalls(&out);
+        assert!(
+            rs.iter()
+                .any(|(to, _, i, gr)| *to == 2 && *i == ino && *gr == g.id),
+            "the unlinked file's grant is recalled: {out:?}"
+        );
+        // A rename over an existing name: the replaced file's grant.
+        let (mut h, victim) = holder_with_file();
+        let src = h.create("src");
+        constellation_meta::execute_mutate(&h.meta, &src, None).unwrap();
+        let g = grant_of(&ask(&mut h, 2, 7, victim));
+        let out = forward(
+            &mut h,
+            3,
+            9,
+            1,
+            MutateOp::Rename {
+                parent: ROOT_INO,
+                name: "src".into(),
+                new_parent: ROOT_INO,
+                new_name: "f".into(),
+            },
+        );
+        assert!(
+            recalls(&out)
+                .iter()
+                .any(|(to, _, i, gr)| *to == 2 && *i == victim && *gr == g.id),
+            "the replaced file's grant is recalled: {out:?}"
+        );
+        // The sequencer's own (core-executed) unlink.
+        let (mut h, ino) = holder_with_file();
+        grant_of(&ask(&mut h, 2, 7, ino));
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            rid,
+            op: MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "f".into(),
+            },
+            policy: Policy::Client,
+        });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        assert!(
+            recalls(&out)
+                .iter()
+                .any(|(to, _, i, _)| *to == 2 && *i == ino),
+            "{out:?}"
+        );
+    }
+
     /// The writer's own delegation is not recalled (read-your-writes
     /// covers its reads); unrelated inodes recall nothing.
     #[test]
@@ -4840,4 +4912,274 @@ mod locks {
         });
         assert_eq!(lock_answer(&out, 60), LockAnswer::Unavailable);
     }
+}
+
+// ---- M16 fixes ----
+
+/// A root holding the lease with a directory `d1` on its replica.
+fn root_with_dir() -> (Harness, constellation_fs_core::Ino) {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        1,
+        1,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d1".into(),
+            ino: dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }],
+    )
+    .unwrap();
+    h.hold(2, None);
+    (h, dir)
+}
+
+/// `undelegate` refuses a designation (only `online` releases one): it
+/// sends no recall, and answers at once with the reason.
+#[test]
+fn undelegate_refuses_a_designation() {
+    let (mut h, dir) = root_with_dir();
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        2,
+        1,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Delegate {
+            dir,
+            node: 2,
+            gen: 1,
+            designated: true,
+            range: (0, 0),
+        }],
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    let out = h.step(Event::Control {
+        op: OpId(1 << 50),
+        req: Control::Undelegate { dir },
+    });
+    assert!(
+        !sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::DelegRecall { .. })),
+        "a designation was recalled: {out:?}"
+    );
+    let done: Vec<_> = out
+        .iter()
+        .filter_map(|a| match a {
+            Action::ControlDone { op, result } if *op == OpId(1 << 50) => Some(result.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(done.as_slice(), [Err(why)] if why.contains("designated")),
+        "{done:?}"
+    );
+}
+
+/// `fs set epoch-slack` raising `f` from 0 on a mounted node whose
+/// promise TTL exceeds lease TTL / 4 (never validated at mount, since
+/// `f` was 0 then): the core clamps the TTL instead of promising for
+/// longer than the rule allows.
+#[test]
+fn raising_the_slack_at_runtime_clamps_an_invalid_promise_ttl() {
+    let mut h = Harness::new(1);
+    h.core.cfg.ttl_ms = 10_000;
+    h.core.cfg.promise_ttl_ms = 9_000;
+    h.step(Event::Slack { epoch_slack: 0 });
+    assert_eq!(h.core.cfg.promise_ttl_ms, 9_000, "unused at f = 0");
+    h.step(Event::Slack { epoch_slack: 1 });
+    assert_eq!(h.core.cfg.epoch_slack, 1);
+    assert_eq!(h.core.cfg.promise_ttl_ms, 2_500, "clamped to lease TTL / 4");
+    // A valid TTL is left alone.
+    h.core.cfg.promise_ttl_ms = 2_000;
+    h.step(Event::Slack { epoch_slack: 1 });
+    assert_eq!(h.core.cfg.promise_ttl_ms, 2_000);
+}
+
+fn inbox_batch(
+    node: NodeId,
+    n: u64,
+    seq: u64,
+    op: &MutateOp,
+) -> constellation_store_s3::inbox::InboxBatch {
+    use constellation_store_s3::inbox::{InboxBatch, InboxOp, InboxRid};
+    InboxBatch {
+        epoch: 1,
+        node,
+        incarnation: 1,
+        n,
+        submitted_unix_ms: 0,
+        ops: vec![InboxOp {
+            rid: InboxRid {
+                node,
+                incarnation: 1,
+                seq,
+            },
+            op: op.to_postcard().unwrap(),
+            deps: Vec::new(),
+        }],
+        wants_lease: false,
+    }
+}
+
+fn inbox_deletes(out: &[Action]) -> Vec<(u64, u64, u64)> {
+    s3_ops(out)
+        .into_iter()
+        .filter_map(|(_, r)| match r {
+            S3Op::InboxDelete { key } => Some((key.epoch, key.node, key.n)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// M16: the takeover drain used to stop at the first op under a live
+/// delegation, leaving every later batch — other requesters' included —
+/// in older-epoch slots the new holder never polls (a crashed
+/// requester's until the next takeover). Now only that requester is
+/// deferred (its batches stay in order), the others drain, and the
+/// deferred batches run from the holder tick once the delegation is
+/// gone. `inbox_drained_batches` counts only what actually executed.
+#[test]
+fn the_takeover_drain_defers_only_the_delegated_requester() {
+    let (mut h, dir) = root_with_dir();
+    h.core.cfg.inbox = true;
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        2,
+        1,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Delegate {
+            dir,
+            node: 2,
+            gen: 1,
+            designated: false,
+            range: (0, 0),
+        }],
+    )
+    .unwrap();
+    // Requester 2 writes under the delegated directory (twice: its second
+    // batch must wait behind its first); requester 3 in the root.
+    let under = |h: &Harness, name: &str| MutateOp::Create {
+        parent: dir,
+        name: name.into(),
+        ino: h.meta.allocate_ino(dir).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let a = under(&h, "a");
+    let b = h.create("b");
+    let c = h.create("c");
+    let batches = vec![
+        inbox_batch(2, 0, 1, &a),
+        inbox_batch(2, 1, 2, &b),
+        inbox_batch(3, 0, 1, &c),
+    ];
+    let mut out = Vec::new();
+    h.core
+        .inbox_drain(h.now, batches, &h.meta, &mut out)
+        .unwrap();
+    assert!(
+        h.meta.child_ino(ROOT_INO, "c").unwrap().is_some(),
+        "requester 3's batch drained"
+    );
+    assert!(h.meta.child_ino(dir, "a").unwrap().is_none());
+    assert!(
+        h.meta.child_ino(ROOT_INO, "b").unwrap().is_none(),
+        "requester 2's later batch waits behind its first"
+    );
+    assert_eq!(inbox_deletes(&out), vec![(1, 3, 0)]);
+    assert_eq!(h.core.stats.inbox_drained_batches, 1);
+    assert_eq!(h.core.inbox.leftover.len(), 2);
+    // The delegation ends (recalled through the log): the holder tick
+    // runs requester 2's batches, in order, and deletes them.
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        2,
+        2,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Recall { dir, gen: 1 }],
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    let mut out = Vec::new();
+    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    assert!(h.meta.child_ino(dir, "a").unwrap().is_some());
+    assert!(h.meta.child_ino(ROOT_INO, "b").unwrap().is_some());
+    assert_eq!(inbox_deletes(&out), vec![(1, 2, 0), (1, 2, 1)]);
+    assert_eq!(h.core.stats.inbox_drained_batches, 3);
+    assert!(h.core.inbox.leftover.is_empty());
+}
+
+/// M16: an inbox op carries its `deps` like a forward: one that depends
+/// on a delegate's stream the holder does not have yet (a marker written
+/// after data the delegate acknowledged, whose stream has not reached a
+/// new root) is deferred by the takeover drain and waits after it, and
+/// runs once the stream is here.
+#[test]
+fn an_inbox_op_waits_for_its_deps() {
+    let (mut h, dir) = root_with_dir();
+    h.core.cfg.inbox = true;
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        2,
+        1,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Delegate {
+            dir,
+            node: 2,
+            gen: 1,
+            designated: false,
+            range: (0, 0),
+        }],
+    )
+    .unwrap();
+    // Requester 2 (the delegate) wrote data under `dir` (stream index 5)
+    // and then a marker in the root, through the inbox.
+    let marker = h.create("marker");
+    let mut batch = inbox_batch(2, 0, 7, &marker);
+    batch.ops[0].deps = constellation_meta::Position::ZERO
+        .with_streams_wire(&[(1, 5)])
+        .to_postcard();
+    let mut out = Vec::new();
+    h.core
+        .inbox_drain(h.now, vec![batch], &h.meta, &mut out)
+        .unwrap();
+    assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_none());
+    assert_eq!(h.core.inbox.leftover.len(), 1, "deferred by the drain");
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    let mut out = Vec::new();
+    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    assert!(
+        h.meta.child_ino(ROOT_INO, "marker").unwrap().is_none(),
+        "still waiting for the delegate's stream"
+    );
+    // The delegate's stream through index 5 is here: it runs.
+    crate::replica::Replica::note_stream(&h.meta, 1, 5);
+    let mut out = Vec::new();
+    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_some());
+    assert_eq!(inbox_deletes(&out), vec![(1, 2, 0)]);
 }

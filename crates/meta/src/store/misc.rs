@@ -478,9 +478,21 @@ impl Meta {
             promised_at,
             state: state.to_string(),
         };
-        self.epochs
-            .insert(epoch_id.as_bytes(), postcard::to_allocvec(&row)?)?;
-        Ok(())
+        let bytes = postcard::to_allocvec(&row)?;
+        // Called after every epoch-machine step: write (and sync) only a
+        // change. M16: an epoch promise or membership forgotten on a
+        // power loss is a safety problem (the node could accept a second
+        // proposal, or promise while still a member), so it is synced
+        // before the machine acts on it further.
+        if self
+            .epochs
+            .get(epoch_id.as_bytes())?
+            .is_some_and(|v| *v == *bytes)
+        {
+            return Ok(());
+        }
+        self.epochs.insert(epoch_id.as_bytes(), bytes)?;
+        self.sync()
     }
 
     pub fn load_open_epoch(&self) -> Result<Option<EpochRow>, MetaError> {
@@ -543,7 +555,8 @@ impl Meta {
         let issued: i64 = kv_get_tx(&tx, &self.local, PROMISE_ISSUED)?
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        if until_unix_ms > issued {
+        let extends = until_unix_ms > issued;
+        if extends {
             kv_set_tx(
                 &mut tx,
                 &self.local,
@@ -552,6 +565,12 @@ impl Meta {
             );
         }
         tx.commit()?;
+        // M16: on stable storage before it is published. A node that
+        // forgot a promise after a power loss could join an epoch before
+        // the time it promised, which a taker counted on.
+        if extends {
+            self.sync()?;
+        }
         Ok(true)
     }
 
@@ -572,6 +591,9 @@ impl Meta {
         }
         kv_set_tx(&mut tx, &self.local, PROMISE_JOINING, "1");
         tx.commit()?;
+        // M16: a member publishes no promise; that must survive a power
+        // loss as it survives a process crash.
+        self.sync()?;
         Ok(true)
     }
 

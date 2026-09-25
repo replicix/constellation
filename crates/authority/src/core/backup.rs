@@ -11,10 +11,18 @@
 //! - `Local`: at once (today; plan 30 §3's Layer A).
 //! - `Backup`: once every backup listed in the *committed* lease object
 //!   has persisted the journal through that position (Layer B). The
-//!   holder streams whole journal transactions to each backup, one
-//!   append in flight per backup, so a LAN backup adds one round trip to
-//!   an acknowledgement and every row journaled during that round trip
-//!   rides the next append (the group commit).
+//!   holder streams whole journal transactions to each backup, up to
+//!   `Config::backup_max_inflight` (8) appends in flight per backup
+//!   (pipelined; the backup acknowledges what it holds contiguously), so
+//!   a LAN backup adds about one round trip to an acknowledgement and
+//!   every row journaled meanwhile rides the next append (the group
+//!   commit). An append is committed to the backup's store before the
+//!   acknowledgement but not fsynced (fjall `PersistMode::Buffer`): it
+//!   survives any failure of the holder, and a crash of the backup's
+//!   process, but not a simultaneous power loss of the holder and every
+//!   backup (the durability contract in
+//!   `docs/reference/features/durability-and-failover.md`). The seal,
+//!   which safety rests on, *is* synced (`Meta::backup_seal`).
 //! - `S3`: once the segment carrying the position landed (Layer C).
 //!
 //! The wait is a parked continuation (plan 30 §M8's park, extended with a

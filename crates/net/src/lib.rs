@@ -20,14 +20,14 @@
 //! crate, and the fault-injection harness asserts the S3-only bounds
 //! still hold.
 //!
-//! **Delegation is the exception** ([`delegation`], DESIGN.md §5.2): a
-//! foreign write under an offline-designated path is only legitimate
-//! while a live delegation from the designee backs it, and the
-//! designee's flush-ack requirement is what keeps its "provably holds
-//! everything" invariant true. There, an unreachable or non-responding
-//! designee correctly turns other nodes read-only rather than degrading
-//! to some default — that IS the safety property, not a fallback from
-//! one.
+//! **Designations are the exception** (DESIGN.md §5.2; since plan 30
+//! M11 a designation is a non-stealable write delegation to the
+//! designee, kept by the authority core,
+//! `constellation_authority::core::delegate`): a foreign write under an
+//! offline-designated path is forwarded to and sequenced by the
+//! designee. An unreachable or non-responding designee correctly leaves
+//! other nodes unable to write there rather than degrading to some
+//! default — that IS the safety property, not a fallback from one.
 
 pub mod allowlist;
 pub mod bloom;

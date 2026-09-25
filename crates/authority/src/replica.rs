@@ -231,7 +231,9 @@ pub trait Replica {
     /// the highest index held contiguously.
     fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> u64;
     fn deleg_backup_tail(&self, gen: u64) -> Vec<DelegateTx>;
-    fn deleg_backup_seal(&self, gen: u64);
+    /// Persist (durably) that `gen` is sealed here; `false`: it could
+    /// not be, and the seal must not be acknowledged.
+    fn deleg_backup_seal(&self, gen: u64) -> bool;
     /// Whether this node holds anything of `gen` as its backup.
     fn deleg_backup_acked_any(&self, gen: u64) -> bool;
     fn deleg_backup_sealed(&self, gen: u64) -> bool;
@@ -287,6 +289,10 @@ pub trait Replica {
     /// `until_ms` (the restart quarantine's horizon). `false`: it could not
     /// be persisted, and the grant must not be made.
     fn note_grant_horizon(&self, until_ms: i64) -> bool;
+    /// M16: the inodes whose read delegations an op not yet executed must
+    /// recall (`Meta::recall_inos_of_op_now`: an unlink's or rename's
+    /// victims included).
+    fn recall_inos_of_op(&self, op: &MutateOp) -> Vec<Ino>;
     /// At start: the previous incarnation's grants may be live until the
     /// returned time; the table is quarantined until then.
     fn load_grant_quarantine(&self, now_ms: i64) -> Option<i64>;
@@ -698,8 +704,14 @@ impl Replica for Meta {
         Meta::deleg_backup_tail(self, gen).unwrap_or_default()
     }
 
-    fn deleg_backup_seal(&self, gen: u64) {
-        let _ = Meta::deleg_backup_seal(self, gen);
+    fn deleg_backup_seal(&self, gen: u64) -> bool {
+        match Meta::deleg_backup_seal(self, gen) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, gen, "persisting a delegate backup's seal failed");
+                false
+            }
+        }
     }
 
     fn deleg_backup_acked_any(&self, gen: u64) -> bool {
@@ -825,6 +837,10 @@ impl Replica for Meta {
         Meta::load_grant_quarantine(self, now_ms)
     }
 
+    fn recall_inos_of_op(&self, op: &MutateOp) -> Vec<Ino> {
+        Meta::recall_inos_of_op_now(self, op)
+    }
+
     fn unshipped_touches_read(
         &self,
         ino: Ino,
@@ -941,6 +957,8 @@ impl Replica for Meta {
     }
 
     fn persist_epoch_hold(&self, hold: Option<Epoch>) -> Result<(), MetaError> {
-        Meta::kv_set(self, "epoch_hold", &hold.unwrap_or(0).to_string())
+        // (Written only when it changes; synced like the epoch's other
+        // persisted state, M16.)
+        Meta::kv_set_durable(self, "epoch_hold", &hold.unwrap_or(0).to_string())
     }
 }

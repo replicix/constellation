@@ -334,8 +334,12 @@ should add them once (in §1, or at the top of §4) and refer back:
   note that "persisted" is fjall `PersistMode::Buffer`
   (`crates/meta/src/store/mod.rs`, `Meta::sync` doc): it survives a
   process crash, not a power loss, until an `fsync()` or clean
-  shutdown syncs it. This matters for backups, seals and promises (see
-  the report's discrepancy list).
+  shutdown syncs it. Since the M16 fixes, safety state (promises and
+  the epoch join gate, epoch state, seals, the read-grant horizon) is
+  synced before it is acted on; backup appends are not, which is the
+  documented Layer B contract (a simultaneous power loss of holder and
+  backups is out of it; ADR-21,
+  [durability](../../../reference/features/durability-and-failover.md#what-on-disk-means)).
 - **L559, "S3 outage"**: "writes continue under held leases/epoch".
   Under `ack=s3` acknowledgements stall at once (they wait for S3), and
   an `S3` lease is never carried into an epoch.
@@ -415,7 +419,9 @@ worth a follow-up:
   Source: `crates/store-s3/src/layout.rs`.
 - **§3, L137–139**: "`fsync` modes: **default** … **paranoid**". The
   flags are `--fsync-mode local|s3` and `--write-mode through|back`,
-  and `--ack local|s3` now sets what an acknowledgement means.
+  and the filesystem's `ack_policy` (`fs create --ack-policy
+  local|s3`; there is no per-mount `--ack` since M16) sets what an
+  acknowledgement means.
 - **§7, L441–462**: cooperative cache described as bloom digests; the
   default is exact mirrors with range-based reconciliation (plan 30
   M15, ADR-26, `crates/net/src/reconcile.rs`); blooms remain as

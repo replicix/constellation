@@ -270,7 +270,7 @@ designations create no delegation.
 |---|---|
 | `constellation delegate TARGET --to NODE` | delegate the directory `TARGET` to node `NODE`. Run it on the root lease holder. Refused if the directory overlaps a live delegation, is the root, or `NODE` already holds a whole delegation |
 | `constellation delegate TARGET --to NODE --range IDX/COUNT` | delegate one of `COUNT` (2, 4, 8 or 16) name-hash ranges of the directory |
-| `constellation undelegate TARGET` | recall the delegation (all ranges) on a directory |
+| `constellation undelegate TARGET` | recall the delegation (all ranges) on a directory. Refused for a designation, which only `constellation online` releases |
 | `constellation delegations TARGET` | list the live table: directory, path, node, generation, designated, range |
 
 ## Configuration
@@ -288,9 +288,11 @@ designations create no delegation.
 | `CONSTELLATION_DELEGATION_DWELL_MS` | `60000` | recall dwell |
 | `CONSTELLATION_DELEGATION_COOLDOWN_MS` | `30000` | cool-down after a recall |
 
-A value of `0` for any of these numeric knobs means the default, so
-splits cannot be turned off with `CONSTELLATION_DELEGATION_SPLIT=0`;
-turn placement off instead. See
+For the millisecond knobs `0` means the default. For `_MIN_OPS`,
+`_DOMINANCE`, `_LEAVE` and `_SPLIT` it is a value: `SPLIT=0` turns hash
+range splits off, `LEAVE=0` never recalls a placed delegation for its
+share (only for its rate), `DOMINANCE=0` gives a subtree to its top
+writer whatever the share, and `MIN_OPS=0` drops the rate floor. See
 [Configuration](../configuration.md#delegation-and-placement).
 
 ## Status

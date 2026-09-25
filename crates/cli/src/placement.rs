@@ -73,18 +73,28 @@ impl Placement {
     }
 
     pub fn note_forwarded(&self, requester: u64) {
-        if !placement_enabled() {
+        self.note_ops(requester, 1);
+    }
+
+    /// An op of this node's own client the core executed (or had
+    /// forwarded).
+    pub fn note_local(&self, node_id: u64) {
+        self.note_ops(node_id, 1);
+    }
+
+    /// `n` writes by `node`. The holder's own FUSE fast path executes
+    /// outside the core, so the driver counts those in bulk (M16: without
+    /// them a busy holder looked idle to its own cost function, and one
+    /// light remote writer could pull the lease away from it).
+    pub fn note_ops(&self, node: u64, n: u64) {
+        if n == 0 || !placement_enabled() {
             return;
         }
         self.maybe_rotate();
         let mut buckets = self.buckets.lock().unwrap();
         if let Some(b) = buckets.back_mut() {
-            *b.ops.entry(requester).or_insert(0) += 1;
+            *b.ops.entry(node).or_insert(0) += n;
         }
-    }
-
-    pub fn note_local(&self, node_id: u64) {
-        self.note_forwarded(node_id);
     }
 
     pub fn note_peer_rtts(&self, from: u64, rtts: Vec<(u64, u16)>) {
@@ -139,6 +149,23 @@ impl Placement {
                 }
             }
         }
+        // Candidates must have a direct path.
+        let direct: Vec<u64> = peers
+            .snapshot()
+            .iter()
+            .filter(|p| p.path == PathKind::Direct)
+            .map(|p| p.node_id)
+            .collect();
+        let (best, self_cost, best_cost) = self.best_holder(self_id, &direct)?;
+        *self.last_reason.lock().unwrap() = Some(format!(
+            "migrate {self_id} -> {best}: cost {self_cost:.0} -> {best_cost:.0}"
+        ));
+        Some(best)
+    }
+
+    /// The decision of [`Self::recommend`] over `candidates` (peers with
+    /// a direct path): `(better holder, cost here, cost there)`.
+    fn best_holder(&self, self_id: u64, candidates: &[u64]) -> Option<(u64, f64, f64)> {
         let ops = self.ops_window();
         if ops.is_empty() {
             return None;
@@ -146,21 +173,17 @@ impl Placement {
         let self_cost = self.cost(self_id, &ops)?;
         let mut best = self_id;
         let mut best_cost = self_cost;
-        let snap = peers.snapshot();
-        for p in &snap {
-            // Candidate must be a recent writer with a direct path.
-            if ops.get(&p.node_id).copied().unwrap_or(0) == 0 {
+        for &node in candidates {
+            // Candidate must be a recent writer.
+            if ops.get(&node).copied().unwrap_or(0) == 0 {
                 continue;
             }
-            if p.path != PathKind::Direct {
-                continue;
-            }
-            let Some(c) = self.cost(p.node_id, &ops) else {
+            let Some(c) = self.cost(node, &ops) else {
                 continue;
             };
             if c < best_cost {
                 best_cost = c;
-                best = p.node_id;
+                best = node;
             }
         }
         if best == self_id {
@@ -172,10 +195,7 @@ impl Placement {
         if best_cost >= HYSTERESIS * self_cost {
             return None;
         }
-        *self.last_reason.lock().unwrap() = Some(format!(
-            "migrate {self_id} -> {best}: cost {self_cost:.0} -> {best_cost:.0}"
-        ));
-        Some(best)
+        Some((best, self_cost, best_cost))
     }
 
     pub fn mark_migrated(&self) {
@@ -206,5 +226,35 @@ impl Placement {
 impl Default for Placement {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M16: the holder's own writes count. A holder doing 200 fast-path
+    /// writes and one peer 50 ms away forwarding 10: moving the lease
+    /// would cost the holder's 200 ops a WAN hop each, so it stays. The
+    /// same window without the holder's writes (what the cost function
+    /// saw before the fast path was counted) moves it.
+    #[test]
+    fn a_busy_holders_fast_path_keeps_the_lease() {
+        let p = Placement::new();
+        p.note_peer_rtts(1, vec![(2, 50)]);
+        for _ in 0..10 {
+            p.note_forwarded(2);
+        }
+        assert_eq!(
+            p.best_holder(1, &[2]).map(|(n, _, _)| n),
+            Some(2),
+            "only the remote writer is counted: the lease moves to it"
+        );
+        p.note_ops(1, 200);
+        assert_eq!(
+            p.best_holder(1, &[2]),
+            None,
+            "the holder's own writes keep it"
+        );
     }
 }

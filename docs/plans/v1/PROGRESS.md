@@ -21933,3 +21933,173 @@ teardown):
 
 No containers, mounts, `/tmp/harness-*` or `/tmp/chaos-soak-4-*`
 directories of this session are left.
+
+## Fix: M16 code discrepancies
+
+Branch `fix-m16-discrepancies` (worktree `constellation-m16fix`, on main
+`3caec49`). The reviewer's code check while writing the plan-30 docs
+found eleven discrepancies; each verified against the code, fixed with a
+test, and the docs updated. Per item: verdict, fix, evidence.
+
+1. **Durability of promises, seals, backup appends: real (safety part).**
+   Every write whose *safety* rests on being remembered is now synced
+   (`Meta::sync`, fjall `SyncAll`) before it is acted on:
+   `promise_issue` (before the heartbeat PUT, only when it extends),
+   `promise_join_begin` (the join gate), `persist_epoch` (only on a
+   change; it is called after every epoch-machine step), the epoch hold
+   (`persist_epoch_hold`, `Meta::kv_set_durable`), `backup_seal` and
+   `deleg_backup_seal` (the latter now fallible: an unpersisted seal is
+   answered unsealed and the root falls back to its plain reclaim), and
+   the read-grant horizon (`note_grant_horizon`, at most once a second
+   of horizon growth). **Backup appends: decided not to fsync**
+   (plan 30 §3's contract is single-failure: a `Backup` ack survives any
+   failure of the holder, power loss included, and any failure of a
+   backup; a simultaneous power loss of the holder and every backup is a
+   correlated failure, `ack=s3`'s job; an fsync per append would put a
+   disk flush on every Layer B acknowledgement). Contract written out in
+   `durability-and-failover.md` ("What on disk means", a per-policy
+   table) and ADR-21; code comments in `core/backup.rs` and
+   `store/backup.rs`. Evidence: `store::backup::durability_tests::
+   safety_writes_request_a_sync` (a `Meta::sync_count` counter; each
+   write syncs once, a no-op write not at all). The sim keeps `Meta`
+   across a crash, so it cannot model forgetting unsynced state cheaply;
+   not attempted.
+2. **`--ack` per tenure, not per mount: real.** Simplest correct
+   semantics: the acknowledgement policy is the filesystem's
+   (`fs create --ack-policy`, fixed at creation), for every mount and
+   tenure. The per-mount `--ack` is removed (clap arg, `MountArgs`,
+   `NodeConfig.ack`, `ack_flag`/`ack_s3_resolved`);
+   `authority_driver::ack_policy_flag`/`ack_s3_of` replace them.
+   `CONSTELLATION_ACK` is now `fs create`'s default (so the harness's
+   `ack-s3-failover`, which sets it on every client, and the pjdfstest
+   recipe keep working); a mount whose env disagrees with `meta.json`
+   logs a warning. Honouring a per-request `--ack` at the holder was
+   rejected: delegates, the inbox and fast takeovers all key off the
+   tenure's policy. Evidence: unit test
+   `authority_driver::tests::the_ack_policy_is_parsed_once_for_the_filesystem`;
+   harness `ack-s3-failover` PASS.
+3. **Inbox takeover drain strands batches: real.** `inbox_drain` now
+   defers only the requester whose op is under a live delegation (that
+   batch and the same requester's later ones, in order) and drains
+   every other requester; the deferred batches (`InboxState::leftover`)
+   run from the holder tick through the admitted path (which starts
+   the recall and waits), before that requester is polled under the new
+   epoch, and are deleted once run. `inbox_drained_batches` counts only
+   batches that executed. Two sim findings on the way, both fixed:
+   - long-delegated seed 70117 (hang): a leftover's cross-subtree
+     recall ended a generation, `deleg_redelegate_after_cross`
+     re-delegated it before the leftover ran, and the op recalled again
+     forever (the poll path had the same window, since `InboxRepoll`
+     only re-arms a poll). `InboxState::recall_waiters` holds the
+     re-delegation while an inbox op waits on a recall it caused
+     (bounded by the inbox in-doubt deadline).
+   - long-delegated seed 70491 (a marker seen without its data): inbox
+     ops carried no `deps`, so a drain (or a poll) could append a
+     requester's marker ahead of the data its delegate had acknowledged
+     but not yet streamed to the new root. Main passes that seed only
+     because its drain stopped earlier; the gap was latent there.
+     `InboxOp` now carries `deps` (postcard `Position`; batch format
+     version 3), and the holder executes an inbox op only once
+     `reaches_streams(deps)` (deferred inside the gate, retried after).
+   Evidence: `core::tests::the_takeover_drain_defers_only_the_delegated_requester`
+   (fails on main: requester 3's batch was stranded) and
+   `core::tests::an_inbox_op_waits_for_its_deps`; both seeds A/B'd
+   against a main build (main passes both; the branch failed each until
+   its fix).
+4. **Root-lease placement undercounts the holder: real.**
+   `DelegateView` counts root fast-path writes exactly
+   (`fast_path_ops`, drained by the driver's `refresh`), and
+   `Placement::note_ops(node, n)` adds them to the root lease's window.
+   `recommend`'s decision is factored into `best_holder` for testing.
+   Evidence: `placement::tests::a_busy_holders_fast_path_keeps_the_lease`
+   (the same window without the holder's writes moves the lease).
+5. **Placement knobs can't be 0: real.** `_MIN_OPS`, `_DOMINANCE`,
+   `_LEAVE`, `_SPLIT` are parsed with `env_u64_zero_ok` (0 is a value;
+   percentages clamp at 100); the millisecond knobs keep `0` = default.
+   Semantics of 0 documented (split off; never recalled for share; top
+   writer wins; no rate floor). Evidence:
+   `authority_driver::tests::zero_is_a_value_for_zero_ok_knobs`.
+6. (a) **`epoch_slack` raise skips promise-TTL validation: real.**
+   `Core::clamp_promise_ttl` (on every `Event::Slack`): with `f > 0` and
+   a TTL above lease TTL / 4 the TTL is clamped to lease TTL / 4 with an
+   error log (clamping, not refusing: the node must run with the
+   filesystem's slack, and a shorter promise is always safe). Test
+   `raising_the_slack_at_runtime_clamps_an_invalid_promise_ttl`.
+   (b) **`undelegate` recalls a designation: real.** Refused with a
+   message pointing at `constellation online`. Test
+   `undelegate_refuses_a_designation` (fails on main: a `DelegRecall`
+   was sent). (c) **unlink doesn't recall the unlinked file's read
+   delegation: real, and it can serve a stale read**: lookups of the
+   old name are safe (the parent's delegation is recalled), but a node
+   holding a delegation on the unlinked inode answers a strict open of
+   it *by inode* (a dentry its kernel still caches) from its stale
+   replica after the unlink completed (and stale `nlink`/`ctime` for a
+   hard-linked file); the recreated-name case is a new inode, so no
+   stale data through the old grant. Fix: `Meta::unlink`/`rmdir`/
+   `rename` note the inodes they change that their records do not name
+   (the victim, the replaced target, the moved inode) inside their own
+   transaction (`readdeleg::note_victim`, a thread-local cleared by
+   `mutate::execute`); `recall_inos_executed` adds them at the three
+   post-execution recall sites (holder forward, core local, FUSE fast
+   path). The pre-execution sites (inbox op, delegate write) use
+   `Replica::recall_inos_of_op` → `Meta::recall_inos_of_op_now`, which
+   looks the victims up just before. Test
+   `cto::an_unlink_or_a_replacing_rename_recalls_the_victims_grant`
+   (fails with the old recall set). (d) **unbounded forwards: not a
+   bug.** Requester side: one forward per blocked caller (FUSE worker
+   threads, bounded upload tasks, a one-at-a-time replay queue), each
+   retried ≤ 3 times before the lease path. Holder side: the P2P layer
+   serves ≤ 32 concurrent streams per peer (`MAX_CONCURRENT_STREAMS`,
+   `net/src/peers.rs`), and further streams wait in QUIC's stream
+   limit on the requester — backpressure per peer, so memory is
+   bounded and one peer's retries cannot starve another. No new bound;
+   the reasoning is in `forwarded-mutations.md` and `configuration.md`
+   where the old knob's removal was mentioned.
+7. **Sim vs production inbox escalation defaults: real.**
+   `Config::defaults` now says 8 ops / 1.5 s (the production values);
+   `cli::inbox::knobs` takes every inbox default from
+   `Config::defaults` (its own `DEFAULT_*` constants are gone); the
+   sim's redundant overrides were removed.
+8. **Stale comments: real, all fixed.** `meta/src/replay.rs` (the
+   `completed` position is load-bearing: 0 = "from the log", which
+   `strand_local_tx` checks), `store/mod.rs` (the `completed` row
+   format), `core/mod.rs` (`CONSTELLATION_FORWARD`), `core/backup.rs`
+   module doc (up to 8 appends in flight, and the durability contract),
+   `net/src/lib.rs` (the nonexistent `delegation` module: designations
+   are now delegations kept by the authority core).
+
+**Docs updated:** `durability-and-failover.md` (contract table,
+filesystem-wide policy, seal fsync, runtime slack clamp, known limits,
+configuration), ADR-21, `configuration.md` (`--ack` row removed,
+`ack_policy`/`CONSTELLATION_ACK`, placement zero values, promise TTL
+clamp, forward bounding, `undelegate`), `delegations.md`,
+`lease-placement.md`, `cto-modes.md` (victim recall; known gap
+removed), `forwarded-mutations.md` (drain leftovers, inbox `deps`,
+forward bounding; known gap removed), `TESTING.md`, the harness
+`ack-s3-failover` description, and `30-design-md-notes.md`.
+
+**Evidence (all on this branch):** fmt and `clippy --workspace
+--all-targets` clean. `cargo test -p constellation-authority --release`
+green (92 lib + 84 sim). Long sweeps: `long_flex` 500, `long_backup`
+1000, `long_delegated` 70000–70999 (1000 seeds; the default 300 found
+seed 70117, the next 700 seed 70491, both fixed above), `long_random`
+10000–14999 (5000), `long_strict` 1000: all pass on the final tree. `constellation-meta` and `constellation-store-s3` tests pass.
+`cargo test -p constellation --bin constellation`: 223/224; the one
+failure, `fusefs::pending_row_tests::random_write_truncate_fallocate_sequences_match_a_model`
+(`fs-core/src/chunk.rs:88` assertion), fails identically on a main
+`3caec49` build (A/B), so it is pre-existing and not from this branch.
+Harness (prefix `constellation-harness-m16fix`), all PASS:
+`ack-s3-failover`, `no-peer-in-budget`, `single-node-unchanged`,
+`backup-failover`, `backup-partition`, `backup-departs`,
+`backup-failover-with-delegation`, `epoch-missing-node`,
+`epoch-slack-zero-unchanged`, `epoch-holder-retired`,
+`epoch-peer-reaching-s3-declines`, `epoch-member-lost`,
+`delegated-subtrees`, `marker-order`, `delegate-crash-backup`,
+`auto-placement`, `cross-subtree-rename`, `delegate-crash`,
+`inbox-holder-takeover-pending-batch`, `inbox-requester-crash-mid-batch`,
+`inbox-sporadic-write-p2p-off`, `inbox-create-storm-p2p-off`,
+`forwarded-mutations`, `forward-timeout-reexec`, `cto-delegation-recall`,
+`cto-strict`, `cto-recall-unreachable`. No perf measurements (host CPU
+frequency-limited): the syncs added are on rare paths (promises, seals,
+epoch changes, a grant horizon at most once a second); the placement
+count is one relaxed atomic per root fast-path write.

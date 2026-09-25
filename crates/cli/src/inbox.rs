@@ -23,42 +23,16 @@
 use constellation_authority::{InboxView, Stats};
 use std::time::Duration;
 
-pub const DEFAULT_WARM_MAX_MS: u64 = 2_000;
-pub const DEFAULT_COLD_MAX_MS: u64 = 10_000;
-pub const DEFAULT_RECHECK_MS: u64 = 1_000;
-/// Plan 30 M13 round 2: the holder's poll interval right after a hit
-/// (`CONSTELLATION_INBOX_HOT_MS`) and for [`HOT_GRACE_ROUNDS`] misses
-/// after it, and the requester's log-tail interval while it has an op
-/// waiting on its outcome (`CONSTELLATION_INBOX_TAIL_MS`).
-pub const DEFAULT_HOT_MS: u64 = 20;
-pub const DEFAULT_TAIL_MS: u64 = 20;
-/// Misses after a hit during which a requester stays hot.
-pub const HOT_GRACE_ROUNDS: u32 = 25;
-/// How long a P2P peer may be disconnected before the inbox counts the
-/// path as gone (`CONSTELLATION_INBOX_P2P_GRACE_MS`).
-pub const DEFAULT_P2P_GRACE_MS: u64 = 3_000;
-/// Plan 30 M13 round 3b, the hybrid: a requester whose inbox demand is
-/// *sustained* asks for the lease and executes locally once it holds; a
-/// *sporadic* writer stays on the inbox. "Sustained" is a sliding window
-/// of `CONSTELLATION_INBOX_ESCALATE_WINDOW_MS` over this node's
-/// inbox-answered ops: at least `CONSTELLATION_INBOX_ESCALATE_OPS` of
-/// them, or at least `CONSTELLATION_INBOX_ESCALATE_WAIT_MS` spent
-/// waiting on their round trips, in the window. Plan 30 M5 retuned the
-/// defaults with the sans-IO core in the simulation and on the
-/// `3node-p2poff-*` meta-bench: 8 ops or 1.5 s of waiting in 10 s (round
-/// 4's 20 ops / 3 s delayed the switch by most of a bench run), and the
-/// escalating requester's batches carry `wants_lease`, which the holder
-/// sees at its next poll instead of its half-TTL renewal. One write
-/// every few seconds is 2–3 ops and well under a second of waiting per
-/// window: never an escalation.
-pub const DEFAULT_ESCALATE_WINDOW_MS: u64 = 10_000;
-pub const DEFAULT_ESCALATE_OPS: u64 = 8;
-pub const DEFAULT_ESCALATE_WAIT_MS: u64 = 1_500;
-/// Longest gap between an escalated requester's lease requests; the
-/// first requests back off from 100 ms like the FUSE lease path's own
-/// retries.
-pub const DEFAULT_ESCALATE_RETRY_MS: u64 = 2_000;
-const DEFAULT_POLL_WIDTH: usize = 4;
+// The defaults are the core's (`constellation_authority::Config::defaults`,
+// one source of truth for production and the simulation). Plan 30 M13
+// round 3b, the hybrid: a requester whose inbox demand is *sustained*
+// asks for the lease and executes locally once it holds; a *sporadic*
+// writer stays on the inbox. "Sustained" is a sliding window of
+// `CONSTELLATION_INBOX_ESCALATE_WINDOW_MS` over this node's
+// inbox-answered ops: at least `CONSTELLATION_INBOX_ESCALATE_OPS` of
+// them, or at least `CONSTELLATION_INBOX_ESCALATE_WAIT_MS` spent waiting
+// on their round trips, in the window (8 ops or 1.5 s in 10 s; see
+// `Config::escalate_ops`).
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -136,40 +110,35 @@ pub fn knobs(base_ms: u64, ttl_ms: u64, retention_s: u64) -> InboxKnobs {
              is clamped to half the completion retention window"
         );
     }
-    let hot_ms = env_u64("CONSTELLATION_INBOX_HOT_MS", DEFAULT_HOT_MS)
+    let d = constellation_authority::Config::defaults(0, 0);
+    let hot_ms = env_u64("CONSTELLATION_INBOX_HOT_MS", d.inbox_hot_ms)
         .max(1)
         .min(base_ms.max(1));
     InboxKnobs {
         enabled: inbox_enabled(),
-        warm_max_ms: env_u64("CONSTELLATION_INBOX_IDLE_MAX_MS", DEFAULT_WARM_MAX_MS),
+        warm_max_ms: env_u64("CONSTELLATION_INBOX_IDLE_MAX_MS", d.inbox_warm_max_ms),
         cold_max_ms: env_u64(
             "CONSTELLATION_INBOX_COLD_MAX_MS",
-            env_u64("CONSTELLATION_SYNC_IDLE_MAX_MS", DEFAULT_COLD_MAX_MS),
+            env_u64("CONSTELLATION_SYNC_IDLE_MAX_MS", d.inbox_cold_max_ms),
         ),
         hot_ms,
-        hot_grace: HOT_GRACE_ROUNDS,
-        poll_width: env_u64("CONSTELLATION_INBOX_POLL_WIDTH", DEFAULT_POLL_WIDTH as u64).max(1)
+        hot_grace: d.inbox_hot_grace,
+        poll_width: env_u64("CONSTELLATION_INBOX_POLL_WIDTH", d.inbox_poll_width as u64).max(1)
             as usize,
-        recheck_ms: env_u64("CONSTELLATION_INBOX_RECHECK_MS", DEFAULT_RECHECK_MS).max(100),
+        recheck_ms: env_u64("CONSTELLATION_INBOX_RECHECK_MS", d.inbox_recheck_ms).max(100),
         deadline_ms: deadline.as_millis() as u64,
-        p2p_grace_ms: env_u64("CONSTELLATION_INBOX_P2P_GRACE_MS", DEFAULT_P2P_GRACE_MS),
-        tail_ms: env_u64("CONSTELLATION_INBOX_TAIL_MS", DEFAULT_TAIL_MS).max(1),
+        p2p_grace_ms: env_u64("CONSTELLATION_INBOX_P2P_GRACE_MS", d.inbox_p2p_grace_ms),
+        tail_ms: env_u64("CONSTELLATION_INBOX_TAIL_MS", d.inbox_tail_ms).max(1),
         escalation: escalation_enabled(),
         escalate_window_ms: env_u64(
             "CONSTELLATION_INBOX_ESCALATE_WINDOW_MS",
-            DEFAULT_ESCALATE_WINDOW_MS,
+            d.escalate_window_ms,
         )
         .max(1_000),
-        escalate_ops: env_u64("CONSTELLATION_INBOX_ESCALATE_OPS", DEFAULT_ESCALATE_OPS).max(2),
-        escalate_wait_ms: env_u64(
-            "CONSTELLATION_INBOX_ESCALATE_WAIT_MS",
-            DEFAULT_ESCALATE_WAIT_MS,
-        ),
-        escalate_retry_ms: env_u64(
-            "CONSTELLATION_INBOX_ESCALATE_RETRY_MS",
-            DEFAULT_ESCALATE_RETRY_MS,
-        )
-        .max(100),
+        escalate_ops: env_u64("CONSTELLATION_INBOX_ESCALATE_OPS", d.escalate_ops).max(2),
+        escalate_wait_ms: env_u64("CONSTELLATION_INBOX_ESCALATE_WAIT_MS", d.escalate_wait_ms),
+        escalate_retry_ms: env_u64("CONSTELLATION_INBOX_ESCALATE_RETRY_MS", d.escalate_retry_ms)
+            .max(100),
     }
 }
 

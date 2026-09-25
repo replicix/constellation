@@ -597,14 +597,14 @@ fn apply_one(
         // check believe an op the log may never contain had completed.
         LogRecord::Completed { .. } if !durable => Ok(Applied::Done),
         LogRecord::Completed { rid } => {
-            // The position stored here is informational only (nothing
-            // in the retry-resolution path needs anything but presence,
-            // `Meta::completed_position` is a diagnostic), so a replica
-            // applying a *tailed* segment (as opposed to the writer's
-            // own `journal::append_tx`, which knows its real seq) just
-            // records 0 rather than opening a second, MVCC-snapshotted
-            // read transaction nested inside this write transaction for
-            // a value nothing consults.
+            // A row applied from a segment records position 0; the
+            // writer's own `journal::append_tx` records its journal seq.
+            // The retry-resolution path needs only presence, but the
+            // distinction is load-bearing: 0 means "the log carries this
+            // outcome", which is what `store::spec`'s `strand_local_tx`
+            // checks before it drops a stranded transaction's `completed`
+            // row (a nonzero position is this node's own unshipped
+            // journal, which the strand takes back out).
             let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
             tx.insert(
                 &meta.completed,

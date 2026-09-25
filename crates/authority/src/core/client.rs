@@ -1240,7 +1240,9 @@ impl Core {
                 self.nudge(now, out);
                 // Plan 30 §M8: the sequencer's own writes recall read
                 // delegations too; `finish` parks the reply until done.
-                let inos = constellation_meta::recall_inos(&records);
+                // (`_executed`: plus what an unlink or rename changed
+                // that its records do not name.)
+                let inos = constellation_meta::recall_inos_executed(&records);
                 let wait = self.recall_needed(now, &inos, None, replica, out);
                 (MutateOutcome::Accepted { epoch, records }, wait)
             }

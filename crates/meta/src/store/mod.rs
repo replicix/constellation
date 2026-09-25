@@ -489,7 +489,10 @@ pub struct Meta {
     /// it is pure allocation policy and every node has its own disjoint
     /// ino-prefix range to draw blocks from.
     pub(crate) ino_alloc: SingleWriterTxKeyspace,
-    /// Plan 30 §M2: `Rid::to_key() -> postcard(CompletedRow)`. Node-local
+    /// Plan 30 §M2: `Rid::to_key() -> position(8 BE) ++
+    /// recorded_at_ms(8 BE)`, plus `ROW_TAG_REFUSED ++ errno(4 BE)` for a
+    /// refused rid (`encode_completed_row`, `encode_refused_row`); position
+    /// 0 means the outcome came from the log. Node-local
     /// and replicated-but-unpublished, like `spec`/`pins`/`epochs` —
     /// never touches `ns`/`dirty`, never appears in `dump_replicated`,
     /// but (unlike those ephemeral ones) is populated by replaying the
@@ -594,6 +597,10 @@ pub struct Meta {
     /// out the attribute/entry TTL).
     foreign_apply_hook: std::sync::OnceLock<ForeignApplyHook>,
     usage: UsageTracker,
+    /// How many times [`Meta::sync`] ran (M16: the tests pin that every
+    /// safety-relevant write — a promise, an epoch join or ack, a seal, a
+    /// grant horizon — requests one before it is acted on).
+    syncs: AtomicU64,
     #[allow(dead_code)]
     path: Option<PathBuf>,
 }
@@ -619,12 +626,33 @@ impl Meta {
     /// Force every committed write to stable storage.
     ///
     /// Commits use `PersistMode::Buffer`: they reach the OS on commit, so
-    /// a process crash loses nothing, but a power loss can drop the tail
-    /// (as SQLite's `synchronous=NORMAL` did). An `fsync(2)` on the mount,
-    /// and an orderly shutdown, call this to close that window.
+    /// a process crash loses nothing, but a power loss (or kernel crash)
+    /// can drop the tail (as SQLite's `synchronous=NORMAL` did). An
+    /// `fsync(2)` on the mount, and an orderly shutdown, call this to
+    /// close that window. So does every write whose *safety* rests on
+    /// being remembered (M16): a published promise and an epoch join
+    /// (`promise_issue`, `promise_join_begin`), an epoch's persisted
+    /// state (`persist_epoch`, the epoch hold), a backup's seal
+    /// (`backup_seal`, `deleg_backup_seal`) and the read-grant horizon
+    /// (`note_grant_horizon`) — each syncs before the caller acts on it.
+    /// What a *durability* contract covers (a journal, a backup tail) is
+    /// described in `docs/reference/features/durability-and-failover.md`.
     pub fn sync(&self) -> Result<(), MetaError> {
         self.db.persist(fjall::PersistMode::SyncAll)?;
+        self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// How many times [`Self::sync`] completed (tests).
+    pub fn sync_count(&self) -> u64 {
+        self.syncs.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::kv_set`], then [`Self::sync`]: for a value whose loss on
+    /// power failure would be a safety problem, not just lost work.
+    pub fn kv_set_durable(&self, key: &str, value: &str) -> Result<(), MetaError> {
+        self.kv_set(key, value)?;
+        self.sync()
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MetaError> {
@@ -718,6 +746,7 @@ impl Meta {
             locks: crate::locks::LockTables::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
             usage: UsageTracker::new(0, 0),
+            syncs: AtomicU64::new(0),
             path,
         };
         meta.bootstrap()?;

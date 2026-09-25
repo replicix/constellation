@@ -197,7 +197,15 @@ outwaited (it is live until `granted + ttl + margin` on the
 sequencer's clock). This covers a forwarded op's reply, a local op's
 reply, the FUSE fast path, an inbox op (recalled before it executes),
 and a release of the lease. A change to a dentry also recalls the
-parent directory's delegation.
+parent directory's delegation, and an `unlink`, `rmdir` or `rename`
+also recalls the inodes it changes that its records do not name: the
+unlinked (or replaced) inode, whose `nlink` and `ctime` change or which
+is gone, and a renamed inode. Otherwise a node holding a delegation on
+an unlinked file would keep answering a strict open of it by inode (a
+dentry its kernel still caches) from its stale replica after the
+unlink completed. The executed paths take these from the op's own
+transaction; an inbox op and a delegate's write, which recall before
+executing, look them up just before.
 
 The wait is parked, not blocking: other keys, the ship round and other
 requesters proceed. A forwarded op whose reply is held longer than half
@@ -251,9 +259,6 @@ the margin (6 s at the defaults).
 
 ### Known gaps
 
-- An `unlink` does not recall a delegation on the unlinked file itself,
-  so its `nlink` and `ctime` can read stale on another node until the
-  delegation expires.
 - A directory listing is satisfied only by the applied position, so an
   `ls` after a refusal waits even when speculation covers the entry.
 - A degraded strict read can take the ReadIndex budget plus a session

@@ -108,6 +108,20 @@ pub(crate) struct InboxState {
     // ---- holder ----
     pub(crate) holder: Option<HolderPoll>,
     pub(crate) poll_timer: Option<TimerId>,
+    /// Older epochs' batches the takeover drain could not execute (an op
+    /// under a live delegation: the recall runs first), in drain order.
+    /// The holder only polls its own epoch, so these are run from the
+    /// holder tick until done; a requester with batches here is not
+    /// polled under the new epoch meanwhile (its ops stay in order).
+    pub(crate) leftover: Vec<InboxBatch>,
+    /// Requesters whose inbox op halted on a write-delegation recall (a
+    /// cross-subtree op), since when. While one waits, a generation that
+    /// recall ended is not re-delegated (`deleg_redelegate_after_cross`):
+    /// the recalled op runs at the next poll or tick, and a re-delegation
+    /// in between would make it recall again, forever (found by
+    /// long-delegated seed 70117 once M16's drain leftovers existed; the
+    /// poll path had the same window).
+    pub(crate) recall_waiters: BTreeMap<NodeId, Ms>,
     // ---- reachability (round 3a) ----
     /// Per holder, when its P2P path first failed since it last answered.
     down_since: BTreeMap<NodeId, Ms>,
@@ -361,7 +375,8 @@ impl Core {
         let ops: Vec<InboxOp> = rids
             .iter()
             .filter_map(|rid| {
-                let op = self.clients.get(rid)?.op.to_postcard().ok()?;
+                let c = self.clients.get(rid)?;
+                let op = c.op.to_postcard().ok()?;
                 Some(InboxOp {
                     rid: InboxRid {
                         node: rid.node,
@@ -369,6 +384,7 @@ impl Core {
                         seq: rid.seq,
                     },
                     op,
+                    deps: c.deps.to_postcard(),
                 })
             })
             .collect();
@@ -825,6 +841,9 @@ impl Core {
             Some(e) if !self.lease.fenced() && !self.lease.epoch_held() => e,
             _ => {
                 self.inbox.holder = None;
+                // Still in the bucket: the next holder's gate drains them.
+                self.inbox.leftover.clear();
+                self.inbox.recall_waiters.clear();
                 return;
             }
         };
@@ -882,11 +901,23 @@ impl Core {
                 holder.executed.push((key, seq));
             }
         }
+        for key in deletes {
+            self.issue_s3(S3Op::InboxDelete { key }, S3For::InboxGc(key), out);
+        }
+        // The takeover drain's leftovers first: a requester's older
+        // batches run before anything it submitted under this epoch.
+        let waiting = self.inbox_run_leftovers(now, replica, out);
+        let Some(holder) = self.inbox.holder.as_mut() else {
+            return;
+        };
         // Polls due now.
         let mut polls = Vec::new();
         let mut next_due: Option<Ms> = None;
+        if !self.inbox.leftover.is_empty() {
+            next_due = Some(now.plus(base));
+        }
         for (node, rp) in holder.requesters.iter_mut() {
-            if rp.in_flight.is_some() {
+            if rp.in_flight.is_some() || waiting.contains(node) {
                 continue;
             }
             if rp.due_at <= now {
@@ -894,9 +925,6 @@ impl Core {
             } else {
                 next_due = Some(next_due.map_or(rp.due_at, |d: Ms| d.min(rp.due_at)));
             }
-        }
-        for key in deletes {
-            self.issue_s3(S3Op::InboxDelete { key }, S3For::InboxGc(key), out);
         }
         for (node, from) in polls {
             let op = self.issue_s3(
@@ -1174,10 +1202,28 @@ impl Core {
             // Plan 30 §M8: recall before executing (see `Halt::Recall`).
             let touched = decoded
                 .as_ref()
-                .map(constellation_meta::recall_inos_of_op)
+                .map(|op| replica.recall_inos_of_op(op))
                 .unwrap_or_default();
             if admitted && self.inbox_recall_first(now, batch.node, &touched, replica, out) {
                 return Err(Halt::Recall);
+            }
+            // M16: the op's `deps`, as a forward's: a delegate's stream
+            // it depends on (a marker written after data the delegate
+            // acknowledged) must be here before the op executes, or the
+            // log would carry the marker ahead of the data (harness and
+            // sim `marker-order`; long-delegated seed 70491 once the drain
+            // no longer stopped at the first delegated op). Inside the
+            // takeover gate the delegates have not re-streamed to this
+            // root yet: the requester's batches are deferred; after it,
+            // the batch waits (`Halt::Recall`: retried at the halted
+            // cadence) — the delegate re-streams, or the root reclaims the
+            // generation and voids its stream.
+            if self.cfg.delegation && !op.deps.is_empty() {
+                let deps = constellation_meta::Position::from_postcard(&op.deps);
+                if !replica.reaches_streams(&deps) {
+                    self.stats.deleg_deps_waits += 1;
+                    return Err(Halt::Recall);
+                }
             }
             // Plan 30 §M11: the same for write delegations — an inbox op
             // in a delegated subtree waits for the recall (the delegate's
@@ -1205,6 +1251,7 @@ impl Core {
                     match self.deleg_recall_plan(now, &keys, replica, out) {
                         super::delegate::RecallPlan::None => {}
                         super::delegate::RecallPlan::Wait(wait) => {
+                            self.inbox.recall_waiters.insert(batch.node, now);
                             self.park(
                                 now,
                                 (wait, None),
@@ -1253,13 +1300,36 @@ impl Core {
                 }
             }
         }
+        self.inbox.recall_waiters.remove(&batch.node);
         Ok(replica.journal_next_seq()?.saturating_sub(1))
+    }
+
+    /// Whether an inbox op still waits to run after a recall it caused
+    /// (see `InboxState::recall_waiters`); a waiter older than the
+    /// requester's own in-doubt deadline no longer counts (it has taken
+    /// the lease path, or is gone).
+    pub(crate) fn inbox_holds_redelegation(&mut self, now: Ms) -> bool {
+        let horizon = self.cfg.inbox_deadline_ms as i64;
+        self.inbox
+            .recall_waiters
+            .retain(|_, since| now.since(*since) < horizon);
+        !self.inbox.recall_waiters.is_empty()
     }
 
     /// Inside the takeover gate, after this node's own stranded ops were
     /// replayed and before its view opens: execute every batch of every
     /// epoch below the new one (dedup and watermark make re-reads exact)
     /// and delete them.
+    ///
+    /// A batch with an op under a live delegation cannot run inside the
+    /// gate (the recall runs first). It and the same requester's later
+    /// batches are kept in `leftover` — per requester, batches run in
+    /// order — while every other requester's batches still drain. The
+    /// holder tick runs the leftovers once the view is open
+    /// (`inbox_run_leftovers`): the holder never polls an older epoch,
+    /// so a batch left in the bucket would otherwise wait for the next
+    /// takeover (a crashed requester's forever, then executed long
+    /// after its incarnation ended).
     pub(crate) fn inbox_drain(
         &mut self,
         now: Ms,
@@ -1268,39 +1338,107 @@ impl Core {
         out: &mut Vec<Action>,
     ) -> Result<(), MetaError> {
         let mut ops = 0u64;
-        for batch in &batches {
-            match self.execute_inbox_batch(now, batch, false, replica, out) {
+        let mut drained = 0u64;
+        let mut stopped: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        let mut leftover = Vec::new();
+        for batch in batches {
+            if stopped.contains(&batch.node) {
+                leftover.push(batch);
+                continue;
+            }
+            match self.execute_inbox_batch(now, &batch, false, replica, out) {
                 Ok(_) => {}
                 Err(Halt::Fenced) => unreachable!("no view admission inside the gate"),
                 Err(Halt::Recall) => {
                     // Phase 2b: an op under an inherited delegation: the
-                    // recall is under way and the batch stays in the inbox
-                    // for the poll that follows it (`InboxRepoll`).
+                    // recall runs first; this requester's batches wait
+                    // for the holder tick after the gate.
                     tracing::info!(
                         node = self.cfg.node_id,
                         requester = batch.node,
-                        "inbox: drain stops at a delegated subtree; the recall runs first"
+                        epoch = batch.epoch,
+                        n = batch.n,
+                        "inbox: drain defers a requester at a delegated subtree; \
+                         the recall runs first"
                     );
-                    break;
+                    stopped.insert(batch.node);
+                    leftover.push(batch);
+                    continue;
                 }
                 Err(Halt::Meta(error)) => return Err(error),
             }
             ops += batch.ops.len() as u64;
+            drained += 1;
             let key = batch.key();
             self.issue_s3(S3Op::InboxDelete { key }, S3For::InboxGc(key), out);
         }
-        if !batches.is_empty() {
+        if drained > 0 || !leftover.is_empty() {
             tracing::info!(
                 node = self.cfg.node_id,
-                batches = batches.len(),
+                batches = drained,
                 ops,
+                deferred = leftover.len(),
                 "inbox: drained older epochs' batches inside the takeover gate"
             );
         }
-        self.stats.inbox_drained_batches += batches.len() as u64;
+        self.stats.inbox_drained_batches += drained;
         self.stats.inbox_drained_ops += ops;
         // The poll state, if any, belongs to the previous tenure.
         self.inbox.holder = None;
+        self.inbox.leftover = leftover;
         Ok(())
+    }
+
+    /// Run the takeover drain's leftovers through the admitted path (the
+    /// recalls a delegated op needs are started and waited for there).
+    /// Returns the requesters that still have leftovers: they are not
+    /// polled under the new epoch until these ran.
+    fn inbox_run_leftovers(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> std::collections::BTreeSet<NodeId> {
+        let mut waiting = std::collections::BTreeSet::new();
+        if self.inbox.leftover.is_empty() {
+            return waiting;
+        }
+        let batches = std::mem::take(&mut self.inbox.leftover);
+        let mut keep = Vec::new();
+        let mut executed = false;
+        for batch in batches {
+            if waiting.contains(&batch.node) {
+                keep.push(batch);
+                continue;
+            }
+            match self.execute_inbox_batch(now, &batch, true, replica, out) {
+                Ok(_) => {
+                    executed = true;
+                    self.stats.inbox_drained_batches += 1;
+                    self.stats.inbox_drained_ops += batch.ops.len() as u64;
+                    let key = batch.key();
+                    self.issue_s3(S3Op::InboxDelete { key }, S3For::InboxGc(key), out);
+                }
+                Err(Halt::Fenced) | Err(Halt::Recall) => {
+                    waiting.insert(batch.node);
+                    keep.push(batch);
+                }
+                Err(Halt::Meta(error)) => {
+                    tracing::warn!(
+                        node = self.cfg.node_id,
+                        %error,
+                        "executing a leftover inbox batch"
+                    );
+                    waiting.insert(batch.node);
+                    keep.push(batch);
+                }
+            }
+        }
+        // (Nothing can have been added meanwhile: only the drain fills it.)
+        self.inbox.leftover = keep;
+        if executed {
+            self.nudge(now, out);
+        }
+        waiting
     }
 }

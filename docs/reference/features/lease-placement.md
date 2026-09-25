@@ -70,9 +70,9 @@ cost(c) = Σ writer_ops(w) × rtt(c, w)
 
 Writer counts are kept in twelve five-second buckets: a rolling window
 of about 60 seconds. The holder counts the ops it accepted from each
-requester and its own ops that went through the authority core. Its
-own writes on the FUSE fast path are not counted (see
-[Troubleshooting](#troubleshooting)). The holder evaluates every 5 s.
+requester and its own ops, both those that went through the authority
+core and those its FUSE fast path executed (the driver drains a count
+of the latter after every core event). The holder evaluates every 5 s.
 
 ### Inputs and candidates
 
@@ -142,11 +142,6 @@ If the root lease never moves, check that the candidate has recent
 writes, a direct (not relay) path, complete RTT samples, enough cost
 improvement, and that the 60-second dwell has elapsed, and that no
 delegation or lock grant is live.
-
-The holder's own writes on the FUSE fast path are not counted as
-writer weight for the root lease. A busy holder can therefore look idle
-to its own cost function, and a light remote writer can win the
-recommendation. Subtree placement counts fast-path writes.
 
 If leases still move frequently with placement disabled, inspect
 `handed the lease to a peer`; that is the requester's fallback handoff
