@@ -479,6 +479,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: xattr_roundtrip,
     },
     Scenario {
+        name: "truncate-never-resurrects",
+        desc: "a truncate never resurrects the bytes it cut: ftruncate / O_TRUNC / a cross-node truncate, then an extension past the cut (write past a gap, truncate-up, fallocate), on the holder and a forwarding node, checked live, after a cold-cache remount and on a fresh node",
+        requires: &[],
+        run: truncate_never_resurrects,
+    },
+    Scenario {
         name: "fallocate-sparse",
         desc: "large sparse extend, hole punch, SEEK_HOLE/DATA, rewrite, and fresh-node verification",
         requires: &[],
@@ -4010,6 +4016,148 @@ fn epoch_peer_reaching_s3_declines(_seed: u64) -> Result<()> {
     let _ = c0.unmount();
     result?;
     unmounted
+}
+
+/// A truncate never resurrects the bytes it cut. Every shape runs on two
+/// nodes — A holds the lease, B forwards — and each file is checked on
+/// both, then again after both remount with an empty chunk cache (so the
+/// content comes from the committed manifests in S3), and on a fresh
+/// node:
+///
+/// - write `abcdefgh`, reopen, `ftruncate(2)`, write `X` at 5 — on the
+///   holder and on a forwarding node;
+/// - a truncate on one node (committed as `setattr`), then the write past
+///   the gap on the other node;
+/// - `O_TRUNC` then a write past a gap;
+/// - truncate down, then truncate up; and then `fallocate` up.
+///
+/// Expected everywhere: the cut bytes read as zeros.
+fn truncate_never_resurrects(_seed: u64) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+    const NAME: &str = "truncate-never-resurrects";
+    let (env, root) = setup(NAME)?;
+    let _route = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let mut a = Client::new(root.path(), "a", &env.endpoint, &backend)?
+        .with_own_node_key()
+        .with_env("CONSTELLATION_LEASE_PLACEMENT", "off");
+    let mut b = Client::new(root.path(), "b", &env.endpoint, &backend)?
+        .with_own_node_key()
+        .with_env("CONSTELLATION_LEASE_PLACEMENT", "off");
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    wait_for_p2p(&[&a, &b])?;
+    std::fs::create_dir(a.mnt.join("t"))?;
+    eventually("t on B", Duration::from_secs(30), || {
+        anyhow::ensure!(b.mnt.join("t").is_dir());
+        Ok(())
+    })?;
+    let gap = |head: &[u8], at: usize, tail: &[u8]| -> Vec<u8> {
+        let mut v = head.to_vec();
+        v.resize(at, 0);
+        v.extend_from_slice(tail);
+        v
+    };
+    let rw = |p: std::path::PathBuf| std::fs::OpenOptions::new().read(true).write(true).open(p);
+    let mut expect: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // 1. ftruncate then a write past the gap, on each node.
+    for (who, c) in [("a", &a), ("b", &b)] {
+        let name = format!("t/ftrunc-{who}");
+        std::fs::write(c.mnt.join(&name), b"abcdefgh")?;
+        let mut f = rw(c.mnt.join(&name))?;
+        f.set_len(2)?;
+        f.seek(SeekFrom::Start(5))?;
+        f.write_all(b"X")?;
+        drop(f);
+        expect.push((name, gap(b"ab", 5, b"X")));
+    }
+    // 2. The truncate on B, the write past the gap on A.
+    std::fs::write(a.mnt.join("t/cross"), b"abcdefghijklmnop")?;
+    eventually("cross on B", Duration::from_secs(30), || {
+        anyhow::ensure!(std::fs::read(b.mnt.join("t/cross"))? == b"abcdefghijklmnop");
+        Ok(())
+    })?;
+    rw(b.mnt.join("t/cross"))?.set_len(3)?;
+    eventually("B's truncate on A", Duration::from_secs(30), || {
+        anyhow::ensure!(std::fs::metadata(a.mnt.join("t/cross"))?.len() == 3);
+        Ok(())
+    })?;
+    {
+        let mut f = rw(a.mnt.join("t/cross"))?;
+        f.seek(SeekFrom::Start(10))?;
+        f.write_all(b"Y")?;
+    }
+    expect.push(("t/cross".into(), gap(b"abc", 10, b"Y")));
+    // 3. O_TRUNC, then a write past a gap (on B).
+    std::fs::write(b.mnt.join("t/otrunc"), b"0123456789")?;
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(b.mnt.join("t/otrunc"))?;
+        f.seek(SeekFrom::Start(5))?;
+        f.write_all(b"Z")?;
+    }
+    expect.push(("t/otrunc".into(), gap(b"", 5, b"Z")));
+    // 4. Truncate down then up; then fallocate up (on A).
+    std::fs::write(a.mnt.join("t/updown"), b"abcdefgh")?;
+    {
+        let f = rw(a.mnt.join("t/updown"))?;
+        f.set_len(2)?;
+        f.set_len(8)?;
+    }
+    expect.push(("t/updown".into(), gap(b"ab", 8, b"")));
+    std::fs::write(a.mnt.join("t/falloc"), b"abcdefgh")?;
+    {
+        let f = rw(a.mnt.join("t/falloc"))?;
+        f.set_len(2)?;
+        // SAFETY: a plain `fallocate(2)` on an fd we own.
+        let r = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, 8) };
+        anyhow::ensure!(r == 0, "fallocate: {}", std::io::Error::last_os_error());
+    }
+    expect.push(("t/falloc".into(), gap(b"ab", 8, b"")));
+
+    let verify = |c: &Client, when: &str| -> Result<()> {
+        eventually(
+            &format!("{} reads every file ({when})", c.name),
+            Duration::from_secs(30),
+            || {
+                for (name, want) in &expect {
+                    let got = std::fs::read(c.mnt.join(name))
+                        .with_context(|| format!("{} reads {name}", c.name))?;
+                    anyhow::ensure!(
+                        &got == want,
+                        "{} ({when}): {name} is {:?}, want {:?}",
+                        c.name,
+                        String::from_utf8_lossy(&got),
+                        String::from_utf8_lossy(want)
+                    );
+                }
+                Ok(())
+            },
+        )
+    };
+    verify(&a, "live")?;
+    verify(&b, "live")?;
+    b.unmount()?;
+    a.unmount()?;
+    a.drop_cache()?;
+    b.drop_cache()?;
+    a.mount()?;
+    b.mount()?;
+    verify(&a, "remounted, cold cache")?;
+    verify(&b, "remounted, cold cache")?;
+    let mut d = Client::new(root.path(), "d", &env.endpoint, &backend)?.with_own_node_key();
+    d.mount()?;
+    let fresh = verify(&d, "fresh node");
+    d.unmount()?;
+    fresh?;
+    b.unmount()?;
+    a.unmount()?;
+    Ok(())
 }
 
 /// Phase 4c: unmount ≠ leave. With C merely unmounted, A+B cannot open

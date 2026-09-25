@@ -150,6 +150,15 @@ pub enum Payload {
         carrier: Option<EpochCarrier>,
         stale_below: u64,
     },
+    /// Plan 30 §M10: the proposer of `epoch_id` gave up on it (a member
+    /// declined or did not answer) and will never activate it: a member
+    /// that persisted its promise for it drops the promise (it would
+    /// otherwise stay `Promised`, an open epoch, for good). Answered
+    /// with `Ok`.
+    EpochAbort {
+        epoch_id: String,
+        proposer: u64,
+    },
     /// Plan 30 §M10: a would-be taker of the expired lease asks for a
     /// heartbeat promise past `expires_unix_ms`. Answered by
     /// [`Payload::PromiseReply`].

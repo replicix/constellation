@@ -367,7 +367,13 @@ fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError
             )?;
         }
         MutateOp::Records { records } => {
-            meta.apply_records_journaled(records)?;
+            // A `Records` op is a stranded transaction re-applied by rid
+            // (plan 30 §M3b's rid-less local work, or §M9's adopted
+            // backup tail stranded again by a second failover): its
+            // manifests may name chunks only a departed holder had, so
+            // they are enrolled for the durability check exactly as an
+            // adopted tail's are (`Meta::apply_adopted_records`).
+            meta.apply_adopted_records(records, None)?;
         }
         MutateOp::AtimeBatch { entries } => {
             // Apply to the holder's own inode table (so its stat reflects

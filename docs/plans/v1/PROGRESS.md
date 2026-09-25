@@ -19032,3 +19032,192 @@ regression.
 - `cargo test -p constellation-authority --release`: 67 lib + 3
   `meta_repro` + 64 sim (7 ignored), all pass.
 - `cargo test -p constellation-meta --release`: 125 passed.
+
+## Fix: truncate resurrected stale bytes (2026-09-25; uncommitted on `fix-truncate-resurrect` = main 623da2c)
+
+### 1. The bug and its root causes
+
+Repro: write `abcdefgh`, truncate to 2, write `X` at 5. The file read
+`abcdeX` instead of `ab\0\0\0X`. More generally, any extension past a
+truncation — a write past a gap, a truncate-up, a `fallocate` — brought
+back the bytes the truncate had cut. There were three independent
+causes:
+
+1. **A truncate never touched the committed content.**
+   - `setattr(size)` (`Meta::setattr`, and its replay `apply_setattr`)
+     changed only `attrs.size`. The manifest kept its `file_len` and
+     every chunk.
+   - Reads stop at the size, so the bytes looked gone. But the next
+     extension composed from, seeded from or read that manifest, and
+     they came back. This affected every node, and also the case where
+     the truncate and the extension happen on different nodes.
+2. **A write session forgot its own truncate.**
+   - `truncate_locked` dropped staging runs and set `file_len`, but
+     three things kept pre-truncate content:
+     - a partial write's *seed* (`committed_chunk_padded`);
+     - a read of an untouched chunk (`read_committed_chunk`);
+     - the flush's composition (`compose_manifest`: the base chunk
+       resized to the new length, and the tail "re-cut", both keep
+       bytes past the cut).
+   - Sealed chunks, the recorded `written` ranges and `high_water` also
+     outlived the truncate.
+3. **A whole-chunk punch or zero (fallocate, plan 16) was forgotten
+   once written into.**
+   - `holes` is cleared by the next write. From then on the dirty
+     chunk's composition, and a read of it, started from the base's
+     bytes again.
+   - Before any write, a read of a punched chunk also went to the base,
+     because `do_read` never looked at `holes`.
+   - The random model test found this one on its third seed.
+
+### The fix
+
+**The invariant: a manifest's content is valid only below its
+`file_len`, and a truncate lowers it.**
+
+- **Meta** (`replay::clip_manifest`, `clip_manifest_to_size_tx`): a
+  size decrease rewrites the stored manifest in the same transaction.
+  - `file_len` becomes the new size, and inline chunks wholly past it
+    are dropped. A spilled list keeps its blob; its chunks past
+    `file_len` are dead.
+  - This runs both where the `setattr` executes and in the log's replay,
+    so every replica cuts the same way.
+  - Chunk refs follow (`track_manifest_transition_tx`).
+  - A concurrent session composed on the pre-truncate manifest now
+    fails the manifest base check. It rebases onto the cut manifest and
+    recomposes, clipped — which is what keeps a truncate on one node
+    safe from a write session on another.
+- **Every reader of base content clips at the base's `file_len`**, or at
+  the session's own truncation if that is lower (`WriteState::floor`,
+  `base_floor`, `clip_base`, `clip_at`). This covers:
+  - the partial write's seed;
+  - `do_read` of an untouched chunk, with or without a session;
+  - `compose_manifest`: base chunks wholly past the floor are dropped;
+    the chunk the floor falls inside is re-cut even when untouched;
+    dirty chunks start from the clipped base;
+  - `seek_sparse`.
+- **`write_state`** starts a session at the inode's size, not the
+  manifest's `file_len`. It sets `floor` when that size is below the
+  manifest's `file_len`: a committed truncate the manifest predates.
+- **`truncate_locked`** (down):
+  - lowers `floor`;
+  - drops sealed chunks wholly past the cut, and moves the sealed chunk
+    the cut falls inside back into staging, so the staging truncate
+    cuts it;
+  - clips `written` and `high_water`.
+- **`WriteState::zeroed`**: chunks this session punched or zeroed whole,
+  set by `fallocate` punch/zero and by sealing an all-zero chunk. Unlike
+  `holes`, a write does not clear it. A zeroed chunk seeds from zeros,
+  composes from zeros and reads as zeros until written. A sealed copy is
+  the session's own and stays valid.
+
+**Paths covered.** All of these reach the same base reads:
+- truncate via `setattr` or `ftruncate`, and `O_TRUNC` (the kernel sends
+  `setattr(size = 0)`);
+- the extension by a write, `fallocate` or truncate-up;
+- an open session or a committed manifest;
+- write-back or write-through;
+- a local, forwarded or delegate manifest commit.
+
+The M5 fold (a truncate folded into the later manifest commit) carries
+the composed manifest, which is now clipped. A lone stranded `Setattr`
+replays through `setattr`, which now cuts the manifest.
+
+**Tests.**
+- **Unit, cli `pending_row_tests`:**
+  - `truncate_then_write_past_a_gap_reads_zeros_in_the_gap` (16-byte
+    and 1 MiB chunks; flushed base and one session);
+  - `truncate_then_extend_by_truncate_or_fallocate_reads_zeros`
+    (truncate-up, fallocate extend, zero-range extend);
+  - `o_trunc_then_a_partial_write_keeps_only_the_write`;
+  - `truncate_inside_a_sealed_chunk_then_extend_reads_zeros`;
+  - `a_committed_truncate_the_manifest_predates_is_honoured` (another
+    node's `setattr` only, then this node's write; then a committed
+    truncate and a committed extend);
+  - each checks the read before the flush and after it.
+- **Model test:** `random_write_truncate_fallocate_sequences_match_a_model`.
+  - Random write / truncate / fallocate (extend, zero range with or
+    without KEEP_SIZE, punch) / flush sequences, 40 steps, 16-byte
+    chunks, files up to about 200 bytes (spilled manifests past 8
+    chunks), against an in-memory reference. The whole file is compared
+    after every step.
+  - 150 seeds by default (about 17 s); `TRUNCATE_FUZZ_SEEDS=5000`
+    passed (134 s).
+  - It found the punch bug above twice: the read path, then the seed
+    path. The second find was in my first fix, which also dropped a
+    sealed copy of a zeroed chunk.
+- **Unit, meta:** `store::tests::a_truncate_cuts_the_manifest_everywhere`
+  (the holder executes, a follower applies the log: `file_len` 5, the
+  chunk past it gone, the size then raised to 40 on both).
+- **Harness `truncate-never-resurrects`:**
+  - Two nodes, A holding and B forwarding:
+    - ftruncate then a write past the gap, on each node;
+    - the truncate on B and the write on A;
+    - `O_TRUNC` then a write past a gap;
+    - truncate down then up;
+    - truncate then fallocate up.
+  - Checked live, again after both remount with an empty chunk cache,
+    and on a fresh node.
+  - Against main 623da2c it fails at once: "`t/ftrunc-a` is `abcdeX`,
+    want `ab\0\0\0X`".
+
+### 2a. `EpochAbort`: no member left `Promised` by a later decline
+
+- `Payload::EpochAbort { epoch_id, proposer }` (`net`). A proposer
+  whose proposal failed (a decline, or no answer) closes its own
+  promise, then sends this to every member.
+- A member drops its promise only if its current promise is that id and
+  still `Promised` (`EpochManager::handle_abort`). An `Active` epoch or
+  another proposal's promise is untouched.
+- **Safety:**
+  - Only the proposer activates, and only after every ack. It sends the
+    abort after closing its own promise, so no activation of that id
+    exists or ever will.
+  - The receiver accepts the abort only if the sender's enrolled key is
+    the proposer's (`peers.rs`). A forged abort could otherwise drop a
+    promise the proposer still counts.
+- **Best effort:** a member that misses the abort keeps its promise, as
+  before.
+- Unit test: `epoch::tests::an_abort_drops_only_the_named_promised_epoch`.
+
+### 2b. A stranded adopted transaction is still checked
+
+- A transaction adopted from a backup tail that strands again (the
+  successor deposed before shipping it) replays by rid as a `Records`
+  op on the next holder.
+- `MutateOp::Records` now executes through `Meta::apply_adopted_records`,
+  so its manifests' chunks are enrolled for the durability check there
+  too (held if missing).
+- Unit test: `a_stranded_adopted_manifest_replayed_elsewhere_is_still_held`
+  (B adopts, B strands, C executes the queued op: pending, then held,
+  never shipped). It fails with the old `apply_records_journaled`.
+
+### Results (this tree)
+
+- `cargo test -p constellation-authority --release`: 67 core,
+  3 meta_repro, 63 sim (7 ignored): green.
+- `cargo test -p constellation -p constellation-meta -p
+  constellation-fs-core --release`: green (219 cli, 74 meta, 35
+  fs-core, …).
+- `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo fmt --all -- --check`: clean.
+- **pjdfstest**, default mount, built and run under a private compose
+  project (`-p constellation-fixtrunc`, `SMOKE_IMAGE=constellation-smoke:fixtrunc`
+  so the shared `:local` tag is untouched, and the `floci-no-port.yml`
+  override because another session holds host port 4566): **8798
+  passed, 0 failed, empty baseline**. Torn down with `down -v`, image
+  removed.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-fixtrunc`):
+
+  | Scenario | Result |
+  |---|---|
+  | `truncate-never-resurrects` | 3/3 passed, and once more before the final build |
+  | `fallocate-sparse` | passed |
+  | `big-file-write` | passed |
+  | `writeback-drain` | passed |
+  | `dedup-write-storm` | passed |
+  | `backup-takeover-holds-missing-chunks` | passed |
+  | `continuation-epoch` | passed |
+  | `epoch-missing-node` | passed |
+  | `epoch-peer-reaching-s3-declines` | passed |
+  | `chaos-ci` | passed |

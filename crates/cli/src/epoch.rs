@@ -514,6 +514,21 @@ impl EpochManager {
                 other => {
                     tracing::warn!(peer = id, ?other, "epoch propose not acked");
                     self.abandon_own_proposal(&epoch_id);
+                    // The members that acked — and the one whose answer
+                    // was lost or late — may hold a promise nobody will
+                    // activate: tell every member (best effort; one that
+                    // misses it keeps its promise, as before this message
+                    // existed).
+                    let abort = Payload::EpochAbort {
+                        epoch_id: epoch_id.clone(),
+                        proposer: self.node_id,
+                    };
+                    for member in members.iter().filter(|m| **m != self.node_id) {
+                        let _ = self
+                            .peers
+                            .request_to_node_timeout(*member, &abort, PROPOSE_REQUEST_TIMEOUT)
+                            .await;
+                    }
                     return Ok(false);
                 }
             }
@@ -583,6 +598,34 @@ impl EpochManager {
         let _ = self.meta.promise_join_end();
         *self.propose_after.lock().unwrap() = Some(std::time::Instant::now() + PROPOSE_BACKOFF);
         self.sync_flags();
+    }
+
+    /// A proposer abandoned `epoch_id` (`Payload::EpochAbort`): drop this
+    /// member's promise for it — if it is still only `Promised`. The
+    /// proposer activates only after every member acked, and it sends
+    /// the abort only after closing its own promise for good, so no
+    /// activation of this id exists or will; an `Active` (or already
+    /// replaced) epoch is left alone. Returns whether it dropped one.
+    pub fn handle_abort(&self, epoch_id: &str, proposer: u64) -> bool {
+        {
+            let mut m = self.machine.lock().unwrap();
+            let promised = m.current().is_some_and(|p| {
+                p.epoch_id == epoch_id && p.state == constellation_net::EpochState::Promised
+            });
+            if !promised {
+                return false;
+            }
+            m.close();
+        }
+        let _ = self.meta.set_epoch_state(epoch_id, "closed");
+        let _ = self.meta.promise_join_end();
+        self.sync_flags();
+        tracing::info!(
+            epoch_id,
+            proposer,
+            "epoch proposal aborted by its proposer; promise dropped"
+        );
+        true
     }
 
     /// Plan 30 §M10: the epoch's carrier was retired (admin `leave
@@ -843,6 +886,35 @@ mod tests {
         let joined = mgr.handle_propose_checked("1-2".into(), vec![1, 2], vec![], 1, 0, false);
         assert!(accepted(&joined), "{joined:?}");
         assert!(mgr.is_open());
+    }
+
+    /// A member that acked a proposal the proposer then abandoned drops
+    /// its promise on the abort; an active epoch, or another proposal's
+    /// promise, is not touched.
+    #[test]
+    fn an_abort_drops_only_the_named_promised_epoch() {
+        let (mgr, _meta) = manager(2, 0);
+        mgr.set_roster(vec![1, 2, 3]);
+        let ack = mgr.handle_propose_checked("1-7".into(), vec![1, 2, 3], vec![], 1, 0, false);
+        assert!(accepted(&ack), "{ack:?}");
+        assert!(mgr.is_open());
+        assert!(!mgr.handle_abort("1-6", 1), "another id");
+        assert!(mgr.is_open());
+        assert!(mgr.handle_abort("1-7", 1));
+        assert!(!mgr.is_open(), "the promise is dropped");
+        // Active: an abort (which no proposer sends after activating) is
+        // ignored.
+        let ack = mgr.handle_propose_checked("1-8".into(), vec![1, 2, 3], vec![], 1, 0, false);
+        assert!(accepted(&ack), "{ack:?}");
+        mgr.handle_activate(constellation_net::EpochActivation {
+            epoch_id: "1-8".into(),
+            members: vec![1, 2, 3],
+            base: vec![],
+            carrier: None,
+            stale_below: 0,
+        });
+        assert!(!mgr.handle_abort("1-8", 1));
+        assert!(mgr.is_active());
     }
 
     #[test]

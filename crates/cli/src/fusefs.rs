@@ -104,6 +104,11 @@ struct WriteState {
     /// see [`ConstellationFs::unseal`].
     enrolled: HashSet<u64>,
     holes: crate::staging::DirtyRuns,
+    /// Chunks this session discarded whole (punched or zeroed): their
+    /// base content is gone even after a later write re-dirties them —
+    /// unlike `holes`, a write does not clear this, so the composition
+    /// starts such a chunk from zeros, not from the base.
+    zeroed: crate::staging::DirtyRuns,
     seal_buffer: Vec<u8>,
     high_water: u64,
     /// Absolute half-open byte ranges this open handle's `write()`
@@ -117,6 +122,43 @@ struct WriteState {
     /// writers converge instead of each writer's seed silently
     /// clobbering the others' bytes with its own stale copy.
     written: Vec<(u64, u64)>,
+    /// The base's content is valid only below this offset: the lowest
+    /// length the file was truncated to — by this session, or by a
+    /// committed `setattr(size)` the base manifest predates (its
+    /// `file_len` then exceeds the inode's size). Every read of base
+    /// content for this session (a partial write's seed, a read of an
+    /// untouched chunk, the flush's composition) zeroes what lies at or
+    /// past it, so a later extension — by a write past a gap, a
+    /// truncate-up, a `fallocate` — reads zeros there and never the
+    /// bytes the truncate cut. `None`: nothing was truncated.
+    floor: Option<u64>,
+}
+
+impl WriteState {
+    /// Where the content of a base manifest of length `base_len` stops
+    /// being valid for this session: its own `file_len` (a manifest's
+    /// content is valid only below it — a truncate lowers it, see
+    /// `constellation_meta::replay::clip_manifest`), or this session's
+    /// truncation, whichever is lower.
+    fn base_floor(&self, base_len: u64) -> u64 {
+        self.floor.map_or(base_len, |f| f.min(base_len))
+    }
+
+    /// Zero what in `data` (content of a base of length `base_len`, the
+    /// chunk starting at `chunk_start`) lies at or past
+    /// [`WriteState::base_floor`].
+    fn clip_base(&self, data: &mut [u8], chunk_start: u64, base_len: u64) {
+        clip_at(Some(self.base_floor(base_len)), data, chunk_start);
+    }
+}
+
+/// Zero what in `data` (content starting at absolute offset `start`) lies
+/// at or past `floor`.
+fn clip_at(floor: Option<u64>, data: &mut [u8], start: u64) {
+    if let Some(floor) = floor {
+        let keep = floor.saturating_sub(start).min(data.len() as u64) as usize;
+        data[keep..].fill(0);
+    }
 }
 
 const WRITE_SHARDS: usize = 256;
@@ -1967,19 +2009,39 @@ impl ConstellationFs {
         manifest: &Manifest,
     ) -> Result<&'a mut WriteState, i32> {
         if let std::collections::hash_map::Entry::Vacant(e) = writes.entry(ino) {
+            // The inode's size is authoritative: a committed
+            // `setattr(size)` (a truncate on this or another node whose
+            // manifest commit has not happened, or never will) leaves the
+            // manifest's `file_len` and chunks as they were. Below it the
+            // manifest's content is valid; past it, it is dead.
+            let size = self
+                .meta
+                .getattr(ino)
+                .ok()
+                .flatten()
+                .map(|a| a.size)
+                .unwrap_or(manifest.file_len);
             let gen = self.staging_gen.next();
             let staging = Staging::create(&self.staging_dir, ino, gen, self.staging_budget.clone())
                 .map_err(|e| staging_errno(&e))?;
+            let mut staging = staging;
+            if size != manifest.file_len {
+                staging
+                    .set_len_sparse(size)
+                    .map_err(|e| staging_errno(&e))?;
+            }
             e.insert(WriteState {
                 staging,
-                file_len: manifest.file_len,
+                file_len: size,
                 base: Some(manifest.clone()),
                 sealed: HashMap::new(),
                 enrolled: HashSet::new(),
                 holes: crate::staging::DirtyRuns::default(),
+                zeroed: crate::staging::DirtyRuns::default(),
                 seal_buffer: Vec::new(),
-                high_water: manifest.file_len,
+                high_water: size.min(manifest.file_len),
                 written: Vec::new(),
+                floor: (size < manifest.file_len).then_some(size),
             });
         }
         Ok(writes.get_mut(&ino).unwrap())
@@ -2025,6 +2087,7 @@ impl ConstellationFs {
             if data.iter().all(|byte| *byte == 0) {
                 ws.staging.release_chunk(idx, self.chunk_size);
                 ws.holes.mark(idx);
+                ws.zeroed.mark(idx);
                 data.clear();
                 ws.seal_buffer = data;
                 sealed_any = true;
@@ -2172,9 +2235,13 @@ impl ConstellationFs {
         let old_hashes = self.chunk_list(base)?;
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let n_chunks = layout.chunk_count(file_len);
+        let cs = u64::from(self.chunk_size);
+        let floor = ws.base_floor(base.file_len);
         let mut new_hashes: SparseChunks = old_hashes
             .iter()
             .filter(|(index, _)| **index < n_chunks && !ws.holes.contains(**index))
+            // Wholly past a truncation: dead, a hole now.
+            .filter(|(index, _)| **index * cs < floor)
             .map(|(index, hash)| (*index, *hash))
             .collect();
         // Every chunk this flush seals into the cache as Dirty: the
@@ -2220,9 +2287,10 @@ impl ConstellationFs {
             // held manifest — and an overwrite must not depend on it).
             let covered = covers(&ws.written, chunk_start, chunk_end);
             let mut data = match old_hashes.get(&idx) {
-                Some(hash) if !covered => {
+                Some(hash) if !covered && !ws.zeroed.contains(idx) => {
                     let mut fetched = self.fetch_chunk(hash)?;
                     fetched.resize(expect_len, 0);
+                    ws.clip_base(&mut fetched, chunk_start, base.file_len);
                     fetched
                 }
                 _ => vec![0u8; expect_len],
@@ -2251,17 +2319,29 @@ impl ConstellationFs {
                 new_hashes.insert(idx, hash);
             }
         }
-        // An untouched old tail chunk needs re-cutting after truncate-down.
-        if n_chunks > 0 {
-            let idx = n_chunks - 1;
+        // An untouched old chunk needs re-cutting when its length changed
+        // (the tail after a truncate-down) or a truncation point falls
+        // inside it (its bytes past the point are dead: zeroed, even when
+        // the file was extended past them again).
+        let straddle = (floor < file_len && !floor.is_multiple_of(cs) && floor / cs < n_chunks)
+            .then_some(floor / cs);
+        let recut: Vec<u64> = n_chunks
+            .checked_sub(1)
+            .into_iter()
+            .chain(straddle)
+            .collect::<std::collections::BTreeSet<u64>>()
+            .into_iter()
+            .collect();
+        for idx in recut {
             if !ws.staging.is_dirty(idx) && !ws.sealed.contains_key(&idx) && !ws.holes.contains(idx)
             {
                 if let Some(h) = old_hashes.get(&idx) {
                     let expect_len = layout.chunk_len(file_len, idx) as usize;
                     let old_len = base.layout.chunk_len(base.file_len.max(1), idx) as usize;
-                    if old_len != expect_len {
+                    if old_len != expect_len || Some(idx) == straddle {
                         let mut data = self.fetch_chunk(h)?;
                         data.resize(expect_len, 0);
+                        ws.clip_base(&mut data, idx * cs, base.file_len);
                         if data.iter().all(|byte| *byte == 0) {
                             new_hashes.remove(&idx);
                         } else {
@@ -2971,6 +3051,10 @@ mod pending_row_tests {
     }
 
     fn env() -> Env {
+        env_with(CHUNK)
+    }
+
+    fn env_with(chunk: u32) -> Env {
         let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = TempDir::new().unwrap();
         let cache = Arc::new(DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap());
@@ -2978,7 +3062,7 @@ mod pending_row_tests {
         let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
             meta.clone(),
             store.clone(),
-            CHUNK,
+            chunk,
             1,
         ));
         let fs_rt = tokio::runtime::Builder::new_current_thread()
@@ -3002,7 +3086,7 @@ mod pending_row_tests {
                 )),
                 prune_stats: crate::prune::PruneStats::new(),
             },
-            CHUNK,
+            chunk,
             CompressionSetting::RAW,
         );
         std::mem::forget(fs_rt);
@@ -3022,6 +3106,261 @@ mod pending_row_tests {
 
     fn chunk(fill: u8) -> Vec<u8> {
         vec![fill; CHUNK as usize]
+    }
+
+    // ---- truncate never resurrects the bytes it cut ----
+    //
+    // Every shape: a truncate (a session's, or a committed `setattr`
+    // the base manifest predates), then an extension past the cut — by
+    // a write past a gap, a truncate-up, a `fallocate` — within one write
+    // session or across a flush; the cut bytes read as zeros, before the
+    // flush (the session's view) and after it (the committed manifest).
+
+    const SMALL: u32 = 16;
+
+    fn read_all(e: &Env, ino: Ino) -> Vec<u8> {
+        e.fs.do_read(ino, 0, 1 << 20).unwrap()
+    }
+
+    /// The FUSE `setattr(size)` path: the session's truncate plus the
+    /// committed size.
+    fn setattr_size(e: &Env, ino: Ino, size: u64) {
+        e.fs.truncate(ino, size).unwrap();
+        e.meta
+            .setattr(ino, None, None, None, Some(size), None, None)
+            .unwrap();
+    }
+
+    fn file_with(e: &Env, name: &str, bytes: &[u8]) -> Ino {
+        let f = e.meta.create(ROOT_INO, name, 0o644, 0, 0).unwrap();
+        e.fs.do_write(f.ino, 0, bytes).unwrap();
+        e.fs.flush_inode(f.ino, false).unwrap();
+        f.ino
+    }
+
+    fn check(e: &Env, ino: Ino, want: &[u8], what: &str) {
+        assert_eq!(read_all(e, ino), want, "{what}: before the flush");
+        e.fs.flush_inode(ino, false).unwrap();
+        assert_eq!(read_all(e, ino), want, "{what}: after the flush");
+    }
+
+    #[test]
+    fn truncate_then_write_past_a_gap_reads_zeros_in_the_gap() {
+        for chunk in [SMALL, CHUNK] {
+            let e = env_with(chunk);
+            // Committed base, then the truncate and the write in a new
+            // session.
+            let a = file_with(&e, "a", b"abcdefgh");
+            setattr_size(&e, a, 2);
+            e.fs.do_write(a, 5, b"X").unwrap();
+            check(&e, a, b"ab\0\0\0X", "flushed base");
+            // All in one session.
+            let f = e.meta.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+            e.fs.do_write(f.ino, 0, b"abcdefgh").unwrap();
+            setattr_size(&e, f.ino, 2);
+            e.fs.do_write(f.ino, 5, b"X").unwrap();
+            check(&e, f.ino, b"ab\0\0\0X", "one session");
+        }
+    }
+
+    #[test]
+    fn truncate_then_extend_by_truncate_or_fallocate_reads_zeros() {
+        let e = env_with(SMALL);
+        let a = file_with(&e, "up", b"abcdefghijklmnopqrstuvwxyz");
+        setattr_size(&e, a, 3);
+        setattr_size(&e, a, 30);
+        let mut want = b"abc".to_vec();
+        want.resize(30, 0);
+        check(&e, a, &want, "truncate-up");
+
+        let f = file_with(&e, "falloc", b"abcdefghijklmnopqrstuvwxyz");
+        setattr_size(&e, f, 3);
+        e.fs.do_fallocate(f, 0, 30, 0).unwrap();
+        check(&e, f, &want, "fallocate extend");
+
+        let z = file_with(&e, "zero", b"abcdefghijklmnopqrstuvwxyz");
+        setattr_size(&e, z, 3);
+        e.fs.do_fallocate(z, 10, 20, libc::FALLOC_FL_ZERO_RANGE)
+            .unwrap();
+        check(&e, z, &want, "fallocate zero-range extend");
+    }
+
+    /// `O_TRUNC` is `setattr(size = 0)` from the kernel: a partial write
+    /// after it must not bring back the old first chunk around it.
+    #[test]
+    fn o_trunc_then_a_partial_write_keeps_only_the_write() {
+        let e = env_with(SMALL);
+        let a = file_with(&e, "t", b"0123456789abcdefghijklmnopqrstuvwxyz");
+        setattr_size(&e, a, 0);
+        e.fs.do_write(a, 20, b"Z").unwrap();
+        let mut want = vec![0u8; 20];
+        want.push(b'Z');
+        check(&e, a, &want, "O_TRUNC");
+    }
+
+    /// Whole chunks sealed into the cache by a sequential writer, cut in
+    /// the middle of one, then extended: the sealed tail and the chunks
+    /// past it are gone.
+    #[test]
+    fn truncate_inside_a_sealed_chunk_then_extend_reads_zeros() {
+        let e = env_with(SMALL);
+        let f = e.meta.create(ROOT_INO, "sealed", 0o644, 0, 0).unwrap();
+        let data: Vec<u8> = (0..64u8).map(|i| b'a' + i % 26).collect();
+        e.fs.do_write(f.ino, 0, &data).unwrap();
+        setattr_size(&e, f.ino, 20);
+        e.fs.do_write(f.ino, 60, b"!").unwrap();
+        let mut want = data[..20].to_vec();
+        want.resize(60, 0);
+        want.push(b'!');
+        check(&e, f.ino, &want, "sealed");
+    }
+
+    /// Another node's committed truncate (`setattr(size)` only: its
+    /// manifest commit has not landed): this node's write past the gap
+    /// must not read the old manifest's bytes back.
+    #[test]
+    fn a_committed_truncate_the_manifest_predates_is_honoured() {
+        let e = env_with(SMALL);
+        let a = file_with(&e, "remote", b"abcdefghijklmnopqrstuvwxyz");
+        e.meta
+            .setattr(a, None, None, None, Some(4), None, None)
+            .unwrap();
+        assert_eq!(read_all(&e, a), b"abcd");
+        e.fs.do_write(a, 10, b"X").unwrap();
+        let mut want = b"abcd".to_vec();
+        want.resize(10, 0);
+        want.push(b'X');
+        check(&e, a, &want, "committed truncate");
+        e.meta
+            .setattr(a, None, None, None, Some(2), None, None)
+            .unwrap();
+        e.meta
+            .setattr(a, None, None, None, Some(12), None, None)
+            .unwrap();
+        let mut want = b"ab".to_vec();
+        want.resize(12, 0);
+        assert_eq!(
+            read_all(&e, a),
+            want,
+            "committed truncate then committed extend"
+        );
+    }
+
+    /// A tiny xorshift: the sequences are reproducible from the seed.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    /// Random write / truncate / fallocate (extend, zero range, punch) /
+    /// flush sequences against an in-memory model of the file; every
+    /// read of the whole file must equal the model, before and after
+    /// each flush. 16-byte chunks, files up to ~200 bytes: every shape
+    /// crosses chunk boundaries, and past 8 chunks the manifest spills.
+    /// `TRUNCATE_FUZZ_SEEDS=5000` for a longer run (5000 passed, 134 s).
+    #[test]
+    fn random_write_truncate_fallocate_sequences_match_a_model() {
+        let seeds: u64 = std::env::var("TRUNCATE_FUZZ_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(150);
+        for seed in 1..=seeds {
+            let e = env_with(SMALL);
+            let f = e.meta.create(ROOT_INO, "fuzz", 0o644, 0, 0).unwrap();
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut model: Vec<u8> = Vec::new();
+            let mut log = Vec::new();
+            for step in 0..40 {
+                let max = 160u64;
+                match rng.below(10) {
+                    0..=3 => {
+                        let off = rng.below(max);
+                        let len = 1 + rng.below(40);
+                        let byte = b'a' + (rng.below(26) as u8);
+                        let data = vec![byte; len as usize];
+                        log.push(format!("write {off}+{len}"));
+                        e.fs.do_write(f.ino, off, &data).unwrap();
+                        let end = (off + len) as usize;
+                        if model.len() < end {
+                            model.resize(end, 0);
+                        }
+                        model[off as usize..end].copy_from_slice(&data);
+                    }
+                    4 | 5 => {
+                        let size = rng.below(max);
+                        log.push(format!("truncate {size}"));
+                        setattr_size(&e, f.ino, size);
+                        model.resize(size as usize, 0);
+                    }
+                    6 => {
+                        let off = rng.below(max);
+                        let len = 1 + rng.below(40);
+                        log.push(format!("fallocate {off}+{len}"));
+                        e.fs.do_fallocate(f.ino, off, len, 0).unwrap();
+                        let end = (off + len) as usize;
+                        if model.len() < end {
+                            model.resize(end, 0);
+                        }
+                    }
+                    7 => {
+                        let off = rng.below(max);
+                        let len = 1 + rng.below(40);
+                        let keep = rng.below(2) == 0;
+                        let mode = libc::FALLOC_FL_ZERO_RANGE
+                            | if keep { libc::FALLOC_FL_KEEP_SIZE } else { 0 };
+                        log.push(format!("zero-range {off}+{len} keep {keep}"));
+                        e.fs.do_fallocate(f.ino, off, len, mode).unwrap();
+                        let end = (off + len) as usize;
+                        if !keep && model.len() < end {
+                            model.resize(end, 0);
+                        }
+                        let stop = end.min(model.len());
+                        if (off as usize) < stop {
+                            model[off as usize..stop].fill(0);
+                        }
+                    }
+                    8 => {
+                        let off = rng.below(max);
+                        let len = 1 + rng.below(40);
+                        log.push(format!("punch {off}+{len}"));
+                        e.fs.do_fallocate(
+                            f.ino,
+                            off,
+                            len,
+                            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        )
+                        .unwrap();
+                        let stop = ((off + len) as usize).min(model.len());
+                        if (off as usize) < stop {
+                            model[off as usize..stop].fill(0);
+                        }
+                    }
+                    _ => {
+                        log.push("flush".into());
+                        e.fs.flush_inode(f.ino, false).unwrap();
+                    }
+                }
+                assert_eq!(
+                    read_all(&e, f.ino),
+                    model,
+                    "seed {seed} step {step}: {log:?}"
+                );
+            }
+            e.fs.flush_inode(f.ino, false).unwrap();
+            assert_eq!(
+                read_all(&e, f.ino),
+                model,
+                "seed {seed} after the last flush: {log:?}"
+            );
+        }
     }
 
     impl Env {

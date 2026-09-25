@@ -1318,7 +1318,28 @@ impl ConstellationFs {
                         .map_err(|e| staging_errno(&e))?;
                     buf
                 }
-                _ => self.read_committed_chunk(ino, &hashes, slice.index)?,
+                // Punched whole by this session: zeros.
+                Some(w) if w.zeroed.contains(slice.index) => Vec::new(),
+                Some(w) => {
+                    // Untouched by this session: the base's bytes, dead
+                    // past a truncation (`WriteState::floor`).
+                    let mut chunk = self.read_committed_chunk(ino, &hashes, slice.index)?;
+                    w.clip_base(&mut chunk, slice.index * self.chunk_size as u64, manifest.file_len);
+                    chunk
+                }
+                None => {
+                    // No session: the committed manifest, valid only
+                    // below its `file_len` (a truncate lowered it; the
+                    // chunk straddling it keeps dead bytes past it, and
+                    // the inode's size may have grown past it since).
+                    let mut chunk = self.read_committed_chunk(ino, &hashes, slice.index)?;
+                    clip_at(
+                        Some(manifest.file_len),
+                        &mut chunk,
+                        slice.index * self.chunk_size as u64,
+                    );
+                    chunk
+                }
             };
             let start = slice.offset as usize;
             let end = (slice.offset + slice.len) as usize;
@@ -1405,6 +1426,10 @@ impl ConstellationFs {
             let is_whole_chunk = slice.offset == 0 && slice.len == full_len;
             let chunk_start = slice.index * self.chunk_size as u64;
             let sealed = self.unseal(ws, ino, slice.index)?;
+            // A chunk this session punched (or zeroed) whole has no base
+            // content any more: seeded from zeros, never the base's
+            // bytes (a sealed copy is this session's own, and valid).
+            let punched = ws.zeroed.contains(slice.index);
             ws.holes.clear(slice.index);
             ws.staging
                 .prepare_chunk(slice.index, self.chunk_size)
@@ -1421,7 +1446,13 @@ impl ConstellationFs {
                         data.resize(full_len as usize, 0);
                         data
                     }
-                    None => self.committed_chunk_padded(&hashes, slice.index, full_len)?,
+                    None if punched => vec![0u8; full_len as usize],
+                    None => {
+                        let mut seed =
+                            self.committed_chunk_padded(&hashes, slice.index, full_len)?;
+                        ws.clip_base(&mut seed, chunk_start, manifest.file_len);
+                        seed
+                    }
                 };
                 ws.staging
                     .write_at(chunk_start, &seed)
@@ -1461,17 +1492,52 @@ impl ConstellationFs {
         manifest: &Manifest,
     ) -> Result<(), i32> {
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
+        let cs = u64::from(self.chunk_size);
         let ws = self.write_state(writes, ino, manifest)?;
         self.quota_check(ino, new_size)?;
         if new_size < ws.file_len {
-            // Drop dirty runs past the new end; `Staging::set_len`
-            // (ftruncate) re-cuts the boundary chunk's on-disk bytes for
-            // free if it was already staged. An untouched boundary chunk
-            // is re-cut later, from the committed hash, by `flush_inode`.
+            // Everything at or past `new_size` is dead, whatever holds it
+            // — the base (`floor`: zeroed wherever base content is read
+            // for this session), this session's sealed chunks, its
+            // staged bytes, its recorded writes — so that a later
+            // extension reads zeros there.
+            ws.floor = Some(ws.floor.map_or(new_size, |f| f.min(new_size)));
             let keep = layout.chunk_count(new_size);
             let old_chunks = layout.chunk_count(ws.file_len);
+            // Sealed chunks: wholly past the point, dropped; the one the
+            // point falls inside goes back to staging, to be cut below.
+            let sealed: Vec<u64> = ws.sealed.keys().copied().filter(|i| *i * cs < ws.file_len).collect();
+            for idx in sealed {
+                if idx * cs >= new_size {
+                    self.unseal(ws, ino, idx)?;
+                } else if (idx + 1) * cs > new_size {
+                    let hash = self.unseal(ws, ino, idx)?.expect("sealed");
+                    let data = self
+                        .cache
+                        .get(&hash)
+                        .map_err(|_| libc::EIO)?
+                        .ok_or(libc::EIO)?;
+                    ws.staging
+                        .prepare_chunk(idx, self.chunk_size)
+                        .map_err(|e| staging_errno(&e))?;
+                    ws.staging
+                        .write_at(idx * cs, &data)
+                        .map_err(|e| staging_errno(&e))?;
+                    // (Its written ranges are already recorded; the rest
+                    // of it was seeded from the base, which the
+                    // composition re-reads, clipped.)
+                    ws.staging.mark_dirty(idx);
+                }
+            }
+            // Drop dirty runs past the new end; `Staging::set_len`
+            // (ftruncate) cuts the boundary chunk's staged bytes.
             ws.staging.retain_dirty_below(keep);
             ws.staging.punch_chunks(keep, old_chunks, self.chunk_size);
+            ws.written.retain_mut(|(start, end)| {
+                *end = (*end).min(new_size);
+                *start < *end
+            });
+            ws.high_water = ws.high_water.min(new_size);
         }
         ws.staging
             .set_len_sparse(new_size)
@@ -1527,6 +1593,7 @@ impl ConstellationFs {
             }
             if full_start < full_end {
                 ws.holes.mark_range(full_start, full_end);
+                ws.zeroed.mark_range(full_start, full_end);
                 let sealed: Vec<_> = ws
                     .sealed
                     .keys()
@@ -1567,7 +1634,9 @@ impl ConstellationFs {
         let mut chunks = self.chunk_list(&manifest)?;
         let writes = self.writes.lock(ino);
         let file_len = if let Some(state) = writes.get(&ino) {
-            chunks.retain(|index, _| !state.holes.contains(*index));
+            let floor = state.base_floor(manifest.file_len);
+            let cs = u64::from(self.chunk_size);
+            chunks.retain(|index, _| !state.zeroed.contains(*index) && *index * cs < floor);
             chunks.extend(state.sealed.iter().map(|(index, hash)| (*index, *hash)));
             for index in state.staging.dirty_indices() {
                 chunks.insert(index, ChunkHash([1; 32]));

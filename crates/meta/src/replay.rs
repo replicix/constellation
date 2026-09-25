@@ -935,8 +935,82 @@ fn apply_setattr(
     }
     if size.is_some() && attrs.kind == Kind::File {
         staged.adjust(attrs.size as i64 - old_size as i64, 0);
+        clip_manifest_to_size_tx(tx, meta, dirty, ino)?;
     }
     Ok(Applied::Done)
+}
+
+/// A truncate's effect on the file's content: its manifest keeps only
+/// what lies below the new size — `file_len` lowered to it, chunks wholly
+/// past it dropped (a spilled list keeps its blob; the chunks past
+/// `file_len` in it are dead). `None`: nothing to cut.
+///
+/// A size change used to leave the manifest as it was. Readers stop at
+/// the size, so the bytes past it looked gone — until the file was
+/// extended again (a write past a gap, a truncate-up, a `fallocate`),
+/// and they came back from the old manifest. The invariant now: **a
+/// manifest's content is valid only below its `file_len`**, and a
+/// truncate lowers it; every reader of manifest content clips there.
+pub fn clip_manifest(manifest: &[u8], size: u64) -> Option<Vec<u8>> {
+    let mut m = constellation_fs_core::Manifest::decode(manifest).ok()?;
+    if size >= m.file_len {
+        return None;
+    }
+    let cs = u64::from(m.layout.chunk_size);
+    if let constellation_fs_core::ChunkInfo::Inline(chunks) = &mut m.chunks {
+        chunks.retain(|index, _| *index * cs < size);
+    }
+    m.file_len = size;
+    Some(m.encode())
+}
+
+/// Apply [`clip_manifest`] to `ino`'s stored manifest at its current
+/// size, in the caller's transaction (a `setattr(size)` executed here or
+/// replayed from the log: every replica cuts the same way).
+pub(crate) fn clip_manifest_to_size_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    dirty: ns::Dirty<'_>,
+    ino: Ino,
+) -> Result<(), MetaError> {
+    let Some(rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
+        return Ok(());
+    };
+    if rec.attrs.kind != Kind::File {
+        return Ok(());
+    }
+    let Some(payload) = rec.manifest.as_ref() else {
+        return Ok(());
+    };
+    let current = ns::resolve_payload(tx, &meta.blobs, payload)?;
+    let Some(clipped) = clip_manifest(&current, rec.attrs.size) else {
+        return Ok(());
+    };
+    let symlink = rec
+        .symlink_target
+        .as_ref()
+        .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
+        .transpose()?;
+    ns::put_inode(
+        tx,
+        &meta.ns,
+        dirty,
+        &meta.blobs,
+        ino,
+        rec.attrs,
+        Some(clipped.clone()),
+        symlink,
+        &rec.xattrs,
+    )?;
+    misc::track_manifest_transition_tx(
+        tx,
+        &meta.chunk_ref,
+        &meta.chunk_ref_by_ino,
+        ino,
+        Some(&current),
+        Some(&clipped),
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

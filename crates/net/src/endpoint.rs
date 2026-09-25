@@ -436,6 +436,8 @@ pub trait PeerService: Send + Sync + 'static {
     }
     /// A peer redistributed activation. Default is a no-op.
     fn epoch_activated(&self, _activation: crate::EpochActivation) {}
+    /// Plan 30 §M10: a proposer abandoned `epoch_id`. Default no-op.
+    fn epoch_aborted(&self, _epoch_id: String, _proposer: u64) {}
     /// Plan 30 §M10: a would-be taker asks for a heartbeat promise.
     /// Default refuses (P2P-disabled / tests).
     fn promise_requested(

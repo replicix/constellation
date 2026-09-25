@@ -1421,6 +1421,61 @@ mod tests {
     use crate::MetaStore;
     use constellation_fs_core::types::ROOT_INO;
 
+    /// A truncate cuts the file's content, not just its size: the stored
+    /// manifest's `file_len` drops to the new size and the chunks wholly
+    /// past it go — on the node that executes the `setattr` and on every
+    /// replica that applies its log record — so a later extension (a
+    /// size increase, which leaves the manifest alone) cannot bring the
+    /// cut bytes back.
+    #[test]
+    fn a_truncate_cuts_the_manifest_everywhere() {
+        use constellation_fs_core::{ChunkHash, ChunkInfo, Manifest};
+        let chunks = [(0u64, ChunkHash::of(b"a")), (1, ChunkHash::of(b"b"))]
+            .into_iter()
+            .collect();
+        let manifest = Manifest::from_sparse_chunks(16, 30, chunks, 8, ChunkHash::of)
+            .0
+            .encode();
+        let holder = Meta::open_in_memory().unwrap();
+        holder.set_node_prefix(1).unwrap();
+        let follower = Meta::open_in_memory().unwrap();
+        follower.set_node_prefix(2).unwrap();
+        let f = holder.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        holder.set_manifest(f.ino, &manifest, 30).unwrap();
+        holder
+            .setattr(f.ino, None, None, None, Some(5), None, None)
+            .unwrap();
+        holder
+            .setattr(f.ino, None, None, None, Some(40), None, None)
+            .unwrap();
+        let records: Vec<crate::LogRecord> = holder
+            .take_journal(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        follower
+            .apply_segment(1, 1, &records, &crate::replay::TouchSet::default())
+            .unwrap();
+        for (who, m) in [("holder", &holder), ("follower", &follower)] {
+            let got = Manifest::decode(&m.manifest(f.ino).unwrap().unwrap()).unwrap();
+            assert_eq!(
+                got.file_len, 5,
+                "{who}: the manifest's content ends at the cut"
+            );
+            let ChunkInfo::Inline(chunks) = got.chunks else {
+                panic!("{who}: inline")
+            };
+            assert_eq!(chunks.keys().copied().collect::<Vec<_>>(), vec![0], "{who}");
+            assert_eq!(
+                m.getattr(f.ino).unwrap().unwrap().size,
+                40,
+                "{who}: the size"
+            );
+        }
+        assert_eq!(crate::replay::clip_manifest(&manifest, 30), None);
+    }
+
     /// The crash-safety invariant every write path relies on: a
     /// namespace change and its journal row must appear together or not
     /// at all. Simulated directly (rather than actually crashing the

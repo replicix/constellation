@@ -1227,6 +1227,24 @@ async fn handle_stream<S: PeerService>(
                 .epoch_proposed(epoch_id, members, base, proposer, epoch_slack)
                 .await,
         ),
+        Payload::EpochAbort { epoch_id, proposer } => {
+            // Only the proposer itself may abort its proposal: a forged
+            // abort would drop a member's promise while the proposer
+            // still counts the member's ack.
+            let sender = inner
+                .peers
+                .lock()
+                .unwrap()
+                .values()
+                .find(|p| p.pubkey_hex.eq_ignore_ascii_case(hex))
+                .map(|p| p.node_id);
+            if sender == Some(proposer) {
+                service.epoch_aborted(epoch_id, proposer);
+            } else {
+                tracing::warn!(peer = %hex, proposer, "dropping an epoch abort not sent by its proposer");
+            }
+            Some(Payload::Ok { req_id: 0 })
+        }
         Payload::EpochActivate {
             epoch_id,
             members,

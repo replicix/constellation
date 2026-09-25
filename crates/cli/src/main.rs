@@ -2646,6 +2646,12 @@ impl constellation_net::PeerService for P2pBridge {
         })
     }
 
+    fn epoch_aborted(&self, epoch_id: String, proposer: u64) {
+        if self.epochs.handle_abort(&epoch_id, proposer) {
+            let _ = self.nudge.send(fusefs::SyncRequest::EpochChanged);
+        }
+    }
+
     fn epoch_activated(&self, activation: constellation_net::EpochActivation) {
         self.epochs.handle_activate(activation);
         let _ = self.nudge.send(fusefs::SyncRequest::EpochChanged);
@@ -6133,6 +6139,92 @@ mod pending_upload_tests {
     #[test]
     fn an_adopted_spilled_manifest_ships_only_once_its_chunks_are_durable() {
         adopted_manifest_ships_only_once_its_chunks_are_durable(true);
+    }
+
+    /// Two failovers inside one upload window: B adopts A's manifest (its
+    /// chunk only on A), then B is deposed before shipping it; the
+    /// stranded adopted transaction is replayed by rid through the next
+    /// holder C as a `Records` op. C must enroll its chunks for the
+    /// durability check as B did — before, `Records` executed without
+    /// enrolling anything and C shipped a manifest naming a missing chunk.
+    #[test]
+    fn a_stranded_adopted_manifest_replayed_elsewhere_is_still_held() {
+        use constellation_fs_core::Manifest;
+        let b = fixture();
+        let c = fixture();
+        b.meta.set_holder_epoch(2);
+        let file = b
+            .meta
+            .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
+            .unwrap();
+        let on_c = c
+            .meta
+            .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
+            .unwrap();
+        assert_eq!(file.ino, on_c.ino, "the same file on both replicas");
+        let lost = ChunkHash::of(b"only on A");
+        let chunks: constellation_fs_core::manifest::SparseChunks =
+            [(0u64, lost)].into_iter().collect();
+        let manifest = Manifest::from_sparse_chunks(4096, 9, chunks, 8, ChunkHash::of).0;
+        let rid = constellation_meta::Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 3,
+        };
+        b.meta
+            .apply_adopted_records(
+                &[
+                    constellation_meta::LogRecord::WriteManifest {
+                        ino: file.ino,
+                        base_manifest: None,
+                        manifest: manifest.encode(),
+                        size: 9,
+                        time_ns: 1,
+                    },
+                    constellation_meta::LogRecord::Completed { rid },
+                ],
+                Some(rid),
+            )
+            .unwrap();
+        // B is deposed (C's epoch 3): the adopted transaction strands.
+        b.meta.set_holder_epoch(0);
+        b.meta.strand_below_epoch(3).unwrap();
+        let queue = b.meta.pending_replays().unwrap();
+        let queued = queue.iter().find(|q| q.rid == rid).expect("queued by rid");
+        assert!(matches!(
+            queued.op,
+            constellation_meta::MutateOp::Records { .. }
+        ));
+
+        // C executes the replay as holder.
+        c.meta.set_holder_epoch(3);
+        constellation_meta::execute_mutate(&c.meta, &queued.op, Some(rid)).unwrap();
+        assert_eq!(c.meta.pending_uploads().unwrap(), vec![(lost, file.ino)]);
+        rt().block_on(upload_dirty_chunks_report(
+            &c.cache,
+            &c.meta,
+            &c.store,
+            CompressionSetting::RAW,
+            &UploadRuntime::for_test(true),
+            None,
+            None,
+        ))
+        .unwrap();
+        let shipped: Vec<constellation_meta::LogRecord> = c
+            .meta
+            .take_journal_grouped(10_000)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, batch)| batch)
+            .map(|(_, rec)| rec)
+            .collect();
+        assert!(
+            !shipped
+                .iter()
+                .any(|r| matches!(r, constellation_meta::LogRecord::WriteManifest { .. })),
+            "C shipped a manifest naming a chunk the bucket lacks: {shipped:?}"
+        );
+        assert!(c.meta.held_summary().inodes.contains_key(&file.ino));
     }
 
     /// The other way out: the predecessor never comes back, and the

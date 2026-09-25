@@ -1487,6 +1487,11 @@ impl MetaStore for Meta {
         rec.attrs.ctime_ns = t;
         let attrs = rec.attrs;
         ns::put_inode_record(&mut tx, &self.ns, dirty, ino, &rec)?;
+        if size.is_some() && attrs.kind == Kind::File {
+            // The content past the new size is gone for good (see
+            // `replay::clip_manifest`): the log's replay does the same.
+            crate::replay::clip_manifest_to_size_tx(&mut tx, self, local.dirty(self), ino)?;
+        }
         if let Some(a) = atime_ns {
             atime::set_atime_tx(&mut tx, &self.atime, ino, a);
         }
