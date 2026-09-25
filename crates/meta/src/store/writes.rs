@@ -3,10 +3,11 @@
 //! publish).
 
 use crate::error::MetaError;
+use crate::hlc::now_ns;
 use crate::record::LogRecord;
 use crate::store::{alloc_ino_tx, atime, journal, misc, ns, Meta};
 use crate::{DirEntry, MetaStore, SetXattrMode};
-use constellation_fs_core::types::{now_ns, ROOT_INO};
+use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::{FileAttr, Ino, InodeKind};
 use constellation_mtree::keys;
 use constellation_mtree::record::{self, Attrs, DentryRecord, InodeRecord, Kind};
@@ -718,7 +719,9 @@ impl Meta {
                 mode: attrs.mode,
                 uid,
                 gid,
-                time_ns: mtime_ns,
+                // Plan 30 §M12: the stamp the parent was touched with (its
+                // replay merges the record's stamp into the parent).
+                time_ns: ctime_ns,
             },
         )?;
         misc::track_manifest_transition_tx(

@@ -722,13 +722,17 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
     // directly (no `touch()`, so a pure prune never pins the lease).
     // Plan 30 §M3b: admitted through the lease view like every other
     // local mutation, so a release's final flush cannot miss it.
+    // Plan 30 §M12: and only for a name the root owns; one a delegation
+    // owns goes through the core below (`Meta::root_fast_path`).
     if let Some(_admitted) = deps.lease.admit() {
-        match constellation_meta::execute_mutate(&deps.meta, &op, Some(rid)) {
-            Ok(_) => {
-                let _ = deps.sync_tx.send(crate::fusefs::SyncRequest::Nudge);
-                return UnlinkResult::Done { freed };
+        if let Some(_owned) = deps.meta.root_fast_path(&op) {
+            match constellation_meta::execute_mutate(&deps.meta, &op, Some(rid)) {
+                Ok(_) => {
+                    let _ = deps.sync_tx.send(crate::fusefs::SyncRequest::Nudge);
+                    return UnlinkResult::Done { freed };
+                }
+                Err(_) => return UnlinkResult::SkippedForward,
             }
-            Err(_) => return UnlinkResult::SkippedForward,
         }
     }
 

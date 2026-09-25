@@ -535,6 +535,21 @@ pub struct Meta {
     /// and a deposed holder rebuilds its namespace from the head commit
     /// instead of rolling back (`cli::recovery::recover_deposed`).
     pub(crate) holder_capture: AtomicBool,
+    /// Plan 30 §M12: whether the delegation table names any live
+    /// delegation (maintained by `delegation::write_table_tx`): the
+    /// root's FUSE fast path reads this atomic before it looks at the
+    /// table at all, so a cluster without delegations pays nothing.
+    pub(crate) deleg_any: AtomicBool,
+    /// Plan 30 §M12: the root's FUSE fast path holds this *shared*
+    /// from its ownership check through its execution; a transaction
+    /// that journals a `Delegate` or `Recall` record here
+    /// (`apply_records_journaled_completing`, the root's grant) holds it
+    /// *exclusively*. So a fast-path write that checked the table
+    /// before a grant is journaled before the grant's record, and one
+    /// checking after it sees the grant — the root never executes,
+    /// behind a delegate's back, a name the log has just given away
+    /// (harness `chaos-soak-4` under the placement: double winners).
+    pub(crate) deleg_gate: std::sync::RwLock<()>,
     /// Plan 30 §M4: what the last ship plan held back behind an
     /// unrecoverable pending chunk (`store::held`), for `status`.
     pub(crate) held: std::sync::Mutex<held::HeldSummary>,
@@ -687,6 +702,8 @@ impl Meta {
             recent: std::sync::Mutex::new(std::collections::HashMap::new()),
             holder_epoch: Arc::new(AtomicU64::new(0)),
             holder_capture: AtomicBool::new(holder_capture_default()),
+            deleg_any: AtomicBool::new(false),
+            deleg_gate: std::sync::RwLock::new(()),
             held: std::sync::Mutex::new(held::HeldSummary::default()),
             held_any: AtomicBool::new(false),
             unshipped: std::sync::Mutex::new(crate::replay::TouchSet::default()),
@@ -700,6 +717,10 @@ impl Meta {
             path,
         };
         meta.bootstrap()?;
+        meta.deleg_any.store(
+            !meta.delegation_table().is_empty(),
+            std::sync::atomic::Ordering::Release,
+        );
         Ok(meta)
     }
 

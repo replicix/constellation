@@ -136,6 +136,17 @@ pub struct SimConfig {
     /// Plan 30 §M11 phase 2b: offline designations `(dir, designee)`,
     /// synced into the table by the root at setup.
     pub designations: Vec<(String, NodeId)>,
+    /// Plan 30 §M12: `(dir, node, (bits, idx))` hash ranges delegated by
+    /// the initial holder before the clients start.
+    pub range_delegations: Vec<(String, NodeId, (u8, u32))>,
+    /// Plan 30 §M12: every client writes in `dirs[0]` with names of its
+    /// own (`<dir>/n<node>-f<i>`): a hot shared directory with no
+    /// colliding names, the workload the hash-range split serves.
+    pub shared_dir: bool,
+    /// Plan 30 §M12: check linearizability per hash range of this many
+    /// bits (0: per directory) — a split directory is sequenced per
+    /// range, so its history is linearizable per range only.
+    pub check_range_bits: u8,
     pub cross_ratio: f64,
     /// Plan 30 §M11: a writer per node writes data in its home
     /// directory then a marker in another; watchers on every node must
@@ -145,6 +156,23 @@ pub struct SimConfig {
     /// node enrolled during an epoch is plan 30 §M10's documented gap
     /// (`flex_node_enrolled_during_an_epoch_is_the_known_gap`).
     pub join_fresh: bool,
+    /// M12 round 2: model the daemon's FUSE fast path — a node holding a
+    /// usable lease executes its own client ops outside the core
+    /// (`fusefs::mutate_op_rebasable_with_rid`), asking
+    /// `Meta::root_fast_path` first (`Checked`), or not at all
+    /// (`Unchecked`: the daemon before round 2, which executed names a
+    /// range's delegate owned behind its back — `chaos-soak-4`'s double
+    /// winners). `Off`: every op goes through the core.
+    pub fast_path: FastPath,
+}
+
+/// See `SimConfig::fast_path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FastPath {
+    #[default]
+    Off,
+    Checked,
+    Unchecked,
 }
 
 /// Core tunables scaled down for simulation (seconds, not minutes).
@@ -294,6 +322,7 @@ impl Default for SimConfig {
             settle_ms: 90_000,
             core: Arc::new(sim_core_config),
             panic_after_events: None,
+            fast_path: FastPath::Off,
             read_ratio: 0.0,
             session_wait: true,
             session_wait_ms: 2_000,
@@ -307,6 +336,9 @@ impl Default for SimConfig {
             dirs: Vec::new(),
             delegations: Vec::new(),
             designations: Vec::new(),
+            range_delegations: Vec::new(),
+            shared_dir: false,
+            check_range_bits: 0,
             cross_ratio: 0.0,
             marker_pairs: 0,
         }
@@ -330,6 +362,9 @@ pub struct Report {
     pub s3_gets: u64,
     pub p2p_sent: u64,
     pub converged_checked: bool,
+    /// M12 round 2: ops the modelled FUSE fast path executed
+    /// (`SimConfig::fast_path`).
+    pub fast_path_executed: u64,
     /// The generic tester ran too (few tentative ops).
     pub stateright_checked: bool,
     /// Refusals explained only by an acked-then-rolled-back effect (L2).
@@ -523,8 +558,15 @@ impl Cluster {
         node.meta.clone()
     }
 
-    /// A mutation was acknowledged now: the open failover, if any, ends.
-    fn note_ack(&self) {
+    /// A mutation was answered now — accepted or definitively refused,
+    /// either of which only a sequencer can do — so the open failover,
+    /// if any, ends. (M12 round 2, holder-cut seed 1515: with the shared
+    /// parent hold a node's creates no longer serialize on the
+    /// directory, the schedule shifted, and the only ops left after the
+    /// crash were refusals on a four-name pool; measured on `Ok` alone,
+    /// a 1.3 s failover read as 9 s — the next `Ok` was the restarted
+    /// holder's.)
+    fn note_answered(&self) {
         let now = self.env.clock.elapsed_ms();
         if let Some(f) = self.failovers.lock().unwrap().last_mut() {
             if f.1.is_none() {
@@ -828,8 +870,18 @@ async fn client_thread(
                 }
                 Ok(ClientReply::Outcome(outcome)) => match ns_ret(&outcome) {
                     Ok(ret) => {
-                        if ret == NsRet::Ok {
-                            cluster.note_ack();
+                        cluster.note_answered();
+                        // `AUTHORITY_SIM_TRACE_OPS=1`: every client return
+                        // with its simulated time (M12 round 2: the
+                        // failover measurement ends at the next `Ok`).
+                        if std::env::var_os("AUTHORITY_SIM_TRACE_OPS").is_some() {
+                            eprintln!(
+                                "t={} client t{thread} rid({},{},{}) {ret:?} attempts={attempts}",
+                                cluster.env.clock.elapsed_ms(),
+                                rid.node,
+                                rid.incarnation,
+                                rid.seq
+                            );
                         }
                         history.ret(thread, rid, ret);
                     }
@@ -880,6 +932,64 @@ fn gen_ops_in(
                     let b = prefix(d, rng.random_range(0..names));
                     return NsOp::Rename(a, b);
                 }
+                let mut b = pool.choose(rng).unwrap().clone();
+                if b == a {
+                    b = pool[(pool.iter().position(|x| *x == a).unwrap() + 1) % pool.len()].clone();
+                }
+                NsOp::Rename(a, b)
+            }
+        })
+        .collect()
+}
+
+/// Plan 30 §M12: ops on `home`'s names of node `node`'s own
+/// (`home/n<node>-f<i>`): creates, unlinks and renames among them — no
+/// two nodes touch a name, the whole directory is shared.
+fn gen_ops_unique(
+    rng: &mut StdRng,
+    n: u64,
+    names: usize,
+    home: &str,
+    node: NodeId,
+    range: (u8, u32),
+) -> Vec<NsOp> {
+    use constellation_meta::delegation::Range;
+    let prefix = |i: usize| {
+        if home.is_empty() {
+            format!("n{node}-f{i}")
+        } else {
+            format!("{home}/n{node}-f{i}")
+        }
+    };
+    // M12 round 2: each node's names have locality — all but one of
+    // them hash into the node's own range (`bits`, `idx`), the way a
+    // writer with a naming scheme of its own does; the placement splits
+    // only ranges a node dominates. The one name outside keeps the
+    // cross-range renames.
+    let (bits, idx) = range;
+    let mut pool: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while pool.len() + 1 < names.max(2) {
+        let name = format!("n{node}-f{i}");
+        i += 1;
+        if Range::of(bits, &name).idx == idx {
+            pool.push(prefix(i - 1));
+        }
+    }
+    loop {
+        let name = format!("n{node}-f{i}");
+        i += 1;
+        if Range::of(bits, &name).idx != idx {
+            pool.push(prefix(i - 1));
+            break;
+        }
+    }
+    (0..n)
+        .map(|_| match rng.random_range(0..10) {
+            0..=5 => NsOp::Create(pool.choose(rng).unwrap().clone()),
+            6..=8 => NsOp::Unlink(pool.choose(rng).unwrap().clone()),
+            _ => {
+                let a = pool.choose(rng).unwrap().clone();
                 let mut b = pool.choose(rng).unwrap().clone();
                 if b == a {
                     b = pool[(pool.iter().position(|x| *x == a).unwrap() + 1) % pool.len()].clone();
@@ -1268,6 +1378,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         in_doubt: in_doubt.clone(),
         config: cfg.core.clone(),
         panic_after_events: cfg.panic_after_events,
+        fast_path: cfg.fast_path,
         clock_skew_ms: cfg.clock_skew_ms,
         seed,
     };
@@ -1309,15 +1420,38 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             // directory, node `n ≥ 2` in `dirs[n − 2]` (its delegation,
             // when one is configured); a second client writes in the
             // next directory (a forward to its delegate).
-            let home = home_dir(&cfg.dirs, node, k);
-            let ops = gen_ops_in(
-                &mut rng,
-                cfg.ops_per_client,
-                cfg.names,
-                &home,
-                &cfg.dirs,
-                cfg.cross_ratio,
-            );
+            let home = if cfg.shared_dir {
+                cfg.dirs.first().cloned().unwrap_or_default()
+            } else {
+                home_dir(&cfg.dirs, node, k)
+            };
+            let ops = if cfg.shared_dir {
+                {
+                    let bits = if cfg.check_range_bits > 0 {
+                        cfg.check_range_bits
+                    } else {
+                        2
+                    };
+                    let idx = ((node.max(1) - 1) % (1u64 << bits)) as u32;
+                    gen_ops_unique(
+                        &mut rng,
+                        cfg.ops_per_client,
+                        cfg.names,
+                        &home,
+                        node,
+                        (bits, idx),
+                    )
+                }
+            } else {
+                gen_ops_in(
+                    &mut rng,
+                    cfg.ops_per_client,
+                    cfg.names,
+                    &home,
+                    &cfg.dirs,
+                    cfg.cross_ratio,
+                )
+            };
             let pace = rng.random_range(20..400);
             // Reads draw from their own generator, so a config without
             // reads replays exactly the schedules it had before M6.
@@ -1582,6 +1716,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             }
         }
         report.stats.insert(id, n.view().stats);
+        report.fast_path_executed += n
+            .shared
+            .fast_path_executed
+            .load(std::sync::atomic::Ordering::Relaxed);
     }
     report.acked_rolled_back = rolled_back_acked;
     report.failover_ms = cluster
@@ -1639,7 +1777,27 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     // across two appears in both as its halves).
     let dirs = super::history::dirs_of(&events);
     let per_dir = !cfg.dirs.is_empty();
-    let projections: Vec<Vec<super::history::HistEvt>> = if per_dir {
+    let mut labels: Vec<String> = Vec::new();
+    let projections: Vec<Vec<super::history::HistEvt>> = if per_dir && cfg.check_range_bits > 0 {
+        // Plan 30 §M12: per hash range of every directory.
+        let mut v = Vec::new();
+        for d in &dirs {
+            for idx in 0..(1u32 << cfg.check_range_bits) {
+                labels.push(format!(
+                    "{d:?} range {idx}/{}",
+                    1u32 << cfg.check_range_bits
+                ));
+                v.push(super::history::project_range(
+                    &events,
+                    d,
+                    cfg.check_range_bits,
+                    idx,
+                ));
+            }
+        }
+        v
+    } else if per_dir {
+        labels = dirs.iter().map(|d| format!("{d:?}")).collect();
         dirs.iter()
             .map(|d| super::history::project_dir(&events, d))
             .collect()
@@ -1649,8 +1807,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     report.dirs_checked = projections.len();
     let mut witness = super::history::Witness::default();
     for (i, proj) in projections.iter().enumerate() {
-        let w = check_linearizable_witnessed(proj, &tentative, &oracle.completed_at)
-            .map_err(|e| lin_context(format!("[directory {:?}] {e}", dirs.get(i))))?;
+        let w =
+            check_linearizable_witnessed(proj, &tentative, &oracle.completed_at).map_err(|e| {
+                lin_context(format!(
+                    "[directory {}] {e}",
+                    labels.get(i).cloned().unwrap_or_default()
+                ))
+            })?;
         witness.observed_tentative += w.observed_tentative;
     }
     report.observed_tentative = witness.observed_tentative;
@@ -1691,6 +1854,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         "\n  faults: {:?}\n  log: {:#?}\n  stats: {:#?}",
         report.faults, oracle.describe, report.stats
     );
+    // A convergence miss names an inode; the history says which ops
+    // made it (M12 round 2, seed 10146 of the long-sessions configuration).
     check::check_commits(&commit_list, &oracle).map_err(|e| format!("{e}{context}"))?;
 
     let lease = read_lease(&bucket).await;
@@ -1708,7 +1873,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .filter(|n| n.alive())
             .map(|n| (n.id, n.meta.ns_dump().expect("dump")))
             .collect();
-        check::check_convergence(&replicas, &oracle).map_err(|e| format!("{e}{context}"))?;
+        check::check_convergence(&replicas, &oracle).map_err(|e| lin_context(e.to_string()))?;
         report.converged_checked = true;
     } else if !quiescent {
         // What keeps each node from quiescence (phase 2b diagnostics).
@@ -1871,6 +2036,7 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
         for _ in 0..30 {
             match handle
                 .control(constellation_authority::Control::Delegate {
+                    range: (0, 0),
                     dir: ino,
                     node: *node,
                 })
@@ -1892,6 +2058,42 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
                 .lock()
                 .unwrap()
                 .push(format!("setup: could not delegate {dir} to node {node}"));
+            return;
+        }
+    }
+    for (dir, node, range) in &cfg.range_delegations {
+        let Some(ino) = handle.meta.child_ino(ROOT_INO, dir).ok().flatten() else {
+            failures
+                .lock()
+                .unwrap()
+                .push(format!("setup: directory {dir} missing on node 1"));
+            return;
+        };
+        let mut done = false;
+        for _ in 0..30 {
+            match handle
+                .control(constellation_authority::Control::Delegate {
+                    range: *range,
+                    dir: ino,
+                    node: *node,
+                })
+                .await
+            {
+                Ok(Ok(_)) => {
+                    done = true;
+                    break;
+                }
+                Ok(Err(e)) if e.contains("is delegated") => {
+                    done = true;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+        if !done {
+            failures.lock().unwrap().push(format!(
+                "setup: could not delegate range {range:?} of {dir} to node {node}"
+            ));
             return;
         }
     }
@@ -1933,10 +2135,16 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
     }
     // Installed and renewed on every delegate.
     for _ in 0..400 {
+        let ranged: Vec<(String, NodeId)> = cfg
+            .range_delegations
+            .iter()
+            .map(|(d, n, _)| (d.clone(), *n))
+            .collect();
         let all = cfg
             .delegations
             .iter()
             .chain(cfg.designations.iter())
+            .chain(ranged.iter())
             .all(|(_, node)| {
                 let v = cluster.get(*node).view();
                 v.delegation

@@ -304,6 +304,10 @@ pub struct Config {
     /// for a dwell, the placement recalls it.
     pub placement_dominance_pct: u64,
     pub placement_leave_pct: u64,
+    /// Plan 30 §M12: a hot directory several nodes each write at least
+    /// this share of (and none dominates) is split into name-hash
+    /// ranges delegated to them (GIGA+); 0 turns splitting off.
+    pub placement_split_pct: u64,
     /// `CONSTELLATION_DELEGATION_DWELL_MS` (60 s) and
     /// `CONSTELLATION_DELEGATION_COOLDOWN_MS` (30 s).
     pub placement_dwell_ms: u64,
@@ -405,11 +409,12 @@ impl Config {
             delegation_stream_rows: 256,
             delegation_stream_tick_ms: 50,
             delegation_reclaim_expired: true,
-            placement: false,
+            placement: true,
             placement_window_ms: 30_000,
             placement_min_ops: 200,
             placement_dominance_pct: 70,
             placement_leave_pct: 50,
+            placement_split_pct: 20,
             placement_dwell_ms: 60_000,
             placement_cooldown_ms: 30_000,
         }
@@ -597,6 +602,10 @@ pub struct Stats {
     /// Phase 2b round 2: forwards held by the root that a retry
     /// executed here as the delegate (the grant installed meanwhile).
     pub deleg_retry_executed: u64,
+    /// M12 round 2: forwards to a delegate answered `NotHolder` while
+    /// this node's table still named it the owner (its grant not yet
+    /// installed there), retried instead of executed here.
+    pub deleg_grant_lag_retries: u64,
     /// Phase 2b round 2: drain ticks that held a delegate-accepted
     /// shadow's replay while its generation was live.
     pub replays_held_for_stream: u64,
@@ -616,6 +625,11 @@ pub struct Stats {
     pub place_recalled: u64,
     pub place_skipped_cooldown: u64,
     pub place_skipped_unreachable: u64,
+    /// Plan 30 §M12: directories split into ranges, and range
+    /// generations recalled (a directory whose every range was recalled
+    /// is merged back).
+    pub place_splits: u64,
+    pub place_range_recalls: u64,
     /// Delegate: ReadIndex answered for its subtree, read grants given.
     pub deleg_read_index_served: u64,
     pub deleg_read_grants: u64,
@@ -683,6 +697,9 @@ pub struct Stats {
     /// Activations that found this node's lease claim stale (a member
     /// knew a later epoch): deposed.
     pub epoch_stale_claims: u64,
+    /// M12 round 2: epoch holds adopted by a member that restarted into
+    /// an open epoch carrying its own lease (flex-crash seed 30299).
+    pub epoch_holds_adopted_late: u64,
 }
 
 /// The log cursor and ship bookkeeping (`Shipper::PartState` + `SpoolInfo`).
@@ -1604,8 +1621,12 @@ impl Core {
                     result: Ok(ControlOk::Done),
                 });
             }
-            Control::Delegate { dir, node } => {
-                self.on_control_delegate(now, op, dir, node, replica, out)
+            Control::Delegate { dir, node, range } => {
+                let range = constellation_meta::delegation::Range {
+                    bits: range.0,
+                    idx: range.1,
+                };
+                self.on_control_delegate(now, op, dir, node, range, replica, out)
             }
             Control::Undelegate { dir } => self.on_control_undelegate(now, op, dir, replica, out),
             Control::Retire => {
@@ -1672,6 +1693,36 @@ impl Core {
             let epoch = self.lease.epoch().unwrap_or(1);
             self.lease.adopt_epoch_hold(now, epoch);
             replica.set_holder_epoch(0);
+        }
+        // M12 round 2 (flex-crash seed 30299): the epoch carries this
+        // node's own lease, but the hold was never adopted — the node was
+        // paused, or died, between the activation and the hold's
+        // persistence, and restarted into the open epoch with no lease in
+        // memory. Nobody else can hold it (the carrier is this node's
+        // lease; the members promise nothing while the epoch is open, so
+        // no taker gets in), and without a holder the epoch never
+        // flushes or closes: every member refuses promises forever and
+        // the cluster has no authority. Adopt it here; the flush and the
+        // close follow once S3 is back.
+        if state.open
+            && !self.lease.epoch_held()
+            && !self.lease.lost
+            && self.lease.held.is_none()
+            && self.pr.restored_hold.is_none()
+            && !replica.lost_persisted()
+        {
+            if let Some(c) = self.pr.carried.filter(|c| c.node == self.cfg.node_id) {
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    epoch = c.epoch,
+                    "adopting the epoch hold the activation carried for this node's lease \
+                     (restarted into the open epoch before the hold was persisted)"
+                );
+                self.stats.epoch_holds_adopted_late += 1;
+                self.skip_ship = true;
+                self.lease.adopt_epoch_hold(now, c.epoch);
+                replica.set_holder_epoch(0);
+            }
         }
         self.restore_epoch_hold(now, replica);
         if !state.open && before.open {

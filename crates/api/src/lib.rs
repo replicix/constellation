@@ -65,7 +65,12 @@ pub trait StatusSource: Send + Sync + 'static {
     }
 
     /// Plan 30 §M11.
-    fn delegate(&self, _path: &str, _node: u64) -> std::result::Result<String, String> {
+    fn delegate(
+        &self,
+        _path: &str,
+        _node: u64,
+        _range: Option<&str>,
+    ) -> std::result::Result<String, String> {
         Err("delegation is not supported by this daemon".into())
     }
 
@@ -239,7 +244,9 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
         Request::ListDesignations => Response::Designations {
             designations: source.list_designations(),
         },
-        Request::Delegate { path, node } => result(source.delegate(&path, node)),
+        Request::Delegate { path, node, range } => {
+            result(source.delegate(&path, node, range.as_deref()))
+        }
         Request::Undelegate { path } => result(source.undelegate(&path)),
         Request::ListDelegations => Response::Delegations {
             delegations: source.list_delegations(),

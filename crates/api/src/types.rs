@@ -28,6 +28,11 @@ pub enum Request {
     Delegate {
         path: String,
         node: u64,
+        /// Plan 30 §M12: one name-hash range of the directory,
+        /// `"<idx>/<count>"` (`count` a power of two); absent: the whole
+        /// directory and its subtree.
+        #[serde(default)]
+        range: Option<String>,
     },
     /// Plan 30 §M11: recall the delegation on the directory at `path`.
     Undelegate {
@@ -373,6 +378,10 @@ pub struct DelegationStatus {
     /// placement).
     #[serde(default)]
     pub designated: bool,
+    /// Plan 30 §M12: `"<idx>/<count>"` for a hash range of the
+    /// directory's names; empty for the whole directory.
+    #[serde(default)]
+    pub range: String,
 }
 
 /// Plan 30 §M11: this node's delegation state.
@@ -397,6 +406,10 @@ pub struct DelegationReport {
     /// counted in `executed`, which is the core's).
     #[serde(default)]
     pub fast_path_executed: u64,
+    /// Plan 30 §M12: ops the root's fast path sent through the core
+    /// because a live delegation owned their keys.
+    #[serde(default)]
+    pub fast_path_routed: u64,
     #[serde(default)]
     pub forwarded_to_delegate: u64,
     #[serde(default)]
@@ -490,6 +503,12 @@ pub struct DelegationReport {
     pub place_skipped_cooldown: u64,
     #[serde(default)]
     pub place_skipped_unreachable: u64,
+    /// Plan 30 §M12: hot directories split into hash ranges, and range
+    /// generations recalled by the placement.
+    #[serde(default)]
+    pub place_splits: u64,
+    #[serde(default)]
+    pub place_range_recalls: u64,
     #[serde(default)]
     pub read_index_served: u64,
     #[serde(default)]

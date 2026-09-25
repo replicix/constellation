@@ -416,6 +416,13 @@ pub struct DelegateView {
     /// Phase 2b: the delegate acknowledges only after its backup (or the
     /// root's segment): its writes go through the core and park there.
     gated: std::sync::atomic::AtomicBool,
+    /// Plan 30 §M12: the keys of the ops the root's fast path executed
+    /// since the driver last drained them, for the placement's
+    /// histogram (`Core::place_note_local`).
+    fast_path_notes: std::sync::Mutex<Vec<constellation_meta::TouchSet>>,
+    /// Plan 30 §M12: ops the root's fast path sent through the core
+    /// because a live delegation owned their keys (`status`).
+    routed: std::sync::atomic::AtomicU64,
 }
 
 /// A fast-path execution admitted under a grant; dropped once the op is
@@ -466,6 +473,33 @@ impl DelegateView {
     /// Ops the fast path executed as the delegate so far.
     pub fn executed(&self) -> u64 {
         self.executed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Plan 30 §M12: the root's fast path executed an op with `keys`.
+    pub fn note_fast_path(&self, keys: constellation_meta::TouchSet) {
+        let mut g = self.fast_path_notes.lock().unwrap();
+        // Bounded: the driver drains after every event; a long stall
+        // keeps the latest instead of growing without bound.
+        if g.len() >= 4096 {
+            g.remove(0);
+        }
+        g.push(keys);
+    }
+
+    /// The notes since the last drain.
+    pub fn take_fast_path_notes(&self) -> Vec<constellation_meta::TouchSet> {
+        std::mem::take(&mut *self.fast_path_notes.lock().unwrap())
+    }
+
+    /// Plan 30 §M12: the root's fast path sent an op through the core
+    /// (a live delegation owned its keys).
+    pub fn note_routed(&self) {
+        self.routed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn routed(&self) -> u64 {
+        self.routed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn mirror(&self, view: &constellation_authority::core::DelegView) {

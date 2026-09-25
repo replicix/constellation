@@ -937,14 +937,16 @@ fn releasing_several_gated_ops_survives_the_nested_release() {
         PeerMsg::MutateRequest { req, .. } => *req,
         other => panic!("{other:?}"),
     };
-    // Two more ops on the same directory queue behind `a` at the gate.
-    for (seq, name) in [(2, "b"), (3, "c")] {
+    // Two more ops on the same name queue behind `a` at the gate (plan
+    // 30 §M12: creates of *different* names in one directory no longer
+    // conflict — the parent hold is shared).
+    for seq in [2, 3] {
         let out = h.step(Event::Submit {
             policy: Policy::Client,
             rid: h.rid(seq),
-            op: h.create(name),
+            op: h.create("a"),
         });
-        assert!(sends(&out).is_empty(), "{name} is gated: {out:?}");
+        assert!(sends(&out).is_empty(), "op {seq} is gated: {out:?}");
     }
     assert_eq!(
         h.core
@@ -3334,6 +3336,7 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
             node: 3,
             gen: 1,
             designated: true,
+            range: (0, 0),
         }],
     )
     .unwrap();

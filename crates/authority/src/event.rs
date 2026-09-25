@@ -210,7 +210,12 @@ pub enum Control {
     Retire,
     /// Plan 30 §M11: delegate `dir` to `node` (this node must hold the
     /// root lease; answered `Text`).
-    Delegate { dir: Ino, node: NodeId },
+    Delegate {
+        dir: Ino,
+        node: NodeId,
+        /// Plan 30 §M12: `(bits, idx)` — `(0, 0)` is the whole directory.
+        range: (u8, u32),
+    },
     /// Plan 30 §M11: recall the delegation on `dir` (drained, or outwaited
     /// by its grant's expiry; answered `Text` once the generation ended).
     Undelegate { dir: Ino },

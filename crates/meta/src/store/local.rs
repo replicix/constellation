@@ -742,6 +742,14 @@ impl Meta {
                 },
             )
         });
+        // Plan 30 §M12: a grant or a recall changes who may execute
+        // what; the root's fast path checks that under the shared side
+        // (`Meta::deleg_gate`). Taken before the write transaction, in
+        // the same order as the fast path (gate, then the database).
+        let _gate = records
+            .iter()
+            .any(|r| matches!(r, LogRecord::Delegate { .. } | LogRecord::Recall { .. }))
+            .then(|| self.deleg_gate.write().unwrap_or_else(|e| e.into_inner()));
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
         let staged = UsageTracker::staging();

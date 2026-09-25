@@ -1146,6 +1146,99 @@ relay of its own so requests can be attributed per role):
       indexes, recalls, the delegation and backup messages) and a denied
       peer is reported as a link that is down, so the stopped delegate's
       write after the cut goes through the holder's inbox.
+  - Plan 30 M12 (hot directories). The placement is now **on by
+    default** (`CONSTELLATION_DELEGATION_PLACEMENT=off` pins the single
+    sequencer; the M11 scenarios above pin it off, `auto-placement`,
+    `hash-range-split-merge` and the M12 scenarios name the knob empty
+    to test the default); `CONSTELLATION_DELEGATION_SPLIT` (20) is the
+    share of a hot directory's ops several nodes must each write for the
+    root to split its names into hash ranges (0 turns splitting off).
+    `constellation delegate <dir> --to <node> --range <idx>/<count>`
+    delegates one range by hand (`count` 2, 4, 8 or 16);
+    `status.delegation.table` entries carry `range` (`"<idx>/<count>"`,
+    empty for a whole directory), the report `place_splits` and
+    `place_range_recalls`.
+    - `shared-dir-multi-writer`: four nodes behind counting proxies
+      creating unique names in one directory, after a warm-up round.
+      Phase 0, the single sequencer: three nodes forward every create to
+      the root. Phase 1, `shared` split four ways by hand (`0/4` to `b`,
+      `1/4` to `c`, `2/4` to `d`, `3/4` the root's): each node executes
+      its range locally and forwards the rest to the range's delegate;
+      the root only appends. Prints the throughput of both phases and the
+      S3 requests per node; asserts every range delegate executed, the
+      chunk PUTs are identical (one per file), the delegates ship no
+      segments, the root's log PUTs did not grow, every name is on every
+      node, the directory listing is identical everywhere with every
+      name once, no conflict copies.
+    - `hash-range-split-merge`: the placement on by default (a 4 s
+      window, 40 ops, a 4 s dwell, a 2 s cool-down); four writers into
+      `shared`, none dominant: the root splits `shared` into hash ranges
+      delegated to the qualifying writers (`place_splits`, the table's
+      `range` entries), each range delegate executes locally; the writers
+      stop, and after the dwell the ranges are recalled
+      (`place_range_recalls`) and `shared` is whole again; everything
+      converges.
+    - `cross-range-rename`: `shared` split two ways by hand; `b` renames
+      a name of its range into a name of `c`'s (the harness picks names
+      by their hash): a cross-range op — the root recalls both ranges,
+      executes the rename after their streams (`cross_subtree`,
+      `recalls_sent`, `ended`), and delegates both again (new
+      generations, `redelegated`); the file is where the rename put it on
+      every node, both delegates execute locally again.
+    - Model: `cargo test -p constellation-model --release --test hotdir`
+      (commutative parent attributes under an HLC, hash-range ownership,
+      the shared/exclusive parent hold, with the naive counterexamples).
+    - Sim: `shared_dir_*` (a hot shared directory with the single
+      sequencer, split by the placement, split by hand with cross-range
+      renames, and under random faults); a split directory's history is
+      checked for linearizability per hash range
+      (`SimConfig::check_range_bits`).
+    - pjdfstest must stay a full pass: every inode timestamp is now an
+      HLC stamp (`crates/meta/src/hlc.rs`) and a parent's times merge by
+      `max`.
+    - M12 round 2. The root's three fast paths outside the core (the
+      FUSE mutation path, the write-back manifest commit, the prune's
+      unlink) admit an op only when `Meta::root_fast_path` says no live
+      delegation owns its keys — a range's name, a file whose name is in
+      a split directory — holding the delegation gate shared across the
+      execution (a grant's transaction holds it exclusively);
+      `status.delegation.fast_path_routed` counts what they sent through
+      the core instead. The sim models the fast path
+      (`SimConfig::fast_path`: `Checked` runs the admission, `Unchecked`
+      is the daemon before round 2): `shared_dir_fast_path_respects_the_ranges`
+      and `shared_dir_unchecked_fast_path_is_caught` (a per-range
+      linearizability violation on seed 77002 without the admission),
+      replayable as `AUTHORITY_SIM_CONFIG=shared-dir-fast-path[-unchecked]`.
+      Pinned: `long_sessions_seed_10146_recovered_segment_is_in_the_base_window`
+      and `flex_crash_seed_30299_restarted_member_adopts_the_carried_hold`.
+      The placement delegates a range only to a node that *dominates*
+      it (`CONSTELLATION_DELEGATION_DOMINANCE`, as for a subtree): names
+      spread uniformly across the writers never split a directory (that
+      split only adds a hop to every op); the sim's `shared_dir_*`
+      workloads and `hash-range-split-merge`'s writers give each node
+      names that hash into its own range. A forward answered `NotHolder`
+      by a delegate this node's table still names the owner is retried
+      after a stream tick (`deleg_grant_lag_retries`) instead of
+      executed here, which recalled the grant just given; a node whose
+      inbox demand escalated drops the escalation once the holder is
+      reachable over P2P again, and the demand window counts overlapping
+      waits once. `shared-dir-multi-writer`'s log-PUT check passes on the
+      count or on the rate (the root ships per shipper round, so the
+      count tracks the phase's wall time). The M11/M12 cluster helper
+      waits until every node *reaches* every peer before the first phase
+      (a link still being set up sent a node's first ops through the
+      root's inbox, whose escalation moved the lease).
+      A sim failover ends at the next *answered* op (accepted or
+      refused), not the next `Ok`; `AUTHORITY_SIM_TRACE_OPS=1` prints
+      every client return with its simulated time. New:
+      `a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over`
+      (`AUTHORITY_SIM_CONFIG=delegated-holder-cut`): a `Recall` applied
+      from the log voids the generation on every replica.
+      A convergence failure now prints the client history like a
+      linearizability one; `chaos-soak-4` keeps every mount's full log
+      next to its `history.jsonl` on failure; `meta-bench` prints each
+      node's delegation counters (splits, recalls, fast path, routed,
+      forwarded) when delegation is on.
 - **`sticky-lease-handoff-over-s3`** runs with `CONSTELLATION_INBOX=off`
   since M5 phase 2: it tests the S3-only cooperative handoff, and with
   M13's inbox on a lone blocked write is answered through the holder's

@@ -339,6 +339,7 @@ pub mod backup;
 pub mod cto;
 pub mod delegation;
 pub mod flex;
+pub mod hotdir;
 pub mod inbox;
 pub mod namespace;
 pub mod positions;

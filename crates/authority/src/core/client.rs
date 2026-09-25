@@ -18,7 +18,7 @@ use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
 use constellation_meta::{
-    CompletedOutcome, KeySet, MetaError, MutateOp, MutateOutcome, Position, Rid,
+    CompletedOutcome, KeySet, MetaError, MutateOp, MutateOutcome, Position, Rid, TouchSet,
 };
 use std::collections::BTreeSet;
 
@@ -96,7 +96,7 @@ pub(crate) struct ClientOp {
     /// Submission order, for the gate.
     pub order: u64,
     /// The inodes the op reads or writes (`forward::conflict_keys`).
-    pub keys: Vec<Ino>,
+    pub keys: TouchSet,
     pub attempts: u32,
     /// `NotHolder` redirects followed (plan 30 §M11: two, since a
     /// delegate's names the root and the root's a delegate).
@@ -189,45 +189,19 @@ pub fn meta_errno(e: &MetaError) -> i32 {
     }
 }
 
-/// `forward::conflict_keys`: the inodes `op` reads or writes, for the
-/// ordering gate. A name that does not resolve locally is left out; every
-/// case includes the parent, so two ops racing on an unresolved child
-/// still serialize on it.
-pub(crate) fn conflict_keys(op: &MutateOp, replica: &dyn Replica) -> Vec<Ino> {
-    let lookup = |parent: Ino, name: &str| replica.lookup_ino(parent, name);
-    let mut keys = match op {
-        MutateOp::Mkdir { parent, .. }
-        | MutateOp::Create { parent, .. }
-        | MutateOp::Symlink { parent, .. }
-        | MutateOp::Mknod { parent, .. } => vec![*parent],
-        MutateOp::Link { ino, parent, .. } => vec![*parent, *ino],
-        MutateOp::Unlink { parent, name } | MutateOp::Rmdir { parent, name } => {
-            let mut k = vec![*parent];
-            k.extend(lookup(*parent, name));
-            k
+/// `forward::conflict_keys`: the keys `op` reads or writes, for the
+/// ordering gate (plan 30 §M12: [`super::holder::keys_of_op_in`], with
+/// an unlink's target exclusive too — a name that does not resolve
+/// locally is left out; the dentry and the shared parent hold still
+/// serialize two ops racing on an unresolved child).
+pub(crate) fn conflict_keys(op: &MutateOp, replica: &dyn Replica) -> TouchSet {
+    let mut set = super::holder::keys_of_op_in(op, replica);
+    if let MutateOp::Unlink { parent, name } = op {
+        if let Some(i) = replica.lookup_ino(*parent, name) {
+            set.inos.insert(i);
         }
-        MutateOp::Rename {
-            parent,
-            name,
-            new_parent,
-            new_name,
-        } => {
-            let mut k = vec![*parent, *new_parent];
-            k.extend(lookup(*parent, name));
-            k.extend(lookup(*new_parent, new_name));
-            k
-        }
-        MutateOp::Setattr { ino, .. }
-        | MutateOp::SetManifest { ino, .. }
-        | MutateOp::SetXattr { ino, .. }
-        | MutateOp::RemoveXattr { ino, .. } => vec![*ino],
-        MutateOp::Publish { ino, parent, .. } => vec![*parent, *ino],
-        MutateOp::AtimeBatch { entries } => entries.iter().map(|(i, _, _)| *i).collect(),
-        MutateOp::Records { .. } => Vec::new(),
-    };
-    keys.sort_unstable();
-    keys.dedup();
-    keys
+    }
+    set
 }
 
 /// `forward::named_child`.
@@ -393,7 +367,7 @@ impl Core {
             }
             if self.cfg.forwarding && self.cfg.p2p {
                 if let Ownership::Delegated(d) =
-                    replica.resolve_ownership(&super::holder::keys_of_op(&op_ref))
+                    replica.resolve_ownership(&super::holder::keys_of_op_in(&op_ref, replica))
                 {
                     if d.node != self.cfg.node_id {
                         if deps.streams.is_full() && deps.streams.get(d.gen).is_none() {
@@ -438,7 +412,7 @@ impl Core {
                     c.phase,
                     Phase::InboxQueued { .. } | Phase::InboxWaiting { .. }
                 )
-                && c.keys.iter().any(|k| me.keys.contains(k))
+                && c.keys.overlaps(&me.keys)
         })
     }
 
@@ -783,6 +757,37 @@ impl Core {
                 if holder != 0 && !names_delegate {
                     self.lease.cached_holder = Some(holder);
                 }
+                // M12 round 2: this node's table names `from` the owner of
+                // the op's keys (a range, or a subtree, just delegated to
+                // it) but `from` answered `NotHolder` — its own table has
+                // not applied the grant yet. Executing here now would
+                // recall the grant this node just gave (the root's own
+                // create 3 ms after a split, harness
+                // `hash-range-split-merge`: the range gone, the directory
+                // stuck half-split for the cool-down); ask again in a
+                // stream tick instead, like a `Held` (the backoff retries
+                // the delegate path first, then the forward).
+                let grant_lags = self.cfg.delegation
+                    && from != self.cfg.node_id
+                    && self.clients.get(&rid).is_some_and(|c| {
+                        matches!(
+                            replica.resolve_ownership(&super::holder::keys_of_op_in(&c.op, replica)),
+                            Ownership::Delegated(d) if d.node == from
+                        )
+                    });
+                if grant_lags {
+                    self.stats.deleg_grant_lag_retries += 1;
+                    let timer = self.set_timer(
+                        now.plus(self.cfg.delegation_stream_tick_ms.max(10)),
+                        Timer::ForwardBackoff(rid),
+                        out,
+                    );
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.phase = Phase::Backoff;
+                        c.timer = Some(timer);
+                    }
+                    return;
+                }
                 let c = self.clients.get_mut(&rid).expect("present");
                 if holder != 0 && holder != from && holder != self.cfg.node_id && c.redirected < 2 {
                     c.redirected += 1;
@@ -926,14 +931,11 @@ impl Core {
             self.finish(now, rid, outcome, replica, out);
             return;
         }
-        // Plan 30 §M11 phase 2b round 2: the op may be this node's own to
-        // execute by now — a delegation of its subtree installed while
-        // the forward was held (the root answers a delegate's own op
-        // `Held` until the delegate's table carries the grant; a retry
-        // that only re-forwards is held again, for the whole forward
-        // deadline, then `EIO`: harness `cross-subtree-rename` and
-        // `auto-placement` after a re-delegation). The delegate path
-        // dedups by rid.
+        // Plan 30 §M12: the op may be this node's own to execute by now
+        // (a delegation of its subtree — or its hash range — installed
+        // while the forward was held: the root answers `Held` to a
+        // delegate's own op until the delegate's table carries the
+        // grant). The delegate path dedups by rid.
         if self.cfg.delegation {
             let own = self.clients.get(&rid).map(|c| (c.op.clone(), c.deps));
             if let Some((op, deps)) = own {
@@ -1190,7 +1192,14 @@ impl Core {
         // op's keys fall under first, and wait for its `deps`; `finish`
         // skips this rid until the parked continuation executes it.
         if self.cfg.delegation {
-            let keys = super::holder::keys_of_op(&op);
+            let keys = super::holder::keys_of_op_in(&op, replica);
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                gens = self.dl.gens.len(),
+                ownership = ?replica.resolve_ownership(&keys),
+                "root executes locally"
+            );
             let wait = if self.dl.gens.is_empty() {
                 Default::default()
             } else {

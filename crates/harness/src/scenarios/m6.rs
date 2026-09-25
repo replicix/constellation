@@ -304,6 +304,15 @@ pub fn session_forwarded_ryw(_seed: u64) -> Result<()> {
         let forwarded =
             b.control_status()?["forwarded_ok"].as_u64().unwrap_or(0) - forwarded_before;
         eprintln!("    {NAME}: B forwarded {forwarded} ops to A");
+        if std::env::var_os("HARNESS_KEEP_LOGS").is_some() {
+            let dir = std::path::Path::new("/tmp/harness-m11-logs");
+            let _ = std::fs::create_dir_all(dir);
+            for c in [&a, &b] {
+                let path = dir.join(format!("{NAME}-{}.log", c.name));
+                let _ = std::fs::write(&path, c.tail_log_n(400_000));
+                eprintln!("    {NAME}: {}'s log kept at {}", c.name, path.display());
+            }
+        }
         anyhow::ensure!(
             n(&after_b, "reads") > n(&before_b, "reads") + 50,
             "B's reads did not go through the session check: {after_b}"

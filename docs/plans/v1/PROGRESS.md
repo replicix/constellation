@@ -19493,3 +19493,1126 @@ and 36 s wall on a 32-core host under load average 58.
 - `crates/meta/src/{record,replay,session}.rs`
 - `crates/meta/src/store/{local,spec}.rs`
 - `crates/meta/tests/speculation.rs`
+
+## Plan 30 M12 — hot directories (coder, 2026-09-25)
+
+Worktree `/home/bra/cvs/constellation-m12`, branch `plan30-m12`: main
+`578ff9c` + WIP `8744d8d` (the 2b tree, untouched) + this milestone,
+uncommitted. Closes phase 5 (scale-out core).
+
+### Design
+
+- **Hybrid logical clock** (`crates/meta/src/hlc.rs`). Every timestamp a
+  mutation writes (`time_ns` on the records, the attributes it sets) is
+  `hlc::now_ns()`: the wall clock when it is ahead of everything the node
+  has issued or applied, one nanosecond past the last stamp otherwise;
+  every record applied from the log advances the clock (`stamp_ns()` on
+  `LogRecord`, observed in `apply_one`); FUSE's `UTIME_NOW` uses it too.
+  So a node's stamps strictly increase, and a stamp is above every stamp
+  its writer had applied — the two facts the `max` merge needs. The
+  clock is ahead of the wall by at most the largest skew among the
+  nodes; it moves inode timestamps only — the lease, grant and promise
+  clocks (M8/M10's drift margins) stay on the wall clock, so their
+  `M > 2D` arguments are untouched.
+- **Commutative parent attributes.** `touch_times_tx`/`bump_nlink_tx`
+  (the only writers of a parent's attributes, local and replay) merge
+  mtime/ctime by `max` and nlink by the record's delta (which the record
+  kind implies — mkdir/rmdir/rename-of-a-directory ±1 — so the record
+  format did not need a delta field; the `time_ns` field's *meaning*
+  changed to an HLC stamp). Two replay divergences found on the way and
+  fixed: replay skipped the parent's nlink −1 when a rename replaced an
+  empty directory (`evict_dentry`), and `publish_file` touched the parent
+  with a different stamp than the `Create` record carried. No directory
+  has a child count (`size` is 0), so nothing to add there.
+- **Conflict keys.** `TouchSet` gained `shared`: a create, unlink, link
+  or rename holds its parent(s) *shared* (their attributes change by a
+  commutative merge, so two such holds never conflict); an inode whose
+  own attributes change is held *exclusively* (`inos`), and — with a
+  lookup on the replica (`keys_of_op_in`) — so is the directory an rmdir
+  removes or a rename moves. `TouchSet::overlaps` is the one rule
+  (dentry∩, exclusive∩any, shared∩exclusive); the core's client gate
+  (`conflict_keys`, `gated`) and the holder's overlap check use it, so
+  creates of different names in one directory pipeline, an rmdir waits
+  for the creates inside it. Ownership resolution treats an exclusive
+  directory hold as the directory itself (`owner_of_dir(ino)` walks
+  from the inode): an rmdir of a delegated directory is cross-subtree
+  and recalls it first. (The plan's `KeyGate` is gone since M5; its job
+  is the core's gate.)
+- **Hash ranges (GIGA+).** `Delegation` carries `Range { bits, idx }`
+  (`(0, 0)`: the whole subtree, M11's delegation; `(b, i)`: the names of
+  the directory itself whose FNV-1a hash's top `b` bits are `i`). The
+  table is `dir → [delegations]`: one whole, or the ranges (one split
+  depth per directory); `owner_of_dir` walks from a directory to the
+  innermost *whole* delegation, passing split ancestors (their ranges
+  cover their own names only, so a subdirectory of a split directory
+  resolves to its ancestors); `owner_of_dentry(parent, name)` picks the
+  range containing the name (a range nobody holds is the root's — a
+  partial split is natural); `resolve` notes a shared hold on a split
+  directory as nothing (the name decides) and an exclusive one as every
+  range (rmdir/setattr/rename of a split directory recalls all of them).
+  A cross-range rename is a cross-subtree op — recalled, executed by the
+  root, both ranges re-delegated after (2b's mechanism; a re-delegation
+  held back by the delegate being away is retried on later events). The
+  `Delegate` record carries the range; `constellation delegate --range
+  <idx>/<count>`; `status.delegation.table[].range`.
+- **Placement**: **on by default** (`CONSTELLATION_DELEGATION_PLACEMENT=off`
+  pins the single sequencer; the core `Config` default is on; the sim's
+  `sim_core_config` keeps it off). The window's counts gained a 16-bucket
+  name-hash histogram per `(dir, node)`. A directory whose own ops reach
+  the floor with no dominant node while several nodes each write
+  `placement_split_pct` (20 %, `CONSTELLATION_DELEGATION_SPLIT`) of it
+  is split into `2^bits` ranges (`bits` the smallest giving every
+  qualifying node one; at most 16); each range goes to the qualifier that
+  wrote most of it within a quota (the root's stay the root's). A range
+  generation is recalled when the directory's rate stays below half the
+  floor or its delegate's share below half the split share for the dwell
+  (`place_range_recalls`); a directory whose every range was recalled is
+  merged; the cool-down applies. Streamed transactions count for their
+  `rid`'s node (a forwarded op counts for its requester). Counters
+  `place_splits`, `place_range_recalls`.
+- **Delegate-side consequences.** A node now holds several generations
+  (a subtree, the ranges of a directory): a transaction of one may
+  depend on this node's own execution under another (it reached it
+  locally); the batch stops before it until the root acknowledged the
+  other generation through that index (`delegated-placement` seed 70516:
+  the root refused a batch whose deps it lacked). A forward the root
+  answers `Held` (a delegate's own op sent before its table carried the
+  grant) re-runs the delegate path on retry instead of re-forwarding
+  forever (`cross-subtree-rename`: a 40 s `Held` loop then `EIO`). A
+  node whose table names it the owner of a range not installed yet
+  answers a forwarded op `Held` rather than bouncing it to the root.
+
+### Model (`crates/model/src/hotdir.rs`, tests `tests/hotdir.rs`)
+
+One directory `D` split into two ranges (even names: node 1, odd: node
+2), a subdirectory `S` delegated to node 1, the root: delegates execute
+locally, the root appends in arrival order, everyone applies the log
+skipping its own records (so per-node application orders differ as they
+do in the system). Properties `converged` (every view equal at
+quiescence), `mtime_monotone`, `no_double_create`, `acked_create_stands`.
+- Counterexamples, each a hand-built path that violates the property at
+  its last step, that the design does not enable or survives, and that
+  the search finds: last-writer-wins parent mtime without an HLC (node
+  2's later create carries an earlier stamp: the parent's mtime goes
+  backwards); last-writer-wins *with* HLC stamps (the root appends two
+  delegates' streams in arrival order: its mtime steps back — both the
+  HLC and the `max` merge are needed); no range ownership (two delegates
+  create the same name: created twice); a cross-range rename executed by
+  the source range's delegate (races the destination range's create);
+  `rmdir S` holding only its dentry (an acknowledged create appended
+  into a removed directory).
+- Clean exhaustive searches: attributes under initial skew and under
+  clock jumps (`design_converges_under_reordering_and_skew`), the ranges
+  with the cross-range rename (`design_ranges_and_cross_range_rename_are_safe`,
+  810k states), the shared/exclusive holds with `rmdir S`
+  (`design_shared_and_exclusive_holds_are_linearizable`, 4.6M states),
+  `max` merges without an HLC also converge (the HLC's role is the
+  per-node monotonicity). `design_everything` (all at once) finds no
+  violation within the 5M-state cap (not exhaustive).
+
+### Results
+
+- Sim: four new configurations/tests — `shared_dir_single_sequencer_converges`
+  (four nodes, unique names per node in one directory, no delegation: the
+  parents' attributes converge on every replica — the convergence check
+  compares them), `shared_dir_is_split_into_ranges` (the placement
+  splits; `place_splits > 0`, delegates execute), `shared_dir_ranges_survive_cross_range_renames`
+  (a hand split with cross-range renames: recalled, re-delegated),
+  `shared_dir_ranges_under_random_faults`. A split directory's history is
+  checked for linearizability *per hash range* (`check_range_bits`; a
+  whole directory's linearizable history projects to linearizable ranges,
+  and a split directory is sequenced per range). Every `delegated*`
+  and `shared_dir*` test and the whole sim suite pass; `long_delegated`
+  100 seeds (see the gate run below).
+- Model: 9 tests, all within budget (`cargo test -p constellation-model
+  --release --test hotdir`).
+- pjdfstest (compose, private project `constellation-m12-fable`, the
+  `floci-no-port.yml` override): **8798 passed, 0 failed** on the M12
+  tree (HLC stamps, `max` merges) — timestamps still increase.
+- Harness (`constellation-harness-m12fable`): the M11 batch with the
+  placement pinned off (`delegated-subtrees`, `cross-subtree-rename`,
+  `delegate-crash`, `marker-order`, `delegate-partition`,
+  `p2p-off-no-delegation`, `root-failover-with-delegates`,
+  `delegate-crash-backup`, `auto-placement` — on the default-on
+  placement now — `designation-as-delegation`, `single-node-unchanged`)
+  and the M12 scenarios `shared-dir-multi-writer`, `hash-range-split-merge`,
+  `cross-range-rename`: PASSED; M9/M10/M13 unaffected:
+  `backup-failover`, `backup-failover-with-delegation`,
+  `backup-partition`, `continuation-epoch`, `epoch-member-lost`,
+  `epoch-slack-zero-unchanged`, `inbox-create-storm-p2p-off`,
+  `inbox-sporadic-write-p2p-off`, `session-forwarded-ryw`, `chaos-ci`
+  (the batch B run; see the gate run).
+
+### Measurements (four nodes on one host behind counting proxies)
+
+- `shared-dir-multi-writer`, 400 files by 4 writers into one directory:
+  single sequencer 388–499 files/s (two runs); split four ways 421–524
+  files/s. S3 requests per node single vs split: a 959–1045 vs
+  1034–1052, b/c/d 518 vs 507; the root's log PUTs 288–337 vs 346;
+  chunk PUTs [100, 100, 100, 100] both ways (one per file); the range
+  delegates executed 80/82/83 each (their range's share of the 400
+  creates and publishes; the rest forwarded to the range's owner). On one
+  host the sequencer is not the bottleneck at four writers (the FUSE
+  write path and the per-file chunk PUT are), so the split's gain is
+  within the run-to-run noise — the point of the measurement is that the
+  S3 request count per file is unchanged and the delegates ship nothing.
+  M11's `delegated-subtrees` (two writers in two directories): 606–624
+  files/s single vs up to 950 delegated (the 2a tester's numbers).
+- `hash-range-split-merge`: the placement split `shared` 4.1 s after
+  the writers started (a 4 s window), two ways to the two writers above
+  20 % at that tick (the root's own fast-path writes are not counted, a
+  known gap below); 840–910 files while split; merged 8.0 s after the
+  writers stopped (a 4 s dwell + a 2 s cool-down + ticks); 1 split, 2
+  range recalls.
+- `cross-range-rename`: the rename across ranges took 1.5–6.7 ms on the
+  delegate (2 recalls, both drained), both ranges re-delegated with new
+  generations, the delegate's local writes after p50 2.9 ms.
+
+### Decisions
+
+- The record format is unchanged: the parent deltas are implied by the
+  record kind (mkdir/rmdir ±1 nlink), `time_ns` is now an HLC stamp
+  (older records read fine; their stamps merge by `max` like any other).
+  There is no child count to make a delta of.
+- One split depth per directory (GIGA+'s nested splits are M12+); a
+  range covers the directory's own names, never a subdirectory's
+  contents (those resolve past the split directory).
+- A partial split is legitimate: ranges nobody holds are the root's.
+- The single-sequencer scenarios pin the placement off; `auto-placement`
+  and the M12 scenarios name the knob empty and run on the default.
+
+### What the tester must run (the phase-5 boundary: the full gate list)
+
+- `cargo test -p constellation-model --release` (the `hotdir` file:
+  9 tests, ≤ 7 s each).
+- `cargo test -p constellation-authority --release` (the sim: 71 tests,
+  7 ignored), then `AUTHORITY_SIM_SEEDS=100 cargo test -p
+  constellation-authority --release --test sim -- --ignored long_delegated`.
+- `cargo test --workspace --release`; `cargo clippy --workspace
+  --all-targets --release -- -D warnings`; `cargo fmt --all -- --check`.
+- `cargo build --release --workspace`, then with
+  `CONSTELLATION_BIN=target/release/constellation` and a private
+  `CONSTELLATION_HARNESS_DOCKER_PREFIX`: the M11 + M12 batch
+  (`delegated-subtrees cross-subtree-rename delegate-crash marker-order
+  delegate-partition p2p-off-no-delegation root-failover-with-delegates
+  delegate-crash-backup auto-placement designation-as-delegation
+  single-node-unchanged shared-dir-multi-writer hash-range-split-merge
+  cross-range-rename`), the M9/M10/M13 batch above, then the write-path
+  and chaos batches (`chaos-ci`, `chaos-soak-4`) as in the 2a tester's
+  gate run.
+- pjdfstest (compose `compliance`, the port-4566 override), the smoke
+  test, and the perf A/B against main (single-node, 3-node p2p-on):
+  the HLC replaces `SystemTime::now()` on every mutation and the
+  conflict gate changed, so the write-path latencies are the ones to
+  watch.
+
+### Known gaps
+
+- The root's own FUSE fast-path writes bypass the core and are not
+  counted by the placement (a 2b gap): a shared directory the root
+  writes heavily looks less contended than it is; its share is not
+  needed for a split (its ranges stay its own) but is for dominance.
+- One split depth; no re-split of a range that turns hot on its own.
+- Reads under a split directory: a lookup asks the range's owner
+  (M8 under M11), a `readdir` reads the local replica (the log carries
+  every range's entries, so the listing is complete once applied; it is
+  not a strict read).
+- Setattr/utimes with an explicit time is last-writer-wins by design
+  (POSIX); only the parents' times merge.
+
+### Phase 2b round 2, ported (2026-09-25)
+
+The 2b round-2 fixes (`/home/bra/cvs/constellation-m11b`'s "Plan 30 M11
+— phase 2b round 2") are applied on top of the M12 work: the held-forward
+retry executing as the delegate (`deleg_retry_executed`, core test
+`a_held_forward_executes_locally_once_the_delegation_installs`), the
+generation expiry re-armed while the root is momentarily unusable, the
+client deadline dropping a parked never-executed local op, the queued
+replay's `gen` held while its generation is live
+(`replays_held_for_stream`), the sim's client-phase bound and watchdog
+instrumentation (`container_sizes`, timer gaps, action counts), and the
+pinned seeds 70051 / 70075. After the port: the sim suite (73 tests, 7
+ignored), `long_delegated` 100 ×2 (8.3 s each), meta + model suites,
+clippy `-D warnings` and fmt: green; the M11 + M12 harness batch rerun
+(see the tester list).
+
+## Plan 30 M12 — tester gate run (phase-5 boundary)
+
+Ran the full phase-5 gate list against the uncommitted M12 tree
+(`/home/bra/cvs/constellation-m12`, `plan30-m12` on main `d214b1c`). Baseline
+for every A/B was main `d214b1c` built in a scratch detached worktree
+(`git worktree add --detach <scratchpad>/main-d214b1c d214b1c`), removed after
+use. Harness runs used `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m12`
+(and `-perf`/`-tester`/`base` variants for isolated sub-runs) and
+`CONSTELLATION_BIN=target/release/constellation`. No mechanical fixes were
+needed anywhere in this run — fmt, clippy and every compile step were clean
+on first try.
+
+### Gate 1 — fmt, clippy, workspace tests
+
+- `cargo fmt --all -- --check`: **clean, no diff.**
+- `cargo clippy --workspace --all-targets --release -- -D warnings`: **0 warnings.**
+- `cargo test --workspace --release`: **zero failures** across every crate
+  (model, authority, meta, api, cli, store-s3, net, mtree, fs-core, chaos,
+  upload-concurrency, harness unit tests); wall 4m00s at 872% CPU, peak RSS
+  14.75 GB for the whole `--workspace` run.
+- `hotdir.rs` in isolation (`cargo test -p constellation-model --release
+  --test hotdir`): **9/9 passed**, test time 5.86 s (9.82 s wall incl.
+  build check), peak RSS **489 MB** — well inside the 60 s/2 GB model-test
+  budget.
+
+### Gate 2 — authority sim + long sweeps
+
+`cargo test -p constellation-authority --release` (via the workspace run):
+66 passed, 0 failed, 7 ignored (73 total), matching PROGRESS's count.
+
+| sweep | seeds | result | time |
+|---|---|---|---|
+| `long_delegated` (`AUTHORITY_SIM_SEEDS=100`) | 100 | **PASS** | 8.0 s |
+| `long_random` (default start 10000) | 1000 | **FAILED** — seed 10146 | 54.7 s |
+| `long_strict` (`AUTHORITY_SIM_SEEDS=500`) | 500 | **PASS** | 36.6 s |
+| `long_backup` (`AUTHORITY_SIM_SEEDS=300`) | 300 | **PASS** | 16.1 s |
+| `long_flex` (`AUTHORITY_SIM_SEEDS=300`) | 300 | **FAILED** — seed 30299 | 28.8 s |
+
+Two sim regressions, both reproduced deterministically 3/3 on M12 and both
+**pass on main `d214b1c`** (also 3/3), i.e. genuine M12 regressions, not
+pre-existing:
+
+- **Seed 10146** (`long-sessions` config): "node 1 did not converge to the
+  log-derived state at head 48: inode 0x1000000040b only on the right."
+  Replay: `AUTHORITY_SIM_SEED=10146 AUTHORITY_SIM_CONFIG=long-sessions cargo
+  test -p constellation-authority --release --test sim replay_seed --
+  --nocapture --exact`. (Bare `AUTHORITY_SIM_CONFIG` defaults to
+  `SimConfig::default()`, not `long_random`'s actual config — the harness's
+  own printed `replay:` line omits the needed `AUTHORITY_SIM_CONFIG=long-sessions`,
+  a test-ergonomics gap, not something fixed here.)
+- **Seed 30299** (`flex-crash` config): "the cluster did not reach
+  quiescence within 90000ms of simulated time" after a pause, an epoch
+  outage/formation, and a crash-restart of node 1. Replay:
+  `AUTHORITY_SIM_SEED=30299 AUTHORITY_SIM_CONFIG=flex-crash cargo test -p
+  constellation-authority --release --test sim replay_seed -- --nocapture
+  --exact`.
+
+Both are plausibly connected to the delegate/root lease-liveness flake found
+in gate 5 below (`delegate-partition`, `shared-dir-multi-writer`): a stall or
+convergence miss under crash/outage timing that main does not exhibit.
+
+### Gate 3 — release build
+
+`cargo build --release --workspace`: **clean**, 36.4 s incremental (full
+from-scratch main-baseline build in the scratch worktree: 1 m 19 s).
+
+### Gate 4 — smoke, integration, pjdfstest
+
+- `tests/smoke.sh` (local backend): **PASSED.** The etag-CAS
+  "unavailable/MISSING" lines are the known `object_store` `LocalFileSystem`
+  gap (every prior milestone's tester notes), not a regression.
+- `tests/integration.sh` equivalent against real S3 (floci): host port 4566
+  was held by the independent `constellation-floci-1` container, so started
+  floci under a private project (`constellation-m12-tester`) with a
+  `ports: !override ["14566:4566"]` compose file and ran the script's own
+  body (`AWS_ENDPOINT=http://localhost:14566`, `bash tests/smoke.sh
+  s3://constellation-ci/<prefix>`) directly rather than editing
+  `tests/integration.sh`'s hardcoded port. **PASSED** — every CAS check
+  (`If-Match`, concurrent creates/swaps) came back `ok` against real S3,
+  unlike the local-backend smoke run. Torn down with `down -v` immediately
+  after.
+- pjdfstest (`docker compose -p constellation-m12-tester -f docker-compose.yml
+  -f <scratchpad>/floci-no-port.yml --profile test build/run --rm
+  compliance`, forcing a rebuild since `constellation-smoke:local` already
+  existed locally from another worktree's tester — confirmed the `build`
+  stage recompiled from M12's `COPY . .` rather than reusing the stale
+  image): **8798 passed, 0 failed, empty baseline**
+  (`COMPLIANCE TEST PASSED (baseline: 0 known failures)`). HLC timestamps
+  and the new conflict gate do not regress POSIX compliance.
+- Torn down with `down -v` immediately after each; `constellation-floci-1`
+  and the M11/fixryw sessions' own containers were confirmed untouched
+  throughout (`docker ps -a` before/after).
+
+### Gate 5 — full harness run
+
+`harness list` under the M12 binary: **133 scenarios**, no known-bug
+repros currently listed. Ran in 17 batches of ≤8 (plus `chaos-soak-4`
+isolated for its ~300 s soak time). **126/133 scenarios passed cleanly on
+first try** (2 of those with the expected "fio not installed" SKIP:
+`fio-latency`, `fio-blips`; `cto-bounded`'s 16 documented stale reads are
+its own expected-staleness note, not a failure). Five scenarios needed
+follow-up:
+
+1. **`deposed-reintegration` — pre-existing, confirmed on main.** FAILED
+   3/3 reruns on M12, same message each time ("'B winner is durable' not
+   reached within 15s: ... `shared/same` != `winner-from-b`"); unaffected by
+   `CONSTELLATION_DELEGATION_PLACEMENT=off`. On main `d214b1c`: **also
+   FAILED**, 3/3 (run 1: `Input/output error (os error 5)`; runs 2–3: the
+   *same* "'B winner is durable'" message as M12). Mixed failure modes on
+   both trees is the same host-timing-sensitive pattern the M11 tester notes
+   already flagged for holder-kill/shadow-stranding scenarios (see gate 5's
+   earlier "1/9 flake" entry above) — not an M12 regression.
+
+2. **`session-forwarded-ryw` — known, not investigated.** Ran once as
+   instructed (a separate agent is bisecting this): **FAILED** — "a read
+   after B's own forwarded create waited (decision 2: installed effects
+   raise nothing)" with `waited=19` out of 318 reads. Recorded only; no
+   reruns, no A/B, no root-causing done here.
+
+3. **`delegate-partition` — likely M12 regression (root lease liveness).**
+   Flaky on M12: 2/4 default-placement runs and 1/3 placement-off runs
+   FAILED with `the root lost its lease: {"epoch":1,"expires_in_ms":0,
+   "held":false,"holder":2,"lost":false}` (3/7 total, ~43%). Placement
+   on/off makes no visible difference. On main `d214b1c`: **3/3 PASSED**,
+   no lease loss. This is an M11-batch scenario (predates M12), so the
+   regression traces to M12's shared code paths (HLC stamping / conflict
+   gate), not to placement specifically.
+
+4. **`shared-dir-multi-writer` — same family, no main baseline (new M12
+   scenario).** Flaky: 3/5 runs FAILED with `delegating range 0/4 of
+   /shared to 2 on a: {"message":"this node does not hold the lease",
+   "resp":"error"}` — the harness's own range-delegation setup call losing
+   the root's lease before it can issue `delegate --range`. Since the
+   scenario is new in M12 there is no main binary to A/B against, but the
+   symptom (root/would-be-root losing its lease under load right after
+   mount) matches #3 closely enough to suspect one root cause across both.
+
+5. **`chaos-soak-4` — clear placement regression, confirmed via
+   placement-off and main.** FAILED **4/4** runs with default (on-by-default)
+   placement, with different symptoms each time — `exactly_one_winner:
+   unlink chaos-soak/u225: 2 Ok, expected ≤1`, `exactly_one_winner: create
+   chaos-soak/c266: 2 Ok completions, expected ≤1`, `exactly_one_winner:
+   create chaos-soak/c276: 2 Ok completions, expected ≤1`, and once
+   `unexpected errno EIO on worker 2 during mkdir_storm:d201` — i.e. a real
+   double-execution/consistency violation, not a timing flake. Every
+   failure's log showed rapid delegation install/end/reinstall/backup
+   cycling on node 4 immediately before the fault. **PASSED with
+   `CONSTELLATION_DELEGATION_PLACEMENT=off`** (1/1, 308.2 s, `exactly_once_log`
+   3158 outcomes each once). **PASSED on main `d214b1c`** (1/1, 308.9 s,
+   with the same known bounded-mode close-to-open note as every prior
+   milestone's run — not a failure). This isolates the bug to automatic
+   placement/delegation under `chaos-soak-4`'s sustained multi-node churn:
+   a double-winner (double create or double unlink) or a spurious EIO, most
+   likely a race in the placement split/range-delegation or backup-reassignment
+   path given the delegation churn visible right before each failure.
+
+All harness containers, `/tmp/harness-*` dirs, and `/tmp/chaos-soak-4-*`
+artifact dirs created by this run were cleaned up afterward;
+`constellation-floci-1`, the M11/fixryw sessions' containers, and the
+concurrent `session-forwarded-ryw` bisection's mounts/worktrees under
+`<scratchpad>/bis-*` were confirmed untouched throughout (checked
+`/proc/<pid>/exe` before every kill; no `pkill -f`/`pgrep -f` used).
+
+### Gate 6 — perf, interleaved against main
+
+Built main `d214b1c` in the same scratch detached worktree as gates 2/5
+(removed after use). Ran `harness meta-bench` (`CONSTELLATION_METABENCH_ONLY`)
+interleaved M12-then-main, 3 pairs per config, each build driven by its own
+matching harness binary (protocol/report-shape safety):
+
+| config | M12 (3 runs, ops/s agg) | M12 avg | main (3 runs) | main avg | delta |
+|---|---|---|---|---|---|
+| `1node-create-lat0` | 6586, 8657, 8054 | 7766 | 7591, 4959, 6191 | 6247 | **+24.3%** |
+| `1node-write4k-lat0` | 2865, 2780, 3295 | 2980 | 3176, 1486, 3554 | 2739 | **+8.8%** |
+| `3node-p2pon-shared-create-lat0` | 1402, 1671, 1813 | 1629 | 2117, 2026, 2142 | 2095 | **−22.3%** |
+
+The two single-node configs favor M12, but with the same enormous
+intra-config, same-binary spread this repo's testers have flagged before
+(main's own `1node-create-lat0` swung 4959→7591, and `1node-write4k-lat0`
+1486→3554) — not a reliable signal either way. The 3-node p2p-on shared-create
+config is the one to note: M12 was lower in **every one of the 3 pairs**
+(−33.8%, −17.5%, −15.4% per pair, avg −22.3%), a consistent direction unlike
+the single-node configs' coin-flip spread. M11 phase-2b's own gate 6 saw an
+identical-magnitude −22.0% on this same config and judged it noise given
+the spread elsewhere, but M12 changes the write path unconditionally (HLC
+stamp + `max`-merge on every mutation's parent touch, plus the new
+shared/exclusive conflict-gate key), so this consistent-direction result is
+worth the coordinator's judgment rather than dismissing outright — flagged
+as evidence, not root-caused further.
+
+`harness bench` (census import, `--files 3000` — the 20000-file default
+timed out past 120 s and was not used), interleaved 3 pairs, durable
+files/s:
+
+| build | run 1 | run 2 | run 3 | avg |
+|---|---|---|---|---|
+| M12 | 412.9 | 413.4 | 413.0 | 413.1 |
+| main | 410.4 | 383.3 | 359.9 | 384.5 |
+
+M12 **+7.4%**, and unlike the meta-bench single-node configs this one was
+consistent (M12's own 3 runs varied by <1%, main's varied by ~13%) — no
+regression signal here.
+
+**Load measured under:** one dev host (32 cores, 62 GiB RAM), containerized
+S3 (floci) + toxiproxy per node behind counting proxies, all nodes and the
+S3 backend on the same host (no real network); meta-bench single-node
+configs are single-process create/write-4KiB loops against a local mount,
+the 3-node config is 3 FUSE mounts + toxiproxy with P2P on doing
+concurrent creates into one shared directory; `harness bench` is a
+single-node 3000-file/4096-byte/100-dir synthetic import. Every pair in a
+config ran back-to-back on an otherwise idle host, but no isolation from
+the other concurrent sessions' harness/build activity on this shared
+machine was attempted beyond using private Docker prefixes.
+
+### Summary for the coordinator
+
+No mechanical issues found or fixed — fmt/clippy/build were clean
+throughout. Four non-mechanical findings, in order of confidence:
+
+1. **`chaos-soak-4` fails under default (on-by-default) placement** with a
+   genuine double-winner/EIO correctness violation; passes with
+   `CONSTELLATION_DELEGATION_PLACEMENT=off` and on main. Highest-confidence
+   finding — deterministic, isolated by both placement-off and main A/B.
+2. **Two authority-sim regressions** (`long_random` seed 10146,
+   `long_flex` seed 30299): deterministic on M12, absent on main. Replay
+   commands above.
+3. **`delegate-partition` / `shared-dir-multi-writer` root-lease flake**:
+   ~43–60% failure rate on M12 (with or without placement) vs 0% on main
+   where a baseline exists; likely one root cause (the root/would-be-root
+   losing or failing to (re)acquire its lease under load).
+4. **3-node p2p-on shared-create latency** down ~22% consistently across
+   3 pairs — flagged given the write-path changes, but the coordinator
+   should weigh it against this host's demonstrated single-node noise band.
+
+`deposed-reintegration` is not included above: confirmed pre-existing on
+main via direct A/B. `session-forwarded-ryw` was run once per instructions
+and left to the separate bisection.
+
+## Plan 30 M12 — round 2 (coder, 2026-09-25)
+
+The phase-5 tester's four findings on the M12 tree (now on main
+`fb11962`, the M12 diff 3-way applied; the two rebase conflicts in
+`crates/harness/src/scenarios/m6.rs` and this file resolved keeping both
+sides), root-caused from the chaos history, the daemon logs and the
+simulation, fixed in the core, the meta store and the daemon, with
+regressions kept.
+
+### 1. `chaos-soak-4`: double winners under the default-on placement (CRITICAL)
+
+- Evidence: `chaos check --history` on the kept `history.jsonl`; the
+  scenario now keeps every mount's *whole* log next to the history on
+  failure. Every double winner (`create c188` twice `Ok`, `unlink u232`
+  twice `Ok`, `create c266`, ...) was a name of a hash range the
+  placement had just delegated (`c188` → range 3/4, `u232` → 3/4), with
+  one winner the range's delegate and the other **the root itself** —
+  the root's record streamed back through the delegate's own stream as
+  a plain `Create { rid: 1.1.151 }` with no `root executes locally` line
+  in the core.
+- Root cause: the daemon has three write paths that execute *outside*
+  the core when this node holds a usable lease — the FUSE mutation fast
+  path (`fusefs::mutate_op_rebasable_with_rid`: `lease.admit()` then
+  `execute_mutate`), the write-back manifest commit
+  (`finish_flush` → `commit_manifest_local`) and the prune's unlink
+  (`prune.rs`) — and none of them consulted the delegation table. Under
+  M11 a whole-subtree delegation of a directory the root does not write
+  hid this; M12's ranges split the very directory the root writes, so
+  the root executed creates and unlinks of names a range delegate owned
+  behind its back, on a replica that had not applied the delegate's
+  stream: two winners. Before the placement was on by default nothing
+  exercised it.
+- Fix (`Meta::root_fast_path(op) -> Option<RootAdmission>`,
+  `crates/meta/src/delegation.rs`): one atomic load (`deleg_any`,
+  maintained by `write_table_tx`) while the table is empty — a cluster
+  without delegations pays nothing — else the op's keys
+  (`TouchSet::from_op_in`, shared with the core's `keys_of_op_in`)
+  resolved through the table; `Root` admits, anything else sends the op
+  through the core (a forward to the delegate, or the root's recall).
+  The admission holds `Meta::deleg_gate` *shared* from the check through
+  the execution, and a transaction that journals a `Delegate` or
+  `Recall` record (`apply_records_journaled_completing`) holds it
+  *exclusively*: a fast-path write is either journaled before the
+  grant's record or refused. All three daemon paths go through it;
+  `status.delegation.fast_path_routed` counts the ops sent to the core.
+  The root's fast-path executions are now also counted by the placement
+  (`Core::place_note_local`, drained by the driver after every event):
+  before, the root's share of a directory was invisible to it.
+- The manifest commit had a second consequence: the root committed the
+  manifest of a file it had created *through* a range delegate against
+  its own replica (which lacked the inode yet), the close's error was
+  swallowed and the file's content never published — harness
+  `shared-dir-multi-writer`'s "b read shared/p1-a-40 as ''" for the
+  whole 90 s wait. A delegate-owned file's commit goes through the core
+  now, like its create did.
+- Also found on the way (`DelegationTable::resolve`): a *file* whose
+  name is in a split directory resolved, for an exclusive hold on its
+  inode (a setattr, a manifest commit), to the root *and* every range —
+  a `CrossSubtree`, so the root recalled the range on every commit
+  (`shared-dir-multi-writer`: the root's log PUTs up by a third, the
+  ranges cycling). It resolves to its name's range now
+  (`Namespace::primary_dentry`); a *directory* inside a split parent
+  stays the root's, since its subtree is not the range's
+  (`a_file_in_a_split_directory_resolves_to_its_range`).
+- Deterministic reproduction: the simulation models the daemon's fast
+  path (`SimConfig::fast_path`: `Checked` runs `Meta::root_fast_path`
+  before an `execute_mutate` outside the core, `Unchecked` is the daemon
+  before round 2; `Off`, the default, keeps every existing seed's
+  schedule). `shared_dir_fast_path_respects_the_ranges` (20 seeds of the
+  placement-split workload, 454 fast-path executions, every range
+  history linearizable) and `shared_dir_unchecked_fast_path_is_caught`
+  (10 seeds without the admission: a per-range linearizability
+  violation on seed 77002 — "rid 3.1.21 returned before rid 1.1.13 was
+  invoked but follows it in the log"). Replay:
+  `AUTHORITY_SIM_CONFIG=shared-dir-fast-path[-unchecked]`.
+
+### 2. Sim seeds 10146 (`long-sessions`) and 30299 (`flex-crash`)
+
+- 10146, "node 1 did not converge ... inode 0x1000000040b only on the
+  right": bisected by reverting each M12 meta change (none of them),
+  then traced. The holder (node 3) recovered segment 42 by re-reading
+  its own timed-out PUT (`recovered unacked segment`), and that path
+  never noted the segment's touches in the window forward replies'
+  `base` is computed from (`note_shipped_touches` ran only for a PUT
+  that answered). Node 1's create of `f3` (rid 1.1.23) was then
+  answered with `base=40`, below segment 42's rename of `f3`; its
+  shadow installed on a state where the name still existed, the create
+  was skipped in the redo, and the replica ended with a dentry to an
+  inode it never materialised. Not M12-specific — M12's HLC-stamped
+  records shifted the schedule onto it (main passes the seed by
+  timing). Fix: `apply_incoming`'s own-segment recovery notes the
+  segment's touches like a shipped one's. Pinned:
+  `long_sessions_seed_10146_recovered_segment_is_in_the_base_window`.
+  (A convergence failure now prints the client history like a
+  linearizability one.)
+- 30299, "no quiescence within 90 s": node 1 (the holder) was paused
+  across its epoch's activation, crashed, and restarted into the open
+  epoch that *carried its own lease* with no hold adopted (the hold is
+  persisted after the activation; the pause and the crash sat between).
+  The epoch's carrier was node 1's lease, the members refuse promises
+  while the epoch is open, so no taker ever got in (node 3: 964
+  "takeover refused: too few promises"), node 1 held nothing and every
+  op cycled the lease path for 85 000 simulated seconds. Fix
+  (`Core::on_epoch_state`): a member restarting into an open epoch whose
+  carrier is its own lease adopts the hold (stat
+  `epoch_holds_adopted_late`); the flush and the close follow when S3 is
+  back. Pinned:
+  `flex_crash_seed_30299_restarted_member_adopts_the_carried_hold`.
+
+### 3. `delegate-partition` / `shared-dir-multi-writer` lease loss
+
+Not the same cause as 1. Both are the root **handing its lease over**
+(`handed the lease to a peer`), twice for one reason:
+
+- the requester's *inbox escalation*: a P2P link the requester marked
+  down for a moment (`acquire retry: the holder is unreachable, routing
+  again (the inbox)`, under host load) sent a few ops through the
+  holder's inbox; the demand window summed their *overlapping* waits
+  (two ops waiting out the same 2 s recall counted as 4 s) and declared
+  sustained demand ("ops=5 wait_ms=2008"), the escalation asked for the
+  lease over P2P, and the holder served it at once — the operator's
+  `CONSTELLATION_LEASE_WANTED_GRACE_MS=600000` binds only the S3
+  `wanted_by` path and the sticky rule only holds while a delegation is
+  live (none between the recall and the re-delegation). Fixes
+  (`core/inbox.rs`): the demand counts overlapping waits once (the union
+  of the wait intervals, the longest left out as before); and the
+  escalation tick drops the escalation when the holder is reachable
+  over P2P again (the inbox was a detour; the forwards resume). A node
+  with no P2P path (M13's inbox configurations, `p2p=false`) is
+  unaffected.
+- `shared-dir-multi-writer` additionally had the manifest-commit and
+  the file-resolution bugs of finding 1 (the empty reads and the root's
+  log PUTs growing). Its log-PUT assertion now compares the root's PUT
+  *rate*: the root ships one segment per shipper round, so the count
+  tracks the phase's wall time, not its ops (measured: 416 segments for
+  1657 records in phase 0, 411 for 1503 in phase 1 of one run; a raw
+  count comparison of two phases with different wall times was
+  measuring their timing).
+
+### 4. `3node-p2pon-shared-create-lat0`
+
+- Cause: the placement split the bench's shared directory (`meta-bench`
+  now prints each node's delegation counters: `splits 1`, no range
+  recalls — no thrash) and the split *costs* on a LAN: the bench's three
+  writers create uniformly-hashed unique names, so no range has a local
+  writer; after the split every op still travels to some sequencer
+  (the root's own ops now forwarded to a delegate too, `routed 186`),
+  and one executed by a delegate pays the delegate's backup
+  acknowledgement (phase 2b's `ack` for delegates) on top — two hops
+  where the single sequencer needed one or none. Measured with the
+  round-1 fix alone, idle host, 3 pairs: M12 1132 / 1399 / 425 ops/s vs
+  main 1947 / 1789 / 1075 (−20 … −40 %). Not the HLC (one atomic
+  `fetch_max` per record) nor the shared parent hold (a set insert):
+  the single-node configs are unchanged.
+- Decision: a range is delegated only to a node that **dominates** it
+  (`placement_dominance_pct`, the rule a subtree's placement already
+  uses); a hot directory whose ranges nobody dominates stays the root's.
+  The split's purpose in this design is locality — a writer's own names
+  executing where the writer is, across continents; a split for
+  parallel sequencing alone (the GIGA+ throughput case, a saturated
+  root) is left to a future knob, because on the hardware this project
+  runs on the root is not the bottleneck and the hop is. The
+  `≥ placement_split_pct` qualifier rule stays. The sim's `shared_dir_*`
+  workloads and `hash-range-split-merge`'s writers now give each node
+  names hashing into its own range (a writer with a naming scheme of
+  its own — `n2-f7` under node 2's prefix, ingest by source), which is
+  the workload the split exists for; the tester's bench does not split
+  any more and runs main's path plus one atomic load per op
+  (`Meta::root_fast_path` while the table is empty).
+- Found on the way (`hash-range-split-merge` 1/4 "not split yet"): the
+  root's own create, forwarded to a range delegate 1 ms after the grant,
+  was answered `NotHolder` (the delegate's table had not applied the
+  grant yet); the root then executed it locally, which *recalled the
+  range it had just delegated*, and the directory stayed half-split for
+  the cool-down. A forward answered `NotHolder` by a node this node's
+  table still names the owner is now retried after a stream tick
+  (`deleg_grant_lag_retries`), like a `Held`.
+
+### Results
+
+All on the final tree (main `fb11962` + M12 + round 2), binaries
+frozen per gate run, this host (32 cores), harness prefix
+`constellation-harness-m12fable`.
+
+- `cargo test --workspace --release`: 1037 passed, 0 failed.
+  `cargo clippy --workspace --all-targets --release -- -D warnings`: 0;
+  `cargo fmt --all -- --check`: clean.
+- Sim: the suite 70 passed (7 ignored) incl. the six pinned/regression
+  tests ×4; `long_random` 1000 seeds 102 s, `long_strict` 500 53 s,
+  `long_backup` 300 29 s, `long_flex` 300 38 s, `long_delegated` 100
+  14 s — all green, ≤ 95 MB RSS.
+- `chaos-soak-4` ×3 with the default placement: **PASSED** 315 / 308 /
+  313 s (`exactly_once_log` 2919 / 2591 / 2902 outcomes each once);
+  before the fix 4/4 failed within 25 s. `chaos-ci` ×3: PASSED
+  (8.8 / 9.6 / 17.1 s).
+- The M11 + M12 batch (14 scenarios): **ALL SCENARIOS PASSED**
+  (`delegated-subtrees` 13.8 s, `cross-subtree-rename` 4.8, `delegate-crash`
+  7.8, `marker-order` 15.5, `delegate-partition` 15.1,
+  `p2p-off-no-delegation` 7.0, `root-failover-with-delegates` 15.2,
+  `delegate-crash-backup` 15.4, `auto-placement` 20.9,
+  `designation-as-delegation` 21.6, `single-node-unchanged` 1.6,
+  `shared-dir-multi-writer` 14.3, `hash-range-split-merge` 20.8,
+  `cross-range-rename` 2.8).
+- `hash-range-split-merge` ×3 (dominance rule): PASSED 18.7 / 19.4 /
+  18.8 s, the split after 4.0–4.1 s each time (`[("1/4", 2), ("2/4",
+  3)]`: the writers' own ranges).
+- `delegate-partition` ×5: PASSED 17.2 / 16.8 / 16.9 / 17.3 / 17.3 s
+  (the tester: ~43 % lease loss; the round-1 tree before the inbox
+  fixes: 2/5 lost the lease on a loaded host).
+- `shared-dir-multi-writer` ×5 (before the peer wait): 4 PASSED
+  (14.4 / 15.2 / 14.7 / 20.7 s, the split phase 427 / 444 / 336 / 236
+  files/s against 725 / 773 / 792 / 172 single-sequencer, chunk PUTs
+  100 per node in both phases, the delegates shipping nothing, every
+  name on every node, identical listings), 1 FAILED at the range
+  delegation ("this node does not hold the lease"): node `d`'s link to
+  the root was still being set up at mount (`forward retries
+  exhausted` twice in its first 5 s, the registry allowlist), its
+  first ops went through the inbox and the escalation (8 ops in the
+  window, `DEFAULT_ESCALATE_OPS`) moved the lease before phase 0 —
+  the escalation working as designed on a node that genuinely could
+  not reach the holder. The cluster helper now waits until every node
+  reaches every peer before the first phase. Reruns with that wait:
+  `shared-dir-multi-writer` ×5 **all PASSED** (14.9 / 16.7 / 17.6 /
+  18.3 / 18.2 s; the split phase 627 / 313 / 469 / 319 / 306 files/s
+  against 696 / 361 / 198 / 589 / 598 single-sequencer — on this
+  all-local host the hand split is not faster: a writer's names are
+  spread over four sequencers, so three quarters of them are still
+  forwarded and the root's own quarter no longer runs on its fast
+  path; the root's log PUT rate 459→520, 302→302, 176→386, 400→310,
+  473→301 /s), `delegate-partition` ×5 all PASSED (17.3 / 17.6 / 17.6
+  / 15.7 / 17.9 s), `hash-range-split-merge` ×2 PASSED (the split
+  after 0.30 s with all three writers' ranges, `[("1/4", 2), ("2/4",
+  3), ("3/4", 4)]`, once every link was up before the writers started).
+- `session-forwarded-ryw` ×2: PASSED 7.9 / 8.0 s;
+  `takeover-resolves-awaiting-close` ×2: PASSED 10.5 / 10.7 s.
+- `meta-bench 3node-p2pon-shared-create-lat0`, idle host, interleaved:
+  - round-1 fix only (the split still taken), 3 pairs: M12 1132 / 1399
+    / 425 vs main 1947 / 1789 / 1075 ops/s — the split's cost (finding
+    4).
+  - final tree (dominance rule: no split, `splits 0` on every node),
+    3 pairs: M12 1733 / 991 / 1841 vs main 2497 / 2086 / 1472; then 5
+    triples M12 / M12 with `CONSTELLATION_DELEGATION_PLACEMENT=off` /
+    main: 531* / 2144 / 2260, 2183 / 2105 / 2239, 2318 / 1663 / 376*,
+    2361 / 1734 / 1758, 2033 / 1479 / 4021* (* = a p99 above 15 ms or
+    below 1.5 ms: a host hiccup, the same binary's neighbours differ
+    2×). Over the seven clean triples/pairs M12 averages 2170 against
+    main's 2100: no measurable difference; the noise band of this host
+    (±30 % run to run, same binary) is wider than the 5–10 % target,
+    so the honest statement is "the same path as main plus one atomic
+    load per op, and the bench no longer splits".
+- Not rerun: pjdfstest (nothing of round 2 touches timestamps or the
+  POSIX paths; the fast-path admission is a table check).
+- Host-load note: every lease-sensitive scenario (`delegate-partition`,
+  `shared-dir-multi-writer`, `hash-range-split-merge`) failed at times
+  while another gate ran on the host (52 s runs instead of 16 s, links
+  flapping); the numbers above are from sequential runs.
+
+### Files (round 2)
+
+`crates/meta/src/delegation.rs` (`root_fast_path`, `RootAdmission`,
+`delegations_any`, `delegation_gate`, `Namespace::primary_dentry`,
+`resolve` for files in split directories, unit test),
+`crates/meta/src/store/{mod,local}.rs` (`deleg_any`, `deleg_gate`, the
+grant transaction's exclusive hold), `crates/meta/src/replay.rs`
+(`TouchSet::from_op_in`); `crates/authority/src/core/{client,holder,
+delegate,inbox,jobs,mod,placement}.rs` (the grant-lag retry, the
+recovered segment's touches, the late epoch-hold adoption, the inbox
+demand union and the P2P de-escalation, `place_note_local`, the range
+dominance rule, stats `deleg_grant_lag_retries`,
+`epoch_holds_adopted_late`); `crates/authority/tests/sim/{run,node}.rs`
+and `tests/sim.rs` (the fast-path model, name locality, the four new
+tests, the convergence failure's history); `crates/cli/src/{fusefs,
+lease,authority_driver,prune,main}.rs` and `crates/api/src/types.rs`
+(the three admissions, `fast_path_routed`, the placement notes);
+`crates/harness/src/scenarios.rs` (`chaos-soak-4` keeps the logs),
+`crates/harness/src/scenarios/m11.rs` (the peer wait, the split-merge
+writers' locality, the log-PUT check), `crates/harness/src/metabench.rs`
+(the delegation line); `docs/how-to-guides/development/TESTING.md`.
+
+### Round 2 on main `623da2c` (coder, 2026-09-25)
+
+The M12 tree moved onto `623da2c` (the deposed-reintegration and
+backup-takeover fixes, the epoch decline rule, `HolderCutEpoch`); one
+sim test failed, `a_holder_alone_cut_from_s3_forms_no_epoch_and_fails_over`,
+and the coordinator asked whether M12 interferes with the decline or the
+failover.
+
+- **Not an interaction — a measurement.** The test ends a failover at
+  the next `Ok` a client sees. On seed 1515 the backup sealed and took
+  the lease 1.3 s after the crash on both trees (the lease moves, the
+  seal, the takeover are line for line the same on main), but on M12
+  every client op left after the crash was a refusal on the four-name
+  pool (`AUTHORITY_SIM_TRACE_OPS=1`, new: `t=3309 rid(1,1,12) Enoent`,
+  `t=3657 Eexist`, ... until the restarted holder's `t=11089 Ok`), so
+  the failover read as 9089 ms. The schedule shifted because M12's
+  shared parent hold no longer serializes a node's creates on their
+  directory (the gate is per name now): the same seeded ops fall on
+  different states. Neither the placement (thresholds never reached by
+  8 ops per client, and no split without a dominant writer) nor a
+  delegation (none in the config) touched the run. Fix in the sim: the
+  open failover ends at the next *answered* op — accepted or
+  definitively refused, either of which only a sequencer can do
+  (`Cluster::note_answered`); the M9 `fast`/`slow` failover
+  distributions and the non-vacuity check (`decline: false`: EROFS is
+  retried, never returned, so a frozen member still answers nothing)
+  keep their meaning. 20/20 seeds: failovers 0.9–1.9 s.
+- **The decline alongside delegations, checked with a new test**
+  (`a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over`: the
+  M11 delegated configuration with backups, the same two faults — the
+  root alone loses S3, proposes, dies; its delegates reach S3 and
+  decline; its backup takes over inside the TTL and inherits the
+  table). It found a **pre-existing 2b × M9 bug**, reproduced on main
+  `623da2c` with the same test (seed 1604, `node 2 appended 344 delegate
+  batches whose deps it lacked`): a recalled generation was voided only
+  on the root that wrote the `Recall` (`void_stream` at the recall);
+  the successor root, inheriting the table from the log after the old
+  root died with that generation's last rows unshipped, could neither
+  apply those rows nor consider them void, refused every batch whose
+  deps named them (`reaches_streams`), and the delegate re-sent the
+  batch every stream tick (813 times in 9 s on M12) while its own
+  `deps` kept naming the dead generation. Fix (`meta/src/replay.rs`):
+  applying a `Recall` from the durable log voids the generation on
+  every replica — the rule the record states — with the cut at what
+  this replica applied; a streamed-ahead install of the record does
+  not (it may strand, and the generation is live again under the
+  successor). 12/12 seeds: no epoch, failovers 0.3–1.3 s, every
+  directory linearizable, 130 delegate executions.
+- **`apply_adopted_records` and range-delegated manifests**: a
+  successor adopting the predecessor root's backup tail adopts the
+  delegates' streamed `WriteManifest` rows too and enrolls their chunks
+  as pending; a delegate (whole or range) drains its chunks before it
+  journals the manifest — the delegate fast path and, after round 2,
+  the root's own commit of a delegate-owned file both go through the
+  drain-then-commit path — so the HEAD finds them and nothing is held;
+  the enrolment's `deleg_gate` interaction is nil (only
+  `Delegate`/`Recall` records take the gate, and a takeover thread holds
+  no read side). Under an active epoch the drain is skipped, but
+  delegations are dropped for the epoch (`deleg_on_epoch`).
+
+Results on `623da2c` + M12 + round 2 (binaries frozen, sequential,
+idle host): fmt clean, clippy 0; `cargo test -p constellation-authority
+--release` 67 + 3 + 72 passed (7 ignored) — the two holder-cut tests
+included, the eight pinned/regression tests ×3; meta 92 passed;
+`long_random` 1000 (88 s), `long_strict` 500 (44 s), `long_backup` 300
+(19 s), `long_flex` 300 (32 s), `long_delegated` 100 (8 s), all green,
+≤ 94 MB RSS; harness `epoch-peer-reaching-s3-declines` PASSED 19.2 s,
+`backup-takeover-holds-missing-chunks` PASSED 10.9 s,
+`deposed-reintegration-backup` PASSED 11.6 s, `chaos-soak-4` PASSED
+312.8 s (`exactly_once_log` 3704 outcomes each once), the 14-scenario
+M11 + M12 batch ALL SCENARIOS PASSED (`shared-dir-multi-writer` 24.0 s,
+`hash-range-split-merge` 20.6 s, the rest 2.9–22.1 s). Files of this
+note: `crates/meta/src/replay.rs` (the void on `Recall`),
+`crates/authority/tests/sim/run.rs` (`note_answered`, the op trace),
+`crates/authority/tests/sim.rs` (the delegated holder-cut config and
+test).
+
+### Triage on main `9589b85` (coder, 2026-09-25): three sim failures, all M9's backup class — not fixed here
+
+Main `9589b85` enlarged the backup configurations' CI seed ranges; on
+M12's shifted schedules three tests fail. Each seed traced
+(`RUST_LOG=constellation_authority=debug`, `AUTHORITY_SIM_TRACE_OPS=1`);
+none involves M12's code — no delegation, placement, range or fast-path
+line in any trace (every execution `gens=0 ownership=Root`), no `Recall`
+record; the HLC stamps only times; the parent hold only moved the
+schedules. All three mechanisms are in `core/backup.rs` / `core/jobs.rs`
+(the seal, the backup tail, the acquisition after a loss), and main
+`9589b85` itself shows the class on a wider range: `long_backup`
+(`AUTHORITY_SIM_SEEDS=1000`, seeds from 40000) fails on main at seed
+50557, "a client op was never answered within 540 s", with no M12 code
+present. The three seeds pass on main by timing alone. Routed to the
+backup agent; nothing changed in this tree for them.
+
+- `backup_failover_reships_the_tail`, **`backup-crash` seed 892** ("no
+  quiescence"): node 3 (holder, epoch 1) cut and crashed; node 1 (its
+  backup) sealed and took epoch 2, then was paused 6.7 s (a random
+  fault) — its lease lapsed, node 3 restarted and took epoch 3 with
+  node 1 as backup; node 1 came back to `LEASE LOST ... my_epoch=2`,
+  `lost: true`, and its client op 1.1.16 went down the lease path into
+  an `Acquire` job that never finishes: with the job slot held no sync
+  round runs, node 1 tails nothing (2 segments applied after the loss
+  against node 3's 27 shipped), and its 23 shadows accepted by node 3
+  at epoch 3 never retire. Mechanism: the acquisition of a lost node
+  (jobs.rs / the M9 deposition path).
+- `pre_s3_streaming_installs_and_retires`, **`backup-crash-slow` seed
+  1438** (rid 2.1.2 "returned success but completed 0 times in the
+  log"): holder 2 acknowledged its own create at t=748 while its backup
+  bring-up was still failing its CAS through the cut S3
+  ("reconfiguration CAS failed; retrying" ×3 — the lease never listed
+  node 1), i.e. under the `Local` policy; node 2 crashed at 1500 with
+  the row unshipped; node 1 sealed, found itself "no longer a listed
+  backup" (it never was) and discarded its tail; node 2's restart
+  replayed the rid, refused (`f2` existed by then), and materialized a
+  conflict copy. Mechanism: an acknowledgement under `Local` while the
+  backup listing is in flight, in a configuration whose strict check
+  assumes `Backup` (backup.rs bring-up).
+- `fast_failover_with_delegations_keeps_close_to_open`,
+  **`backup-strict` seed 1353** (2.1.9 "returned before 1.1.15 was
+  invoked but follows it in the log"): holder 2 acknowledged 2.1.9 at
+  t=1102 (backup-acked by node 1), crashed at 1500; node 1 sealed, its
+  takeover CAS succeeded, and its backup watch's next lease read saw
+  *its own* new lease (`holder=1 epoch=2`) and took the "the lease
+  moved on: our tail is void" branch — discarding the sealed tail it
+  was about to re-ship (`backup_clear`), 2.1.9 with it; node 2's restart
+  replayed 2.1.9 by rid 4 s later, behind 1.1.15. Mechanism: the
+  backup watch's discard rule racing the same node's takeover
+  (backup.rs, "no longer a listed backup; discarding the backup tail").
+
+### What the tester must run
+
+- `cargo test --workspace --release`; `cargo clippy --workspace
+  --all-targets --release -- -D warnings`; `cargo fmt --all -- --check`.
+- The long sweeps: `long_random` (1000), `long_strict` (500),
+  `long_backup` (300), `long_flex` (300), `long_delegated` (100); the
+  pinned seeds run in the suite.
+- `chaos-soak-4` ×3 and `chaos-ci` ×3 with the default placement.
+- The M11 + M12 batch (`delegated-subtrees cross-subtree-rename
+  delegate-crash marker-order delegate-partition p2p-off-no-delegation
+  root-failover-with-delegates delegate-crash-backup auto-placement
+  designation-as-delegation single-node-unchanged
+  shared-dir-multi-writer hash-range-split-merge cross-range-rename`),
+  `delegate-partition` ×5, `shared-dir-multi-writer` ×5, on an
+  otherwise idle host (both scenarios pin the root and are sensitive to
+  P2P liveness blips under load).
+- `session-forwarded-ryw` ×2, `takeover-resolves-awaiting-close` ×2.
+- `meta-bench 3node-p2pon-shared-create-lat0` interleaved against main,
+  3 pairs, idle host.
+- pjdfstest (unchanged by round 2; the HLC work was not touched).
+
+## Plan 30 M12 — tester gate run, round 2 (phase-5 boundary)
+
+Re-ran the full phase-5 gate list against the round-2 M12 tree
+(`/home/bra/cvs/constellation-m12`, `plan30-m12`, now on main `2522402`,
+uncommitted). Baseline for every A/B was main `2522402` built in a scratch
+detached worktree (`git worktree add --detach <scratchpad>/main-2522402
+2522402`), removed after use. Same harness prefix
+(`constellation-harness-m12`, `-perf`/`-tester`/`base` suffixes for isolated
+sub-runs), same `CONSTELLATION_BIN`. No mechanical fixes needed — fmt,
+clippy and every build were clean on first try, as in round 1.
+
+**Headline: every one of round 1's five findings is confirmed fixed.**
+`chaos-soak-4`, the two sim seeds (10146, 30299), the `delegate-partition`/
+`shared-dir-multi-writer` lease flake, and the `3node-p2pon-shared-create-lat0`
+regression all now pass reliably and were independently reproduced as fixed
+here, not just taken on the coder's word. Two *new*, low-severity findings
+turned up, and both are pre-existing on main `2522402` itself (confirmed by
+direct A/B), not M12 regressions.
+
+### Gate 1 — fmt, clippy, workspace tests
+
+- `cargo fmt --all -- --check`: **clean.** `cargo clippy --workspace
+  --all-targets --release -- -D warnings`: **0 warnings.**
+- `cargo test --workspace --release`: **zero failures**, ~1069 tests
+  passed (28 ignored) across every crate; wall 5m08s, peak RSS 14.7 GB.
+- `hotdir.rs` isolated: **9/9 passed**, 9.22 s test time, peak RSS **473 MB**
+  — within the 60 s/2 GB model-test budget.
+
+### Gate 2 — authority sim + long sweeps
+
+| sweep | seeds | result | time |
+|---|---|---|---|
+| `long_delegated` (100) | 100 | **PASS** | 8.3 s |
+| `long_random` (1000) | 1000 | **PASS** — seed 10146 no longer fails | 61.6 s |
+| `long_strict` (500) | 500 | **PASS** | 28.9 s |
+| `long_backup` (300) | 300 | **PASS** | 16.7 s |
+| `long_flex` (300) | 300 | **PASS** — seed 30299 no longer fails | 31.8 s |
+
+Both round-1 regressions are gone: `long_random` 1000 seeds (including
+10146) and `long_flex` 300 seeds (including 30299) are green. Confirms the
+coder's fixes (`apply_incoming`'s own-segment recovery now notes touches;
+`Core::on_epoch_state` adopts a late-restarting member's carried hold) at
+face value — did not re-bisect, since the sim reruns green end to end.
+
+### Gate 3 — release build
+
+`cargo build --release --workspace`: **clean**, 33.6 s incremental.
+
+### Gate 4 — smoke, integration, pjdfstest
+
+- `tests/smoke.sh` (local backend): **PASSED.**
+- `tests/integration.sh` equivalent against real S3 (private floci on port
+  14566, same workaround as round 1 since `constellation-floci-1` still
+  holds 4566): **PASSED**, full CAS ok.
+- pjdfstest (`docker compose -p constellation-m12r2-tester`, rebuilt the
+  `constellation-smoke:local` image from this tree's `COPY . .` — confirmed
+  fresh, not reused): **8798 passed, 0 failed, empty baseline.** Round 2's
+  FUSE-fast-path admission and main's truncate/manifest-clipping work do
+  not regress POSIX compliance.
+- Torn down with `down -v` immediately after each; other sessions'
+  containers (`constellation-floci-1`, `constellation-harness-m11-*`,
+  `constellation-harness-m14fable-*`) confirmed untouched throughout.
+
+### Gate 5 — full harness run
+
+`harness list`: **139 scenarios** (133 + the 6 new: `backup-takeover-holds-missing-chunks`,
+`backup-takeover-drops-held-chunks`, `epoch-peer-reaching-s3-declines`,
+`deposed-reintegration-backup`, `truncate-never-resurrects`,
+`takeover-resolves-awaiting-close`). Ran in 18 batches of ≤8 plus
+`chaos-soak-4` isolated. All 6 new scenarios **PASSED** on first try. The
+five round-1 failures were each rerun and, per instructions, A/B'd again
+where they still failed:
+
+1. **`chaos-soak-4` — FIXED, confirmed 3/3.** PASSED 306.4 / 308.4 / 309.0 s
+   (`exactly_once_log` 4391 / 4264 / 4465 outcomes each once). Round 1 was
+   4/4 FAILED with double-winner creates/unlinks under default placement;
+   `Meta::root_fast_path`'s range-ownership check closes that hole.
+2. **`delegate-partition` — FIXED, confirmed 3/3** (17.3 / 17.3 / 18.0 s,
+   plus one more PASS inside the M11+M12 batch = 4/4). Round 1 was ~43%
+   lease-loss failures; the inbox demand-union and P2P-de-escalation fixes
+   hold up under an independent rerun.
+3. **`shared-dir-multi-writer` — FIXED, confirmed 3/3** (19.9 / 21.3 / 19.7 s,
+   plus one more inside the M11+M12 batch = 4/4), including the
+   log-PUT-rate assertion (round 1's raw-count comparison bug is also
+   fixed: `single sequencer 302-347/s, split 257-282/s`, not a raw count).
+4. **`session-forwarded-ryw` — FIXED, confirmed 3/3** (15.3 s each). Round 1
+   left this to a separate bisection; main's own fix (`00d073a`,
+   "session-forwarded-ryw tests forwarded writes again") landed since and
+   resolved it independent of M12.
+5. **`3node-p2pon-shared-create-lat0` — see gate 6.** Round 1's −22.3%
+   is gone now that the dominance rule stops the bench's directory from
+   splitting (see below).
+
+Two **new** findings, both flaky and both **confirmed pre-existing on
+main `2522402`** by direct A/B (not M12 regressions):
+
+- **`takeover-marker-strands-promptly`**: 2 of 4 M12 reruns FAILED ("C
+  must hold the accepted create as an outstanding shadow": `outstanding:0`)
+  — the same message every time. On main `2522402`: 1 of 3 runs **also
+  FAILED**, identical message. A host-timing-sensitive race in the same
+  family this repo's tester notes have flagged before for
+  holder-kill/shadow-stranding scenarios.
+- **`session-ryw-after-holder-kill`**: 2 of 4 M12 reruns FAILED ("C's
+  shadow was never stranded (the scenario did not exercise the window)").
+  On main `2522402`: 1 of 3 runs **also FAILED**, identical message. Same
+  family/pattern as above — the scenario's crash timing window is
+  occasionally missed on this host, on both trees equally.
+
+One **carried-over, now-hardened** finding:
+
+- **`deposed-reintegration`**: **FAILED 4/4** on M12 with a single,
+  consistent message this time ("'clean replays and the one conflict copy
+  converge on both nodes' not reached within 40s: c0: a-only (never
+  touched by B) did not replay A's content") — different from round 1's
+  mixed-symptom flake. On main `2522402`: **also FAILED 3/3**, byte-for-byte
+  the same message every time. Confirmed pre-existing on main, not an M12
+  regression, but worth flagging to the coordinator as a *harder* failure
+  than round 1's: main went from an intermittent flake (round-1 baseline
+  `d214b1c`: 3/3 failed but with two different, mixed messages) to a
+  deterministic one (round-2 baseline `2522402`: 3/3 failed, one message)
+  somewhere in between — i.e. this looks like a real bug newly introduced
+  on main's own line of work (the round-2 notes' own "truncate fold,
+  adopted commits" deposed-reintegration fix, or something after it),
+  not something round 2's M12 diff touches or fixes.
+
+All harness containers, `/tmp/harness-*` dirs and `/tmp/chaos-soak-4-*`
+artifact dirs created by this run were cleaned up afterward. One stale,
+unowned mount was found and left untouched:
+`/tmp/harness-hash-range-split-merge-Mel9LX/{c,d}/mnt`, created 09:14
+local (hours before this round's gate-5 run started ~11:30 UTC / 13:30
+local) with no process holding it (`fuser` empty) — not from this
+session's batches, most likely a leftover from the round-2 coder's own
+testing; left alone per the rule against touching anything not
+verifiably this session's. `constellation-floci-1`,
+`constellation-harness-m11-*`, `constellation-harness-m14fable-*`, and
+the bisection worktrees under `<scratchpad>/bis-*` were all confirmed
+untouched throughout.
+
+### Gate 6 — perf, interleaved against main
+
+Built main `2522402` in the same scratch detached worktree as gates 2/5
+(removed after use). Ran `harness meta-bench`, interleaved M12-then-main,
+3 pairs per config:
+
+| config | M12 (3 runs, ops/s agg) | M12 avg | main (3 runs) | main avg | delta |
+|---|---|---|---|---|---|
+| `1node-create-lat0` | 2190, 2516, 3904 | 2870 | 3749, 2590, 3660 | 3333 | **−13.9%** |
+| `1node-write4k-lat0` | 956, 979, 1495 | 1143 | 988, 1167, 978 | 1044 | **+9.5%** |
+| `3node-p2pon-shared-create-lat0` | 2009, 1591, 1700 | 1767 | 2108, 1404, 1437 | 1650 | **+7.1%** |
+
+The 3-node config — round 1's flagged −22.3%, consistent-direction
+regression — is **fixed**: `fwd=2400` on *both* trees now (round 1's M12
+was 1827–1903, i.e. the bench's shared directory no longer splits, per
+round 2's dominance-rule decision), and the delta is now a small **+7.1%**
+favoring M12, well inside noise. The single-node configs swing in both
+directions by double-digit percentages on both builds run-to-run — this
+host was visibly busier during this round's perf pass than round 1's (see
+load note below), consistent with the round-2 coder's own note that
+lease-sensitive scenarios saw slower runs "while another gate ran on the
+host."
+
+`harness bench` (census import, `--files 3000`), interleaved 3 pairs,
+durable files/s:
+
+| build | run 1 | run 2 | run 3 | avg |
+|---|---|---|---|---|
+| M12 | 164.6 | 187.6 | 142.8 | 165.0 |
+| main | 173.7 | 145.9 | 186.1 | 168.6 |
+
+M12 **−2.1%**, within noise — no regression signal. Note the absolute
+numbers here (~165 fps) are much lower than round 1's (~413 fps) on the
+same `--files 3000` benchmark and the same host; this is host load, not a
+code change (round 1's perf pass ran on a quieter host — see below).
+
+**Load measured under:** same one dev host (32 cores, 62 GiB RAM) as
+round 1, containerized floci + toxiproxy per node, no real network.
+Unlike round 1, this pass ran with **other concurrent activity on the
+host** (other sessions' builds/tests were active during gate 6, evidenced
+by the harness-bench absolute throughput dropping to ~40% of round 1's
+figure on *both* builds identically) — the interleaving still isolates
+M12 from main correctly (both builds see the same contention in the same
+window), but the absolute numbers are not comparable across rounds, only
+within this round's own M12-vs-main pairs.
+
+### Summary for the coordinator
+
+All five round-1 findings are fixed and independently reconfirmed:
+`chaos-soak-4`, sim seeds 10146/30299, the `delegate-partition`/
+`shared-dir-multi-writer` lease flake, and the `3node-p2pon-shared-create-lat0`
+regression. `session-forwarded-ryw` is also fixed (by main's own change,
+landed since round 1). No mechanical fixes were needed in this pass.
+
+Two items to flag, both evidenced by direct A/B against main `2522402`,
+neither attributable to the M12 diff:
+
+1. **`deposed-reintegration` now fails deterministically (4/4 on M12, 3/3
+   on main)**, with one consistent message, where round 1 saw an
+   intermittent, mixed-symptom flake on both trees. This reads as a new
+   bug on main's own line of work between `d214b1c` and `2522402`
+   (plausibly interacting with, but not caused by, the round-2 notes'
+   deposed-reintegration fix), not something introduced or fixed by the
+   M12 diff. Recommend routing to whoever owns that fix, same as the
+   round-2 notes routed three other backup-class sim failures to "the
+   backup agent."
+2. **`takeover-marker-strands-promptly` and `session-ryw-after-holder-kill`**
+   are host-timing-sensitive flakes present at a similar rate on both M12
+   and main `2522402` — not new, not M12-specific, consistent with this
+   repo's long-documented holder-kill/shadow-stranding timing sensitivity
+   on this host.
+
+pjdfstest, smoke and integration all still pass 8798/8798 / clean / clean.
+Perf shows no regression anywhere once the dominance-rule fix is in place;
+the single-node meta-bench swings are host-load noise, evidenced by the
+identical-direction slowdown on both builds in `harness bench`.

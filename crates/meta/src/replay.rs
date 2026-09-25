@@ -24,10 +24,18 @@ use std::collections::HashSet;
 /// work. Atime is deliberately invisible here (see [`LogRecord::Atime`]):
 /// it records neither a dentry nor an ino, so it can neither suppress
 /// nor be suppressed.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct TouchSet {
     pub dentries: HashSet<(u64, String)>,
+    /// Inodes held *exclusively*: their own attributes change, or (a
+    /// directory) their subtree is removed, moved or re-attributed.
     pub inos: HashSet<u64>,
+    /// Plan 30 §M12: directories held *shared* — a create, unlink or
+    /// link in them changes their times and link count, but by a
+    /// commutative merge (`max` times, additive nlink), so two such
+    /// holds never conflict; an exclusive hold on the same directory
+    /// (rmdir, a rename of it, setattr on it) conflicts with both.
+    pub shared: HashSet<u64>,
 }
 
 impl TouchSet {
@@ -58,9 +66,11 @@ impl TouchSet {
             } => {
                 self.dentries.insert((*parent, name.clone()));
                 self.inos.insert(*ino);
+                self.shared.insert(*parent);
             }
             LogRecord::Unlink { parent, name, .. } | LogRecord::Rmdir { parent, name, .. } => {
                 self.dentries.insert((*parent, name.clone()));
+                self.shared.insert(*parent);
             }
             LogRecord::Rename {
                 parent,
@@ -71,6 +81,8 @@ impl TouchSet {
             } => {
                 self.dentries.insert((*parent, name.clone()));
                 self.dentries.insert((*new_parent, new_name.clone()));
+                self.shared.insert(*parent);
+                self.shared.insert(*new_parent);
             }
             LogRecord::Setattr { ino, .. }
             | LogRecord::WriteManifest { ino, .. }
@@ -94,9 +106,22 @@ impl TouchSet {
                 for node in nodes {
                     self.dentries.insert((node.parent, node.name.clone()));
                     self.inos.insert(node.ino);
+                    self.shared.insert(node.parent);
                 }
             }
         }
+    }
+
+    /// Plan 30 §M12: whether two sets conflict — a common dentry, a
+    /// common exclusive inode, or an exclusive hold against any hold on
+    /// the same inode. Shared holds never conflict with each other.
+    pub fn overlaps(&self, other: &TouchSet) -> bool {
+        self.dentries.iter().any(|d| other.dentries.contains(d))
+            || self
+                .inos
+                .iter()
+                .any(|i| other.inos.contains(i) || other.shared.contains(i))
+            || self.shared.iter().any(|i| other.inos.contains(i))
     }
 
     /// The keys `op` reads or writes, before it runs (plan 30 §M11's
@@ -106,6 +131,7 @@ impl TouchSet {
         let mut set = TouchSet::default();
         let mut dentry = |p: u64, n: &str| {
             set.dentries.insert((p, n.to_string()));
+            set.shared.insert(p);
         };
         match op {
             MutateOp::Mkdir { parent, name, .. }
@@ -151,10 +177,43 @@ impl TouchSet {
         set
     }
 
+    /// [`Self::from_op`] plus the inodes the op takes away or moves,
+    /// looked up through `lookup` (plan 30 §M12: an rmdir or a rename
+    /// holds the directory it removes or moves *exclusively* — against
+    /// the creates inside it, and against a delegation of it). The
+    /// core's `keys_of_op_in` and the FUSE fast path compute the same.
+    pub fn from_op_in(
+        op: &crate::mutate::MutateOp,
+        lookup: &dyn Fn(u64, &str) -> Option<u64>,
+    ) -> Self {
+        use crate::mutate::MutateOp;
+        let mut set = TouchSet::from_op(op);
+        match op {
+            MutateOp::Rmdir { parent, name } => {
+                if let Some(i) = lookup(*parent, name) {
+                    set.inos.insert(i);
+                }
+            }
+            MutateOp::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+            } => {
+                for (p, n) in [(parent, name), (new_parent, new_name)] {
+                    if let Some(i) = lookup(*p, n) {
+                        set.inos.insert(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+        set
+    }
+
     pub fn conflicts(&self, rec: &LogRecord) -> bool {
         let touched = TouchSet::from_records(std::iter::once(rec));
-        touched.dentries.iter().any(|d| self.dentries.contains(d))
-            || touched.inos.iter().any(|i| self.inos.contains(i))
+        self.overlaps(&touched)
     }
 }
 
@@ -289,6 +348,11 @@ fn apply_one(
     rec: &LogRecord,
     staged: &crate::store::UsageTracker,
 ) -> Result<Applied, MetaError> {
+    // Plan 30 §M12: a stamp applied here is one this node's clock stays
+    // above from now on (the HLC's receive rule).
+    if let Some(t) = rec.stamp_ns() {
+        crate::hlc::observe(t);
+    }
     match rec {
         LogRecord::Mkdir {
             parent,
@@ -586,6 +650,7 @@ fn apply_one(
             node,
             gen,
             designated,
+            range,
         } => {
             let mut table = crate::delegation::read_table_tx(tx, meta)?;
             table.apply(crate::delegation::DelegationRecord::Delegate {
@@ -593,6 +658,10 @@ fn apply_one(
                 node: *node,
                 gen: *gen,
                 designated: *designated,
+                range: crate::delegation::Range {
+                    bits: range.0,
+                    idx: range.1,
+                },
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             Ok(Applied::Done)
@@ -604,6 +673,24 @@ fn apply_one(
                 gen: *gen,
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
+            // M12 round 2 (623da2c's holder-cut shape with delegations):
+            // the generation is void from here for *every* replica — the
+            // rule the record states (its rows not before it in the log
+            // never take effect; a stranded one is replayed by rid), not
+            // only for the root that wrote it. Before, only that root
+            // voided it (`void_stream` at the recall): its successor,
+            // inheriting the table from the log after the root died with
+            // the generation's last rows unshipped, refused every batch
+            // whose deps named them (`reaches_streams`: neither applied
+            // nor void) and the delegate re-sent it forever (813 batches
+            // in 9 s, sim seed 1604); and the delegate itself kept naming
+            // the dead generation in its `deps`. Only from the durable log
+            // — a streamed-ahead install of the record may strand, and
+            // the generation would then be live again under the successor.
+            if durable {
+                let cut = meta.session().stream_applied(*gen);
+                meta.session().void_stream(*gen, cut);
+            }
             Ok(Applied::Done)
         }
         // The replica's session state reads it (`SessionState::owe`).
@@ -706,6 +793,10 @@ fn evict_dentry(
         }
         ns::remove_dentry(tx, &meta.ns, dirty, parent, name, ino)?;
         ns::ns_remove(tx, &meta.ns, dirty, keys::inode(ino))?;
+        // The parent lost a subdirectory (`..`): the same delta the
+        // writer applied (`writes::rename_in_tx`); plan 30 §M12 makes
+        // every parent delta additive, so replay must carry it too.
+        misc::bump_nlink_tx(tx, &meta.ns, dirty, parent, -1, t)?;
         ns::clear_spilled_xattrs(tx, &meta.ns, dirty, ino)?;
         let names: Vec<Vec<u8>> = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?
             .into_iter()

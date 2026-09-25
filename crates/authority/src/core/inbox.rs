@@ -150,12 +150,41 @@ impl InboxState {
         }
     }
 
-    /// `(ops, wait_ms)` over the window: the op count, and the cumulative
-    /// round-trip wait with the single largest sample left out.
+    /// `(ops, wait_ms)` over the window: the op count, and the time this
+    /// node's ops spent waiting on the inbox path with the single longest
+    /// wait left out. Overlapping waits count once (M12 round 2): ops
+    /// submitted together wait out the same delay — the holder's recall
+    /// of a delegation on what they touch, say — and summing them made
+    /// one three-second incident look like sustained demand (harness
+    /// `delegate-partition`: the root handed its lease to the requester
+    /// it had just recalled, on a demand of two ops).
     fn demand(&self) -> (u64, u64) {
-        let total: u64 = self.window.iter().map(|(_, w)| *w).sum();
+        let mut spans: Vec<(i64, i64)> = self
+            .window
+            .iter()
+            .map(|(at, w)| (at.0 - *w as i64, at.0))
+            .collect();
+        spans.sort_unstable();
+        let mut union: i64 = 0;
+        let mut cur: Option<(i64, i64)> = None;
+        for (from, to) in spans {
+            match cur {
+                Some((f, t)) if from <= t => cur = Some((f, t.max(to))),
+                Some((f, t)) => {
+                    union += t - f;
+                    cur = Some((from, to));
+                }
+                None => cur = Some((from, to)),
+            }
+        }
+        if let Some((f, t)) = cur {
+            union += t - f;
+        }
         let largest = self.window.iter().map(|(_, w)| *w).max().unwrap_or(0);
-        (self.window.len() as u64, total.saturating_sub(largest))
+        (
+            self.window.len() as u64,
+            (union.max(0) as u64).saturating_sub(largest),
+        )
     }
 }
 
@@ -709,6 +738,26 @@ impl Core {
         if !self.escalated(now) {
             return;
         }
+        // M12 round 2: the inbox was a detour — the holder was briefly
+        // unreachable over P2P (harness `delegate-partition` and
+        // `shared-dir-multi-writer` under load: a link marked down for
+        // a few ops) — and is reachable again: the forwards resume, so
+        // the demand is over. Asking for the lease now would move it off
+        // a root the operator pinned (the wanted grace binds only the
+        // S3 path; a P2P handoff is served at once), for nothing. A
+        // node with no P2P path (M13) is unaffected.
+        if let Some(holder) = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id) {
+            if self.cfg.p2p && self.reaches(now, holder) {
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    holder,
+                    "inbox: the holder is reachable over P2P again; no longer asking for the lease"
+                );
+                self.inbox.escalated_since = None;
+                self.inbox.window.clear();
+                return;
+            }
+        }
         let held = self.lease.ship_epoch(now, &self.cfg).is_some();
         if !held {
             let backoff =
@@ -1141,7 +1190,7 @@ impl Core {
                 // table decides — an op under any live delegation stays
                 // in the inbox for the poll that follows the gate.
                 if let Ok(op) = &decoded {
-                    let keys = super::holder::keys_of_op(op);
+                    let keys = super::holder::keys_of_op_in(op, replica);
                     if !matches!(
                         replica.resolve_ownership(&keys),
                         constellation_meta::delegation::Ownership::Root
@@ -1152,7 +1201,7 @@ impl Core {
             }
             if self.cfg.delegation && !self.dl.gens.is_empty() {
                 if let Ok(op) = &decoded {
-                    let keys = super::holder::keys_of_op(op);
+                    let keys = super::holder::keys_of_op_in(op, replica);
                     match self.deleg_recall_plan(now, &keys, replica, out) {
                         super::delegate::RecallPlan::None => {}
                         super::delegate::RecallPlan::Wait(wait) => {

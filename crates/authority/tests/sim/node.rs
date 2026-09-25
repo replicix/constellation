@@ -16,7 +16,7 @@ use constellation_authority::{
     Action, Carrier, CasFailure, ClientReply, Config, Control, Core, EpochClaimView, Event, NodeId,
     OpId, PeerLink, PeerMsg, Policy, Replica, S3Failure, S3Op, S3Result, Seq, Stats, UploadResult,
 };
-use constellation_meta::{Meta, MutateOp, PublishBasis, Rid};
+use constellation_meta::{Meta, MutateOp, MutateOutcome, PublishBasis, Rid, TouchSet};
 use constellation_store_s3::commits::{CommitChain, CommitPayload};
 use constellation_store_s3::heartbeat::HeartbeatStore;
 use constellation_store_s3::inbox::InboxStore;
@@ -138,6 +138,8 @@ pub struct Shared {
     pub commits: Arc<Mutex<Vec<CommitRecord>>>,
     /// Plan 30 §M10.
     pub epoch: Mutex<SimEpoch>,
+    /// M12 round 2: ops the modelled FUSE fast path executed here.
+    pub fast_path_executed: AtomicU64,
     /// Every `InDoubt` reply of any incarnation (see `NodeEnv`).
     pub in_doubt: InDoubtLog,
 }
@@ -168,6 +170,8 @@ pub struct NodeEnv {
     pub config: Arc<dyn Fn(NodeId, u32) -> Config + Send + Sync>,
     /// See `SimConfig::panic_after_events`.
     pub panic_after_events: Option<u64>,
+    /// See `SimConfig::fast_path`.
+    pub fast_path: super::run::FastPath,
     /// Plan 30 §M8: every node's clock is off by up to this (ms), by a
     /// seeded constant per node.
     pub clock_skew_ms: i64,
@@ -227,6 +231,7 @@ impl NodeHandle {
             tentative: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
             epoch: Mutex::new(epoch),
+            fast_path_executed: AtomicU64::new(0),
             in_doubt: env.in_doubt.clone(),
         });
         env.bus.attach(id, tx.clone());
@@ -248,6 +253,7 @@ impl NodeHandle {
             deferred: Vec::new(),
             events_handled: 0,
             panic_after_events: env.panic_after_events,
+            fast_path: env.fast_path,
         };
         let task = tokio::spawn(driver.run());
         NodeHandle {
@@ -346,6 +352,7 @@ struct Driver {
     /// Events this driver has handled, for `panic_after_events`.
     events_handled: u64,
     panic_after_events: Option<u64>,
+    fast_path: super::run::FastPath,
 }
 
 impl Driver {
@@ -481,6 +488,10 @@ impl Driver {
                 *IN_FLIGHT.lock().unwrap() = Some((self.id, text, std::time::Instant::now()));
             }
             self.events_handled += 1;
+            if let Some(actions) = self.fast_path(now, &event) {
+                self.dispatch(actions);
+                continue;
+            }
             if self.id == 1 && self.panic_after_events == Some(self.events_handled) {
                 panic!(
                     "injected panic after {} events (SimConfig::panic_after_events)",
@@ -616,6 +627,72 @@ impl Driver {
                 t.insert(q.rid);
             }
         }
+    }
+
+    /// M12 round 2: the daemon's FUSE fast path (`SimConfig::fast_path`).
+    /// A client op of a node whose lease is open for a new mutation, and
+    /// which holds no delegation and is not acknowledgement-gated,
+    /// executes here, outside the core, exactly as
+    /// `fusefs::mutate_op_rebasable_with_rid` does: admitted by
+    /// `Meta::root_fast_path` (`Checked`) or blindly (`Unchecked`), then
+    /// `execute_mutate`, the acknowledgement fed to the core as
+    /// `Event::Activity` and the keys to the placement. `None`: not a
+    /// fast-path op; the core handles the event.
+    fn fast_path(
+        &mut self,
+        now: constellation_authority::Ms,
+        event: &Event,
+    ) -> Option<Vec<Action>> {
+        use super::run::FastPath;
+        if self.fast_path == FastPath::Off {
+            return None;
+        }
+        let Event::Submit {
+            rid,
+            op,
+            policy: Policy::Client,
+        } = event
+        else {
+            return None;
+        };
+        let cfg = self.core.config();
+        let epoch = self.core.lease().new_mutation_epoch(now, cfg)?;
+        if self.core.lease().releasing
+            || self.core.ack_gated()
+            || !self.core.deleg_view().mine.is_empty()
+        {
+            return None;
+        }
+        let admission = match self.fast_path {
+            FastPath::Checked => Some(self.meta.root_fast_path(op)?),
+            _ => None,
+        };
+        let outcome = match constellation_meta::execute_mutate(&self.meta, op, Some(*rid)) {
+            Ok(records) => MutateOutcome::Accepted { epoch, records },
+            Err(constellation_meta::MetaError::Conflict) => {
+                MutateOutcome::Conflict { manifest: None }
+            }
+            Err(e) => MutateOutcome::Errno(constellation_authority::core::meta_errno(&e)),
+        };
+        drop(admission);
+        self.shared
+            .fast_path_executed
+            .fetch_add(1, Ordering::Relaxed);
+        self.core
+            .place_note_local(&[TouchSet::from_op(op)], &*self.meta);
+        let mut actions = self.core.handle(
+            now,
+            Event::Activity {
+                last_write: now,
+                acked_seqs: vec![rid.seq],
+            },
+            &*self.meta,
+        );
+        actions.push(Action::Reply {
+            rid: *rid,
+            reply: ClientReply::Outcome(outcome),
+        });
+        Some(actions)
     }
 
     fn dispatch(&mut self, actions: Vec<Action>) {

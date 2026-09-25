@@ -435,6 +435,14 @@ impl Core {
             self.stats.own_recovered += 1;
             // Plan 30 §M9: durable in the log, whichever way we learned it.
             self.note_shipped(&seqs, seg.through);
+            // M12 round 2 (long-sessions seed 10146): the segment is in
+            // the window a forward reply's `base` is computed from, like
+            // one whose PUT answered — or a reply names a base below a
+            // rename this segment carried, and the requester's shadow
+            // installs on a state where the name still exists (its
+            // create skipped, the inode never materialised: node 1 ended
+            // with a dentry to an inode it did not have).
+            self.note_shipped_touches(seq, payload);
             tracing::info!(
                 node = self.cfg.node_id,
                 seq,

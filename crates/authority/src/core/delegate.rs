@@ -59,7 +59,7 @@ use crate::event::PeerMsg;
 use crate::ids::{Ms, NodeId, OpId, TimerId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
-use constellation_meta::delegation::Ownership;
+use constellation_meta::delegation::{Ownership, Range};
 use constellation_meta::{LogRecord, MetaError, MutateOp, MutateOutcome, Position, Rid, TouchSet};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -99,6 +99,8 @@ pub enum DelegKind {
 pub(crate) struct GenState {
     pub dir: Ino,
     pub node: NodeId,
+    /// Plan 30 §M12: the part of `dir` (a hash range, or the whole).
+    pub range: Range,
     /// Why it exists (phase 2b): an operator, the placement, a
     /// designation.
     pub kind: DelegKind,
@@ -256,10 +258,6 @@ pub struct DelegView {
 }
 
 /// The keys `op` touches, as ownership is resolved over them.
-pub(crate) fn op_keys(op: &MutateOp) -> TouchSet {
-    super::holder::keys_of_op(op)
-}
-
 impl Core {
     pub fn deleg_view(&self) -> DelegView {
         DelegView {
@@ -452,6 +450,7 @@ impl Core {
                     GenState {
                         dir: d.dir,
                         node: d.node,
+                        range: d.range,
                         kind: if d.designated {
                             DelegKind::Designated
                         } else {
@@ -613,7 +612,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
-        let keys = op_keys(op);
+        let keys = super::holder::keys_of_op_in(op, replica);
         let Some(gen) = self.my_generation_for(&keys, replica) else {
             return false;
         };
@@ -1088,7 +1087,7 @@ impl Core {
         if gs.ended || gs.backup != Some(from) {
             return;
         }
-        let (dir, kind) = (gs.dir, gs.kind);
+        let (dir, kind, range) = (gs.dir, gs.kind, gs.range);
         if sealed && self.root_usable(now) {
             let mut cursor = gs.cursor;
             let mut drained = 0u64;
@@ -1133,7 +1132,7 @@ impl Core {
         }
         self.end_generation(now, gen, replica, out);
         if sealed && kind != DelegKind::Designated {
-            match self.delegate_dir(now, dir, from, kind, replica, out) {
+            match self.delegate_dir(now, dir, from, kind, range, replica, out) {
                 Ok(new_gen) => {
                     tracing::info!(
                         node = self.me(),
@@ -1161,6 +1160,11 @@ impl Core {
         // Phase 2b: the placement runs on the root, delegations or not.
         if self.root_usable(now) {
             self.place_arm(now, out);
+            // M12: a re-delegation held back (the op still parked, the
+            // delegate away) is tried again on the next event.
+            if self.dl.gens.values().any(|g| g.ended && g.redelegate) {
+                self.deleg_redelegate_after_cross(now, replica, out);
+            }
         }
         if self.dl.mine.is_empty() && self.dl.gens.is_empty() {
             return;
@@ -1337,7 +1341,24 @@ impl Core {
                 continue;
             }
             let from = d.streamed_through + 1;
-            let txs = replica.delegate_txs_from(gen, from, self.cfg.delegation_stream_rows);
+            let mut txs = replica.delegate_txs_from(gen, from, self.cfg.delegation_stream_rows);
+            // Plan 30 §M12: a node holds several generations (the ranges
+            // of a directory, a subtree); a transaction of one may depend
+            // on this node's own execution under another (it reached it
+            // locally). The root must hold that first: the batch stops
+            // before a transaction whose own-generation deps the root has
+            // not acknowledged, and goes out once it has.
+            let acked_here = |h: u64, i: u64, mine: &BTreeMap<u64, DelegateState>| -> bool {
+                h == gen || mine.get(&h).is_none_or(|o| o.streamed_through >= i)
+            };
+            if let Some(stop) = txs.iter().position(|t| {
+                t.deps
+                    .streams
+                    .iter()
+                    .any(|(h, i)| !acked_here(h, i, &self.dl.mine))
+            }) {
+                txs.truncate(stop);
+            }
             if txs.is_empty() {
                 continue;
             }
@@ -1362,13 +1383,13 @@ impl Core {
             });
         }
         // A lost ack (the transport reports it), a batch that could not
-        // be sent, or a generation backing off: the tick retries.
-        if self
-            .dl
-            .mine
-            .values()
-            .any(|d| d.inflight.is_some() || d.stream_after.is_some_and(|t| now < t))
-        {
+        // be sent, a generation backing off, or rows held back behind
+        // another generation's acknowledgement: the tick retries.
+        if self.dl.mine.values().any(|d| {
+            d.inflight.is_some()
+                || d.stream_after.is_some_and(|t| now < t)
+                || (!d.stopped && replica.delegate_idx(d.gen) > d.streamed_through)
+        }) {
             self.arm_stream_tick(now, out);
         }
     }
@@ -1886,14 +1907,14 @@ impl Core {
         if !self.root_usable(now) {
             return;
         }
-        let again: Vec<(u64, Ino, NodeId, DelegKind)> = self
+        let again: Vec<(u64, Ino, NodeId, DelegKind, Range)> = self
             .dl
             .gens
             .iter()
             .filter(|(_, g)| g.ended && g.redelegate)
-            .map(|(gen, g)| (*gen, g.dir, g.node, g.kind))
+            .map(|(gen, g)| (*gen, g.dir, g.node, g.kind, g.range))
             .collect();
-        for (gen, dir, node, kind) in again {
+        for (gen, dir, node, kind, range) in again {
             if let Some(g) = self.dl.gens.get_mut(&gen) {
                 g.redelegate = false;
             }
@@ -1908,9 +1929,14 @@ impl Core {
                 continue;
             }
             if !self.links.get(&node).is_some_and(|l| l.connected) {
+                // The delegate is away for the moment (M12: a range's
+                // delegate reconnecting mid-recall): once it is back.
+                if let Some(g) = self.dl.gens.get_mut(&gen) {
+                    g.redelegate = true;
+                }
                 continue;
             }
-            match self.delegate_dir(now, dir, node, kind, replica, out) {
+            match self.delegate_dir(now, dir, node, kind, range, replica, out) {
                 Ok(new_gen) => {
                     self.stats.deleg_redelegated += 1;
                     tracing::info!(
@@ -2242,6 +2268,14 @@ impl Core {
             // and count it; the delegate re-sends after a tick.
             if !replica.reaches_streams(&tx.deps) {
                 self.stats.deleg_deps_unsatisfied_at_append += 1;
+                tracing::debug!(
+                    node = self.me(),
+                    gen,
+                    idx = tx.idx,
+                    deps = ?tx.deps,
+                    applied = ?replica.applied_position(),
+                    "delegate batch refused: the root lacks its deps"
+                );
                 break;
             }
             match replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps) {
@@ -2292,12 +2326,14 @@ impl Core {
 
     // ----------------------------------------------------- controls
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_control_delegate(
         &mut self,
         now: Ms,
         op: OpId,
         dir: Ino,
         node: NodeId,
+        range: Range,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2307,7 +2343,7 @@ impl Core {
                 result: Err(msg),
             });
         };
-        match self.delegate_dir(now, dir, node, DelegKind::Manual, replica, out) {
+        match self.delegate_dir(now, dir, node, DelegKind::Manual, range, replica, out) {
             Ok(gen) => out.push(Action::ControlDone {
                 op,
                 result: Ok(ControlOk::Text(format!(
@@ -2322,12 +2358,14 @@ impl Core {
     /// root's generation state. The checks every path shares (an
     /// operator's control, the placement, a designation, a
     /// re-delegation after a cross-subtree op).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn delegate_dir(
         &mut self,
         now: Ms,
         dir: Ino,
         node: NodeId,
         kind: DelegKind,
+        range: Range,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<u64, String> {
@@ -2347,21 +2385,57 @@ impl Core {
             return Err("cannot delegate to the root itself".into());
         }
         let table = replica.delegation_table();
-        if let Some(d) = table.owner_of_dir(replica.namespace(), dir) {
+        if let Some(d) = table.covering(replica.namespace(), dir) {
             return Err(format!(
                 "directory {dir} is under delegation {} (gen {})",
                 d.dir, d.gen
             ));
         }
-        // A delegation on a descendant of `dir` would be shadowed.
-        if table
-            .iter()
-            .any(|d| d.dir != dir && is_under(replica.namespace(), d.dir, dir))
-        {
-            return Err(format!("a directory under {dir} is already delegated"));
-        }
-        if kind != DelegKind::Designated && table.iter().any(|d| d.node == node && !d.designated) {
-            return Err(format!("node {node} already holds a delegation"));
+        if range.is_whole() {
+            if table.is_split(dir) {
+                return Err(format!("directory {dir} is split into ranges"));
+            }
+            // A delegation on a descendant of `dir` would be shadowed.
+            if table
+                .iter()
+                .any(|d| d.dir != dir && is_under(replica.namespace(), d.dir, dir))
+            {
+                return Err(format!("a directory under {dir} is already delegated"));
+            }
+            if kind != DelegKind::Designated
+                && table
+                    .iter()
+                    .any(|d| d.node == node && !d.designated && d.range.is_whole())
+            {
+                return Err(format!("node {node} already holds a delegation"));
+            }
+        } else {
+            // Plan 30 §M12: one split depth per directory; a range is
+            // delegated once; never over a designation.
+            if kind == DelegKind::Designated {
+                return Err("a designation covers a whole directory".into());
+            }
+            let ranges = table.ranges_of(dir);
+            if let Some(d) = ranges.iter().find(|d| d.range.is_whole()) {
+                return Err(format!(
+                    "directory {dir} is wholly delegated (gen {})",
+                    d.gen
+                ));
+            }
+            if let Some(d) = ranges.iter().find(|d| d.range.bits != range.bits) {
+                return Err(format!(
+                    "directory {dir} is split {} ways, not {}",
+                    1u64 << d.range.bits,
+                    1u64 << range.bits
+                ));
+            }
+            if let Some(d) = ranges.iter().find(|d| d.range == range) {
+                return Err(format!(
+                    "range {} of {dir} is delegated (gen {})",
+                    range.label(),
+                    d.gen
+                ));
+            }
         }
         // Above every generation the log ever named (a predecessor's
         // ended ones included): a generation is a stream's identity.
@@ -2377,6 +2451,7 @@ impl Core {
                     node,
                     gen,
                     designated,
+                    range: (range.bits, range.idx),
                 }],
                 None,
             )
@@ -2386,6 +2461,7 @@ impl Core {
             GenState {
                 dir,
                 node,
+                range,
                 kind,
                 backup: None,
                 redelegate: false,
@@ -2463,14 +2539,31 @@ impl Core {
                 }
                 _ => {}
             }
-            if let Some(d) = table.owner_of_dir(replica.namespace(), dir) {
+            if let Some(d) = table.covering(replica.namespace(), dir) {
                 if !d.designated && self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
                     self.start_recall(now, d.gen, out);
                 }
                 continue;
             }
-            if let Err(why) = self.delegate_dir(now, dir, node, DelegKind::Designated, replica, out)
-            {
+            if table.is_split(dir) {
+                // Plan 30 §M12: the ranges end first; the designation
+                // follows on the next sync.
+                for d in table.ranges_of(dir) {
+                    if self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
+                        self.start_recall(now, d.gen, out);
+                    }
+                }
+                continue;
+            }
+            if let Err(why) = self.delegate_dir(
+                now,
+                dir,
+                node,
+                DelegKind::Designated,
+                Range::WHOLE,
+                replica,
+                out,
+            ) {
                 tracing::debug!(
                     node = self.me(),
                     dir,
@@ -2513,14 +2606,25 @@ impl Core {
             });
             return;
         }
-        let gen = replica.delegation_table().get(dir).map(|d| d.gen);
-        let Some(gen) = gen.filter(|g| self.dl.gens.contains_key(g)) else {
+        // Plan 30 §M12: every generation of the directory (one whole, or
+        // its ranges); the control is answered when the last one ended.
+        let gens: Vec<u64> = replica
+            .delegation_table()
+            .ranges_of(dir)
+            .iter()
+            .map(|d| d.gen)
+            .filter(|g| self.dl.gens.get(g).is_some_and(|s| !s.ended))
+            .collect();
+        let Some(&gen) = gens.last() else {
             out.push(Action::ControlDone {
                 op,
                 result: Err(format!("directory {dir} is not delegated")),
             });
             return;
         };
+        for g in gens.iter().filter(|g| **g != gen) {
+            self.start_recall(now, *g, out);
+        }
         self.dl
             .gens
             .get_mut(&gen)

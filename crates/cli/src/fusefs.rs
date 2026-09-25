@@ -392,6 +392,8 @@ pub enum SyncRequest {
     Delegate {
         dir: Ino,
         node: u64,
+        /// Plan 30 §M12: `(bits, idx)`; `(0, 0)` is the whole directory.
+        range: (u8, u32),
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     Undelegate {
@@ -718,7 +720,9 @@ fn to_fuse_attr(a: &FileAttr) -> fuser::FileAttr {
 fn time_or_now_ns(t: TimeOrNow) -> i64 {
     let st = match t {
         TimeOrNow::SpecificTime(st) => st,
-        TimeOrNow::Now => SystemTime::now(),
+        // Plan 30 §M12: "now" is the node's HLC (never below a stamp it
+        // applied), like every other timestamp a mutation writes.
+        TimeOrNow::Now => return constellation_meta::hlc::now_ns(),
     };
     st.duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
@@ -1699,6 +1703,21 @@ impl ConstellationFs {
                 };
             }
         }
+        // Plan 30 §M12: the root's fast path executes only what the root
+        // owns. A name a live delegation owns — a subtree, or a hash
+        // range of this very directory — goes through the core, which
+        // forwards it to the delegate or recalls the grant first. The
+        // check and the execution hold the delegation gate shared, so no
+        // grant is journaled between them (`Meta::deleg_gate`; before it,
+        // the root executed its own creates and unlinks in a split
+        // directory behind the range's delegate: two winners under
+        // harness `chaos-soak-4`). Placement counts these executions
+        // too (`note_fast_path`), or the root's share of a directory is
+        // invisible to it.
+        let Some(gate) = self.meta.root_fast_path(op) else {
+            h.delegates.note_routed();
+            return self.submit_to_core(h, op, rid, false);
+        };
         // Plan 30 §M3b: the fast path admits the op (counted in flight)
         // atomically with respect to a release's final flush + CAS — see
         // `lease.rs`'s module doc, "The releasing flag".
@@ -1715,6 +1734,9 @@ impl ConstellationFs {
             // The row is journaled: a release's quiescence wait need not
             // wait on the recall below (it recalls every grant itself).
             drop(admitted);
+            drop(gate);
+            h.delegates
+                .note_fast_path(constellation_meta::TouchSet::from_op(op));
             return match result {
                 Ok(records) => {
                     h.lease.touch();
@@ -1729,6 +1751,7 @@ impl ConstellationFs {
                 Err(e) => Err(mutate_fail(e)),
             };
         }
+        drop(gate);
         if h.lease.is_lost() {
             return Err(MutateFail::Errno(libc::EIO));
         }
@@ -2392,7 +2415,32 @@ impl ConstellationFs {
         // releasing flag". The guard is dropped right after the commit:
         // the chunk drain below can take long and must not hold a release.
         let view = self.sync.as_ref().map(|handle| handle.lease.clone());
-        let admitted = view.as_ref().and_then(|view| view.admit());
+        let mut admitted = view.as_ref().and_then(|view| view.admit());
+        // Plan 30 §M12: the sequencer's own commit runs here only for a
+        // file the root owns; one a range's (or a subtree's) delegate owns
+        // goes through the core, like the file's create did — before,
+        // the root committed the manifest of a file it had created
+        // through a range delegate against a replica that lacked the
+        // inode, the close's error was swallowed and the content never
+        // published (harness `shared-dir-multi-writer`, the root's own
+        // files in the split phase read back empty for the whole run).
+        // The admission holds the delegation gate shared across the
+        // commit (`Meta::root_fast_path`).
+        let owned = admitted.as_ref().and_then(|_| {
+            self.meta
+                .root_fast_path(&constellation_meta::MutateOp::SetManifest {
+                    ino,
+                    base_manifest: None,
+                    manifest: Vec::new(),
+                    size: 0,
+                })
+        });
+        if admitted.is_some() && owned.is_none() {
+            admitted = None;
+            if let Some(h) = &self.sync {
+                h.delegates.note_routed();
+            }
+        }
         let holds_lease = self.sync.is_none() || admitted.is_some();
         if holds_lease {
             // Plan 30 §M9: under a durability gate the commit is
@@ -2406,6 +2454,7 @@ impl ConstellationFs {
                 self.commit_manifest_local(ino, &ws, base, manifest_bytes, dirty_hashes);
             let jseq =
                 (gated && committed.is_ok()).then(|| self.meta.journal_tip().unwrap_or(u64::MAX));
+            drop(owned);
             drop(admitted);
             if let Err(error) = committed {
                 writes.insert(ino, ws);

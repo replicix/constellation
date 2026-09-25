@@ -245,6 +245,10 @@ enum Command {
         /// The delegate's node id.
         #[arg(long)]
         to: u64,
+        /// Plan 30 §M12: one name-hash range of the directory,
+        /// `<idx>/<count>` (count 2, 4, 8 or 16), instead of the whole.
+        #[arg(long)]
+        range: Option<String>,
     },
     /// Plan 30 §M11: recall the delegation on a directory.
     Undelegate {
@@ -1087,12 +1091,17 @@ fn main() -> Result<()> {
             target,
             state_dir,
             to,
+            range,
         } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
             rt.block_on(control_call(
                 &dir,
-                constellation_api::Request::Delegate { path, node: to },
+                constellation_api::Request::Delegate {
+                    path,
+                    node: to,
+                    range,
+                },
             ))
         }
         Command::Undelegate { target, state_dir } => {
@@ -4457,12 +4466,14 @@ impl constellation_api::StatusSource for DaemonStatus {
                             node: d.node,
                             gen: d.gen,
                             designated: d.designated,
+                            range: d.range.label(),
                         })
                         .collect(),
                     mine: v.mine.clone(),
                     gens: v.gens.clone(),
                     executed: stats.deleg_executed,
                     fast_path_executed: core.delegation_fast_path_executed,
+                    fast_path_routed: core.delegation_fast_path_routed,
                     forwarded_to_delegate: stats.deleg_forwarded,
                     deps_waits: stats.deleg_deps_waits,
                     parked_expired: stats.deleg_parked_expired,
@@ -4506,6 +4517,8 @@ impl constellation_api::StatusSource for DaemonStatus {
                     place_recalled: stats.place_recalled,
                     place_skipped_cooldown: stats.place_skipped_cooldown,
                     place_skipped_unreachable: stats.place_skipped_unreachable,
+                    place_splits: stats.place_splits,
+                    place_range_recalls: stats.place_range_recalls,
                     read_index_served: stats.deleg_read_index_served,
                     read_grants: stats.deleg_read_grants,
                 }
@@ -4712,15 +4725,42 @@ impl constellation_api::StatusSource for DaemonStatus {
             .collect()
     }
 
-    fn delegate(&self, path: &str, node: u64) -> std::result::Result<String, String> {
+    fn delegate(
+        &self,
+        path: &str,
+        node: u64,
+        range: Option<&str>,
+    ) -> std::result::Result<String, String> {
         let dir = self
             .meta
             .resolve_path(path)
             .map_err(|e| format!("{e:#}"))?
             .ok_or_else(|| format!("no such directory: {path}"))?;
+        // Plan 30 §M12: `"<idx>/<count>"`, `count` a power of two.
+        let range = match range.map(str::trim).filter(|r| !r.is_empty()) {
+            None => (0u8, 0u32),
+            Some(r) => {
+                let (i, k) = r
+                    .split_once('/')
+                    .ok_or_else(|| format!("range {r}: expected <idx>/<count>"))?;
+                let idx: u32 = i.parse().map_err(|_| format!("range {r}: bad index"))?;
+                let count: u32 = k.parse().map_err(|_| format!("range {r}: bad count"))?;
+                if !count.is_power_of_two() || count > 16 || idx >= count {
+                    return Err(format!(
+                        "range {r}: count must be 2, 4, 8 or 16 and idx below it"
+                    ));
+                }
+                (count.trailing_zeros() as u8, idx)
+            }
+        };
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sync_tx
-            .send(fusefs::SyncRequest::Delegate { dir, node, reply })
+            .send(fusefs::SyncRequest::Delegate {
+                dir,
+                node,
+                range,
+                reply,
+            })
             .map_err(|_| "sync task is not running".to_string())?;
         tokio::task::block_in_place(|| {
             self.rt
@@ -4756,6 +4796,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                 node: d.node,
                 gen: d.gen,
                 designated: d.designated,
+                range: d.range.label(),
             })
             .collect()
     }

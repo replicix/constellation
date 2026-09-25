@@ -17,56 +17,23 @@ use constellation_meta::{MetaError, MutateOp, MutateOutcome, Position, Rid, Touc
 /// set keeps them.
 /// Whether two touch sets share a dentry or an inode.
 pub(crate) fn touch_sets_overlap(a: &TouchSet, b: &TouchSet) -> bool {
-    a.dentries.iter().any(|d| b.dentries.contains(d)) || a.inos.iter().any(|i| b.inos.contains(i))
+    a.overlaps(b)
 }
 
+/// The keys `op` reads or writes, before it runs (plan 30 §M12: a
+/// dentry plus a *shared* hold on its directory for a create, unlink,
+/// link or rename; an *exclusive* hold on an inode whose own attributes
+/// change).
 pub(crate) fn keys_of_op(op: &MutateOp) -> TouchSet {
-    let mut set = TouchSet::default();
-    let mut dentry = |p: u64, n: &str| {
-        set.dentries.insert((p, n.to_string()));
-    };
-    match op {
-        MutateOp::Mkdir { parent, name, .. }
-        | MutateOp::Create { parent, name, .. }
-        | MutateOp::Symlink { parent, name, .. }
-        | MutateOp::Mknod { parent, name, .. }
-        | MutateOp::Unlink { parent, name }
-        | MutateOp::Rmdir { parent, name } => dentry(*parent, name),
-        MutateOp::Link { ino, parent, name } => {
-            dentry(*parent, name);
-            set.inos.insert(*ino);
-        }
-        MutateOp::Rename {
-            parent,
-            name,
-            new_parent,
-            new_name,
-        } => {
-            dentry(*parent, name);
-            dentry(*new_parent, new_name);
-        }
-        MutateOp::Setattr { ino, .. }
-        | MutateOp::SetManifest { ino, .. }
-        | MutateOp::SetXattr { ino, .. }
-        | MutateOp::RemoveXattr { ino, .. } => {
-            set.inos.insert(*ino);
-        }
-        MutateOp::Publish {
-            ino, parent, name, ..
-        } => {
-            dentry(*parent, name);
-            set.inos.insert(*ino);
-        }
-        MutateOp::AtimeBatch { entries } => {
-            for (i, _, _) in entries {
-                set.inos.insert(*i);
-            }
-        }
-        MutateOp::Records { records } => {
-            set = TouchSet::from_records(records.iter());
-        }
-    }
-    set
+    TouchSet::from_op(op)
+}
+
+/// [`keys_of_op`] plus the inodes the op takes away or moves, looked up
+/// on `replica` (plan 30 §M12: an rmdir or a rename holds the directory
+/// it removes or moves *exclusively* — against the creates inside it,
+/// and against a delegation of it).
+pub(crate) fn keys_of_op_in(op: &MutateOp, replica: &dyn Replica) -> TouchSet {
+    TouchSet::from_op_in(op, &|p, n| replica.lookup_ino(p, n))
 }
 
 impl Core {
@@ -116,6 +83,34 @@ impl Core {
         {
             return;
         }
+        // Plan 30 §M12: the table names this node the owner (a range or
+        // a subtree just delegated) but the grant is not installed yet:
+        // the requester retries here in a moment rather than bouncing
+        // between the root and this node until its redirects run out.
+        if self.cfg.delegation && req != OpId(0) && self.lease.ship_epoch(now, &self.cfg).is_none()
+        {
+            if let Ownership::Delegated(d) = replica.resolve_ownership(&keys_of_op_in(&op, replica))
+            {
+                if d.node == self.cfg.node_id
+                    && !self.dl.mine.get(&d.gen).is_some_and(|m| m.stopped)
+                {
+                    self.stats.deleg_not_owner += 1;
+                    out.push(Action::Send {
+                        to: from,
+                        msg: PeerMsg::MutateReply {
+                            req,
+                            outcome: MutateOutcome::Held {
+                                retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
+                            },
+                            base: None,
+                            position: Position::ZERO,
+                            gen: 0,
+                        },
+                    });
+                    return;
+                }
+            }
+        }
         let mut base = None;
         let mut position = Position::ZERO;
         let mut fresh = None;
@@ -126,7 +121,7 @@ impl Core {
             // handoff pause closes this node's *own* new writes so a
             // waiter can claim, not a peer's forwarded ones.
             if self.cfg.delegation && !self.dl.gens.is_empty() {
-                let keys = keys_of_op(&op);
+                let keys = keys_of_op_in(&op, replica);
                 if let Ownership::Delegated(d) = replica.resolve_ownership(&keys) {
                     if d.node != self.cfg.node_id
                         && self

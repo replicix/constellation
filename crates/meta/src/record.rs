@@ -216,6 +216,12 @@ pub enum LogRecord {
         /// cross-subtree op touching it is refused (`EXDEV`).
         #[serde(default)]
         designated: bool,
+        /// Plan 30 §M12: the name-hash range of `dir` this generation
+        /// owns (`(0, 0)`: the whole directory and its subtree; `(b,
+        /// i)`: the names whose hash's top `b` bits are `i`, in `dir`
+        /// itself only — GIGA+).
+        #[serde(default)]
+        range: (u8, u32),
     },
     /// Plan 30 §M11: generation `gen` of the delegation on `dir` ended.
     /// Every record of its stream that is not before this one in the log
@@ -233,6 +239,27 @@ pub enum LogRecord {
     /// for a TTL takeover, whose predecessor's unshipped work is lost,
     /// but not here: that work comes back). Touches nothing.
     TailFollows { prev_epoch: u64 },
+}
+
+impl LogRecord {
+    /// Plan 30 §M12: the HLC stamp the record carries, if any.
+    pub fn stamp_ns(&self) -> Option<i64> {
+        match self {
+            LogRecord::Mkdir { time_ns, .. } => Some(*time_ns),
+            LogRecord::Create { time_ns, .. } => Some(*time_ns),
+            LogRecord::Symlink { time_ns, .. } => Some(*time_ns),
+            LogRecord::Mknod { time_ns, .. } => Some(*time_ns),
+            LogRecord::Link { time_ns, .. } => Some(*time_ns),
+            LogRecord::Unlink { time_ns, .. } => Some(*time_ns),
+            LogRecord::Rmdir { time_ns, .. } => Some(*time_ns),
+            LogRecord::Rename { time_ns, .. } => Some(*time_ns),
+            LogRecord::Setattr { time_ns, .. } => Some(*time_ns),
+            LogRecord::WriteManifest { time_ns, .. } => Some(*time_ns),
+            LogRecord::SetXattr { time_ns, .. } => Some(*time_ns),
+            LogRecord::RemoveXattr { time_ns, .. } => Some(*time_ns),
+            _ => None,
+        }
+    }
 }
 
 impl LogRecord {

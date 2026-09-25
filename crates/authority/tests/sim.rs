@@ -274,6 +274,7 @@ fn replay_seed() {
         Ok("backup-strict") => backup_strict_config(),
         Ok("backup-crash") => backup_crash_config(),
         Ok("holder-cut") => holder_cut_crash_config(true),
+        Ok("delegated-holder-cut") => delegated_holder_cut_config(),
         Ok("holder-cut-join") => holder_cut_crash_config(false),
         Ok("backup-crash-slow") => SimConfig {
             s3_latency: (60, 200),
@@ -308,6 +309,12 @@ fn replay_seed() {
         Ok("delegated-designated") => delegated_designated_config(),
         Ok("delegated-placement") => delegated_placement_config(),
         Ok("delegated-strict") => delegated_strict_config(),
+        Ok("shared-dir") => shared_dir_config(),
+        Ok("shared-dir-split") => shared_dir_split_config(),
+        Ok("shared-dir-fast-path") => shared_dir_fast_path_config(),
+        Ok("shared-dir-fast-path-unchecked") => shared_dir_fast_path_unchecked_config(),
+        Ok("shared-dir-ranges") => shared_dir_ranges_config(),
+        Ok("shared-dir-faults") => shared_dir_faults_config(),
         Ok("long-delegated") => long_delegated_config(),
         // Plan 30 §M7.
         Ok("streams-off") => streams_off_config(),
@@ -2011,6 +2018,50 @@ fn a_holder_alone_cut_from_s3_forms_no_epoch_and_fails_over() {
     assert!(stuck > 0, "without the rule no peer was ever stuck");
 }
 
+/// M12 round 2 × 623da2c: the holder-cut shape with live delegations
+/// (the delegates are the members that reach S3 and decline the cut
+/// root's proposal; the root dies; its backup takes over inside the
+/// TTL and inherits the delegation table from the log, the delegates
+/// re-stream to it). No epoch, a failover well inside the restart,
+/// every directory's history linearizable (`run_seed`'s checks).
+fn delegated_holder_cut_config() -> SimConfig {
+    SimConfig {
+        faults: holder_cut_crash_config(true).faults,
+        read_ratio: 0.0,
+        ..delegated_backup_config()
+    }
+}
+
+#[test]
+fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
+    let restart = 9_000;
+    let mut epochs = 0;
+    let mut failovers = Vec::new();
+    let mut executed = 0;
+    for seed in 1600..1612 {
+        let report = run_seed(seed, delegated_holder_cut_config()).unwrap_or_else(|e| {
+            panic!(
+                "delegated-holder-cut seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=delegated-holder-cut"
+            )
+        });
+        epochs += report.epochs_formed;
+        failovers.extend(report.failover_ms.iter().copied());
+        executed += report.stats.values().map(|s| s.deleg_executed).sum::<u64>();
+    }
+    eprintln!(
+        "delegated-holder-cut: epochs {epochs}, failovers {failovers:?}, executed {executed}"
+    );
+    assert_eq!(epochs, 0, "a delegate that reaches S3 joined an epoch");
+    assert!(executed > 0, "the delegates never executed");
+    assert!(!failovers.is_empty(), "no failover measured");
+    let ttl = sim::run::backup_core_config(1, 1).ttl_ms;
+    assert!(
+        failovers.iter().all(|ms| *ms < ttl.min(restart)),
+        "a failover waited for the TTL or the holder's return: {failovers:?}"
+    );
+}
+
 /// Plan 30 §M10: many more seeds of the epoch configurations.
 #[test]
 #[ignore]
@@ -2208,8 +2259,79 @@ fn delegated_placement_config() -> SimConfig {
         delegations: Vec::new(),
         cross_ratio: 0.0,
         ops_per_client: 16,
+        // M12: the placement may split a shared directory; per range.
+        check_range_bits: 2,
         core: std::sync::Arc::new(sim::run::placement_core_config),
         ..delegated_config()
+    }
+}
+
+/// Plan 30 §M12: four nodes, every client writing names of its own in
+/// one shared directory; no delegation at all (the single sequencer):
+/// the commutative parent attributes alone.
+fn shared_dir_config() -> SimConfig {
+    SimConfig {
+        nodes: 4,
+        clients_per_node: 2,
+        ops_per_client: 8,
+        names: 3,
+        dirs: vec!["shared".into(), "other".into()],
+        delegations: Vec::new(),
+        shared_dir: true,
+        cross_ratio: 0.0,
+        ..delegated_config()
+    }
+}
+
+/// Plan 30 §M12: the same workload with the placement on: the root
+/// splits `shared` into hash ranges delegated to the writers.
+fn shared_dir_split_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 20,
+        names: 6,
+        check_range_bits: 2,
+        core: std::sync::Arc::new(sim::run::placement_core_config),
+        ..shared_dir_config()
+    }
+}
+
+/// M12 round 2: the split workload with the daemon's FUSE fast path
+/// modelled — the root executes its own ops outside the core, admitted
+/// by `Meta::root_fast_path` (harness `chaos-soak-4`: four nodes racing
+/// on the same names, the placement splitting the directory under them).
+fn shared_dir_fast_path_config() -> SimConfig {
+    SimConfig {
+        fast_path: sim::run::FastPath::Checked,
+        ..shared_dir_split_config()
+    }
+}
+
+/// The same with the admission skipped: the daemon before round 2.
+fn shared_dir_fast_path_unchecked_config() -> SimConfig {
+    SimConfig {
+        fast_path: sim::run::FastPath::Unchecked,
+        ..shared_dir_split_config()
+    }
+}
+
+/// Plan 30 §M12: `shared` split two ways by hand (node 2 the low range,
+/// node 3 the high one), renames within the directory crossing ranges:
+/// the root's recall path.
+fn shared_dir_ranges_config() -> SimConfig {
+    SimConfig {
+        range_delegations: vec![("shared".into(), 2, (1, 0)), ("shared".into(), 3, (1, 1))],
+        ops_per_client: 10,
+        check_range_bits: 1,
+        ..shared_dir_config()
+    }
+}
+
+/// The hand split under random faults (crashes, partitions, a root
+/// failover with live range delegates).
+fn shared_dir_faults_config() -> SimConfig {
+    SimConfig {
+        random_faults: 2,
+        ..shared_dir_ranges_config()
     }
 }
 
@@ -2236,6 +2358,7 @@ fn long_delegated_config() -> SimConfig {
 #[derive(Debug, Default, Clone)]
 struct M11Totals {
     seeds: u64,
+    fast_path_executed: u64,
     executed: u64,
     forwarded: u64,
     appended: u64,
@@ -2264,6 +2387,8 @@ struct M11Totals {
     acks_parked: u64,
     place_delegated: u64,
     place_recalled: u64,
+    place_splits: u64,
+    place_range_recalls: u64,
     redelegated: u64,
     refused_designated: u64,
     designated: u64,
@@ -2273,6 +2398,7 @@ struct M11Totals {
 
 impl M11Totals {
     fn add(&mut self, r: &Report) {
+        self.fast_path_executed += r.fast_path_executed;
         self.seeds += 1;
         for s in r.stats.values() {
             self.executed += s.deleg_executed;
@@ -2299,6 +2425,8 @@ impl M11Totals {
             self.acks_parked += s.deleg_acks_parked;
             self.place_delegated += s.place_delegated;
             self.place_recalled += s.place_recalled;
+            self.place_splits += s.place_splits;
+            self.place_range_recalls += s.place_range_recalls;
             self.redelegated += s.deleg_redelegated;
             self.refused_designated += s.deleg_refused_designated;
             self.designated += s.deleg_designated;
@@ -2481,6 +2609,91 @@ fn delegated_placement_delegates_dominated_subtrees() {
     assert!(t.executed > 0, "placed delegates never executed: {t:?}");
 }
 
+/// Plan 30 §M12: a shared directory with the single sequencer — the
+/// commutative parent attributes converge on every replica (the
+/// convergence check compares the parents' times and link counts).
+#[test]
+fn shared_dir_single_sequencer_converges() {
+    let t = run_m11("shared-dir", shared_dir_config(), 72_000..72_020);
+    assert!(
+        t.dirs_checked >= t.seeds as usize,
+        "per-directory checks missing: {t:?}"
+    );
+}
+
+/// Plan 30 §M12: the placement splits the hot shared directory into
+/// hash ranges; the delegates execute their ranges locally; every
+/// directory's history is linearizable and the replicas converge.
+#[test]
+fn shared_dir_is_split_into_ranges() {
+    let t = run_m11(
+        "shared-dir-split",
+        shared_dir_split_config(),
+        73_000..73_020,
+    );
+    assert!(t.place_splits > 0, "the placement never split: {t:?}");
+    assert!(t.executed > 0, "range delegates never executed: {t:?}");
+}
+
+/// M12 round 2: the root's fast path executes what the root owns and
+/// sends what a range's delegate owns through the core; every
+/// directory's history stays linearizable under the split.
+#[test]
+fn shared_dir_fast_path_respects_the_ranges() {
+    let t = run_m11(
+        "shared-dir-fast-path",
+        shared_dir_fast_path_config(),
+        76_000..76_020,
+    );
+    assert!(t.place_splits > 0, "the placement never split: {t:?}");
+    assert!(t.executed > 0, "range delegates never executed: {t:?}");
+    assert!(
+        t.fast_path_executed > 0,
+        "the fast path never executed: {t:?}"
+    );
+}
+
+/// M12 round 2: without the admission the root executes, on its fast
+/// path, names the log has given to a range's delegate — two winners
+/// for one create or unlink (the tester's `chaos-soak-4` under the
+/// placement). The checker catches it on these seeds.
+#[test]
+fn shared_dir_unchecked_fast_path_is_caught() {
+    let mut caught = 0;
+    for seed in 77_000..77_010 {
+        if let Err(e) = run_seed(seed, shared_dir_fast_path_unchecked_config()) {
+            eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
+            caught += 1;
+        }
+    }
+    assert!(caught > 0, "the unchecked fast path was never caught");
+}
+
+/// Plan 30 §M12: a hand split with cross-range renames: recalled by the
+/// root, re-delegated after.
+#[test]
+fn shared_dir_ranges_survive_cross_range_renames() {
+    let t = run_m11(
+        "shared-dir-ranges",
+        shared_dir_ranges_config(),
+        74_000..74_020,
+    );
+    assert!(t.executed > 0, "range delegates never executed: {t:?}");
+    assert!(t.cross_subtree > 0, "no cross-range op: {t:?}");
+    assert!(t.redelegated > 0, "ranges never re-delegated: {t:?}");
+}
+
+/// Plan 30 §M12: the hand split under random faults.
+#[test]
+fn shared_dir_ranges_under_random_faults() {
+    let t = run_m11(
+        "shared-dir-faults",
+        shared_dir_faults_config(),
+        75_000..75_030,
+    );
+    assert!(t.executed > 0, "range delegates never executed: {t:?}");
+}
+
 /// Phase 2b (M8): strict reads under delegation are served by the owning
 /// delegate.
 #[test]
@@ -2551,6 +2764,37 @@ fn long_delegated_seed_70051_finishes() {
         let t = run_m11("long-delegated", long_delegated_config(), 70_051..70_052);
         assert!(t.executed > 0, "{t:?}");
     }
+}
+
+/// M12 round 2, long-sessions seed 10146: the holder recovered a
+/// segment by re-reading its own timed-out PUT, and that path left the
+/// segment out of the window forward replies' `base` is computed from;
+/// a create's reply named a base below a rename the segment carried,
+/// the requester's shadow installed on a state where the name still
+/// existed, and its replica ended with a dentry to an inode it did not
+/// have. Now the recovered segment's touches are noted like a shipped
+/// one's.
+#[test]
+fn long_sessions_seed_10146_recovered_segment_is_in_the_base_window() {
+    run_seed(10146, long_sessions_config())
+        .unwrap_or_else(|e| panic!("long-sessions seed 10146: {e}"));
+}
+
+/// M12 round 2, flex-crash seed 30299: a member paused across its
+/// epoch's activation, crashed, and restarted into the open epoch that
+/// carried its own lease with no hold adopted; nobody could hold or
+/// close the epoch and no taker got promises. Now a member restarting
+/// into an open epoch whose carrier is its own lease adopts the hold.
+#[test]
+fn flex_crash_seed_30299_restarted_member_adopts_the_carried_hold() {
+    let report = run_seed(30299, flex_crash_config())
+        .unwrap_or_else(|e| panic!("flex-crash seed 30299: {e}"));
+    let adopted: u64 = report
+        .stats
+        .values()
+        .map(|s| s.epoch_holds_adopted_late)
+        .sum();
+    assert!(adopted > 0, "the carried hold was never adopted late");
 }
 
 /// Plan 30 §M11 phase 2b round 2: the seed whose successor root replayed

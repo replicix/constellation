@@ -155,6 +155,70 @@ pub fn project_dir(events: &[HistEvt], dir: &str) -> Vec<HistEvt> {
     out
 }
 
+/// Plan 30 §M12: the history projected to one hash range of `dir`'s
+/// names (`bits` bits, range `idx`): a split directory is sequenced per
+/// range, so linearizability holds per range (and a whole directory's
+/// linearizable history projects to linearizable ranges). A rename
+/// between two ranges appears in both as its halves, like a rename
+/// between two directories in `project_dir`.
+pub fn project_range(events: &[HistEvt], dir: &str, bits: u8, idx: u32) -> Vec<HistEvt> {
+    use constellation_meta::delegation::Range;
+    use std::collections::HashMap;
+    let leaf = |n: &str| n.rsplit('/').next().unwrap_or(n).to_string();
+    let in_range = |n: &str| dir_of(n) == dir && Range::of(bits, &leaf(n)).idx == idx;
+    let mut returns: HashMap<Rid, NsRet> = HashMap::new();
+    for e in events {
+        if let HistEvt::Return { rid, ret, .. } = e {
+            returns.insert(*rid, *ret);
+        }
+    }
+    let mut out = Vec::new();
+    let mut projected: HashMap<Rid, NsOp> = HashMap::new();
+    for e in events {
+        match e {
+            HistEvt::Invoke { thread, rid, op } => {
+                let p = match op {
+                    NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) if in_range(n) => {
+                        Some(op.clone())
+                    }
+                    NsOp::Rename(a, b) if in_range(a) && in_range(b) => Some(op.clone()),
+                    NsOp::Rename(a, _) if in_range(a) => Some(NsOp::Unlink(a.clone())),
+                    NsOp::Rename(_, b) if in_range(b) => {
+                        if returns.get(rid).is_some_and(|r| *r != NsRet::Ok) {
+                            None
+                        } else {
+                            Some(NsOp::Put(b.clone()))
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(p) = p {
+                    projected.insert(*rid, p.clone());
+                    out.push(HistEvt::Invoke {
+                        thread: *thread,
+                        rid: *rid,
+                        op: p,
+                    });
+                }
+            }
+            HistEvt::Return { thread, rid, ret } => {
+                if let Some(p) = projected.get(rid) {
+                    let ret = match p {
+                        NsOp::Put(_) => NsRet::Ok,
+                        _ => *ret,
+                    };
+                    out.push(HistEvt::Return {
+                        thread: *thread,
+                        rid: *rid,
+                        ret,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Every directory the history touches.
 pub fn dirs_of(events: &[HistEvt]) -> Vec<String> {
     let mut dirs: Vec<String> = Vec::new();

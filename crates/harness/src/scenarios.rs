@@ -827,6 +827,24 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::designation_as_delegation,
     },
     Scenario {
+        name: "shared-dir-multi-writer",
+        desc: "plan 30 M12: four nodes creating unique names in one directory; the single sequencer (three nodes forwarding every create) against the directory split into four hash ranges (three delegated, one the root's): throughput, every name on every node, an identical listing everywhere, no S3 request added per file",
+        requires: &[],
+        run: m11::shared_dir_multi_writer,
+    },
+    Scenario {
+        name: "hash-range-split-merge",
+        desc: "plan 30 M12: the placement (on by default) splits a hot shared directory written by four nodes into hash ranges delegated to them; when the writers stop the ranges are recalled after the dwell and the directory is whole again; everything converges",
+        requires: &[],
+        run: m11::hash_range_split_merge,
+    },
+    Scenario {
+        name: "cross-range-rename",
+        desc: "plan 30 M12: a directory split two ways by hand; a rename from one range into the other is a cross-range op: the root recalls both ranges, executes it after their streams and delegates both again; the file is where the rename put it everywhere, the delegates execute locally again",
+        requires: &[],
+        run: m11::cross_range_rename,
+    },
+    Scenario {
         name: "inbox-create-storm-p2p-off",
         desc: "plan 30 M13 (hybrid): with P2P off, two non-holders sustain a create/unlink storm; sustained inbox demand escalates to a lease request, every op gets its errno right, and throughput is never worse than lease ping-pong (>= 41 ops/s)",
         requires: &[],
@@ -6649,6 +6667,11 @@ fn chaos_soak_4(seed: u64) -> Result<()> {
         eprintln!("artifacts kept at: {}", store.display());
         for c in &clients {
             eprintln!("--- {} mount.log (tail) ---\n{}", c.name, c.tail_log());
+            // The whole mount log next to the history: the tail above is
+            // rarely enough to root-cause a double winner.
+            let path = store.join(format!("{}.mount.log", c.name));
+            let _ = std::fs::write(&path, c.tail_log_n(50_000_000));
+            eprintln!("    {}'s log kept at {}", c.name, path.display());
         }
     }
     for c in &mut clients {

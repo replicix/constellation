@@ -85,6 +85,9 @@ pub struct CoreStatus {
     pub delegation_enabled: bool,
     /// Ops the FUSE fast path executed as the delegate (`DelegateView`).
     pub delegation_fast_path_executed: u64,
+    /// Plan 30 §M12: ops the FUSE fast path sent through the core because
+    /// a live delegation owned their keys.
+    pub delegation_fast_path_routed: u64,
     /// Phase 2b: the placement's busiest subtrees, `(dir, node, node_ops,
     /// subtree_ops)`.
     pub placement_top: Vec<(u64, u64, u64, u64)>,
@@ -459,18 +462,19 @@ pub fn load_config(
         );
     c.delegation_ttl_ms = env_ms("CONSTELLATION_DELEGATION_TTL_MS", c.delegation_ttl_ms);
     // Plan 30 §M11 phase 2b: the placement's knobs.
-    // Opt-in for now (M12 flips the default once the hash-range split
-    // exists): on, a dominant writer's subtree moves to it by itself,
-    // which changes the S3 request pattern of every multi-node run.
+    // Plan 30 §M12: on by default (a dominant writer's subtree moves to
+    // it, a hot shared directory splits into hash ranges);
+    // `CONSTELLATION_DELEGATION_PLACEMENT=off` pins the single sequencer.
     c.placement = c.delegation
-        && matches!(
+        && !matches!(
             std::env::var("CONSTELLATION_DELEGATION_PLACEMENT")
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_lowercase()
                 .as_str(),
-            "1" | "on" | "true"
+            "0" | "off" | "false"
         );
+    c.placement_split_pct = env_ms("CONSTELLATION_DELEGATION_SPLIT", c.placement_split_pct);
     c.placement_window_ms = env_ms("CONSTELLATION_DELEGATION_WINDOW_MS", c.placement_window_ms);
     c.placement_min_ops = env_ms("CONSTELLATION_DELEGATION_MIN_OPS", c.placement_min_ops);
     c.placement_dominance_pct = env_ms(
@@ -777,6 +781,12 @@ impl Driver {
     /// status snapshot.
     fn refresh(&mut self) {
         let now = now();
+        // Plan 30 §M12: what the FUSE fast path executed since the last
+        // event, for the placement.
+        let notes = self.deps.delegates.take_fast_path_notes();
+        if !notes.is_empty() {
+            self.core.place_note_local(&notes, &*self.deps.meta);
+        }
         let cfg = self.core.config();
         let lease = self.core.lease();
         self.deps
@@ -806,6 +816,7 @@ impl Driver {
         status.delegation = self.core.deleg_view();
         status.delegation_enabled = cfg.delegation;
         status.delegation_fast_path_executed = self.deps.delegates.executed();
+        status.delegation_fast_path_routed = self.deps.delegates.routed();
         self.deps.delegates.mirror(&status.delegation);
         self.deps
             .delegates
@@ -1046,9 +1057,15 @@ impl Driver {
             SyncRequest::SyncDesignations { entries } => {
                 control(Control::SyncDesignations { entries }, ControlReply::None)
             }
-            SyncRequest::Delegate { dir, node, reply } => {
-                control(Control::Delegate { dir, node }, ControlReply::Text(reply))
-            }
+            SyncRequest::Delegate {
+                dir,
+                node,
+                range,
+                reply,
+            } => control(
+                Control::Delegate { dir, node, range },
+                ControlReply::Text(reply),
+            ),
             SyncRequest::Undelegate { dir, reply } => {
                 control(Control::Undelegate { dir }, ControlReply::Text(reply))
             }

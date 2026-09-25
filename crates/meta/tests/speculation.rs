@@ -149,10 +149,14 @@ fn a_shadow_for_an_already_completed_rid_is_not_installed() {
 fn stranding_rolls_back_a_shadow_under_a_foreign_segment_touching_the_same_parent() {
     let meta = Meta::open_in_memory().unwrap();
     let reference = Meta::open_in_memory().unwrap();
-    let seg1 = vec![create("other", ino(2), 20)];
-    let seg2 = vec![chmod(ino(2), 0o600, 30)];
+    // Plan 30 §M12: a parent's times merge by `max`, so the stamps must
+    // be above the root directory's own (its creation, the wall clock)
+    // for the two stores to end byte-identical.
+    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let seg1 = vec![create("other", ino(2), t0 + 20)];
+    let seg2 = vec![chmod(ino(2), 0o600, t0 + 30)];
 
-    let phantom = vec![create("phantom", ino(1), 10), completed(rid(1))];
+    let phantom = vec![create("phantom", ino(1), t0 + 10), completed(rid(1))];
     meta.install_shadow(rid(1), 1, &create_op("phantom", ino(1)), &phantom)
         .unwrap();
     // Tailed while the shadow is outstanding: captured for redo.

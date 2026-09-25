@@ -383,6 +383,31 @@ pub fn run_one(
         }
     }
     let handoffs = end_epoch.saturating_sub(start_epoch);
+    // M12 round 2: where the ops executed (the placement may have split
+    // a shared directory into ranges; the root's fast path routes what
+    // a delegate owns through the core).
+    for c in clients.iter() {
+        if let Ok(s) = c.control_status() {
+            let d = &s["delegation"];
+            if d["enabled"].as_bool().unwrap_or(false) {
+                eprintln!(
+                    "metabench {}: {} delegation: splits {} range_recalls {} placed {} recalled {} \
+                     executed {} fast_path {} routed {} forwarded_to_delegate {} not_owner {}",
+                    cfg.label,
+                    c.name,
+                    d["place_splits"],
+                    d["place_range_recalls"],
+                    d["place_delegated"],
+                    d["place_recalled"],
+                    d["executed"],
+                    d["fast_path_executed"],
+                    d["fast_path_routed"],
+                    d["forwarded_to_delegate"],
+                    d["not_owner"],
+                );
+            }
+        }
+    }
 
     for c in clients.iter_mut() {
         c.unmount()
