@@ -10,7 +10,7 @@ pub mod types;
 pub mod web;
 
 pub use types::{
-    AckStatus, CasProbeStatus, CtoStatus, HeldInodeStatus, HeldStatus, LogStreamStatus,
+    AckStatus, CasProbeStatus, CtoStatus, HeldInodeStatus, HeldStatus, LockStatus, LogStreamStatus,
     PeerPathsStatus, SessionStatus,
 };
 pub use types::{
@@ -440,6 +440,7 @@ mod tests {
                 held: HeldStatus::default(),
                 session: SessionStatus::default(),
                 cto: crate::CtoStatus::default(),
+                locks: crate::LockStatus::default(),
                 ack: crate::AckStatus::default(),
                 coop: CoopStatus::default(),
                 prefetch: PrefetchStatus::default(),

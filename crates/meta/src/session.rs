@@ -459,7 +459,9 @@ impl Inner {
             && self.applied_seq >= target.seq
             && self.applied >= target.pending
             && target.streams.iter().all(|(g, i)| {
-                self.voided.contains(&g) || self.streams.get(&g).is_some_and(|m| *m >= i)
+                // Plan 30 §M14: a stream with nothing appended yet (a fresh
+                // generation's `(gen, 0)`) is reached by everyone.
+                i == 0 || self.voided.contains(&g) || self.streams.get(&g).is_some_and(|m| *m >= i)
             })
     }
 }
@@ -641,9 +643,9 @@ impl SessionState {
     /// its own; an older tenure's are applied or void).
     pub fn reaches_streams(&self, deps: &Position) -> bool {
         let g = self.inner.lock().unwrap();
-        deps.streams
-            .iter()
-            .all(|(gen, i)| g.voided.contains(&gen) || g.streams.get(&gen).is_some_and(|m| *m >= i))
+        deps.streams.iter().all(|(gen, i)| {
+            i == 0 || g.voided.contains(&gen) || g.streams.get(&gen).is_some_and(|m| *m >= i)
+        })
     }
 
     /// The stream index this replica holds of `gen` (0: none).

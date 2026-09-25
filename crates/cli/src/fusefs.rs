@@ -357,15 +357,18 @@ pub enum SyncRequest {
         gen: u64,
         /// Phase 2b: the delegate's backup peer (0: none).
         backup: u64,
-        reply: tokio::sync::oneshot::Sender<u64>,
+        /// Answered with the ttl and (§M14) the root's lock grants under
+        /// the subtree, handed over with the first renewal.
+        reply: tokio::sync::oneshot::Sender<(u64, Vec<constellation_meta::locks::Grant>)>,
     },
     /// Plan 30 §M11: the root recalls a generation this node holds;
-    /// answered with the highest stream index executed here.
+    /// answered with the highest stream index executed here (and, §M14,
+    /// the lock grants handed back).
     PeerDelegRecall {
         root: u64,
         dir: Ino,
         gen: u64,
-        reply: tokio::sync::oneshot::Sender<u64>,
+        reply: tokio::sync::oneshot::Sender<(u64, Vec<constellation_meta::locks::Grant>)>,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to this backup;
     /// answered `(acked, sealed)`.
@@ -480,6 +483,84 @@ pub enum SyncRequest {
         force: bool,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
+    /// Plan 30 §M14: a local lock on `ino` needs a cross-node grant in
+    /// `mode` (`Control::Lock`); `blocking` waits at the owner.
+    Lock {
+        ino: Ino,
+        mode: constellation_meta::locks::LockMode,
+        blocking: bool,
+        reply: tokio::sync::oneshot::Sender<constellation_authority::LockAnswer>,
+    },
+    /// Plan 30 §M14: the last local lock under a recalled grant on `ino`
+    /// left; the core releases the grant (nobody waits).
+    LockIdle {
+        ino: Ino,
+    },
+    /// Plan 30 §M14: `getlk` — does another node hold a conflicting
+    /// grant?
+    LockTest {
+        ino: Ino,
+        mode: constellation_meta::locks::LockMode,
+        reply: tokio::sync::oneshot::Sender<constellation_authority::LockTestAnswer>,
+    },
+    /// Plan 30 §M14: a peer's lock request, to answer as the owning
+    /// sequencer.
+    PeerLockRequest {
+        requester: u64,
+        ino: Ino,
+        mode: constellation_meta::locks::LockMode,
+        blocking: bool,
+        /// The requester's clock when it sent (echoed in a push).
+        sent: i64,
+        reply: tokio::sync::oneshot::Sender<constellation_authority::LockOutcome>,
+    },
+    /// Plan 30 §M14: the owner recalls a grant this node holds; answered
+    /// on receipt.
+    PeerLockRecall {
+        owner: u64,
+        ino: Ino,
+        grant: constellation_meta::locks::GrantId,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Plan 30 §M14: a holder renews its grants at this node.
+    PeerLockRenew {
+        from: u64,
+        entries: Vec<constellation_authority::LockRenewEntry>,
+        reply: tokio::sync::oneshot::Sender<
+            Vec<(
+                Ino,
+                constellation_meta::locks::GrantId,
+                constellation_authority::LockRenewResult,
+            )>,
+        >,
+    },
+    /// Plan 30 §M14: a peer's `getlk`, to answer as the owner.
+    PeerLockTest {
+        requester: u64,
+        ino: Ino,
+        mode: constellation_meta::locks::LockMode,
+        reply: tokio::sync::oneshot::Sender<constellation_authority::LockTestOutcome>,
+    },
+    /// Plan 30 §M14, one way: the owner pushed a parked request's grant.
+    PeerLockGranted {
+        from: u64,
+        ino: Ino,
+        sent: i64,
+        outcome: constellation_authority::LockOutcome,
+    },
+    /// Plan 30 §M14, one way: a holder released a grant.
+    PeerLockReleased {
+        from: u64,
+        ino: Ino,
+        grant: constellation_meta::locks::GrantId,
+    },
+    /// Plan 30 §M14, one way: the holder's grant table (this node backs
+    /// it up).
+    PeerLockMirror {
+        from: u64,
+        ver: u64,
+        grants: Vec<constellation_meta::locks::Grant>,
+    },
     /// Final flush + release on unmount; the core stops afterwards.
     Shutdown {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -493,6 +574,9 @@ pub struct SyncHandle {
     pub fsync_s3: bool,
     /// Plan 30 §M8: `--cto strict` (see `crate::cto`).
     pub cto_strict: bool,
+    /// Plan 30 §M14: `--locks cluster` (see `crate::locks`); `None` is
+    /// `--locks local` (the kernel keeps locks node-local).
+    pub locks: Option<Arc<crate::locks::ClusterLocks>>,
     /// Lock-free lease view (the core's state, mirrored by the driver);
     /// the write gate reads it per mutating op.
     pub lease: Arc<crate::lease::LeaseView>,
@@ -1277,6 +1361,20 @@ impl ConstellationFs {
         if let Some(h) = &self.sync {
             let _ = h.tx.send(SyncRequest::Nudge);
         }
+    }
+
+    /// Plan 30 §M14: this view's cluster locks (`None`: `--locks local`,
+    /// or no sync handle).
+    pub(crate) fn cluster_locks(&self) -> Option<&Arc<crate::locks::ClusterLocks>> {
+        self.sync.as_ref().and_then(|h| h.locks.as_ref())
+    }
+
+    /// Plan 30 §M14: I/O on `ino` is fenced (`EIO`) — this node holds
+    /// local locks on it under a grant that lapsed. One relaxed atomic
+    /// load while no local lock exists anywhere (and nothing at all under
+    /// `--locks local`).
+    pub(crate) fn lock_fenced(&self, ino: Ino) -> bool {
+        self.cluster_locks().is_some_and(|l| l.fenced(ino))
     }
 
     /// The write gate (DESIGN.md §5): every mutating op passes through
@@ -2689,6 +2787,38 @@ impl ConstellationFs {
 }
 
 // (Filesystem impl in fusefs_ops.rs include)
+/// Plan 30 §M14: a recalled grant's flush — what `fsync` guarantees,
+/// for one inode: the write state flushed and its manifest committed at
+/// the sequencer, the inode's chunks uploaded (write-back included: the
+/// next holder must be able to fetch them), and the local journal synced
+/// (the log too under `--fsync-mode s3`).
+impl crate::locks::LockFlush for ConstellationFs {
+    fn flush_for_lock(&self, ino: Ino) -> bool {
+        let r = self
+            .flush_inode(ino, true)
+            .and_then(|()| self.drain_inode(ino))
+            .and_then(|()| self.sync_barrier(ino));
+        if let Err(errno) = r {
+            tracing::warn!(target: "constellation::locks", ino, errno, "flush before a lock release failed");
+        }
+        r.is_ok()
+    }
+}
+
+/// The FUSE session's filesystem: a shared [`ConstellationFs`], so the
+/// lock path (`crate::locks::LockFlushers`) can reach a view's write
+/// state while the session runs it. Derefs to the filesystem, so the
+/// `Filesystem` impl reads as if written on it.
+pub struct FuseFs(pub Arc<ConstellationFs>);
+
+impl std::ops::Deref for FuseFs {
+    type Target = ConstellationFs;
+
+    fn deref(&self) -> &ConstellationFs {
+        &self.0
+    }
+}
+
 include!("fusefs_ops.rs");
 
 #[cfg(test)]
@@ -3643,6 +3773,7 @@ mod durable_ack_tests {
                     )),
                     node_id: 1,
                     incarnation: 1,
+                    locks: None,
                     next_rid_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     acked: Arc::new(std::sync::Mutex::new(Vec::new())),
                 }),

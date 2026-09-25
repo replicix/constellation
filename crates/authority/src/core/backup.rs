@@ -574,9 +574,12 @@ impl Core {
         } else {
             self.reclaim_horizon_ms() as i64
         };
+        // Plan 30 §M14: lock grants are capped like read delegations and
+        // marked the same way; the longer ttl covers both.
+        let ttl = self.cfg.read_delegation_ttl_ms.max(self.cfg.lock_ttl_ms) as i64;
         let bound = now.0
             + self.cfg.backup_takeover_ms as i64
-            + self.cfg.read_delegation_ttl_ms as i64
+            + ttl
             + deleg
             + 2 * self.cfg.expiry_margin_ms as i64;
         let until = prev_expires.min(bound);

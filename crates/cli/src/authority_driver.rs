@@ -30,11 +30,13 @@ use anyhow::{Context, Result};
 use constellation_authority::action::ControlOk;
 use constellation_authority::core::JobKind;
 use constellation_authority::{
-    Action, CasFailure, ClientReply, Config, Control, Core, EpochState, Event, InboxView, Ms,
-    NodeId, OpId, PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure,
-    S3Op, S3Result, ShipState, Stats, TimerKind, UploadResult,
+    Action, CasFailure, ClientReply, Config, Control, Core, EpochState, Event, InboxView,
+    LockAnswer, LockOutcome, LockRenewResult, LockTestAnswer, LockTestOutcome, Ms, NodeId, OpId,
+    PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Op,
+    S3Result, ShipState, Stats, TimerKind, UploadResult,
 };
 use constellation_fs_core::cache::DiskCache;
+use constellation_meta::locks::{Grant, GrantId};
 use constellation_meta::{JournalPos, Meta, MutateOp, MutateOutcome, Position, Rid};
 use constellation_net::{LogEvent, Payload};
 use constellation_store_s3::inbox::InboxStore;
@@ -54,6 +56,9 @@ use tokio::sync::{mpsc, oneshot};
 /// outcome, plan 30 §M6's `base`, the position and (§M11) the executing
 /// delegation generation (0: the root).
 pub type MutateReplyParts = (MutateOutcome, Option<u64>, Position, u64);
+
+/// Plan 30 §M14: an owner's answer to a `LockRenew`.
+pub type LockRenewResults = Vec<(constellation_fs_core::Ino, GrantId, LockRenewResult)>;
 
 /// The core's observable state, refreshed after every event, for
 /// `status` and the background tickers (placement, atime, prune).
@@ -91,6 +96,12 @@ pub struct CoreStatus {
     /// Phase 2b: the placement's busiest subtrees, `(dir, node, node_ops,
     /// subtree_ops)`.
     pub placement_top: Vec<(u64, u64, u64, u64)>,
+    /// Plan 30 §M14: `--locks cluster`, and the core's lock requests,
+    /// parked waiters and recalls in flight.
+    pub locks_cluster: bool,
+    pub lock_requests_in_flight: usize,
+    pub lock_waiters: usize,
+    pub lock_recalls_in_flight: usize,
 }
 
 /// Short names for the trace line around every core step.
@@ -112,6 +123,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::PublishDone { .. } => "PublishDone",
         Event::ConflictCopyDone { .. } => "ConflictCopyDone",
         Event::RebuildDone { .. } => "RebuildDone",
+        Event::LockFlushed { .. } => "LockFlushed",
         Event::Roster { .. } => "Roster",
         Event::Slack { .. } => "Slack",
         Event::Peers { .. } => "Peers",
@@ -146,6 +158,7 @@ fn action_kind(action: &Action) -> &'static str {
         Action::Announce { .. } => "Announce",
         Action::ConflictCopy { .. } => "ConflictCopy",
         Action::RebuildReplica { .. } => "RebuildReplica",
+        Action::LockFlush { .. } => "LockFlush",
         Action::RoundDone { .. } => "RoundDone",
         Action::RefreshRoster => "RefreshRoster",
         Action::EpochClose => "EpochClose",
@@ -201,6 +214,11 @@ pub struct DriverDeps {
     pub pending_acks: Arc<Mutex<Vec<u64>>>,
     pub status: Arc<Mutex<CoreStatus>>,
     pub config: Config,
+    /// Plan 30 §M14: flush one inode through before a recalled lock
+    /// grant is released (`Action::LockFlush`); blocking, run on the
+    /// blocking pool. Every mounted view's write state
+    /// (`crate::locks::LockFlushers`).
+    pub lock_flush: crate::locks::LockFlushHook,
     /// Plan 30 M0's fault knob (`CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS`):
     /// delay every forwarded-mutation reply this node sends, after the
     /// op executed (bug A's trigger). 0 in production.
@@ -343,6 +361,9 @@ enum ControlReply {
     /// Plan 30 §M8.
     ReadIndex(oneshot::Sender<ReadAnswer>),
     Recall(oneshot::Sender<()>),
+    /// Plan 30 §M14.
+    Lock(oneshot::Sender<LockAnswer>),
+    LockTest(oneshot::Sender<LockTestAnswer>),
 }
 
 /// What reaches the driver task from the IO it spawned.
@@ -442,6 +463,11 @@ pub fn load_config(
         );
     c.read_delegation_ttl_ms = crate::cto::read_delegation_ttl_ms();
     c.recall_hold_ms = (c.forward_timeout_ms / 2).max(1);
+    // Plan 30 §M14: cluster locks follow P2P here; `node_runtime` applies
+    // the mount's `--locks` (`crate::locks::cluster_effective`).
+    c.locks = p2p;
+    c.lock_ttl_ms = crate::locks::lock_ttl_ms(c.lock_ttl_ms);
+    c.lock_cache_idle_ms = crate::locks::lock_cache_idle_ms(c.lock_cache_idle_ms);
     c.read_index_deadline_ms = crate::cto::read_index_budget_ms();
     // Plan 30 §M9: backups (peers within the RTT budget; `0` backups or
     // no peer in budget is today's behaviour), the ack timeout that
@@ -579,8 +605,14 @@ pub struct Driver {
     /// Plan 30 §M11: peers' delegate-stream batches, renewals and
     /// recalls this node is answering.
     deleg_stream_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
-    deleg_renew_replies: HashMap<OpId, oneshot::Sender<u64>>,
-    deleg_recall_replies: HashMap<OpId, oneshot::Sender<u64>>,
+    deleg_renew_replies: HashMap<OpId, oneshot::Sender<(u64, Vec<Grant>)>>,
+    deleg_recall_replies: HashMap<OpId, oneshot::Sender<(u64, Vec<Grant>)>>,
+    /// Plan 30 §M14: peers' lock requests, recalls, renewals and tests
+    /// this node is answering.
+    lock_request_replies: HashMap<OpId, oneshot::Sender<LockOutcome>>,
+    lock_recall_replies: HashMap<OpId, oneshot::Sender<()>>,
+    lock_renew_replies: HashMap<OpId, oneshot::Sender<LockRenewResults>>,
+    lock_test_replies: HashMap<OpId, oneshot::Sender<LockTestOutcome>>,
     deleg_backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
     deleg_seal_replies: HashMap<OpId, oneshot::Sender<(bool, Vec<constellation_meta::DelegateTx>)>>,
     /// Plan 30 §M10: peers' promise requests this node is answering.
@@ -637,6 +669,10 @@ impl Driver {
             deleg_stream_replies: HashMap::new(),
             deleg_renew_replies: HashMap::new(),
             deleg_recall_replies: HashMap::new(),
+            lock_request_replies: HashMap::new(),
+            lock_recall_replies: HashMap::new(),
+            lock_renew_replies: HashMap::new(),
+            lock_test_replies: HashMap::new(),
             deleg_backup_replies: HashMap::new(),
             deleg_seal_replies: HashMap::new(),
             promise_replies: HashMap::new(),
@@ -822,6 +858,11 @@ impl Driver {
             .delegates
             .set_gated(self.core.deleg_fast_path_gated());
         status.placement_top = self.core.placement_top();
+        status.locks_cluster = cfg.locks;
+        let lv = self.core.lock_view();
+        status.lock_requests_in_flight = lv.requests_in_flight;
+        status.lock_waiters = lv.waiters;
+        status.lock_recalls_in_flight = lv.recalls_in_flight;
         drop(status);
         self.deps
             .epochs
@@ -1268,6 +1309,108 @@ impl Driver {
                 });
                 None
             }
+            SyncRequest::Lock {
+                ino,
+                mode,
+                blocking,
+                reply,
+            } => control(
+                Control::Lock {
+                    ino,
+                    mode,
+                    blocking,
+                },
+                ControlReply::Lock(reply),
+            ),
+            SyncRequest::LockIdle { ino } => control(Control::LockIdle { ino }, ControlReply::None),
+            SyncRequest::LockTest { ino, mode, reply } => control(
+                Control::LockTest { ino, mode },
+                ControlReply::LockTest(reply),
+            ),
+            SyncRequest::PeerLockRequest {
+                requester,
+                ino,
+                mode,
+                blocking,
+                sent,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.lock_request_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from: requester,
+                    msg: PeerMsg::LockRequest {
+                        req,
+                        ino,
+                        mode,
+                        blocking,
+                        sent: constellation_authority::Ms(sent),
+                    },
+                }))
+            }
+            SyncRequest::PeerLockRecall {
+                owner,
+                ino,
+                grant,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.lock_recall_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from: owner,
+                    msg: PeerMsg::LockRecall { req, ino, grant },
+                }))
+            }
+            SyncRequest::PeerLockRenew {
+                from,
+                entries,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.lock_renew_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from,
+                    msg: PeerMsg::LockRenew { req, entries },
+                }))
+            }
+            SyncRequest::PeerLockTest {
+                requester,
+                ino,
+                mode,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.lock_test_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from: requester,
+                    msg: PeerMsg::LockTest { req, ino, mode },
+                }))
+            }
+            SyncRequest::PeerLockGranted {
+                from,
+                ino,
+                sent,
+                outcome,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::LockGranted {
+                    ino,
+                    sent: Ms(sent),
+                    outcome,
+                },
+            })),
+            SyncRequest::PeerLockReleased { from, ino, grant } => {
+                Some(Internal::Event(Event::Peer {
+                    from,
+                    msg: PeerMsg::LockReleased { ino, grant },
+                }))
+            }
+            SyncRequest::PeerLockMirror { from, ver, grants } => {
+                Some(Internal::Event(Event::Peer {
+                    from,
+                    msg: PeerMsg::LockMirror { ver, grants },
+                }))
+            }
             SyncRequest::Shutdown { reply } => {
                 control(Control::Shutdown, ControlReply::Done(reply))
             }
@@ -1464,6 +1607,17 @@ impl Driver {
                         let _ = tx.send(Internal::Event(Event::RebuildDone { op, ok }));
                     });
                 }
+                Action::LockFlush { ino, grant } => {
+                    // The flush goes through the FUSE views' write state
+                    // and waits on this driver (manifest commit, upload,
+                    // barrier): never on the driver loop.
+                    let tx = self.int_tx.clone();
+                    let flush = self.deps.lock_flush.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let ok = flush(ino);
+                        let _ = tx.send(Internal::Event(Event::LockFlushed { ino, grant, ok }));
+                    });
+                }
                 Action::RefreshRoster => {
                     let store = self.deps.store_inner.clone();
                     let sync_tx = self.sync_tx.clone();
@@ -1570,15 +1724,139 @@ impl Driver {
                     let _ = tx.send((through, refused));
                 }
             }
-            PeerMsg::DelegRenewed { req, ttl_ms, .. } => {
+            PeerMsg::DelegRenewed {
+                req, ttl_ms, locks, ..
+            } => {
                 if let Some(tx) = self.deleg_renew_replies.remove(&req) {
-                    let _ = tx.send(ttl_ms);
+                    let _ = tx.send((ttl_ms, locks));
                 }
             }
-            PeerMsg::DelegRecalled { req, through, .. } => {
+            PeerMsg::DelegRecalled {
+                req,
+                through,
+                locks,
+                ..
+            } => {
                 if let Some(tx) = self.deleg_recall_replies.remove(&req) {
-                    let _ = tx.send(through);
+                    let _ = tx.send((through, locks));
                 }
+            }
+            PeerMsg::LockReply { req, outcome } => {
+                if let Some(tx) = self.lock_request_replies.remove(&req) {
+                    let _ = tx.send(outcome);
+                }
+            }
+            PeerMsg::LockRecalled { req } => {
+                if let Some(tx) = self.lock_recall_replies.remove(&req) {
+                    let _ = tx.send(());
+                }
+            }
+            PeerMsg::LockRenewed { req, results } => {
+                if let Some(tx) = self.lock_renew_replies.remove(&req) {
+                    let _ = tx.send(results);
+                }
+            }
+            PeerMsg::LockTestReply { req, outcome } => {
+                if let Some(tx) = self.lock_test_replies.remove(&req) {
+                    let _ = tx.send(outcome);
+                }
+            }
+            PeerMsg::LockRequest {
+                req,
+                ino,
+                mode,
+                blocking,
+                sent,
+            } => {
+                let payload = Payload::LockRequest {
+                    requester: self.node_id,
+                    req_id: req.0,
+                    ino,
+                    exclusive: crate::locks::exclusive(mode),
+                    blocking,
+                    sent: sent.0,
+                };
+                self.lock_rpc(to, req, payload, |reply, req| match reply {
+                    Payload::LockReply { req_id, outcome } if req_id == req.0 => {
+                        Some(PeerMsg::LockReply {
+                            req,
+                            outcome: crate::locks::outcome_of(outcome),
+                        })
+                    }
+                    _ => None,
+                });
+            }
+            PeerMsg::LockRecall { req, ino, grant } => {
+                let payload = Payload::LockRecall {
+                    owner: self.node_id,
+                    req_id: req.0,
+                    ino,
+                    grant: crate::locks::grant_wire(grant),
+                };
+                self.lock_rpc(to, req, payload, |reply, req| match reply {
+                    Payload::LockRecalled { req_id } if req_id == req.0 => {
+                        Some(PeerMsg::LockRecalled { req })
+                    }
+                    _ => None,
+                });
+            }
+            PeerMsg::LockRenew { req, entries } => {
+                let payload = Payload::LockRenew {
+                    from: self.node_id,
+                    req_id: req.0,
+                    entries: crate::locks::renew_entries_wire(&entries),
+                };
+                self.lock_rpc(to, req, payload, |reply, req| match reply {
+                    Payload::LockRenewed { req_id, results } if req_id == req.0 => {
+                        Some(PeerMsg::LockRenewed {
+                            req,
+                            results: crate::locks::renew_results_of(results),
+                        })
+                    }
+                    _ => None,
+                });
+            }
+            PeerMsg::LockTest { req, ino, mode } => {
+                let payload = Payload::LockTest {
+                    requester: self.node_id,
+                    req_id: req.0,
+                    ino,
+                    exclusive: crate::locks::exclusive(mode),
+                };
+                self.lock_rpc(to, req, payload, |reply, req| match reply {
+                    Payload::LockTestReply { req_id, outcome } if req_id == req.0 => {
+                        Some(PeerMsg::LockTestReply {
+                            req,
+                            outcome: crate::locks::test_outcome_of(outcome),
+                        })
+                    }
+                    _ => None,
+                });
+            }
+            PeerMsg::LockGranted { ino, sent, outcome } => {
+                let payload = Payload::LockGranted {
+                    from: self.node_id,
+                    ino,
+                    sent: sent.0,
+                    outcome: crate::locks::outcome_wire(&outcome),
+                };
+                self.one_way(to, payload);
+            }
+            PeerMsg::LockReleased { ino, grant } => {
+                let payload = Payload::LockReleased {
+                    from: self.node_id,
+                    ino,
+                    grant: crate::locks::grant_wire(grant),
+                };
+                self.one_way(to, payload);
+            }
+            PeerMsg::LockMirror { ver, grants } => {
+                let payload = Payload::LockMirror {
+                    from: self.node_id,
+                    ver,
+                    grants: crate::locks::grants_wire(&grants),
+                };
+                self.one_way(to, payload);
             }
             PeerMsg::DelegBackupAck {
                 req, acked, sealed, ..
@@ -1776,10 +2054,16 @@ impl Driver {
                             req_id,
                             gen,
                             ttl_ms,
+                            locks,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
-                                msg: PeerMsg::DelegRenewed { req, gen, ttl_ms },
+                                msg: PeerMsg::DelegRenewed {
+                                    req,
+                                    gen,
+                                    ttl_ms,
+                                    locks: crate::locks::grants_of(&locks),
+                                },
                             }));
                         }
                         _ => {
@@ -1819,10 +2103,16 @@ impl Driver {
                             req_id,
                             gen,
                             through,
+                            locks,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
-                                msg: PeerMsg::DelegRecalled { req, gen, through },
+                                msg: PeerMsg::DelegRecalled {
+                                    req,
+                                    gen,
+                                    through,
+                                    locks: crate::locks::grants_of(&locks),
+                                },
                             }));
                         }
                         _ => {
@@ -2382,6 +2672,65 @@ impl Driver {
         }
     }
 
+    /// Plan 30 §M14: one lock RPC to `to`, bounded by the forward
+    /// timeout; `answer` turns the matching reply into the core's
+    /// message. No answer (timeout, a cut link, a reply for another
+    /// request) is the request's `PeerFailed`.
+    fn lock_rpc(
+        &self,
+        to: NodeId,
+        req: OpId,
+        payload: Payload,
+        answer: impl FnOnce(Payload, OpId) -> Option<PeerMsg> + Send + 'static,
+    ) {
+        let tx = self.int_tx.clone();
+        let peers = self.deps.peers.clone();
+        let timeout = Duration::from_millis(self.core.config().forward_timeout_ms);
+        if crate::fault::p2p_denied(to) {
+            // Fault injection: the link to this peer is cut — a
+            // connection failure, at once.
+            let _ = tx.send(Internal::Event(Event::PeerFailed {
+                req,
+                to,
+                outage: true,
+            }));
+            return;
+        }
+        tokio::spawn(async move {
+            let reply = tokio::time::timeout(
+                timeout,
+                peers.request_to_node_timeout(to, &payload, timeout),
+            )
+            .await;
+            match reply.ok().and_then(|r| r.ok()).and_then(|r| answer(r, req)) {
+                Some(msg) => {
+                    let _ = tx.send(Internal::Event(Event::Peer { from: to, msg }));
+                }
+                None => {
+                    let outage = crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
+                    let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                }
+            }
+        });
+    }
+
+    /// Plan 30 §M14: a one-way message (fire and forget, like
+    /// `StreamAhead`): the core's timers cover a lost one.
+    fn one_way(&self, to: NodeId, payload: Payload) {
+        if crate::fault::p2p_denied(to) {
+            return;
+        }
+        let peers = self.deps.peers.clone();
+        let timeout = Duration::from_millis(self.core.config().forward_timeout_ms);
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                timeout,
+                peers.request_to_node_timeout(to, &payload, timeout),
+            )
+            .await;
+        });
+    }
+
     /// Plan 30 §M7, holder side: queue one frame for subscriber `to`. The
     /// holder never waits on a subscriber: a full queue, or one holding
     /// more than the byte budget, drops the subscriber (it falls back to
@@ -2644,6 +2993,19 @@ impl Driver {
             ControlReply::Recall(tx) => {
                 let _ = tx.send(());
             }
+            ControlReply::Lock(tx) => {
+                let _ = tx.send(match result {
+                    Ok(ControlOk::Lock(answer)) => answer,
+                    // Refused or dropped: no grant (`ENOLCK`).
+                    _ => LockAnswer::Unavailable,
+                });
+            }
+            ControlReply::LockTest(tx) => {
+                let _ = tx.send(match result {
+                    Ok(ControlOk::LockTest(answer)) => answer,
+                    _ => LockTestAnswer::Free,
+                });
+            }
             ControlReply::Publish(tx) => match result {
                 Ok(_) => {
                     // The round shipped everything; publish the replica as
@@ -2777,6 +3139,7 @@ impl Standalone {
         cfg.inbox = false;
         cfg.publisher = publisher.is_some();
         cfg.forwarding = false;
+        cfg.locks = false;
         cfg.ttl_ms = crate::lease::lease_ttl_ms();
         let mut core = Core::new(cfg);
         let mut out = Vec::new();
@@ -2977,6 +3340,12 @@ impl Standalone {
                 Action::RebuildReplica { op } => {
                     self.queue.push_back(Event::RebuildDone { op, ok: false })
                 }
+                // No FUSE views here: nothing unflushed to flush.
+                Action::LockFlush { ino, grant } => self.queue.push_back(Event::LockFlushed {
+                    ino,
+                    grant,
+                    ok: true,
+                }),
                 Action::CancelTimer { .. }
                 | Action::Announce { .. }
                 | Action::RoundDone { .. }

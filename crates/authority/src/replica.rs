@@ -277,6 +277,12 @@ pub trait Replica {
     /// Both sides' delegation tables, shared with the FUSE threads (see
     /// `constellation_meta::readdeleg` for why they live in `Meta`).
     fn read_delegations(&self) -> &ReadDelegations;
+    /// Plan 30 §M14: the lock tables (grants made, grants held, local
+    /// locks), shared with the FUSE threads.
+    fn locks(&self) -> &constellation_meta::locks::LockTables;
+    /// Plan 30 §M14: whether `ino` is `dir` or below it (its primary
+    /// link's ancestors), for a subtree grace.
+    fn is_under(&self, ino: Ino, dir: Ino) -> bool;
     /// Persist, before answering a grant, that grants may be live until
     /// `until_ms` (the restart quarantine's horizon). `false`: it could not
     /// be persisted, and the grant must not be made.
@@ -784,6 +790,25 @@ impl Replica for Meta {
 
     fn read_delegations(&self) -> &ReadDelegations {
         Meta::read_delegations(self)
+    }
+
+    fn locks(&self) -> &constellation_meta::locks::LockTables {
+        Meta::locks(self)
+    }
+
+    fn is_under(&self, ino: Ino, dir: Ino) -> bool {
+        use constellation_meta::delegation::Namespace;
+        let mut cur = ino;
+        for _ in 0..4096 {
+            if cur == dir {
+                return true;
+            }
+            match self.primary_parent(cur) {
+                Some(p) if p != cur => cur = p,
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn note_grant_horizon(&self, until_ms: i64) -> bool {

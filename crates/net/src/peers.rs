@@ -1213,6 +1213,62 @@ async fn handle_stream<S: PeerService>(
         Payload::DelegSeal { root, req_id, gen } => {
             Some(service.deleg_seal_requested(root, req_id, gen).await)
         }
+        Payload::LockRequest {
+            requester,
+            req_id,
+            ino,
+            exclusive,
+            blocking,
+            sent,
+        } => Some(
+            service
+                .lock_requested(requester, req_id, ino, exclusive, blocking, sent)
+                .await,
+        ),
+        Payload::LockRecall {
+            owner,
+            req_id,
+            ino,
+            grant,
+        } => Some(
+            service
+                .lock_recall_requested(owner, req_id, ino, grant)
+                .await,
+        ),
+        Payload::LockRenew {
+            from,
+            req_id,
+            entries,
+        } => Some(service.lock_renew_requested(from, req_id, entries).await),
+        Payload::LockTest {
+            requester,
+            req_id,
+            ino,
+            exclusive,
+        } => Some(
+            service
+                .lock_test_requested(requester, req_id, ino, exclusive)
+                .await,
+        ),
+        // One way: acknowledged with `Ok` so the sender's request
+        // completes; nothing waits on what the service does with it.
+        Payload::LockGranted {
+            from,
+            ino,
+            sent,
+            outcome,
+        } => {
+            service.lock_granted(from, ino, sent, outcome);
+            Some(Payload::Ok { req_id: 0 })
+        }
+        Payload::LockReleased { from, ino, grant } => {
+            service.lock_released(from, ino, grant);
+            Some(Payload::Ok { req_id: 0 })
+        }
+        Payload::LockMirror { from, ver, grants } => {
+            service.lock_mirror(from, ver, grants);
+            Some(Payload::Ok { req_id: 0 })
+        }
         Payload::Ping { .. } => Some(Payload::Pong {
             node_id: service.node_id(),
         }),
@@ -1315,6 +1371,10 @@ async fn handle_stream<S: PeerService>(
         | Payload::DelegSealed { .. }
         | Payload::BackupAck { .. }
         | Payload::PromiseReply { .. }
+        | Payload::LockReply { .. }
+        | Payload::LockRecalled { .. }
+        | Payload::LockRenewed { .. }
+        | Payload::LockTestReply { .. }
         | Payload::Ok { .. } => None,
     };
     let served_us = t0.elapsed().as_micros() as u64;

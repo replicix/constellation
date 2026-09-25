@@ -50,6 +50,8 @@ enum Msg {
     },
     Unregister(u64),
     Batch(Vec<Inval>),
+    /// Plan 30 §M14: a batch someone waits for (`done` once sent).
+    Waited(Vec<Inval>, mpsc::Sender<()>),
 }
 
 /// The node's invalidation thread (one for every mounted view).
@@ -92,6 +94,14 @@ impl KernelInvalidator {
         let _ = self.tx.send(Msg::Unregister(id));
     }
 
+    /// Plan 30 §M14: a handle for the lock path, which drops one file's
+    /// pages and attributes after a lock grant.
+    pub fn inodes(&self) -> InodeInvalidator {
+        InodeInvalidator {
+            tx: self.tx.clone(),
+        }
+    }
+
     /// The hook for `Meta::set_foreign_apply_hook`.
     pub fn hook(&self) -> constellation_meta::ForeignApplyHook {
         let tx = self.tx.clone();
@@ -101,6 +111,32 @@ impl KernelInvalidator {
                 let _ = tx.send(Msg::Batch(batch));
             }
         })
+    }
+}
+
+/// Plan 30 §M14: invalidates one file (by replica inode) in every view,
+/// waiting — bounded — for the notifications to be sent. A lock grant
+/// must not be answered while the kernel may still serve pages written
+/// before the previous holder's flush; the bound keeps a notification
+/// stuck behind an unrelated FUSE request (see the module doc) from
+/// holding the lock up indefinitely.
+#[derive(Clone)]
+pub struct InodeInvalidator {
+    tx: mpsc::Sender<Msg>,
+}
+
+impl InodeInvalidator {
+    /// `true` once sent, `false` on timeout (or no invalidation thread).
+    pub fn invalidate_and_wait(&self, ino: Ino, timeout: std::time::Duration) -> bool {
+        let (done, wait) = mpsc::channel();
+        if self
+            .tx
+            .send(Msg::Waited(vec![Inval::Inode { ino, data: true }], done))
+            .is_err()
+        {
+            return false;
+        }
+        wait.recv_timeout(timeout).is_ok()
     }
 }
 
@@ -192,30 +228,32 @@ fn run(rx: mpsc::Receiver<Msg>) {
                 view_root,
             } => views.push((id, notifier, view_root)),
             Msg::Unregister(id) => views.retain(|(v, _, _)| *v != id),
-            Msg::Batch(batch) => {
-                for (_, notifier, view_root) in &views {
-                    for inval in &batch {
-                        // ENOENT (nothing cached) is the common answer;
-                        // every error only means there was nothing to drop.
-                        let _ = match inval {
-                            Inval::Entry { parent, name } => match in_view(*parent, *view_root) {
-                                Some(p) => {
-                                    notifier.inval_entry(fuser::INodeNo(p), OsStr::new(name))
-                                }
-                                None => Ok(()),
-                            },
-                            Inval::Inode { ino, data } => match in_view(*ino, *view_root) {
-                                Some(i) => notifier.inval_inode(
-                                    fuser::INodeNo(i),
-                                    if *data { 0 } else { -1 },
-                                    0,
-                                ),
-                                None => Ok(()),
-                            },
-                        };
-                    }
-                }
+            Msg::Waited(batch, done) => {
+                send(&views, &batch);
+                let _ = done.send(());
             }
+            Msg::Batch(batch) => send(&views, &batch),
+        }
+    }
+}
+
+fn send(views: &[(u64, fuser::Notifier, Ino)], batch: &[Inval]) {
+    for (_, notifier, view_root) in views {
+        for inval in batch {
+            // ENOENT (nothing cached) is the common answer;
+            // every error only means there was nothing to drop.
+            let _ = match inval {
+                Inval::Entry { parent, name } => match in_view(*parent, *view_root) {
+                    Some(p) => notifier.inval_entry(fuser::INodeNo(p), OsStr::new(name)),
+                    None => Ok(()),
+                },
+                Inval::Inode { ino, data } => match in_view(*ino, *view_root) {
+                    Some(i) => {
+                        notifier.inval_inode(fuser::INodeNo(i), if *data { 0 } else { -1 }, 0)
+                    }
+                    None => Ok(()),
+                },
+            };
         }
     }
 }

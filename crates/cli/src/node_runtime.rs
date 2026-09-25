@@ -134,6 +134,9 @@ pub struct NodeConfig {
     pub fsync_s3: bool,
     /// Plan 30 §M8: `--cto strict`.
     pub cto_strict: bool,
+    /// Plan 30 §M14: `--locks cluster` (`Some(true)`), `--locks local`
+    /// (`Some(false)`), or neither (cluster when P2P runs).
+    pub locks: Option<bool>,
     /// Plan 30 §M9: `--ack s3` (`Some(true)`), `--ack local`
     /// (`Some(false)`), or the filesystem's policy (`None`).
     pub ack: Option<bool>,
@@ -250,6 +253,10 @@ pub struct NodeRuntime {
     read_only_member: bool,
     fsync_s3: bool,
     cto_strict: bool,
+    /// Plan 30 §M14: the effective `--locks` mode, and every view's flush
+    /// for a recalled grant.
+    locks_cluster: bool,
+    lock_flushers: Arc<crate::locks::LockFlushers>,
     pins: Arc<pin::PinManager>,
     reintegration: Arc<reintegrate::ReintegrationState>,
     stop: Arc<AtomicBool>,
@@ -294,6 +301,7 @@ impl NodeRuntime {
             cache_size,
             fsync_s3,
             cto_strict,
+            locks,
             ack,
             initial_write_mode,
             read_only_member,
@@ -753,6 +761,14 @@ impl NodeRuntime {
         core_config.ack_s3 =
             crate::authority_driver::ack_s3_resolved(ack, fsmeta.ack_policy.as_deref());
         core_config.strict_mounts = cto_strict;
+        // Plan 30 §M14: cluster locks need a P2P path to the sequencer.
+        let locks_cluster = crate::locks::cluster_effective(locks, peers.is_enabled())?;
+        core_config.locks = locks_cluster;
+        tracing::info!(
+            locks = if locks_cluster { "cluster" } else { "local" },
+            "file locks"
+        );
+        let lock_flushers = Arc::new(crate::locks::LockFlushers::default());
         // Plan 30 §M10: flexible-quorum continuation epochs.
         core_config.epoch_slack = fsmeta.epoch_slack();
         {
@@ -851,6 +867,10 @@ impl NodeRuntime {
                     pending_acks: pending_acks.clone(),
                     status: core_status.clone(),
                     config: core_config,
+                    lock_flush: {
+                        let flushers = lock_flushers.clone();
+                        Arc::new(move |ino| flushers.flush(ino))
+                    },
                     fault_reply_delay_ms: fault_forward_delay_ms,
                 },
                 sync_tx.clone(),
@@ -1220,6 +1240,8 @@ impl NodeRuntime {
             read_only_member,
             fsync_s3,
             cto_strict,
+            locks_cluster,
+            lock_flushers,
             pins,
             reintegration,
             stop,
@@ -1371,6 +1393,13 @@ impl NodeRuntime {
                     tx: self.sync_tx.clone(),
                     fsync_s3: self.fsync_s3,
                     cto_strict: self.cto_strict,
+                    locks: self.locks_cluster.then(|| {
+                        Arc::new(crate::locks::ClusterLocks {
+                            meta: self.meta.clone(),
+                            tx: self.sync_tx.clone(),
+                            inval: self.kernel_inval.as_ref().map(|k| k.inodes()),
+                        })
+                    }),
                     lease: self.lease.clone(),
                     delegates: self.delegates.clone(),
                     acquire_deadline: self.acquire_deadline,
@@ -1499,11 +1528,17 @@ impl NodeRuntime {
         // kill leaves a dead mountpoint that needs `fusermount3 -u`.
         let view_root = fs.view_root();
         let frozen_view = selector.is_some() && !rw_snapshot;
-        let mut session =
-            fuser::Session::new(fs, &mountpoint, &fuse_config).context("FUSE mount")?;
+        // Plan 30 §M14: shared, so a recalled lock grant's flush reaches
+        // this view's write state (`locks::LockFlushers`).
+        let fs = Arc::new(fs);
+        let flusher: std::sync::Weak<dyn crate::locks::LockFlush> =
+            Arc::downgrade(&(fs.clone() as Arc<dyn crate::locks::LockFlush>));
+        let mut session = fuser::Session::new(fusefs::FuseFs(fs), &mountpoint, &fuse_config)
+            .context("FUSE mount")?;
         let unmounter = session.unmount_callable();
 
         let id = MountId(self.next_mount_id.fetch_add(1, Ordering::Relaxed));
+        self.lock_flushers.register(id.0, flusher);
         if let (Some(k), false) = (&self.kernel_inval, frozen_view) {
             k.register(id.0, session.notifier(), view_root);
         }
@@ -1527,6 +1562,7 @@ impl NodeRuntime {
             if let Some(k) = &node.kernel_inval {
                 k.unregister(id.0);
             }
+            node.lock_flushers.unregister(id.0);
             tracing::info!("FUSE detached");
             if let Some(path) = ephemeral_clone {
                 if let Err(e) = crate::remove_live_subtree(&node.meta, &path) {
@@ -1928,6 +1964,7 @@ mod tests {
                 cache_size: 16 * 1024 * 1024,
                 fsync_s3: false,
                 cto_strict: false,
+                locks: None,
                 ack: None,
                 initial_write_mode: writeback::WriteMode::Through,
                 read_only_member: false,

@@ -149,6 +149,8 @@ pub(crate) enum ParkedWhat {
         req: OpId,
         gen: u64,
         through: u64,
+        /// Plan 30 §M14: the lock grants handed back with it.
+        locks: Vec<constellation_meta::locks::Grant>,
     },
 }
 
@@ -912,12 +914,18 @@ impl Core {
                     req,
                     gen,
                     through,
+                    locks,
                 } => {
                     // Answered as it stands: the root outwaits the read
                     // grants by its horizon anyway.
                     out.push(Action::Send {
                         to,
-                        msg: PeerMsg::DelegRecalled { req, gen, through },
+                        msg: PeerMsg::DelegRecalled {
+                            req,
+                            gen,
+                            through,
+                            locks,
+                        },
                     });
                 }
             }
@@ -1326,10 +1334,16 @@ impl Core {
                     req,
                     gen,
                     through,
+                    locks,
                 } => {
                     out.push(Action::Send {
                         to,
-                        msg: PeerMsg::DelegRecalled { req, gen, through },
+                        msg: PeerMsg::DelegRecalled {
+                            req,
+                            gen,
+                            through,
+                            locks,
+                        },
                     });
                 }
                 ParkedWhat::ExecuteLocal { rid } => {

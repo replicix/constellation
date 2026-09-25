@@ -53,6 +53,7 @@ mod holder;
 mod inbox;
 mod jobs;
 mod lease;
+mod locks;
 mod placement;
 mod promise;
 mod readindex;
@@ -80,6 +81,7 @@ pub const DELEG_READ_EPOCH_BASE: u64 = 1 << 48;
 pub use inbox::InboxView;
 pub use jobs::JobKind;
 pub use lease::{backup_claim_grace_ms, LeaseState, PendingGate, Plan};
+pub use locks::LockView;
 pub use promise::{lease_may_carry, resolve_epoch_claims, EpochClaimView};
 pub use readindex::ReadView;
 pub use stream::StreamView;
@@ -282,6 +284,18 @@ pub struct Config {
     /// `CONSTELLATION_DELEGATION_TTL_MS` (default 5000): a grant's ttl;
     /// the margin is the lease's (`expiry_margin_ms`).
     pub delegation_ttl_ms: u64,
+    /// Plan 30 §M14: `--locks cluster` (`CONSTELLATION_LOCKS`, default
+    /// `cluster` with P2P, forced `local` without): lock requests reach
+    /// the owning sequencer. Off: the kernel keeps locks node-local and
+    /// nothing here runs.
+    pub locks: bool,
+    /// `CONSTELLATION_LOCK_TTL_MS` (default 5000): a lock grant's ttl;
+    /// the margin is the lease's (`expiry_margin_ms`).
+    pub lock_ttl_ms: u64,
+    /// `CONSTELLATION_LOCK_CACHE_IDLE_MS` (default 30000): a grant with
+    /// no local lock under it for this long is released (its renewals
+    /// stop); the next local lock asks for a new one.
+    pub lock_cache_idle_ms: u64,
     /// Rows per `DelegateStream` batch.
     pub delegation_stream_rows: usize,
     /// The delegate's stream/renew retry tick.
@@ -406,6 +420,9 @@ impl Config {
             takeover_promise_check: true,
             delegation: true,
             delegation_ttl_ms: 5_000,
+            locks: true,
+            lock_ttl_ms: 5_000,
+            lock_cache_idle_ms: 30_000,
             delegation_stream_rows: 256,
             delegation_stream_tick_ms: 50,
             delegation_reclaim_expired: true,
@@ -633,6 +650,31 @@ pub struct Stats {
     /// Delegate: ReadIndex answered for its subtree, read grants given.
     pub deleg_read_index_served: u64,
     pub deleg_read_grants: u64,
+    /// Plan 30 §M14: locks. Owner side.
+    pub lock_grants: u64,
+    pub lock_would_block: u64,
+    pub lock_grace_refusals: u64,
+    pub lock_grace_periods: u64,
+    pub lock_recalls_sent: u64,
+    pub lock_recalls_released: u64,
+    pub lock_recalls_expired: u64,
+    pub lock_waiters_parked: u64,
+    pub lock_waiting_replies: u64,
+    pub lock_wait_ms_total: u64,
+    pub lock_renewals_served: u64,
+    pub lock_reclaimed: u64,
+    pub lock_moved: u64,
+    /// Node side.
+    pub lock_requests: u64,
+    pub lock_unavailable: u64,
+    pub lock_grant_ms_total: u64,
+    pub lock_grant_ms: [u64; 14],
+    pub lock_granted_recalled: u64,
+    pub lock_renewals: u64,
+    pub lock_lost: u64,
+    pub lock_released: u64,
+    pub lock_idle_released: u64,
+    pub lock_released_replies: u64,
     // ---- M9: backups, seals, `ack=s3` ----
     /// Holder: backups added to / removed from the lease, and the lease
     /// CASes spent on it (a reconfiguration is one CAS when it lands).
@@ -783,6 +825,9 @@ pub(crate) enum S3For {
     InboxWithdraw(Rid),
     /// M8: a strict read learning who holds the lease.
     ReadHolder(OpId),
+    /// M14: a lock request learning the holder; renewals relearning it.
+    LockHolder(OpId),
+    LockRenewHolder,
     /// M9: the holder's backup-set reconfiguration CAS, and its re-read
     /// after a conflict.
     Reconfig,
@@ -833,6 +878,15 @@ enum Timer {
     PromiseWatch,
     DelegExpiry(u64),
     DelegRenew(u64),
+    /// M14.
+    LockRequestTimeout(OpId),
+    LockRetry(OpId),
+    LockHeldReply(u64),
+    LockGrantExpiry(constellation_meta::locks::GrantId),
+    LockRenewTick,
+    LockWaiterTick,
+    LockRenewTimeout(OpId),
+    LockTestTimeout(OpId),
     DelegStream,
     /// Phase 2b: the placement's evaluation tick.
     Placement,
@@ -866,6 +920,14 @@ impl Timer {
             Timer::PromiseWait => TimerKind::PromiseWait,
             Timer::PromiseWatch => TimerKind::PromiseWatch,
             Timer::DelegExpiry(_) => TimerKind::DelegExpiry,
+            Timer::LockRequestTimeout(_) => TimerKind::LockRequestTimeout,
+            Timer::LockRetry(_) => TimerKind::LockRetry,
+            Timer::LockHeldReply(_) => TimerKind::LockHeldReply,
+            Timer::LockGrantExpiry(_) => TimerKind::LockGrantExpiry,
+            Timer::LockRenewTick => TimerKind::LockRenewTick,
+            Timer::LockWaiterTick => TimerKind::LockWaiterTick,
+            Timer::LockRenewTimeout(_) => TimerKind::LockRenewTimeout,
+            Timer::LockTestTimeout(_) => TimerKind::LockTestTimeout,
             Timer::DelegRenew(_) => TimerKind::DelegRenew,
             Timer::DelegStream => TimerKind::DelegStream,
             Timer::Placement => TimerKind::Placement,
@@ -954,6 +1016,8 @@ pub struct Core {
     pub(crate) dl: delegate::DelegationState,
     /// Plan 30 §M11 phase 2b: the placement window (the root).
     pl: placement::PlacementState,
+    /// Plan 30 §M14.
+    lk: locks::LockState,
     /// The `now` of the event being handled (for `issue_s3`'s send time).
     last_now: Ms,
     stopped: bool,
@@ -1006,6 +1070,7 @@ impl Core {
             pr: promise::PromiseState::default(),
             dl: delegate::DelegationState::default(),
             pl: placement::PlacementState::default(),
+            lk: locks::LockState::default(),
             last_now: Ms(0),
             stopped: false,
             stats: Stats::default(),
@@ -1051,6 +1116,7 @@ impl Core {
         v.extend(self.stream.container_sizes());
         v.extend(self.rd.container_sizes());
         v.extend(self.dl.container_sizes());
+        v.extend(self.lk.container_sizes());
         v
     }
 
@@ -1101,6 +1167,7 @@ impl Core {
         self.arm_poll(now, 0, out);
         self.arm_drain(now, out);
         self.read_start(now, replica, out);
+        self.locks_start(replica);
         self.backup_start(now, replica, out);
         self.promise_start(now, replica, out);
     }
@@ -1125,6 +1192,9 @@ impl Core {
             Event::Timer { id } => self.on_timer(now, id, replica, &mut out),
             Event::UploadsDone { op, result } => {
                 self.on_uploads_done(now, op, result, replica, &mut out)
+            }
+            Event::LockFlushed { ino, grant, ok } => {
+                self.on_lock_flushed(now, ino, grant, ok, replica, &mut out)
             }
             Event::PublishDone { op, ok } => {
                 if self.publishing == Some(op) {
@@ -1183,6 +1253,7 @@ impl Core {
         self.backup_after_event(now, replica, &mut out);
         self.promise_after_event(now, replica, &mut out);
         self.deleg_after_event(now, replica, &mut out);
+        self.locks_after_event(now, replica, &mut out);
         out
     }
 
@@ -1304,8 +1375,18 @@ impl Core {
             PeerMsg::DelegRenew { req, gen, backup } => {
                 self.on_deleg_renew(now, from, req, gen, backup, out)
             }
-            PeerMsg::DelegRenewed { req, gen, ttl_ms } => {
-                self.on_deleg_renewed(now, req, gen, ttl_ms, replica, out)
+            PeerMsg::DelegRenewed {
+                req,
+                gen,
+                ttl_ms,
+                locks,
+            } => {
+                // The renewal installs the generation's window first; the
+                // handoff is tagged with the generation itself.
+                self.on_deleg_renewed(now, req, gen, ttl_ms, replica, out);
+                if ttl_ms > 0 && !locks.is_empty() {
+                    self.lock_install_moved(now, gen, locks, replica);
+                }
             }
             PeerMsg::DelegRecall { req, gen, .. } => {
                 self.on_deleg_recall(now, from, req, gen, replica, out)
@@ -1328,9 +1409,49 @@ impl Core {
                 sealed,
                 txs,
             } => self.on_deleg_sealed(now, from, req, gen, sealed, txs, replica, out),
-            PeerMsg::DelegRecalled { req, gen, through } => {
+            PeerMsg::DelegRecalled {
+                req,
+                gen,
+                through,
+                locks,
+            } => {
+                if !locks.is_empty() {
+                    // Back in the root's table (tag 0).
+                    self.lock_install_moved(now, 0, locks, replica);
+                }
                 self.on_deleg_recalled(now, req, gen, through, replica, out)
             }
+            PeerMsg::LockRequest {
+                req,
+                ino,
+                mode,
+                blocking,
+                sent,
+            } => self.on_lock_request(now, from, req, ino, mode, blocking, sent, replica, out),
+            PeerMsg::LockReply { req, outcome } => {
+                self.on_lock_reply(now, from, req, outcome, replica, out)
+            }
+            PeerMsg::LockGranted { ino, sent, outcome } => {
+                self.on_lock_granted_push(now, from, ino, sent, outcome, replica, out)
+            }
+            PeerMsg::LockRecall { req, ino, grant } => {
+                self.on_lock_recall(now, from, req, ino, grant, replica, out)
+            }
+            PeerMsg::LockRecalled { req } => self.on_lock_recalled_ack(req),
+            PeerMsg::LockReleased { ino, grant } => {
+                self.on_lock_released(now, from, ino, grant, replica, out)
+            }
+            PeerMsg::LockRenew { req, entries } => {
+                self.on_lock_renew(now, from, req, entries, replica, out)
+            }
+            PeerMsg::LockRenewed { req, results } => {
+                self.on_lock_renewed(now, from, req, results, replica, out)
+            }
+            PeerMsg::LockMirror { ver, grants } => self.on_lock_mirror(from, ver, grants),
+            PeerMsg::LockTest { req, ino, mode } => {
+                self.on_lock_test(now, from, req, ino, mode, replica, out)
+            }
+            PeerMsg::LockTestReply { req, outcome } => self.on_lock_test_reply(req, outcome, out),
         }
     }
 
@@ -1356,6 +1477,9 @@ impl Core {
             return;
         }
         if self.on_deleg_request_failed(now, req, out) {
+            return;
+        }
+        if self.on_lock_request_failed(now, req, to, outage, replica, out) {
             return;
         }
         if let Some(rid) = self.by_req.remove(&req) {
@@ -1396,6 +1520,8 @@ impl Core {
             S3For::InboxGc(key) => self.on_inbox_gc(now, key, result),
             S3For::InboxWithdraw(rid) => self.on_inbox_withdrawn(now, rid, result, replica, out),
             S3For::ReadHolder(op) => self.on_read_holder_learned(now, op, result, replica, out),
+            S3For::LockHolder(op) => self.on_lock_holder_learned(now, op, result, replica, out),
+            S3For::LockRenewHolder => self.on_lock_renew_holder(now, result, out),
             S3For::Reconfig => self.on_reconfig_put(now, result, replica, out),
             S3For::ReconfigReread => self.on_reconfig_reread(now, result, replica, out),
             S3For::TakeoverGet => self.on_takeover_get(now, result, replica, out),
@@ -1474,6 +1600,14 @@ impl Core {
             }
             Timer::DelegExpiry(gen) => self.on_deleg_expiry(now, gen, replica, out),
             Timer::DelegRenew(gen) => self.on_deleg_renew_timer(now, gen, out),
+            Timer::LockRequestTimeout(req) => self.on_lock_request_timeout(now, req, out),
+            Timer::LockRetry(op) => self.on_lock_retry(now, op, replica, out),
+            Timer::LockHeldReply(w) => self.on_lock_held_reply_timer(w, out),
+            Timer::LockGrantExpiry(id) => self.on_lock_grant_expiry(now, id, replica, out),
+            Timer::LockRenewTick => self.on_lock_renew_tick(now, replica, out),
+            Timer::LockWaiterTick => self.on_lock_waiter_tick(now, replica, out),
+            Timer::LockRenewTimeout(req) => self.on_lock_renew_timeout(req, replica, out),
+            Timer::LockTestTimeout(req) => self.on_lock_test_timeout(req, out),
             Timer::DelegStream => self.on_deleg_stream_timer(now, replica, out),
             Timer::Placement => self.on_placement_timer(now, replica, out),
         }
@@ -1584,6 +1718,15 @@ impl Core {
                 self.on_read_index_control(now, op, ino, dir, name, replica, out)
             }
             Control::Recall { inos } => self.on_recall_control(now, op, inos, replica, out),
+            Control::Lock {
+                ino,
+                mode,
+                blocking,
+            } => self.on_lock_control(now, op, ino, mode, blocking, replica, out),
+            Control::LockIdle { ino } => self.on_lock_idle_control(now, op, ino, replica, out),
+            Control::LockTest { ino, mode } => {
+                self.on_lock_test_control(now, op, ino, mode, replica, out)
+            }
             Control::Epoch {
                 open,
                 active,

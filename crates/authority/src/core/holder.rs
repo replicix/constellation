@@ -435,7 +435,8 @@ impl Core {
         // stays; see `round_release`).
         let can_serve = self.lease.ship_epoch(now, &self.cfg).is_some()
             && !self.lease.fenced()
-            && self.deleg_live_generations() == 0;
+            && self.deleg_live_generations() == 0
+            && replica.locks().grants_len() == 0;
         if !can_serve {
             self.stats.handoffs_declined += 1;
             out.push(Action::Send {

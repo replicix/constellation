@@ -596,6 +596,9 @@ pub struct StatusReport {
     /// Plan 30 §M8: `cto=strict` and read delegations.
     #[serde(default)]
     pub cto: CtoStatus,
+    /// Plan 30 §M14: `--locks` and cross-node lock grants.
+    #[serde(default)]
+    pub locks: LockStatus,
     /// Plan 30 §M9: acknowledgement policy, backups, seals.
     #[serde(default)]
     pub ack: AckStatus,
@@ -1290,6 +1293,79 @@ pub struct CtoStatus {
     /// Parked acknowledgements and recalls in flight right now.
     #[serde(default)]
     pub parked_acks: u64,
+    #[serde(default)]
+    pub recalls_in_flight: u64,
+}
+
+/// Plan 30 §M14: `--locks cluster` — lock grants leased from the
+/// owning sequencer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LockStatus {
+    /// `cluster` or `local`.
+    #[serde(default)]
+    pub mode: String,
+    // ---- this node as a lock holder ----
+    /// Grants this node holds now (cached across unlocks).
+    #[serde(default)]
+    pub grants_held: u64,
+    /// Local lock requests, answered under a held grant, refused by
+    /// another local owner, granted by the sequencer, refused
+    /// (`EAGAIN`), or unavailable (`ENOLCK`).
+    #[serde(default)]
+    pub requests: u64,
+    #[serde(default)]
+    pub local_hits: u64,
+    #[serde(default)]
+    pub local_conflicts: u64,
+    #[serde(default)]
+    pub granted: u64,
+    #[serde(default)]
+    pub would_block: u64,
+    #[serde(default)]
+    pub unavailable: u64,
+    /// Grant round trips: total ms and log2 histogram (`[0]` < 1 ms).
+    #[serde(default)]
+    pub grant_ms_total: u64,
+    #[serde(default)]
+    pub grant_ms: Vec<u64>,
+    #[serde(default)]
+    pub renewals: u64,
+    /// Grants the sequencer no longer knew (I/O under them is fenced).
+    #[serde(default)]
+    pub lost: u64,
+    /// Recalls received (and how many found local locks), releases sent.
+    #[serde(default)]
+    pub recalled: u64,
+    #[serde(default)]
+    pub recalled_busy: u64,
+    #[serde(default)]
+    pub released: u64,
+    /// I/O refused with `EIO` under a lapsed grant.
+    #[serde(default)]
+    pub fenced_io: u64,
+    // ---- this node as a sequencer ----
+    /// Live grants in this node's table.
+    #[serde(default)]
+    pub grants_table: u64,
+    #[serde(default)]
+    pub grants_made: u64,
+    #[serde(default)]
+    pub recalls_sent: u64,
+    #[serde(default)]
+    pub recalls_released: u64,
+    #[serde(default)]
+    pub recalls_expired: u64,
+    #[serde(default)]
+    pub reclaimed: u64,
+    #[serde(default)]
+    pub waiters_parked: u64,
+    #[serde(default)]
+    pub grace_refusals: u64,
+    /// Right now: requests in flight, parked waiters, recalls in flight.
+    #[serde(default)]
+    pub requests_in_flight: u64,
+    #[serde(default)]
+    pub waiters: u64,
     #[serde(default)]
     pub recalls_in_flight: u64,
 }

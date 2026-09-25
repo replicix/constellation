@@ -89,6 +89,11 @@ pub struct CoreView {
     pub s3_held: Option<(u64, i64)>,
     /// Plan 30 §M11.
     pub delegation: constellation_authority::core::DelegView,
+    /// Plan 30 §M14: lock requests in flight (node side), waiters parked
+    /// and recalls outstanding (owner side).
+    pub lock_requests: usize,
+    pub lock_waiters: usize,
+    pub lock_recalls: usize,
 }
 
 /// Plan 30 §M10: a node's continuation-epoch state, as the sim's epoch
@@ -498,7 +503,38 @@ impl Driver {
                     self.events_handled
                 );
             }
+            let lock_timer = match &event {
+                Event::Timer { id } if debug => self
+                    .timer_kinds
+                    .get(id)
+                    .map(|k| format!("{k:?}"))
+                    .filter(|k| k.contains("Lock")),
+                _ => None,
+            };
             let actions = self.core.handle(now, event, &*self.meta);
+            if debug && (debug_event.contains("Lock") || lock_timer.is_some()) {
+                let debug_event = match &lock_timer {
+                    Some(k) => format!("{debug_event} ({k})"),
+                    None => debug_event.clone(),
+                };
+                // `RUST_LOG=sim=debug`: plan 30 §M14's exchanges, timed.
+                let sent: Vec<String> = actions
+                    .iter()
+                    .filter_map(|a| {
+                        let t = format!("{a:?}");
+                        t.contains("Lock").then_some(t)
+                    })
+                    .collect();
+                tracing::debug!(
+                    node = self.id,
+                    now = now.0,
+                    event = %debug_event,
+                    ?sent,
+                    held = ?self.meta.locks().held_all(),
+                    grants = ?self.meta.locks().grants_snapshot(),
+                    "lock event"
+                );
+            }
             if std::env::var_os("AUTHORITY_SIM_WATCHDOG").is_some() {
                 *IN_FLIGHT.lock().unwrap() = None;
                 {
@@ -601,6 +637,10 @@ impl Driver {
         view.speculation = self.meta.speculation_counts().unwrap_or_default();
         view.ack = self.core.ack_view();
         view.delegation = self.core.deleg_view();
+        let locks = self.core.lock_view();
+        view.lock_requests = locks.requests_in_flight;
+        view.lock_waiters = locks.waiters;
+        view.lock_recalls = locks.recalls_in_flight;
         let now = self.clock.now();
         view.claim = self.core.epoch_claim_view(now);
         view.epoch_held = lease.epoch_held();
@@ -744,6 +784,24 @@ impl Driver {
                     let _ = self.tx.send(Event::RebuildDone { op, ok: false });
                 }
                 Action::RoundDone { .. } => {}
+                Action::LockFlush { ino, grant } => {
+                    // Plan 30 §M14: no file data in this simulation, so the
+                    // flush is only a delay (seeded by the grant, so a
+                    // replay repeats it): the release still races the
+                    // recalls, renewals and requests that arrive meanwhile.
+                    let tx = self.tx.clone();
+                    let delay = (grant.seq.wrapping_mul(7) ^ ino) % 25;
+                    tokio::spawn(async move {
+                        if delay > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
+                        let _ = tx.send(Event::LockFlushed {
+                            ino,
+                            grant,
+                            ok: true,
+                        });
+                    });
+                }
                 Action::EpochClose | Action::EpochFlushed => {
                     // `EpochManager::close` / `finish_flushing`.
                     let req = {

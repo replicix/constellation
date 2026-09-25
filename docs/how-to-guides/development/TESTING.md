@@ -1333,6 +1333,41 @@ baseline's 20% tolerance. It compares the median of three runs so scheduler
 noise in the sub-second metadata and warm-cache probes does not create a
 spurious regression.
 
+## Cross-node `flock`/`fcntl` (plan 30 M14)
+
+`--locks cluster` (the default when P2P is on; `CONSTELLATION_LOCKS`)
+makes POSIX and `flock` locks cluster-wide: per-node, per-file *grants*
+leased from the file's owning sequencer, cached across local unlocks,
+recalled on conflict, and fenced with `EIO` once a grant lapses. `--locks
+local` is the node-local behaviour of before (and the only mode without
+P2P). Knobs: `CONSTELLATION_LOCK_TTL_MS` (5000), `CONSTELLATION_LOCK_CACHE_IDLE_MS`
+(30000). `constellation status` has a `locks` section (both tables'
+counters).
+
+Model: `cargo test -p constellation-model --release --test locks -- --nocapture`
+(`crates/model/src/locks.rs`; counterexamples for no fencing, a grant
+before expiry plus margin under drift, failover without grace, moves
+that lose state, an outwaited delegate without grace; the design clean).
+
+Simulation: `cargo test -p constellation-authority --release` runs the
+lock configurations (`locks`, `locks-partition`, `locks-skew`,
+`locks-failover`, `locks-failover-backup`, `locks-faults`,
+`locks-delegated`) with a mutual-exclusion ghost; replay one with
+`AUTHORITY_SIM_SEED=<seed> AUTHORITY_SIM_CONFIG=<config> RUST_LOG=sim=debug,constellation_authority::core::locks=debug cargo test -p constellation-authority --release --test sim replay_seed -- --nocapture --exact`.
+
+Harness scenarios (the harness process is the application: it calls
+`flock(2)`/`fcntl(2)` on the mounts):
+
+| Scenario | What it checks |
+|---|---|
+| `flock-cross-node` | an exclusive `flock` on one node refuses (`EWOULDBLOCK`) and blocks the other until the unlock; shared locks coexist; `fcntl` ranges conflict across nodes and `F_GETLK` sees the remote holder; a write under the lock is read by the next holder; then `--locks local` for the record (both nodes hold `LOCK_EX`) |
+| `sqlite-two-nodes` (needs `sqlite3`) | concurrent `sqlite3` writers on one database from two nodes; `PRAGMA integrity_check` ok on both, every committed row present |
+| `lock-holder-partitioned` | the lock holder cut from the owner is fenced (`EIO`) and the waiter is granted only after ttl + margin, never before the fence; the healed node locks again |
+| `lock-failover` | the holder is killed with a lock held under an M9 backup; the successor reclaims/mirrors the grant (no `EIO` for the locker), refuses the contender throughout, grants it after the unlock |
+| `lock-latency` | measurements: first lock from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff, and a lone node under `cluster` against `local` |
+
+On failure `lock-failover` keeps the node logs under `/tmp/harness-m14-logs`.
+
 ## xfstests
 
 The nightly container builds pinned xfstests-dev revision

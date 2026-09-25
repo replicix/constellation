@@ -19,6 +19,8 @@ mod coop_churn;
 mod m10;
 /// Plan 30 §M11: delegated sub-sequencers, one log.
 mod m11;
+/// Plan 30 §M14: cross-node `flock`/`fcntl` (`--locks cluster`).
+mod m14;
 /// Plan 30 §M4's scenarios and the chaos runs' whole-cluster checks.
 mod m4;
 /// Plan 30 §M5 phase 2: the stale-base rule on the wire.
@@ -801,6 +803,36 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M11: CONSTELLATION_P2P=off on two nodes: delegation reports itself off, `delegate` is refused, nothing is ever delegated, appended or executed by a delegate, and both nodes' writes complete as before",
         requires: &[],
         run: m11::p2p_off_no_delegation,
+    },
+    Scenario {
+        name: "flock-cross-node",
+        desc: "plan 30 M14: two nodes under --locks cluster; an exclusive flock on one refuses (EWOULDBLOCK) and blocks the other until the unlock, shared locks coexist, fcntl ranges conflict across nodes and F_GETLK sees the remote holder, a write under the lock is read by the next holder; then --locks local for the record (both nodes hold LOCK_EX at once)",
+        requires: &[],
+        run: m14::flock_cross_node,
+    },
+    Scenario {
+        name: "sqlite-two-nodes",
+        desc: "plan 30 M14: concurrent sqlite3 writers on one database from two nodes (rollback journal, fcntl locks, busy_timeout); PRAGMA integrity_check ok on both, every committed row present",
+        requires: &["sqlite3"],
+        run: m14::sqlite_two_nodes,
+    },
+    Scenario {
+        name: "lock-holder-partitioned",
+        desc: "plan 30 M14: B holds LOCK_EX and is cut from the owner: its writes under the lock get EIO once its grant lapses; C, waiting, is granted only after the owner outwaited B's grant (ttl + margin) and never before B was fenced; after the heal B locks again",
+        requires: &[],
+        run: m14::lock_holder_partitioned,
+    },
+    Scenario {
+        name: "lock-failover",
+        desc: "plan 30 M14: four nodes with an M9 backup; B holds LOCK_EX and writes under it while the holder is killed; the backup takes over by seal, B's grant is reclaimed (no EIO), the contender's non-blocking attempts are refused throughout and it is granted once B unlocks",
+        requires: &[],
+        run: m14::lock_failover,
+    },
+    Scenario {
+        name: "lock-latency",
+        desc: "plan 30 M14 measurements: first lock on a file from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff; and a lone node under --locks cluster against --locks local",
+        requires: &[],
+        run: m14::lock_latency,
     },
     Scenario {
         name: "root-failover-with-delegates",

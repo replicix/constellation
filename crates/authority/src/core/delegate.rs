@@ -331,7 +331,7 @@ impl Core {
 
     /// The root this node streams to and renews with: the lease holder
     /// as last learned.
-    fn root_node(&self) -> Option<NodeId> {
+    pub(crate) fn root_node(&self) -> Option<NodeId> {
         self.lease
             .cached_holder
             .or(self.lease.last_seen.as_ref().map(|l| l.holder))
@@ -524,6 +524,21 @@ impl Core {
         for p in d.parked {
             self.answer_not_owner(now, p, root, replica, out);
         }
+        // Plan 30 §M14: whatever lock grants of the subtree are still
+        // here (the log ended the generation before the recall message
+        // did, or without one) are dropped — their holders keep
+        // honouring them, which the root's outwait grace covers (a
+        // generation ended without the delegate's drained answer).
+        let dropped = self.lock_take_generation(gen, replica);
+        if !dropped.is_empty() {
+            tracing::info!(
+                node = self.me(),
+                gen,
+                n = dropped.len(),
+                "delegation ended by the log with lock grants still here; dropped (the root's grace covers their holders)"
+            );
+        }
+        self.lock_reserve_all(now, replica, out);
     }
 
     /// A parked op cannot execute here any more: the requester
@@ -1605,10 +1620,32 @@ impl Core {
         } else {
             self.stats.deleg_renewals_refused += 1;
         }
+        // Plan 30 §M14: the lock grants under the subtree travel with the
+        // first renewal that grants.
+        let locks = if ttl_ms > 0 {
+            self.lock_take_handoff(gen)
+        } else {
+            Vec::new()
+        };
         out.push(Action::Send {
             to: from,
-            msg: PeerMsg::DelegRenewed { req, gen, ttl_ms },
+            msg: PeerMsg::DelegRenewed {
+                req,
+                gen,
+                ttl_ms,
+                locks,
+            },
         });
+    }
+
+    /// Plan 30 §M14: this node's honoured end of generation `gen` as its
+    /// delegate (`None`: not held, stopped, or never renewed).
+    pub(crate) fn deleg_mine_until(&self, gen: u64) -> Option<Ms> {
+        self.dl
+            .mine
+            .get(&gen)
+            .filter(|d| !d.stopped && d.until.0 > 0)
+            .map(|d| d.until)
     }
 
     /// A grant never outlives the root lease's usable end (the cap).
@@ -1687,6 +1724,9 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let through = replica.delegate_idx(gen);
+        // Plan 30 §M14: the subtree's lock grants go back with the answer;
+        // its waiters are told to ask the root.
+        let locks = self.lock_take_generation(gen, replica);
         if let Some(d) = self.dl.mine.get_mut(&gen) {
             d.stopped = true;
             self.stats.deleg_recalls_received += 1;
@@ -1713,15 +1753,23 @@ impl Core {
                         req,
                         gen,
                         through,
+                        locks,
                     },
                 );
+                self.lock_reserve_all(now, replica, out);
                 return;
             }
         }
         out.push(Action::Send {
             to: from,
-            msg: PeerMsg::DelegRecalled { req, gen, through },
+            msg: PeerMsg::DelegRecalled {
+                req,
+                gen,
+                through,
+                locks,
+            },
         });
+        self.lock_reserve_all(now, replica, out);
     }
 
     // ----------------------------------------------------- reads (M8)
@@ -2043,7 +2091,7 @@ impl Core {
             self.dl.gens.get_mut(&gen).expect("present").expiry = Some(t);
             return;
         }
-        let g = self.dl.gens.get(&gen).expect("present");
+        let g = self.dl.gens.get(&gen).expect("present").clone();
         if now < g.until {
             self.arm_gen_expiry(now, gen, out);
             return;
@@ -2052,14 +2100,25 @@ impl Core {
         if done {
             return;
         }
-        // Phase 2b: a silent delegate with a backup — ask the backup to
-        // seal and hand over what it holds first (once; the answer, or
-        // its absence, ends the generation either way).
-        if let (Some(backup), 0, true) = (
+        // Plan 30 §M14: an outwaited delegate — the lock grants moved to
+        // it may still be honoured with this root's windows: a grace on
+        // the subtree (the seal path re-delegates; the grace stands).
+        let outwaited_dir = (g.recall != RecallPhase::Sealing).then_some(g.dir);
+        let seal = match (
             g.backup,
             g.seal_attempts,
             g.recall != RecallPhase::Drained(0),
         ) {
+            (Some(backup), 0, true) => Some(backup),
+            _ => None,
+        };
+        if let Some(dir) = outwaited_dir {
+            self.lock_on_generation_outwaited(now, gen, dir);
+        }
+        // Phase 2b: a silent delegate with a backup — ask the backup to
+        // seal and hand over what it holds first (once; the answer, or
+        // its absence, ends the generation either way).
+        if let Some(backup) = seal {
             let req = self.op_id();
             let g = self.dl.gens.get_mut(&gen).expect("present");
             g.seal_attempts = 1;
@@ -2168,6 +2227,7 @@ impl Core {
         }
         let dir = g.dir;
         let cursor = g.cursor;
+        let drained = matches!(g.recall, RecallPhase::Drained(_));
         if let Err(error) = replica.apply_records_journaled(&[LogRecord::Recall { dir, gen }], None)
         {
             tracing::warn!(node = self.me(), gen, %error, "could not journal the recall record");
@@ -2177,6 +2237,22 @@ impl Core {
         replica.void_stream(gen, cursor);
         self.lease.touch(now);
         self.nudge(now, out);
+        // Plan 30 §M14: grants still waiting to be handed to this
+        // generation (it ended before its first renewal) come back to
+        // this table (sim seed 96027 lost them).
+        let back = self.lock_take_handoff(gen);
+        if !back.is_empty() {
+            self.lock_install_moved(now, 0, back, replica);
+        }
+        // A generation that did not hand its grants back (no graceful
+        // drain), or one whose handoff may still be in flight (sent with
+        // a renewal, recalled before it landed: the drained answer
+        // carries nothing), may leave holders honouring them: a grace on
+        // the subtree (sim seeds 96046, 196252).
+        let handoff_sent = self.lock_handoff_was_sent(gen);
+        if !drained || handoff_sent {
+            self.lock_on_generation_outwaited(now, gen, dir);
+        }
         tracing::info!(
             node = self.me(),
             gen,
@@ -2478,6 +2554,9 @@ impl Core {
             },
         );
         self.arm_gen_expiry(now, gen, out);
+        // Plan 30 §M14: the subtree's lock grants go with it.
+        self.lock_on_delegated(gen, replica);
+        self.lock_reserve_all(now, replica, out);
         self.stats.deleg_delegated += 1;
         match kind {
             DelegKind::Placed => self.stats.place_delegated += 1,
@@ -2700,6 +2779,8 @@ impl Core {
                 });
             }
         }
+        // Plan 30 §M14: the tenure's lock grants go with it.
+        self.lock_on_lease_gone(now, replica, out);
     }
 }
 

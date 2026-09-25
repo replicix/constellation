@@ -341,6 +341,7 @@ pub mod delegation;
 pub mod flex;
 pub mod hotdir;
 pub mod inbox;
+pub mod locks;
 pub mod namespace;
 pub mod positions;
 pub mod protocol;

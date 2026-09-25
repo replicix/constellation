@@ -20763,3 +20763,904 @@ Files: `crates/meta/src/store/spec.rs`,
 `crates/harness/src/reqlog.rs`, `crates/harness/src/scenarios.rs`
 (plus a more informative `a-only` failure message),
 `crates/harness/src/scenarios/m11.rs`.
+
+## Plan 30 M14 — strict mode: cross-node `flock` and `fcntl` (coder, 2026-09-25; pipelined on the M12 WIP base 323996d; all M14 work is uncommitted on top of it)
+
+Closes structural limit L6: SQLite or any lock-based application on two
+nodes could corrupt data, because every node's kernel kept its own lock
+table. Locks are now leased, recallable, per-node file-lock *grants* at
+the owning sequencer, with NFSv4-style fencing; the kernel-facing POSIX
+and `flock` tables stay node-local under those grants.
+
+### Design (one page)
+
+**Two levels.**
+- A **grant** is the cross-node unit: the owning sequencer of a file
+  (the lease holder, or the M11 delegate of its subtree, or the M12
+  range delegate for its name's ancestor as ownership resolves it) gives
+  one node a shared or exclusive grant on the whole inode, leased for
+  `lock_ttl` (5 s, `CONSTELLATION_LOCK_TTL_MS`). The sequencer's table is
+  keyed by `(node, ino)` and never sees ranges or owners
+  (`constellation_meta::locks::LockTables`, sequencer side).
+- A grant is **cached**: the node keeps it after its last application
+  unlocks, so an uncontended re-lock by the same node — SQLite's five
+  lock ops per transaction, git's `index.lock` — costs no message. The
+  sequencer *recalls* it when another node asks for a conflicting one; an
+  idle cache is given back after `CONSTELLATION_LOCK_CACHE_IDLE_MS`
+  (30 s) so renewals stop.
+- **Local locks** are the kernel's POSIX (`fcntl`) and `flock` locks of
+  this node's processes, keyed by the kernel's `lock_owner` with byte
+  ranges (POSIX split/merge semantics), resolved on the node under the
+  grant it holds (`LockTables`, node side; `LocalOutcome::{Done,
+  Conflict, NeedGrant}`). fuser 0.18 delivers `flock` through `setlk`
+  without `FUSE_LK_FLOCK`, so both share one table and one owner space
+  (a process's `flock` owner is its open file, its `fcntl` owner its file
+  table: distinct ids, never colliding). Consequence, documented: a
+  `flock` and an `fcntl` lock of the *same* process conflict with each
+  other here, where Linux keeps them independent (BSD semantics).
+
+**Time discipline** — exactly M8's read delegations, reused rather than
+reinvented:
+- the sequencer grants `ttl = min(lock_ttl, usable end of its authority −
+  now)` (the cap: the root's lease, `expires − margin`; a delegate's
+  renewed grant `until − margin`) and records the grant live until
+  `granted + ttl + margin` in its clock;
+- the node honours it until `sent + ttl − margin`, measured from when it
+  *sent* the request or renewal; renewals every `ttl/2` (one `LockRenew`
+  per owner carrying every due grant, `Timer::LockRenewTick` at `ttl/4`);
+- a grant is renewed **only while honoured**; a lapsed grant is lost;
+- `margin` is the lease's `expiry_margin_ms` (`M > 2D`).
+
+**Fencing.** Every `read`, `write`, `flush`, `fsync`, `fallocate` and
+truncating `setattr` checks `LockTables::fenced(ino, now)`: local locks
+on the inode and no honoured grant → `EIO`, until a lock is taken again.
+With no local lock anywhere on the node it is one relaxed atomic load —
+the cost to workloads that never lock.
+
+**Recall.** A conflicting request recalls the conflicting grants
+(`LockRecall`, with `Timer::LockGrantExpiry` at `until` as the outwait
+backstop) and parks the request (FIFO per inode). The recalled node acks
+receipt, and releases (`LockReleased`) once no local lock is under the
+grant *and its dirty data is flushed through* (`Action::LockFlush` →
+the fs's `flush_inode` + barrier → `Event::LockFlushed`), so the next
+holder's grant carries a position past the writes made under the
+previous one. A grant with local locks under it is released when the
+last one leaves (`Control::LockIdle` from the FUSE unlock/close paths).
+The waiter's RPC is answered `Waiting` after `recall_hold_ms` (M8's
+`Held` pattern) and the grant is *pushed* (`LockGranted`, echoing the
+requester's send time) when it comes, or the next re-send re-attaches.
+A non-blocking request that conflicts gets `WouldBlock` (`EAGAIN`) at
+once — and the recall still goes out, so SQLite's busy loop succeeds on a
+retry once the other node's application unlocks.
+
+**Lock-to-unlock coherence.** A grant's reply carries the sequencer's
+position for the inode (as a ReadIndex answer would); the FUSE thread
+session-waits to it and invalidates the kernel's data and attribute
+cache of the inode before the local lock is taken. Together with the
+flush-before-release this gives "what the previous holder wrote under
+its lock is what the next holder reads under its" — what SQLite needs.
+
+**Failover.**
+- A **TTL takeover** starts an empty table: every grant of the old
+  tenure was capped by its lease, so it has lapsed at its holder (fenced)
+  before the successor may act. Nothing to reclaim.
+- A **fast takeover** (a sealed backup, or `ack=s3`) reuses M9's
+  acknowledgement floor as the **grace period**: the successor makes no
+  new grant until `min(old expiry, marker + takeover_window +
+  max(read_deleg_ttl, lock_ttl) + 2M)` (`note_marker_landed`, the
+  `granted_delegations` marking now also set by the first lock grant),
+  while renewals of unknown grants are accepted as **reclaims**
+  (`on_lock_renew` → `lock_renew_one`). The predecessor answers lock
+  traffic only with fresh S3 liveness (M8's probe rule,
+  `strict_answer_allowed`). The holder's table is also mirrored to its
+  backups asynchronously (`LockMirror`, coalesced per event); the fast
+  successor installs the last mirror restamped (`lock_install_mirror` in
+  the takeover gate). The mirror is an availability optimisation only:
+  the model shows it is neither sufficient (asynchronous) nor necessary
+  (the grace is the safety argument).
+- The **restart quarantine** (`note_grant_horizon`) covers lock grants
+  too: a holder restarting inside its lease grants nothing new until the
+  persisted horizon, and accepts reclaims.
+
+**Delegation moves (M11/M12).** The table follows the subtree with the
+existing messages: the root hands the subtree's grants over in the
+delegate's first `DelegRenewed` (`lock_on_delegated` → `handoff` →
+`lock_take_handoff`), the delegate hands them back in `DelegRecalled`
+(`lock_take_generation`); the receiver installs them **restamped** (live
+until `now + ttl + margin` in its clock — as if renewed at the move,
+never sooner than what the holder measured). Range delegations need
+nothing extra: ownership of a file resolves by its primary link's
+ancestors (`resolve_ownership(read_keys(ino))`), the same rule every
+other lock-table lookup uses. A delegate outwaited by TTL leaves a
+**grace on its subtree** (`lock_on_generation_outwaited`,
+`LockState::grace`): the grants moved to it still carry the root's
+windows until their first renewal there.
+
+**Inbox mode (M13, no P2P).** Decision: **locks are not routed through
+the S3 inbox.** A lock through the inbox would cost one S3 PUT, a
+holder poll (warm tier up to 2 s) and a reply through the log per
+request, plus lease renewals every 2.5 s per node as S3 PUTs — SQLite's
+five lock ops per transaction would take ten seconds, and a renewal
+lapsing on S3 latency would fence I/O mid-transaction. Instead: with
+P2P off the effective mode is `local` (today's node-local kernel locks);
+an explicit `--locks cluster` with P2P off refuses the mount with a
+clear error; with P2P on but the owner unreachable, a non-blocking lock
+fails with `ENOLCK` after the forward retries (`LockAnswer::Unavailable`)
+and a blocking one keeps retrying until the owner is reachable again.
+
+**Mount option** `--locks local|cluster` (`CONSTELLATION_LOCKS`).
+Default: **`cluster`** when P2P is on, `local` when it is off.
+Justification: correctness by default is what a distributed filesystem
+owes lock users (the alternative is silent corruption); a single node in
+cluster mode pays nothing (it is the holder: every lock op is one core
+call, no message, and the fence is an atomic load); the cost falls only
+on lock users on non-sequencer nodes, who get one round trip per
+*first* lock on a file and none for re-locks; `local` remains the
+documented escape hatch for lock-heavy single-writer workloads that
+never share files.
+
+### The safety argument (why safety never depends on failure detection)
+
+Mutual exclusion is a property of time-bounded promises only:
+1. a node performs I/O under a lock only while its grant is honoured,
+   `real ≤ s + ttl − M + 2D` (`s` its send time);
+2. the sequencer grants a conflicting lock only after the grant is gone:
+   released by the holder (after its flush), or expired at
+   `real ≥ g + ttl + M − 2D` with `g ≥ s`; safe when `2M > 4D`;
+3. a successor of a fast takeover waits M8's floor before granting; the
+   predecessor answers only with a fresh probe; a TTL successor needs
+   nothing (the cap); an outwaited delegate leaves a grace;
+4. reclaims are accepted only from nodes still honouring their grant
+   (a lapsed grant is never renewed), so a reclaim is always of a grant
+   the previous tenure had live;
+5. moves restamp conservatively (later expiry at the receiver, never
+   earlier), so a grant never expires at an owner before it lapses at
+   its holder.
+
+No step consults liveness; a partition only delays (recalls are
+outwaited; requests are refused or parked).
+
+### The model (`crates/model/src/locks.rs`, `tests/locks.rs`)
+
+A focused Stateright model over clocks with bounded drift, in the style
+of `cto.rs`: per-node grants on one file with recall, release, expiry,
+renewal, cached re-locks, upgrades, blocking waiters (parked and pushed),
+TTL and fast takeovers (with the backup's asynchronous mirror and the
+floor as grace), delegation moves with and without state, and an
+outwaited delegate. Property `mutual_exclusion`: no node performs I/O
+under a grant after a conflicting grant to another node was issued (the
+interval form; a reclaim keeps its id, an upgrade is a new grant).
+
+Counterexamples found by the checker (each asserted *found*, path
+printed), then the design clean and exhaustive:
+
+| Test | Result |
+|---|---|
+| `no_fencing_violates` | violation (2.1M states) |
+| `granting_before_expiry_plus_margin_violates_under_drift` (margins 1, D = 1) | violation (11.8M) |
+| `the_lease_margin_is_clean_under_drift` (margins 3) | clean, exhaustive (16.9M) |
+| `fast_takeover_without_replication_or_grace_violates` | violation |
+| `fast_takeover_with_only_the_async_mirror_violates` | violation |
+| `fast_takeover_with_grace_is_clean` / `_and_mirror_` | clean (reclaim witnessed) |
+| `fast_takeover_without_the_probe_violates` / `_with_the_probe_is_clean_for_the_old_root` | violation / clean |
+| `uncapped_grants_violate_across_a_ttl_takeover` / `capped_grants_are_clean_across_a_ttl_takeover` | violation / clean (fencing witnessed) |
+| `a_delegation_move_that_loses_state_violates` / `a_recall_that_loses_state_violates` / `delegation_moves_with_state_are_clean` | violation / violation / clean |
+| `an_outwaited_delegate_without_grace_violates` / `a_capped_delegate_outwaited_is_clean` | violation / clean |
+| `contention_is_clean`, `cached_relock_and_shared_pairs_are_clean`, `the_owner_as_a_lock_user_is_clean` | clean |
+
+20 tests, 15 s in release together. Three design corrections came out
+of the checker before any code existed (each is a comment at the code
+it shaped):
+1. **A recall that overtakes its grant's reply.** Answering "released"
+   for an unknown grant livelocks two contenders (the owner grants the
+   waiter, the stale reply is discarded and re-sent, which recalls the
+   waiter's not-yet-installed grant, forever — depth-215 traces). The
+   recall is remembered instead (`note_pending_recall`), the reply
+   installs the grant already recalled, and the application it was
+   granted for gets its one local lock (`HeldGrant::first_use`) before
+   the release.
+2. **No late reclaims.** A successor's grace accepted a reclaim of a
+   grant that had lapsed at its holder and been given away by the old
+   owner. A node renews only what it still honours.
+3. **Outwaited delegates need a grace.** The cap covers a delegate's own
+   grants, not the ones *moved* to it with the root's windows.
+
+### Implementation (files)
+
+- `crates/meta/src/locks.rs` (new): `LockTables`, both sides + local
+  locks + `fenced`; `Meta::locks()`.
+- `crates/authority/src/core/locks.rs` (new): the protocol;
+  `event.rs`/`action.rs`: `Control::{Lock, LockIdle, LockTest}`,
+  `ControlOk::{Lock, LockTest}`, `PeerMsg::Lock*` (10 messages),
+  `DelegRenewed/DelegRecalled { locks }`, `Action::LockFlush`,
+  `Event::LockFlushed`; `core/mod.rs`: config (`locks`, `lock_ttl_ms`,
+  `lock_cache_idle_ms`), stats (`lock_*`), timers, dispatch;
+  `delegate.rs`: handoff hooks; `backup.rs`: the floor bound;
+  `jobs.rs`: mirror install, lease-gone; `replica.rs`: `locks()`,
+  `is_under()`.
+- CLI/net: `crates/cli/src/locks.rs` (new: `--locks local|cluster` /
+  `CONSTELLATION_LOCKS`, the wire conversions), `fusefs.rs`/`fusefs_ops.rs`
+  (`init` capabilities `FUSE_POSIX_LOCKS | FUSE_FLOCK_LOCKS` in cluster
+  mode; `getlk`/`setlk`; the blocking wait on its own `lock-wait` thread
+  owning the `ReplyEmpty`; owner release in `flush` (POSIX) and
+  `release` (flock); the fence in `read`/`write`/`flush`/`fsync`/
+  `fallocate`/truncating `setattr`; the kernel-cache invalidation and
+  session wait after a grant), `authority_driver.rs` (`SyncRequest::
+  {Lock, LockIdle, LockTest, PeerLock*}`, `Driver::lock_rpc`/`one_way`,
+  `Action::LockFlush` on `spawn_blocking` through a `lock_flush` hook =
+  `flush_inode(ino, true)` + `drain_inode` + `sync_barrier` in every
+  view), `node_runtime.rs`, `main.rs` (`PeerService` bridge; `status.locks`),
+  `crates/net/src/{message,endpoint,peers}.rs` (`Payload::Lock*`, appended;
+  `DelegRenewed/DelegRecalled { locks }`), `crates/api` (status types).
+- Sim: `crates/authority/tests/sim/locks.rs` (new: the lock workload
+  emulating the FUSE dance, the mutual-exclusion ghost, the
+  "200 Granted answers refused" liveness check), `run.rs`/`node.rs`/
+  `sim.rs` (configs `locks`, `locks-partition`, `locks-skew`,
+  `locks-failover`, `locks-failover-backup`, `locks-faults`,
+  `locks-delegated`; the driver answers `Action::LockFlush` and narrates
+  every `Lock*` event and timer under `RUST_LOG=sim=debug`).
+- Harness: `crates/harness/src/scenarios/m14.rs` (new; five scenarios,
+  registered in `scenarios.rs`); `docs/how-to-guides/development/TESTING.md`
+  gained the M14 section.
+
+### What the sim found (and the code now does)
+
+The deterministic sim, driving the real core with the lock workload and
+the ghost, found eighteen issues in the first implementation before any
+harness scenario ran, none of which the model had (the model's node
+holds one grant and one application; the code's node holds many local
+owners under one grant, and its replies cross its own releases). Each is
+a rule in the code now, with the seed that found it in the comment:
+
+| # | What | Rule |
+|---|---|---|
+| 1 | a same-node shared request *downgraded* an exclusive grant under a local exclusive lock | an owner never downgrades (`lock_try_grant` takes `max(existing, requested)`); the node merges by id and never weakens |
+| 2 | a cooperative lease release lost the table; the successor granted at once | no idle release / handoff while grants are live; a takeover of a *released* unexpired lease starts a root-wide grace |
+| 3 | a `(gen, 0)` stream position was unreachable (a fresh generation) | `SessionState::reaches` treats index 0 as reached (this also fixes M11's delegate ReadIndex positions) |
+| 4 | the pushed grant was matched by an echoed send time; an expired recall of an already-replaced grant left a waiter parked | pushes match by `(ino, owner, covering mode)`; `Recalling` carries the inode and a gone grant's expiry still serves waiters |
+| 5 | nobody acquired a claimable lease for lock traffic alone | a lock request that reads a claimable lease enqueues `JobReq::Acquire` |
+| 6, 7 | a re-affirmed recalled grant (same id) crossed the node's own release; the owner's client spun on its own recalled grant | an owner grants nothing while the requester's own grant is recalled (the request parks); a node sends no request while its held grant is recalled or releasing |
+| 8 | a grant that answered an op it did not cover was neither used nor released | pushes cover the op's mode; lapsed held grants are dropped; recalled idle grants are released, never renewed |
+| 9 | two same-node ops shared one owner-side waiter | waiters re-attach by `(node, ino, mode)` |
+| 10 | a generation recalled before its first renewal lost the handoff | `end_generation` returns the un-handed grants |
+| 11 | an owner's own fresh grant was recalled and released before its FUSE thread ran | every install pins one local lock attempt (`first_use`) |
+| 13, 14 | an in-place upgrade's reply crossed the release of the same id | an upgrade — every grant — is a **new id**; `end_release` re-checks for local locks and first use; a node tombstones released ids and refuses to reinstall them (`Installed::Released` → re-request) |
+| 16 | a delegate ending via the log left its grants behind | grants are tagged with their generation; `lock_take_generation` takes by tag; every non-drained generation end applies the subtree grace |
+| 17, 18 | a locally parked op was stamped from its original request; a re-affirmed dropped id looped | local waiters are stamped at delivery; a window already over on arrival is re-requested; ids are never reused |
+
+| 19 | a renewal of an id the owner had replaced (the newer reply lost) was answered `Lost`: a spurious `EIO` in a healthy cluster | the owner answers from the node's current grant; `LockRenewResult::Ok` carries `id`/`mode` and the node adopts them |
+| 20 | a `LockGranted` push queued behind a *pause* was installed with a fresh window (a real violation) | the request carries the requester's send time, the push echoes it, the node takes `min(echoed, current)`; a window over on arrival is re-requested |
+| 21 | `locks-failover-backup` seed 194287: the namespace did not converge after a holder crashed twice (not a lock property, deterministic, 3/3 replays) | **open, pre-existing (M6)** — narrated: node 1 restarts one segment behind (applied 28); its `Create(f3)` is refused `Exists { records }` from the holder's state *after* seq 29 (`Rename f2→f3`); installing the hint's records removes `f2` locally but leaves `f3`'s inode, so seq 29 then finds no `f2` and the replica diverges (`f0` ends as 0x30000000401 against 0x20000000405 elsewhere). The lock workload only made the window (a crash inside a critical section, a restart one segment behind) likelier. Reproduce: `AUTHORITY_SIM_SEED=194287 AUTHORITY_SIM_CONFIG=locks-failover-backup RUST_LOG=constellation_authority=debug,sim=debug … replay_seed`. Not fixed here (M6's refusal-hint path, out of M14's scope): for the tester and the coordinator |
+
+Two more came from the harness: (12) a successor whose takeover gate is
+pending (the view fenced for M9's floor) answered renewals `NotOwner`
+for the whole floor, so the locker's grant lapsed — renewals and reclaims
+are now served through the gate (`lock_route_for(.., renewal)`); and a
+parked waiter refused for stale liveness, an unmarked lease or a grace
+had no event ending its wait — `Timer::LockWaiterTick` re-serves parked
+waiters every `recall_hold_ms`. And renewals whose RPC fails re-read the
+lease (`lock_relearn_owner`) instead of trusting `reaches()`, which keeps
+a dead holder "connected" until the transport notices.
+
+### Results
+
+**Model** (`cargo test -p constellation-model --release --test locks`):
+20 tests, all as intended (the table above), 15–25 s in release.
+
+**Sim** (`cargo test -p constellation-authority --release`, 76 sim tests
++ 74 lib, ~35 s; the 1000-seed CI shards and every earlier regression
+unchanged). The lock configurations, seeds per config and the counters
+summed over nodes (the sim-harness agent's census, CI seeds
+90000–97080, 800/800 pass, no violation):
+
+| Test (config) | Seeds | What happened |
+|---|---|---|
+| `locks_are_mutually_exclusive` (`locks`, 3 nodes, no faults) | 200 | 5048 lock steps, 18637 I/Os, 3980 grants, 3244 recalls (3195 released, 49 outwaited), 3074 waiters, 614 renewals, 164 grants arriving recalled; max wait 4.5 s |
+| `locks_partitioned_holder_is_fenced` (`locks-partition`: the locker partitioned twice + a random fault) | 120 | 29396 I/Os, 819 fenced (`EIO`), 2767 grants, 541 recalls outwaited (ttl + margin), 4208 renewals, 26 lost, 32 `ENOLCK`; max wait 16 s |
+| `locks_hold_under_clock_skew` (±200 ms skew, margin 500 ms, 2% P2P drop) | 120 | 2387 grants, 78 outwaited, 15 fenced |
+| `locks_survive_holder_failover` (holder and locker crashes, TTL takeover) | 80 | 1857 grants, 213 outwaited, 289 fenced, 1 grace period, 6 grace refusals |
+| `locks_survive_backup_failover` (the same under the M9 backup) | 80 | 80 seal takeovers with the mirror installed, 1946 grants, 211 outwaited, 264 fenced |
+| `locks_under_random_faults` (2 CI faults per seed) | 120 | 1376 grants, 27 outwaited, 8 fenced |
+| `locks_in_a_delegated_subtree` (lock files under a delegated `d1`, 30% cross-subtree renames) | 80 | 2255 grants, 757 moved with the delegation, 83 outwaited, 40 fenced |
+| `locks_survive_paused_nodes` (`locks-pause`: SIGSTOP-style pauses of 3–4.5 s) | 80 | the stale-push case (issue 20) |
+| `locks_without_the_fence_are_found` | 60 | non-vacuity: clients ignoring `fenced` are caught by the ghost |
+
+Final census on the finished core (the sim-harness agent): the CI set
+880/880 (`locks` 200, `locks-partition` 120, `locks-skew` 120,
+`locks-failover` 80, `locks-failover-backup` 80, `locks-faults` 120,
+`locks-delegated` 80, `locks-pause` 80); the long set (`--ignored
+long_locks`, 300 seeds × 8 configs, seeds 19x000+) 2399/2400 — the one
+failure is issue 21 below, an M6 `Exists`-hint divergence, not a lock
+check (no mutual-exclusion violation anywhere).
+
+**Harness** (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m14fable`,
+release binary, this host):
+
+| Scenario | Result | What it measured |
+|---|---|---|
+| `flock-cross-node` | PASSED 6.0 s | B's `LOCK_EX\|LOCK_NB` refused in 1.2–1.6 ms while A holds; B's blocking `LOCK_EX` granted 307–310 ms after A's unlock (the harness holds 300 ms before unlocking: the handoff itself is ~2 ms); shared pair 0.4–2.7 ms; `fcntl` overlap refused, `F_GETLK` reports the remote write lock; lock-to-unlock coherence holds; `--locks local`: both nodes hold `LOCK_EX` at once |
+| `sqlite-two-nodes` | PASSED 9.6 s | 80 transactions from two nodes in 0.87 s; per transaction p50 8.8 ms, p90 11.2 ms, p99 25 ms, max 458 ms; `integrity_check` ok on both, 80 rows on both, no lost commit |
+| `lock-holder-partitioned` (ttl 3 s, margin 1 s) | PASSED 7.8–48 s | B fenced (`EIO`) 2.0 s after the cut (= last renewal + ttl − margin); C granted 4.0–4.7 s after the cut (= ttl + margin from B's last renewal at the owner), always after B was fenced; B locked again 1.6–2.6 ms after the heal |
+| `lock-failover` (ttl 15 s) | PASSED 34.7 s | seal takeover; the locker's writes saw 0 `EIO` across the failover; the contender refused 114–115 times; granted 0.5–0.8 ms after the locker's unlock |
+| `lock-latency` | PASSED 7.0 s | see below |
+
+Latency (LAN = one host, two nodes; the sequencer A, non-sequencer B):
+
+| Operation | p50 | p90 | p99 |
+|---|---|---|---|
+| B, first `LOCK_EX` on a file (one round trip + session wait + cache invalidation) | 460–670 µs | 480–780 µs | 52–55 ms (the first grant marks the lease: one S3 CAS) |
+| B, cached re-lock (`LOCK_EX` after `LOCK_UN`, same file) | 25–33 µs | 31–44 µs | 50–88 µs |
+| B, cached `fcntl` `F_SETLK`+`F_UNLCK` | 10–15 µs | 12–25 µs | 15–37 µs |
+| A (the sequencer), `LOCK_EX` | 26–29 µs | 39–40 µs | 51–75 µs |
+| contended handoff (A unlocks → B, blocked, is granted) | 1.6–2.6 ms | 1.8–4.1 ms | 2.4–5.3 ms |
+
+Cost to a single node (a lone mount, 1000 iterations each):
+
+| | `--locks local` (the kernel) | `--locks cluster` |
+|---|---|---|
+| `flock` `LOCK_EX`+`LOCK_UN` | 117–272 ns | 21–30 µs |
+| `fcntl` `F_SETLK`+`F_UNLCK` | 294–590 ns | 7–13 µs |
+| `write(2)` under a lock (the fence check) | 12–22 µs | 12–14 µs |
+
+So a lone node in cluster mode pays two FUSE round trips per lock/unlock
+pair (~10–30 µs, what any FUSE-implemented lock costs: the kernel no
+longer short-circuits them) and nothing on the data path: the fence is
+one relaxed atomic load plus a clock read (~20 ns). No S3 request is
+added by locks anywhere except the one-time `granted_delegations` CAS
+per tenure (M9's mark, shared with read delegations). `git-workflow`
+(no lock calls, rename-based lock files): 7.9 s under `local`, 7.2 s
+under `cluster` — no effect.
+
+Regression sweep on the same binary: `delegate-crash`,
+`cross-subtree-rename`, `root-failover-with-delegates`,
+`backup-failover-with-delegation`, `cto-strict` — all PASSED.
+`bash tests/smoke.sh` and `bash tests/integration.sh` PASSED. The
+pjdfstest lane could not start on this host while another session's
+compose project held port 4566 (see "what the tester must run"); pjdfstest
+has no lock cases (checked: the pinned 85a8aea has no `flock`/`fcntl`
+tests), xfstests' `generic/131`, `478`, `504` do (504 is already in
+`tests/xfstests-baseline.txt`).
+
+### Decisions and limits
+
+- Default `--locks cluster` (P2P on), `local` (P2P off); inbox mode
+  never carries locks (above).
+- `getlk` against a grant held by another node reports a whole-file
+  write lock with pid 0 (the remote holder); node-level granularity
+  means readers and writers on different nodes serialise per file, which
+  SQLite in rollback-journal mode does anyway.
+- Blocked `setlkw`/`flock` waits cannot be interrupted: fuser 0.18
+  answers `FUSE_INTERRUPT` with `ENOSYS`, so the kernel waits for the
+  reply even under SIGKILL. The wait is off the FUSE worker threads (a
+  blocking task), so it never starves the mount.
+- A `flock` and an `fcntl` lock of the same process conflict (one owner
+  space; fuser hides `FUSE_LK_FLOCK`).
+- Continuation epochs: grants continue under a held lease (the cap is
+  `lock_ttl` there, as `grant_cap_ms` does for delegations).
+
+### What the tester must run
+
+1. `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
+   `cargo test --workspace --release` (the model's `locks` tests and the
+   sim's lock configurations are in it).
+2. `target/release/harness run flock-cross-node sqlite-two-nodes lock-holder-partitioned lock-failover lock-latency`
+   under its own `CONSTELLATION_HARNESS_DOCKER_PREFIX`, plus the
+   regression set above. `sqlite-two-nodes` needs `sqlite3` on the host
+   (it SKIPs in the docker harness image). `lock-failover` keeps the
+   node logs under `/tmp/harness-m14-logs` on failure.
+3. `docker compose --profile test run --rm compliance` (pjdfstest
+   8798/8798, empty baseline) — not run here (port 4566 was taken by a
+   concurrent session's lane).
+4. The long sim sweep: `cargo test -p constellation-authority --release --test sim -- --ignored long_locks`
+   (300 seeds × 8 configs; expect exactly seed 194287 of
+   `locks-failover-backup` to fail on the namespace check — issue 21,
+   an M6 bug to be fixed separately).
+5. On EC2 (M16): `lock-latency` across regions for the WAN numbers (one
+   round trip on a first lock; cached re-locks local).
+
+## Fix: M6 Exists-hint divergence (seed 194287)
+
+(2026-09-25; uncommitted on `plan30-m14`, on top of the M14 work. This
+closes M14's issue 21: seed 194287 of `locks-failover-backup` passes now.)
+
+### The divergence, exactly
+
+Replay: `AUTHORITY_SIM_SEED=194287 AUTHORITY_SIM_CONFIG=locks-failover-backup RUST_LOG=constellation_authority=debug,sim=debug cargo test -p constellation-authority --release --test sim replay_seed -- --nocapture --exact`.
+
+Node 2 holds epoch 2 (a backup takeover after node 1's first crash).
+Node 1 restarts after its second crash, applies the log through seq 28
+(`f2 -> 0x20000000405`, `f3 -> 0x30000000401`) and is node 2's backup
+again. Then, within ~40 ms of simulated time:
+
+1. Node 1 forwards `create f3` (rid `(1,3,1)`). Node 2 refuses it:
+   `EEXIST`, `Refused { rid }` journaled at row 34, and the reply is
+   `Exists { f3 -> 0x30000000401 }` with position `(seq 28, pending (2,34))`
+   and base 28. The reply waits for the backup's acknowledgement of row 34.
+2. Node 2 executes node 2's own `rename f2 -> f3` (rows 35–36).
+3. Node 1 receives the pre-S3 stream first and installs transactions 33,
+   34 (the refusal) and 35–36 (the rename) as `Streamed` entries.
+   Locally that makes `f2` absent and `f3 -> 0x20000000405`, which is correct.
+4. The `Exists` reply arrives. It passes both core checks (`base_ok`:
+   applied 28 ≥ base 28; applied 28 < hint floor 29), so the core installs
+   the hint. The hint re-creates `f3 -> 0x30000000401` **on top of the
+   streamed rename**. The hint was read at row 34, the local state is
+   already at row 36, so the hint is stale.
+5. Segment 29 (rows 33–36) lands. The streamed rows are skipped (M9's
+   rule: they are applied already), and the hint retires (floor 29
+   reached). Retiring does not roll anything back. Node 1 is left with
+   `f3 -> 0x30000000401` while every other replica has `f3 -> 0x20000000405`.
+   Later renames carry the difference forward to the checker's
+   `f0 0x30000000401` vs `0x20000000405` at head 43.
+
+M14's narration was nearly right. The detail it missed is that the
+rename was already installed from the stream, not waiting in seq 29.
+Nothing was stranded. The hint was installed wrongly, and its ordinary
+retirement then made the divergence permanent.
+
+### Root cause
+
+This is the missing mirror of M9's shadow rule. `install_shadow` refuses
+to re-apply an op that the holder's pre-S3 stream already carried here
+(backup seed 753). `install_hint` had no such check. The stream installs
+the holder's transactions contiguously and ahead of the log. So when the
+refusal's own `Refused { rid }` row has been streamed, everything the
+holder streamed after it is applied too, and a hint read at the refusal
+is older than the local state. The core's position check (`applied <
+floor`) compares only against the applied log, never against streamed
+speculation. This needs M9 streaming (`backup`/`acks3` cores). The lock
+workload only makes it more likely.
+
+### Reproduction without locks, and on main 1641850
+
+Temporary sweep (not kept; 12 threads, `run_seed` directly). `nolock-*`
+is 3 nodes × 2 clients × 8 ops, 4 names, read 0.2, and the backup core.
+`nolock-failover-backup` adds M14's fault schedule without locks: crash
+the holder at 0.9 s and restart it after 5 s; crash node 1 at 9 s and
+restart it after 3 s, journals kept.
+
+| Config (seeds 600000+) | M14 tree, before | M14 tree, fixed | main 1641850, before | main, fix ported |
+|---|---|---|---|---|
+| `nolock-failover-backup` ×30000 | 1 | 0 | 5 | 0 |
+| `nolock-backup` (no faults) ×30000 | 38 | 0 | 48 | 0 |
+| `backup` (the repo's) ×20000 | 30 | 1 (607857, other) | 20 | 1 (607661, other) |
+| `backup-crash` ×10000 | 24 | 19 (other) | — | 20 (other) |
+| `long-backup` ×5000 | 2 | 0 | — | — |
+
+Fresh ranges on the fixed M14 tree gave these results:
+- `nolock-backup` 700000–759999: 0 failures of 60000.
+- `backup` 700000–739999: 1 of 40000 (727961, quiescence).
+- `long-backup` 700000–709999: 3 of 10000 (702578 and 708176 never
+  answered; 705523 `took effect in the log but the spec refuses it`).
+
+The failures the fix clears are namespace non-convergence ("did not
+converge" or "commit N is not the log prefix"), plus a few
+linearizability failures that follow from it (on main's `nolock-backup`:
+38, 4 and 6 of 48). The ones left are listed below. On main the bug
+is the same code. The meta scenario below also diverges on main when
+written with main's `install_hint`. **So the bug is pre-existing on main
+1641850. It reproduces without the lock workload (~0.1–0.2% of `backup`
+seeds) and without any fault.** CI misses it only because its backup seed
+ranges are small. The scratch worktree was removed.
+
+**Not this bug (still failing with the fix, and unchanged with it
+reverted):**
+- `backup-crash` ~0.2% on both trees: linearizability ordering, e.g. 600488
+  "returned before … was invoked but follows it in the log";
+  `monotonic_reads` (600390); and "returned success but completed 0
+  times in the log" (601634, 605521, 607377; on main 606255, 609417), an
+  acknowledged write missing from the log under strict durability.
+- `backup` 607857 (M14) / 607661 (main); `backup` 727961 (quiescence);
+  and `long-backup` 702578, 705523, 708176.
+- `long_random` seed 10146 (below) fails identically at the M12 WIP base
+  323996d without M14 or this fix. It is a namespace divergence in the
+  non-backup `long-sessions` config.
+
+These need their own investigation.
+
+### The fix
+
+- `Meta::install_hint_from(rid: Option<Rid>, records, floor, epoch, gen) -> Result<bool>`
+  (`crates/meta/src/store/spec.rs`) refuses to install (`Ok(false)`) in
+  two cases. The first is a `completed` row for `rid` that already exists
+  (the log carries the refusal). The second is a live `Streamed` entry
+  carrying `Refused { rid }`, found by the new `streamed_entry_refusing`,
+  which shares a scan with `streamed_entry_completing`. `Meta::install_hint`
+  (no rid) is unchanged for the meta tests.
+- `Replica::install_hint` takes the rid and returns `bool`
+  (`crates/authority/src/replica.rs`). In `core/client.rs`, a hint that
+  is not installed takes the uncovered path and raises `observed`. That
+  is always correct, and the streamed entry already covers those keys
+  (`on_stream_ahead`'s `note_covering`), so reads of them stay fast.
+- Regressions:
+  - The meta test `a_hint_whose_refusal_was_streamed_first_is_not_installed`
+    (`crates/meta/tests/speculation.rs`) is the seed reduced to three
+    records. It fails without the check (the replica ends on the hint's
+    inode) and passes with it.
+  - The sim test `regression_exists_hint_after_its_streamed_refusal`
+    pins seeds 194287 (`locks-failover-backup`) and 600396 (`backup`, no
+    locks, no fault). Both fail without the check.
+  - `meta_repro.rs` was updated for the signature.
+
+### Results (release, this tree)
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test -p constellation-authority --release`: 74 lib + 3
+  `meta_repro` + 77 sim (8 ignored), all pass (31 s).
+- `cargo test -p constellation-meta --release`: 132 passed.
+- `long_locks` (300 seeds × 8 configs): **2400/2400**, 176 s. 194287 passes.
+- `AUTHORITY_SIM_SEEDS=1000 long_random`: 999/1000. **Seed 10146 fails**
+  ("node 1 did not converge … inode 0x1000000040b only on the right").
+  It fails identically with this fix reverted and at the M12 WIP base
+  323996d, so it is not from this fix or from M14. Main's gates passed
+  `long_random` 1000, so it most likely came in with M12. It is for the
+  M12 owner and the coordinator.
+
+## Plan 30 M14 — rebase onto main + M12 round 2 (coder, 2026-09-25; uncommitted on `plan30-m14` = main 2522402 + the M12 round 2 WIP base b4e7cbe; the pre-rebase state is stash 4b3492e, for reference only)
+
+### Conflicts and how they were resolved
+
+| File | Resolution |
+|---|---|
+| `crates/authority/src/core/client.rs` | main's comment (the stale-hint rule now cites backup seed 600396) |
+| `crates/meta/src/store/spec.rs`, `crates/meta/tests/speculation.rs` | **main's `install_hint_from`** everywhere: the duplicate Exists-hint fix another agent had made in the M14 tree is dropped (main's is the same fix extended by item 6 of the backup fixes — hints overlapping pending local work are not installed, `live_speculation_touches`) |
+| `crates/authority/tests/sim.rs` | the duplicate `regression_exists_hint_after_its_streamed_refusal` dropped (main's, on backup seeds 600596/603050, stays); the M14 lock tests unchanged |
+| `crates/authority/src/core/jobs.rs` (`acquire_won`) | both: main's `sealed` bookkeeping for the own-lease-next-epoch tail re-apply, then M14's released-lease grace |
+| `crates/authority/src/core/mod.rs` | both re-exports (`backup_claim_grace_ms`, `LockView`) |
+| `crates/authority/src/core/tests.rs` | the 3-way merge interleaved two appended blocks (main's backup-crash tests and M14's `mod locks`, which share a `PeerLink` tail); rebuilt as the base file plus M14's block verbatim |
+| `crates/authority/tests/sim/run.rs` | both; the M14 `SimConfig` lock fields had landed inside the new `FastPath` enum and were moved back into the struct |
+| `docs/plans/v1/PROGRESS.md` | every section in order (M12 tester gate, M12 round 2), then M14 |
+
+Plus one compile fix: main's new `SyncHandle` test literal in `fusefs.rs` gets `locks: None`.
+
+### M14 against what moved underneath
+
+- **`Meta::root_fast_path` (M12 round 2).** Lock requests never take the
+  FUSE fast path: `setlk` goes to the core (`Control::Lock`), whose
+  `lock_route` resolves the owner through `resolve_ownership` — the same
+  table the gate consults. The release flush (`flush_inode` + `drain_inode`
+  + `sync_barrier`) runs the fs's own write path, which is gated. No
+  change needed.
+- **Durability waits, the durable close, `ack.eligible`.** Lock-to-unlock
+  coherence rests on two things that both still hold: the grant's
+  `position` (head + the owner's pending journal position for the inode)
+  and the flush before `LockReleased`. Main's new waits only make the
+  flush's acknowledgement later (a backup being brought up, a per-row
+  durability wait); the flush is on `spawn_blocking`, and while it lasts
+  the recalling owner's `LockGrantExpiry` timer still serves the waiters
+  at ttl + margin — a stalled flush delays a handoff, never deadlocks it,
+  and a grant that lapses under it is fenced as before. The successor of
+  a durable close reads a position past the close.
+- **Backup takeover under `TailFollows`, the 3 s non-backup delay.** The
+  mirror is installed in `complete_gate` right after `apply_backup_tail`
+  (main's re-apply, `TailFollows` marker included), so the successor's
+  table is there before its view opens and the floor covers the rest. A
+  non-backup claiming a `Backup`-policy lease now waits
+  `backup_claim_grace_ms` past expiry: a TTL takeover starts with an
+  empty table anyway (every grant was capped by the lease), so the delay
+  only adds to the time a locker is fenced before the next grant.
+- **`lock-failover` timing.** The scenario's takeover is seal-based
+  (the backup is listed), unaffected by the non-backup delay; ttl 15 s
+  still outlives it. `lock-holder-partitioned` mounts with the RTT
+  budget 0 (`Local` policy), so its TTL-based outwait is unchanged.
+- **Sim.** `SimConfig::fast_path` defaults `Off` in every lock config;
+  the lock workload's clients go through the core as before.
+
+### What the rebased tree found (issue 22)
+
+The first `long_locks` sweep on the rebased tree (300 seeds × 8
+configs) failed one seed the old base had passed — `locks-delegated`
+196252, a mutual-exclusion violation — and only in some processes (2 of
+3 standalone replays passed). Narrated: the root recalls `d1`'s
+generation 1 for a cross-subtree rename, gets its two grants back,
+**re-delegates** `d1` to the same node as generation 3, sends the two
+grants along with the delegate's first renewal — and recalls generation
+3 (another cross-subtree op) while that handoff is still in flight. The
+delegate answers the recall with nothing (the handoff has not landed),
+the root ends generation 3 as *drained* (no grace), the delegate then
+installs the late handoff and, when the log ends the generation on its
+replica (M12 round 2 voids a recalled generation on every replica),
+drops it. Node 1 still honours its Shared grant from generation 1; the
+root's table is empty; the root grants node 3 Exclusive. Two smaller
+defects hid behind it: the handoff was tagged generation 0 because it was
+installed before `on_deleg_renewed` set the delegation's window (so a
+later `lock_take_generation` by tag missed it), and the meta tables were
+`HashMap`s, whose iteration order in the renewal tick made the seed
+probabilistic.
+
+Fixes (the model's "moves that lose state" counterexample, in its
+in-flight form):
+- `lock_install_moved` takes the generation the message names
+  (`DelegRenewed { gen }`, or 0 for the root) instead of resolving it,
+  and is called after `on_deleg_renewed`;
+- the root remembers every generation it sent a handoff to
+  (`LockState::handoff_sent`); `end_generation` applies the subtree grace
+  when the generation was not drained **or** had a handoff sent —
+  reclaims stand, nothing new is granted for `lock_ttl + M`;
+- the delegate's log-ended path logs what it drops (the root's grace
+  covers the holders);
+- `LockTables` uses `BTreeMap`s throughout (deterministic replays).
+
+Seed 196252: 0 failures in 20 replays after the fix (3 of 15 before).
+
+### Gates
+
+First round (before issue 22's fix), all on the rebased tree:
+`cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets -- -D warnings`
+clean; `cargo test --workspace --release` zero failures (authority 84
+sim tests + 74 lib, model `locks` 20, meta 87, cli 206, net 89);
+`long_backup` 300 PASS (16 s); `long_random` 1000 PASS (54 s);
+`long_locks` 300 × 8: 2399/2400 — the failure being issue 22; harness
+under `constellation-harness-m14fable`: `flock-cross-node` 9.2 s,
+`sqlite-two-nodes` 11.3 s (80 txns, integrity ok, 80 rows both sides),
+`lock-holder-partitioned` 8.9 s (fenced 2.03 s after the cut, C granted
+4.78 s after), `lock-failover` 36.5 s (0 EIO, 113 refusals, granted
+8 ms after the unlock), `lock-latency` 7.4 s (numbers within the
+pre-rebase ranges; sqlite per-txn p50 37 ms under the concurrent sim
+load, 9 ms isolated before), `chaos-ci` 263.6 s, `backup-failover`
+15.7 s, `delegated-subtrees` 6.4 s — all PASSED.
+
+Second round (after issue 22's fix and the `BTreeMap` change):
+`cargo fmt --all -- --check` clean; clippy `-D warnings` clean;
+`cargo test -p constellation-authority --release` 87 lib + 84 sim
+passed (8 `long_*` ignored); model `locks` 20 passed (13.7 s);
+**`long_locks` 300 × 8 = 2400/2400 PASS** (127 s); `long_backup` 300
+PASS (16 s); `long_random` 1000 PASS (57 s); harness under
+`constellation-harness-m14fable`: `flock-cross-node` 6.8 s,
+`sqlite-two-nodes` 10.3 s, `lock-holder-partitioned` 46.8 s,
+`lock-failover` 51.4 s, `lock-latency` 7.0 s, `delegated-subtrees`
+6.6 s, `cross-subtree-rename` 4.3 s — all PASSED, no mount left behind.
+(`chaos-ci` and `backup-failover` passed in the first round; the fix
+touched only the lock tables and the delegation recall's grace.)
+
+### For the tester
+
+The tree is `plan30-m14` = main 2522402 + b4e7cbe + this diff,
+uncommitted. Run the M14 gate list from the section above plus
+`delegated-subtrees` and `cross-subtree-rename`; `long_locks` is
+expected clean now (issue 21's seed 194287 is fixed by main's
+`install_hint_from`). pjdfstest was not run here: port 4566 is held by
+another session's compose project (the lane's mapping is fixed).
+
+## Plan 30 M14 — tester gate run
+
+Tree `/home/bra/cvs/constellation-m14`, `plan30-m14` = main `87cfe36`
+(M12, round 2 included) + the M14 diff, uncommitted (unchanged
+throughout — nothing committed). Own harness prefix
+`constellation-harness-m14tester` (`-base` for the main A/B), own
+compose project `constellation-m14tester`. A/B baseline throughout:
+main `87cfe36` built in a scratch detached worktree (`git worktree
+add --detach <scratchpad>/main-87cfe36 87cfe36`), removed after use.
+**Headline: green.** One pre-existing bug reconfirmed (not M14's),
+one low-confidence possible M14 flake needing more soak, one
+environment-coincident non-reproducing blip, and one Docker-caching
+process note — see "Findings for the coordinator" below.
+
+### Gate 1 — fmt, clippy, workspace tests
+
+- `cargo fmt --all -- --check`: **clean.**
+- `cargo clippy --workspace --all-targets -- -D warnings`: **0
+  warnings.**
+- `cargo test --workspace --release`: **zero failures**, 1121 passed
+  (51 test binaries) across every crate, wall 4m32s (14:32:04–14:36:36
+  CEST). Notable per-crate counts: `constellation-authority` lib 87,
+  `sim` 84 passed/8 ignored (47.2s); `constellation-meta` lib 84;
+  `constellation-model` lib 5 + `locks.rs` 20/1 ignored (14.2s) +
+  `hotdir.rs` 9/0 ignored (2.5s); `constellation-net` lib 89;
+  `constellation-cli` (`constellation` bin) 221/1 ignored;
+  `constellation-store-s3` 192/2 ignored.
+
+### Gate 2 — model tests isolated
+
+`cargo test -p constellation-model --release`: **zero failures**,
+wall 2m31s (14:37:05–14:39:36), peak RSS 14.8 GB for the whole crate
+(dominated by the Stateright checkers in `cto`/`delegation`/
+`flex_epochs`, consistent with the model doc's 11.8M–16.9M-state
+checks; not a per-test figure). `locks.rs`: 20/20 passed (1 ignored),
+14–20 s. `hotdir.rs`: 9/9 passed, 2.5–5 s.
+
+### Gate 3 — authority sim, ignored long sweeps (release)
+
+| Sweep | Seeds | Result | Time |
+|---|---|---|---|
+| `long_locks` (300 × 8 configs) | 2400 | **PASS** | 129.6 s |
+| `long_backup` | 300 | **PASS** | 18.3 s |
+| `long_random` | 1000 | **PASS** (seed 10146 stays fixed) | 70.8 s |
+| `long_delegated` | 300 (default) | **PASS** | 23.9 s |
+| `long_flex` | 500 (default) | **PASS** | 50.0 s |
+| `long_strict` | 1000 (default) | **PASS** | 58.7 s |
+
+Note: `long_locks`' `run_m14` helper is a plain sequential loop over
+the 8 configs (unlike `run_m9`/`run_m11`, which spread across up to 8
+threads) — "8 threads" in the tester brief reads as "8 configs" here;
+the 2400-seed sweep in 130 s is consistent with that being
+single-threaded.
+
+### Gate 4 — harness scenarios
+
+Release binaries built fresh (`cargo build --release -p constellation
+-p constellation-harness`, 14:46–14:47). Each "at least 3×" scenario
+run 3 times with seeds 42/43/44:
+
+| Scenario | Result |
+|---|---|
+| `flock-cross-node` | 3/3 PASS (6 s each) |
+| `sqlite-two-nodes` | 3/3 PASS (10–12 s each; see the timing caveat below) |
+| `lock-holder-partitioned` | 3/3 PASS (47, 7, 7 s) |
+| `lock-failover` | 3/3 PASS (36, 35, 52 s) |
+| `lock-latency` | 3/3 PASS (9, 8, 8 s) |
+| `delegated-subtrees` | 3/3 PASS (6, 10, 29 s) |
+| `cross-subtree-rename` | 3/3 PASS (9, 5, 8 s) |
+| `backup-failover` | 3/3 PASS (15, 18, 17 s) |
+
+M12 scenarios and `chaos-ci`, once each: `hash-range-split-merge`,
+`shared-dir-multi-writer`, `chaos-ci` all **PASSED** first try.
+`delegate-partition` and `chaos-soak-4` each hit one failure — see
+findings below; both were re-run for evidence rather than waved
+through.
+
+**Full harness scenario list, once** (`harness list`: 144 scenarios +
+2 known-bug repros, run in 18 batches of ≤8 plus `chaos-soak-4`
+isolated, seed 42 throughout): **142/144 PASSED, 2 SKIPPED** (`fio-
+latency`, `fio-blips`: `fio` not installed on this host — environmental,
+matches the scenario's own `requires` gate, not a finding), **1
+FAILED**:
+
+- `deposed-reintegration` **FAILED** with the exact message the M12
+  round-2 tester already logged: `'clean replays and the one conflict
+  copy converge on both nodes' not reached within 40s: c0: a-only
+  (never touched by B) did not replay A's content`. A/B'd once against
+  main `87cfe36` in the scratch worktree: **FAILED identically**,
+  byte-for-byte the same message. Confirmed pre-existing, not M14's —
+  per the tester brief, not dug into further; it's already flagged as
+  "being fixed separately."
+- `delegate-partition` **FAILED once** inside batch 15 (52.6 s,
+  `"the root lost its lease: {"epoch":1,"expires_in_ms":0,"held":false,
+  "holder":2,"lost":false}"`), immediately after the coordinator's
+  mid-run note that this host's CPU frequency had just been capped
+  (confirmed: `scaling_governor=powersave`, `scaling_max_freq` capped
+  at 2.4 GHz, `scaling_cur_freq` ~1.48 GHz, load average ~52 on 32
+  cores at that moment). Re-run 3× immediately after on the M14 tree:
+  **3/3 PASS** at the scenario's normal ~17 s. A/B once on main
+  `87cfe36`: **PASS** (17.7 s). Not reproduced again; read as a
+  host-load/frequency-change artifact coincident with the throttling
+  change, not a regression. Flagged for awareness only.
+- The three flakes the tester brief named ahead of time
+  (`takeover-marker-strands-promptly`, `session-ryw-after-holder-kill`,
+  `continuation-epoch`) **all PASSED** their single occurrence in this
+  pass — no new evidence either way, consistent with them being
+  intermittent.
+
+**`chaos-soak-4` (M12 scenario, run outside the full-list batch,
+same as the M12 round-2 tester did):** **FAILED 1/5** on the M14 tree
+(seed 42 throughout): first run **FAILED in 96.5 s** —
+`convergence not reached within 60s after write_full_duel:wf293:
+chaos-soak/wf293: [(0, "hash:1beb3151…"), (1, "hash:a2764f1b…"), (2,
+"hash:a2764f1b…"), (3, "hash:a2764f1b…")]` (node 0's content hash
+differs from nodes 1–3's, which agree). Re-run 4 more times on the
+M14 tree: **4/4 PASSED** (306–314 s each, `exactly_once_log`
+3491–4465 outcomes each once). **A/B on main `87cfe36`** (same
+scratch worktree, own prefix `constellation-harness-m14tester-base`,
+same seed 42): **3/3 PASSED** (313.4, 308.7, 312.6 s), no failure. So:
+M14 tree 4/5 (80%) vs. main 3/3 (100%) on this small a sample — not
+proof of an M14 regression, but the one occurrence was on the M14
+tree and not on main under matching conditions, and it's a real
+namespace-divergence assertion (not a timeout-adjacent one), so it is
+reported as a finding rather than dismissed. The failing artifacts
+(`/tmp/chaos-soak-4-42-3759888`) were captured above and then cleaned
+up along with this session's other 7 `chaos-soak-4-42-*` dirs; the
+~40 other `chaos-soak-4-42-*` directories found under `/tmp` predate
+or postdate this session by hours and were left untouched (not
+created by this run).
+
+All containers, `/tmp/harness-*` dirs and mounts created by this
+session's harness runs were cleaned up (harness's own drop-based
+teardown left nothing under the `m14tester` prefix). One pre-existing,
+unowned stale mount was found and left alone, exactly as the M12
+round-2 tester noted: `/tmp/harness-hash-range-split-merge-Mel9LX/
+{c,d}/mnt`, dated 09:14 local, well before this session started
+(14:30) — not touched. `/tmp/harness-m14-logs` (from 08:19–08:45
+local, also pre-session) was likewise left alone.
+`constellation-floci-1`, `constellation-harness-m11-*`, and a new
+`constellation-harness-ec2fix-*` pair (another concurrent session)
+were all confirmed present and untouched throughout.
+
+### Gate 5 — pjdfstest, smoke, integration
+
+Port 4566 is held by another session's `constellation-floci-1`
+(confirmed, still running throughout), so this ran the same private
+compose workaround as the M12 round-2 tester: own compose project
+`constellation-m14tester`, an override file remapping `floci` to host
+port 14566 (`ports: !override ["14566:4566"]` — a plain second
+`ports:` list is *merged*, not replaced, by Docker Compose, so the
+override needs the `!override` YAML tag or the base's `4566:4566`
+stays and collides; noted here since it wasn't obvious from the base
+`docker-compose.yml` alone).
+
+**Process note (Docker BuildKit caching hazard, not a code bug):**
+the first `docker compose build compliance` reused a cached `COPY .
+.` layer that silently produced a build **missing
+`crates/meta/src/locks.rs`** — 25 compile errors (`unresolved import
+constellation_meta::locks`, `module crate::core::locks exists but is
+inaccessible`), even though `git status` confirmed the file present
+and untracked (not `.dockerignore`d) on disk, and the same source
+built cleanly on the host moments earlier. `docker compose build
+--no-cache compliance` (2m50s, clean) fixed it. Recommend future
+testers always pass `--no-cache` when building the compose test
+images against an uncommitted diff that adds new untracked files —
+the default layer cache can silently serve a stale context and produce
+misleading compile failures that look like a source bug but aren't.
+
+- **pjdfstest** (`docker compose -p constellation-m14tester -f
+  docker-compose.yml -f <override> run --rm compliance`, `--no-cache`
+  rebuilt `constellation-smoke:local`): **8798 passed, 0 failed,
+  empty baseline.**
+- **`tests/smoke.sh`** (local backend, `CONSTELLATION_BIN=target/
+  release/constellation`): **PASSED.**
+- **Integration test** (`tests/smoke.sh s3://constellation-ci/<prefix>`
+  against the private floci at `http://localhost:14566`, replicating
+  `tests/integration.sh`'s logic by hand since that script hardcodes
+  port 4566): **PASSED**, full CAS ok (`etag CAS (If-Match) ... ok`,
+  every conditional-write semantics line `ok`).
+- Torn down immediately after with `down -v --remove-orphans`; other
+  sessions' containers confirmed untouched (see gate 4).
+
+### Gate 6 — perf: DEFERRED
+
+Mid-run, the coordinator reported the dev host's CPU frequency is now
+limited and asked to skip gate 6 entirely (the `lock-latency` isolated
+sqlite recheck and the `meta-bench`/`harness bench` A/B vs. main) and
+to draw no timing conclusions from any local run. Confirmed the host
+state at that point: `scaling_governor=powersave`,
+`scaling_max_freq` capped at 2.4 GHz (`scaling_cur_freq` ~1.48 GHz),
+load average ~52 on 32 cores. **Not run.** Perf validation
+(`lock-latency` isolated, `meta-bench`/`harness bench` A/B) is
+deferred to the EC2 hosts, consistent with the M14 notes' own item 5
+("On EC2 (M16): `lock-latency` across regions for the WAN numbers").
+For reference only, **not** as regression evidence: the gate-4
+`sqlite-two-nodes` runs (under concurrent host load, non-isolated)
+saw per-txn p50 24.9–30.5 ms (n=80) against the coder's isolated 9 ms
+and the M14 rebase notes' 37 ms-under-sim-load figure; `lock-latency`'s
+own numbers were in the same ballpark as the M14 rebase notes but with
+higher tails. Both are host-load artifacts, not gate-6 findings.
+
+### Findings for the coordinator
+
+1. **`deposed-reintegration`** fails deterministically on both the
+   M14 tree and main `87cfe36`, identical message — confirmed
+   pre-existing, already flagged as being fixed separately. No action
+   needed from the M14 owner.
+2. **`chaos-soak-4`**: 1 failure in 5 runs on the M14 tree (a genuine
+   namespace-divergence assertion, not a timeout), 0 in 3 on main
+   `87cfe36` under matching conditions (same seed, same host state as
+   best as could be arranged). Small sample; not proven as an M14
+   regression, but also not dismissable as pre-existing without more
+   evidence. **Recommend a longer soak** (10–20 runs each tree) by
+   whoever owns the chaos scenarios, ideally once this host is back to
+   normal clock speed.
+3. **`delegate-partition`**: one failure exactly at the moment the
+   host's CPU frequency was newly capped; did not reproduce in 3
+   immediate re-runs on M14 nor once on main. Read as a host-timing
+   artifact coincident with the environment change, not a regression;
+   flagged for awareness only, no action expected.
+4. **Docker BuildKit caching hazard** (see gate 5): `docker compose
+   build` can silently reuse a stale `COPY . .` layer and drop
+   newly-added untracked files from the build context, producing
+   compile errors that look like a source bug. Always `--no-cache`
+   when testing an uncommitted diff with new untracked files.
+5. **Gate 6 deferred** to EC2 per the coordinator's mid-run
+   instruction (host CPU frequency now limited); no local timing
+   numbers should be read as regression evidence from this run.
+
+### Summary
+
+Gates 1–5 are **green**: fmt/clippy clean, 1121 workspace tests + 20
+model `locks` + 9 model `hotdir` all pass, all six long sim sweeps
+pass (`long_locks` 2400/2400), all 8 "run ≥3×" harness scenarios
+3/3, the M12 scenarios and `chaos-ci` pass once each (`chaos-soak-4`
+needs the soak noted above), the full 144-scenario harness list is
+142/144 PASS + 2 environmental SKIP + 1 confirmed-pre-existing FAIL,
+and pjdfstest/smoke/integration are all clean (8798/8798, empty
+baseline). Gate 6 (perf) is deferred to EC2 per the coordinator's
+instruction, not run here. Two items need the coordinator's attention:
+`chaos-soak-4`'s single M14-only failure (recommend a longer soak) and
+the Docker build-cache hazard (process note for future testers).

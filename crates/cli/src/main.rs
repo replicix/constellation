@@ -20,6 +20,7 @@ mod inbox;
 mod kernel_inval;
 mod lease;
 mod leave;
+mod locks;
 mod log_buffer;
 mod mtree_gc;
 mod mtree_publish;
@@ -112,6 +113,14 @@ enum Command {
         /// delegation). `CONSTELLATION_CTO` supplies the default.
         #[arg(long)]
         cto: Option<String>,
+        /// File locks (plan 30 §M14): "cluster" (the default with P2P:
+        /// `flock`/`fcntl` locks exclude each other across nodes, leased
+        /// from the file's sequencer) or "local" (each node's kernel keeps
+        /// its own locks, as before). Cluster locks need P2P; without it
+        /// the mode is local, and an explicit "cluster" fails the mount.
+        /// `CONSTELLATION_LOCKS` supplies the default.
+        #[arg(long)]
+        locks: Option<String>,
         /// Acknowledgement policy (plan 30 §M9): "local" (a mutation is
         /// acknowledged once journaled here; a backup peer within the
         /// RTT budget, when there is one, holds it too) or "s3" (every
@@ -760,6 +769,7 @@ fn main() -> Result<()> {
         fs_name,
         fsync_mode,
         cto,
+        locks,
         ack,
         write_mode,
         read_only_member,
@@ -783,6 +793,7 @@ fn main() -> Result<()> {
                 fs_name,
                 fsync_mode,
                 cto,
+                locks,
                 ack,
                 write_mode,
                 read_only_member,
@@ -1366,6 +1377,7 @@ struct MountArgs {
     fs_name: Option<String>,
     fsync_mode: Option<String>,
     cto: Option<String>,
+    locks: Option<String>,
     ack: Option<String>,
     write_mode: Option<String>,
     read_only_member: bool,
@@ -1461,6 +1473,7 @@ fn cmd_mount(
         fs_name,
         fsync_mode,
         cto,
+        locks,
         ack,
         write_mode,
         read_only_member,
@@ -1471,6 +1484,11 @@ fn cmd_mount(
         web_ui,
     } = args;
     let cto_strict = crate::cto::strict_from(cto.as_deref())?;
+    // Plan 30 §M14: refuse an explicit `--locks cluster` with P2P turned
+    // off here, before forking (the daemon re-checks against the endpoint
+    // it actually started).
+    let locks = crate::locks::cluster_flag(locks.as_deref())?;
+    crate::locks::cluster_effective(locks, constellation_net::enabled())?;
     let ack = crate::authority_driver::ack_flag(ack.as_deref())?;
     // Resolve once: env CONSTELLATION_ATIME overrides the --atime flag.
     let atime_mode =
@@ -1678,6 +1696,7 @@ fn cmd_mount(
             node_cache_size,
             fsync_s3,
             cto_strict,
+            locks,
             ack,
             initial_write_mode,
             read_only_member,
@@ -1696,6 +1715,7 @@ fn cmd_mount(
                 node_cache_size,
                 fsync_s3,
                 cto_strict,
+                locks,
                 ack,
                 initial_write_mode,
                 read_only_member,
@@ -1772,6 +1792,7 @@ fn cmd_mount_body(
     cache_size: u64,
     fsync_s3: bool,
     cto_strict: bool,
+    locks: Option<bool>,
     ack: Option<bool>,
     initial_write_mode: writeback::WriteMode,
     read_only_member: bool,
@@ -1851,6 +1872,7 @@ fn cmd_mount_body(
                     cache_size,
                     fsync_s3,
                     cto_strict,
+                    locks,
                     ack,
                     initial_write_mode,
                     read_only_member,
@@ -2870,7 +2892,7 @@ impl constellation_net::PeerService for P2pBridge {
     {
         Box::pin(async move {
             let (reply, receive) = tokio::sync::oneshot::channel();
-            let ttl_ms = if self
+            let (ttl_ms, locks) = if self
                 .nudge
                 .send(fusefs::SyncRequest::PeerDelegRenew {
                     from,
@@ -2880,14 +2902,15 @@ impl constellation_net::PeerService for P2pBridge {
                 })
                 .is_ok()
             {
-                receive.await.unwrap_or(0)
+                receive.await.unwrap_or_default()
             } else {
-                0
+                Default::default()
             };
             constellation_net::Payload::DelegRenewed {
                 req_id,
                 gen,
                 ttl_ms,
+                locks: crate::locks::grants_wire(&locks),
             }
         })
     }
@@ -2902,7 +2925,7 @@ impl constellation_net::PeerService for P2pBridge {
     {
         Box::pin(async move {
             let (reply, receive) = tokio::sync::oneshot::channel();
-            let through = if self
+            let (through, locks) = if self
                 .nudge
                 .send(fusefs::SyncRequest::PeerDelegRecall {
                     root,
@@ -2912,14 +2935,15 @@ impl constellation_net::PeerService for P2pBridge {
                 })
                 .is_ok()
             {
-                receive.await.unwrap_or(0)
+                receive.await.unwrap_or_default()
             } else {
-                0
+                Default::default()
             };
             constellation_net::Payload::DelegRecalled {
                 req_id,
                 gen,
                 through,
+                locks: crate::locks::grants_wire(&locks),
             }
         })
     }
@@ -3044,6 +3068,177 @@ impl constellation_net::PeerService for P2pBridge {
             epoch,
             base,
             txs,
+        });
+    }
+
+    fn lock_requested(
+        &self,
+        requester: u64,
+        req_id: u64,
+        ino: u64,
+        exclusive: bool,
+        blocking: bool,
+        sent: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let outcome = if self
+                .nudge
+                .send(fusefs::SyncRequest::PeerLockRequest {
+                    requester,
+                    ino,
+                    mode: crate::locks::mode_of(exclusive),
+                    blocking,
+                    sent,
+                    reply,
+                })
+                .is_ok()
+            {
+                receive
+                    .await
+                    .unwrap_or(constellation_authority::LockOutcome::Busy)
+            } else {
+                constellation_authority::LockOutcome::Busy
+            };
+            constellation_net::Payload::LockReply {
+                req_id,
+                outcome: crate::locks::outcome_wire(&outcome),
+            }
+        })
+    }
+
+    fn lock_recall_requested(
+        &self,
+        owner: u64,
+        req_id: u64,
+        ino: u64,
+        grant: (u64, u64),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let sent = self
+                .nudge
+                .send(fusefs::SyncRequest::PeerLockRecall {
+                    owner,
+                    ino,
+                    grant: crate::locks::grant_of(grant),
+                    reply,
+                })
+                .is_ok();
+            // A dropped reply (daemon shutting down) acks nothing: the
+            // owner outwaits the grant.
+            if sent && receive.await.is_ok() {
+                return constellation_net::Payload::LockRecalled { req_id };
+            }
+            constellation_net::Payload::LockRecalled { req_id: 0 }
+        })
+    }
+
+    fn lock_renew_requested(
+        &self,
+        from: u64,
+        req_id: u64,
+        entries: Vec<constellation_net::LockRenewWire>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let sent = self
+                .nudge
+                .send(fusefs::SyncRequest::PeerLockRenew {
+                    from,
+                    entries: crate::locks::renew_entries_of(entries),
+                    reply,
+                })
+                .is_ok();
+            let results = if sent { receive.await.ok() } else { None };
+            match results {
+                Some(results) => constellation_net::Payload::LockRenewed {
+                    req_id,
+                    results: crate::locks::renew_results_wire(&results),
+                },
+                // Unanswered: a reply for no request, which the renewer
+                // treats as a failed renewal and retries.
+                None => constellation_net::Payload::LockRenewed {
+                    req_id: 0,
+                    results: Vec::new(),
+                },
+            }
+        })
+    }
+
+    fn lock_test_requested(
+        &self,
+        requester: u64,
+        req_id: u64,
+        ino: u64,
+        exclusive: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let outcome = if self
+                .nudge
+                .send(fusefs::SyncRequest::PeerLockTest {
+                    requester,
+                    ino,
+                    mode: crate::locks::mode_of(exclusive),
+                    reply,
+                })
+                .is_ok()
+            {
+                receive
+                    .await
+                    .unwrap_or(constellation_authority::LockTestOutcome::NotOwner { owner: 0 })
+            } else {
+                constellation_authority::LockTestOutcome::NotOwner { owner: 0 }
+            };
+            constellation_net::Payload::LockTestReply {
+                req_id,
+                outcome: crate::locks::test_outcome_wire(outcome),
+            }
+        })
+    }
+
+    fn lock_granted(
+        &self,
+        from: u64,
+        ino: u64,
+        sent: i64,
+        outcome: constellation_net::LockOutcomeWire,
+    ) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self.nudge.send(fusefs::SyncRequest::PeerLockGranted {
+            from,
+            ino,
+            sent,
+            outcome: crate::locks::outcome_of(outcome),
+        });
+    }
+
+    fn lock_released(&self, from: u64, ino: u64, grant: (u64, u64)) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self.nudge.send(fusefs::SyncRequest::PeerLockReleased {
+            from,
+            ino,
+            grant: crate::locks::grant_of(grant),
+        });
+    }
+
+    fn lock_mirror(&self, from: u64, ver: u64, grants: Vec<u8>) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self.nudge.send(fusefs::SyncRequest::PeerLockMirror {
+            from,
+            ver,
+            grants: crate::locks::grants_of(&grants),
         });
     }
 
@@ -4557,6 +4752,44 @@ impl constellation_api::StatusSource for DaemonStatus {
                     fuse_recall_wait_ms_total: c.fuse_recall_wait_ms_total,
                     parked_acks: core.read.parked_acks as u64,
                     recalls_in_flight: core.read.recalls_in_flight as u64,
+                }
+            },
+            locks: {
+                let t = self.meta.locks();
+                let l = t.stats();
+                constellation_api::LockStatus {
+                    mode: if core.locks_cluster {
+                        "cluster"
+                    } else {
+                        "local"
+                    }
+                    .to_string(),
+                    grants_held: t.held_count() as u64,
+                    requests: stats.lock_requests,
+                    local_hits: l.local_hits,
+                    local_conflicts: l.local_conflicts,
+                    granted: l.granted,
+                    would_block: stats.lock_would_block,
+                    unavailable: stats.lock_unavailable,
+                    grant_ms_total: stats.lock_grant_ms_total,
+                    grant_ms: stats.lock_grant_ms.to_vec(),
+                    renewals: stats.lock_renewals,
+                    lost: stats.lock_lost,
+                    recalled: l.recalled,
+                    recalled_busy: l.recalled_busy,
+                    released: stats.lock_released,
+                    fenced_io: l.fenced_io,
+                    grants_table: t.grants_len() as u64,
+                    grants_made: stats.lock_grants,
+                    recalls_sent: stats.lock_recalls_sent,
+                    recalls_released: stats.lock_recalls_released,
+                    recalls_expired: stats.lock_recalls_expired,
+                    reclaimed: stats.lock_reclaimed,
+                    waiters_parked: stats.lock_waiters_parked,
+                    grace_refusals: stats.lock_grace_refusals,
+                    requests_in_flight: core.lock_requests_in_flight as u64,
+                    waiters: core.lock_waiters as u64,
+                    recalls_in_flight: core.lock_recalls_in_flight as u64,
                 }
             },
             coop,
@@ -6691,6 +6924,7 @@ mod umount_tests {
                 cache_size: 16 * 1024 * 1024,
                 fsync_s3: false,
                 cto_strict: false,
+                locks: None,
                 ack: None,
                 initial_write_mode: writeback::WriteMode::Through,
                 read_only_member: false,

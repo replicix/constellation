@@ -343,6 +343,11 @@ pub enum Payload {
         req_id: u64,
         gen: u64,
         ttl_ms: u64,
+        /// Plan 30 §M14: postcard of the root's lock grants under the
+        /// subtree (`Vec<constellation_meta::locks::Grant>`), handed over
+        /// with the first renewal; empty otherwise.
+        #[serde(default)]
+        locks: Vec<u8>,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
     /// delegate stops and answers the highest stream index it executed.
@@ -356,6 +361,10 @@ pub enum Payload {
         req_id: u64,
         gen: u64,
         through: u64,
+        /// Plan 30 §M14: postcard of the delegate's lock grants under the
+        /// subtree, handed back to the root.
+        #[serde(default)]
+        locks: Vec<u8>,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to its backup (postcard
     /// `Vec<DelegateTx>`), and the backup's contiguous hold (or `sealed`).
@@ -444,6 +453,134 @@ pub enum Payload {
         part: String,
         epoch: u64,
     },
+    // ---- Plan 30 §M14: cross-node `flock`/`fcntl` (appended: postcard
+    // numbers variants by position). The authority core's `PeerMsg::Lock*`
+    // one for one; a grant id travels as `(node, seq)`, a mode as
+    // `exclusive`.
+    /// A node asks the owning sequencer of `ino` for a lock grant.
+    /// Answered by [`Payload::LockReply`].
+    LockRequest {
+        requester: u64,
+        req_id: u64,
+        ino: u64,
+        exclusive: bool,
+        blocking: bool,
+        /// The requester's clock (unix ms) when it sent; echoed in a
+        /// `LockGranted` push.
+        sent: i64,
+    },
+    LockReply {
+        req_id: u64,
+        outcome: LockOutcomeWire,
+    },
+    /// One way: a parked request's grant, pushed (`sent`: the requester's
+    /// clock at its last send, echoed).
+    LockGranted {
+        from: u64,
+        ino: u64,
+        sent: i64,
+        outcome: LockOutcomeWire,
+    },
+    /// The owner recalls `grant`; answered by [`Payload::LockRecalled`]
+    /// on receipt (the release follows as [`Payload::LockReleased`]).
+    LockRecall {
+        owner: u64,
+        req_id: u64,
+        ino: u64,
+        grant: (u64, u64),
+    },
+    LockRecalled {
+        req_id: u64,
+    },
+    /// One way: the holder released `grant`.
+    LockReleased {
+        from: u64,
+        ino: u64,
+        grant: (u64, u64),
+    },
+    /// Renew grants at their owner; answered by [`Payload::LockRenewed`].
+    LockRenew {
+        from: u64,
+        req_id: u64,
+        entries: Vec<LockRenewWire>,
+    },
+    LockRenewed {
+        req_id: u64,
+        results: Vec<(u64, (u64, u64), LockRenewResultWire)>,
+    },
+    /// One way: the holder's grant table mirrored to a backup (`grants`:
+    /// postcard of `Vec<constellation_meta::locks::Grant>`).
+    LockMirror {
+        from: u64,
+        ver: u64,
+        grants: Vec<u8>,
+    },
+    /// `getlk`: is a conflicting grant held elsewhere? Answered by
+    /// [`Payload::LockTestReply`].
+    LockTest {
+        requester: u64,
+        req_id: u64,
+        ino: u64,
+        exclusive: bool,
+    },
+    LockTestReply {
+        req_id: u64,
+        outcome: LockTestOutcomeWire,
+    },
+}
+
+/// Plan 30 §M14: `constellation_authority::LockOutcome` on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LockOutcomeWire {
+    Granted {
+        grant: (u64, u64),
+        exclusive: bool,
+        ttl_ms: u64,
+        position_seq: u64,
+        position_pending: Option<(u64, u64)>,
+        position_streams: Vec<(u64, u64)>,
+    },
+    Waiting {
+        retry_ms: u64,
+    },
+    WouldBlock,
+    NotOwner {
+        owner: u64,
+    },
+    Busy,
+}
+
+/// Plan 30 §M14: one `constellation_authority::LockRenewEntry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockRenewWire {
+    pub ino: u64,
+    pub grant: (u64, u64),
+    pub exclusive: bool,
+}
+
+/// Plan 30 §M14: `constellation_authority::LockRenewResult` on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LockRenewResultWire {
+    /// `id`/`exclusive`: the grant the owner holds for the node (a newer
+    /// one than asked about when its reply was lost).
+    Ok {
+        ttl_ms: u64,
+        recalled: bool,
+        id: (u64, u64),
+        exclusive: bool,
+    },
+    Lost,
+    NotOwner {
+        owner: u64,
+    },
+}
+
+/// Plan 30 §M14: `constellation_authority::LockTestOutcome` on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LockTestOutcomeWire {
+    Free,
+    Held { node: u64, exclusive: bool },
+    NotOwner { owner: u64 },
 }
 
 /// Plan 30 §M10: a member's lease claim in an [`Payload::EpochAck`].
@@ -850,6 +987,63 @@ mod tests {
             msg.encode().is_ok(),
             "children-only reply exceeds MAX_FRAME"
         );
+    }
+
+    #[test]
+    fn lock_payloads_round_trip() {
+        let k = key();
+        for payload in [
+            Payload::LockRequest {
+                requester: 1,
+                req_id: 2,
+                ino: 3,
+                exclusive: true,
+                blocking: false,
+                sent: 7,
+            },
+            Payload::LockReply {
+                req_id: 2,
+                outcome: LockOutcomeWire::Granted {
+                    grant: (4, 5),
+                    exclusive: false,
+                    ttl_ms: 5000,
+                    position_seq: 6,
+                    position_pending: Some((7, 8)),
+                    position_streams: vec![(9, 10)],
+                },
+            },
+            Payload::LockRenewed {
+                req_id: 2,
+                results: vec![(
+                    3,
+                    (4, 5),
+                    LockRenewResultWire::Ok {
+                        ttl_ms: 1,
+                        recalled: true,
+                        id: (4, 5),
+                        exclusive: true,
+                    },
+                )],
+            },
+            Payload::LockTestReply {
+                req_id: 2,
+                outcome: LockTestOutcomeWire::Held {
+                    node: 1,
+                    exclusive: true,
+                },
+            },
+            Payload::DelegRenewed {
+                req_id: 1,
+                gen: 2,
+                ttl_ms: 3,
+                locks: vec![1, 2, 3],
+            },
+        ] {
+            let signed = Signed::new(&k, &payload).unwrap();
+            let frame = signed.encode().unwrap();
+            let back = Signed::decode(&frame[4..]).unwrap();
+            assert_eq!(back.verify().unwrap().1, payload);
+        }
     }
 
     #[test]

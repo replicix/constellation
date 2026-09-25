@@ -27,7 +27,7 @@ fn n(v: &serde_json::Value, key: &str) -> u64 {
     v[key].as_u64().unwrap_or(0)
 }
 
-fn node_id(c: &Client) -> Result<u64> {
+pub(super) fn node_id(c: &Client) -> Result<u64> {
     c.control_status()?["node_id"]
         .as_u64()
         .with_context(|| format!("{} reports no node id", c.name))
@@ -86,7 +86,7 @@ const TTL_MS: u64 = 20_000;
 /// (M9's knobs are per mount); node 0 holds the lease and `f` exists
 /// everywhere. The first `counting` nodes reach S3 through a counting
 /// proxy each (returned in order).
-fn cluster(
+pub(super) fn cluster(
     scenario: &str,
     names: &[&str],
     extra: &[(&str, &str)],
@@ -158,7 +158,7 @@ fn cluster(
 
 /// The P2P deny file of `name` (`fault::p2p_denied`): peers listed in it
 /// are unreachable from that node. Absent until a scenario cuts a link.
-fn c_deny_path(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+pub(super) fn c_deny_path(root: &std::path::Path, name: &str) -> std::path::PathBuf {
     root.join(name).join("deny")
 }
 
@@ -200,7 +200,7 @@ fn by_id(clients: &[Client], id: u64) -> Result<&Client> {
 
 /// Wait until `c` holds the lease at an epoch above `after`; how long it
 /// took.
-fn wait_holds(c: &Client, after: u64, deadline: Duration) -> Result<Duration> {
+pub(super) fn wait_holds(c: &Client, after: u64, deadline: Duration) -> Result<Duration> {
     let t = Instant::now();
     loop {
         if let Ok(l) = lease_of(c) {

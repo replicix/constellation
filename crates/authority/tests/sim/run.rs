@@ -58,6 +58,18 @@ pub enum FaultKind {
     /// keeps acknowledging through its backup; what it journals meanwhile
     /// is the backup's tail).
     CutS3Holder { for_ms: u64 },
+    /// Plan 30 §M14: once a node other than the lease holder is inside a
+    /// lock's critical section (waiting up to 5 s for one), cut it from
+    /// every other node over P2P for `for_ms`: its renewals fail, its
+    /// grant lapses under the section (I/O fenced) and the owner outwaits
+    /// it before granting anyone else.
+    PartitionLocker { for_ms: u64 },
+    /// Plan 30 §M14: once a node other than the lease holder is inside a
+    /// critical section, kill the lease holder (the grants' owner).
+    CrashHolderWhileLocked { restart_ms: Option<u64> },
+    /// Plan 30 §M14: kill a node other than the lease holder while it is
+    /// inside a critical section (its grant is outwaited).
+    CrashLocker { restart_ms: Option<u64> },
     /// Plan 30 §M10: an S3 outage for the current holder and `members −
     /// 1` other nodes (the lowest ids), which are also cut from every
     /// other node over P2P; the others keep S3. The sim's epoch
@@ -164,6 +176,24 @@ pub struct SimConfig {
     /// range's delegate owned behind its back — `chaos-soak-4`'s double
     /// winners). `Off`: every op goes through the core.
     pub fast_path: FastPath,
+    /// Plan 30 §M14: files `lk<i>` (in `lock_dir`, else the root)
+    /// created at setup; after each op a client takes a whole-file lock on
+    /// one of them with probability `lock_ratio` (`lock_shared_ratio` of
+    /// them shared, `lock_nonblocking_ratio` non-blocking), performs
+    /// `lock_ios` I/O steps `lock_io_ms` apart and unlocks (see
+    /// `locks.rs`). Off with `lock_files: 0`.
+    pub lock_files: usize,
+    pub lock_ratio: f64,
+    pub lock_shared_ratio: f64,
+    pub lock_nonblocking_ratio: f64,
+    pub lock_ios: (u32, u32),
+    /// Below twice the expiry margin, so a lapse between two I/O steps is
+    /// seen before any other node can be granted.
+    pub lock_io_ms: (u64, u64),
+    pub lock_dir: Option<String>,
+    /// Plan 30 §M14's non-vacuity knob: clients perform I/O even when
+    /// `fenced` says the grant lapsed (the checker must catch it).
+    pub lock_ignore_fence: bool,
 }
 
 /// See `SimConfig::fast_path`.
@@ -217,6 +247,10 @@ pub fn sim_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.stream_buffer_segments = 32;
     c.stream_retry_min_ms = 150;
     c.stream_retry_max_ms = 2_000;
+    // Plan 30 §M14: a lock grant lives 1.5 s (renewed every 750 ms); the
+    // expiry margin (500 ms) stays below half of it.
+    c.lock_ttl_ms = 1_500;
+    c.lock_cache_idle_ms = 15_000;
     // Plan 30 §M11 phase 2b: the placement is opted into per configuration
     // (`placement_core_config`); the 2a configurations are what they were.
     c.placement = false;
@@ -341,6 +375,14 @@ impl Default for SimConfig {
             check_range_bits: 0,
             cross_ratio: 0.0,
             marker_pairs: 0,
+            lock_files: 0,
+            lock_ratio: 0.0,
+            lock_shared_ratio: 0.25,
+            lock_nonblocking_ratio: 0.1,
+            lock_ios: (2, 6),
+            lock_io_ms: (5, 60),
+            lock_dir: None,
+            lock_ignore_fence: false,
         }
     }
 }
@@ -395,6 +437,8 @@ pub struct Report {
     /// `InDoubt` answers sent (every one checked against the log by
     /// `check::check_in_doubt_answers`).
     pub in_doubt_answers: usize,
+    /// Plan 30 §M14: what the lock clients saw.
+    pub locks: super::locks::LockCounters,
 }
 
 pub struct Cluster {
@@ -418,6 +462,8 @@ pub struct Cluster {
     /// claim the lease: a lease read, a tail and the CAS (four S3 round
     /// trips at the configured worst latency).
     pub claim_ms: i64,
+    /// Plan 30 §M14: the mutual-exclusion ghost and the lock files.
+    pub locks: Arc<super::locks::LockGhost>,
 }
 
 impl Cluster {
@@ -555,6 +601,9 @@ impl Cluster {
     pub fn crash(&self, id: NodeId) -> Arc<Meta> {
         let node = self.get(id);
         node.crash(&self.env.bus);
+        // Plan 30 §M14: the process's lock state dies with it.
+        self.locks.drop_node(id, self.env.clock.elapsed_ms());
+        super::locks::reset_node(&node.meta, &self.locks.inos(), node.clock.now().0);
         node.meta.clone()
     }
 
@@ -589,7 +638,7 @@ fn ns_ret(outcome: &MutateOutcome) -> Result<NsRet, String> {
 
 /// Plan 30 §M11: `"d1/x"` is name `x` in directory `d1` (created under
 /// the root before the clients start); a bare name is in the root.
-fn split_name(meta: &Meta, name: &str) -> (u64, String) {
+pub fn split_name(meta: &Meta, name: &str) -> (u64, String) {
     match name.rfind('/') {
         Some(i) => {
             let dir = &name[..i];
@@ -697,6 +746,8 @@ pub enum Step {
     Op(NsOp),
     /// Plan 30 §M6: look a name up in the local replica.
     Read(String),
+    /// Plan 30 §M14: a lock, a critical section, the unlock.
+    Lock(super::locks::LockStep),
 }
 
 /// Plan 30 §M6: a client read — the session wait (polled: this runtime
@@ -805,6 +856,7 @@ async fn client_thread(
     pace_ms: u64,
     wait: Option<u64>,
     strict: bool,
+    ignore_fence: bool,
 ) {
     for step in steps {
         let op = match step {
@@ -814,6 +866,20 @@ async fn client_thread(
                 if handle.alive() {
                     client_read(&handle, &history, thread, name, wait, strict).await;
                 }
+                continue;
+            }
+            Step::Lock(lock) => {
+                tokio::time::sleep(Duration::from_millis(pace_ms / 2)).await;
+                super::locks::client_lock(
+                    cluster.clone(),
+                    node,
+                    thread,
+                    lock,
+                    wait.unwrap_or(2_000),
+                    ignore_fence,
+                    failures.clone(),
+                )
+                .await;
                 continue;
             }
         };
@@ -1025,6 +1091,34 @@ fn with_reads(rng: &mut StdRng, ops: Vec<NsOp>, names: usize, ratio: f64) -> Vec
                 d => format!("{d}/{random}"),
             };
             out.push(Step::Read(random));
+        }
+    }
+    out
+}
+
+/// Plan 30 §M14: interleave lock steps with `steps` (after each op, with
+/// `lock_ratio`); a config without locks draws nothing.
+fn with_locks(rng: &mut StdRng, steps: Vec<Step>, cfg: &SimConfig) -> Vec<Step> {
+    if cfg.lock_files == 0 || cfg.lock_ratio <= 0.0 {
+        return steps;
+    }
+    let mut out = Vec::new();
+    for step in steps {
+        let op = matches!(step, Step::Op(_));
+        out.push(step);
+        if op && rng.random_bool(cfg.lock_ratio.min(1.0)) {
+            let mode = if rng.random_bool(cfg.lock_shared_ratio.clamp(0.0, 1.0)) {
+                constellation_meta::locks::LockMode::Shared
+            } else {
+                constellation_meta::locks::LockMode::Exclusive
+            };
+            out.push(Step::Lock(super::locks::LockStep {
+                file: rng.random_range(0..cfg.lock_files),
+                mode,
+                blocking: !rng.random_bool(cfg.lock_nonblocking_ratio.clamp(0.0, 1.0)),
+                ios: rng.random_range(cfg.lock_ios.0..=cfg.lock_ios.1),
+                io_ms: rng.random_range(cfg.lock_io_ms.0..=cfg.lock_io_ms.1),
+            }));
         }
     }
     out
@@ -1266,6 +1360,72 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             tokio::time::sleep(Duration::from_millis(for_ms)).await;
             cluster.env.bucket.set_cut(lease.holder, false);
         }
+        FaultKind::PartitionLocker { for_ms } => {
+            let Some(node) = wait_for_locker(&cluster).await else {
+                note(format!("t={} partition-locker: no locker", fault.at_ms));
+                return;
+            };
+            let others: Vec<NodeId> = cluster.ids().into_iter().filter(|n| *n != node).collect();
+            note(format!(
+                "t={} partition locker {node} from {others:?} for {for_ms}ms",
+                cluster.env.clock.elapsed_ms()
+            ));
+            for o in &others {
+                cluster.env.bus.set_partition(node, *o, true);
+            }
+            tokio::time::sleep(Duration::from_millis(for_ms)).await;
+            for o in &others {
+                cluster.env.bus.set_partition(node, *o, false);
+            }
+        }
+        FaultKind::CrashHolderWhileLocked { restart_ms } => {
+            if wait_for_locker(&cluster).await.is_none() {
+                note(format!(
+                    "t={} crash-holder-while-locked: no locker",
+                    fault.at_ms
+                ));
+                return;
+            }
+            let at_ms = cluster.env.clock.elapsed_ms();
+            note(format!(
+                "t={at_ms} a locker is in its critical section: crash the holder"
+            ));
+            Box::pin(run_fault(
+                cluster,
+                ScheduledFault {
+                    at_ms: 0,
+                    kind: FaultKind::CrashHolder {
+                        restart_ms,
+                        keep_journal: true,
+                    },
+                },
+                log.clone(),
+            ))
+            .await;
+        }
+        FaultKind::CrashLocker { restart_ms } => {
+            let Some(node) = wait_for_locker(&cluster).await else {
+                note(format!("t={} crash-locker: no locker", fault.at_ms));
+                return;
+            };
+            note(format!(
+                "t={} node {node} is in its critical section: crash it",
+                cluster.env.clock.elapsed_ms()
+            ));
+            Box::pin(run_fault(
+                cluster,
+                ScheduledFault {
+                    at_ms: 0,
+                    kind: FaultKind::CrashNode {
+                        node,
+                        restart_ms,
+                        keep_journal: true,
+                    },
+                },
+                log.clone(),
+            ))
+            .await;
+        }
         FaultKind::EpochOutage { members, for_ms } => {
             super::epochs::epoch_outage(cluster.clone(), fault.at_ms, members, for_ms, log.clone())
                 .await;
@@ -1301,6 +1461,24 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             cluster.env.bus.set_partition(lease.holder, backup, false);
         }
     }
+}
+
+/// Plan 30 §M14: a live node other than the lease holder inside a
+/// critical section, waited for up to 5 s.
+async fn wait_for_locker(cluster: &Arc<Cluster>) -> Option<NodeId> {
+    for _ in 0..1_000 {
+        let holder = read_lease(&cluster.env.bucket).await.map(|l| l.holder);
+        let found = cluster
+            .locks
+            .nodes_in_io()
+            .into_iter()
+            .find(|n| Some(*n) != holder && cluster.get(*n).alive());
+        if found.is_some() {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    None
 }
 
 /// Run one seed. `Err` carries the failure and the replay command.
@@ -1392,6 +1570,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         epochs: Mutex::new(Vec::new()),
         split_brains: Mutex::new(Vec::new()),
         slack: cfg.epoch_slack,
+        locks: Arc::new(super::locks::LockGhost::new(seed)),
     });
     for ((a, b), ms) in &cfg.rtts {
         bus.set_rtt(*a, *b, *ms);
@@ -1410,6 +1589,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let marker_stats: Arc<Mutex<(u64, u64)>> = Arc::new(Mutex::new((0, 0)));
     if !cfg.dirs.is_empty() {
         setup_dirs(&cluster, &cfg, &failures).await;
+    }
+    if cfg.lock_files > 0 {
+        setup_lock_files(&cluster, &cfg, &history, &abandoned, &failures).await;
     }
 
     // The workload.
@@ -1457,6 +1639,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             // reads replays exactly the schedules it had before M6.
             let mut read_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x5e55);
             let steps = with_reads(&mut read_rng, ops, cfg.names, cfg.read_ratio);
+            // Plan 30 §M14: locks from their own generator too.
+            let mut lock_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x10c5);
+            let steps = with_locks(&mut lock_rng, steps, &cfg);
             clients.push(tokio::spawn(client_thread(
                 cluster.clone(),
                 history.clone(),
@@ -1468,6 +1653,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                 pace,
                 cfg.session_wait.then_some(cfg.session_wait_ms),
                 cfg.strict,
+                cfg.lock_ignore_fence,
             )));
         }
     }
@@ -1664,6 +1850,35 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         }
     }
 
+    // Plan 30 §M14: no lock request, waiter or recall is left: every
+    // parked request was served and every recall answered or outwaited.
+    let mut locks_stuck = None;
+    if cfg.lock_files > 0 {
+        let mut drained = false;
+        for _ in 0..100 {
+            let busy: Vec<(NodeId, usize, usize, usize)> = cluster
+                .ids()
+                .into_iter()
+                .map(|id| cluster.get(id))
+                .filter(|n| n.alive())
+                .map(|n| {
+                    let v = n.view();
+                    (n.id, v.lock_requests, v.lock_waiters, v.lock_recalls)
+                })
+                .filter(|(_, a, b, c)| a + b + c > 0)
+                .collect();
+            if busy.is_empty() {
+                drained = true;
+                break;
+            }
+            locks_stuck = Some(busy);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if drained {
+            locks_stuck = None;
+        }
+    }
+
     sampler.abort();
     // Checks.
     let mut report = Report {
@@ -1688,6 +1903,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         return Err(format!(
             "two authorities at once (plan 30 §M10): {what}\n  faults: {:?}",
             fault_log.lock().unwrap()
+        ));
+    }
+    // Plan 30 §M14: mutual exclusion.
+    report.locks = cluster.locks.counters();
+    let lock_violations = cluster.locks.violations();
+    if let Some(what) = lock_violations.first() {
+        return Err(format!(
+            "mutual exclusion violated (plan 30 §M14): {what} ({} violation(s))\n  faults: {:?}\n  \
+             lock trace (last events):\n    {}",
+            lock_violations.len(),
+            fault_log.lock().unwrap(),
+            cluster.locks.trace().join("\n    ")
         ));
     }
     report.faults = fault_log.lock().unwrap().clone();
@@ -1722,6 +1949,26 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .load(std::sync::atomic::Ordering::Relaxed);
     }
     report.acked_rolled_back = rolled_back_acked;
+    if let Some(busy) = locks_stuck {
+        return Err(format!(
+            "lock state never drained after the workload (node, requests, waiters, recalls): \
+             {busy:?}\n  faults: {:?}\n  lock trace (last events):\n    {}",
+            report.faults,
+            cluster.locks.trace().join("\n    ")
+        ));
+    }
+    if cfg.lock_files > 0 && cfg.lock_ratio > 0.0 {
+        // The core's counter restarts with a restarted node (the one that
+        // made every grant may have crashed since): the clients' `Granted`
+        // answers count too.
+        let grants: u64 = report.stats.values().map(|s| s.lock_grants).sum();
+        if (grants == 0 && report.locks.granted == 0) || report.locks.acquired == 0 {
+            return Err(format!(
+                "a lock workload that never took a lock (vacuous): {grants} grants, {:?}\n  faults: {:?}",
+                report.locks, report.faults
+            ));
+        }
+    }
     report.failover_ms = cluster
         .failovers
         .lock()
@@ -2161,6 +2408,79 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
         .lock()
         .unwrap()
         .push("setup: delegations were not installed on the delegates".into());
+}
+
+/// Plan 30 §M14: create the lock files through node 1 (recorded in the
+/// history like any client op), then wait until every node has them.
+async fn setup_lock_files(
+    cluster: &Arc<Cluster>,
+    cfg: &SimConfig,
+    history: &Arc<History>,
+    abandoned: &Arc<Mutex<HashSet<Rid>>>,
+    failures: &Arc<Mutex<Vec<String>>>,
+) {
+    let handle = cluster.get(1);
+    let names: Vec<String> = (0..cfg.lock_files)
+        .map(|i| match &cfg.lock_dir {
+            Some(d) => format!("{d}/lk{i}"),
+            None => format!("lk{i}"),
+        })
+        .collect();
+    for (i, name) in names.iter().enumerate() {
+        let thread = (1 << 21) + i as u64;
+        let rid = handle.next_rid();
+        let op = NsOp::Create(name.clone());
+        let mop = mutate_op(&handle.meta, &op);
+        history.invoke(thread, rid, op);
+        let mut ok = false;
+        for _ in 0..20 {
+            match handle.submit(rid, mop.clone()).await {
+                Ok(ClientReply::Outcome(o)) => {
+                    if let Ok(ret) = ns_ret(&o) {
+                        history.ret(thread, rid, ret);
+                        ok = true;
+                    }
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+        if !ok {
+            abandoned.lock().unwrap().insert(rid);
+            failures
+                .lock()
+                .unwrap()
+                .push(format!("setup: could not create lock file {name}"));
+            return;
+        }
+    }
+    for _ in 0..200 {
+        let inos: Option<Vec<u64>> = names
+            .iter()
+            .map(|name| {
+                let (parent, leaf) = split_name(&handle.meta, name);
+                handle.meta.child_ino(parent, &leaf).ok().flatten()
+            })
+            .collect();
+        let everywhere = cluster.ids().into_iter().all(|id| {
+            let n = cluster.get(id);
+            names.iter().all(|name| {
+                let (parent, leaf) = split_name(&n.meta, name);
+                n.meta.child_ino(parent, &leaf).ok().flatten().is_some()
+            })
+        });
+        if let (Some(inos), true) = (inos, everywhere) {
+            cluster
+                .locks
+                .set_files(names.iter().cloned().zip(inos).collect());
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    failures
+        .lock()
+        .unwrap()
+        .push("setup: the lock files never reached every node".into());
 }
 
 /// Plan 30 §M11: write `pairs` data names in `home`, each followed by a

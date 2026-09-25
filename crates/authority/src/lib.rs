@@ -35,14 +35,17 @@ pub mod ids;
 pub mod replica;
 pub mod segment;
 
-pub use action::{Action, ClientReply, ControlOk, ReadAnswer, S3Op, TimerKind};
+pub use action::{
+    Action, ClientReply, ControlOk, LockAnswer, LockTestAnswer, ReadAnswer, S3Op, TimerKind,
+};
 pub use core::{
     lease_may_carry, resolve_epoch_claims, Config, Core, EpochClaimView, EpochState, InboxView,
-    ShipState, Stats,
+    LockView, ShipState, Stats,
 };
 pub use event::{
-    Carrier, CasFailure, Control, Event, PeerLink, PeerMsg, Policy, ReadGrantMsg, ReadIndexOutcome,
-    S3Failure, S3Result, UploadResult,
+    Carrier, CasFailure, Control, Event, LockOutcome, LockRenewEntry, LockRenewResult,
+    LockTestOutcome, PeerLink, PeerMsg, Policy, ReadGrantMsg, ReadIndexOutcome, S3Failure,
+    S3Result, UploadResult,
 };
 pub use ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 pub use replica::Replica;

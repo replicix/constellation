@@ -15,6 +15,7 @@ mod sim {
     pub mod cto;
     pub mod epochs;
     pub mod history;
+    pub mod locks;
     pub mod node;
     pub mod run;
     pub mod session;
@@ -316,6 +317,19 @@ fn replay_seed() {
         Ok("shared-dir-ranges") => shared_dir_ranges_config(),
         Ok("shared-dir-faults") => shared_dir_faults_config(),
         Ok("long-delegated") => long_delegated_config(),
+        // Plan 30 §M14.
+        Ok("locks") => locks_config(),
+        Ok("locks-partition") => locks_partition_config(),
+        Ok("locks-skew") => locks_skew_config(),
+        Ok("locks-failover") => locks_failover_config(),
+        Ok("locks-failover-backup") => locks_failover_backup_config(),
+        Ok("locks-faults") => locks_faults_config(),
+        Ok("locks-pause") => locks_pause_config(),
+        Ok("locks-delegated") => locks_delegated_config(),
+        Ok("locks-nofence") => SimConfig {
+            lock_ignore_fence: true,
+            ..locks_partition_config()
+        },
         // Plan 30 §M7.
         Ok("streams-off") => streams_off_config(),
         Ok("stream-faults") => stream_faults_config(),
@@ -2828,4 +2842,386 @@ fn long_delegated() {
         start..start + seeds,
     );
     assert!(t.executed > 0);
+}
+
+// ===================================================================
+// Plan 30 §M14: cross-node `flock`/`fcntl`.
+
+/// Three nodes, no faults: every client mixes namespace ops with whole-
+/// file locks on two shared files (a quarter shared, a tenth
+/// non-blocking), a few I/O steps under each. Node 1 takes the lease at
+/// setup and owns every grant; its own clients lock through the same
+/// path.
+fn locks_config() -> SimConfig {
+    SimConfig {
+        nodes: 3,
+        clients_per_node: 2,
+        ops_per_client: 6,
+        names: 4,
+        random_faults: 0,
+        read_ratio: 0.2,
+        lock_files: 2,
+        lock_ratio: 0.7,
+        ..SimConfig::default()
+    }
+}
+
+/// A node inside a long critical section is cut from every other node
+/// over P2P for longer than a grant: its renewals fail, the grant lapses
+/// under the section (its I/O is fenced) and the owner outwaits it (TTL
+/// + margin) before granting the next node. Plus one random fault.
+fn locks_partition_config() -> SimConfig {
+    SimConfig {
+        random_faults: 1,
+        lock_ios: (6, 20),
+        lock_io_ms: (40, 200),
+        faults: vec![
+            ScheduledFault {
+                at_ms: 600,
+                kind: FaultKind::PartitionLocker { for_ms: 3_000 },
+            },
+            ScheduledFault {
+                at_ms: 5_000,
+                kind: FaultKind::PartitionLocker { for_ms: 2_500 },
+            },
+        ],
+        ..locks_config()
+    }
+}
+
+/// Clocks off by up to ±200 ms (the margin is 500 ms: `margin > 2 ×
+/// skew`), a little P2P loss.
+fn locks_skew_config() -> SimConfig {
+    SimConfig {
+        clock_skew_ms: 200,
+        p2p_drop: 0.02,
+        ..locks_config()
+    }
+}
+
+/// The lease holder (every grant's owner) dies while another node is
+/// inside a critical section, and a lock-holding node dies inside one:
+/// the successor waits the old grants out (TTL takeover), a dead
+/// holder's grant is outwaited.
+fn locks_failover_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 8,
+        lock_ios: (4, 12),
+        lock_io_ms: (20, 150),
+        faults: vec![
+            ScheduledFault {
+                at_ms: 800,
+                kind: FaultKind::CrashHolderWhileLocked {
+                    restart_ms: Some(5_000),
+                },
+            },
+            ScheduledFault {
+                at_ms: 9_000,
+                kind: FaultKind::CrashLocker {
+                    restart_ms: Some(3_000),
+                },
+            },
+        ],
+        ..locks_config()
+    }
+}
+
+/// The same under M9's backups: the holder's backup seals and takes over
+/// before the TTL with the mirrored grant table (restamped) and the
+/// acknowledgement floor.
+fn locks_failover_backup_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::backup_core_config),
+        ..locks_failover_config()
+    }
+}
+
+/// Nodes stop (their events queue, their clients keep running) while
+/// their clients wait for or hold locks: renewals stall, grants lapse
+/// under critical sections, and replies and pushes are handled late —
+/// a late grant must never be honoured past its window.
+fn locks_pause_config() -> SimConfig {
+    SimConfig {
+        lock_ios: (4, 12),
+        lock_io_ms: (20, 150),
+        faults: vec![
+            ScheduledFault {
+                at_ms: 700,
+                kind: FaultKind::Pause {
+                    node: 3,
+                    for_ms: 4_500,
+                },
+            },
+            ScheduledFault {
+                at_ms: 2_500,
+                kind: FaultKind::Pause {
+                    node: 2,
+                    for_ms: 3_000,
+                },
+            },
+        ],
+        ..locks_config()
+    }
+}
+
+/// The CI faults (two random ones per seed) under the lock workload.
+fn locks_faults_config() -> SimConfig {
+    SimConfig {
+        random_faults: 2,
+        ..locks_config()
+    }
+}
+
+/// The lock files live in `d1`, delegated to node 2 (its grants are
+/// node 2's); a third of the renames cross subtrees, so the root recalls
+/// the delegation and the lock table moves with the subtree.
+fn locks_delegated_config() -> SimConfig {
+    SimConfig {
+        lock_files: 2,
+        lock_ratio: 0.7,
+        lock_dir: Some("d1".into()),
+        ..delegated_config()
+    }
+}
+
+/// Plan 30 §M14: the lock counters summed over a run's nodes.
+#[derive(Debug, Default)]
+struct M14Totals {
+    seeds: u64,
+    clients: sim::locks::LockCounters,
+    grants: u64,
+    requests: u64,
+    waiters_parked: u64,
+    waiting_replies: u64,
+    recalls_sent: u64,
+    recalls_released: u64,
+    recalls_expired: u64,
+    renewals: u64,
+    renewals_served: u64,
+    reclaimed: u64,
+    moved: u64,
+    lost: u64,
+    released: u64,
+    granted_recalled: u64,
+    grace_refusals: u64,
+    grace_periods: u64,
+    idle_released: u64,
+    backup_takeovers: u64,
+    unavailable: u64,
+    wait_ms_total: u64,
+    max_simulated_ms: u64,
+}
+
+impl M14Totals {
+    fn add(&mut self, r: &Report) {
+        self.seeds += 1;
+        let c = &mut self.clients;
+        let l = r.locks;
+        c.steps += l.steps;
+        c.acquired += l.acquired;
+        c.ios += l.ios;
+        c.fenced_ios += l.fenced_ios;
+        c.local_conflicts += l.local_conflicts;
+        c.granted += l.granted;
+        c.would_block += l.would_block;
+        c.unavailable += l.unavailable;
+        c.regrants += l.regrants;
+        c.idle_sent += l.idle_sent;
+        c.position_timeouts += l.position_timeouts;
+        c.abandoned += l.abandoned;
+        c.max_wait_ms = c.max_wait_ms.max(l.max_wait_ms);
+        for s in r.stats.values() {
+            self.grants += s.lock_grants;
+            self.requests += s.lock_requests;
+            self.waiters_parked += s.lock_waiters_parked;
+            self.waiting_replies += s.lock_waiting_replies;
+            self.recalls_sent += s.lock_recalls_sent;
+            self.recalls_released += s.lock_recalls_released;
+            self.recalls_expired += s.lock_recalls_expired;
+            self.renewals += s.lock_renewals;
+            self.renewals_served += s.lock_renewals_served;
+            self.reclaimed += s.lock_reclaimed;
+            self.moved += s.lock_moved;
+            self.lost += s.lock_lost;
+            self.released += s.lock_released;
+            self.granted_recalled += s.lock_granted_recalled;
+            self.grace_refusals += s.lock_grace_refusals;
+            self.grace_periods += s.lock_grace_periods;
+            self.idle_released += s.lock_idle_released;
+            self.backup_takeovers += s.backup_takeovers;
+            self.unavailable += s.lock_unavailable;
+            self.wait_ms_total += s.lock_wait_ms_total;
+        }
+        self.max_simulated_ms = self.max_simulated_ms.max(r.simulated_ms);
+    }
+}
+
+fn run_m14(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M14Totals {
+    let mut totals = M14Totals::default();
+    for seed in seeds {
+        let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+            panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+        });
+        totals.add(&report);
+    }
+    eprintln!("{label}: {totals:#?}");
+    totals
+}
+
+/// Plan 30 §M14: no two nodes ever perform I/O under conflicting locks;
+/// contended grants are recalled and released; every client finishes and
+/// no request, waiter or recall is left behind.
+#[test]
+fn locks_are_mutually_exclusive() {
+    let t = run_m14("locks", locks_config(), 90_000..90_200);
+    assert!(t.grants > 500, "grants rarely made: {t:?}");
+    assert!(t.recalls_sent > 100, "grants rarely contended: {t:?}");
+    assert!(t.recalls_released > 100, "recalls never released: {t:?}");
+    assert!(t.clients.ios > 1_000, "little I/O under locks: {t:?}");
+    assert!(t.clients.local_conflicts > 0, "no local contention: {t:?}");
+}
+
+/// Plan 30 §M14: a partitioned lock holder's grant lapses under its
+/// critical section — its I/O is fenced — and the owner outwaits the
+/// grant before the next node's lock (mutual exclusion holds).
+#[test]
+fn locks_partitioned_holder_is_fenced() {
+    let t = run_m14("locks-partition", locks_partition_config(), 91_000..91_120);
+    assert!(t.clients.fenced_ios > 0, "no I/O was ever fenced: {t:?}");
+    assert!(t.recalls_expired > 0, "no recall was outwaited: {t:?}");
+}
+
+/// Plan 30 §M14: clock skew within the margin keeps mutual exclusion.
+#[test]
+fn locks_hold_under_clock_skew() {
+    let t = run_m14("locks-skew", locks_skew_config(), 92_000..92_120);
+    assert!(t.recalls_released > 50, "{t:?}");
+}
+
+/// Plan 30 §M14: the owner dies while grants are held (TTL takeover) and
+/// a lock holder dies inside its section.
+#[test]
+fn locks_survive_holder_failover() {
+    let t = run_m14("locks-failover", locks_failover_config(), 93_000..93_080);
+    assert!(t.grants > 500, "{t:?}");
+    assert!(
+        t.clients.abandoned > 0,
+        "no node ever died inside a critical section: {t:?}"
+    );
+    assert!(t.recalls_expired > 0, "no dead holder was outwaited: {t:?}");
+}
+
+/// Plan 30 §M14: the same with M9's backups (seal takeover with the
+/// mirrored table).
+#[test]
+fn locks_survive_backup_failover() {
+    let t = run_m14(
+        "locks-failover-backup",
+        locks_failover_backup_config(),
+        94_000..94_080,
+    );
+    assert!(t.grants > 500, "{t:?}");
+    assert!(
+        t.backup_takeovers > 20,
+        "the backup rarely took over (with the mirror): {t:?}"
+    );
+}
+
+/// Plan 30 §M14: the CI's random faults under the lock workload.
+#[test]
+fn locks_under_random_faults() {
+    let t = run_m14("locks-faults", locks_faults_config(), 95_000..95_120);
+    assert!(t.grants > 500, "{t:?}");
+}
+
+/// Plan 30 §M14: paused nodes (late replies and pushes, stalled
+/// renewals) keep mutual exclusion.
+#[test]
+fn locks_survive_paused_nodes() {
+    let t = run_m14("locks-pause", locks_pause_config(), 97_000..97_080);
+    assert!(t.grants > 500, "{t:?}");
+    assert!(
+        t.clients.fenced_ios > 0,
+        "no paused holder was fenced: {t:?}"
+    );
+}
+
+/// Plan 30 §M14: lock files in a delegated subtree: the delegate owns the
+/// grants, recalls of the delegation move the table.
+#[test]
+fn locks_in_a_delegated_subtree() {
+    let t = run_m14("locks-delegated", locks_delegated_config(), 96_000..96_080);
+    assert!(t.grants > 500, "{t:?}");
+    assert!(
+        t.moved > 0,
+        "the lock table never moved with the subtree: {t:?}"
+    );
+}
+
+/// Plan 30 §M14: a lock seed replays identically (the lock tables and
+/// the ghost must not add nondeterminism).
+#[test]
+fn locks_seed_replays_identically() {
+    for seed in [90_003, 91_004] {
+        let cfg = if seed < 91_000 {
+            locks_config()
+        } else {
+            locks_partition_config()
+        };
+        let a = run_seed(seed, cfg.clone()).expect("run a");
+        let b = run_seed(seed, cfg).expect("run b");
+        assert_eq!(a.stats, b.stats, "per-node counters differ between replays");
+        assert_eq!(format!("{:?}", a.locks), format!("{:?}", b.locks));
+        assert_eq!(a.simulated_ms, b.simulated_ms);
+    }
+}
+
+/// Plan 30 §M14's non-vacuity check: clients that keep doing I/O after
+/// their grant lapsed (ignoring the fence) are caught by the checker on
+/// some partition seed.
+#[test]
+fn locks_without_the_fence_are_found() {
+    let cfg = SimConfig {
+        lock_ignore_fence: true,
+        ..locks_partition_config()
+    };
+    let caught = (91_000..91_060)
+        .filter_map(|seed| run_seed(seed, cfg.clone()).err())
+        .filter(|e| e.contains("mutual exclusion violated"))
+        .count();
+    assert!(caught > 0, "ignoring the fence was never caught");
+}
+
+/// `cargo test -p constellation-authority --release --test sim -- --ignored long_locks`
+#[test]
+#[ignore]
+fn long_locks() {
+    let n: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    run_m14("locks", locks_config(), 190_000..190_000 + n);
+    run_m14(
+        "locks-partition",
+        locks_partition_config(),
+        191_000..191_000 + n,
+    );
+    run_m14("locks-skew", locks_skew_config(), 192_000..192_000 + n);
+    run_m14(
+        "locks-failover",
+        locks_failover_config(),
+        193_000..193_000 + n,
+    );
+    run_m14(
+        "locks-failover-backup",
+        locks_failover_backup_config(),
+        194_000..194_000 + n,
+    );
+    run_m14("locks-faults", locks_faults_config(), 195_000..195_000 + n);
+    run_m14("locks-pause", locks_pause_config(), 197_000..197_000 + n);
+    run_m14(
+        "locks-delegated",
+        locks_delegated_config(),
+        196_000..196_000 + n,
+    );
 }

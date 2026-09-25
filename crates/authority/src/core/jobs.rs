@@ -894,6 +894,9 @@ impl Core {
             if let Some(g) = self.lease.gate.as_mut() {
                 g.backup_tail_epoch = None;
             }
+            // Plan 30 §M14: the predecessor's lock table, as last
+            // mirrored; the floor covers what the mirror missed.
+            self.lock_install_mirror(now, replica);
         }
         if let Err(e) = self.replay_queue_locally(now, replica, out) {
             return GateStep::Failed(e.to_string());
@@ -1470,6 +1473,12 @@ impl Core {
             self.finish_round(now, None, replica, out);
             return;
         }
+        // Plan 30 §M14: nor while lock grants are live (a successor would
+        // start a grace; the holders keep their locks instead).
+        if replica.locks().grants_len() > 0 {
+            self.finish_round(now, None, replica, out);
+            return;
+        }
         if self
             .lease
             .idle_release_due(now, &self.cfg, backlog, self.held_back)
@@ -1978,6 +1987,13 @@ impl Core {
         // although it applied, 603631). The tail and the role are on
         // disk; nobody else can have held in between.
         let sealed = self.bk.sealed;
+        // Plan 30 §M14: a released (unexpired) lease's lock grants may
+        // still be honoured: a grace before any new grant.
+        if prev.as_ref().is_some_and(|p| {
+            takeover && p.released && !p.is_expired(now.0) && p.holder != self.cfg.node_id
+        }) {
+            self.lock_on_released_takeover(now);
+        }
         let backup_tail_epoch = prev
             .as_ref()
             .and_then(|p| {

@@ -592,6 +592,7 @@ pub trait PeerService: Send + Sync + 'static {
                 req_id,
                 gen,
                 ttl_ms: 0,
+                locks: Vec::new(),
             }
         })
     }
@@ -608,6 +609,7 @@ pub trait PeerService: Send + Sync + 'static {
                 req_id,
                 gen,
                 through: 0,
+                locks: Vec::new(),
             }
         })
     }
@@ -669,6 +671,88 @@ pub trait PeerService: Send + Sync + 'static {
     /// Plan 30 §M9: backup-acked transactions streamed ahead of S3.
     /// Default ignores them.
     fn stream_ahead(&self, _from: u64, _epoch: u64, _base: u64, _txs: Vec<u8>) {}
+    /// Plan 30 §M14: a node asks this one, as the owning sequencer, for
+    /// a lock grant. Default: busy (no lock service here).
+    fn lock_requested(
+        &self,
+        _requester: u64,
+        req_id: u64,
+        _ino: u64,
+        _exclusive: bool,
+        _blocking: bool,
+        _sent: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::LockReply {
+                req_id,
+                outcome: crate::message::LockOutcomeWire::Busy,
+            }
+        })
+    }
+    /// Plan 30 §M14: the owner recalls a grant this node holds. Default:
+    /// holds none, acks at once.
+    fn lock_recall_requested(
+        &self,
+        _owner: u64,
+        req_id: u64,
+        _ino: u64,
+        _grant: (u64, u64),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move { Payload::LockRecalled { req_id } })
+    }
+    /// Plan 30 §M14: a holder renews its grants here. Default: not the
+    /// owner of any of them.
+    fn lock_renew_requested(
+        &self,
+        _from: u64,
+        req_id: u64,
+        entries: Vec<crate::message::LockRenewWire>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::LockRenewed {
+                req_id,
+                results: entries
+                    .into_iter()
+                    .map(|e| {
+                        (
+                            e.ino,
+                            e.grant,
+                            crate::message::LockRenewResultWire::NotOwner { owner: 0 },
+                        )
+                    })
+                    .collect(),
+            }
+        })
+    }
+    /// Plan 30 §M14: `getlk` against this node as the owner. Default: not
+    /// the owner.
+    fn lock_test_requested(
+        &self,
+        _requester: u64,
+        req_id: u64,
+        _ino: u64,
+        _exclusive: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::LockTestReply {
+                req_id,
+                outcome: crate::message::LockTestOutcomeWire::NotOwner { owner: 0 },
+            }
+        })
+    }
+    /// Plan 30 §M14, one way: a parked request's grant, pushed.
+    fn lock_granted(
+        &self,
+        _from: u64,
+        _ino: u64,
+        _sent: i64,
+        _outcome: crate::message::LockOutcomeWire,
+    ) {
+    }
+    /// Plan 30 §M14, one way: a holder released a grant.
+    fn lock_released(&self, _from: u64, _ino: u64, _grant: (u64, u64)) {}
+    /// Plan 30 §M14, one way: the holder's grant table, for a backup.
+    fn lock_mirror(&self, _from: u64, _ver: u64, _grants: Vec<u8>) {}
     /// Holder offered us this lease (placement). Default ignores it.
     fn lease_offered(&self, _part: String, _epoch: u64) {}
     /// A peer gossiped its RTT vector. Default ignores it.

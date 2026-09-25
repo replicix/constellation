@@ -32,7 +32,7 @@ macro_rules! gate {
     };
 }
 
-impl Filesystem for ConstellationFs {
+impl Filesystem for FuseFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         let threads = crate::parallelism::thread_plan();
         let _ = config.set_max_background(threads.fuse_max_background());
@@ -41,6 +41,20 @@ impl Filesystem for ConstellationFs {
             // Older kernels may not advertise this capability. Multi-reader
             // dispatch still works; only directory operations remain ordered.
             let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+        }
+        // Plan 30 §M14: under `--locks cluster` the kernel hands POSIX and
+        // `flock` locks to `getlk`/`setlk`; without the capabilities (and
+        // on a frozen snapshot view, where nothing can be written) it
+        // keeps them node-local, as it always did.
+        if self.cluster_locks().is_some() && !ConstellationFs::is_synthetic(self.view_root()) {
+            if let Err(missing) =
+                config.add_capabilities(InitFlags::FUSE_POSIX_LOCKS | InitFlags::FUSE_FLOCK_LOCKS)
+            {
+                tracing::warn!(
+                    ?missing,
+                    "the kernel does not offer FUSE lock forwarding; locks on this mount stay node-local"
+                );
+            }
         }
         Ok(())
     }
@@ -198,6 +212,12 @@ impl Filesystem for ConstellationFs {
             self.atime.purge(ino);
         }
         if let Some(new_size) = size {
+            // Plan 30 §M14: a truncation is a write (fenced under a
+            // lapsed lock grant).
+            if self.lock_fenced(ino) {
+                reply.error(Errno::from_i32(libc::EIO));
+                return;
+            }
             if let Err(error) = self.truncate(ino, new_size) {
                 reply.error(Errno::from_i32(error));
                 return;
@@ -723,11 +743,15 @@ impl Filesystem for ConstellationFs {
     ) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
-        if Self::is_synthetic(ino) {
+        if ConstellationFs::is_synthetic(ino) {
             match self.read_frozen(ino, offset, size as u64) {
                 Ok(data) => reply.data(&data),
                 Err(error) => reply.error(Errno::from_i32(error)),
             }
+            return;
+        }
+        if self.lock_fenced(ino) {
+            reply.error(Errno::from_i32(libc::EIO));
             return;
         }
         match self.do_read(ino, offset, size as u64) {
@@ -750,8 +774,12 @@ impl Filesystem for ConstellationFs {
     ) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
-        if Self::is_synthetic(ino) {
+        if ConstellationFs::is_synthetic(ino) {
             reply.error(Errno::from_i32(libc::EROFS));
+            return;
+        }
+        if self.lock_fenced(ino) {
+            reply.error(Errno::from_i32(libc::EIO));
             return;
         }
         match self.do_write(ino, offset, data) {
@@ -766,10 +794,27 @@ impl Filesystem for ConstellationFs {
         }
     }
 
-    fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
-        match self.flush_inode(ino, false) {
+        // Plan 30 §M14: a close drops the closing process's POSIX locks
+        // on the file (any descriptor's close, as POSIX says); the kernel
+        // also sends an explicit unlock, which then finds nothing. A
+        // fenced file (other owners' locks under a lapsed grant) refuses
+        // to publish what was written under it.
+        let locks = self.cluster_locks().filter(|_| !ConstellationFs::is_synthetic(ino));
+        let idle = locks.map(|l| l.drop_owner(ino, lock_owner.0));
+        if self.lock_fenced(ino) {
+            reply.error(Errno::from_i32(libc::EIO));
+            return;
+        }
+        let r = self.flush_inode(ino, false);
+        // The release of a recalled grant flushes the file first; asking
+        // for it only after this flush lets that flush find it done.
+        if let (Some(l), Some(true)) = (locks, idle) {
+            l.idle(ino);
+        }
+        match r {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -778,6 +823,10 @@ impl Filesystem for ConstellationFs {
     fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
+        if self.lock_fenced(ino) {
+            reply.error(Errno::from_i32(libc::EIO));
+            return;
+        }
         match self.flush_inode(ino, true) {
             Ok(()) => match self.sync_barrier(ino) {
                 Ok(()) => reply.ok(),
@@ -793,17 +842,27 @@ impl Filesystem for ConstellationFs {
         ino: INodeNo,
         _fh: FileHandle,
         flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
+        lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
-        if Self::is_synthetic(ino) {
+        if ConstellationFs::is_synthetic(ino) {
             reply.ok();
             return;
         }
+        // Plan 30 §M14: `FUSE_RELEASE_FLOCK_UNLOCK` — the last close of an
+        // open file drops its `flock` lock (whose owner is the open file).
+        let locks = self.cluster_locks();
+        let idle = match (locks, lock_owner) {
+            (Some(l), Some(owner)) => l.drop_owner(ino, owner.0),
+            _ => false,
+        };
         let flush_result = self.flush_inode(ino, flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0);
+        if let (Some(l), true) = (locks, idle) {
+            l.idle(ino);
+        }
         let last = {
             let mut opens = self.opens.lock().unwrap();
             match opens.get_mut(&ino) {
@@ -848,7 +907,7 @@ impl Filesystem for ConstellationFs {
         let ino = ino.0;
         let visible_ino = ino;
         let ino = self.real_ino(ino);
-        if Self::is_synthetic(ino) {
+        if ConstellationFs::is_synthetic(ino) {
             let entries = match self.synthetic_entries(ino) {
                 Ok(entries) => entries,
                 Err(error) => return reply.error(Errno::from_i32(error)),
@@ -950,7 +1009,7 @@ impl Filesystem for ConstellationFs {
             reply.error(Errno::from_i32(libc::EPERM));
             return;
         }
-        if Self::is_synthetic(ino) {
+        if ConstellationFs::is_synthetic(ino) {
             reply.error(Errno::from_i32(libc::EROFS));
             return;
         }
@@ -1050,11 +1109,11 @@ impl Filesystem for ConstellationFs {
             Ok(name) => name,
             Err(error) => return reply.error(Errno::from_i32(error)),
         };
-        if !Self::is_synthetic(ino) {
+        if !ConstellationFs::is_synthetic(ino) {
             self.session_wait(&[ReadKey::Ino(ino)]);
         }
         let value = if virtual_xattr(&name) {
-            let aggregate = if Self::is_synthetic(ino) {
+            let aggregate = if ConstellationFs::is_synthetic(ino) {
                 self.synthetic_recursive_size(ino)
             } else {
                 self.meta.recursive_size(ino).map_err(|error| errno(&error))
@@ -1070,7 +1129,7 @@ impl Filesystem for ConstellationFs {
                 Err(error) => return reply.error(Errno::from_i32(error)),
             }
         } else {
-            let result = if Self::is_synthetic(ino) {
+            let result = if ConstellationFs::is_synthetic(ino) {
                 self.synthetic_xattrs(ino).map(|attrs| {
                     attrs
                         .into_iter()
@@ -1098,10 +1157,10 @@ impl Filesystem for ConstellationFs {
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
-        if !Self::is_synthetic(ino) {
+        if !ConstellationFs::is_synthetic(ino) {
             self.session_wait(&[ReadKey::Ino(ino)]);
         }
-        let names = if Self::is_synthetic(ino) {
+        let names = if ConstellationFs::is_synthetic(ino) {
             self.synthetic_xattrs(ino)
                 .map(|attrs| attrs.into_iter().map(|(name, _)| name).collect())
         } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
@@ -1146,7 +1205,7 @@ impl Filesystem for ConstellationFs {
             reply.error(Errno::from_i32(libc::EPERM));
             return;
         }
-        if Self::is_synthetic(ino) {
+        if ConstellationFs::is_synthetic(ino) {
             reply.error(Errno::from_i32(libc::EROFS));
             return;
         }
@@ -1206,6 +1265,10 @@ impl Filesystem for ConstellationFs {
         let ino = ino.0;
         let ino = self.real_ino(ino);
         gate!(self, ino, reply);
+        if self.lock_fenced(ino) {
+            reply.error(Errno::from_i32(libc::EIO));
+            return;
+        }
         if length == 0 {
             reply.error(Errno::from_i32(libc::EINVAL));
             return;
@@ -1234,6 +1297,83 @@ impl Filesystem for ConstellationFs {
             Ok(position) => reply.offset(position),
             Err(error) => reply.error(Errno::from_i32(error)),
         }
+    }
+
+    /// Plan 30 §M14: `F_GETLK` under `--locks cluster` (see
+    /// `crate::locks`). Under `--locks local` the kernel never asks.
+    fn getlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        _pid: u32,
+        reply: fuser::ReplyLock,
+    ) {
+        let ino = self.real_ino(ino.0);
+        let Some(locks) = self.cluster_locks() else {
+            reply.error(Errno::from_i32(libc::ENOSYS));
+            return;
+        };
+        if ConstellationFs::is_synthetic(ino) {
+            // Frozen snapshot files take no cluster locks (see `setlk`).
+            reply.locked(0, 0, libc::F_UNLCK, 0);
+            return;
+        }
+        let (start, end, typ, pid) = locks.test(ino, lock_owner.0, start, end, typ);
+        reply.locked(start, end, typ, pid);
+    }
+
+    /// Plan 30 §M14: `F_SETLK`/`F_SETLKW`/`flock` under `--locks
+    /// cluster`. Non-blocking requests are answered on this worker; a
+    /// blocking one (`sleep`) waits on a thread of its own
+    /// (`ClusterLocks::lock`), so a contended lock never pins a FUSE
+    /// worker. fuser 0.18 delivers no interrupts: a blocked wait cannot be
+    /// cancelled by a signal.
+    fn setlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        let ino = self.real_ino(ino.0);
+        let Some(locks) = self.cluster_locks() else {
+            reply.error(Errno::from_i32(libc::ENOSYS));
+            return;
+        };
+        if typ == libc::F_UNLCK {
+            locks.unlock(ino, lock_owner.0, start, end);
+            reply.ok();
+            return;
+        }
+        if typ != libc::F_RDLCK && typ != libc::F_WRLCK {
+            reply.error(Errno::from_i32(libc::EINVAL));
+            return;
+        }
+        if ConstellationFs::is_synthetic(ino) {
+            // A frozen snapshot file (inside a live view's `.snapshots`)
+            // has no sequencer to lease a grant from.
+            reply.error(Errno::from_i32(libc::ENOLCK));
+            return;
+        }
+        let lock = constellation_meta::locks::LocalLock {
+            owner: lock_owner.0,
+            pid,
+            write: typ == libc::F_WRLCK,
+            start,
+            end,
+        };
+        locks.lock(ino, lock, sleep, reply);
     }
 }
 

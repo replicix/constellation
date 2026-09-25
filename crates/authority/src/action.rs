@@ -94,6 +94,14 @@ pub enum Action {
     /// (`Meta::replace_ns_from_rebuilt` over a bootstrapped side replica)
     /// and report `Event::RebuildDone`.
     RebuildReplica { op: OpId },
+    /// Plan 30 §M14: a recalled lock grant on `ino` is about to be
+    /// released: flush the file's dirty data through (chunks, manifest
+    /// mutation acknowledged), then report `Event::LockFlushed`. The next
+    /// holder's grant carries a position past that mutation.
+    LockFlush {
+        ino: Ino,
+        grant: constellation_meta::locks::GrantId,
+    },
     /// A sync round finished (`failed` says how), for the driver's spool
     /// counters, pin refresh and continuation-epoch bookkeeping.
     RoundDone { failed: Option<String> },
@@ -214,6 +222,15 @@ pub enum TimerKind {
     ReadIndexTimeout,
     ReadIndexRetry,
     ReadIndexDeadline,
+    /// M14: lock requests, waiters, grants and renewals.
+    LockRequestTimeout,
+    LockRetry,
+    LockHeldReply,
+    LockGrantExpiry,
+    LockRenewTick,
+    LockWaiterTick,
+    LockRenewTimeout,
+    LockTestTimeout,
     /// M9: the holder's append/heartbeat tick to its backups.
     BackupTick,
     /// M9: a backup's check that its holder is still heard from (silence
@@ -252,6 +269,10 @@ pub enum ControlOk {
     Text(String),
     /// Plan 30 §M8: how a strict open or lookup may read.
     ReadIndex(ReadAnswer),
+    /// Plan 30 §M14: `Control::Lock`'s answer.
+    Lock(LockAnswer),
+    /// Plan 30 §M14: `Control::LockTest`'s answer.
+    LockTest(LockTestAnswer),
 }
 
 /// Plan 30 §M8: the answer to `Control::ReadIndex`.
@@ -273,4 +294,29 @@ pub enum ReadAnswer {
     /// No answer within the budget: read the replica as bounded mode
     /// would (degraded, not an error — M6's rule).
     Degraded,
+}
+
+/// Plan 30 §M14: the answer to `Control::Lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockAnswer {
+    /// A grant covering the request is held now (installed in
+    /// `Meta::locks()`); wait for `position` and invalidate the kernel's
+    /// cache of the file before using it.
+    Granted {
+        position: constellation_meta::Position,
+    },
+    /// A conflicting grant is held by another node (`EAGAIN`).
+    WouldBlock,
+    /// No sequencer reachable over P2P (`ENOLCK`).
+    Unavailable,
+}
+
+/// Plan 30 §M14: the answer to `Control::LockTest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockTestAnswer {
+    Free,
+    Held {
+        node: NodeId,
+        mode: constellation_meta::locks::LockMode,
+    },
 }

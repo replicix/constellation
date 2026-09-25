@@ -4,6 +4,7 @@
 pub mod delegation;
 pub mod error;
 pub mod hlc;
+pub mod locks;
 pub mod mutate;
 pub mod prune;
 pub mod readdeleg;

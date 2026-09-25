@@ -56,6 +56,13 @@ pub enum Event {
     /// `Action::RebuildReplica` finished (a deposition recovery with
     /// uncaptured journal rows).
     RebuildDone { op: OpId, ok: bool },
+    /// Plan 30 §M14: `Action::LockFlush` finished (`ok`: the file's dirty
+    /// data and its manifest are acknowledged).
+    LockFlushed {
+        ino: Ino,
+        grant: constellation_meta::locks::GrantId,
+        ok: bool,
+    },
     /// The membership poll read the write-eligible roster (M13's inbox
     /// polls it; M9 picks backups from it).
     Roster { write_eligible: Vec<NodeId> },
@@ -178,6 +185,22 @@ pub enum Control {
     /// touched `inos`, which carry read delegations: recall them (or
     /// wait them out), then answer `Done` — the write returns only then.
     Recall { inos: Vec<Ino> },
+    /// Plan 30 §M14: a local lock on `ino` needs a cross-node grant in
+    /// `mode` (answered with `ControlOk::Lock`; a blocking request waits
+    /// at the owner, a non-blocking one is answered `WouldBlock`).
+    Lock {
+        ino: Ino,
+        mode: constellation_meta::locks::LockMode,
+        blocking: bool,
+    },
+    /// Plan 30 §M14: the last local lock under a recalled grant on `ino`
+    /// left; the grant is released (`Done` at once).
+    LockIdle { ino: Ino },
+    /// Plan 30 §M14: `getlk` — is a conflicting grant held elsewhere?
+    LockTest {
+        ino: Ino,
+        mode: constellation_meta::locks::LockMode,
+    },
     /// Continuation epochs (DESIGN.md §5.3): the driver's epoch machine
     /// changed state. `open`: a promise or active epoch blocks S3
     /// takeover; `active`: writes are local (no S3 CAS); `frozen`: a
@@ -453,6 +476,9 @@ pub enum PeerMsg {
         req: OpId,
         gen: u64,
         ttl_ms: u64,
+        /// Plan 30 §M14: the root's lock grants under the subtree, handed
+        /// over with the first renewal (restamped by the delegate).
+        locks: Vec<constellation_meta::locks::Grant>,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
     /// delegate stops executing under it and answers with the highest
@@ -467,6 +493,9 @@ pub enum PeerMsg {
         req: OpId,
         gen: u64,
         through: u64,
+        /// Plan 30 §M14: the delegate's lock grants under the subtree,
+        /// handed back (restamped by the root).
+        locks: Vec<constellation_meta::locks::Grant>,
     },
     /// Phase 2b: a delegate appends its stream transactions to its
     /// backup before acknowledging them; the backup answers with what it
@@ -495,6 +524,72 @@ pub enum PeerMsg {
         sealed: bool,
         txs: Vec<DelegateTx>,
     },
+    /// Plan 30 §M14: a node asks the owning sequencer of `ino` for a
+    /// lock grant in `mode`; `blocking` parks at the owner until the
+    /// conflicting grants are recalled or outwaited.
+    LockRequest {
+        req: OpId,
+        ino: Ino,
+        mode: constellation_meta::locks::LockMode,
+        blocking: bool,
+        /// The requester's clock when it sent: echoed in a `LockGranted`
+        /// push, so the grant's window never starts later than the
+        /// request it answers (a stale push after a pause found this).
+        sent: Ms,
+    },
+    LockReply {
+        req: OpId,
+        outcome: LockOutcome,
+    },
+    /// Plan 30 §M14: a parked request answered `Waiting` gets its grant
+    /// pushed; `sent` echoes the requester's clock at its last send (the
+    /// grant's lifetime counts from there).
+    LockGranted {
+        ino: Ino,
+        sent: Ms,
+        outcome: LockOutcome,
+    },
+    /// Plan 30 §M14: the owner recalls `grant`; the holder acks receipt
+    /// and releases (`LockReleased`) once no local lock is under it and
+    /// its dirty data is flushed — or is outwaited by the grant's expiry.
+    LockRecall {
+        req: OpId,
+        ino: Ino,
+        grant: constellation_meta::locks::GrantId,
+    },
+    LockRecalled {
+        req: OpId,
+    },
+    LockReleased {
+        ino: Ino,
+        grant: constellation_meta::locks::GrantId,
+    },
+    /// Plan 30 §M14: renew the grants this node holds at the owner.
+    LockRenew {
+        req: OpId,
+        entries: Vec<LockRenewEntry>,
+    },
+    LockRenewed {
+        req: OpId,
+        results: Vec<(Ino, constellation_meta::locks::GrantId, LockRenewResult)>,
+    },
+    /// Plan 30 §M14: the holder's lock table, mirrored to a backup (one
+    /// way, asynchronous; the successor installs the last one it saw).
+    LockMirror {
+        ver: u64,
+        grants: Vec<constellation_meta::locks::Grant>,
+    },
+    /// Plan 30 §M14: `getlk` — whether another node holds a conflicting
+    /// grant.
+    LockTest {
+        req: OpId,
+        ino: Ino,
+        mode: constellation_meta::locks::LockMode,
+    },
+    LockTestReply {
+        req: OpId,
+        outcome: LockTestOutcome,
+    },
 }
 
 impl PeerMsg {
@@ -511,7 +606,11 @@ impl PeerMsg {
             | PeerMsg::DelegRenewed { req, .. }
             | PeerMsg::DelegRecalled { req, .. }
             | PeerMsg::DelegBackupAck { req, .. }
-            | PeerMsg::DelegSealed { req, .. } => Some(*req),
+            | PeerMsg::DelegSealed { req, .. }
+            | PeerMsg::LockReply { req, .. }
+            | PeerMsg::LockRecalled { req }
+            | PeerMsg::LockRenewed { req, .. }
+            | PeerMsg::LockTestReply { req, .. } => Some(*req),
             _ => None,
         }
     }
@@ -531,7 +630,11 @@ impl PeerMsg {
             | PeerMsg::DelegRenew { req, .. }
             | PeerMsg::DelegRecall { req, .. }
             | PeerMsg::DelegBackupAppend { req, .. }
-            | PeerMsg::DelegSeal { req, .. } => Some(*req),
+            | PeerMsg::DelegSeal { req, .. }
+            | PeerMsg::LockRequest { req, .. }
+            | PeerMsg::LockRecall { req, .. }
+            | PeerMsg::LockRenew { req, .. }
+            | PeerMsg::LockTest { req, .. } => Some(*req),
             _ => None,
         }
     }
@@ -607,3 +710,65 @@ pub enum CasFailure {
 /// A non-conditional request failed (timeout, 5xx, unreachable).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3Failure(pub String);
+
+/// Plan 30 §M14: the owner's answer to a `LockRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockOutcome {
+    /// Honour it until `sent + ttl − margin`; read `ino` only once the
+    /// replica reaches `position`.
+    Granted {
+        id: constellation_meta::locks::GrantId,
+        mode: constellation_meta::locks::LockMode,
+        ttl_ms: u64,
+        position: Position,
+    },
+    /// Parked (a blocking request): ask again in `retry_ms` (the grant
+    /// may be pushed before that).
+    Waiting { retry_ms: u64 },
+    /// A conflicting grant is held elsewhere (recalled now); a
+    /// non-blocking request.
+    WouldBlock,
+    /// Ask `owner` (0: unknown; read the lease).
+    NotOwner { owner: NodeId },
+    /// Try again shortly (the owner is between tenures, or probing).
+    Busy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockRenewEntry {
+    pub ino: Ino,
+    pub grant: constellation_meta::locks::GrantId,
+    pub mode: constellation_meta::locks::LockMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockRenewResult {
+    /// Honoured until `sent + ttl − margin`; `recalled`: release it once
+    /// free (a lost recall repaired by the renewal). `id`/`mode`: the
+    /// grant the owner holds for this node on the inode — a newer one
+    /// than asked about when its reply was lost (the node adopts it).
+    Ok {
+        ttl_ms: u64,
+        recalled: bool,
+        id: constellation_meta::locks::GrantId,
+        mode: constellation_meta::locks::LockMode,
+    },
+    /// The owner does not know it (and no grace admits a reclaim): it is
+    /// lost; I/O under it is fenced.
+    Lost,
+    NotOwner {
+        owner: NodeId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockTestOutcome {
+    Free,
+    Held {
+        node: NodeId,
+        mode: constellation_meta::locks::LockMode,
+    },
+    NotOwner {
+        owner: NodeId,
+    },
+}
