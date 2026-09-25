@@ -1102,6 +1102,50 @@ relay of its own so requests can be attributed per role):
     nodes' writes complete as before.
   - `single-node-unchanged` (M9's) still passes: delegation is on by
     default but a single node never delegates.
+  - Phase 2b (the same cluster; the placement is opt-in per node with
+    `CONSTELLATION_DELEGATION_PLACEMENT=1`, its knobs
+    `CONSTELLATION_DELEGATION_WINDOW_MS` (30 s), `_MIN_OPS` (200),
+    `_DOMINANCE` (70 %), `_LEAVE` (50 %), `_DWELL_MS` (60 s) and
+    `_COOLDOWN_MS` (30 s)):
+    - `root-failover-with-delegates`: four nodes with M9 backups
+      (`CONSTELLATION_BACKUP_RTT_BUDGET_MS=50`); `d1` and `d2` delegated
+      to `b` and `c`, both writing in the background; the root is killed
+      mid-burst once it lists a backup; the backup seals and takes the
+      lease over, learns the two generations from the log (`inherited`),
+      the delegates re-stream what the old root never shipped
+      (`restreams`); every acknowledged file is on every node, the dead
+      root remounts and converges, no conflict copies.
+    - `delegate-crash-backup`: `b` (delegate of `d1`) has a backup, `c`
+      (a LAN peer in budget); its acknowledgements wait for the backup
+      (`acks_parked`, `backup_appends`, `backup_acks`); `b` is killed
+      mid-burst; the root seals the backup (`seals_sent`), drains its
+      tail (`sealed_drained`), ends the generation and delegates `d1` to
+      `c`, which writes locally; `b` remounts and converges.
+    - `auto-placement`: no operator. `CONSTELLATION_DELEGATION_PLACEMENT=1`
+      with a 4 s window, 20 ops, a 4 s dwell and a 2 s cool-down; `b`
+      writes into `d1` steadily and the root delegates `d1` to `b` by
+      itself (`place_delegated`, `kinds` says `Placed`); then `c` takes
+      the writes over and `b` stops: after the dwell the placement
+      recalls `b`'s generation (`place_recalled`) and after the cool-down
+      delegates `d1` to `c`; the counters bound the moves (no flapping);
+      everything converges.
+    - `designation-as-delegation` (plans 03–05): `offline /site` on `b`
+      becomes a designated generation in the root's table (the 10 s
+      designation poll syncs it, `designated: true`); `c`'s and the
+      root's writes under `/site` are forwarded to `b`; `b` cut from
+      everyone (the deny files) keeps writing locally — its grant never
+      lapses — while `c`'s write under `/site` is refused `EROFS` once
+      `b`'s grant lapsed on the root's clock (`refused_designated`; the
+      generation is never reclaimed); after the heal everything
+      converges; `online` recalls it and `c`'s writes go through the root
+      again.
+    - `cross-subtree-rename` now also checks the root's automatic
+      re-delegation after the cross-subtree op (`redelegated`).
+    - `delegate-partition` now exercises a real cut: the deny file is
+      honoured by every P2P request (forwards, lease requests, read
+      indexes, recalls, the delegation and backup messages) and a denied
+      peer is reported as a link that is down, so the stopped delegate's
+      write after the cut goes through the holder's inbox.
 - **`sticky-lease-handoff-over-s3`** runs with `CONSTELLATION_INBOX=off`
   since M5 phase 2: it tests the S3-only cooperative handoff, and with
   M13's inbox on a lone blocked write is answered through the holder's

@@ -38,6 +38,12 @@ pub static EVENT_HISTOGRAM: Mutex<Option<(u64, BTreeMap<String, u64>)>> = Mutex:
 /// What the run and each client thread are waiting on, for the watchdog.
 pub static WAITING: Mutex<Option<BTreeMap<String, String>>> = Mutex::new(None);
 
+/// `AUTHORITY_SIM_WATCHDOG=1`: per `(node, timer kind)`, the last fire's
+/// simulated clock, the count, and the smallest interval between fires
+/// (a timer re-armed at no delay shows as 0 here).
+pub type TimerGaps = BTreeMap<String, (i64, u64, i64)>;
+pub static TIMER_GAPS: Mutex<Option<TimerGaps>> = Mutex::new(None);
+
 pub fn note_waiting(who: &str, what: String) {
     if std::env::var_os("AUTHORITY_SIM_WATCHDOG").is_some() {
         WAITING
@@ -448,6 +454,19 @@ impl Driver {
                 let (clock, hist) = h.get_or_insert_with(|| (0, BTreeMap::new()));
                 *clock = now.0 as u64;
                 *hist.entry(format!("node{}:{kind}", self.id)).or_default() += 1;
+                drop(h);
+                if let Event::Timer { .. } = &event {
+                    let mut g = TIMER_GAPS.lock().unwrap();
+                    let m = g.get_or_insert_with(BTreeMap::new);
+                    let e =
+                        m.entry(format!("node{}:{kind}", self.id))
+                            .or_insert((now.0, 0, i64::MAX));
+                    if e.1 > 0 {
+                        e.2 = e.2.min(now.0 - e.0);
+                    }
+                    e.0 = now.0;
+                    e.1 += 1;
+                }
                 *IN_FLIGHT.lock().unwrap() = Some((self.id, text, std::time::Instant::now()));
             }
             self.events_handled += 1;
@@ -460,6 +479,35 @@ impl Driver {
             let actions = self.core.handle(now, event, &*self.meta);
             if std::env::var_os("AUTHORITY_SIM_WATCHDOG").is_some() {
                 *IN_FLIGHT.lock().unwrap() = None;
+                {
+                    let mut h = EVENT_HISTOGRAM.lock().unwrap();
+                    let (_, hist) = h.get_or_insert_with(|| (0, BTreeMap::new()));
+                    for a in &actions {
+                        let k = match a {
+                            Action::S3 { req, .. } => format!(
+                                "S3:{}",
+                                format!("{req:?}")
+                                    .split([' ', '{', '('])
+                                    .next()
+                                    .unwrap_or("")
+                            ),
+                            Action::SetTimer { kind, .. } => format!("SetTimer:{kind:?}"),
+                            Action::Send { msg, .. } => format!(
+                                "Send:{}",
+                                format!("{msg:?}")
+                                    .split([' ', '{', '('])
+                                    .next()
+                                    .unwrap_or("")
+                            ),
+                            other => format!("{other:?}")
+                                .split([' ', '{', '('])
+                                .next()
+                                .unwrap_or("")
+                                .to_string(),
+                        };
+                        *hist.entry(format!("node{}:A:{k}", self.id)).or_default() += 1;
+                    }
+                }
                 let clients: Vec<String> = self
                     .core
                     .clients()
@@ -470,7 +518,9 @@ impl Driver {
                 note_waiting(
                     &format!("node {}", self.id),
                     format!(
-                        "job={:?} lease={:?} gate={} ack={:?} clients={clients:?}",
+                        "sizes={:?} events={} job={:?} lease={:?} gate={} ack={:?} clients={clients:?}",
+                        self.core.container_sizes(),
+                        self.events_handled,
                         self.core.job(),
                         self.core.lease().epoch(),
                         self.core.lease().gate.is_some(),

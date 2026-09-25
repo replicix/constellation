@@ -961,7 +961,7 @@ impl Core {
         let _ = replica.persist_lost(true);
         self.inbox.holder = None;
         self.ack_abort_parked(now, replica, out);
-        self.deleg_on_lease_gone(out);
+        self.deleg_on_lease_gone(now, replica, out);
     }
 
     /// Plan 30 §M9: whether the job in the slot has a lease CAS (or its
@@ -1205,6 +1205,7 @@ impl Core {
                         out.push(Action::EpochClose);
                         self.skip_ship = false;
                         self.lease.release_local();
+                        self.deleg_on_lease_gone(now, replica, out);
                         replica.set_holder_epoch(0);
                         if let Some(Job {
                             what: What::Round { epoch_closed, .. },
@@ -2010,9 +2011,15 @@ impl Core {
                 }),
             });
         }
+        if acquired {
+            // Plan 30 §M11: the generations a predecessor left live —
+            // known before anything queued behind the takeover executes
+            // (phase 2b: the root's own op under an inherited delegation
+            // recalls it first, like a forwarded one).
+            self.delegation_sync(now, replica, out);
+        }
         self.on_acquire_finished(now, acquired, replica, out);
         if acquired {
-            // Plan 30 §M11: the generations a predecessor left live.
             self.delegation_sync(now, replica, out);
             // M13/M5: start polling requesters' inboxes now, not at the
             // end of the first round — that round can spend seconds in
@@ -2475,6 +2482,7 @@ impl Core {
             (Phase::Release, S3Result::LeasePut(Ok(_))) => {
                 let epoch = self.lease.epoch().unwrap_or(0);
                 self.lease.released();
+                self.deleg_on_lease_gone(now, replica, out);
                 replica.set_holder_epoch(0);
                 self.stats.releases += 1;
                 self.inbox.holder = None;

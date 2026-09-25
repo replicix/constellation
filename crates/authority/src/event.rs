@@ -214,6 +214,10 @@ pub enum Control {
     /// Plan 30 §M11: recall the delegation on `dir` (drained, or outwaited
     /// by its grant's expiry; answered `Text` once the generation ended).
     Undelegate { dir: Ino },
+    /// Plan 30 §M11 phase 2b: the live write designations `(dir,
+    /// designee)`; the root delegates the new ones (designated) and
+    /// recalls the released ones. Answered `Done` at once.
+    SyncDesignations { entries: Vec<(Ino, NodeId)> },
 }
 
 /// Plan 30 §M10: the lease a continuation epoch carries, exactly as the
@@ -437,6 +441,8 @@ pub enum PeerMsg {
     DelegRenew {
         req: OpId,
         gen: u64,
+        /// Phase 2b: the delegate's backup peer, if it appends to one.
+        backup: Option<NodeId>,
     },
     DelegRenewed {
         req: OpId,
@@ -457,6 +463,33 @@ pub enum PeerMsg {
         gen: u64,
         through: u64,
     },
+    /// Phase 2b: a delegate appends its stream transactions to its
+    /// backup before acknowledging them; the backup answers with what it
+    /// holds contiguously, or `sealed`.
+    DelegBackupAppend {
+        req: OpId,
+        gen: u64,
+        txs: Vec<DelegateTx>,
+    },
+    DelegBackupAck {
+        req: OpId,
+        gen: u64,
+        acked: u64,
+        sealed: bool,
+    },
+    /// Phase 2b: the root asks a silent delegate's backup to seal the
+    /// generation and hand over its tail.
+    DelegSeal {
+        req: OpId,
+        gen: u64,
+    },
+    DelegSealed {
+        req: OpId,
+        gen: u64,
+        /// Whether this node was the backup (else `txs` is empty).
+        sealed: bool,
+        txs: Vec<DelegateTx>,
+    },
 }
 
 impl PeerMsg {
@@ -471,7 +504,9 @@ impl PeerMsg {
             | PeerMsg::PromiseReply { req, .. }
             | PeerMsg::DelegateStreamAck { req, .. }
             | PeerMsg::DelegRenewed { req, .. }
-            | PeerMsg::DelegRecalled { req, .. } => Some(*req),
+            | PeerMsg::DelegRecalled { req, .. }
+            | PeerMsg::DelegBackupAck { req, .. }
+            | PeerMsg::DelegSealed { req, .. } => Some(*req),
             _ => None,
         }
     }
@@ -489,7 +524,9 @@ impl PeerMsg {
             | PeerMsg::PromiseRequest { req, .. }
             | PeerMsg::DelegateStream { req, .. }
             | PeerMsg::DelegRenew { req, .. }
-            | PeerMsg::DelegRecall { req, .. } => Some(*req),
+            | PeerMsg::DelegRecall { req, .. }
+            | PeerMsg::DelegBackupAppend { req, .. }
+            | PeerMsg::DelegSeal { req, .. } => Some(*req),
             _ => None,
         }
     }

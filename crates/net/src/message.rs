@@ -112,32 +112,6 @@ pub enum Payload {
     Pong {
         node_id: u64,
     },
-    /// "I want to write under `path`, which you are designated for."
-    /// Sent directly to the designee.
-    DelegationRequest {
-        path: String,
-        requester: u64,
-    },
-    /// Designee's answer: a short-TTL delegation to write under `path`,
-    /// or a refusal (`granted: false`) if the designee does not hold
-    /// that designation. Renewed like a mini-lease.
-    DelegationGrant {
-        path: String,
-        epoch: u64,
-        ttl_ms: u64,
-        granted: bool,
-    },
-    /// "I flushed segment `seq` of `part`, which touches your
-    /// delegation for `path` — please ack so I can consider it
-    /// published." Sent to the designee after a foreign flush.
-    FlushAck {
-        path: String,
-        part: String,
-        seq: u64,
-        /// `false` means the designee has not (yet) tailed this segment;
-        /// the requester keeps waiting up to its bounded deadline.
-        acked: bool,
-    },
     /// Propose a continuation epoch (DESIGN.md §5.3). Recipients persist
     /// the promise locally BEFORE replying; activation is a later
     /// [`Payload::EpochActivate`] once every member has acked.
@@ -352,6 +326,9 @@ pub enum Payload {
         from: u64,
         req_id: u64,
         gen: u64,
+        /// Phase 2b: the delegate's backup peer (0: none).
+        #[serde(default)]
+        backup: u64,
     },
     DelegRenewed {
         req_id: u64,
@@ -370,6 +347,33 @@ pub enum Payload {
         req_id: u64,
         gen: u64,
         through: u64,
+    },
+    /// Plan 30 §M11 phase 2b: a delegate's append to its backup (postcard
+    /// `Vec<DelegateTx>`), and the backup's contiguous hold (or `sealed`).
+    DelegBackupAppend {
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        txs: Vec<u8>,
+    },
+    DelegBackupAck {
+        req_id: u64,
+        gen: u64,
+        acked: u64,
+        sealed: bool,
+    },
+    /// Plan 30 §M11 phase 2b: the root asks a delegate's backup to seal
+    /// generation `gen` and hand its tail over.
+    DelegSeal {
+        root: u64,
+        req_id: u64,
+        gen: u64,
+    },
+    DelegSealed {
+        req_id: u64,
+        gen: u64,
+        sealed: bool,
+        txs: Vec<u8>,
     },
     /// Plan 30 §M8: the sequencer recalls read delegation `grant` on
     /// `ino`; the delegate stops honouring it, then answers

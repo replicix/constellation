@@ -545,7 +545,16 @@ impl Core {
             Some(lease) if lease.holder != self.cfg.node_id => {
                 let holder = lease.holder;
                 let epoch = lease.epoch;
-                if self.reaches(now, holder) {
+                let reaches = self.reaches(now, holder);
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    holder,
+                    reaches,
+                    inbox = self.cfg.inbox,
+                    "holder learned from the lease"
+                );
+                if reaches {
                     self.send_forward(now, rid, holder, out);
                 } else if self.cfg.inbox {
                     self.inbox_enqueue(now, rid, epoch, replica, out);
@@ -859,7 +868,15 @@ impl Core {
                 let timer = self.set_timer(now.plus(delay), Timer::ForwardBackoff(rid), out);
                 self.clients.get_mut(&rid).expect("present").timer = Some(timer);
             }
-            _ => self.lease_path(now, rid, replica, out),
+            _ => {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    attempts = c.attempts,
+                    "forward retries exhausted: the lease path"
+                );
+                self.lease_path(now, rid, replica, out)
+            }
         }
     }
 
@@ -884,6 +901,23 @@ impl Core {
             let outcome = self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
             self.finish(now, rid, outcome, replica, out);
             return;
+        }
+        // Plan 30 §M11 phase 2b round 2: the op may be this node's own to
+        // execute by now — a delegation of its subtree installed while
+        // the forward was held (the root answers a delegate's own op
+        // `Held` until the delegate's table carries the grant; a retry
+        // that only re-forwards is held again, for the whole forward
+        // deadline, then `EIO`: harness `cross-subtree-rename` and
+        // `auto-placement` after a re-delegation). The delegate path
+        // dedups by rid.
+        if self.cfg.delegation {
+            let own = self.clients.get(&rid).map(|c| (c.op.clone(), c.deps));
+            if let Some((op, deps)) = own {
+                if self.delegate_try_execute(now, 0, None, rid, &op, deps, 0, replica, out) {
+                    self.stats.deleg_retry_executed += 1;
+                    return;
+                }
+            }
         }
         let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
         match cached {
@@ -1056,6 +1090,12 @@ impl Core {
                     .get(&rid)
                     .is_some_and(|c| c.policy == Policy::Client)
             {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    holder = ?self.lease.cached_holder,
+                    "acquire retry: the holder is unreachable, routing again (the inbox)"
+                );
                 self.route(now, rid, replica, out);
                 return;
             }
@@ -1130,8 +1170,13 @@ impl Core {
             let wait = if self.dl.gens.is_empty() {
                 Default::default()
             } else {
-                self.deleg_recall_needed(now, &keys, replica, out)
-                    .unwrap_or_default()
+                match self.deleg_recall_plan(now, &keys, replica, out) {
+                    super::delegate::RecallPlan::None => Default::default(),
+                    super::delegate::RecallPlan::Wait(w) => w,
+                    super::delegate::RecallPlan::Refuse(errno) => {
+                        return MutateOutcome::Errno(errno);
+                    }
+                }
             };
             let deps_wait = (!replica.reaches_streams(&deps)).then_some(deps);
             if !wait.is_empty() || deps_wait.is_some() {
@@ -1149,6 +1194,10 @@ impl Core {
                 self.park_exec_local(now, wait, deps_wait, rid);
                 return MutateOutcome::Busy;
             }
+        }
+        if self.cfg.placement && self.cfg.delegation {
+            let dirs = Core::dirs_of_keys(&super::holder::keys_of_op(&op), replica);
+            self.place_note(self.cfg.node_id, dirs);
         }
         let outcome = match replica.execute(&op, Some(rid)) {
             Ok(records) => {
@@ -1260,7 +1309,14 @@ impl Core {
         let Some(c) = self.clients.get(&rid) else {
             return;
         };
-        if c.phase == Phase::Recalling {
+        // Phase 2b round 2: parked *before* executing (the root waits
+        // for a delegation's recall): nothing ran, the park is dropped
+        // and the client hears in doubt — never held past its deadline.
+        let unexecuted = c.phase == Phase::Recalling && self.abort_exec_local_park(rid);
+        let Some(c) = self.clients.get(&rid) else {
+            return;
+        };
+        if c.phase == Phase::Recalling && !unexecuted {
             // Executed; only the acknowledgement waits. A recall ends by
             // the grant's TTL: not in doubt. A durability wait (plan 30
             // §M9) can outlast anything (S3 away under `ack=s3`): the
@@ -1274,7 +1330,7 @@ impl Core {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
-        if c.phase == Phase::Recalling {
+        if c.phase == Phase::Recalling && !unexecuted {
             // Executed here, never acknowledged: the resubmission is in
             // doubt (it must find the completion, not run again).
             c.forwarded = true;

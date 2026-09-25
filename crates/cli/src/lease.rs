@@ -413,6 +413,9 @@ pub struct DelegateView {
     stopped: std::sync::Mutex<std::collections::HashSet<u64>>,
     /// Fast-path executions admitted and not yet journaled.
     in_flight: std::sync::atomic::AtomicU64,
+    /// Phase 2b: the delegate acknowledges only after its backup (or the
+    /// root's segment): its writes go through the core and park there.
+    gated: std::sync::atomic::AtomicBool,
 }
 
 /// A fast-path execution admitted under a grant; dropped once the op is
@@ -448,6 +451,12 @@ impl DelegateView {
         self.in_flight.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Phase 2b: close (or open) the fast path for delegated writes.
+    pub fn set_gated(&self, gated: bool) {
+        self.gated
+            .store(gated, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The fast path executed one op as the delegate.
     pub fn note_executed(&self) {
         self.executed
@@ -479,7 +488,7 @@ impl DelegateView {
         keys: &constellation_meta::TouchSet,
     ) -> Option<DelegateAdmission<'_>> {
         let g = self.entries.lock().unwrap();
-        if g.is_empty() {
+        if g.is_empty() || self.gated.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
         }
         drop(g);

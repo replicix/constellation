@@ -1133,9 +1133,16 @@ async fn handle_stream<S: PeerService>(
                 .delegate_stream_requested(from, req_id, gen, txs)
                 .await,
         ),
-        Payload::DelegRenew { from, req_id, gen } => {
-            Some(service.deleg_renew_requested(from, req_id, gen).await)
-        }
+        Payload::DelegRenew {
+            from,
+            req_id,
+            gen,
+            backup,
+        } => Some(
+            service
+                .deleg_renew_requested(from, req_id, gen, backup)
+                .await,
+        ),
         Payload::DelegRecall {
             root,
             req_id,
@@ -1193,18 +1200,18 @@ async fn handle_stream<S: PeerService>(
             service.stream_ahead(from, epoch, base, txs);
             Some(Payload::Ok { req_id: 0 })
         }
-        Payload::DelegationRequest { path, requester } => {
-            Some(service.delegation_requested(path, requester).await)
-        }
-        Payload::FlushAck {
-            path, part, seq, ..
-        } => {
-            // Inbound `FlushAck` on this ALPN is a *request* for an
-            // ack (see the module doc on `Payload::FlushAck`): the
-            // field name is shared with the reply for symmetry, but
-            // an incoming message's `acked` is meaningless — only
-            // the reply's `acked` matters.
-            Some(service.flush_ack_requested(path, part, seq).await)
+        Payload::DelegBackupAppend {
+            from,
+            req_id,
+            gen,
+            txs,
+        } => Some(
+            service
+                .deleg_backup_append_requested(from, req_id, gen, txs)
+                .await,
+        ),
+        Payload::DelegSeal { root, req_id, gen } => {
+            Some(service.deleg_seal_requested(root, req_id, gen).await)
         }
         Payload::Ping { .. } => Some(Payload::Pong {
             node_id: service.node_id(),
@@ -1271,7 +1278,6 @@ async fn handle_stream<S: PeerService>(
         }
         Payload::Pong { .. }
         | Payload::LeaseHandoff { .. }
-        | Payload::DelegationGrant { .. }
         | Payload::EpochAck { .. }
         | Payload::CacheDigest { .. }
         | Payload::CacheDigestDelta { .. }
@@ -1287,6 +1293,8 @@ async fn handle_stream<S: PeerService>(
         | Payload::DelegateStreamAck { .. }
         | Payload::DelegRenewed { .. }
         | Payload::DelegRecalled { .. }
+        | Payload::DelegBackupAck { .. }
+        | Payload::DelegSealed { .. }
         | Payload::BackupAck { .. }
         | Payload::PromiseReply { .. }
         | Payload::Ok { .. } => None,

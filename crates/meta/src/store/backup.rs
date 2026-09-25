@@ -343,6 +343,101 @@ impl Meta {
     }
 }
 
+// ------------------------------------------- plan 30 §M11 phase 2b: delegate backups
+
+/// The `backup_tail` key space of a delegate's stream: `epoch` slots
+/// above this base hold generation `epoch - base` (the M9 tail keys are
+/// lease epochs, far below).
+const DELEG_BACKUP_BASE: u64 = 1 << 48;
+
+fn deleg_epoch(gen: u64) -> u64 {
+    DELEG_BACKUP_BASE + gen
+}
+
+fn deleg_sealed_key(gen: u64) -> String {
+    format!("deleg_backup_sealed:{gen}")
+}
+
+impl Meta {
+    /// A delegate's transactions `txs` of generation `gen`, persisted by
+    /// its backup (idempotent: a retransmission rewrites the same keys).
+    /// Returns the highest contiguous index held from 1.
+    pub fn deleg_backup_append(
+        &self,
+        gen: u64,
+        txs: &[super::DelegateTx],
+    ) -> Result<u64, MetaError> {
+        let mut tx = self.db.write_tx();
+        for t in txs {
+            let bytes = postcard::to_allocvec(t)
+                .map_err(|e| MetaError::Invalid(format!("delegate tx: {e}")))?;
+            tx.insert(&self.backup_tail, tail_key(deleg_epoch(gen), t.idx), bytes);
+        }
+        tx.commit()?;
+        self.deleg_backup_acked(gen)
+    }
+
+    /// The highest index held contiguously from 1 (0: nothing).
+    pub fn deleg_backup_acked(&self, gen: u64) -> Result<u64, MetaError> {
+        let r = self.db.read_tx();
+        let e = deleg_epoch(gen);
+        let mut acked = 0u64;
+        for guard in r.range(&self.backup_tail, tail_key(e, 0)..=tail_key(e, u64::MAX)) {
+            let (k, _) = guard.into_inner()?;
+            let (_, idx) = decode_tail_key(&k)?;
+            if idx == acked + 1 {
+                acked = idx;
+            } else {
+                break;
+            }
+        }
+        Ok(acked)
+    }
+
+    /// Every transaction held of generation `gen`, in index order.
+    pub fn deleg_backup_tail(&self, gen: u64) -> Result<Vec<super::DelegateTx>, MetaError> {
+        let r = self.db.read_tx();
+        let e = deleg_epoch(gen);
+        let mut out = Vec::new();
+        for guard in r.range(&self.backup_tail, tail_key(e, 0)..=tail_key(e, u64::MAX)) {
+            let (_, v) = guard.into_inner()?;
+            out.push(
+                postcard::from_bytes(&v)
+                    .map_err(|e| MetaError::Invalid(format!("delegate tx: {e}")))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Seal generation `gen`: nothing more of it is acknowledged here.
+    pub fn deleg_backup_seal(&self, gen: u64) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        kv_set_tx(&mut tx, &self.local, &deleg_sealed_key(gen), "1");
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn deleg_backup_sealed(&self, gen: u64) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        Ok(kv_get_tx(&r, &self.local, &deleg_sealed_key(gen))?.is_some())
+    }
+
+    /// The generation ended (its `Recall` is in the log): drop its rows.
+    pub fn deleg_backup_clear(&self, gen: u64) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        let e = deleg_epoch(gen);
+        let keys: Vec<Vec<u8>> = tx
+            .range(&self.backup_tail, tail_key(e, 0)..=tail_key(e, u64::MAX))
+            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+        for k in keys {
+            tx.remove(&self.backup_tail, k);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

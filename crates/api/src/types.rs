@@ -369,6 +369,10 @@ pub struct DelegationStatus {
     pub path: String,
     pub node: u64,
     pub gen: u64,
+    /// Phase 2b: an offline designation (never recalled by TTL or
+    /// placement).
+    #[serde(default)]
+    pub designated: bool,
 }
 
 /// Plan 30 §M11: this node's delegation state.
@@ -440,6 +444,56 @@ pub struct DelegationReport {
     /// Delegate rows stranded here by a recall (rolled back, replayed).
     #[serde(default)]
     pub stranded: u64,
+    // ---- phase 2b ----
+    /// As the root: `(gen, kind, backup)` per generation (kind: Manual,
+    /// Placed, Designated).
+    #[serde(default)]
+    pub kinds: Vec<(u64, String, u64)>,
+    /// As a delegate: `(gen, backup, backup_acked)`.
+    #[serde(default)]
+    pub backups: Vec<(u64, u64, u64)>,
+    /// The placement's busiest subtrees, `(dir, node, node_ops,
+    /// subtree_ops)` over the window (M12's input).
+    #[serde(default)]
+    pub placement: Vec<(u64, u64, u64, u64)>,
+    #[serde(default)]
+    pub inherited: u64,
+    #[serde(default)]
+    pub refused_designated: u64,
+    #[serde(default)]
+    pub designated: u64,
+    #[serde(default)]
+    pub redelegated: u64,
+    #[serde(default)]
+    pub seals_sent: u64,
+    #[serde(default)]
+    pub sealed_drained: u64,
+    #[serde(default)]
+    pub restreams: u64,
+    #[serde(default)]
+    pub backup_appends: u64,
+    #[serde(default)]
+    pub backup_acks: u64,
+    #[serde(default)]
+    pub acks_parked: u64,
+    #[serde(default)]
+    pub backup_persisted: u64,
+    #[serde(default)]
+    pub backup_seals: u64,
+    #[serde(default)]
+    pub place_evaluations: u64,
+    #[serde(default)]
+    pub place_delegated: u64,
+    #[serde(default)]
+    pub place_recalled: u64,
+    #[serde(default)]
+    pub place_skipped_cooldown: u64,
+    #[serde(default)]
+    pub place_skipped_unreachable: u64,
+    #[serde(default)]
+    pub read_index_served: u64,
+    #[serde(default)]
+    pub read_grants: u64,
 }
 
 /// One pinned subtree on this node.

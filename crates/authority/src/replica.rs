@@ -210,11 +210,27 @@ pub trait Replica {
     fn note_stream(&self, gen: u64, idx: u64);
     /// The stream index this replica holds of `gen`.
     fn stream_applied(&self, gen: u64) -> u64;
+    /// Phase 2b: the stream index of `gen` this replica holds *from the
+    /// log* (appended by a root here, applied from a segment), never a
+    /// shadow's: a successor's cursor, a delegate's re-stream start.
+    fn log_stream_idx(&self, gen: u64) -> u64;
     /// The highest stream index this node assigned as the delegate of
     /// `gen`.
     fn delegate_idx(&self, gen: u64) -> u64;
     /// Generation `gen` ended at `cut` (the void rule).
     fn void_stream(&self, gen: u64, cut: u64);
+    /// Phase 2b (`ack=s3`): transaction `(gen, idx)` of this delegate's
+    /// stream is still in its journal (no applied segment carries it).
+    fn delegate_tx_pending(&self, gen: u64, idx: u64) -> bool;
+    /// Phase 2b: a delegate's backup persists its transactions; returns
+    /// the highest index held contiguously.
+    fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> u64;
+    fn deleg_backup_tail(&self, gen: u64) -> Vec<DelegateTx>;
+    fn deleg_backup_seal(&self, gen: u64);
+    /// Whether this node holds anything of `gen` as its backup.
+    fn deleg_backup_acked_any(&self, gen: u64) -> bool;
+    fn deleg_backup_sealed(&self, gen: u64) -> bool;
+    fn deleg_backup_clear(&self, gen: u64);
     /// The session watermark (what this node's client has observed).
     fn observed(&self) -> Position;
     /// Plan 30 §M11: the `deps` of a write submitted here (`observed`
@@ -542,6 +558,11 @@ impl Replica for Meta {
             if let LogRecord::Recall { gen, .. } = rec {
                 let cut = self.session().stream_applied(*gen);
                 self.session().void_stream(*gen, cut);
+                // Phase 2b: the read delegations its delegate granted,
+                // and the tail its backup held, are over.
+                self.read_delegations()
+                    .void_epoch(crate::core::DELEG_READ_EPOCH_BASE + *gen);
+                let _ = Meta::deleg_backup_clear(self, *gen);
             }
         }
         // Plan 30 §M8: a newer epoch voids the delegations an older
@@ -640,8 +661,40 @@ impl Replica for Meta {
         self.session().note_stream(gen, idx)
     }
 
+    fn delegate_tx_pending(&self, gen: u64, idx: u64) -> bool {
+        Meta::delegate_tx_pending(self, gen, idx).unwrap_or(true)
+    }
+
+    fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> u64 {
+        Meta::deleg_backup_append(self, gen, txs).unwrap_or(0)
+    }
+
+    fn deleg_backup_tail(&self, gen: u64) -> Vec<DelegateTx> {
+        Meta::deleg_backup_tail(self, gen).unwrap_or_default()
+    }
+
+    fn deleg_backup_seal(&self, gen: u64) {
+        let _ = Meta::deleg_backup_seal(self, gen);
+    }
+
+    fn deleg_backup_acked_any(&self, gen: u64) -> bool {
+        Meta::deleg_backup_acked(self, gen).unwrap_or(0) > 0
+    }
+
+    fn deleg_backup_sealed(&self, gen: u64) -> bool {
+        Meta::deleg_backup_sealed(self, gen).unwrap_or(false)
+    }
+
+    fn deleg_backup_clear(&self, gen: u64) {
+        let _ = Meta::deleg_backup_clear(self, gen);
+    }
+
     fn stream_applied(&self, gen: u64) -> u64 {
         self.session().stream_applied(gen)
+    }
+
+    fn log_stream_idx(&self, gen: u64) -> u64 {
+        Meta::log_stream_idx(self, gen).unwrap_or(0)
     }
 
     fn delegate_idx(&self, gen: u64) -> u64 {

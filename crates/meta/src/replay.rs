@@ -580,12 +580,18 @@ fn apply_one(
         // publisher carries it) and captured (so a holder's unshipped
         // `Delegate`/`Recall` is substituted out of its commits like any
         // other unshipped effect).
-        LogRecord::Delegate { dir, node, gen } => {
+        LogRecord::Delegate {
+            dir,
+            node,
+            gen,
+            designated,
+        } => {
             let mut table = crate::delegation::read_table_tx(tx, meta)?;
             table.apply(crate::delegation::DelegationRecord::Delegate {
                 dir: *dir,
                 node: *node,
                 gen: *gen,
+                designated: *designated,
             });
             crate::delegation::write_table_tx(tx, meta, dirty, &table)?;
             Ok(Applied::Done)

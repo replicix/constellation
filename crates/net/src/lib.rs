@@ -31,7 +31,6 @@
 
 pub mod allowlist;
 pub mod bloom;
-pub mod delegation;
 pub mod endpoint;
 pub mod epoch;
 pub mod handoff;
@@ -44,7 +43,6 @@ pub mod relay;
 
 pub use allowlist::{Allowlist, Decision};
 pub use bloom::Bloom;
-pub use delegation::{DelegationGranter, DelegationHolder, DEFAULT_DELEGATION_TTL_MS};
 pub use endpoint::{
     topic_for, ChunkFetch, DigestDelta, DigestSnapshot, LogEvent, P2p, PathKind, PeerService,
 };

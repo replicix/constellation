@@ -53,6 +53,7 @@ mod holder;
 mod inbox;
 mod jobs;
 mod lease;
+mod placement;
 mod promise;
 mod readindex;
 mod replay;
@@ -70,7 +71,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub use backup::AckView;
 pub use client::{meta_errno, ClientPhase};
-pub use delegate::{DelegView, RecallPhase};
+pub use delegate::{DelegKind, DelegView, RecallPhase};
+
+/// Plan 30 §M11 phase 2b: read delegations a *delegate* grants carry
+/// `epoch = DELEG_READ_EPOCH_BASE + gen`, so a `Recall` of the
+/// generation voids exactly them (`ReadDelegations::void_epoch`).
+pub const DELEG_READ_EPOCH_BASE: u64 = 1 << 48;
 pub use inbox::InboxView;
 pub use jobs::JobKind;
 pub use lease::{LeaseState, PendingGate, Plan};
@@ -284,6 +290,24 @@ pub struct Config {
     /// Always on in production; the simulation turns it off to pin the
     /// liveness it provides.
     pub delegation_reclaim_expired: bool,
+    // ---- plan 30 §M11 phase 2b: placement ----
+    /// `CONSTELLATION_DELEGATION_PLACEMENT` (default on): the root
+    /// delegates dominated subtrees by itself (`core::placement`).
+    pub placement: bool,
+    /// `CONSTELLATION_DELEGATION_WINDOW_MS` (30 s): the sliding window.
+    pub placement_window_ms: u64,
+    /// `CONSTELLATION_DELEGATION_MIN_OPS` (200): ops per window under a
+    /// subtree before it may be delegated (the rate floor).
+    pub placement_min_ops: u64,
+    /// `CONSTELLATION_DELEGATION_DOMINANCE` (70): the share, in percent,
+    /// one node must have to get a subtree; `_LEAVE` (50): below this
+    /// for a dwell, the placement recalls it.
+    pub placement_dominance_pct: u64,
+    pub placement_leave_pct: u64,
+    /// `CONSTELLATION_DELEGATION_DWELL_MS` (60 s) and
+    /// `CONSTELLATION_DELEGATION_COOLDOWN_MS` (30 s).
+    pub placement_dwell_ms: u64,
+    pub placement_cooldown_ms: u64,
 }
 
 impl Config {
@@ -381,6 +405,13 @@ impl Config {
             delegation_stream_rows: 256,
             delegation_stream_tick_ms: 50,
             delegation_reclaim_expired: true,
+            placement: false,
+            placement_window_ms: 30_000,
+            placement_min_ops: 200,
+            placement_dominance_pct: 70,
+            placement_leave_pct: 50,
+            placement_dwell_ms: 60_000,
+            placement_cooldown_ms: 30_000,
         }
     }
 }
@@ -542,6 +573,46 @@ pub struct Stats {
     pub deps_overflow_to_root: u64,
     /// Root: executions parked for a recall of a write delegation.
     pub deleg_exec_parked: u64,
+    // ---- M11 phase 2b ----
+    /// Root: generations learned from the log at acquisition (a
+    /// predecessor's), ops refused because a designation was involved
+    /// (`EROFS`/`EXDEV`), designations delegated, re-delegations after a
+    /// cross-subtree op, seals asked of a dead delegate's backup and the
+    /// transactions drained from it.
+    pub deleg_inherited: u64,
+    pub deleg_refused_designated: u64,
+    pub deleg_designated: u64,
+    pub deleg_redelegated: u64,
+    pub deleg_seals_sent: u64,
+    pub deleg_sealed_drained: u64,
+    /// Delegate: streams restarted for a new root, backup appends and
+    /// acks, acknowledgements parked for the backup or the segment.
+    pub deleg_restreams: u64,
+    /// Phase 2b round 2: forwards held by the root that a retry
+    /// executed here as the delegate (the grant installed meanwhile).
+    pub deleg_retry_executed: u64,
+    /// Phase 2b round 2: drain ticks that held a delegate-accepted
+    /// shadow's replay while its generation was live.
+    pub replays_held_for_stream: u64,
+    /// Phase 2b: stream batches, backup appends re-sent after a lost
+    /// answer.
+    pub deleg_stream_timeouts: u64,
+    pub deleg_backup_appends: u64,
+    pub deleg_backup_acks: u64,
+    pub deleg_acks_parked: u64,
+    /// Backup of a delegate: transactions persisted, seals.
+    pub deleg_backup_persisted: u64,
+    pub deleg_backup_seals: u64,
+    /// Placement: evaluations, delegations made, recalls made,
+    /// candidates skipped for cool-down / an unreachable node.
+    pub place_evaluations: u64,
+    pub place_delegated: u64,
+    pub place_recalled: u64,
+    pub place_skipped_cooldown: u64,
+    pub place_skipped_unreachable: u64,
+    /// Delegate: ReadIndex answered for its subtree, read grants given.
+    pub deleg_read_index_served: u64,
+    pub deleg_read_grants: u64,
     // ---- M9: backups, seals, `ack=s3` ----
     /// Holder: backups added to / removed from the lease, and the lease
     /// CASes spent on it (a reconfiguration is one CAS when it lands).
@@ -740,6 +811,8 @@ enum Timer {
     DelegExpiry(u64),
     DelegRenew(u64),
     DelegStream,
+    /// Phase 2b: the placement's evaluation tick.
+    Placement,
 }
 
 impl Timer {
@@ -772,6 +845,7 @@ impl Timer {
             Timer::DelegExpiry(_) => TimerKind::DelegExpiry,
             Timer::DelegRenew(_) => TimerKind::DelegRenew,
             Timer::DelegStream => TimerKind::DelegStream,
+            Timer::Placement => TimerKind::Placement,
         }
     }
 }
@@ -855,6 +929,8 @@ pub struct Core {
     pub(crate) pr: promise::PromiseState,
     /// M11: delegations held here and, as the root, the generations.
     pub(crate) dl: delegate::DelegationState,
+    /// Plan 30 §M11 phase 2b: the placement window (the root).
+    pl: placement::PlacementState,
     /// The `now` of the event being handled (for `issue_s3`'s send time).
     last_now: Ms,
     stopped: bool,
@@ -906,6 +982,7 @@ impl Core {
             bk: backup::BackupState::default(),
             pr: promise::PromiseState::default(),
             dl: delegate::DelegationState::default(),
+            pl: placement::PlacementState::default(),
             last_now: Ms(0),
             stopped: false,
             stats: Stats::default(),
@@ -935,6 +1012,25 @@ impl Core {
     }
 
     /// The current authority job, for `status` and tests.
+    /// The sizes of the core's growable containers (diagnostics: a
+    /// state that grows without bound shows here).
+    pub fn container_sizes(&self) -> Vec<(&'static str, usize)> {
+        let mut v = vec![
+            ("timers", self.timers.len()),
+            ("clients", self.clients.len()),
+            ("by_req", self.by_req.len()),
+            ("queued_jobs", self.queued_jobs.len()),
+            ("round_waiters", self.round_waiters.len()),
+            ("acquire_waiters", self.acquire_waiters.len()),
+            ("links", self.links.len()),
+            ("inbox_pending", self.inbox.pending.len()),
+        ];
+        v.extend(self.stream.container_sizes());
+        v.extend(self.rd.container_sizes());
+        v.extend(self.dl.container_sizes());
+        v
+    }
+
     pub fn job(&self) -> Option<JobKind> {
         self.job.as_ref().map(|j| j.kind())
     }
@@ -1032,6 +1128,11 @@ impl Core {
                 }
             }
             Event::Peers { links } => {
+                tracing::trace!(
+                    node = self.cfg.node_id,
+                    links = ?links.iter().map(|l| (l.node, l.connected)).collect::<Vec<_>>(),
+                    "peers"
+                );
                 if links.iter().any(|l| l.node != self.cfg.node_id) {
                     self.note_foreign(now, replica, &mut out);
                 }
@@ -1176,13 +1277,33 @@ impl Core {
                 through,
                 refused,
             } => self.on_delegate_stream_ack(now, req, gen, through, refused, replica, out),
-            PeerMsg::DelegRenew { req, gen } => self.on_deleg_renew(now, from, req, gen, out),
+            PeerMsg::DelegRenew { req, gen, backup } => {
+                self.on_deleg_renew(now, from, req, gen, backup, out)
+            }
             PeerMsg::DelegRenewed { req, gen, ttl_ms } => {
                 self.on_deleg_renewed(now, req, gen, ttl_ms, replica, out)
             }
             PeerMsg::DelegRecall { req, gen, .. } => {
                 self.on_deleg_recall(now, from, req, gen, replica, out)
             }
+            PeerMsg::DelegBackupAppend { req, gen, txs } => {
+                self.on_deleg_backup_append(now, from, req, gen, txs, replica, out)
+            }
+            PeerMsg::DelegBackupAck {
+                req,
+                gen,
+                acked,
+                sealed,
+            } => self.on_deleg_backup_ack(now, from, req, gen, acked, sealed, replica, out),
+            PeerMsg::DelegSeal { req, gen } => {
+                self.on_deleg_seal(now, from, req, gen, replica, out)
+            }
+            PeerMsg::DelegSealed {
+                req,
+                gen,
+                sealed,
+                txs,
+            } => self.on_deleg_sealed(now, from, req, gen, sealed, txs, replica, out),
             PeerMsg::DelegRecalled { req, gen, through } => {
                 self.on_deleg_recalled(now, req, gen, through, replica, out)
             }
@@ -1330,6 +1451,7 @@ impl Core {
             Timer::DelegExpiry(gen) => self.on_deleg_expiry(now, gen, replica, out),
             Timer::DelegRenew(gen) => self.on_deleg_renew_timer(now, gen, out),
             Timer::DelegStream => self.on_deleg_stream_timer(now, replica, out),
+            Timer::Placement => self.on_placement_timer(now, replica, out),
         }
     }
 
@@ -1372,6 +1494,7 @@ impl Core {
             Control::Reintegrate => {
                 if replica.lost_persisted() && !self.lease.lost {
                     self.lease.force_lost();
+                    self.deleg_on_lease_gone(now, replica, out);
                 }
                 if !self.lease.lost {
                     out.push(Action::ControlDone {
@@ -1467,6 +1590,13 @@ impl Core {
                     result: Ok(ControlOk::Done),
                 });
             }
+            Control::SyncDesignations { entries } => {
+                self.on_control_sync_designations(now, &entries, replica, out);
+                out.push(Action::ControlDone {
+                    op,
+                    result: Ok(ControlOk::Done),
+                });
+            }
             Control::Delegate { dir, node } => {
                 self.on_control_delegate(now, op, dir, node, replica, out)
             }
@@ -1546,6 +1676,7 @@ impl Core {
         if !state.active && before.active && !state.frozen {
             self.skip_ship = false;
             self.lease.release_local();
+            self.deleg_on_lease_gone(now, replica, out);
             replica.set_holder_epoch(0);
             self.nudge(now, out);
         }

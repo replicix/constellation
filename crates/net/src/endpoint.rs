@@ -414,33 +414,6 @@ pub trait PeerService: Send + Sync + 'static {
         part: String,
         requester: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>;
-    /// A peer wants a delegation to write under `path`, which this node
-    /// may be offline-designated for. Returns the grant or decline.
-    fn delegation_requested(
-        &self,
-        _path: String,
-        _requester: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
-        let decline = crate::delegation::DelegationGranter::decline("");
-        Box::pin(async move { decline })
-    }
-    /// A delegated peer flushed `seq` of `part` (touching `path`) and
-    /// wants this node's ack. Returns whether it has been tailed yet.
-    fn flush_ack_requested(
-        &self,
-        _path: String,
-        _part: String,
-        _seq: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
-        Box::pin(async move {
-            Payload::FlushAck {
-                path: String::new(),
-                part: String::new(),
-                seq: 0,
-                acked: false,
-            }
-        })
-    }
     /// A peer proposed a continuation epoch. Persist the promise, then
     /// reply with an ack. Default declines (P2P-disabled / tests).
     fn epoch_proposed(
@@ -569,12 +542,48 @@ pub trait PeerService: Send + Sync + 'static {
             }
         })
     }
+    /// Plan 30 §M11 phase 2b: a delegate's append to this backup.
+    /// Default: sealed (nothing held).
+    fn deleg_backup_append_requested(
+        &self,
+        _from: u64,
+        req_id: u64,
+        gen: u64,
+        _txs: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::DelegBackupAck {
+                req_id,
+                gen,
+                acked: 0,
+                sealed: true,
+            }
+        })
+    }
+    /// Plan 30 §M11 phase 2b: the root's seal request. Default: not a
+    /// backup of it.
+    fn deleg_seal_requested(
+        &self,
+        _root: u64,
+        req_id: u64,
+        gen: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::DelegSealed {
+                req_id,
+                gen,
+                sealed: false,
+                txs: Vec::new(),
+            }
+        })
+    }
     /// Plan 30 §M11: a delegate's renewal. Default: refused (ttl 0).
     fn deleg_renew_requested(
         &self,
         _from: u64,
         req_id: u64,
         gen: u64,
+        _backup: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::DelegRenewed {

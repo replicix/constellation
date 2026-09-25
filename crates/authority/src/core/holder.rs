@@ -88,6 +88,10 @@ impl Core {
     ) {
         replica.forget_acked_through(rid.node, rid.incarnation, acked_through);
         self.note_foreign(now, replica, out);
+        if self.cfg.placement && self.cfg.delegation && self.root_usable(now) {
+            let dirs = Core::dirs_of_keys(&keys_of_op(&op), replica);
+            self.place_note(from, dirs);
+        }
         // Plan 30 §M8: a retry of an op whose reply waits for recalls
         // re-attaches to that wait (its outcome is final; only the
         // acknowledgement is held).
@@ -125,16 +129,34 @@ impl Core {
                 let keys = keys_of_op(&op);
                 if let Ownership::Delegated(d) = replica.resolve_ownership(&keys) {
                     if d.node != self.cfg.node_id
-                        && !self.dl.gens.get(&d.gen).is_some_and(|g| g.ended)
+                        && self
+                            .dl
+                            .gens
+                            .get(&d.gen)
+                            .is_some_and(|g| !g.ended && now < g.until)
+                        && self.links.get(&d.node).is_some_and(|l| l.connected)
                     {
                         // Wholly a live delegate's: the requester's table
-                        // was stale; send it there.
+                        // was stale; send it there. (Phase 2b: only while
+                        // the delegate renews and the root reaches it; a
+                        // silent one is recalled — or, for a designation,
+                        // the op refused — instead of bouncing the
+                        // requester between the two.) The delegate's own
+                        // op, sent before its table carried the grant, is
+                        // held for a retry instead of a redirect to itself.
                         self.stats.deleg_not_owner += 1;
+                        let outcome = if from == d.node {
+                            MutateOutcome::Held {
+                                retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
+                            }
+                        } else {
+                            MutateOutcome::NotHolder { holder: d.node }
+                        };
                         out.push(Action::Send {
                             to: from,
                             msg: PeerMsg::MutateReply {
                                 req,
-                                outcome: MutateOutcome::NotHolder { holder: d.node },
+                                outcome,
                                 base: None,
                                 position: Position::ZERO,
                                 gen: 0,
@@ -143,9 +165,25 @@ impl Core {
                         return;
                     }
                 }
-                let wait = self
-                    .deleg_recall_needed(now, &keys, replica, out)
-                    .unwrap_or_default();
+                let wait = match self.deleg_recall_plan(now, &keys, replica, out) {
+                    super::delegate::RecallPlan::None => Default::default(),
+                    super::delegate::RecallPlan::Wait(w) => w,
+                    super::delegate::RecallPlan::Refuse(errno) => {
+                        if req != OpId(0) {
+                            out.push(Action::Send {
+                                to: from,
+                                msg: PeerMsg::MutateReply {
+                                    req,
+                                    outcome: MutateOutcome::Errno(errno),
+                                    base: None,
+                                    position: Position::ZERO,
+                                    gen: 0,
+                                },
+                            });
+                        }
+                        return;
+                    }
+                };
                 let deps_wait = (!replica.reaches_streams(&deps)).then_some(deps);
                 if !wait.is_empty() || deps_wait.is_some() {
                     if deps_wait.is_some() {
@@ -441,6 +479,7 @@ impl Core {
             }
             let epoch = self.lease.epoch().unwrap_or(1);
             self.lease.release_local();
+            self.deleg_on_lease_gone(now, replica, out);
             replica.set_holder_epoch(0);
             self.stats.handoffs_served += 1;
             out.push(Action::Send {

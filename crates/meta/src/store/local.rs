@@ -102,7 +102,7 @@ use crate::TreeInode;
 use constellation_fs_core::Ino;
 use constellation_mtree::keys;
 use constellation_mtree::record::{InodeRecord, Payload};
-use fjall::{Readable, SingleWriterWriteTx, Snapshot};
+use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -409,6 +409,22 @@ impl Meta {
             .unwrap_or(0))
     }
 
+    /// Phase 2b: the highest index of `gen` in the log as this replica
+    /// holds it (see [`deleg_log_idx_key`]).
+    pub fn log_stream_idx(&self, gen: u64) -> Result<u64, MetaError> {
+        let r = self.db.read_tx();
+        Ok(kv_get_tx(&r, &self.local, &deleg_log_idx_key(gen))?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    fn note_log_idx(&self, gen: u64, idx: u64) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        bump_log_idx_tx(&mut tx, &self.local, gen, idx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Plan 30 §M11: the root appends one of a delegate's transactions
     /// (validated by the delegate; no re-validation) into its own
     /// journal with the delegate's origin and `deps`, completing `rid`
@@ -431,15 +447,18 @@ impl Meta {
             }
             let _d = journal::PendingDelegate::set(gen, Some(idx), deps);
             self.journal_refusal(*r, *errno)?;
+            self.note_log_idx(gen, idx)?;
             return Ok(true);
         }
         if let Some(rid) = rid {
             if self.completed_position(rid)?.is_some() {
+                self.note_log_idx(gen, idx)?;
                 return Ok(false);
             }
         }
         let _d = journal::PendingDelegate::set(gen, Some(idx), deps);
         self.apply_records_journaled_completing(records, rid)?;
+        self.note_log_idx(gen, idx)?;
         Ok(true)
     }
 
@@ -510,6 +529,16 @@ impl Meta {
                     .unwrap_or((0, 0))
             })
             .collect())
+    }
+
+    /// Plan 30 §M11 phase 2b: whether transaction `(gen, idx)` of this
+    /// delegate's stream is still in the journal (not yet carried by a
+    /// segment the replica applied) — `ack=s3`'s wait.
+    pub fn delegate_tx_pending(&self, gen: u64, idx: u64) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        Ok(read_journal_tx_heads(&r, self)?
+            .iter()
+            .any(|(_, h)| h.gen == gen && h.idx == idx))
     }
 
     /// Plan 30 §M11: whether the unshipped journal holds any transaction
@@ -1224,6 +1253,34 @@ mod root_substitution_tests {
 /// generation.
 fn deleg_idx_key(gen: u64) -> String {
     format!("deleg_idx:{gen}")
+}
+
+/// `local` kv: the highest index of generation `gen` this replica holds
+/// *from the log* (appended in the root's journal here, or applied from
+/// a segment) — never a shadow's (phase 2b: a successor root's cursor,
+/// a delegate's re-stream start).
+pub(crate) fn deleg_log_idx_key(gen: u64) -> String {
+    format!("deleg_log_idx:{gen}")
+}
+
+/// Raise the persisted log index of `gen` to `idx`.
+pub(crate) fn bump_log_idx_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+    idx: u64,
+) -> Result<(), MetaError> {
+    if gen == 0 {
+        return Ok(());
+    }
+    let key = deleg_log_idx_key(gen);
+    let cur = kv_get_tx(tx, local, &key)?
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if idx > cur {
+        kv_set_tx(tx, local, &key, &idx.to_string());
+    }
+    Ok(())
 }
 
 /// Plan 30 §M11: one transaction of a delegate's stream.

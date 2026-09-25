@@ -142,6 +142,14 @@ pub(crate) enum ParkedWhat {
     /// Plan 30 §M11: a local op of this root, executed (and finished)
     /// once the recall is done and its `deps` are here.
     ExecuteLocal { rid: Rid },
+    /// Phase 2b: a delegate's answer to the root's recall, sent once the
+    /// read delegations it granted are recalled.
+    DelegRecalled {
+        to: NodeId,
+        req: OpId,
+        gen: u64,
+        through: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -153,12 +161,27 @@ struct Parked {
     durable: Option<u64>,
     /// Plan 30 §M11: the position the replica must reach first.
     deps: Option<Position>,
+    /// Phase 2b: a delegate's `(gen, idx)` that must be on its backup or
+    /// in an applied segment first.
+    stream_need: Option<(u64, u64)>,
     since: Ms,
     what: ParkedWhat,
 }
 
 /// What a parked acknowledgement waits for besides durability.
 pub(crate) type RecallWait = (BTreeSet<u64>, Option<Ms>);
+
+impl ReadState {
+    pub(crate) fn container_sizes(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            ("rd_parked", self.parked.len()),
+            ("rd_reads", self.reads.len()),
+            ("rd_by_req", self.by_req.len()),
+            ("rd_recalls", self.recalls.len()),
+            ("rd_parked_rids", self.parked_rids.len()),
+        ]
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ReadState {
@@ -173,7 +196,7 @@ pub(crate) struct ReadState {
     /// `finish` parks.
     pub(crate) parked_local: BTreeMap<Rid, (RecallWait, Option<u64>)>,
     /// Inodes an inbox op waits to execute on: no new grants until then.
-    blocked: BTreeMap<Ino, Ms>,
+    pub(crate) blocked: BTreeMap<Ino, Ms>,
     /// Strict reads answered by a tail to head (no live sequencer, or no
     /// P2P): the leader's job, not yet started, that later reads join —
     /// a tail that starts after a read began covers it — and each
@@ -258,6 +281,29 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.note_foreign(now, replica, out);
+        // Phase 2b: this node as the delegate of the subtree.
+        if let Some(outcome) = self.deleg_read_index(now, from, ino, name.as_deref(), replica) {
+            out.push(Action::Send {
+                to: from,
+                msg: PeerMsg::ReadIndexReply { req, outcome },
+            });
+            return;
+        }
+        // Phase 2b: keys under another node's live delegation have that
+        // delegate's index, not the holder's (a stale requester's table):
+        // send it there, and never grant a read delegation over them.
+        if let Some(n) = self.deleg_read_owner(now, ino, name.as_deref(), replica) {
+            if n != self.cfg.node_id {
+                out.push(Action::Send {
+                    to: from,
+                    msg: PeerMsg::ReadIndexReply {
+                        req,
+                        outcome: ReadIndexOutcome::NotHolder { holder: n },
+                    },
+                });
+                return;
+            }
+        }
         let outcome = if !self.lease.usable(now, &self.cfg) {
             self.stats.read_index_refused += 1;
             let holder = self
@@ -372,7 +418,7 @@ impl Core {
         self.start_recalls(now, need, out)
     }
 
-    fn start_recalls(
+    pub(crate) fn start_recalls(
         &mut self,
         now: Ms,
         need: RecallNeed,
@@ -450,11 +496,141 @@ impl Core {
                 quarantine: wait.1,
                 durable,
                 deps,
+                stream_need: None,
                 since: now,
                 what,
             },
         );
         id
+    }
+
+    /// Phase 2b: park an acknowledgement until stream transaction
+    /// `(gen, idx)` is durable (`Core::deleg_stream_durable`).
+    pub(crate) fn park_stream_need(
+        &mut self,
+        now: Ms,
+        gen: u64,
+        idx: u64,
+        what: ParkedWhat,
+    ) -> u64 {
+        self.rd.next_park += 1;
+        let id = self.rd.next_park;
+        self.stats.acks_waited += 1;
+        if let ParkedWhat::Reply { rid, .. } = &what {
+            self.rd.parked_rids.insert(*rid, id);
+        }
+        self.rd.parked.insert(
+            id,
+            Parked {
+                waiting: BTreeSet::new(),
+                quarantine: None,
+                durable: None,
+                deps: None,
+                stream_need: Some((gen, idx)),
+                since: now,
+                what,
+            },
+        );
+        id
+    }
+
+    /// Phase 2b: the parks waiting on generation `gen`'s durability.
+    pub(crate) fn stream_parks_of(&self, gen: u64) -> Vec<u64> {
+        self.rd
+            .parked
+            .iter()
+            .filter(|(_, p)| p.stream_need.is_some_and(|(g, _)| g == gen))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    pub(crate) fn has_stream_parks(&self) -> bool {
+        self.rd.parked.values().any(|p| p.stream_need.is_some())
+    }
+
+    /// Phase 2b: answer a parked acknowledgement `Busy` (the requester,
+    /// or this node's client, retries by rid).
+    pub(crate) fn abort_park_busy(
+        &mut self,
+        now: Ms,
+        id: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(p) = self.rd.parked.remove(&id) else {
+            return;
+        };
+        match p.what {
+            ParkedWhat::Reply {
+                to,
+                req,
+                rid,
+                held_timer,
+                ..
+            } => {
+                self.rd.parked_rids.remove(&rid);
+                if let Some(t) = held_timer {
+                    self.cancel_timer(t, out);
+                }
+                if let Some(req) = req {
+                    out.push(Action::Send {
+                        to,
+                        msg: PeerMsg::MutateReply {
+                            req,
+                            outcome: MutateOutcome::Busy,
+                            base: None,
+                            position: Position::ZERO,
+                            gen: 0,
+                        },
+                    });
+                }
+            }
+            ParkedWhat::Finish { rid, .. } => {
+                if let Some(c) = self.clients.get_mut(&rid) {
+                    c.phase = ClientPhase::WaitingLease;
+                }
+                self.retry_or_lease(now, rid, replica, out);
+            }
+            // Phase 2b: the root's execution parks (a lease lost with a
+            // recall in flight): the requester is answered `Busy` and
+            // re-sends; a local op takes the lease path; an inbox batch
+            // is polled again by whoever holds the lease next.
+            ParkedWhat::ExecuteReply {
+                from,
+                req,
+                rid,
+                held_timer,
+                ..
+            } => {
+                self.rd.parked_rids.remove(&rid);
+                if let Some(t) = held_timer {
+                    self.cancel_timer(t, out);
+                }
+                if let Some(req) = req {
+                    out.push(Action::Send {
+                        to: from,
+                        msg: PeerMsg::MutateReply {
+                            req,
+                            outcome: MutateOutcome::Busy,
+                            base: None,
+                            position: Position::ZERO,
+                            gen: 0,
+                        },
+                    });
+                }
+            }
+            ParkedWhat::ExecuteLocal { rid } => {
+                self.dl.pending_exec.remove(&rid);
+                if let Some(c) = self.clients.get_mut(&rid) {
+                    c.phase = ClientPhase::WaitingLease;
+                }
+                self.retry_or_lease(now, rid, replica, out);
+            }
+            ParkedWhat::InboxRepoll { .. } => {}
+            other => {
+                self.rd.parked.insert(id, Parked { what: other, ..p });
+            }
+        }
     }
 
     /// Plan 30 §M11: park a forwarded op's *execution* (the root recalls
@@ -527,6 +703,46 @@ impl Core {
         self.rd.parked.values().any(|p| p.deps.is_some())
     }
 
+    /// Phase 2b round 2: a local op parked on a recall (`ExecuteLocal`)
+    /// reached its client deadline: the park is dropped (the op never
+    /// ran; the client hears in doubt and retries by rid).
+    pub(crate) fn abort_exec_local_park(&mut self, rid: Rid) -> bool {
+        let id = self
+            .rd
+            .parked
+            .iter()
+            .find(|(_, p)| matches!(p.what, ParkedWhat::ExecuteLocal { rid: r } if r == rid))
+            .map(|(id, _)| *id);
+        let Some(id) = id else {
+            return false;
+        };
+        self.rd.parked.remove(&id);
+        self.dl.pending_exec.remove(&rid);
+        true
+    }
+
+    /// Phase 2b: the root lost its lease with executions parked on its
+    /// generations' recalls — abort them (`Busy` to a requester, the
+    /// lease path for a local op).
+    pub(crate) fn abort_parks_waiting_on(
+        &mut self,
+        now: Ms,
+        ids: &BTreeSet<u64>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let parked: Vec<u64> = self
+            .rd
+            .parked
+            .iter()
+            .filter(|(_, p)| p.waiting.iter().any(|w| ids.contains(w)))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in parked {
+            self.abort_park_busy(now, id, replica, out);
+        }
+    }
+
     /// Plan 30 §M11: a write delegation's wait id is done (its generation
     /// ended): release what waited on it.
     pub(crate) fn deleg_wait_done(
@@ -540,6 +756,30 @@ impl Core {
             p.waiting.remove(&id);
         }
         self.complete_ready(now, replica, out);
+        // Phase 2b: the generations a cross-subtree op ended are granted
+        // again once it ran.
+        self.deleg_redelegate_after_cross(now, replica, out);
+    }
+
+    /// Phase 2b: whether any parked continuation still waits on the
+    /// recall of generation `gen`.
+    pub(crate) fn rd_has_recall_wait(&self, gen: u64) -> bool {
+        let id = super::delegate::wait_id(gen);
+        self.rd.parked.values().any(|p| p.waiting.contains(&id))
+    }
+
+    /// Phase 2b: whether any execution (a forwarded op, a local op, an
+    /// inbox batch) is parked on the root at all — a re-delegation
+    /// before it ran would only make it recall again.
+    pub(crate) fn has_exec_parks(&self) -> bool {
+        self.rd.parked.values().any(|p| {
+            matches!(
+                p.what,
+                ParkedWhat::ExecuteReply { .. }
+                    | ParkedWhat::ExecuteLocal { .. }
+                    | ParkedWhat::InboxRepoll { .. }
+            )
+        })
     }
 
     /// Acknowledgements parked for durability (plan 30 §M9, `status`).
@@ -666,6 +906,19 @@ impl Core {
                         c.phase = ClientPhase::WaitingLease;
                     }
                     self.retry_or_lease(now, rid, replica, out);
+                }
+                ParkedWhat::DelegRecalled {
+                    to,
+                    req,
+                    gen,
+                    through,
+                } => {
+                    // Answered as it stands: the root outwaits the read
+                    // grants by its horizon anyway.
+                    out.push(Action::Send {
+                        to,
+                        msg: PeerMsg::DelegRecalled { req, gen, through },
+                    });
                 }
             }
         }
@@ -964,6 +1217,8 @@ impl Core {
                     && p.quarantine.is_none_or(|q| q <= now)
                     && p.durable.is_none_or(|j| self.durable_covers(j))
                     && p.deps.as_ref().is_none_or(|d| replica.reaches_streams(d))
+                    && p.stream_need
+                        .is_none_or(|(g, i)| self.deleg_stream_durable(g, i, replica))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1059,6 +1314,17 @@ impl Core {
                         out,
                     );
                 }
+                ParkedWhat::DelegRecalled {
+                    to,
+                    req,
+                    gen,
+                    through,
+                } => {
+                    out.push(Action::Send {
+                        to,
+                        msg: PeerMsg::DelegRecalled { req, gen, through },
+                    });
+                }
                 ParkedWhat::ExecuteLocal { rid } => {
                     self.dl.pending_exec.remove(&rid);
                     if !self.clients.contains_key(&rid) {
@@ -1129,7 +1395,13 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if self.lease.usable(now, &self.cfg) && !self.lease.fenced() {
+        // Phase 2b (M8 under M11): the index of a delegated subtree is
+        // its delegate's, the holder's included — the root's replica
+        // trails the delegate's stream.
+        let delegate = self
+            .deleg_read_owner(now, ino, name.as_deref(), replica)
+            .filter(|n| *n != self.cfg.node_id);
+        if delegate.is_none() && self.lease.usable(now, &self.cfg) && !self.lease.fenced() {
             // Plan 30 §M9: a holder of a tenure that may be taken over
             // before its lease expires reads its own replica only with
             // fresh S3 liveness; otherwise this read probes first (a tail
@@ -1170,6 +1442,29 @@ impl Core {
     }
 
     fn read_route(&mut self, now: Ms, op: OpId, replica: &dyn Replica, out: &mut Vec<Action>) {
+        // Phase 2b (M8 under M11): a read under a delegated subtree asks
+        // the delegate, not the holder; this node as that delegate reads
+        // its own replica.
+        let owner = self
+            .rd
+            .reads
+            .get(&op)
+            .and_then(|r| self.deleg_read_owner(now, r.ino, r.name.as_deref(), replica));
+        match owner {
+            Some(n) if n == self.cfg.node_id => {
+                if let Some(r) = self.rd.reads.remove(&op) {
+                    self.cancel_timer(r.deadline, out);
+                }
+                self.stats.deleg_read_index_served += 1;
+                self.read_answer(op, ReadAnswer::Holder, out);
+                return;
+            }
+            Some(n) => {
+                self.send_read_index(now, op, n, replica, out);
+                return;
+            }
+            None => {}
+        }
         match self.lease.cached_holder.filter(|h| *h != self.cfg.node_id) {
             Some(holder) => self.send_read_index(now, op, holder, replica, out),
             None => {
@@ -1272,7 +1567,11 @@ impl Core {
         r.req = None;
         match outcome {
             ReadIndexOutcome::Ok { position, grant } => {
-                self.lease.cached_holder = Some(from);
+                // Phase 2b: a delegate's answer (its position names its
+                // stream) says nothing about the lease.
+                if position.streams.is_empty() {
+                    self.lease.cached_holder = Some(from);
+                }
                 let Some(r) = self.rd.reads.remove(&op) else {
                     return;
                 };
@@ -1308,9 +1607,15 @@ impl Core {
             }
             ReadIndexOutcome::NotHolder { holder } => {
                 let redirect = holder != 0 && holder != from && holder != self.cfg.node_id;
+                // Phase 2b: a redirect to a delegate is a route, not the
+                // lease holder.
+                let names_delegate =
+                    holder != 0 && replica.delegation_table().iter().any(|e| e.node == holder);
                 if redirect && !r.redirected {
                     r.redirected = true;
-                    self.lease.cached_holder = Some(holder);
+                    if !names_delegate {
+                        self.lease.cached_holder = Some(holder);
+                    }
                     self.send_read_index(now, op, holder, replica, out);
                 } else {
                     self.lease.cached_holder = None;

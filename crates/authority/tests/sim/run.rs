@@ -127,6 +127,9 @@ pub struct SimConfig {
     /// Plan 30 §M11: `(dir, node)` delegated by the initial holder
     /// (node 1) before the clients start.
     pub delegations: Vec<(String, NodeId)>,
+    /// Plan 30 §M11 phase 2b: offline designations `(dir, designee)`,
+    /// synced into the table by the root at setup.
+    pub designations: Vec<(String, NodeId)>,
     pub cross_ratio: f64,
     /// Plan 30 §M11: a writer per node writes data in its home
     /// directory then a marker in another; watchers on every node must
@@ -180,6 +183,9 @@ pub fn sim_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.stream_buffer_segments = 32;
     c.stream_retry_min_ms = 150;
     c.stream_retry_max_ms = 2_000;
+    // Plan 30 §M11 phase 2b: the placement is opted into per configuration
+    // (`placement_core_config`); the 2a configurations are what they were.
+    c.placement = false;
     c
 }
 
@@ -204,6 +210,25 @@ pub fn backup_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c.backup_stable_ms = 200;
     c.backup_reconfig_min_ms = 500;
     c
+}
+
+/// Plan 30 §M11 phase 2b: the placement on, with thresholds a short
+/// workload reaches (a 2 s window, 6 ops, a 1.5 s dwell, a 1 s
+/// cool-down).
+pub fn placement_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let mut c = sim_core_config(node_id, incarnation);
+    c.placement = true;
+    c.placement_window_ms = 2_000;
+    c.placement_min_ops = 6;
+    c.placement_dwell_ms = 1_500;
+    c.placement_cooldown_ms = 1_000;
+    c
+}
+
+/// Plan 30 §M11 phase 2b: delegates with backups (M9's backup
+/// configuration: the bus RTT is in budget, so every delegate picks one).
+pub fn deleg_backup_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    backup_core_config(node_id, incarnation)
 }
 
 /// Plan 30 §M9: `ack=s3` — no backups, every acknowledgement waits for
@@ -275,6 +300,7 @@ impl Default for SimConfig {
             join_fresh: true,
             dirs: Vec::new(),
             delegations: Vec::new(),
+            designations: Vec::new(),
             cross_ratio: 0.0,
             marker_pairs: 0,
         }
@@ -378,6 +404,7 @@ fn ns_ret(outcome: &MutateOutcome) -> Result<NsRet, String> {
         MutateOutcome::Exists { .. } => Ok(NsRet::Eexist),
         MutateOutcome::Errno(e) if *e == libc::EEXIST => Ok(NsRet::Eexist),
         MutateOutcome::Errno(e) if *e == libc::ENOENT => Ok(NsRet::Enoent),
+        MutateOutcome::Errno(e) if *e == libc::EROFS || *e == libc::EXDEV => Ok(NsRet::Erofs),
         other => Err(format!("unexpected client outcome {other:?}")),
     }
 }
@@ -567,6 +594,8 @@ async fn client_read(
         name,
         present,
         timed_out,
+        ?floor,
+        held = handle.meta.read_delegations().valid(parent, handle.clock.now().0).is_some(),
         replays = handle.meta.pending_replays().map(|q| q.len()).unwrap_or(0),
         speculation = ?handle.meta.speculation_counts().ok(),
         "client read"
@@ -1020,6 +1049,9 @@ pub fn run_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             if let Some(waiting) = super::node::WAITING.lock().unwrap().as_ref() {
                 eprintln!("WATCHDOG: waiting: {waiting:?}");
             }
+            if let Some(gaps) = super::node::TIMER_GAPS.lock().unwrap().as_ref() {
+                eprintln!("WATCHDOG: timer gaps (last, count, min gap ms): {gaps:?}");
+            }
             if let Some((node, event, since)) = super::node::IN_FLIGHT.lock().unwrap().clone() {
                 if since.elapsed() > Duration::from_secs(2) {
                     eprintln!(
@@ -1181,8 +1213,23 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         )));
     }
     super::node::note_waiting("run", "clients".into());
+    // A client whose op is never answered would run the clock forever
+    // (paused time races: 85 000 simulated seconds in 30 s of wall for
+    // long-delegated seed 70051 before the fix): a bound, and a failure
+    // that names it.
+    let client_cap = Duration::from_millis(cfg.settle_ms * 6);
     for c in clients {
-        c.await.expect("client task");
+        match tokio::time::timeout(client_cap, c).await {
+            Ok(r) => r.expect("client task"),
+            Err(_) => {
+                failures.lock().unwrap().push(format!(
+                    "a client op was never answered within {client_cap:?} of simulated time; \
+                     waiting: {:?}",
+                    super::node::WAITING.lock().unwrap()
+                ));
+                break;
+            }
+        }
     }
     for m in marker_tasks {
         // Watchers loop until the writers are done and the markers
@@ -1494,9 +1541,35 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         check::check_convergence(&replicas, &oracle).map_err(|e| format!("{e}{context}"))?;
         report.converged_checked = true;
     } else if !quiescent {
+        // What keeps each node from quiescence (phase 2b diagnostics).
+        let why: Vec<String> = cluster
+            .ids()
+            .into_iter()
+            .map(|id| cluster.get(id))
+            .filter(|n| n.alive())
+            .map(|n| {
+                let rows = constellation_authority::Replica::take_journal(&*n.meta, 12)
+                    .map(|b| {
+                        b.into_iter()
+                            .map(|(s, r)| format!("{s}:{r:?}"))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "node {}: journal {:?} held {:?} speculation {:?} live {:?} replays {}",
+                    n.id,
+                    rows,
+                    n.meta.held_summary(),
+                    n.meta.speculation_counts().ok(),
+                    n.meta.speculation_live_debug(),
+                    n.meta.pending_replays().map(|q| q.len()).unwrap_or(0)
+                )
+            })
+            .collect();
         return Err(format!(
-            "the cluster did not reach quiescence within {}ms of simulated time\n  faults: {:?}\n  views: {:?}",
+            "the cluster did not reach quiescence within {}ms of simulated time\n  why: {:#?}\n  faults: {:?}\n  views: {:?}",
             cfg.settle_ms,
+            why,
             report.faults,
             cluster
                 .ids()
@@ -1645,15 +1718,55 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
             return;
         }
     }
+    // Plan 30 §M11 phase 2b: the designations, through the root's sync.
+    if !cfg.designations.is_empty() {
+        let mut entries = Vec::new();
+        for (dir, node) in &cfg.designations {
+            match handle.meta.child_ino(ROOT_INO, dir).ok().flatten() {
+                Some(ino) => entries.push((ino, *node)),
+                None => {
+                    failures
+                        .lock()
+                        .unwrap()
+                        .push(format!("setup: directory {dir} missing on node 1"));
+                    return;
+                }
+            }
+        }
+        let mut done = false;
+        for _ in 0..30 {
+            if let Ok(Ok(_)) = handle
+                .control(constellation_authority::Control::SyncDesignations {
+                    entries: entries.clone(),
+                })
+                .await
+            {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if !done {
+            failures
+                .lock()
+                .unwrap()
+                .push("setup: could not sync the designations".into());
+            return;
+        }
+    }
     // Installed and renewed on every delegate.
     for _ in 0..400 {
-        let all = cfg.delegations.iter().all(|(_, node)| {
-            let v = cluster.get(*node).view();
-            v.delegation
-                .mine
-                .iter()
-                .any(|(_, _, until, stopped, ..)| !*stopped && *until > 0)
-        });
+        let all = cfg
+            .delegations
+            .iter()
+            .chain(cfg.designations.iter())
+            .all(|(_, node)| {
+                let v = cluster.get(*node).view();
+                v.delegation
+                    .mine
+                    .iter()
+                    .any(|(_, _, until, stopped, ..)| !*stopped && *until > 0)
+            });
         if all {
             return;
         }

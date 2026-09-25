@@ -2416,8 +2416,6 @@ fn remove_live_subtree(meta: &Meta, path: &str) -> Result<()> {
 struct P2pBridge {
     node_id: u64,
     nudge: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
-    designations: std::sync::Arc<designation::DesignationManager>,
-    meta: std::sync::Arc<Meta>,
     epochs: std::sync::Arc<epoch::EpochManager>,
     coop: std::sync::Arc<crate::coop::Coop>,
     placement: std::sync::Arc<placement::Placement>,
@@ -2522,36 +2520,79 @@ impl constellation_net::PeerService for P2pBridge {
         })
     }
 
-    fn delegation_requested(
+    fn deleg_backup_append_requested(
         &self,
-        path: String,
-        requester: u64,
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        txs: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
-            self.designations
-                .handle_delegation_request(&path, requester)
+            let sealed = constellation_net::Payload::DelegBackupAck {
+                req_id,
+                gen,
+                acked: 0,
+                sealed: true,
+            };
+            let Ok(txs) = postcard::from_bytes::<Vec<constellation_meta::DelegateTx>>(&txs) else {
+                return sealed;
+            };
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            if self
+                .nudge
+                .send(fusefs::SyncRequest::PeerDelegBackupAppend {
+                    from,
+                    gen,
+                    txs,
+                    reply,
+                })
+                .is_err()
+            {
+                return sealed;
+            }
+            match receive.await {
+                Ok((acked, is_sealed)) => constellation_net::Payload::DelegBackupAck {
+                    req_id,
+                    gen,
+                    acked,
+                    sealed: is_sealed,
+                },
+                Err(_) => sealed,
+            }
         })
     }
 
-    fn flush_ack_requested(
+    fn deleg_seal_requested(
         &self,
-        path: String,
-        part: String,
-        seq: u64,
+        root: u64,
+        req_id: u64,
+        gen: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
-            // We can ack once our own replica has tailed at least this
-            // seq — that IS "provably holds all committed changes" for
-            // this record. `applied_seq` reads the same kv counter the
-            // syncer advances after applying (or shipping) a segment.
-            let applied = self.meta.applied_seq().unwrap_or(0);
-            constellation_net::Payload::FlushAck {
-                path,
-                part,
-                seq,
-                acked: applied >= seq,
+            let none = constellation_net::Payload::DelegSealed {
+                req_id,
+                gen,
+                sealed: false,
+                txs: Vec::new(),
+            };
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            if self
+                .nudge
+                .send(fusefs::SyncRequest::PeerDelegSeal { root, gen, reply })
+                .is_err()
+            {
+                return none;
+            }
+            match receive.await {
+                Ok((sealed, txs)) => constellation_net::Payload::DelegSealed {
+                    req_id,
+                    gen,
+                    sealed,
+                    txs: postcard::to_allocvec(&txs).unwrap_or_default(),
+                },
+                Err(_) => none,
             }
         })
     }
@@ -2775,13 +2816,19 @@ impl constellation_net::PeerService for P2pBridge {
         from: u64,
         req_id: u64,
         gen: u64,
+        backup: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
             let (reply, receive) = tokio::sync::oneshot::channel();
             let ttl_ms = if self
                 .nudge
-                .send(fusefs::SyncRequest::PeerDelegRenew { from, gen, reply })
+                .send(fusefs::SyncRequest::PeerDelegRenew {
+                    from,
+                    gen,
+                    backup,
+                    reply,
+                })
                 .is_ok()
             {
                 receive.await.unwrap_or(0)
@@ -4330,6 +4377,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                             path: self.meta.path_of(d.dir).unwrap_or_default(),
                             node: d.node,
                             gen: d.gen,
+                            designated: d.designated,
                         })
                         .collect(),
                     mine: v.mine.clone(),
@@ -4359,6 +4407,28 @@ impl constellation_api::StatusSource for DaemonStatus {
                     deps_overflow_to_root: stats.deps_overflow_to_root,
                     exec_parked: stats.deleg_exec_parked,
                     stranded: stats.local_rolled_back,
+                    kinds: v.kinds.clone(),
+                    backups: v.backups.clone(),
+                    placement: core.placement_top.clone(),
+                    inherited: stats.deleg_inherited,
+                    refused_designated: stats.deleg_refused_designated,
+                    designated: stats.deleg_designated,
+                    redelegated: stats.deleg_redelegated,
+                    seals_sent: stats.deleg_seals_sent,
+                    sealed_drained: stats.deleg_sealed_drained,
+                    restreams: stats.deleg_restreams,
+                    backup_appends: stats.deleg_backup_appends,
+                    backup_acks: stats.deleg_backup_acks,
+                    acks_parked: stats.deleg_acks_parked,
+                    backup_persisted: stats.deleg_backup_persisted,
+                    backup_seals: stats.deleg_backup_seals,
+                    place_evaluations: stats.place_evaluations,
+                    place_delegated: stats.place_delegated,
+                    place_recalled: stats.place_recalled,
+                    place_skipped_cooldown: stats.place_skipped_cooldown,
+                    place_skipped_unreachable: stats.place_skipped_unreachable,
+                    read_index_served: stats.deleg_read_index_served,
+                    read_grants: stats.deleg_read_grants,
                 }
             },
             cto: {
@@ -4606,6 +4676,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                 path: self.meta.path_of(d.dir).unwrap_or_default(),
                 node: d.node,
                 gen: d.gen,
+                designated: d.designated,
             })
             .collect()
     }

@@ -230,6 +230,7 @@ pub enum TimerKind {
     DelegRenew,
     /// M11: a delegate's stream tick (a batch to send, a lost ack).
     DelegStream,
+    Placement,
 }
 
 /// Successful control-plane results.

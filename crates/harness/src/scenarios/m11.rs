@@ -721,12 +721,23 @@ pub fn cross_subtree_rename(_seed: u64) -> Result<()> {
             )?;
             all_visible(x, &all, Duration::from_secs(30))?;
         }
-        // The same directories can be delegated again (a new generation).
-        delegate(a, "/d1", b_id)?;
+        // Phase 2b: the root delegates the directories again by itself
+        // once the cross-subtree op ran (a new generation each).
+        eventually("d1 delegated to b again", Duration::from_secs(20), || {
+            let d = deleg_of(a)?;
+            anyhow::ensure!(
+                d["table"]
+                    .as_array()
+                    .is_some_and(|t| t.iter().any(|e| e["path"] == "/d1" && n(e, "node") == b_id)),
+                "d1 not re-delegated yet: {d}"
+            );
+            Ok(())
+        })?;
         let gen2 = wait_installed(b, "/d1", Duration::from_secs(20))?;
         let (again, lat) = write_files(b, "d1", "again", 20)?;
         eprintln!(
-            "    {NAME}: d1 delegated again to b (gen {gen2}); b's local writes {}",
+            "    {NAME}: d1 re-delegated to b by the root (gen {gen2}, re-delegated {}); b's local writes {}",
+            n(&deleg_of(a)?, "redelegated"),
             dist(lat)
         );
         all.extend(again.iter().cloned());
@@ -1133,6 +1144,550 @@ pub fn p2p_off_no_delegation(_seed: u64) -> Result<()> {
             "something was delegated with P2P off: a {da} b {db}"
         );
         ensure_no_conflicts(&[a, b])?;
+        Ok(())
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
+// ------------------------------------------------------------ phase 2b
+
+/// Sets the writers' stop flag when dropped (a failed assertion must not
+/// leave a writer thread holding the mounts open).
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The lease holder of `clients`, if any holds.
+fn holder_of(clients: &[Client]) -> Option<usize> {
+    (0..clients.len()).find(|i| lease_of(&clients[*i]).is_ok_and(|l| l["held"] == true))
+}
+
+/// Phase 2b: the root dies with two live delegates streaming (M9's
+/// backup takes it over by seal, inside the lease); the successor learns
+/// the table from the log, the delegates re-stream what the old root
+/// never shipped, every acknowledged file is everywhere, and the dead
+/// root remounts and converges.
+pub fn root_failover_with_delegates(_seed: u64) -> Result<()> {
+    const NAME: &str = "root-failover-with-delegates";
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "b", "c", "d"],
+        &[("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "50")],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let b = &clients[1];
+        let c = &clients[2];
+        let d = &clients[3];
+        let b_id = node_id(b)?;
+        let c_id = node_id(c)?;
+        std::fs::create_dir(a.mnt.join("d1"))?;
+        std::fs::create_dir(a.mnt.join("d2"))?;
+        for x in [b, c, d] {
+            eventually("dirs visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("d1").is_dir() && x.mnt.join("d2").is_dir());
+                Ok(())
+            })?;
+        }
+        delegate(a, "/d1", b_id)?;
+        delegate(a, "/d2", c_id)?;
+        wait_installed(b, "/d1", Duration::from_secs(20))?;
+        wait_installed(c, "/d2", Duration::from_secs(20))?;
+        let epoch = lease_of(a)?["epoch"].as_u64().unwrap_or(0);
+        // M9: the root has a backup (the seal-based takeover) before it dies.
+        let backups = super::m9::wait_for_backup(a, Duration::from_secs(30))?;
+        eprintln!("    {NAME}: a (epoch {epoch}) backs up to {backups:?}");
+        // Both delegates write continuously; the root is killed mid-burst.
+        let stop = Arc::new(AtomicBool::new(false));
+        let _guard = StopOnDrop(stop.clone());
+        let bg: Vec<_> = [(b.mnt.clone(), "d1"), (c.mnt.clone(), "d2")]
+            .into_iter()
+            .map(|(mnt, dir)| {
+                let stop = stop.clone();
+                std::thread::spawn(move || -> Result<Vec<String>> {
+                    let mut names = Vec::new();
+                    let mut i = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        let name = format!("{dir}/bg-{i}");
+                        if write_timed(&mnt.join(&name), name.as_bytes()).is_ok() {
+                            names.push(name);
+                        }
+                        i += 1;
+                    }
+                    Ok(names)
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(800));
+        let killed = Instant::now();
+        clients[0].kill9()?;
+        let b = &clients[1];
+        let c = &clients[2];
+        let d = &clients[3];
+        let successor = eventually_value("a successor holds", Duration::from_secs(30), || {
+            let i = holder_of(&clients[1..]).map(|i| i + 1);
+            let i = i.context("nobody holds yet")?;
+            let l = lease_of(&clients[i])?;
+            anyhow::ensure!(l["epoch"].as_u64().unwrap_or(0) > epoch, "old epoch");
+            Ok(i)
+        })?;
+        let took = killed.elapsed();
+        let s = &clients[successor];
+        eprintln!(
+            "    {NAME}: {} took the lease over {took:?} after the kill",
+            s.name
+        );
+        // The writes keep going through the takeover; then stop.
+        std::thread::sleep(Duration::from_millis(1500));
+        stop.store(true, Ordering::Relaxed);
+        let mut names = Vec::new();
+        for h in bg {
+            names.extend(h.join().map_err(|_| anyhow::anyhow!("writer panicked"))??);
+        }
+        let ds = deleg_of(s)?;
+        print_deleg(NAME, &s.name, &ds);
+        for x in [b, c] {
+            print_deleg(NAME, &x.name, &deleg_of(x)?);
+        }
+        let restreams: u64 = [b, c]
+            .iter()
+            .map(|x| n(&deleg_of(x).unwrap_or_default(), "restreams"))
+            .sum();
+        eprintln!(
+            "    {NAME}: {} acknowledged writes across the failover; successor inherited {} \
+             generations; delegates re-streamed {} times",
+            names.len(),
+            n(&ds, "inherited"),
+            restreams
+        );
+        anyhow::ensure!(
+            n(&ds, "inherited") >= 1 || n(&ds, "delegated") >= 1,
+            "the successor learned no generation: {ds}"
+        );
+        anyhow::ensure!(names.len() > 50, "too few writes landed: {}", names.len());
+        for x in [b, c, d] {
+            all_visible(x, &names, Duration::from_secs(90))?;
+        }
+        // The dead root returns and converges.
+        clients[0].mount()?;
+        let a = &clients[0];
+        all_visible(a, &names, Duration::from_secs(90))?;
+        ensure_no_conflicts(&[a, &clients[1], &clients[2], &clients[3]])?;
+        Ok(())
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
+/// `eventually` returning the closure's value.
+fn eventually_value<T>(
+    what: &str,
+    deadline: Duration,
+    mut f: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let t = Instant::now();
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if t.elapsed() > deadline => {
+                anyhow::bail!("{what}: not reached within {deadline:?}: {e:#}")
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// Phase 2b: the delegate of `d1` has a backup (a LAN peer in budget)
+/// and dies mid-burst: the root seals the backup, drains its tail, ends
+/// the generation and delegates `d1` to the backup; every write the
+/// delegate acknowledged is in the log; the remounted delegate converges.
+pub fn delegate_crash_with_backup(_seed: u64) -> Result<()> {
+    const NAME: &str = "delegate-crash-backup";
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "b", "c"],
+        &[("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "50")],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let b = &clients[1];
+        let c = &clients[2];
+        let b_id = node_id(b)?;
+        let c_id = node_id(c)?;
+        std::fs::create_dir(a.mnt.join("d1"))?;
+        for x in [b, c] {
+            eventually("dir visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("d1").is_dir());
+                Ok(())
+            })?;
+        }
+        delegate(a, "/d1", b_id)?;
+        let gen = wait_installed(b, "/d1", Duration::from_secs(20))?;
+        eventually("b chose a backup", Duration::from_secs(20), || {
+            let d = deleg_of(b)?;
+            anyhow::ensure!(
+                d["backups"].as_array().is_some_and(|v| !v.is_empty()),
+                "no backup yet: {d}"
+            );
+            Ok(())
+        })?;
+        let db = deleg_of(b)?;
+        let backup = db["backups"][0][1].as_u64().unwrap_or(0);
+        eprintln!("    {NAME}: b (gen {gen}) backs up to node {backup}");
+        anyhow::ensure!(
+            backup == c_id,
+            "b's backup is {backup}, expected c ({c_id})"
+        );
+        let (names_b, lat) = write_files(b, "d1", "b", 40)?;
+        let db = deleg_of(b)?;
+        eprintln!(
+            "    {NAME}: b's writes under a backup: {}; acks parked {} backup appends {} acks {}",
+            dist(lat),
+            n(&db, "acks_parked"),
+            n(&db, "backup_appends"),
+            n(&db, "backup_acks")
+        );
+        anyhow::ensure!(
+            n(&db, "backup_acks") > 0,
+            "no backup acknowledged anything: {db}"
+        );
+        let killed = Instant::now();
+        clients[1].kill9()?;
+        let a = &clients[0];
+        let c = &clients[2];
+        // The root seals the backup and delegates d1 to it.
+        eventually(
+            "d1 re-delegated to the backup",
+            Duration::from_secs(30),
+            || {
+                let d = deleg_of(a)?;
+                let table = d["table"].as_array().cloned().unwrap_or_default();
+                anyhow::ensure!(
+                    table
+                        .iter()
+                        .any(|e| e["path"] == "/d1" && n(e, "node") == c_id),
+                    "d1 not on c yet: {d}"
+                );
+                Ok(())
+            },
+        )?;
+        let da = deleg_of(a)?;
+        print_deleg(NAME, "a", &da);
+        eprintln!(
+            "    {NAME}: sealed {:?} after the kill; seals sent {} drained {} re-delegated to c",
+            killed.elapsed(),
+            n(&da, "seals_sent"),
+            n(&da, "sealed_drained")
+        );
+        anyhow::ensure!(
+            n(&da, "seals_sent") >= 1,
+            "the root never sealed the backup: {da}"
+        );
+        // c writes into d1 locally now.
+        wait_installed(c, "/d1", Duration::from_secs(20))?;
+        let (names_c, lat_c) = write_files(c, "d1", "c", 20)?;
+        eprintln!(
+            "    {NAME}: c's writes into d1 as the new delegate: {}",
+            dist(lat_c)
+        );
+        let mut all = names_b.clone();
+        all.extend(names_c);
+        all_visible(a, &all, Duration::from_secs(60))?;
+        all_visible(c, &all, Duration::from_secs(60))?;
+        clients[1].mount()?;
+        all_visible(&clients[1], &all, Duration::from_secs(90))?;
+        ensure_no_conflicts(&[&clients[0], &clients[1], &clients[2]])?;
+        Ok(())
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
+/// Phase 2b: automatic placement. b dominates the writes under `d1` for
+/// a window: the root delegates `d1` to b by itself; then c takes the
+/// writes over and b stops: after the dwell the placement recalls b's
+/// generation, and after the cool-down delegates `d1` to c — with no
+/// flapping in between.
+pub fn auto_placement(_seed: u64) -> Result<()> {
+    const NAME: &str = "auto-placement";
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "b", "c"],
+        &[
+            ("CONSTELLATION_DELEGATION_PLACEMENT", "1"),
+            ("CONSTELLATION_DELEGATION_WINDOW_MS", "4000"),
+            ("CONSTELLATION_DELEGATION_MIN_OPS", "20"),
+            ("CONSTELLATION_DELEGATION_DWELL_MS", "4000"),
+            ("CONSTELLATION_DELEGATION_COOLDOWN_MS", "2000"),
+        ],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let b = &clients[1];
+        let c = &clients[2];
+        let b_id = node_id(b)?;
+        let c_id = node_id(c)?;
+        std::fs::create_dir(a.mnt.join("d1"))?;
+        for x in [b, c] {
+            eventually("dir visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("d1").is_dir());
+                Ok(())
+            })?;
+        }
+        let table_owner = |path: &str| -> Result<Option<u64>> {
+            let d = deleg_of(a)?;
+            Ok(d["table"]
+                .as_array()
+                .and_then(|t| t.iter().find(|e| e["path"] == path).map(|e| n(e, "node"))))
+        };
+        // Phase 1: b writes into d1 steadily.
+        let stop = Arc::new(AtomicBool::new(false));
+        let _guard = StopOnDrop(stop.clone());
+        let writer = |mnt: std::path::PathBuf, tag: &'static str, stop: Arc<AtomicBool>| {
+            std::thread::spawn(move || -> Result<Vec<String>> {
+                let mut names = Vec::new();
+                let mut i = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let name = format!("d1/{tag}-{i}");
+                    write_timed(&mnt.join(&name), name.as_bytes())?;
+                    names.push(name);
+                    i += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(names)
+            })
+        };
+        let t0 = Instant::now();
+        let wb = writer(b.mnt.clone(), "b", stop.clone());
+        eventually_value("d1 placed on b", Duration::from_secs(30), || {
+            anyhow::ensure!(table_owner("/d1")? == Some(b_id), "not yet");
+            Ok(())
+        })?;
+        let placed_b = t0.elapsed();
+        eprintln!("    {NAME}: d1 delegated to b by the placement after {placed_b:?}");
+        std::thread::sleep(Duration::from_secs(3));
+        // Phase 2: c takes over, b stops.
+        stop.store(true, Ordering::Relaxed);
+        let names_b = wb
+            .join()
+            .map_err(|_| anyhow::anyhow!("writer panicked"))??;
+        let db = deleg_of(b)?;
+        print_deleg(NAME, "b (after phase 1)", &db);
+        print_deleg(NAME, "a (after phase 1)", &deleg_of(a)?);
+        anyhow::ensure!(
+            n(&db, "executed") + n(&db, "fast_path_executed") > 0,
+            "b executed nothing as the placed delegate: {db}"
+        );
+        let stop2 = Arc::new(AtomicBool::new(false));
+        let _guard2 = StopOnDrop(stop2.clone());
+        let t1 = Instant::now();
+        let wc = writer(c.mnt.clone(), "c", stop2.clone());
+        eventually_value("d1 recalled from b", Duration::from_secs(40), || {
+            anyhow::ensure!(table_owner("/d1")? != Some(b_id), "still b");
+            Ok(())
+        })?;
+        let recalled = t1.elapsed();
+        eventually_value("d1 placed on c", Duration::from_secs(40), || {
+            anyhow::ensure!(table_owner("/d1")? == Some(c_id), "not c yet");
+            Ok(())
+        })?;
+        let placed_c = t1.elapsed();
+        std::thread::sleep(Duration::from_secs(2));
+        stop2.store(true, Ordering::Relaxed);
+        let names_c = wc
+            .join()
+            .map_err(|_| anyhow::anyhow!("writer panicked"))??;
+        let da = deleg_of(a)?;
+        print_deleg(NAME, "a", &da);
+        eprintln!(
+            "    {NAME}: recalled from b {recalled:?} after c took over, placed on c after \
+             {placed_c:?}; placement delegated {} recalled {} (evaluations {}); top {}",
+            n(&da, "place_delegated"),
+            n(&da, "place_recalled"),
+            n(&da, "place_evaluations"),
+            da["placement"]
+        );
+        anyhow::ensure!(
+            n(&da, "place_delegated") >= 2 && n(&da, "place_recalled") >= 1,
+            "placement counters: {da}"
+        );
+        anyhow::ensure!(
+            n(&da, "place_delegated") <= 3 && n(&da, "place_recalled") <= 2,
+            "the placement flapped: {da}"
+        );
+        let mut all = names_b;
+        all.extend(names_c);
+        for x in [a, b, c] {
+            all_visible(x, &all, Duration::from_secs(60))?;
+        }
+        ensure_no_conflicts(&[a, b, c])?;
+        Ok(())
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    unmount_all(&mut clients);
+    result
+}
+
+/// Phase 2b: an offline designation (plans 03–05) as a delegation. b
+/// runs `offline /site`; the root's table gets a designated generation
+/// for b; c's writes under it are forwarded to b; the root's own client
+/// forwards too. b cut from everyone keeps writing locally (its grant
+/// never lapses) while c's writes under the path are refused `EROFS`
+/// (the root will not sequence a designated subtree); after the heal
+/// everything converges, and `online` on b recalls it: c's writes go
+/// through the root again.
+pub fn designation_as_delegation(_seed: u64) -> Result<()> {
+    const NAME: &str = "designation-as-delegation";
+    let (_env, root, mut clients, _) = cluster(NAME, &["a", "b", "c"], &[], 0)?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let b = &clients[1];
+        let c = &clients[2];
+        let a_id = node_id(a)?;
+        let b_id = node_id(b)?;
+        let c_id = node_id(c)?;
+        std::fs::create_dir(a.mnt.join("site"))?;
+        for x in [b, c] {
+            eventually("dir visible", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("site").is_dir());
+                Ok(())
+            })?;
+        }
+        let resp = b.control(&serde_json::json!({"cmd": "offline", "path": "/site"}))?;
+        anyhow::ensure!(resp["resp"] == "ok", "offline: {resp}");
+        // The root's designation poll (10 s) syncs the table.
+        let t = Instant::now();
+        eventually(
+            "the designation is in the table",
+            Duration::from_secs(40),
+            || {
+                let d = deleg_of(a)?;
+                let table = d["table"].as_array().cloned().unwrap_or_default();
+                anyhow::ensure!(
+                    table.iter().any(|e| e["path"] == "/site"
+                        && n(e, "node") == b_id
+                        && e["designated"] == true),
+                    "not yet: {d}"
+                );
+                Ok(())
+            },
+        )?;
+        wait_installed(b, "/site", Duration::from_secs(20))?;
+        eprintln!(
+            "    {NAME}: /site designated to b in the table after {:?}",
+            t.elapsed()
+        );
+        let (names_b, lat_b) = write_files(b, "site", "b", 20)?;
+        let (names_c, lat_c) = write_files(c, "site", "c", 20)?;
+        let (names_a, lat_a) = write_files(a, "site", "a", 10)?;
+        eprintln!(
+            "    {NAME}: designee's local writes {}; c's forwarded {}; the root's forwarded {}",
+            dist(lat_b),
+            dist(lat_c),
+            dist(lat_a)
+        );
+        let mut all: Vec<String> = names_b
+            .iter()
+            .chain(&names_c)
+            .chain(&names_a)
+            .cloned()
+            .collect();
+        all_visible(b, &all, Duration::from_secs(30))?;
+        // Cut b from everyone.
+        std::fs::write(deny_path(root.path(), &a.name), format!("{b_id}\n"))?;
+        std::fs::write(deny_path(root.path(), &c.name), format!("{b_id}\n"))?;
+        std::fs::write(deny_path(root.path(), &b.name), format!("{a_id}\n{c_id}\n"))?;
+        // The root stops routing to b once b's grant lapses on the root's
+        // clock (no renewal got through): from then on it refuses.
+        eventually(
+            "b's grant lapses at the root",
+            Duration::from_secs(40),
+            || {
+                let d = deleg_of(a)?;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|t| t.as_millis() as u64)
+                    .unwrap_or(0);
+                let lapsed = d["gens"].as_array().is_some_and(|g| {
+                    g.iter().any(|e| {
+                        e[1].as_u64() == Some(b_id) && e[4].as_u64().is_some_and(|u| u < now_ms)
+                    })
+                });
+                anyhow::ensure!(lapsed, "not yet: {}", d["gens"]);
+                Ok(())
+            },
+        )?;
+        let (names_cut, lat_cut) = write_files(b, "site", "cut", 10)?;
+        let refused = match std::fs::write(c.mnt.join("site/c-during-cut"), b"x") {
+            Err(e) => e.raw_os_error(),
+            Ok(()) => None,
+        };
+        eprintln!(
+            "    {NAME}: b isolated: its writes {}; c's write under /site -> {:?} (EROFS {})",
+            dist(lat_cut),
+            refused,
+            libc::EROFS
+        );
+        anyhow::ensure!(
+            refused == Some(libc::EROFS),
+            "c's write under the isolated designation: {refused:?}"
+        );
+        let da = deleg_of(a)?;
+        anyhow::ensure!(
+            n(&da, "refused_designated") >= 1,
+            "the root refused nothing: {da}"
+        );
+        anyhow::ensure!(
+            n(&da, "reclaimed") + n(&da, "recalls_expired") == 0,
+            "the designation was reclaimed: {da}"
+        );
+        // Heal.
+        for x in [a, b, c] {
+            let _ = std::fs::remove_file(deny_path(root.path(), &x.name));
+        }
+        all.extend(names_cut);
+        for x in [a, b, c] {
+            all_visible(x, &all, Duration::from_secs(90))?;
+        }
+        // online: the table entry goes; c's writes through the root.
+        let resp = b.control(&serde_json::json!({"cmd": "online", "path": "/site"}))?;
+        anyhow::ensure!(resp["resp"] == "ok", "online: {resp}");
+        eventually(
+            "the designation is recalled",
+            Duration::from_secs(40),
+            || {
+                let d = deleg_of(a)?;
+                anyhow::ensure!(
+                    d["table"]
+                        .as_array()
+                        .is_some_and(|t| t.iter().all(|e| e["path"] != "/site")),
+                    "still designated: {d}"
+                );
+                Ok(())
+            },
+        )?;
+        let (names_after, lat_after) = write_files(c, "site", "after", 10)?;
+        eprintln!(
+            "    {NAME}: after online, c's writes under /site (through the root): {}",
+            dist(lat_after)
+        );
+        all.extend(names_after);
+        for x in [a, b, c] {
+            all_visible(x, &all, Duration::from_secs(60))?;
+        }
+        print_deleg(NAME, "a", &deleg_of(a)?);
+        ensure_no_conflicts(&[a, b, c])?;
         Ok(())
     })();
     dump_logs_on_failure(NAME, &clients, &result);

@@ -35,7 +35,7 @@ use constellation_authority::{
     S3Op, S3Result, ShipState, Stats, TimerKind, UploadResult,
 };
 use constellation_fs_core::cache::DiskCache;
-use constellation_meta::{JournalPos, LogRecord, Meta, MutateOp, MutateOutcome, Position, Rid};
+use constellation_meta::{JournalPos, Meta, MutateOp, MutateOutcome, Position, Rid};
 use constellation_net::{LogEvent, Payload};
 use constellation_store_s3::inbox::InboxStore;
 use constellation_store_s3::lease::now_unix_ms;
@@ -85,6 +85,9 @@ pub struct CoreStatus {
     pub delegation_enabled: bool,
     /// Ops the FUSE fast path executed as the delegate (`DelegateView`).
     pub delegation_fast_path_executed: u64,
+    /// Phase 2b: the placement's busiest subtrees, `(dir, node, node_ops,
+    /// subtree_ops)`.
+    pub placement_top: Vec<(u64, u64, u64, u64)>,
 }
 
 /// Short names for the trace line around every core step.
@@ -455,6 +458,31 @@ pub fn load_config(
             "0" | "off" | "false"
         );
     c.delegation_ttl_ms = env_ms("CONSTELLATION_DELEGATION_TTL_MS", c.delegation_ttl_ms);
+    // Plan 30 §M11 phase 2b: the placement's knobs.
+    // Opt-in for now (M12 flips the default once the hash-range split
+    // exists): on, a dominant writer's subtree moves to it by itself,
+    // which changes the S3 request pattern of every multi-node run.
+    c.placement = c.delegation
+        && matches!(
+            std::env::var("CONSTELLATION_DELEGATION_PLACEMENT")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "on" | "true"
+        );
+    c.placement_window_ms = env_ms("CONSTELLATION_DELEGATION_WINDOW_MS", c.placement_window_ms);
+    c.placement_min_ops = env_ms("CONSTELLATION_DELEGATION_MIN_OPS", c.placement_min_ops);
+    c.placement_dominance_pct = env_ms(
+        "CONSTELLATION_DELEGATION_DOMINANCE",
+        c.placement_dominance_pct,
+    );
+    c.placement_leave_pct = env_ms("CONSTELLATION_DELEGATION_LEAVE", c.placement_leave_pct);
+    c.placement_dwell_ms = env_ms("CONSTELLATION_DELEGATION_DWELL_MS", c.placement_dwell_ms);
+    c.placement_cooldown_ms = env_ms(
+        "CONSTELLATION_DELEGATION_COOLDOWN_MS",
+        c.placement_cooldown_ms,
+    );
     c.backup_rtt_budget_ms = std::env::var("CONSTELLATION_BACKUP_RTT_BUDGET_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -549,6 +577,8 @@ pub struct Driver {
     deleg_stream_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
     deleg_renew_replies: HashMap<OpId, oneshot::Sender<u64>>,
     deleg_recall_replies: HashMap<OpId, oneshot::Sender<u64>>,
+    deleg_backup_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
+    deleg_seal_replies: HashMap<OpId, oneshot::Sender<(bool, Vec<constellation_meta::DelegateTx>)>>,
     /// Plan 30 §M10: peers' promise requests this node is answering.
     promise_replies: HashMap<OpId, oneshot::Sender<(Option<i64>, u32)>>,
     /// Plan 30 §M9: the holder's `BackupAppend` requests this node is
@@ -603,6 +633,8 @@ impl Driver {
             deleg_stream_replies: HashMap::new(),
             deleg_renew_replies: HashMap::new(),
             deleg_recall_replies: HashMap::new(),
+            deleg_backup_replies: HashMap::new(),
+            deleg_seal_replies: HashMap::new(),
             promise_replies: HashMap::new(),
             backup_replies: HashMap::new(),
             controls: HashMap::new(),
@@ -643,7 +675,11 @@ impl Driver {
                         .snapshot()
                         .into_iter()
                         .map(|p| {
-                            let since = if p.connected {
+                            // Fault injection: a denied peer is a link that
+                            // is down (the cut is a real one to the core:
+                            // the inbox path, no redirects to it).
+                            let connected = p.connected && !crate::fault::p2p_denied(p.node_id);
+                            let since = if connected {
                                 Some(*since.entry(p.node_id).or_insert(now))
                             } else {
                                 since.remove(&p.node_id);
@@ -651,10 +687,14 @@ impl Driver {
                             };
                             PeerLink {
                                 node: p.node_id,
-                                connected: p.connected,
-                                last_seen: p
-                                    .last_seen
-                                    .map(|at| Ms(now_unix_ms() - at.elapsed().as_millis() as i64)),
+                                connected,
+                                last_seen: if connected {
+                                    p.last_seen.map(|at| {
+                                        Ms(now_unix_ms() - at.elapsed().as_millis() as i64)
+                                    })
+                                } else {
+                                    None
+                                },
                                 rtt_ms: p.rtt_ms,
                                 since,
                             }
@@ -767,6 +807,10 @@ impl Driver {
         status.delegation_enabled = cfg.delegation;
         status.delegation_fast_path_executed = self.deps.delegates.executed();
         self.deps.delegates.mirror(&status.delegation);
+        self.deps
+            .delegates
+            .set_gated(self.core.deleg_fast_path_gated());
+        status.placement_top = self.core.placement_top();
         drop(status);
         self.deps
             .epochs
@@ -931,12 +975,21 @@ impl Driver {
                     msg: PeerMsg::DelegateStream { req, gen, txs },
                 }))
             }
-            SyncRequest::PeerDelegRenew { from, gen, reply } => {
+            SyncRequest::PeerDelegRenew {
+                from,
+                gen,
+                backup,
+                reply,
+            } => {
                 let req = self.control_id();
                 self.deleg_renew_replies.insert(req, reply);
                 Some(Internal::Event(Event::Peer {
                     from,
-                    msg: PeerMsg::DelegRenew { req, gen },
+                    msg: PeerMsg::DelegRenew {
+                        req,
+                        gen,
+                        backup: (backup != 0).then_some(backup),
+                    },
                 }))
             }
             SyncRequest::PeerDelegRecall {
@@ -968,6 +1021,30 @@ impl Driver {
                     }));
                 });
                 None
+            }
+            SyncRequest::PeerDelegBackupAppend {
+                from,
+                gen,
+                txs,
+                reply,
+            } => {
+                let req = self.control_id();
+                self.deleg_backup_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from,
+                    msg: PeerMsg::DelegBackupAppend { req, gen, txs },
+                }))
+            }
+            SyncRequest::PeerDelegSeal { root, gen, reply } => {
+                let req = self.control_id();
+                self.deleg_seal_replies.insert(req, reply);
+                Some(Internal::Event(Event::Peer {
+                    from: root,
+                    msg: PeerMsg::DelegSeal { req, gen },
+                }))
+            }
+            SyncRequest::SyncDesignations { entries } => {
+                control(Control::SyncDesignations { entries }, ControlReply::None)
             }
             SyncRequest::Delegate { dir, node, reply } => {
                 control(Control::Delegate { dir, node }, ControlReply::Text(reply))
@@ -1313,8 +1390,7 @@ impl Driver {
                     payload,
                 } => {
                     let peers = self.deps.peers.clone();
-                    let designations = self.deps.designations.clone();
-                    let meta = self.deps.meta.clone();
+                    let _ = &payload;
                     tokio::spawn(async move {
                         // Plan 30 §M7: a hint only. The segment reaches the
                         // holder's subscribers on their log streams (over
@@ -1323,9 +1399,6 @@ impl Driver {
                         // parties — never carries log content, sealed or
                         // not.
                         peers.announce_segment(PARTITION, seq, epoch).await;
-                        if let Ok(seg) = constellation_authority::segment::decode(&payload) {
-                            verify_flush_acks(&designations, &meta, seq, &seg.records).await;
-                        }
                     });
                 }
                 Action::ConflictCopy {
@@ -1490,6 +1563,121 @@ impl Driver {
                     let _ = tx.send(through);
                 }
             }
+            PeerMsg::DelegBackupAck {
+                req, acked, sealed, ..
+            } => {
+                if let Some(tx) = self.deleg_backup_replies.remove(&req) {
+                    let _ = tx.send((acked, sealed));
+                }
+            }
+            PeerMsg::DelegSealed {
+                req, sealed, txs, ..
+            } => {
+                if let Some(tx) = self.deleg_seal_replies.remove(&req) {
+                    let _ = tx.send((sealed, txs));
+                }
+            }
+            PeerMsg::DelegBackupAppend { req, gen, txs } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let from = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().forward_timeout_ms * 4);
+                let bytes = postcard::to_allocvec(&txs).unwrap_or_default();
+                if crate::fault::p2p_denied(to) {
+                    let _ = tx.send(Internal::Event(Event::PeerFailed {
+                        req,
+                        to,
+                        outage: true,
+                    }));
+                    return;
+                }
+                tokio::spawn(async move {
+                    let payload = Payload::DelegBackupAppend {
+                        from,
+                        req_id: req.0,
+                        gen,
+                        txs: bytes,
+                    };
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::DelegBackupAck {
+                            req_id,
+                            gen,
+                            acked,
+                            sealed,
+                        })) if req_id == req.0 => {
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::DelegBackupAck {
+                                    req,
+                                    gen,
+                                    acked,
+                                    sealed,
+                                },
+                            }));
+                        }
+                        _ => {
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
+            }
+            PeerMsg::DelegSeal { req, gen } => {
+                let tx = self.int_tx.clone();
+                let peers = self.deps.peers.clone();
+                let root = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().forward_timeout_ms * 4);
+                if crate::fault::p2p_denied(to) {
+                    let _ = tx.send(Internal::Event(Event::PeerFailed {
+                        req,
+                        to,
+                        outage: true,
+                    }));
+                    return;
+                }
+                tokio::spawn(async move {
+                    let payload = Payload::DelegSeal {
+                        root,
+                        req_id: req.0,
+                        gen,
+                    };
+                    let reply = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
+                    match reply {
+                        Ok(Ok(Payload::DelegSealed {
+                            req_id,
+                            gen,
+                            sealed,
+                            txs,
+                        })) if req_id == req.0 => {
+                            let txs = postcard::from_bytes(&txs).unwrap_or_default();
+                            let _ = tx.send(Internal::Event(Event::Peer {
+                                from: to,
+                                msg: PeerMsg::DelegSealed {
+                                    req,
+                                    gen,
+                                    sealed,
+                                    txs,
+                                },
+                            }));
+                        }
+                        _ => {
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
+                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                        }
+                    }
+                });
+            }
             PeerMsg::DelegateStream { req, gen, txs } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
@@ -1534,13 +1722,14 @@ impl Driver {
                             }));
                         }
                         _ => {
-                            let outage = !peers.connection_alive(to).await;
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                             let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                         }
                     }
                 });
             }
-            PeerMsg::DelegRenew { req, gen } => {
+            PeerMsg::DelegRenew { req, gen, backup } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
                 let from = self.node_id;
@@ -1558,6 +1747,7 @@ impl Driver {
                         from,
                         req_id: req.0,
                         gen,
+                        backup: backup.unwrap_or(0),
                     };
                     let reply = tokio::time::timeout(
                         timeout,
@@ -1576,7 +1766,8 @@ impl Driver {
                             }));
                         }
                         _ => {
-                            let outage = !peers.connection_alive(to).await;
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                             let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                         }
                     }
@@ -1618,7 +1809,8 @@ impl Driver {
                             }));
                         }
                         _ => {
-                            let outage = !peers.connection_alive(to).await;
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                             let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                         }
                     }
@@ -1639,6 +1831,7 @@ impl Driver {
                 let peers = self.deps.peers.clone();
                 let requester = self.node_id;
                 let timeout = Duration::from_millis(self.core.config().forward_timeout_ms);
+                let denied = crate::fault::p2p_denied(to);
                 tokio::spawn(async move {
                     let payload = Payload::ReadIndex {
                         requester,
@@ -1647,6 +1840,16 @@ impl Driver {
                         dir,
                         name,
                     };
+                    if denied {
+                        // Fault injection: the link to this peer is cut —
+                        // a connection failure, at once.
+                        let _ = tx.send(Internal::Event(Event::PeerFailed {
+                            req,
+                            to,
+                            outage: true,
+                        }));
+                        return;
+                    }
                     let reply = tokio::time::timeout(
                         timeout,
                         peers.request_to_node_timeout(to, &payload, timeout),
@@ -1686,7 +1889,8 @@ impl Driver {
                             }));
                         }
                         _ => {
-                            let outage = !peers.connection_alive(to).await;
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                             let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                         }
                     }
@@ -1701,6 +1905,7 @@ impl Driver {
                 let timeout = Duration::from_millis(
                     self.core.config().read_delegation_ttl_ms + self.core.config().expiry_margin_ms,
                 );
+                let denied = crate::fault::p2p_denied(to);
                 tokio::spawn(async move {
                     let payload = Payload::ReadRecall {
                         holder,
@@ -1708,6 +1913,16 @@ impl Driver {
                         ino,
                         grant,
                     };
+                    if denied {
+                        // Fault injection: the link to this peer is cut —
+                        // a connection failure, at once.
+                        let _ = tx.send(Internal::Event(Event::PeerFailed {
+                            req,
+                            to,
+                            outage: true,
+                        }));
+                        return;
+                    }
                     let reply = tokio::time::timeout(
                         timeout,
                         peers.request_to_node_timeout(to, &payload, timeout),
@@ -1721,7 +1936,8 @@ impl Driver {
                             }));
                         }
                         _ => {
-                            let outage = !peers.connection_alive(to).await;
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                             let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                         }
                     }
@@ -1754,6 +1970,7 @@ impl Driver {
                 let deps_bytes = deps.to_postcard();
                 let timeout = Duration::from_millis(self.core.config().forward_timeout_ms);
                 let requester = self.node_id;
+                let denied = crate::fault::p2p_denied(to);
                 let op_bytes = match op.to_postcard() {
                     Ok(b) => b,
                     Err(_) => {
@@ -1782,6 +1999,16 @@ impl Driver {
                         deps: deps_bytes,
                     };
                     let started = std::time::Instant::now();
+                    if denied {
+                        // Fault injection: the link to this peer is cut —
+                        // a connection failure, at once.
+                        let _ = tx.send(Internal::Event(Event::PeerFailed {
+                            req,
+                            to,
+                            outage: true,
+                        }));
+                        return;
+                    }
                     let reply =
                         tokio::time::timeout(timeout, peers.request_to_node(to, &payload)).await;
                     tracing::trace!(
@@ -1852,7 +2079,8 @@ impl Driver {
                             forward.record_err();
                             // Round 3a/4's rule: an outage only with no
                             // open connection left to the holder.
-                            let outage = !peers.connection_alive(to).await;
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                             let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                         }
                     }
@@ -1863,11 +2091,22 @@ impl Driver {
                 let peers = self.deps.peers.clone();
                 let requester = self.node_id;
                 let timeout = Duration::from_millis(self.core.config().handoff_request_timeout_ms);
+                let denied = crate::fault::p2p_denied(to);
                 tokio::spawn(async move {
                     let payload = Payload::LeaseRequest {
                         part: PARTITION.to_string(),
                         requester,
                     };
+                    if denied {
+                        // Fault injection: the link to this peer is cut —
+                        // a connection failure, at once.
+                        let _ = tx.send(Internal::Event(Event::PeerFailed {
+                            req,
+                            to,
+                            outage: true,
+                        }));
+                        return;
+                    }
                     let reply = tokio::time::timeout(
                         timeout,
                         peers.request_to_node_timeout(to, &payload, timeout),
@@ -1894,7 +2133,8 @@ impl Driver {
                             }));
                         }
                         _ => {
-                            let outage = !peers.connection_alive(to).await;
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                             let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                         }
                     }
@@ -2019,7 +2259,8 @@ impl Driver {
                             }));
                         }
                         _ => {
-                            let outage = !peers.connection_alive(to).await;
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                             let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                         }
                     }
@@ -2103,7 +2344,8 @@ impl Driver {
                             }));
                         }
                         _ => {
-                            let outage = !peers.connection_alive(to).await;
+                            let outage =
+                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                             let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                         }
                     }
@@ -2194,7 +2436,7 @@ impl Driver {
                         %error,
                         "could not open the holder's log stream"
                     );
-                    let outage = !peers.connection_alive(to).await;
+                    let outage = crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                     let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                     return;
                 }
@@ -2451,51 +2693,6 @@ impl Uploader {
         )
         .await
         .map(|_| ())
-    }
-}
-
-/// Offline designation flush-ack (DESIGN.md §5.2): for every shipped
-/// record touching a path designated to another node, wait (bounded) for
-/// the designee's ack. Best effort: the segment is already durable.
-async fn verify_flush_acks(
-    designations: &crate::designation::DesignationManager,
-    meta: &Meta,
-    seq: u64,
-    records: &[LogRecord],
-) {
-    let mut checked: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for rec in records {
-        let dir = match rec {
-            LogRecord::Mkdir { parent, .. }
-            | LogRecord::Create { parent, .. }
-            | LogRecord::Symlink { parent, .. }
-            | LogRecord::Mknod { parent, .. }
-            | LogRecord::Link { parent, .. }
-            | LogRecord::Unlink { parent, .. }
-            | LogRecord::Rmdir { parent, .. }
-            | LogRecord::Rename { parent, .. } => Some(*parent),
-            LogRecord::Setattr { ino, .. } | LogRecord::WriteManifest { ino, .. } => {
-                meta.parent_of(*ino).ok().flatten()
-            }
-            _ => None,
-        };
-        let Some(dir) = dir else {
-            continue;
-        };
-        let Ok(path) = meta.path_of(dir) else {
-            continue;
-        };
-        if !checked.insert(path.clone()) {
-            continue;
-        }
-        if !designations.await_flush_ack(&path, PARTITION, seq).await {
-            tracing::warn!(
-                seq,
-                path,
-                "designee did not ack this flush within the bound; the write is durable in S3 \
-                 but the designee's view may lag briefly"
-            );
-        }
     }
 }
 

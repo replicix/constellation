@@ -17427,3 +17427,693 @@ None — every gate passed without needing a code change.
 | 4: harness (M11 + write-path + regressions + chaos) | PASSED (1 non-mechanical flake, see above) |
 | 5: smoke + pjdfstest | PASSED (8798/8798) |
 | 6: perf vs. main | PASSED (all 3 configs within 5–10%) |
+
+## Plan 30 M11 — phase 2b (coder, 2026-09-25)
+
+Worktree `/home/bra/cvs/constellation-m11b`, branch `plan30-m11b`: main
+`b292e5c` + WIP `8655ee0` (the 2a tree, untouched) + this phase,
+uncommitted. Scope: automatic placement, designations as delegations,
+root failover with live delegates, delegate backups (`ack=s3`, M8 strict
+reads under a delegation), re-delegation after a cross-subtree op, the
+`long_delegated` soak, the M12 notes.
+
+### What was built
+
+- **Automatic placement** (`crates/authority/src/core/placement.rs`,
+  ADR-15 generalized). The root counts every op's `(directory, origin
+  node)` in a bucketed sliding window (its own, forwarded and streamed
+  ops — a streamed transaction counts for its `rid`'s node, not the
+  delegate), rolls the counts up to ancestors at each tick and delegates
+  the *topmost* directory below the root one node dominates
+  (`placement_dominance_pct` 70 % of at least `placement_min_ops` 200
+  ops in `placement_window_ms` 30 s), to a connected, write-eligible,
+  non-root node with no delegation yet. A placed generation
+  (`DelegKind::Placed`) is recalled when its delegate's share stayed
+  below `placement_leave_pct` 50 % (or the subtree's rate below half the
+  floor) for `placement_dwell_ms` 60 s; the directory then cools down
+  for `placement_cooldown_ms` 30 s. Manual delegations and designations
+  are never touched. Counters `place_evaluations / place_delegated /
+  place_recalled / place_skipped_cooldown / place_skipped_unreachable`
+  and `status.delegation.placement` = the busiest subtrees
+  `(dir, node, node_ops, subtree_ops)` (M12's input). The root directory
+  is never placed. **Opt-in for now**: `CONSTELLATION_DELEGATION_PLACEMENT=1`
+  (default off in the CLI and the core `Config`; the sim's
+  `placement_core_config` turns it on) — on, a dominant writer's subtree
+  moves by itself, which changes the S3 request pattern of every
+  multi-node run; M12 flips the default once the hash-range split
+  exists. Knobs: `CONSTELLATION_DELEGATION_WINDOW_MS / _MIN_OPS /
+  _DOMINANCE / _LEAVE / _DWELL_MS / _COOLDOWN_MS`.
+- **Designations as delegations** (plans 03–05). `net/delegation.rs`,
+  the `DelegationRequest/DelegationGrant/FlushAck` payloads, the
+  granter/holder/flush-ack machinery and the FUSE designation gates are
+  gone. `node_runtime`'s 10 s refresh sends `SyncDesignations` to the
+  core; the root turns a live write designation into a designated
+  generation (`LogRecord::Delegate { designated: true }`, `DelegKind::Designated`)
+  to its designee, recalling a non-designated delegation covering the
+  directory first, and recalls it when the designation is released
+  (`online`). A designated generation never expires (the delegate's
+  `until` is unbounded, the root arms no expiry, the placement skips it)
+  and is never recalled for an op: an op wholly under an unreachable
+  designation is refused `EROFS`, a cross-subtree op involving one
+  `EXDEV` (`RecallPlan::Refuse`, `refused_designated`), on every path
+  (forwarded, local, inbox). The designee writes while isolated
+  (DESIGN.md §5.2).
+- **Root failover with live delegates.** The successor rebuilds its
+  generation state from the log's table (`deleg_inherited`), with a
+  cursor from the *log's* stream index — a new persisted `deleg_log_idx`
+  per generation raised by segment origins and by the root's own
+  appends, never by a shadow (a forwarded op's reply raised
+  `stream_applied` past what the predecessor appended: seeds 66025/66027
+  skipped the delegate's re-streamed transactions and executed later ops
+  first) — and honours each grant for `reclaim_horizon` (`delegation_ttl
+  + expiry_margin`; the read-delegation term was dropped: every read grant
+  a delegate makes is capped by its own `until` less the margin). The
+  delegates re-stream every unretired transaction when `root_node()`
+  changes (`deleg_restreams`); the root deduplicates by cursor and rid.
+  Generation numbers are allocated above the highest the log ever named
+  (`DelegationTable::max_gen`, persisted in the table row): a successor
+  reused its predecessor's numbers (seed 66009). A generation a
+  predecessor delegated to the successor itself ends at once. Inside the
+  takeover gate the inbox drain leaves any op under a live delegation
+  (per the table) in the inbox, and the table is synced before anything
+  queued behind the takeover executes (seeds 66001/66025/66027: the
+  successor executed ops under an inherited delegation before recalling
+  it). The M9 marker bound adds `reclaim_horizon_ms` while the table is
+  non-empty. Composes with M9 seal failover (harness
+  `root-failover-with-delegates`: a backup takes over 1.5 s after the
+  kill, 1866 acknowledged writes across it) and M10 epochs (sim
+  `delegated-epoch`).
+- **Delegate backups.** A delegate picks a backup by M9's candidate rule
+  (a LAN peer in budget, not the root) and tells the root at once
+  (a renewal carries `backup`; the root learns a newly chosen backup
+  before the next timer). `DelegBackupAppend { gen, txs }` persists the
+  transactions in the M9 `backup_tail` keyspace under the epoch
+  `DELEG_BACKUP_BASE + gen`; `DelegBackupAck { acked, sealed }`. With a
+  backup (or `ack=s3`) the fast path is gated (`DelegateView.gated`) and
+  every acknowledgement waits (`park_stream_need`) until the backup acked
+  the index (or, for `ack=s3`, the root's segment carries it:
+  `delegate_tx_pending`). On a silent delegate with a backup the root
+  seals it first (`DelegSeal` → `DelegSealed { sealed, txs }`,
+  `RecallPhase::Sealing`), appends the tail (`sealed_drained`), ends the
+  generation and delegates the directory to the backup (unless
+  designated). The sim's `delegated-backup-crash` cuts the root from the
+  delegate 300 ms before the crash so the backup's tail is exactly what
+  the root lacks. Harness `delegate-crash-backup`: sealed 3.8 s after
+  the kill, `d1` moved to the backup, which then writes locally.
+- **M8 strict reads under a delegation.** A strict read of a key under a
+  delegation asks the *delegate* (the reader's `read_route`, and the
+  holder's own `on_read_index_control` too — the root's replica trails
+  the delegate's stream); the delegate answers with its position
+  including `(gen, stream_applied)` and grants read delegations under
+  epoch `DELEG_READ_EPOCH_BASE + gen`, voided when the generation ends
+  (`ReadDelegations::void_epoch`). Before executing, a delegate recalls
+  the read delegations it granted on what the op touches (the holder's
+  rule, `recall_needed`); the delegate recalls all its grants before
+  answering `DelegRecalled`. A root answering a `ReadIndex` for keys
+  under another node's live delegation redirects (`NotHolder { holder:
+  delegate }`, never a grant); a redirect to a delegate is a route, not
+  the lease holder. Read keys are the write keys (a lookup is its
+  dentry; the directory's own inode resolves by its parent).
+- **Re-delegation after a cross-subtree op**: the generations a
+  cross-subtree op ended are granted again to the same nodes once the op
+  ran (`deleg_redelegated`; waits while any execution is still parked).
+- **Robustness found by the soaks** (all fixed here): a stream batch,
+  backup append or renewal lost without a transport failure (a partition
+  that drops silently) is re-sent after `forward_timeout` (a delegate
+  waited forever, seed 69008); a refused stream backs off and retries
+  instead of stopping for good (a successor refuses before its table is
+  built); a delegate's first renewal is retried when the holder is not
+  known yet or the renewal was dropped (`long-delegated` 70067: reclaimed
+  unrenewed); a root that loses its lease (deposed, released, handed
+  off, epoch closed) aborts every execution parked on its recalls (a
+  local op takes the lease path, a forwarded one is answered `Busy`; seed
+  64008 hung); a redirect to a delegate only while its grant is fresh
+  and the link up (else recall/refuse; the designation harness) and a
+  delegate's own early op is `Held`, not redirected to itself; a
+  successor root that was itself the delegate of an inherited generation
+  ends it (seed 66000 looped on its own parked op); a delegate's
+  stranded transaction keeps its rid's `completed` row when the log
+  carries the outcome (a segment-applied row records position 0; the
+  requester's own replay landed first: seeds 63000, 70039/70075/70078 —
+  a dedup reply installed a shadow nothing retired); the M9 pre-S3 stream
+  skips a transaction whose completion this replica already holds (seed
+  68018). The harness fault injection now cuts every P2P request
+  (`p2p_denied` on forwards, lease requests, read indexes, recalls; a
+  denied peer is a link that is down, and a denied request fails at once
+  as an outage), which is what makes the partition scenarios real.
+
+### Model
+
+`crates/model/src/delegation.rs` gained designations (`designated`
+pairs, `designations_expire`, `designated_gens`,
+`Violation::DesignationStranded`, property `designation_final`; a
+designee's grant never lapses, `RecallTimeout` is not enabled for a
+designated generation). Tests (release, ≤ 60 s each):
+`reclaiming_a_designation_forks_the_designee` (the naive rule — expire
+a designation like any grant — is refuted by a 4-step counterexample),
+`design_designee_writes_survive_isolation`,
+`design_root_failover_with_a_designation`; root failover with a live
+delegate, delegate crash with a backup and re-delegation after a timed-out
+recall are the existing clean configs
+(`design_root_failover_with_a_live_delegate`,
+`design_delegate_crash_with_backup_keeps_every_durable_ack`). `cargo test
+-p constellation-model --release`: green.
+
+### Results
+
+- Sim (`crates/authority/tests/sim.rs`, six new tests: `delegated_root_failover_keeps_every_ack`
+  66000..66030, `delegated_backups_gate_acknowledgements` 67000..67020,
+  `delegated_delegate_crash_drains_the_backup` 68000..68020,
+  `delegated_designation_is_never_reclaimed` 69000..69020,
+  `delegated_placement_delegates_dominated_subtrees` 70500..70520,
+  `delegated_strict_reads_are_served_by_the_delegate` 71000..71020; the
+  `delegated` set is 320 seeds): every seed of every `delegated*`
+  configuration passes with the final binary (a per-seed sweep,
+  `AUTHORITY_SIM_CONFIG=<label> AUTHORITY_SIM_SEED=<n>`), and the soak
+  `long_delegated` (`AUTHORITY_SIM_SEEDS=100`, random faults, 2 % drops,
+  marker pairs) 100/100. The sim's `NsRet::Erofs` accepts `EROFS`/`EXDEV`
+  as no-effect refusals; a quiescence failure now prints each node's
+  unshipped journal, held summary, speculation counts and live
+  speculation entries.
+- `cargo test -p constellation-authority --release` (61 core + 3
+  meta_repro + 67 sim, 7 ignored), `cargo test --workspace --release`
+  (every other crate), `cargo clippy --workspace --all-targets --release
+  -- -D warnings`, `cargo fmt --all -- --check`: green (see the tester's
+  run for the reference numbers).
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m11bfable`,
+  the release binary), one batch: `delegated-subtrees`,
+  `cross-subtree-rename`, `delegate-crash`, `marker-order`,
+  `delegate-partition`, `p2p-off-no-delegation`,
+  `root-failover-with-delegates`, `delegate-crash-backup`,
+  `auto-placement`, `designation-as-delegation`, `single-node-unchanged`:
+  ALL PASSED (the batch is about four minutes).
+
+### Measurements (three nodes on one host, the final batch)
+
+- `delegated-subtrees`: S3 PUTs single sequencer 1217 vs delegated 1153
+  (log PUTs 654 vs 596, chunk PUTs [100, 200, 200] both ways: one chunk
+  PUT per file everywhere, the delegates make no request for their
+  writes); b forwarded p50 2.9 ms / c forwarded 2.7 ms vs b local 2.3 ms /
+  c local 2.5 ms; a (root) local 1.6 ms vs 2.5 ms — unchanged shape
+  against 2a.
+- `delegate-crash-backup`: b's writes under a backup p50 2.4 ms p99 23 ms
+  (every ack parked for the backup: 80 appends, 80 acks); sealed 3.8 s
+  after the kill; c as the new delegate p50 1.6 ms.
+- `root-failover-with-delegates`: the backup holds 1.5 s after the kill;
+  1866 acknowledged writes across the failover, 2 generations inherited,
+  1 re-stream, no conflict.
+- `auto-placement`: `d1` placed on the dominant writer 4.2 s after it
+  started (a 4 s window); after the writer changed, recalled 6.2 s later
+  (a 4 s dwell) and placed on the new one 8.2 s after the change (a 2 s
+  cool-down); 2 placements, 1 recall over 140 evaluations.
+- `designation-as-delegation`: the designee's local writes p50 1.6 ms;
+  forwarded writes into it from c 3.9 ms, from the root 1.5 ms; isolated
+  designee still 1.6 ms while c gets `EROFS`; after `online` c through
+  the root 2.7 ms.
+- `single-node-unchanged`: 200 writes p50 1.5 ms, 625 S3 requests (PUT
+  340, GET 245, LIST 2) — the single-node request count is unchanged.
+
+### Decisions
+
+- Placement is opt-in (`CONSTELLATION_DELEGATION_PLACEMENT=1`) until M12:
+  default-on would silently change the S3 request pattern and the
+  latency shape of every multi-node run (the 2a scenarios failed the
+  moment it was on: their "single sequencer" phases got delegated).
+- The reclaim horizon is `delegation_ttl + expiry_margin` only; read
+  grants under a delegation are capped by the delegate's own grant.
+- A successor root's cursor is the log's index, never a shadow's; the
+  delegate re-streams from the log's index too.
+- Generation numbers are global (`max_gen` in the table row).
+- A designation is refused (`EROFS`/`EXDEV`), never recalled, and never
+  placed over; the placement never places the root directory.
+- The harness fault injection cuts every P2P request and reports the
+  link down: `delegate-partition` and `designation-as-delegation` need a
+  real cut (the 2a `delegate-partition` "over S3" path was in fact a
+  forward that the deny did not cover).
+
+### M12 (GIGA+-style hash-range splitting of hot shared directories)
+
+- Trigger: `status.delegation.placement` reports, per busiest subtree,
+  `(dir, dominant node, its ops, subtree ops)`; a directory whose
+  subtree is *hot* (above the rate floor) but has *no* dominant node
+  (the dominant share below `placement_dominance_pct` while several nodes
+  write) is a shared directory the placement will never move — that is
+  M12's split candidate. M12 needs from 2b: the per-directory,
+  per-node counts of the window (already kept, `PlacementState::per_dir`)
+  exposed with the share vector, not just the top node; the window's
+  length in ops so the split decision uses the same floor; and the
+  cool-down map so a freshly recalled directory is not split at once.
+- Design: split a hot shared directory's *name space* into hash ranges
+  (GIGA+: a directory index bitmap, ranges doubling as they split), each
+  range delegated as its own generation to the node dominating that
+  range (the placement's dominance rule per range); the table entry
+  becomes `(dir, range, node, gen)` and `resolve_ownership` hashes the
+  dentry name into the range; a cross-range rename inside the directory
+  is a cross-subtree op (recall both ranges) — the same machinery as
+  today. Readdir merges the ranges (each delegate's stream carries its
+  range's entries; the root's replica has them all once appended).
+- Not needed from 2b: any change to the stream, the deps or the void
+  rule — a range generation is a generation.
+
+### What the tester must run
+
+- `cargo test -p constellation-model --release`
+- `cargo test -p constellation-authority --release` (the sim, 67 tests;
+  the six 2b tests are 20–30 seeds each), then the soak:
+  `AUTHORITY_SIM_SEEDS=100 cargo test -p constellation-authority --release
+  --test sim -- --ignored long_delegated` (about six minutes on 4 threads).
+- `cargo test --workspace --release`, `cargo clippy --workspace
+  --all-targets --release -- -D warnings`, `cargo fmt --all -- --check`.
+- `cargo build --release --workspace`, then with
+  `CONSTELLATION_BIN=target/release/constellation` and a private
+  `CONSTELLATION_HARNESS_DOCKER_PREFIX`: `target/release/harness run
+  delegated-subtrees cross-subtree-rename delegate-crash marker-order
+  delegate-partition p2p-off-no-delegation root-failover-with-delegates
+  delegate-crash-backup auto-placement designation-as-delegation
+  single-node-unchanged` (about four minutes), plus the M9/M10/M13 and
+  chaos batches as in the 2a run (the driver's fault injection and the
+  strand/complete bookkeeping changed under them).
+- Perf A/B against main as in the 2a run: the single-node and the
+  3-node p2p-on numbers must be within the band; the S3 request counts
+  of `single-node-unchanged` and `delegated-subtrees` are above.
+
+### Known gaps
+
+- The placement is per whole directory: a hot directory shared by
+  several writers is never delegated (M12).
+- A delegate with a backup gates its fast path; the backup's ack is on
+  the write's latency (p99 23 ms in the measurement) — the M9 streaming
+  of appends to the backup ahead of the ack is not done for delegates.
+- A designation's designee cut from the root keeps writing forever by
+  design; its writes reach the log only after the heal (the witnessed
+  check of the sim is aware: `Erofs` is a no-effect refusal).
+
+## Plan 30 M11 — phase 2b tester gate run
+
+Ran the full tiered gate list against `/home/bra/cvs/constellation-m11b`
+(branch `plan30-m11b`, main `578ff9c` = phase 2a committed, + this
+phase's uncommitted work). No mechanical fixes were needed. No commits
+made. **Two non-mechanical, high-confidence findings below** (a
+correctness regression in the delegate write path under recall/
+re-delegation, and a long-soak timing anomaly); everything else is
+green.
+
+### Gate 1 — fmt, clippy, workspace tests
+
+- `cargo fmt --all -- --check`: clean. `cargo clippy --workspace
+  --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --release`: 49 test-result blocks, all `ok`,
+  0 failures.
+- `constellation-model`'s `delegation.rs` isolated (`--test-threads=1`,
+  `/usr/bin/time -v`): **20 passed, 1 ignored, 14.95 s test time
+  (21.0 s wall with cargo overhead), 395 MB peak RSS** — well inside
+  the 60 s / 2 GB budget (2a's own isolated number was 385 MB / 14.9 s;
+  2b added three more model tests for designations and stayed flat).
+
+### Gate 2 — authority crate, long sweeps
+
+- `cargo test -p constellation-authority --release`: 61 core + 3
+  meta_repro + 60/67 sim (7 ignored) — matches the phase-2b coder's own
+  count, including all twelve `delegated_*` sim tests (the six from 2a
+  plus 2b's `delegated_root_failover_keeps_every_ack`,
+  `delegated_backups_gate_acknowledgements`,
+  `delegated_delegate_crash_drains_the_backup`,
+  `delegated_designation_is_never_reclaimed`,
+  `delegated_placement_delegates_dominated_subtrees`,
+  `delegated_strict_reads_are_served_by_the_delegate`).
+- `AUTHORITY_SIM_SEEDS=1000 ... long_random`: **PASSED** (55.94 s).
+- `AUTHORITY_SIM_SEEDS=500 ... long_strict`: **PASSED** (28.76 s).
+- `AUTHORITY_SIM_SEEDS=300 ... long_backup`: **PASSED** (18.58 s;
+  `failover n=236 p50=1211ms p90=2670ms max=9559ms`, identical
+  distribution to 2a's run — unaffected by 2b).
+- `AUTHORITY_SIM_SEEDS=300 ... long_flex`: **PASSED** (29.55 s).
+
+**Non-mechanical finding: `AUTHORITY_SIM_SEEDS=100 ... long_delegated`
+timed out once, then passed 3/3 on rerun.** First attempt: `timeout 600`
+killed it (exit 124) after the process ran at a steady ~100% CPU (one
+core) for the full 600 s while its RSS climbed roughly linearly from
+~2 GB to 6.3+ GB and never plateaued — i.e. it was doing real work the
+whole time, not stalled (no futex/`wchan` hang signature; this is a
+`--nocapture` sim test binary, not a live mount, so the taskdump
+procedure in the debugging-hangs memory doesn't apply here — there is
+nothing to `ptrace` differently, and the process was never idle).
+Three immediate reruns of the identical binary and env
+(`AUTHORITY_SIM_SEEDS=100 cargo test -p constellation-authority --release
+--test sim -- --ignored long_delegated --nocapture`) each **PASSED
+cleanly in ~8 s** (8.12 s, 8.01 s, 7.91 s; 100/100 seeds every time,
+`M11Totals` roughly identical each run). A/B against main `578ff9c`
+(built in a scratch detached worktree, removed after): main's own
+`long_delegated` test (same test name/shape, pre-existing since 2a, was
+2a's stated "known gap" — never actually run to green) **fails
+deterministically in <0.7 s on all 4 attempts**, at seed 70003, with a
+real assertion (`commit 3 by node 1 is not the log prefix at 24:
+inode ... only on the left; dentry .../m1-1-marker only on the left`)
+— so main cannot supply a timing baseline here (it never gets past
+seed 70003) and evidently 2b's coder fixed that bug along the way (2b's
+own notes list several `long-delegated`-found fixes). The one 2b
+timeout is therefore not explained by anything pre-existing; it is
+reported as-is — a real, unreproduced (1-in-4) multi-minute stall/
+slowdown with unbounded-looking memory growth in a passing (not merely
+flaky-failing) test — for the coordinator to judge whether it warrants
+a deeper look.
+
+### Gate 3 — release build
+
+- `cargo build --release --workspace`: clean, 37.4 s incremental.
+
+### Gate 4 — harness
+
+All runs used `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m11`
+and `CONSTELLATION_BIN=/home/bra/cvs/constellation-m11b/target/release/constellation`,
+foreground, `timeout`-wrapped. A few `/tmp/harness-*` directories seen
+during this run belonged to a **concurrent, independent session**
+building `/home/bra/cvs/constellation-m12` (`plan30-m12`) — verified via
+`/proc/<pid>/exe` before assuming anything, per the safety rule — and
+were left untouched; nothing of mine was left behind.
+
+**11-scenario M11 batch** (`root-failover-with-delegates` and
+`auto-placement` ×3 each, one invocation):
+
+| scenario | result |
+|---|---|
+| `delegated-subtrees` | PASSED, 7.3 s |
+| `cross-subtree-rename` | **FAILED**, 43.5 s |
+| `delegate-crash` | PASSED, 8.0 s |
+| `marker-order` | PASSED, 15.4 s |
+| `delegate-partition` | PASSED, 15.6 s |
+| `p2p-off-no-delegation` | PASSED, 7.0 s |
+| `root-failover-with-delegates` ×3 | PASSED, PASSED, PASSED (42.9 s, 22.7 s, 20.1 s) |
+| `delegate-crash-backup` | PASSED, 16.2 s |
+| `auto-placement` ×3 | **FAILED**, PASSED, PASSED (17.0 s, 22.3 s, 21.7 s) |
+| `designation-as-delegation` | PASSED, 22.2 s |
+| `single-node-unchanged` | PASSED, 2.8 s |
+
+**Non-mechanical finding (high confidence): `cross-subtree-rename` and
+`auto-placement` fail frequently, both with the identical signature
+`Input/output error (os error 5)` writing a background file, and this
+is absent on main.**
+
+- `cross-subtree-rename`: failed above (`writing .../b/mnt/d1/bg-115:
+  Input/output error (os error 5)`, 43.5 s). Reran 3× more
+  (`harness run cross-subtree-rename cross-subtree-rename
+  cross-subtree-rename`): **FAILED** (43.6 s, `.../c/mnt/d2/bg-86` EIO),
+  **PASSED** (43.8 s), **FAILED** (43.4 s, `.../c/mnt/d2/bg-155` EIO).
+  Combined: **3 of 4 runs failed (75%)**, and even the one passing run
+  took 43.8 s — every run, pass or fail, took ~43–44 s.
+  A/B against main `578ff9c` (scratch detached worktree, removed after):
+  **5 of 5 runs PASSED**, each in **4.3–4.8 s** — no EIO ever, and
+  roughly 9–10× faster than every 2b run regardless of 2b's outcome.
+  This is a clear, reproducible regression introduced somewhere in
+  2b's write path (delegate backups / placement / root-failover
+  inheritance / re-delegation-after-cross-subtree-op — the tester did
+  not root-cause which), not a flake or host noise.
+- `auto-placement`: failed above (`b executed nothing as the placed
+  delegate`, its own `status.delegation` all zeros, 17.0 s). Reran 3×
+  more: **PASSED** (23.0 s), **FAILED** (11.7 s, same "b executed
+  nothing as the placed delegate" signature), **FAILED** (93.6 s,
+  `writing .../c/mnt/d1/c-272: Input/output error (os error 5)` — the
+  *same* EIO signature as `cross-subtree-rename` above). Combined:
+  **3 of 6 runs failed (50%)**, in two distinct failure shapes (a
+  placement that never executes anything, and the shared EIO). This
+  scenario is new in 2b (no main equivalent to A/B), but sharing the
+  exact EIO string with the confirmed `cross-subtree-rename` regression
+  strongly implicates the same underlying 2b code path.
+
+The plans-03–05 batch, M9/M10/M13 batch, and chaos/regression batch all
+passed cleanly:
+
+- `continuation-epoch`, `epoch-member-lost`, `node-leave`: **ALL
+  PASSED** (15.8 s, 6.6 s, 43.3 s). (`harness list` was searched for
+  "designation"/"pin"/"offline"; the only scenario named for those is
+  `designation-as-delegation` itself, already covered above — plans
+  03–05's dedicated coverage today is these three plus that one.)
+- `backup-failover`, `backup-departs`, `backup-partition`,
+  `ack-s3-failover`, `epoch-missing-node`, `epoch-holder-retired`,
+  `inbox-create-storm-p2p-off`, `inbox-sporadic-write-p2p-off`,
+  `inbox-requester-crash-mid-batch`, `inbox-holder-takeover-pending-batch`:
+  **ALL PASSED** (19.0 s, 8.6 s, 19.5 s, 6.7 s, 76.8 s, 62.7 s, 36.8 s,
+  63.5 s, 12.0 s, 7.8 s).
+- `chaos-ci`, `chaos-ci-strict`, `cto-strict`,
+  `session-ryw-after-holder-kill` ×3, `p2p-partition-tolerance`,
+  `p2p-same-identity-restart`, `kill9-remount`, `forwarded-mutations`,
+  `holder-ships-under-forward-load`, `baseline`, `git-workflow`: **ALL
+  PASSED** (21.8 s, 2.8 s, 9.1 s, 13.2 s/13.3 s/9.8 s, 7.8 s, 10.8 s,
+  3.2 s, 1.9 s, 5.8 s, 3.2 s, 7.2 s) — `session-ryw-after-holder-kill`
+  was clean all 3 times here (2a's tester run saw a 1-in-9 flake on
+  this same scenario; not reproduced under 2b).
+- `chaos-soak-4`: **PASSED** in 313.9 s, `exactly_once_log` 3023
+  outcomes each once. One informational line (`close-to-open not
+  guaranteed (bounded mode): ... violations=4`) — the scenario's own
+  expected, tolerated bounded-mode note (same as 2a's run), not a
+  failure.
+
+### Gate 5 — smoke and pjdfstest
+
+- `tests/smoke.sh`: **PASSED** (the etag-CAS "unavailable/MISSING"
+  lines are the known `object_store` `LocalFileSystem` gap, not a
+  regression).
+- pjdfstest, default mount: host port 4566 held by the independent
+  `constellation-floci-1` container (confirmed via `docker ps`), so
+  used the scratchpad's `floci-no-port.yml` override under project
+  name `constellation-m11b-tester`. Result: **8798 passed, 0 failed,
+  empty baseline**. Torn down with `down -v` immediately after;
+  `constellation-floci-1` and the concurrent M12 session's own floci
+  containers were untouched throughout.
+
+### Gate 6 — perf, interleaved against main
+
+Built main `578ff9c` in a second scratch detached worktree (removed
+after), ran `harness meta-bench` filtered per label via
+`CONSTELLATION_METABENCH_ONLY`, interleaved 2b-then-main, 3 pairs per
+config:
+
+| config | 2b (3 runs, ops/s agg) | 2b avg | main (3 runs) | main avg | delta |
+|---|---|---|---|---|---|
+| `1node-create-lat0` | 1390, 4952, 4312 | 3551 | 1738, 4378, 3244 | 3120 | +13.8% |
+| `1node-write4k-lat0` | 1688, 1459, 1137 | 1428 | 1512, 965, 1054 | 1177 | +21.3% |
+| `3node-p2pon-shared-create-lat0` | 1237, 1445, 1135 | 1272 | 1838, 1471, 1585 | 1631 | −22.0% |
+
+All three exceed the nominal 5–10% band, but not consistently in one
+direction (2b measured *faster* on both single-node configs and
+*slower* on the 3-node config), and the intra-config spread on an
+otherwise-identical binary is enormous — `1node-create-lat0` swung
+1390→4952 ops/s (3.6×) across three back-to-back 2b runs, and main
+swung 1738→4378 the same way. `uptime` during the run showed load
+average 12–14 on this 32-core host (a concurrent, independent M12
+harness session was active throughout — confirmed via `ps`/`docker
+ps`), and this repo's own tester notes have repeatedly documented
+8–23%+ swings between identical binaries on this shared, non-idle
+sandbox. Given that plus the inconsistent direction, this reads as host
+noise rather than a real regression; it is not close to the confidence
+of the gate-4 EIO finding above. Recommend the coordinator re-run
+`meta-bench` on an idle host for the authoritative ±10% verdict; the
+numbers here are recorded for reference only.
+
+`delegated-subtrees` printed numbers (same batch as gate 4, one run):
+single-sequencer — b forwarded p50 2.69 ms, c forwarded p50 2.72 ms, a
+local p50 1.43 ms; b+c 200 files in 362 ms (553 files/s). Delegated —
+b local p50 1.84 ms, c local p50 1.85 ms, a local p50 1.45 ms; b+c 200
+files in 213 ms (**938 files/s**, vs 553 single-sequencer). S3 PUTs:
+single-sequencer 1165 vs delegated 1072; log PUTs 608→523; chunk PUTs
+unchanged [100, 200, 200] both ways. The in-scenario cross-subtree
+rename (distinct from the standalone `cross-subtree-rename` scenario
+above, and not exhibiting its EIO) returned in 1.49 ms.
+
+### Mechanical fixes made
+
+None.
+
+### Summary
+
+| Gate | Result |
+|---|---|
+| 1: fmt/clippy/workspace tests | PASSED |
+| 2: authority crate + long sweeps | PASSED (`long_delegated` soak: 1 unexplained timeout in 4 attempts, see evidence above) |
+| 3: release build | PASSED |
+| 4: harness | **`cross-subtree-rename` and `auto-placement` regress (75% / 50% failure rate, shared EIO signature, confirmed absent on main)**; everything else PASSED |
+| 5: smoke + pjdfstest | PASSED (8798/8798) |
+| 6: perf vs. main | Numbers recorded; exceeds 5–10% band but reads as host noise (inconsistent direction, 3.6× intra-config spread, non-idle host) — not conclusive either way |
+
+**For the coordinator:** gate 4's `cross-subtree-rename` / `auto-placement`
+finding is the one item here that looks like a real 2b defect rather
+than noise — same `os error 5` (`EIO`) string in both, both scenarios
+exercise the recall/re-delegation path that's new or changed in 2b
+(cross-subtree recall-and-drain, and placement's automatic
+delegate-then-recall cycle), and main does not exhibit it at all on 5/5
+tries while running ~9–10× faster. Worth the coder/coordinator's own
+look before this phase is called done.
+
+### round 2 re-verify
+
+Targeted re-verification of the coder's round 2 fixes (see "Plan 30
+M11 — phase 2b round 2" below): the held-forward-executes-locally fix
+for the `cross-subtree-rename`/`auto-placement` `EIO`, the delegation
+expiry re-arm plus parked-op abort for the `long_delegated` blow-up, and
+the gen-tagged queued replays for seed 70075. Same worktree, same
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m11`,
+foreground/`timeout`. No mechanical fixes needed; no commits.
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`: clean.
+- `cargo test -p constellation-authority --release`: 62 core (the new
+  `a_held_forward_executes_locally_once_the_delegation_installs`
+  included) + 3 meta_repro + 62/69 sim (7 ignored) — both new pinned
+  tests present and green: `long_delegated_seed_70051_finishes`,
+  `long_delegated_seed_70075_keeps_stream_order`.
+- `AUTHORITY_SIM_SEEDS=100 ... long_delegated` ×2 under `/usr/bin/time
+  -v`: **run 1: 14.63 s test time (15.68 s wall), 91,828 KB (90 MB)
+  peak RSS; run 2: 17.69 s (18.17 s wall), 94,820 KB (93 MB) peak
+  RSS.** Both green, 100/100 seeds. No blow-up reproduced (before:
+  one run in four hit the 600 s timeout at 6+ GB and rising, pegged at
+  ~100 % CPU throughout). The 13–15 MB the coder reported is presumably
+  a narrower measurement scope; either way both numbers are two orders
+  of magnitude under the old failure and the timing is stable run to
+  run now, which is what matters.
+- `AUTHORITY_SIM_SEEDS=1000 ... long_random`: **PASSED**, 90.11 s (a
+  concurrent M12 session and a separate agent's `session-forwarded-ryw`
+  investigation were both active on this host during this run, hence
+  slower than round 1's 55.94 s on an otherwise idle host — not a
+  regression signal).
+- `cargo build --release --workspace`: clean, 32.2 s incremental.
+- **`cross-subtree-rename` ×5: all PASSED, 5.5 s / 5.6 s / 5.6 s /
+  5.0 s / 5.9 s.** Confirms the fix: round 1 saw 3 of 4 runs fail with
+  `EIO` at ~43 s each; every run here is fast and clean (close to, if a
+  little above, main's ~4.5 s — plausibly the same concurrent-host-load
+  effect noted above, not a residual issue: no `EIO`, no run over 6 s).
+- **`auto-placement` ×5: all PASSED, 22.3 s / 21.7 s / 21.7 s / 21.8 s /
+  21.1 s.** Confirms the fix: round 1 saw 3 of 6 runs fail (either the
+  shared `EIO` or "b executed nothing as the placed delegate"); every
+  run here lands in the same tight 21–22 s band with no failure.
+- `delegated-subtrees`, `delegate-crash`, `delegate-partition`,
+  `root-failover-with-delegates`, `delegate-crash-backup`,
+  `designation-as-delegation`, `marker-order`, `p2p-off-no-delegation`,
+  `single-node-unchanged`: **ALL PASSED** (7.6 s, 9.3 s, 15.5 s, 30.6 s,
+  15.5 s, 21.7 s, 15.3 s, 7.2 s, 1.6 s).
+- `chaos-ci`, `backup-failover`, `epoch-missing-node`,
+  `inbox-create-storm-p2p-off`: **ALL PASSED** (11.0 s, 16.1 s, 76.2 s,
+  36.5 s).
+- `session-forwarded-ryw`, run once as asked (not investigated further —
+  a separate agent owns this): **timed out** at the 120 s wrapper with
+  no step output at all beyond the scenario's own start line (`timeout`
+  sent SIGTERM, exit 124; no mount processes survived it, so nothing
+  needed killing). This is a different failure shape than what the
+  coder reported for main 578ff9c (a sub-second run that then asserts
+  "a read after B's own forwarded create waited" over 309 reads) — main's
+  failure is fast and specific, this run never got anywhere in 120 s.
+  Left two unmounted `/tmp/harness-session-forwarded-ryw-*` directories
+  in place (not cleaned up) since the other agent investigating this
+  scenario may be using the same host concurrently and might need that
+  state; both were already unmounted by the time of inspection, so
+  nothing is leaking a live mount.
+
+**Round 2 verdict: both fixes hold up.** `cross-subtree-rename` and
+`auto-placement` are clean at 5/5 each (10/10 total, 0 failures, times
+consistent run to run), and `long_delegated` is clean at 2/2 with RSS
+two orders of magnitude below the old blow-up. The 13 other scenarios
+requested (the M11 batch minus the two above, plus the M9/M10/M13/chaos
+spot-checks) all passed. `session-forwarded-ryw` is out of scope here
+per the coordinator's note; recorded as a slow/hanging (not merely
+failing) run on 2b for whoever is investigating it.
+
+## Plan 30 M11 — phase 2b round 2 (coder, 2026-09-25)
+
+The tester's two findings on the 2b tree (`/home/bra/cvs/constellation-m11b`,
+main `578ff9c` + the 2b changes, uncommitted), root-caused and fixed;
+the same diff is applied to the M12 tree (`/home/bra/cvs/constellation-m12`)
+on top of the M12 work.
+
+### 1. `cross-subtree-rename` / `auto-placement`: `EIO` after a re-delegation
+
+- Root cause: 2b's automatic re-delegation after a cross-subtree op
+  (and a placement's delegation) installs a new generation on the
+  delegate from the log. A background write the delegate had already
+  forwarded to the root — sent while its own table lacked the grant —
+  is answered `Held { retry_ms }` by the root (2b's rule for a delegate's
+  own op, instead of a redirect to itself). The client's backoff retry
+  (`on_forward_backoff`) only ever re-forwarded: held again, on every
+  retry, for the whole forward deadline (40 s), then `EIO` — and the
+  scenario ran 43 s instead of main's 4.5 s. Same shape after the
+  placement moved a directory (`auto-placement`).
+- Fix (`crates/authority/src/core/client.rs`, `on_forward_backoff`): a
+  retry first tries `delegate_try_execute` — the op is this node's own
+  now — before re-forwarding; the delegate path dedups by rid. New
+  counter `deleg_retry_executed`.
+- Regression test: `core::tests::a_held_forward_executes_locally_once_the_delegation_installs`
+  (a delegate forwards its own create, the root answers `Held`, the
+  grant installs from the log, the backoff timer must answer the client
+  from a local execution with no second forward; fails without the fix
+  with a re-forward).
+- Result: `cross-subtree-rename` 5/5 at 4.1–5.4 s (main: about 4.5 s),
+  `auto-placement` 5/5 at 20–22 s.
+
+### 2. `long_delegated` blow-up (600 s, 6 GB)
+
+- Found with a per-seed sweep under `/usr/bin/time` (`AUTHORITY_SIM_SEED=n`,
+  120 s cap, max RSS): seed 70051 (faults: an S3 GET fault rule, slow
+  replies from the holder, a paused root). The schedule is not
+  deterministic run to run (the same seed finishes in 0.3 s or races);
+  under the sim's new watchdog instrumentation (`container_sizes()` on
+  the core, per-timer fire intervals and per-action counts in the
+  `AUTHORITY_SIM_WATCHDOG` histogram) the racing runs showed *no*
+  growing container in the core: every timer fired at its interval
+  (`ReplayDrain` 200 ms, heartbeats 300 ms) while the simulated clock
+  ran to 85 000 s in 30 s of wall — a client op of the root stuck in
+  `Recalling` forever, the run never ending, memory going to the sim's
+  per-event bookkeeping and tokio's timer entries.
+- Root cause (core, `delegate.rs` `on_deleg_expiry`): the generation's
+  expiry timer returned without re-arming when the root was momentarily
+  unusable (`!root_usable` — a renewal in flight, S3 away), so a recall
+  in flight was never outwaited and the root's own op parked on it
+  waited forever; and `on_client_deadline` returned early for an op in
+  `Recalling` that had never executed (a parked local execution), so the
+  client never heard anything.
+- Fixes: the expiry re-arms after `delegation_stream_tick_ms` when the
+  root is temporarily unusable (a lost lease drops the state through
+  `deleg_on_lease_gone` as before); a client deadline drops a parked,
+  never-executed local op (`abort_exec_local_park`) and answers in
+  doubt. The sim bounds the client phase (`settle_ms × 6` of simulated
+  time) and fails with the waiting map instead of racing.
+- Pinned: `long_delegated_seed_70051_finishes` (4 runs of the seed).
+- A second nondeterministic seed surfaced by the 100-seed reruns, 70075:
+  a per-directory linearizability violation after a root crash — the
+  successor root (node 2) replayed its own *shadow* of an op a delegate
+  had accepted (`Rid 2.1.25`, stream position `(7, 13)`) at takeover,
+  executing it into the log before the delegate re-streamed the earlier
+  transactions of that generation (`3.1.22..24`): the log order broke
+  the delegate's acknowledged order. Fix: a queued replay carries the
+  delegate generation of the shadow it came from (`QueuedReplay::gen`,
+  serde-default; `StrandedOp::gen`), and both replay paths (the takeover's
+  `replay_locally` and the drain tick) hold such an entry while that
+  generation is live in the table — the delegate re-streams the op to
+  the successor in stream order (the replay then finds it completed), or
+  the generation ends and the entry replays as before. Counter
+  `replays_held_for_stream`. Pinned: `long_delegated_seed_70075_keeps_stream_order`.
+- Clippy lints of the new sim instrumentation fixed.
+
+### Results (2b tree, after round 2)
+
+- `cargo test -p constellation-authority --release`: 62 core (the new
+  regression test included) + 3 meta_repro + 68 sim (7 ignored; the two
+  pinned seeds included): green.
+- `long_delegated` 100 seeds ×2: 8.8 s / 8.9 s, 13–15 MB max RSS, both
+  green (before: one run past 600 s at 6 GB).
+- `cargo clippy --workspace --all-targets --release -- -D warnings`,
+  `cargo fmt --all -- --check`: clean.
+- The 11-scenario M11 batch (`delegated-subtrees cross-subtree-rename
+  delegate-crash marker-order delegate-partition p2p-off-no-delegation
+  root-failover-with-delegates delegate-crash-backup auto-placement
+  designation-as-delegation single-node-unchanged`): ALL PASSED on an
+  idle host (one run under a concurrent sim suite + clippy saw
+  `delegate-partition` lose the 20 s lease, and an earlier one
+  `delegated-subtrees` not yet holding it at start: host-load flakes,
+  both 3/3 on rerun).
+- `cross-subtree-rename` ×5: 4.1, 4.2, 4.2, 5.1, 5.4 s; `auto-placement`
+  ×5: 20.3–21.5 s.
+
+### Noted, not 2b's
+
+- `session-forwarded-ryw` fails on **main 578ff9c** too (built in a
+  scratch worktree, 2/2: "a read after B's own forwarded create waited",
+  4–7 sub-millisecond waits of 309 reads, once with `raised 2`), on the
+  2b tree and on the M12 tree alike; its recorded pass is from an older
+  milestone. Not touched here.

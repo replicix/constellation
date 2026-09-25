@@ -300,6 +300,12 @@ fn replay_seed() {
         Ok("delegated-partition") => delegated_partition_config(),
         Ok("delegated-epoch") => delegated_epoch_config(),
         Ok("delegated-faults") => delegated_faults_config(),
+        Ok("delegated-root-crash") => delegated_root_crash_config(),
+        Ok("delegated-backup") => delegated_backup_config(),
+        Ok("delegated-backup-crash") => delegated_backup_crash_config(),
+        Ok("delegated-designated") => delegated_designated_config(),
+        Ok("delegated-placement") => delegated_placement_config(),
+        Ok("delegated-strict") => delegated_strict_config(),
         Ok("long-delegated") => long_delegated_config(),
         // Plan 30 §M7.
         Ok("streams-off") => streams_off_config(),
@@ -1895,6 +1901,109 @@ fn delegated_faults_config() -> SimConfig {
     }
 }
 
+// ---- phase 2b configurations ----
+
+/// The root dies mid-stream with two live delegates (restarts with its
+/// journal): the successor learns the table from the log, the delegates
+/// re-stream, nothing acknowledged is lost.
+fn delegated_root_crash_config() -> SimConfig {
+    SimConfig {
+        cross_ratio: 0.1,
+        faults: vec![ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::CrashHolder {
+                restart_ms: Some(5_000),
+                keep_journal: true,
+            },
+        }],
+        ..delegated_config()
+    }
+}
+
+/// Delegates with backups (the M9 backup configuration): every
+/// acknowledgement waits for the backup.
+fn delegated_backup_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::deleg_backup_core_config),
+        ..delegated_config()
+    }
+}
+
+/// The delegate of `d1` dies with a backup: the root seals the backup,
+/// drains its tail, ends the generation and delegates `d1` to the
+/// backup; every backup-acknowledged write is in the log.
+fn delegated_backup_crash_config() -> SimConfig {
+    SimConfig {
+        cross_ratio: 0.0,
+        faults: vec![
+            // The delegate loses the root first: what it acknowledges
+            // through its backup from here on is exactly the tail the
+            // root must drain from the backup after the crash.
+            ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 2_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::CrashNode {
+                    node: 2,
+                    restart_ms: Some(9_000),
+                    keep_journal: true,
+                },
+            },
+        ],
+        ..delegated_backup_config()
+    }
+}
+
+/// `d1` is an offline designation of node 2: never recalled, cross ops
+/// touching it refused (`EXDEV`), the designee's writes local; node 2
+/// is cut from the root for longer than a grant and keeps writing.
+fn delegated_designated_config() -> SimConfig {
+    SimConfig {
+        dirs: vec!["d1".into(), "d2".into()],
+        delegations: vec![("d2".into(), 3)],
+        designations: vec![("d1".into(), 2)],
+        cross_ratio: 0.2,
+        faults: vec![ScheduledFault {
+            at_ms: 1_000,
+            kind: FaultKind::Partition {
+                a: 1,
+                b: 2,
+                for_ms: 9_000,
+            },
+        }],
+        ..delegated_config()
+    }
+}
+
+/// No operator: the placement delegates each node's home directory to
+/// it once it dominates the writes there, and recalls when the pattern
+/// changes.
+fn delegated_placement_config() -> SimConfig {
+    SimConfig {
+        delegations: Vec::new(),
+        cross_ratio: 0.0,
+        ops_per_client: 16,
+        core: std::sync::Arc::new(sim::run::placement_core_config),
+        ..delegated_config()
+    }
+}
+
+/// Plan 30 §M8 under delegation: strict reads are answered by the
+/// owning delegate (a ReadIndex, or a read delegation from it).
+fn delegated_strict_config() -> SimConfig {
+    SimConfig {
+        strict: true,
+        read_ratio: 0.6,
+        ..delegated_config()
+    }
+}
+
 fn long_delegated_config() -> SimConfig {
     SimConfig {
         ops_per_client: 12,
@@ -1926,6 +2035,21 @@ struct M11Totals {
     marker_checks: u64,
     dirs_checked: usize,
     epochs: usize,
+    // ---- phase 2b ----
+    inherited: u64,
+    restreams: u64,
+    seals_sent: u64,
+    sealed_drained: u64,
+    backup_appends: u64,
+    backup_acks: u64,
+    acks_parked: u64,
+    place_delegated: u64,
+    place_recalled: u64,
+    redelegated: u64,
+    refused_designated: u64,
+    designated: u64,
+    deleg_reads: u64,
+    deleg_read_grants: u64,
 }
 
 impl M11Totals {
@@ -1947,6 +2071,20 @@ impl M11Totals {
             self.not_owner += s.deleg_not_owner;
             self.exec_parked += s.deleg_exec_parked;
             self.stranded += s.local_rolled_back;
+            self.inherited += s.deleg_inherited;
+            self.restreams += s.deleg_restreams;
+            self.seals_sent += s.deleg_seals_sent;
+            self.sealed_drained += s.deleg_sealed_drained;
+            self.backup_appends += s.deleg_backup_appends;
+            self.backup_acks += s.deleg_backup_acks;
+            self.acks_parked += s.deleg_acks_parked;
+            self.place_delegated += s.place_delegated;
+            self.place_recalled += s.place_recalled;
+            self.redelegated += s.deleg_redelegated;
+            self.refused_designated += s.deleg_refused_designated;
+            self.designated += s.deleg_designated;
+            self.deleg_reads += s.deleg_read_index_served;
+            self.deleg_read_grants += s.deleg_read_grants;
         }
         self.marker_checks += r.marker_checks;
         self.dirs_checked += r.dirs_checked;
@@ -2046,6 +2184,99 @@ fn delegated_under_random_faults() {
     assert!(t.executed > 100, "delegates rarely executed: {t:?}");
 }
 
+/// Phase 2b: root failover with live delegates.
+#[test]
+fn delegated_root_failover_keeps_every_ack() {
+    let t = run_m11(
+        "delegated-root-crash",
+        delegated_root_crash_config(),
+        66_000..66_030,
+    );
+    assert!(
+        t.inherited > 0,
+        "no successor inherited a generation: {t:?}"
+    );
+    assert!(t.restreams > 0, "no delegate re-streamed: {t:?}");
+}
+
+/// Phase 2b: delegates with backups; acknowledgements wait for them.
+#[test]
+fn delegated_backups_gate_acknowledgements() {
+    let t = run_m11(
+        "delegated-backup",
+        delegated_backup_config(),
+        67_000..67_020,
+    );
+    assert!(
+        t.backup_appends > 0 && t.backup_acks > 0,
+        "no backup traffic: {t:?}"
+    );
+    assert!(
+        t.acks_parked > 0,
+        "no acknowledgement waited for a backup: {t:?}"
+    );
+}
+
+/// Phase 2b: a delegate with a backup dies: seal, drain, re-delegate.
+#[test]
+fn delegated_delegate_crash_drains_the_backup() {
+    let t = run_m11(
+        "delegated-backup-crash",
+        delegated_backup_crash_config(),
+        68_000..68_020,
+    );
+    assert!(t.seals_sent > 0, "no backup was sealed: {t:?}");
+    assert!(t.sealed_drained > 0, "no sealed tail was drained: {t:?}");
+}
+
+/// Phase 2b: designations are never recalled by time; cross ops touching
+/// them are refused; the isolated designee keeps writing.
+#[test]
+fn delegated_designation_is_never_reclaimed() {
+    let t = run_m11(
+        "delegated-designated",
+        delegated_designated_config(),
+        69_000..69_020,
+    );
+    assert!(t.designated > 0, "nothing was designated: {t:?}");
+    assert!(t.refused_designated > 0, "no cross op was refused: {t:?}");
+    assert_eq!(
+        t.reclaimed + t.recalls_expired,
+        0,
+        "a designation was reclaimed or outwaited: {t:?}"
+    );
+}
+
+/// Phase 2b: the placement delegates dominated subtrees by itself.
+#[test]
+fn delegated_placement_delegates_dominated_subtrees() {
+    let t = run_m11(
+        "delegated-placement",
+        delegated_placement_config(),
+        70_500..70_520,
+    );
+    assert!(
+        t.place_delegated > 0,
+        "the placement never delegated: {t:?}"
+    );
+    assert!(t.executed > 0, "placed delegates never executed: {t:?}");
+}
+
+/// Phase 2b (M8): strict reads under delegation are served by the owning
+/// delegate.
+#[test]
+fn delegated_strict_reads_are_served_by_the_delegate() {
+    let t = run_m11(
+        "delegated-strict",
+        delegated_strict_config(),
+        71_000..71_020,
+    );
+    assert!(
+        t.deleg_reads > 0,
+        "no strict read reached a delegate: {t:?}"
+    );
+}
+
 /// Plan 30 §M11 (single-node-unchanged / p2p-off-no-delegation): the
 /// ordinary configurations never write a `Delegate` record and never
 /// park an execution on a delegation.
@@ -2087,6 +2318,32 @@ fn no_delegation_without_a_delegate_record() {
                 assert_eq!(s.deleg_deps_waits, 0, "{label} node {id} waited for deps");
             }
         }
+    }
+}
+
+/// Plan 30 §M11 phase 2b round 2: the seed whose recall was never
+/// outwaited (the root's expiry timer dropped while it was momentarily
+/// unusable), which left a root-local op parked forever and the clock
+/// racing. The schedule is not deterministic run to run, so the seed
+/// runs several times.
+#[test]
+fn long_delegated_seed_70051_finishes() {
+    for _ in 0..4 {
+        let t = run_m11("long-delegated", long_delegated_config(), 70_051..70_052);
+        assert!(t.executed > 0, "{t:?}");
+    }
+}
+
+/// Plan 30 §M11 phase 2b round 2: the seed whose successor root replayed
+/// a delegate-accepted shadow ahead of the delegate's earlier
+/// transactions (a per-directory linearizability violation); now the
+/// replay is held while the generation is live. Not deterministic run
+/// to run: several runs.
+#[test]
+fn long_delegated_seed_70075_keeps_stream_order() {
+    for _ in 0..4 {
+        let t = run_m11("long-delegated", long_delegated_config(), 70_075..70_076);
+        assert!(t.executed > 0, "{t:?}");
     }
 }
 

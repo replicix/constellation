@@ -67,7 +67,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// id; `Parked::waiting` holds both kinds).
 pub(crate) const DELEG_WAIT_BASE: u64 = 1 << 62;
 
-fn wait_id(gen: u64) -> u64 {
+pub(crate) fn wait_id(gen: u64) -> u64 {
     DELEG_WAIT_BASE + gen
 }
 
@@ -77,6 +77,21 @@ pub enum RecallPhase {
     Sent,
     /// `DelegRecalled { through }` received: ends once the cursor is there.
     Drained(u64),
+    /// Phase 2b: the delegate is silent; its backup was asked to seal
+    /// and drain.
+    Sealing,
+}
+
+/// Why a generation exists (phase 2b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegKind {
+    /// `constellation delegate`: until `undelegate` or a cross-subtree op.
+    Manual,
+    /// The placement (`core::placement`): recalled by it too.
+    Placed,
+    /// An offline designation (plans 03–05): recalled only by `online`;
+    /// never expires; a cross-subtree op touching it is refused.
+    Designated,
 }
 
 /// The root's view of one generation.
@@ -84,6 +99,22 @@ pub enum RecallPhase {
 pub(crate) struct GenState {
     pub dir: Ino,
     pub node: NodeId,
+    /// Why it exists (phase 2b): an operator, the placement, a
+    /// designation.
+    pub kind: DelegKind,
+    /// Phase 2b: the delegate's backup peer, as its renewals report it;
+    /// the root drains it (seal) when the delegate dies.
+    pub backup: Option<NodeId>,
+    /// Phase 2b: ended by a cross-subtree op: delegate the directory to
+    /// the same node again once the op executed.
+    pub redelegate: bool,
+    /// When the root granted it (placement's dwell counts from here).
+    pub granted: Ms,
+    /// Placement: since when the delegate's share has been below the
+    /// leave threshold (`None`: it is not).
+    pub below_since: Option<Ms>,
+    /// Phase 2b: seals asked of the backup (one; then the plain reclaim).
+    pub seal_attempts: u8,
     /// Appended through this stream index.
     pub cursor: u64,
     /// The root outwaits the delegate once its clock reaches this.
@@ -140,6 +171,27 @@ pub(crate) struct DelegateState {
     pub parked: Vec<ParkedDeleg>,
     /// Executed under this generation here (for `status`).
     pub executed: u64,
+    /// Phase 2b: a designation — honoured whatever the clock says.
+    pub designated: bool,
+    /// Phase 2b: the root the stream last went to; a different one
+    /// (a failover) gets every unretired transaction again.
+    pub last_root: Option<NodeId>,
+    /// Phase 2b: the backup peer this delegate appends to before it
+    /// acknowledges, and what it has acknowledged.
+    pub backup: Option<NodeId>,
+    pub backup_acked: u64,
+    pub backup_sent_through: u64,
+    pub backup_inflight: Option<(OpId, u64)>,
+    pub backup_sealed: bool,
+    pub backup_failures: u32,
+    /// The backup the in-flight renewal named (the root must learn a
+    /// newly chosen backup before the next timer).
+    pub renew_backup: Option<NodeId>,
+    /// When the in-flight stream batch / backup append was sent: one
+    /// lost in a partition (no transport failure) is re-sent after
+    /// `deleg_request_timeout_ms`, not waited for forever.
+    pub inflight_at: Ms,
+    pub backup_inflight_at: Ms,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +199,27 @@ enum ReqKind {
     Stream,
     Renew,
     Recall,
+    /// Phase 2b: a delegate's append to its backup.
+    BackupAppend,
+    /// Phase 2b: the root's seal request to a dead delegate's backup.
+    Seal,
+}
+
+impl DelegationState {
+    pub(crate) fn container_sizes(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            ("dl_gens", self.gens.len()),
+            ("dl_mine", self.mine.len()),
+            ("dl_by_req", self.by_req.len()),
+            ("dl_pending_exec", self.pending_exec.len()),
+            (
+                "dl_parked",
+                self.mine.values().map(|d| d.parked.len()).sum(),
+            ),
+            ("dl_backing", self.backing.len()),
+            ("dl_sealed", self.sealed.len()),
+        ]
+    }
 }
 
 #[derive(Debug, Default)]
@@ -155,13 +228,17 @@ pub(crate) struct DelegationState {
     pub gens: BTreeMap<u64, GenState>,
     /// The generations this node is the delegate of.
     pub mine: BTreeMap<u64, DelegateState>,
+    /// Phase 2b: the generations this node backs, `gen -> (delegate,
+    /// acked)`, and the ones it sealed.
+    pub backing: BTreeMap<u64, (NodeId, u64)>,
+    pub sealed: BTreeSet<u64>,
     by_req: BTreeMap<OpId, (u64, ReqKind)>,
     /// Local ops whose execution waits for a recall or for `deps` (their
     /// `finish` is deferred to the parked continuation).
     pub pending_exec: BTreeSet<Rid>,
     stream_timer: Option<TimerId>,
     /// Plan 30 §M10: an active continuation epoch — no delegation.
-    epoch_active: bool,
+    pub(crate) epoch_active: bool,
 }
 
 /// Plan 30 §M11's view for `status`.
@@ -172,6 +249,10 @@ pub struct DelegView {
     /// `(dir, node, gen, cursor, until_ms, recall, ended)`.
     pub gens: Vec<(Ino, NodeId, u64, u64, i64, String, bool)>,
     pub pending_exec: usize,
+    /// Phase 2b: per generation held here, `(gen, backup, backup_acked)`.
+    pub backups: Vec<(u64, NodeId, u64)>,
+    /// Phase 2b: per generation on the root, `(gen, kind, backup)`.
+    pub kinds: Vec<(u64, String, NodeId)>,
 }
 
 /// The keys `op` touches, as ownership is resolved over them.
@@ -215,7 +296,30 @@ impl Core {
                 })
                 .collect(),
             pending_exec: self.dl.pending_exec.len(),
+            backups: self
+                .dl
+                .mine
+                .values()
+                .filter_map(|d| d.backup.map(|b| (d.gen, b, d.backup_acked)))
+                .collect(),
+            kinds: self
+                .dl
+                .gens
+                .iter()
+                .map(|(g, s)| (*g, format!("{:?}", s.kind), s.backup.unwrap_or(0)))
+                .collect(),
         }
+    }
+
+    /// Phase 2b: the delegate's fast path is gated (a backup acknowledges
+    /// first, or `ack=s3`): its writes go through the core and park.
+    pub fn deleg_fast_path_gated(&self) -> bool {
+        self.cfg.ack_s3 || self.dl.mine.values().any(|d| d.backup.is_some())
+    }
+
+    /// Phase 2b: the placement's busiest subtrees (`status`).
+    pub fn placement_top(&self) -> Vec<(Ino, NodeId, u64, u64)> {
+        self.pl.top.clone()
     }
 
     fn me(&self) -> NodeId {
@@ -237,7 +341,7 @@ impl Core {
     }
 
     /// This node holds the root lease usably (may append, recall, grant).
-    fn root_usable(&self, now: Ms) -> bool {
+    pub(crate) fn root_usable(&self, now: Ms) -> bool {
         self.lease.ship_epoch(now, &self.cfg).is_some() && !self.lease.fenced()
     }
 
@@ -290,14 +394,30 @@ impl Core {
                     stream_after: None,
                     stream_backoff_ms: 0,
                     refused: false,
-                    streamed_through: replica.stream_applied(d.gen),
+                    streamed_through: replica.log_stream_idx(d.gen),
                     inflight: None,
                     renew: None,
                     renew_timer: None,
                     parked: Vec::new(),
                     executed: 0,
+                    designated: d.designated,
+                    last_root: self.root_node(),
+                    backup: None,
+                    backup_acked: 0,
+                    backup_sent_through: 0,
+                    backup_inflight: None,
+                    backup_sealed: false,
+                    backup_failures: 0,
+                    renew_backup: None,
+                    inflight_at: Ms(0),
+                    backup_inflight_at: Ms(0),
                 },
             );
+            if d.designated {
+                // Honoured whatever the root says or the clock does
+                // (DESIGN.md §5.2: the designee writes while isolated).
+                self.dl.mine.get_mut(&d.gen).expect("present").until = Ms(i64::MAX / 2);
+            }
             self.deleg_renew_now(now, d.gen, out);
         }
         // The root side.
@@ -313,14 +433,37 @@ impl Core {
                 // unexpired lease (M9) has not, so the conservative
                 // horizon is waited before a reclaim — a renewal from the
                 // delegate ends the wait sooner.
-                let cursor = replica.stream_applied(d.gen);
+                // The log's index of the stream, never a shadow's (a
+                // forwarded op's reply raised `stream_applied` past what
+                // the predecessor appended; the delegate re-streams the
+                // rest from here).
+                let cursor = replica.log_stream_idx(d.gen);
+                tracing::info!(
+                    node = me,
+                    gen = d.gen,
+                    dir = d.dir,
+                    delegate = d.node,
+                    cursor,
+                    stream_applied = replica.stream_applied(d.gen),
+                    "inherited a delegation from a predecessor root"
+                );
                 self.dl.gens.insert(
                     d.gen,
                     GenState {
                         dir: d.dir,
                         node: d.node,
+                        kind: if d.designated {
+                            DelegKind::Designated
+                        } else {
+                            DelegKind::Manual
+                        },
+                        backup: None,
+                        redelegate: false,
+                        granted: now,
+                        below_since: None,
+                        seal_attempts: 0,
                         cursor,
-                        until: now.plus(self.cfg.delegation_ttl_ms + self.cfg.expiry_margin_ms),
+                        until: now.plus(self.reclaim_horizon_ms()),
                         recall: RecallPhase::None,
                         ended: false,
                         expiry: None,
@@ -328,6 +471,13 @@ impl Core {
                         controls: Vec::new(),
                     },
                 );
+                self.stats.deleg_inherited += 1;
+                if d.node == me {
+                    // A predecessor delegated this subtree to the node
+                    // that is now the root: the root executes it itself.
+                    self.end_generation(now, d.gen, replica, out);
+                    continue;
+                }
                 self.arm_gen_expiry(now, d.gen, out);
             }
             let gone: Vec<u64> = self
@@ -346,17 +496,7 @@ impl Core {
                 self.recall_all(now, out);
             }
         } else if !self.dl.gens.is_empty() {
-            for (_, g) in std::mem::take(&mut self.dl.gens) {
-                if let Some(t) = g.expiry {
-                    self.cancel_timer(t, out);
-                }
-                for c in g.controls {
-                    out.push(Action::ControlDone {
-                        op: c,
-                        result: Err("the lease was lost before the recall ended".into()),
-                    });
-                }
-            }
+            self.deleg_on_lease_gone(now, replica, out);
         }
         self.deleg_after_event(now, replica, out);
     }
@@ -477,24 +617,35 @@ impl Core {
         let Some(gen) = self.my_generation_for(&keys, replica) else {
             return false;
         };
-        let honoured = self.dl.mine.get(&gen).is_some_and(|d| now < d.until);
+        let honoured = self
+            .dl
+            .mine
+            .get(&gen)
+            .is_some_and(|d| now < d.until || d.designated);
         // The model's rule 1: the delegate waits for `deps` too.
         let reaches = replica.reaches(&deps);
-        if !honoured || !reaches {
+        // Phase 2b (M8): the read delegations this delegate granted on
+        // what the op touches are recalled first.
+        let recalling =
+            honoured && reaches && self.deleg_read_recall_pending(now, from, op, replica, out);
+        if !honoured || !reaches || recalling {
             tracing::debug!(
                 node = self.me(),
                 gen,
                 ?rid,
                 honoured,
                 reaches,
+                recalling,
                 ?deps,
                 applied = ?replica.applied_position(),
                 "delegate parks an op"
             );
             if !reaches {
                 self.stats.deleg_deps_waits += 1;
-            } else {
+            } else if !honoured {
                 self.stats.deleg_parked_expired += 1;
+            } else {
+                self.stats.recall_waits += 1;
             }
             let d = self.dl.mine.get_mut(&gen).expect("present");
             d.parked.push(ParkedDeleg {
@@ -519,6 +670,31 @@ impl Core {
         true
     }
 
+    /// Phase 2b (M8 under M11): a write this delegate executes must not
+    /// leave a read delegation it granted on what the write touches
+    /// live (the holder's rule, `recall_needed`, for the delegate's
+    /// subtree; the requester's own grant excepted). `true` while a
+    /// recall is in flight (started here, once).
+    fn deleg_read_recall_pending(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        op: &MutateOp,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if !self.cfg.read_delegations {
+            return false;
+        }
+        let inos = constellation_meta::recall_inos_of_op(op);
+        if inos.is_empty() {
+            return false;
+        }
+        let except = Some(if from == 0 { self.me() } else { from });
+        self.recall_needed(now, &inos, except, replica, out)
+            .is_some()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn delegate_execute_now(
         &mut self,
@@ -538,6 +714,7 @@ impl Core {
         // shadow strands at a root takeover (conservative: the record
         // re-streams and the replay dedups) and never before.
         let epoch = self.ship.max_epoch.max(1);
+        let mut exec_idx: Option<u64> = None;
         let outcome = if let Some(records) = replica.recent_outcome(rid) {
             self.stats.forward_dedup_hits += 1;
             MutateOutcome::Accepted { epoch, records }
@@ -554,12 +731,13 @@ impl Core {
             }
         } else {
             match replica.delegate_execute(op, Some(rid), gen, deps) {
-                Ok((records, _idx)) => {
+                Ok((records, idx)) => {
                     replica.remember_outcome(rid, &records);
                     self.stats.deleg_executed += 1;
                     if let Some(d) = self.dl.mine.get_mut(&gen) {
                         d.executed += 1;
                     }
+                    exec_idx = Some(idx);
                     MutateOutcome::Accepted { epoch, records }
                 }
                 Err(MetaError::Conflict) => match op {
@@ -571,6 +749,7 @@ impl Core {
                 Err(MetaError::Exists) => {
                     let errno = libc::EEXIST;
                     self.record_delegate_refusal(rid, errno, gen, deps, replica);
+                    exec_idx = Some(replica.delegate_idx(gen));
                     match super::client::named_child(op) {
                         Some((parent, name)) => match replica.entry_as_record(parent, name) {
                             Some(record) => MutateOutcome::Exists {
@@ -585,6 +764,7 @@ impl Core {
                 Err(e) => {
                     let errno = super::client::meta_errno(&e);
                     self.record_delegate_refusal(rid, errno, gen, deps, replica);
+                    exec_idx = Some(replica.delegate_idx(gen));
                     MutateOutcome::Errno(errno)
                 }
             }
@@ -599,6 +779,34 @@ impl Core {
             },
         };
         self.arm_stream_tick(now, out);
+        // Phase 2b: under a backup (or `ack=s3`) the acknowledgement
+        // waits until the transaction is on the backup (or in a segment
+        // this replica applied); the row streams meanwhile.
+        if let Some(idx) = exec_idx {
+            if self.deleg_ack_gated(gen) && !self.deleg_stream_durable(gen, idx, replica) {
+                self.stats.deleg_acks_parked += 1;
+                let what = if from == 0 {
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.phase = super::client::Phase::Recalling;
+                    }
+                    super::readindex::ParkedWhat::Finish { rid, outcome }
+                } else {
+                    super::readindex::ParkedWhat::Reply {
+                        to: from,
+                        req,
+                        rid,
+                        outcome,
+                        base,
+                        position,
+                        gen,
+                        held_timer: None,
+                    }
+                };
+                self.park_stream_need(now, gen, idx, what);
+                self.deleg_backup_stream(now, replica, out);
+                return;
+            }
+        }
         if from == 0 {
             self.finish(now, rid, outcome, replica, out);
             return;
@@ -617,6 +825,332 @@ impl Core {
         }
     }
 
+    /// Phase 2b: whether this delegate's acknowledgements of `gen` wait
+    /// for durability beyond its own disk.
+    pub(crate) fn deleg_ack_gated(&self, gen: u64) -> bool {
+        self.cfg.ack_s3 || self.dl.mine.get(&gen).is_some_and(|d| d.backup.is_some())
+    }
+
+    /// Phase 2b: transaction `(gen, idx)` is durable enough to
+    /// acknowledge: on the backup, or in a segment this replica applied.
+    pub(crate) fn deleg_stream_durable(&self, gen: u64, idx: u64, replica: &dyn Replica) -> bool {
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return true;
+        };
+        if self.cfg.ack_s3 {
+            return !replica.delegate_tx_pending(gen, idx);
+        }
+        match d.backup {
+            None => true,
+            Some(_) => d.backup_acked >= idx || !replica.delegate_tx_pending(gen, idx),
+        }
+    }
+
+    /// Phase 2b: pick a backup for each generation held here (M9's
+    /// candidate rule: a write-eligible peer within the RTT budget,
+    /// connected the longest), never the root itself.
+    fn deleg_backup_select(&mut self, now: Ms, out: &mut Vec<Action>) {
+        if self.cfg.backup_rtt_budget_ms == 0 {
+            return;
+        }
+        let root = self.root_node();
+        let candidates = self.backup_candidates(now);
+        let mut chosen = Vec::new();
+        for d in self.dl.mine.values_mut() {
+            if d.backup.is_some() || d.backup_sealed || d.stopped {
+                continue;
+            }
+            if let Some(b) = candidates.iter().find(|n| Some(**n) != root).copied() {
+                d.backup = Some(b);
+                d.backup_acked = 0;
+                d.backup_sent_through = 0;
+                chosen.push(d.gen);
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    gen = d.gen,
+                    backup = b,
+                    "delegate chose a backup"
+                );
+            }
+        }
+        for gen in chosen {
+            // The root learns the backup from a renewal (it seals it when
+            // this delegate falls silent): send one now.
+            self.deleg_renew_now(now, gen, out);
+        }
+    }
+
+    /// Phase 2b: append what the backup lacks, one batch in flight.
+    pub(crate) fn deleg_backup_stream(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
+        for gen in gens {
+            let d = self.dl.mine.get(&gen).expect("present");
+            let Some(backup) = d.backup else { continue };
+            if d.backup_inflight.is_some() {
+                continue;
+            }
+            let from = d.backup_sent_through + 1;
+            let txs = replica.delegate_txs_from(gen, from, self.cfg.delegation_stream_rows);
+            if txs.is_empty() {
+                continue;
+            }
+            let last = txs.last().map(|t| t.idx).unwrap_or(from);
+            let req = self.op_id();
+            self.dl.by_req.insert(req, (gen, ReqKind::BackupAppend));
+            self.stats.deleg_backup_appends += 1;
+            let d = self.dl.mine.get_mut(&gen).expect("present");
+            d.backup_inflight = Some((req, last));
+            d.backup_inflight_at = now;
+            out.push(Action::Send {
+                to: backup,
+                msg: PeerMsg::DelegBackupAppend { req, gen, txs },
+            });
+        }
+        let _ = now;
+    }
+
+    /// Phase 2b: the backup answered an append.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on_deleg_backup_ack(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        req: OpId,
+        gen: u64,
+        acked: u64,
+        sealed: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some((g, ReqKind::BackupAppend)) = self.dl.by_req.remove(&req) else {
+            return;
+        };
+        if g != gen {
+            return;
+        }
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        if d.backup != Some(from) {
+            return;
+        }
+        self.stats.deleg_backup_acks += 1;
+        let inflight = d.backup_inflight.take();
+        if sealed {
+            // The backup sealed the generation: the root is draining it
+            // and will end it. Nothing more is acknowledged here; what
+            // waited retries by rid (the root has it, or refuses it).
+            tracing::warn!(
+                node = self.cfg.node_id,
+                gen,
+                backup = from,
+                "the backup sealed this delegation"
+            );
+            d.backup_sealed = true;
+            d.backup = None;
+            d.stopped = true;
+            self.deleg_abort_stream_parks(now, gen, replica, out);
+            return;
+        }
+        d.backup_failures = 0;
+        d.backup_acked = d.backup_acked.max(acked);
+        if let Some((_, last)) = inflight {
+            if acked < last {
+                // Short: resend from what it holds.
+                d.backup_sent_through = acked;
+            } else {
+                d.backup_sent_through = d.backup_sent_through.max(last);
+            }
+        }
+        self.complete_ready(now, replica, out);
+        self.deleg_backup_stream(now, replica, out);
+    }
+
+    /// Phase 2b: what waited for the backup of `gen` cannot be
+    /// acknowledged here any more: the requester (or this node's own
+    /// client) retries by rid, which the root answers from the drain.
+    fn deleg_abort_stream_parks(
+        &mut self,
+        now: Ms,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let ids = self.stream_parks_of(gen);
+        for id in ids {
+            self.abort_park_busy(now, id, replica, out);
+        }
+    }
+
+    // ----------------------------------------------------- the backup
+
+    /// Phase 2b: a delegate's append (this node is its backup).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on_deleg_backup_append(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        req: OpId,
+        gen: u64,
+        txs: Vec<constellation_meta::DelegateTx>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.note_foreign(now, replica, out);
+        let sealed = self.dl.sealed.contains(&gen) || replica.deleg_backup_sealed(gen);
+        let mut acked = self.dl.backing.get(&gen).map(|(_, a)| *a).unwrap_or(0);
+        if !sealed && !txs.is_empty() {
+            acked = replica.deleg_backup_append(gen, &txs);
+            self.stats.deleg_backup_persisted += txs.len() as u64;
+        }
+        if !sealed {
+            self.dl.backing.insert(gen, (from, acked));
+        }
+        out.push(Action::Send {
+            to: from,
+            msg: PeerMsg::DelegBackupAck {
+                req,
+                gen,
+                acked,
+                sealed,
+            },
+        });
+    }
+
+    /// Phase 2b: the root asks this backup to seal `gen` and hand over
+    /// its tail (the delegate is silent).
+    pub(crate) fn on_deleg_seal(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        req: OpId,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.note_foreign(now, replica, out);
+        let backing = self.dl.backing.contains_key(&gen) || replica.deleg_backup_acked_any(gen);
+        let txs = if backing {
+            replica.deleg_backup_seal(gen);
+            self.dl.sealed.insert(gen);
+            self.stats.deleg_backup_seals += 1;
+            replica.deleg_backup_tail(gen)
+        } else {
+            Vec::new()
+        };
+        tracing::info!(
+            node = self.cfg.node_id,
+            gen,
+            root = from,
+            backing,
+            rows = txs.len(),
+            "sealed a delegation for the root"
+        );
+        out.push(Action::Send {
+            to: from,
+            msg: PeerMsg::DelegSealed {
+                req,
+                gen,
+                sealed: backing,
+                txs,
+            },
+        });
+    }
+
+    /// Phase 2b: the backup's answer to a seal: append its tail, end the
+    /// generation, delegate the directory to the backup.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn on_deleg_sealed(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        req: OpId,
+        gen: u64,
+        sealed: bool,
+        txs: Vec<constellation_meta::DelegateTx>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some((g, ReqKind::Seal)) = self.dl.by_req.remove(&req) else {
+            return;
+        };
+        if g != gen {
+            return;
+        }
+        let Some(gs) = self.dl.gens.get(&gen) else {
+            return;
+        };
+        if gs.ended || gs.backup != Some(from) {
+            return;
+        }
+        let (dir, kind) = (gs.dir, gs.kind);
+        if sealed && self.root_usable(now) {
+            let mut cursor = gs.cursor;
+            let mut drained = 0u64;
+            for tx in txs {
+                if tx.idx <= cursor {
+                    continue;
+                }
+                if tx.idx != cursor + 1 {
+                    break;
+                }
+                if !replica.reaches_streams(&tx.deps) {
+                    self.stats.deleg_deps_unsatisfied_at_append += 1;
+                    break;
+                }
+                match replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps) {
+                    Ok(_) => {
+                        cursor = tx.idx;
+                        drained += 1;
+                    }
+                    Err(error) => {
+                        tracing::warn!(node = self.me(), gen, idx = tx.idx, %error, "could not append a sealed transaction");
+                        break;
+                    }
+                }
+            }
+            if let Some(gs) = self.dl.gens.get_mut(&gen) {
+                gs.cursor = cursor;
+            }
+            self.stats.deleg_sealed_drained += drained;
+            if drained > 0 {
+                self.answer_awaiting_log(now, replica, out);
+                self.nudge(now, out);
+            }
+            tracing::info!(
+                node = self.me(),
+                gen,
+                backup = from,
+                drained,
+                cursor,
+                "drained a sealed delegation"
+            );
+        }
+        self.end_generation(now, gen, replica, out);
+        if sealed && kind != DelegKind::Designated {
+            match self.delegate_dir(now, dir, from, kind, replica, out) {
+                Ok(new_gen) => {
+                    tracing::info!(
+                        node = self.me(),
+                        dir,
+                        delegate = from,
+                        gen,
+                        new_gen,
+                        "re-delegated to the backup"
+                    );
+                }
+                Err(why) => {
+                    tracing::debug!(node = self.me(), dir, why, "not re-delegated to the backup")
+                }
+            }
+        }
+    }
+
     /// Retry every parked op whose wait is over, then stream and renew.
     pub(crate) fn deleg_after_event(
         &mut self,
@@ -624,8 +1158,34 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // Phase 2b: the placement runs on the root, delegations or not.
+        if self.root_usable(now) {
+            self.place_arm(now, out);
+        }
         if self.dl.mine.is_empty() && self.dl.gens.is_empty() {
             return;
+        }
+        // Phase 2b: a new root (a failover) gets every unretired
+        // transaction again; it deduplicates by cursor and rid.
+        let root = self.root_node();
+        for d in self.dl.mine.values_mut() {
+            if d.last_root != root {
+                if d.last_root.is_some() && root.is_some() {
+                    d.streamed_through = 0;
+                    d.inflight = None;
+                    d.refused = false;
+                    d.stream_after = None;
+                    d.stream_backoff_ms = 0;
+                    self.stats.deleg_restreams += 1;
+                    tracing::info!(
+                        node = self.cfg.node_id,
+                        gen = d.gen,
+                        ?root,
+                        "re-streaming to a new root"
+                    );
+                }
+                d.last_root = root;
+            }
         }
         // Parked delegate ops.
         let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
@@ -637,13 +1197,22 @@ impl Core {
                 continue;
             }
             let honoured = now < d.until && !d.stopped;
-            let ready: Vec<usize> = d
+            if !honoured {
+                continue;
+            }
+            let candidates: Vec<(usize, NodeId, MutateOp)> = d
                 .parked
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| honoured && replica.reaches(&p.deps))
-                .map(|(i, _)| i)
+                .filter(|(_, p)| replica.reaches(&p.deps))
+                .map(|(i, p)| (i, p.from, p.op.clone()))
                 .collect();
+            let mut ready = Vec::new();
+            for (i, from, op) in candidates {
+                if !self.deleg_read_recall_pending(now, from, &op, replica, out) {
+                    ready.push(i);
+                }
+            }
             if ready.is_empty() {
                 continue;
             }
@@ -663,8 +1232,12 @@ impl Core {
             }
         }
         self.deleg_stream(now, replica, out);
-        // Root-side parked executions waiting for `deps`.
-        if self.has_deps_parks() {
+        // Phase 2b: the delegate's backup.
+        self.deleg_backup_select(now, out);
+        self.deleg_backup_stream(now, replica, out);
+        // Root-side parked executions waiting for `deps` (and, phase 2b,
+        // a delegate's acknowledgements waiting for a segment).
+        if self.has_deps_parks() || self.has_stream_parks() {
             self.complete_ready(now, replica, out);
         }
     }
@@ -690,10 +1263,62 @@ impl Core {
         self.deleg_stream(now, replica, out);
     }
 
+    /// How long a stream batch, backup append or renewal waits for its
+    /// answer before it is sent again (a partition drops it silently).
+    fn deleg_request_timeout_ms(&self) -> u64 {
+        self.cfg
+            .forward_timeout_ms
+            .max(self.cfg.delegation_stream_tick_ms * 4)
+            .max(1)
+    }
+
+    /// Drop the in-flight requests whose answers are overdue; the
+    /// generations whose renewal was dropped (re-sent by the caller).
+    fn deleg_expire_inflight(&mut self, now: Ms) -> Vec<u64> {
+        let timeout = self.deleg_request_timeout_ms() as i64;
+        let mut drop_reqs = Vec::new();
+        let mut renew_again = Vec::new();
+        for d in self.dl.mine.values_mut() {
+            if let Some((req, _)) = d.inflight {
+                if now.since(d.inflight_at) >= timeout {
+                    drop_reqs.push(req);
+                    d.inflight = None;
+                    self.stats.deleg_stream_timeouts += 1;
+                }
+            }
+            if let Some((req, _)) = d.backup_inflight {
+                if now.since(d.backup_inflight_at) >= timeout {
+                    drop_reqs.push(req);
+                    d.backup_inflight = None;
+                    self.stats.deleg_stream_timeouts += 1;
+                }
+            }
+            if let Some((req, sent)) = d.renew {
+                if now.since(sent) >= timeout {
+                    drop_reqs.push(req);
+                    d.renew = None;
+                    if d.renew_timer.is_none() && !d.stopped {
+                        renew_again.push(d.gen);
+                    }
+                }
+            }
+        }
+        for req in drop_reqs {
+            self.dl.by_req.remove(&req);
+        }
+        renew_again
+    }
+
     /// Send the next batch of every generation without one in flight.
     fn deleg_stream(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.dl.mine.is_empty() {
             return;
+        }
+        // A renewal whose answer was lost (a dropped message: no
+        // transport failure, no reply) is sent again, or its timer never
+        // comes back (long-delegated seed 70067: reclaimed unrenewed).
+        for gen in self.deleg_expire_inflight(now) {
+            self.deleg_renew_now(now, gen, out);
         }
         let Some(root) = self.root_node() else {
             // Learn the holder; the next event streams.
@@ -720,7 +1345,9 @@ impl Core {
             let req = self.op_id();
             self.dl.by_req.insert(req, (gen, ReqKind::Stream));
             self.stats.deleg_streamed_txs += txs.len() as u64;
-            self.dl.mine.get_mut(&gen).expect("present").inflight = Some((req, last));
+            let d = self.dl.mine.get_mut(&gen).expect("present");
+            d.inflight = Some((req, last));
+            d.inflight_at = now;
             tracing::debug!(
                 node = self.me(),
                 gen,
@@ -768,10 +1395,15 @@ impl Core {
         };
         d.inflight = None;
         if refused {
-            // The generation is ending (or the root has not learned it
-            // yet): stop streaming; the log says what happened.
+            // The generation is ending, or the root has not learned it
+            // (a successor before its table, a holder inside its takeover
+            // gate): the log ends a generation, a refusal does not — back
+            // off and try again on the tick.
             self.stats.deleg_stream_refused += 1;
-            d.refused = true;
+            let tick = self.cfg.delegation_stream_tick_ms.max(1);
+            d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
+            d.stream_after = Some(now.plus(d.stream_backoff_ms));
+            self.arm_stream_tick(now, out);
             return;
         }
         d.streamed_through = d.streamed_through.max(through);
@@ -823,6 +1455,39 @@ impl Core {
                     g.recall_req = None;
                 }
             }
+            ReqKind::BackupAppend => {
+                // Phase 2b: the backup is unreachable; the tick resends,
+                // and after three failures the delegate goes on without
+                // it (M9: no peer in budget means the local policy).
+                let mut dropped = None;
+                if let Some(d) = self.dl.mine.get_mut(&gen) {
+                    d.backup_inflight = None;
+                    d.backup_failures += 1;
+                    if d.backup_failures >= 3 {
+                        dropped = d.backup.take();
+                        d.backup_failures = 0;
+                    }
+                }
+                if let Some(b) = dropped {
+                    tracing::warn!(
+                        node = self.cfg.node_id,
+                        gen,
+                        backup = b,
+                        "delegate dropped an unreachable backup"
+                    );
+                }
+                self.arm_stream_tick(now, out);
+            }
+            ReqKind::Seal => {
+                // Phase 2b: the backup did not answer the seal: the
+                // grant's expiry ends the generation without its tail.
+                if let Some(g) = self.dl.gens.get_mut(&gen) {
+                    if g.recall == RecallPhase::Sealing {
+                        g.recall = RecallPhase::None;
+                    }
+                }
+                self.arm_gen_expiry(now, gen, out);
+            }
         }
         true
     }
@@ -831,13 +1496,28 @@ impl Core {
 
     fn deleg_renew_now(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
         let Some(root) = self.root_node() else {
+            // Learn the holder, and try again after a tick: the first
+            // renewal of a grant installed from an S3 tail (no P2P
+            // exchange with the root yet) must not be the last
+            // (long-delegated seed 70067: never renewed, reclaimed).
             self.issue_s3(
                 crate::action::S3Op::LeaseGet,
                 super::S3For::RefreshHolder,
                 out,
             );
+            if let Some(d) = self.dl.mine.get_mut(&gen) {
+                if d.renew_timer.is_none() && !d.stopped {
+                    let t = self.set_timer(
+                        now.plus(self.cfg.delegation_stream_tick_ms.max(1)),
+                        Timer::DelegRenew(gen),
+                        out,
+                    );
+                    self.dl.mine.get_mut(&gen).expect("present").renew_timer = Some(t);
+                }
+            }
             return;
         };
+        let _ = self.deleg_expire_inflight(now);
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return;
         };
@@ -851,9 +1531,11 @@ impl Core {
             self.cancel_timer(t, out);
         }
         self.dl.by_req.insert(req, (gen, ReqKind::Renew));
+        let backup = self.dl.mine.get(&gen).and_then(|d| d.backup);
+        self.dl.mine.get_mut(&gen).expect("present").renew_backup = backup;
         out.push(Action::Send {
             to: root,
-            msg: PeerMsg::DelegRenew { req, gen },
+            msg: PeerMsg::DelegRenew { req, gen, backup },
         });
     }
 
@@ -871,19 +1553,24 @@ impl Core {
         from: NodeId,
         req: OpId,
         gen: u64,
+        backup: Option<NodeId>,
         out: &mut Vec<Action>,
     ) {
         let mut ttl_ms = 0u64;
         if self.root_usable(now) && !self.dl.epoch_active {
             let cap = self.grant_cap_ms(now);
+            let extra = self.reclaim_horizon_ms() - self.cfg.delegation_ttl_ms;
             if let Some(g) = self.dl.gens.get_mut(&gen) {
                 if g.node == from && !g.ended && g.recall == RecallPhase::None {
                     ttl_ms = self.cfg.delegation_ttl_ms.min(cap);
                     if ttl_ms > 0 {
-                        let until = now.plus(ttl_ms + self.cfg.expiry_margin_ms);
+                        let until = now.plus(ttl_ms + extra);
                         if until > g.until {
                             g.until = until;
                         }
+                    }
+                    if g.backup != backup {
+                        g.backup = backup;
                     }
                 }
             }
@@ -957,7 +1644,13 @@ impl Core {
         // Renew at half the ttl.
         let at = sent.plus(ttl_ms / 2);
         let t = self.set_timer(at.max(now.plus(1)), Timer::DelegRenew(gen), out);
-        self.dl.mine.get_mut(&gen).expect("present").renew_timer = Some(t);
+        let d = self.dl.mine.get_mut(&gen).expect("present");
+        d.renew_timer = Some(t);
+        if d.backup.is_some() && d.renew_backup != d.backup {
+            // Phase 2b: the root seals the backup on a silent delegate
+            // only once it knows it — tell it now, not at the next timer.
+            self.deleg_renew_now(now, gen, out);
+        }
         self.deleg_after_event(now, replica, out);
     }
 
@@ -984,10 +1677,137 @@ impl Core {
             // waits for the cursor to reach `through`.
             self.deleg_stream(now, replica, out);
         }
+        // Phase 2b (M8): the read delegations this delegate granted are
+        // recalled first; the root executes under the subtree only once
+        // they are gone (or, past the horizon, expired).
+        if self.cfg.read_delegations {
+            let need = replica.read_delegations().all_live(now.0);
+            if let Some(wait) = self.start_recalls(now, need, out) {
+                self.park(
+                    now,
+                    wait,
+                    None,
+                    super::readindex::ParkedWhat::DelegRecalled {
+                        to: from,
+                        req,
+                        gen,
+                        through,
+                    },
+                );
+                return;
+            }
+        }
         out.push(Action::Send {
             to: from,
             msg: PeerMsg::DelegRecalled { req, gen, through },
         });
+    }
+
+    // ----------------------------------------------------- reads (M8)
+
+    /// Phase 2b: the keys a read of `ino` (and `name` under it) touches,
+    /// for ownership.
+    /// The keys a strict read touches, keyed like the writes that change
+    /// them (`keys_of_op`): a lookup is its dentry (the directory's own
+    /// inode resolves by *its* parent, which would make every lookup in
+    /// a delegated directory cross-subtree); an inode read is the inode.
+    pub(crate) fn read_keys(ino: Ino, name: Option<&str>) -> TouchSet {
+        let mut keys = TouchSet::default();
+        match name {
+            Some(n) => {
+                keys.dentries.insert((ino, n.to_string()));
+            }
+            None => {
+                keys.inos.insert(ino);
+            }
+        }
+        keys
+    }
+
+    /// Phase 2b: answer a strict read for this delegate's subtree, if it
+    /// is: the position is this replica's plus the stream index, and a
+    /// read delegation capped by the grant.
+    pub(crate) fn deleg_read_index(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        ino: Ino,
+        name: Option<&str>,
+        replica: &dyn Replica,
+    ) -> Option<crate::event::ReadIndexOutcome> {
+        if !self.cfg.delegation || self.dl.mine.is_empty() {
+            return None;
+        }
+        let keys = Self::read_keys(ino, name);
+        let gen = self.my_generation_for(&keys, replica)?;
+        let d = self.dl.mine.get(&gen)?;
+        if now >= d.until {
+            return None;
+        }
+        let epoch = super::DELEG_READ_EPOCH_BASE + gen;
+        let grant = if self.cfg.read_delegations && from != self.cfg.node_id {
+            let margin = self.cfg.expiry_margin_ms as i64;
+            let cap = d.until.0 - margin - now.0;
+            let ttl = (self.cfg.read_delegation_ttl_ms as i64).min(cap);
+            if ttl > 0 && !self.rd.blocked.get(&ino).is_some_and(|until| *until > now) {
+                let until = now.0 + ttl + margin;
+                let id = replica.read_delegations().grant(from, ino, until);
+                self.stats.deleg_read_grants += 1;
+                Some(crate::event::ReadGrantMsg {
+                    id,
+                    ttl_ms: ttl as u64,
+                    epoch,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.stats.deleg_read_index_served += 1;
+        Some(crate::event::ReadIndexOutcome::Ok {
+            position: Position {
+                seq: replica.applied_seq().unwrap_or(0),
+                pending: None,
+                streams: {
+                    let mut s = constellation_meta::Streams::NONE;
+                    s.raise(gen, replica.stream_applied(gen));
+                    s
+                },
+            },
+            grant,
+        })
+    }
+
+    /// Phase 2b: where a strict read of `ino` goes — the delegate owning
+    /// it (`Some(node)`), this node itself as that delegate (`Some(me)`),
+    /// or the holder (`None`).
+    pub(crate) fn deleg_read_owner(
+        &self,
+        now: Ms,
+        ino: Ino,
+        name: Option<&str>,
+        replica: &dyn Replica,
+    ) -> Option<NodeId> {
+        if !self.cfg.delegation || replica.delegation_table().is_empty() {
+            return None;
+        }
+        let keys = Self::read_keys(ino, name);
+        match replica.resolve_ownership(&keys) {
+            Ownership::Delegated(d) => {
+                if d.node == self.cfg.node_id {
+                    let honoured = self
+                        .dl
+                        .mine
+                        .get(&d.gen)
+                        .is_some_and(|m| now < m.until && !m.stopped);
+                    honoured.then_some(d.node)
+                } else {
+                    Some(d.node)
+                }
+            }
+            _ => None,
+        }
     }
 
     // ----------------------------------------------------- the root
@@ -995,36 +1815,125 @@ impl Core {
     /// The generations `keys` fall under that this root must end before
     /// it executes: started (recalled) here; the caller parks on their
     /// wait ids. `None`: nothing to recall.
-    pub(crate) fn deleg_recall_needed(
+    /// What executing an op touching `keys` on the root needs first
+    /// (phase 2b: a designation is never recalled — the op is refused).
+    pub(crate) fn deleg_recall_plan(
         &mut self,
         now: Ms,
         keys: &TouchSet,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
-    ) -> Option<BTreeSet<u64>> {
+    ) -> RecallPlan {
         if !self.cfg.delegation || self.dl.gens.is_empty() {
-            return None;
+            return RecallPlan::None;
         }
-        let involved: Vec<u64> = match replica.resolve_ownership(keys) {
-            Ownership::Root => return None,
-            Ownership::Delegated(d) => vec![d.gen],
+        let (involved, cross): (Vec<u64>, bool) = match replica.resolve_ownership(keys) {
+            Ownership::Root => return RecallPlan::None,
+            Ownership::Delegated(d) => (vec![d.gen], false),
             Ownership::CrossSubtree { involved, .. } => {
                 self.stats.deleg_cross_subtree += 1;
-                involved.iter().map(|d| d.gen).collect()
+                (involved.iter().map(|d| d.gen).collect(), true)
             }
         };
+        let designated = involved.iter().any(|g| {
+            self.dl
+                .gens
+                .get(g)
+                .is_some_and(|s| !s.ended && s.kind == DelegKind::Designated)
+        });
+        if designated {
+            // Plans 03–05: only the designee writes under its path
+            // (`EROFS` for anyone else once the designee is unreachable),
+            // and nothing moves across its boundary (`EXDEV`).
+            self.stats.deleg_refused_designated += 1;
+            tracing::info!(
+                node = self.me(),
+                cross,
+                "refusing an op under an unreachable designation (plans 03-05)"
+            );
+            return RecallPlan::Refuse(if cross { libc::EXDEV } else { libc::EROFS });
+        }
         let mut waiting = BTreeSet::new();
         for gen in involved {
             if self.dl.gens.get(&gen).is_some_and(|g| g.ended) {
                 continue;
             }
+            if cross {
+                if let Some(g) = self.dl.gens.get_mut(&gen) {
+                    // Ended by an op, not a decision: delegate it again
+                    // to the same node once the op ran (a known 2a gap).
+                    g.redelegate = true;
+                }
+            }
             self.start_recall(now, gen, out);
             waiting.insert(wait_id(gen));
         }
-        (!waiting.is_empty()).then_some(waiting)
+        if waiting.is_empty() {
+            RecallPlan::None
+        } else {
+            RecallPlan::Wait(waiting)
+        }
     }
 
-    fn start_recall(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
+    /// Phase 2b: after a cross-subtree op executed, the generations it
+    /// ended are granted again to their nodes (a new generation each).
+    pub(crate) fn deleg_redelegate_after_cross(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.root_usable(now) {
+            return;
+        }
+        let again: Vec<(u64, Ino, NodeId, DelegKind)> = self
+            .dl
+            .gens
+            .iter()
+            .filter(|(_, g)| g.ended && g.redelegate)
+            .map(|(gen, g)| (*gen, g.dir, g.node, g.kind))
+            .collect();
+        for (gen, dir, node, kind) in again {
+            if let Some(g) = self.dl.gens.get_mut(&gen) {
+                g.redelegate = false;
+            }
+            if !self.dl.pending_exec.is_empty()
+                || self.has_exec_parks()
+                || self.rd_has_recall_wait(gen)
+            {
+                // The op that ended it has not run yet: next time.
+                if let Some(g) = self.dl.gens.get_mut(&gen) {
+                    g.redelegate = true;
+                }
+                continue;
+            }
+            if !self.links.get(&node).is_some_and(|l| l.connected) {
+                continue;
+            }
+            match self.delegate_dir(now, dir, node, kind, replica, out) {
+                Ok(new_gen) => {
+                    self.stats.deleg_redelegated += 1;
+                    tracing::info!(
+                        node = self.me(),
+                        dir,
+                        delegate = node,
+                        gen,
+                        new_gen,
+                        "re-delegated after a cross-subtree op"
+                    );
+                }
+                Err(why) => tracing::debug!(
+                    node = self.me(),
+                    dir,
+                    delegate = node,
+                    why,
+                    "not re-delegated"
+                ),
+            }
+        }
+    }
+
+    pub(crate) fn start_recall(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
@@ -1068,7 +1977,10 @@ impl Core {
         let Some(g) = self.dl.gens.get(&gen) else {
             return;
         };
-        if g.ended {
+        if g.ended || g.kind == DelegKind::Designated {
+            // A designation never expires: `online` ends it (an
+            // unreachable designee's stays until it returns, DESIGN.md
+            // §5.2).
             return;
         }
         let at = g.until.max(now);
@@ -1090,7 +2002,19 @@ impl Core {
             return;
         };
         g.expiry = None;
-        if g.ended || !self.root_usable(now) {
+        if g.ended {
+            return;
+        }
+        if !self.root_usable(now) {
+            // Phase 2b round 2: the root is unusable for the moment (a
+            // renewal in flight, S3 away) but not gone (`deleg_on_lease_gone`
+            // drops the state when it is): the expiry is tried again
+            // shortly, or a recall in flight is never outwaited — an
+            // execution parked on it waits forever (long-delegated seed
+            // 70051: 85 000 simulated seconds of timers).
+            let again = now.plus(self.cfg.delegation_stream_tick_ms.max(100));
+            let t = self.set_timer(again, Timer::DelegExpiry(gen), out);
+            self.dl.gens.get_mut(&gen).expect("present").expiry = Some(t);
             return;
         }
         let g = self.dl.gens.get(&gen).expect("present");
@@ -1102,15 +2026,64 @@ impl Core {
         if done {
             return;
         }
+        // Phase 2b: a silent delegate with a backup — ask the backup to
+        // seal and hand over what it holds first (once; the answer, or
+        // its absence, ends the generation either way).
+        if let (Some(backup), 0, true) = (
+            g.backup,
+            g.seal_attempts,
+            g.recall != RecallPhase::Drained(0),
+        ) {
+            let req = self.op_id();
+            let g = self.dl.gens.get_mut(&gen).expect("present");
+            g.seal_attempts = 1;
+            g.recall = RecallPhase::Sealing;
+            g.until = now.plus(self.cfg.forward_timeout_ms * 2);
+            self.dl.by_req.insert(req, (gen, ReqKind::Seal));
+            self.stats.deleg_seals_sent += 1;
+            tracing::info!(
+                node = self.me(),
+                gen,
+                backup,
+                "delegate silent: sealing its backup"
+            );
+            out.push(Action::Send {
+                to: backup,
+                msg: PeerMsg::DelegSeal { req, gen },
+            });
+            self.arm_gen_expiry(now, gen, out);
+            return;
+        }
         // The grant is not honoured any more (the margin argument): a
         // pending recall is outwaited, an unrenewed grant reclaimed.
-        if g.recall == RecallPhase::None {
-            if !self.cfg.delegation_reclaim_expired {
-                return;
+        match g.recall {
+            RecallPhase::None => {
+                if !self.cfg.delegation_reclaim_expired {
+                    return;
+                }
+                self.stats.deleg_reclaimed += 1;
+                tracing::info!(
+                    node = self.me(),
+                    gen,
+                    until = g.until.0,
+                    now = now.0,
+                    "reclaiming an unrenewed delegation"
+                );
             }
-            self.stats.deleg_reclaimed += 1;
-        } else {
-            self.stats.deleg_recalls_expired += 1;
+            RecallPhase::Sealing => {
+                // The seal was not answered in time.
+                if let Some(req) = self
+                    .dl
+                    .by_req
+                    .iter()
+                    .find(|(_, (g, k))| *g == gen && *k == ReqKind::Seal)
+                    .map(|(r, _)| *r)
+                {
+                    self.dl.by_req.remove(&req);
+                }
+                self.stats.deleg_reclaimed += 1;
+            }
+            _ => self.stats.deleg_recalls_expired += 1,
         }
         self.end_generation(now, gen, replica, out);
     }
@@ -1186,6 +2159,12 @@ impl Core {
             "delegation generation ended"
         );
         self.mark_ended(now, gen, replica, out);
+        // The record is journaled here, not applied from a segment: a
+        // generation this node held itself (inherited by a successor
+        // that was the delegate) ends on the delegate side too.
+        if self.dl.mine.contains_key(&gen) {
+            self.drop_delegate_state(now, gen, replica, out);
+        }
     }
 
     fn mark_ended(&mut self, now: Ms, gen: u64, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -1269,6 +2248,14 @@ impl Core {
                 Ok(_) => {
                     cursor = tx.idx;
                     appended += 1;
+                    if self.cfg.placement {
+                        // The op's origin, not the delegate that executed
+                        // it: a forwarded op counts for its requester.
+                        let origin = tx.rid.map(|r| r.node).unwrap_or(from);
+                        let keys = TouchSet::from_records(tx.records.iter());
+                        let dirs = Core::dirs_of_keys(&keys, replica);
+                        self.place_note(origin, dirs);
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(node = self.me(), gen, idx = tx.idx, %error, "could not append a delegate transaction");
@@ -1320,54 +2307,93 @@ impl Core {
                 result: Err(msg),
             });
         };
+        match self.delegate_dir(now, dir, node, DelegKind::Manual, replica, out) {
+            Ok(gen) => out.push(Action::ControlDone {
+                op,
+                result: Ok(ControlOk::Text(format!(
+                    "delegated dir {dir} to node {node} (gen {gen})"
+                ))),
+            }),
+            Err(msg) => fail(out, msg),
+        }
+    }
+
+    /// Delegate `dir` to `node` as `kind`: the `Delegate` record and the
+    /// root's generation state. The checks every path shares (an
+    /// operator's control, the placement, a designation, a
+    /// re-delegation after a cross-subtree op).
+    pub(crate) fn delegate_dir(
+        &mut self,
+        now: Ms,
+        dir: Ino,
+        node: NodeId,
+        kind: DelegKind,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> Result<u64, String> {
         if !self.cfg.delegation {
-            return fail(out, "delegation is off (CONSTELLATION_DELEGATION)".into());
+            return Err("delegation is off (CONSTELLATION_DELEGATION)".into());
         }
         if !self.cfg.p2p {
-            return fail(out, "delegation needs P2P".into());
+            return Err("delegation needs P2P".into());
         }
         if !self.root_usable(now) {
-            return fail(out, "this node does not hold the lease".into());
+            return Err("this node does not hold the lease".into());
         }
         if self.dl.epoch_active || self.epoch.open {
-            return fail(
-                out,
-                "no delegation while a continuation epoch is open".into(),
-            );
+            return Err("no delegation while a continuation epoch is open".into());
         }
         if node == self.me() {
-            return fail(out, "cannot delegate to the root itself".into());
+            return Err("cannot delegate to the root itself".into());
         }
         let table = replica.delegation_table();
         if let Some(d) = table.owner_of_dir(replica.namespace(), dir) {
-            return fail(
-                out,
-                format!(
-                    "directory {dir} is under delegation {} (gen {})",
-                    d.dir, d.gen
-                ),
-            );
+            return Err(format!(
+                "directory {dir} is under delegation {} (gen {})",
+                d.dir, d.gen
+            ));
         }
-        if table.iter().any(|d| d.node == node) {
-            return fail(out, format!("node {node} already holds a delegation"));
-        }
-        let highest = table.iter().map(|d| d.gen).max().unwrap_or(0);
-        let gen = match replica.next_delegation_gen(highest + 1) {
-            Ok(g) => g,
-            Err(e) => return fail(out, e.to_string()),
-        };
-        if let Err(e) =
-            replica.apply_records_journaled(&[LogRecord::Delegate { dir, node, gen }], None)
+        // A delegation on a descendant of `dir` would be shadowed.
+        if table
+            .iter()
+            .any(|d| d.dir != dir && is_under(replica.namespace(), d.dir, dir))
         {
-            return fail(out, e.to_string());
+            return Err(format!("a directory under {dir} is already delegated"));
         }
+        if kind != DelegKind::Designated && table.iter().any(|d| d.node == node && !d.designated) {
+            return Err(format!("node {node} already holds a delegation"));
+        }
+        // Above every generation the log ever named (a predecessor's
+        // ended ones included): a generation is a stream's identity.
+        let highest = table.max_gen();
+        let gen = replica
+            .next_delegation_gen(highest + 1)
+            .map_err(|e| e.to_string())?;
+        let designated = kind == DelegKind::Designated;
+        replica
+            .apply_records_journaled(
+                &[LogRecord::Delegate {
+                    dir,
+                    node,
+                    gen,
+                    designated,
+                }],
+                None,
+            )
+            .map_err(|e| e.to_string())?;
         self.dl.gens.insert(
             gen,
             GenState {
                 dir,
                 node,
+                kind,
+                backup: None,
+                redelegate: false,
+                granted: now,
+                below_since: None,
+                seal_attempts: 0,
                 cursor: 0,
-                until: now.plus(self.cfg.delegation_ttl_ms + self.cfg.expiry_margin_ms),
+                until: now.plus(self.reclaim_horizon_ms()),
                 recall: RecallPhase::None,
                 ended: false,
                 expiry: None,
@@ -1377,15 +2403,99 @@ impl Core {
         );
         self.arm_gen_expiry(now, gen, out);
         self.stats.deleg_delegated += 1;
+        match kind {
+            DelegKind::Placed => self.stats.place_delegated += 1,
+            DelegKind::Designated => self.stats.deleg_designated += 1,
+            DelegKind::Manual => {}
+        }
         self.lease.touch(now);
         self.nudge(now, out);
-        tracing::info!(node = self.me(), dir, delegate = node, gen, "delegated");
-        out.push(Action::ControlDone {
-            op,
-            result: Ok(ControlOk::Text(format!(
-                "delegated dir {dir} to node {node} (gen {gen})"
-            ))),
-        });
+        tracing::info!(
+            node = self.me(),
+            dir,
+            delegate = node,
+            gen,
+            ?kind,
+            "delegated"
+        );
+        Ok(gen)
+    }
+
+    /// How long the root honours a grant it cannot see renewed: the
+    /// grant's ttl plus the margin. The read delegations a delegate
+    /// grants under it (phase 2b, M8) need no extra term: each is capped
+    /// by the delegate's own `until` less the margin, so every one of
+    /// them lapses before the grant does.
+    pub(crate) fn reclaim_horizon_ms(&self) -> u64 {
+        self.cfg.delegation_ttl_ms + self.cfg.expiry_margin_ms
+    }
+
+    /// Phase 2b: keep the table in step with the offline designations
+    /// (plans 03–05): a live write designation becomes a designated
+    /// generation to its designee (unless the designee is this root:
+    /// then the root sequences it, which is the same thing); a released
+    /// one is recalled (drained by the designee). A directory under
+    /// another delegation waits for that generation to end first.
+    pub(crate) fn on_control_sync_designations(
+        &mut self,
+        now: Ms,
+        entries: &[(Ino, NodeId)],
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.cfg.delegation || !self.root_usable(now) {
+            return;
+        }
+        let table = replica.delegation_table();
+        for &(dir, node) in entries {
+            if node == self.me() {
+                continue;
+            }
+            match table.get(dir) {
+                Some(d) if d.designated && d.node == node => continue,
+                Some(d) if !d.designated => {
+                    // A placed or manual delegation on the very directory:
+                    // it ends, the designation follows on the next sync.
+                    if self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
+                        self.start_recall(now, d.gen, out);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(d) = table.owner_of_dir(replica.namespace(), dir) {
+                if !d.designated && self.dl.gens.get(&d.gen).is_some_and(|g| !g.ended) {
+                    self.start_recall(now, d.gen, out);
+                }
+                continue;
+            }
+            if let Err(why) = self.delegate_dir(now, dir, node, DelegKind::Designated, replica, out)
+            {
+                tracing::debug!(
+                    node = self.me(),
+                    dir,
+                    designee = node,
+                    why,
+                    "designation not delegated yet"
+                );
+            }
+        }
+        let released: Vec<u64> = table
+            .iter()
+            .filter(|d| {
+                d.designated
+                    && !entries
+                        .iter()
+                        .any(|(dir, node)| *dir == d.dir && *node == d.node)
+            })
+            .map(|d| d.gen)
+            .collect();
+        for gen in released {
+            if self.dl.gens.get(&gen).is_some_and(|g| !g.ended) {
+                tracing::info!(node = self.me(), gen, "designation released: recalling");
+                self.start_recall(now, gen, out);
+            }
+        }
     }
 
     pub(crate) fn on_control_undelegate(
@@ -1454,7 +2564,24 @@ impl Core {
 
     /// The lease was lost or released: no generation is this node's to
     /// end any more (a successor learns them from the log).
-    pub(crate) fn deleg_on_lease_gone(&mut self, out: &mut Vec<Action>) {
+    pub(crate) fn deleg_on_lease_gone(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        // Phase 2b: what waited on these generations' recalls re-routes
+        // (a local op to the new holder; a forwarded one is answered
+        // `Busy` and re-sent).
+        let ids: BTreeSet<u64> = self.dl.gens.keys().map(|g| wait_id(*g)).collect();
+        if !ids.is_empty() {
+            tracing::info!(
+                node = self.me(),
+                generations = ids.len(),
+                "the root lease is gone: its delegation state is dropped"
+            );
+            self.abort_parks_waiting_on(now, &ids, replica, out);
+        }
         for (_, g) in std::mem::take(&mut self.dl.gens) {
             if let Some(t) = g.expiry {
                 self.cancel_timer(t, out);
@@ -1470,6 +2597,34 @@ impl Core {
             }
         }
     }
+}
+
+/// What the root must do before executing an op (phase 2b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecallPlan {
+    None,
+    /// Wait for these recalls (`wait_id`s).
+    Wait(BTreeSet<u64>),
+    /// Refuse with this errno (a designation is involved).
+    Refuse(i32),
+}
+
+/// Whether `dir` is `ancestor` or under it.
+fn is_under(
+    ns: &dyn constellation_meta::delegation::Namespace,
+    mut dir: Ino,
+    ancestor: Ino,
+) -> bool {
+    for _ in 0..4096 {
+        if dir == ancestor {
+            return true;
+        }
+        match ns.parent_of(dir) {
+            Some(p) => dir = p,
+            None => return false,
+        }
+    }
+    false
 }
 
 fn gen_of(g: &GenState, gens: &BTreeMap<u64, GenState>) -> u64 {

@@ -169,6 +169,16 @@ impl Core {
                 }
                 continue;
             }
+            // Plan 30 §M11 phase 2b round 2: a shadow a delegate accepted
+            // is not re-executed while its generation is live — the
+            // delegate re-streams it to the (successor) root, in its
+            // stream's order, or the generation ends and the void rule
+            // frees it (long-delegated seed 70075: the successor's replay
+            // ran ahead of the delegate's earlier transactions).
+            if head.gen != 0 && replica.delegation_table().iter().any(|d| d.gen == head.gen) {
+                self.stats.replays_held_for_stream += 1;
+                return;
+            }
             if self.clients.contains_key(&head.rid) {
                 // Still in flight as a client op (its reply is what will
                 // resolve it); nothing to do this tick.
@@ -444,6 +454,20 @@ impl Core {
         out: &mut Vec<Action>,
     ) -> Result<(), constellation_meta::MetaError> {
         if queued.refused.is_some() {
+            return Ok(());
+        }
+        // Plan 30 §M11 phase 2b round 2: a delegate-accepted shadow stays
+        // queued while its generation is live (the delegate re-streams it
+        // to this successor, in stream order; the drain tick frees it
+        // once the generation ended) — never executed here ahead of the
+        // delegate's earlier transactions (long-delegated seed 70075).
+        if queued.gen != 0
+            && replica
+                .delegation_table()
+                .iter()
+                .any(|d| d.gen == queued.gen)
+        {
+            self.stats.replays_held_for_stream += 1;
             return Ok(());
         }
         if let Some(outcome) = completed_as_outcome(replica, queued.rid, 0) {

@@ -522,6 +522,14 @@ pub struct DelegModel {
     /// `(dir, node)`: delegations in the initial log, generations `1..`,
     /// renewed at `t = 0`.
     pub initial_delegations: Vec<(u8, u8)>,
+    /// Phase 2b: `(dir, node)` offline designations in the initial log
+    /// (generations after `initial_delegations`'): the designee honours
+    /// its grant whatever its clock says, and its acknowledgements are
+    /// promised final (DESIGN.md §5.2: "its root claim is non-stealable").
+    pub designated: Vec<(u8, u8)>,
+    /// Phase 2b, the naive knob: the root reclaims a designation like any
+    /// grant nobody renewed (`reclaim_expired`); the design never does.
+    pub designations_expire: bool,
     /// `(delegate, backup)`: the delegate acknowledges only after the
     /// backup persisted the record.
     pub backups: Vec<(u8, u8)>,
@@ -579,6 +587,8 @@ impl DelegModel {
             scripts,
             initial_present: Vec::new(),
             initial_delegations: Vec::new(),
+            designated: Vec::new(),
+            designations_expire: false,
             backups: Vec::new(),
             delegatable: Vec::new(),
             deps_at_root: true,
@@ -856,6 +866,9 @@ pub enum Violation {
     ReadYourWrites(u8, Key),
     /// A delegate acknowledged under an ended generation.
     RecallSafety(u8, u8),
+    /// Phase 2b: a designee's acknowledged op was retracted (its
+    /// generation ended under it): a fork of the designated subtree.
+    DesignationStranded(u8),
 }
 
 pub const SAW_LOCAL_DELEG_WRITE: u16 = 1;
@@ -890,6 +903,8 @@ pub struct State {
     pub closed: u16,
     /// Ghost: rids acknowledged after a backup persisted them.
     pub durable_rids: Vec<Rid>,
+    /// Phase 2b: the generations that are designations (bit `gen`).
+    pub designated_gens: u16,
     pub violation: Option<Violation>,
     pub saw: u16,
 }
@@ -1212,9 +1227,19 @@ impl Model for DelegModel {
         } else {
             self.deleg_ttl
         };
-        for &(dir, node) in &self.initial_delegations {
+        let mut designated_gens: u16 = 0;
+        let all_initial: Vec<(u8, u8, bool)> = self
+            .initial_delegations
+            .iter()
+            .map(|&(d, n)| (d, n, false))
+            .chain(self.designated.iter().map(|&(d, n)| (d, n, true)))
+            .collect();
+        for &(dir, node, is_designated) in &all_initial {
             let gen = next_gen;
             next_gen += 1;
+            if is_designated {
+                designated_gens |= 1 << gen;
+            }
             root.jseq += 1;
             log.push(Entry {
                 origin: Origin {
@@ -1237,7 +1262,11 @@ impl Model for DelegModel {
             nodes[node as usize].deleg = Some(DelegState {
                 dir,
                 gen,
-                until: off[node as usize] + ttl - self.deleg_margin,
+                until: if is_designated {
+                    i16::MAX
+                } else {
+                    off[node as usize] + ttl - self.deleg_margin
+                },
                 stopped: false,
                 spec: Vec::new(),
                 next_idx: 1,
@@ -1271,6 +1300,7 @@ impl Model for DelegModel {
             ended_gens: 0,
             closed: 0,
             durable_rids: Vec::new(),
+            designated_gens,
             violation: None,
             saw: 0,
         }]
@@ -1323,9 +1353,11 @@ impl Model for DelegModel {
                         // A recall the delegate did not answer in time, or
                         // (`reclaim_expired`) a grant nobody renewed: the
                         // delegate honours neither any more.
+                        let designated = s.designated_gens & (1 << g) != 0;
                         if gs.live
                             && !gs.ended
                             && (gs.recall != RecallPhase::None || self.reclaim_expired)
+                            && (!designated || self.designations_expire)
                         {
                             let done =
                                 matches!(gs.recall, RecallPhase::Drained(th) if gs.cursor >= th);
@@ -1625,6 +1657,9 @@ impl Model for DelegModel {
             }),
             Property::always("recall_safety", |_, s: &State| {
                 !matches!(s.violation, Some(Violation::RecallSafety(..)))
+            }),
+            Property::always("designation_final", |_, s: &State| {
+                !matches!(s.violation, Some(Violation::DesignationStranded(..)))
             }),
             Property::always("log_records_valid", |m: &DelegModel, s: &State| {
                 prop_log_valid(m, s)
@@ -2040,6 +2075,14 @@ fn strand_stream(s: &mut State, stream: u8, cut: u8) {
         .filter(|a| a.origin.stream == stream && a.origin.idx > cut)
         .map(|a| (a.rid, a.durable))
         .collect();
+    // Phase 2b: a designee's acknowledgements are promised final.
+    if stream > GEN_BASE
+        && s.designated_gens & (1 << (stream - GEN_BASE)) != 0
+        && !lost.is_empty()
+        && s.violation.is_none()
+    {
+        s.violation = Some(Violation::DesignationStranded(stream - GEN_BASE));
+    }
     let _ = &lost;
     for (rid, _) in lost {
         s.mark(rid, Ret::Tentative);
@@ -2257,7 +2300,9 @@ fn takeover(cfg: &DelegModel, s: &mut State, i: usize) {
             dir: d.dir,
             node: d.node,
             cursor: State::applied_of(&s.log, gen_stream(d.gen)),
-            until: if cfg.takeover_horizon {
+            until: if s.designated_gens & (1 << d.gen) != 0 {
+                i16::MAX
+            } else if cfg.takeover_horizon {
                 now + cfg.deleg_ttl + cfg.root_margin
             } else {
                 now

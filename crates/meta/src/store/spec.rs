@@ -289,6 +289,14 @@ struct QueuedReplay {
     /// makes no conflict copy (the op's own requester replays it).
     #[serde(default)]
     foreign: bool,
+    /// Plan 30 §M11 phase 2b round 2: the delegation generation whose
+    /// stream the op's reply named (a shadow accepted by a delegate);
+    /// 0: the root's. Held from replay while that generation is live in
+    /// the table — the delegate re-streams it to the successor root, or
+    /// the generation ends — so a successor never executes it ahead of
+    /// the delegate's earlier transactions (long-delegated seed 70075).
+    #[serde(default)]
+    gen: u64,
 }
 
 /// A stranded op waiting to be replayed by rid (plan 30 §M3a recovery
@@ -302,6 +310,8 @@ pub struct StrandedOp {
     pub refused: Option<Refusal>,
     /// Plan 30 §M9: see `QueuedReplay::foreign`.
     pub foreign: bool,
+    /// Plan 30 §M11 phase 2b round 2: see `QueuedReplay::gen`.
+    pub gen: u64,
 }
 
 /// What a stranding pass rolled back.
@@ -599,7 +609,19 @@ fn enqueue_replay_tx(
     rid: Rid,
     op: MutateOp,
 ) -> Result<(), MetaError> {
-    enqueue_replay_as_tx(tx, meta, key, rid, op, false)
+    enqueue_replay_as_tx(tx, meta, key, rid, op, false, 0)
+}
+
+/// [`enqueue_replay_tx`] for a shadow a delegate accepted under `gen`.
+fn enqueue_replay_gen_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    key: u64,
+    rid: Rid,
+    op: MutateOp,
+    gen: u64,
+) -> Result<(), MetaError> {
+    enqueue_replay_as_tx(tx, meta, key, rid, op, false, gen)
 }
 
 fn enqueue_replay_as_tx(
@@ -609,12 +631,14 @@ fn enqueue_replay_as_tx(
     rid: Rid,
     op: MutateOp,
     foreign: bool,
+    gen: u64,
 ) -> Result<(), MetaError> {
     let row = QueuedReplay {
         rid,
         op,
         refused: None,
         foreign,
+        gen,
     };
     if tx.get(&meta.pending_replay, seq_key(key))?.is_none() {
         counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, 1)?;
@@ -711,8 +735,26 @@ fn strand_local_tx(
         KV_UNCAPTURED_TX_COUNT
     };
     counter_add_tx(tx, &meta.local, count, -1)?;
+    // The rid's `completed` row goes with the transaction — unless the
+    // log carries the rid's outcome already (a row applied from a
+    // segment records position 0; a journaled one its journal seq): a
+    // delegate's transaction stranded by a recall after the requester's
+    // own replay of the same rid landed (plan 30 §M11 phase 2b,
+    // long-delegated seeds 70039/70075/70078: the completion forgotten,
+    // the replay's dedup reply installed a shadow nothing retired).
+    let log_carries = |tx: &SingleWriterWriteTx, rid: &Rid| -> Result<bool, MetaError> {
+        Ok(tx
+            .get(&meta.completed, rid.to_key())?
+            .and_then(|v| {
+                v.get(0..8)
+                    .map(|p| u64::from_be_bytes(p.try_into().expect("8 bytes")))
+            })
+            .is_some_and(|position| position == 0))
+    };
     if let Some(rid) = row.rid {
-        tx.remove(&meta.completed, rid.to_key());
+        if !log_carries(tx, &rid)? {
+            tx.remove(&meta.completed, rid.to_key());
+        }
         meta.forget_recent(rid);
     }
     let records: Vec<LogRecord> = rows.into_iter().map(|(_, rec)| rec).collect();
@@ -722,7 +764,9 @@ fn strand_local_tx(
     // from a decision the log never carried.
     for rec in &records {
         if let LogRecord::Refused { rid, .. } = rec {
-            tx.remove(&meta.completed, rid.to_key());
+            if !log_carries(tx, rid)? {
+                tx.remove(&meta.completed, rid.to_key());
+            }
         }
     }
     let rid = match row.rid {
@@ -947,8 +991,8 @@ fn redo_row_tx(
             counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)?;
         }
         match row.kind {
-            SpecKind::Shadow { rid, op, .. } => {
-                enqueue_replay_tx(tx, meta, row.origin, rid, op)?;
+            SpecKind::Shadow { rid, op, gen, .. } => {
+                enqueue_replay_gen_tx(tx, meta, row.origin, rid, op, gen)?;
                 out.shadows += 1;
             }
             SpecKind::Local { first, .. } => {
@@ -974,7 +1018,7 @@ fn redo_row_tx(
                         let op = MutateOp::Records {
                             records: row.records.clone(),
                         };
-                        enqueue_replay_as_tx(tx, meta, row.origin, rid, op, true)?;
+                        enqueue_replay_as_tx(tx, meta, row.origin, rid, op, true, 0)?;
                     }
                     out.hints += 1;
                 }
@@ -1385,8 +1429,8 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
         if let LiveEntry::Shadow { .. } = entry {
             if let Some(v) = tx.get(&meta.spec, seq_key(*seq))? {
                 let row: SpecRow = postcard::from_bytes(&v)?;
-                if let SpecKind::Shadow { rid, op, .. } = row.kind {
-                    enqueue_replay_tx(tx, meta, row.origin, rid, op)?;
+                if let SpecKind::Shadow { rid, op, gen, .. } = row.kind {
+                    enqueue_replay_gen_tx(tx, meta, row.origin, rid, op, gen)?;
                 }
             }
             tx.remove(&meta.spec_live, seq_key(*seq));
@@ -1484,6 +1528,7 @@ pub(crate) fn refuse_queued_tx(
         op,
         refused: Some(refusal),
         foreign: false,
+        gen: 0,
     };
     tx.insert(
         &meta.pending_replay,
@@ -1527,6 +1572,7 @@ pub(crate) fn read_pending_replays(
             op: row.op,
             refused: row.refused,
             foreign: row.foreign,
+            gen: row.gen,
         });
     }
     Ok(out)
@@ -1668,6 +1714,16 @@ impl Meta {
         // takeover strands it as this node's own op.
         for rec in records {
             if let LogRecord::Completed { rid } = rec {
+                // Plan 30 §M11 phase 2b: this node's own delegate
+                // transaction, executed (and completed) here, comes back
+                // on the root's pre-S3 stream; applying it again would
+                // replay its effect over what this delegate did since
+                // (backup-crash seed 68018: a streamed copy of an unlink
+                // removed the file the delegate had created after it).
+                // The segment retires it by origin.
+                if tx.get(&self.completed, rid.to_key())?.is_some() {
+                    return Ok(());
+                }
                 if let Some((seq, own_epoch, op)) = shadow_row_for(&tx, self, *rid)? {
                     if let Some(v) = tx.get(&self.spec, seq_key(seq))? {
                         let mut row: SpecRow = postcard::from_bytes(&v)?;
@@ -1800,6 +1856,9 @@ impl Meta {
         // carries — their segment rows are skipped below, and the
         // transactions retire after the apply.
         let own_txs = self.journal_seqs_of_origins(&tx, origins)?;
+        for (gen, idx) in origins {
+            local::bump_log_idx_tx(&mut tx, &self.local, *gen, *idx)?;
+        }
         if origins.iter().any(|o| o.0 != 0) {
             tracing::trace!(
                 seq,
@@ -2023,6 +2082,29 @@ impl Meta {
             stranded.shadows += more.shadows;
             stranded.hints += more.hints;
             stranded.locals += more.locals;
+            // Phase 2b: stranding a delegate's own transaction drops its
+            // rid's `completed` row (it never reached the log *as that
+            // transaction*) — but this very segment may carry the rid's
+            // completion or refusal (the root executed the requester's
+            // retry): that outcome is the log's and stays, or a later
+            // reply for the rid would install a shadow nothing retires
+            // (delegated-partition seed 63000).
+            let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
+            for rec in records {
+                let (rid, refused) = match rec {
+                    LogRecord::Completed { rid } => (*rid, None),
+                    LogRecord::Refused { rid, errno } => (*rid, Some(*errno)),
+                    _ => continue,
+                };
+                if tx.get(&self.completed, rid.to_key())?.is_some() {
+                    continue;
+                }
+                let row = match refused {
+                    Some(errno) => Meta::encode_refused_row(0, now_ms, errno),
+                    None => Meta::encode_completed_row(0, now_ms),
+                };
+                tx.insert(&self.completed, rid.to_key(), row);
+            }
         }
         let from = journal_from(&tx, self)?;
         compact_tx(&mut tx, self, from)?;
@@ -2094,6 +2176,14 @@ impl Meta {
     /// Outstanding entries and queued replays, for `status` (polled as
     /// often as every few milliseconds): three counter reads under one
     /// snapshot, never a scan — plan 30 §M3b's hot-path rule.
+    /// Every live speculation entry, for diagnostics.
+    pub fn speculation_live_debug(&self) -> Vec<String> {
+        let r = self.db.read_tx();
+        read_live(&r, self)
+            .map(|v| v.into_iter().map(|(s, e)| format!("{s}:{e:?}")).collect())
+            .unwrap_or_default()
+    }
+
     pub fn speculation_counts(&self) -> Result<SpeculationCounts, MetaError> {
         let r = self.db.read_tx();
         Ok(SpeculationCounts {

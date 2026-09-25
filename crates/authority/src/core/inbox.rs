@@ -207,6 +207,14 @@ impl Core {
             return true;
         };
         if link.connected || link.last_seen.is_some_and(|at| at > since) {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                holder,
+                connected = link.connected,
+                last_seen = ?link.last_seen,
+                since = ?since,
+                "reaches: the link is up again"
+            );
             self.inbox.down_since.remove(&holder);
             return true;
         }
@@ -1124,12 +1132,30 @@ impl Core {
             }
             // Plan 30 §M11: the same for write delegations — an inbox op
             // in a delegated subtree waits for the recall (the delegate's
-            // stream is appended first), like a forwarded one.
-            if admitted && self.cfg.delegation && !self.dl.gens.is_empty() {
+            // stream is appended first), like a forwarded one. Inside the
+            // takeover gate too (phase 2b): a successor's drain must not
+            // run ahead of a live delegate's stream.
+            if !admitted && self.cfg.delegation {
+                // Inside the takeover gate the root's generation state is
+                // not built yet (`delegation_sync` follows the gate): the
+                // table decides — an op under any live delegation stays
+                // in the inbox for the poll that follows the gate.
                 if let Ok(op) = &decoded {
                     let keys = super::holder::keys_of_op(op);
-                    if let Some(wait) = self.deleg_recall_needed(now, &keys, replica, out) {
-                        if !wait.is_empty() {
+                    if !matches!(
+                        replica.resolve_ownership(&keys),
+                        constellation_meta::delegation::Ownership::Root
+                    ) {
+                        return Err(Halt::Recall);
+                    }
+                }
+            }
+            if self.cfg.delegation && !self.dl.gens.is_empty() {
+                if let Ok(op) = &decoded {
+                    let keys = super::holder::keys_of_op(op);
+                    match self.deleg_recall_plan(now, &keys, replica, out) {
+                        super::delegate::RecallPlan::None => {}
+                        super::delegate::RecallPlan::Wait(wait) => {
                             self.park(
                                 now,
                                 (wait, None),
@@ -1137,6 +1163,12 @@ impl Core {
                                 super::readindex::ParkedWhat::InboxRepoll { node: batch.node },
                             );
                             return Err(Halt::Recall);
+                        }
+                        super::delegate::RecallPlan::Refuse(errno) => {
+                            // Phase 2b: a designation is involved.
+                            replica.journal_inbox_refusal(rid, errno, ack)?;
+                            self.stats.inbox_refused_ops += 1;
+                            continue;
                         }
                     }
                 }
@@ -1151,6 +1183,11 @@ impl Core {
                     replica.remember_outcome(rid, &records);
                     if admitted {
                         self.lease.touch(now);
+                    }
+                    if admitted && self.cfg.placement && self.cfg.delegation {
+                        let keys = constellation_meta::TouchSet::from_records(records.iter());
+                        let dirs = Core::dirs_of_keys(&keys, replica);
+                        self.place_note(batch.node, dirs);
                     }
                     self.stats.inbox_executed_ops += 1;
                 }
@@ -1185,8 +1222,17 @@ impl Core {
         for batch in &batches {
             match self.execute_inbox_batch(now, batch, false, replica, out) {
                 Ok(_) => {}
-                Err(Halt::Fenced) | Err(Halt::Recall) => {
-                    unreachable!("no view admission or recall inside the gate")
+                Err(Halt::Fenced) => unreachable!("no view admission inside the gate"),
+                Err(Halt::Recall) => {
+                    // Phase 2b: an op under an inherited delegation: the
+                    // recall is under way and the batch stays in the inbox
+                    // for the poll that follows it (`InboxRepoll`).
+                    tracing::info!(
+                        node = self.cfg.node_id,
+                        requester = batch.node,
+                        "inbox: drain stops at a delegated subtree; the recall runs first"
+                    );
+                    break;
                 }
                 Err(Halt::Meta(error)) => return Err(error),
             }

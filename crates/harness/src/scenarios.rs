@@ -767,6 +767,30 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::p2p_off_no_delegation,
     },
     Scenario {
+        name: "root-failover-with-delegates",
+        desc: "plan 30 M11 phase 2b: four nodes with M9 backups; d1 and d2 delegated to b and c, both writing; the root is killed mid-burst; its backup takes the lease over by seal, learns the table from the log, the delegates re-stream what the old root never shipped; every acknowledged file is everywhere, the dead root remounts and converges",
+        requires: &[],
+        run: m11::root_failover_with_delegates,
+    },
+    Scenario {
+        name: "delegate-crash-backup",
+        desc: "plan 30 M11 phase 2b: the delegate of d1 has a backup (c) and is killed mid-burst; the root seals the backup, drains its tail, ends the generation and delegates d1 to c; every write b acknowledged is in the log, c writes locally, b remounts and converges",
+        requires: &[],
+        run: m11::delegate_crash_with_backup,
+    },
+    Scenario {
+        name: "auto-placement",
+        desc: "plan 30 M11 phase 2b: no operator; b dominates the writes under d1 for a window and the root delegates d1 to b by itself; c takes the writes over and b stops; after the dwell the placement recalls b's generation and after the cool-down delegates d1 to c, with no flapping",
+        requires: &[],
+        run: m11::auto_placement,
+    },
+    Scenario {
+        name: "designation-as-delegation",
+        desc: "plan 30 M11 phase 2b (plans 03–05): `offline /site` on b becomes a designated delegation in the root's table; c's and the root's writes under it are forwarded to b; b cut from everyone keeps writing locally while c gets EROFS under /site; after the heal everything converges; `online` recalls it and c's writes go through the root again",
+        requires: &[],
+        run: m11::designation_as_delegation,
+    },
+    Scenario {
         name: "inbox-create-storm-p2p-off",
         desc: "plan 30 M13 (hybrid): with P2P off, two non-holders sustain a create/unlink storm; sustained inbox demand escalates to a lease request, every op gets its errno right, and throughput is never worse than lease ping-pong (>= 41 ops/s)",
         requires: &[],

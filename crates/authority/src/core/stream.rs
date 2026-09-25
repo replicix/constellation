@@ -98,6 +98,20 @@ struct Subscription {
 }
 
 /// Both sides' state.
+impl StreamState {
+    pub(crate) fn container_sizes(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            ("stream_served", self.served.len()),
+            ("stream_ring", self.ring.len()),
+            ("stream_ring_bytes", self.ring_bytes),
+            (
+                "stream_sub_buf",
+                self.sub.as_ref().map(|s| s.buf.len()).unwrap_or(0),
+            ),
+        ]
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct StreamState {
     // ---- holder ----

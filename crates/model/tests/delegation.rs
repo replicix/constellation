@@ -35,7 +35,8 @@ const D1B: Key = key(1, 1);
 const D2A: Key = key(2, 0);
 const D3A: Key = key(3, 0);
 
-const ALWAYS: [&str; 10] = [
+const ALWAYS: [&str; 11] = [
+    "designation_final",
     "per_key_linearizable",
     "causal_cut",
     "marker_order",
@@ -955,5 +956,99 @@ fn deep_root_failover_two_delegates() {
     println!(
         "deep-root-failover: clean in the explored region (exhaustive: {})",
         checker.state_count() < BIG_CAP.0
+    );
+}
+
+// ------------------------------------------------- phase 2b: designations
+
+/// Phase 2b: an offline designation (plans 03–05) as a delegation the
+/// root never reclaims. The naive knob (`designations_expire`) treats it
+/// like any grant nobody renewed: the designee, cut off from the root,
+/// keeps writing (its grant never lapses — DESIGN.md §5.2's "designee
+/// isolated → write"), the root reclaims the generation at its horizon,
+/// and the designee's acknowledged write is retracted: a fork of the
+/// designated subtree. The design never ends a designation by time.
+fn designation_config(expire: bool) -> DelegModel {
+    DelegModel {
+        designated: vec![(1, 1)],
+        designations_expire: expire,
+        reclaim_expired: true,
+        deleg_ttl: 2,
+        max_drops: 2,
+        max_tick: 4,
+        ..DelegModel::design(P3.to_vec(), vec![vec![], vec![create(D1A)], vec![]])
+    }
+}
+
+fn designation_path() -> Vec<Step> {
+    vec![
+        // The designee's own write: acknowledged locally at once.
+        A(Action::Start(1)),
+        Step::Drop("the designee's stream to the root", stream_of_gen(1)),
+        A(Action::Tick),
+        A(Action::Tick),
+        A(Action::Tick),
+        A(Action::Tick),
+        A(Action::RecallTimeout(1)),
+    ]
+}
+
+#[test]
+fn reclaiming_a_designation_forks_the_designee() {
+    let naive = designation_config(true);
+    assert_counterexample(
+        "designation-reclaimed",
+        &naive,
+        "designation_final",
+        &designation_path(),
+    );
+    let design = designation_config(false);
+    assert_design_survives("designation-reclaimed", &design, &designation_path());
+    assert_search_finds("designation-reclaimed", &naive, "designation_final");
+}
+
+/// The design: a designee cut off from the root (its stream and
+/// renewals dropped) keeps its acknowledged writes; when the drops end,
+/// the stream lands and the log carries them. Nothing is ever retracted.
+#[test]
+fn design_designee_writes_survive_isolation() {
+    let m = DelegModel {
+        designated: vec![(1, 1)],
+        reclaim_expired: true,
+        deleg_ttl: 2,
+        max_drops: 2,
+        max_tick: 4,
+        ..DelegModel::design(
+            P3.to_vec(),
+            vec![vec![create(RA)], vec![create(D1A), create(D1B)], vec![]],
+        )
+    };
+    assert_clean("designation-isolated", &m, &["all_ops_done"]);
+}
+
+/// Root failover with a live designation: the successor reads it from
+/// the log with no horizon (it never expires), the designee re-streams
+/// to it, and every acknowledged write lands. Cites the same mechanics
+/// `design_root_failover_with_a_live_delegate` checks for a grant.
+#[test]
+fn design_root_failover_with_a_designation() {
+    let m = DelegModel {
+        designated: vec![(1, 1)],
+        journal: true,
+        allow_renew: true,
+        reclaim_expired: true,
+        lease_ttl: 3,
+        deleg_ttl: 2,
+        max_epoch: 2,
+        max_tick: 4,
+        ..DelegModel::design(
+            P3.to_vec(),
+            vec![vec![create(RA)], vec![create(D1A)], vec![]],
+        )
+    };
+    assert_clean(
+        "root-failover-designation",
+        &m,
+        &["all_ops_done", "root_takeover", "restreamed"],
     );
 }

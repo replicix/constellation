@@ -879,8 +879,6 @@ impl NodeRuntime {
         let bridge = Arc::new(crate::P2pBridge {
             node_id,
             nudge: sync_tx.clone(),
-            designations: designations.clone(),
-            meta: meta.clone(),
             epochs: epochs.clone(),
             coop: coop.clone(),
             placement: placement.clone(),
@@ -1046,10 +1044,15 @@ impl NodeRuntime {
         // for this yet.
         {
             let designations = designations.clone();
+            let deleg_tx = sync_tx.clone();
             rt.spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     designations.refresh().await;
+                    // Plan 30 §M11 phase 2b: the root keeps the table in
+                    // step with the designations (a no-op elsewhere).
+                    let entries = designations.delegation_entries();
+                    let _ = deleg_tx.send(fusefs::SyncRequest::SyncDesignations { entries });
                 }
             });
         }
@@ -1370,7 +1373,6 @@ impl NodeRuntime {
                     lease: self.lease.clone(),
                     delegates: self.delegates.clone(),
                     acquire_deadline: self.acquire_deadline,
-                    designations: Some(self.designations.clone()),
                     epoch_frozen: Some(self.epochs.frozen.clone()),
                     epoch_active: Some(self.epochs.active.clone()),
                     departed: Some(departed),

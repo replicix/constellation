@@ -48,7 +48,12 @@ pub type Gen = u64;
 pub enum DelegationRecord {
     /// `dir` and everything under it is sequenced by `node` under
     /// generation `gen` from this record on.
-    Delegate { dir: Ino, node: NodeId, gen: Gen },
+    Delegate {
+        dir: Ino,
+        node: NodeId,
+        gen: Gen,
+        designated: bool,
+    },
     /// Generation `gen` ended: every record of its stream that is not
     /// before this one in the log is void.
     Recall { dir: Ino, gen: Gen },
@@ -59,6 +64,8 @@ pub struct Delegation {
     pub dir: Ino,
     pub node: NodeId,
     pub gen: Gen,
+    /// Phase 2b: an offline designation — recalled only by `online`.
+    pub designated: bool,
 }
 
 /// The live delegations, derived from the log prefix (plus, on the root,
@@ -68,13 +75,31 @@ pub struct Delegation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegationTable {
     by_dir: BTreeMap<Ino, Delegation>,
+    /// The highest generation any `Delegate` record ever named (phase
+    /// 2b: a successor root allocates above it — a generation number is
+    /// a stream's identity, never reused across roots).
+    max_gen: Gen,
 }
 
 impl DelegationTable {
     pub fn apply(&mut self, rec: DelegationRecord) {
         match rec {
-            DelegationRecord::Delegate { dir, node, gen } => {
-                self.by_dir.insert(dir, Delegation { dir, node, gen });
+            DelegationRecord::Delegate {
+                dir,
+                node,
+                gen,
+                designated,
+            } => {
+                self.max_gen = self.max_gen.max(gen);
+                self.by_dir.insert(
+                    dir,
+                    Delegation {
+                        dir,
+                        node,
+                        gen,
+                        designated,
+                    },
+                );
             }
             DelegationRecord::Recall { dir, gen } => {
                 if self.by_dir.get(&dir).is_some_and(|d| d.gen == gen) {
@@ -88,19 +113,47 @@ impl DelegationTable {
         self.by_dir.is_empty()
     }
 
+    /// The highest generation ever delegated (0: none).
+    pub fn max_gen(&self) -> Gen {
+        self.max_gen
+    }
+
     /// The `0x30 | Delegation` row's value: postcard of the live rows,
     /// sorted by directory.
     pub fn encode(&self) -> Vec<u8> {
-        let rows: Vec<(Ino, NodeId, Gen)> = self.iter().map(|d| (d.dir, d.node, d.gen)).collect();
-        postcard::to_allocvec(&rows).unwrap_or_default()
+        let rows: Vec<(Ino, NodeId, Gen, bool)> = self
+            .iter()
+            .map(|d| (d.dir, d.node, d.gen, d.designated))
+            .collect();
+        postcard::to_allocvec(&(rows, self.max_gen)).unwrap_or_default()
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, MetaError> {
-        let rows: Vec<(Ino, NodeId, Gen)> = postcard::from_bytes(bytes)
-            .map_err(|e| MetaError::Invalid(format!("delegation row: {e}")))?;
-        let mut t = DelegationTable::default();
-        for (dir, node, gen) in rows {
-            t.by_dir.insert(dir, Delegation { dir, node, gen });
+        type Rows = Vec<(Ino, NodeId, Gen, bool)>;
+        let (rows, max_gen): (Rows, Gen) = match postcard::from_bytes(bytes) {
+            Ok(v) => v,
+            // Phase 2a rows carried no counter.
+            Err(_) => {
+                let rows: Rows = postcard::from_bytes(bytes)
+                    .map_err(|e| MetaError::Invalid(format!("delegation row: {e}")))?;
+                let max = rows.iter().map(|r| r.2).max().unwrap_or(0);
+                (rows, max)
+            }
+        };
+        let mut t = DelegationTable {
+            max_gen,
+            ..DelegationTable::default()
+        };
+        for (dir, node, gen, designated) in rows {
+            t.by_dir.insert(
+                dir,
+                Delegation {
+                    dir,
+                    node,
+                    gen,
+                    designated,
+                },
+            );
         }
         Ok(t)
     }
@@ -205,7 +258,7 @@ pub(crate) fn write_table_tx(
     dirty: ns::Dirty<'_>,
     table: &DelegationTable,
 ) -> Result<(), MetaError> {
-    if table.is_empty() {
+    if table.is_empty() && table.max_gen() == 0 {
         ns::ns_remove(tx, &meta.ns, dirty, table_key())
     } else {
         ns::ns_insert(tx, &meta.ns, dirty, table_key(), table.encode())
@@ -311,11 +364,13 @@ mod tests {
             dir: 2,
             node: 7,
             gen: 1,
+            designated: false,
         });
         t.apply(DelegationRecord::Delegate {
             dir: 3,
             node: 8,
             gen: 2,
+            designated: false,
         });
         t
     }
@@ -339,6 +394,7 @@ mod tests {
             dir: 4,
             node: 9,
             gen: 3,
+            designated: false,
         });
         assert_eq!(t2.owner_of_dir(&ns, 4).map(|d| d.gen), Some(3));
     }

@@ -546,9 +546,19 @@ impl Core {
         let Some((prev_expires, _)) = self.ack.pending_floor.take() else {
             return;
         };
+        // Plan 30 §M11 phase 2b: a tenure with live write delegations
+        // has grants (and, under them, read grants a delegate gave)
+        // that its successor cannot see renewed; one constant covers
+        // them all.
+        let deleg = if replica.delegation_table().is_empty() {
+            0
+        } else {
+            self.reclaim_horizon_ms() as i64
+        };
         let bound = now.0
             + self.cfg.backup_takeover_ms as i64
             + self.cfg.read_delegation_ttl_ms as i64
+            + deleg
             + 2 * self.cfg.expiry_margin_ms as i64;
         let until = prev_expires.min(bound);
         if until <= now.0 {
@@ -647,7 +657,7 @@ impl Core {
 
     /// Eligible peers, best first: in the roster, connected, within the
     /// RTT budget, stable, not us, not already a backup.
-    fn backup_candidates(&self, now: Ms) -> Vec<NodeId> {
+    pub(crate) fn backup_candidates(&self, now: Ms) -> Vec<NodeId> {
         if self.cfg.backup_rtt_budget_ms == 0 || self.cfg.backups_max == 0 {
             return Vec::new();
         }

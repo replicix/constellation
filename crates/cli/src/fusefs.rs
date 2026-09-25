@@ -294,6 +294,8 @@ pub enum SyncRequest {
     PeerDelegRenew {
         from: u64,
         gen: u64,
+        /// Phase 2b: the delegate's backup peer (0: none).
+        backup: u64,
         reply: tokio::sync::oneshot::Sender<u64>,
     },
     /// Plan 30 §M11: the root recalls a generation this node holds;
@@ -303,6 +305,26 @@ pub enum SyncRequest {
         dir: Ino,
         gen: u64,
         reply: tokio::sync::oneshot::Sender<u64>,
+    },
+    /// Plan 30 §M11 phase 2b: a delegate's append to this backup;
+    /// answered `(acked, sealed)`.
+    PeerDelegBackupAppend {
+        from: u64,
+        gen: u64,
+        txs: Vec<constellation_meta::DelegateTx>,
+        reply: tokio::sync::oneshot::Sender<(u64, bool)>,
+    },
+    /// Plan 30 §M11 phase 2b: the root's seal request to this backup;
+    /// answered `(sealed, tail)`.
+    PeerDelegSeal {
+        root: u64,
+        gen: u64,
+        reply: tokio::sync::oneshot::Sender<(bool, Vec<constellation_meta::DelegateTx>)>,
+    },
+    /// Plan 30 §M11 phase 2b: the live write designations `(dir,
+    /// designee)`, after every refresh; the root keeps the table in step.
+    SyncDesignations {
+        entries: Vec<(Ino, u64)>,
     },
     /// Plan 30 §M11: operator controls (`constellation delegate` /
     /// `undelegate`).
@@ -416,10 +438,6 @@ pub struct SyncHandle {
     pub delegates: Arc<crate::lease::DelegateView>,
     /// Bound on how long a mutation waits for a foreign holder.
     pub acquire_deadline: Duration,
-    /// Offline designation (DESIGN.md §5.2). `None` when no designations
-    /// exist for this mount — the write gate then behaves exactly as
-    /// before phase 4a.
-    pub designations: Option<Arc<crate::designation::DesignationManager>>,
     /// Continuation epoch (DESIGN.md §5.3): frozen ⇒ EROFS; active ⇒
     /// epoch is the authority root (writes without S3 CAS).
     pub epoch_frozen: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -1206,7 +1224,7 @@ impl ConstellationFs {
         self.require_lease_for(constellation_fs_core::types::ROOT_INO)
     }
 
-    pub(crate) fn require_lease_for(&self, ino: Ino) -> Result<(), i32> {
+    pub(crate) fn require_lease_for(&self, _ino: Ino) -> Result<(), i32> {
         let Some(h) = &self.sync else { return Ok(()) };
         if h.read_only_member {
             return Err(libc::EROFS);
@@ -1223,26 +1241,11 @@ impl ConstellationFs {
                 return Err(libc::EROFS);
             }
         }
-        // Offline designation gate (DESIGN.md §5.2), checked before the
-        // ordinary lease: a designated path's write authority does not
-        // come from the partition lease at all while the designee is
-        // reachable — see the module doc on `designation::GateDecision`.
-        if let Some(designations) = &h.designations {
-            let path = self.meta.path_of(ino).unwrap_or_else(|_| "/".into());
-            match self.rt.block_on(designations.check(&path)) {
-                crate::designation::GateDecision::NoDesignation => {}
-                crate::designation::GateDecision::Proceed => return Ok(()),
-                crate::designation::GateDecision::ReadOnly { designee, path } => {
-                    tracing::error!(
-                        path,
-                        designee,
-                        "refusing mutation: path is offline-designated to another node \
-                         and no delegation is available"
-                    );
-                    return Err(libc::EROFS);
-                }
-            }
-        }
+        // Offline designation (DESIGN.md §5.2): since plan 30 §M11 phase
+        // 2b a designation is a delegation in the table; the ownership
+        // routing below (the delegate fast path, or a forward to the
+        // designee, or the root's `EROFS`) is the gate.
+        {}
         if h.epoch_active
             .as_ref()
             .is_some_and(|active| active.load(std::sync::atomic::Ordering::Relaxed))
@@ -1574,7 +1577,7 @@ impl ConstellationFs {
     fn mutate_op_rebasable_with_rid(
         &self,
         h: &SyncHandle,
-        part_hint_ino: Ino,
+        _part_hint_ino: Ino,
         op: &constellation_meta::MutateOp,
         rid: constellation_meta::Rid,
     ) -> Result<(), MutateFail> {
@@ -1592,24 +1595,6 @@ impl ConstellationFs {
             .is_some_and(|frozen| frozen.load(std::sync::atomic::Ordering::Relaxed))
         {
             return Err(MutateFail::Errno(libc::EROFS));
-        }
-        if let Some(designations) = &h.designations {
-            let path = self
-                .meta
-                .path_of(part_hint_ino)
-                .unwrap_or_else(|_| "/".into());
-            match self.rt.block_on(designations.check(&path)) {
-                crate::designation::GateDecision::NoDesignation => {}
-                crate::designation::GateDecision::Proceed => {
-                    let records = constellation_meta::execute_mutate(&self.meta, op, Some(rid))
-                        .map_err(mutate_fail)?;
-                    self.recall_after_local_write(h, &records);
-                    return Ok(());
-                }
-                crate::designation::GateDecision::ReadOnly { .. } => {
-                    return Err(MutateFail::Errno(libc::EROFS));
-                }
-            }
         }
         // Plan 30 §M11: the delegate's own writes run here at local speed
         // (the sequencer's fast path, under a grant instead of the

@@ -169,7 +169,7 @@ fn unmount_all(clients: &mut [Client]) {
 }
 
 /// Wait until `c` lists at least one backup in its lease; returns them.
-fn wait_for_backup(c: &Client, deadline: Duration) -> Result<Vec<u64>> {
+pub(super) fn wait_for_backup(c: &Client, deadline: Duration) -> Result<Vec<u64>> {
     let mut backups = Vec::new();
     eventually(&format!("{} lists a backup", c.name), deadline, || {
         let a = ack_of(c)?;

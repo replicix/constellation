@@ -42,6 +42,11 @@ pub enum NsRet {
     Ok,
     Eexist,
     Enoent,
+    /// Plan 30 §M11 phase 2b: refused because a designation was
+    /// involved (`EROFS` under it from a non-designee reaching the root,
+    /// `EXDEV` across its boundary): no effect, explained by the table,
+    /// not by the namespace.
+    Erofs,
 }
 
 /// The reference object: the set of names present in the root directory.
@@ -394,7 +399,11 @@ pub fn check_linearizable_witnessed(
     // 3. Refusals: some state in the window returns the same refusal.
     let mut witness = Witness::default();
     for (rid, (ret_i, ret)) in &return_at {
-        if *ret == NsRet::Ok || tentative.contains(rid) || index_of.contains_key(rid) {
+        if *ret == NsRet::Ok
+            || *ret == NsRet::Erofs
+            || tentative.contains(rid)
+            || index_of.contains_key(rid)
+        {
             continue;
         }
         let (inv_i, op) = &invoke_at[rid];

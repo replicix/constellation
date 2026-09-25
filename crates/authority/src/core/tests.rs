@@ -6,7 +6,7 @@ use super::*;
 use crate::action::{ClientReply, S3Op};
 use crate::event::{CasFailure, PeerMsg, Policy, S3Result, UploadResult};
 use constellation_fs_core::types::ROOT_INO;
-use constellation_meta::{Meta, MetaStore, MutateOp, MutateOutcome, Rid};
+use constellation_meta::{LogRecord, Meta, MetaStore, MutateOp, MutateOutcome, Rid};
 use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
 
 struct Harness {
@@ -2952,4 +2952,112 @@ mod claim_resolution {
             (None, 0)
         );
     }
+}
+
+// ---- plan 30 §M11 phase 2b round 2: a held forward becomes the delegate's own ----
+
+/// A delegate's own op is forwarded to the root before the delegate's
+/// table carries the grant; the root answers `Held`. The grant installs
+/// meanwhile: the backoff retry must execute the op here as the
+/// delegate, not re-forward it (which the root would hold again, until
+/// the forward deadline: `EIO` after 40 s — harness `cross-subtree-rename`
+/// / `auto-placement` after a re-delegation).
+#[test]
+fn a_held_forward_executes_locally_once_the_delegation_installs() {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.cfg.forwarding = true;
+    h.core.lease.cached_holder = Some(2);
+    // The directory exists on this replica (applied from the log).
+    let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        1,
+        1,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d1".into(),
+            ino: dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }],
+    )
+    .unwrap();
+    let rid = h.rid(1);
+    let op = MutateOp::Create {
+        parent: dir,
+        name: "f".into(),
+        ino: h.meta.allocate_ino(dir).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    let Some((_, PeerMsg::MutateRequest { req, .. })) = sends(&out).first().copied() else {
+        panic!(
+            "no forward: {out:?} clients {:?}",
+            h.core.clients().collect::<Vec<_>>()
+        );
+    };
+    let req = *req;
+    // The root holds it: the delegate's table lacks the grant still.
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateReply {
+            req,
+            outcome: MutateOutcome::Held { retry_ms: 50 },
+            base: None,
+            position: constellation_meta::Position::ZERO,
+            gen: 0,
+        },
+    });
+    let backoff = timers(&out, TimerKind::ForwardBackoff);
+    assert_eq!(backoff.len(), 1, "{out:?}");
+    // The grant lands from the log and installs here.
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        2,
+        1,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Delegate {
+            dir,
+            node: 3,
+            gen: 1,
+            designated: true,
+        }],
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    assert_eq!(
+        h.core.deleg_view().mine.len(),
+        1,
+        "{:?}",
+        h.core.deleg_view()
+    );
+    // The retry executes here; nothing is forwarded again.
+    h.advance(100);
+    let out = h.step(Event::Timer { id: backoff[0] });
+    assert!(
+        !sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. })),
+        "re-forwarded: {out:?}"
+    );
+    let answered: Vec<Rid> = replies(&out).into_iter().map(|(r, _)| r).collect();
+    assert_eq!(answered, vec![rid], "{out:?}");
+    assert_eq!(h.core.stats.deleg_retry_executed, 1);
+    assert!(h.meta.child_ino(dir, "f").unwrap().is_some());
 }
