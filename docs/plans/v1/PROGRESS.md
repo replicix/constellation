@@ -18966,3 +18966,69 @@ formation (5 s TTL), so nobody held the epoch.
     flush. The file reads `abcdeX` instead of `ab\0\0\0X`.
   - Untouched old chunks between the truncation point and the new end
     are kept whole, too.
+
+## Fix: Exists hint after its streamed refusal (on main)
+
+(2026-09-25, branch `fix-hint-streamed` off 623da2c. This is the main
+port of the fix described in the M14 tree's "Fix: M6 Exists-hint
+divergence (seed 194287)".)
+
+**Bug.** A requester that is also the holder's backup forwards a
+create. The holder refuses it with `EEXIST`, journals `Refused { rid }`,
+and answers `Exists`; that reply waits for the backup's acknowledgement.
+Meanwhile the holder's pre-S3 stream installs the refusal *and the
+holder's next transactions* (for example a rename onto the refused name)
+on the requester. The reply's hint, read at the refusal, then passed the
+core's checks (`base_ok`, `applied < hint_floor`: both look only at the
+applied log). It put the old entry back over the streamed rename. The
+segment skipped the streamed rows and retired the hint, which left the
+replica diverged.
+
+This is the missing mirror of `install_shadow`'s streamed rule
+(backup seed 753). About 0.1–0.15% of `backup`-core seeds hit it, with
+or without faults. It needs M9 pre-S3 streaming, so `ack=s3` and
+no-backup configurations cannot hit it.
+
+**Fix.**
+- `Meta::install_hint_from(rid: Option<Rid>, …) -> Result<bool>` does not
+  install when the log already records the rid, or when a live
+  `Streamed` entry carries `Refused { rid }` (`streamed_entry_refusing`).
+- `Replica::install_hint` takes the rid and returns `bool`.
+- `core/client.rs` treats a hint that is not installed as an uncovered
+  refusal, which raises `observed`.
+
+**Tests.**
+- The meta test `a_hint_whose_refusal_was_streamed_first_is_not_installed`
+  (`crates/meta/tests/speculation.rs`).
+- The sim test `regression_exists_hint_after_its_streamed_refusal` pins
+  `backup` seeds 600596 and 603050. Both diverge without the check.
+  (The M14 tree's pin 600396 does not fail on main: the schedules differ.
+  M14's lock seed 194287 stays pinned in the M14 tree.)
+
+**CI seed ranges.** `run_m9` now runs its seeds on up to 8 threads. The
+backup-core ranges grew as follows:
+
+| Config | Seeds before → after |
+|---|---|
+| `backup` | 60 → 600 |
+| `backup-crash` | 40 → 200 |
+| `backup-departs`, `backup-partition`, `backup-strict` | 30 → 100 each |
+| `backup-crash-slow` | 20 → 50 |
+
+That adds 1030 seeds. `ack=s3` and `backup-far` are unchanged: they have
+no streaming, so the bug cannot occur there. The sim test binary costs
++36 s user and +91 s sys of CPU (286 → 413 CPU-s). Wall time on a 32-core
+host rose from about 25–28 s to 35–37 s when idle (more under load).
+
+The ranges stop where the next M9 bug starts: `backup-crash-slow` seed
+1454 fails an ordering check that is not this bug. It is item B of the
+follow-up, and the ranges should grow again once B is fixed. The ranges
+catch *this* bug only probabilistically: seeds 700–2699 of `backup` hold
+no instance on main, so the pinned seeds are the deterministic
+regression.
+
+**Results (release).**
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test -p constellation-authority --release`: 67 lib + 3
+  `meta_repro` + 64 sim (7 ignored), all pass.
+- `cargo test -p constellation-meta --release`: 125 passed.

@@ -96,13 +96,18 @@ pub trait Replica {
         op: &MutateOp,
         records: &[LogRecord],
     ) -> Result<bool, MetaError>;
+    /// Install the entry behind `rid`'s `Exists` refusal ahead of the
+    /// log. `false` when not installed: this replica already has the
+    /// refusal (applied, or streamed ahead of the log with whatever the
+    /// holder streamed after it).
     fn install_hint(
         &self,
+        rid: Rid,
         records: &[LogRecord],
         floor: Seq,
         epoch: Epoch,
         gen: u64,
-    ) -> Result<(), MetaError>;
+    ) -> Result<bool, MetaError>;
     fn has_outstanding_speculation(&self) -> bool;
     /// Roll back every speculative entry accepted below `epoch` and
     /// queue its op for replay.
@@ -460,12 +465,13 @@ impl Replica for Meta {
 
     fn install_hint(
         &self,
+        rid: Rid,
         records: &[LogRecord],
         floor: Seq,
         epoch: Epoch,
         gen: u64,
-    ) -> Result<(), MetaError> {
-        Meta::install_hint_from(self, records, floor, epoch, gen)
+    ) -> Result<bool, MetaError> {
+        Meta::install_hint_from(self, Some(rid), records, floor, epoch, gen)
     }
 
     fn has_outstanding_speculation(&self) -> bool {

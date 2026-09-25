@@ -783,12 +783,17 @@ impl Core {
                 let floor = position.hint_floor();
                 let mut hinted = false;
                 if base_ok && applied < floor {
-                    match replica.install_hint(records, floor, epoch, gen) {
-                        Ok(()) => {
+                    // Not installed (`Ok(false)`): the refusal is here
+                    // already — streamed ahead of the log, with what the
+                    // holder did after it — so the hint is stale (backup
+                    // sim seed 600396); the refusal is uncovered, as below.
+                    match replica.install_hint(rid, records, floor, epoch, gen) {
+                        Ok(true) => {
                             self.stats.hints_installed += 1;
                             replica.note_covering(KeySet::from_records(records), position);
                             hinted = true;
                         }
+                        Ok(false) => {}
                         Err(error) => tracing::warn!(%error, "failed to install hint"),
                     }
                 }

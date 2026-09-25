@@ -1292,10 +1292,36 @@ fn backup_strict_config() -> SimConfig {
     }
 }
 
+/// Runs the seeds on up to 8 threads (the backup ranges are a few
+/// hundred seeds each since the `Exists`-hint fix: that divergence showed
+/// in ~0.15% of `backup` seeds and the ranges of 30–60 never met it);
+/// the totals are summed in seed order.
 fn run_m9(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M9Totals {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, 8) as u64;
+    let mut results: Vec<(u64, Result<Report, String>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (cfg, seeds) = (cfg.clone(), seeds.clone());
+                s.spawn(move || {
+                    seeds
+                        .skip(t as usize)
+                        .step_by(threads as usize)
+                        .map(|seed| (seed, run_seed(seed, cfg.clone())))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("sim thread"))
+            .collect()
+    });
+    results.sort_by_key(|(seed, _)| *seed);
     let mut totals = M9Totals::default();
-    for seed in seeds {
-        let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+    for (seed, result) in results {
+        let report = result.unwrap_or_else(|e| {
             panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
         });
         totals.add(&report);
@@ -1311,7 +1337,7 @@ fn run_m9(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> M9Totals 
 /// makes both hard failures); linearizable; converged.
 #[test]
 fn backup_no_acked_op_lost() {
-    let t = run_m9("backup", backup_config(), 700..760);
+    let t = run_m9("backup", backup_config(), 700..1300);
     assert!(t.backups_added >= 40, "backups rarely chosen: {t:?}");
     assert!(t.acks_waited > 100, "acknowledgements never waited: {t:?}");
     // `acked_rolled_back` counts *transient* rollbacks too: a requester's
@@ -1327,7 +1353,7 @@ fn backup_no_acked_op_lost() {
 /// and every acknowledged op is in the log exactly once.
 #[test]
 fn backup_failover_reships_the_tail() {
-    let t = run_m9("backup-crash", backup_crash_config(), 800..840);
+    let t = run_m9("backup-crash", backup_crash_config(), 800..1000);
     assert!(t.seals >= 20, "the backup rarely sealed: {t:?}");
     assert!(
         t.backup_takeovers >= 20,
@@ -1393,7 +1419,7 @@ fn no_peer_in_budget_is_todays_behaviour() {
 /// lease CAS and writes continue; when it returns it is brought back.
 #[test]
 fn backup_departs_reconfigures() {
-    let t = run_m9("backup-departs", backup_departs_config(), 1100..1130);
+    let t = run_m9("backup-departs", backup_departs_config(), 1100..1200);
     assert!(
         t.backups_removed >= 20,
         "the backup was rarely removed: {t:?}"
@@ -1407,7 +1433,7 @@ fn backup_departs_reconfigures() {
 /// durability, linearizability, convergence) say so.
 #[test]
 fn backup_partition_reconfigures_or_seals() {
-    let t = run_m9("backup-partition", backup_partition_config(), 1200..1230);
+    let t = run_m9("backup-partition", backup_partition_config(), 1200..1300);
     assert!(
         t.backups_removed + t.backup_takeovers >= 20,
         "the partition was rarely resolved either way: {t:?}"
@@ -1421,7 +1447,7 @@ fn backup_partition_reconfigures_or_seals() {
 /// holds (enforced).
 #[test]
 fn fast_failover_with_delegations_keeps_close_to_open() {
-    let t = run_m9("backup-strict", backup_strict_config(), 1300..1330);
+    let t = run_m9("backup-strict", backup_strict_config(), 1300..1400);
     assert!(t.backup_takeovers >= 15, "{t:?}");
     assert!(t.ack_floor_waits >= 10, "the successor never waited: {t:?}");
 }
@@ -1435,7 +1461,7 @@ fn pre_s3_streaming_installs_and_retires() {
         s3_latency: (60, 200),
         ..backup_crash_config()
     };
-    let t = run_m9("backup-crash-slow", cfg, 1400..1420);
+    let t = run_m9("backup-crash-slow", cfg, 1400..1450);
     assert!(t.streamed_ahead > 20, "{t:?}");
     assert!(t.streamed_installed > 20, "{t:?}");
 }
@@ -1540,6 +1566,28 @@ fn regression_refused_forward_is_not_re_executed() {
             journaled >= 1 || !matches!(seed, 50068 | 50126 | 50277),
             "seed {seed} no longer refuses a forward ({journaled})"
         );
+    }
+}
+
+/// Plan 30 §M6/§M9: an `Exists` hint installed after the holder's pre-S3
+/// stream had already carried the refusal here — and what the holder did
+/// after it. The requester (a backup, so its reply waited for its own
+/// acknowledgement) had `Refused { rid }` and a later rename onto the
+/// refused name streamed in; the hint, read at the refusal, put the old
+/// entry back over the rename, and the segment (skipping the streamed
+/// rows, retiring the hint) left the replica diverged. A hint whose
+/// refusal is already streamed is not installed now
+/// (`Meta::install_hint_from`; the meta test
+/// `a_hint_whose_refusal_was_streamed_first_is_not_installed`). Found by
+/// M14's lock sim (seed 194287, pinned in that tree); ~0.15% of `backup`
+/// seeds, no fault needed.
+#[test]
+fn regression_exists_hint_after_its_streamed_refusal() {
+    for seed in [600_596u64, 603_050] {
+        let report = run_seed(seed, backup_config()).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup")
+        });
+        assert!(report.converged_checked, "seed {seed} did not converge");
     }
 }
 

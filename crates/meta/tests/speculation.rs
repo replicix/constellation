@@ -266,6 +266,73 @@ fn a_hint_retires_at_its_floor_and_strands_on_a_later_epoch() {
     );
 }
 
+/// Plan 30 §M6/§M9 (backup sim seed 600396): an `Exists` reply whose
+/// refusal the holder's pre-S3 stream carried here first. The holder
+/// refused `create f3` (journal row 2: `Refused`) and read `f3 -> B` for
+/// the hint; it then renamed `f2 -> f3` (rows 3–4) and streamed all
+/// three before the (acknowledgement-held) reply arrived. The hint is
+/// older than the streamed state: installed on top, it put `f3 -> B`
+/// back over the rename, and the segment — skipping the streamed rows,
+/// retiring the hint — left the replica on `f3 -> B` while every other
+/// replica had `f3 -> A`. The mirror of `install_shadow`'s streamed rule:
+/// a hint whose refusal is already streamed is not installed.
+#[test]
+fn a_hint_whose_refusal_was_streamed_first_is_not_installed() {
+    let (a, b) = (ino(1), ino(2));
+    let requester = rid(9);
+    let other = Rid {
+        node: 3,
+        incarnation: 1,
+        seq: 1,
+    };
+    // (Stamps above the root's own creation time: parent times merge by
+    // `max`, plan 30 §M12.)
+    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let seg1 = [create("f2", a, t0 + 10), create("f3", b, t0 + 11)];
+    let refused = LogRecord::Refused {
+        rid: requester,
+        errno: 17,
+    };
+    let rename = LogRecord::Rename {
+        parent: ROOT_INO,
+        name: "f2".into(),
+        new_parent: ROOT_INO,
+        new_name: "f3".into(),
+        time_ns: t0 + 12,
+    };
+    let seg2 = [refused.clone(), rename.clone(), completed(other)];
+
+    let reference = Meta::open_in_memory().unwrap();
+    apply(&reference, 1, 1, &seg1);
+    apply(&reference, 2, 1, &seg2);
+
+    let meta = Meta::open_in_memory().unwrap();
+    apply(&meta, 1, 1, &seg1);
+    meta.install_streamed(1, 2, 2, std::slice::from_ref(&refused))
+        .unwrap();
+    meta.install_streamed(1, 3, 4, &[rename, completed(other)])
+        .unwrap();
+    let f3 = |m: &Meta| m.lookup(ROOT_INO, "f3").unwrap().map(|e| e.ino);
+    assert_eq!(f3(&meta), Some(a));
+    let installed = meta
+        .install_hint_from(Some(requester), &[create("f3", b, t0 + 11)], 2, 1, 0)
+        .unwrap();
+    assert!(
+        !installed,
+        "the hint was read before state this replica streamed already"
+    );
+    assert_eq!(
+        f3(&meta),
+        Some(a),
+        "the stale hint moved f3 back over the streamed rename"
+    );
+    meta.apply_segment_rows(2, 1, 4, &[2, 3, 4], &[], &seg2, &TouchSet::default())
+        .unwrap();
+    assert!(!meta.has_outstanding_speculation());
+    assert_eq!(f3(&reference), Some(a));
+    assert_eq!(raw_ns(&meta), raw_ns(&reference));
+}
+
 /// The takeover gate's rollback: every shadow below the new epoch is
 /// rolled back and queued, in acceptance order.
 #[test]

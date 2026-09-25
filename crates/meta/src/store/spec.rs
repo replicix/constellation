@@ -470,17 +470,39 @@ fn streamed_entry_completing(
     meta: &Meta,
     rid: Rid,
 ) -> Result<Option<u64>, MetaError> {
+    streamed_entry_with(
+        r,
+        meta,
+        |rec| matches!(rec, LogRecord::Completed { rid: c } if *c == rid),
+    )
+}
+
+/// Plan 30 §M6/§M9: the live `Streamed` entry carrying `rid`'s journaled
+/// refusal (`Refused { rid }`), if any: its spec seq.
+fn streamed_entry_refusing(
+    r: &impl Readable,
+    meta: &Meta,
+    rid: Rid,
+) -> Result<Option<u64>, MetaError> {
+    streamed_entry_with(
+        r,
+        meta,
+        |rec| matches!(rec, LogRecord::Refused { rid: c, .. } if *c == rid),
+    )
+}
+
+fn streamed_entry_with(
+    r: &impl Readable,
+    meta: &Meta,
+    matches: impl Fn(&LogRecord) -> bool,
+) -> Result<Option<u64>, MetaError> {
     for (seq, entry) in read_live(r, meta)? {
         if !matches!(entry, LiveEntry::Streamed { .. }) {
             continue;
         }
         if let Some(v) = r.get(&meta.spec, seq_key(seq))? {
             let row: SpecRow = postcard::from_bytes(&v)?;
-            if row
-                .records
-                .iter()
-                .any(|rec| matches!(rec, LogRecord::Completed { rid: c } if *c == rid))
-            {
+            if row.records.iter().any(&matches) {
                 return Ok(Some(seq));
             }
         }
@@ -1676,20 +1698,47 @@ impl Meta {
         floor: u64,
         epoch: u64,
     ) -> Result<(), MetaError> {
-        self.install_hint_from(records, floor, epoch, 0)
+        self.install_hint_from(None, records, floor, epoch, 0)
+            .map(|_| ())
     }
 
-    /// [`Self::install_hint`] for a refusal answered by a delegate of
-    /// generation `gen` (plan 30 §M11).
+    /// [`Self::install_hint`] for the refusal of `rid` (when known),
+    /// answered by a delegate of generation `gen` (plan 30 §M11; 0: the
+    /// root). Returns `false`, and installs nothing, when this replica is
+    /// already at or past the state the entry was read from:
+    /// - the applied log carries `rid`'s refusal;
+    /// - plan 30 §M9: the holder's pre-S3 stream carried the refusal here
+    ///   before the reply (which waits for the backup's acknowledgement
+    ///   of it), as a `Streamed` entry. The stream installs the holder's
+    ///   transactions contiguously, so what it streamed *after* the
+    ///   refusal — a rename onto the refused name, an unlink of it — is
+    ///   applied already; the hint, read before those, would put the old
+    ///   entry back over them, and the segment (skipping the streamed
+    ///   rows, retiring the hint) would leave it there (backup sim seed
+    ///   600396; M14's lock sim seed 194287: `f3` kept the hint's inode,
+    ///   every other replica had the renamed one). The mirror of
+    ///   `install_shadow`'s streamed rule.
+    ///
+    /// The caller then treats the refusal as uncovered (raises
+    /// `observed`), which is always correct.
     pub fn install_hint_from(
         &self,
+        rid: Option<Rid>,
         records: &[LogRecord],
         floor: u64,
         epoch: u64,
         gen: u64,
-    ) -> Result<(), MetaError> {
+    ) -> Result<bool, MetaError> {
         let tx = self.db.write_tx();
-        self.install_speculative_tx(tx, SpecKind::Hint { floor, epoch, gen }, records)
+        if let Some(rid) = rid {
+            if tx.get(&self.completed, rid.to_key())?.is_some()
+                || streamed_entry_refusing(&tx, self, rid)?.is_some()
+            {
+                return Ok(false);
+            }
+        }
+        self.install_speculative_tx(tx, SpecKind::Hint { floor, epoch, gen }, records)?;
+        Ok(true)
     }
 
     /// Plan 30 §M9: install one of the holder's backup-acked journal
