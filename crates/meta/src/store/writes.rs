@@ -515,6 +515,17 @@ impl Meta {
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
         let dirty = local.dirty(self);
+        // The holder's own manifest commit has no client rid, so a
+        // deposition replays it by the transaction's local replay rid
+        // (`spec::replay_rid_for`). It carries that rid's `Completed`
+        // like any executed op, so the replay can tell whether the
+        // commit reached the log anyway — plan 30 §M9: a backup that took
+        // the lease over adopted it from its backup tail. Without the
+        // marker the replay re-evaluated it against a file the successor
+        // had written since and materialized a conflict copy of a version
+        // that was never lost (harness `deposed-reintegration-backup`).
+        let rid = crate::store::spec::replay_rid_for(&tx, self, local.start())?;
+        let _completion = crate::store::journal::PendingCompletion::set(Some(rid));
         let delta = Self::set_manifest_tx(
             &mut tx,
             &self.ns,

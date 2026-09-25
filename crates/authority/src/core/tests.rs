@@ -1141,6 +1141,149 @@ fn a_refusal_raises_observed_until_the_segment_lands() {
     assert_eq!((stats.timeouts, stats.covered), (3, 1), "{stats:?}");
 }
 
+/// Harness `deposed-reintegration` (PROGRESS, "Fix: deposed-reintegration
+/// regression"): A's stranded overwrite of `same` is a size-only truncate
+/// (the FUSE `O_TRUNC`) followed by the manifest commit, both queued for
+/// replay by rid. B has overwritten `same` since. When A takes the lease
+/// back, its takeover gate replays the queue locally: the truncate must
+/// be folded into the manifest commit (whose base check refuses it, so
+/// A's bytes become a conflict copy) — not executed on its own, which
+/// truncated B's winner to nothing.
+#[test]
+fn the_takeover_gates_local_replay_folds_a_truncate_into_its_manifest_commit() {
+    use constellation_fs_core::{ChunkHash, Manifest};
+    let mut h = Harness::new(1);
+    let file = h.meta.create(ROOT_INO, "same", 0o644, 0, 0).unwrap();
+    let manifest = |bytes: &[u8]| {
+        let chunks = [(0u64, ChunkHash::of(bytes))].into_iter().collect();
+        Manifest::from_sparse_chunks(4096, bytes.len() as u64, chunks, 64, ChunkHash::of)
+            .0
+            .encode()
+    };
+    let set = |base: Option<Vec<u8>>, bytes: &[u8]| MutateOp::SetManifest {
+        ino: file.ino,
+        base_manifest: base,
+        manifest: manifest(bytes),
+        size: bytes.len() as u64,
+    };
+    let base = manifest(b"baseline");
+    constellation_meta::execute_mutate(&h.meta, &set(None, b"baseline"), None).unwrap();
+    // B's winner, in the log before A comes back.
+    constellation_meta::execute_mutate(&h.meta, &set(Some(base.clone()), b"winner-from-b"), None)
+        .unwrap();
+    // A's stranded `O_TRUNC` + write, queued for replay by rid.
+    let a = |seq| Rid {
+        node: 2,
+        incarnation: 1,
+        seq,
+    };
+    let truncate = MutateOp::Setattr {
+        ino: file.ino,
+        mode: None,
+        uid: None,
+        gid: None,
+        size: Some(0),
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    h.meta.queue_replay(a(1), &truncate).unwrap();
+    h.meta
+        .queue_replay(a(2), &set(Some(base), b"loser-from-a"))
+        .unwrap();
+
+    h.hold(2, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+
+    let attr = h.meta.getattr(file.ino).unwrap().unwrap();
+    assert_eq!(
+        attr.size, 13,
+        "B's winner keeps its size (was truncated to 0)"
+    );
+    assert_eq!(
+        MetaStore::manifest(&h.meta, file.ino).unwrap(),
+        Some(manifest(b"winner-from-b")),
+        "B's winner keeps its content"
+    );
+    let queue = h.meta.pending_replays().unwrap();
+    assert_eq!(queue.len(), 1, "the truncate is folded away: {queue:?}");
+    assert_eq!(queue[0].rid, a(2));
+    assert!(
+        queue[0].refused.is_some(),
+        "the manifest commit is refused on its base (its conflict copy follows)"
+    );
+    assert!(h.meta.completed_outcome(a(1)).unwrap().is_none());
+}
+
+/// Plan 30 §M9 meets §M3b (harness `deposed-reintegration-backup`): the
+/// holder's own manifest commit (the FUSE close, `set_manifest_dirty`) has
+/// no client rid; deposed, the holder queues it for replay under its
+/// local replay rid. If its backup adopted the commit when it took over,
+/// the log carries it — and must say so, by that rid, or the replay
+/// re-evaluates the commit against whatever the successor wrote since
+/// and materializes a conflict copy of a version that was never lost.
+#[test]
+fn a_deposed_holders_adopted_manifest_commit_is_not_replayed() {
+    use constellation_fs_core::{ChunkHash, Manifest};
+    let mut h = Harness::new(1);
+    let file = h.meta.create(ROOT_INO, "same", 0o644, 0, 0).unwrap();
+    // Everything so far is in the log.
+    let rows = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();
+    let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+    h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+
+    // A holds epoch 1 and closes the file: a local manifest commit.
+    h.meta.set_holder_epoch(1);
+    let chunks = [(0u64, ChunkHash::of(b"loser-from-a"))]
+        .into_iter()
+        .collect();
+    let manifest = Manifest::from_sparse_chunks(4096, 12, chunks, 64, ChunkHash::of)
+        .0
+        .encode();
+    h.meta
+        .set_manifest_dirty(file.ino, None, &manifest, 12, &[])
+        .unwrap();
+    let adopted: Vec<LogRecord> = MetaStore::take_journal(&h.meta, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect();
+    assert!(
+        adopted.iter().any(|r| matches!(
+            r,
+            LogRecord::Completed { rid }
+                if rid.incarnation == constellation_meta::LOCAL_REPLAY_INCARNATION
+        )),
+        "the manifest commit carries its replay rid's completion: {adopted:?}"
+    );
+
+    // Deposed: the unshipped commit is rolled back and queued by rid.
+    h.meta.set_holder_epoch(0);
+    h.meta.strand_below_epoch(2).unwrap();
+    let queue = h.meta.pending_replays().unwrap();
+    assert_eq!(queue.len(), 1, "{queue:?}");
+    assert!(
+        h.meta.completed_outcome(queue[0].rid).unwrap().is_none(),
+        "the stranding forgets the rid's own completion"
+    );
+
+    // B adopted it from its backup tail and shipped it under epoch 2.
+    crate::replica::Replica::apply_segment(&h.meta, 2, 2, 0, &[], &[], &adopted).unwrap();
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    assert!(
+        h.meta.pending_replays().unwrap().is_empty(),
+        "the replay found its completion in the log"
+    );
+    assert!(
+        sends(&out).is_empty() && replies(&out).is_empty(),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.replay_conflicts, 0);
+}
+
 /// Read-your-writes across a stranding: while one of this node's own ops
 /// is queued for replay (rolled back), reads of its keys wait even on the
 /// fast path; other keys do not.

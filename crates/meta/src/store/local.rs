@@ -272,6 +272,12 @@ pub(crate) struct LocalTx {
 }
 
 impl LocalTx {
+    /// The journal seq this transaction's first row gets (its
+    /// `journal_tx` key).
+    pub(crate) fn start(&self) -> u64 {
+        self.start
+    }
+
     /// The `ns::Dirty` every `ns` write of this transaction goes through:
     /// plain dirty-tracking, plus before-image capture when it applies.
     pub(crate) fn dirty<'a>(&'a self, meta: &'a Meta) -> ns::Dirty<'a> {

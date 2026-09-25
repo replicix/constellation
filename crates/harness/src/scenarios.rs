@@ -144,9 +144,15 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "deposed-reintegration",
-        desc: "plan 30 M3b: a deposed holder recovers automatically; its non-overlapping stranded edits replay cleanly and only the true edit-vs-edit overlap materializes a conflict copy",
+        desc: "plan 30 M3b: a deposed holder recovers automatically; its non-overlapping stranded edits replay cleanly and only the true edit-vs-edit overlap materializes a conflict copy (Layer A: no backup, A alone cut from S3)",
         requires: &[],
         run: deposed_reintegration,
+    },
+    Scenario {
+        name: "deposed-reintegration-backup",
+        desc: "plan 30 M9's side of deposed-reintegration: with the default LAN backup, a holder whose ship is held has its edits acknowledged by the backup, which seals and takes over inside the TTL with them — nothing strands, no conflict copy, every adopted chunk is in S3",
+        requires: &[],
+        run: deposed_reintegration_backup,
     },
     Scenario {
         name: "node-leave",
@@ -3152,13 +3158,33 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
 /// B's winner and A's bytes land as exactly one
 /// `.constellation-conflict/same@<node>-<ts>` copy, while `clean-from-a`
 /// and `a-only` replay cleanly with no conflict copy at all.
+///
+/// **Layer A only** (plan 30 §3's durability table, "no backup"): the
+/// premise is a holder that keeps acknowledging locally while cut off
+/// from S3, so its acknowledged writes strand when it is deposed. Plan
+/// 30 §M9 auto-selects a LAN peer as a synchronous backup
+/// (`CONSTELLATION_BACKUP_RTT_BUDGET_MS`, default 5 ms), and with one the
+/// premise no longer holds: while the backup is being brought up nothing
+/// is acknowledged without S3 (the writes block, then fail in doubt),
+/// and once it is committed the writes are acknowledged by the backup,
+/// which seals A's epoch and adopts them — nothing strands. So this
+/// scenario pins the budget to 0 (today's `Local`), and
+/// `deposed-reintegration-backup` covers the M9 path.
 fn deposed_reintegration(_seed: u64) -> Result<()> {
     let (env, root) = setup("deposed-reintegration")?;
-    let proxy = env.s3_proxy()?;
+    // A reaches S3 through its own switch, so the cut below isolates A
+    // alone, as the scenario means to: through the shared toxiproxy route
+    // it cut B too — an S3 outage for the whole cluster, in which A and
+    // B form a continuation epoch (plan 30 §M10) and the premise (a
+    // holder acknowledging locally while the rest of the cluster carries
+    // on) no longer holds.
+    let _route = env.s3_proxy()?;
+    let a_s3 = env.counting_proxy()?;
     let backend = format!("s3://{BUCKET}/reintegrate-{}", ts());
-    let tune = |client: Client, key: &str| {
+    let tune = |client: Client| {
         client
-            .with_env("CONSTELLATION_NODE_KEY", key)
+            .with_own_node_key()
+            .with_env("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0")
             .with_env("CONSTELLATION_LEASE_TTL_MS", "5000")
             // Keep B holding for a while after its takeover write, so
             // resumed A's renewal finds B's lease (the deposition path
@@ -3168,14 +3194,17 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "10000")
             .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "3000")
     };
-    let mut c0 = tune(
-        Client::new(root.path(), "c0", &env.endpoint, &backend)?,
-        "/tmp/.constellation-reintegrate-c0.key",
-    );
-    let mut c1 = tune(
-        Client::new(root.path(), "c1", &env.endpoint, &backend)?,
-        "/tmp/.constellation-reintegrate-c1.key",
-    );
+    // Each node its own key in its state dir: the fixed `/tmp` key paths
+    // this used before were shared by every concurrent run on the host.
+    // Write-back on A: its stranded writes journal and return at once, as
+    // the premise says. Under the default write-through each close first
+    // tries to upload its chunk to the cut S3 (with retries and backoff,
+    // and behind the rounds' own upload attempts of the same chunks), and
+    // three of them can outlast A's lease view (5 s TTL): the last write
+    // then fails with EIO before A is even frozen (1 run in ~6).
+    let mut c0 =
+        tune(Client::new(root.path(), "c0", &a_s3.endpoint(), &backend)?).with_write_mode("back");
+    let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
@@ -3209,10 +3238,13 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     // to replay. The cut removes the race outright: with S3 unreachable
     // the ship cannot possibly succeed, so the records are guaranteed to
     // still be local when A is frozen a moment later.
-    proxy.cut()?;
-    std::fs::write(c0.mnt.join("shared/clean-from-a"), b"clean")?;
-    std::fs::write(c0.mnt.join("shared/a-only"), b"stranded-from-a")?;
-    std::fs::write(c0.mnt.join("shared/same"), b"loser-from-a")?;
+    a_s3.cut();
+    std::fs::write(c0.mnt.join("shared/clean-from-a"), b"clean")
+        .context("A's stranded create of clean-from-a")?;
+    std::fs::write(c0.mnt.join("shared/a-only"), b"stranded-from-a")
+        .context("A's stranded overwrite of a-only")?;
+    std::fs::write(c0.mnt.join("shared/same"), b"loser-from-a")
+        .context("A's stranded overwrite of same")?;
     let a_before = c0.control_status()?;
     anyhow::ensure!(
         a_before["spool"]["journal_backlog"].as_u64().unwrap_or(0) > 0,
@@ -3230,7 +3262,7 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     c0.pause()?;
     // Safe to restore now: A cannot act on it while stopped, and B needs
     // it to take over below.
-    proxy.heal()?;
+    a_s3.heal();
 
     std::thread::sleep(Duration::from_millis(6500));
     std::fs::write(c1.mnt.join("shared/same"), b"winner-from-b")
@@ -3346,6 +3378,238 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
     c0.unmount()?;
     c1.unmount()?;
     Ok(())
+}
+
+/// Plan 30 §M9's side of `deposed-reintegration`, in the default
+/// configuration (A's LAN peer B is its synchronous backup). A holds;
+/// its ship rounds are held (the sync-hold fault: S3 stays reachable,
+/// nothing A journals ships), and it makes the same three edits —
+/// `clean-from-a`, an overwrite of `a-only`, an overwrite of `same` —
+/// which are acknowledged once B has them. A is then frozen. B, its
+/// backup, seals A's epoch and takes the lease over well inside the TTL
+/// (20 s here), with A's journal adopted from its backup tail: nothing
+/// strands. B overwrites `same`. Resumed, A is deposed and finds every
+/// op of its queue completed in the log, so no conflict copy is made;
+/// both nodes converge on A's two files and B's `same`. Finally A is
+/// killed and B re-reads everything with an empty cache: the adopted
+/// records name chunks that are in the bucket.
+///
+/// Why a hold and not `deposed-reintegration`'s S3 cut: a holder cut
+/// from S3 with a live LAN peer forms a continuation epoch with it
+/// within a round interval (plan 30 §M10), and a member backup does not
+/// seal while its epoch is open — see PROGRESS, "Fix:
+/// deposed-reintegration regression", for what that does when the
+/// holder is then lost.
+fn deposed_reintegration_backup(_seed: u64) -> Result<()> {
+    const NAME: &str = "deposed-reintegration-backup";
+    let (env, root) = setup(NAME)?;
+    let _route = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/reintegrate-backup-{}", ts());
+    let hold_dir = tempfile::tempdir()?;
+    let hold = hold_dir.path().join("hold-a");
+    let held = hold_dir.path().join("hold-a.held");
+    let tune = |client: Client| {
+        client
+            .with_own_node_key()
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "20000")
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "60000")
+            .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
+    };
+    let mut c0 = tune(Client::new(root.path(), "c0", &env.endpoint, &backend)?).with_env(
+        "CONSTELLATION_FAULT_HOLD_SYNC_FILE",
+        hold.to_str().context("hold path")?,
+    );
+    let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    let mut paused = false;
+    let result = (|| -> Result<()> {
+        wait_for_p2p(&[&c0, &c1])?;
+        let b_id = c1.control_status()?["node_id"]
+            .as_u64()
+            .context("B reports no node id")?;
+        std::fs::create_dir(c0.mnt.join("shared"))?;
+        std::fs::write(c0.mnt.join("shared/same"), b"baseline")?;
+        std::fs::write(c0.mnt.join("shared/a-only"), b"baseline-a")?;
+        eventually("baseline visible on B", Duration::from_secs(30), || {
+            anyhow::ensure!(std::fs::read(c1.mnt.join("shared/same"))? == b"baseline");
+            anyhow::ensure!(std::fs::read(c1.mnt.join("shared/a-only"))? == b"baseline-a");
+            Ok(())
+        })?;
+        eventually("A lists B as its backup", Duration::from_secs(30), || {
+            let ack = c0.control_status()?["ack"].clone();
+            let backups: Vec<u64> = ack["backups"]
+                .as_array()
+                .map(|v| v.iter().filter_map(|x| x.as_u64()).collect())
+                .unwrap_or_default();
+            anyhow::ensure!(
+                ack["policy"] == "backup" && backups == [b_id],
+                "A's backup set is not [B]: {ack}"
+            );
+            Ok(())
+        })?;
+        let a_epoch = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
+
+        std::fs::write(&hold, b"hold")?;
+        eventually(
+            "A's round observes the hold",
+            Duration::from_secs(20),
+            || {
+                anyhow::ensure!(held.is_file(), "no round has observed the hold yet");
+                Ok(())
+            },
+        )?;
+        for (name, bytes) in [
+            ("clean-from-a", &b"clean"[..]),
+            ("a-only", &b"stranded-from-a"[..]),
+            ("same", &b"loser-from-a"[..]),
+        ] {
+            std::fs::write(c0.mnt.join("shared").join(name), bytes)
+                .with_context(|| format!("A's write of {name}"))?;
+        }
+        let spool = c0.control_status()?["spool"].clone();
+        anyhow::ensure!(
+            spool["journal_backlog"].as_u64().unwrap_or(0) > 0,
+            "A shipped its edits although its rounds are held: {spool}"
+        );
+        c0.pause()?;
+        paused = true;
+        let frozen = std::time::Instant::now();
+
+        eventually(
+            "B seals A's epoch and takes the lease over",
+            Duration::from_secs(10),
+            || {
+                let lease = lease_of(&c1)?;
+                anyhow::ensure!(
+                    lease["held"] == true && lease["epoch"].as_u64().unwrap_or(0) > a_epoch,
+                    "B does not hold a newer epoch than A's {a_epoch} yet: {lease}"
+                );
+                Ok(())
+            },
+        )?;
+        let took = frozen.elapsed();
+        let ack = c1.control_status()?["ack"].clone();
+        eprintln!(
+            "    {NAME}: B took over {took:?} after A froze (TTL 20 s); seals {} takeovers {} \
+             tail-applied {}",
+            ack["seals"], ack["backup_takeovers"], ack["backup_tail_applied"]
+        );
+        anyhow::ensure!(
+            ack["seals"].as_u64().unwrap_or(0) >= 1,
+            "B took over without sealing (by expiry?): {ack}"
+        );
+        // A's acknowledged edits are B's once its takeover gate has
+        // applied the backup tail — before A is back. (Not linearizable
+        // with A's acknowledgements: B's own session never observed them,
+        // and a read during the gate may still miss them.)
+        eventually(
+            "B has A's acknowledged edits while A is frozen",
+            Duration::from_secs(10),
+            || {
+                for (name, bytes) in [
+                    ("clean-from-a", &b"clean"[..]),
+                    ("a-only", &b"stranded-from-a"[..]),
+                    ("same", &b"loser-from-a"[..]),
+                ] {
+                    let got = std::fs::read(c1.mnt.join("shared").join(name))
+                        .with_context(|| format!("B reads A's {name}"))?;
+                    anyhow::ensure!(
+                        got == bytes,
+                        "B has {name} as {:?}",
+                        String::from_utf8_lossy(&got)
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        let ack = c1.control_status()?["ack"].clone();
+        anyhow::ensure!(
+            ack["backup_tail_applied"].as_u64().unwrap_or(0) >= 1,
+            "B has A's edits but applied no backup tail: {ack}"
+        );
+        std::fs::write(c1.mnt.join("shared/same"), b"winner-from-b")
+            .context("B's overwrite of same")?;
+
+        let _ = std::fs::remove_file(&hold);
+        c0.resume()?;
+        paused = false;
+        let expect: [(&str, &[u8]); 3] = [
+            ("clean-from-a", b"clean"),
+            ("a-only", b"stranded-from-a"),
+            ("same", b"winner-from-b"),
+        ];
+        eventually(
+            "A recovers and both nodes converge with no conflict copy",
+            Duration::from_secs(60),
+            || {
+                let spec = speculation_of(&c0)?;
+                anyhow::ensure!(
+                    spec["depositions"].as_u64().unwrap_or(0) >= 1,
+                    "A has not noticed the deposition yet: {spec}"
+                );
+                anyhow::ensure!(
+                    spec["pending_replay"].as_u64() == Some(0)
+                        && spec["outstanding"].as_u64() == Some(0),
+                    "A is still recovering: {spec}"
+                );
+                for client in [&c0, &c1] {
+                    for (name, bytes) in expect {
+                        let got = std::fs::read(client.mnt.join("shared").join(name))
+                            .with_context(|| format!("{} reads {name}", client.name))?;
+                        anyhow::ensure!(
+                            got == bytes,
+                            "{}: {name} is {:?}",
+                            client.name,
+                            String::from_utf8_lossy(&got)
+                        );
+                    }
+                    let copies =
+                        std::fs::read_dir(client.mnt.join("shared/.constellation-conflict"))
+                            .map(|d| d.count())
+                            .unwrap_or(0);
+                    anyhow::ensure!(
+                        copies == 0,
+                        "{}: {copies} conflict copies, but nothing stranded",
+                        client.name
+                    );
+                }
+                Ok(())
+            },
+        )
+        .with_context(|| format!("--- c0 log ---\n{}", c0.tail_log_n(40)))?;
+        let spec = speculation_of(&c0)?;
+        eprintln!("    {NAME}: A after recovery: {spec}");
+        anyhow::ensure!(
+            spec["replay_conflicts"].as_u64().unwrap_or(0) == 0,
+            "A materialized a conflict although B adopted its writes: {spec}"
+        );
+
+        // Durability without A.
+        c0.kill9()?;
+        c1.unmount()?;
+        c1.drop_cache()?;
+        c1.mount()?;
+        for (name, bytes) in expect {
+            let got = std::fs::read(c1.mnt.join("shared").join(name))
+                .with_context(|| format!("B re-reads {name} from S3 with A gone"))?;
+            anyhow::ensure!(
+                got == bytes,
+                "B re-reads {name} as {:?}",
+                String::from_utf8_lossy(&got)
+            );
+        }
+        Ok(())
+    })();
+    if paused {
+        let _ = c0.resume();
+    }
+    let _ = std::fs::remove_file(&hold);
+    let unmounted = c1.unmount();
+    let _ = c0.unmount();
+    result?;
+    unmounted
 }
 
 /// Phase 4c: unmount ≠ leave. With C merely unmounted, A+B cannot open

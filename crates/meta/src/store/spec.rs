@@ -751,12 +751,16 @@ fn strand_local_tx(
             })
             .is_some_and(|position| position == 0))
     };
-    if let Some(rid) = row.rid {
-        if !log_carries(tx, &rid)? {
-            tx.remove(&meta.completed, rid.to_key());
-        }
-        meta.forget_recent(rid);
+    let rid = match row.rid {
+        Some(rid) => rid,
+        None => replay_rid_for(&*tx, meta, first)?,
+    };
+    // (A rid-less transaction's replay rid carries a `completed` row too
+    // when it journaled its own marker — the holder's manifest commit.)
+    if !log_carries(tx, &rid)? {
+        tx.remove(&meta.completed, rid.to_key());
     }
+    meta.forget_recent(rid);
     let records: Vec<LogRecord> = rows.into_iter().map(|(_, rec)| rec).collect();
     // Plan 30 §M13: a refusal this tenure journaled but never shipped was
     // evaluated against state that is being rolled back; its `completed`
@@ -769,10 +773,6 @@ fn strand_local_tx(
             }
         }
     }
-    let rid = match row.rid {
-        Some(rid) => rid,
-        None => replay_rid_for(&*tx, meta, first)?,
-    };
     let op = match row.op {
         Some(op) => Some(op),
         None => derive_replay_op(&records),

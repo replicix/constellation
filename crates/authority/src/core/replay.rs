@@ -438,8 +438,22 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<(), constellation_meta::MetaError> {
-        let queued = replica.pending_replays()?;
-        for queued in &queued {
+        let queue = replica.pending_replays()?;
+        for queued in &queue {
+            // The drain tick's rule, here too (it was the pre-M5
+            // `recovery::takeover_gate`'s, lost when the gate moved into
+            // the core): a size-only truncate with a manifest commit for
+            // the same inode queued after it is folded into that commit,
+            // which carries the final size *and* the base check. Executed
+            // on its own it has no base to check — a takeover gate that
+            // replayed it truncated the file another node had written
+            // since (harness `deposed-reintegration`: B's `same` became
+            // empty while A's manifest was, correctly, refused).
+            if folded_into_later_manifest(queued, &queue) {
+                replica.forget_replay(queued.queue_seq)?;
+                self.stats.stranded_replayed += 1;
+                continue;
+            }
             self.replay_locally(now, queued, replica, out)?;
         }
         self.replay.in_flight = None;

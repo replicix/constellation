@@ -18482,3 +18482,210 @@ in-flight create in the directory, so it is a separate decision.
   bumped rather than moving it backwards. That is harmless metadata, not
   data. Making every `stat .` wait for in-flight creates in the
   directory would cost far more than it protects.
+
+## Fix: deposed-reintegration regression (2026-09-25; uncommitted on `fix-deposed-reint` = main fb11962)
+
+`deposed-reintegration` failed on main in three different ways. One is
+a real M3b-era bug: the M5 core extraction dropped a replay rule, and
+the replayed truncate cleared another node's newer write. One is a real
+M9 × M3b bug: a spurious conflict copy after a backup takeover. The
+rest is a premise that M9 and M10 changed. All three are fixed or
+pinned below, plus a scenario variant for the M9 path.
+
+### Bisection
+
+Each commit got its own release build in a scratch detached worktree
+(removed afterwards). Runs were sequential under one docker prefix,
+×3 each.
+
+| Commit | Result |
+|---|---|
+| `33adc8e` M4 | 3/3 passed |
+| `617499b` M5 | 3/3 passed (the latent bug is here; see below) |
+| `92c4078` M6 | 2/3; **FAILED**: "c0 kept wrong winner \"\"" |
+| `0f9583d` M7 | 2/3; same failure |
+| `e0437df` M8 | 2/3; same failure |
+| `0e1017b` M9 | **0/3**: "B winner is durable" not reached, or `Input/output error` |
+| `fb11962` main | 1/3 (same M9 failures, plus one pass) |
+
+An earlier attempt ran two commits in parallel and saw 2/3 failures at
+M8. It is not counted: the scenario used fixed key paths
+(`/tmp/.constellation-reintegrate-c{0,1}.key`), so two concurrent runs
+anywhere on the host share P2P identities. The scenario now uses
+per-run keys.
+
+- **First bad commit for the intermittent failure:** `617499b` (M5),
+  by code inspection. It first *shows* at `92c4078` (M6), about 1 run
+  in 3, because it needs a timing (A re-acquiring the lease itself)
+  that M6 and later hit more often.
+- **First bad commit for the deterministic failure:** `0e1017b` (M9).
+  The default LAN backup changes the scenario's premise. `ee7243b`
+  (M10) adds a second premise change (below).
+
+### 1. The takeover gate replayed a truncate on its own (real bug, M5)
+
+A's stranded `same` overwrite is two queued ops: a size-only `Setattr`
+(the FUSE `O_TRUNC`) and the `SetManifest`. Since M3b, the replay
+**drain** folds such a truncate into the later manifest commit for the
+same inode (`folded_into_later_manifest`): the commit carries the final
+size and the base check.
+
+The pre-M5 `recovery::takeover_gate` did the same. When M5 moved the
+gate into the core, `Core::replay_queue_locally` lost the fold. So when
+A took the lease back and replayed its queue locally, the truncate ran
+alone: it has no base to check, so it truncated B's `winner-from-b` to
+nothing. The manifest was then (correctly) refused and became the
+conflict copy. Both nodes ended with an empty `same`: **B's write was
+lost.** The log shows it: `stranded op replayed locally … seq: 5`
+followed by the refused `SetManifest`.
+
+- **Fix** (`core/replay.rs`): `replay_queue_locally` applies the same
+  fold.
+- **Test:** `the_takeover_gates_local_replay_folds_a_truncate_into_its_manifest_commit`
+  (`core/tests.rs`). It fails without the fix: "B's winner keeps its
+  size (was truncated to 0)".
+- **End to end:** a pinned run whose A re-acquired and replayed locally
+  (`replayed locally` ×3, the truncates folded) passed.
+
+### 2. The premise changed under M9 and M10 (the scenario, pinned)
+
+The scenario means "A holds, is cut from S3, keeps acknowledging
+locally (Layer A), is frozen and deposed; its stranded edits replay".
+In the default configuration today, three things break that:
+
+- **M9 backup.** A's LAN peer B is auto-selected as its backup
+  (`CONSTELLATION_BACKUP_RTT_BUDGET_MS=5`).
+  - While the candidate is being brought up, nothing is acknowledged
+    without S3 (by design), so A's writes block until its lease view
+    closes, then fail in doubt. That is the `Input/output error` runs.
+  - Once B is committed, A's writes are acknowledged by B. When A
+    freezes, B seals and takes over with A's tail, so nothing strands.
+    In the shared-cut version, B's overwrite of `same` then failed:
+    the adopted manifest names a chunk A never uploaded (item 4).
+- **M10 epochs.** `proxy.cut()` cut the shared toxiproxy route, so B
+  lost S3 too. That is a cluster-wide outage, and A and B formed a
+  continuation epoch.
+- **Write-through timing.** Under the default write-through mode, each
+  of A's closes tries to upload to the cut S3 (retries, and behind the
+  rounds' own upload of the same chunk). Three of them can outlast A's
+  5 s lease view, and the last write fails with EIO before A is frozen:
+  1 run in 6, measured.
+
+**Pinned** (in `crates/harness/src/scenarios.rs`, `deposed_reintegration`):
+- `CONSTELLATION_BACKUP_RTT_BUDGET_MS=0`, which gives today's `Local`
+  policy (Layer A);
+- A reaches S3 through its own `counting_proxy` switch, so the cut
+  isolates A alone, as the scenario's comment always said;
+- `--write-mode back` on A, so the stranded writes journal and return at
+  once, as the comment says;
+- per-run node keys;
+- contexts on A's three writes.
+
+Result: 8/8, then 5/5 in the final list.
+
+### 3. A deposed holder's adopted manifest commit was replayed (real bug, M9 × M3b)
+
+This was found writing the M9 variant below. The holder's own manifest
+commit (`set_manifest_dirty`, every FUSE close on the holder) has no
+client rid. On deposition it is queued under its local replay rid
+(`LOCAL_REPLAY_INCARNATION`, seq = the transaction's first journal
+seq). Nothing in the log ever carried that rid.
+
+So when M9's backup adopted the commit (`apply_backup_tail`) and
+shipped it, A still could not tell that it had landed. A replayed it by
+rid against B's newer `same`, the base check refused it, and A
+materialized a conflict copy of a version that was never lost (B had
+overwritten it knowingly).
+
+- **Fix** (`meta/store/writes.rs`): the commit journals
+  `Completed { replay rid }` in its own transaction, like every executed
+  op. `strand_local_tx` (`meta/store/spec.rs`) now forgets that rid's
+  `completed` row when it strands the transaction, as it does for a
+  client rid, unless the log carries it. A commit that really strands
+  is still replayed; an adopted one is found completed once the
+  successor's segment is applied.
+- **Cost:** one small `Completed` record per holder close, which every
+  forwarded and fast-path op already has.
+- **Test:** `a_deposed_holders_adopted_manifest_commit_is_not_replayed`
+  (`core/tests.rs`).
+- **End to end:** with the marker disabled, `deposed-reintegration-backup`
+  fails 2/2 ("c0: 1 conflict copies, but nothing stranded"); with it,
+  it passes 5/5.
+
+### The variant: `deposed-reintegration-backup` (new)
+
+This is the M9 path in the default configuration (backup on, 20 s TTL,
+placement off).
+
+**Setup.**
+- Wait until A lists `[B]` as its backup.
+- A's sync rounds are held with the sync-hold fault: S3 stays
+  reachable, so no M10 epoch forms, but nothing A journals ships.
+- A makes the same three edits and is frozen.
+
+**Checks.**
+1. **Takeover.** B seals and takes over in about 1.5 s: `seals 1`,
+   `backup_tail_applied ≥ 1`.
+2. **Adoption.** Once B's gate has applied the tail, B reads A's three
+   edits while A is still frozen.
+3. **Convergence.** B overwrites `same`. A resumes and is deposed. The
+   run then requires `pending_replay 0`, `replay_conflicts 0`, no
+   conflict copy on either node, and `same` = B's winner while the
+   other two keep A's content.
+4. **Durability.** A is killed, and B re-reads all three files with an
+   empty cache.
+
+A read taken on B *during* the takeover gate can still miss A's
+acknowledged edits. B's session never observed them, so this is not a
+session violation, and the check waits for the gate.
+
+### Noted, not fixed (flagged as separate tasks)
+
+- **M10: a holder cut from S3 on its own pulls its healthy peer into a
+  continuation epoch.** `EpochManager::handle_propose` does not check
+  the member's own S3. The epoch carries A's lease, because B is a
+  listed backup. When A then dies, B is frozen: it answered `EIO` after
+  51 s, then `EROFS` on every retry for 40+ s more, with A's 20 s lease
+  long expired and S3 reachable from B throughout. M10 rule (b)
+  suspends B's seal watch, and a frozen non-holder never probes S3.
+  Without the epoch, M9 fails over in about 1.5 s.
+- **M9 vs M4: a backup takeover can ship manifests whose chunks never
+  reached S3.**
+  - The holder streams journal rows to its backup whatever their
+    chunks' upload state.
+  - The successor ships the adopted tail, and its planner has no
+    pending rows for those chunks, so the M4 rule "a manifest ships
+    only once its chunks are in S3" does not hold for the tail.
+  - Seen in the shared-cut runs: B's overwrite of `same` failed with
+    `coop fetch failed … unavailable from peers and S3`.
+    `compose_manifest` also fetches the old chunk even when the write
+    covers it completely.
+- **Known flake:** `takeover-marker-strands-promptly` failed 1 of 3
+  with its pre-existing signature ("C must hold the accepted create as
+  an outstanding shadow … outstanding:0"), documented since M5.
+
+### Results (this tree)
+
+- `cargo test -p constellation-authority --release`: 67 core (2 new),
+  3 meta_repro, 62 sim (7 ignored): green.
+- `cargo test -p constellation -p constellation-meta --release`: green
+  (206 cli, 73 meta).
+- `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo fmt --all -- --check`: clean.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-fixdepo`):
+
+  | Scenario | Result |
+  |---|---|
+  | `deposed-reintegration` (final form) | 8/8 passed |
+  | `deposed-reintegration-backup` | 3/3 passed (and 2/2 before the final list) |
+  | `lease-fencing` | passed |
+  | `kill9-remount` | passed |
+  | `holder-crash-phantom-shadow` | passed |
+  | `holder-crash-phantom-new-holder` | passed |
+  | `backup-failover` | passed |
+  | `chaos-ci` | passed |
+  | `takeover-marker-strands-promptly` ×3 | 2/3 (the known flake above) |
+
+  The final list's own 5 `deposed-reintegration` runs were 4/5. The
+  one failure is the write-through timing in item 2, which the
+  write-back pin then removed.
