@@ -171,52 +171,188 @@ pub fn session_exists_observed(_seed: u64) -> Result<()> {
     result
 }
 
+/// A node's `status.ack` block (plan 30 §M9).
+fn ack_of(c: &Client) -> Result<serde_json::Value> {
+    Ok(c.control_status()?["ack"].clone())
+}
+
+/// `ls` shows `name`; `stat .`, `stat name` succeed; `cat name` reads
+/// `content` — every one of them a FUSE read through the session check.
+fn ls_stat_cat(dir: &Path, name: &str, content: &[u8], who: &str) -> Result<()> {
+    let p = dir.join(name);
+    let listed = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_str() == Some(name));
+    anyhow::ensure!(
+        listed,
+        "`ls` on {who} right after creating {name} misses it"
+    );
+    std::fs::metadata(dir).with_context(|| format!("stat . on {who}"))?;
+    std::fs::metadata(&p).with_context(|| format!("stat {name} on {who}"))?;
+    anyhow::ensure!(
+        std::fs::read(&p)? == content,
+        "{who} reads back other content for {name}"
+    );
+    Ok(())
+}
+
 /// Read-your-writes on the forwarding path, and coordinator decision 2:
 /// B creates files through A (accepted, installed as shadows) and at once
 /// lists the directory, stats the parent and each file, and reads it —
-/// every read on the fast path (`waited == 0`), even though A has shipped
-/// nothing yet (its sync is held for the first half).
+/// every read on the fast path (`waited == 0`).
+///
+/// Three phases, in the default configuration (plan 30 §M9: A picks B as
+/// its backup, so every forwarded reply is parked until B has the row):
+/// 1. *held* — A's sync is held (nothing ships): `touch a; ls; stat .;
+///    stat a; cat a` on B, 25 times. Only creates: a content write's
+///    manifest commit on a file whose create A has not shipped is accepted
+///    on a stale base and waits for the log (plan 30 §M5's base rule), so
+///    with A held it would block until A's lease lapsed (the hold stops
+///    its renewals too) and B took the lease over — which is what this
+///    scenario did before, measuring B's reads *as the holder* for 49 of
+///    its 50 iterations (see PROGRESS, "Fix: session-forwarded-ryw
+///    regression").
+/// 2. *shipping* — the hold lifted: the same with content (`echo x > a`).
+/// 3. *holder* — the same on A, the holder, whose acknowledgements wait
+///    for B's backup ack: its own reads never find a row of its own that
+///    is not durable yet (the close's manifest commit included).
+///
+/// A's placement is off, and the scenario checks that A held the lease
+/// under the same epoch, with B as its backup, from start to end: B's
+/// writes were forwarded, not executed by B as a holder.
 pub fn session_forwarded_ryw(_seed: u64) -> Result<()> {
     const NAME: &str = "session-forwarded-ryw";
     let tmp = tempfile::tempdir()?;
     let hold = tmp.path().join("hold-a");
-    let (_env, _root, mut a, mut b) = two_nodes(NAME, &[], Some(&hold))?;
+    let (_env, _root, mut a, mut b) = two_nodes(
+        NAME,
+        &[("CONSTELLATION_LEASE_PLACEMENT", "off")],
+        Some(&hold),
+    )?;
     let result = (|| -> Result<()> {
-        let before = session_of(&b)?;
+        let a_id = a.control_status()?["node_id"]
+            .as_u64()
+            .context("A reports no node id")?;
+        let b_id = b.control_status()?["node_id"]
+            .as_u64()
+            .context("B reports no node id")?;
+        // The default configuration's backup (plan 30 §M9): B, the only
+        // peer on this LAN.
+        eventually("A lists B as its backup", Duration::from_secs(30), || {
+            let ack = ack_of(&a)?;
+            let backups: Vec<u64> = ack["backups"]
+                .as_array()
+                .map(|v| v.iter().filter_map(|x| x.as_u64()).collect())
+                .unwrap_or_default();
+            anyhow::ensure!(
+                ack["policy"] == "backup" && backups == [b_id],
+                "A's backup set is not [B]: {ack}"
+            );
+            Ok(())
+        })?;
+        let epoch = lease_of(&a)?["epoch"].as_u64().unwrap_or(0);
+        let a_holds = |when: &str| -> Result<()> {
+            let la = lease_of(&a)?;
+            let lb = lease_of(&b)?;
+            anyhow::ensure!(
+                la["held"] == true
+                    && la["holder"].as_u64() == Some(a_id)
+                    && la["epoch"].as_u64() == Some(epoch)
+                    && lb["held"] != true,
+                "{when}: A no longer holds epoch {epoch} (B's writes were not forwarded): \
+                 A {la}, B {lb}"
+            );
+            let ack = ack_of(&a)?;
+            anyhow::ensure!(
+                ack["policy"] == "backup",
+                "{when}: A is no longer under the backup policy: {ack}"
+            );
+            Ok(())
+        };
+        let before_b = session_of(&b)?;
+        let forwarded_before = b.control_status()?["forwarded_ok"].as_u64().unwrap_or(0);
         for phase in ["held", "shipping"] {
             if phase == "held" {
                 hold_sync(tmp.path(), &hold)?;
             } else {
                 std::fs::remove_file(&hold)?;
             }
+            let started = Instant::now();
             for i in 0..25 {
                 let name = format!("{phase}-{i}");
-                let p = b.mnt.join(&name);
-                // touch a; ls; stat .; stat a; cat a
-                std::fs::write(&p, name.as_bytes())
-                    .with_context(|| format!("B's forwarded create of {name}"))?;
-                let listed = std::fs::read_dir(&b.mnt)?
-                    .filter_map(|e| e.ok())
-                    .any(|e| e.file_name().to_str() == Some(name.as_str()));
-                anyhow::ensure!(listed, "`ls` on B right after creating {name} misses it");
-                std::fs::metadata(&b.mnt).context("stat . on B")?;
-                std::fs::metadata(&p).with_context(|| format!("stat {name} on B"))?;
-                anyhow::ensure!(
-                    std::fs::read(&p)? == name.as_bytes(),
-                    "B reads back other content for {name}"
-                );
+                // touch a (held) / echo x > a (shipping); ls; stat .;
+                // stat a; cat a
+                let content: &[u8] = if phase == "held" {
+                    create_new(&b.mnt, &name)
+                        .with_context(|| format!("B's forwarded create of {name}"))?;
+                    b""
+                } else {
+                    std::fs::write(b.mnt.join(&name), name.as_bytes())
+                        .with_context(|| format!("B's forwarded create of {name}"))?;
+                    name.as_bytes()
+                };
+                ls_stat_cat(&b.mnt, &name, content, "B")?;
             }
+            eprintln!(
+                "    {NAME}: phase {phase}: 25 creates on B in {:?}",
+                started.elapsed()
+            );
+            a_holds(&format!("after phase {phase}"))?;
         }
-        let after = session_of(&b)?;
-        print_session(NAME, "B", &after);
+        let after_b = session_of(&b)?;
+        print_session(NAME, "B", &after_b);
+        let forwarded =
+            b.control_status()?["forwarded_ok"].as_u64().unwrap_or(0) - forwarded_before;
+        eprintln!("    {NAME}: B forwarded {forwarded} ops to A");
         anyhow::ensure!(
-            n(&after, "reads") > n(&before, "reads") + 50,
-            "B's reads did not go through the session check: {after}"
+            n(&after_b, "reads") > n(&before_b, "reads") + 50,
+            "B's reads did not go through the session check: {after_b}"
         );
         anyhow::ensure!(
-            n(&after, "waited") == n(&before, "waited") && n(&after, "timeouts") == 0,
+            forwarded >= 50,
+            "B forwarded only {forwarded} ops for its 50 creates: they did not go through A"
+        );
+        anyhow::ensure!(
+            n(&after_b, "waited") == n(&before_b, "waited") && n(&after_b, "timeouts") == 0,
             "a read after B's own forwarded create waited (decision 2: installed effects \
-             raise nothing): {after}"
+             raise nothing): {after_b}"
+        );
+
+        // Phase 3: the holder's own writes under the backup policy.
+        let before_a = session_of(&a)?;
+        let before_ack = ack_of(&a)?;
+        let started = Instant::now();
+        for i in 0..25 {
+            let name = format!("holder-{i}");
+            std::fs::write(a.mnt.join(&name), name.as_bytes())
+                .with_context(|| format!("A's create of {name}"))?;
+            ls_stat_cat(&a.mnt, &name, name.as_bytes(), "A")?;
+        }
+        eprintln!(
+            "    {NAME}: phase holder: 25 creates on A in {:?}",
+            started.elapsed()
+        );
+        a_holds("after phase holder")?;
+        let after_a = session_of(&a)?;
+        let after_ack = ack_of(&a)?;
+        print_session(NAME, "A", &after_a);
+        eprintln!(
+            "    {NAME}: A reads durability-blocked {} -> {}",
+            n(&before_ack, "reads_durability_blocked"),
+            n(&after_ack, "reads_durability_blocked")
+        );
+        anyhow::ensure!(
+            n(&after_a, "reads") > n(&before_a, "reads") + 50,
+            "A's reads did not go through the session check: {after_a}"
+        );
+        anyhow::ensure!(
+            n(&after_a, "waited") == n(&before_a, "waited")
+                && n(&after_a, "timeouts") == n(&before_a, "timeouts")
+                && n(&after_ack, "reads_durability_blocked")
+                    == n(&before_ack, "reads_durability_blocked"),
+            "a read of the holder's own write waited for durability: an acknowledgement \
+             (the close's manifest commit) returned before its row was durable: \
+             session {after_a}, ack {after_ack}"
         );
         Ok(())
     })();

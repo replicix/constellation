@@ -594,7 +594,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "session-forwarded-ryw",
-        desc: "plan 30 M6 (decision 2): `touch a; ls; stat .; stat a; cat a` right after forwarded creates, with the holder's shipping held and then running, never waits: installed shadows raise nothing",
+        desc: "plan 30 M6 (decision 2): `touch a; ls; stat .; stat a; cat a` right after forwarded creates (the holder's shipping held), then with content and shipping running, never waits: installed shadows raise nothing; A holds throughout with B as its M9 backup; then the same on the holder, whose close waits for its manifest row to be durable so its reads never do",
         requires: &[],
         run: m6::session_forwarded_ryw,
     },

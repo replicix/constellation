@@ -1694,17 +1694,34 @@ impl ConstellationFs {
         op: &constellation_meta::MutateOp,
         jseq: u64,
     ) -> Option<Result<(), MutateFail>> {
+        if self.local_ack_durable(h, jseq) {
+            None
+        } else {
+            Some(self.submit_to_core(h, op, rid, true))
+        }
+    }
+
+    /// Plan 30 §M9: wait until the local journal row at or below `jseq`
+    /// is durable under the lease's acknowledgement policy (or the gate
+    /// went off with the lease still this node's). `false`: in doubt —
+    /// the lease was lost meanwhile, or the budget ran out; the caller
+    /// resolves the op through the core. Every fast-path acknowledgement
+    /// under a gate goes through here: `execute_mutate`'s ops and the
+    /// holder's own manifest commit on close (without it the close
+    /// returned before its row was durable, and the file's next read
+    /// waited for it in `Meta::durability_pending` instead).
+    fn local_ack_durable(&self, h: &SyncHandle, jseq: u64) -> bool {
         let _ = h.tx.send(SyncRequest::Journaled);
         let session = self.meta.session();
         match session.wait_durable(jseq, DURABLE_WAIT_BUDGET) {
             constellation_meta::DurableWait::Durable(waited) => {
                 session.count_fast_ack(waited);
-                None
+                true
             }
-            constellation_meta::DurableWait::Ungated => None,
+            constellation_meta::DurableWait::Ungated => true,
             constellation_meta::DurableWait::Lost | constellation_meta::DurableWait::TimedOut => {
                 session.count_fast_ack_in_doubt();
-                Some(self.submit_to_core(h, op, rid, true))
+                false
             }
         }
     }
@@ -2274,12 +2291,35 @@ impl ConstellationFs {
         let admitted = view.as_ref().and_then(|view| view.admit());
         let holds_lease = self.sync.is_none() || admitted.is_some();
         if holds_lease {
+            // Plan 30 §M9: under a durability gate the commit is
+            // acknowledged (the close returns) only once its row is
+            // durable, as `execute_mutate`'s fast path does; an in-doubt
+            // outcome re-commits through the core, so keep the inputs.
+            let gated =
+                admitted.is_some() && self.sync.as_ref().is_some_and(|h| h.lease.ack_gated());
+            let retry = gated.then(|| (base.clone(), manifest_bytes.clone(), dirty_hashes.clone()));
             let committed =
                 self.commit_manifest_local(ino, &ws, base, manifest_bytes, dirty_hashes);
+            let jseq =
+                (gated && committed.is_ok()).then(|| self.meta.journal_tip().unwrap_or(u64::MAX));
             drop(admitted);
             if let Err(error) = committed {
                 writes.insert(ino, ws);
                 return Err(error);
+            }
+            if let (Some(h), Some(jseq), Some((base, bytes, dirty))) = (&self.sync, jseq, retry) {
+                if !self.local_ack_durable(h, jseq) {
+                    // In doubt (the lease was lost, or the backups never
+                    // answered): the row may be rolled back. Commit
+                    // again through the core, which resolves it — the
+                    // base check refuses a duplicate and the rebase then
+                    // lays this flush over whatever survived.
+                    if let Err(error) = self.commit_manifest_forwarded(ino, &ws, base, bytes, dirty)
+                    {
+                        writes.insert(ino, ws);
+                        return Err(error);
+                    }
+                }
             }
             // Plan 30 §M8: the sequencer's own manifest commit bypasses
             // `execute_mutate`; it recalls read delegations on the file
@@ -3095,5 +3135,167 @@ mod pending_row_tests {
         e.upload_round();
         e.assert_manifest_in_s3(a.ino);
         e.assert_manifest_in_s3(b.ino);
+    }
+}
+
+#[cfg(test)]
+mod durable_ack_tests {
+    //! Plan 30 §M9 with §M6: under a durability gate, the holder's own
+    //! manifest commit on close is acknowledged only once its row is
+    //! durable, so its next read never waits for it
+    //! (`session-forwarded-ryw`'s regression: the close returned at once
+    //! and the file's next `stat`/`cat` waited in
+    //! `Meta::durability_pending` instead).
+    use super::*;
+    use constellation_authority::core::LeaseState;
+    use constellation_authority::{Config, Ms};
+    use constellation_fs_core::types::ROOT_INO;
+    use constellation_meta::{ReadKey, SessionWait};
+    use constellation_store_s3::lease::now_unix_ms;
+    use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
+    use object_store::memory::InMemory;
+    use tempfile::TempDir;
+
+    /// A holder's filesystem: the lease view is held with the durability
+    /// gate `gated`; the core's side of the channel is returned (kept
+    /// open, never answered — nothing here goes through the core).
+    fn holder_fs(
+        meta: Arc<Meta>,
+        gated: bool,
+    ) -> (
+        ConstellationFs,
+        TempDir,
+        tokio::sync::mpsc::UnboundedReceiver<SyncRequest>,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap());
+        let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
+        let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
+            meta.clone(),
+            store.clone(),
+            constellation_fs_core::DEFAULT_CHUNK_SIZE,
+            1,
+        ));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tag = rt.block_on(async {
+            LeaseStore::new(Arc::new(InMemory::new()), "p0", LeaseMode::Cas)
+                .try_create(&Lease::granted("p0", 1, 1, 1000))
+                .await
+                .unwrap()
+        });
+        let cfg = Config::defaults(1, 1);
+        let now = Ms(now_unix_ms());
+        let mut state = LeaseState::default();
+        let lease = state.granted_lease(now, &cfg, None);
+        state.adopt(now, lease, tag, None);
+        let view = Arc::new(crate::lease::LeaseView::default());
+        view.mirror(&state, now, &cfg, gated);
+        assert!(
+            view.admit().is_some(),
+            "the fast path is open to the holder"
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = rt.handle().clone();
+        let fs = ConstellationFs::new(
+            FsDependencies {
+                meta,
+                store,
+                cache,
+                rt: handle,
+                sync: Some(SyncHandle {
+                    tx,
+                    fsync_s3: false,
+                    cto_strict: false,
+                    lease: view,
+                    delegates: Arc::new(crate::lease::DelegateView::default()),
+                    acquire_deadline: Duration::from_secs(1),
+                    epoch_frozen: None,
+                    epoch_active: None,
+                    departed: None,
+                    read_only_member: false,
+                    write_mode: Arc::new(crate::writeback::WriteModeState::new(
+                        crate::writeback::WriteMode::Back,
+                    )),
+                    node_id: 1,
+                    incarnation: 1,
+                    next_rid_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    acked: Arc::new(std::sync::Mutex::new(Vec::new())),
+                }),
+                coop: None,
+                staging_dir: dir.path().join("staging"),
+                staging_budget: StagingBudget::new(1 << 30),
+                snapshots,
+                atime: Arc::new(crate::atime::AtimeAccumulator::new(
+                    crate::atime::AtimeMode::Off,
+                    crate::atime::AtimeStats::new(),
+                )),
+                prune_stats: crate::prune::PruneStats::new(),
+            },
+            constellation_fs_core::DEFAULT_CHUNK_SIZE,
+            CompressionSetting::RAW,
+        );
+        std::mem::forget(rt);
+        (fs, dir, rx)
+    }
+
+    #[test]
+    fn a_gated_holders_close_returns_once_its_manifest_row_is_durable() {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        // Everything journaled so far is durable (on the backups).
+        let session = meta.session();
+        session.set_durable(true, meta.journal_tip().unwrap(), false);
+        let (fs, _dir, _core) = holder_fs(meta.clone(), true);
+        fs.do_write(file.ino, 0, b"hello").unwrap();
+
+        let keys = [ReadKey::Ino(file.ino)];
+        std::thread::scope(|scope| {
+            let close = scope.spawn(|| fs.flush_inode(file.ino, false));
+            // The manifest row is journaled, not yet durable: the close
+            // has not returned.
+            let tip = {
+                let started = std::time::Instant::now();
+                loop {
+                    let tip = meta.journal_tip().unwrap();
+                    if tip > session.durable_jseq() {
+                        break tip;
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "the manifest commit never journaled"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                !close.is_finished(),
+                "the close returned before its manifest row was durable"
+            );
+            assert!(meta.durability_pending(&keys));
+            // The backups acknowledge it: the close returns.
+            session.set_durable(true, tip, false);
+            assert_eq!(close.join().unwrap(), Ok(()));
+        });
+        // Read-your-writes without a wait: nothing of the file's is
+        // tentative any more.
+        assert!(!meta.durability_pending(&keys));
+        assert_eq!(meta.session_wait(&keys), SessionWait::Fast);
+        assert_eq!(meta.getattr(file.ino).unwrap().unwrap().size, 5);
+        assert_eq!(session.stats().fast_acks_waited, 1);
+    }
+
+    #[test]
+    fn an_ungated_holders_close_does_not_wait() {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let (fs, _dir, _core) = holder_fs(meta.clone(), false);
+        fs.do_write(file.ino, 0, b"hello").unwrap();
+        fs.flush_inode(file.ino, false).unwrap();
+        assert_eq!(meta.getattr(file.ino).unwrap().unwrap().size, 5);
+        assert_eq!(meta.session().stats().fast_acks_waited, 0);
     }
 }

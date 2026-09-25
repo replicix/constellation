@@ -18117,3 +18117,166 @@ on top of the M12 work.
   4–7 sub-millisecond waits of 309 reads, once with `raised 2`), on the
   2b tree and on the M12 tree alike; its recorded pass is from an older
   milestone. Not touched here.
+
+## Fix: session-forwarded-ryw regression (2026-09-25; uncommitted on `fix-session-ryw` = main d214b1c (M11 2b); first worked on 578ff9c and rebased)
+
+**First bad commit: `0e1017b` (plan 30 M9).** The regression has two
+parts. The scenario had stopped testing forwarded writes long before M9:
+B soon becomes the holder. M9 then gated a holder's reads on durability,
+and its close acknowledged the manifest row before the row was durable.
+That is a real M9 bug and is fixed in code. The M6 forwarded-write
+contract itself did not regress: rewritten to keep B a forwarder, the
+scenario shows 0 waits even without the fix.
+
+### Bisection
+
+Each commit was built in a scratch detached worktree (release, its own
+target dir; removed afterwards). Runs used
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-fixryw[-m8|-m9]`.
+
+| Commit | Runs | Result |
+|---|---|---|
+| `e0437df` M8 | 3 | 3 PASSED (308/308/307 reads, 0 waited, 122.3–122.8 s) |
+| `0e1017b` M9 | 3 (+3 with debug logs) | 6 FAILED: 5–20 waits, all < 16 ms; 12–32 s or 122 s runs |
+| `578ff9c` main | 1 + 5 instrumented | 6 FAILED (6–22 waits, `raised 0`, `replay-blocked 0`) |
+
+M7 (`0f9583d`) is the tester's known-good, and M8 passes, so M9 is the first
+bad commit. (`ee7243b`, `4fcb6fb` and `b292e5c` sit after it and were not
+needed.)
+
+### Root cause
+
+Temporary tracing in `SessionState::wait` and `Meta::durability_pending`
+(removed) showed the same thing for every wait: `gate=true`,
+`durability_pending=true`, `observed = ZERO`. This is not M6's
+`observed` rule at all. It is **M9's holder-side durability gate on a
+holder's own reads**, and the holder is **B**:
+
+1. *The scenario kept B a forwarder for one iteration only.* Its
+   "held" phase does `std::fs::write` (create plus content) while A's
+   sync is held. A forwarded manifest commit on a file whose create A
+   has not shipped is accepted with `base = None`, so B waits for the
+   log (`Phase::AwaitingLog`, M5's stale-base rule). With A held, that
+   log never arrives. The hold fault also skips `round_renew`
+   (`UploadResult::Skip` → `finish_round`), so A's 60 s lease lapses.
+   B then takes it over: before M9 by expiry, since M9 by sealing A's
+   epoch (`holder silent: sealed its epoch`, ~60 s in). The stuck close
+   ends at the 120 s client deadline in `InDoubt` → the flush returns `EIO`.
+   Rust's `File` drop ignores that error, and the async `release`
+   commits the manifest again, now locally. The other 49 iterations are
+   **B's local writes as the holder**. In the short 12–32 s runs, the
+   lease reaches B through a placement offer (`claiming offered lease`)
+   instead. This explains M6's recorded 31 s / 122 s bimodality.
+2. *Before M9, B as holder was `Local`, and its reads were always
+   `Fast`.* Since M9, B's takeover auto-selects A as its backup
+   (`CONSTELLATION_BACKUP_RTT_BUDGET_MS=5` on any LAN), so B is gated.
+   Its reads wait while the unshipped journal touches their keys and
+   reaches past the durable watermark (`Meta::durability_pending`).
+3. *The waited-for row was always the holder's own close.* Logged at
+   each wait: `keys=[Ino(f)] tip=5 durable=4 txs=[WriteManifest { ino: f }]`,
+   and the same for `Dir(1)`. M9 round 1 reopened the FUSE fast path
+   under the gate and made `execute_mutate` wait
+   (`ack_when_durable`). The holder's manifest commit on close
+   (`finish_flush` → `commit_manifest_local` → `set_manifest_dirty`)
+   got no such wait. So the close returned before its row was on the
+   backup, and the next `stat a` / `cat a` (and `ls` / `stat .`, because
+   the check is per key set, not per row) waited one backup round trip
+   for it. That breaks M9's own rule: an acknowledgement is sent only
+   once the row is durable. It also has a durability consequence: a
+   failover between the close and the backup ack drops a manifest the
+   client was told was written.
+
+**Does the backup parking affect the scenario's wait counts?** No. A
+forwarded reply parked until the backup acks delays the *write*. When
+the reply arrives, the shadow is installed, nothing is raised, and the
+reads are `Fast`. The rewritten phases 1–2 below run under `Backup`
+with 0 waits.
+
+### Fix
+
+`crates/cli/src/fusefs.rs`:
+- **`finish_flush`.** When the holder commits locally under a gate
+  (`LeaseView::ack_gated`), it waits for the row at the journal tip to
+  become durable (`local_ack_durable`) before the close returns. It then
+  recalls, as before.
+- **In doubt.** If the wait ends in doubt (lease lost, or the 30 s
+  budget ran out), the manifest is committed again through the core
+  (`commit_manifest_forwarded`). If the row survived, the base check
+  refuses the duplicate and the rebase lays the flush over the
+  survivor. If the row was rolled back, the commit simply succeeds.
+- **`local_ack_durable`.** `execute_mutate`'s wait was factored out of
+  `ack_when_durable`, so both paths count `fast_acks_waited` /
+  `fast_acks_in_doubt` the same way.
+- **Tests.** New `durable_ack_tests`:
+  - `a_gated_holders_close_returns_once_its_manifest_row_is_durable`:
+    the close is still blocked 200 ms after its row is journaled and
+    `durability_pending` holds. After `set_durable(tip)` the close
+    returns `Ok`, and the next read is `SessionWait::Fast`. It **fails
+    without the fix** ("the close returned before its manifest row was
+    durable").
+  - `an_ungated_holders_close_does_not_wait`.
+
+### Scenario: made to test what it names (`crates/harness/src/scenarios/m6.rs`)
+
+The zero-wait assertions stay. The preconditions are now checked:
+- A's placement is off on both mounts, as in M4's scenarios, so A holds
+  the lease. The backup is left at the default.
+- The scenario waits until A's lease lists `[B]` under `policy=backup`.
+- After every phase it asserts that A still holds the same epoch, B does
+  not hold, and the policy is still `backup`. It also asserts that B
+  forwarded at least 50 ops.
+
+The phases:
+1. **held.** A's sync is held. B runs `touch a; ls; stat .; stat a;
+   cat a` ×25. This is the documented contract; a create with no
+   content, since content cannot be acknowledged on a held holder under
+   M5's base rule.
+2. **shipping.** The same, with content (`echo x > a`).
+3. **holder (new).** The same on A, the gated holder. A's `waited` and
+   `reads_durability_blocked` must not move. This pins the fix end to
+   end: a no-fix binary failed it 1 run in 2 with
+   `reads durability-blocked 0 -> 3`.
+
+The run now takes about 8 s instead of 122 s.
+
+The 2b "hang" the coordinator saw (120 s, no output) is the old
+scenario's 122 s run hitting a 120 s wrapper timeout, not a hang. The
+old scenario on 2b plus the fix passed in 122.4 s, with the same
+AwaitingLog stall and seal takeover in its logs.
+
+### Results (on d214b1c + this fix)
+
+- `session-forwarded-ryw` ×5: 5/5 PASSED (7.8–8.8 s). B had 324–335
+  reads, all fast, 75 forwarded. A had 156–157 reads, all fast, 0
+  durability-blocked.
+- One harness batch: `session-exists-observed` (3.6 s),
+  `session-forwarded-ryw` (8.2 s), `session-stale-base-rename` (6.4 s),
+  `session-ryw-after-holder-kill` (9.0 s), `session-wait-degrades`
+  (9.8 s), `session-idle-latency` (4.4 s), `cto-strict` (12.7 s),
+  `backup-failover` (15.0 s), `delegated-subtrees` (6.5 s),
+  `forwarded-mutations` (1.5 s), `chaos-ci` (2.7 s): ALL PASSED.
+- `cargo test -p constellation-authority --release`: 62 core,
+  3 meta_repro, 62 sim (7 ignored), green.
+- `cargo test -p constellation --release`: 206 passed (1 ignored).
+- `cargo test -p constellation-harness --release`: green.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+
+### Noted, not fixed here
+
+- **The AwaitingLog forward outlives this node's own takeover.** B held
+  the lease for 60 s while its forwarded `SetManifest` sat in
+  `AwaitingLog` until the 120 s deadline. The close got `EIO` for a
+  write that had landed. Once the requester holds and has tailed to
+  head, `completed` is exact and the op could be answered at once.
+  Split out as a separate task.
+- **`Meta::durability_pending` is per key set, not per row.** A read
+  waits whenever *any* unshipped row touches its keys and the journal
+  tip is past the durable watermark, even if the non-durable rows touch
+  other keys. With the fix, acknowledged rows are durable, so this only
+  costs anything around asynchronous rows (the in-doubt re-commit, a
+  policy change from `Local` to `Backup`). A per-key durable seq would
+  make it exact.
+- **The harness hold fault also stops lease renewals.** Any scenario
+  that holds a holder's sync past the lease TTL loses the lease to a
+  seal or expiry takeover.
