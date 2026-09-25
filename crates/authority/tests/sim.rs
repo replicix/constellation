@@ -273,6 +273,8 @@ fn replay_seed() {
         Ok("backup-far") => far_config(),
         Ok("backup-strict") => backup_strict_config(),
         Ok("backup-crash") => backup_crash_config(),
+        Ok("holder-cut") => holder_cut_crash_config(true),
+        Ok("holder-cut-join") => holder_cut_crash_config(false),
         Ok("backup-crash-slow") => SimConfig {
             s3_latency: (60, 200),
             ..backup_crash_config()
@@ -1790,6 +1792,83 @@ fn flex_epochs_with_backups() {
 fn flex_zero_forms_no_partial_epoch() {
     let t = run_flex("flex-zero", flex_zero_config(), 1000..1020);
     assert_eq!(t.epochs, 0, "{t:?}");
+}
+
+/// Plan 30 §M9 × §M10, the shape `deposed-reintegration` found: only
+/// the holder loses S3 (P2P stays up), it proposes a continuation epoch,
+/// and it dies (restarted only 9 s later). Its backup must take the
+/// lease over well inside that — which it can only while it is not a
+/// member of an open epoch (a member runs no seal watch and no S3
+/// acquisition, and a frozen epoch answers `EROFS`).
+fn holder_cut_crash_config(decline: bool) -> SimConfig {
+    SimConfig {
+        ops_per_client: 8,
+        random_faults: 0,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_100,
+                kind: FaultKind::HolderCutEpoch {
+                    for_ms: 8_000,
+                    decline,
+                },
+            },
+            ScheduledFault {
+                at_ms: 2_000,
+                kind: FaultKind::CrashHolder {
+                    restart_ms: Some(9_000),
+                    keep_journal: true,
+                },
+            },
+        ],
+        ..backup_config()
+    }
+}
+
+/// With the member rule (a member that reaches S3 declines the
+/// proposal), no epoch forms and the backup seals and fails over in
+/// about `backup_takeover_ms`; without it (`decline: false`) the backup
+/// joins, freezes when the holder dies, and waits for the holder's
+/// return — the stuck peer, reproduced (non-vacuity).
+#[test]
+fn a_holder_alone_cut_from_s3_forms_no_epoch_and_fails_over() {
+    let restart = 9_000;
+    let mut epochs = 0;
+    let mut failovers = Vec::new();
+    for seed in 1500..1520 {
+        let report = run_seed(seed, holder_cut_crash_config(true)).unwrap_or_else(|e| {
+            panic!("holder-cut seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=holder-cut")
+        });
+        epochs += report.epochs_formed;
+        failovers.extend(report.failover_ms.iter().copied());
+    }
+    eprintln!("holder-cut: epochs {epochs}, failovers {failovers:?}");
+    assert_eq!(epochs, 0, "a member that reaches S3 joined an epoch");
+    assert!(!failovers.is_empty(), "no failover measured");
+    let ttl = sim::run::backup_core_config(1, 1).ttl_ms;
+    assert!(
+        failovers.iter().all(|ms| *ms < ttl.min(restart)),
+        "a failover waited for the TTL or the holder's return: {failovers:?}"
+    );
+
+    let mut epochs = 0;
+    let mut stuck = 0;
+    for seed in 1500..1510 {
+        let report = run_seed(seed, holder_cut_crash_config(false)).unwrap_or_else(|e| {
+            panic!(
+                "holder-cut-join seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=holder-cut-join"
+            )
+        });
+        epochs += report.epochs_formed;
+        stuck += report
+            .failover_ms
+            .iter()
+            .filter(|ms| **ms >= restart - 1_000)
+            .count();
+    }
+    eprintln!("holder-cut-join: epochs {epochs}, stuck failovers {stuck}");
+    assert!(epochs > 0, "without the rule the peers never joined");
+    assert!(stuck > 0, "without the rule no peer was ever stuck");
 }
 
 /// Plan 30 §M10: many more seeds of the epoch configurations.

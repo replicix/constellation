@@ -314,7 +314,9 @@ pub trait Replica {
     fn backup_sealed_epoch(&self) -> Epoch;
     /// A takeover re-applies one of the predecessor's transactions into
     /// this node's own journal (plan 30 §M3b's replay-from-records path),
-    /// completing `rid` once.
+    /// completing `rid` once. Every chunk an applied manifest names is
+    /// enrolled as a pending upload (plan 30 §M9 × §M4: the predecessor
+    /// may never have uploaded it; see `Meta::apply_adopted_records`).
     fn apply_records_journaled(
         &self,
         records: &[LogRecord],
@@ -845,7 +847,10 @@ impl Replica for Meta {
         records: &[LogRecord],
         rid: Option<Rid>,
     ) -> Result<(), MetaError> {
-        Meta::apply_records_journaled_completing(self, records, rid)
+        // Adopted: an adopted manifest's chunks are enrolled as pending
+        // uploads (`Meta::apply_adopted_records`); the other callers
+        // (`Delegate`/`Recall` records) name no chunk.
+        Meta::apply_adopted_records(self, records, rid)
     }
 
     fn install_streamed(

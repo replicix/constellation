@@ -128,6 +128,25 @@ const WRITE_SHARDS: usize = 256;
 /// storm across a realistic writer set without spinning forever.
 const MANIFEST_COMMIT_ATTEMPTS: u32 = 8;
 
+/// Whether the half-open byte ranges `written` cover `[start, end)`
+/// entirely.
+fn covers(written: &[(u64, u64)], start: u64, end: u64) -> bool {
+    let mut ranges: Vec<(u64, u64)> = written
+        .iter()
+        .map(|&(s, e)| (s.max(start), e.min(end)))
+        .filter(|(s, e)| s < e)
+        .collect();
+    ranges.sort_unstable();
+    let mut reached = start;
+    for (s, e) in ranges {
+        if s > reached {
+            return false;
+        }
+        reached = reached.max(e);
+    }
+    reached >= end
+}
+
 /// Per-inode write serialization without making unrelated files contend on
 /// one process-wide mutex. FUSE can dispatch callbacks concurrently, while
 /// operations on the same inode retain their previous ordering. The shard
@@ -2195,13 +2214,18 @@ impl ConstellationFs {
             // that writer's seed silently reproduces the *other*
             // writer's bytes as zero: the earlier content it copied in
             // predates the sibling's patch landing.
+            // A chunk this flush's writes cover completely needs nothing
+            // of the base: not fetched (plan 30 §M9 × §M4: the base's
+            // chunk may be one only a departed holder had — an adopted,
+            // held manifest — and an overwrite must not depend on it).
+            let covered = covers(&ws.written, chunk_start, chunk_end);
             let mut data = match old_hashes.get(&idx) {
-                Some(hash) => {
+                Some(hash) if !covered => {
                     let mut fetched = self.fetch_chunk(hash)?;
                     fetched.resize(expect_len, 0);
                     fetched
                 }
-                None => vec![0u8; expect_len],
+                _ => vec![0u8; expect_len],
             };
             for &(start, end) in &ws.written {
                 let start = start.max(chunk_start);
@@ -2560,6 +2584,16 @@ mod jitter_tests {
 #[cfg(test)]
 mod write_shard_tests {
     use super::*;
+
+    #[test]
+    fn covers_needs_the_whole_range() {
+        assert!(covers(&[(0, 13)], 0, 13));
+        assert!(covers(&[(5, 13), (0, 6)], 0, 13));
+        assert!(covers(&[(0, 100)], 10, 20));
+        assert!(!covers(&[(0, 5), (6, 13)], 0, 13));
+        assert!(!covers(&[(0, 12)], 0, 13));
+        assert!(!covers(&[], 0, 1));
+    }
 
     #[test]
     fn same_inode_serializes_while_unrelated_inode_remains_available() {

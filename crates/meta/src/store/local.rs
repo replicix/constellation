@@ -694,6 +694,42 @@ impl Meta {
         records: &[LogRecord],
         rid: Option<crate::Rid>,
     ) -> Result<(), MetaError> {
+        self.apply_records_journaled_inner(records, rid, false)
+    }
+
+    /// Plan 30 §M9 × §M4: [`Self::apply_records_journaled_completing`]
+    /// for a transaction adopted from the predecessor's backup tail.
+    /// Every chunk an adopted `WriteManifest` names is enrolled as a
+    /// pending upload for its inode in the same transaction, because this
+    /// node cannot know whether the predecessor uploaded it: a write-back
+    /// close acknowledges before its chunks reach S3, and a holder's own
+    /// manifest commit is backed up (and so adopted) as soon as it is
+    /// journaled. The ordinary machinery then decides per chunk — the
+    /// upload pass acknowledges one that is durable in S3 (a HEAD), and
+    /// records one that is neither in S3 nor in the local cache as
+    /// unrecoverable, which holds the manifest's transaction and its
+    /// dependents back (M4: `status` shows them held, `repair drop-held`
+    /// turns them into a conflict copy); until a chunk is settled the
+    /// ship planner defers the transaction (M7). So the log never names a
+    /// chunk the bucket lacks, and neither does a published commit (held
+    /// work is `Local` speculation the publisher substitutes). A spilled
+    /// manifest enrolls its list blob and is marked for expansion (see
+    /// [`Self::adopted_spills`]): its chunk list is only known once the
+    /// blob can be read.
+    pub fn apply_adopted_records(
+        &self,
+        records: &[LogRecord],
+        rid: Option<crate::Rid>,
+    ) -> Result<(), MetaError> {
+        self.apply_records_journaled_inner(records, rid, true)
+    }
+
+    fn apply_records_journaled_inner(
+        &self,
+        records: &[LogRecord],
+        rid: Option<crate::Rid>,
+        adopted: bool,
+    ) -> Result<(), MetaError> {
         // With a rid, the transaction is that op's (plan 30 §M9): a
         // stranding replays it *by rid* — where `completed` dedups —
         // never as anonymous records under a derived rid, which would
@@ -757,6 +793,13 @@ impl Meta {
                     &self.completed,
                     rid,
                 )?;
+            }
+        }
+        if adopted {
+            for rec in &applied {
+                if let LogRecord::WriteManifest { ino, manifest, .. } = rec {
+                    crate::store::held::enroll_adopted_manifest_tx(&mut tx, self, *ino, manifest)?;
+                }
             }
         }
         let (bytes, files) = staged.raw_delta();

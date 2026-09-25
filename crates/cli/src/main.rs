@@ -2413,10 +2413,20 @@ fn remove_live_subtree(meta: &Meta, path: &str) -> Result<()> {
 /// nudges the syncer, which would have polled anyway; a `LeaseRequest`
 /// asks the sync task to flush and release, and S3's CAS remains the
 /// authority for who actually holds the lease.
+/// How long an epoch proposal's member-side S3 probe may take: a member
+/// whose probe has not succeeded by then is treated as cut from S3 (and
+/// may join, today's behaviour). Well inside the proposer's wait for the
+/// answer (`epoch::PROPOSE_REQUEST_TIMEOUT`, 2 s), so a probe that hangs
+/// in a real outage never turns the ack into a timeout — which would stop
+/// the epoch from forming in exactly the outage it is for.
+const EPOCH_MEMBER_S3_PROBE: std::time::Duration = std::time::Duration::from_millis(300);
+
 struct P2pBridge {
     node_id: u64,
     nudge: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
     epochs: std::sync::Arc<epoch::EpochManager>,
+    /// The bucket, for an epoch proposal's member-side S3 probe.
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
     coop: std::sync::Arc<crate::coop::Coop>,
     placement: std::sync::Arc<placement::Placement>,
 }
@@ -2607,8 +2617,32 @@ impl constellation_net::PeerService for P2pBridge {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
-            self.epochs
-                .handle_propose(epoch_id, members, base, proposer, epoch_slack)
+            // Plan 30 §M10 (the member rule, see `handle_propose_checked`):
+            // probe S3 now — one lease GET, bounded — rather than trust a
+            // last-success time that a follower on the holder's log stream
+            // may not have refreshed for seconds.
+            // A member whose own rounds are failing at S3 is in the
+            // outage: it joins at once (a probe would only delay the
+            // formation, eating into the carried lease's usable window).
+            let reaches_s3 = !self.epochs.s3_failing() && {
+                let leases = constellation_store_s3::LeaseStore::new(
+                    self.store.clone(),
+                    constellation_store_s3::log::PARTITION,
+                    constellation_store_s3::LeaseMode::Cas,
+                );
+                matches!(
+                    tokio::time::timeout(EPOCH_MEMBER_S3_PROBE, leases.get()).await,
+                    Ok(Ok(_))
+                )
+            };
+            self.epochs.handle_propose_checked(
+                epoch_id,
+                members,
+                base,
+                proposer,
+                epoch_slack,
+                reaches_s3,
+            )
         })
     }
 
@@ -3699,6 +3733,42 @@ pub(crate) async fn upload_dirty_chunks_report(
     .await
 }
 
+/// Plan 30 §M9 × §M4: enroll the chunk lists of adopted spilled
+/// manifests (`Meta::adopted_spills`) as pending uploads, from the list
+/// blob in the local cache or in S3. A blob that is in neither stays a
+/// pending row of its own (this pass then records it unrecoverable, which
+/// holds the manifest), and its mark keeps the manifest deferred until a
+/// later pass can read it.
+async fn expand_adopted_spills(cache: &DiskCache, meta: &Meta, store: &ChunkStore) -> Result<()> {
+    for (ino, blob) in meta.adopted_spills()? {
+        let bytes = match cache.get(&blob)? {
+            Some(bytes) => bytes,
+            None => match store.get_chunk(&blob).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::debug!(%error, ino, %blob, "adopted chunk list not readable yet");
+                    continue;
+                }
+            },
+        };
+        let chunks: Vec<constellation_fs_core::ChunkHash> =
+            match constellation_fs_core::manifest::decode_chunk_list(&bytes) {
+                Ok(list) => list.into_values().collect(),
+                Err(error) => {
+                    tracing::warn!(%error, ino, %blob, "adopted chunk list undecodable; left held");
+                    continue;
+                }
+            };
+        tracing::info!(
+            ino,
+            chunks = chunks.len(),
+            "enrolled an adopted manifest's chunk list for its durability check"
+        );
+        meta.expand_adopted_spill(ino, &blob, &chunks)?;
+    }
+    Ok(())
+}
+
 /// One pass of [`upload_dirty_chunks_report`]: `depth` counts the passes
 /// a row another drain had claimed sent this one back for.
 #[allow(clippy::too_many_arguments)]
@@ -3713,6 +3783,9 @@ async fn upload_dirty_chunks_pass(
     depth: u8,
 ) -> Result<UploadReport> {
     use futures::StreamExt;
+    if only_ino.is_none() {
+        expand_adopted_spills(cache, meta, store).await?;
+    }
     let mut grouped: std::collections::HashMap<
         constellation_fs_core::ChunkHash,
         Vec<constellation_fs_core::Ino>,
@@ -5897,6 +5970,231 @@ mod pending_upload_tests {
         )));
         assert!(f.meta.take_journal_grouped(10_000).unwrap().is_empty());
         assert_eq!(f.meta.speculation_counts().unwrap().local, 1);
+    }
+
+    /// Plan 30 §M9 × §M4: a successor adopts, from its predecessor's
+    /// backup tail, a manifest naming one chunk the predecessor uploaded
+    /// and one it never did (a write-back close acknowledged before its
+    /// upload). The adopted manifest never ships while a chunk it names is
+    /// missing from the bucket: it is deferred until the upload pass has
+    /// looked, then held (M4 status) — and it ships once the missing chunk
+    /// turns up (the predecessor back, uploading). The same for a spilled
+    /// manifest, whose list is read from its blob.
+    fn adopted_manifest_ships_only_once_its_chunks_are_durable(spilled: bool) {
+        use constellation_fs_core::{manifest::encode_chunk_list, Manifest};
+        let f = fixture();
+        f.meta.set_holder_epoch(2);
+        let file = f
+            .meta
+            .create(
+                constellation_fs_core::types::ROOT_INO,
+                "adopted",
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+        let shipped: Vec<u64> = constellation_meta::MetaStore::take_journal(&f.meta, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        f.meta.ack_journal_rows_at(&shipped, 1).unwrap();
+
+        let uploaded = b"uploaded by the predecessor".to_vec();
+        let lost = b"only on the predecessor's disk".to_vec();
+        let (up_hash, lost_hash) = (ChunkHash::of(&uploaded), ChunkHash::of(&lost));
+        rt().block_on(
+            f.store
+                .put_chunk(&up_hash, &uploaded, CompressionSetting::RAW),
+        )
+        .unwrap();
+        let chunks: constellation_fs_core::manifest::SparseChunks =
+            [(0u64, up_hash), (1u64, lost_hash)].into_iter().collect();
+        let (manifest, blob) = if spilled {
+            let blob = encode_chunk_list(&chunks);
+            let blob_hash = ChunkHash::of(&blob);
+            rt().block_on(
+                f.store
+                    .put_chunk(&blob_hash, &blob, CompressionSetting::RAW),
+            )
+            .unwrap();
+            let (m, spill) = Manifest::from_sparse_chunks(4096, 8192, chunks, 0, ChunkHash::of);
+            assert!(spill.is_some());
+            (m, Some(blob_hash))
+        } else {
+            (
+                Manifest::from_sparse_chunks(4096, 8192, chunks, 8, ChunkHash::of).0,
+                None,
+            )
+        };
+        let rid = constellation_meta::Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 7,
+        };
+        f.meta
+            .apply_adopted_records(
+                &[
+                    constellation_meta::LogRecord::WriteManifest {
+                        ino: file.ino,
+                        base_manifest: None,
+                        manifest: manifest.encode(),
+                        size: 8192,
+                        time_ns: 1,
+                    },
+                    constellation_meta::LogRecord::Completed { rid },
+                ],
+                Some(rid),
+            )
+            .unwrap();
+        let manifests_shipped = |f: &Fixture| -> Vec<u64> {
+            f.meta
+                .take_journal_grouped(10_000)
+                .unwrap()
+                .into_iter()
+                .flat_map(|(_, batch)| batch)
+                .filter_map(|(_, rec)| match rec {
+                    constellation_meta::LogRecord::WriteManifest { ino, .. } => Some(ino),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Enrolled: deferred before any upload pass has looked.
+        assert!(!f.meta.pending_uploads().unwrap().is_empty());
+        assert!(manifests_shipped(&f).is_empty(), "shipped before any check");
+        if spilled {
+            assert_eq!(
+                f.meta.adopted_spills().unwrap(),
+                vec![(file.ino, blob.unwrap())]
+            );
+        }
+
+        // The upload pass: the uploaded chunk (and the blob) are
+        // acknowledged from S3; the other is recorded unrecoverable.
+        let report = rt()
+            .block_on(upload_dirty_chunks_report(
+                &f.cache,
+                &f.meta,
+                &f.store,
+                CompressionSetting::RAW,
+                &UploadRuntime::for_test(true),
+                None,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(report.missing, vec![(lost_hash, file.ino)]);
+        assert!(
+            f.meta.adopted_spills().unwrap().is_empty(),
+            "the list was expanded"
+        );
+        assert_eq!(
+            f.meta.pending_uploads().unwrap(),
+            vec![(lost_hash, file.ino)]
+        );
+        assert!(
+            manifests_shipped(&f).is_empty(),
+            "a dangling manifest shipped"
+        );
+        let held = f.meta.held_summary();
+        assert_eq!(held.transactions, 1, "{held:?}");
+        assert_eq!(held.inodes[&file.ino].missing, vec![lost_hash]);
+        // Held work is `Local` speculation: never published.
+        assert_eq!(f.meta.speculation_counts().unwrap().local, 1);
+
+        // The predecessor is back and uploads: the next pass finds the
+        // chunk in S3, and the manifest ships.
+        rt().block_on(
+            f.store
+                .put_chunk(&lost_hash, &lost, CompressionSetting::RAW),
+        )
+        .unwrap();
+        let report = rt()
+            .block_on(upload_dirty_chunks_report(
+                &f.cache,
+                &f.meta,
+                &f.store,
+                CompressionSetting::RAW,
+                &UploadRuntime::for_test(true),
+                None,
+                None,
+            ))
+            .unwrap();
+        assert!(report.missing.is_empty());
+        assert!(f.meta.pending_uploads().unwrap().is_empty());
+        assert_eq!(manifests_shipped(&f), vec![file.ino]);
+    }
+
+    #[test]
+    fn an_adopted_manifest_ships_only_once_its_chunks_are_durable() {
+        adopted_manifest_ships_only_once_its_chunks_are_durable(false);
+    }
+
+    #[test]
+    fn an_adopted_spilled_manifest_ships_only_once_its_chunks_are_durable() {
+        adopted_manifest_ships_only_once_its_chunks_are_durable(true);
+    }
+
+    /// The other way out: the predecessor never comes back, and the
+    /// operator drops the held manifest (`repair drop-held`): it becomes a
+    /// refused replay (a conflict copy with the lost chunk as a hole).
+    #[test]
+    fn an_adopted_manifest_with_a_lost_chunk_can_be_dropped() {
+        use constellation_fs_core::Manifest;
+        let f = fixture();
+        f.meta.set_holder_epoch(2);
+        let file = f
+            .meta
+            .create(constellation_fs_core::types::ROOT_INO, "lost", 0o644, 0, 0)
+            .unwrap();
+        let lost_hash = ChunkHash::of(b"gone with the predecessor");
+        let chunks: constellation_fs_core::manifest::SparseChunks =
+            [(0u64, lost_hash)].into_iter().collect();
+        let manifest = Manifest::from_sparse_chunks(4096, 25, chunks, 8, ChunkHash::of).0;
+        f.meta
+            .apply_adopted_records(
+                &[constellation_meta::LogRecord::WriteManifest {
+                    ino: file.ino,
+                    base_manifest: None,
+                    manifest: manifest.encode(),
+                    size: 25,
+                    time_ns: 1,
+                }],
+                None,
+            )
+            .unwrap();
+        rt().block_on(upload_dirty_chunks_report(
+            &f.cache,
+            &f.meta,
+            &f.store,
+            CompressionSetting::RAW,
+            &UploadRuntime::for_test(true),
+            None,
+            None,
+        ))
+        .unwrap();
+        // (The summary is the last ship plan's; the create ships.)
+        assert!(f
+            .meta
+            .take_journal_grouped(10_000)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, b)| b)
+            .all(|(_, rec)| !matches!(rec, constellation_meta::LogRecord::WriteManifest { .. })));
+        assert!(f.meta.held_summary().inodes.contains_key(&file.ino));
+        let dropped = f.meta.drop_held(file.ino, 1).unwrap();
+        assert_eq!(dropped.dropped, 1, "{dropped:?}");
+        assert!(f.meta.pending_uploads().unwrap().is_empty());
+        let queue = f.meta.pending_replays().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert!(queue[0].refused.is_some(), "a conflict copy is queued");
+        assert!(f
+            .meta
+            .take_journal_grouped(10_000)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, b)| b)
+            .all(|(_, rec)| !matches!(rec, constellation_meta::LogRecord::WriteManifest { .. })));
     }
 
     #[test]

@@ -75,6 +75,70 @@ pub async fn epoch_outage(
             cluster.env.bus.set_partition(*n, *r, true);
         }
     }
+    drive_epoch(&cluster, at_ms, &cut, for_ms, &note).await;
+    note(format!("t={} epoch outage healed", at_ms + for_ms));
+    for n in &cut {
+        cluster.env.bucket.set_cut(*n, false);
+        for r in &rest {
+            cluster.env.bus.set_partition(*n, *r, false);
+        }
+    }
+    unfreeze_after_heal(&cluster, &cut).await;
+}
+
+/// The fault: see `FaultKind::HolderCutEpoch`. Only the holder loses S3;
+/// P2P stays up. The holder proposes an epoch to everyone it reaches,
+/// and each asked node joins only by the daemon's member rule
+/// (`EpochManager::handle_propose_checked`): a member that reaches S3
+/// declines — this is no bucket outage, and a member of an open epoch
+/// runs no S3 acquisition, so joining would leave it frozen (EROFS) if
+/// the holder then died. `decline: false` is the rule's absence: every
+/// live peer joins.
+pub async fn holder_cut_epoch(
+    cluster: Arc<Cluster>,
+    at_ms: u64,
+    for_ms: u64,
+    decline: bool,
+    log: Arc<Mutex<Vec<String>>>,
+) {
+    let note = |s: String| log.lock().unwrap().push(s);
+    let Some(lease) = super::node::read_lease(&cluster.env.bucket).await else {
+        note(format!("t={at_ms} holder-cut-epoch: no lease yet"));
+        return;
+    };
+    if !cluster.ids().contains(&lease.holder) {
+        return;
+    }
+    note(format!(
+        "t={at_ms} holder {} alone loses S3 for {for_ms}ms (members decline with S3: {decline})",
+        lease.holder
+    ));
+    cluster.env.bucket.set_cut(lease.holder, true);
+    let candidates: Vec<NodeId> = if decline {
+        // The members the rule admits: the nodes cut from S3.
+        cluster
+            .ids()
+            .into_iter()
+            .filter(|n| cluster.env.bucket.is_cut(*n))
+            .collect()
+    } else {
+        cluster.ids()
+    };
+    drive_epoch(&cluster, at_ms, &candidates, for_ms, &note).await;
+    note(format!("t={} holder-cut-epoch healed", at_ms + for_ms));
+    cluster.env.bucket.set_cut(lease.holder, false);
+    unfreeze_after_heal(&cluster, &candidates).await;
+}
+
+/// Form an epoch among `cut` (after a grace, every 100 ms) and keep its
+/// liveness (freeze and thaw) until `for_ms` has passed.
+async fn drive_epoch(
+    cluster: &Arc<Cluster>,
+    at_ms: u64,
+    cut: &[NodeId],
+    for_ms: u64,
+    note: &impl Fn(String),
+) {
     let grace = 300u64;
     let mut elapsed = 0u64;
     let mut formed = false;
@@ -86,7 +150,7 @@ pub async fn epoch_outage(
             continue;
         }
         if !formed {
-            if let Some(members) = try_form(&cluster, &cut) {
+            if let Some(members) = try_form(cluster, cut) {
                 formed = true;
                 note(format!("t={} epoch formed: {members:?}", at_ms + elapsed));
             }
@@ -131,15 +195,12 @@ pub async fn epoch_outage(
             }
         }
     }
-    note(format!("t={} epoch outage healed", at_ms + for_ms));
-    for n in &cut {
-        cluster.env.bucket.set_cut(*n, false);
-        for r in &rest {
-            cluster.env.bus.set_partition(*n, *r, false);
-        }
-    }
-    // A frozen epoch unfreezes once every member is back (the daemon's
-    // `note_live_members`), so its non-holders can close after the flush.
+}
+
+/// After the heal: a frozen epoch unfreezes once every member is back
+/// (the daemon's `note_live_members`), so its non-holders can close
+/// after the flush.
+async fn unfreeze_after_heal(cluster: &Arc<Cluster>, cut: &[NodeId]) {
     for _ in 0..600 {
         let open: Vec<NodeId> = cut
             .iter()

@@ -149,6 +149,24 @@ pub const SCENARIOS: &[Scenario] = &[
         run: deposed_reintegration,
     },
     Scenario {
+        name: "backup-takeover-holds-missing-chunks",
+        desc: "plan 30 M9 x M4: a write-back holder cut from S3 dies after acknowledging; its backup adopts the manifests and holds them (never ships a missing chunk; a fresh node sees the files empty); when the holder returns and uploads, the held records ship and everyone reads its bytes",
+        requires: &[],
+        run: backup_takeover_holds_missing_chunks,
+    },
+    Scenario {
+        name: "backup-takeover-drops-held-chunks",
+        desc: "plan 30 M9 x M4: as backup-takeover-holds-missing-chunks, but the old holder never returns: `repair drop-held` on the successor turns the held manifest into a conflict copy with the lost chunk as a hole",
+        requires: &[],
+        run: backup_takeover_drops_held_chunks,
+    },
+    Scenario {
+        name: "epoch-peer-reaching-s3-declines",
+        desc: "plan 30 M10: only the holder loses S3; its peer reaches S3 and declines the continuation epoch, so when the holder then dies the peer (its backup) seals and writes within seconds instead of staying frozen (EROFS)",
+        requires: &[],
+        run: epoch_peer_reaching_s3_declines,
+    },
+    Scenario {
         name: "deposed-reintegration-backup",
         desc: "plan 30 M9's side of deposed-reintegration: with the default LAN backup, a holder whose ship is held has its edits acknowledged by the backup, which seals and takes over inside the TTL with them — nothing strands, no conflict copy, every adopted chunk is in S3",
         requires: &[],
@@ -3606,6 +3624,388 @@ fn deposed_reintegration_backup(_seed: u64) -> Result<()> {
         let _ = c0.resume();
     }
     let _ = std::fs::remove_file(&hold);
+    let unmounted = c1.unmount();
+    let _ = c0.unmount();
+    result?;
+    unmounted
+}
+
+/// Plan 30 §M9 × §M4: a backup takeover never publishes a manifest whose
+/// chunks the bucket lacks. A holds (write-back mode) with B as its M9
+/// backup; A alone is cut from S3 (its own switch — B declines the
+/// continuation epoch A proposes, since B reaches S3). Then:
+///
+/// - a write-through close on A returns an error: its upload failed, so
+///   the write was never acknowledged (the manifest row, already backed
+///   up, is not lost data: it is held like the next one);
+/// - a write-back close on A succeeds at once: acknowledged, its bytes
+///   only on A;
+/// - A freezes; B seals and takes the lease over, adopting both manifests
+///   from its backup tail. Neither ships: B's upload pass finds the
+///   chunks neither in S3 nor in its cache, and holds them (`status` →
+///   `held`, the path listed). A fresh node sees both files as they were
+///   before the manifests — created, empty — never a manifest naming a
+///   missing chunk.
+///
+/// `returns`: A comes back (S3 healed), is deposed, uploads its pending
+/// chunks; B's next pass finds them in S3, the held records ship, and
+/// every node — a fresh one included — reads A's bytes; no conflict copy.
+/// Otherwise A is killed for good and the operator drops the held record
+/// on B (`repair drop-held`): a conflict copy with the lost chunk as a
+/// hole, the file itself as the log had it.
+fn backup_takeover_held_chunks(name: &str, returns: bool) -> Result<()> {
+    let (env, root) = setup(name)?;
+    let _route = env.s3_proxy()?;
+    let a_s3 = env.counting_proxy()?;
+    let backend = format!("s3://{BUCKET}/{name}-{}", ts());
+    let tune = |client: Client| {
+        client
+            .with_own_node_key()
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "20000")
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "60000")
+            .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
+    };
+    let mut c0 =
+        tune(Client::new(root.path(), "c0", &a_s3.endpoint(), &backend)?).with_write_mode("back");
+    let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    let mut paused = false;
+    let result = (|| -> Result<()> {
+        wait_for_p2p(&[&c0, &c1])?;
+        let b_id = c1.control_status()?["node_id"]
+            .as_u64()
+            .context("B reports no node id")?;
+        std::fs::create_dir(c0.mnt.join("shared"))?;
+        std::fs::write(c0.mnt.join("shared/keep"), b"baseline")?;
+        eventually("baseline on B", Duration::from_secs(30), || {
+            anyhow::ensure!(std::fs::read(c1.mnt.join("shared/keep"))? == b"baseline");
+            Ok(())
+        })?;
+        eventually("A lists B as its backup", Duration::from_secs(30), || {
+            let ack = c0.control_status()?["ack"].clone();
+            let backups: Vec<u64> = ack["backups"]
+                .as_array()
+                .map(|v| v.iter().filter_map(|x| x.as_u64()).collect())
+                .unwrap_or_default();
+            anyhow::ensure!(
+                ack["policy"] == "backup" && backups == [b_id],
+                "A's backup set is not [B]: {ack}"
+            );
+            Ok(())
+        })?;
+        let a_epoch = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
+
+        let close_after_write = |path: std::path::PathBuf, bytes: &[u8]| -> std::io::Result<()> {
+            use std::io::Write;
+            use std::os::fd::IntoRawFd;
+            let mut f = std::fs::File::create(path)?;
+            f.write_all(bytes)?;
+            let fd = f.into_raw_fd();
+            // SAFETY: `fd` is ours, just taken out of the `File`.
+            if unsafe { libc::close(fd) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        };
+        a_s3.cut();
+        c0.set_write_mode("through")?;
+        let wt = close_after_write(c0.mnt.join("shared/wt"), b"write-through, S3 cut");
+        eprintln!("    {name}: A's write-through close with S3 cut: {wt:?}");
+        anyhow::ensure!(
+            wt.is_err(),
+            "a write-through close succeeded although its chunk cannot reach S3"
+        );
+        c0.set_write_mode("back")?;
+        let wb_bytes = b"write-back, acknowledged, only on A".to_vec();
+        close_after_write(c0.mnt.join("shared/wb"), &wb_bytes)
+            .context("A's write-back close (acknowledged at once)")?;
+        let pending = c0.control_status()?["writeback"]["pending_uploads"]
+            .as_u64()
+            .unwrap_or(0);
+        anyhow::ensure!(
+            pending >= 2,
+            "A has {pending} pending uploads, expected both files'"
+        );
+        c0.pause()?;
+        paused = true;
+
+        eventually("B seals and takes over", Duration::from_secs(15), || {
+            let lease = lease_of(&c1)?;
+            anyhow::ensure!(
+                lease["held"] == true && lease["epoch"].as_u64().unwrap_or(0) > a_epoch,
+                "B does not hold a newer epoch yet: {lease}"
+            );
+            let ack = c1.control_status()?["ack"].clone();
+            anyhow::ensure!(
+                ack["backup_tail_applied"].as_u64().unwrap_or(0) >= 1,
+                "no tail adopted: {ack}"
+            );
+            Ok(())
+        })?;
+        let epoch = c1.control_status()?["epoch"].clone();
+        anyhow::ensure!(
+            epoch["active"] != true && epoch["frozen"] != true,
+            "B joined a continuation epoch although it reaches S3: {epoch}"
+        );
+        let mut held_inos = Vec::new();
+        eventually(
+            "B holds both adopted manifests",
+            Duration::from_secs(30),
+            || {
+                let held = c1.control_status()?["held"].clone();
+                let paths: Vec<String> = held["inodes"]
+                    .as_array()
+                    .map(|v| {
+                        v.iter()
+                            .filter_map(|i| i["path"].as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                anyhow::ensure!(
+                    paths.iter().any(|p| p.ends_with("wb"))
+                        && paths.iter().any(|p| p.ends_with("wt")),
+                    "not both held yet: {held}"
+                );
+                held_inos = held["inodes"]
+                    .as_array()
+                    .map(|v| v.iter().filter_map(|i| i["ino"].as_u64()).collect())
+                    .unwrap_or_default();
+                eprintln!("    {name}: B holds {held}");
+                Ok(())
+            },
+        )?;
+        // What the bucket says (commits and log): the files exist, empty.
+        let mut d = Client::new(root.path(), "d", &env.endpoint, &backend)?.with_own_node_key();
+        d.mount()?;
+        let seen = eventually("D sees the files' creates", Duration::from_secs(30), || {
+            for f in ["wb", "wt"] {
+                let data = std::fs::read(d.mnt.join("shared").join(f))
+                    .with_context(|| format!("D reads {f}"))?;
+                anyhow::ensure!(data.is_empty(), "D sees {f} as {} bytes", data.len());
+            }
+            Ok(())
+        });
+        d.unmount()?;
+        seen?;
+
+        if returns {
+            a_s3.heal();
+            c0.resume()?;
+            paused = false;
+            eventually(
+                "A uploads, B's held records ship, everyone reads A's bytes",
+                Duration::from_secs(90),
+                || {
+                    let held = c1.control_status()?["held"].clone();
+                    anyhow::ensure!(
+                        held["transactions"].as_u64() == Some(0),
+                        "B still holds: {held}"
+                    );
+                    for c in [&c0, &c1] {
+                        anyhow::ensure!(
+                            std::fs::read(c.mnt.join("shared/wb"))? == wb_bytes,
+                            "{} reads other wb bytes",
+                            c.name
+                        );
+                        anyhow::ensure!(
+                            !c.mnt.join("shared/.constellation-conflict").exists(),
+                            "{}: a conflict copy for an adopted write",
+                            c.name
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .with_context(|| format!("--- c1 log ---\n{}", c1.tail_log_n(40)))?;
+            let mut d =
+                Client::new(root.path(), "d2", &env.endpoint, &backend)?.with_own_node_key();
+            d.mount()?;
+            let fresh = eventually("a fresh node reads wb", Duration::from_secs(60), || {
+                anyhow::ensure!(std::fs::read(d.mnt.join("shared/wb"))? == wb_bytes);
+                Ok(())
+            });
+            d.unmount()?;
+            fresh?;
+        } else {
+            c0.kill9()?;
+            paused = false;
+            for ino in &held_inos {
+                let reply = c1.control(&serde_json::json!({ "cmd": "drop_held", "ino": ino }))?;
+                anyhow::ensure!(reply["resp"] == "ok", "drop-held {ino} failed: {reply}");
+            }
+            eventually(
+                "the conflict copies land and the held set drains",
+                Duration::from_secs(60),
+                || {
+                    let status = c1.control_status()?;
+                    anyhow::ensure!(
+                        status["held"]["transactions"].as_u64() == Some(0),
+                        "still held: {}",
+                        status["held"]
+                    );
+                    let dir = c1.mnt.join("shared/.constellation-conflict");
+                    let names: Vec<String> = std::fs::read_dir(&dir)?
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    let copy = names
+                        .iter()
+                        .find(|n| n.starts_with("wb@"))
+                        .with_context(|| format!("no wb@ copy yet: {names:?}"))?;
+                    let data = std::fs::read(dir.join(copy))?;
+                    anyhow::ensure!(
+                        data.len() == wb_bytes.len() && data.iter().all(|b| *b == 0),
+                        "the conflict copy keeps the length with the lost chunk as a hole"
+                    );
+                    anyhow::ensure!(
+                        std::fs::read(c1.mnt.join("shared/wb"))?.is_empty(),
+                        "wb is not as the log had it"
+                    );
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    })();
+    if paused {
+        let _ = c0.resume();
+    }
+    a_s3.heal();
+    let unmounted = c1.unmount();
+    if returns {
+        let _ = c0.unmount();
+    }
+    result?;
+    unmounted
+}
+
+fn backup_takeover_holds_missing_chunks(_seed: u64) -> Result<()> {
+    backup_takeover_held_chunks("backup-takeover-holds-missing-chunks", true)
+}
+
+fn backup_takeover_drops_held_chunks(_seed: u64) -> Result<()> {
+    backup_takeover_held_chunks("backup-takeover-drops-held-chunks", false)
+}
+
+/// Plan 30 §M10's member rule: only the holder loses S3 (its own switch;
+/// P2P stays up). It proposes a continuation epoch; its peer B reaches S3
+/// and declines. Then A dies (frozen): B — its M9 backup — seals and
+/// takes the lease over within seconds, and B's own writes succeed. Before
+/// the rule B joined the epoch, froze with it when A died, and answered
+/// `EIO` then `EROFS` for as long as A was away, with S3 reachable the
+/// whole time.
+fn epoch_peer_reaching_s3_declines(_seed: u64) -> Result<()> {
+    const NAME: &str = "epoch-peer-reaching-s3-declines";
+    let (env, root) = setup(NAME)?;
+    let _route = env.s3_proxy()?;
+    let a_s3 = env.counting_proxy()?;
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let tune = |client: Client| {
+        client
+            .with_own_node_key()
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "20000")
+            .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
+    };
+    let mut c0 = tune(Client::new(root.path(), "c0", &a_s3.endpoint(), &backend)?);
+    let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
+    c0.fs_create()?;
+    c0.mount()?;
+    c1.mount()?;
+    let mut paused = false;
+    let result = (|| -> Result<()> {
+        wait_for_p2p(&[&c0, &c1])?;
+        std::fs::create_dir(c0.mnt.join("shared"))?;
+        eventually("shared on B", Duration::from_secs(30), || {
+            anyhow::ensure!(c1.mnt.join("shared").is_dir());
+            Ok(())
+        })?;
+        let b_id = c1.control_status()?["node_id"]
+            .as_u64()
+            .context("B reports no node id")?;
+        eventually("A lists B as its backup", Duration::from_secs(30), || {
+            let ack = c0.control_status()?["ack"].clone();
+            let backups: Vec<u64> = ack["backups"]
+                .as_array()
+                .map(|v| v.iter().filter_map(|x| x.as_u64()).collect())
+                .unwrap_or_default();
+            anyhow::ensure!(
+                ack["policy"] == "backup" && backups == [b_id],
+                "A's backup set is not [B]: {ack}"
+            );
+            Ok(())
+        })?;
+        let a_epoch = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
+        a_s3.cut();
+        // A proposes once S3 has failed for a round interval: wait for its
+        // first proposal to be answered either way.
+        eventually("A proposes an epoch", Duration::from_secs(20), || {
+            let a_log = c0.log_text();
+            anyhow::ensure!(
+                a_log.contains("epoch propose not acked")
+                    || a_log.contains("continuation epoch active"),
+                "A has proposed nothing yet"
+            );
+            Ok(())
+        })?;
+        std::thread::sleep(Duration::from_millis(500));
+        let b_epoch = c1.control_status()?["epoch"].clone();
+        let declined = c1.log_text().contains("not a bucket outage");
+        eprintln!("    {NAME}: B declined: {declined}; B epoch {b_epoch}");
+        if declined {
+            // The declined proposer drops its own promise (it used to
+            // stay `Promised` — open — for good).
+            eventually(
+                "A's declined promise is dropped",
+                Duration::from_secs(10),
+                || {
+                    let e = c0.control_status()?["epoch"].clone();
+                    anyhow::ensure!(
+                        e["members"].as_array().is_some_and(|m| m.is_empty()),
+                        "A still has an open promise: {e}"
+                    );
+                    Ok(())
+                },
+            )?;
+        }
+        c0.pause()?;
+        paused = true;
+        let frozen = std::time::Instant::now();
+        let mut attempts = Vec::new();
+        eventually("B writes again", Duration::from_secs(30), || {
+            let r = std::fs::write(c1.mnt.join("shared/after"), b"B writes");
+            attempts.push(format!(
+                "{:?}: {:?}",
+                frozen.elapsed(),
+                r.as_ref().map_err(|e| e.raw_os_error())
+            ));
+            r?;
+            let lease = lease_of(&c1)?;
+            anyhow::ensure!(
+                lease["held"] == true && lease["epoch"].as_u64().unwrap_or(0) > a_epoch,
+                "B does not hold: {lease}"
+            );
+            Ok(())
+        })
+        .with_context(|| format!("B's attempts: {attempts:?}"))?;
+        let took = frozen.elapsed();
+        eprintln!(
+            "    {NAME}: B writes {took:?} after A froze (TTL 20 s); attempts {}",
+            attempts.len()
+        );
+        anyhow::ensure!(
+            took < Duration::from_secs(10),
+            "B took {took:?} to write after A froze"
+        );
+        anyhow::ensure!(declined, "B did not decline A's proposal");
+        Ok(())
+    })();
+    if paused {
+        let _ = c0.resume();
+    }
+    a_s3.heal();
     let unmounted = c1.unmount();
     let _ = c0.unmount();
     result?;

@@ -880,6 +880,7 @@ impl NodeRuntime {
             node_id,
             nudge: sync_tx.clone(),
             epochs: epochs.clone(),
+            store: store.inner().clone(),
             coop: coop.clone(),
             placement: placement.clone(),
         });

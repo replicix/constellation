@@ -222,6 +222,11 @@ impl Bucket {
         }
     }
 
+    /// Whether `node`'s path to the bucket is cut.
+    pub fn is_cut(&self, node: u64) -> bool {
+        self.cut.lock().unwrap().contains(&node)
+    }
+
     pub fn counts(&self) -> Counts {
         *self.counts.lock().unwrap()
     }

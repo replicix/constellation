@@ -63,7 +63,19 @@ pub struct EpochManager {
     claim: Mutex<EpochClaimView>,
     /// The current (or last) epoch's `(carrier, stale_below)`.
     carrier: Mutex<(Option<EpochCarrier>, u64)>,
+    /// No new proposal before this (a declined one backs off).
+    propose_after: Mutex<Option<std::time::Instant>>,
 }
+
+/// How long a proposer waits after a declined proposal before the next.
+const PROPOSE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a proposer waits for each member's answer. A member probes
+/// S3 before it answers (`handle_propose_checked`, bounded by the
+/// daemon's 300 ms probe), so the P2P default (500 ms) would leave too
+/// little room: a member that accepted just after the proposer gave up
+/// would keep a promise nobody activates.
+const PROPOSE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl EpochManager {
     pub fn new(node_id: u64, meta: Arc<Meta>, peers: constellation_net::Peers) -> Self {
@@ -103,6 +115,7 @@ impl EpochManager {
             slack: AtomicU32::new(0),
             claim: Mutex::new(EpochClaimView::default()),
             carrier: Mutex::new(carrier),
+            propose_after: Mutex::new(None),
         };
         mgr.sync_flags();
         mgr
@@ -230,6 +243,13 @@ impl EpochManager {
         self.flushing.store(false, Ordering::Relaxed);
     }
 
+    /// Whether this node's own last S3 round failed (and none has
+    /// succeeded since): it is in the outage itself, and joins a proposal
+    /// without probing.
+    pub fn s3_failing(&self) -> bool {
+        self.s3_failure_since.lock().unwrap().is_some()
+    }
+
     pub fn note_s3_success(&self) {
         *self.s3_failure_since.lock().unwrap() = None;
     }
@@ -251,6 +271,9 @@ impl EpochManager {
     /// Persist a promise (BEFORE any ack is sent) then reply. Plan 30
     /// §M10: only under this node's own quorum rule, and only once its
     /// own last issued heartbeat promise has expired (the join gate).
+    /// (The daemon calls [`Self::handle_propose_checked`] with its S3
+    /// probe; this is the tests' form, S3 unreachable.)
+    #[cfg(test)]
     pub fn handle_propose(
         &self,
         epoch_id: String,
@@ -258,6 +281,33 @@ impl EpochManager {
         base: Vec<(String, u64)>,
         proposer: u64,
         proposer_slack: u32,
+    ) -> Payload {
+        self.handle_propose_checked(epoch_id, members, base, proposer, proposer_slack, false)
+    }
+
+    /// [`Self::handle_propose`] with the member's own S3 reachability
+    /// (probed by the caller just before): a member that reaches S3
+    /// declines. A continuation epoch is for a bucket outage; a proposer
+    /// cut from S3 on its own is not one. Joining would be harmful, not
+    /// just pointless: a member of an open epoch runs no seal watch and
+    /// no S3 acquisition (M10's rule (b), which keeps fast takeovers away
+    /// from epochs), so if the proposer — typically the holder, whose
+    /// lease the epoch carries — then died, this member would stay
+    /// frozen (`EROFS`) with S3 reachable, until the holder came back.
+    /// Declined, the proposer keeps acknowledging through its M9 backup
+    /// (if any) until its lease runs out, and a dead holder is replaced by
+    /// a seal (M9) or the TTL takeover (M10's promise check). Declining
+    /// is always safe: an epoch that does not form claims nothing. The
+    /// simulation's epoch coordinator has always formed epochs among the
+    /// S3-cut nodes only (`tests/sim/epochs.rs`).
+    pub fn handle_propose_checked(
+        &self,
+        epoch_id: String,
+        members: Vec<u64>,
+        base: Vec<(String, u64)>,
+        proposer: u64,
+        proposer_slack: u32,
+        member_reaches_s3: bool,
     ) -> Payload {
         let refuse = |why: &str| {
             tracing::info!(
@@ -281,6 +331,9 @@ impl EpochManager {
         // rule decides. Otherwise the proposer's view — as fresh as ours,
         // or fresher (a leave this node has not read yet) — stands, as it
         // always did.
+        if member_reaches_s3 {
+            return refuse("this member reaches S3: not a bucket outage");
+        }
         let own = self.slack();
         if proposer_slack > own && !self.quorum_ok(&members) {
             return refuse("not a quorum under this node's slack");
@@ -364,6 +417,14 @@ impl EpochManager {
         if self.is_open() {
             return Ok(self.is_active());
         }
+        if self
+            .propose_after
+            .lock()
+            .unwrap()
+            .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            return Ok(false);
+        }
         {
             let now = std::time::Instant::now();
             let mut since = self.s3_failure_since.lock().unwrap();
@@ -438,7 +499,11 @@ impl EpochManager {
                 proposer: self.node_id,
                 epoch_slack: f,
             };
-            match self.peers.request_to_node(id, &payload).await {
+            match self
+                .peers
+                .request_to_node_timeout(id, &payload, PROPOSE_REQUEST_TIMEOUT)
+                .await
+            {
                 Ok(Payload::EpochAck {
                     accepted: true,
                     member,
@@ -448,6 +513,7 @@ impl EpochManager {
                 }) if member == id => acks.push((member, claim, known)),
                 other => {
                     tracing::warn!(peer = id, ?other, "epoch propose not acked");
+                    self.abandon_own_proposal(&epoch_id);
                     return Ok(false);
                 }
             }
@@ -492,6 +558,31 @@ impl EpochManager {
             "continuation epoch active"
         );
         Ok(true)
+    }
+
+    /// A proposal this node made was declined (or not answered): drop
+    /// its own promise, which nobody can have activated — only the
+    /// proposer activates, and only once every member acked. Before,
+    /// the proposer stayed `Promised` for good (`is_open`: it never
+    /// proposed again, and a member of an open epoch runs no S3
+    /// acquisition), which the member S3 rule (`handle_propose_checked`)
+    /// would make routine. Proposals then back off for
+    /// [`PROPOSE_BACKOFF`], so a member that keeps declining is not asked
+    /// (and does not probe S3) every round. Members that acked before
+    /// the decline keep their `Promised` state, as before this change.
+    fn abandon_own_proposal(&self, epoch_id: &str) {
+        {
+            let mut m = self.machine.lock().unwrap();
+            if m.current().is_some_and(|p| p.epoch_id == epoch_id) && !m.is_active() {
+                m.close();
+            } else {
+                return;
+            }
+        }
+        let _ = self.meta.set_epoch_state(epoch_id, "closed");
+        let _ = self.meta.promise_join_end();
+        *self.propose_after.lock().unwrap() = Some(std::time::Instant::now() + PROPOSE_BACKOFF);
+        self.sync_flags();
     }
 
     /// Plan 30 §M10: the epoch's carrier was retired (admin `leave
@@ -738,6 +829,20 @@ mod tests {
         // The carrier survives a restart of the coordinator.
         let again = EpochManager::new(1, meta, constellation_net::Peers::disabled());
         assert_eq!(again.carrier().0.map(|c| c.node), Some(2));
+    }
+
+    /// A member that reaches S3 declines a proposal and persists no
+    /// promise; the same member cut from S3 joins.
+    #[test]
+    fn a_member_that_reaches_s3_declines_an_epoch() {
+        let (mgr, _meta) = manager(2, 0);
+        mgr.set_roster(vec![1, 2]);
+        let declined = mgr.handle_propose_checked("1-1".into(), vec![1, 2], vec![], 1, 0, true);
+        assert!(!accepted(&declined), "{declined:?}");
+        assert!(!mgr.is_open(), "no promise persisted");
+        let joined = mgr.handle_propose_checked("1-2".into(), vec![1, 2], vec![], 1, 0, false);
+        assert!(accepted(&joined), "{joined:?}");
+        assert!(mgr.is_open());
     }
 
     #[test]

@@ -64,6 +64,12 @@ pub enum FaultKind {
     /// coordinator (`epochs.rs`) forms a continuation epoch among the cut
     /// nodes when the flexible-quorum rule allows. Healed after `for_ms`.
     EpochOutage { members: usize, for_ms: u64 },
+    /// Only the current holder loses S3 (P2P stays up) for `for_ms`; it
+    /// proposes a continuation epoch to every peer, and each joins by the
+    /// member rule (`decline`: a member that reaches S3 declines; false:
+    /// the rule's absence, every live peer joins). See
+    /// `epochs::holder_cut_epoch`.
+    HolderCutEpoch { for_ms: u64, decline: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -1010,6 +1016,16 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
         FaultKind::EpochOutage { members, for_ms } => {
             super::epochs::epoch_outage(cluster.clone(), fault.at_ms, members, for_ms, log.clone())
                 .await;
+        }
+        FaultKind::HolderCutEpoch { for_ms, decline } => {
+            super::epochs::holder_cut_epoch(
+                cluster.clone(),
+                fault.at_ms,
+                for_ms,
+                decline,
+                log.clone(),
+            )
+            .await;
         }
         FaultKind::PartitionBackup { for_ms } => {
             let Some(lease) = read_lease(&cluster.env.bucket).await else {

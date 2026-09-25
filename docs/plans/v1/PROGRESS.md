@@ -18689,3 +18689,280 @@ session violation, and the check waits for the gate.
   The final list's own 5 `deposed-reintegration` runs were 4/5. The
   one failure is the write-through timing in item 2, which the
   write-back pin then removed.
+
+## Fix: backup takeover never publishes missing chunks; epoch peer liveness (2026-09-25; uncommitted on `fix-epoch-backup-avail` = main 1641850)
+
+These are the two bugs flagged in "Fix: deposed-reintegration
+regression".
+
+### 1. M9 × M4: an adopted manifest never names a chunk the bucket lacks
+
+**The bug.**
+- Under write-back, a holder's close acknowledges as soon as its
+  manifest row is backed up. The chunks stay in the holder's cache
+  until its upload pass.
+- M9 streams every journal transaction to the backup as soon as it is
+  journaled, and a backup that seals and takes over applies that tail
+  into its own journal (`apply_backup_tail`) and ships it.
+- The successor has no pending-upload row for those chunks. They live
+  in the old holder's `pending_upload`, so M4/M7's ship planner, which
+  defers or holds manifests by *pending* rows, let them straight
+  through.
+- Result: the log and later commits named chunks S3 never received.
+  The file was unreadable everywhere, and could not be overwritten
+  (see the `compose_manifest` fix below).
+
+**The fix: adopted records go through the M4/M7 machinery.**
+- **Enrollment.** `Meta::apply_adopted_records` (`meta/store/local.rs`)
+  is what the core's `Replica::apply_records_journaled` calls. It
+  enrolls every chunk an applied `WriteManifest` names as a pending
+  upload for its inode, **in the same transaction** as the records
+  (`held::enroll_adopted_manifest_tx`). The planner then defers the
+  manifest (M7) before any upload pass has looked.
+- **Resolution** by the existing upload pass:
+  - a chunk durable in S3 is acknowledged by its `HEAD`
+    (`ChunkStore::chunk_durable`, b292e5c);
+  - a chunk in the local cache is uploaded;
+  - a chunk in neither is recorded unrecoverable. That **holds** the
+    manifest's transaction and its dependents: `status.held` lists the
+    inode and path, and `repair drop-held <ino>` makes a conflict copy
+    with the lost chunks as holes.
+  - A full pass re-evaluates the recorded set, so when the old holder
+    returns and uploads, the next pass finds the chunk in S3 and the
+    records ship.
+  - Held work is `Local` speculation, so the publisher never publishes
+    it.
+- **Spilled manifests** (more than 8 chunks). Their chunk list is a
+  blob in the chunk store, unknown to `meta`.
+  - The blob hash is enrolled, and an `adopted-spill/<ino><blob>` mark
+    makes the manifest a deferral seed until the list is known
+    (`read_pending`).
+  - The upload pass first calls `expand_adopted_spills` (`cli`): it
+    reads each marked blob (cache, else S3), enrolls its chunks and
+    clears the mark.
+  - A blob that cannot be read yet stays pending. It is recorded
+    unrecoverable (held), and expansion is retried each pass.
+  - `drop_held` clears the inode's marks.
+- **Other callers of `apply_records_journaled`** (a delegation's
+  `Delegate`/`Recall` records) name no chunk. The delegate stream
+  (`apply_delegate_tx`) does not need this: a delegate's manifest
+  commit is forwarded-style (`commit_manifest_forwarded` drains the
+  inode first).
+
+**Alternative considered: carry chunk durability (or bytes) in the M9
+append.**
+- The exact per-transaction list would have to come from the holder's
+  pending set at commit time. `BackupTx` is postcard-encoded, both on
+  the wire and in the persisted `backup_tail`. Postcard is not
+  self-describing, so a new field breaks mixed versions and existing
+  tails.
+- Inlining small chunks would add their bytes to every synchronous
+  acknowledgement round trip.
+- Enrollment plus the `HEAD` needs neither, and costs one `HEAD` per
+  adopted chunk that is not in the successor's cache, only at a
+  takeover.
+
+**`compose_manifest` (`cli/src/fusefs.rs`).** A chunk that the flush's
+writes cover completely no longer fetches the base's chunk
+(`covers(&ws.written, …)`). Before, an overwrite of a file whose base
+chunk only a departed holder had failed with `coop fetch failed …
+unavailable from peers and S3`.
+
+**Write-through vs write-back under backup failover.**
+- *Write-through:* the close uploads before it returns. The harness
+  confirms it: with S3 cut, a write-through close returns `EIO`, so it
+  is never acknowledged. Its manifest row, already committed and
+  backed, is adopted and held like any other. If the old holder later
+  uploads, the file appears; that is an in-doubt write, which is
+  allowed.
+- *Write-back* (documented here, and in the scenario's doc):
+  "acknowledged" means durable on the holder's disk (and, under M9,
+  its metadata on the backup). **The bytes live only on the old holder
+  until its upload pass.**
+  - A backup failover adopts the metadata and holds it until the bytes
+    appear in S3 (the old holder back and uploading).
+  - If the old holder never returns, the operator drops the held
+    records into a conflict copy with the lost range as a hole.
+
+**Tests.**
+- **Unit tests, in `cli`'s `pending_upload_tests`:**
+  - `an_adopted_manifest_ships_only_once_its_chunks_are_durable` and
+    the `…_spilled_…` variant walk through: adopted, deferred; the pass
+    acknowledges the uploaded chunk and records the lost one; held
+    (with `status`); still unshipped; the lost chunk put into S3; the
+    next pass releases it and the manifest ships.
+  - `an_adopted_manifest_with_a_lost_chunk_can_be_dropped`: the
+    `drop_held` path produces a refused replay (the conflict copy).
+  - All three fail with enrollment disabled.
+  - `covers_needs_the_whole_range`.
+- **Harness `backup-takeover-holds-missing-chunks`:**
+  - A is in write-back mode, B is its backup, and A alone is cut from
+    S3 (its own switch). A write-through close returns `EIO`; a
+    write-back close succeeds.
+  - A freezes; B seals and takes over, and both adopted manifests are
+    held, `status.held` listing `/shared/wt` and `/shared/wb`.
+  - A fresh node D sees both files created and empty (no manifest in
+    commits or log).
+  - A resumes with S3: it uploads, B's held set drains, everyone
+    (including a second fresh node) reads A's bytes, and there is no
+    conflict copy.
+  - With enrollment disabled it fails: "not both held yet: …
+    transactions 0".
+- **Harness `backup-takeover-drops-held-chunks`:** the same, but A is
+  killed for good. `drop_held` on B gives `wb@…` (the length kept, the
+  lost chunk a hole), and `wb` stays as the log had it (empty).
+
+### 2. M10: a peer that reaches S3 declines a continuation epoch
+
+**The bug.**
+- `EpochManager::handle_propose` had no member-side S3 check, so a
+  holder cut from S3 on its own pulled a healthy LAN peer into a
+  continuation epoch carrying its lease. (The claim rule allows it
+  because the peer is a listed backup.)
+- A member of an open epoch runs no seal watch and no S3 acquisition:
+  that is rule (b), which keeps fast takeovers away from epochs. A
+  frozen non-holder does not probe S3 either.
+- So when the holder then died, the peer was frozen: `EIO`, then
+  `EROFS`, for as long as the holder was away, with S3 reachable the
+  whole time.
+
+**Why not "abandon the epoch once the carrier is gone"?**
+- An epoch holder acknowledges locally, and nothing is backed during
+  an epoch (`durable_jseq` is `MAX` under an epoch hold). Its
+  acknowledged journal exists only on the holder.
+- A member that abandoned the epoch and took the lease through S3
+  would lose it. The model's `converged_at_quiescence` fails exactly
+  there ("an epoch whose close finds the register moved has lost its
+  journal"). A paused, not dead, holder would also still be acking.
+- Making abandonment safe would need the epoch journal replicated to
+  members (write-all during epochs) plus an acknowledgement lease the
+  members can outwait. That is a design change, not a liveness fix.
+- The stuck state is only avoidable by never entering it when there is
+  no outage.
+
+**The rule, in `EpochManager::handle_propose_checked` (`cli/src/epoch.rs`).**
+- A member that reaches S3 declines: this is not a bucket outage.
+- The daemon's `epoch_proposed` decides reachability with a bounded
+  lease `GET` (`EPOCH_MEMBER_S3_PROBE`, 300 ms). A member whose own
+  rounds are already failing at S3 (`EpochManager::s3_failing`) skips
+  the probe and joins at once, so a real outage's formation is not
+  delayed.
+- The proposer now waits `PROPOSE_REQUEST_TIMEOUT` (2 s) per answer
+  instead of the P2P default of 500 ms.
+- Once declined, the proposer keeps acknowledging through its M9 backup
+  until its lease runs out. If it dies, the backup seals and takes
+  over in about 1.5 s (or anyone takes over by TTL with M10's promise
+  check).
+
+**Safety and the model.**
+- Declining only removes formations, so every reachable state of the
+  new rule is a state of the old one. `single_authority`,
+  `linearizable` and `converged_at_quiescence` hold on a subset of an
+  already-checked state space.
+- The flex model (`crates/model/src/flex.rs`) has no per-node S3
+  reachability. Its partitions are "an S3 step never fires", so this
+  restriction has no transition of its own to add.
+- The simulation's epoch coordinator (`tests/sim/epochs.rs`) always
+  formed epochs among the S3-cut nodes only; the daemon now matches
+  it.
+- `cargo test -p constellation-model --release --test flex_epochs --
+  --test-threads=1`: 21 passed, unchanged.
+
+**The declined proposer drops its own promise** (`abandon_own_proposal`).
+- A proposer persists its promise before asking. Before this change, a
+  declined or unanswered proposal left the proposer `Promised` (open)
+  for good: `maybe_propose` returned early on `is_open`, and an open
+  member runs no S3 acquisition. The new rule makes declines routine.
+- It is safe: only the proposer activates, and only after every
+  member acked. Proposals then back off 5 s (`PROPOSE_BACKOFF`), so a
+  declining member is not probed every round.
+- A member that acked before a *later* member declined still keeps its
+  `Promised` state. This is pre-existing and **not fixed**: it needs an
+  abort message, or a member-side timeout the proposer can outwait
+  before activating. It is noted for the coordinator. It only arises in
+  3+ node clusters with mixed S3 reachability.
+
+**Tests.**
+- **Unit:** `a_member_that_reaches_s3_declines_an_epoch` (the member
+  persists no promise; the same member, cut from S3, joins).
+- **Simulation:** `a_holder_alone_cut_from_s3_forms_no_epoch_and_fails_over`.
+  - The new fault `HolderCutEpoch { for_ms, decline }` cuts only the
+    holder from S3, keeps P2P up, proposes an epoch by the member rule,
+    and the holder then crashes (restart 9 s later).
+  - With the rule (seeds 1500–1519): 0 epochs formed; every failover
+    under 2 s (seal); `strict_durability` held.
+  - Without it (`decline: false`, 10 seeds): 10 epochs formed, and 10
+    of 10 failovers waited for the holder's return. That is the stuck
+    peer, reproduced (non-vacuity).
+  - Replay with `AUTHORITY_SIM_CONFIG=holder-cut` or `holder-cut-join`.
+- **Harness `epoch-peer-reaching-s3-declines`:**
+  - A (backup B) is cut from S3 on its own; A proposes and B declines.
+  - A's declined promise is dropped. A freezes; B writes about 1.6 s
+    later.
+  - With the rule disabled, B joined (`carrier: 1`, active) and its
+    write returned `EIO` after 40 s.
+
+### Continuation-epoch flake (pre-existing)
+
+`continuation-epoch` failed 2 of the first 5 runs on this branch, with
+`Input/output error`. The epoch had formed, but A's own write went in
+doubt after 10 s: the carried lease had under a second left at
+formation (5 s TTL), so nobody held the epoch.
+
+- Main `1641850` had the same failure 1 run in 12, with the same
+  signature (`carrier=None`).
+- On this branch the member probe delayed formation by up to 300 ms.
+  The `s3_failing` shortcut removed that delay: after it, 1 of 12 on
+  this branch versus 1 of 12 on main, and 8/8 and 3/3 in later runs.
+- The flake itself is the harness's short TTL racing formation, and is
+  noted, not fixed.
+
+### Results (this tree)
+
+- `cargo test -p constellation-authority --release`: 67 core,
+  3 meta_repro, 63 sim (7 ignored; the new sim test included): green.
+- `cargo test -p constellation -p constellation-meta --release`: green
+  (211 cli, 73 meta).
+- `AUTHORITY_SIM_SEEDS=500 … long_flex`: ok (103 s).
+- `AUTHORITY_SIM_SEEDS=300 … long_backup`: ok (30 s).
+- `AUTHORITY_SIM_SEEDS=1000 … long_random`: ok (119 s).
+- `cargo test -p constellation-model --release --test flex_epochs --
+  --test-threads=1`: 21 passed (3 ignored).
+- `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt
+  --all -- --check`: clean.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-fixeb`):
+
+  | Scenario | Result |
+  |---|---|
+  | `backup-takeover-holds-missing-chunks` | 4/4 passed |
+  | `backup-takeover-drops-held-chunks` | 4/4 passed |
+  | `epoch-peer-reaching-s3-declines` | 6/6 passed (3 of them on the final build) |
+  | `deposed-reintegration` | 2/2 passed |
+  | `deposed-reintegration-backup` | 2/2 passed |
+  | `backup-failover` | passed |
+  | `epoch-missing-node` | 2/2 passed |
+  | `epoch-holder-retired` | 2/2 passed |
+  | `continuation-epoch` | the pre-existing flake above; 3/3 on the final build |
+  | `epoch-member-lost` | 2/2 passed |
+  | `poison-record-isolation` | passed |
+  | `unmount-with-held-records` | passed |
+  | `chaos-ci` | 2/2 passed |
+
+### Noted, not fixed
+
+- **A member stranded `Promised` by a later member's decline** (above).
+- **A stranded adopted transaction.** If the successor is itself
+  deposed before shipping an adopted transaction, the transaction is
+  replayed as `Records` through the next holder. That holder executes
+  it without enrollment, so it could ship a manifest naming a chunk the
+  bucket lacks. This needs two failovers inside one upload window.
+- **Truncate then extend with a gap exposes the truncated bytes
+  (verified, pre-existing, a data-correctness bug; flagged as a
+  separate task).**
+  - `compose_manifest` rebuilds a dirty chunk from the base's chunk and
+    replays only `written`. `truncate_locked` records nothing the
+    compose sees.
+  - Repro: write `abcdefgh`, flush, `truncate(2)`, write `X` at 5,
+    flush. The file reads `abcdeX` instead of `ab\0\0\0X`.
+  - Untouched old chunks between the truncation point and the new end
+    are kept whole, too.

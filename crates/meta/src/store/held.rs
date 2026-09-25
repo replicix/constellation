@@ -111,6 +111,93 @@ use std::sync::atomic::Ordering;
 
 const POISON_PREFIX: &[u8] = b"poisoned/";
 
+/// Plan 30 §M9 × §M4: a spilled manifest adopted from a predecessor's
+/// backup tail whose chunk list is not expanded into pending rows yet:
+/// `adopted-spill/<ino><blob hash>`. While one exists its inode's
+/// manifests are deferral seeds (`read_pending`).
+const ADOPTED_SPILL_PREFIX: &[u8] = b"adopted-spill/";
+
+fn adopted_spill_key(ino: Ino, blob: &ChunkHash) -> Vec<u8> {
+    let mut k = ADOPTED_SPILL_PREFIX.to_vec();
+    k.extend_from_slice(&ino.to_be_bytes());
+    k.extend_from_slice(&blob.0);
+    k
+}
+
+/// Enroll every chunk `manifest` names for `ino` as a pending upload
+/// (see `Meta::apply_adopted_records`). An undecodable manifest enrolls
+/// nothing it could name; the planner already treats it as naming
+/// anything (`names_any`).
+pub(crate) fn enroll_adopted_manifest_tx(
+    tx: &mut fjall::SingleWriterWriteTx,
+    meta: &Meta,
+    ino: Ino,
+    manifest: &[u8],
+) -> Result<(), MetaError> {
+    let Ok(m) = Manifest::decode(manifest) else {
+        return Ok(());
+    };
+    match m.chunks {
+        ChunkInfo::Inline(chunks) => {
+            for hash in chunks.values() {
+                crate::store::misc::add_pending_claim_tx(tx, &meta.pending_upload, hash, ino)?;
+            }
+        }
+        ChunkInfo::Spilled(blob) => {
+            crate::store::misc::add_pending_claim_tx(tx, &meta.pending_upload, &blob, ino)?;
+            tx.insert(&meta.local, adopted_spill_key(ino, &blob), Vec::new());
+        }
+    }
+    Ok(())
+}
+
+fn read_adopted_spills(r: &impl Readable, meta: &Meta) -> Result<Vec<(Ino, ChunkHash)>, MetaError> {
+    let mut out = Vec::new();
+    for guard in r.prefix(&meta.local, ADOPTED_SPILL_PREFIX) {
+        let (k, _) = guard.into_inner()?;
+        let rest = &k[ADOPTED_SPILL_PREFIX.len()..];
+        if rest.len() != 40 {
+            return Err(MetaError::Invalid("malformed adopted-spill mark".into()));
+        }
+        let ino = u64::from_be_bytes(rest[..8].try_into().expect("8 bytes"));
+        let blob = ChunkHash(rest[8..].try_into().expect("32 bytes"));
+        out.push((ino, blob));
+    }
+    Ok(out)
+}
+
+impl Meta {
+    /// Plan 30 §M9 × §M4: the adopted spilled manifests whose chunk lists
+    /// still wait to be enrolled, `(ino, list blob)`. The upload pass
+    /// reads each blob (cache, else S3) and calls
+    /// [`Self::expand_adopted_spill`]; a blob it cannot read stays
+    /// pending, and is recorded unrecoverable like any lost chunk.
+    pub fn adopted_spills(&self) -> Result<Vec<(Ino, ChunkHash)>, MetaError> {
+        let r = self.db.read_tx();
+        read_adopted_spills(&r, self)
+    }
+
+    /// Enroll the chunk list of an adopted spilled manifest (`chunks`,
+    /// decoded from its blob) and clear its mark, in one transaction.
+    pub fn expand_adopted_spill(
+        &self,
+        ino: Ino,
+        blob: &ChunkHash,
+        chunks: &[ChunkHash],
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        if tx.get(&self.local, adopted_spill_key(ino, blob))?.is_none() {
+            return Ok(());
+        }
+        for hash in chunks {
+            crate::store::misc::add_pending_claim_tx(&mut tx, &self.pending_upload, hash, ino)?;
+        }
+        tx.remove(&self.local, adopted_spill_key(ino, blob));
+        tx.commit()?;
+        Ok(())
+    }
+}
+
 fn poison_key(hash: &ChunkHash, ino: Ino) -> Vec<u8> {
     let mut k = POISON_PREFIX.to_vec();
     k.extend_from_slice(&hash.0);
@@ -162,9 +249,14 @@ fn read_poisoned(r: &impl Readable, meta: &Meta) -> Result<PoisonMap, MetaError>
 
 /// Every pending (not yet uploaded) chunk per inode: the deferral seeds
 /// (plan 30 §M7). One seek when nothing is pending — the ship path's cost
-/// in write-through steady state.
+/// in write-through steady state. An adopted spilled manifest whose list
+/// is not expanded yet counts as pending under its blob (so it waits for
+/// the expansion even once the blob itself is acknowledged).
 fn read_pending(r: &impl Readable, meta: &Meta) -> Result<PoisonMap, MetaError> {
     let mut out = PoisonMap::new();
+    for (ino, blob) in read_adopted_spills(r, meta)? {
+        out.entry(ino).or_default().insert(blob);
+    }
     for guard in r.iter(&meta.pending_upload) {
         let (k, _) = guard.into_inner()?;
         if k.len() != 40 {
@@ -683,6 +775,17 @@ impl Meta {
             }
         }
         counter_add_tx(&mut tx, &self.local, KV_POISONED_COUNT, -marks_removed)?;
+        // An adopted spilled manifest of this inode (plan 30 §M9) is
+        // dropped with it: nothing is left to expand.
+        let mut prefix = ADOPTED_SPILL_PREFIX.to_vec();
+        prefix.extend_from_slice(&ino.to_be_bytes());
+        let spills: Vec<Vec<u8>> = tx
+            .prefix(&self.local, &prefix)
+            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+        for key in spills {
+            tx.remove(&self.local, key);
+        }
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;
