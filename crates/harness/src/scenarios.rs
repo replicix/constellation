@@ -829,6 +829,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: ovh::nonowner_op_latency,
     },
     Scenario {
+        name: "delegated-op-latency",
+        desc: "nonowner-op-latency with the shared directory delegated to b (placement off, backups on): the other nodes' ops go to the delegate, and a reply it evaluated behind its own unappended rows is answered from the root's pre-S3 stream of its append, not from S3; every non-owner's median stays under half an S3 round trip except the write-through close of a new chunk",
+        requires: &[],
+        run: ovh::delegated_op_latency,
+    },
+    Scenario {
         name: "sqlite-two-nodes",
         desc: "plan 30 M14: concurrent sqlite3 writers on one database from two nodes (rollback journal, fcntl locks, busy_timeout); PRAGMA integrity_check ok on both, every committed row present",
         requires: &["sqlite3"],

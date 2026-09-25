@@ -56,6 +56,18 @@ pub struct BackupTx {
     pub first: u64,
     pub last: u64,
     pub records: Vec<LogRecord>,
+    /// Plan 30 §M11: the transaction's delegation origin `(gen, idx)`
+    /// (`(0, 0)`: the holder's own) — a root's append of a delegate's
+    /// stream row. A backup that takes over re-journals the row under
+    /// it, so its segment still names the origin: the delegate retires
+    /// its row by it, and every replica's (and the successor's own)
+    /// per-generation index advances. Without it the re-shipped row
+    /// went out as the successor's own, the delegate's row never
+    /// retired, and every later segment's insert-before-`Local` redo
+    /// re-applied it on top of newer state (delegated-holder-cut seed
+    /// 1719: a stale `unlink f0` deleted the re-created `f0`).
+    #[serde(default)]
+    pub origin: (u64, u64),
 }
 
 /// Whom this node backs (persisted).
@@ -127,17 +139,22 @@ impl Meta {
                     first: expect,
                     last: seq - 1,
                     records: Vec::new(),
+                    origin: (0, 0),
                 });
             }
-            let last = match r.get(&self.journal_tx, tx_key(seq))? {
-                Some(h) => postcard::from_bytes::<JournalTxHead>(&h)?.last.max(seq),
-                None => seq,
+            let (last, origin) = match r.get(&self.journal_tx, tx_key(seq))? {
+                Some(h) => {
+                    let h = postcard::from_bytes::<JournalTxHead>(&h)?;
+                    (h.last.max(seq), (h.gen, h.idx))
+                }
+                None => (seq, (0, 0)),
             };
             rows += 1;
             cur = Some(BackupTx {
                 first: seq,
                 last,
                 records: vec![rec],
+                origin,
             });
         }
         if let Some(t) = cur {
@@ -563,7 +580,8 @@ mod tests {
             BackupTx {
                 first: txs[1].first,
                 last: txs[1].last,
-                records: Vec::new()
+                records: Vec::new(),
+                origin: (0, 0),
             },
             "the shipped rows are a hole"
         );

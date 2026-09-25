@@ -1552,6 +1552,10 @@ pub struct AckStatus {
     pub awaited_log: u64,
     #[serde(default)]
     pub awaited_log_streamed: u64,
+    /// Of `awaited_log_streamed`, a delegate's replies (answered from
+    /// the root's stream of its append of the delegate's transaction).
+    #[serde(default)]
+    pub awaited_log_streamed_deleg: u64,
     #[serde(default)]
     pub backup_persisted: u64,
     #[serde(default)]

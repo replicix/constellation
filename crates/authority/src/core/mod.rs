@@ -483,6 +483,21 @@ pub struct Stats {
     /// could not install as a shadow answered from the pre-S3 stream
     /// (their transaction installed here) instead of the log.
     pub awaited_log_streamed: u64,
+    /// Of `awaited_log_streamed`, the replies of a delegate (their
+    /// position names a delegation stream): answered from the root's
+    /// pre-S3 stream once it carried the root's append of them.
+    pub awaited_log_streamed_deleg: u64,
+    /// Ops held (per check) because their `deps` named a transaction its
+    /// generation ended without, while this node's replays settled; and
+    /// ops re-sent with fresh `deps` after that
+    /// (`Core::hold_for_lost_deps`). Executions refused for it at a
+    /// delegate or the root (`Held`, or left in the inbox).
+    pub deps_lost_holds: u64,
+    pub deps_refreshed: u64,
+    pub deps_lost_refused: u64,
+    /// Delegate transactions a root did not append because their `deps`
+    /// named a newer root tenure (it was deposed without knowing yet).
+    pub deleg_append_newer_tenure: u64,
     /// Ops of this node whose wait its own acquisition made moot
     /// (`resolve_moot_waits`): accepted forwards awaiting the log from an
     /// earlier epoch, and inbox ops durable under an earlier epoch —
@@ -1272,6 +1287,9 @@ impl Core {
         self.backup_after_event(now, replica, &mut out);
         self.promise_after_event(now, replica, &mut out);
         self.deleg_after_event(now, replica, &mut out);
+        if self.cfg.delegation {
+            self.withdraw_lost_deps_inbox_ops(now, replica, &mut out);
+        }
         self.locks_after_event(now, replica, &mut out);
         out
     }

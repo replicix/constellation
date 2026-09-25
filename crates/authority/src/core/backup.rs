@@ -845,6 +845,7 @@ impl Core {
                     first: last_live + 1,
                     last: tip,
                     records: Vec::new(),
+                    origin: (0, 0),
                 });
             }
             let last = txs.last().map(|t| t.last);
@@ -1762,9 +1763,22 @@ impl Core {
                 .is_some_and(|rid| replica.completed_position(rid).ok().flatten().is_some())
                 || refused
                     .is_some_and(|rid| replica.completed_outcome(rid).ok().flatten().is_some());
+            tracing::debug!(
+                node = self.cfg.node_id,
+                first = tx.first,
+                last = tx.last,
+                origin = ?tx.origin,
+                ?rid,
+                ?refused,
+                done,
+                "backup tail transaction"
+            );
             if !done {
+                // Under the row's delegation origin: a root's append of a
+                // delegate's stream row stays one (delegated-holder-cut
+                // seed 1719).
                 replica
-                    .apply_records_journaled(&tx.records, rid)
+                    .apply_backup_tx_journaled(&tx.records, rid, tx.origin)
                     .map_err(|e| format!("re-applying the backup tail: {e}"))?;
                 applied += 1;
             }
@@ -1898,6 +1912,10 @@ impl Core {
                 // `base`, which this node has applied. The cursor steps
                 // over them.
                 self.bk.ahead_next = Some((epoch, tx.last + 1));
+                replica.note_streamed(constellation_meta::JournalPos {
+                    epoch,
+                    jseq: tx.last,
+                });
                 continue;
             }
             match replica.install_streamed(epoch, tx.first, tx.last, &tx.records) {
@@ -1933,6 +1951,14 @@ impl Core {
                         },
                     );
                     self.bk.ahead_next = Some((epoch, tx.last + 1));
+                    // The holder's journal is here through `tx.last`, in
+                    // its order: a dependency on it (a forward's `deps`,
+                    // the root's own writes into a delegated directory
+                    // above all) is reached without waiting for S3.
+                    replica.note_streamed(constellation_meta::JournalPos {
+                        epoch,
+                        jseq: tx.last,
+                    });
                 }
                 Err(error) => {
                     tracing::debug!(node = self.cfg.node_id, %error, "streamed transaction not installed");

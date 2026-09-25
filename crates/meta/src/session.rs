@@ -405,6 +405,14 @@ struct Inner {
     applied_seq: u64,
     /// The journal position of the last applied (or shipped) segment.
     applied: Option<JournalPos>,
+    /// Plan 30 §M9 × §M11: the holder's journal position the pre-S3
+    /// stream installed here contiguously from the applied log (backup-
+    /// acknowledged rows, in the holder's order). A dependency on the
+    /// holder's journal (`Position::pending`) is reached through it as
+    /// through `applied`: this replica holds those rows, and a takeover
+    /// re-ships exactly them. Cleared whenever streamed speculation may
+    /// have been rolled back ([`SessionState::clear_streamed`]).
+    streamed: Option<JournalPos>,
     observed: Position,
     /// Speculation installed with a position, until the applied position
     /// dominates it.
@@ -415,6 +423,13 @@ struct Inner {
     /// Plan 30 §M11: generations whose `Recall` this replica applied:
     /// any dependency on them is satisfied (void past the cut).
     voided: std::collections::BTreeSet<u64>,
+    /// The log's cut of each voided generation: the stream index its
+    /// root appended before the `Recall` (what this replica holds of it
+    /// *from the log*, never a delegate's own executed-but-unappended
+    /// rows). A dependency past it is *lost*: a tentative
+    /// acknowledgement, stranded and replayed by rid (see
+    /// [`SessionState::deps_lost`]).
+    void_cuts: std::collections::BTreeMap<u64, u64>,
     /// Plan 30 §M11: the delegation stream positions this node's
     /// clients were answered with (a shadow or hint installed from a
     /// delegate's reply does not raise `observed`, M6's rule, but a
@@ -457,7 +472,7 @@ impl Inner {
         };
         !owed
             && self.applied_seq >= target.seq
-            && self.applied >= target.pending
+            && self.applied.max(self.streamed) >= target.pending
             && target.streams.iter().all(|(g, i)| {
                 // Plan 30 §M14: a stream with nothing appended yet (a fresh
                 // generation's `(gen, 0)`) is reached by everyone.
@@ -591,6 +606,22 @@ impl SessionState {
                 return None;
             }
         }
+        // A voided generation is depended on only up to its cut: past it
+        // nothing will ever be appended (this node's own tentative rows
+        // are replayed by rid, and its writes wait for those replays), and
+        // a dependency there would never be met (`deps_lost`). `observed`
+        // can name one past the cut (a reply that arrived after the
+        // `Recall` applied here: long-delegated seed 70176).
+        for gen in g.voided.iter() {
+            if streams.get(*gen).is_some() {
+                let cut = g
+                    .void_cuts
+                    .get(gen)
+                    .copied()
+                    .unwrap_or_else(|| g.streams.get(gen).copied().unwrap_or(0));
+                streams.lower(*gen, cut);
+            }
+        }
         Some(Position {
             seq: g.observed.seq.max(g.frontier_log.seq).max(g.applied_seq),
             pending: g
@@ -630,6 +661,44 @@ impl SessionState {
         g.observed.streams.lower(gen, cut);
         drop(g);
         self.cv.notify_all();
+    }
+
+    /// The log's cut of voided generation `gen` (see `Inner::void_cuts`).
+    /// Only raised: rows of the generation the log carries after its
+    /// `Recall` (a root that was itself the delegate ships its own rows
+    /// after ending the generation) are not lost.
+    pub fn note_void_cut(&self, gen: u64, cut: u64) {
+        let mut g = self.inner.lock().unwrap();
+        let e = g.void_cuts.entry(gen).or_insert(0);
+        *e = (*e).max(cut);
+    }
+
+    /// Whether generation `gen` is voided here.
+    pub fn is_voided(&self, gen: u64) -> bool {
+        self.inner.lock().unwrap().voided.contains(&gen)
+    }
+
+    /// Whether `deps` names a transaction the log will never carry: a
+    /// generation that ended below the index it depends on. The void rule
+    /// would count it as satisfied, but the effect it names was a
+    /// tentative acknowledgement, stranded and replayed by rid *after*
+    /// the generation ended — executing the dependent op now would put
+    /// it in the log ahead of its cause (sim `marker-order`,
+    /// long-delegated seeds 74189, 76967, long-delegated-backup 77901).
+    /// Such an op is not executed: the executor answers `Held` (or leaves
+    /// an inbox op in the inbox), and the requester re-sends it with
+    /// fresh `deps` once its own replays have settled.
+    pub fn deps_lost(&self, deps: &Position) -> bool {
+        let g = self.inner.lock().unwrap();
+        deps.streams.iter().any(|(gen, i)| {
+            i > 0
+                && g.voided.contains(&gen)
+                && i > g
+                    .void_cuts
+                    .get(&gen)
+                    .copied()
+                    .unwrap_or_else(|| g.streams.get(&gen).copied().unwrap_or(0))
+        })
     }
 
     /// Whether this replica has everything `deps` names, with the void
@@ -691,6 +760,23 @@ impl SessionState {
         g.covering.retain(|(_, p)| !applied.dominates(p));
         drop(g);
         self.cv.notify_all();
+    }
+
+    /// Plan 30 §M9 × §M11: the pre-S3 stream installed the holder's
+    /// journal here through `pos` (see `Inner::streamed`).
+    pub fn note_streamed(&self, pos: JournalPos) {
+        let mut g = self.inner.lock().unwrap();
+        if Some(pos) > g.streamed {
+            g.streamed = Some(pos);
+            drop(g);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Streamed speculation may have been rolled back (a strand, a
+    /// takeover, a newer epoch): only the applied log counts again.
+    pub fn clear_streamed(&self) {
+        self.inner.lock().unwrap().streamed = None;
     }
 
     /// A reply whose effects are not installed here observed `pos`.
@@ -1073,6 +1159,43 @@ mod tests {
         assert!(s.reaches(&Position {
             seq: 19,
             pending: jp(2, 4),
+            streams: Default::default(),
+        }));
+    }
+
+    /// A dependency on the holder's journal is reached through the pre-S3
+    /// stream's watermark as through the applied log; clearing it (a
+    /// strand) leaves only the applied log; the `owed` rule still holds.
+    #[test]
+    fn the_streamed_watermark_reaches_a_journal_dependency_until_cleared() {
+        let s = SessionState::default();
+        s.advance(10, jp(1, 40));
+        let deps = Position {
+            seq: 10,
+            pending: jp(1, 45),
+            streams: Default::default(),
+        };
+        assert!(!s.reaches(&deps));
+        s.note_streamed(JournalPos { epoch: 1, jseq: 44 });
+        assert!(!s.reaches(&deps), "short of the dependency");
+        s.note_streamed(JournalPos { epoch: 1, jseq: 45 });
+        assert!(s.reaches(&deps));
+        // Never lowered by an older report.
+        s.note_streamed(JournalPos { epoch: 1, jseq: 41 });
+        assert!(s.reaches(&deps));
+        s.clear_streamed();
+        assert!(!s.reaches(&deps), "a strand leaves the applied log only");
+        // The applied log's seq is still required.
+        s.note_streamed(JournalPos { epoch: 1, jseq: 50 });
+        assert!(!s.reaches(&Position { seq: 11, ..deps }));
+        // An announced tail is not reached through the old tenure's stream.
+        let t = SessionState::default();
+        t.owe(JournalPos { epoch: 2, jseq: 4 });
+        t.advance(19, jp(2, 4));
+        t.note_streamed(JournalPos { epoch: 1, jseq: 60 });
+        assert!(!t.reaches(&Position {
+            seq: 18,
+            pending: jp(1, 53),
             streams: Default::default(),
         }));
     }

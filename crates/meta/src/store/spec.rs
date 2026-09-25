@@ -882,6 +882,13 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
     // tenure, not an effect to redo. A transaction made only of those
     // (an inbox refusal, a deduplicated batch position) replays nothing:
     // the requester re-submits, or the successor's drain re-evaluates.
+    // Plan 30 §M11: so is a lost tenure's `Delegate` or `Recall`: the
+    // delegation table is the root's own, decided by the tenure that
+    // wrote it. Replayed as plain records through the successor, a
+    // deposed root's re-delegation became a grant *to the successor
+    // itself* that nothing tracked or ended, and every op of the
+    // successor under it parked on a recall that never came
+    // (long-delegated-backup seed 71792).
     let effective: Vec<&LogRecord> = records
         .iter()
         .filter(|rec| {
@@ -891,6 +898,8 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
                     | LogRecord::Atime { .. }
                     | LogRecord::Refused { .. }
                     | LogRecord::InboxAck { .. }
+                    | LogRecord::Delegate { .. }
+                    | LogRecord::Recall { .. }
             )
         })
         .collect();
@@ -2075,7 +2084,13 @@ impl Meta {
         }
         if self.holder_epoch() > epoch {
             let key = next_spec_seq_tx(&mut tx, &self.local)?;
-            enqueue_replay_tx(&mut tx, self, key, rid, op.clone(), &[])?;
+            // A delegate's acceptance keeps its generation: the queued
+            // replay is held while the generation is live (the delegate
+            // re-streams the op to this new root in its stream order), as
+            // a stranded shadow of it would be — replayed at once, the
+            // takeover gate executed it ahead of the delegate's earlier
+            // transactions (locks-released-delegated seed 198670).
+            enqueue_replay_gen_tx(&mut tx, self, key, rid, op.clone(), gen, &[])?;
             tx.commit()?;
             tracing::info!(
                 ?rid,
@@ -2352,6 +2367,18 @@ impl Meta {
         records: &[LogRecord],
         pending: &TouchSet,
     ) -> Result<SegmentApplied, MetaError> {
+        // Plan 30 §M11: the generations this segment recalls, from all of
+        // its records — a `Recall` the pre-S3 stream installed here first
+        // is among the rows skipped below, and still ends its generation
+        // (long-delegated-backup seed 78172: a requester's shadow of the
+        // recalled generation was never stranded, and stayed forever).
+        let recalled: HashSet<u64> = records
+            .iter()
+            .filter_map(|rec| match rec {
+                LogRecord::Recall { gen, .. } => Some(*gen),
+                _ => None,
+            })
+            .collect();
         let completes: HashSet<Rid> = records
             .iter()
             .filter_map(|rec| match rec {
@@ -2580,13 +2607,6 @@ impl Meta {
         // Plan 30 §M11: a generation the log recalls strands whatever of
         // it this node still holds unappended (past the cut: everything
         // appended is before the `Recall` record, hence retired above).
-        let recalled: HashSet<u64> = records
-            .iter()
-            .filter_map(|rec| match rec {
-                LogRecord::Recall { gen, .. } => Some(*gen),
-                _ => None,
-            })
-            .collect();
         let mut stranded = stranded;
         if !recalled.is_empty() {
             let more = strand_tx(&mut tx, self, &staged, |entry| {
@@ -2655,6 +2675,72 @@ impl Meta {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
         let stranded = strand_tx(&mut tx, self, &staged, |entry| entry.stranded_by(epoch))?;
+        if !stranded.any() {
+            return Ok(stranded);
+        }
+        let from = journal_from(&tx, self)?;
+        compact_tx(&mut tx, self, from)?;
+        let (bytes, files) = staged.raw_delta();
+        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        tx.commit()?;
+        staged.drain_into(self.usage_tracker());
+        Ok(stranded)
+    }
+
+    /// The takeover gate's strand (plan 30 §M3a × §M9 × §M11): everything
+    /// [`Self::strand_below_epoch`] strands, and this node's own
+    /// transactions as the *delegate* of generations `own_gens` (a
+    /// `Local` row of one of them; the fast path may have executed some
+    /// after the lease was acquired, under its epoch). A delegate that takes the root over
+    /// has those rows in its journal *before* the predecessor's backup
+    /// tail it is about to re-apply, but the log orders them the other
+    /// way: the tail holds the predecessor's appends of them (after the
+    /// `Delegate` that granted them, and before whatever it appended
+    /// later), and the rest were never appended. Shipped in journal
+    /// order, they overtook the predecessor's tail (delegated-holder-cut
+    /// seed 772: a create in `d1` shipped ahead of the tail's rename of
+    /// the same name out of `d1`). Stranded here, the tail re-journals
+    /// the appended ones in their place (completing their rids) and the
+    /// queued replay re-executes the rest by rid after it, in order.
+    pub fn strand_for_takeover(&self, epoch: u64, own_gens: &[u64]) -> Result<Stranded, MetaError> {
+        let mut tx = self.db.write_tx();
+        let staged = UsageTracker::staging();
+        let stranded = strand_tx(&mut tx, self, &staged, |entry| {
+            entry.stranded_by(epoch)
+                || matches!(entry, LiveEntry::Local { gen, .. } if *gen != 0 && own_gens.contains(gen))
+        })?;
+        if !stranded.any() {
+            return Ok(stranded);
+        }
+        let from = journal_from(&tx, self)?;
+        compact_tx(&mut tx, self, from)?;
+        let (bytes, files) = staged.raw_delta();
+        adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+        tx.commit()?;
+        staged.drain_into(self.usage_tracker());
+        Ok(stranded)
+    }
+
+    /// Plan 30 §M11 on the root: it ended generation `gen` itself (its
+    /// own `Recall` journaled, never applied from a segment here), so the
+    /// segment path's recall strand never runs on its replica. Its own
+    /// shadows and hints from that delegate's replies are stranded here
+    /// the same way (rolled back, queued for replay by rid once the
+    /// generation is gone); its own `Local` rows of `gen` are the
+    /// delegate's appended stream, before the `Recall`, and stay.
+    /// Without this, the root kept a shadow of its own create that the
+    /// delegate never streamed (partitioned, outwaited), executed its
+    /// next op on top of it and journaled an `unlink` of a name the log
+    /// never created (long-delegated seed 72780).
+    pub fn strand_recalled_speculation(&self, gen: u64) -> Result<Stranded, MetaError> {
+        let mut tx = self.db.write_tx();
+        let staged = UsageTracker::staging();
+        let stranded = strand_tx(&mut tx, self, &staged, |entry| {
+            matches!(
+                entry,
+                LiveEntry::Shadow { gen: g, .. } | LiveEntry::Hint { gen: g, .. } if *g == gen
+            )
+        })?;
         if !stranded.any() {
             return Ok(stranded);
         }

@@ -319,6 +319,7 @@ fn replay_seed() {
         Ok("shared-dir-ranges") => shared_dir_ranges_config(),
         Ok("shared-dir-faults") => shared_dir_faults_config(),
         Ok("long-delegated") => long_delegated_config(),
+        Ok("long-delegated-backup") => long_delegated_backup_config(),
         // Plan 30 §M14.
         Ok("locks") => locks_config(),
         Ok("locks-partition") => locks_partition_config(),
@@ -2080,7 +2081,12 @@ fn flex_zero_forms_no_partial_epoch() {
 /// acquisition, and a frozen epoch answers `EROFS`).
 fn holder_cut_crash_config(decline: bool) -> SimConfig {
     SimConfig {
-        ops_per_client: 8,
+        // Enough work that the other nodes' clients are still writing
+        // when the holder dies: the failover is measured to the next
+        // answered op, and with 8 each they had all finished before it
+        // in seed 1513 once the pre-S3 stream answered their forwards
+        // sooner — the next op was the restarted holder's, at 9 s.
+        ops_per_client: 12,
         random_faults: 0,
         faults: vec![
             ScheduledFault {
@@ -2191,6 +2197,115 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
         failovers.iter().all(|ms| *ms < ttl.min(restart)),
         "a failover waited for the TTL or the holder's return: {failovers:?}"
     );
+}
+
+/// The `delegated-holder-cut` seeds outside the CI range that failed on
+/// main (1528 of 0..20000: 1200 never quiescent, the rest history
+/// violations), one per failure shape. The root's backup is also a
+/// delegate (three nodes), so its takeover re-ships a tail holding the
+/// predecessor's appends of delegate streams:
+/// - the re-shipped rows lost their delegation origin (`BackupTx` had
+///   none), so the log carried them as the successor's own: the delegate
+///   never retired its rows (seed 2: never quiescent), and every later
+///   segment's insert-before-`Local` redo re-applied them over newer
+///   state (seed 1719: a stale `unlink f0` deleted the re-created `f0`;
+///   22, 330);
+/// - the successor's own rows as a delegate sat in its journal ahead of
+///   the tail it re-applied and shipped before it (seeds 772, 1039: a
+///   create in `d1` ahead of the tail's rename of the name out of `d1`).
+#[test]
+fn regression_delegated_holder_cut_takeover_keeps_delegate_rows_in_log_order() {
+    let mut rolled_back = 0;
+    for seed in [2, 22, 330, 1719, 772, 1039] {
+        let report = run_seed(seed, delegated_holder_cut_config()).unwrap_or_else(|e| {
+            panic!(
+                "delegated-holder-cut seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=delegated-holder-cut"
+            )
+        });
+        if seed == 772 || seed == 1039 {
+            rolled_back += report
+                .stats
+                .values()
+                .map(|s| s.local_rolled_back)
+                .sum::<u64>();
+        }
+    }
+    assert!(
+        rolled_back > 0,
+        "the takeover never stranded the successor's own delegate rows"
+    );
+}
+
+/// Many seeds of a named configuration, run in parallel
+/// (`AUTHORITY_SIM_CONFIG`, default `delegated-holder-cut`;
+/// `AUTHORITY_SIM_START`, `AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_THREADS`).
+/// Prints every failing seed's first lines and fails at the end.
+#[test]
+#[ignore]
+fn sweep_config() {
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(d)
+    };
+    let start = env("AUTHORITY_SIM_START", 0);
+    let seeds = env("AUTHORITY_SIM_SEEDS", 2_000);
+    let threads = env("AUTHORITY_SIM_THREADS", 8);
+    let label = std::env::var("AUTHORITY_SIM_CONFIG").unwrap_or("delegated-holder-cut".into());
+    let config = |label: &str| match label {
+        "delegated-holder-cut" => delegated_holder_cut_config(),
+        "long-delegated" => long_delegated_config(),
+        "long-backup" => long_backup_config(),
+        "delegated-backup" => delegated_backup_config(),
+        "long-delegated-backup" => long_delegated_backup_config(),
+        "placement-hot" => placement_hot_config(),
+        "backup-hot" => backup_hot_config(),
+        other => panic!("sweep_config: unknown config {other}"),
+    };
+    let streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let streamed_deleg = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start));
+    let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut handles = Vec::new();
+    for _ in 0..threads {
+        let (next, failures, label) = (next.clone(), failures.clone(), label.clone());
+        let (streamed, streamed_deleg) = (streamed.clone(), streamed_deleg.clone());
+        handles.push(std::thread::spawn(move || loop {
+            let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if seed >= start + seeds {
+                break;
+            }
+            match run_seed(seed, config(&label)) {
+                Ok(report) => {
+                    let ord = std::sync::atomic::Ordering::Relaxed;
+                    for s in report.stats.values() {
+                        streamed.fetch_add(s.awaited_log_streamed, ord);
+                        streamed_deleg.fetch_add(s.awaited_log_streamed_deleg, ord);
+                    }
+                }
+                Err(e) => {
+                    let head: String = e.lines().take(3).collect::<Vec<_>>().join(" | ");
+                    eprintln!("SWEEP-FAIL {label} seed {seed}: {head}");
+                    failures.lock().unwrap().push(seed);
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let mut f = failures.lock().unwrap().clone();
+    f.sort_unstable();
+    eprintln!(
+        "sweep {label} {start}..{}: {} failing: {f:?}; answered from the stream: {} ({} a delegate's)",
+        start + seeds,
+        f.len(),
+        streamed.load(std::sync::atomic::Ordering::Relaxed),
+        streamed_deleg.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    assert!(f.is_empty(), "failing seeds: {f:?}");
 }
 
 /// Plan 30 §M10: many more seeds of the epoch configurations.
@@ -2483,6 +2598,17 @@ fn long_delegated_config() -> SimConfig {
         p2p_drop: 0.02,
         marker_pairs: 2,
         ..delegated_config()
+    }
+}
+
+/// `long-delegated` with backups in budget for the root and every
+/// delegate: the root streams its journal — its appends of the delegate
+/// streams included — ahead of S3, and a delegate's reply a requester
+/// cannot install is answered from that stream.
+fn long_delegated_backup_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::deleg_backup_core_config),
+        ..long_delegated_config()
     }
 }
 
@@ -2897,6 +3023,105 @@ fn long_delegated_seed_70051_finishes() {
     }
 }
 
+/// Long-delegated seeds that failed on main:
+/// - 70162 (1 in 15 runs, by the key sets' hash order): a delegate's
+///   reply `base` came from an older window entry below the floor its
+///   grant set, missing the segment (applied between two generations)
+///   that renamed the name away; the requester installed the create
+///   under that rename. Deterministic since `TouchSet` iterates in
+///   order; it failed 5 in 100 runs with hash order and without the
+///   floor, 0 in 100 with it;
+/// - 70705: the successor's takeover gate opened in a later round (its
+///   marker PUT had failed), which never learned the predecessor's live
+///   generations: the delegate's stream was refused for good and its
+///   acknowledged create never reached the log;
+/// - 72780: the root ended a generation itself and kept its own shadow of
+///   a create the (partitioned) delegate never streamed; its next op, an
+///   `unlink` of that name, took effect in the log where the name did
+///   not exist;
+/// - 73964: a successor's takeover gate replayed a stranded create in a
+///   directory delegated to another node, ahead of that delegate's
+///   earlier acknowledged unlink (the gate's local replay ignored
+///   ownership);
+/// - 75808: a root whose lease was held but unusable for a moment
+///   dropped its generations and never learned them again; it then
+///   executed ops under a live delegation beside the delegate;
+/// - 79725: a root's own op parked on a recall was answered `EIO` at its
+///   deadline although the delegate's re-stream had appended its
+///   completion;
+/// - 79689 (a checker artifact): a delegate's tentative acknowledgement
+///   stopped counting as tentative once its node restarted;
+/// - 74189, 76967 (`marker-order`): the data write was a tentative
+///   acknowledgement (its generation ended before the root appended it);
+///   the marker, whose `deps` named it, was executed under the void rule
+///   and reached the log (and a watcher) before the data's replay. Now a
+///   lost dependency is never executed (`Held`, or left in the inbox and
+///   withdrawn), and a requester's writes wait for its own replays.
+#[test]
+fn regression_long_delegated_seeds() {
+    let t = run_m11("long-delegated", long_delegated_config(), 70_162..70_163);
+    assert!(t.executed > 0, "{t:?}");
+    for seed in [
+        70_705, 72_780, 73_964, 75_808, 79_725, 79_689, 74_189, 76_967,
+    ] {
+        run_m11("long-delegated", long_delegated_config(), seed..seed + 1);
+    }
+}
+
+/// `long-delegated-backup` seeds (the root and every delegate with a
+/// backup in budget) that failed on main:
+/// - 71251: an unanswered seal of a crashed delegate's backup set the
+///   recall back to "none", the restarted delegate's renewals were
+///   granted again, and the root's op parked on the recall ended `EIO`;
+/// - 71792: a deposed root's stranded `Delegate` record was replayed as
+///   plain records through its successor — a grant to the successor
+///   itself that nothing ended, every op under it parked forever;
+/// - 75504: a paused, then deposed root's late stream acknowledgement
+///   counted for its successor, and the delegate never streamed its last
+///   transaction to it;
+/// - 78172: a `Recall` installed first by the pre-S3 stream was skipped
+///   with its segment's streamed rows and never stranded a requester's
+///   shadow of the recalled generation;
+/// - 77901: the `marker-order` class of 74189 under backups;
+/// - 74035: a paused root, deposed without knowing it, drained a sealed
+///   delegate backup's marker whose `deps` named its successor's journal
+///   (where the data was); its replica showed the marker without the
+///   data until the deposition stranded it.
+#[test]
+fn regression_long_delegated_backup_seeds() {
+    for seed in [71_251, 71_792, 75_504, 78_172, 77_901, 74_035] {
+        run_m11(
+            "long-delegated-backup",
+            long_delegated_backup_config(),
+            seed..seed + 1,
+        );
+    }
+}
+
+/// Item 3 of the delegation-safety fix: a delegate's reply that the
+/// requester cannot install (the delegate evaluated it behind its own
+/// unappended rows: `base: None`) is answered once the root's pre-S3
+/// stream has installed the root's append of that transaction here —
+/// not when its segment comes back from S3. The runs pass every check
+/// (linearizability per directory, convergence, exactly-once, marker
+/// order, strict acknowledgement order); zero such answers without the
+/// change.
+#[test]
+fn a_delegate_reply_is_answered_from_the_root_pre_s3_stream() {
+    let mut deleg = 0u64;
+    for seed in 70_000..70_010 {
+        let report = run_seed(seed, delegated_backup_config()).unwrap_or_else(|e| {
+            panic!("delegated-backup seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=delegated-backup")
+        });
+        deleg += report
+            .stats
+            .values()
+            .map(|s| s.awaited_log_streamed_deleg)
+            .sum::<u64>();
+    }
+    assert!(deleg > 0, "no delegate reply was answered from the stream");
+}
+
 /// M12 round 2, long-sessions seed 10146: the holder recovered a
 /// segment by re-reading its own timed-out PUT, and that path left the
 /// segment out of the window forward replies' `base` is computed from;
@@ -3130,6 +3355,22 @@ fn locks_released_delegated_config() -> SimConfig {
         ],
         ..delegated_config()
     }
+}
+
+/// `locks-released-delegated` seed 198670: a delegate's acceptance of
+/// the successor's own op reached it just after its takeover; the reply
+/// was queued for replay without its generation, so the takeover gate
+/// executed it at once — ahead of the delegate's earlier acknowledged
+/// op. The queued replay keeps the generation now and is held while it
+/// lives (the delegate re-streams the op).
+#[test]
+fn regression_locks_released_delegated_seed_198670() {
+    run_seed(198_670, locks_released_delegated_config()).unwrap_or_else(|e| {
+        panic!(
+            "locks-released-delegated seed 198670: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-released-delegated"
+        )
+    });
 }
 
 /// Plan 30 §M14: the lock counters summed over a run's nodes.

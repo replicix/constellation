@@ -1224,6 +1224,20 @@ impl Core {
                     self.stats.deleg_deps_waits += 1;
                     return Err(Halt::Recall);
                 }
+                // A dependency its generation ended without: the op stays
+                // in the inbox; its requester withdraws it and re-sends it
+                // after its own replay of the cause
+                // (`withdraw_lost_deps_inbox_ops`).
+                if replica.deps_lost(&deps) {
+                    self.stats.deps_lost_refused += 1;
+                    tracing::debug!(
+                        node = self.cfg.node_id,
+                        ?rid,
+                        ?deps,
+                        "an execution whose deps were lost with their generation is refused"
+                    );
+                    return Err(Halt::Recall);
+                }
             }
             // Plan 30 §M11: the same for write delegations — an inbox op
             // in a delegated subtree waits for the recall (the delegate's

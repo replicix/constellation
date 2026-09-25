@@ -83,6 +83,38 @@ impl Core {
         {
             return;
         }
+        // A dependency its generation ended without (see
+        // `Replica::deps_lost`): not executed here; the requester re-sends
+        // once its own replay of the cause has landed. A retry of an op
+        // already done is answered from the dedup below as ever.
+        if self.cfg.delegation
+            && replica.deps_lost(&deps)
+            && replica.recent_outcome(rid).is_none()
+            && replica.completed_outcome(rid).ok().flatten().is_none()
+        {
+            self.stats.deps_lost_refused += 1;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                ?deps,
+                "an execution whose deps were lost with their generation is refused"
+            );
+            if req != OpId(0) {
+                out.push(Action::Send {
+                    to: from,
+                    msg: PeerMsg::MutateReply {
+                        req,
+                        outcome: MutateOutcome::Held {
+                            retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
+                        },
+                        base: None,
+                        position: Position::ZERO,
+                        gen: 0,
+                    },
+                });
+            }
+            return;
+        }
         // Plan 30 §M12: the table names this node the owner (a range or
         // a subtree just delegated) but the grant is not installed yet:
         // the requester retries here in a moment rather than bouncing
@@ -310,7 +342,17 @@ impl Core {
             .rev()
             .find(|(_, touches)| touch_sets_overlap(touches, &keys))
             .map(|(seq, _)| *seq);
-        Some(touched.unwrap_or(self.shipped_floor))
+        // Never below the floor, even when an older window entry touched
+        // the keys: a delegate's window only records segments applied
+        // while it delegates, and its grant raised the floor over the
+        // ones applied before (a root's floor is below every entry it
+        // holds, so this is its old rule). Long-delegated seed 70162: the
+        // segment that renamed `d2/f1` away and granted the new
+        // generation was applied between two generations, missing from
+        // the window; the create of `d2/f1` answered base 46 (an older
+        // touch) instead of 75, and the requester installed it under
+        // the rename it had not applied yet.
+        Some(touched.unwrap_or(0).max(self.shipped_floor))
     }
 
     /// `forward::holder_execute`: dedup by `recent`, then by `completed`,

@@ -468,6 +468,30 @@ impl Meta {
         Ok(true)
     }
 
+    /// Plan 30 §M9 × §M11: a takeover re-journals one of its
+    /// predecessor's backed-up transactions ([`Self::apply_adopted_records`])
+    /// under the delegation origin `(gen, idx)` the predecessor journaled
+    /// it with (`gen` 0: the predecessor's own row). The successor's
+    /// segment then names the origin, as the predecessor's would have:
+    /// the delegate retires its row by it and every replica's
+    /// per-generation index (this node's `log_stream_idx`, the inherited
+    /// cursor, included) advances.
+    pub fn apply_adopted_records_from(
+        &self,
+        records: &[LogRecord],
+        rid: Option<Rid>,
+        (gen, idx): (u64, u64),
+    ) -> Result<(), MetaError> {
+        if gen == 0 {
+            return self.apply_adopted_records(records, rid);
+        }
+        {
+            let _d = journal::PendingDelegate::set(gen, Some(idx), crate::session::Position::ZERO);
+            self.apply_adopted_records(records, rid)?;
+        }
+        self.note_log_idx(gen, idx)
+    }
+
     /// Plan 30 §M11: a delegate's refusal of `rid` (plan 30 §M9's
     /// journaled `Refused` row), as the next transaction of stream
     /// `gen` — the root appends it like any other, so a retry by rid

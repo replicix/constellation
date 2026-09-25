@@ -5008,6 +5008,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                     streamed_dropped: stats.streamed_dropped,
                     awaited_log: stats.awaited_log,
                     awaited_log_streamed: stats.awaited_log_streamed,
+                    awaited_log_streamed_deleg: stats.awaited_log_streamed_deleg,
                     backup_persisted: stats.backup_persisted,
                     seals: stats.seals,
                     backup_takeovers: stats.backup_takeovers,

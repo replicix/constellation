@@ -497,6 +497,11 @@ impl Core {
                     (applied.stranded.shadows + applied.stranded.hints) as u64;
                 self.stats.local_rolled_back += applied.stranded.locals as u64;
             }
+            // A newer tenure strands what the old one streamed ahead: the
+            // stream's watermark no longer stands for this replica.
+            if applied.stranded.any() || seg.epoch > self.ship.max_epoch {
+                replica.clear_streamed();
+            }
             // A segment above the epoch we hold is a deposition: only a
             // lease CAS winner can have written it. Plan 30 §M9: give the
             // lease up at once (a fast takeover's fence), not at the next
@@ -866,8 +871,21 @@ impl Core {
         if !gate.marker_shipped {
             return GateStep::NeedMarker;
         }
+        // Whatever the old tenure streamed ahead is stranded or re-shipped
+        // under this one.
+        replica.clear_streamed();
         if gate.takeover {
-            match replica.strand_below_epoch(gate.epoch) {
+            // With a predecessor's backup tail to re-apply, this node's
+            // own rows as a delegate too: they must follow the tail, not
+            // precede it (`strand_for_takeover`). Once: the tail is
+            // cleared below, and a later pass of the gate (waiting for
+            // the drain) must not strand the tail's own re-journaled rows.
+            let own_gens: Vec<u64> = if gate.backup_tail_epoch.is_some() {
+                self.dl.mine.keys().copied().collect()
+            } else {
+                Vec::new()
+            };
+            match replica.strand_for_takeover(gate.epoch, &own_gens) {
                 Ok(stranded) => {
                     if stranded.any() {
                         tracing::warn!(
@@ -1024,6 +1042,7 @@ impl Core {
     ) -> Result<bool, String> {
         let floor = self.lease.lost_floor.max(1);
         let mut rolled = 0u64;
+        replica.clear_streamed();
         if replica.holder_capture() {
             let stranded = replica
                 .strand_below_epoch(floor)
@@ -1317,7 +1336,17 @@ impl Core {
     fn round_gate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.lease.gate.is_some() && !self.lease.lost {
             match self.complete_gate(now, replica, out) {
-                GateStep::Done => {}
+                GateStep::Done => {
+                    // The gate opened in a round, not in the acquisition
+                    // (its marker PUT failed there, or it waited for the
+                    // quarantine or the drain): the root is usable only
+                    // now, so the generations a predecessor left live are
+                    // learned here — `finish_acquire` saw a closed gate
+                    // (long-delegated seed 70705: never inherited, the
+                    // delegate's stream refused for good and its
+                    // acknowledged writes never appended).
+                    self.delegation_sync(now, replica, out);
+                }
                 GateStep::NeedMarker => {
                     self.issue_marker(0, replica, out);
                     return;

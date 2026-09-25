@@ -122,11 +122,31 @@ no replica ever contains a record whose causes are missing: data
 written in `D1` and then a marker written in `D2` are never seen in the
 wrong order (`marker-order`). A requester tracks at most 8 streams; if
 its observed set overflows, it sends the op to the root instead. A
-dependency on a generation that has ended is void.
+dependency on a generation that has ended is void, except one past the
+generation's cut (the transaction was acknowledged but never appended,
+so it is being replayed by rid): an op with such a dependency is not
+executed (a delegate or the root answers `Held`; an inbox op stays in
+the inbox and its requester withdraws it), and the requester re-sends
+it with fresh `deps` once its own replays have landed. A node holds its
+new writes while it has stranded ops of its own to replay, so its
+writes stay in the order it issued them.
 
 Replies from a delegate carry `(gen, idx)` in their position, so the
 session guarantees of [Close-to-open modes](cto-modes.md) cover
 delegated writes too.
+
+A reply the requester cannot install at once (the delegate evaluated
+the op behind its own transactions the log does not have yet, such as
+a close right after the requester's create) waits for that
+transaction. When the root has a backup, the root streams its journal,
+its appends of the delegate streams included, to every node ahead of
+S3 (see [Durability and failover](durability-and-failover.md)); the
+requester's op is answered as soon as that stream installs the root's
+append of it, one LAN round trip or two, not an S3 round trip. A node's
+dependency on the root's journal (the `deps` of its next forward) is
+likewise reached through that stream, so the root's own writes into a
+delegated directory do not wait for its ship either. Status:
+`ack.awaited_log_streamed_deleg`.
 
 ### Grants, renewal and expiry
 
@@ -254,7 +274,13 @@ designations create no delegation.
   inherited grant is already dead at a TTL takeover and the successor
   may reclaim at once. After a fast failover the delegates re-stream to
   the new root from the index the log already has
-  (`root-failover-with-delegates`).
+  (`root-failover-with-delegates`). The backup that takes over
+  re-journals the predecessor's appends of delegate streams under their
+  delegation origin, in the predecessor's order; if it was itself a
+  delegate, its own unappended transactions are rolled back and
+  replayed by rid after that tail, never shipped ahead of it. A
+  generation the successor inherits is learned when its takeover gate
+  opens, whichever round that is in.
 - While any generation is live, the root does not release its lease when
   idle and declines a cooperative handoff.
 

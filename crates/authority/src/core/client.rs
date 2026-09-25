@@ -131,6 +131,10 @@ pub(crate) struct ClientOp {
     /// that client too (long-acks3 seed 50557: the resubmission was
     /// dropped as a duplicate and never answered).
     pub also_client: bool,
+    /// Held by `hold_for_lost_deps` at least once: its `deps` are taken
+    /// afresh before it proceeds, so they order after the replays it
+    /// waited for.
+    pub deps_held: bool,
 }
 
 impl ClientOp {
@@ -294,31 +298,7 @@ impl Core {
             out,
         );
         let keys = conflict_keys(&op, replica);
-        // Plan 30 §M11: `None` (the streams overflow) is a root-only op:
-        // the root orders after everything it appended.
-        let (mut deps, overflow) = match replica.deps() {
-            Some(d) => (d, false),
-            None => (
-                Position {
-                    streams: Default::default(),
-                    ..replica.observed()
-                },
-                true,
-            ),
-        };
-        if overflow {
-            self.stats.deps_overflow_to_root += 1;
-        }
-        // The root's own journal (its local executions, the streams it
-        // appended) is ahead of what it shipped: a delegate orders after
-        // all of it.
-        if let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) {
-            if let Some(jp) = replica.journal_position(epoch) {
-                if Some(jp) > deps.pending {
-                    deps.pending = Some(jp);
-                }
-            }
-        }
+        let deps = self.fresh_deps(now, replica);
         // A rid this core already answered `InDoubt` may have taken
         // effect somewhere: its resubmission is in doubt from the start.
         // So is a stranded op's replay (`Origin::Replay`): its first
@@ -350,8 +330,14 @@ impl Core {
                 inbox_keys,
                 deps,
                 also_client: false,
+                deps_held: false,
             },
         );
+        // Causal order after a generation ended with this node's writes
+        // tentative (see `hold_for_lost_deps`).
+        if self.hold_for_lost_deps(now, rid, replica, out) {
+            return;
+        }
         // Plan 30 §M11: a delegate executes its own subtree here; an op
         // under another node's delegation goes to that delegate (or to
         // the root, which recalls, when the observed stream table is
@@ -451,6 +437,160 @@ impl Core {
                 c.phase = Phase::WaitingLease;
             }
             self.route(now, rid, replica, out);
+        }
+    }
+
+    /// The `deps` a write submitted now carries: the session's (see
+    /// `SessionState::deps`), plus, on the root, its own journal.
+    pub(crate) fn fresh_deps(&mut self, now: Ms, replica: &dyn Replica) -> Position {
+        // Plan 30 §M11: `None` (the streams overflow) is a root-only op:
+        // the root orders after everything it appended.
+        let (mut deps, overflow) = match replica.deps() {
+            Some(d) => (d, false),
+            None => (
+                Position {
+                    streams: Default::default(),
+                    ..replica.observed()
+                },
+                true,
+            ),
+        };
+        if overflow {
+            self.stats.deps_overflow_to_root += 1;
+        }
+        // The root's own journal (its local executions, the streams it
+        // appended) is ahead of what it shipped: a delegate orders after
+        // all of it.
+        if let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) {
+            if let Some(jp) = replica.journal_position(epoch) {
+                if Some(jp) > deps.pending {
+                    deps.pending = Some(jp);
+                }
+            }
+        }
+        deps
+    }
+
+    /// Causal order across a generation's end. This node's own
+    /// tentatively acknowledged ops (a delegate's acceptance whose
+    /// generation ended before the root appended it) are stranded and
+    /// replayed by rid; a later write of this node must not overtake
+    /// those replays — above all one whose `deps` name such a
+    /// transaction (`Replica::deps_lost`), which the void rule alone
+    /// would let run first (a `marker-order` marker ahead of its data:
+    /// long-delegated seeds 74189, 76967, long-delegated-backup 77901).
+    ///
+    /// So a client op is held (a backoff, re-checked on its timer) while
+    /// this node has replays to settle; then, if its `deps` were lost,
+    /// they are taken afresh — ordering after wherever the replays
+    /// landed — and it proceeds. `true`: held. A replay itself is never
+    /// held (the queue is what the others wait for); its own lost `deps`
+    /// are refreshed.
+    pub(crate) fn hold_for_lost_deps(
+        &mut self,
+        now: Ms,
+        rid: Rid,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if !self.cfg.delegation {
+            return false;
+        }
+        let Some(c) = self.clients.get(&rid) else {
+            return false;
+        };
+        let lost = replica.deps_lost(&c.deps);
+        let replay = matches!(c.origin, Origin::Replay { .. });
+        let unsettled = !replay && self.own_replays_unsettled(replica);
+        if !lost && !unsettled && !c.deps_held {
+            return false;
+        }
+        if unsettled {
+            self.stats.deps_lost_holds += 1;
+            let old = self.clients.get_mut(&rid).and_then(|c| c.timer.take());
+            if let Some(t) = old {
+                self.cancel_timer(t, out);
+            }
+            let timer = self.set_timer(
+                now.plus(self.cfg.delegation_stream_tick_ms.max(10)),
+                Timer::ForwardBackoff(rid),
+                out,
+            );
+            let c = self.clients.get_mut(&rid).expect("present");
+            c.phase = Phase::Backoff;
+            c.timer = Some(timer);
+            c.deps_held = true;
+            return true;
+        }
+        let deps = self.fresh_deps(now, replica);
+        tracing::debug!(
+            node = self.cfg.node_id,
+            ?rid,
+            ?deps,
+            "an op held for this node's replays (or with deps lost with their generation) proceeds with fresh deps"
+        );
+        self.stats.deps_refreshed += 1;
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.deps = deps;
+            c.deps_held = false;
+        }
+        false
+    }
+
+    /// Replays this node still has to run (its own stranded ops, not a
+    /// refused one waiting for its conflict copy, not another node's
+    /// streamed op, not one held while its generation lives — the
+    /// delegate re-streams it in order — and not one whose rid is already
+    /// in flight as a client op).
+    fn own_replays_unsettled(&self, replica: &dyn Replica) -> bool {
+        if self.replay.in_flight.is_some() {
+            return true;
+        }
+        let Ok(queue) = replica.pending_replays() else {
+            return false;
+        };
+        if queue.is_empty() {
+            return false;
+        }
+        let table = replica.delegation_table();
+        queue.iter().any(|s| {
+            s.refused.is_none()
+                && !s.foreign
+                && !self.clients.contains_key(&s.rid)
+                && (s.gen == 0 || !table.iter().any(|d| d.gen == s.gen))
+        })
+    }
+
+    /// Ops of this node waiting in an S3 inbox with lost `deps`: the root
+    /// leaves them there (it will not execute them), so they are withdrawn
+    /// and held here (`send_forward` to node 0 = withdraw, then back off).
+    pub(crate) fn withdraw_lost_deps_inbox_ops(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let lost: Vec<Rid> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| {
+                matches!(c.phase, Phase::InboxWaiting { .. })
+                    && !c.inbox_keys.is_empty()
+                    && !matches!(c.origin, Origin::Replay { .. })
+            })
+            .filter(|(_, c)| replica.deps_lost(&c.deps))
+            .map(|(r, _)| *r)
+            .collect();
+        for rid in lost {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                "inbox op's dependency was lost with its generation: withdrawing it"
+            );
+            if let Some(t) = self.clients.get_mut(&rid).and_then(|c| c.timer.take()) {
+                self.cancel_timer(t, out);
+            }
+            self.send_forward(now, rid, 0, out);
         }
     }
 
@@ -597,6 +737,19 @@ impl Core {
                 super::S3For::InboxWithdraw(rid),
                 out,
             );
+            return;
+        }
+        if holder == 0 {
+            // `withdraw_lost_deps_inbox_ops`: withdrawn; back off, where
+            // `hold_for_lost_deps` decides.
+            c.phase = Phase::Backoff;
+            self.cancel_timer(timer, out);
+            let t = self.set_timer(
+                now.plus(self.cfg.delegation_stream_tick_ms.max(10)),
+                Timer::ForwardBackoff(rid),
+                out,
+            );
+            self.clients.get_mut(&rid).expect("present").timer = Some(t);
             return;
         }
         c.phase = Phase::Forwarded { req, holder };
@@ -937,6 +1090,9 @@ impl Core {
             return;
         }
         c.timer = None;
+        if self.hold_for_lost_deps(now, rid, replica, out) {
+            return;
+        }
         // The view may have opened meanwhile (another op's acquisition
         // landed the lease here, tailed to head). The op was forwarded,
         // so it is in doubt: the coverage rule applies before executing.
@@ -1180,6 +1336,10 @@ impl Core {
                 return outcome;
             }
         }
+        if self.hold_for_lost_deps(now, rid, replica, out) {
+            // Held (`finish` leaves a held op alone).
+            return MutateOutcome::Held { retry_ms: 0 };
+        }
         self.execute_local(now, rid, epoch, replica, out)
     }
 
@@ -1314,15 +1474,23 @@ impl Core {
     /// (adopting it as this node's op): then an accepted reply this
     /// replica could not install as a shadow is answered at once.
     ///
-    /// Only for a reply evaluated at no delegation stream position
-    /// (`position.streams` empty): the root's stream carries its own
-    /// journal, not the delegate streams the op may have been evaluated
-    /// behind, so such a reply still waits for the log, which orders
-    /// both.
+    /// A delegate's reply too (its position names the delegation stream):
+    /// the root appends a generation's stream in index order, after the
+    /// `deps` of each transaction and after everything it had streamed to
+    /// the delegate, so the root's journal through the transaction
+    /// completing `rid` holds everything the delegate evaluated it
+    /// against — the delegate's own earlier transactions, root rows it
+    /// held only as streamed speculation, the log it had applied. The
+    /// pre-S3 stream installs that journal here contiguously from the
+    /// applied log, in order, so the op's effect sits exactly where the
+    /// log will put it. (A first version of this rule, with the root's
+    /// stream alone, failed `delegated-holder-cut` seed 1607: a takeover
+    /// re-shipped the predecessor's appends of delegate streams without
+    /// their origin and behind the successor's own delegate rows, so the
+    /// log's order differed from the journal's the stream had carried;
+    /// both are fixed in the takeover, see `apply_backup_tail` and
+    /// `Meta::strand_for_takeover`.)
     fn adopt_streamed(&mut self, rid: Rid, position: &Position, replica: &dyn Replica) -> bool {
-        if !position.streams.is_empty() {
-            return false;
-        }
         let Some(op) = self.clients.get(&rid).map(|c| c.op.clone()) else {
             return false;
         };
@@ -1334,6 +1502,9 @@ impl Core {
                     "accepted forward answered from the pre-S3 stream"
                 );
                 self.stats.awaited_log_streamed += 1;
+                if !position.streams.is_empty() {
+                    self.stats.awaited_log_streamed_deleg += 1;
+                }
                 true
             }
             Ok(false) => false,
@@ -1640,6 +1811,16 @@ impl Core {
         // Plan 30 §M11: the execution itself is parked (a recall, `deps`);
         // the parked continuation finishes it.
         if self.dl.pending_exec.contains(&rid) {
+            return;
+        }
+        // Held for a lost dependency (`hold_for_lost_deps`): its backoff
+        // timer drives it on.
+        if matches!(outcome, MutateOutcome::Held { .. })
+            && self
+                .clients
+                .get(&rid)
+                .is_some_and(|c| c.phase == Phase::Backoff && c.timer.is_some())
+        {
             return;
         }
         if let Some((wait, durable)) = self.rd.parked_local.remove(&rid) {

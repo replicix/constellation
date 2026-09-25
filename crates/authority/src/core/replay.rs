@@ -109,6 +109,9 @@ impl Core {
                     self.stats.speculation_rolled_back +=
                         (stranded.shadows + stranded.hints) as u64;
                     self.stats.local_rolled_back += stranded.locals as u64;
+                    if stranded.any() {
+                        replica.clear_streamed();
+                    }
                 }
             }
         }
@@ -481,6 +484,28 @@ impl Core {
                 .iter()
                 .any(|d| d.gen == queued.gen)
         {
+            self.stats.replays_held_for_stream += 1;
+            return Ok(());
+        }
+        // Plan 30 §M11: executed here, the replay bypasses the ownership
+        // every other path respects. An op on keys another node sequences
+        // (a live delegation) is left for the drain tick, whose submit
+        // routes it like any client op: to the delegate, or through the
+        // root's recall of the generation (long-delegated seed 73964: the
+        // successor's gate replayed a create in `d1` while `d1` was
+        // delegated to another node; the log put it ahead of that
+        // delegate's earlier, acknowledged unlink). The delegations this
+        // node holds itself are its own to execute (its stranded rows
+        // are in this very queue, in order).
+        let keys = super::holder::keys_of_op_in(&queued.op, replica);
+        let foreign_owner = match replica.resolve_ownership(&keys) {
+            constellation_meta::delegation::Ownership::Root => false,
+            constellation_meta::delegation::Ownership::Delegated(d) => d.node != self.cfg.node_id,
+            constellation_meta::delegation::Ownership::CrossSubtree { involved, .. } => {
+                involved.iter().any(|d| d.node != self.cfg.node_id)
+            }
+        };
+        if foreign_owner && completed_as_outcome(replica, queued.rid, 0).is_none() {
             self.stats.replays_held_for_stream += 1;
             return Ok(());
         }

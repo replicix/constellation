@@ -122,6 +122,9 @@ pub(crate) struct GenState {
     /// The root outwaits the delegate once its clock reaches this.
     pub until: Ms,
     pub recall: RecallPhase,
+    /// The phase a seal of the backup replaced: what an unanswered seal
+    /// goes back to.
+    pub recall_before_seal: RecallPhase,
     pub ended: bool,
     pub expiry: Option<TimerId>,
     pub recall_req: Option<OpId>,
@@ -473,6 +476,7 @@ impl Core {
                         cursor,
                         until: now.plus(self.reclaim_horizon_ms()),
                         recall: RecallPhase::None,
+                        recall_before_seal: RecallPhase::None,
                         ended: false,
                         expiry: None,
                         recall_req: None,
@@ -503,7 +507,15 @@ impl Core {
             if self.dl.epoch_active {
                 self.recall_all(now, out);
             }
-        } else if !self.dl.gens.is_empty() {
+        } else if !self.dl.gens.is_empty() && (self.lease.held.is_none() || self.lease.lost) {
+            // Only a lease that is gone ends this root's generations. One
+            // held but unusable for the moment (a renewal or a gate in
+            // flight, S3 away) keeps them, as `on_deleg_expiry` does: the
+            // state dropped there was never learned again while the lease
+            // stayed this node's, and with no generation known the root
+            // executed ops under a live delegation itself — beside the
+            // delegate (long-delegated seed 75808: an `EEXIST` evaluated
+            // on the root's replica, which lacked the delegate's rename).
             self.deleg_on_lease_gone(now, replica, out);
         }
         self.deleg_after_event(now, replica, out);
@@ -732,6 +744,47 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // A dependency its generation ended without (a tentative
+        // acknowledgement, replayed by rid after the end): executing now
+        // would put this op in the log ahead of its cause (`marker-order`,
+        // long-delegated seed 74189). Not a retry of an op already done.
+        if replica.deps_lost(&deps)
+            && replica.recent_outcome(rid).is_none()
+            && replica.completed_outcome(rid).ok().flatten().is_none()
+        {
+            if from == 0 {
+                if self.hold_for_lost_deps(now, rid, replica, out) {
+                    return;
+                }
+                let fresh = self.clients.get(&rid).map(|c| c.deps);
+                if let Some(fresh) = fresh.filter(|d| !replica.deps_lost(d)) {
+                    self.delegate_try_execute(now, 0, None, rid, op, fresh, 0, replica, out);
+                }
+                return;
+            }
+            self.stats.deps_lost_refused += 1;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                ?deps,
+                "an execution whose deps were lost with their generation is refused"
+            );
+            if let Some(req) = req {
+                out.push(Action::Send {
+                    to: from,
+                    msg: PeerMsg::MutateReply {
+                        req,
+                        outcome: MutateOutcome::Held {
+                            retry_ms: self.cfg.delegation_stream_tick_ms.max(10),
+                        },
+                        base: None,
+                        position: Position::ZERO,
+                        gen: 0,
+                    },
+                });
+            }
+            return;
+        }
         // chaos-soak-4 seed 42 (`wf293`): what this replica holds ahead of
         // its applied log (the root's pre-S3 stream, a shadow of its own)
         // is nowhere in the log the requester's `base` check reads, so
@@ -1137,6 +1190,10 @@ impl Core {
                 if tx.idx != cursor + 1 {
                     break;
                 }
+                if self.deps_from_a_newer_tenure(&tx.deps) {
+                    self.stats.deleg_append_newer_tenure += 1;
+                    break;
+                }
                 if !replica.reaches_streams(&tx.deps) {
                     self.stats.deleg_deps_unsatisfied_at_append += 1;
                     break;
@@ -1158,6 +1215,7 @@ impl Core {
             self.stats.deleg_sealed_drained += drained;
             if drained > 0 {
                 self.answer_awaiting_log(now, replica, out);
+                self.release_exec_parks_completed(now, replica, out);
                 self.nudge(now, out);
             }
             tracing::info!(
@@ -1211,11 +1269,17 @@ impl Core {
         // Phase 2b: a new root (a failover) gets every unretired
         // transaction again; it deduplicates by cursor and rid.
         let root = self.root_node();
+        let mut stale_reqs = Vec::new();
         for d in self.dl.mine.values_mut() {
             if d.last_root != root {
                 if d.last_root.is_some() && root.is_some() {
                     d.streamed_through = 0;
-                    d.inflight = None;
+                    // The old root's answer to the batch in flight must
+                    // not count for the new one (see
+                    // `on_delegate_stream_ack`).
+                    if let Some((req, _)) = d.inflight.take() {
+                        stale_reqs.push(req);
+                    }
                     d.refused = false;
                     d.stream_after = None;
                     d.stream_backoff_ms = 0;
@@ -1229,6 +1293,9 @@ impl Core {
                 }
                 d.last_root = root;
             }
+        }
+        for req in stale_reqs {
+            self.dl.by_req.remove(&req);
         }
         // Parked delegate ops.
         let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
@@ -1453,6 +1520,16 @@ impl Core {
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return;
         };
+        // Only the answer to the batch in flight counts: a late answer
+        // from a root this generation no longer streams to (it was paused,
+        // then deposed) would claim the new root holds rows it never got,
+        // and the stream would stop short of them for good (long-
+        // delegated-backup seed 75504: the old root's ack through 7
+        // arrived after the re-stream to its successor, whose cursor was
+        // 6; the delegate's last row never reached the log).
+        if d.inflight.map(|(r, _)| r) != Some(req) {
+            return;
+        }
         d.inflight = None;
         if refused {
             // The generation is ending, or the root has not learned it
@@ -1541,9 +1618,19 @@ impl Core {
             ReqKind::Seal => {
                 // Phase 2b: the backup did not answer the seal: the
                 // grant's expiry ends the generation without its tail.
+                // Back to the phase the seal replaced: a recall under way
+                // stays one, so no renewal revives the grant (long-
+                // delegated-backup seed 71251: the backup had crashed,
+                // the phase went back to `None`, the restarted delegate's
+                // renewals were granted again and again, and the root's
+                // own op parked on the recall waited past its deadline —
+                // `EIO` for a write the log carried).
                 if let Some(g) = self.dl.gens.get_mut(&gen) {
                     if g.recall == RecallPhase::Sealing {
-                        g.recall = RecallPhase::None;
+                        g.recall = match g.recall_before_seal {
+                            RecallPhase::Sealing => RecallPhase::None,
+                            before => before,
+                        };
                     }
                 }
                 self.arm_gen_expiry(now, gen, out);
@@ -1976,6 +2063,18 @@ impl Core {
         }
     }
 
+    /// A delegate transaction whose `deps` name a journal position of a
+    /// newer root tenure than this one: this root has been superseded
+    /// without knowing it yet (paused, cut off), and must not append it —
+    /// its replica would hold the transaction without its cause (long-
+    /// delegated-backup seed 74035: a deposed root drained a sealed
+    /// backup's marker whose data only its successor had; the rows strand
+    /// at the deposition, but the replica showed the marker meanwhile).
+    pub(crate) fn deps_from_a_newer_tenure(&self, deps: &Position) -> bool {
+        deps.pending
+            .is_some_and(|p| self.lease.epoch().is_none_or(|mine| p.epoch > mine))
+    }
+
     /// Phase 2b: after a cross-subtree op executed, the generations it
     /// ended are granted again to their nodes (a new generation each).
     pub(crate) fn deleg_redelegate_after_cross(
@@ -2155,6 +2254,7 @@ impl Core {
             let req = self.op_id();
             let g = self.dl.gens.get_mut(&gen).expect("present");
             g.seal_attempts = 1;
+            g.recall_before_seal = g.recall;
             g.recall = RecallPhase::Sealing;
             g.until = now.plus(self.cfg.forward_timeout_ms * 2);
             self.dl.by_req.insert(req, (gen, ReqKind::Seal));
@@ -2268,6 +2368,37 @@ impl Core {
             return;
         }
         replica.void_stream(gen, cursor);
+        // This root was the generation's delegate (inherited at a
+        // takeover): its own rows past the cursor stay in its journal and
+        // ship after the `Recall`, so they are not lost.
+        let own = self.dl.mine.contains_key(&gen);
+        replica.note_void_cut(
+            gen,
+            if own {
+                cursor.max(replica.stream_applied(gen))
+            } else {
+                cursor
+            },
+        );
+        // What this root holds of the generation's replies (its own
+        // forwarded ops' shadows and hints) is stranded like on any
+        // other replica applying the `Recall` (long-delegated seed 72780).
+        match replica.strand_recalled_speculation(gen) {
+            Ok(s) if s.any() => {
+                tracing::info!(
+                    node = self.me(),
+                    gen,
+                    shadows = s.shadows,
+                    hints = s.hints,
+                    "the root's own speculation of an ended generation stranded; replaying"
+                );
+                self.stats.speculation_rolled_back += (s.shadows + s.hints) as u64;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(node = self.me(), gen, %error, "could not strand the root's speculation of an ended generation");
+            }
+        }
         self.lease.touch(now);
         self.nudge(now, out);
         // Plan 30 §M14: grants handed to this generation and not handed
@@ -2369,6 +2500,10 @@ impl Core {
             // waited for these before executing, so they are in the log
             // (and in this journal) already. Not so: refuse the batch
             // and count it; the delegate re-sends after a tick.
+            if self.deps_from_a_newer_tenure(&tx.deps) {
+                self.stats.deleg_append_newer_tenure += 1;
+                break;
+            }
             if !replica.reaches_streams(&tx.deps) {
                 self.stats.deleg_deps_unsatisfied_at_append += 1;
                 tracing::debug!(
@@ -2406,8 +2541,10 @@ impl Core {
         if appended > 0 {
             self.stats.deleg_appended_txs += appended;
             // The root's own ops forwarded to this delegate may await
-            // the log for exactly these completions.
+            // the log for exactly these completions, or be parked on a
+            // recall of it.
             self.answer_awaiting_log(now, replica, out);
+            self.release_exec_parks_completed(now, replica, out);
             self.lease.touch(now);
             self.nudge(now, out);
         }
@@ -2574,6 +2711,7 @@ impl Core {
                 cursor: 0,
                 until: now.plus(self.reclaim_horizon_ms()),
                 recall: RecallPhase::None,
+                recall_before_seal: RecallPhase::None,
                 ended: false,
                 expiry: None,
                 recall_req: None,

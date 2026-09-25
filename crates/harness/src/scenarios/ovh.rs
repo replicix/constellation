@@ -12,6 +12,11 @@
 //!   a shared directory, and the per-entry syscalls `tar` issues
 //!   (mkdir, symlink, link, chmod, chown, utimensat), cost no S3 round
 //!   trip — they are forwarded to the sequencer over P2P.
+//! - `delegated-op-latency`: the same with the shared directory delegated
+//!   to one node (what placement does for a dominant writer): the other
+//!   nodes' ops go to that delegate, and a reply it evaluated behind its
+//!   own unappended rows is answered from the root's pre-S3 stream of
+//!   its append, not from the log.
 
 use super::m11::{delegate, s3_breakdown, wait_installed};
 use super::m8::dist;
@@ -486,7 +491,26 @@ fn p50(mut v: Vec<Duration>) -> Duration {
 /// close of a file whose chunk S3 does not have yet: the sequencer's
 /// own waits the same).
 pub fn nonowner_op_latency(_seed: u64) -> Result<()> {
-    const NAME: &str = "nonowner-op-latency";
+    op_latency("nonowner-op-latency", false)
+}
+
+/// [`nonowner_op_latency`] with `shared` delegated to `b` (a manual
+/// delegation; placement off, so nothing recalls it): `c`, `d` and the
+/// root `a` forward to `b`. A non-owner's close after its create (and a
+/// `chmod`/`utimensat` after its close) finds the delegate's own
+/// transaction for the file still unappended, so the reply names no base
+/// and the requester waits for that transaction: before, until the
+/// root's segment came back from S3 (one S3 round trip per such op, the
+/// cost placement put on every other writer of a directory it had given
+/// to a dominant one); now until the root's pre-S3 stream installs the
+/// root's append of it (the root has a backup on the LAN). Also checks
+/// that the delegation stayed `b`'s, and that the other nodes' waits
+/// were answered from the stream (`awaited_log_streamed_deleg`).
+pub fn delegated_op_latency(_seed: u64) -> Result<()> {
+    op_latency("delegated-op-latency", true)
+}
+
+fn op_latency(name: &'static str, delegated: bool) -> Result<()> {
     let lat = knob("NONOWNER_LAT_MS", 100);
     let count = knob("NONOWNER_OPS", 12) as usize;
     // The root stays the directory's only sequencer: with placement on
@@ -495,7 +519,7 @@ pub fn nonowner_op_latency(_seed: u64) -> Result<()> {
     // a different path (see PROGRESS.md: a delegate's replies behind its
     // own unshipped rows still wait for the log).
     let (env, _root, mut clients, proxies) = cluster(
-        NAME,
+        name,
         &["a", "b", "c", "d"],
         &[("CONSTELLATION_DELEGATION_PLACEMENT", "off")],
         4,
@@ -509,6 +533,24 @@ pub fn nonowner_op_latency(_seed: u64) -> Result<()> {
                 Ok(())
             })?;
         }
+        let deleg_gen = if delegated {
+            let b = &clients[1];
+            delegate(a, "/shared", node_id(b)?)?;
+            let gen = wait_installed(b, "/shared", Duration::from_secs(30))?;
+            // The delegate acknowledges under a backup of its own.
+            eventually("b chose a backup", Duration::from_secs(30), || {
+                let d = b.control_status()?["delegation"].clone();
+                anyhow::ensure!(
+                    d["backups"].as_array().is_some_and(|v| !v.is_empty()),
+                    "b has no backup yet: {d}"
+                );
+                Ok(())
+            })?;
+            eprintln!("    {name}: /shared delegated to b (gen {gen})");
+            Some(gen)
+        } else {
+            None
+        };
         // Warm-up: forwarding paths up (P2P connections made).
         for x in &clients {
             for i in 0..3 {
@@ -521,11 +563,11 @@ pub fn nonowner_op_latency(_seed: u64) -> Result<()> {
         // after the mount — an acknowledgement waits for the log, by
         // design: `durable_jseq`.)
         let backups = super::m9::wait_for_backup(a, Duration::from_secs(60))?;
-        eprintln!("    {NAME}: a's backups {backups:?}");
+        eprintln!("    {name}: a's backups {backups:?}");
         std::thread::sleep(Duration::from_secs(1));
         env.existing_s3_proxy().latency(lat, 0)?;
         let rtt = Duration::from_millis(2 * lat);
-        eprintln!("    {NAME}: S3 latency injected: every request >= {rtt:?}");
+        eprintln!("    {name}: S3 latency injected: every request >= {rtt:?}");
         let mut failures = Vec::new();
         let mut table = Vec::new();
         // Debugging knobs: `NONOWNER_ONLY=Chmod,Link` and
@@ -536,7 +578,11 @@ pub fn nonowner_op_latency(_seed: u64) -> Result<()> {
             if !nodes.is_empty() && !nodes.split(',').any(|n| n == x.name) {
                 continue;
             }
-            let owner = lease_of(x)?["held"] == true;
+            let owner = if delegated {
+                k == 1
+            } else {
+                lease_of(x)?["held"] == true
+            };
             let payload = vec![b'a' + k as u8; 4096];
             let dir = x.mnt.join("shared");
             for op in OPS {
@@ -580,30 +626,49 @@ pub fn nonowner_op_latency(_seed: u64) -> Result<()> {
             }
         }
         for row in &table {
-            eprintln!("    {NAME}: {row}");
+            eprintln!("    {name}: {row}");
         }
+        let mut deleg_streamed = 0u64;
         for x in &clients {
             let s = x.control_status()?;
             eprintln!(
-                "    {NAME}: {}: inbox ops {}, lease held {}, write mode {}, forwards that \
-                 waited for their transaction {} (answered from the pre-S3 stream {}); streamed \
-                 transactions installed {} dropped {}",
+                "    {name}: {}: inbox ops {}, lease held {}, write mode {}, forwards that \
+                 waited for their transaction {} (answered from the pre-S3 stream {}, a \
+                 delegate's {}); streamed transactions installed {} dropped {}",
                 x.name,
                 s["inbox"]["submitted_ops"],
                 s["lease"]["held"],
                 s["writeback"]["mode"],
                 s["ack"]["awaited_log"],
                 s["ack"]["awaited_log_streamed"],
+                s["ack"]["awaited_log_streamed_deleg"],
                 s["ack"]["streamed_installed"],
                 s["ack"]["streamed_dropped"]
             );
+            deleg_streamed += s["ack"]["awaited_log_streamed_deleg"].as_u64().unwrap_or(0);
         }
         env.existing_s3_proxy().remove_all_toxics()?;
-        anyhow::ensure!(failures.is_empty(), "{NAME}: {failures:#?}");
+        if let Some(gen) = deleg_gen {
+            // The run measured the delegated path throughout.
+            let b = &clients[1];
+            let d = b.control_status()?["delegation"].clone();
+            let table = d["table"].as_array().cloned().unwrap_or_default();
+            anyhow::ensure!(
+                table
+                    .iter()
+                    .any(|e| e["path"] == "/shared" && e["gen"].as_u64() == Some(gen)),
+                "{name}: /shared is no longer b's gen {gen}: {d}"
+            );
+            anyhow::ensure!(
+                deleg_streamed > 0,
+                "{name}: no delegate reply was answered from the root's pre-S3 stream"
+            );
+        }
+        anyhow::ensure!(failures.is_empty(), "{name}: {failures:#?}");
         Ok(())
     })();
     if result.is_err() {
-        keep_logs(NAME, &clients);
+        keep_logs(name, &clients);
     }
     for c in clients.iter_mut().rev() {
         let _ = c.unmount();

@@ -422,6 +422,7 @@ mod tests {
                 size: 4096,
                 time_ns: 0,
             }],
+            origin: (0, 0),
         };
         let txs = vec![tx(&[a]), tx(&[b]), tx(&[a])];
         assert_eq!(

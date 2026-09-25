@@ -120,6 +120,24 @@ pub trait Replica {
     /// Roll back every speculative entry accepted below `epoch` and
     /// queue its op for replay.
     fn strand_below_epoch(&self, epoch: Epoch) -> Result<Stranded, MetaError>;
+    /// The takeover gate's strand: [`Self::strand_below_epoch`] plus this
+    /// node's own transactions as the delegate of `own_gens`
+    /// (`Meta::strand_for_takeover`).
+    fn strand_for_takeover(&self, epoch: Epoch, own_gens: &[u64]) -> Result<Stranded, MetaError>;
+    /// The pre-S3 stream installed the holder's journal through `pos`
+    /// (`SessionState::note_streamed`).
+    fn note_streamed(&self, pos: JournalPos);
+    /// Streamed speculation may have been rolled back
+    /// (`SessionState::clear_streamed`).
+    fn clear_streamed(&self);
+    /// The root ended `gen` itself: strand its own shadows and hints of
+    /// it (`Meta::strand_recalled_speculation`).
+    fn strand_recalled_speculation(&self, gen: u64) -> Result<Stranded, MetaError>;
+    /// Whether `deps` names a transaction of a generation that ended below
+    /// it (`SessionState::deps_lost`).
+    fn deps_lost(&self, deps: &Position) -> bool;
+    /// The log's cut of voided generation `gen` (`SessionState::note_void_cut`).
+    fn note_void_cut(&self, gen: u64, cut: u64);
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError>;
     fn forget_replay(&self, queue_seq: u64) -> Result<(), MetaError>;
     fn mark_replay_refused(&self, queue_seq: u64, reason: String) -> Result<(), MetaError>;
@@ -355,6 +373,15 @@ pub trait Replica {
         records: &[LogRecord],
         rid: Option<Rid>,
     ) -> Result<(), MetaError>;
+    /// [`Self::apply_records_journaled`] for a predecessor's backed-up
+    /// transaction, under its delegation origin `(gen, idx)` (plan 30
+    /// §M9 × §M11; `(0, 0)`: the predecessor's own row).
+    fn apply_backup_tx_journaled(
+        &self,
+        records: &[LogRecord],
+        rid: Option<Rid>,
+        origin: (u64, u64),
+    ) -> Result<(), MetaError>;
     /// Install a streamed transaction ahead of the log
     /// (`SpecKind::Streamed`).
     fn install_streamed(
@@ -519,6 +546,30 @@ impl Replica for Meta {
         Meta::strand_below_epoch(self, epoch)
     }
 
+    fn strand_for_takeover(&self, epoch: Epoch, own_gens: &[u64]) -> Result<Stranded, MetaError> {
+        Meta::strand_for_takeover(self, epoch, own_gens)
+    }
+
+    fn strand_recalled_speculation(&self, gen: u64) -> Result<Stranded, MetaError> {
+        Meta::strand_recalled_speculation(self, gen)
+    }
+
+    fn deps_lost(&self, deps: &Position) -> bool {
+        self.session().deps_lost(deps)
+    }
+
+    fn note_void_cut(&self, gen: u64, cut: u64) {
+        self.session().note_void_cut(gen, cut)
+    }
+
+    fn note_streamed(&self, pos: JournalPos) {
+        self.session().note_streamed(pos)
+    }
+
+    fn clear_streamed(&self) {
+        self.session().clear_streamed()
+    }
+
     fn pending_replays(&self) -> Result<Vec<StrandedOp>, MetaError> {
         Meta::pending_replays(self)
     }
@@ -598,11 +649,20 @@ impl Replica for Meta {
         // holds of it now: everything appended is before the record).
         for (gen, idx) in origins {
             self.session().note_stream(*gen, *idx);
+            // A row of a voided generation the log carries after all is
+            // not lost (see `note_void_cut`).
+            if *gen != 0 && self.session().is_voided(*gen) {
+                self.session().note_void_cut(*gen, *idx);
+            }
         }
         for rec in records {
             if let LogRecord::Recall { gen, .. } = rec {
                 let cut = self.session().stream_applied(*gen);
                 self.session().void_stream(*gen, cut);
+                // What the log holds of it (a delegate's own unappended
+                // rows are not): a dependency past this is lost.
+                self.session()
+                    .note_void_cut(*gen, Meta::log_stream_idx(self, *gen).unwrap_or(0));
                 // Phase 2b: the read delegations its delegate granted,
                 // and the tail its backup held, are over.
                 self.read_delegations()
@@ -940,6 +1000,19 @@ impl Replica for Meta {
         // uploads (`Meta::apply_adopted_records`); the other callers
         // (`Delegate`/`Recall` records) name no chunk.
         Meta::apply_adopted_records(self, records, rid)
+    }
+
+    fn apply_backup_tx_journaled(
+        &self,
+        records: &[LogRecord],
+        rid: Option<Rid>,
+        origin: (u64, u64),
+    ) -> Result<(), MetaError> {
+        Meta::apply_adopted_records_from(self, records, rid, origin)?;
+        if origin.0 != 0 {
+            self.session().note_stream(origin.0, origin.1);
+        }
+        Ok(())
     }
 
     fn install_streamed(

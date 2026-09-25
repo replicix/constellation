@@ -215,7 +215,9 @@ fn ls_stat_cat(dir: &Path, name: &str, content: &[u8], who: &str) -> Result<()> 
 /// 2. *shipping* — the hold lifted: the same with content (`echo x > a`).
 /// 3. *holder* — the same on A, the holder, whose acknowledgements wait
 ///    for B's backup ack: its own reads never find a row of its own that
-///    is not durable yet (the close's manifest commit included).
+///    is not durable yet (the close's manifest commit included). In a
+///    subdirectory, out of reach of desktop mount watchers (see the
+///    phase).
 ///
 /// A's placement is off, and the scenario checks that A held the lease
 /// under the same epoch, with B as its backup, from start to end: B's
@@ -304,15 +306,6 @@ pub fn session_forwarded_ryw(_seed: u64) -> Result<()> {
         let forwarded =
             b.control_status()?["forwarded_ok"].as_u64().unwrap_or(0) - forwarded_before;
         eprintln!("    {NAME}: B forwarded {forwarded} ops to A");
-        if std::env::var_os("HARNESS_KEEP_LOGS").is_some() {
-            let dir = std::path::Path::new("/tmp/harness-m11-logs");
-            let _ = std::fs::create_dir_all(dir);
-            for c in [&a, &b] {
-                let path = dir.join(format!("{NAME}-{}.log", c.name));
-                let _ = std::fs::write(&path, c.tail_log_n(400_000));
-                eprintln!("    {NAME}: {}'s log kept at {}", c.name, path.display());
-            }
-        }
         anyhow::ensure!(
             n(&after_b, "reads") > n(&before_b, "reads") + 50,
             "B's reads did not go through the session check: {after_b}"
@@ -327,15 +320,27 @@ pub fn session_forwarded_ryw(_seed: u64) -> Result<()> {
              raise nothing): {after_b}"
         );
 
-        // Phase 3: the holder's own writes under the backup policy.
+        // Phase 3: the holder's own writes under the backup policy, in a
+        // directory of their own. Not the mount's top directory: a desktop
+        // session's `gvfsd-trash` watches every mount's top directory for
+        // a trash directory to appear and stats each entry created there —
+        // a GETATTR of the file *while its close is still waiting for the
+        // backup*, which rightly waits (the row is not durable yet) and
+        // was counted here as this scenario's read (1 run in ~15 on a
+        // GNOME host: `reads durability-blocked 0 -> 6`, every blocked
+        // read from pid `gvfsd-trash`, every close returned with its row
+        // durable). The assertion is about reads issued after the
+        // acknowledgement, which only this process makes here.
+        let dir = a.mnt.join("holder");
+        std::fs::create_dir(&dir).context("A's mkdir holder")?;
         let before_a = session_of(&a)?;
         let before_ack = ack_of(&a)?;
         let started = Instant::now();
         for i in 0..25 {
             let name = format!("holder-{i}");
-            std::fs::write(a.mnt.join(&name), name.as_bytes())
+            std::fs::write(dir.join(&name), name.as_bytes())
                 .with_context(|| format!("A's create of {name}"))?;
-            ls_stat_cat(&a.mnt, &name, name.as_bytes(), "A")?;
+            ls_stat_cat(&dir, &name, name.as_bytes(), "A")?;
         }
         eprintln!(
             "    {NAME}: phase holder: 25 creates on A in {:?}",
@@ -365,6 +370,16 @@ pub fn session_forwarded_ryw(_seed: u64) -> Result<()> {
         );
         Ok(())
     })();
+    // Kept at the end, so a failure in any phase has its logs.
+    if std::env::var_os("HARNESS_KEEP_LOGS").is_some() {
+        let dir = std::path::Path::new("/tmp/harness-m11-logs");
+        let _ = std::fs::create_dir_all(dir);
+        for c in [&a, &b] {
+            let path = dir.join(format!("{NAME}-{}.log", c.name));
+            let _ = std::fs::write(&path, c.tail_log_n(400_000));
+            eprintln!("    {NAME}: {}'s log kept at {}", c.name, path.display());
+        }
+    }
     let _ = std::fs::remove_file(&hold);
     b.unmount()?;
     a.unmount()?;
@@ -383,6 +398,13 @@ pub fn session_forwarded_ryw(_seed: u64) -> Result<()> {
 /// must return at once and succeed. Before the fix it waited for a log
 /// that would never carry the op and returned `EIO` at the 120 s client
 /// deadline, for a write that had landed.
+///
+/// The pre-S3 stream is off (`CONSTELLATION_PRE_S3_STREAMING=0`): since
+/// edd3d5d it answers exactly this wait (A streams the backup-acknowledged
+/// manifest commit to B ahead of S3), so the close returned in ~6 ms and
+/// the precondition — a forwarded close waiting for the log — no longer
+/// held. The backup stays (B's seal-based takeover of A is what the
+/// scenario checks; with no backup in budget it would be a TTL takeover).
 pub fn takeover_resolves_awaiting_close(_seed: u64) -> Result<()> {
     use std::io::Write;
     use std::os::fd::IntoRawFd;
@@ -391,7 +413,10 @@ pub fn takeover_resolves_awaiting_close(_seed: u64) -> Result<()> {
     let hold = tmp.path().join("hold-a");
     let (_env, _root, mut a, mut b) = two_nodes(
         NAME,
-        &[("CONSTELLATION_LEASE_PLACEMENT", "off")],
+        &[
+            ("CONSTELLATION_LEASE_PLACEMENT", "off"),
+            ("CONSTELLATION_PRE_S3_STREAMING", "0"),
+        ],
         Some(&hold),
     )?;
     let mut paused = false;

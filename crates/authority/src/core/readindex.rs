@@ -763,6 +763,40 @@ impl Core {
         self.deleg_redelegate_after_cross(now, replica, out);
     }
 
+    /// The root just appended delegate transactions: a local op of this
+    /// node parked on a recall whose rid they complete (it was forwarded
+    /// to the delegate before this node became the root, or before the
+    /// recall began) has its outcome in the journal now. Its park is made
+    /// ready, and `complete_ready` answers it from the completion (with
+    /// the durability wait an acknowledgement needs) instead of letting
+    /// it wait for the recall — which a delegate that is gone ends only
+    /// at its grant's horizon, past the client's deadline: `EIO` for a
+    /// write the log carried (long-delegated seed 79725).
+    pub(crate) fn release_exec_parks_completed(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let mut any = false;
+        for p in self.rd.parked.values_mut() {
+            if let ParkedWhat::ExecuteLocal { rid } = p.what {
+                let in_doubt = self
+                    .clients
+                    .get(&rid)
+                    .is_some_and(|c| c.forwarded || c.attempts > 0);
+                if in_doubt && replica.completed_position(rid).ok().flatten().is_some() {
+                    p.waiting.clear();
+                    p.deps = None;
+                    any = true;
+                }
+            }
+        }
+        if any {
+            self.complete_ready(now, replica, out);
+        }
+    }
+
     /// Phase 2b: whether any parked continuation still waits on the
     /// recall of generation `gen`.
     pub(crate) fn rd_has_recall_wait(&self, gen: u64) -> bool {

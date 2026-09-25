@@ -23351,3 +23351,409 @@ afterwards; `list-object-versions --prefix s3fs/lag-` is empty.
   (output not captured) and round 3's identical symptom are consistent
   with it. The OVH coverage gaps it caused (create race, lock recovery,
   lock fence, Part C/D) are untested rather than failing.
+
+## Fix: delegation safety seeds, 70162, delegate pre-S3 replies, session-forwarded-ryw
+
+(coder, 2026-09-25; uncommitted on `fix-delegation-safety` = main
+379a00d, rebased from edd3d5d through 9e3f8e2 and 381c66d.)
+
+New ignored sweep `sweep_config` in `crates/authority/tests/sim.rs`:
+`AUTHORITY_SIM_CONFIG` (`delegated-holder-cut` by default,
+`long-delegated`, `long-delegated-backup`, `long-backup`,
+`delegated-backup`, `placement-hot`, `backup-hot`),
+`AUTHORITY_SIM_START`, `AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_THREADS`
+(parallel seeds; prints every failing seed and the stream-answer
+counters). New config `long-delegated-backup` = `long-delegated` with a
+backup in budget for the root and every delegate (replay alias
+`long-delegated-backup`).
+
+### 1. `delegated-holder-cut` outside the CI range
+
+**Sweep on main** (edd3d5d, then 9e3f8e2): 1528 of seeds 0..20000
+failed — 1200 "did not reach quiescence", the rest history violations
+(`took effect in the log but the spec refuses it`, `returned … but no
+state in its window`), every one in the directory delegated to node 3 or
+node 2. The config: three nodes, `d1` delegated to 2, `d2` to 3, the root
+(1) cut from S3 and killed; its backup (always one of the delegates, the
+only peers) seals and takes over. Two product bugs, both in the takeover
+of a root by a node that is also a delegate:
+
+- **A. The re-shipped tail lost the delegation origin.** `BackupTx` had
+  no origin, so `apply_backup_tail` re-journaled the predecessor's
+  appends of delegate streams as the successor's own rows (`(0, 0)` in
+  the segment's `origins`). Consequences: the delegate never retired its
+  rows (nothing in the log named them) — the 1200 quiescence failures
+  (seed 2); every later segment's insert-before-`Local` redo re-applied
+  those stale rows on top of newer state — seed 1719: the delegate's
+  `unlink d2/f0` (gen 6 idx 2) was redone after the re-create of
+  `d2/f0`, the next `unlink` answered `ENOENT`; the successor's
+  inherited cursor (`log_stream_idx`) also missed them.
+  **Fix:** `BackupTx::origin` (`(gen, idx)`, filled by
+  `journal_txs_from` from `journal_tx`), and the takeover re-journals
+  each tail transaction under it (`Replica::apply_backup_tx_journaled` →
+  `Meta::apply_adopted_records_from`: `PendingDelegate` + `note_log_idx`
+  + the session's stream index).
+- **B. The successor's own delegate rows overtook the tail.** The new
+  root's own unappended transactions as a delegate sat in its journal at
+  lower journal seqs than the tail it re-applied, so they shipped first
+  — seed 772: a create in `d1` (gen 6) shipped ahead of the tail's
+  `Recall(g4)` + rename of the same name out of `d1` and the `Delegate`
+  that granted gen 6. **Fix:** `Meta::strand_for_takeover(epoch,
+  own_gens)` — the takeover gate (only when a predecessor tail is to be
+  re-applied, and once: a later pass of the gate must not strand the
+  tail's re-journaled rows) also strands this node's `Local` rows of the
+  generations it holds as delegate (`dl.mine`). The tail then
+  re-journals the appended ones in their place (completing their rids)
+  and the queued replay re-executes the rest by rid after it, in order.
+  The fast path can journal such rows after the lease is acquired (epoch
+  set), so the selection is by generation, not by `epoch == 0` (seed 5).
+
+After A+B: **0 of 0..40000**. Representative seeds pinned in
+`regression_delegated_holder_cut_takeover_keeps_delegate_rows_in_log_order`
+(2, 22, 330, 1719: A; 772, 1039: B, with a non-vacuity check that the
+strand ran). With A alone, 2 of 4000 still failed (772, 1039).
+
+### 2. `long_delegated` seed 70162 (and the same family)
+
+**Nondeterminism.** Two runs of one seed diverged first where the root
+recalled two generations in a different order (`Recall(g1), Recall(g2)`
+vs the reverse): `DelegationTable::resolve` walked `TouchSet`'s
+`HashSet`s, whose order is per-process random, and the root recalled in
+that order. I sorted the owners by generation; meanwhile the locks
+coder's 381c66d made `TouchSet` `BTreeSet`s (the same effect), which I
+took instead. With it, debug logs of six seeds (long-delegated 70162,
+70705, 70011; delegated-holder-cut 1719; long-backup 50412, 50001) are
+byte-identical across 4 runs each.
+
+**70162's bug** (from a failing hash-order run: node 2 did not converge,
+`d1/f1` pointing at the inode a later create made): **a delegate's
+reply `base` below its own floor.** 9e3f8e2 raises `shipped_floor` to
+the applied seq when a grant is installed, but `reply_base` returned an
+*older* window entry that touched the keys (seq 46) whenever one
+existed, ignoring the floor. The segment that renamed `d2/f1` away and
+granted the new generation (75) was applied between two generations, so
+it was not in the window; the create of `d2/f1` answered base 46, and
+the requester installed it under the rename it had not applied yet.
+**Fix** (`holder.rs`): `base = max(touched, shipped_floor)` (for a root
+the floor is below every window entry: unchanged). With hash-order
+`TouchSet` (to reproduce): 5 of 100 runs failed without the fix, 0 of
+100 with it; deterministic now.
+
+Sweeping `long-delegated` 70000..80000 then found (main: 13 of 10000
+fail):
+- **70705** — the successor's takeover gate opened in a later round
+  (its marker PUT answered 500 after landing), and nothing learned the
+  predecessor's live generations (`delegation_sync` ran only in
+  `finish_acquire`, which saw the gate closed): the delegate's stream was
+  refused forever, its acknowledged create never reached the log. Fix
+  (`jobs.rs` `round_gate`): `delegation_sync` when the gate opens there.
+- **72780** — the root ended a generation itself (`end_generation`
+  journals the `Recall`; the segment path's recall strand never runs on
+  the root) and kept its own shadow of a create the partitioned delegate
+  never streamed; its next op, `unlink` of that name, took effect where
+  the log never had it. Fix: `Meta::strand_recalled_speculation(gen)`
+  (shadows and hints of `gen` only; the root's appended `Local` rows of
+  it are the delegate's stream, before the `Recall`), called in
+  `end_generation`.
+- **73964, 79490** — the takeover gate's local replay
+  (`replay_locally`, `replica.execute` directly) ignored ownership and
+  executed a stranded op in a directory delegated to another node, ahead
+  of that delegate's earlier acknowledged op. Fix (`replay.rs`): an op on
+  keys another node sequences is left for the drain tick, whose `submit`
+  routes it like any client op.
+- **75808** — a root whose lease was held but momentarily unusable
+  (acquisition/gate in flight after S3 came back) ran `delegation_sync`,
+  which dropped all its generations (`deleg_on_lease_gone`) and never
+  learned them again; with `dl.gens` empty the recall plan is `None`, so
+  it executed ops under a live delegation beside the delegate (an
+  `EEXIST` from a replica without the delegate's rename). Fix
+  (`delegate.rs`): only a lease that is gone (not held, or lost) drops
+  the generations, as `on_deleg_expiry` already assumed.
+- **79725** — the root's own op, forwarded to a delegate before the
+  root took over, then parked on the recall of that delegate
+  (`ExecuteLocal`), went `EIO` at its deadline although the delegate's
+  re-stream had appended its completion. Fix
+  (`readindex.rs` `release_exec_parks_completed`, called after appends
+  in `on_delegate_stream` and the sealed drain): an in-doubt parked op
+  whose rid is now complete is made ready and answered from the
+  completion (with the durability wait an acknowledgement needs).
+- **79689** — a checker artifact: a node's restart replaced its sim
+  `NodeShared`, losing the set of rids it had seen rolled back, so a
+  delegate's tentative (stranded, then conflict-copied) acknowledgement
+  was checked as durable. Fix (`tests/sim/run.rs` `restart`): the set
+  carries over.
+- **74189, 76967** — *not fixed*: see "Open" below.
+
+After these: `long-delegated` 70000..80000 2 of 10000 (74189, 76967).
+Pinned: `regression_long_delegated_seeds` (70162, 70705, 72780, 73964,
+75808, 79725, 79689).
+
+`long-delegated-backup` 70000..80000 (main: 33 of 10000) found, besides
+the above:
+- **71251** — an unanswered seal of a crashed delegate's backup set the
+  generation's recall phase back to `None`, so the restarted delegate's
+  renewals were granted again and again; the root's op parked on the
+  recall ended `EIO`. Fix: `GenState::recall_before_seal`; an
+  unanswered seal goes back to the phase it replaced.
+- **71792** — a deposed root's stranded `Delegate` record (journaled
+  after its successor took over) was replayed by rid as plain records
+  through the successor: a grant *to the successor itself* that no one
+  tracked or ended; every op of the successor under it parked on a recall
+  that never came. Fix (`spec.rs` `derive_replay_op`): `Delegate` and
+  `Recall` are a tenure's own decisions, never replayed.
+- **75504** — a paused, then deposed root's late stream acknowledgement
+  (`through 7`) arrived after the delegate re-streamed to the successor
+  (cursor 6); the delegate took it as the successor's and never sent its
+  last transaction. Fix (`delegate.rs`): the re-stream drops the old
+  in-flight request, and `on_delegate_stream_ack` counts only the answer
+  to the batch in flight.
+- **78172** — a `Recall` the pre-S3 stream had installed first was
+  among the streamed rows its segment skipped, and the recall strand
+  read only the unskipped records: a requester's shadow of the recalled
+  generation never stranded (never quiescent). Fix
+  (`spec.rs` `apply_segment_rows`): the recalled set from all records.
+- **locks-released-delegated 198670** (reported by the coordinator) — a
+  delegate's reply arrived just after the requester's own takeover;
+  `install_shadow_from` queued it for replay *without its generation*, so
+  the gate executed it at once, ahead of the delegate's earlier op. Fix:
+  the queued replay keeps `gen` (held while the generation lives, as a
+  stranded shadow is). Pinned in
+  `regression_locks_released_delegated_seed_198670`.
+
+After: `long-delegated-backup` 70000..80000 1 of 10000 (77901, the same
+open class). Pinned: `regression_long_delegated_backup_seeds` (71251,
+71792, 75504, 78172).
+
+**Marker order under a tentative acknowledgement** (74189, 76967,
+77901; all three failed the same on main 379a00d; fixed in round 2,
+see below).
+
+### 3. A delegate's replies answered ahead of S3
+
+Two changes; neither adds a speculation kind.
+
+- **The root's pre-S3 stream answers a delegate's reply.** edd3d5d
+  answered a waiting forward from the root's stream only when the
+  reply named no delegation stream. The root appends a generation's
+  stream in index order, after each transaction's `deps` and after
+  everything it streamed to the delegate, so the root's journal through
+  the append of `rid`'s transaction holds everything the delegate
+  evaluated it against; the stream installs that journal contiguously
+  from the applied log. The restriction was dropped (`client.rs`
+  `adopt_streamed`). The first attempt at this (edd3d5d's note) failed
+  `delegated-holder-cut` 1607; that failure was item 1's takeover order
+  (the journal the stream carried and the log differed after a
+  takeover), fixed above. Counter `ack.awaited_log_streamed_deleg`.
+- **A dependency on the root's journal is reached through the stream.**
+  With the above, `c`/`d` were fast but the root itself still paid an
+  S3 round trip per op into the delegated directory: its forward's
+  `deps.pending` named its own journal position (the append of the
+  delegate's previous transaction), and the delegate parked it until the
+  root's segment arrived. The session now keeps a `streamed` watermark
+  (`SessionState::note_streamed`, from `on_stream_ahead` for every
+  installed transaction or hole) and `reaches` compares `pending` with
+  `max(applied, streamed)`. It is cleared wherever streamed speculation
+  may be rolled back: a segment of a newer epoch or one that stranded
+  anything, the takeover gate, a deposition, the drain tick's strand.
+  The `owed` (TailFollows) rule is unchanged. Unit test
+  `the_streamed_watermark_reaches_a_journal_dependency_until_cleared`.
+
+The M5 stale-base rule is untouched: a reply is still installed as a
+shadow only on a replica that has its base; otherwise it waits for its
+own transaction — now from the root's stream. The previous coder's
+unsound variant (stacking a node's reply on its own earlier shadows) is
+not used: no reply is installed on top of another.
+
+**Sim.** New `a_delegate_reply_is_answered_from_the_root_pre_s3_stream`
+(`delegated-backup` 70000..70010; fails with the old restriction: zero
+such answers). In the sweeps (all pass apart from the open marker
+class): `delegated-holder-cut` 0..20000 answered 38187 waits from the
+stream (31337 of them a delegate's), `long-delegated-backup`
+70000..80000 17454 (15903), `delegated-backup` 0..3000 8027 (7820),
+`placement-hot` 90000..93000 27981 (3507). `holder_cut_crash_config`
+now gives each client 12 ops (was 8): in seed 1513 the other nodes had
+finished all their work before the holder died once their forwards were
+answered sooner, so the failover (measured to the next answered op) was
+the restarted holder's 9 s.
+
+**Harness.** New scenario `delegated-op-latency`
+(`crates/harness/src/scenarios/ovh.rs`, `op_latency` shared with
+`nonowner-op-latency`): `/shared` delegated to `b` (placement off), the
+root and `b` with backups, S3 100 ms each way; asserts every non-owner
+median < half an S3 round trip (except `UniqueWrite`), that `/shared`
+stayed `b`'s generation, and that delegate replies were answered from
+the stream. Medians (p50):
+
+| node | op | main 379a00d | this branch |
+|---|---|---|---|
+| a (root, forwards) | SmallWrite / TarFile | 412 / 823 ms | 12 / 25 ms |
+| a | mkdir / chmod / utimensat | 206 / 207 / 205 ms | 6 / 6 / 6 ms |
+| c, d | SmallWrite / TarFile | 410 / 825 ms | 11–12 / 19–24 ms |
+| c, d | link / chmod / chown / utimensat | 206–207 ms | 6 ms |
+| b (delegate) | SmallWrite / mkdir | 4 / 1.5 ms | 3–4 / 1.4 ms |
+
+`c`/`d`: 152–153 of 159 waiting forwards answered from the stream.
+`UniqueWrite` (a new chunk's write-through PUT) stays ~410–620 ms on
+every node, by design.
+
+### 4. `session-forwarded-ryw`
+
+**Root cause: the scenario counted a desktop process's reads.**
+Instrumented (every `durability_pending` read with its FUSE caller and
+requesting pid): every blocked read was a `GETATTR` of the file whose
+close was *still waiting* for the backup's acknowledgement, issued by
+`/usr/libexec/gvfsd-trash` (GNOME's trash monitor watches each mount's
+top directory for a trash directory and stats every entry created
+there). Waiting there is right (the row is not durable yet), and every
+close returned only with its row durable (logged at the flush:
+`durable >= jseq` each time). No read-your-writes violation; a host
+without a desktop session would never see it. **Fix (scenario only):**
+phase 3 writes into a subdirectory `holder/` of its own, out of reach of
+mount-top watchers; the assertion (no read of A's session waited) is
+unchanged. The node logs are now kept at the end of the scenario (they
+were written before phase 3). Before: 1 in 6–30 runs failed (6 of 25
+reads blocked 1–4 ms); after: 40 of 40 passed.
+
+### Files
+
+- `crates/meta/src/store/backup.rs` (`BackupTx::origin`),
+  `store/local.rs` (`apply_adopted_records_from`),
+  `store/spec.rs` (`strand_for_takeover`,
+  `strand_recalled_speculation`, `derive_replay_op`,
+  `install_shadow_from`'s gen, `apply_segment_rows`' recalled set),
+  `session.rs` (streamed watermark).
+- `crates/authority/src/core/`: `backup.rs` (tail origin, stream
+  watermark), `jobs.rs` (takeover strand, gate-open sync, watermark
+  clears), `delegate.rs` (root recall strand, lease-gone rule, seal
+  phase, stale stream acks, parked release after appends), `holder.rs`
+  (base floor), `client.rs` (stream answers for delegate replies),
+  `readindex.rs`, `replay.rs` (gate replay ownership), `mod.rs`
+  (counter); `replica.rs`.
+- `crates/authority/tests/sim.rs`, `tests/sim/run.rs`;
+  `crates/harness/src/scenarios/{ovh.rs,m6.rs}`, `scenarios.rs`;
+  `crates/api/src/types.rs`, `crates/cli/src/main.rs` (status field);
+  `docs/reference/features/delegations.md`,
+  `docs/how-to-guides/development/TESTING.md`.
+
+### Tests run (final code)
+
+- `cargo fmt --all -- --check`; `cargo clippy -p constellation-authority
+  -p constellation-meta -p constellation-harness -p constellation-api -p
+  constellation --all-targets -- -D warnings`: clean.
+- Unit: authority lib 95, `meta_repro` 3, meta (lib 88 plus its
+  integration tests), `constellation` 229, api: all pass.
+- `cargo test -p constellation-authority --release --test sim`: 95 passed,
+  10 ignored (the new regressions and `a_delegate_reply_is_answered_…`
+  included).
+- Long sweeps: `long_delegated` 2000, `long_backup` 1000, `long_random`
+  1000, `long_strict` 500, `long_backup_hot` 1000: all pass.
+- `sweep_config`: `delegated-holder-cut` 0..40000 0 failing (main: 1528
+  of 0..20000); `long-delegated` 70000..80000 2 (main 13);
+  `long-delegated-backup` 70000..80000 1 (main 33); `delegated-backup`
+  0..3000, `placement-hot` 90000..93000, `long-backup` 50000..53000,
+  `backup-hot` 90000..92000: 0. The 3 left are the open marker class.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-delegsafety`):
+  `delegated-op-latency` 6/6 PASS with the final code (7 runs, the first
+  before the streamed watermark: the root's own ops failed at ~205 ms),
+  FAIL on main 379a00d (every non-owner 205–825 ms); `session-forwarded-ryw`
+  40/40 PASS (before: 1 fail in 12–30 runs, all from `gvfsd-trash`).
+  Once each, PASS: delegated-subtrees, cross-subtree-rename,
+  delegate-crash, marker-order, delegate-partition, p2p-off-no-delegation,
+  root-failover-with-delegates, delegate-crash-backup, auto-placement,
+  designation-as-delegation, backup-failover-with-delegation,
+  cto-delegation-recall, shared-dir-multi-writer, hash-range-split-merge,
+  cross-range-rename, forwarded-mutations, nonowner-op-latency,
+  concurrent-create-no-excl, forward-timeout-reexec,
+  holder-ships-under-forward-load, session-exists-observed,
+  session-stale-base-rename, session-ryw-after-holder-kill,
+  session-wait-degrades, session-idle-latency, backup-failover,
+  backup-departs, backup-partition, ack-s3-failover.
+- `takeover-resolves-awaiting-close` failed the same on main 379a00d
+  (its precondition had gone since edd3d5d); fixed in round 2, below.
+
+### Round 2 (coordinator decisions; rebased onto main 4798008)
+
+**Marker order under a tentative acknowledgement** (74189, 76967,
+77901; coordinator's option 1). Mechanism (74189): node 2, delegate of
+`d1` (gen 5), acknowledged its own data create `m2-1-data` (idx 6); the
+marker, forwarded to `d2`'s delegate with `deps` `(5, 6)`, waited; the
+root reclaimed gen 5 at cursor 4 (node 2 partitioned), the void rule
+made `(5, 6)` "satisfied", and the marker (retried through the inbox)
+reached the log before the data's replay by rid.
+
+- **A lost dependency is never executed.** `SessionState::deps_lost`:
+  a `(gen, idx)` of a voided generation past its *cut* — the index the
+  log holds (`void_cuts`: the root's cursor at `end_generation`,
+  `log_stream_idx` where a replica applies the `Recall`; only raised,
+  and raised again by a row of that generation the log carries after
+  all, e.g. a root that inherited its own generation ships its rows after
+  ending it — seed 70744). Executors: a delegate (`delegate_execute_now`)
+  and the root (`on_mutate_request`) answer `Held` (no attempt spent);
+  the root's inbox drain leaves the op in the inbox (`Halt::Recall`). A
+  retry of an op already done is still answered from the dedup.
+- **The requester re-sends after its own replays.** `hold_for_lost_deps`
+  (client.rs), at submit, on every backoff and before any local
+  execution: while this node has replays to settle (its own stranded
+  ops: not refused, not another node's streamed op, not held for a live
+  generation, not already in flight as a client op) a client op is held
+  (backoff at the stream tick); once they are settled its `deps` are
+  taken afresh (ordering after wherever the replays landed) if they were
+  lost or it was held. Chosen over parking at the executor because the
+  requester's own data replay may itself go through the same root or
+  inbox behind the parked marker (a deadlock); a replay op is never
+  held (its lost `deps`, if any, are refreshed). An op in an S3 inbox
+  whose `deps` became lost is withdrawn (`withdraw_lost_deps_inbox_ops`,
+  `send_forward` to node 0 = withdraw then back off).
+- `SessionState::deps` clamps a voided generation to its cut: a reply
+  arriving after the `Recall` could raise `observed` past it, and the
+  next write's `deps` would be lost forever (seed 70176: ops `Held` until
+  their deadline).
+- **74035** (found by the re-sweep, long-delegated-backup): a paused
+  root, deposed without knowing it yet, drained a sealed delegate
+  backup's marker whose `deps` named its successor's journal (epoch 2,
+  where the data was); its replica showed the marker without the data
+  until the deposition stranded it. A root now appends no delegate
+  transaction whose `deps.pending` names a newer tenure than its own
+  (`deps_from_a_newer_tenure`, in `on_delegate_stream` and the sealed
+  drain; counter `deleg_append_newer_tenure`).
+- Counters `deps_lost_holds`, `deps_refreshed`, `deps_lost_refused`.
+  Pinned: 74189, 76967 in `regression_long_delegated_seeds`; 77901,
+  74035 in `regression_long_delegated_backup_seeds`. Docs:
+  `delegations.md` (the void rule's exception).
+
+**`takeover-resolves-awaiting-close`.** The scenario now runs with
+`CONSTELLATION_PRE_S3_STREAMING=0` rather than with no backup in budget
+(the coordinator's suggestion): what it checks is B's *seal-based*
+takeover of A while B's forwarded close waits for the log, and with no
+backup in budget the takeover would be by TTL (60 s, over its 15 s
+bound). With the stream off the close waits for the log again (the
+precondition), and everything else it asserts is unchanged. 5/5 PASS
+before the rebase, 3/3 after (close returns 1.25–1.44 s after A stalls).
+
+**Rebase onto 4798008** (write-path: pre-S3 stream fixes in `backup.rs`,
+`pending` on forwards). The stream-ahead changes merged without
+conflict: main's `ahead_waiting` / non-regressing cursor and this
+branch's `note_streamed` (called on every installed transaction and
+hole, including those retried from `ahead_waiting`) compose; one new
+`BackupTx` initializer in `meta/src/store/remote.rs` got `origin`.
+Doc conflicts (TESTING.md, PROGRESS.md) resolved by keeping both.
+
+**Results after rebase (final code).**
+- fmt, clippy (`-D warnings`, authority/meta/harness/api/cli): clean.
+- authority: lib 98, `meta_repro` 3, sim 95 (10 ignored); meta all
+  pass; cli 235.
+- Sweeps: `long-delegated` 70000..80000 **0** (main 13),
+  `long-delegated-backup` 70000..80000 **0** (main 33),
+  `delegated-holder-cut` 0..20000 **0** (main 1528), `placement-hot`
+  90000..93000 0, `delegated-backup` 0..3000 0, `long-backup`
+  50000..53000 0. Stream answers: 41383 in delegated-holder-cut (33777
+  a delegate's), 19408 in long-delegated-backup (17300).
+- Long gates: `long_delegated` 2000, `long_backup` 1000, `long_random`
+  1000, `long_strict` 500, `long_backup_hot` 1000: pass.
+- Harness (prefix `constellation-harness-delegsafety`, post-rebase
+  binary): `takeover-resolves-awaiting-close` 3/3, `delegated-op-latency`
+  3/3; once each PASS: marker-order, delegated-subtrees, delegate-crash,
+  delegate-partition, root-failover-with-delegates, delegate-crash-backup,
+  backup-failover-with-delegation, shared-dir-multi-writer,
+  hash-range-split-merge, cross-range-rename, forwarded-mutations,
+  nonowner-op-latency, session-forwarded-ryw.

@@ -630,7 +630,20 @@ impl Cluster {
             (Some(_), Some(old)) => old.shared.epoch.lock().unwrap().clone(),
             _ => Default::default(),
         };
+        // The rids the crashed incarnation found rolled back stay tentative
+        // (long-delegated seed 79689: a delegate's acknowledged create,
+        // stranded by the root's recall and replayed as a conflict copy,
+        // was checked as durable once its node had restarted — the new
+        // incarnation's set was empty).
+        let tentative = self
+            .nodes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|old| old.shared.tentative.lock().unwrap().clone())
+            .unwrap_or_default();
         let handle = NodeHandle::start_with(&self.env, id, meta, epoch);
+        handle.shared.tentative.lock().unwrap().extend(tentative);
         self.nodes.lock().unwrap().insert(id, Arc::new(handle));
     }
 
