@@ -297,6 +297,12 @@ struct QueuedReplay {
     /// the delegate's earlier transactions (long-delegated seed 70075).
     #[serde(default)]
     gen: u64,
+    /// A size-only `setattr` (the FUSE truncate path, `O_TRUNC`
+    /// included): the manifest its inode had just before it, from the
+    /// stranded row's before-image. A manifest commit for the same inode
+    /// queued after it is rebased onto this (see [`rebase_on_truncate`]).
+    #[serde(default)]
+    truncate_base: Option<Vec<u8>>,
 }
 
 /// A stranded op waiting to be replayed by rid (plan 30 §M3a recovery
@@ -645,14 +651,18 @@ pub(crate) fn record_local_tx(
     )
 }
 
+/// A row's before-images: `(key, value before the row first touched it)`.
+type Before = [(Vec<u8>, Option<Vec<u8>>)];
+
 fn enqueue_replay_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     key: u64,
     rid: Rid,
     op: MutateOp,
+    before: &Before,
 ) -> Result<(), MetaError> {
-    enqueue_replay_as_tx(tx, meta, key, rid, op, false, 0)
+    enqueue_replay_as_tx(tx, meta, key, rid, op, false, 0, before)
 }
 
 /// [`enqueue_replay_tx`] for a shadow a delegate accepted under `gen`.
@@ -663,25 +673,35 @@ fn enqueue_replay_gen_tx(
     rid: Rid,
     op: MutateOp,
     gen: u64,
+    before: &Before,
 ) -> Result<(), MetaError> {
-    enqueue_replay_as_tx(tx, meta, key, rid, op, false, gen)
+    enqueue_replay_as_tx(tx, meta, key, rid, op, false, gen, before)
 }
 
+/// Queue `op` for replay by `rid` under `key`. `before` is the stranded
+/// row's before-images (empty when there are none): a truncate keeps the
+/// manifest it cut from them, and a manifest commit queued after one is
+/// rebased onto it ([`rebase_on_truncate`]).
+#[allow(clippy::too_many_arguments)]
 fn enqueue_replay_as_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     key: u64,
     rid: Rid,
-    op: MutateOp,
+    mut op: MutateOp,
     foreign: bool,
     gen: u64,
+    before: &Before,
 ) -> Result<(), MetaError> {
+    let truncate_base = truncate_pre_manifest(tx, meta, &op, before);
+    rebase_on_truncate(tx, meta, key, &mut op)?;
     let row = QueuedReplay {
         rid,
         op,
         refused: None,
         foreign,
         gen,
+        truncate_base,
     };
     if tx.get(&meta.pending_replay, seq_key(key))?.is_none() {
         counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, 1)?;
@@ -691,6 +711,120 @@ fn enqueue_replay_as_tx(
         seq_key(key),
         postcard::to_allocvec(&row)?,
     );
+    Ok(())
+}
+
+/// The inode of a size-only `setattr` — the FUSE truncate path
+/// (`truncate`, `ftruncate`, `O_TRUNC`). The replay drain folds such an
+/// op into a manifest commit for the same inode queued after it
+/// (`authority::core::replay`'s `folded_into_later_manifest`, which
+/// matches exactly this shape).
+fn size_only_truncate(op: &MutateOp) -> Option<u64> {
+    match op {
+        MutateOp::Setattr {
+            ino,
+            mode: None,
+            uid: None,
+            gid: None,
+            size: Some(_),
+            atime_ns: None,
+            mtime_ns: None,
+        } => Some(*ino),
+        _ => None,
+    }
+}
+
+/// For a size-only `setattr`, the manifest its inode had just before it
+/// (from the stranded row's before-images); `None` for any other op, or
+/// when the inode had no manifest (nothing a truncate could cut).
+fn truncate_pre_manifest(
+    tx: &SingleWriterWriteTx,
+    meta: &Meta,
+    op: &MutateOp,
+    before: &Before,
+) -> Option<Vec<u8>> {
+    let ino = size_only_truncate(op)?;
+    let key = keys::inode(ino);
+    let (_, value) = before.iter().find(|(k, _)| *k == key)?;
+    let rec = InodeRecord::decode(value.as_deref()?).ok()?;
+    manifest_bytes(tx, &meta.blobs, Some(&rec)).ok().flatten()
+}
+
+/// A manifest commit queued right after a truncate of its inode is
+/// rebased onto the manifest the truncate cut.
+///
+/// A truncate clips the stored manifest in its own transaction
+/// (`replay::clip_manifest`), so a write session that follows it — the
+/// write after an `O_TRUNC` open, say — commits with the *clipped*
+/// manifest as its base. The replay drain folds the truncate into that
+/// commit (executed alone it would have no base check, and would cut a
+/// file another node wrote since), so the commit's base must stand for
+/// the truncate too: the manifest the truncate started from. Left as
+/// the clipped one, it is compared against the holder's uncut file —
+/// the truncate never ran there — and every truncate-then-write of a
+/// file nobody else touched was refused as a stale base and turned
+/// into a conflict copy (harness `deposed-reintegration`'s `a-only`).
+/// Rebased, a file changed elsewhere since still fails the check, as
+/// the edit-vs-edit overlap it is.
+///
+/// Only when the commit composed on exactly that cut (its base is the
+/// clipped pre-image), and only onto the nearest earlier queued size or
+/// manifest change of the inode, which must be such a truncate.
+fn rebase_on_truncate(
+    tx: &SingleWriterWriteTx,
+    meta: &Meta,
+    key: u64,
+    op: &mut MutateOp,
+) -> Result<(), MetaError> {
+    let MutateOp::SetManifest {
+        ino,
+        base_manifest: Some(base),
+        ..
+    } = op
+    else {
+        return Ok(());
+    };
+    if counter_get(tx, &meta.local, KV_PENDING_REPLAY_COUNT)? == 0 {
+        return Ok(());
+    }
+    let mut nearest: Option<QueuedReplay> = None;
+    for guard in tx.range(&meta.pending_replay, ..seq_key(key)).rev() {
+        let (_, v) = guard.into_inner()?;
+        let row: QueuedReplay = postcard::from_bytes(&v)?;
+        let touches = match &row.op {
+            MutateOp::SetManifest { ino: i, .. } => i == ino,
+            MutateOp::Setattr {
+                ino: i,
+                size: Some(_),
+                ..
+            } => i == ino,
+            _ => false,
+        };
+        if touches {
+            nearest = Some(row);
+            break;
+        }
+    }
+    let Some(truncate) = nearest else {
+        return Ok(());
+    };
+    let (
+        MutateOp::Setattr {
+            size: Some(size), ..
+        },
+        Some(pre),
+        None,
+    ) = (&truncate.op, &truncate.truncate_base, &truncate.refused)
+    else {
+        return Ok(());
+    };
+    if size_only_truncate(&truncate.op).is_none() {
+        return Ok(());
+    }
+    let cut = crate::replay::clip_manifest(pre, *size);
+    if cut.as_deref().unwrap_or(pre) == base.as_slice() {
+        *base = pre.clone();
+    }
     Ok(())
 }
 
@@ -763,6 +897,7 @@ fn strand_local_tx(
     meta: &Meta,
     first: u64,
     key: u64,
+    before: &Before,
 ) -> Result<(), MetaError> {
     let Some(row) = local::get_journal_tx(&*tx, meta, first)? else {
         return Ok(());
@@ -821,7 +956,7 @@ fn strand_local_tx(
         None => derive_replay_op(&records),
     };
     if let Some(op) = op {
-        enqueue_replay_tx(tx, meta, key, rid, op)?;
+        enqueue_replay_tx(tx, meta, key, rid, op, before)?;
     }
     Ok(())
 }
@@ -1035,11 +1170,11 @@ fn redo_row_tx(
         }
         match row.kind {
             SpecKind::Shadow { rid, op, gen, .. } => {
-                enqueue_replay_gen_tx(tx, meta, row.origin, rid, op, gen)?;
+                enqueue_replay_gen_tx(tx, meta, row.origin, rid, op, gen, &row.before)?;
                 out.shadows += 1;
             }
             SpecKind::Local { first, .. } => {
-                strand_local_tx(tx, meta, first, row.origin)?;
+                strand_local_tx(tx, meta, first, row.origin, &row.before)?;
                 out.locals += 1;
             }
             SpecKind::Streamed { own, .. } => {
@@ -1050,7 +1185,7 @@ fn redo_row_tx(
                 // node's own op (adopted by `install_shadow`) replays as
                 // a shadow's would.
                 if let Some((rid, op)) = own {
-                    enqueue_replay_tx(tx, meta, row.origin, rid, op)?;
+                    enqueue_replay_tx(tx, meta, row.origin, rid, op, &row.before)?;
                     out.shadows += 1;
                 } else {
                     let rid = row.records.iter().find_map(|r| match r {
@@ -1061,7 +1196,7 @@ fn redo_row_tx(
                         let op = MutateOp::Records {
                             records: row.records.clone(),
                         };
-                        enqueue_replay_as_tx(tx, meta, row.origin, rid, op, true, 0)?;
+                        enqueue_replay_as_tx(tx, meta, row.origin, rid, op, true, 0, &[])?;
                     }
                     out.hints += 1;
                 }
@@ -1473,7 +1608,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
             if let Some(v) = tx.get(&meta.spec, seq_key(*seq))? {
                 let row: SpecRow = postcard::from_bytes(&v)?;
                 if let SpecKind::Shadow { rid, op, gen, .. } = row.kind {
-                    enqueue_replay_gen_tx(tx, meta, row.origin, rid, op, gen)?;
+                    enqueue_replay_gen_tx(tx, meta, row.origin, rid, op, gen, &row.before)?;
                 }
             }
             tx.remove(&meta.spec_live, seq_key(*seq));
@@ -1484,14 +1619,17 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
     }
     counter_set_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, 0);
     for (first, row) in local::read_journal_txs(&*tx, meta)? {
-        let key = match row.spec_seq {
+        let (key, before) = match row.spec_seq {
             Some(seq) => match tx.get(&meta.spec, seq_key(seq))? {
-                Some(v) => postcard::from_bytes::<SpecRow>(&v)?.origin,
-                None => seq,
+                Some(v) => {
+                    let spec_row = postcard::from_bytes::<SpecRow>(&v)?;
+                    (spec_row.origin, spec_row.before)
+                }
+                None => (seq, Vec::new()),
             },
-            None => next_spec_seq_tx(tx, &meta.local)?,
+            None => (next_spec_seq_tx(tx, &meta.local)?, Vec::new()),
         };
-        strand_local_tx(tx, meta, first, key)?;
+        strand_local_tx(tx, meta, first, key, &before)?;
     }
     // Every journaled transaction is gone now: drop every row.
     let from = journal_from(tx, meta)?;
@@ -1572,6 +1710,7 @@ pub(crate) fn refuse_queued_tx(
         refused: Some(refusal),
         foreign: false,
         gen: 0,
+        truncate_base: None,
     };
     tx.insert(
         &meta.pending_replay,
@@ -1687,7 +1826,7 @@ impl Meta {
         }
         if self.holder_epoch() > epoch {
             let key = next_spec_seq_tx(&mut tx, &self.local)?;
-            enqueue_replay_tx(&mut tx, self, key, rid, op.clone())?;
+            enqueue_replay_tx(&mut tx, self, key, rid, op.clone(), &[])?;
             tx.commit()?;
             tracing::info!(
                 ?rid,
@@ -2285,7 +2424,7 @@ impl Meta {
     pub fn queue_replay(&self, rid: Rid, op: &MutateOp) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let key = next_spec_seq_tx(&mut tx, &self.local)?;
-        enqueue_replay_tx(&mut tx, self, key, rid, op.clone())?;
+        enqueue_replay_tx(&mut tx, self, key, rid, op.clone(), &[])?;
         tx.commit()?;
         Ok(())
     }

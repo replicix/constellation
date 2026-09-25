@@ -20616,3 +20616,150 @@ pjdfstest, smoke and integration all still pass 8798/8798 / clean / clean.
 Perf shows no regression anywhere once the dominance-rule fix is in place;
 the single-node meta-bench swings are host-load noise, evidenced by the
 identical-direction slowdown on both builds in `harness bench`.
+
+## Fix: deposed-reintegration (and holder-kill flakes)
+
+### 1. `deposed-reintegration`: a clean truncate-then-write became a conflict copy
+
+**Symptom.** Deterministic on main (3/3 on `2522402`, 4/4 with M12):
+"`c0: a-only (never touched by B) did not replay A's content`". With the
+check extended to print the file and status, `a-only` still held
+`baseline-a`, `replay_conflicts` was 2 (not 1), and
+`.constellation-conflict/a-only@1-…` existed. A's log showed the replay of
+`a-only`'s manifest commit refused with "stale manifest base", and the
+refused op's `base_manifest` was a manifest with `file_len` 0 and no
+chunks.
+
+**Bisect.** Scratch worktree, both the node binary and the harness built
+at each commit: `9589b85` passed 3/3 (18.4–19.0 s); `9794abc` failed 2/2
+with the same message. **Offending commit: `9794abc`** ("truncate never
+resurrects stale bytes"), not any of the backup or replay commits around
+it.
+
+**Root cause.** `9794abc` made a size decrease clip the stored manifest
+in the same transaction (`replay::clip_manifest`, called from both
+`setattr` and the log replay). The write after `O_TRUNC`
+(`std::fs::write`) is two transactions: a size-only `setattr(0)`, then
+the write session's manifest commit, whose base is the manifest *after*
+the truncate, which is now the clipped, empty one. On deposition both
+strand. The replay drain (and, since `1641850`, the takeover gate's
+local replay) folds the size-only truncate into the later manifest commit
+for the same inode (`folded_into_later_manifest`). This is right: run on
+its own, the truncate has no base check and would wipe a file another
+node had written. The fold assumes the commit's base stands for the
+truncate too. Before `9794abc` it did, because a truncate left the
+manifest alone and the base was the uncut manifest. After `9794abc` the
+successor compares the clipped base against its uncut file (the truncate
+never ran there), so every stranded truncate-then-write is refused, even
+on a file nobody else touched. `same` still conflicted correctly, which
+hid the bug from the conflict count at first glance.
+
+The expectation in the scenario is right, and nothing changed the design
+on purpose. The fold and the clip are both correct on their own, but
+together they break.
+
+**Fix** (`crates/meta/src/store/spec.rs`). When a stranded op is queued,
+the stranded row's before-images are available. For a size-only
+`setattr`, the queue row now keeps the manifest its inode had just before
+it (`QueuedReplay::truncate_base`, read from the row's before-image of the
+inode key). When a manifest commit for the same inode is queued, its base
+is rebased onto that pre-truncate manifest (`rebase_on_truncate`), but
+only if all of these hold:
+- the nearest earlier queued size or manifest change of the inode is an
+  unrefused size-only truncate (the exact shape the drain folds);
+- the commit composed on exactly that cut (its base equals
+  `clip_manifest(pre, size)`, or `pre` itself when the cut removed
+  nothing).
+
+The folded replay then checks against the file as it was before A's
+truncate. A file nobody else touched is accepted. A file another node
+wrote since is still refused, which is the genuine edit-vs-edit overlap,
+and exactly one conflict copy results. This covers every stranding path:
+`Local` rows (deposed holder), `Shadow` and own-`Streamed` rows (a
+requester's forwarded ops), and `reset_for_rebuilt_ns_tx`. Chains
+(truncate, write, truncate, write) rebase each commit onto its own
+truncate's pre-image. The drain's fold in `authority::core::replay` is
+unchanged.
+
+**Regression tests** (`crates/meta/tests/holder_capture.rs`):
+- `a_stranded_truncate_then_write_replays_on_the_uncut_base`: a holder's
+  `O_TRUNC` rewrite, stranded by deposition, queues the truncate plus a
+  `SetManifest` whose base is the baseline. The test then executes it on
+  two replicas: one where nobody touched the file (accepted, new content
+  and size) and one where another node wrote it (refused). With the
+  rebase disabled it fails, and the refused base is byte-for-byte the
+  empty manifest from the harness log.
+- `a_stranded_commit_not_composed_on_the_cut_keeps_its_base`: a
+  truncate-up (nothing cut) and a commit composed on some other base are
+  left alone.
+
+### 2. `takeover-marker-strands-promptly` / `session-ryw-after-holder-kill`
+
+**These are not lost or late acknowledged writes, and no marker was
+stuck.** Both failures are the same setup race:
+- takeover-marker: "C must hold the accepted create as an outstanding
+  shadow … outstanding:0";
+- session-ryw: "C's shadow was never stranded".
+
+From a failing `session-ryw` run's logs (kept with `CHAOS_KEEP_TMP`):
+- Holder A logged `rejecting peer: not in the registry allowlist` for C
+  twenty times, from C's first dial (mount + 0.4 s) until after the
+  scenario cut A's S3.
+- C's forwarded create therefore went to the S3 inbox. A, cut off, could
+  not serve it.
+- A's lease expired, **C** took the lease itself (epoch 2) and drained its
+  own inbox op inside the takeover gate. The create was acknowledged only
+  then, so C never had a shadow to strand.
+
+Nothing was lost; the scenario's premise ("A acks C's create from
+memory") just never happened.
+
+Two causes, both fixed:
+- **Product (`crates/net/src/allowlist.rs`).** An unknown key's miss
+  triggers one registry refresh, rate-limited by a 5 s cooldown. B's first
+  dial after A's startup was such a miss. Its refresh *found* B, yet it
+  armed the cooldown anyway, so C (mounting 0.2 s later) was rejected
+  without a refresh until A's next periodic 5 s registry read. In these
+  scenarios that read came after the S3 cut, so it failed and A never
+  admitted C. Now only a futile refresh (the key still unknown
+  afterwards) spends the cooldown. A refresh, or a later periodic read,
+  that enrols the key whose miss armed it gives the arming back. The
+  amplification guard is intact, because an unenrolled key can never make
+  its own refresh productive. Before the fix every run of both scenarios
+  showed at least one such rejection of C on A (10/10). After it, none
+  did (0/16). This is the same effect M12 round 2 worked around in
+  `m11::cluster` with `wait_for_connected_peers`. New unit test:
+  `a_refresh_that_finds_its_key_spends_no_cooldown`.
+- **Harness (`wait_for_peers`).** The count included the S3 pseudo-peer
+  that `status.p2p.peers` lists first (since `26586cd`), so with three
+  nodes the holder "saw 2 peers" (S3 and B) before it had admitted C. A
+  new `node_peers` helper excludes it. `wait_for_peers`, the two
+  three-node `>= 2` checks and `m11`'s connected-peer wait now count real
+  nodes only. What the scenarios check is unchanged.
+- **Harness (`CountingProxy::cut`), a latent race found on the way.** A
+  relay thread already blocked in `read` when the cut came (up to 100 ms)
+  forwarded whatever arrived next, so a request made after `cut()`
+  returned could still reach S3. Bytes read after the cut are now
+  dropped, in both directions. No run was shown to have hit this race.
+
+### Evidence
+
+| Run | Before | After |
+|---|---|---|
+| `deposed-reintegration` | 2/2 FAILED at `87cfe36` (as reported); `9794abc` 2/2 FAILED, `9589b85` 3/3 passed | 6/6 passed (18.4–18.8 s), plus 3/3 on the final build (18.4–18.5 s) |
+| `takeover-marker-strands-promptly` | 5/5 passed this session (reported 1/3–2/4 failing) | 8/8 passed (10.0–11.6 s) |
+| `session-ryw-after-holder-kill` | 1/5 FAILED ("never stranded") | 8/8 passed (9.2–13.3 s) |
+| A's allowlist rejections of C per run | ≥1 in 10/10 runs (20 in the failing one) | 0 in 16/16 runs |
+
+Also on the final build, all passed: `deposed-reintegration-backup` ×2 (9.6 s, 10.1 s), `truncate-never-resurrects`, `backup-takeover-holds-missing-chunks`, `forwarded-mutations`, `delegated-subtrees` and `shared-dir-multi-writer` (the last two use the changed peer wait).
+`cargo test --release`: `constellation-meta` and `constellation-net`
+(all green, 12/12 `holder_capture`, 6/6 allowlist),
+`constellation-authority` (75 + 3 + 74 sim, 7 ignored: green), and the
+`constellation` bin's unit tests (219 passed). `cargo clippy --release
+--tests` on meta, net and harness: clean.
+
+Files: `crates/meta/src/store/spec.rs`,
+`crates/meta/tests/holder_capture.rs`, `crates/net/src/allowlist.rs`,
+`crates/harness/src/reqlog.rs`, `crates/harness/src/scenarios.rs`
+(plus a more informative `a-only` failure message),
+`crates/harness/src/scenarios/m11.rs`.

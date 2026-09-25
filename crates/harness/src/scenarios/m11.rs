@@ -279,10 +279,9 @@ fn wait_for_connected_peers(clients: &[&Client]) -> Result<()> {
             Duration::from_secs(30),
             || {
                 let s = c.control_status()?;
-                let n = s["p2p"]["peers"]
-                    .as_array()
-                    .map(|v| v.iter().filter(|p| p["connected"] == true).count())
-                    .unwrap_or(0);
+                let n = super::node_peers(&s["p2p"])
+                    .filter(|p| p["connected"] == true)
+                    .count();
                 anyhow::ensure!(n >= need, "{} reaches {n} peers, want {need}", c.name);
                 Ok(())
             },
@@ -1865,10 +1864,9 @@ pub fn shared_dir_multi_writer(_seed: u64) -> Result<()> {
             .iter()
             .map(|c| {
                 let s = c.control_status().unwrap_or_default();
-                let peers = s["p2p"]["peers"]
-                    .as_array()
-                    .map(|v| v.iter().filter(|p| p["connected"] == true).count())
-                    .unwrap_or(0);
+                let peers = super::node_peers(&s["p2p"])
+                    .filter(|p| p["connected"] == true)
+                    .count();
                 format!(
                     "{}: connected peers {peers}, inbox ops {}, lease {}",
                     c.name,

@@ -18,6 +18,18 @@
 //! cooldown window — its forwarded mutations would fail as transport
 //! errors and escalate into a lease takeover the moment two mounts
 //! start together (observed as `forwarded-mutations` flaking).
+//!
+//! Nor does a miss-triggered refresh that *found* the key it was for:
+//! that miss was a legitimate new peer, not an unknown key probing, so
+//! it spends no cooldown. Otherwise the first peer to join after us
+//! locks out every peer joining within the next five seconds — with
+//! three mounts starting together the third one's forwards to the holder
+//! were rejected until the holder's next periodic registry read (harness
+//! `session-ryw-after-holder-kill` and `takeover-marker-strands-promptly`,
+//! whose third node then fell back to the S3 inbox). Only a futile
+//! refresh — the key still unknown after it — arms the cooldown, which is
+//! all the amplification guard needs: an unenrolled key can never make
+//! its own refresh productive.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -29,8 +41,12 @@ const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 pub struct Allowlist {
     keys: HashSet<String>,
     /// When a miss last triggered a refresh; periodic refreshes via
-    /// [`Allowlist::replace`] deliberately leave this untouched.
+    /// [`Allowlist::replace`] never arm it (one that enrols the key whose
+    /// miss armed it gives the arming back).
     last_miss_refresh: Option<Instant>,
+    /// The key whose miss armed `last_miss_refresh` (with the arming it
+    /// replaced): a refresh that turns out to enrol it disarms again.
+    armed_by: Option<(String, Option<Instant>)>,
     cooldown: Duration,
 }
 
@@ -45,6 +61,7 @@ impl Allowlist {
         Self {
             keys: HashSet::new(),
             last_miss_refresh: None,
+            armed_by: None,
             cooldown: REFRESH_COOLDOWN,
         }
     }
@@ -61,8 +78,17 @@ impl Allowlist {
     /// Never arms the miss cooldown: a periodic or startup refresh must
     /// leave an unknown key able to trigger its own re-read (see the
     /// module doc for the cold-start failure that otherwise results).
+    /// A read that enrols the key whose miss armed the cooldown gives
+    /// that arming back (see the module doc).
     pub fn replace(&mut self, keys: impl IntoIterator<Item = String>) {
         self.keys = keys.into_iter().collect();
+        if let Some((key, before)) = self.armed_by.take() {
+            if self.keys.contains(&key) {
+                self.last_miss_refresh = before;
+            } else {
+                self.armed_by = Some((key, before));
+            }
+        }
     }
 
     pub fn contains(&self, pubkey_hex: &str) -> bool {
@@ -96,7 +122,8 @@ impl Allowlist {
         if self.contains(pubkey_hex) {
             Decision::Accept
         } else if self.refresh_due() {
-            self.last_miss_refresh = Some(Instant::now());
+            let before = self.last_miss_refresh.replace(Instant::now());
+            self.armed_by = Some((pubkey_hex.to_string(), before));
             Decision::Refresh
         } else {
             Decision::Reject
@@ -175,5 +202,41 @@ mod tests {
         // The miss-triggered re-read finds B (it enrolled in between).
         a.replace(["aa".to_string(), "bb".to_string()]);
         assert_eq!(a.check("bb"), Decision::Accept);
+    }
+
+    /// Three mounts starting together: B's first dial refreshes and finds
+    /// B, which must not lock C out for the cooldown — C enrolled a moment
+    /// later and deserves its own re-read. A key that stays unknown still
+    /// arms it.
+    #[test]
+    fn a_refresh_that_finds_its_key_spends_no_cooldown() {
+        let mut a = Allowlist::with_cooldown(Duration::from_secs(3600));
+        a.replace(["aa".to_string()]);
+        assert_eq!(a.check("bb"), Decision::Refresh);
+        a.replace(["aa".to_string(), "bb".to_string()]);
+        assert_eq!(a.check("bb"), Decision::Accept);
+        assert_eq!(
+            a.check("cc"),
+            Decision::Refresh,
+            "B's productive refresh must not have armed the cooldown"
+        );
+        a.replace(["aa".to_string(), "bb".to_string()]);
+        assert_eq!(
+            a.check("cc"),
+            Decision::Reject,
+            "a futile refresh arms it: C is still unknown"
+        );
+        // A periodic read admits C: its miss was legitimate after all.
+        a.replace(["aa".to_string(), "bb".to_string(), "cc".to_string()]);
+        assert_eq!(a.check("cc"), Decision::Accept);
+        // An unenrolled key gets one futile refresh, then the cooldown.
+        assert_eq!(a.check("zz"), Decision::Refresh);
+        a.replace(["aa".to_string(), "bb".to_string(), "cc".to_string()]);
+        assert_eq!(a.check("zz"), Decision::Reject);
+        assert_eq!(
+            a.check("yy"),
+            Decision::Reject,
+            "nor may another unknown key"
+        );
     }
 }

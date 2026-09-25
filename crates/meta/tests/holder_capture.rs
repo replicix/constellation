@@ -638,3 +638,161 @@ fn with_capture_off_a_holder_defers_publishing_and_rebuilds_on_deposition() {
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].rid, rid(1));
 }
+
+/// A one-chunk manifest of `len` bytes whose chunk hashes `tag`.
+fn one_chunk_manifest(tag: &[u8], len: u64) -> Vec<u8> {
+    use constellation_fs_core::{ChunkHash, Manifest};
+    let chunks = [(0u64, ChunkHash::of(tag))].into_iter().collect();
+    Manifest::from_sparse_chunks(1 << 20, len, chunks, 8, ChunkHash::of)
+        .0
+        .encode()
+}
+
+/// Harness `deposed-reintegration`'s `a-only`, in the store: a deposed
+/// holder's `O_TRUNC` rewrite of a file — a size-only `setattr` to 0,
+/// then the write session's manifest commit — strands as those two ops,
+/// and the replay drain folds the truncate into the commit. A truncate
+/// clips the stored manifest (`replay::clip_manifest`), so the commit
+/// composed on the *clipped* manifest; queued, it must carry the
+/// manifest the truncate cut as its base instead, or on the successor
+/// (which never ran the truncate) it is refused as a stale base even
+/// when nobody else touched the file — a conflict copy for a clean edit.
+/// Rebased, it is accepted there, and still refused where another node
+/// wrote the file since (the genuine edit-vs-edit overlap).
+#[test]
+fn a_stranded_truncate_then_write_replays_on_the_uncut_base() {
+    let holder = Meta::open_in_memory().unwrap();
+    let successor = Meta::open_in_memory().unwrap();
+    let overwritten = Meta::open_in_memory().unwrap();
+    let f = holder.create(ROOT_INO, "a-only", 0o644, 0, 0).unwrap().ino;
+    let baseline = one_chunk_manifest(b"baseline-a", 10);
+    holder.set_manifest(f, &baseline, 10).unwrap();
+    // The baseline ships: every replica has it.
+    let rows = holder.take_journal(usize::MAX).unwrap();
+    let records: Vec<LogRecord> = rows.iter().map(|(_, r)| r.clone()).collect();
+    successor.apply_records(&records).unwrap();
+    overwritten.apply_records(&records).unwrap();
+    let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+    holder.ack_journal_rows_at(&seqs, 1).unwrap();
+    // Another node's write, on one replica only.
+    let theirs = one_chunk_manifest(b"winner-from-b", 13);
+    execute_mutate(
+        &overwritten,
+        &MutateOp::SetManifest {
+            ino: f,
+            base_manifest: Some(baseline.clone()),
+            manifest: theirs.clone(),
+            size: 13,
+        },
+        Some(rid(9)),
+    )
+    .unwrap();
+
+    // The holder's O_TRUNC rewrite, unshipped when it is deposed.
+    holder.set_holder_epoch(1);
+    let truncate = MutateOp::Setattr {
+        ino: f,
+        mode: None,
+        uid: None,
+        gid: None,
+        size: Some(0),
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    execute_mutate(&holder, &truncate, Some(rid(1))).unwrap();
+    let clipped = holder.manifest(f).unwrap().expect("a clipped manifest");
+    assert_ne!(clipped, baseline, "the truncate clips the manifest");
+    let mine = one_chunk_manifest(b"stranded-from-a", 15);
+    holder
+        .set_manifest_dirty(f, Some(&clipped), &mine, 15, &[])
+        .unwrap();
+    holder.set_holder_epoch(0);
+    holder.strand_below_epoch(2).unwrap();
+    assert_eq!(holder.manifest(f).unwrap(), Some(baseline.clone()));
+
+    let queued = holder.pending_replays().unwrap();
+    assert_eq!(queued.len(), 2, "{queued:?}");
+    assert_eq!(queued[0].op, truncate);
+    let MutateOp::SetManifest {
+        base_manifest,
+        manifest,
+        ..
+    } = &queued[1].op
+    else {
+        panic!("the write replays as a manifest commit: {:?}", queued[1].op)
+    };
+    assert_eq!(
+        base_manifest.as_deref(),
+        Some(baseline.as_slice()),
+        "the commit is rebased onto the manifest the folded truncate cut"
+    );
+    assert_eq!(manifest, &mine);
+
+    // Folded into the commit (the drain forgets the truncate), it lands
+    // where nobody else wrote the file ...
+    execute_mutate(&successor, &queued[1].op, Some(queued[1].rid)).unwrap();
+    assert_eq!(successor.manifest(f).unwrap(), Some(mine.clone()));
+    assert_eq!(successor.getattr(f).unwrap().unwrap().size, 15);
+    // ... and is refused where somebody did.
+    assert!(
+        execute_mutate(&overwritten, &queued[1].op, Some(queued[1].rid)).is_err(),
+        "an edit-vs-edit overlap must still fail the base check"
+    );
+    assert_eq!(overwritten.manifest(f).unwrap(), Some(theirs));
+}
+
+/// The rebase applies only to a commit composed on exactly the cut: one
+/// whose base is something else keeps it (and fails its check as
+/// before), and a truncate that cut nothing leaves the commit alone.
+#[test]
+fn a_stranded_commit_not_composed_on_the_cut_keeps_its_base() {
+    let holder = Meta::open_in_memory().unwrap();
+    let f = holder.create(ROOT_INO, "f", 0o644, 0, 0).unwrap().ino;
+    let baseline = one_chunk_manifest(b"baseline", 8);
+    holder.set_manifest(f, &baseline, 8).unwrap();
+    ship_all(&holder, 1);
+    holder.set_holder_epoch(1);
+    let truncate = |size| MutateOp::Setattr {
+        ino: f,
+        mode: None,
+        uid: None,
+        gid: None,
+        size: Some(size),
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    // A truncate-up cuts nothing: the commit's base is the uncut manifest.
+    execute_mutate(&holder, &truncate(20), Some(rid(1))).unwrap();
+    let grown = one_chunk_manifest(b"grown", 20);
+    holder
+        .set_manifest_dirty(f, Some(&baseline), &grown, 20, &[])
+        .unwrap();
+    // A truncate whose following commit composed on some other base.
+    execute_mutate(&holder, &truncate(0), Some(rid(2))).unwrap();
+    let elsewhere = one_chunk_manifest(b"elsewhere", 9);
+    let last = one_chunk_manifest(b"last", 4);
+    // The holder itself would refuse a commit on that base, so it is
+    // queued behind the stranded truncate directly.
+    holder.set_holder_epoch(0);
+    holder.strand_below_epoch(2).unwrap();
+    holder
+        .queue_replay(
+            rid(3),
+            &MutateOp::SetManifest {
+                ino: f,
+                base_manifest: Some(elsewhere.clone()),
+                manifest: last,
+                size: 4,
+            },
+        )
+        .unwrap();
+    let queued = holder.pending_replays().unwrap();
+    let bases: Vec<Option<Vec<u8>>> = queued
+        .iter()
+        .filter_map(|q| match &q.op {
+            MutateOp::SetManifest { base_manifest, .. } => Some(base_manifest.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(bases, vec![Some(baseline), Some(elsewhere)], "{queued:?}");
+}

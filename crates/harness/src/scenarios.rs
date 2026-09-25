@@ -2147,13 +2147,32 @@ fn wait_for_peers(clients: &[&Client]) -> Result<()> {
             || {
                 let p = p2p_of(c)?;
                 anyhow::ensure!(p["enabled"] == true, "{} has no fast path: {p}", c.name);
-                let n = p["peers"].as_array().map(|a| a.len()).unwrap_or(0);
+                let n = node_peers(&p).count();
                 anyhow::ensure!(n >= need, "{} sees {n} peers, want {need}: {p}", c.name);
                 Ok(())
             },
         )?;
     }
     Ok(())
+}
+
+/// The other *nodes* in a `status` `p2p` object's `peers`: every entry
+/// but the S3 pseudo-peer, which `peers` lists first for the operator
+/// table (26586cd). A node listed here was read from the registry, so it
+/// is on this node's accept allowlist too.
+///
+/// Counting S3 as a peer made [`wait_for_peers`] one short: with three
+/// nodes, the holder "saw two peers" — S3 and B — before its registry
+/// read had admitted C, and a scenario that cut the holder's S3 path
+/// next left it unable ever to admit C: C's forwards were rejected, went
+/// to the S3 inbox, and C took the lease over itself
+/// (`session-ryw-after-holder-kill`, `takeover-marker-strands-promptly`).
+pub(crate) fn node_peers(p2p: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    p2p["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|peer| peer["s3"] != true)
 }
 
 /// As [`wait_for_peers`], for the common 2-node call shape; also usable
@@ -3375,10 +3394,13 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
                     "{}: clean-from-a did not replay",
                     client.name
                 );
+                let a_only = std::fs::read(client.mnt.join("shared/a-only"))?;
                 anyhow::ensure!(
-                    std::fs::read(client.mnt.join("shared/a-only"))? == b"stranded-from-a",
-                    "{}: a-only (never touched by B) did not replay A's content",
-                    client.name
+                    a_only == b"stranded-from-a",
+                    "{}: a-only (never touched by B) did not replay A's content: holds {:?}; status {}",
+                    client.name,
+                    String::from_utf8_lossy(&a_only),
+                    client.control_status()?
                 );
                 // Conflicts only for true overlaps: exactly one copy, for
                 // `same` — none for `clean-from-a` or `a-only`.
@@ -4215,7 +4237,7 @@ fn node_leave(_seed: u64) -> Result<()> {
             || {
                 let p = p2p_of(c)?;
                 anyhow::ensure!(p["enabled"] == true);
-                anyhow::ensure!(p["peers"].as_array().map(|a| a.len()).unwrap_or(0) >= 2);
+                anyhow::ensure!(node_peers(&p).count() >= 2);
                 Ok(())
             },
         )?;
@@ -4299,7 +4321,7 @@ fn node_leave(_seed: u64) -> Result<()> {
     c3.mount()?;
     eventually("C3 peers with A+B", Duration::from_secs(30), || {
         let p = p2p_of(&c3)?;
-        anyhow::ensure!(p["peers"].as_array().map(|a| a.len()).unwrap_or(0) >= 2);
+        anyhow::ensure!(node_peers(&p).count() >= 2);
         Ok(())
     })?;
     let c3_id = c3.control_status()?["node_id"].as_u64().unwrap();

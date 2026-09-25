@@ -357,6 +357,9 @@ fn relay(
                 match from.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        if cut.load(Ordering::Relaxed) {
+                            continue; // shut down at the top of the loop
+                        }
                         if to.write_all(&buf[..n]).is_err() {
                             break;
                         }
@@ -385,6 +388,15 @@ fn relay(
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                // A read that was already blocking when the cut came
+                // returns what arrived after it: drop it, or a request
+                // the node made after `cut()` returned could still reach
+                // S3 through a connection opened before.
+                if cut.load(Ordering::Relaxed) {
+                    let _ = from.shutdown(std::net::Shutdown::Both);
+                    let _ = to.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
                 if to.write_all(&buf[..n]).is_err() {
                     break;
                 }
