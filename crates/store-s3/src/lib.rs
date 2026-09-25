@@ -30,10 +30,12 @@ pub mod packs;
 pub mod parallel;
 pub mod probe;
 pub(crate) mod run;
+#[cfg(test)]
+pub(crate) mod scripted_http;
 pub mod snapshot;
 pub mod store;
 
-pub use aws_auth::amazon_s3_builder;
+pub use aws_auth::{amazon_s3_builder, amazon_s3_builder_resolved, S3Resolution};
 
 pub use blobs::BlobStore;
 pub use codec::{Codec, CompressionSetting};
@@ -72,4 +74,6 @@ pub use packs::{
 pub use parallel::{effective_threads, gc_threads};
 pub use probe::{probe_cas_semantics, CasProbe, CasProbeReport, Versioning};
 pub use snapshot::{snapshot_id, SnapshotRecord, SnapshotStore, SnapshotTreeRoot};
-pub use store::{Capabilities, ChunkPutMode, ChunkPutResult, ChunkStore, FsMeta, PreflightCheck};
+pub use store::{
+    Capabilities, ChunkPutMode, ChunkPutResult, ChunkStore, FsMeta, MissingFs, PreflightCheck,
+};

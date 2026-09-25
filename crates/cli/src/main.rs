@@ -706,25 +706,52 @@ async fn preflight_backend(store: &ChunkStore, s3: &str) -> Result<()> {
     Ok(())
 }
 
-fn prompt_e2e_passphrase_if_needed(s3: &str) -> Result<Option<Zeroizing<String>>> {
-    if std::env::var_os("CONSTELLATION_PASSPHRASE").is_some() {
-        return Ok(None);
-    }
+/// What [`check_fs_before_mount`] learned from `meta.json`.
+struct MountCheck {
+    e2e: bool,
+    /// The S3 endpoint `meta.json` was read from (`None`: local backend).
+    endpoint: Option<String>,
+}
+
+/// Read `meta.json` before the daemon forks, so a missing filesystem
+/// fails here — on this terminal, explained by
+/// [`backend::load_fs_explained`] (where the command looked, and whether
+/// it reached the store the name was created on) — and so an interactive
+/// E2E mount knows to prompt for the passphrase before the child loses
+/// the terminal. Runs through a throwaway runtime that is fully dropped
+/// before the caller forks, so no runtime threads leak into the daemon
+/// child.
+fn check_fs_before_mount(s3: &str, registered_endpoint: Option<&str>) -> Result<MountCheck> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let e2e = rt.block_on(async {
-        let backend = backend::open_backend(s3).await?;
-        anyhow::Ok(ChunkStore::new(backend).load_fs().await?.e2e)
+    let check = rt.block_on(async {
+        let (backend, info) = backend::open_backend_described(s3).await?;
+        let meta = backend::load_fs_explained(&backend, &info, registered_endpoint).await?;
+        anyhow::Ok(MountCheck {
+            e2e: meta.e2e,
+            endpoint: info.endpoint().map(str::to_string),
+        })
     })?;
     drop(rt);
-    if !e2e {
-        return Ok(None);
+    Ok(check)
+}
+
+/// Remember the endpoint a name's `meta.json` was read from (best effort:
+/// diagnostics only, see `FsEntry::endpoint`).
+fn remember_endpoint(name: &str, endpoint: &str) {
+    let saved = registry::Registry::load_locked().and_then(|mut reg| {
+        reg.merge_and_save(
+            name,
+            registry::FsOverrides {
+                endpoint: Some(endpoint.to_string()),
+                ..Default::default()
+            },
+        )
+    });
+    if let Err(e) = saved {
+        tracing::debug!(name, error = %e, "recording the name's S3 endpoint failed");
     }
-    Ok(Some(passphrase(
-        "CONSTELLATION_PASSPHRASE",
-        "Filesystem passphrase: ",
-    )?))
 }
 
 fn main() -> Result<()> {
@@ -732,7 +759,10 @@ fn main() -> Result<()> {
     let log_writer = log_buffer.clone();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            // aws_config logs the loaded credentials (access key id
+            // included) at INFO on every command.
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,aws_config=warn".into()),
         )
         .with_writer(move || log_writer.writer())
         .init();
@@ -824,8 +854,8 @@ fn main() -> Result<()> {
             let ack_policy = crate::authority_driver::ack_policy_flag(ack_policy.as_deref())?;
             let setting: CompressionSetting =
                 compression.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let backend = rt
-                .block_on(backend::open_backend(&s3))
+            let (backend, backend_info) = rt
+                .block_on(backend::open_backend_described(&s3))
                 .context("opening backend")?;
             let store = ChunkStore::new(backend.clone());
             // Verify the backend supports every operation a filesystem
@@ -870,6 +900,7 @@ fn main() -> Result<()> {
                     &name,
                     registry::FsOverrides {
                         s3: Some(s3.clone()),
+                        endpoint: backend_info.endpoint().map(str::to_string),
                         ..Default::default()
                     },
                 )
@@ -977,10 +1008,11 @@ fn main() -> Result<()> {
             let reg = registry::Registry::load()?;
             let t = target::resolve(&target, &reg);
             let s3 = target::s3_url(s3, &t)?;
-            let store = ChunkStore::new(
-                rt.block_on(backend::open_backend(&s3))
-                    .context("opening backend")?,
-            );
+            let (backend, info) = rt
+                .block_on(backend::open_backend_described(&s3))
+                .context("opening backend")?;
+            println!("backend ........................... {info}");
+            let store = ChunkStore::new(backend);
             let caps = rt.block_on(store.probe_conditional_writes())?;
             let yn = |b: bool| if b { "ok" } else { "MISSING" };
             println!(
@@ -1004,10 +1036,13 @@ fn main() -> Result<()> {
             doctor::print_cas_report(&report)?;
             print!("filesystem at prefix .............. ");
             // `HEAD` first: a `GET` of a `meta.json` that does not exist
-            // yet is the answer a store caching negative reads keeps
-            // serving to the `mount` after `fs create` (the OVH run).
+            // yet is the answer a store caching negative reads would keep
+            // serving to the `mount` after `fs create`.
             match rt.block_on(store.fs_exists()) {
-                Ok(false) => println!("none (run `constellation fs create`)"),
+                Ok(false) => println!(
+                    "none — {} (run `constellation fs create`)",
+                    rt.block_on(store.locate_missing_fs())
+                ),
                 Ok(true) => match rt.block_on(store.load_fs()) {
                     Ok(meta) => println!("ok ({}, format v{})", meta.uuid, meta.format_version),
                     Err(e) => bail!(e),
@@ -1022,11 +1057,10 @@ fn main() -> Result<()> {
             state_dir,
         } => {
             if let Some(s3) = s3 {
-                let store = ChunkStore::new(
-                    rt.block_on(backend::open_backend(&s3))
-                        .context("opening backend")?,
-                );
-                let meta = rt.block_on(store.load_fs())?;
+                let (backend, info) = rt
+                    .block_on(backend::open_backend_described(&s3))
+                    .context("opening backend")?;
+                let meta = rt.block_on(backend::load_fs_explained(&backend, &info, None))?;
                 println!("{}", serde_json::to_string_pretty(&meta)?);
                 return Ok(());
             }
@@ -1519,7 +1553,8 @@ fn cmd_mount(
 
     // Build the plan: which views to bring up, the node-level config,
     // and (for a named target) the registry writes to make first.
-    let (_name, state_dir, node_s3, node_cache_size, node_fsync_mode, node_write_mode, views): (
+    let mut registered_endpoint: Option<String> = None;
+    let (name, state_dir, node_s3, node_cache_size, node_fsync_mode, node_write_mode, views): (
         Option<String>,
         PathBuf,
         String,
@@ -1590,9 +1625,15 @@ fn cmd_mount(
                     write_mode: write_mode.clone(),
                     read_only_member: read_only_member.then_some(true),
                     web_ui,
+                    // A repointed name forgets the old URL's endpoint.
+                    endpoint: s3
+                        .as_ref()
+                        .filter(|new| **new != current.s3)
+                        .map(|_| String::new()),
                     mount: mount_override,
                 },
             )?;
+            registered_endpoint = (!entry.endpoint.is_empty()).then(|| entry.endpoint.clone());
             let views = if path.is_none() && mountpoint.is_none() {
                 // Bare `mount NAME`: every registered view.
                 if entry.mounts.is_empty() {
@@ -1669,15 +1710,30 @@ fn cmd_mount(
     let initial_write_mode: writeback::WriteMode =
         node_write_mode.parse().map_err(anyhow::Error::msg)?;
 
-    // Collect the E2E passphrase in the FOREGROUND, before the fork: the
-    // daemon child is `setsid()`'d away from its controlling terminal and
-    // cannot prompt. `fork()` inherits the secret in memory. Skipped in
-    // `--foreground` (the body keeps the terminal) and when a daemon
-    // already serves this state dir (we will attach, not unlock).
-    let mount_passphrase = if foreground || daemon_socket_is_live(&state_dir) {
+    // Read meta.json before the fork (a missing filesystem fails on this
+    // terminal, explained), and collect the E2E passphrase in the
+    // FOREGROUND: the daemon child is `setsid()`'d away from its
+    // controlling terminal and cannot prompt. `fork()` inherits the secret
+    // in memory. The prompt is skipped in `--foreground` (the body keeps
+    // the terminal); both are skipped when a daemon already serves this
+    // state dir (we will attach, not unlock).
+    let mount_passphrase = if daemon_socket_is_live(&state_dir) {
         None
     } else {
-        prompt_e2e_passphrase_if_needed(&node_s3)?
+        let check = check_fs_before_mount(&node_s3, registered_endpoint.as_deref())?;
+        if let (Some(name), Some(endpoint)) = (&name, &check.endpoint) {
+            if registered_endpoint.as_deref() != Some(endpoint.as_str()) {
+                remember_endpoint(name, endpoint);
+            }
+        }
+        if foreground || !check.e2e || std::env::var_os("CONSTELLATION_PASSPHRASE").is_some() {
+            None
+        } else {
+            Some(passphrase(
+                "CONSTELLATION_PASSPHRASE",
+                "Filesystem passphrase: ",
+            )?)
+        }
     };
 
     match daemonize::fork_if_needed(foreground, &state_dir)? {

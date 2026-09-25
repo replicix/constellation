@@ -19,8 +19,7 @@ pub const FORMAT_VERSION: u32 = 1;
 
 /// How long [`ChunkStore::load_fs`] keeps retrying a `GET` of
 /// `meta.json` that answers 404 while a `HEAD` finds the object
-/// (`CONSTELLATION_META_READ_WAIT_S`, default 600 s: the OVH run's lag was
-/// up to ~7 minutes).
+/// (`CONSTELLATION_META_READ_WAIT_S`, default 600 s).
 pub fn meta_read_wait() -> std::time::Duration {
     std::time::Duration::from_secs(
         std::env::var("CONSTELLATION_META_READ_WAIT_S")
@@ -28,6 +27,60 @@ pub fn meta_read_wait() -> std::time::Duration {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(600),
     )
+}
+
+/// What a prefix holds when `meta.json` is missing
+/// ([`ChunkStore::locate_missing_fs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingFs {
+    /// The bucket does not exist at this endpoint (a `LIST` answered
+    /// 404): the request reached a different store than the one the
+    /// filesystem was created on.
+    NoBucket,
+    /// The bucket exists and holds nothing under the prefix.
+    EmptyPrefix,
+    /// Objects exist under the prefix, but no `meta.json`.
+    NoMeta { sample: String },
+    /// The `LIST` failed otherwise (the error's text).
+    Unknown(String),
+}
+
+impl std::fmt::Display for MissingFs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MissingFs::NoBucket => write!(
+                f,
+                "the bucket does not exist at this endpoint: the command is talking to a \
+                 different store than the one the filesystem was created on"
+            ),
+            MissingFs::EmptyPrefix => write!(
+                f,
+                "the bucket exists but holds nothing under this prefix (`fs create` first?)"
+            ),
+            MissingFs::NoMeta { sample } => write!(
+                f,
+                "objects exist under this prefix (e.g. {sample}) but meta.json does not: a \
+                 partly deleted filesystem, or a prefix holding something else"
+            ),
+            MissingFs::Unknown(e) => write!(f, "listing the prefix failed too: {e}"),
+        }
+    }
+}
+
+/// Whether a `LIST` error says the bucket is absent: `object_store` keeps
+/// a `LIST`'s status only in the error text (S3's `NoSuchBucket` code, or
+/// a 404 status; a `LIST` cannot 404 for any other reason).
+fn is_missing_bucket(e: &object_store::Error) -> bool {
+    if matches!(e, object_store::Error::NotFound { .. }) {
+        return true;
+    }
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        text.push_str(&s.to_string());
+        source = s.source();
+    }
+    text.contains("NoSuchBucket") || text.contains("status code: 404")
 }
 
 /// `meta.json`: filesystem identity and settings (DESIGN.md §2).
@@ -304,15 +357,17 @@ impl ChunkStore {
 
     /// Load `meta.json`; `NotFound` when the prefix holds no filesystem.
     ///
-    /// A `GET` answered 404 is only believed once a `HEAD` agrees: the
-    /// OVH run saw `mount` fail with "missing meta.json" for 4-7 minutes
-    /// after `fs create` while a `HEAD` of the very key succeeded
-    /// throughout — a `GET` read (a negative answer cached, or a replica
-    /// that lags) disagreeing with the object's existence. When the
-    /// `HEAD` finds it, the `GET` is retried with backoff (alternating a
-    /// plain and a ranged request) for up to [`meta_read_wait`], saying
-    /// so, and then fails with an error that names the inconsistency
-    /// instead of "no filesystem".
+    /// A `GET` answered 404 is only believed once a `HEAD` agrees — a
+    /// defence against a store whose reads disagree (a cached negative
+    /// answer, a lagging replica). The OVH runs' "missing meta.json" that
+    /// motivated it turned out to be something else (a `mount` run
+    /// without the OVH profile asked AWS; see
+    /// [`Self::locate_missing_fs`]), and OVH served every read
+    /// consistently when probed; the check costs one `HEAD` on the 404
+    /// path only. When the `HEAD` finds the object, the `GET` is retried
+    /// with backoff (alternating a plain and a ranged request) for up to
+    /// [`meta_read_wait`], saying so, and then fails with an error that
+    /// names the inconsistency instead of "no filesystem".
     pub async fn load_fs(&self) -> Result<FsMeta, StoreError> {
         self.load_fs_waiting(meta_read_wait()).await
     }
@@ -344,6 +399,25 @@ impl ChunkStore {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// `load_fs` said [`StoreError::NotFound`]: what the prefix holds
+    /// instead, so the error can say whether the request reached the
+    /// store the filesystem lives on. One `LIST` of the prefix — only on
+    /// this failure path. A `LIST` answers 404 only when the bucket itself
+    /// is absent, which means the command talks to a different store (a
+    /// different endpoint or account) than the one the filesystem was
+    /// created on: the OVH campaigns' "mount lag" was a scripted `mount`
+    /// that ran without the OVH profile and asked AWS for the bucket.
+    pub async fn locate_missing_fs(&self) -> MissingFs {
+        match self.store.list(None).next().await {
+            None => MissingFs::EmptyPrefix,
+            Some(Ok(object)) => MissingFs::NoMeta {
+                sample: object.location.to_string(),
+            },
+            Some(Err(e)) if is_missing_bucket(&e) => MissingFs::NoBucket,
+            Some(Err(e)) => MissingFs::Unknown(e.to_string()),
         }
     }
 
@@ -1356,6 +1430,60 @@ mod tests {
         assert_eq!(faulty.calls(OpKind::Get, "meta.json"), 1);
         assert_eq!(faulty.calls(OpKind::Head, "meta.json"), 1);
         assert!(!s.fs_exists().await.unwrap());
+    }
+
+    /// The OVH campaigns' "mount lag": a `mount` run without the OVH
+    /// profile asked AWS, which has no such bucket — `GET` and `HEAD` of
+    /// `meta.json` 404, and the one `LIST` that follows says why: the
+    /// bucket is not there, so the command reached the wrong store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_bucket_is_told_apart_from_a_missing_filesystem() {
+        use crate::scripted_http::{methods, real_s3, scripted_s3_replies, Reply};
+        let no_bucket = Reply::with_body(
+            404,
+            "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not \
+             exist</Message><BucketName>b</BucketName></Error>",
+        );
+        let (endpoint, seen) = scripted_s3_replies(vec![no_bucket]).await;
+        let s = ChunkStore::new(real_s3(&endpoint));
+        assert!(matches!(s.load_fs().await, Err(StoreError::NotFound)));
+        assert_eq!(s.locate_missing_fs().await, MissingFs::NoBucket);
+        assert_eq!(methods(&seen), vec!["GET", "HEAD", "GET"]);
+        assert!(seen.lock().unwrap()[2].contains("list-type=2"));
+        assert!(MissingFs::NoBucket.to_string().contains("different store"));
+    }
+
+    /// A bucket that is there answers the `LIST`: empty, or holding
+    /// objects but no `meta.json`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_present_bucket_without_meta_json_says_what_the_prefix_holds() {
+        use crate::scripted_http::{real_s3, scripted_s3_replies, Reply};
+        let empty = Reply::with_body(
+            200,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>b</Name>\
+             <Prefix></Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys>\
+             <IsTruncated>false</IsTruncated></ListBucketResult>",
+        );
+        let (endpoint, _) = scripted_s3_replies(vec![empty]).await;
+        let s = ChunkStore::new(real_s3(&endpoint));
+        assert_eq!(s.locate_missing_fs().await, MissingFs::EmptyPrefix);
+
+        let mem = ChunkStore::new(Arc::new(InMemory::new()));
+        assert_eq!(mem.locate_missing_fs().await, MissingFs::EmptyPrefix);
+        mem.inner()
+            .put(
+                &object_store::path::Path::from("log/0001"),
+                PutPayload::from_static(b"x"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(mem.load_fs().await, Err(StoreError::NotFound)));
+        assert_eq!(
+            mem.locate_missing_fs().await,
+            MissingFs::NoMeta {
+                sample: "log/0001".into()
+            }
+        );
     }
 
     /// A `GET` that never catches up fails after the wait with an error

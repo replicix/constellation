@@ -567,109 +567,7 @@ mod tests {
 
     // ---- the OVH run's finding 5, against the real S3 client ----
 
-    /// A one-shot HTTP responder: answers the n-th request with
-    /// `statuses[n]` (the last one repeats), recording each request's
-    /// method. Enough of HTTP/1.1 for `object_store`'s S3 client.
-    async fn scripted_s3(statuses: Vec<u16>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let log = seen.clone();
-        tokio::spawn(async move {
-            let mut n = 0usize;
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
-                let status = statuses[n.min(statuses.len() - 1)];
-                n += 1;
-                let log = log.clone();
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    // Headers, then the body its Content-Length names.
-                    let head_end = loop {
-                        let Ok(k) = sock.read(&mut chunk).await else {
-                            return;
-                        };
-                        if k == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&chunk[..k]);
-                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            break i + 4;
-                        }
-                    };
-                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-                    let len: usize = head
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            k.eq_ignore_ascii_case("content-length")
-                                .then(|| v.trim().parse().ok())
-                                .flatten()
-                        })
-                        .unwrap_or(0);
-                    while buf.len() < head_end + len {
-                        let Ok(k) = sock.read(&mut chunk).await else {
-                            return;
-                        };
-                        if k == 0 {
-                            break;
-                        }
-                        buf.extend_from_slice(&chunk[..k]);
-                    }
-                    log.lock()
-                        .unwrap()
-                        .push(head.split(' ').next().unwrap_or("").to_string());
-                    let (reason, body) = match status {
-                        200 => ("OK", String::new()),
-                        409 => (
-                            "Conflict",
-                            "<Error><Code>OperationAborted</Code><Message>A conflicting \
-                             conditional operation is currently in progress against this \
-                             resource.</Message></Error>"
-                                .to_string(),
-                        ),
-                        412 => (
-                            "Precondition Failed",
-                            "<Error><Code>PreconditionFailed</Code></Error>".to_string(),
-                        ),
-                        _ => ("Error", String::new()),
-                    };
-                    let reply = format!(
-                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nETag: \"e1\"\r\n\
-                         Connection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = sock.write_all(reply.as_bytes()).await;
-                    let _ = sock.shutdown().await;
-                });
-            }
-        });
-        (format!("http://{addr}"), seen)
-    }
-
-    fn real_s3(endpoint: &str) -> Arc<dyn ObjectStore> {
-        Arc::new(
-            object_store::aws::AmazonS3Builder::new()
-                .with_endpoint(endpoint)
-                .with_allow_http(true)
-                .with_bucket_name("b")
-                .with_region("us-east-1")
-                .with_access_key_id("k")
-                .with_secret_access_key("s")
-                .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
-                .with_retry(object_store::RetryConfig {
-                    max_retries: 0,
-                    retry_timeout: Duration::from_secs(5),
-                    backoff: Default::default(),
-                })
-                .build()
-                .unwrap(),
-        )
-    }
+    use crate::scripted_http::{methods, real_s3, scripted_s3};
 
     /// The OVH run's finding 5: OVH answers a losing conditional write
     /// with 409 Conflict before settling on 412. The *real* S3 client's
@@ -725,7 +623,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out, CasPut::Lost);
-        assert_eq!(*seen.lock().unwrap(), vec!["PUT", "PUT", "PUT"]);
+        assert_eq!(methods(&seen), vec!["PUT", "PUT", "PUT"]);
 
         let (endpoint, seen) = scripted_s3(vec![409, 409, 409, 409, 409, 409, 409]).await;
         let store = real_s3(&endpoint);

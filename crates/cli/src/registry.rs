@@ -58,6 +58,13 @@ pub struct FsEntry {
     pub read_only_member: bool,
     #[serde(default)]
     pub web_ui: u16,
+    /// The S3 endpoint this name's `meta.json` was last read from (or
+    /// created at). Diagnostics only: a later command that resolves a
+    /// different endpoint and finds no filesystem says so, because that
+    /// is a command run without the filesystem's `AWS_PROFILE` /
+    /// `AWS_CONFIG_FILE` / `AWS_ENDPOINT_URL` environment.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
     #[serde(default, rename = "mounts")]
     pub mounts: Vec<MountEntry>,
 }
@@ -80,6 +87,7 @@ pub struct FsOverrides {
     pub write_mode: Option<String>,
     pub read_only_member: Option<bool>,
     pub web_ui: Option<u16>,
+    pub endpoint: Option<String>,
     /// The one view this `mount` invocation touched, if any. Bare
     /// `mount NAME` (no subtree/mountpoint given) supplies `None` here
     /// and only reads the registry back.
@@ -246,6 +254,9 @@ impl Registry {
         }
         if let Some(v) = overrides.web_ui {
             entry.web_ui = v;
+        }
+        if let Some(v) = overrides.endpoint {
+            entry.endpoint = v;
         }
         if let Some(view) = overrides.mount {
             match entry.mounts.iter_mut().find(|m| m.subtree == view.subtree) {

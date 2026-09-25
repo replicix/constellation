@@ -7,6 +7,8 @@ use crate::registry::{FsEntry, Registry};
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
+// One value per CLI command: its size does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Target {
     /// `name` is a registered filesystem; `path` is whatever followed

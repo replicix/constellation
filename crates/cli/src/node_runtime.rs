@@ -315,12 +315,16 @@ impl NodeRuntime {
             );
         }
 
-        let backend = rt
-            .block_on(crate::backend::open_backend(&s3))
+        let (backend, backend_info) = rt
+            .block_on(crate::backend::open_backend_described(&s3))
             .context("opening backend")?;
         let fsmeta = rt
-            .block_on(ChunkStore::new(backend.clone()).load_fs())
-            .context("loading filesystem (fs create first?)")?;
+            .block_on(crate::backend::load_fs_explained(
+                &backend,
+                &backend_info,
+                None,
+            ))
+            .context("loading filesystem")?;
         let e2e_keys = if fsmeta.e2e {
             // Prefer the passphrase collected in the foreground before the
             // fork; fall back to the env var / a prompt (works in

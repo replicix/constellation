@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_types::service_config::ServiceConfigKey;
-use object_store::aws::{AmazonS3Builder, AwsCredential};
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential};
 use object_store::CredentialProvider;
 use tokio::sync::RwLock;
 
@@ -97,6 +97,56 @@ impl CredentialProvider for SdkCredentialProvider {
     }
 }
 
+/// Where an S3 client built by [`amazon_s3_builder_resolved`] sends its
+/// requests and who it signs them as: named in the errors a missing
+/// filesystem reports, because a command run without the environment the
+/// filesystem was created with (`AWS_PROFILE`, `AWS_CONFIG_FILE`,
+/// `AWS_ENDPOINT_URL`) silently talks to a different store — the OVH
+/// campaigns' "mount lag" was exactly that (a scripted `mount` went to
+/// AWS with the instance role and found no bucket there).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Resolution {
+    /// The endpoint requests go to: the configured one, or AWS's
+    /// regional default.
+    pub endpoint: String,
+    /// Whether `endpoint` was configured (profile, `services` stanza or
+    /// environment) rather than AWS's default.
+    pub endpoint_configured: bool,
+    pub region: String,
+    /// The link of the credential chain that answered ("ProfileFile",
+    /// "IMDSv2", "Environment", ...), when the SDK names it.
+    pub credentials: Option<String>,
+    /// `AWS_PROFILE`, when set (else the SDK's default profile).
+    pub profile: Option<String>,
+}
+
+impl std::fmt::Display for S3Resolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "endpoint {}", self.endpoint)?;
+        if !self.endpoint_configured {
+            write!(f, " (AWS default: no endpoint configured)")?;
+        }
+        write!(f, ", region {}", self.region)?;
+        if let Some(c) = &self.credentials {
+            write!(f, ", credentials from {c}")?;
+        }
+        match &self.profile {
+            Some(p) => write!(f, ", AWS_PROFILE={p}"),
+            None => write!(f, ", AWS_PROFILE unset"),
+        }
+    }
+}
+
+/// The provider name the SDK stamps on credentials. `Credentials` has no
+/// getter for it; its `Debug` (which redacts the secret) prints it. Only
+/// that field is extracted — the rest of the `Debug` text is never kept.
+fn provider_name(creds: &aws_credential_types::Credentials) -> Option<String> {
+    let debug = format!("{creds:?}");
+    let rest = &debug[debug.find("provider_name: \"")? + "provider_name: \"".len()..];
+    let name = &rest[..rest.find('"')?];
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// Build an [`AmazonS3Builder`] for `bucket` using the standard AWS
 /// credential chain (env vars, shared config/credentials files,
 /// `AWS_PROFILE`, SSO, IMDS, ECS/IRSA, process credentials, …).
@@ -105,6 +155,13 @@ impl CredentialProvider for SdkCredentialProvider {
 /// (`AWS_ENDPOINT`, `AWS_ALLOW_HTTP`, …) keep working; credentials and
 /// region from the SDK override the builder's limited env parsing.
 pub async fn amazon_s3_builder(bucket: &str) -> Result<AmazonS3Builder, StoreError> {
+    Ok(amazon_s3_builder_resolved(bucket).await?.0)
+}
+
+/// [`amazon_s3_builder`], plus where the client will send its requests.
+pub async fn amazon_s3_builder_resolved(
+    bucket: &str,
+) -> Result<(AmazonS3Builder, S3Resolution), StoreError> {
     let sdk = aws_config::defaults(BehaviorVersion::latest()).load().await;
     let provider = sdk.credentials_provider().ok_or_else(|| {
         StoreError::AwsCredentials(
@@ -114,18 +171,20 @@ pub async fn amazon_s3_builder(bucket: &str) -> Result<AmazonS3Builder, StoreErr
         )
     })?;
 
-    let adapter = SdkCredentialProvider {
-        provider,
-        cache: RwLock::new(None),
-    };
     // Fail fast with a clear message (expired SSO, missing profile, …)
-    // instead of on the first PUT minutes later.
-    adapter.get_credential().await.map_err(|source| {
+    // instead of on the first PUT minutes later; the answer seeds the
+    // adapter's cache.
+    let first = provider.provide_credentials().await.map_err(|source| {
         StoreError::AwsCredentials(format!(
             "loading via the standard chain \
              (env, ~/.aws profile/SSO, IMDS, …): {source}"
         ))
     })?;
+    let credentials = provider_name(&first);
+    let adapter = SdkCredentialProvider {
+        provider,
+        cache: RwLock::new(Some(CachedCreds::from_sdk(&first))),
+    };
 
     let region = sdk
         .region()
@@ -136,7 +195,7 @@ pub async fn amazon_s3_builder(bucket: &str) -> Result<AmazonS3Builder, StoreErr
 
     let mut builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
-        .with_region(region)
+        .with_region(region.clone())
         .with_credentials(Arc::new(adapter));
 
     // `AmazonS3Builder::from_env` reads `AWS_ENDPOINT` (object_store's own
@@ -164,5 +223,46 @@ pub async fn amazon_s3_builder(bucket: &str) -> Result<AmazonS3Builder, StoreErr
         builder = builder.with_endpoint(ep);
     }
 
-    Ok(builder)
+    let configured = builder.get_config_value(&AmazonS3ConfigKey::Endpoint);
+    let resolution = S3Resolution {
+        endpoint_configured: configured.is_some(),
+        endpoint: configured.unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com")),
+        region,
+        credentials,
+        profile: std::env::var("AWS_PROFILE").ok().filter(|p| !p.is_empty()),
+    };
+    Ok((builder, resolution))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_name_is_read_without_the_keys() {
+        let creds = aws_credential_types::Credentials::new(
+            "AKIDEXAMPLE",
+            "secret-example",
+            None,
+            None,
+            "ProfileFile",
+        );
+        assert_eq!(provider_name(&creds).as_deref(), Some("ProfileFile"));
+    }
+
+    #[test]
+    fn resolution_names_the_default_endpoint_and_the_credentials() {
+        let r = S3Resolution {
+            endpoint: "https://s3.us-west-2.amazonaws.com".into(),
+            endpoint_configured: false,
+            region: "us-west-2".into(),
+            credentials: Some("IMDSv2".into()),
+            profile: None,
+        };
+        assert_eq!(
+            r.to_string(),
+            "endpoint https://s3.us-west-2.amazonaws.com (AWS default: no endpoint configured), \
+             region us-west-2, credentials from IMDSv2, AWS_PROFILE unset"
+        );
+    }
 }

@@ -70,7 +70,12 @@ def ssh_run(node: str, remote_cmd: str, timeout: float = 30, env: Optional[dict]
     ip = _ip(node)
     prefix = ""
     if env:
-        prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + " "
+        # `export`, not a `VAR=value cmd` prefix: callers chain commands
+        # (`mkdir -p X && constellation mount ...`), and a prefix binds only
+        # the first one. That is how the OVH campaigns' mounts ran without
+        # the OVH profile, asked AWS for the bucket, and failed "missing
+        # meta.json" while manual mounts worked.
+        prefix = "export " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + "; "
     full_cmd = prefix + remote_cmd
     cmd = ["ssh"] + SSH_OPTS + [f"{SSH_USER}@{ip}", full_cmd]
     t0 = time.time()

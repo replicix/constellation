@@ -23212,3 +23212,142 @@ request).
   still be uploading on the deposed node. The replay's forward now
   carries them (the sync task fills `pending` at send time), so this is
   closed for P2P replays; worth a look by the M3b owner anyway.
+
+## Fix: OVH mount lag
+
+The "mount lag" on OVH (EC2 round 3 Finding 5, campaign 4 Finding A-2:
+`mount` failing for 11-30+ minutes after `fs create` or after a kill -9,
+flapping, while `aws s3api head-object` of `meta.json` succeeded) was
+never an OVH behaviour. The scripted mounts did not talk to OVH at all.
+
+### The failing request sequence
+
+The campaign drivers (`c4common.py`, and the repo's
+`bench/remote/common.py`) ran each remote command as
+`AWS_CONFIG_FILE=… AWS_PROFILE=bra-private AWS_SHARED_CREDENTIALS_FILE=/dev/null mkdir -p MNT && constellation mount --s3 s3://bra-private/PREFIX NAME MNT`.
+A `VAR=value` prefix binds only the first command of the line (`mkdir`),
+so `mount` ran with no OVH profile: the SDK chain fell through to the EC2
+instance role (IMDSv2), region us-west-2 and no configured endpoint, so
+object_store sent the requests to `https://s3.us-west-2.amazonaws.com`,
+where no bucket `bra-private` exists:
+
+1. `GET bra-private/PREFIX/meta.json` → 404 (the pre-fork E2E check,
+   `prompt_e2e_passphrase_if_needed`, background mounts only);
+2. `HEAD bra-private/PREFIX/meta.json` → 404 (edd3d5d's check agreed);
+3. `Error: no filesystem found at this prefix (missing meta.json)` — the
+   exact text captured in campaign 4's `testA_createrace_ovh.log`, with
+   no `aws_config` "loaded base credentials" line (the profile was never
+   read). `fs create` worked because its line had no `&&`, and every
+   "manual mount that worked within seconds" had the environment
+   exported; hence the "flapping". Reproduced on 10.108.0.70 with the
+   edd3d5d binary: the harness-shaped line fails the same way and
+   `RUST_LOG=reqwest=debug` shows `starting new connection
+   s3.us-west-2.amazonaws.com`; `aws s3api head-bucket --bucket
+   bra-private` without the profile answers 404.
+
+### The backend's behaviour (probed directly)
+
+A SigV4 probe (path style, as object_store sends, and virtual-host
+style; keep-alive connections) against `s3.eu-south-mil.io.cloud.ovh.net`:
+
+- `HEAD`/`GET` of `meta.json` (the kept soak prefix and a fresh one): 200
+  every time, both styles, same ETag / `x-amz-version-id`.
+- 20 keys: `PUT If-None-Match: *` → immediate `GET` 200, `HEAD` 200,
+  `LIST` (ListObjectsV2, prefix = the key) lists it, `PUT If-Match:
+  <etag>` 200. No lag at all.
+- `PUT If-None-Match: *` on an existing key → 412 `PreconditionFailed`
+  (`<Condition>If-None-Match</Condition>`); `If-Match` with a superseded
+  ETag → 412; `If-Match` on a missing key → 404 `NoSuchKey`;
+  `If-None-Match: *` after a `DELETE` → 200.
+- The bucket is not versioned: `get-bucket-versioning` returns no
+  status, `DELETE` returns the deleted version id and no
+  `x-amz-delete-marker`, `list-object-versions` shows one version per
+  key and no delete markers.
+
+### The fix
+
+Constellation was correct on OVH; what failed was the diagnosis. The
+changes make this failure explain itself:
+
+- `amazon_s3_builder_resolved` (store-s3) also returns an `S3Resolution`:
+  the endpoint (configured, or AWS's regional default), region,
+  credential provider name ("ProfileFile", "IMDSv2", …, from the SDK's
+  own credentials) and `AWS_PROFILE`. The CLI's `open_backend_described`
+  returns it as `BackendInfo`; `doctor` prints it.
+- `ChunkStore::locate_missing_fs`: when `meta.json` is missing, one
+  `LIST` of the prefix tells a missing bucket (a `LIST` can only 404 for
+  that: NoSuchBucket) from an empty prefix from a prefix holding other
+  objects. Only on the failure path.
+- `backend::load_fs_explained` (mount pre-fork, the daemon's
+  `NodeRuntime::start`, `status --s3`) turns "missing meta.json" into:
+
+  ```
+  Error: no filesystem found at s3://bra-private/s3fs/lag-…: meta.json is missing
+    looked at: endpoint https://s3.us-west-2.amazonaws.com (AWS default: no endpoint configured), region us-west-2, credentials from IMDSv2, AWS_PROFILE unset
+    found: the bucket does not exist at this endpoint: the command is talking to a different store than the one the filesystem was created on
+    this name was created or last mounted against endpoint https://s3.eu-south-mil.io.cloud.ovh.net, but this command resolved https://s3.us-west-2.amazonaws.com: run it with the same AWS_PROFILE / AWS_CONFIG_FILE / AWS_ENDPOINT_URL environment the filesystem was created with
+  ```
+
+  (captured on EC2 from the harness-shaped line with the new binary).
+- The registry remembers the endpoint per name (`FsEntry::endpoint`,
+  diagnostics only): set by `fs create` and by every mount whose
+  pre-fork read of `meta.json` succeeded; cleared when `--s3` repoints
+  the name. A mismatch is only reported, never acted on.
+- `mount` reads `meta.json` before forking in `--foreground` too (one
+  `GET`), so both modes fail on the terminal with the same explanation;
+  the E2E passphrase prompt is unchanged (background mounts only).
+- The default log filter is `info,aws_config=warn`: `aws_config` logged
+  the loaded credentials, access key id included, at INFO on every
+  command.
+- `bench/remote/common.py` `ssh_run` exports the environment
+  (`export …; cmd`) instead of prefixing it.
+
+Safety: nothing about CAS, leases or the log changed; the new code runs
+only after `load_fs` already returned `NotFound` (one `LIST`, then an
+error) or records a diagnostic string in the local registry. edd3d5d's
+`GET`-404-needs-a-`HEAD` check stays as a cheap defence (one `HEAD` on
+the 404 path); its comments no longer claim OVH served inconsistent
+reads. No lag fault knob was added: no store lag exists to simulate.
+
+Tests: store-s3 `a_missing_bucket_is_told_apart_from_a_missing_filesystem`
+(the real S3 client against the scripted HTTP server answering 404
+NoSuchBucket to GET, HEAD and LIST, which is what AWS answered the
+campaign's mounts), `a_present_bucket_without_meta_json_says_what_the_prefix_holds`
+(empty ListBucketResult; InMemory with a stray object),
+`provider_name_is_read_without_the_keys`,
+`resolution_names_the_default_endpoint_and_the_credentials`; CLI
+`a_mount_that_reached_the_wrong_store_says_so`,
+`a_local_prefix_without_meta_json_is_explained`. The scripted HTTP server
+moved from `cas.rs`'s tests to `scripted_http.rs` (per-request bodies,
+records method and target). store-s3 lib 207 passed; CLI bin 237 passed;
+clippy clean on both; workspace `cargo check --all-targets` clean.
+
+### EC2 verification against OVH (binary b9639ea0, 4 × c5n.2xlarge us-west-2 → Milan)
+
+Environment exported properly; background `mount`; times include the ssh
+round trip (~0.3 s). Every round wrote a file and read it back (4-node
+rounds: written on a, read on d).
+
+| run | result | `fs create` | `mount` |
+|---|---|---|---|
+| 10 × fresh prefix, 1 node | 10/10 | 2.5-2.7 s | 7.2-7.5 s |
+| 10 × fresh prefix, 4 nodes in parallel (b, c, d join with `--s3`) | 40/40 mounts | 2.4-2.6 s | 7.9-11.2 s (p50 ≈ 8.6 s); write on a visible on d in 0.37-0.56 s |
+| 5 × kill -9 one node (a, b, c, d, a) + `fusermount3 -uz` + remount | 5/5 | — | 5.64-5.67 s; new write visible on another node in 0.4-0.7 s; pre-kill file readable |
+| 1 × kill -9 all 4 nodes + remount | 4/4 | — | 5.39-5.62 s |
+| `--foreground` mount, fresh prefix | ok | — | 7.1 s |
+
+The edd3d5d binary with the environment exported also mounted a fresh
+prefix in 7.0 s and remounted in 4.0-4.2 s three times; with the
+harness-shaped line it failed at once, every time, as described above.
+All `lag-*` prefixes, registry rows, state dirs and mounts were removed
+afterwards; `list-object-versions --prefix s3fs/lag-` is empty.
+
+### For other owners
+
+- The campaign drivers in the coordinator's scratchpad (`c4common.py`
+  `ssh_run`, used by `chaos_driver.py` and `testA_*.py`) have the same
+  `VAR=value cmd1 && cmd2` bug. Campaign 4's captured mount output
+  matches it exactly; its OVH "remount after kill -9 failed" results
+  (output not captured) and round 3's identical symptom are consistent
+  with it. The OVH coverage gaps it caused (create race, lock recovery,
+  lock fence, Part C/D) are untested rather than failing.
