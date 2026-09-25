@@ -382,6 +382,15 @@ impl Core {
             }
             tracing::info!(node = me, dir = d.dir, gen = d.gen, "delegation installed");
             self.stats.deleg_installed += 1;
+            // A delegate's reply base is the last applied segment that
+            // touched the op's keys (`reply_base`), and the window only
+            // records segments applied while this node delegates: one
+            // applied before this grant — the root's earlier writes in
+            // the subtree — would be missing from it, and a reply naming
+            // a lower base would let the requester install it on a
+            // replica without them (chaos-soak-4 seed 42, `wf293`). The
+            // floor covers everything applied so far.
+            self.shipped_floor = self.shipped_floor.max(replica.applied_seq().unwrap_or(0));
             self.dl.mine.insert(
                 d.gen,
                 DelegateState {
@@ -722,7 +731,18 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let base = self.reply_base(op, replica);
+        // chaos-soak-4 seed 42 (`wf293`): what this replica holds ahead of
+        // its applied log (the root's pre-S3 stream, a shadow of its own)
+        // is nowhere in the log the requester's `base` check reads, so
+        // an op touching it is answered without a base: the requester
+        // waits for the log instead of installing the reply on a replica
+        // that may lack the earlier write (see
+        // `a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_state`).
+        let base = if replica.speculation_touches(&super::holder::keys_of_op(op)) {
+            None
+        } else {
+            self.reply_base(op, replica)
+        };
         // The requester installs an accepted reply as a shadow under
         // this epoch: the root's, as this delegate knows it, so that the
         // shadow strands at a root takeover (conservative: the record

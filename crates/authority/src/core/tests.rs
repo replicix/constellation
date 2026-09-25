@@ -5183,3 +5183,129 @@ fn an_inbox_op_waits_for_its_deps() {
     assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_some());
     assert_eq!(inbox_deletes(&out), vec![(1, 2, 0)]);
 }
+
+// ---- chaos-soak-4 seed 42 (`wf293`): a delegate's reply base ----
+
+/// A delegate's reply `base` must cover everything its replica held when
+/// it evaluated the op — also what it applied *before* the grant
+/// installed (a segment of the root's, applied while this node had no
+/// delegation, is not in its shipped-touch window), and what it holds
+/// only as speculation ahead of the log (the root's pre-S3 stream). A
+/// base below either let the requester install the accepted reply as a
+/// shadow on a replica that lacked the earlier write: the write then
+/// landed on top of the shadow, and when the stream's copy of the
+/// requester's own op adopted the shadow in place the replica kept the
+/// earlier write for good (the requester served another node's
+/// whole-file write while every other replica served its own).
+#[test]
+fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_state() {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.cfg.forwarding = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+    let apply = |h: &Harness, seq: u64, recs: &[LogRecord]| {
+        crate::replica::Replica::apply_segment(&h.meta, seq, 1, 0, &[], &[], recs).unwrap();
+    };
+    apply(
+        &h,
+        1,
+        &[LogRecord::Mkdir {
+            parent: ROOT_INO,
+            name: "d1".into(),
+            ino: dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }],
+    );
+    // The root creates `d1/f` for another node, before the grant.
+    let f = (1u64 << 40) | 77;
+    apply(
+        &h,
+        2,
+        &[LogRecord::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: f,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 2,
+        }],
+    );
+    apply(
+        &h,
+        3,
+        &[LogRecord::Delegate {
+            dir,
+            node: 3,
+            gen: 1,
+            designated: true,
+            range: (0, 0),
+        }],
+    );
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    assert_eq!(h.core.deleg_view().mine.len(), 1);
+    // The root's stream carries a create of `d1/g` ahead of the log.
+    let g = (1u64 << 40) | 78;
+    h.meta
+        .install_streamed(
+            1,
+            5,
+            5,
+            &[LogRecord::Create {
+                parent: dir,
+                name: "g".into(),
+                ino: g,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 3,
+            }],
+        )
+        .unwrap();
+    let mut ask = |name: &str, req: u64| {
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: req,
+                },
+                op: MutateOp::Unlink {
+                    parent: dir,
+                    name: name.into(),
+                },
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+            },
+        });
+        match sends(&out).first().map(|(_, m)| *m) {
+            Some(PeerMsg::MutateReply { base, outcome, .. }) => {
+                assert!(
+                    matches!(outcome, MutateOutcome::Accepted { .. }),
+                    "{outcome:?}"
+                );
+                *base
+            }
+            other => panic!("{other:?}: {out:?}"),
+        }
+    };
+    let base_f = ask("f", 1);
+    assert!(
+        base_f.is_some_and(|b| b >= 2),
+        "the base {base_f:?} is below the segment that created d1/f"
+    );
+    assert_eq!(
+        ask("g", 2),
+        None,
+        "d1/g is streamed speculation here: only the log can order the reply"
+    );
+    assert_eq!(h.core.stats.deleg_executed, 2);
+}

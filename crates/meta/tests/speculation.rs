@@ -1057,3 +1057,65 @@ fn a_hint_is_not_installed_over_live_speculation_on_its_keys() {
     assert!(meta.lookup(ROOT_INO, "f0").unwrap().is_none());
     assert_eq!(meta.lookup(ROOT_INO, "f1").unwrap().map(|e| e.ino), Some(a));
 }
+
+/// `chaos-soak-4` seed 42, `write_full_duel:wf293`: a requester's own
+/// op whose accepted reply overtook the holder's pre-S3 stream. The
+/// holder journaled another node's write to the inode (row 2–3) and
+/// then this node's (rows 4–5); both became backup-durable together,
+/// and the reply to this node was installed as a shadow before the
+/// stream delivered row 2. The streamed transaction was then applied on
+/// top of the shadow, and the stream's copy of this node's own
+/// transaction was adopted in place, without re-applying it: the replica
+/// kept the other node's write while the log (and every other replica)
+/// ends on this node's. The segment skips streamed rows, so nothing ever
+/// corrected it. A streamed transaction belongs *before* every shadow
+/// the stream has not reached yet, and an adopted shadow at its stream
+/// position.
+#[test]
+fn a_streamed_transaction_goes_under_a_shadow_whose_reply_overtook_it() {
+    let a = ino(60);
+    let mine = rid(61);
+    let other = Rid {
+        node: 3,
+        incarnation: 1,
+        seq: 1,
+    };
+    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let seg1 = [create("wf", a, t0)];
+    let theirs = [chmod(a, 0o600, t0 + 1), completed(other)];
+    let ours = [chmod(a, 0o640, t0 + 2), completed(mine)];
+    let seg2: Vec<LogRecord> = theirs.iter().chain(ours.iter()).cloned().collect();
+    let op = MutateOp::Setattr {
+        ino: a,
+        mode: Some(0o640),
+        uid: None,
+        gid: None,
+        size: None,
+        atime_ns: None,
+        mtime_ns: None,
+    };
+
+    let reference = Meta::open_in_memory().unwrap();
+    apply(&reference, 1, 1, &seg1);
+    apply(&reference, 2, 1, &seg2);
+    let mode = |m: &Meta| m.getattr(a).unwrap().unwrap().mode & 0o7777;
+    assert_eq!(mode(&reference), 0o640);
+
+    let meta = Meta::open_in_memory().unwrap();
+    apply(&meta, 1, 1, &seg1);
+    assert!(meta.install_shadow(mine, 1, &op, &ours).unwrap());
+    assert_eq!(mode(&meta), 0o640, "read-your-writes");
+    meta.install_streamed(1, 2, 3, &theirs).unwrap();
+    assert_eq!(
+        mode(&meta),
+        0o640,
+        "the streamed earlier write went over this node's later one"
+    );
+    meta.install_streamed(1, 4, 5, &ours).unwrap();
+    assert_eq!(mode(&meta), 0o640, "the adopted shadow is not on top");
+    meta.apply_segment_rows(2, 1, 5, &[2, 3, 4, 5], &[], &seg2, &TouchSet::default())
+        .unwrap();
+    assert!(!meta.has_outstanding_speculation());
+    assert_eq!(mode(&meta), 0o640);
+    assert_eq!(raw_ns(&meta), raw_ns(&reference));
+}

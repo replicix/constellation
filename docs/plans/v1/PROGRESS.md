@@ -22384,3 +22384,175 @@ a node tailing S3 alone could see the same lag there.
   same class as this branch's first-version 1607, e.g. 1686
   "`Unlink("d2/f3")` took effect in the log but the spec refuses it") —
   worth their own investigation (M11 delegation × holder failover).
+
+## Fix: chaos-soak-4 divergence and the truncate/fallocate fuzz failure
+
+(coder, 2026-09-25; uncommitted on `fix-divergence` = main fc3c5f6.)
+
+### 1. `chaos-soak-4` seed 42, `write_full_duel:wf293`
+
+**The shape.** `WriteFull` is `open(O_CREAT|O_TRUNC)`, 256 bytes,
+`fsync`, close; four workers race on a fresh name. Worker 0's create
+wins. A worker whose lookup already sees the file opens it with
+`O_TRUNC` and writes too. Both manifest commits carry a base, the empty
+manifest. The second one to reach its sequencer is refused (`Conflict`)
+and rebased onto the winner's manifest. The log therefore ends on the
+rebased commit. In the failing run that was worker 0's `w0'` (rebased
+onto worker 3's `w3`). Nodes 1–3 served `w0'` and node 0 served `w3`,
+permanently.
+
+**The mechanism: a meta-level ordering hole in `Meta::install_streamed`
+(root cause of the permanence).** A requester keeps one entry for its
+own op, whichever of its reply and its pre-S3 stream copy arrives first.
+When the reply arrives first, the shadow is installed, and the stream's
+copy later *adopts* it in place without re-applying it (seed 1402's
+rule). The segment then skips all streamed rows. That is only right if
+nothing the log orders *before* the op landed on top of the shadow in the
+meantime. Nothing enforced that:
+- a streamed transaction the holder ordered before the shadowed op
+  (still unstreamed when the reply arrived) was installed at the end,
+  on top of the shadow;
+- a tailed segment carrying an earlier write was applied on top as a
+  `Foreign` row too.
+
+The adoption then froze that order: node 0 = shadow `w0'`, then `w3`
+on top, then the adoption of `w0'` without a re-apply, then the segment
+skips both. `w3` stays for good, and every other replica applies
+`w3, w0'`. Reproduced deterministically:
+`crates/meta/tests/speculation.rs`
+`a_streamed_transaction_goes_under_a_shadow_whose_reply_overtook_it`
+(chmods instead of manifests, the same records path). On main it fails,
+with 0o600 after the segment where the log gives 0o640.
+
+**How the shadow got ahead of `w3`: a delegate's reply `base`.** A root
+holder's reply cannot cause this. `reply_base` names no base (`None`, so
+the requester waits for the log) when the holder's unshipped journal
+touched the op's keys, and names the last shipped touch otherwise. A
+*delegate* (M11/M12, placement on by default, and chaos-soak-4 splits its
+directory into hash ranges) computed the same base from its own
+shipped-touch window. That window has two gaps:
+- the window records only segments applied **while the node delegates**
+  (`jobs.rs`: `if !self.dl.mine.is_empty()`). The root's writes to the
+  subtree before the grant (here `w3`, executed by the root before the
+  range was delegated) were not in it, so the base fell to
+  `shipped_floor` = 0;
+- the delegate's replica may hold root transactions only as **pre-S3
+  streamed speculation**. No base names them.
+
+So the delegate evaluated `w0'` against a replica with `w3` and answered
+`Accepted, base 0`. Node 0, which did not have `w3` yet (a `Conflict`
+reply installs nothing), passed the `applied ≥ base` check and installed
+the shadow. `w3` then reached node 0 from the root (stream or segment),
+on top of it. The delegate streamed `w0'` to the root, the root appended
+it after `w3`, and the root's pre-S3 stream carried it to node 0, where
+it adopted the shadow in place. Pinned in
+`crates/authority/src/core/tests.rs`
+`a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_state`.
+On main that test fails with base `Some(0)` below the segment that
+created the name.
+
+What the evidence shows, and what it does not: the failure's artifacts
+are gone. The chain above is the only one I found that produces "the
+writer of the content every other replica serves holds the other write,
+permanently" with no fault injected. Each link is shown by a test that
+fails on main. I did not reproduce the whole chain end to end in the sim
+or the harness (see below).
+
+**Fixes.**
+- `Meta::install_streamed` (`crates/meta/src/store/spec.rs`) puts a
+  streamed transaction in its log place. The stream is contiguous from
+  the applied log, so every outstanding shadow (its reply here, its
+  transaction not streamed yet) and every `Local` row is later in the
+  log than what the stream delivers now. A shadow the stream confirms
+  belongs after everything tailed or streamed. When the order matters
+  (the keys overlap: `streamed_out_of_place`), `insert_streamed_tx`
+  works like the segment's insert-before-`Local` path. It rolls back to
+  the oldest outstanding shadow and redoes the rows in this order:
+  1. the tailed and streamed rows;
+  2. the streamed transaction (the adopted shadow, now `Streamed`, or a
+     fresh row);
+  3. the shadows and `Local` rows.
+
+  Relative order is kept within each group, and every row gets a fresh
+  `spec_seq`. **Hints stay where they are.** A hint is not converted when
+  its refusal streams, so it may already be ahead of what arrives. A
+  first version moved hints behind the streamed transaction, and the new
+  sim config caught it: seed 90024 has the hint of `create f1`, its
+  streamed refusal, then the streamed `rename f1 f0`, and the redo undid
+  the rename. A hint never overlaps a live shadow (`install_hint_from`),
+  so leaving it in place never misplaces one. Nothing changes when no
+  shadow is outstanding (one counter read), or when the keys do not
+  overlap.
+- A delegate's reply base (`crates/authority/src/core/delegate.rs`):
+  - installing a grant raises `shipped_floor` to the replica's applied
+    seq, so segments applied before the grant are covered;
+  - an op whose keys overlap outstanding non-`Local` speculation
+    (streamed, shadow or hint; the new `Meta::speculation_touches` /
+    `Replica::speculation_touches`, which scans `spec_live` only) is
+    answered with `base: None`, so the requester waits for the log.
+
+**Sim.** New `backup-hot` config (four nodes, two names, backups on,
+30 ms stream hold-off, no faults) and `placement-hot` (the same plus
+placement and two directories), with the sweep `long_backup_hot` (even
+seeds `backup-hot`, odd `placement-hot`). With a probe in place, streamed
+transactions landed under a live shadow about 120 times in 100 seeds. None
+overlapped, because the root's `base` rule keeps an overlapping shadow
+out, and the placement config rarely has a delegate answer other nodes'
+ops on hot names. So the sweep exercises the new path's no-op side and
+the hint rule (it found the first version's bug), not the divergence
+itself. `regression_streamed_reorder_keeps_hints_in_place` pins seeds
+90024 (`backup-hot`) and 90039 (`placement-hot`), which failed with hints
+moved.
+
+**Ruled out along the way:**
+- a root holder's reply overtaking the stream on an overlapping key:
+  `reply_base` is `None` whenever the unshipped journal (the holder's
+  own manifest commit included, via `note_unshipped_ino`) touched it;
+- stream frames reordered in flight: `on_stream_ahead` accepts only
+  `first == ahead_next` (contiguous from the log);
+- a delegate's own `Local` rows under a later streamed root transaction:
+  they retire only by a segment, whose insert-before-`Local` rewind
+  re-applies both in log order;
+- node 0 as the holder: its own journal order is the log order.
+
+### 2. `random_write_truncate_fallocate_sequences_match_a_model`
+
+Failing sequence: seed 34 (the default 150 seeds hit it). It is a debug
+assertion, `start < file_len` in `ChunkLayout::chunk_len`, from
+`compose_manifest`'s re-cut loop during a rebase in the final flush. The
+file had grown to ten 16-byte chunks, so its manifest **spills**. A
+truncate to 32 then ran `meta.setattr(size)` → `clip_manifest`, which
+lowers `file_len` but can only drop *inline* chunk entries (it cannot
+rewrite a spill blob). The session's base was stale, so the commit
+rebased onto the clipped manifest: `file_len` 32 with entries 0–9. The
+re-cut then asked for the old length of chunk 7 of a 32-byte base.
+
+The product was wrong, not the model. 9794abc's invariant is that "a
+manifest's content is valid only below its `file_len`", but
+`compose_manifest` read the chunk list of a spilled base without
+clipping it. The fix (`crates/cli/src/fusefs.rs`, `compose_manifest`
+only) drops the base's entries at or past `file_len` once, where the
+list is read. Every later use (the carried chunks, a partial chunk's
+seed and the re-cut) now agrees with the invariant. The failure dates
+from 9794abc, which introduced both the clip and the straddle re-cut.
+`TRUNCATE_FUZZ_SEEDS=5000`: pass (729 s, debug).
+
+### Gates (this branch)
+
+- `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings`: clean;
+- meta: every test passed (86 lib, and speculation 13 including the new
+  one); the ignored long speculation property test passed (117 s);
+- `cargo test -p constellation-authority --release`: 90 lib (the new
+  core test included) + 85 sim (9 ignored) passed;
+- sweeps: `long_random` 1000, `long_backup` 1000, `long_delegated` 300,
+  `long_strict` 1000 and `long_backup_hot` 1000 all passed;
+- cli unit tests: 221 passed (the fuzz at its default 150 seeds
+  included);
+- harness (private prefix `constellation-harness-diverge`): `chaos-ci`
+  seed 42 PASS; `chaos-soak-4` seeds 42, 43 and 42 PASS (309–311 s
+  each). Those three runs cannot show the fix: the failure was 1 in about
+  18 runs.
+
+No containers, mounts, `/tmp/harness-*` or `/tmp/chaos-soak-4-*`
+directories of this session are left.

@@ -469,6 +469,22 @@ fn read_live(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, Me
     Ok(out)
 }
 
+/// The outstanding shadows, hints and streamed transactions (`spec_live`,
+/// normally empty): one counter read when there are none, and never a
+/// scan of this node's own `Local` backlog.
+fn live_non_local(r: &impl Readable, meta: &Meta) -> Result<Vec<(u64, LiveEntry)>, MetaError> {
+    let mut out = Vec::new();
+    if counter_get(r, &meta.local, KV_SPEC_LIVE_COUNT)? == 0 {
+        return Ok(out);
+    }
+    let floor = counter_get(r, &meta.local, KV_SPEC_FLOOR)?;
+    for guard in r.range(&meta.spec_live, seq_key(floor)..) {
+        let (k, v) = guard.into_inner()?;
+        out.push((decode_seq(&k)?, postcard::from_bytes(&v)?));
+    }
+    Ok(out)
+}
+
 /// Plan 30 §M9: the live `Streamed` entry whose records complete `rid`,
 /// if any.
 fn streamed_entry_completing(
@@ -1298,6 +1314,203 @@ fn redo_row_tx(
     Ok(())
 }
 
+/// A streamed transaction to put in its log place (see
+/// [`Meta::install_streamed`]): its tenure position, its records, and the
+/// shadow it confirms (`spec_seq`, rid, op), if it is this node's own op.
+struct StreamedTx<'a> {
+    epoch: u64,
+    first: u64,
+    last: u64,
+    records: &'a [LogRecord],
+    adopt: Option<(u64, Rid, MutateOp)>,
+}
+
+/// Whether a row stays ahead of a transaction the stream delivers now: a
+/// tailed segment (`Foreign`) or a streamed transaction precedes it in
+/// the log. So does a hint, as far as the reordering goes: its refusal
+/// may be streamed already (a hint is not converted when it is), and then
+/// what the stream delivers now is later than the state the hint read
+/// (`backup-hot` seed 90024: the hint of `create f1`, its streamed
+/// refusal, then the streamed `rename f1 f0` — redone under the hint, the
+/// rename was undone). A hint never overlaps an outstanding shadow
+/// (`install_hint_from`), so leaving it where it is never misplaces one.
+fn row_is_ordered(row: &SpecRow) -> bool {
+    matches!(
+        row.kind,
+        SpecKind::Foreign { .. } | SpecKind::Streamed { .. } | SpecKind::Hint { .. }
+    )
+}
+
+/// The keys a row's application touched (a `Local` row's records are its
+/// journal rows).
+fn row_touches(r: &impl Readable, meta: &Meta, row: &SpecRow) -> Result<TouchSet, MetaError> {
+    if let SpecKind::Local { first, .. } = &row.kind {
+        let Some(head) = local::get_journal_tx_head(r, meta, *first)? else {
+            return Ok(TouchSet::default());
+        };
+        let records = local::journal_records(r, meta, *first, head.last)?;
+        return Ok(TouchSet::from_records(records.iter().map(|(_, rec)| rec)));
+    }
+    Ok(TouchSet::from_records(row.records.iter()))
+}
+
+/// Plan 30 §M9: where [`Meta::install_streamed`] must rewind from to put
+/// a streamed transaction in its log place, or `None` when installing it
+/// at the end (or adopting the shadow `adopt` in place) gives the same
+/// state. The stream is contiguous from the applied log, so every
+/// outstanding shadow (its reply here, its transaction not streamed yet)
+/// and `Local` row is later in the log than the transaction the stream
+/// delivers now, and everything tailed or streamed is earlier than a
+/// shadow the stream confirms now (hints: see [`row_is_ordered`]). Out of
+/// place:
+/// - the transaction (not this node's) overlaps an outstanding shadow or
+///   `Local` row at or after the oldest outstanding shadow;
+/// - the confirmed shadow `adopt` overlaps a tailed, streamed or hint row
+///   installed after it, or an outstanding shadow or `Local` row
+///   installed before it.
+fn streamed_out_of_place(
+    r: &impl Readable,
+    meta: &Meta,
+    adopt: Option<u64>,
+    records: &[LogRecord],
+) -> Result<Option<u64>, MetaError> {
+    let Some(cutoff) = live_non_local(r, meta)?
+        .into_iter()
+        .filter(|(_, entry)| matches!(entry, LiveEntry::Shadow { .. }))
+        .map(|(seq, _)| seq)
+        .min()
+    else {
+        return Ok(None);
+    };
+    let live: HashMap<u64, LiveEntry> = read_live(r, meta)?.into_iter().collect();
+    let rows = read_rows_from(r, &meta.spec, cutoff)?;
+    let touches = match adopt {
+        Some(x) => match rows.iter().find(|(seq, _)| *seq == x) {
+            Some((_, row)) => TouchSet::from_records(row.records.iter()),
+            None => return Ok(None),
+        },
+        None => TouchSet::from_records(records.iter()),
+    };
+    for (seq, row) in &rows {
+        let misplaced = match adopt {
+            Some(x) if *seq == x => false,
+            Some(x) if *seq > x => row_is_ordered(row),
+            Some(_) => !row_is_ordered(row) && live.contains_key(seq),
+            None => !row_is_ordered(row) && live.contains_key(seq),
+        };
+        if misplaced && row_touches(r, meta, row)?.overlaps(&touches) {
+            return Ok(Some(cutoff));
+        }
+    }
+    Ok(None)
+}
+
+/// [`Meta::install_streamed`]'s reordering, inside the caller's
+/// transaction: roll every row from `cutoff` back, then redo in the log's
+/// order — the tailed, streamed and hint rows (their relative order
+/// kept), the streamed transaction (the confirmed shadow, now `Streamed`,
+/// or a fresh row), then the outstanding shadows and `Local` rows (their
+/// relative order kept). Every redone row moves to a fresh `spec_seq`.
+/// Retired speculation is dropped as in [`rewind_tx`]. Usage moves are
+/// staged into `staged`.
+fn insert_streamed_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    staged: &UsageTracker,
+    cutoff: u64,
+    t: StreamedTx<'_>,
+) -> Result<(), MetaError> {
+    let mut live: HashMap<u64, LiveEntry> = read_live(tx, meta)?.into_iter().collect();
+    let rows = read_rows_from(tx, &meta.spec, cutoff)?;
+    let plain = meta.dirty_for_ns();
+    for (_, row) in rows.iter().rev() {
+        for (key, before) in row.before.iter().rev() {
+            restore_key_tx(tx, meta, plain, key, before.as_deref())?;
+        }
+        staged.adjust(-row.usage.0, -row.usage.1);
+    }
+    let adopt_seq = t.adopt.as_ref().map(|a| a.0);
+    let mut adopted = None;
+    let mut ahead = Vec::new();
+    let mut behind = Vec::new();
+    for (seq, row) in rows {
+        if Some(seq) == adopt_seq {
+            adopted = Some((seq, row));
+        } else if row_is_ordered(&row) {
+            ahead.push((seq, row));
+        } else {
+            behind.push((seq, row));
+        }
+    }
+    let none = HashSet::new();
+    let mut out = Stranded::default();
+    for (seq, row) in ahead {
+        redo_row_tx(tx, meta, staged, &live, &none, &mut out, true, seq, row)?;
+    }
+    match (adopted, t.adopt) {
+        (Some((seq, mut row)), Some((_, rid, op))) => {
+            row.kind = SpecKind::Streamed {
+                epoch: t.epoch,
+                first: t.first,
+                last: t.last,
+                own: Some((rid, op)),
+            };
+            live.insert(
+                seq,
+                LiveEntry::Streamed {
+                    epoch: t.epoch,
+                    last: t.last,
+                },
+            );
+            redo_row_tx(tx, meta, staged, &live, &none, &mut out, true, seq, row)?;
+        }
+        (None, None) => {
+            let capture = Capture::new();
+            let row_staged = UsageTracker::staging();
+            let (_, applied) = {
+                let cx = ApplyCx {
+                    dirty: meta.dirty_capturing(&capture),
+                    durable: false,
+                };
+                apply_batch_tx(
+                    tx,
+                    meta,
+                    cx,
+                    t.records,
+                    &TouchSet::default(),
+                    &row_staged,
+                    true,
+                )?
+            };
+            let usage = row_staged.raw_delta();
+            staged.adjust(usage.0, usage.1);
+            record_tx(
+                tx,
+                meta,
+                SpecKind::Streamed {
+                    epoch: t.epoch,
+                    first: t.first,
+                    last: t.last,
+                    own: None,
+                },
+                applied,
+                capture.into_before(),
+                usage,
+            )?;
+        }
+        _ => {
+            return Err(MetaError::Invalid(format!(
+                "streamed transaction {}..={}: the shadow it confirms is not at or after {cutoff}",
+                t.first, t.last
+            )))
+        }
+    }
+    for (seq, row) in behind {
+        redo_row_tx(tx, meta, staged, &live, &none, &mut out, true, seq, row)?;
+    }
+    Ok(())
+}
+
 /// Roll back and take out every outstanding entry `strands` selects (see
 /// [`rewind_tx`]).
 fn strand_tx(
@@ -1966,6 +2179,7 @@ impl Meta {
         // 1402: a shadow retired the ordinary way had the segment's
         // unlink re-applied over a later streamed create) — and a
         // takeover strands it as this node's own op.
+        let mut adopt: Option<(u64, Rid, MutateOp)> = None;
         for rec in records {
             if let LogRecord::Completed { rid } = rec {
                 // Plan 30 §M11 phase 2b: this node's own delegate
@@ -1978,27 +2192,72 @@ impl Meta {
                 if tx.get(&self.completed, rid.to_key())?.is_some() {
                     return Ok(());
                 }
-                if let Some((seq, own_epoch, op)) = shadow_row_for(&tx, self, *rid)? {
-                    if let Some(v) = tx.get(&self.spec, seq_key(seq))? {
-                        let mut row: SpecRow = postcard::from_bytes(&v)?;
-                        row.kind = SpecKind::Streamed {
-                            epoch,
-                            first,
-                            last,
-                            own: Some((*rid, op)),
-                        };
-                        put_row(&mut tx, &self.spec, seq, &row)?;
-                    }
-                    let _ = own_epoch;
-                    tx.insert(
-                        &self.spec_live,
-                        seq_key(seq),
-                        postcard::to_allocvec(&LiveEntry::Streamed { epoch, last })?,
-                    );
-                    tx.commit()?;
-                    return Ok(());
+                if let Some((seq, _, op)) = shadow_row_for(&tx, self, *rid)? {
+                    adopt = Some((seq, *rid, op));
+                    break;
                 }
             }
+        }
+        // The stream is contiguous and in the holder's order, so every
+        // shadow still outstanding here — a reply the stream has not
+        // reached yet — belongs *after* this transaction, and a
+        // shadow it confirms belongs *here*, after everything streamed
+        // or tailed before it. A reply can overtake the stream (they
+        // travel apart, and one backup acknowledgement releases both):
+        // then this transaction, or one tailed or streamed before it,
+        // sits on top of a shadow it precedes. So can a segment when the
+        // reply's `base` fell short (a delegate's did, see
+        // `constellation_authority`'s `delegate_execute_now`). Installed
+        // at the end, or adopted in place, that order is permanent: the
+        // segment skips streamed rows (chaos-soak-4 seed 42, `wf293`:
+        // node 0 installed its rebased whole-file write as a shadow, node
+        // 3's earlier write then landed on top of it, the stream's copy
+        // of node 0's own write adopted the shadow without re-applying
+        // it, and node 0 served node 3's content while the log and every
+        // other replica ended on node 0's). When that order matters (the
+        // keys overlap), roll back to the oldest outstanding shadow and
+        // redo in the log's order.
+        if let Some(cutoff) =
+            streamed_out_of_place(&tx, self, adopt.as_ref().map(|a| a.0), records)?
+        {
+            let staged = UsageTracker::staging();
+            insert_streamed_tx(
+                &mut tx,
+                self,
+                &staged,
+                cutoff,
+                StreamedTx {
+                    epoch,
+                    first,
+                    last,
+                    records,
+                    adopt,
+                },
+            )?;
+            let (bytes, files) = staged.raw_delta();
+            adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
+            tx.commit()?;
+            staged.drain_into(self.usage_tracker());
+            return Ok(());
+        }
+        if let Some((seq, rid, op)) = adopt {
+            if let Some(v) = tx.get(&self.spec, seq_key(seq))? {
+                let mut row: SpecRow = postcard::from_bytes(&v)?;
+                row.kind = SpecKind::Streamed {
+                    epoch,
+                    first,
+                    last,
+                    own: Some((rid, op)),
+                };
+                put_row(&mut tx, &self.spec, seq, &row)?;
+            }
+            tx.insert(
+                &self.spec_live,
+                seq_key(seq),
+                postcard::to_allocvec(&LiveEntry::Streamed { epoch, last })?,
+            );
+            tx.commit()?;
+            return Ok(());
         }
         self.install_speculative_tx(
             tx,
@@ -2420,6 +2679,26 @@ impl Meta {
     pub fn has_pending_replays(&self) -> bool {
         let r = self.db.read_tx();
         counter_get(&r, &self.local, KV_PENDING_REPLAY_COUNT).is_ok_and(|n| n > 0)
+    }
+
+    /// Whether an outstanding streamed transaction, shadow or hint (not
+    /// this node's own `Local` work: that is its unshipped journal)
+    /// touches any of `keys`. A delegate's forward reply names no `base`
+    /// then (`constellation_authority`'s `delegate_execute_now`): its
+    /// replica evaluated the op on state ahead of the log that the
+    /// requester may not have. One counter read when nothing is
+    /// outstanding.
+    pub fn speculation_touches(&self, keys: &TouchSet) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        for (seq, _) in live_non_local(&r, self)? {
+            if let Some(v) = r.get(&self.spec, seq_key(seq))? {
+                let row: SpecRow = postcard::from_bytes(&v)?;
+                if TouchSet::from_records(row.records.iter()).overlaps(keys) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub fn has_outstanding_speculation(&self) -> bool {

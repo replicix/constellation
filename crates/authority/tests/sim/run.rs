@@ -280,6 +280,32 @@ pub fn backup_core_config(node_id: NodeId, incarnation: u32) -> Config {
     c
 }
 
+/// `chaos-soak-4` seed 42 (`wf293`): the backup configuration with a
+/// longer pre-S3 stream hold-off, so a forward's reply (sent the moment
+/// its row is backup-acknowledged) often overtakes the stream frame that
+/// carries the rows before it (held for the hold-off): streamed
+/// transactions then arrive under live shadows and hints.
+pub fn backup_hot_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let mut c = backup_core_config(node_id, incarnation);
+    c.stream_ahead_holdoff_ms = 30;
+    c
+}
+
+/// The placement on over the backup configuration (the root and every
+/// delegate stream ahead of S3), with the `backup-hot` hold-off.
+pub fn placement_backup_core_config(node_id: NodeId, incarnation: u32) -> Config {
+    let mut c = placement_core_config(node_id, incarnation);
+    let b = backup_hot_core_config(node_id, incarnation);
+    c.backup_rtt_budget_ms = b.backup_rtt_budget_ms;
+    c.backup_takeover_ms = b.backup_takeover_ms;
+    c.backup_ack_timeout_ms = b.backup_ack_timeout_ms;
+    c.backup_heartbeat_ms = b.backup_heartbeat_ms;
+    c.backup_stable_ms = b.backup_stable_ms;
+    c.backup_reconfig_min_ms = b.backup_reconfig_min_ms;
+    c.stream_ahead_holdoff_ms = b.stream_ahead_holdoff_ms;
+    c
+}
+
 /// Plan 30 §M11 phase 2b: the placement on, with thresholds a short
 /// workload reaches (a 2 s window, 6 ops, a 1.5 s dwell, a 1 s
 /// cool-down).

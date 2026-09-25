@@ -56,6 +56,11 @@ pub trait Replica {
     /// Whether the unshipped journal (this tenure) touched any of `keys`
     /// (the stale-base rule on forward replies, `Meta::unshipped_overlaps`).
     fn unshipped_overlaps(&self, keys: &TouchSet) -> bool;
+    /// Whether outstanding speculation that is not this node's own
+    /// journal (a streamed transaction, a shadow, a hint) touches any of
+    /// `keys`: state this replica holds ahead of its applied log, which a
+    /// forward reply's `base` cannot name (`Meta::speculation_touches`).
+    fn speculation_touches(&self, keys: &TouchSet) -> bool;
 
     // ---- M13: the inbox on the holder ----
 
@@ -426,6 +431,11 @@ impl Replica for Meta {
 
     fn unshipped_overlaps(&self, keys: &TouchSet) -> bool {
         Meta::unshipped_overlaps(self, keys)
+    }
+
+    fn speculation_touches(&self, keys: &TouchSet) -> bool {
+        // An error reads as "touched": the reply then waits for the log.
+        Meta::speculation_touches(self, keys).unwrap_or(true)
     }
 
     fn inbox_ack_covers(&self, ack: InboxAck) -> bool {

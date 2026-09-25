@@ -285,6 +285,8 @@ fn replay_seed() {
         Ok("backup-departs") => backup_departs_config(),
         Ok("backup-partition") => backup_partition_config(),
         Ok("long-backup") => long_backup_config(),
+        Ok("backup-hot") => backup_hot_config(),
+        Ok("placement-hot") => placement_hot_config(),
         // `long_backup`'s odd seeds: the same, under `ack=s3`.
         Ok("long-acks3") => SimConfig {
             core: std::sync::Arc::new(sim::run::ack_s3_core_config),
@@ -1730,6 +1732,92 @@ fn an_accepted_forward_is_answered_from_the_pre_s3_stream() {
             .sum::<u64>();
     }
     assert!(answered > 0, "no forward was answered from the stream");
+}
+
+/// Plan 30 §M9 × `chaos-soak-4` (seed 42, `wf293`): backups on, so the
+/// holder streams backup-acknowledged transactions ahead of S3 (after a
+/// 30 ms hold-off), and every client of four nodes contends on two names
+/// without faults. Replies overtake the stream frames of transactions
+/// the holder ordered before them, so streamed transactions land under
+/// live shadows and hints all the time (`Meta::install_streamed`'s
+/// reordering; a root holder's reply `base` keeps an *overlapping*
+/// shadow from being installed ahead of the stream, so the reorder
+/// itself is pinned by the meta test).
+fn backup_hot_config() -> SimConfig {
+    SimConfig {
+        nodes: 4,
+        names: 2,
+        clients_per_node: 3,
+        ops_per_client: 10,
+        random_faults: 0,
+        core: std::sync::Arc::new(sim::run::backup_hot_core_config),
+        ..backup_config()
+    }
+}
+
+/// `backup-hot` with the placement on over two directories the four
+/// nodes share unevenly (renames crossing between them): the root
+/// executes names in a directory before the placement delegates it, and
+/// the delegate then answers ops on the same names for nodes whose
+/// replicas have not caught up with the root's.
+fn placement_hot_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 16,
+        dirs: vec!["d1".into(), "d2".into()],
+        cross_ratio: 0.3,
+        check_range_bits: 2,
+        read_ratio: 0.3,
+        core: std::sync::Arc::new(sim::run::placement_backup_core_config),
+        ..backup_hot_config()
+    }
+}
+
+/// `Meta::install_streamed`'s reordering (chaos-soak-4 seed 42) must
+/// leave a hint where it is: its refusal may be streamed already, so what
+/// the stream delivers now is later than the state the hint read. A first
+/// version redid hints after the streamed transaction and failed these
+/// seeds (the hint of `create f1` undid a streamed `rename f1 f0`).
+#[test]
+fn regression_streamed_reorder_keeps_hints_in_place() {
+    for (seed, cfg, alias) in [
+        (90_024u64, backup_hot_config(), "backup-hot"),
+        (90_039, placement_hot_config(), "placement-hot"),
+    ] {
+        let report = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={alias}")
+        });
+        assert!(report.converged_checked, "seed {seed} did not converge");
+    }
+}
+
+/// The `backup-hot` sweep: `cargo test -p constellation-authority
+/// --release --test sim -- --ignored long_backup_hot`
+/// (`AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_START`; replay one with
+/// `AUTHORITY_SIM_CONFIG=backup-hot`).
+#[test]
+#[ignore]
+fn long_backup_hot() {
+    let seeds: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000);
+    let start: u64 = std::env::var("AUTHORITY_SIM_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90_000);
+    let mut failures = Vec::new();
+    for seed in start..start + seeds {
+        let (cfg, alias) = if seed % 2 == 0 {
+            (backup_hot_config(), "backup-hot")
+        } else {
+            (placement_hot_config(), "placement-hot")
+        };
+        if let Err(e) = run_seed(seed, cfg) {
+            eprintln!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={alias}");
+            failures.push(seed);
+        }
+    }
+    assert!(failures.is_empty(), "failing seeds: {failures:?}");
 }
 
 /// Plan 30 §M9: the long configuration with backups (and, every other

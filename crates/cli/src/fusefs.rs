@@ -2422,10 +2422,18 @@ impl ConstellationFs {
         base: &Manifest,
         file_len: u64,
     ) -> Result<(Vec<u8>, Vec<ChunkHash>), i32> {
-        let old_hashes = self.chunk_list(base)?;
+        let cs = u64::from(self.chunk_size);
+        // A manifest's content is valid only below its `file_len`
+        // (`replay::clip_manifest`). A clipped *spilled* manifest keeps
+        // its chunk list (the clip cannot rewrite the spill blob), so
+        // the entries at or past `file_len` are dead: dropped here, or
+        // the re-cut below measured one against a base it lies outside
+        // of (`chunk_len`'s debug assertion; the truncate/fallocate fuzz
+        // seed 34, a truncate to 32 of a ten-chunk file).
+        let mut old_hashes = self.chunk_list(base)?;
+        old_hashes.retain(|index, _| *index * cs < base.file_len);
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let n_chunks = layout.chunk_count(file_len);
-        let cs = u64::from(self.chunk_size);
         let floor = ws.base_floor(base.file_len);
         let mut new_hashes: SparseChunks = old_hashes
             .iter()
